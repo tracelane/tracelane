@@ -285,6 +285,6 @@ jobs:
         run: python -m build packages/sdk-python/
 
       - name: Publish to PyPI via OIDC (no long-lived token)
-        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0  # release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
         with:
           packages-dir: packages/sdk-python/dist/
