@@ -1,0 +1,23 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "tracelane-web",
+	"main": ".open-next/worker.js",
+	// nodejs_compat is mandatory: WorkOS AuthKit + node:crypto (api-key HMAC,
+	// Polar webhook verify, CMK PEM parse) resolve through it. The 2025-09-23
+	// compatibility_date also auto-populates process.env from vars/secrets, which
+	// is how our `process.env.*` reads (DATABASE_URL, WORKOS_*, pepper, etc.) work
+	// on the Worker. OpenNext additionally bridges env onto process.env per request.
+	"compatibility_date": "2025-09-23",
+	"compatibility_flags": ["nodejs_compat"],
+	// Static assets emitted by the OpenNext build, served by the Worker's asset
+	// handler. The ASSETS binding is what OpenNext's worker entry expects.
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	},
+	"observability": {
+		"enabled": true
+	}
+	// Secrets/vars are NOT defined here — they are set per-environment in the CF
+	// dashboard / `wrangler secret put` (preview + prod). See the deployment env list.
+}

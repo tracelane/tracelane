@@ -1,0 +1,124 @@
+[package]
+name = "ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tracelane Rust ingest workers — OTLP receiver, NATS consumer, ClickHouse writer"
+publish = false # product binary, not a crates.io library (generic name); ships via GHCR + GitHub Releases
+
+[lib]
+name = "ingest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ingest"
+path = "src/main.rs"
+
+[[bench]]
+name = "limits"
+harness = false
+
+[[bench]]
+name = "cardinality"
+harness = false
+
+[[bench]]
+name = "sampler"
+harness = false
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+figment = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-nats = { workspace = true }
+clickhouse = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+ring = { workspace = true }
+# FT-08 disk-pressure self-protection: safe statvfs wrapper (no openssl, no
+# unsafe at our call site). Already vendored transitively; pinned here as a
+# direct dep. Apache-2.0/MIT/BSD.
+rustix = { version = "1.1", features = ["fs"] }
+# X.509 parsing for SPIFFE SVID identity extraction. Pure Rust, MIT/Apache,
+# no openssl. Used only to walk SubjectAlternativeName extensions and validity
+# dates — chain trust validation happens at the rustls layer.
+x509-parser = "0.17"
+
+# mTLS termination — rustls 0.23 + tokio-rustls + ring backend (no openssl).
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+arc-swap = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+# SPIRE Workload API gRPC client (Unix Domain Socket).
+tonic = { workspace = true }
+prost = { workspace = true }
+tower = { workspace = true }
+tower-service = "0.3"
+
+# SecretString wrapping for SVID private keys (Zeroize-on-drop).
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+
+# ADR-030: per-tenant attribute-key cardinality cap. HyperLogLog++ p=14
+# sketch (~16 KB per workspace, ~0.81% relative error at 95% CI). Pure
+# Rust, MIT/Apache. DashMap shards the per-workspace lookup so the hot
+# path `observe_and_classify` is a single shard-load + mutex-lock + HLL
+# insert — measured <200 ns p99 in `benches/cardinality.rs`.
+hyperloglogplus = "0.4"
+dashmap = "6"
+
+tracelane-shared = { path = "../shared" }
+# A6: tracelane_policy::pii ↑ for span-attribute redaction before any
+# external write (ClickHouse, R2). Mirrors the gateway's audit-row redact.
+tracelane-policy = { path = "../policy" }
+
+# Control-plane Postgres pool for the per-tenant config resolver (ADR-048 D4.1):
+# deadpool over tokio-postgres with rustls TLS (Neon mandates TLS) + webpki roots
+# (no FS dep for distroless). Mirrors crates/gateway/src/db. openssl banned.
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+tokio-postgres-rustls = "0.13"
+webpki-roots = "0.26"
+
+# OTLP protobuf decoder. opentelemetry-proto generates the prost types
+# we need (ResourceSpans, Span, KeyValue, Status, AnyValue). Use the
+# `gen-tonic-messages` feature so the trace service types are
+# available; we only consume the decoded structs, not the gRPC service.
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+# Vendored protoc binary so CI containers without system protoc still build.
+# Apache 2.0, ships protoc as a static binary per supported host triple.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+# Test-only: mint self-signed X.509-SVIDs for unit + integration tests.
+# `ring` backend matches the workspace crypto pin (no aws-lc-sys C build).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+http-body-util = "0.1"
+tempfile = "3.13"
+# Mock SPIRE server harness uses tonic server in tests only.
+tonic = { workspace = true, features = ["server"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+# Criterion for ADR-029 hot-path microbench (pre-decode reject <1 µs p50
+# on a 10 MiB payload). default-features=false drops the rayon pull-in.
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+# FT-03 chaos: a wiremock HTTP server stands in for a flapping ClickHouse so
+# the writer's retry loop can be exercised against real transient failures.
+wiremock = "0.6"

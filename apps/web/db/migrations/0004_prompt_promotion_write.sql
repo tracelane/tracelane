@@ -1,0 +1,2 @@
+ALTER TABLE "plan_entitlements" ADD COLUMN "f_prompt_promotion_write" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "workspace_entitlements" ADD COLUMN "f_prompt_promotion_write" boolean;

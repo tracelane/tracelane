@@ -1,0 +1,65 @@
+---
+title: Migrating from Langfuse
+description: Drop-in OTel pivot — point Langfuse SDKs at the Tracelane OTLP endpoint.
+---
+
+Langfuse exposes traces over its own SDK + an OTLP endpoint. Tracelane is
+OTel-native, so the pivot is:
+
+1. Keep your Langfuse SDK if you want, but configure its OTLP exporter
+   to point at Tracelane's ingest endpoint.
+2. Or swap to `@tracelanedev/sdk` / `tracelane` (Python) and
+   delete the Langfuse SDK.
+
+## Path A — keep the Langfuse SDK
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://ingest.tracelane.dev:4317
+export OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer\ tlane_<your_key>
+```
+
+Langfuse-emitted spans land in Tracelane's ClickHouse hot tier and the
+dashboard renders them. Predictive guardrails won't fire (they need the
+gateway path), but observability + audit work.
+
+## Path B — full swap
+
+```bash
+npm uninstall langfuse
+npm install @tracelanedev/sdk
+```
+
+```typescript
+import { init, instrumentOpenAI } from "@tracelanedev/sdk";
+import OpenAI from "openai";
+
+init({
+  endpoint: "https://ingest.tracelane.dev", // an OTLP receiver you run
+  apiKey: process.env.TRACELANE_API_KEY!,
+});
+
+const client = new OpenAI();
+instrumentOpenAI(client); // wrap each client you want traced
+```
+
+Instrumentation is explicit — after `init()`, wrap each client with its
+`instrument*` function (`instrumentOpenAI`, `instrumentAnthropic`,
+`instrumentLangGraph`, …). Custom Langfuse `observe(...)` decorators become
+standard OpenTelemetry spans via `@opentelemetry/api`
+(`trace.getTracer(...).startActiveSpan(...)`).
+
+## Why move
+
+| | Langfuse | Tracelane |
+|---|---|---|
+| License | MIT (per Langfuse's public licensing) | Apache 2.0 across the board |
+| Predictive guardrails | None inline | Eight, on the hot path |
+| Tamper-evident audit | None | Hash chain + Ed25519 per-tenant signing (live) + byte-identical 3-language verifier; resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
+| Routing across providers | Via the SDK | Via the gateway — no SDK swap, single API key |
+| Dashboard trace viewer | Standard | In-house transcript-spine viewer (SVG/DOM) |
+
+## Related
+
+- [Quickstart](/quickstart)
+- [Architecture](/architecture)
+- [Predictive guardrails](/predictive-guardrails)

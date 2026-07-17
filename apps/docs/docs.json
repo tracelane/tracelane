@@ -1,0 +1,114 @@
+{
+ "$schema": "https://mintlify.com/docs.json",
+ "theme": "mint",
+ "name": "Tracelane",
+ "colors": {
+ "primary": "#0F62FE",
+ "light": "#4589FF",
+ "dark": "#0043CE"
+ },
+ "favicon": "/favicon.svg",
+ "navigation": {
+ "tabs": [
+ {
+ "tab": "Documentation",
+ "groups": [
+ {
+ "group": "Get started",
+ "pages": ["index", "quickstart", "concepts", "onboarding"]
+ },
+ {
+ "group": "SDKs",
+ "pages": ["sdk-python", "sdk-typescript"]
+ },
+ {
+ "group": "Concepts",
+ "pages": [
+ "architecture",
+ "predictive-guardrails",
+ "providers",
+ "audit-ledger",
+ "byok",
+ "pricing"
+ ]
+ },
+ {
+ "group": "Features",
+ "pages": [
+ "prompt-promotion",
+ "eval-gates",
+ "slo",
+ "time-travel"
+ ]
+ },
+ {
+ "group": "Tools",
+ "pages": ["cli", "mcp-server", "api-reference"]
+ },
+ {
+ "group": "Operations",
+ "pages": ["self-hosting", "security", "troubleshooting", "changelog"]
+ },
+ {
+ "group": "Migrations",
+ "pages": [
+ "migrations/from-litellm",
+ "migrations/from-helicone",
+ "migrations/from-langsmith",
+ "migrations/from-langfuse",
+ "migrations/from-datadog"
+ ]
+ },
+ {
+ "group": "Comparisons",
+ "pages": [
+ "comparisons/vs-langsmith-engine",
+ "comparisons/vs-litellm",
+ "comparisons/vs-portkey",
+ "comparisons/vs-helicone"
+ ]
+ }
+ ]
+ },
+ {
+ "tab": "Decisions",
+ "groups": [
+ {
+ "group": "Architecture decisions",
+ "pages": ["decisions/index"]
+ }
+ ]
+ }
+ ]
+ },
+ "logo": {
+ "light": "/logo/light.svg",
+ "dark": "/logo/dark.svg"
+ },
+ "navbar": {
+ "links": [
+ {
+ "label": "GitHub",
+ "href": "https://github.com/tracelane/tracelane"
+ },
+ {
+ "label": "Status",
+ "href": "https://status.tracelane.dev"
+ }
+ ],
+ "primary": {
+ "type": "button",
+ "label": "Sign up",
+ "href": "https://app.tracelane.dev/signup"
+ }
+ },
+ "footer": {
+ "socials": {
+ "github": "https://github.com/tracelane/tracelane",
+ "x": "https://x.com/tracelanedev"
+ }
+ },
+ "search": {
+ "prompt": "Search Tracelane docs"
+ }
+}

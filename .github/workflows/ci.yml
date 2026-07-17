@@ -1,0 +1,432 @@
+name: CI
+
+# This workflow does NOT name a box. CI home = GitHub Actions, LIVE + tiered.
+# EXHAUSTED (2,000/2,000) from ~2026-06-20 with a budget cap blocking paid
+# overflow, so GitHub started no runs until the 2026-07-01 monthly reset — the
+# "disabled_manually" / "payments failed" strings GitHub showed were BOTH
+# misleading; the real cause was minutes-exhaustion, which self-healed on the
+# reset (no fix, no cap raise). Permanent fix = the public-repo flip (free
+# GitHub-hosted Actions forever, no cap). GCP Cloud Build running `ci/run-ci.sh`
+# (separate GitHub App + service; WIF, no PAT) and on-node `bash ci/run-ci.sh`
+# remain zero-Actions-budget fallbacks, not the primary path.
+#
+# `runs-on` is host-neutral via the `CI_RUNNER` repo variable, defaulting to
+# `ubuntu-latest` — correct for the most-likely restoration path (public repo →
+# free GitHub-hosted minutes; there, self-hosted would be the WRONG default). To
+# dispatch to a self-hosted runner instead (private repo + a free box), set repo
+# variable CI_RUNNER (e.g. =tl-node-1) — no YAML edit for the light jobs.
+#
+# PER-JOB ROUTING (2026-07-13): `CI_RUNNER` routes only the LIGHT jobs (changes,
+# web, L16, verifier-roundtrip, python, eval, grep guards). The HEAVY cargo/stack
+# jobs (rust full-workspace, span-publish-integration, ingest-release-guard,
+# live-eval-gate, bench) are HARDCODED `ubuntu-latest` and never hit the runner —
+# a cold `cargo test --workspace --all-features` SATURATED the tl-node-1 prod box
+# (SSH lost; prod gateway stayed up).
+#
+# Tiers (apply whenever this workflow actually runs):
+#   • FAST tier (fmt·clippy·unit-test, web, python, grep guards, secret-scan):
+#     on push-to-main + every PR-to-main. Path-scoped by the `changes` job.
+#   • FULL/BEHAVIORAL tier (eval-suite, span-publish-integration, live-eval-gate,
+#     bench): on PR-to-main (gates the merge) + post-merge main push + WEEKLY +
+#     manual dispatch. NOT on feature-branch pushes.
+#   • Feature-branch pushes do NOT trigger CI — the per-push gate there is local
+#     `scripts/verify-all.sh` (mirrors every infra-free check). Opening the PR to
+#     main is what runs the behavioral net.
+#   • WEEKLY (cron) + workflow_dispatch run the FULL suite regardless of paths
+#     (the `changes` job fail-safes to run-all on non-push/PR events) — the
+#     scheduled safety net for a path-gate miss.
+#
+# BUDGET: on GitHub-hosted Linux (the CI_RUNNER default), a full+behavioral run
+# (live-eval-gate + bench + cold builds) is ~50-90 billed min. A DAILY such run
+# alone would exceed the 2,000 free private-repo min/month — so the scheduled net
+# is WEEKLY, not nightly. Weekly (~4×) + hot-path-PR behavioral + fast-tier push
+# stays well under 2,000 → ~$0. For a true nightly net at $0, run `bash
+# ci/run-ci.sh` on-node via cron (free, off GitHub's budget). Self-hosted
+# runners (CI_RUNNER=self-hosted) don't consume billed minutes at all.
+#
+# Portable fallback (no CI provider at all): `bash ci/run-ci.sh` runs the SAME
+# gateway→NATS→ingest→ClickHouse live-eval on any Docker host (proven on-node
+# 2026-06-22).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 0" # weekly, Sun 03:00 UTC — full + behavioral, all paths (budget: not daily)
+  workflow_dispatch: {} # manual full run (use to validate the runner end-to-end)
+
+# Runs QUEUE, they do NOT cancel each other. Was `cancel-in-progress: true`, but
+# on the self-hosted runner a cancelled L16 sweep ORPHANS its `next dev`(turbopack)
+# + Playwright + chrome-headless children (SIGKILL skips cleanup) — they keep
+# running for 30+ min, pin the box at load 25, and knock the runner offline. False
+# = a superseding push waits its turn instead of stranding a half-killed sweep.
+# (2026-07-13; revisit if a proper per-job process-group cleanup lands.)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Path filter: decide which language areas a change actually touches so we
+  # don't cold-compile Rust for an apps/web-only push (and vice versa). Uses the
+  # compare API — no deep checkout. FAIL-SAFE: any uncertainty (new branch,
+  # cross-cutting file, API error) runs ALL areas, so the gate is never weakened,
+  # only made cheaper when it safely can be.
+  changes:
+    name: Detect changed areas
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    outputs:
+      rust: ${{ steps.f.outputs.rust }}
+      web: ${{ steps.f.outputs.web }}
+      python: ${{ steps.f.outputs.python }}
+      code: ${{ steps.f.outputs.code }}
+      live_stack: ${{ steps.f.outputs.live_stack }}
+    steps:
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          emit() { { echo "rust=$1"; echo "web=$2"; echo "python=$3"; echo "code=$4"; echo "live_stack=$5"; } >> "$GITHUB_OUTPUT"; }
+          run_all() { echo "→ running ALL areas ($1)"; emit true true true true true; exit 0; }
+
+          if [ "$EVENT" = "pull_request" ]; then base="$BASE"
+          elif [ "$EVENT" = "push" ]; then base="$BEFORE"
+          else run_all "event=$EVENT"; fi
+          [ -z "${base:-}" ] && run_all "no base sha"
+          [ "$base" = "0000000000000000000000000000000000000000" ] && run_all "new branch / no parent"
+
+          files=$(gh api "repos/${REPO}/compare/${base}...${SHA}" --jq '.files[].filename' 2>/dev/null) \
+            || run_all "compare API failed"
+          [ -z "$files" ] && run_all "empty file list"
+          echo "Changed files:"; echo "$files" | sed 's/^/  /'
+
+          rust=false; web=false; python=false; live_stack=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              spec/*|infra/*|.github/*|*.sql|Makefile|justfile|.cargo/*|rust-toolchain.toml) run_all "cross-cutting: $f";;
+            esac
+            case "$f" in
+              crates/*|Cargo.toml|Cargo.lock|packages/verifier-rust/*) rust=true;;
+            esac
+            # L2 live eval gate — only the gateway/ingest/span/CH/eval surface
+            # needs the (expensive) ephemeral real stack. Docs/frontend PRs stay
+            # mock-only, preserving the CI cost reduction.
+            case "$f" in
+              crates/gateway/*|crates/ingest/*|crates/shared/*|crates/policy/*|evals/*|scripts/ci/live-eval-stack.sh) live_stack=true;;
+            esac
+            case "$f" in
+              apps/*|packages/sdk-typescript/*|packages/verifier-typescript/*|packages/cli/*|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|biome.json|tsconfig*|*.ts|*.tsx|*.jsx) web=true;;
+            esac
+            case "$f" in
+              evals/*|ml/*|packages/sdk-python/*|packages/verifier-python/*|*.py|pyproject.toml|ruff.toml) python=true;;
+            esac
+          done <<< "$files"
+
+          code=false
+          { [ "$rust" = true ] || [ "$web" = true ] || [ "$python" = true ]; } && code=true
+          echo "→ rust=$rust web=$web python=$python code=$code live_stack=$live_stack"
+          emit "$rust" "$web" "$python" "$code" "$live_stack"
+
+  # One Rust job: fmt + clippy + test share a single toolchain, checkout, and
+  # cache (one rust-cache instead of the old lint/test split that cold-compiled
+  # the workspace twice and fragmented the 10 GB cache budget).
+  rust:
+    name: Rust (fmt · clippy · test)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest  # HEAVY (cargo/stack): OFF the prod node (per-job routing; ubuntu-latest is billing-gated - the founder's separate concern)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        with:
+          # Share ONE debug cache across the rust / span-publish / live-eval jobs
+          # (they all compile the workspace in the debug profile). Without a
+          # shared-key each job wrote its own multi-GB cache → 4 caches blew the
+          # 10 GB repo limit → the service 400'd and nothing persisted → perpetual
+          # cold builds. One shared cache stays under the cap and actually restores.
+          shared-key: "rust-ci"
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        # --all-targets lints test + bench code too (audit finding P2-1).
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  #  regression gate: a published gateway span MUST land on the
+  # TRACELANE_SPANS JetStream stream. Boots NATS with JetStream (-js) via
+  # `docker run` (GitHub `services:` can't pass the -js command flag) and runs
+  # the otherwise-#[ignore]d integration test. Triggered on Rust changes.
+  web:
+    name: Web (biome · typecheck · vitest)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Build dist-based workspace deps
+        # apps/web imports `@tracelanedev/audit-verifier` (ships `main: dist/…`, no
+        # source-types export), so `tsc --noEmit` in apps/web cannot resolve its
+        # types until the package is built. Build it before lint/typecheck/test.
+        run: pnpm --filter @tracelanedev/audit-verifier build
+      - name: pnpm lint (Biome)
+        run: pnpm lint
+      - name: pnpm typecheck
+        run: pnpm typecheck
+      - name: pnpm test (Vitest)
+        run: pnpm test
+
+  verifier-roundtrip:
+    name: Cross-verifier round-trip (Rust · TS · Python agree — ADR-062 crown jewel)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Setup Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        with:
+          shared-key: "rust-ci"
+      - name: Install deps (JS workspace + Python verifier)
+        run: |
+          pnpm install --frozen-lockfile
+          pip install -e packages/verifier-python/
+      - name: Build TS verifier dist + Rust verifier CLI
+        run: |
+          pnpm --filter @tracelanedev/audit-verifier build
+          cargo build --release -p tracelane-audit
+      - name: Round-trip — anchored GREEN · forged-anchor REJECTED · tampered RED (all 3 verifiers)
+        run: bash scripts/ci/verifier-roundtrip/run.sh
+
+  python:
+    name: Python (ruff · pytest)
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Setup Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        # Editable installs so pytest's imports resolve across evals/orchestrator,
+        # verifier-python (tracelane_audit_verifier), and sdk-python (tracelane).
+        run: |
+          pip install ruff pytest pytest-asyncio
+          pip install -e evals/
+          pip install -e packages/verifier-python/
+          pip install -e packages/sdk-python/
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format check
+        run: ruff format --check .
+      - name: pytest
+        run: pytest
+
+  no-auth-stub:
+    name: SPIFFE auth stub regression guard (ADR-028)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block Ok(()) regression in crates/ingest/src/auth.rs
+        run: ./scripts/ci/no-auth-stub.sh
+
+  no-raw-ch-query:
+    name: ClickHouse query cap-wrapper guard (ADR-031)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block raw ClickHouse .query() outside the cap wrapper
+        run: ./scripts/ci/no-raw-ch-query.sh
+
+  tenant-isolation-check:
+    name: Tenant Isolation (ClickHouse SQL guard)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Verify all ClickHouse queries have tenant_id filter
+        run: python3 scripts/ci/check-tenant-isolation.py
+
+  tenant-id-provenance:
+    name: org_id→tenant-UUID provenance guard (the #1 recurring bug class)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block raw session.tenantId (WorkOS org_id) bound to a ClickHouse tenant filter
+        run: ./scripts/ci/check-tenant-id-provenance.sh
+
+  tenants-pk-guard:
+    name: tenants PK is `id` not `tenant_id` (old-shape SQL guard)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block SQL that treats the tenants PK as tenant_id (bitten 4x — derived-id vs PK seam)
+        run: ./scripts/ci/check-tenants-pk-column.sh
+
+  no-llm-in-recovery:
+    name: Token-free recovery guard (ADR-037)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block LLM/MCP/provider imports in recovery paths
+        run: ./scripts/ci/no-llm-in-recovery.sh
+
+  span-publish-ordering:
+    name: Span-before-guardrail ordering guard (#81 span-drop)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Assert the buffered span publishes before the content-filter block
+        run: python3 scripts/ci/check-span-publish-ordering.py
+
+  genai-attr-keys:
+    name: GenAI attribute-key guard (ADR-043 / )
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block ClickHouse SQL reading bare llm.* GenAI attrs without the gen_ai_* primary
+        run: ./scripts/ci/check-genai-attr-keys.sh
+
+  no-e2e-auth-in-prod:
+    name: E2E auth-bypass flag confinement guard
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Block the E2E auth-bypass flag anywhere a prod build can see it
+        run: ./scripts/ci/no-e2e-auth-in-prod.sh
+
+  # Fast per-push secret + supply-chain gate. Secret detection is the one scan
+  # where push-time matters (especially ahead of the public extraction, ).
+  # The slow Rust vuln scans (cargo-audit, cargo-deny, grype, osv) stay nightly
+  # in security-scan.yml. Always-on; ~1 min.
+  secret-scan:
+    name: Secret + supply-chain scan (fast)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      # gitleaks runs FIRST, on the pristine checkout (no node_modules/target
+      # present yet), so it stays ~3s and false-positive-free.
+      - name: Install gitleaks
+        # Extract to $RUNNER_TEMP (always runner-writable) — NOT /usr/local/bin,
+        # which the self-hosted runner user can't write (it only worked on the
+        # ephemeral ubuntu-latest VM where the runner had sudo).
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" gitleaks
+      - name: Gitleaks secret scan
+        run: |
+          "$RUNNER_TEMP/gitleaks" dir . --no-banner --config .gitleaks.toml
+      - name: .pth file scan (ML supply chain)
+        run: |
+          if find . -name "*.pth" -not -path "./node_modules/*" -not -path "./.git/*" | grep -q .; then
+            echo "ERROR: .pth files found — potential ML model backdoor"
+            find . -name "*.pth" -not -path "./node_modules/*" -not -path "./.git/*"
+            exit 1
+          fi
+          echo ".pth scan: clean"
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+      - name: Setup Node
+        # No pnpm cache here: `pnpm audit` reads pnpm-lock.yaml (no install,
+        # no node_modules), so the cache adds nothing — and dropping it removes
+        # the cache-save post-step that can fail the job during a GitHub
+        # cache-service outage.
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+      - name: pnpm audit (high severity)
+        run: pnpm audit --audit-level=high
+
+  bench:
+    name: Benchmarks (gateway + ingest hot path)
+    needs: changes
+    # Auto-run whenever the perf-sensitive surface (gateway/ingest/shared/policy)
+    # changed — no manual 'hot-path' label needed (the label gate meant bench
+    # almost never ran). On nightly/dispatch the `changes` job fail-safes to
+    # all-true, so the perf budgets are enforced every night regardless of paths.
+    # The dedicated self-hosted box also yields STABLE criterion numbers (vs the
+    # noisy shared GitHub runners), which is what makes `bench:budgets` meaningful.
+    #
+    # gate is needed — a PR-to-main touching the hot path (`live_stack`, which the
+    # `changes` filter sets for crates/gateway|ingest|shared|policy) + the WEEKLY
+    # cron + manual dispatch — but NOT on the post-merge main `push` (redundant
+    # with the PR run that already gated the merge). `!= push` keeps it off the
+    # main-push event while `live_stack` keeps it on hot-path PRs.
+    # NOTE: a DIRECT-to-main hot-path push (no PR) therefore skips bench until the
+    # weekly cron — route hot-path changes through a PR to get the bench gate.
+    if: needs.changes.outputs.live_stack == 'true' && github.event_name != 'push'
+    runs-on: ubuntu-latest  # HEAVY (cargo/stack): OFF the prod node (per-job routing; ubuntu-latest is billing-gated - the founder's separate concern)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        with:
+          # Bench compiles in the RELEASE profile — a distinct target dir from the
+          # debug jobs, so it gets its own shared cache (mixing profiles under one
+          # key thrashes the hit rate). 2 caches total (rust-ci + rust-bench),
+          # both under the 10 GB cap.
+          shared-key: "rust-bench"
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Run hot-path benchmarks (gateway + ingest criterion)
+        run: |
+          pnpm bench:gateway
+          pnpm bench:ingest
+      - name: Enforce performance budgets (punchlist #5)
+        run: pnpm bench:budgets

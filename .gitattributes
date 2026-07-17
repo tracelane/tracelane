@@ -1,0 +1,66 @@
+# Default: treat everything as text and normalize to LF in the index.
+# Working-tree files keep platform-native line endings on checkout.
+* text=auto eol=lf
+
+# Explicit text formats — never CRLF in the index.
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.mdx       text eol=lf
+*.txt       text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.py        text eol=lf
+*.sql       text eol=lf
+*.sh        text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.scss      text eol=lf
+*.svg       text eol=lf
+*.ndjson    text eol=lf
+
+# Lockfiles — binary-ish, never edit by hand.
+Cargo.lock        text eol=lf -diff
+pnpm-lock.yaml    text eol=lf -diff
+package-lock.json text eol=lf -diff
+poetry.lock       text eol=lf -diff
+uv.lock           text eol=lf -diff
+
+# Linguist hints for GitHub repo summary.
+docs/**             linguist-documentation
+evals/**/*.eval.ts  linguist-language=TypeScript
+spec/**             linguist-documentation
+
+# Binary files — never touched.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.tar       binary
+*.tar.gz    binary
+*.tgz       binary
+*.gz        binary
+*.onnx      binary
+*.pt        binary
+*.pth       binary
+*.bin       binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.eot       binary
+
+# Windows-only scripts must keep CRLF.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf

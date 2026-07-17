@@ -1,0 +1,183 @@
+name: Release tracelane-audit CLI
+
+# ADR-034: cross-compile the public audit verifier CLI for four
+# targets, Cosign-sign each artefact, attach CycloneDX SBOM + SLSA
+# Build Level 3 provenance, then Trusted-Publish to crates.io via the
+# crates-io GitHub Environment (no long-lived registry tokens).
+#
+# Tag format: v<semver>-audit-cli (e.g. `v0.1.0-audit-cli`). Triggers
+# this workflow without firing the general `release.yml` (which keys
+# off plain `v*` tags but excludes the `-audit-cli` suffix).
+
+on:
+  push:
+    tags:
+      - 'v*-audit-cli'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0-audit-cli)'
+        required: true
+        type: string
+
+permissions:
+  contents: write     # release upload
+  id-token: write     # Cosign keyless + crates.io OIDC + SLSA generator
+  attestations: write # SLSA generator
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            cross: true
+            binary: tracelane-audit
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            cross: false
+            binary: tracelane-audit
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            cross: false
+            binary: tracelane-audit
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            cross: false
+            binary: tracelane-audit.exe
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tooling (Linux musl target only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release -p tracelane-audit --target ${{ matrix.target }}
+
+      - name: Stage artefact
+        id: stage
+        shell: bash
+        run: |
+          mkdir -p dist
+          src=target/${{ matrix.target }}/release/${{ matrix.binary }}
+          out=dist/tracelane-audit-${{ matrix.target }}
+          if [[ "${{ matrix.binary }}" == *.exe ]]; then
+            out="${out}.exe"
+          fi
+          cp "$src" "$out"
+          # Compute SHA256 — used for SLSA provenance subject lines.
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$out" > "${out}.sha256"
+          else
+            shasum -a 256 "$out" > "${out}.sha256"
+          fi
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+          ls -lah dist
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20  # v3.5.0
+
+      - name: Cosign keyless sign
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign-blob --yes \
+            --bundle "${{ steps.stage.outputs.out }}.cosign.bundle" \
+            "${{ steps.stage.outputs.out }}"
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@d94f46e13c6c62f59525ac9a1e147a99dc0b9bf5  # v0.17.0
+        with:
+          format: cyclonedx-json
+          output-file: "dist/tracelane-audit-${{ matrix.target }}.sbom.cyclonedx.json"
+          path: crates/tracelane-audit-cli
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@69320dbe05506a9a39fc8ae11030b214ec2d1f87  # v2.0.5
+        with:
+          files: |
+            dist/tracelane-audit-${{ matrix.target }}*
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+
+  slsa-provenance:
+    name: SLSA L3 provenance subjects
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      hashes: ${{ steps.collect.outputs.hashes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download release assets
+        uses: robinraju/release-downloader@daf26c55d821e836577a15f77d86ddc078948b05  # v1.10
+        with:
+          tag: ${{ github.event.inputs.tag || github.ref_name }}
+          fileName: 'tracelane-audit-*'
+          out-file-path: 'release-assets'
+
+      - name: Compute base64 subjects
+        id: collect
+        shell: bash
+        run: |
+          cd release-assets
+          # Build the `name:hash` lines SLSA expects, then base64.
+          {
+            for f in tracelane-audit-*; do
+              [[ "$f" == *.sha256 || "$f" == *.cosign.bundle || "$f" == *.sbom.cyclonedx.json ]] && continue
+              h=$(sha256sum "$f" | awk '{print $1}')
+              echo "$h  $f"
+            done
+          } > _subjects.txt
+          b64=$(base64 -w0 _subjects.txt)
+          echo "hashes=$b64" >> "$GITHUB_OUTPUT"
+
+  slsa-l3:
+    name: SLSA L3 provenance generator
+    needs: slsa-provenance
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563  # v2.0.0
+    with:
+      base64-subjects: "${{ needs.slsa-provenance.outputs.hashes }}"
+      upload-assets: true
+
+  publish-crates-io:
+    name: Trusted-Publish to crates.io
+    needs: [build, slsa-l3]
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+
+      - name: Cargo publish (Trusted Publishing OIDC, no static token)
+        run: cargo publish -p tracelane-audit --locked

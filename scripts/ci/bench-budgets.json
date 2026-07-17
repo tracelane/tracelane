@@ -1,0 +1,53 @@
+{
+	"_comment": "Hot-path performance budgets enforced by check-bench-budgets.mjs (punchlist #5). budgetNs is a CI-load-tolerant ceiling on the criterion MEAN — generous enough to absorb runner jitter, tight enough to catch a real (~10x) regression. `target` records the documented hot-path goal the bench defends. `path` is relative to target/criterion.",
+	"benches": [
+		{
+			"id": "quota_check_hot_path",
+			"path": "quota_check_hot_path",
+			"budgetNs": 2000,
+			"target": "ADR-020 QuotaTracker hot path <500ns p99 (single atomic load + compare)"
+		},
+		{
+			"id": "quota_check_overage_band",
+			"path": "quota_check_overage_band",
+			"budgetNs": 2000,
+			"target": "ADR-020 QuotaTracker overage-band check <500ns p99"
+		},
+		{
+			"id": "gateway_admission_overhead",
+			"path": "gateway_admission_overhead",
+			"budgetNs": 3000,
+			"target": "Gateway per-request admission overhead (feeds the <25ms-p99 budget)"
+		},
+		{
+			"id": "circuit_breaker_allow",
+			"path": "circuit_breaker_allow",
+			"budgetNs": 2000,
+			"target": "ADR-036 circuit-breaker allow-path check on the hot path"
+		},
+		{
+			"id": "ingest_limits_reject_10mb_payload",
+			"path": "ingest_limits_pre_decode/reject_10mb_payload",
+			"budgetNs": 5000,
+			"target": "ADR-029 pre-decode reject of a 10 MiB payload <1µs p50"
+		},
+		{
+			"id": "ingest_limits_pre_decode_accept_normal",
+			"path": "ingest_limits_pre_decode_accept_normal",
+			"budgetNs": 2000,
+			"target": "ADR-029 pre-decode accept of a normal payload"
+		},
+		{
+			"id": "ingest_limits_post_decode_small_span",
+			"path": "ingest_limits_post_decode_small_span",
+			"budgetNs": 5000,
+			"target": "ADR-029 post-decode size/cardinality pass on a small span"
+		},
+		{
+			"id": "cardinality_observe_repeated_keys",
+			"path": "cardinality_observe_repeated_keys",
+			"budgetNs": 3000,
+			"target": "ADR-030 HLL++ observe on the common repeated-key path"
+		}
+	]
+}

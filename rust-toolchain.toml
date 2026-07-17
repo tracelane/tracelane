@@ -1,0 +1,12 @@
+# Toolchain pin for reproducible CI + self-host builds.
+#
+# This pins the BUILD toolchain to current stable (1.95) — the version the workspace
+# is developed and linted against. Its clippy knows every lint the crates configure
+# (e.g. `clippy::manual_is_multiple_of`, added after 1.88); an older clippy errors on
+# the unknown lint name. The MSRV is a SEPARATE contract: `Cargo.toml rust-version =
+# "1.88"` is the compile floor (jsonwebtoken 10.4 + the `time` 0.3.47 crate family
+# require rustc >= 1.88 to build), while this pin is the toolchain CI actually runs.
+[toolchain]
+channel = "1.95"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

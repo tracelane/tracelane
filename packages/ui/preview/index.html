@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@tracelanedev/ui — Neon design system preview</title>
+    <!--
+      Standalone token preview (NOT wired into apps/web). Token values mirror
+      src/styles/tokens.css; this file is build-free so it opens directly in a
+      browser to eyeball palette / type / the three signatures in both themes.
+      The contrast PROOF is `pnpm --filter @tracelanedev/ui contrast:check`.
+    -->
+    <style>
+      :root {
+        --bg:#070809; --surface:#0f1112; --surface-2:#171a1c; --surface-3:#212528;
+        --line:#212528; --ink:#e9edec; --ink-2:#99a2a0; --ink-3:#6a726f;
+        --accent:#b6ff3c; --accent-ink:#b6ff3c; --accent-on:#0b1402; --accent-soft:#16210a;
+        --seal:#54e0c7; --seal-ink:#54e0c7; --seal-soft:#06201c;
+        --ok:#3fb950; --danger:#e5484d; --warn:#d9930a; --warn-soft:#2a1f08; --info:#9d7bff;
+        color-scheme: dark;
+      }
+      [data-theme="light"] {
+        --bg:#f6f7f6; --surface:#ffffff; --surface-2:#edefee; --surface-3:#e2e5e3;
+        --line:#e1e4e2; --ink:#0a0c0b; --ink-2:#515955; --ink-3:#818985;
+        --accent:#b6ff3c; --accent-ink:#3a5e0d; --accent-on:#0b1402; --accent-soft:#eef8dc;
+        --seal:#0f7f6f; --seal-ink:#0c6052; --seal-soft:#e4f7f3;
+        --ok:#1a7f37; --danger:#cf222e; --warn:#9a6700; --warn-soft:#fdf6e8; --info:#6639ba;
+        color-scheme: light;
+      }
+      * { box-sizing: border-box; border-color: var(--line); }
+      body {
+        margin:0; background:var(--bg); color:var(--ink);
+        font-family:"Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+        font-variant-numeric: tabular-nums; letter-spacing:-0.006em; padding:32px;
+      }
+      h1 { font-size:24px; margin:0 0 4px; } h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.04em; color:var(--ink-2); margin:28px 0 10px; }
+      .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+      .sw { width:96px; height:56px; border-radius:8px; border:1px solid var(--line); display:flex; align-items:end; padding:6px; font-size:10px; font-family:"JetBrains Mono",monospace; }
+      .card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px; }
+      .prov { border-top:2px solid var(--seal); }
+      .btn { height:36px; padding:0 16px; border-radius:8px; font:500 13px "Space Grotesk",sans-serif; border:1px solid transparent; cursor:pointer; }
+      .btn-primary { background:var(--accent); color:var(--accent-on); }
+      .btn-secondary { background:var(--surface); color:var(--ink); border-color:var(--line); }
+      .chip { display:inline-flex; gap:4px; align-items:center; border-radius:6px; padding:2px 6px; font:600 11px "Space Grotesk",sans-serif; }
+      .chip-seal { background:var(--seal-soft); color:var(--seal-ink); }
+      .seen { display:inline-flex; gap:6px; align-items:center; background:var(--warn-soft); color:var(--warn); border-radius:6px; padding:2px 6px; font-size:11px; text-decoration:underline wavy var(--warn); text-underline-offset:2px; }
+      .spine { position:relative; padding-left:24px; }
+      .spine::before { content:""; position:absolute; left:8px; top:8px; bottom:8px; border-left:1px dashed var(--seal); }
+      .node { position:relative; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:8px; }
+      .node.err { border-color:color-mix(in srgb, var(--danger) 40%, transparent); background:color-mix(in srgb, var(--danger) 12%, var(--surface)); }
+      .pin { position:absolute; left:-19px; top:12px; width:8px; height:8px; border-radius:50%; outline:2px solid var(--bg); }
+      .bar { height:4px; border-radius:99px; background:var(--surface-2); margin-top:4px; }
+      .bar > i { display:block; height:4px; border-radius:99px; background:var(--accent-ink); }
+      .mono { font-family:"JetBrains Mono",monospace; font-size:11px; color:var(--ink-2); }
+      button.toggle { position:fixed; top:16px; right:16px; }
+      .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
+    </style>
+  </head>
+  <body>
+    <button class="btn btn-secondary toggle" onclick="document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'">toggle theme</button>
+
+    <h1>tracelane — Neon design system</h1>
+    <div class="mono">ADR-045 · dark-default · lime rationed · teal = provenance</div>
+
+    <h2>Palette</h2>
+    <div class="row">
+      <div class="sw" style="background:var(--bg)">--bg</div>
+      <div class="sw" style="background:var(--surface)">--surface</div>
+      <div class="sw" style="background:var(--surface-2)">--surface-2</div>
+      <div class="sw" style="background:var(--accent); color:var(--accent-on)">--accent</div>
+      <div class="sw" style="background:var(--seal); color:#03120f">--seal</div>
+      <div class="sw" style="background:var(--ok)">--ok</div>
+      <div class="sw" style="background:var(--danger)">--danger</div>
+      <div class="sw" style="background:var(--warn)">--warn</div>
+      <div class="sw" style="background:var(--info)">--info</div>
+    </div>
+
+    <h2>Type — Space Grotesk + JetBrains Mono</h2>
+    <div style="font-size:32px">The flight recorder for AI agents</div>
+    <div style="font-size:15px; color:var(--ink-2)">Restraint everywhere except the differentiator.</div>
+    <div class="mono">tlane verify · 11&nbsp;ms · $0.014 · 8 spans</div>
+
+    <h2>Primitives</h2>
+    <div class="row">
+      <button class="btn btn-primary">Promote to prod</button>
+      <button class="btn btn-secondary">Cancel</button>
+      <span class="chip chip-seal">Verified · chain ✓</span>
+      <span class="seen">◆ <b>SEEN 3×</b> — Tool-definition drift</span>
+    </div>
+    <div class="grid" style="margin-top:14px">
+      <div class="card prov"><b>Audit ledger</b><div class="mono">teal provenance top-border (rationed)</div></div>
+      <div class="card"><b>Trace</b><div class="mono">neutral utility card</div></div>
+    </div>
+
+    <h2>Signature — transcript-with-a-spine</h2>
+    <div class="spine card" style="max-width:520px">
+      <div class="node"><span class="pin" style="background:var(--accent-ink)"></span><b>agent.plan</b> <span class="mono" style="float:right">420&nbsp;ms</span><div class="bar"><i style="width:70%"></i></div></div>
+      <div class="node"><span class="pin" style="background:var(--info)"></span><b>tool.search</b> <span class="mono" style="float:right">180&nbsp;ms</span><div class="bar"><i style="width:30%"></i></div></div>
+      <div class="node err"><span class="pin" style="background:var(--ok); outline-color:var(--danger)"></span><b>llm.completion</b> <span class="mono" style="float:right">610&nbsp;ms</span><div class="bar"><i style="width:100%"></i></div><div style="margin-top:6px"><span class="seen">◆ <b>SEEN 3×</b> — Tool-definition drift</span></div></div>
+    </div>
+  </body>
+</html>

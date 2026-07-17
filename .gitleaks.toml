@@ -1,0 +1,71 @@
+# Gitleaks config for the Secret scan (security-scan.yml).
+#
+# Extends the default ruleset. The allowlist covers FALSE POSITIVES only:
+# Tracelane's own secret-detection / redaction source carries secret-SHAPED
+# regex patterns and example tokens BY DESIGN (it exists to scrub them). Build
+# artifacts (`target/`) and local env files (`.env.local`) are gitignored and
+# absent from a CI checkout, but are listed for belt-and-braces local runs.
+#
+# No real committed secrets are allowlisted. If a genuine credential is ever
+# added to one of these files, tighten the allowlist to specific lines.
+
+title = "Tracelane gitleaks config"
+
+[extend]
+useDefault = true
+
+# Google "Authentication Key" (AQ.) — the 2026 successor to the classic `AIza`
+# Standard key. The DEFAULT gitleaks ruleset only carries `AIza[\w-]{35}`, and
+# TruffleHog's googlegemini detector only `AIzaSy[A-Za-z0-9_-]{33}` — NEITHER
+# has an AQ rule (checked against upstream rule definitions 2026-07-17). So
+# without this rule the "secrets in code" control in CLAUDE.md §Security is
+# false for every key AI Studio issues today: a committed AQ key would pass
+# both scanners silently.
+#
+# Prefix-anchored with a length FLOOR, not a pinned length — Google publishes
+# no format spec and treats the key as opaque, so a pinned length lets a
+# slightly-different key through. See B-112 / RCA-b112-google-key-redaction.md.
+[[rules]]
+id = "tracelane-google-auth-key-aq"
+description = "Google Authentication Key (AQ. format, 2026) — no upstream rule exists"
+regex = '''AQ\.[A-Za-z0-9_\-]{20,}'''
+keywords = ["aq."]
+
+[allowlist]
+description = "Redaction/PII-detection source patterns + gitignored artifacts"
+paths = [
+  '''crates/shared/src/redact\.rs''',  # the credential-redaction layer's own patterns
+  '''crates/gateway/src/redact\.rs''',  # SAME redaction source, pre-crate-move path (history-only; a full `gitleaks git` scan, e.g. public-extraction prep, hits the old location)
+  '''crates/policy/src/pii\.rs''',      # PII/secret detection regexes
+  '''.*\.env\.local$''',                # gitignored local env (absent in CI)
+  '''^target/''',                        # gitignored Rust build artifacts (absent in CI)
+  '''(^|/)node_modules/''',              # gitignored JS deps (absent in CI at scan time)
+]
+
+# FALSE POSITIVE: the pinned PUBLIC Sigstore Rekor v2 log signing key (ADR-062
+# trust anchor). It is a published PUBLIC key — embedded by design in the audit
+# conformance vectors, the vector generator, and the three reference verifiers —
+# not a secret. The `generic-api-key` rule false-flags its base64 as high-entropy.
+regexes = [
+  '''t8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=''',
+
+  # FALSE POSITIVES: clearly-marked TEST FIXTURES that are credential-SHAPED by
+  # design — they exist to prove the parser/redactor/fingerprinter handles a real
+  # shape (`.claude/rules/testing.md`: test secrets must be obviously fake). Each
+  # is pinned by its exact fake literal, NOT by allow-listing the whole file:
+  # vertex.rs and provider_keys.rs handle REAL credentials, so blinding those
+  # files wholesale would hide a genuine key committed there later. These also
+  # surfaced in the public-export staging tree, where they would have given the
+  # public repo a red secret-scan on day one.
+  '''FAKEunittestonly''',                            # provider_keys.rs — B-116 fingerprint test PEM
+  '''NOT-A-REAL-KEY-do-not-use''',                   # vertex.rs — service-account parse test PEM
+  '''AQ\.AbSomeApiKeyNotAServiceAccount''',          # vertex.rs — "an API key is not an SA" test
+  '''AQ\.AbFAKEauthkeyshapedvaluefortesting00000''', # providers/mod.rs — safe_reason cannot admit a credential
+
+  # FALSE POSITIVE: a UI line that RENDERS the first 16 chars of a tenant's
+  # PUBLIC audit key (`keyId = tenantPubkeyB64.slice(0, 16)`); the `generic-api-key`
+  # rule fires on the variable-name shape, not on any secret. Verified 2026-07-17.
+  # NOTE: these regexes match gitleaks' extracted SECRET, not the matched line —
+  # so this is the identifier itself, not `keyId = tenantPubkeyB64`. Also covers
+  '''^tenantPubkeyB64$''',
+]

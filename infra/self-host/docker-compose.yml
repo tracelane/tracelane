@@ -1,0 +1,165 @@
+# Tracelane self-host — single-node deployment for $5–$10 VPS
+#
+# Minimum requirements: 2 vCPU, 2 GB RAM, 40 GB disk
+# Tested on: Hetzner CX21, Fly.io shared-cpu-2x, DigitalOcean Droplet 2GB
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your API keys
+#   2. docker compose up -d --build      # builds the gateway + ingest from source
+#   3. Point your agents at http://<your-ip>:8080/v1/chat/completions
+#      (authenticate with the TRACELANE_MASTER_KEY you set in .env)
+#
+# Span path (single-tenant self-host, ADR-067):
+#   gateway → NATS (JetStream) → ingest → ClickHouse
+# Self-host is single-tenant, so ingest runs SPIRE-less: it stamps every span
+# with TRACELANE_SINGLE_TENANT_ID. This mode hard-fails to start if any
+# hosted/multi-tenant signal (POSTGRES_URL / WORKOS_CLIENT_ID / a SPIRE socket)
+# is present — it can never be enabled in the hosted deployment.
+#
+# The gateway is pre-configured to proxy to Anthropic by default.
+# Set TRACELANE_DEFAULT_PROVIDER=openai to switch.
+
+services:
+
+  # ── ClickHouse — span storage ──────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8123:8123"  # HTTP — localhost-only
+      - "127.0.0.1:9000:9000"  # Native TCP — localhost-only
+    environment:
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_selfhost}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./clickhouse/02_slo_alerting.sql:/docker-entrypoint-initdb.d/02_slo_alerting.sql:ro
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/self-host.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password ${CLICKHOUSE_PASSWORD:-tracelane_selfhost} --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── NATS JetStream — the gateway→ingest span bus ───────────────────────────
+  # Tiny footprint (~15 MB RSS). JetStream (-js) gives durable at-least-once
+  # delivery so a brief ingest/ClickHouse blip does not lose spans.
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      # /healthz on the monitoring port; wget ships in the alpine image.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── Gateway — the core proxy ───────────────────────────────────────────────
+  gateway:
+    # Published on release as ghcr.io/<owner>/<repo>/gateway. Build from source
+    # with `docker compose up --build` (the `build:` block below).
+    image: ${TRACELANE_GATEWAY_IMAGE:-ghcr.io/tracelane/tracelane/gateway:latest}
+    build:
+      context: ../..
+      dockerfile: infra/docker/gateway.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8080:8080"
+    environment:
+      TRACELANE_PORT: "8080"
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Provider API keys — set at least one
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+
+      # Auth — generate with: openssl rand -base64 32
+      # In single-tenant self-host mode this is ALSO the client bearer token:
+      # agents authenticate with `Authorization: Bearer $TRACELANE_MASTER_KEY`.
+      # Quoted: the `:?…` default message contains a colon-space, which an
+      # unquoted YAML scalar rejects ("mapping values are not allowed").
+      TRACELANE_MASTER_KEY: "${TRACELANE_MASTER_KEY:?required — run openssl rand -base64 32}"
+
+      # Single-tenant self-host mode (ADR-067). Every request authenticates as
+      # the one tenant below; every span is stamped with it. Refuses to start if
+      # a hosted/multi-tenant signal (Postgres / WorkOS / SPIRE) is present.
+      TRACELANE_SELF_HOST: "1"
+      TRACELANE_SINGLE_TENANT_ID: ${TRACELANE_SINGLE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+
+      # Rekor signing key (optional — enables audit log anchoring)
+      TRACELANE_REKOR_SIGNING_KEY: ${TRACELANE_REKOR_SIGNING_KEY:-}
+
+      # Span bus — publish to NATS so ingest can persist to ClickHouse
+      NATS_URL: nats://nats:4222
+
+      # ClickHouse connection (gateway persists the audit_log here directly)
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_selfhost}
+
+      # OTLP export (optional — send spans to your own Jaeger/Tempo/etc.)
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Ingest — NATS consumer → ClickHouse writer ─────────────────────────────
+  # SPIRE-less single-tenant mode (ADR-067): no SPIRE stack, no mTLS. Consumes
+  # spans off NATS and stamps each with TRACELANE_SINGLE_TENANT_ID before writing
+  # to ClickHouse. The OTLP HTTP receiver (:4318) runs plaintext for local SDKs.
+  ingest:
+    image: ${TRACELANE_INGEST_IMAGE:-ghcr.io/tracelane/tracelane/ingest:latest}
+    build:
+      context: ../..
+      dockerfile: infra/docker/ingest.Dockerfile
+    restart: unless-stopped
+    # OTLP HTTP receiver — localhost-only (SDKs on the same box). Omit to keep it
+    # purely gateway-fed over NATS.
+    ports:
+      - "127.0.0.1:4318:4318"
+    environment:
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Single-tenant self-host mode (ADR-067) — MUST match the gateway's tenant.
+      TRACELANE_SELF_HOST: "1"
+      TRACELANE_SINGLE_TENANT_ID: ${TRACELANE_SINGLE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+
+      # Span bus + storage
+      NATS_URL: nats://nats:4222
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_selfhost}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+volumes:
+  clickhouse_data:
+    driver: local
+  nats_data:
+    driver: local
