@@ -1,0 +1,9 @@
+{
+  "merkle_root_hex": "32d3bf6bc9128e45f2d1c037561172232d73792075853949ba33ac8299c9279e",
+  "trusted_tenant_ed25519_pubkey_b64": "+n4+cpxk9SZH8BK/WUifFHDGLGRn2ceyKMHd1R7S7Pw=",
+  "attacker_tenant_ed25519_pubkey_b64": "RzXOWVicfQJxiyKk2vyteL7O5+23VVnvDXShOZX1nhE=",
+  "log_host": "log2025-1.rekor.sigstore.dev",
+  "log_ed25519_pubkey_b64": "t8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=",
+  "anchored_log_index": "18812240",
+  "forged_log_index": "18812374"
+}

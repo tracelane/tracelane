@@ -1,0 +1,87 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug", "triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill in as much detail as possible.
+        **Do not include API keys, tenant IDs, or PII in this report.**
+
+  - type: input
+    id: version
+    attributes:
+      label: Tracelane version
+      description: Output of `tlane --version` or git SHA
+      placeholder: "0.1.0 or abc1234"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - label: Gateway (`crates/gateway/`)
+        - label: Ingest workers (`crates/ingest/`)
+        - label: Dashboard (`apps/web/`)
+        - label: MCP server (`apps/mcp/`)
+        - label: Python SDK (`packages/sdk-python/`)
+        - label: TypeScript SDK (`packages/sdk-typescript/`)
+        - label: CLI (`tlane`)
+        - label: Predictive layer
+        - label: Eval suite
+        - label: Other
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear description of what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce. Include code snippets with secrets redacted.
+      placeholder: |
+        1. Configure TRACELANE_GATEWAY_URL=...
+        2. Send request to /v1/chat/completions with ...
+        3. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant logs. Redact any API keys, tenant IDs, or PII.
+      render: text
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment type
+      options:
+        - Tracelane hosted (tracelane.dev)
+        - Self-hosted (Docker Compose)
+        - Self-hosted (binary)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Ubuntu 24.04 / macOS 15 / Windows 11"

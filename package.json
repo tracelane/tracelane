@@ -1,0 +1,45 @@
+{
+ "name": "tracelane",
+ "version": "0.1.0",
+ "private": true,
+ "description": "Predictive reliability platform for AI agents",
+ "scripts": {
+ "dev": "pnpm --filter @tracelanedev/web dev",
+ "dev:mcp": "pnpm --filter @tracelanedev/mcp dev",
+ "build": "pnpm --filter @tracelanedev/web build",
+ "lint": "pnpm --recursive run lint",
+ "typecheck": "pnpm --recursive run typecheck",
+ "test": "pnpm --recursive run test",
+ "eval:run": "pnpm --filter @tracelanedev/evals run eval:run",
+ "bench:gateway": "cargo bench -p gateway",
+ "bench:gateway:overhead": "k6 run bench/gateway/overhead-measurement.js",
+ "bench:gateway:rps": "k6 run bench/gateway/sustained-5k-rps.js",
+ "bench:ingest": "INGEST_BUILD_SERVER=1 cargo bench -p ingest",
+ "bench:budgets": "node scripts/ci/check-bench-budgets.mjs",
+ "bench:all": "pnpm bench:gateway && pnpm bench:ingest && pnpm bench:budgets"
+ },
+ "engines": {
+ "node": ">=22.0.0",
+ "pnpm": ">=9.0.0"
+ },
+ "packageManager": "pnpm@9.15.0",
+ "dependencies": {
+ "@workos-inc/authkit-nextjs": "^4.0.1"
+ },
+ "pnpm": {
+ "overrides": {
+ "fast-uri": ">=3.1.2",
+ "fast-xml-builder": ">=1.1.7",
+ "shell-quote": ">=1.8.4",
+ "@grpc/grpc-js": ">=1.14.4 <2",
+ "protobufjs": ">=7.6.1 <8",
+ "hono": ">=4.12.25 <5"
+ },
+ "auditConfig": {
+ "ignoreGhsas": [
+ "GHSA-5xrq-8626-4rwp",
+ "GHSA-fx2h-pf6j-xcff"
+ ]
+ }
+ }
+}

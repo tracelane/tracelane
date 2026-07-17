@@ -1,0 +1,291 @@
+@import "tailwindcss";
+
+/*
+ * Tracelane "Tinted Slate + Lava" design system — ADR-053 (palette) over the
+ * ADR-045 role architecture / design-system spec §1.
+ *
+ * Semantic tokens, named by ROLE (--surface / --ink / --accent / --seal), never
+ * by color — a palette remap never touches component code. LIGHT is the default
+ * (the tinted #f4f6fa slate canvas is the brand's primary surface, per ADR-053 —
+ * page bg is never plain white); the `.dark` / `[data-theme="dark"]` block is
+ * the paired alternative.
+ *
+ * Discipline: Lava is the rationed BRAND/CTA accent, by role so it stays legible
+ * in BOTH themes:
+ *   --accent-ink  = any LEGIBLE functional mark: links, active-nav text, the
+ *                   trace-line. A DEEPENED lava (#c8300f on light) so a thin
+ *                   line/text clears ≥4.5:1 on the near-white canvas.
+ *   --accent      = a solid FILL (default primary button); with --accent-on
+ *                   (white) as the label/icon on top.
+ *   .cta-lava     = the one gradient allowed on a control (hero/primary CTA):
+ *                   135deg --accent-2 → --accent → --accent-strong, white label,
+ *                   soft lava glow (see @layer components below).
+ *   --accent-field= pure decoration (hairlines, node pins), never load-bearing.
+ * --seal + --ok = Verify green (#149861), the rationed PROVENANCE/verified/ok
+ * signature — provenance card borders, the tamper-evident chip, the hash-chain
+ * thread, semantic ok. Use --seal-ink for provenance text/lines.
+ *
+ * `inline` makes the Tailwind v4 color utilities reference the live CSS vars.
+ */
+@theme inline {
+	/* surfaces + ink */
+	--color-bg: var(--bg);
+	--color-surface: var(--surface);
+	--color-surface-2: var(--surface-2);
+	--color-surface-3: var(--surface-3);
+	--color-line: var(--line);
+	--color-line-2: var(--line-2);
+	--color-ink: var(--ink);
+	--color-ink-2: var(--ink-2);
+	--color-ink-3: var(--ink-3);
+
+	/* neon accents */
+	--color-accent: var(--accent);
+	--color-accent-ink: var(--accent-ink);
+	--color-accent-on: var(--accent-on);
+	--color-accent-soft: var(--accent-soft);
+	--color-accent-line: var(--accent-line);
+	--color-accent-field: var(--accent-field);
+	--color-seal: var(--seal);
+	--color-seal-ink: var(--seal-ink);
+	--color-seal-soft: var(--seal-soft);
+	--color-seal-line: var(--seal-line);
+
+	/* semantic status (pair with icon/shape — never color alone) */
+	--color-ok: var(--ok);
+	--color-ok-soft: var(--ok-soft);
+	--color-danger: var(--danger);
+	--color-danger-on: var(--danger-on);
+	--color-danger-soft: var(--danger-soft);
+	--color-warn: var(--warn);
+	--color-warn-soft: var(--warn-soft);
+	--color-info: var(--info);
+	--color-info-soft: var(--info-soft);
+
+	/* shadcn-compat aliases so existing apps/web components keep working */
+	--color-background: var(--bg);
+	--color-foreground: var(--ink);
+	--color-muted: var(--surface-2);
+	--color-muted-foreground: var(--ink-2);
+	--color-border: var(--line);
+	--color-primary: var(--accent);
+	--color-primary-foreground: var(--accent-on);
+	--color-destructive: var(--danger);
+
+	/* type (ADR-053): Inter UI + JetBrains Mono data/code (no serif in the app —
+	   Source Serif 4 is marketing-only). globals.css points these at the actual
+	   next/font vars; these named fallbacks apply before the faces load. */
+	--font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+	--font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+/* LIGHT — DEFAULT (Tinted Slate + Lava, ADR-053). The tinted #f4f6fa slate is
+   the brand's primary surface; the dark block below is the paired alternative.
+   Lava/Verify deepened where used as thin text/lines so they clear ≥4.5:1. */
+:root {
+	color-scheme: light;
+	--bg: #f4f6fa; /* tinted slate canvas — never plain white */
+	--surface: #ffffff;
+	--surface-2: #eef1f7;
+	--surface-3: #e4e8f0;
+	--line: #e2e7ee;
+	--line-2: #cfd7e2;
+	--ink: #141c24;
+	--ink-2: #4f5f6c;
+	--ink-3: #87949f;
+	--accent: #ff3621; /* Lava — solid fill */
+	--accent-2: #ff6a3d; /* Lava-2 — gradient light stop */
+	--accent-strong: #e8330e; /* Lava — gradient dark stop */
+	--accent-ink: #c8300f; /* deepened Lava for accent TEXT/line on light (≥4.5:1) */
+	--accent-on: #ffffff; /* label placed ON a Lava fill */
+	--accent-soft: #feeeea; /* selected-row tint / chip bg */
+	--accent-line: #f8d3ca;
+	--accent-field: #ff6a3d; /* decoration only: hairlines, node pins */
+	--accent-glow: rgba(255, 54, 33, 0.45); /* CTA drop-glow */
+	--accent-glow-2: rgba(255, 54, 33, 0.55); /* CTA drop-glow, hover */
+	--seal: #149861; /* Verify green — provenance signature */
+	--seal-ink: #0e7a4d; /* deepened Verify for provenance TEXT on light (≥4.5:1) */
+	--seal-on: #ffffff;
+	--seal-soft: #e3f3ec;
+	--seal-line: #bfe3d2;
+	--ok: #149861; /* ok = Verify green (ADR-053) */
+	--ok-soft: #e3f3ec;
+	--danger: #cf222e;
+	--danger-on: #ffffff; /* label placed ON a solid danger fill (matches --accent-on) */
+	--danger-soft: #fdeced;
+	--warn: #b45309;
+	--warn-soft: #fdf6e8;
+	--info: #7c5cff; /* tool-span violet */
+	--info-soft: #efecff;
+}
+
+/* DARK — paired alternative (Tinted Slate dark; brighter Lava/Verify for AA on
+   the near-black slate canvas). */
+[data-theme="dark"],
+.dark {
+	color-scheme: dark;
+	--bg: #0b0f14; /* tinted slate near-black */
+	--surface: #121821;
+	--surface-2: #1a222d;
+	--surface-3: #232d3a;
+	--line: #232d3a;
+	--line-2: #1a222d;
+	--ink: #e7edf3;
+	--ink-2: #9aa7b4;
+	--ink-3: #6b7885;
+	--accent: #ff5a3d; /* brightened Lava fill for dark */
+	--accent-2: #ff7a52;
+	--accent-strong: #e8330e;
+	--accent-ink: #ff8a63; /* Lava as TEXT/line on dark */
+	--accent-on: #ffffff;
+	--accent-soft: #2a0f0a;
+	--accent-line: #4a1f14;
+	--accent-field: #ff7a52;
+	--accent-glow: rgba(255, 90, 61, 0.45);
+	--accent-glow-2: rgba(255, 90, 61, 0.55);
+	--seal: #1fb87a; /* brightened Verify for dark */
+	--seal-ink: #3fd39a;
+	--seal-on: #04140d;
+	--seal-soft: #0a2419;
+	--seal-line: #14432f;
+	--ok: #1fb87a;
+	--ok-soft: #0a2419;
+	--danger: #f0555a;
+	--danger-on: #ffffff; /* white label on the danger fill (matches --accent-on) */
+	--danger-soft: #2a1012;
+	--warn: #e0a020;
+	--warn-soft: #2a1f08;
+	--info: #9d7bff;
+	--info-soft: #1a142e;
+}
+
+@layer components {
+	/*
+	 * Lava CTA (ADR-053) — the ONE gradient permitted on an interactive control.
+	 * Solid `bg-accent` stays the default primary; `.cta-lava` is the elevated
+	 * hero/primary action. White label, soft lava glow that lifts on hover.
+	 * transition is scoped here (the base uses transition-colors, which won't
+	 * animate box-shadow/transform).
+	 */
+	.cta-lava {
+		background-image: linear-gradient(
+			135deg,
+			var(--accent-2) 0%,
+			var(--accent) 55%,
+			var(--accent-strong) 100%
+		);
+		color: var(--accent-on);
+		box-shadow: 0 4px 14px -4px var(--accent-glow);
+		transition: box-shadow 150ms cubic-bezier(0.2, 0, 0, 1), transform 150ms
+			cubic-bezier(0.2, 0, 0, 1);
+	}
+	.cta-lava:hover {
+		transform: translateY(-1px);
+		box-shadow: 0 8px 22px -6px var(--accent-glow-2);
+	}
+	.cta-lava:active {
+		transform: translateY(0);
+	}
+
+	/*
+	 * Provenance card top-accent (ADR-053) — a 3px Verify-green gradient painted
+	 * as the card's top edge (one of the three permitted gradient sites). A
+	 * background strip (not a border/pseudo) so it clips cleanly to the rounded
+	 * corners with no overflow and never clips card content. Pair with
+	 * `border-t-0` so the gradient IS the top edge.
+	 */
+	.card-provenance-top {
+		background-image: linear-gradient(90deg, var(--seal), var(--seal-ink));
+		background-size: 100% 3px;
+		background-position: top;
+		background-repeat: no-repeat;
+	}
+
+	/*
+	 * Premium metric tile (ADR-053) — the shared <StatCard> surface. Quiet
+	 * elevation: a subtle surface→surface-2 gradient + hairline + a soft 1px
+	 * shadow. NOT literal glass (backdrop-blur costs frames and reads as nothing
+	 * on a flat page bg); this is a cheap-to-paint tile that still feels lifted.
+	 * `--interactive` adds a 1px hover-lift for click-through tiles.
+	 */
+	.stat-tile {
+		border-radius: 0.75rem;
+		border: 1px solid var(--line);
+		background-image: linear-gradient(
+			180deg,
+			var(--surface) 0%,
+			var(--surface-2) 170%
+		);
+		box-shadow: 0 1px 2px -1px rgba(20, 28, 36, 0.06);
+	}
+	.stat-tile--interactive {
+		cursor: pointer;
+		transition: box-shadow 160ms cubic-bezier(0.2, 0, 0, 1), transform 160ms
+			cubic-bezier(0.2, 0, 0, 1), border-color 160ms cubic-bezier(0.2, 0, 0, 1);
+	}
+	.stat-tile--interactive:hover {
+		transform: translateY(-1px);
+		border-color: var(--line-2);
+		box-shadow: 0 2px 6px -2px rgba(20, 28, 36, 0.08),
+			0 10px 24px -12px rgba(20, 28, 36, 0.12);
+	}
+	[data-theme="dark"] .stat-tile,
+	.dark .stat-tile {
+		background-image: linear-gradient(
+			180deg,
+			var(--surface-2) 0%,
+			var(--surface) 150%
+		);
+		box-shadow: 0 1px 2px -1px rgba(0, 0, 0, 0.4),
+			inset 0 1px 0 0 rgba(255, 255, 255, 0.02);
+	}
+	[data-theme="dark"] .stat-tile--interactive:hover,
+	.dark .stat-tile--interactive:hover {
+		box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.5),
+			0 12px 28px -12px rgba(0, 0, 0, 0.5);
+	}
+
+	/*
+	 * Official brand logo (public/brand) — theme-swapped by data-theme so the
+	 * mark tracks the in-app toggle (not the OS scheme). `.brand-logo` = the full
+	 * horizontal logo; `.brand-logo-icon` = the square Chisel app icon. Sized by
+	 * the <Logo> component (height + aspect-ratio); size/position come from the
+	 * bg-* utilities on the element.
+	 */
+	.brand-logo {
+		background-image: url("/brand/logo-full-light.png");
+	}
+	.brand-logo-icon {
+		background-image: url("/brand/logo-icon-light.png");
+	}
+	[data-theme="dark"] .brand-logo {
+		background-image: url("/brand/logo-full-dark.png");
+	}
+	[data-theme="dark"] .brand-logo-icon {
+		background-image: url("/brand/logo-icon-dark.png");
+	}
+}
+
+@layer base {
+	* {
+		border-color: var(--line);
+	}
+	body {
+		background-color: var(--bg);
+		color: var(--ink);
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums; /* mandatory for all data */
+		-webkit-font-smoothing: antialiased;
+		letter-spacing: -0.006em;
+	}
+	/* Verify-green focus ring (ADR-053) — one uniform focus affordance across
+	   links, buttons, and disclosure controls. */
+	a:focus-visible,
+	button:focus-visible,
+	summary:focus-visible,
+	[role="button"]:focus-visible {
+		outline: 2px solid var(--seal);
+		outline-offset: 3px;
+		border-radius: 2px;
+	}
+}

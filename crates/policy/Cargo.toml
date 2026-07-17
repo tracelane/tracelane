@@ -1,0 +1,22 @@
+[package]
+name = "tracelane-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cedar policy evaluation for Tracelane gateway"
+publish = false # internal workspace crate, not published to crates.io
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracelane-shared = { path = "../shared" }
+
+# PII redaction — compiled regex with lazy global cache so the
+# multi-pattern fast path doesn't recompile per call.
+regex = "1.11"
+once_cell = "1.20"

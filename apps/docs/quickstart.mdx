@@ -1,0 +1,97 @@
+---
+title: 60-second quickstart
+description: Your first trace, two env vars, no SDK swap.
+---
+
+The shortest path from zero to a Tracelane trace.
+
+## Step 1 — Install the SDK
+
+<CodeGroup>
+
+```bash TypeScript
+npm install @tracelanedev/sdk
+```
+
+```bash Python
+pip install tracelane
+```
+
+```bash CLI only
+npm install -g @tracelanedev/cli
+```
+
+</CodeGroup>
+
+## Step 2 — Set two env vars
+
+```bash
+export TRACELANE_API_KEY=tlane_<your_key>
+export TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev
+```
+
+The API key comes from sign-up at [app.tracelane.dev](https://app.tracelane.dev/signup).
+The gateway URL only changes for self-host.
+
+## Step 3 — Point your client at the gateway
+
+The gateway speaks the OpenAI Chat Completions API. Point any OpenAI-compatible
+client at the gateway base URL and choose your model by name (`claude-…`,
+`gpt-…`, `gemini-…`) — we route + capture, no SDK swap.
+
+<CodeGroup>
+
+```typescript TypeScript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: process.env.TRACELANE_GATEWAY_URL + "/v1",
+  apiKey: process.env.TRACELANE_API_KEY,
+});
+
+await client.chat.completions.create({
+  model: "claude-sonnet-4-6",
+  messages: [{ role: "user", content: "Hello" }],
+});
+```
+
+```python Python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["TRACELANE_GATEWAY_URL"] + "/v1",
+    api_key=os.environ["TRACELANE_API_KEY"],
+)
+
+client.chat.completions.create(
+    model="claude-sonnet-4-6",   # routed to Anthropic by model name
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+</CodeGroup>
+
+## Step 4 — See the trace
+
+```bash
+tlane trace --latest --format timeline
+```
+
+Or open the trace viewer in the dashboard at
+[app.tracelane.dev/traces](https://app.tracelane.dev/traces).
+
+## What you got for free
+
+- **Routing across 30+ providers** with a single API key, no SDK swap.
+- **Low-overhead gateway routing** on every call.
+- **Full-fidelity OTLP traces** with prompt + completion, tool calls, retries, predictive verdicts.
+- **Predictive guardrails** running inline (see [predictive guardrails](/predictive-guardrails)).
+- **Tamper-evident audit log** — a live SHA-256 hash chain and Ed25519 per-tenant signing; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
+
+## Next
+
+- [Onboarding](/onboarding) — operator self-host checklist.
+- [Architecture](/architecture) — what the gateway is doing under the hood.
+- [API reference](/api-reference) — REST surface.
+- [CLI](/cli) — `tlane` command-line tool.

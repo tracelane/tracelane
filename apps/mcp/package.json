@@ -1,0 +1,37 @@
+{
+	"name": "@tracelanedev/mcp",
+	"version": "0.1.0",
+	"description": "Tracelane MCP server — read-only, tenant-scoped trace access",
+	"bin": {
+		"tracelane-mcp": "./dist/index.js"
+	},
+	"main": "./dist/index.js",
+	"scripts": {
+		"dev": "tsx watch src/index.ts",
+		"build": "tsup src/index.ts --format cjs --dts --no-splitting",
+		"start": "node dist/index.js",
+		"lint": "biome check src/",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run --passWithNoTests"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.4.0",
+		"@clickhouse/client": "^1.8.0",
+		"zod": "^3.23.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"@types/node": "^22.0.0",
+		"tsx": "^4.0.0",
+		"tsup": "^8.0.0",
+		"typescript": "^5.5.0",
+		"vitest": "^2.0.0"
+	},
+	"files": ["dist"],
+	"license": "Apache-2.0",
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"keywords": ["tracelane", "mcp", "opentelemetry", "ai-observability", "llm-tracing"]
+}

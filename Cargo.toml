@@ -1,0 +1,123 @@
+[workspace]
+resolver = "2"
+
+members = [
+ "crates/gateway",
+ "crates/ingest",
+ "crates/mcp-rs",
+ "crates/policy",
+ "crates/shared",
+ "crates/tracelane-audit-cli",
+ "packages/verifier-rust",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "Apache-2.0"
+authors = ["Tracelane Contributors"]
+repository = "https://github.com/tracelane/tracelane"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["http2", "macros", "ws"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "request-id"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+bytes = { version = "1.10" }
+
+# Tracing / observability
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.27" }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-semantic-conventions = { version = "0.27" }
+
+# Error handling
+anyhow = { version = "1.0" }
+thiserror = { version = "2.0" }
+
+# JWT validation. v10 requires an explicit CryptoProvider feature (like
+# rustls); use aws_lc_rs to match the workspace crypto stack (ring/rustls/
+# aws-lc-rs only per CLAUDE.md — openssl banned). default-features=false drops
+# the RustCrypto provider so exactly one provider is active.
+# `use_pem` is jsonwebtoken's own default feature; it is listed explicitly only
+# because `default-features = false` (which exists to select aws_lc_rs over ring)
+# drops it. Needed to load a GCP service-account PKCS#8 private key for the
+# Vertex adapter's RS256 JWT-bearer grant. Pulls one dep: `pem` v3 (MIT).
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+
+# Crypto — never openssl
+ring = { version = "0.17" }
+rustls = { version = "0.23" }
+rustls-pki-types = { version = "1.10" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+secrecy = { version = "0.10" }
+zeroize = { version = "1.8", features = ["derive"] }
+
+# gRPC client for SPIRE Workload API (Unix Domain Socket). Versions
+# match what's already pulled transitively to avoid lockfile churn.
+tonic = { version = "0.12", default-features = false, features = ["prost", "codegen", "transport"] }
+prost = { version = "0.13" }
+tonic-build = { version = "0.12" }
+
+# Config + hot reload
+arc-swap = { version = "1.7" }
+figment = { version = "0.10", features = ["env", "toml", "yaml"] }
+
+# ONNX Runtime for predictive layer inference
+ort = { version = "=2.0.0-rc.12", features = ["load-dynamic"] }
+
+# NATS JetStream client.
+# Pinned to 0.42 (not 0.46/0.47 latest) to balance CVE remediation with
+# API stability — 0.42 already carries rustls-webpki 0.103 (resolves
+# RUSTSEC-2026-0049 / 0098 / 0099 / 0104) but pre-dates the Client trait
+# refactor in 0.43+. Bump deliberately (tracked internally).
+async-nats = { version = "0.42" }
+
+# ClickHouse client. `uuid` feature is REQUIRED for native CH UUID <-> Rust Uuid
+# in clickhouse::Row (de)serialization — without it, reading/writing a row with a
+# UUID column fails at runtime (0 rows masks it; 1 row triggers it). ADR-054.
+clickhouse = { version = "0.13", features = ["lz4", "uuid"] }
+
+# Postgres client + connection pool. tokio-postgres for raw async SQL,
+# deadpool-postgres for pooling. Picked over sqlx/diesel because we own
+# the migrations and want fast compiles + minimal indirection — every
+# query is visible at the call site, no compile-time SQL macros.
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = { version = "0.14" }
+postgres-types = { version = "0.2", features = ["derive", "with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+
+# Async streams
+async-stream = { version = "0.3" }
+async-trait = { version = "0.1" }
+futures = { version = "0.3" }
+
+# Shared utilities
+uuid = { version = "1.11", features = ["v4", "v5", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = { version = "0.22" }
+hex = { version = "0.4" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true

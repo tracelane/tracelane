@@ -1,0 +1,206 @@
+---
+title: tracelane-audit verifier CLI
+description: Install, run, and integrate the regulator-runnable static-binary audit verifier into your CI.
+sidebarTitle: Verifier CLI
+---
+
+# `tracelane-audit` verifier CLI
+
+> **Authoritative:** [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md).
+> Wraps the shipped [`tracelane-audit-verifier`](https://crates.io/crates/tracelane-audit-verifier) Rust crate
+> with an argument parser, an HTTP fetch step, and PASS/FAIL rendering.
+
+> **What the verifier checks — all offline.** Three independent layers,
+> none requiring a network call: (1) the **per-tenant SHA-256 hash-chain
+> replay** + Merkle-root recomputation; (2) the **per-batch Ed25519
+> signature** against the workspace's own public key (`--tenant-pubkey`);
+> (3) for anchored batches, the **Sigstore Rekor v2 inclusion proof +
+> signed checkpoint** against the pinned public-log key, verified from
+> the bundle exported with the ledger. Layers 2 and 3 are **live in
+> production** (first public anchor: log index `19398597`, 2026-07-13).
+> Pass `--tenant-pubkey` (from `/settings/audit` or `GET /v1/audit/pubkey`)
+> to verify anchors: it is the trust root that makes a real-but-forged
+> Rekor entry fail (see [Forgery resistance](#forgery-resistance-tenant-pubkey)).
+> Without it, the chain + Merkle structure still verify and anchors are
+> reported unverified.
+
+## Install
+
+### Pre-built binary (recommended)
+
+```bash
+# Linux musl (static, no glibc dependency)
+curl -fsSLO https://github.com/tracelane/tracelane/releases/latest/download/tracelane-audit-x86_64-unknown-linux-musl
+chmod +x tracelane-audit-x86_64-unknown-linux-musl
+
+# Optional: verify the binary itself before running.
+cosign verify-blob \
+  --bundle tracelane-audit-x86_64-unknown-linux-musl.cosign.bundle \
+  --certificate-identity-regexp 'github.com/tracelane/tracelane/.github/workflows/release-audit-cli.yml' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  tracelane-audit-x86_64-unknown-linux-musl
+```
+
+Four targets ship on every release tag (`v*-audit-cli`):
+
+- `x86_64-unknown-linux-musl`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc.exe`
+
+Each artefact is **Cosign-signed (keyless)** + **SLSA Build Level 3
+provenance** + **CycloneDX SBOM**.
+
+### From crates.io
+
+```bash
+cargo install tracelane-audit
+```
+
+## CLI surface
+
+```
+tracelane-audit verify
+  --workspace <uuid>           Workspace UUID (tenant_id on every audit row)
+  --from <iso8601>             Lower bound (inclusive)
+  --to <iso8601>               Upper bound (exclusive)
+  [--api-url <url>]            Default: https://api.tracelane.dev
+  [--read-key <key>]           Or set TRACELANE_AUDIT_READ_KEY env var
+  [--file <path>]              Offline: verify a local NDJSON instead of HTTP fetch
+  [--tenant-pubkey <pubkey>]   Workspace Ed25519 pubkey — the anchor TRUST ROOT.
+                               base64 (44 chars) or hex (64 chars). Required to
+                               verify Rekor anchors. From /settings/audit or
+                               GET /v1/audit/pubkey.
+  [--rekor-url <url>]          Default: https://log2025-1.rekor.sigstore.dev (public v2 log)
+  [--offline]                  Skip anchor (inclusion-proof) verification entirely
+  [--pinned-pubkey <hex32>]    Legacy pin of the log's own signing key (self-hosted Rekor; R1 H2)
+  [--format text|json]         Default: text
+  [--format-version v1|v2]     Default: v2 (current); v1 for pre-Phase-3 chains
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | PASS — every check passed. |
+| `1` | FAIL — at least one check failed; output includes field-level diff identifying the offending `seq`. |
+| `2` | I/O or network failure before verification could run. |
+
+## Usage examples
+
+### Online — typical workspace audit
+
+```bash
+tracelane-audit verify \
+  --workspace 00000000-0000-0000-0000-00000000000a \
+  --from 2026-05-01T00:00:00Z \
+  --to   2026-05-26T00:00:00Z \
+  --read-key $TRACELANE_AUDIT_READ_KEY
+```
+
+### Offline — verify a previously-exported NDJSON
+
+```bash
+tracelane-audit verify --file ./audit-range.ndjson --offline
+```
+
+All verification is offline from the exported bundle — Rekor anchoring
+is verified from the inclusion proof + signed checkpoint carried in the
+NDJSON, so no live network call to Sigstore is needed even for the
+transparency-log layer. `--offline` additionally *skips* the anchor
+(inclusion-proof) layer entirely, leaving only the hash-chain replay +
+Merkle recomputation — use it for an air-gapped chain-integrity check
+that does not, on its own, satisfy the Article 12 transparency-log
+obligation. To verify anchors, pass `--tenant-pubkey` (the trust root);
+without it the anchor layer is reported unverified.
+
+### JSON output for piping
+
+```bash
+tracelane-audit verify --file ./audit-range.ndjson --format json \
+  | jq '.errors[] | select(.kind == "row_hash_mismatch")'
+```
+
+### Forgery resistance (`--tenant-pubkey`) {#forgery-resistance-tenant-pubkey}
+
+```bash
+tracelane-audit verify \
+  --workspace ... --from ... --to ... \
+  --tenant-pubkey I5rZ...workspace-ed25519-pubkey-base64
+```
+
+Sigstore Rekor v2 is a **permissionless** log: anyone can submit any
+well-formed entry and receive a real inclusion proof + checkpoint. So a
+"real Rekor entry" alone proves only that *some* body was admitted to
+the log — not that **Tracelane** admitted it. An attacker could take a
+tampered chain, sign it with their *own* ECDSA key, anchor it, and get a
+genuine, publicly-queryable log index.
+
+`--tenant-pubkey` is the trust root that closes this. It is the
+workspace's Ed25519 key, delivered out-of-band via a channel you already
+trust (`/settings/audit` or `GET /v1/audit/pubkey`) — **never** taken
+from the anchor bundle. The verifier accepts an anchor only when the
+batch's Ed25519 signature verifies against this key, and that signature
+cryptographically binds the anchor's ECDSA key, anchor state, and log
+index. The published conformance vector `forged-anchor.ndjson` is a
+genuine, publicly-queryable Rekor entry an attacker planted with their
+own key over a tampered chain; run it through the verifier with the real
+`--tenant-pubkey` and it is **rejected** (`untrusted_tenant_key`, exit
+1), while the legitimately-anchored `anchored.v1.ndjson` passes
+(`anchors_included = 1`). (`--pinned-pubkey` is a separate, legacy pin of
+the *log's own* signing key for self-hosted Rekor; the public-log key is
+already pinned in the verifier.)
+
+## Integration patterns
+
+### CI gate: verify every release against the last 24h
+
+```yaml
+# .github/workflows/audit-verify.yml
+on:
+  schedule:
+    - cron: '0 1 * * *'
+
+jobs:
+  audit-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: curl -fsSLO https://github.com/tracelane/tracelane/releases/latest/download/tracelane-audit-x86_64-unknown-linux-musl
+      - run: chmod +x tracelane-audit-x86_64-unknown-linux-musl
+      - run: |
+          FROM=$(date -u -d '24 hours ago' --iso-8601=seconds)
+          TO=$(date -u --iso-8601=seconds)
+          ./tracelane-audit-x86_64-unknown-linux-musl verify \
+            --workspace ${{ vars.WORKSPACE_UUID }} \
+            --from "$FROM" --to "$TO"
+        env:
+          TRACELANE_AUDIT_READ_KEY: ${{ secrets.AUDIT_READ_KEY }}
+```
+
+### Slack alert on FAIL
+
+```bash
+if ! tracelane-audit verify --workspace $WS --from $FROM --to $TO; then
+  curl -X POST -H 'Content-Type: application/json' \
+    -d '{"text":"🚨 Audit verification FAILED for workspace '"$WS"'"}' \
+    $SLACK_WEBHOOK_URL
+fi
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Exit 2, `error: HTTP 401` | Missing or expired `--read-key` | Request a new audit-read key via Tracelane support |
+| Exit 1, `row_hash mismatch` at `seq N` | Single-event tampering at seq N | Investigate — this is the live check the verifier exists to detect |
+| Exit 1, `untrusted_tenant_key` | An anchor's batch signature did not verify against your `--tenant-pubkey` | Either the chain/anchor was tampered (a forged entry), or you passed the wrong key. Re-fetch the pubkey from `/settings/audit` or `GET /v1/audit/pubkey` and confirm it matches the workspace under audit |
+| `anchors_included: 0` on a chain you expected to be anchored | `--tenant-pubkey` not passed, or the batches were captured before anchoring, or the log was unreachable at capture (best-effort) | Pass `--tenant-pubkey` to enable anchor verification. Anchoring covers gateway-proxied batches; unanchored batches still verify via the hash chain + Ed25519 signature |
+
+## V1.1 follow-ups
+
+- `tracelane-audit export --format pdf` (regulator-ready conformance
+  packet PDF).
+- Type-system-level export retention enforcement (the
+  `audit_retention.rs` resolver is in place; the V1.1 cleanup job
+  will be the first caller).

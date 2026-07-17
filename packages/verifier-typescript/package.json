@@ -1,0 +1,36 @@
+{
+ "name": "@tracelanedev/audit-verifier",
+ "version": "0.2.0",
+ "description": "Reference verifier for Tracelane tamper-evident audit ledgers",
+ "type": "module",
+ "main": "./dist/index.js",
+ "types": "./dist/index.d.ts",
+ "exports": {
+ ".": {
+ "types": "./dist/index.d.ts",
+ "import": "./dist/index.js"
+ },
+ "./node": {
+ "types": "./dist/node.d.ts",
+ "import": "./dist/node.js"
+ }
+ },
+ "scripts": {
+ "build": "tsc",
+ "lint": "biome check src/",
+ "typecheck": "tsc --noEmit",
+ "test": "vitest run"
+ },
+ "dependencies": {
+ "@noble/curves": "^1.6.0",
+ "@noble/hashes": "^1.4.0"
+ },
+ "devDependencies": {
+ "@biomejs/biome": "^1.9.0",
+ "@types/node": "^22.0.0",
+ "typescript": "^5.5.0",
+ "vitest": "^2.0.0"
+ },
+ "files": ["dist"],
+ "license": "Apache-2.0"
+}

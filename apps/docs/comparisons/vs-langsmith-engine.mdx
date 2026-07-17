@@ -1,0 +1,51 @@
+---
+title: Tracelane vs LangSmith Engine
+description: Pre-flight predictive guardrails with tamper-evident promotion record vs reactive clustering and PR drafting in the LangSmith trace surface.
+---
+
+LangSmith launched Engine on May 13, 2026. Engine clusters production failures, drafts PRs against connected GitHub code, and proposes online evaluators inside the LangSmith UI.
+
+Tracelane sits one step earlier in the agent lifecycle. Predictive pre-flight guardrails at the gateway, inline, with a tamper-evident promotion record on every deploy.
+
+## How we compare
+
+| Claim | Tracelane | LangSmith Engine |
+|---|---|---|
+| When intervention happens | Pre-flight (before model call) | Post-failure (after trace lands) |
+| Where intervention happens | Inline at gateway | LangSmith trace UI + GitHub PR draft |
+| Tamper-evidence | Hash-chained promotion record + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap | None |
+| Key custody | BYOK 0% markup | LangSmith-managed inference per ToS |
+| Wire format | OTel GenAI semconv (neutral) | LangSmith proprietary |
+| Self-host | Apache 2.0 full stack | Cloud + Enterprise Self-Hosted SKU |
+| Auto-rollback | EWMA on cost / latency / error / guardrail-fire rate | Manual prompt promotion |
+| Inline guardrails | Heuristic guardrails (multi-model ML ensemble on the roadmap) | None |
+| LangChain SDK dependency | None — framework-agnostic | Required |
+| Entry price (paid) | $59/mo Builder | Per-seat (see LangSmith pricing) |
+
+*Engine facts verified against [langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview) (May 13, 2026).*
+
+## When to pick each
+
+**Pick LangSmith Engine if** you are already on LangSmith, your team uses the LangChain SDK, and you want clustering + PR drafting inside one tool. Engine's strength is reactive analysis of issues that already landed.
+
+**Pick Tracelane if** you want a neutral OTel GenAI semconv wire format, BYOK key custody with zero markup, pre-flight policy enforcement at the gateway, a tamper-evident audit ledger designed for EU AI Act Article 12 record-keeping (the Annex III high-risk timeline is provisional — expected around December 2027), and a self-hostable Apache 2.0 stack.
+
+**Run both** if you want both moments — Tracelane in front for prevention, LangSmith behind for post-hoc analysis.
+
+## FAQ
+
+<AccordionGroup>
+
+<Accordion title="Does Tracelane do failure clustering today?">
+No. Engine ships clustering today; Tracelane does not. Tracelane positions on the pre-flight moment, not the post-failure clustering moment. Clustering-adjacent capabilities are on the V1.5 roadmap.
+</Accordion>
+
+<Accordion title="Can I migrate from LangSmith to Tracelane?">
+Yes. `tlane import langsmith` reads your existing project, traces, and prompt versions. OTel GenAI semconv is the wire format, so once instrumented you can dual-write during cutover.
+</Accordion>
+
+<Accordion title="What does 'tamper-evident promotion record' mean?">
+Every promotion event (staging → production) is recorded in a tamper-evident Merkle-batched hash chain with Ed25519 per-tenant signing (live). Anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis (independently verifiable via `tlane audit prove --promotion-id ...`); universal per-run anchoring is on the roadmap. See [Audit Ledger](/audit-ledger).
+</Accordion>
+
+</AccordionGroup>

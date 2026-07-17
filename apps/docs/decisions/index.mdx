@@ -1,0 +1,57 @@
+---
+title: Architectural Decisions
+description: A record of the design choices behind Tracelane V1.
+---
+
+Tracelane keeps every load-bearing decision in `decisions/` as an ADR.
+The full list is in the GitHub repo; major ones are summarised below.
+
+## Recent
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-006 | BYOK envelope encryption | Accepted |
+| ADR-008 | Trusted Publishing (OIDC) | Accepted |
+| ADR-008 | Tamper-evident agent ledger v1 design | Accepted |
+| ADR-009 | B1 — Prompt Promotion (atomic + rollbackable) | Accepted |
+| ADR-011 | Path-to-live sequencing | Accepted |
+| ADR-012 | Cowork ↔ Claude Code split | Accepted |
+
+Browse the canonical list in
+[`decisions/`](https://github.com/tracelane/tracelane/tree/main/decisions).
+
+## Key decisions in plain English
+
+**Apache 2.0 over GPL-3.0 / ELv2.** We compete with Helicone (GPL-3.0
+viral) and Phoenix (ELv2 SaaS-blocked) by being the OSS that doesn't
+make customers nervous. Reference patterns; never fork.
+
+**Rust gateway, not Go.** Low p95 overhead with full tracing on is a
+hot-path budget (measured figures publish with the Reliability Benchmark v1.0).
+Rust's zero-allocation request flow and tokio's runtime get us there without
+exotic tuning.
+
+**ClickHouse hot tier, R2 cold tier.** High-cardinality, high-throughput OLAP
+requirements rule out Postgres for spans. ClickHouse is the cheapest path to
+the throughput.
+
+**Sigstore Rekor for audit anchoring.** Tamper evidence without us
+having to run a notary. Public log, free, audited, and standard.
+
+**OTLP semconv compatibility.** Free interop with the entire OTel
+ecosystem. Customers who already export OTel traces don't have to swap
+SDKs — they swap exporters.
+
+**Agent-tool safety inline, not async.** The point is to catch a
+compromised or hallucinated tool call at the gateway, inline, rather than
+reconstruct it from an incident after the fact. The budget is real
+(`combined, inline`) and `benchmark-runner` enforces it.
+
+**Evals are the merge gate.** A claim that a guard exists is gated on
+its eval being green on `main`; a red eval blocks the merge that would
+ship the claim.
+
+## Related
+
+- [Architecture](/architecture)
+- [Predictive guardrails](/predictive-guardrails)

@@ -1,0 +1,101 @@
+---
+title: API reference
+description: Full REST surface of the Tracelane gateway.
+---
+
+The Tracelane gateway exposes:
+
+- **OpenAI-compatible** `/v1/chat/completions`
+- **Tenant control plane** `/v1/prompts/*`, `/v1/guardrails/*`, `/v1/audit/*`
+- **Billing** `/v1/billing/*`, `/v1/webhooks/polar`
+- **Auth** `/v1/auth/whoami`, `/v1/webhooks/workos`, `/v1/keys`
+- **Operational** `/health`
+
+All authenticated endpoints accept `Authorization: Bearer <jwt | tlane_*>`.
+
+## Inference
+
+### `POST /v1/chat/completions`
+
+The single inference endpoint — the OpenAI Chat Completions shape. Routed to
+OpenAI for `gpt-*` / `o1*` / `o3*` and to any of the 28 OpenAI-compatible
+adapters by model-name prefix; Anthropic (`claude-*`), Google, Bedrock, and
+Cohere are reached by model name and translated to their native wire format.
+There is no separate `/v1/messages`, `/v1/embeddings`, or `/v1/rerank`
+endpoint — everything routes through chat/completions.
+
+## Prompt promotion (B1 / ADR-009)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/prompts` | List all prompts in the tenant |
+| GET | `/v1/prompts/:name` | Show a prompt + its env pinnings |
+| GET | `/v1/prompts/:name/history` | Version timeline |
+| POST | `/v1/prompts/:name/promote` | Pin a version to an env (with eval gate) |
+| POST | `/v1/prompts/:name/rollback` | Roll back to the previous pinned version |
+| POST | `/v1/prompts/:name/versions` | Record a new prompt version |
+| POST | `/v1/prompts/:name/observe` | Log an observation against a pinned version |
+
+## Audit (Audit-SKU)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/audit/export` | Stream NDJSON audit ledger for a date range |
+| GET | `/v1/audit/pubkey` | Ed25519 public key for verifying signed audit batches |
+| GET | `/v1/audit/summary` | Audit ledger summary (counts, latest anchor state) |
+
+The ledger is verifiable end-to-end with `tlane verify` and is byte-identical
+across the Rust, Python, and TypeScript verifier implementations.
+
+## Billing
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/billing/checkout` | Create a Polar Checkout session for a plan |
+| POST | `/v1/billing/portal` | Create a Polar customer-portal session |
+| POST | `/v1/webhooks/polar` | Polar → Tracelane webhook (HMAC-signed) |
+
+## Auth
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/auth/whoami` | Current session / identity |
+| POST | `/v1/webhooks/workos` | WorkOS → Tracelane webhook (HMAC-signed) |
+| POST | `/v1/keys` | Mint a tenant API key (`tlane_*`) |
+
+API-key listing and revocation are dashboard surfaces, not gateway routes.
+
+## Guardrails
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/guardrails/stats` | Guardrail verdict counts and rates |
+| GET | `/v1/guardrails/verdicts` | Recent guardrail verdicts |
+
+These are read-only. There is no gateway policy-write endpoint; guardrail
+enforcement is configured in the dashboard. See
+[Predictive guardrails](/predictive-guardrails) for the rail catalog.
+
+## Operational
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness probe |
+
+## Errors
+
+Error envelope:
+
+```json
+{ "error": "human-readable message" }
+```
+
+Status codes are plain HTTP. The gateway also adds:
+
+- `x-tracelane-failover` — present if a fallback served the request
+
+## Related
+
+- [CLI](/cli) — what the CLI calls
+- [Architecture](/architecture) — what the gateway does internally
+- [Providers](/providers) — provider adapters behind these endpoints

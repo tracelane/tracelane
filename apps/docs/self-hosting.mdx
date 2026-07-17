@@ -1,0 +1,235 @@
+---
+title: Self-hosting
+description: Run Tracelane on your own infrastructure with Docker Compose for dev and prod.
+---
+
+Tracelane is fully self-hostable. The same binary that powers
+`gateway.tracelane.dev` runs on a $6/mo Hetzner VPS or a
+hardened production Docker Compose stack.
+
+## Prerequisites
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| Rust toolchain | 1.87+ | Build gateway + ingest |
+| Node.js | 20+ | Dashboard + MCP server |
+| pnpm | 11+ | Node package manager |
+| Postgres | 17+ (Neon-compatible) | Tenant metadata, API keys, billing |
+| ClickHouse | 24.12+ | Span hot tier (90-day) |
+| NATS | 2.10+ with JetStream | Ingest queue |
+| Cloudflare R2 or S3 | — | Span cold tier (optional) |
+| L4 GPU (1×) | — | SLM judge (optional; degrades to regex-only) |
+
+## Quick start — Docker Compose
+
+The fastest path to a running stack:
+
+```bash
+git clone https://github.com/tracelane/tracelane
+cd tracelane
+
+# Starts Postgres, ClickHouse, NATS, Grafana on local ports
+docker compose -f infra/dev/docker-compose.yml up -d
+
+# Apply migrations
+./scripts/apply-migration-pg.sh
+```
+
+Then start the services:
+
+```bash
+# In three separate terminals:
+cargo run -p gateway --release
+cargo run -p ingest --release
+pnpm --filter @tracelanedev/web dev
+```
+
+The gateway listens on `:8080`, dashboard on `:3000`.
+
+## Production — Docker Compose
+
+The production stack is the same compose model as dev, hardened. See
+`infra/prod/docker-compose.yml` (ClickHouse + NATS/JetStream + gateway +
+ingest + Caddy TLS). Postgres is external (Neon or RDS); the dashboard runs
+on Vercel/Cloudflare.
+
+```bash
+# On your host, from the repo root of your deployment checkout:
+docker compose -f infra/prod/docker-compose.yml up -d
+```
+
+Images are built on-node from source (`infra/prod/blue-green-deploy.sh`
+performs blue-green cutover with auto-rollback). A published Helm chart and
+signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
+
+## Environment variables
+
+### Required (production)
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | `postgres://user:pass@host:5432/tracelane` |
+| `CLICKHOUSE_URL` | `http://host:8123` |
+| `NATS_URL` | `nats://host:4222` |
+| `WORKOS_CLIENT_ID` | WorkOS Connect client ID |
+| `WORKOS_API_KEY` | WorkOS secret key (tenant/user provisioning) |
+| `WORKOS_JWKS_URL` | Defaults to `https://api.workos.com/sso/jwks/{client_id}` |
+| `WORKOS_ISSUER` | JWT issuer for validation |
+| `WORKOS_WEBHOOK_SECRET` | Webhook HMAC secret (provisions new tenants) |
+| `POLAR_ACCESS_TOKEN` | Polar.sh organization access token (billing) |
+| `POLAR_WEBHOOK_SECRET` | Polar webhook secret (`polar_whs_…`) |
+| `POLAR_EXPECTED_ORGANIZATION_ID` | Polar organization id the webhook secret was issued for |
+| `TRACELANE_CMK_KEY` | 32-byte hex master key for BYOK envelope encryption |
+| `TRACELANE_REKOR_SIGNING_KEY` | PKCS#8 DER base64 Ed25519 key for audit anchoring |
+
+### Optional
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRACELANE_PORT` | `8080` | Gateway listen port |
+| `TRACELANE_REKOR_URL` | `https://rekor.sigstore.dev` | Rekor instance |
+| `TRACELANE_REKOR_ANCHOR_EVERY` | `100` | Audit events per Rekor anchor batch |
+| `TRACELANE_BILLING_RETURN_URL` | `/settings/billing` | Polar portal return URL |
+| `TRACELANE_DEV_AUTH` | `1` | Set to `0` to disable dev auth fallback |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Export gateway's own spans to an OTLP collector |
+| `NEXT_PUBLIC_GATEWAY_URL` | `http://localhost:8080` | Gateway URL shown in dashboard |
+| `R2_BUCKET` | — | Cloudflare R2 bucket for cold-tier spans |
+| `R2_ACCOUNT_ID` | — | Cloudflare account ID |
+| `R2_ACCESS_KEY_ID` | — | R2 access key |
+| `R2_SECRET_ACCESS_KEY` | — | R2 secret key |
+
+## Apply migrations
+
+```bash
+# Postgres — tenant metadata, API keys, CMK keys, billing
+./scripts/apply-migration-pg.sh
+
+# ClickHouse — spans, trace_summaries, audit_log (auto-applied by Docker Compose
+# from infra/dev/clickhouse/schema.sql at container init).
+# Non-compose install — apply schema + migrations directly:
+clickhouse-client < infra/dev/clickhouse/schema.sql
+for m in infra/dev/clickhouse/migrations/*.sql; do clickhouse-client < "$m"; done
+```
+
+<Note>
+SLO tables/views (`slo_hourly_stats`, `v_slo_stats`) live in
+`infra/dev/clickhouse/migrations/06_genai_attr_keys_and_slo.sql`, **not** in
+`schema.sql` — a fresh compose stack must also apply the migrations dir or
+`/v1/slo` returns `UNKNOWN_TABLE`.
+</Note>
+
+## Configure WorkOS
+
+WorkOS handles SSO (Google, Microsoft, SAML, GitHub, email OTP).
+
+1. Create a WorkOS application at [workos.com](https://workos.com).
+2. Set the **Redirect URI** to `https://app.<your-domain>/auth/callback`.
+3. Configure **Connections** for the providers you want to support.
+4. Add a **Webhook** at `https://gateway.<your-domain>/v1/webhooks/workos`, subscribed to:
+   `organization.created`, `user.created`, `dsync.user.created`.
+5. Copy the webhook secret to `WORKOS_WEBHOOK_SECRET`.
+6. Copy Client ID and API Key to `WORKOS_CLIENT_ID` and `WORKOS_API_KEY`.
+
+## Configure Polar
+
+Tracelane bills through [Polar.sh](https://polar.sh) (Merchant of Record);
+there is no direct Stripe integration.
+
+1. Create three **Products** with these `lookup_key` values (set on each
+   product's `product_metadata`):
+
+   | lookup_key | Plan | Price |
+   |---|---|---|
+   | `builder_v1` | Builder | $59/mo |
+   | `team_v1` | Team | $249/mo |
+   | `business_v1` | Business | $899/mo |
+
+2. Create two **Meters** with `event_name`:
+   - `tokens_processed`
+   - `audit_anchors`
+
+3. Create a **Webhook** at `https://gateway.<your-domain>/v1/webhooks/polar`, subscribed to:
+   `subscription.created`, `subscription.updated`, `subscription.active`,
+   `subscription.canceled`, `order.created`, `order.paid`.
+
+4. Issue an **Organization Access Token** with read/write scope for products,
+   subscriptions, meter events, and customer-portal sessions.
+
+5. Set `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID`.
+
+## Generate audit signing key
+
+<Note>
+The SHA-256 hash chain and Ed25519 per-tenant signing are live. Anchored
+batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort,
+opt-in); universal per-run anchoring is on the roadmap.
+</Note>
+
+```bash
+# Generate Ed25519 signing key for audit signing + Rekor anchoring
+openssl genpkey -algorithm ed25519 -out rekor-signing.pem
+
+# Export as PKCS#8 DER base64
+openssl pkcs8 -topk8 -nocrypt -in rekor-signing.pem -outform DER | base64 -w 0
+# Paste the output into TRACELANE_REKOR_SIGNING_KEY
+```
+
+Store `rekor-signing.pem` in your secrets manager. Losing it means you cannot
+anchor new audit batches — existing anchors remain verifiable.
+
+## Verify the stack
+
+```bash
+# Gateway health
+curl http://localhost:8080/health
+# {"status":"ok","service":"tracelane-gateway"}
+
+# First trace
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer tlane_..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"ping"}]}'
+
+# Confirm it landed in ClickHouse
+curl "http://localhost:8080/v1/audit/export?since=$(date -u +%Y-%m-%dT%H:%M:%SZ -d '5 minutes ago')" \
+  -H "Authorization: Bearer tlane_..." | head -3
+```
+
+## Production checklist
+
+Before accepting production traffic:
+
+- [ ] `TRACELANE_CMK_KEY` set and rotated (32 random bytes, stored in secrets manager)
+- [ ] `TRACELANE_REKOR_SIGNING_KEY` generated and stored
+- [ ] WorkOS webhook verified (send a test event, confirm tenant is provisioned)
+- [ ] Polar products + meters + webhook configured and verified
+- [ ] ClickHouse pointing at production cluster (not dev compose)
+- [ ] Postgres pointing at production branch (Neon or RDS)
+- [ ] R2 bucket configured (optional — cold-tier span archival is on the roadmap)
+- [ ] TLS termination at reverse proxy (Caddy, Nginx, or Cloudflare Tunnel)
+- [ ] `TRACELANE_DEV_AUTH=0` (disables dev auth bypass)
+- [ ] OSV-Scanner + Grype clean on deployed commit
+- [ ] All 50 pain-point evals green: `pnpm eval:run --suite=all`
+
+## Upgrading
+
+```bash
+git pull origin main
+cargo build --release --workspace
+pnpm install && pnpm build
+
+# Run migrations (idempotent)
+./scripts/apply-migration-pg.sh
+# ClickHouse schema + migrations (non-compose installs):
+clickhouse-client < infra/dev/clickhouse/schema.sql
+for m in infra/dev/clickhouse/migrations/*.sql; do clickhouse-client < "$m"; done
+
+# Rolling restart: ingest first, then gateway, then dashboard
+```
+
+## Related
+
+- [Architecture](/architecture)
+- [BYOK](/byok)
+- [Onboarding](/onboarding)
+- [API reference](/api-reference)

@@ -1,0 +1,63 @@
+[package]
+name = "tracelane-audit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "Public audit verifier CLI for Tracelane tamper-evident agent ledgers (EU AI Act Article 12)"
+repository = "https://github.com/tracelane/tracelane"
+readme = "README.md"
+# `single-binary` posture: keep transitive deps minimal so the
+# musl-linked Linux build stays under 5 MB stripped. The verifier
+# itself does the heavy lifting; this binary is CLI + HTTP + render.
+
+[[bin]]
+name = "tracelane-audit"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing. `env` feature lets --read-key fall back to the
+# TRACELANE_AUDIT_READ_KEY env var so the key doesn't have to land in
+# the regulator's shell history.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Reuse the existing reference verifier — no duplication of the
+# row-hash / Merkle / Rekor verification logic.
+tracelane-audit-verifier = { path = "../../packages/verifier-rust" }
+
+# HTTP fetch from /api/audit/range. `ureq` matches the verifier's
+# choice — minimal deps, native-certs, no async runtime.
+ureq = { version = "2.10", default-features = false, features = ["tls", "native-certs"] }
+
+# JSON rendering for --format json.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling + structured output.
+anyhow = "1"
+thiserror = "2"
+
+# Tempfile for streaming the NDJSON to a local path before handing
+# to verify_ledger (which takes &Path).
+tempfile = "3"
+
+# UUID + ISO8601 parsing — keep both lightweight.
+uuid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# Hex parse for --pinned-pubkey; base64 for --tenant-pubkey (the trust
+# root is published base64 at /settings/audit + GET /v1/audit/pubkey).
+hex = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+# Pin behaviour: every assertion uses pretty_assertions for readable
+# diffs on the JSON VerifyReport.
+pretty_assertions = "1"
+
+# SHA-256 only for the test scaffold that synthesises a minimal NDJSON
+# ledger fixture (write_minimal_ledger_to in src/main.rs). The verifier
+# itself does not depend on sha2 in the production tree — this is test
+# data generation only. Pinned matching the transitive resolution from
+# the verifier's signature dep tree.
+sha2 = "0.10"

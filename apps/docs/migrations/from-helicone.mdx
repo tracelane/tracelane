@@ -1,0 +1,55 @@
+---
+title: Migrating from Helicone
+description: Translate HELICONE_* env vars + custom properties to Tracelane in one command.
+---
+
+Helicone is mostly a proxy with config-via-env + per-request headers. The
+canonical Tracelane migration path is one CLI command:
+
+```bash
+tlane migrate helicone                           # dry-run scan
+tlane migrate helicone --apply                   # write .env.tracelane
+tlane migrate helicone --apply --with-config --src src/
+```
+
+The CLI:
+
+1. Reads `.env` (or `--env <path>`) looking for `HELICONE_*` vars
+2. Translates each known var to its Tracelane equivalent
+3. Emits a new `.env.tracelane` stanza with the renamed vars
+4. With `--with-config --src <dir>`, also greps for `Helicone-Property-*` headers
+   in your source and synthesises a matching `tracelane.yaml`
+
+## Env var mapping
+
+| Helicone | Tracelane | Notes |
+|---|---|---|
+| `HELICONE_API_KEY` | `TRACELANE_API_KEY` | Same role: tenant API key |
+| `HELICONE_BASE_URL` | `TRACELANE_GATEWAY_URL` | Override only for self-host |
+| `HELICONE_PROPERTY_*` | `tracelane.yaml` route metadata | Translated by `--with-config` |
+| `HELICONE_USER_ID` | `TRACELANE_USER_ID` | Per-request user attribution |
+| `HELICONE_CACHE_ENABLED` | `TRACELANE_CACHE_ENABLED` | Same semantics |
+
+## What you keep
+
+- Existing OpenAI/Anthropic SDK code — no swap required
+- Per-request user attribution via header
+- Custom properties — translated to span attributes
+
+## What changes
+
+- The base URL: `https://gateway.tracelane.dev/v1` (or your self-host endpoint)
+- Caching backend: ClickHouse-tier, surfaced as `predictive.cache_hit` span attribute
+- Predictive guardrails inline — Helicone has no equivalent
+
+## License posture
+
+Helicone's `ai-gateway` is GPL-3.0 (viral copyleft). Tracelane is Apache
+2.0. We never copied code from `ai-gateway` — we reference patterns and
+build cleaner.
+
+## Related
+
+- [Quickstart](/quickstart)
+- [Providers](/providers) — the 30+ we route to (6 native + any OpenAI-compatible)
+- [CLI](/cli) — full `tlane` command list

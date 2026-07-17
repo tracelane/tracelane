@@ -1,0 +1,250 @@
+---
+title: TypeScript SDK
+description: Instrumentation for TypeScript AI agents. ESM and CJS. Explicit init + per-library wrapping.
+---
+
+## Install
+
+```bash
+npm install @tracelanedev/sdk
+# or
+pnpm add @tracelanedev/sdk
+```
+
+## Fastest path — route through the gateway (no SDK)
+
+For Tracelane Cloud, the shortest path to your first trace needs **no SDK at
+all**: point your existing client's base URL at the gateway and use your
+`tlane_…` key. The gateway routes the call and captures the trace.
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://gateway.tracelane.dev/v1",
+  apiKey: process.env.TRACELANE_API_KEY!, // tlane_… from app.tracelane.dev
+});
+
+await client.chat.completions.create({
+  model: "claude-sonnet-4-6",
+  messages: [{ role: "user", content: "Hello" }],
+});
+// → Trace visible at https://app.tracelane.dev/traces within ~1 second
+```
+
+Use the SDK below when you want to **export OTLP spans to an endpoint you run** —
+a self-hosted Tracelane ingest, or your own OTLP collector (Jaeger, Tempo, …).
+
+## Initialize
+
+Call `init()` once, before any instrumented library is used. The SDK is built
+on the OpenTelemetry Node SDK and runs anywhere that runtime does (Node.js, Bun).
+
+```typescript
+import { init } from "@tracelanedev/sdk";
+
+// endpoint + apiKey are REQUIRED (no env-var auto-read).
+// `endpoint` is an OTLP HTTP receiver YOU can reach — your collector, or a
+// self-hosted Tracelane ingest. (Tracelane Cloud's ingest is not a public
+// OTLP endpoint — use the gateway path above for Cloud.)
+init({
+  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
+  apiKey: process.env.TRACELANE_API_KEY!,
+  serviceName: "my-agent",
+});
+```
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `endpoint` | yes | — | OTLP HTTP endpoint you can reach. Spans POST to `${endpoint}/v1/traces`. |
+| `apiKey` | yes | — | Your `tlane_*` key. Sent as the `x-tracelane-api-key` header. |
+| `serviceName` | no | `"unknown-service"` | Service name on spans |
+| `sampleRate` | no | `1.0` | Fraction of traces to capture (0–1; the tail sampler decides) |
+
+Call `shutdown()` on exit to flush pending spans (a flush is also registered on
+`beforeExit`).
+
+## Adapters
+
+Instrumentation is explicit: after `init()`, wrap each client with its
+`instrument*` function. Wrapping patches the client in place — what's traced is
+exactly what you opt in.
+
+### Anthropic
+
+```typescript
+import { init, instrumentAnthropic } from "@tracelanedev/sdk";
+init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY! });
+
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+instrumentAnthropic(client); // now every messages.create() emits a span
+const response = await client.messages.create({
+  model: "claude-sonnet-4-6",
+  messages: [{ role: "user", content: "Hello" }],
+  max_tokens: 1024,
+});
+```
+
+Tool use, streaming, vision, and beta features are all captured.
+
+### OpenAI
+
+```typescript
+import { instrumentOpenAI } from "@tracelanedev/sdk";
+import OpenAI from "openai";
+
+const client = new OpenAI();
+instrumentOpenAI(client); // chat.completions, embeddings, Responses now traced
+await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [{ role: "user", content: "Hello" }],
+});
+```
+
+OpenAI Responses API and streaming are captured.
+
+### OpenAI Agents SDK
+
+```typescript
+import { instrumentOpenAIAgents } from "@tracelanedev/sdk";
+import { Agent, run, Runner } from "@openai/agents";
+
+instrumentOpenAIAgents(Runner); // wrap the Runner class once, before running
+const agent = new Agent({ name: "helper", model: "gpt-4o" });
+const result = await run(agent, "Summarise this doc…");
+// Agent steps, tool calls, and handoffs all traced.
+```
+
+### LangChain.js
+
+```typescript
+import { instrumentLangGraph } from "@tracelanedev/sdk";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+
+const model = new ChatAnthropic({ model: "claude-sonnet-4-6" });
+const graph = createReactAgent({ llm: model, tools: [] });
+instrumentLangGraph(graph); // wrap the compiled graph — steps + tool calls traced
+```
+
+### Vercel AI SDK
+
+Two ways to capture, depending on whether you want gateway routing:
+
+```typescript
+// Option A — gateway as base URL (full routing + guardrails, no SDK needed)
+import { generateText } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+
+const anthropic = createAnthropic({
+  baseURL: "https://gateway.tracelane.dev/v1",
+  apiKey: process.env.TRACELANE_API_KEY,
+});
+const { text } = await generateText({
+  model: anthropic("claude-sonnet-4-6"),
+  prompt: "Write a haiku about observability.",
+});
+```
+
+```typescript
+// Option B — SDK patch (spans reach your OTLP endpoint; calls go direct to provider)
+import { init, instrumentVercelAI } from "@tracelanedev/sdk";
+import * as ai from "ai";
+
+init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY! });
+instrumentVercelAI(ai); // generateText, streamText, generateObject now traced
+```
+
+### MCP (Model Context Protocol)
+
+```typescript
+import { instrumentMCP } from "@tracelanedev/sdk";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+
+const client = new Client({ name: "my-agent", version: "1.0" }, { capabilities: {} });
+instrumentMCP(client); // tool_call and tool_result messages traced with latency + schema
+```
+
+> **Zero-config `autoInstrument()` is not in v1** — calling it throws with a
+> pointer to this explicit API. Auto-detection lands in v1.1.
+
+## Custom spans
+
+The SDK sets up a standard OpenTelemetry tracer provider, so custom spans use
+`@opentelemetry/api` directly — there is no Tracelane-specific wrapper:
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("my-agent");
+const hits = await tracer.startActiveSpan("retrieval", async (span) => {
+  span.setAttribute("retrieval.top_k", 10);
+  const results = await vectorStore.search(query, { topK: 10 });
+  span.end();
+  return results;
+});
+```
+
+## Next.js App Router
+
+Initialize in `instrumentation.ts` (Next.js 15 instrumentation hook) so it
+runs once per server process:
+
+```typescript
+// instrumentation.ts (project root)
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { init } = await import("@tracelanedev/sdk");
+    init({
+      endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
+      apiKey: process.env.TRACELANE_API_KEY!,
+      serviceName: "my-nextjs-app",
+    });
+  }
+}
+```
+
+Enable the hook in `next.config.ts`:
+
+```typescript
+const config: NextConfig = {
+  experimental: { instrumentationHook: true },
+};
+export default config;
+```
+
+## Testing
+
+The SDK builds on the OpenTelemetry Node SDK, so you assert on emitted spans
+with a standard in-memory exporter — no Tracelane-specific test API needed.
+Register your own provider with an `InMemorySpanExporter` before wrapping a
+client, then read the finished spans:
+
+```typescript
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { instrumentAnthropic } from "@tracelanedev/sdk";
+
+const exporter = new InMemorySpanExporter();
+const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+provider.register();
+
+// ... construct + instrumentAnthropic(client), run the code under test ...
+
+expect(exporter.getFinishedSpans()).toHaveLength(3);
+expect(exporter.getFinishedSpans()[0]!.name).toBe("anthropic.messages.create");
+```
+
+## ESM / CJS
+
+The package ships dual ESM + CJS. No extra configuration needed. Works with
+`"type": "module"` and without.
+
+## Related
+
+- [Python SDK](/sdk-python)
+- [Quickstart](/quickstart)
+- [Predictive guardrails](/predictive-guardrails)
+- [MCP server](/mcp-server)

@@ -1,0 +1,93 @@
+---
+title: Trace replay & time-travel
+description: Step through any recorded trace span-by-span from the CLI or MCP server. Shadow-fork replay with model/prompt/tool overrides is on the roadmap.
+---
+
+Trace replay lets you take any production trace and **step through its recorded
+span sequence** — every LLM call, tool call, and guardrail verdict, in order —
+for offline inspection and debugging.
+
+<Note>
+**What is live vs. roadmap.** Stepping through a **recorded** trace
+(`tlane replay <traceId>` and the MCP `replay_trace` tool) is **live** — it
+reads the stored spans as-is and does **not** re-execute any model or tool.
+**Shadow-fork replay** — re-running a trace against a *different* model,
+prompt version, or tool response and diffing the outputs, plus the dashboard
+"Time-travel" UI — is **on the roadmap** and not yet available. This page marks
+the roadmap surface explicitly.
+</Note>
+
+## From the CLI (live)
+
+`tlane replay <traceId>` fetches the trace's stored spans and renders the step
+sequence in your terminal — read-only, no re-execution:
+
+```bash
+# Step through a recorded trace (table view)
+tlane replay abc123
+
+# JSON output for piping into your own tooling
+tlane replay abc123 --format json
+
+# Point at a self-hosted gateway
+tlane replay abc123 --endpoint https://gateway.example.com --token tlane_...
+```
+
+## From the MCP server (live)
+
+The `replay_trace` tool returns the full stored structure of a trace (ordered
+spans with their LLM/tool attributes) directly in your Claude conversation.
+Read-only — it does **not** re-execute any model or tool:
+
+```typescript
+mcp.tracelane.replay_trace({
+  trace_id: "abc123",
+  include_tool_calls: true,
+})
+```
+
+## Recorded-trace output
+
+```json
+{
+  "trace_id": "abc123",
+  "spans": [
+    {
+      "span_id": "span-1",
+      "kind": "llm_request",
+      "model": "claude-sonnet-4-6",
+      "latency_ms": 823,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "guardrail_verdict": "allow"
+    }
+  ]
+}
+```
+
+## Shadow-fork replay (roadmap)
+
+The following capabilities are **on the roadmap and not yet available**. They
+re-execute a trace against the gateway with overrides and require real provider
+calls:
+
+- **Model override** — replay the same input sequence against a different model
+  and diff the outputs.
+- **Prompt-version override** — replay against a different prompt version from
+  your prompt history.
+- **Tool-response injection** — override a tool's return value to reproduce a
+  scenario.
+- **Side-by-side diff** — output text, latency, token-cost, and
+  guardrail-verdict deltas between the original and the shadow run.
+- **Dashboard "Time-travel"** — the in-app scrubber UI for the above.
+
+When shadow-fork ships, it will run against the gateway with your API key
+(same guardrails apply) and will never write to your production trace store —
+each run is stored as a separate `replay_id` linked to the original `trace_id`.
+
+## Related
+
+- [Prompt Promotion](/prompt-promotion)
+- [MCP server](/mcp-server)
+- [CLI](/cli)
+- [Predictive guardrails](/predictive-guardrails)
