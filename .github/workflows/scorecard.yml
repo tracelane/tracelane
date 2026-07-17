@@ -1,0 +1,85 @@
+name: openssf-scorecard
+# OpenSSF Scorecard analysis.
+#
+# IMPORTANT — repo visibility constraints:
+# - On private repos:
+#     * `publish_results: true` fails — scorecard.dev only ingests
+#       publicly-resolvable repos.
+#     * The `branch_protection_rule` trigger requires GitHub Pro/Team
+#       AND a configured branch protection rule, otherwise the run
+#       errors out before any check.
+#     * Several scorecard checks ("Maintained", "License", "Code-Review")
+#       depend on public metadata and degrade silently rather than
+#       failing — that's fine.
+# - When this repo (or its public extraction `tracelane/tracelane`) goes
+#   public per an internal ticket:
+#     1. Flip `publish_results: false` -> `publish_results: true`
+#     2. Re-add the `branch_protection_rule:` trigger
+#     3. Move this workflow to the public repo so the badge resolves
+#
+# Until then this workflow generates SARIF locally, uploads it to the
+# GitHub Security tab (via codeql-action/upload-sarif — works on private),
+# and exits clean. Score is visible per-run in the Actions UI.
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+# Moved off per-push (2026-06-06 CI cost pass): Scorecard is a slow scan with no
+# per-change merge-gating value. Runs weekly + on demand.
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      # NON-BLOCKING while the repo is PRIVATE. Scorecard's commit-history
+      # checks query the GraphQL API and fail on a private repo with the default
+      # GITHUB_TOKEN ("Resource not accessible by integration: ListCommits").
+      # To make scorecard fully green: either (a) go public, or (b) add a
+      # fine-grained PAT secret `SCORECARD_TOKEN` (contents:read + metadata:read)
+      # and pass it as `repo_token`. Until then this step must not red `main`.
+      - uses: ossf/scorecard-action@62b2cac7ed8198b15735ed49ab1e5cf35480ba46  # v2.4.0
+        continue-on-error: true
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          repo_token: ${{ secrets.SCORECARD_TOKEN || github.token }}
+          # publish_results MUST be false while the repo is private.
+          # Flip to true on public release per an internal ticket.
+          publish_results: false
+
+      # Upload only if scorecard actually produced a SARIF (skipped on the
+      # private-repo error path above).
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        if: ${{ hashFiles('results.sarif') != '' }}
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      # Best-effort: uploading to the GitHub code-scanning (Security) tab needs
+      # GitHub Advanced Security, which a PRIVATE repo without GHAS lacks — the
+      # upload errors ("Code scanning is not available"). continue-on-error so
+      # it does not red `main`; the SARIF is still kept as a build artifact
+      # above. Re-enabled automatically once the repo is public / GHAS is on.
+      - uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.5
+        if: ${{ hashFiles('results.sarif') != '' }}
+        continue-on-error: true
+        with:
+          sarif_file: results.sarif

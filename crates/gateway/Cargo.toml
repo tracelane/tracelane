@@ -1,0 +1,139 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tracelane Rust gateway — BYOK LLM proxy with inline predictive layer"
+publish = false # product binary, not a crates.io library (generic name); ships via GHCR + GitHub Releases
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace deps
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+arc-swap = { workspace = true }
+figment = { workspace = true }
+jsonwebtoken = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+ring = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
+
+# ClickHouse for audit_log persistence
+clickhouse = { workspace = true }
+
+# Postgres for tenant + api_key + user metadata (Move #1)
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+postgres-types = { workspace = true }
+# Postgres TLS connector — Neon (and any managed PG) mandates TLS; deadpool's
+# NoTls fails the handshake. rustls + aws-lc-rs provider + webpki roots
+# (CLAUDE.md: rustls/aws-lc-rs only, openssl banned; no FS dep for distroless).
+tokio-postgres-rustls = "0.13"
+rustls = { workspace = true }
+webpki-roots = "0.26"
+sha2 = "0.10"
+# Argon2id KDF for API-key verification. RustCrypto crate,
+# pure-Rust, MIT/Apache. The `std` feature pulls in `PasswordHash`/
+# `PasswordVerifier` which we use to verify the stored PHC string.
+argon2 = { version = "0.5", features = ["std"] }
+# In-process token-bucket rate limiter. Not a workspace dep — only gateway uses DashMap.
+# V1.5: replace with Upstash Redis (deadpool) for multi-node support.
+dashmap = "6"
+# In-process entitlement-resolution cache (ADR-035). The only new crate this
+# reconciliation adds; eliminates the per-request Neon round-trip.
+moka = { version = "0.12", features = ["future"] }
+# `std::sync::Mutex` poison would permanently DoS a tenant after any
+# panic inside the lock; `parking_lot::Mutex` has no poison semantics.
+parking_lot = "0.12"
+
+# Gateway-specific deps
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio-stream = "0.1"
+pin-project-lite = "0.2"
+
+# NATS JetStream — span publish to ingest workers
+async-nats = { workspace = true }
+
+# Shared crate
+tracelane-shared = { path = "../shared" }
+
+# Policy crate — hosts PII redaction (100% recall invariant).
+# Audit chain redacts every payload before hashing/storage.
+tracelane-policy = { path = "../policy" }
+
+# Reference audit-ledger verifier (Apache-2.0). The free-tier self-verify
+# endpoint (audit_self_verify.rs) reuses the SAME verifier the OSS CLI ships —
+# one implementation, so the server verdict equals an offline `tlane verify`
+# verdict byte-for-byte over the same NDJSON. Never a second verification.
+tracelane-audit-verifier = { path = "../../packages/verifier-rust" }
+
+# Inline guardrails V1 (the guardrail spec). Licenses verified
+# against the CLAUDE.md banned list (all MIT / Apache-2.0 / CC0 — none banned).
+bitflags = "2" # CapabilitySet bitflags (§2.3 ToolDef capability tags)
+blake3 = "1" # ToolDef.def_hash = blake3(name+schema+description) (§2.3 / R3 pinning)
+ulid = "1" # GuardrailContext.correlation_id — k-sortable, threads ledger + spans (§2.1)
+aho-corasick = "1" # R7 topic/competitor multi-pattern match (§3 R7)
+
+[dev-dependencies]
+tokio-test = "0.4"
+axum-test = "20"
+wiremock = "0.6"
+futures-util = "0.3"
+# Criterion for hot-path microbenches (ADR-020 hard-cap budget: <500ns p99
+# overhead on the QuotaTracker check). default-features=false drops the rayon
+# dep we don't need.
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+[[bench]]
+name = "gateway_throughput"
+harness = false
+
+[[bench]]
+name = "rate_limiter"
+harness = false
+
+[features]
+default = []
+predictive = ["ort"]
+# B1 Prompt Promotion + Eval Gates + Auto-Rollback (ADR-009) is always
+# compiled — product access is gated at runtime via workspace_entitlements,
+# not a cfg(feature) flag (CLAUDE.md bans cfg(feature) for product gating).
+# The former `prompt-promotion` feature was removed 2026-05-29 (audit P2-5).
+# Wasm plugin sandbox for untrusted third-party provider extensions.
+# Off by default — explicit opt-in because wasmtime adds ~15MB to the binary.
+wasm-plugin = ["dep:wasmtime"]
+
+[dependencies.ort]
+workspace = true
+optional = true
+
+[dependencies.wasmtime]
+version = "20.0"
+optional = true
+default-features = false
+features = ["cranelift", "component-model", "async"]

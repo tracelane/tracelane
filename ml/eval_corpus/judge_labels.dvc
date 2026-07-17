@@ -1,0 +1,9 @@
+outs:
+- md5: TODO-run-dvc-add-after-labeling
+  size: 0
+  path: judge_labels.ndjson
+  desc: "SLM Judge distillation dataset — 20K samples with teacher soft labels"
+  meta:
+    generated_by: ml/slm_judge/label_with_teachers.py
+    records: 20000
+    dvc_pull: dvc pull eval_corpus/judge_labels.dvc

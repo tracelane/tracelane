@@ -1,0 +1,101 @@
+# Dependabot configuration — OpenSSF Scorecard's Dependency-Update-Tool check
+# requires either Dependabot or Renovate. Without this file the Scorecard
+# plateaus around 7-8 (CLAUDE.md target: ≥9.0).
+#
+# Patch-update PRs auto-merge after CI green; minor + major updates require
+# a human reviewer. Security advisories are always immediate.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    groups:
+      rust-patches:
+        update-types:
+          - patch
+      rust-minors:
+        update-types:
+          - minor
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      node-patches:
+        update-types:
+          - patch
+      node-minors:
+        update-types:
+          - minor
+    ignore:
+      # Biome major bumps tend to ship formatter changes that need
+      # a manual sweep of all touched files.
+      - dependency-name: "@biomejs/biome"
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: pip
+    directory: "/packages/sdk-python"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - python
+
+  - package-ecosystem: pip
+    directory: "/evals"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - python
+
+  - package-ecosystem: pip
+    directory: "/packages/verifier-python"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - python
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    # SHA-pinning policy (CLAUDE.md): keep actions SHA-pinned, not tag-pinned.
+    # Dependabot's GitHub-actions ecosystem supports SHA pins natively.
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker

@@ -1,0 +1,146 @@
+---
+title: Agent-tool safety guardrails
+description: MCP tool-definition-drift + schema validation at the gateway, with heuristic rails alongside and an ML ensemble on the roadmap.
+---
+
+The genuinely **enforced** surface is Tracelane's deterministic **guardrail
+rails engine** (R1–R8, `crates/gateway/src/guardrail/`, wired inline and exposed
+at `/v1/guardrails/stats`) — eight rails, live-proven, that can allow, redact,
+or block a request at the gateway.
+
+Alongside the rails, an **observe-first predictive layer**
+(`crates/gateway/src/predictive/`, the PR1–PR8 predictors below) scores each
+request and **records** a verdict. By default it does **not** enforce —
+`predictive_enforce` is `false`, so a `Block` verdict is written to the audit
+trail, not turned into a 403, unless an operator sets
+`TRACELANE_PREDICTIVE_ENFORCE=1`. On a plain `/v1/chat/completions` body only
+`tool_definition_drift` and the tool-call schema validator do reachable work;
+the rest fire only on the specialised span shapes noted per-guard below. The
+internal latency target for the layer is `<30ms p50 / <50ms p95 / <100ms p99` —
+an engineering target, not yet measured on production-equivalent hardware
+(pending Reliability Benchmark v1.0).
+
+## At a glance
+
+<Frame>
+  <img src="/images/predictive-layer.svg" alt="Agent-tool safety guardrails (PR1 through PR8) — with per-guard status" />
+</Frame>
+
+| ID | Guard | Status (gateway chat path) | Eval IDs |
+|---|---|---|---|
+| PR1 | MCP rug-pull detection | Live detection, observe-first | PP-MCP1..3 |
+| PR2 | Lethal-trifecta taint tracking | Roadmap / dormant on the chat path | PP-TFT1..4 |
+| PR3 | A2UI catalog conformance | Roadmap (A2UI payloads only) | PP-UI1..3 |
+| PR4 | Prompt-injection classifier (heuristic) | Partial / dormant on the chat path | PP-PI1..6 |
+| PR5 | Browser stuck-loop prediction | Roadmap (browser spans only) | PP-BR1..3 |
+| PR6 | A2A handoff validation | Roadmap (A2A envelopes only) | PP-A2A1..4 |
+| PR7 | Output-policy regex + SLM judge | SLM judge is a stub; regex lives in the rails | PP-OUT1..5 |
+| PR8 | Argument drift (PR8-lite Mahalanobis) | Roadmap / dormant on the chat path | PP-G3, PP-PR8 |
+
+## PR1 — MCP rug-pull detection
+
+*Live detection, observe-first.* Catches an MCP tool whose schema,
+description, or pinned hash mutates mid-session. `tool_definition_drift` +
+`mcp_hash_watcher` hash `(name, description, input_schema_json)` on a request's
+declared `tools[]` on first use; any later mismatch is recorded at the gateway.
+Enforcement (halt) is opt-in; the enforced tool-pinning path is guardrail rail R3.
+
+## PR2 — Lethal-trifecta taint tracking
+
+*Roadmap / dormant on the gateway chat path.* Tracks the three ingredients of
+agent exfil: untrusted input, private data access, external write. The detector
+requires a top-level `tool_name` + `tracelane_untrusted_input` + a frontier
+`model`; a chat-completions body supplies only `model`, so it never reaches
+threshold there. The enforced trifecta check is guardrail rail R4 (gated).
+
+## PR3 — A2UI catalog conformance
+
+*Roadmap.* Validates Agent-to-UI surfaces (cards, buttons, forms emitted via
+A2UI) against the published per-tenant catalog. Fires only on `protocol:"a2ui"`
+payloads — never on LLM chat traffic.
+
+## PR4 — Prompt-injection classifier
+
+*Partial / dormant on the chat path.* The heuristic pattern layer reads
+top-level `tool_output`/`content`; on a standard chat body the content is nested
+inside `messages[]`, so the heuristic is dormant there. The ML upgrade — Llama
+Prompt Guard 2 distilled to ONNX for low-latency CPU inference — is on the
+roadmap; the ONNX sidecar is undeployed and fails open. The PII/secret redaction
+that does fire on live traffic is guardrail rail R2, a separate system.
+
+## PR5 — Browser stuck-loop prediction
+
+*Roadmap.* Operator agents (Browserbase, Playwright via MCP) can loop on the
+same page action. The detector uses a sliding window of
+(URL, DOM-action-fingerprint) tuples, but fires only on browser/operator spans
+(`tracelane.browser.step_index`) — not on LLM chat.
+
+## PR6 — A2A handoff validation
+
+*Roadmap.* When one agent hands a task to another, the validator checks the
+envelope schema, required fields, signed origin, and no circular handoff
+(A → B → A → B …). It fires only on `tracelane_message_type` A2A envelopes,
+never on a chat body.
+
+## PR7 — Output-policy regex + SLM judge
+
+*SLM judge is a stub.* The SLM judge predictor (1B encoder on L4 GPU) is a
+constant stub today — it returns "safe" with no model file — so PR7's judge
+stage performs no real grading. The live output-policy work (PII, credentials,
+profanity regex) is the guardrail rails engine (R2/R5/R6), a different system
+from this predictor.
+
+## PR8 — Argument drift
+
+*Roadmap / dormant on the chat path.* Rolling Mahalanobis distance over
+featurised tool-call argument embeddings, per `(tenant, tool)` pair (background
+EMA mean + covariance, 4σ threshold). The state machine is real but requires a
+top-level `tool_name` + `tool_args`; those are not present on a chat-completions
+body, so it is unreachable there. PR8-lite is the lightweight version; the full
+PR8 swaps EMA for a learned encoder.
+
+## Configuring per-tenant
+
+Each guard has a per-tenant `policy` — `disabled`, `warn`, or `block`. Because
+the predictive layer is **observe-first by default**, a `block` policy records a
+block verdict in the audit trail but does not return a 403 unless an operator
+enables enforcement (`TRACELANE_PREDICTIVE_ENFORCE=1`). Defaults:
+
+```yaml
+predictive:
+  pr1_mcp_rugpull:        block
+  pr2_lethal_trifecta:    block
+  pr3_a2ui_catalog:       warn
+  pr4_prompt_injection:   block       # threshold 0.85
+  pr5_browser_loop:       warn
+  pr6_a2a_handoff:        block
+  pr7_output_policy:      warn
+  pr8_arg_drift:          warn
+```
+
+## Reading predictive output
+
+Every hit emits a span attribute under `predictive.*`. The dashboard
+trace viewer surfaces these in a dedicated lane. The MCP server filters
+by predictive severity:
+
+```typescript
+mcp.traces.list({
+  filter: { "predictive.severity": "block" },
+  since: "1h",
+});
+```
+
+## Performance
+
+`benchmark-runner` gates the **combined** predictive-layer latency budget
+(`<30ms p50 / <50ms p95 / <100ms p99`, internal target). There are no per-guard
+measured numbers — the layer's latency is not yet measured on
+production-equivalent hardware (pending Reliability Benchmark v1.0).
+
+## Related
+
+- [Architecture](/architecture)
+- [Providers](/providers)
+- The full eval mapping is in
+  [`evals/pain-points/INDEX.md`](https://github.com/tracelane/tracelane/blob/main/evals/pain-points/INDEX.md)

@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" role="img"
+     aria-labelledby="rp-title rp-desc" font-family="ui-sans-serif, system-ui, sans-serif">
+  <title id="rp-title">Tracelane read path</title>
+  <desc id="rp-desc">The dashboard never reads ClickHouse directly. It sends a per-user
+    WorkOS JWT to the gateway read API, which bridges the WorkOS org id to the internal
+    tenant UUID from the validated claim, builds a SQL query with per-tier row caps, and
+    reads ClickHouse. Every query is scoped by WHERE tenant_id equals the claim's tenant
+    UUID, never a value from the request body.</desc>
+  <style>
+    :root{ --ink:#141c24; --muted:#4f5f6c; --line:#87949f; --lava:#ff3621; --seal:#149861; --panel:#ffffff; }
+    @media (prefers-color-scheme: dark){
+      :root{ --ink:#e6edf3; --muted:#9fb0bd; --line:#4f5f6c; --lava:#ff6a3d; --seal:#37c491; --panel:#0e1520; }
+    }
+    .lbl{ fill:var(--ink); font-size:14px; font-weight:600; }
+    .sub{ fill:var(--muted); font-size:11px; font-weight:500; }
+    .ref{ fill:var(--muted); font-size:10px; font-family:ui-monospace, "SF Mono", Menlo, monospace; }
+    .grp{ fill:var(--ink); font-size:12px; font-weight:700; letter-spacing:.04em; }
+    .box{ fill:var(--panel); fill-opacity:.55; stroke:var(--line); stroke-width:1.4; }
+    .step{ fill:none; stroke:var(--line); stroke-width:1.2; }
+    .flow{ fill:none; stroke:var(--lava); stroke-width:2.2; }
+    .bridge{ fill:none; stroke:var(--lava); stroke-width:1.8; }
+    .brt{ fill:var(--lava); font-size:11px; font-weight:700; }
+    .inv{ fill:none; stroke:var(--seal); stroke-width:1.6; }
+    .invt{ fill:var(--seal); font-size:11px; font-weight:700; }
+  </style>
+  <defs>
+    <marker id="rp-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--lava)"/>
+    </marker>
+  </defs>
+
+  <!-- Dashboard -->
+  <rect class="box" x="16" y="150" width="176" height="140" rx="11"/>
+  <text class="grp" x="34" y="176">DASHBOARD</text>
+  <text class="ref" x="34" y="192">apps/web · Next.js RSC</text>
+  <text class="sub" x="34" y="216">Holds a per-user</text>
+  <text class="sub" x="34" y="231">WorkOS JWT only.</text>
+  <text class="invt" x="34" y="258">Zero direct</text>
+  <text class="invt" x="34" y="273">ClickHouse reads.</text>
+
+  <!-- Gateway read API -->
+  <rect class="box" x="360" y="40" width="352" height="360" rx="12"/>
+  <text class="grp" x="380" y="66">GATEWAY READ API</text>
+  <text class="ref" x="380" y="82">crates/gateway/src/trace_reads.rs</text>
+
+  <rect class="bridge" x="380" y="96" width="312" height="62" rx="8"/>
+  <text class="brt" x="392" y="118">org_id → internal tenant UUID</text>
+  <text class="sub" x="392" y="134">resolved from the validated claim (never the body)</text>
+  <text class="ref" x="392" y="150">auth · TenantId::from_jwt_claim</text>
+
+  <rect class="step" x="380" y="166" width="312" height="70" rx="8"/>
+  <text class="lbl" x="392" y="186">Read routes</text>
+  <text class="sub" x="392" y="203">/v1/traces · /v1/sessions · /v1/slo</text>
+  <text class="sub" x="392" y="218">/v1/query/{signatures,tool-analytics}</text>
+  <text class="ref" x="392" y="232">trace_reads.rs:2035–2046</text>
+
+  <rect class="step" x="380" y="244" width="312" height="62" rx="8"/>
+  <text class="lbl" x="392" y="264">SQL builder · per-tier row caps</text>
+  <text class="sub" x="392" y="280">bounded rows / memory / timeout</text>
+  <text class="ref" x="392" y="294">build_trace_list_sql:905 · clickhouse_query.rs::TenantQuery</text>
+
+  <rect class="inv" x="380" y="314" width="312" height="66" rx="8"/>
+  <text class="invt" x="392" y="338">Every query:</text>
+  <text class="invt" x="392" y="358" font-family="ui-monospace, Menlo, monospace" font-size="13px">WHERE tenant_id = ?</text>
+  <text class="sub" x="392" y="374">tenant_id from the claim — CI-guarded, never request body</text>
+
+  <!-- ClickHouse -->
+  <rect class="box" x="836" y="150" width="150" height="140" rx="11"/>
+  <text class="grp" x="854" y="176">CLICKHOUSE</text>
+  <text class="sub" x="854" y="200">spans</text>
+  <text class="sub" x="854" y="216">trace_summaries</text>
+  <text class="sub" x="854" y="232">audit_log</text>
+  <text class="sub" x="854" y="248">v_slo_stats</text>
+  <text class="ref" x="854" y="272">read-only</text>
+
+  <!-- flows -->
+  <path class="flow" marker-end="url(#rp-arrow)" d="M192 220 H360"/>
+  <text class="ref" x="276" y="210" text-anchor="middle" fill="var(--lava)">per-user JWT</text>
+  <path class="flow" marker-end="url(#rp-arrow)" d="M712 347 H770 V220 H836"/>
+  <text class="ref" x="792" y="212" text-anchor="middle" fill="var(--lava)">scoped SQL</text>
+  <path class="flow" marker-end="url(#rp-arrow)" d="M836 250 H772 V270 H712" opacity=".5"/>
+  <text class="ref" x="792" y="300" text-anchor="middle">rows</text>
+</svg>

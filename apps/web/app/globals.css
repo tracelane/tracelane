@@ -1,0 +1,23 @@
+@import "@tracelanedev/ui/styles/tokens.css";
+
+/*
+ * Tailwind v4 must scan the design-system package so the utility classes its
+ * components use (bg-surface, text-ink, text-accent-ink, border-seal, …) are
+ * generated into this app's stylesheet. Path is relative to this CSS file →
+ * repo-root/packages/ui/src.
+ */
+@source "../../../packages/ui/src";
+
+/*
+ * Wire the self-hosted next/font families (loaded in layout.tsx) into the
+ * design-system tokens. tokens.css references "Inter" / "JetBrains Mono" by
+ * name as a fallback; here we point --font-sans / --font-mono at the actual
+ * next/font CSS variables so the real self-hosted faces are used. The
+ * Tinted-Slate-+-Lava palette, the @theme utilities, and the light-default
+ * base all come from the imported tokens.css (ADR-053) — this app no longer
+ * defines its own tokens.
+ */
+:root {
+	--font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+	--font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", monospace;
+}

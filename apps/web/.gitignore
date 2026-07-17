@@ -1,0 +1,15 @@
+.vercel
+
+# Cloudflare / OpenNext (Vercel→CF migration)
+.open-next/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env*
+
+e2e/.auth/
+
+# Playwright local run output
+test-results/
+playwright-report/

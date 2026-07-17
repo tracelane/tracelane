@@ -1,0 +1,35 @@
+<!-- ClickHouse memory limits for self-host on ≤2 GB RAM VPS.
+     These settings cap total memory use to ~512 MB so ClickHouse
+     co-exists with the gateway and OS on a budget instance. -->
+<clickhouse>
+    <max_server_memory_usage>536870912</max_server_memory_usage>    <!-- 512 MB (server-level) -->
+    <max_concurrent_queries>20</max_concurrent_queries>
+    <max_connections>100</max_connections>
+
+    <!-- Per-query memory cap is a USER/profile-level setting; ClickHouse 24.12
+         rejects it at the top level (UNKNOWN_ELEMENT_IN_CONFIG → server won't
+         boot). It must live in a <profiles> section. -->
+    <profiles>
+        <default>
+            <max_memory_usage>268435456</max_memory_usage>          <!-- 256 MB per query -->
+        </default>
+    </profiles>
+
+    <!-- Disable telemetry to Altinity/ClickHouse Inc. -->
+    <send_crash_reports>false</send_crash_reports>
+
+    <!-- NOTE: background_pool_size was previously pinned to 2 to "reduce merge
+         threads on small instances", but ClickHouse 24.12 refuses to boot when
+         background_pool_size * background_merges_mutations_concurrency_ratio (4)
+         is below the default number_of_free_entries_in_pool_to_execute_mutation
+         (20) — BAD_ARGUMENTS. RAM is already bounded by max_server_memory_usage
+         above (the real lever on a 2 GB box), so the pool-size overrides are
+         dropped and the CH defaults apply. -->
+
+    <!-- Keep logs small -->
+    <logger>
+        <level>warning</level>
+        <size>50M</size>
+        <count>3</count>
+    </logger>
+</clickhouse>

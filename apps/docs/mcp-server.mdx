@@ -1,0 +1,202 @@
+---
+title: MCP server
+description: Read-only trace access for Claude Desktop, Cursor, and any MCP client.
+---
+
+The Tracelane MCP server exposes your agent traces and guardrail verdicts as
+Model Context Protocol tools. Use it to give Claude (or any MCP-compatible LLM)
+live access to your production traces during debugging.
+
+**Read-only by design.** The server can never modify traces, change configuration,
+or access another tenant's data.
+
+## Install
+
+```bash
+# Runs locally and reads your traces directly from Tracelane's ClickHouse —
+# it is not a hosted service and does not proxy the gateway.
+npx @tracelanedev/mcp
+
+# Self-hosted / local
+TRACELANE_API_KEY=tlane_... \
+TRACELANE_GATEWAY_URL=http://localhost:8080 \
+npx @tracelanedev/mcp
+```
+
+## Configure Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "tracelane": {
+      "command": "npx",
+      "args": ["@tracelanedev/mcp"],
+      "env": {
+        "TRACELANE_API_KEY": "tlane_...",
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You should see "tracelane" in the MCP tools list.
+
+## Configure Claude Code
+
+Add to `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "tracelane": {
+      "command": "npx",
+      "args": ["@tracelanedev/mcp"],
+      "env": {
+        "TRACELANE_API_KEY": "tlane_...",
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+      }
+    }
+  }
+}
+```
+
+## Available tools
+
+### `list_traces`
+
+```typescript
+mcp.tracelane.list_traces({
+  since: "1h",            // "1h" | "24h" | "7d" | ISO-8601 timestamp
+  limit: 20,              // default 20, max 100
+  model: "claude-*",      // optional glob filter
+  intervention: "block",  // "none" | "warn" | "block"
+})
+```
+
+Returns: array of trace summaries (trace_id, root_name, duration_ms, span_count,
+intervention, model, timestamp).
+
+### `get_trace`
+
+```typescript
+mcp.tracelane.get_trace({ trace_id: "uuid" })
+```
+
+Returns: full span tree with all OTel GenAI attributes, predictive layer
+annotations, token counts, and latency breakdown.
+
+### `get_span`
+
+```typescript
+mcp.tracelane.get_span({ span_id: "uuid" })
+```
+
+Returns: single span with all attributes, input/output content (if
+`trace_content=true`), and predictive verdict detail.
+
+### `search_traces`
+
+```typescript
+mcp.tracelane.search_traces({
+  query: "tool_call browserbase stuck-loop",
+  since: "24h",
+  limit: 10,
+})
+```
+
+Free-text search across span names and OTel attribute values.
+
+### `explain_guardrail_block`
+
+```typescript
+mcp.tracelane.explain_guardrail_block({ span_id: "uuid" })
+```
+
+Returns a structured explanation: which AFT rule fired, the evidence, the
+intervention taken, and how to resolve.
+
+Example output:
+
+```
+PR2 — Lethal-trifecta taint block
+
+Evidence:
+  - Untrusted input entered at span 3 (user message)
+  - Private data accessed at span 7 (read_file tool)
+  - External write attempted at span 9 (send_email tool)
+
+Intervention: blocked — request was not forwarded to provider.
+
+Resolution: review span 7–9 for unintended data exfiltration.
+```
+
+### `list_evals`
+
+```typescript
+mcp.tracelane.list_evals({ suite: "pain-points" })
+```
+
+Returns the eval scoreboard — all 50 pain-point evals + 8 fault-tolerance evals
+with current status (green / mock / stub / not-written).
+
+### `get_eval_result`
+
+```typescript
+mcp.tracelane.get_eval_result({ eval_id: "PP-G1" })
+```
+
+Returns the latest result for a specific eval, including assertion details and
+the last run timestamp.
+
+### `replay_trace`
+
+```typescript
+mcp.tracelane.replay_trace({ trace_id: "uuid", include_tool_calls: true })
+```
+
+Returns the recorded trace as-is (ordered spans with LLM/tool attributes) for
+offline step-through. Read-only — it does **not** re-execute any model or tool.
+Live shadow / cross-model re-execution is a gateway capability, not exposed via
+MCP.
+
+## Transport
+
+| Mode | When to use |
+|---|---|
+| **Stdio** (default) | Claude Desktop, Cursor, local development |
+| **Streamable HTTP** | Remote deployments, CI/CD pipelines, Composio |
+
+Start in HTTP mode:
+
+```bash
+TRACELANE_MCP_TRANSPORT=http \
+TRACELANE_MCP_PORT=3100 \
+npx @tracelanedev/mcp
+```
+
+## Auth
+
+**V1:** `TRACELANE_API_KEY` env var — the `tlane_*` key is hashed and looked up
+against the Postgres `api_keys` table. The resulting `tenant_id` scopes all
+ClickHouse queries.
+
+**V2:** OAuth 2.1 PKCE — `tenant_id` extracted from the JWT claim only, never
+from tool arguments.
+
+## Security invariants
+
+- Read-only: no write tools are exposed — enforced at the `@modelcontextprotocol/sdk` handler level.
+- Every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound).
+- `tenant_id` from env/JWT only — MCP tool arguments cannot override it.
+- No raw SQL in tool arguments — all filters are parsed into typed query parameters.
+
+## Related
+
+- [Python SDK](/sdk-python)
+- [TypeScript SDK](/sdk-typescript)
+- [Predictive guardrails](/predictive-guardrails)
+- [API reference](/api-reference)

@@ -1,0 +1,23 @@
+Tracelane
+Copyright 2026 Sanjeev Kumar Singh and Tracelane contributors
+
+This product includes software developed by:
+- The Apache Software Foundation (https://www.apache.org/)
+
+This product references architectural patterns and design ideas from the
+following open-source projects (no code copied):
+- MLflow (Apache 2.0) — https://github.com/mlflow/mlflow
+- Langfuse (MIT) — https://github.com/langfuse/langfuse
+- OpenLLMetry / Traceloop (Apache 2.0) — https://github.com/traceloop/openllmetry
+- Comet Opik (Apache 2.0) — https://github.com/comet-ml/opik
+- OpenInference (Apache 2.0) — https://github.com/Arize-ai/openinference
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.

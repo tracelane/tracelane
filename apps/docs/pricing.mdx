@@ -1,0 +1,89 @@
+---
+title: Pricing
+description: Predictable AI agent reliability. Honest pricing — bundled seats, capped overage, no retention upcharge.
+---
+
+50 named competitor pains, fixed. Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger for EU AI Act. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
+
+## Tiers
+
+| Tier | Price | What's included |
+|---|---|---|
+| **OSS self-host** | $0 forever | 30+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
+| **Free hosted** | $0 | 10K traces + 10K gateway calls/mo, 60 RPM, 7-day retention, no commercial use, rule-based PR1+PR2. |
+| **Qualified-free** | $0 | Full Builder tier for verified OSS projects, .edu emails, startups with <$1M ARR. |
+| **Builder** | $59/mo | 150K traces + 150K gateway/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), 30-day retention, predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
+| **Team** | $249/mo | 1M traces + 1M gateway/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 90-day retention, predictive PR1–PR6, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 10 seats included + $19/seat to 25 (contact sales above), 99% uptime target, predictive pre-flight guardrails with tamper-evident promotion record. |
+| **Business** | $899/mo | 5M traces + 5M gateway/mo, 60K RPM, 180-day retention, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 25 seats included + $19/seat to 50 (contact sales above), SSO via WorkOS, 99.9% uptime target, cohort baselines when your cohort reaches 30 customers (on the roadmap). |
+| **Enterprise** | From $2,999/mo | 25M+ traces custom, unlimited seats, 365-day retention, PR1–PR6 at launch, PR7–PR12 on the roadmap, dedicated tenancy option, 99.95% uptime target, EU AI Act Article 12, DPDP, GDPR DPA, ISO 27001 inherited from Hetzner, SOC 2 Type I planned, ISO 42001 planned, HIPAA via opt-in GCP +$2,000/mo. |
+
+<Note>
+Uptime targets are objectives, not contractual SLAs with service credits — a
+formal SLA with credits is available on Enterprise contracts. SOC 2 Type I is
+planned (not yet under audit). See [SLO](/slo) for the live error-budget dashboard.
+</Note>
+| **Audit SKU** | +$999/mo | EU AI Act Article 12 compliance. Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), eIDAS-grade timestamps via QTSP daily batch, regulatory export pack. See [Audit Ledger](/audit-ledger) for protocol details. |
+
+## How we compare
+
+| Claim | Tracelane | LangSmith | LangSmith Engine | Langfuse Pro | Braintrust Pro |
+|---|---|---|---|---|---|
+| Price entry paid | $59 Builder | $39/seat Plus | Plus + Engine usage | $199 Pro | $249 Pro |
+| Seat economics | 10 + $19/seat → 25 Team / unlimited Enterprise | $39/seat from seat 1 | $39/seat from seat 1 | unlimited | unlimited |
+| Trace overage | $1.20/10K, 5× hard cap, 429 | $0.50/1K, no cap documented | $0.50/1K + Engine usage | $8/100K, no cap | $3/GB ingest |
+| Retention | 30/90/180/365d per tier | 14d base, 9–10× upcharge to 400d | 14d base, 9–10× upcharge to 400d | 90d Core, 3yr Pro | 14d Starter, 30d Pro |
+| Gateway | Rust gateway, BYOK 0% | none (obs only) | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
+| Inline predictive guardrails | yes, inline | no | no (post-failure clustering) | no | no |
+| Auto-rollback on cost/latency/error | yes, EWMA-based | manual prompt promotion | manual prompt promotion | none | none |
+| Tamper-evident audit ledger | $999 SKU, hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap) | no | no | SOC 2 / ISO 27001 / HIPAA on Pro | no |
+| Self-host license | Apache 2.0 (full stack) | none | Cloud + Enterprise Self-Hosted SKU | MIT (4-DB stack) | hybrid, seats charged |
+| OTel GenAI semconv | canonical wire format | proprietary | proprietary | partial | proprietary |
+| Intervention timing | pre-flight (before model call) | post-failure | post-failure (cluster + draft PR) | post-failure | eval-time |
+
+*Competitive pricing verified May 2026 against each vendor's public pricing page. LangSmith Engine launched May 13, 2026 ([langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview)). See also [vs LangSmith Engine](/comparisons/vs-langsmith-engine). We're wrong? Open an issue at [github.com/tracelane/tracelane](https://github.com/tracelane/tracelane).*
+
+## FAQ
+
+<AccordionGroup>
+
+<Accordion title="What happens if I exceed my trace quota?">
+Soft cap at 100% (you get an alert). Overages bill at $1.20 per 10K traces up to 5× your included quota. At 5× we return HTTP 429 + a Slack alert. No surprise bills.
+</Accordion>
+
+<Accordion title="Why are seats capped on Team and Business?">
+Honest pricing. We bundle 10 seats on Team (additional seats $19/mo each, contact sales above 25) and 25 on Business (additional $19/mo, contact sales above 50). Enterprise is unlimited.
+</Accordion>
+
+<Accordion title="What inline guardrails run on every request?">
+A layer of heuristic guardrails runs inline at the gateway on every request — MCP rug-pull detection, lethal-trifecta taint tracking, prompt-injection patterns, browser stuck-loop, A2A/A2UI validation, argument drift, and tool-schema checks — each can flag or halt the request at the gateway, inline, per the configured policy. A multi-model ML ensemble (Llama Prompt Guard 2 ONNX + a fine-tuned classifier) is on the roadmap to augment the heuristic layer.
+</Accordion>
+
+<Accordion title="How does Tracelane compare to LangSmith Engine (launched May 13, 2026)?">
+Engine clusters production failures after they happen, then drafts PRs and online evaluators in your LangSmith UI. Tracelane sits one step earlier in the agent lifecycle: inline heuristic guardrails at the gateway (multi-model ML ensemble on the roadmap), tamper-evident promotion record on every deploy, and auto-rollback on objective metrics (cost, latency, error rate, guardrail-fire rate). Engine requires the LangSmith trace surface + LangChain-managed inference keys per LangSmith AI ToS. Tracelane is OTel GenAI semconv-native, BYOK zero markup, Apache 2.0 full stack, self-hostable. See [vs LangSmith Engine](/comparisons/vs-langsmith-engine).
+</Accordion>
+
+<Accordion title="When are PR7–PR12 available?">
+PR7–PR10 (trajectory embedding, arg drift, A2A handoff, inline 1B distilled judge) and PR11–PR12 (SLO drift sentinel, LangGraph predictive branch) are on the post-launch roadmap. Free, Builder, Team, and Business get them upon ship without re-contracting.
+</Accordion>
+
+<Accordion title="What is the Audit SKU and do I need it?">
+Tamper-evident agent ledger for regulated AI deployments under EU AI Act Article 12 record-keeping obligations for high-risk AI systems (the Annex III high-risk timeline is provisional — expected around December 2027; confirm against the current text of the Act). Every span's Merkle root is recorded in a tamper-evident hash chain with Ed25519 per-tenant signing today; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis, with universal per-run anchoring and daily anchoring to an eIDAS Qualified Trust Service Provider (GlobalSign / ADACOM / Evidency) on the roadmap. If you deploy high-risk AI in the EU, you need this. See [Audit Ledger](/audit-ledger).
+</Accordion>
+
+<Accordion title="Is there a free trial for paid tiers?">
+Free hosted (10K traces/mo) is permanently free for non-commercial use. Qualified-free (full Builder tier) for verified OSS projects, .edu emails, and startups with <$1M ARR. No paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+</Accordion>
+
+<Accordion title="Can I self-host?">
+Yes. Apache 2.0 full stack on GitHub (`github.com/tracelane/tracelane`). Self-host the full stack with a single-node Docker Compose (ClickHouse-backed) — no managed cloud required. Enterprise gets a commercial-support license. See [Self-hosting](/self-hosting).
+</Accordion>
+
+<Accordion title="Why is HIPAA an add-on?">
+Hetzner does not sign Business Associate Agreements. Our HIPAA-eligible deployment runs on GCP us-central1 (BAA signed) at $2,000/mo on top of Enterprise base.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+Prices billed via [Polar.sh](https://polar.sh) (Merchant of Record). Early Member rate locked before May 27, 2026. EU VAT, US sales tax, and India GST handled by Polar.sh.

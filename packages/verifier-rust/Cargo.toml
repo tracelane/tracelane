@@ -1,0 +1,24 @@
+[package]
+name = "tracelane-audit-verifier"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "Reference verifier for Tracelane tamper-evident audit ledgers"
+repository = "https://github.com/tracelane/tracelane"
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "2"
+hex = "0.4"
+# ECDSA-P256 (RustCrypto) for the ADR-062 Rekor v2 anchor entry signature
+# (hashedrekord PKIX_ECDSA_P256_SHA_256): DER parse + prehashed verify. Default
+# features (arithmetic + ecdsa) cover from_sec1_bytes + Signature::from_der +
+# verify_prehash; the online Rekor fetch (ureq) is gone (v2 = offline bundle).
+p256 = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

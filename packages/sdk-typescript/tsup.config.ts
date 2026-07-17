@@ -1,0 +1,31 @@
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+	entry: {
+		index: "src/index.ts",
+		"instrumentations/anthropic": "src/instrumentations/anthropic.ts",
+		"instrumentations/openai": "src/instrumentations/openai.ts",
+		"instrumentations/litellm": "src/instrumentations/litellm.ts",
+		"instrumentations/openrouter": "src/instrumentations/openrouter.ts",
+		"instrumentations/langgraph": "src/instrumentations/langgraph.ts",
+		"instrumentations/openai_agents": "src/instrumentations/openai_agents.ts",
+		"instrumentations/vercel_ai": "src/instrumentations/vercel_ai.ts",
+		"instrumentations/mcp": "src/instrumentations/mcp.ts",
+		"instrumentations/claude_code": "src/instrumentations/claude_code.ts",
+		"instrumentations/cursor": "src/instrumentations/cursor.ts",
+		"instrumentations/pinecone": "src/instrumentations/pinecone.ts",
+		"instrumentations/qdrant": "src/instrumentations/qdrant.ts",
+		"instrumentations/composio": "src/instrumentations/composio.ts",
+		"instrumentations/browserbase": "src/instrumentations/browserbase.ts",
+		"instrumentations/e2b": "src/instrumentations/e2b.ts",
+		"instrumentations/mem0": "src/instrumentations/mem0.ts",
+		"instrumentations/letta": "src/instrumentations/letta.ts",
+		"instrumentations/firecrawl": "src/instrumentations/firecrawl.ts",
+	},
+	format: ["cjs", "esm"],
+	dts: true,
+	splitting: false,
+	sourcemap: true,
+	clean: true,
+	target: "es2022",
+});
