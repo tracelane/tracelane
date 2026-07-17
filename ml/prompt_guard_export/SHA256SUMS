@@ -1,0 +1,5 @@
+# Llama Prompt Guard 2 22M INT8 ONNX — SHA-256 pin
+# Update after running export.py.
+# Gateway loads model and verifies SHA-256 at startup. Mismatch = build fail.
+# Format: <64-hex-sha256>  <filename>
+PENDING  llama-prompt-guard-2-22m-int8.onnx

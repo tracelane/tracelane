@@ -1,0 +1,143 @@
+---
+title: Providers
+description: 30+ LLM providers behind one OpenAI-compatible API.
+---
+
+Tracelane gateway speaks to **30+ LLM providers** through a single API
+surface. You point at `https://gateway.tracelane.dev`, set the model
+string, and we route + failover.
+
+## Dedicated adapters (7)
+
+Purpose-built request/response translators for providers whose API shape
+differs enough that a generic adapter would lose fidelity.
+
+| Provider | Model prefix | Auth env var |
+|---|---|---|
+| Anthropic | `claude-*`, `anthropic/*` | `ANTHROPIC_API_KEY` |
+| OpenAI | `gpt-*`, `o1*`, `o3*`, `openai/*` | `OPENAI_API_KEY` |
+| Google Gemini (AI Studio) | `gemini-*`, `google/*` | `GOOGLE_API_KEY` |
+| Google Vertex AI | `vertex/*` | service-account JSON |
+| AWS Bedrock | `bedrock/*` | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` |
+| Azure OpenAI | `azure/*` | `AZURE_OPENAI_API_KEY` |
+| Cohere | `command-*`, `cohere/*` | `COHERE_API_KEY` |
+
+### Google: AI Studio vs Vertex AI
+
+Both serve Gemini and take the same model IDs (`gemini-2.5-pro`,
+`gemini-3-flash-preview`, …), but they are different products:
+
+- **`gemini-*`** → AI Studio. Auth is an **API key**.
+- **`vertex/*`** → Vertex AI. Auth is a **GCP service-account JSON**; Vertex
+  rejects API keys outright. Paste the whole JSON as the credential — we read
+  the project from it. Billed to the linked Cloud project, so **Google Cloud
+  credits apply to Vertex but not to AI Studio**.
+
+Some models Vertex serves are unavailable to newer AI Studio keys, so
+`vertex/gemini-2.5-flash` can work where `gemini-2.5-flash` returns
+`model_not_found`.
+
+<Warning>
+**Google is retiring classic `AIza…` API keys.** Google now issues
+`AQ.…` Authentication Keys from AI Studio, and per
+[Google's API key docs](https://ai.google.dev/gemini-api/docs/api-key) it stops
+accepting **all** Standard (`AIza…`) keys in **September 2026** — unrestricted
+ones already stopped working in June 2026.
+
+If your Google credential starts with `AIza`, replace it with an `AQ.` key
+before September 2026. After the cutoff, calls fail and Tracelane returns
+`provider_key_rejected` — not a Tracelane outage.
+
+Unaffected: `vertex/*` (service-account auth), and `AIza` keys used against
+non-Gemini Google APIs.
+</Warning>
+
+## OpenAI-compatible adapters (28)
+
+Together AI · Fireworks · Groq · OpenRouter · Mistral · Perplexity ·
+DeepSeek · xAI · NVIDIA NIM · Cerebras · SambaNova · Lepton · Lambda ·
+Novita · AI21 · Hyperbolic · DeepInfra · Cloudflare Workers AI · Ollama ·
+Baseten · Hugging Face · Anyscale · Modal · Predibase · Moonshot ·
+Upstage · 01.AI / Yi · Aleph Alpha.
+
+Each base URL is overridable via `<PROVIDER>_BASE_URL` for self-hosted or
+private-link deployments. Auth env var is `<PROVIDER>_API_KEY`.
+
+## Routing
+
+Tracelane routes by model-string prefix:
+
+```
+claude-sonnet-4.5                → Anthropic
+gpt-5-codex                      → OpenAI
+gemini-3-pro                     → Google
+bedrock/anthropic.claude-3-5...  → AWS Bedrock
+azure/gpt-4o-mini                → Azure OpenAI
+together/Qwen2.5-72B-Instruct    → Together AI
+groq/llama-3.3-70b-versatile     → Groq
+ollama/llama3.2:3b               → local Ollama
+```
+
+Model-string aliases and a `tracelane.yaml` routing config (mapping arbitrary
+model names to a provider + upstream model) are on the roadmap; V1 routes
+strictly by the built-in prefix table above.
+
+## Failover
+
+The gateway fails over on upstream **500 / 502 / 503 / 504** (not 429 — a
+rate-limited upstream returns 429 to the caller with `Retry-After`). The
+fallback order is a fixed cross-provider chain: **Anthropic → OpenAI → Google**
+(`crates/gateway/src/providers/failover.rs`). Per-model, config-driven fallback
+chains (`timeout_ms`, custom `retry_on`) are on the roadmap; there is no
+`tracelane.yaml` model/failover config in V1.
+
+## Upstream error mapping
+
+When an upstream provider rejects a request, the gateway maps it to a distinct
+status so you can tell *whose* problem it is. A provider failure is never
+flattened into a generic "unavailable".
+
+| Upstream | Tracelane returns | Meaning |
+|---|---|---|
+| 401 / 403, or 400 with a key-invalid reason | `401 provider_key_rejected` | Your provider key is wrong, expired, or retired. Rotate it. |
+| 429 | `429 provider_rate_limited` + `Retry-After` | You are over the provider's rate limit or quota. Retry later, or check that account's plan and billing. |
+| 404 | `404 model_not_found` | The provider does not recognise this model **for your account**. Fix the model string, or get access. |
+| 500 / 502 / 503 / 504 | `502 provider unavailable` (after failover) | A genuine upstream outage. |
+
+Only the status and a machine-readable reason token cross this boundary — the
+upstream's error body never reaches your response or our logs, because provider
+error bodies can echo the credential that was sent.
+
+The key-invalid case covers a shape a status code alone cannot: Google answers a
+dead API key with **400 `API_KEY_INVALID`**, not 401. Without reading that
+reason, a retired Google key would look like an outage rather than a credential
+you need to rotate — which matters most in September 2026 (see the warning
+above).
+
+## BYOK only (V1)
+
+V1 ships **bring-your-own-key only**. Provider API keys are envelope-
+encrypted at rest (AES-256-GCM via `ring` AEAD, with AAD bound to the
+tenant + provider) and decrypted in-memory just-in-time on dispatch. They
+never appear in logs, spans, or error messages. KMS-backed master keys are on
+the roadmap.
+
+## Smoke tests
+
+Each adapter has a wiremock-backed smoke test in
+[`crates/gateway/src/providers/smoke_tests.rs`](https://github.com/tracelane/tracelane/blob/main/crates/gateway/src/providers/smoke_tests.rs).
+Single-shot, streaming, tool-use, error mapping. Run with:
+
+```bash
+cargo test -p gateway providers::smoke_tests
+```
+
+These use `wiremock` (loopback mock servers, gated by an RAII SSRF-loopback
+bypass) and never hit the real network — they catch wire-format drift before it
+reaches a customer.
+
+## Related
+
+- [Architecture](/architecture)
+- [API reference](/api-reference)
+- [CLI](/cli)

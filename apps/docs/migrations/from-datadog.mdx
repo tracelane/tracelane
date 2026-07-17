@@ -1,0 +1,136 @@
+---
+title: Migrating from Datadog LLM Observability
+description: Replace Datadog's LLM Observability with Tracelane — a platform purpose-built for AI agents.
+---
+
+Datadog's LLM Observability added AI tracing to a platform designed for
+traditional APM. It understands LLM calls but has no model for MCP tools, A2A
+handoffs, browser agents, agent loops, or the failure modes specific to
+multi-step agents. Predictive guardrails, prompt versioning, and tamper-evident
+audit trails are absent entirely.
+
+You also pay Datadog APM pricing on top of your GPU bills.
+
+## What changes
+
+| Capability | Datadog LLM Obs. | Tracelane |
+|---|---|---|
+| LLM call tracing | Yes | Yes |
+| Agent-specific failure modes | No | 8 predictive guards — MCP rug-pull, lethal trifecta, A2A, loops, … |
+| Predictive guardrails inline | No | Yes — combined inline at the gateway |
+| Prompt versioning + eval gates | No | Prompt promotion + auto-rollback (B1); eval gates dark-launched V1.1 |
+| Time-travel replay | No | Yes — model-swap, prompt-swap |
+| BYOK gateway (0 % markup) | No | Yes — 30+ providers |
+| Tamper-evident audit ledger | No | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
+| Self-hostable | Datadog infra only | Yes — Docker Compose + Helm |
+| Pricing model | Per GB ingested | Per span · predictable |
+
+## Step 1 — Install Tracelane
+
+```bash
+pip install tracelane        # Python
+npm install @tracelanedev/sdk   # TypeScript
+```
+
+## Step 2 — Remove Datadog LLM Observability init
+
+Before:
+
+```python
+from ddtrace.llmobs import LLMObs
+
+LLMObs.enable(
+    ml_app="my-agent",
+    api_key=os.environ["DD_API_KEY"],
+)
+```
+
+After:
+
+```python
+import tracelane
+
+tracelane.init(
+    endpoint="http://localhost:4318",   # an OTLP receiver you run
+    api_key="tlane_...",
+)
+tracelane.auto_instrument()  # best-effort: anthropic, openai, litellm, claude_code
+```
+
+`auto_instrument()` covers those four libraries when installed; for anything
+else, call its explicit `instrument_*` function after you construct the object
+(see the [Python SDK](/sdk-python)). For Tracelane Cloud — which does not expose
+a public OTLP endpoint — point your client at the gateway instead (see the
+[Quickstart](/quickstart)).
+
+Remove `DD_API_KEY`, `DD_LLMOBS_ENABLED`, `DD_LLMOBS_ML_APP` from your environment.
+
+## Step 3 — Replace Datadog spans with OTel spans
+
+Datadog uses a proprietary span API. Tracelane uses OpenTelemetry GenAI
+semconv — portable across any OTel-compatible backend.
+
+```python
+# Datadog
+from ddtrace.llmobs.decorators import llm
+
+@llm(model_provider="anthropic", model_name="claude-sonnet-4-6", name="my-call")
+def invoke(prompt):
+    ...
+
+# Tracelane — standard OpenTelemetry API (GenAI semconv attribute keys)
+from opentelemetry import trace
+
+tracer = trace.get_tracer("my-agent")
+with tracer.start_as_current_span("my-call") as s:
+    s.set_attribute("gen_ai.system", "anthropic")
+    s.set_attribute("gen_ai.request.model", "claude-sonnet-4-6")
+    result = client.messages.create(...)
+```
+
+Or wrap the client with its `instrument_*` function — no manual span code needed:
+
+```python
+import tracelane
+from tracelane import instrument_anthropic
+
+tracelane.init(endpoint="http://localhost:4318", api_key="tlane_...")
+
+from anthropic import Anthropic
+client = Anthropic()
+instrument_anthropic(client)  # now this client's calls are traced
+```
+
+## Step 4 — Migrate dashboards
+
+Datadog dashboards use proprietary widgets. Tracelane provides:
+
+- **Traces view** — transcript-spine span tree for deep agent traces
+- **SLO dashboard** — error rate, latency, token spend per model/provider
+- **Eval Scoreboard** — 50 pain-point evals + 8 fault-tolerance chaos evals
+- **Trust Center** — audit ledger exports, verifier downloads
+
+If you have custom Datadog monitors, recreate critical ones as Tracelane SLO
+thresholds or eval assertions.
+
+## Keeping Datadog for infrastructure APM
+
+Tracelane traces AI-specific spans (LLM calls, tool calls, A2A handoffs).
+You can run both simultaneously — Tracelane handles the AI layer, Datadog
+handles the infrastructure layer. They are not mutually exclusive.
+
+```python
+# Both active at the same time
+import ddtrace; ddtrace.patch_all()   # infra APM
+import tracelane
+tracelane.init(endpoint="http://localhost:4318", api_key="tlane_...")  # AI agent layer
+tracelane.auto_instrument()
+```
+
+## Related
+
+- [Architecture](/architecture)
+- [Predictive guardrails](/predictive-guardrails)
+- [Audit ledger](/audit-ledger)
+- [Migrating from LiteLLM](/migrations/from-litellm)
+- [Migrating from LangSmith](/migrations/from-langsmith)

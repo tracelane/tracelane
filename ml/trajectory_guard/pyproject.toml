@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracelane-trajectory-guard"
+version = "0.1.0"
+description = "Siamese recurrent autoencoder for trajectory-level anomaly detection"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+ "torch>=2.3.0",
+ "numpy>=1.26.0",
+ "pydantic>=2.7.0",
+ "onnx>=1.16.0",
+ "onnxruntime>=1.18.0",
+ "datasets>=2.19.0",
+ "dvc>=3.50.0",
+ "structlog>=24.1.0",
+ "rich>=13.7.0",
+ "click>=8.1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+ "pytest>=8.2.0",
+ "ruff>=0.4.7",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "RUF"]

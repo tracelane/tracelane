@@ -1,0 +1,9 @@
+# Pinned MSRV / toolchain for the workspace.
+#
+# The documented MSRV is 1.87. Pinning it here gives a reproducible toolchain
+# for CI, the self-host build, and anyone building from source — everyone
+# compiles against the same rustc, rustfmt, and clippy.
+[toolchain]
+channel = "1.87"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

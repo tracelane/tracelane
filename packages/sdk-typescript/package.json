@@ -1,0 +1,153 @@
+{
+	"name": "@tracelanedev/sdk",
+	"version": "0.1.0",
+	"description": "Tracelane TypeScript SDK — auto-instrument AI agent frameworks",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tracelane/tracelane.git",
+		"directory": "packages/sdk-typescript"
+	},
+	"homepage": "https://tracelane.dev",
+	"bugs": "https://github.com/tracelane/tracelane/issues",
+	"main": "./dist/index.js",
+	"module": "./dist/index.mjs",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.mjs",
+			"require": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		},
+		"./anthropic": {
+			"import": "./dist/instrumentations/anthropic.mjs",
+			"require": "./dist/instrumentations/anthropic.js",
+			"types": "./dist/instrumentations/anthropic.d.ts"
+		},
+		"./openai": {
+			"import": "./dist/instrumentations/openai.mjs",
+			"require": "./dist/instrumentations/openai.js",
+			"types": "./dist/instrumentations/openai.d.ts"
+		},
+		"./litellm": {
+			"import": "./dist/instrumentations/litellm.mjs",
+			"require": "./dist/instrumentations/litellm.js",
+			"types": "./dist/instrumentations/litellm.d.ts"
+		},
+		"./langchain": {
+			"import": "./dist/instrumentations/langchain.mjs",
+			"require": "./dist/instrumentations/langchain.js",
+			"types": "./dist/instrumentations/langchain.d.ts"
+		},
+		"./openrouter": {
+			"import": "./dist/instrumentations/openrouter.mjs",
+			"require": "./dist/instrumentations/openrouter.js",
+			"types": "./dist/instrumentations/openrouter.d.ts"
+		},
+		"./langgraph": {
+			"import": "./dist/instrumentations/langgraph.mjs",
+			"require": "./dist/instrumentations/langgraph.js",
+			"types": "./dist/instrumentations/langgraph.d.ts"
+		},
+		"./openai_agents": {
+			"import": "./dist/instrumentations/openai_agents.mjs",
+			"require": "./dist/instrumentations/openai_agents.js",
+			"types": "./dist/instrumentations/openai_agents.d.ts"
+		},
+		"./vercel_ai": {
+			"import": "./dist/instrumentations/vercel_ai.mjs",
+			"require": "./dist/instrumentations/vercel_ai.js",
+			"types": "./dist/instrumentations/vercel_ai.d.ts"
+		},
+		"./mcp": {
+			"import": "./dist/instrumentations/mcp.mjs",
+			"require": "./dist/instrumentations/mcp.js",
+			"types": "./dist/instrumentations/mcp.d.ts"
+		},
+		"./claude_code": {
+			"import": "./dist/instrumentations/claude_code.mjs",
+			"require": "./dist/instrumentations/claude_code.js",
+			"types": "./dist/instrumentations/claude_code.d.ts"
+		},
+		"./cursor": {
+			"import": "./dist/instrumentations/cursor.mjs",
+			"require": "./dist/instrumentations/cursor.js",
+			"types": "./dist/instrumentations/cursor.d.ts"
+		},
+		"./pinecone": {
+			"import": "./dist/instrumentations/pinecone.mjs",
+			"require": "./dist/instrumentations/pinecone.js",
+			"types": "./dist/instrumentations/pinecone.d.ts"
+		},
+		"./qdrant": {
+			"import": "./dist/instrumentations/qdrant.mjs",
+			"require": "./dist/instrumentations/qdrant.js",
+			"types": "./dist/instrumentations/qdrant.d.ts"
+		},
+		"./composio": {
+			"import": "./dist/instrumentations/composio.mjs",
+			"require": "./dist/instrumentations/composio.js",
+			"types": "./dist/instrumentations/composio.d.ts"
+		},
+		"./browserbase": {
+			"import": "./dist/instrumentations/browserbase.mjs",
+			"require": "./dist/instrumentations/browserbase.js",
+			"types": "./dist/instrumentations/browserbase.d.ts"
+		},
+		"./e2b": {
+			"import": "./dist/instrumentations/e2b.mjs",
+			"require": "./dist/instrumentations/e2b.js",
+			"types": "./dist/instrumentations/e2b.d.ts"
+		},
+		"./mem0": {
+			"import": "./dist/instrumentations/mem0.mjs",
+			"require": "./dist/instrumentations/mem0.js",
+			"types": "./dist/instrumentations/mem0.d.ts"
+		},
+		"./letta": {
+			"import": "./dist/instrumentations/letta.mjs",
+			"require": "./dist/instrumentations/letta.js",
+			"types": "./dist/instrumentations/letta.d.ts"
+		},
+		"./firecrawl": {
+			"import": "./dist/instrumentations/firecrawl.mjs",
+			"require": "./dist/instrumentations/firecrawl.js",
+			"types": "./dist/instrumentations/firecrawl.d.ts"
+		}
+	},
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"lint": "biome check src/",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run --passWithNoTests"
+	},
+	"peerDependencies": {
+		"@anthropic-ai/sdk": ">=0.26.0",
+		"openai": ">=4.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@anthropic-ai/sdk": { "optional": true },
+		"openai": { "optional": true }
+	},
+	"dependencies": {
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/sdk-node": "^0.218.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.218.0",
+		"@opentelemetry/semantic-conventions": "^1.27.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"@opentelemetry/sdk-trace-base": "^2.0.0",
+		"@types/node": "^22.0.0",
+		"tsup": "^8.0.0",
+		"typescript": "^5.5.0",
+		"vitest": "^2.0.0"
+	},
+	"files": ["dist"],
+	"license": "Apache-2.0",
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"keywords": ["tracelane", "opentelemetry", "ai-observability", "llm-tracing", "instrumentation"]
+}

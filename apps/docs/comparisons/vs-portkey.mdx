@@ -1,0 +1,40 @@
+---
+title: Tracelane vs Portkey
+description: Apache 2.0 full-stack alternative to Portkey — independent, with no vendor-stack consolidation path. Inline predictive guardrails, tamper-evident audit ledger, OTel GenAI semconv.
+---
+
+Portkey has been reported as an acquisition target in 2026 (per press coverage; the deal is unconfirmed and, if it proceeds, may take quarters to close). Teams that want a neutral, independent gateway rather than one folded into a larger security vendor's stack have a window to evaluate alternatives.
+
+Customers who want a neutral, framework-agnostic AI gateway with a clean Apache 2.0 license and no vendor-stack consolidation risk have a clear reason to evaluate an independent alternative.
+
+## How we compare
+
+| Claim | Tracelane | Portkey |
+|---|---|---|
+| License | Apache 2.0 (full stack, including predictive layer) | Portkey OSS + paid hybrid |
+| Ownership posture | Independent | Reported acquisition interest (unconfirmed) |
+| Self-host | Apache 2.0 full stack; single-node Docker Compose | OSS gateway; paid hosted observability |
+| Wire format | OTel GenAI semconv (canonical) | Proprietary + OpenTelemetry partial |
+| Predictive guardrails | Inline heuristic guardrails (multi-model ML ensemble on the roadmap) | Guardrails library (Portkey markets realtime guardrails; verify fit for your policy) |
+| Tamper-evident audit ledger | $999 add-on SKU (tamper-evident hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap) | — |
+| BYOK key custody | Envelope encryption, AAD bound to (tenant_id, provider_id) | BYOK supported |
+| Auto-rollback on objective metrics | Yes, EWMA-based | Manual prompt promotion |
+| Ownership independence | Yes — independent | Reported acquisition interest; potential vendor-stack consolidation |
+
+## FAQ
+
+<AccordionGroup>
+
+<Accordion title="Has the reported Portkey acquisition closed?">
+As of mid-2026 this is reported interest, not a closed deal — treat the specifics as unconfirmed. Acquisitions of this kind often take multiple quarters to close if they proceed at all. Either way, the independence question is worth evaluating now.
+</Accordion>
+
+<Accordion title="Does Tracelane have feature parity with Portkey?">
+On the gateway feature set (30+ providers, failover, retry, BYOK, usage/token tracking) yes. Tracelane adds inline heuristic predictive guardrails (a multi-model ML ensemble is on the roadmap), tamper-evident audit ledger for EU AI Act Article 12, and OTel GenAI semconv as the canonical wire format. Portkey ships a guardrails library; Tracelane ships inline heuristic guardrails that run on every request.
+</Accordion>
+
+<Accordion title="How long does migration take?">
+Tracelane reads OpenAI-, Anthropic-, and Google-shaped requests directly. Most Portkey configs map 1:1 — provider list, fallback chain, BYOK keys. Cutover is typically an afternoon.
+</Accordion>
+
+</AccordionGroup>

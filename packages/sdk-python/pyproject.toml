@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracelane"
+version = "0.1.0"
+description = "Tracelane Python SDK — auto-instrument AI agent frameworks"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+keywords = ["llm", "observability", "opentelemetry", "ai-agents"]
+classifiers = [
+ "Development Status :: 3 - Alpha",
+ "Intended Audience :: Developers",
+ "License :: OSI Approved :: Apache Software License",
+ "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+ "opentelemetry-api>=1.27.0",
+ "opentelemetry-sdk>=1.27.0",
+ "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+ "wrapt>=1.16.0",
+]
+
+[project.urls]
+Homepage = "https://tracelane.dev"
+Repository = "https://github.com/tracelane/tracelane"
+Documentation = "https://docs.tracelane.dev"
+Issues = "https://github.com/tracelane/tracelane/issues"
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.26.0"]
+openai = ["openai>=1.40.0"]
+langchain = ["langchain-core>=0.2.0"]
+all = [
+ "tracelane[anthropic]",
+ "tracelane[openai]",
+ "tracelane[langchain]",
+]
+dev = [
+ "pytest>=8.0.0",
+ "pytest-asyncio>=0.23.0",
+ "ruff>=0.6.0",
+ "mypy>=1.11.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tracelane"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

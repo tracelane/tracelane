@@ -1,0 +1,60 @@
+---
+title: Tracelane vs LiteLLM
+description: Rust gateway with signed releases, SLSA Build Level 3 provenance, and Sigstore Cosign keyless signing — no Python interpreter and no PyPI transitive deps on the request path.
+---
+
+LiteLLM is a widely-adopted open-source Python proxy. Two public events make the migration window relevant in 2026:
+
+1. **CVE-2026-42208** — added to the CISA Known Exploited Vulnerabilities catalog on May 8, 2026 (per [cisa.gov/known-exploited-vulnerabilities-catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)).
+2. A **reported March 2026 supply-chain incident** affecting its PyPI distribution.
+
+Tracelane is a Rust gateway with Trusted Publishing OIDC, Cosign keyless signing, SLSA Build Level 3 provenance, and a vuln-scanning stack of OSV-Scanner + Grype + Syft. Trivy is banned in our supply chain (per ADR-007).
+
+## How we compare
+
+| Claim | Tracelane | LiteLLM |
+|---|---|---|
+| Language on request path | Rust (Apache 2.0) | Python (Apache 2.0 OSS, paid proxy) |
+| Supply-chain posture | Cosign keyless + SLSA L3 + OSV-Scanner + Grype + Syft | PyPI install with transitive deps; CVE-2026-42208 on CISA KEV May 8, 2026 |
+| Token model | Trusted Publishing OIDC (no long-lived tokens) | Long-lived tokens history |
+| Vuln scanning | OSV-Scanner + Grype + Syft (Trivy banned per ADR-007) | — |
+| Gateway overhead | Low — no interpreter on the hot path (measured figures publish with the Reliability Benchmark v1.0) | Python interpreter on the hot path adds measurable per-request overhead |
+| BYOK key custody | Envelope encryption, AAD bound to (tenant_id, provider_id) | Keys commonly supplied via proxy config / environment |
+| Audit ledger | Tamper-evident hash chain + Merkle + Ed25519 per-tenant signing (live); best-effort Rekor v2 inclusion proof on anchored batches (universal anchoring on the roadmap) | None |
+| Predictive guardrails | Inline heuristic guardrails | None native |
+| Self-host complexity | Single-node Docker Compose (ClickHouse-backed) | Python venv + Redis + Postgres |
+| Migration tool | `tlane import litellm` reads litellm_config.yaml | — |
+
+## Migration
+
+```bash
+# 1. Translate your LiteLLM config
+tlane import litellm --from ./litellm_config.yaml --out ./tracelane.toml
+
+# 2. Verify the gateway binary signature (Cosign keyless)
+cosign verify-blob --certificate-identity-regexp \
+  'https://github.com/tracelane/tracelane/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  --bundle ./tracelane.bundle ./tracelane
+
+# 3. Point your agents at the new gateway endpoint
+export OPENAI_BASE_URL=https://gateway.tracelane.dev/v1
+```
+
+## FAQ
+
+<AccordionGroup>
+
+<Accordion title="Does Tracelane have feature parity with LiteLLM?">
+For the request-path features (30+-provider routing, failover, retry, usage/token tracking, BYOK), yes. Tracelane adds predictive guardrails inline, tamper-evident audit ledger, and OTel GenAI semconv wire format that LiteLLM does not have.
+</Accordion>
+
+<Accordion title="Is `tlane import litellm` a complete migration?">
+It translates `litellm_config.yaml` 1:1 for provider routing, failover chains, and BYOK key references. Custom Python hooks in your LiteLLM proxy do not auto-port — you'll rewrite those as Tracelane gateway middleware or as separate services. For most teams the config translation is the only manual step.
+</Accordion>
+
+<Accordion title="What is Tracelane's vuln-scanning stack?">
+OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. Every release ships a signed SBOM as a Cosign attestation. See [Security](/security).
+</Accordion>
+
+</AccordionGroup>

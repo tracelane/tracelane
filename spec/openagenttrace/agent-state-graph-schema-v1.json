@@ -1,0 +1,176 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://tracelane.dev/spec/openagenttrace/agent-state-graph-schema-v1.json",
+ "title": "AgentStateGraph",
+ "description": "Schema for an OpenAgentTrace v0.1 agent state graph. Serialized as a span attribute or as a standalone JSON document.",
+ "type": "object",
+ "required": ["schema_version", "run_id", "agent_name", "framework", "states"],
+ "properties": {
+ "schema_version": {
+ "type": "string",
+ "const": "1.0",
+ "description": "OpenAgentTrace schema version"
+ },
+ "run_id": {
+ "type": "string",
+ "format": "uuid",
+ "description": "UUID v7 uniquely identifying this agent run"
+ },
+ "agent_name": {
+ "type": "string",
+ "description": "Human-readable agent identifier"
+ },
+ "framework": {
+ "type": "string",
+ "enum": [
+ "anthropic",
+ "openai-assistants",
+ "langchain",
+ "langgraph",
+ "autogen",
+ "crewai",
+ "custom"
+ ]
+ },
+ "model": {
+ "type": "string",
+ "description": "Primary model used in this run"
+ },
+ "states": {
+ "type": "array",
+ "description": "Ordered list of states visited during the run",
+ "items": {
+ "$ref": "#/$defs/AgentState"
+ }
+ },
+ "transitions": {
+ "type": "array",
+ "description": "State transitions with timestamps and trigger events",
+ "items": {
+ "$ref": "#/$defs/StateTransition"
+ }
+ },
+ "outcome": {
+ "type": "string",
+ "enum": ["success", "failure", "timeout", "budget_exceeded", "blocked"],
+ "description": "Terminal outcome of the agent run"
+ },
+ "total_steps": {
+ "type": "integer",
+ "minimum": 0
+ },
+ "total_tokens": {
+ "type": "integer",
+ "minimum": 0
+ },
+ "interventions": {
+ "type": "array",
+ "items": {
+ "$ref": "#/$defs/Intervention"
+ }
+ }
+ },
+ "$defs": {
+ "AgentState": {
+ "type": "object",
+ "required": ["index", "state", "entered_at"],
+ "properties": {
+ "index": {
+ "type": "integer",
+ "minimum": 0,
+ "description": "0-indexed step number"
+ },
+ "state": {
+ "type": "string",
+ "enum": ["planning", "executing", "observing", "reflecting"]
+ },
+ "entered_at": {
+ "type": "string",
+ "format": "date-time"
+ },
+ "exited_at": {
+ "type": "string",
+ "format": "date-time"
+ },
+ "span_id": {
+ "type": "string",
+ "description": "OTel span ID for this state's agent.step span"
+ },
+ "llm_calls": {
+ "type": "integer",
+ "minimum": 0
+ },
+ "tool_calls": {
+ "type": "array",
+ "items": { "type": "string" },
+ "description": "Tool names called in this state"
+ },
+ "tokens_used": {
+ "type": "integer",
+ "minimum": 0
+ }
+ }
+ },
+ "StateTransition": {
+ "type": "object",
+ "required": ["from_state", "to_state", "at", "trigger"],
+ "properties": {
+ "from_state": {
+ "type": "string",
+ "enum": ["planning", "executing", "observing", "reflecting", "start", "end"]
+ },
+ "to_state": {
+ "type": "string",
+ "enum": ["planning", "executing", "observing", "reflecting", "start", "end"]
+ },
+ "at": {
+ "type": "string",
+ "format": "date-time"
+ },
+ "trigger": {
+ "type": "string",
+ "enum": [
+ "llm_response",
+ "tool_result",
+ "tool_error",
+ "budget_limit",
+ "max_steps",
+ "goal_achieved",
+ "user_interrupt",
+ "guardrail_block"
+ ]
+ }
+ }
+ },
+ "Intervention": {
+ "type": "object",
+ "required": ["aft_id", "severity", "at", "step_index"],
+ "properties": {
+ "aft_id": {
+ "type": "string",
+ "description": "AFT failure mode ID, e.g. AFT-MCP-RUGPULL-001"
+ },
+ "severity": {
+ "type": "string",
+ "enum": ["warn", "block"]
+ },
+ "at": {
+ "type": "string",
+ "format": "date-time"
+ },
+ "step_index": {
+ "type": "integer",
+ "minimum": 0
+ },
+ "span_id": {
+ "type": "string",
+ "description": "OTel span ID where the intervention fired"
+ },
+ "details": {
+ "type": "object",
+ "description": "Intervention-specific details (varies by AFT ID)"
+ }
+ }
+ }
+ }
+}

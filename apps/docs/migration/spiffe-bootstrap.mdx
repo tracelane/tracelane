@@ -1,0 +1,142 @@
+---
+title: Migrating onto Tracelane ingest mTLS (SPIFFE)
+description: Step-by-step plan for design partners moving from plaintext OTLP / shared-secret ingest to SPIFFE-authenticated mTLS.
+sidebarTitle: SPIFFE bootstrap (migration)
+---
+
+# Migrating onto Tracelane ingest mTLS
+
+> **Audience:** Design partners and early customers running a non-mTLS
+> Tracelane ingest setup, or coming from another vendor's plaintext OTLP
+> endpoint. **Operator runbook** for SPIRE itself lives at
+> [SPIFFE/SPIRE ingest mTLS](/security/spiffe-ingest).
+
+V1 ingest enforces SPIFFE mTLS in release builds. There is no
+"continue running plaintext" production path — release binaries bail at
+startup unless `TRACELANE_SPIRE_SOCKET` is set. This page walks you
+from a fresh cluster (or one running plaintext dev ingest) to a
+mTLS-only deployment with zero span loss.
+
+## Pre-flight
+
+| Check | How |
+|---|---|
+| You're running Tracelane ingest `v0.1.0` or later | `ingest --version` |
+| You can install SPIRE in your cluster | Helm (k8s) or systemd (VM); see operator runbook |
+| You own a workspace UUID | Visible in the Tracelane dashboard → Settings → Workspace |
+| Your agents can be redeployed with a new auth config | Required to swap from bearer tokens / plaintext to mTLS |
+
+If any of those is "no", file an issue or reach out before continuing.
+
+## Migration in four steps
+
+### Step 1 — Bring up SPIRE (zero disruption to existing ingest)
+
+Follow the [operator runbook §1](/security/spiffe-ingest#1-bring-up-spire-in-a-customer-cluster).
+At this point your existing plaintext-or-bearer ingest keeps running;
+SPIRE is installed but not yet wired into Tracelane.
+
+### Step 2 — Register the workload entry
+
+Pick the SPIFFE ID — it MUST match this exact shape (the path is
+enforced at parse time, not configurable):
+
+```
+spiffe://tracelane.dev/tenant/<your-workspace-uuid>/ingest-worker
+```
+
+Register the entry in SPIRE Server with whichever selector matches your
+cluster (k8s service account or unix UID + binary path). See
+[operator runbook §2](/security/spiffe-ingest#2-register-the-tracelane-ingest-workload).
+
+Verify the agent can mint the SVID:
+
+```bash
+# From inside the node that will run ingest:
+spire-agent api fetch x509 -socketPath /tmp/spire-agent/public/api.sock
+# → Received 1 svid after ...ms
+#   SPIFFE ID:        spiffe://tracelane.dev/tenant/<uuid>/ingest-worker
+#   SVID Valid After: ...
+#   SVID Valid Until: ...
+```
+
+### Step 3 — Cut ingest over to mTLS mode
+
+Set the env vars before restarting:
+
+```bash
+export TRACELANE_SPIRE_SOCKET=/tmp/spire-agent/public/api.sock
+export TRACELANE_TRUST_DOMAIN=tracelane.dev
+```
+
+Restart ingest. You should see in the logs:
+
+```
+INFO  bootstrapping mTLS from SPIRE         spire_socket=...
+INFO  OTLP HTTPS receiver listening (mTLS enforced)  addr=0.0.0.0:4318
+INFO  tls trust bundle rotated              cert_count=2
+```
+
+If you see `OTLP HTTP receiver listening (PLAINTEXT — dev only)` instead,
+you're on a debug build. **Release binaries cannot run in plaintext**;
+re-pull from the release channel.
+
+### Step 4 — Update SDK / collector clients
+
+Each agent that exports spans needs:
+
+1. **A client SVID** — a SPIRE entry whose SPIFFE ID is **exactly**
+   `spiffe://tracelane.dev/tenant/<your-workspace-uuid>/ingest-worker`.
+   The ingest server verifies the presented peer cert and enforces this
+   full path shape (`crates/ingest/src/auth.rs::parse_spiffe_id`) — any
+   other suffix (e.g. `/customer-app`) or a non-UUID tenant segment is
+   rejected **fail-closed** with `401` (`result=invalid_path`). Use the
+   `ingest-worker` shape on the client side too; only the workspace UUID
+   differs per tenant.
+2. **mTLS client config** in your OTLP exporter pointing at the SPIRE
+   agent socket so SDKs can read their own SVID at connect time.
+
+Native SPIFFE auto-wiring in the Tracelane Python and TypeScript SDKs
+(a `TRACELANE_USE_SPIFFE=1` switch) is on the roadmap. Until then,
+configure mTLS in your OTLP exporter directly — mount the SPIRE agent
+socket into the exporter process and point its client TLS at it.
+
+For non-SDK agents (raw OpenTelemetry Collector, fluentd, etc.) use the
+[`go-spiffe`](https://github.com/spiffe/go-spiffe) or
+[`java-spiffe`](https://github.com/spiffe/java-spiffe) helpers to
+build the TLS config.
+
+## Failure modes you should expect to hit (and what to do)
+
+| Log line | Meaning | Action |
+|---|---|---|
+| `401 Unauthorized` with `WWW-Authenticate: SPIFFE-mTLS` | Client SVID was rejected | Check the `tracelane_ingest_auth_total{result=...}` counter to bucket. |
+| `result=wrong_trust_domain` | Client SVID is from a foreign trust domain | Re-issue the SVID against `tracelane.dev`. |
+| `result=invalid_path` | SPIFFE path doesn't end in `/ingest-worker` or `/<uuid>` isn't a UUID | Re-register the workload entry with the correct path shape. |
+| `result=expired_svid` | Clock skew, or client cached an old SVID | Verify the client refreshes from the SPIRE agent at least every 1h. |
+| `result=no_svid` | TLS handshake failed before any cert reached the app layer | The client doesn't have a valid SVID, or `client_auth_mandatory` saw an empty `peer_certificates()`. |
+
+## Roll-back
+
+If something goes wrong and you need to revert quickly:
+
+1. **Do not** ship a debug build to prod. The plaintext fallback is
+   debug-only and bypasses authentication entirely — re-deploying a
+   debug binary as a "temporary workaround" silently disables ingest
+   auth for every tenant.
+2. **Stop ingest** until SPIRE is fixed. The supervisor restart loop is
+   the right place for this; new spans queue at the SDK side (default
+   60s buffer) so a brief outage doesn't lose data.
+3. **Open an incident** with the founder via `security@tracelane.dev`
+   if you suspect a security regression — not a misconfiguration.
+
+## After migration
+
+- Set up the [Prometheus alerts in the operator runbook](/security/spiffe-ingest#5-observability)
+  so a future SPIRE outage pages you, not your customers.
+- Document your SVID rotation cadence and CA-rotation runbook locally;
+  the Tracelane defaults (1h SVID TTL, hot bundle rotation) match SPIRE
+  upstream defaults.
+- For the Audit add-on SKU, the same SVID identity is what binds audit
+  events to the originating workspace. See [Audit ledger](/audit-ledger)
+  for how this composes with the tamper-evident chain.

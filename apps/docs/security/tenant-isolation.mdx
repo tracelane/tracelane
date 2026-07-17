@@ -1,0 +1,147 @@
+---
+title: Tenant isolation — V1 guarantees
+description: Three structural surfaces that scope every Tracelane read and write to one workspace — ClickHouse, R2, Postgres.
+sidebarTitle: Tenant isolation
+---
+
+# Tenant isolation — V1 guarantees
+
+> **Authoritative design:** [ADR-031](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-031-admin-audit-and-ch-resource-caps.md). **Composes with:** [ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md) (tamper-evident agent ledger).
+
+Tracelane is multi-tenant from day one. Every read, every write, and
+every admin mutation is scoped to one workspace UUID at three
+independent layers — so a misconfigured query, a typo in a key
+prefix, or a regression in one layer cannot break the others.
+
+## Three independent isolation surfaces
+
+### 1. ClickHouse — per-tier resource caps
+
+Every ClickHouse read goes through a `TenantQuery` wrapper that
+attaches a `SETTINGS` block sized to the workspace's plan tier:
+
+| Tier | `max_memory_usage` | `max_execution_time` | `max_rows_to_read` |
+|---|---|---|---|
+| Builder | 512 MiB | 10 s | 50 M rows |
+| Team | 2 GiB | 30 s | 500 M rows |
+| Business | 8 GiB | 60 s | 5 B rows |
+| Enterprise | 32 GiB | 300 s | 50 B rows |
+
+A misconfigured query bouncing off a `WHERE` clause that scans 5 B
+rows on a Builder workspace returns a ClickHouse-side
+`MEMORY_LIMIT_EXCEEDED` or `TIMEOUT_EXCEEDED` error — surfaced to the
+user, never silently downgraded — instead of taking down the shared
+node. Caps are enforced by ClickHouse itself; no application
+cooperation is required once the SETTINGS clause is attached.
+
+Wrapper file location:
+- Rust: [`crates/gateway/src/clickhouse_query.rs::TenantQuery`](https://github.com/tracelane/tracelane/blob/main/crates/gateway/src/clickhouse_query.rs)
+
+Dashboard reads currently pass `PlanTier::Builder`; per-tier cap
+differentiation is not yet plumbed through the read path (V1.1).
+
+The CI guard [`no-raw-ch-query.sh`](https://github.com/tracelane/tracelane/blob/main/scripts/ci/no-raw-ch-query.sh)
+fails the build if any new ClickHouse read is added outside these
+wrappers. Three pre-existing call sites (`audit.rs`, `audit_export.rs`,
+`prompt_history.rs`) are exempted via the V1.1 sweep allow-list —
+their queries are tenant-scoped + bounded, so per-tier caps are
+additive rather than load-bearing; full routing through TenantQuery
+ships in V1.1.
+
+The existing [`tenant-isolation-check`](https://github.com/tracelane/tracelane/blob/main/.github/workflows/ci.yml)
+CI job (unchanged from prior releases) blocks any new ClickHouse
+query that references `FROM tracelane.<table>` without a `tenant_id`
+filter nearby.
+
+### 2. R2 — `tenants/<uuid>/` prefix invariant
+
+Every object key written by `crates/ingest/src/r2_batcher.rs` is
+prefixed `tenants/<workspace_uuid>/yyyy/mm/dd/<hash>.ndjson`. The
+fixed `tenants/` prefix lets bucket-level IAM policies pin a
+per-tenant role to the prefix (`s3:prefix=tenants/<uuid>/`) without
+matching unrelated objects in the same bucket.
+
+The invariant is enforced in code:
+
+```rust
+// crates/ingest/src/r2_batcher.rs
+pub const TENANT_KEY_PREFIX: &str = "tenants/";
+
+fn assert_tenant_prefix(key: &str) -> bool {
+    if !key.starts_with(TENANT_KEY_PREFIX) {
+        #[cfg(debug_assertions)]
+        { panic!("ADR-031 tenant isolation invariant violated"); }
+        #[cfg(not(debug_assertions))]
+        {
+            tracing::error!(/* … */);
+            return false; // PUT refused
+        }
+    }
+    true
+}
+```
+
+Debug builds panic the moment a key skips the prefix; release builds
+log at `tracing::error!` and refuse the R2 PUT. Either path defends
+against a future refactor accidentally regressing the layout.
+
+### 3. Postgres — `WHERE tenant_id = ?` + admin audit trail
+
+Every Postgres row-bearing table has a `tenant_id` (or `workspace_id`)
+column indexed for the tenant-scoped query path. The CI grep
+`tenant-isolation-check` blocks any new query that selects from a
+ClickHouse table without a `tenant_id` filter; the equivalent on
+Postgres-side queries is enforced by Drizzle's query-builder typing
+(every `where()` clause is statically checked against the schema).
+
+Adjacent to the row-level isolation, V1 ships
+[`admin_audit_log`](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql):
+a durable trail of every mutating admin action with the actor user
+id, workspace id, target type / id, before / after JSON snapshots,
+IP, and user agent. Indexed for "show me everything I did to this
+workspace in the last 30 days" — see [Admin audit log](/admin/audit-log).
+
+## Identity flow — where `tenant_id` comes from
+
+The single security invariant: **`tenant_id` MUST come from a
+JWT-verified session claim or a SPIFFE-attested workload SVID — never
+from a request body, URL parameter, or header.**
+
+```
+Request → WorkOS AuthKit middleware → session.tenantId (WorkOS orgId)
+        → upsertTenantId(orgId) → tenants.id (UUID)
+        → bound as `tenantId: String` query_param to ClickHouse
+        → ClickHouse server enforces WHERE tenant_id = ?
+```
+
+For mTLS-only ingest (`crates/ingest/src/auth.rs`), the same value
+arrives via the SPIFFE SVID's path component `/tenant/<uuid>/ingest-worker`
+(ADR-028). `TenantId::from_spiffe_svid(uuid)` is structurally
+distinct from `TenantId::from_jwt_claim(uuid)` — downstream code can
+compile-time-prove which path the identity took.
+
+## Failure modes
+
+| Symptom | Layer | What it means |
+|---|---|---|
+| `MEMORY_LIMIT_EXCEEDED` from ClickHouse | Cap layer | Query exceeded the tier's `max_memory_usage`. Tighten the time window or upgrade. |
+| `TIMEOUT_EXCEEDED` from ClickHouse | Cap layer | Query exceeded `max_execution_time`. Same fix. |
+| `Too many rows to read` from ClickHouse | Cap layer | Query would scan past `max_rows_to_read`. Same fix. |
+| 500 Internal Server Error with `R2 key violates tenant prefix invariant` in logs | R2 layer | A regression slipped past the debug `assert!`. Open an incident. |
+| `no SPIFFE peer + no resource attribute` from ingest | Identity layer | Release-mode ingest received an unattributed connection. Misconfigured client, or SPIRE outage — see [SPIFFE ingest runbook](/security/spiffe-ingest). |
+
+## V1.1 follow-ups
+
+- Three pre-existing audit-internal ClickHouse reads (`audit.rs`,
+  `audit_export.rs`, `prompt_history.rs`) currently bypass the
+  TenantQuery wrapper. They read tenant-scoped, bounded row sets;
+  the V1.1 sweep routes them through the wrapper for consistency.
+- The 12 remaining admin endpoints (BYOK CRUD, billing portal,
+  workspace member invites, etc.) get an audit-log call-site sweep
+  in V1.1. The three demo endpoints (`api-keys` POST/DELETE,
+  `prompts/[name]/promote` POST) cover the contract today; ADR-031
+  §"V1 wiring scope" tracks the full list.
+- A grep-based "every tenant-data Postgres table has a `workspace_id`
+  column" CI guard. Policy ambiguity (e.g., `webhook_events` is
+  global by design) means the V1.1 version ships with a curated
+  allow-list.

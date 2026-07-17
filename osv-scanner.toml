@@ -1,0 +1,255 @@
+# osv-scanner.toml — ignore list for OSV-Scanner (security-scan.yml).
+#
+# OSV-Scanner fails on ANY advisory across BOTH ecosystems with no severity
+# gate and does not read .cargo/audit.toml, so it re-surfaces advisories that
+# cargo-audit / pnpm-audit already justify. Each ignore below is the SAME
+# posture as those tools. The one genuinely actionable finding OSV raised —
+# jsonwebtoken GHSA-h395-gr6q-cpjc — was FIXED by bumping to 10.4.0,
+# not ignored. npm moderates are below the pnpm-audit --audit-level=high gate
+# and tracked internally.
+
+# bincode: bincode 1.x unmaintained, transitive; 2.0 is a transitive-incompatible major bump. Mirrors .cargo/audit.toml.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"
+reason = "bincode 1.x unmaintained, transitive; 2.0 is a transitive-incompatible major bump. Mirrors .cargo/audit.toml."
+
+# vite: dev/test tooling (vitest), never shipped in any product artifact; tied to the vitest-major migration.
+[[IgnoredVulns]]
+id = "GHSA-fx2h-pf6j-xcff"
+reason = "vite dev/test tooling (vitest), not shipped in any product artifact; tied to the vitest-major migration. Mirrors .grype.yaml."
+[[IgnoredVulns]]
+id = "GHSA-v6wh-96g9-6wx3"
+reason = "vite dev/test tooling (vitest), not shipped in any product artifact; tied to the vitest-major migration. Mirrors .grype.yaml."
+# esbuild: build-time bundler (vitest/tsup), never shipped; dev tooling only (same class as GHSA-67mh).
+[[IgnoredVulns]]
+id = "GHSA-g7r4-m6w7-qqqr"
+reason = "esbuild build-time bundler (vitest/tsup), never shipped; dev tooling only. Same class as GHSA-67mh."
+# @babel/core: dev/build-time transform tooling; below the pnpm-audit high gate.
+[[IgnoredVulns]]
+id = "GHSA-4x5r-pxfx-6jf8"
+reason = "@babel/core dev/build-time tooling; below the pnpm-audit high gate; tracked internally."
+# @opentelemetry/core: transitive OTel JS moderate; below the pnpm-audit high gate.
+[[IgnoredVulns]]
+id = "GHSA-8988-4f7v-96qf"
+reason = "@opentelemetry/core transitive moderate; below the pnpm-audit high gate; tracked internally."
+# opentelemetry_sdk (Rust 0.27.1): transitive OTel Rust SDK moderate; not a reachable RCE. Tracked with the OTel-Rust bump.
+[[IgnoredVulns]]
+id = "GHSA-w9wp-h8wv-79jx"
+reason = "opentelemetry_sdk 0.27.x transitive moderate (OTel Rust SDK); not a reachable RCE; tracked with the OTel-Rust upgrade."
+# cmov (Rust 0.5.3): transitive constant-time helper; moderate, no reachable exploit in our use. Tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-3rjw-m598-pq24"
+reason = "cmov 0.5.x transitive constant-time helper; moderate, not reachable in our use; tracked internally."
+
+# esbuild: build-time bundler (vitest/tsup), never shipped; dev tooling only.
+[[IgnoredVulns]]
+id = "GHSA-67mh-4wv8-2f99"
+reason = "build-time bundler (vitest/tsup), never shipped; dev tooling only."
+
+# hono: moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep.
+[[IgnoredVulns]]
+id = "GHSA-hm8q-7f3q-5f36"
+reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
+
+[[IgnoredVulns]]
+id = "GHSA-p77w-8qqv-26rm"
+reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
+
+[[IgnoredVulns]]
+id = "GHSA-qp7p-654g-cw7p"
+reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
+
+# ip-address: transitive moderate, below the pnpm-audit high gate; tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-v2v4-37r5-5v8g"
+reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
+
+# openssl: build-dependency only of ort-sys's ONNX downloader (ureq->native-tls->openssl); absent from the product runtime tree (the no-openssl gate confirms).
+[[IgnoredVulns]]
+id = "GHSA-phqj-4mhp-q6mq"
+reason = "build-dependency only of ort-sys's ONNX downloader (ureq->native-tls->openssl); absent from the product runtime tree (the no-openssl gate confirms)."
+
+# paste: unmaintained proc-macro, transitive, no fix; mirrors .cargo/audit.toml.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "unmaintained proc-macro, transitive, no fix; mirrors .cargo/audit.toml."
+
+# postcss: transitive moderate, below the pnpm-audit high gate; tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-qx2v-qp2m-jg93"
+reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
+
+# protobufjs: transitive moderate, below the pnpm-audit high gate; tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-jggg-4jg4-v7c6"
+reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
+
+# qs: transitive moderate, below the pnpm-audit high gate; tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-q8mj-m7cp-5q26"
+reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
+
+# rustls-pemfile: informational/deprecated, transitive; mirrors .cargo/audit.toml.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "informational/deprecated, transitive; mirrors .cargo/audit.toml."
+
+# rustls-webpki: transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade.
+[[IgnoredVulns]]
+id = "GHSA-82j2-j2ch-gfr8"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-965h-392x-2mh5"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-pwjx-qhcg-rvj4"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-xgp8-3hg3-c2mh"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0049"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0098"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0099"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0104"
+reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
+
+# vite: dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migration. Tracked in .
+[[IgnoredVulns]]
+id = "GHSA-4w7w-66w2-5vf9"
+reason = "dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migration. Tracked in ."
+
+# vitest: file-read only when `vitest --ui` is running — we never run the UI (only `vitest run`). Patch is vitest 4.1.0 (major). Tracked in .
+[[IgnoredVulns]]
+id = "GHSA-5xrq-8626-4rwp"
+reason = "file-read only when `vitest --ui` is running — we never run the UI (only `vitest run`). Patch is vitest 4.1.0 (major). Tracked in ."
+
+# wasmtime: wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally.
+[[IgnoredVulns]]
+id = "GHSA-243v-98vx-264h"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-394w-hwhg-8vgm"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-7qmx-3fpx-r45m"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-852m-cvvp-9p4w"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-c2f5-jxjv-2hh8"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-fm79-3f68-h2fc"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-hc7m-r6v8-hg9q"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-hx6p-xpx3-jvvv"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-jxhv-7h78-9775"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-m758-wjhj-p3jq"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-q8hx-mm92-4wvg"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "GHSA-qqfj-4vcm-26hv"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0438"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0439"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0046"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0118"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0020"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0021"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0085"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0086"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0087"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0088"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0089"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0091"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0092"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0093"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0094"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0095"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0096"
+reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin` feature (not in any V1 binary); mirrors .cargo/audit.toml. Upgrade tracked internally."

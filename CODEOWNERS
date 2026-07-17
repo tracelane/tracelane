@@ -1,0 +1,36 @@
+# Tracelane CODEOWNERS
+# These owners are automatically requested for review on PRs.
+# Format: <pattern> <owner> [<owner>...]
+
+# Default: founder reviews everything
+* @sanjeevlabs
+
+# Rust components — gateway is hot-path, security-critical
+/crates/gateway/       @sanjeevlabs
+/crates/ingest/        @sanjeevlabs
+/crates/shared/        @sanjeevlabs
+/crates/policy/        @sanjeevlabs
+/crates/mcp-rs/        @sanjeevlabs
+
+# ML models — trajectory guard and SLM judge
+/ml/                   @sanjeevlabs
+
+# Eval suite — merge gate, never modified by eval-runner subagent
+/evals/                @sanjeevlabs
+
+# Security-critical: auth, crypto, tenant isolation
+/crates/gateway/src/auth/        @sanjeevlabs
+/crates/gateway/src/audit.rs     @sanjeevlabs
+
+# CI/CD — supply-chain sensitive
+/.github/              @sanjeevlabs
+
+# Public spec files (CC0)
+/spec/                 @sanjeevlabs
+
+# Decisions and docs
+/decisions/            @sanjeevlabs
+/docs/                 @sanjeevlabs
+
+# Infrastructure
+/infra/                @sanjeevlabs

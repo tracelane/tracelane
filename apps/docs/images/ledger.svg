@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 470" role="img"
+     aria-labelledby="lg-title lg-desc" font-family="ui-sans-serif, system-ui, sans-serif">
+  <title id="lg-title">Tracelane audit ledger</title>
+  <desc id="lg-desc">Each audit event is hashed into a per-tenant append-only chain:
+    row_hash is the SHA-256 of tenant id, sequence, type, actor, canonical payload, and
+    the previous hash. Every one hundred events a Merkle root is computed and Ed25519-signed
+    with the tenant's per-tenant key. Signing is live. Anchored batches are additionally
+    submitted to the public Sigstore Rekor v2 transparency log on a best-effort, opt-in
+    basis and carry a resolved inclusion proof and log index; universal per-run anchoring
+    is on the roadmap. This anchoring step has a distinct dashed treatment.</desc>
+  <style>
+    :root{ --ink:#141c24; --muted:#4f5f6c; --line:#87949f; --lava:#ff3621; --seal:#149861; --panel:#ffffff; }
+    @media (prefers-color-scheme: dark){
+      :root{ --ink:#e6edf3; --muted:#9fb0bd; --line:#4f5f6c; --lava:#ff6a3d; --seal:#37c491; --panel:#0e1520; }
+    }
+    .lbl{ fill:var(--ink); font-size:14px; font-weight:600; }
+    .sub{ fill:var(--muted); font-size:11px; font-weight:500; }
+    .ref{ fill:var(--muted); font-size:10px; font-family:ui-monospace, "SF Mono", Menlo, monospace; }
+    .grp{ fill:var(--ink); font-size:12px; font-weight:700; letter-spacing:.04em; }
+    .ev{ fill:var(--panel); fill-opacity:.55; stroke:var(--line); stroke-width:1.3; }
+    .led{ fill:none; stroke:var(--seal); stroke-width:1.7; }
+    .ledt{ fill:var(--seal); font-size:12px; font-weight:700; }
+    .flow{ fill:none; stroke:var(--lava); stroke-width:2.1; }
+    .anchor{ fill:none; stroke:var(--seal); stroke-width:1.7; stroke-dasharray:6 4; }
+    .mono{ font-family:ui-monospace, "SF Mono", Menlo, monospace; }
+  </style>
+  <defs>
+    <marker id="lg-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--lava)"/>
+    </marker>
+    <marker id="lg-seal" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--seal)"/>
+    </marker>
+  </defs>
+
+  <text class="grp" x="24" y="34">1 · PER-TENANT HASH CHAIN — live, all tenants</text>
+
+  <!-- three linked events -->
+  <g>
+    <rect class="ev" x="24" y="52" width="150" height="86" rx="9"/>
+    <text class="lbl" x="34" y="74">event n−1</text>
+    <text class="ref" x="34" y="92">seq · type · actor</text>
+    <text class="ref" x="34" y="108">payload (canonical)</text>
+    <text class="ref" x="34" y="128" fill="var(--seal)">row_hash → h₋₁</text>
+
+    <rect class="ev" x="214" y="52" width="150" height="86" rx="9"/>
+    <text class="lbl" x="224" y="74">event n</text>
+    <text class="ref" x="224" y="92">seq · type · actor</text>
+    <text class="ref" x="224" y="108">payload (canonical)</text>
+    <text class="ref" x="224" y="128" fill="var(--seal)">prev_hash = h₋₁</text>
+
+    <rect class="ev" x="404" y="52" width="150" height="86" rx="9"/>
+    <text class="lbl" x="414" y="74">event n+1</text>
+    <text class="ref" x="414" y="92">seq · type · actor</text>
+    <text class="ref" x="414" y="108">payload (canonical)</text>
+    <text class="ref" x="414" y="128" fill="var(--seal)">prev_hash = hₙ</text>
+  </g>
+  <path class="flow" marker-end="url(#lg-arrow)" d="M174 95 H214"/>
+  <path class="flow" marker-end="url(#lg-arrow)" d="M364 95 H404"/>
+
+  <!-- row_hash formula -->
+  <rect class="led" x="24" y="164" width="530" height="70" rx="9"/>
+  <text class="ledt" x="36" y="186">row_hash = SHA-256(</text>
+  <text class="ref mono" x="36" y="206">  tenant_id ‖ seq ‖ type ‖ actor ‖ canonical_payload ‖ prev_hash )</text>
+  <text class="ref" x="36" y="224">domain-separated, length-prefixed · audit_format/mod.rs:102 (row_hash_v2)</text>
+
+  <!-- pipeline: merkle -> sign -> anchor -->
+  <text class="grp" x="600" y="34">2 · BATCH ANCHORING — Audit SKU</text>
+
+  <rect class="led" x="600" y="52" width="176" height="86" rx="9"/>
+  <text class="ledt" x="612" y="76">Merkle root</text>
+  <text class="sub" x="612" y="94">every 100 events</text>
+  <text class="ref" x="612" y="112">audit.rs:789</text>
+  <text class="ref mono" x="612" y="127">anchor_task</text>
+
+  <rect class="led" x="600" y="164" width="176" height="86" rx="9"/>
+  <text class="ledt" x="612" y="188">Ed25519 sign</text>
+  <text class="sub" x="612" y="206">per-tenant key · LIVE</text>
+  <text class="ref" x="612" y="224">audit.rs:174</text>
+  <text class="ref mono" x="612" y="239">anchor_artifact</text>
+
+  <!-- Rekor anchor - distinct dashed treatment -->
+  <rect class="anchor" x="816" y="164" width="180" height="130" rx="9"/>
+  <text class="ledt" x="828" y="188">Sigstore Rekor v2</text>
+  <text class="sub" x="828" y="206">best-effort · opt-in</text>
+  <text class="ref" x="828" y="224">log2025-1.rekor</text>
+  <text class="ref" x="828" y="238">.sigstore.dev</text>
+  <text class="ref" x="828" y="256">→ inclusion proof</text>
+  <text class="ref" x="828" y="270">+ log_index</text>
+  <text class="ref" x="828" y="287">audit.rs:1077 submit_anchor_v2</text>
+
+  <!-- pipeline arrows -->
+  <path class="flow" marker-end="url(#lg-arrow)" d="M554 199 H600" opacity=".55"/>
+  <text class="ref" x="577" y="192" text-anchor="middle">root</text>
+  <path class="flow" marker-end="url(#lg-arrow)" d="M688 138 V164"/>
+  <path stroke="var(--seal)" stroke-width="1.7" stroke-dasharray="6 4" fill="none" marker-end="url(#lg-seal)" d="M776 207 H816"/>
+
+  <!-- roadmap footnote -->
+  <rect x="600" y="316" width="396" height="60" rx="8" fill="none" stroke="var(--line)" stroke-width="1.1" stroke-dasharray="3 3"/>
+  <text class="sub" x="614" y="338">Dashed = distinct treatment. Anchored batches carry a resolved</text>
+  <text class="sub" x="614" y="354">Rekor inclusion proof; universal per-run anchoring + eIDAS QTSP</text>
+  <text class="sub" x="614" y="370">timestamping remain on the roadmap.</text>
+
+  <!-- verify note -->
+  <rect class="led" x="24" y="264" width="530" height="112" rx="9"/>
+  <text class="ledt" x="36" y="288">Independent verification</text>
+  <text class="sub" x="36" y="308">tlane verify recomputes the chain offline — byte-identical</text>
+  <text class="sub" x="36" y="324">verifiers in Rust / Python / TypeScript. Exit 0 = intact;</text>
+  <text class="sub" x="36" y="340">exit 1 names the faulted event. Anchored batches also verify</text>
+  <text class="sub" x="36" y="356">their Ed25519 signature + Rekor inclusion proof.</text>
+  <text class="ref" x="36" y="372">packages/verifier-rust/src/lib.rs · tamper-evident</text>
+</svg>
