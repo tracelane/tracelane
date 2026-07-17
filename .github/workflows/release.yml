@@ -232,7 +232,7 @@ jobs:
         # node 24+ ships an npm CLI with OIDC Trusted Publishing support;
         # `--provenance` requires id-token: write and no NODE_AUTH_TOKEN.
         # See npmjs.com/docs/cli/v10/configuring-npm/trusted-publishing.
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
