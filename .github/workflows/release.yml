@@ -113,7 +113,7 @@ jobs:
             sbom.cyclonedx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@e7a8f85174e1f197b1c2f01bb60e1c350ccad01f  # v2.2.0
+        uses: softprops/action-gh-release@1c214ab373197cfdedb8c44482a8faf4608192d7  # v2.2.0
         with:
           files: |
             artifacts/**/*
