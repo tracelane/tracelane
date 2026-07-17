@@ -78,7 +78,7 @@ jobs:
       # upload errors ("Code scanning is not available"). continue-on-error so
       # it does not red `main`; the SARIF is still kept as a build artifact
       # above. Re-enabled automatically once the repo is public / GHAS is on.
-      - uses: github/codeql-action/upload-sarif@f779452ac5af1c261dce0346a8f964149f49322b  # v3.27.5
+      - uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a  # v3.27.5
         if: ${{ hashFiles('results.sarif') != '' }}
         continue-on-error: true
         with:
