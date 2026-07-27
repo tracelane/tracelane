@@ -1,0 +1,415 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  id-token: write      # Required for Trusted Publishing OIDC, Sigstore keyless, and SLSA provenance
+  attestations: write  # Required for actions/attest-build-provenance (SLSA L3)
+
+jobs:
+  verify-signed-tag:
+    name: Verify release tag is signed
+    runs-on: ubuntu-latest
+    # The release gate is CRYPTOGRAPHIC, not human — and it is ENFORCED HERE, in this
+    # job, NOT by a ruleset. (GitHub's `required_signatures` ruleset rule is
+    # commit-oriented and was empirically proven NOT to block unsigned tags — via API
+    # and via `git push` — so it is deliberately not relied on.) This job runs
+    # `git verify-tag` against the maintainer's PINNED public key and FAILS CLOSED;
+    # every publish job `needs:` it (publish-* -> sign-and-release -> build-rust ->
+    # verify-signed-tag), so an unsigned / lightweight / wrong-key tag can trigger the
+    # workflow but can NEVER reach a publish. The signing key is held offline on the
+    # maintainer's machine — never in CI or on the node. `production-release` is kept
+    # as a 0-reviewer environment (branch policy v*/main only) — deliberately NO manual
+    # approval step. Residual: an attacker who can also rewrite this workflow (full
+    # main-write compromise) bypasses it — mitigated by 2FA + credential hygiene, not
+    # here. Founder action: set the `RELEASE_TAG_ALLOWED_SIGNERS` repo variable to the
+    # maintainer's SSH signing pubkey line (`<git-user-email> ssh-ed25519 AAAA…`).
+    environment:
+      name: production-release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Verify the release tag carries the trusted maintainer signature
+        env:
+          ALLOWED_SIGNERS: ${{ vars.RELEASE_TAG_ALLOWED_SIGNERS }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ -z "${ALLOWED_SIGNERS:-}" ]; then
+            echo "::error title=Signing not configured::Set the RELEASE_TAG_ALLOWED_SIGNERS repo variable to the maintainer's SSH signing public key before releasing. Failing closed."
+            exit 1
+          fi
+          printf '%s\n' "${ALLOWED_SIGNERS}" > "${RUNNER_TEMP}/allowed_signers"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "${RUNNER_TEMP}/allowed_signers"
+          # actions/checkout leaves refs/tags/<TAG> pointing at the dereferenced COMMIT,
+          # so `git verify-tag` can't find the annotated tag OBJECT and fails on EVERY
+          # tag ("cannot verify a non-tag object of type commit") — signed or not.
+          # Re-fetch the tag ref explicitly so it points at the signed tag object.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          echo "Verifying signature on ${TAG} …"
+          git verify-tag "${TAG}"
+          echo "::notice title=Signed tag verified::${TAG} carries a valid signature from the pinned maintainer key."
+
+  build-rust:
+    name: Build Rust binaries
+    needs: verify-signed-tag
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Add build target to the pinned toolchain
+        # rust-toolchain.toml pins the repo to 1.95, but dtolnay/rust-toolchain
+        # (`@stable`) installed the cross-target onto the STABLE toolchain — a
+        # DIFFERENT toolchain from the 1.95 override cargo actually runs. So
+        # `cargo build --target <cross>` on 1.95 can't find std → E0463 "can't
+        # find crate for `core`". Add the target to the ACTIVE toolchain from
+        # inside the repo (rust-toolchain.toml applies here). Host-target rows
+        # (x86_64-linux on ubuntu, aarch64-darwin on macOS) are a harmless no-op.
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build gateway release binary
+        run: cargo build --release --package gateway --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        with:
+          name: gateway-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gateway
+
+  sign-and-release:
+    name: Sign artifacts and publish release
+    needs: build-rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        with:
+          path: artifacts/
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20  # v3.5.0
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@d94f46e13c6c62f59525ac9a1e147a99dc0b9bf5  # v0.17.0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Sign binaries with Sigstore Cosign (keyless OIDC)
+        run: |
+          for binary in artifacts/gateway-*/gateway; do
+            cosign sign-blob \
+              --yes \
+              --oidc-issuer=https://token.actions.githubusercontent.com \
+              --bundle="${binary}.cosign.bundle" \
+              "${binary}"
+          done
+
+      - name: Sign SBOM
+        run: |
+          cosign sign-blob \
+            --yes \
+            --oidc-issuer=https://token.actions.githubusercontent.com \
+            --bundle=sbom.cyclonedx.json.cosign.bundle \
+            sbom.cyclonedx.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@e7a8f85174e1f197b1c2f01bb60e1c350ccad01f  # v2.2.0
+        with:
+          files: |
+            artifacts/**/*
+            sbom.cyclonedx.json
+            sbom.cyclonedx.json.cosign.bundle
+          generate_release_notes: true
+          body: |
+            ## Verification
+
+            All binaries are signed with [Sigstore Cosign](https://sigstore.dev) keyless OIDC.
+
+            Verify a binary:
+            ```bash
+            cosign verify-blob \
+              --bundle <binary>.cosign.bundle \
+              --certificate-identity-regexp="https://github.com/tracelane/tracelane/.*" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              <binary>
+            ```
+
+            SBOM (CycloneDX JSON) is attached as `sbom.cyclonedx.json`.
+
+  slsa-provenance:
+    name: Generate SLSA Build Level 3 provenance
+    needs: build-rust
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        with:
+          path: artifacts/
+
+      - name: Generate SHA-256 hashes for all binaries
+        id: hash
+        run: |
+          cd artifacts
+          # Generate hashes for all downloaded binaries
+          find . -type f -name "gateway" | while read f; do
+            sha256sum "$f"
+          done > ../binary-hashes.txt
+          cat ../binary-hashes.txt
+          HASH_B64=$(base64 -w0 ../binary-hashes.txt)
+          echo "hashes=${HASH_B64}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest binary provenance (GitHub Attestations / SLSA L3)
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c  # v1.4.3
+        with:
+          subject-path: |
+            artifacts/gateway-x86_64-unknown-linux-gnu/gateway
+            artifacts/gateway-aarch64-unknown-linux-gnu/gateway
+            artifacts/gateway-x86_64-apple-darwin/gateway
+            artifacts/gateway-aarch64-apple-darwin/gateway
+
+      - name: Upload hash manifest
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        with:
+          name: binary-hashes
+          path: binary-hashes.txt
+
+  slsa-framework-generator:
+    name: SLSA L3 provenance (slsa-github-generator)
+    needs: [build-rust, slsa-provenance]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563  # v2.0.0
+    with:
+      base64-subjects: "${{ needs.slsa-provenance.outputs.hashes }}"
+      upload-assets: true
+
+  # publish-crate (tracelane-shared) DROPPED for v0.2.1 (2026-07-27): crates.io
+  # Trusted Publishing cannot create a NEW crate — RFC 3691 requires an initial
+  # manual publish before a Trusted Publisher config can exist (no PyPI-style
+  # pending pre-registration), so an OIDC publish-crate would 403 on the first tag.
+  # Nothing consumes tracelane-shared and it is unrelated to the ADR-070 verifier
+  # fix. If ever needed publicly: manual `cargo publish` with a token, then
+  # configure Trusted Publishing for subsequent versions — a separate task.
+
+  publish-npm:
+    name: Publish to npm (Trusted Publishing / OIDC)
+    # Gated on the SIGNED-TAG check only, NOT on build-rust/sign-and-release.
+    # These packages are TS/Python (verifier/SDK/CLI) built in THIS job — they
+    # consume no gateway binary or GitHub-release artifact, so chaining them
+    # behind the Rust binary build was a false coupling: a residual gateway
+    # cross-compile failure must not strand a verifier hotfix. The signed tag is
+    # the real authorization gate; each job's own build step is its compile gate.
+    needs: verify-signed-tag
+    runs-on: ubuntu-latest
+    # NO `environment:` — npm Trusted Publishing requires the token's environment
+    # claim to EXACTLY match the package config (unlike PyPI, where blank = any).
+    # The npm configs are registered with a BLANK environment, so this job must
+    # emit NO environment claim or npm 401s mid-release. (If the npm configs are
+    # ever re-registered with environment `npm`, re-add `environment: npm` here.)
+    permissions:
+      id-token: write  # Required for npm OIDC Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+
+      - name: Setup Node
+        # node 24 ships npm 11.5.1+, which performs npm's tokenless OIDC Trusted
+        # Publishing exchange (mints a short-lived token from the id-token OIDC
+        # claim). node 22 ships npm 10.x, which does NOT — and `pnpm publish`
+        # (pnpm 9) does not do the exchange either, so the v0.2.1 run published
+        # anonymously and npm masked the unauthorized PUT as `E404`. We therefore
+        # PACK with pnpm (rewrites workspace:*) and PUBLISH with the npm CLI below.
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the published packages
+        # The published packages ship `files: ["dist"]`; build them explicitly
+        # (root `pnpm build` only builds the dashboard). pnpm builds in
+        # dependency order, so the verifier is built before the CLI that uses it.
+        run: pnpm --filter @tracelanedev/audit-verifier --filter @tracelanedev/sdk --filter @tracelanedev/cli build
+
+      - name: Publish @tracelanedev/* (npm CLI · OIDC Trusted Publishing · no long-lived token)
+        # ADR-008: Trusted Publishing OIDC for crates.io, npm, PyPI, Docker Hub.
+        # No long-lived tokens. The npm CLI (node 24, npm 11.5.1+) performs the
+        # tokenless OIDC exchange from `id-token: write` when the package has a
+        # Trusted Publisher on npmjs.com (owner=tracelane, repo=tracelane,
+        # workflow=release.yml, environment=BLANK — this job emits no environment).
+        #
+        # Why npm CLI and not `pnpm publish`: pnpm 9 does not perform npm's OIDC
+        # exchange, so the v0.2.1 run PUT anonymously → E404. We PACK with pnpm
+        # (which rewrites `workspace:*` → the concrete version, required because
+        # @tracelanedev/cli depends on @tracelanedev/audit-verifier via workspace:*)
+        # and PUBLISH the resulting tarball with the npm CLI (does the OIDC exchange
+        # + --provenance). Publish ORDER matters: the verifier must be on npm before
+        # the CLI so the CLI's rewritten dependency resolves.
+        #
+        # IDEMPOTENT: a coordinated tag fires this for ALL three packages, but some
+        # may already be on npm (e.g. the SDK at 0.1.0, or a re-tagged run). Skip any
+        # version already present so one unchanged package never strands the rest.
+        run: |
+          set -euo pipefail
+          echo "npm $(npm --version) (need >= 11.5.1 for tokenless OIDC Trusted Publishing)"
+          for pkg in @tracelanedev/audit-verifier @tracelanedev/sdk @tracelanedev/cli; do
+            dir=$(pnpm --filter "$pkg" exec pwd | tail -1)
+            ver=$(node -p "require('${dir}/package.json').version")
+            if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+              echo "· $pkg@$ver already on npm — skipping (unchanged)"
+              continue
+            fi
+            packdir="${RUNNER_TEMP}/pack-$(echo "$pkg" | tr '/@' '__')"
+            mkdir -p "$packdir"
+            echo "· packing $pkg@$ver (pnpm pack rewrites workspace:* → concrete)"
+            ( cd "$dir" && pnpm pack --pack-destination "$packdir" )
+            tgz=$(ls "$packdir"/*.tgz | head -1)
+            echo "· publishing $tgz via npm CLI (OIDC Trusted Publishing + provenance)"
+            npm publish "$tgz" --access public --provenance
+          done
+
+  publish-pypi:
+    name: Publish tracelane (SDK) to PyPI (Trusted Publishing / OIDC)
+    # Gated on the SIGNED-TAG check only, NOT on build-rust/sign-and-release.
+    # These packages are TS/Python (verifier/SDK/CLI) built in THIS job — they
+    # consume no gateway binary or GitHub-release artifact, so chaining them
+    # behind the Rust binary build was a false coupling: a residual gateway
+    # cross-compile failure must not strand a verifier hotfix. The signed tag is
+    # the real authorization gate; each job's own build step is its compile gate.
+    needs: verify-signed-tag
+    runs-on: ubuntu-latest
+    # PyPI project "tracelane". Trusted publisher (entry 1):
+    # owner=tracelane, repo=tracelane, workflow=release.yml, environment=pypi.
+    # The PyPI registration is pinned to environment=pypi (tightened from blank),
+    # so it accepts ONLY a token carrying this job's `pypi` OIDC claim below. The
+    # `pypi` environment binds the OIDC claim + branch policy (v*/main); it is NOT a
+    # reviewer gate — the release gate is the signed-tag ruleset (verify-signed-tag).
+    # Renaming the environment here requires updating the PyPI registration to
+    # match, or the publish OIDC exchange 403s.
+    environment: pypi  # Requires OIDC Trusted Publishing configured on pypi.org
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build Python SDK
+        run: python -m build packages/sdk-python/
+
+      - name: Publish to PyPI via OIDC (no long-lived token)
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        with:
+          packages-dir: packages/sdk-python/dist/
+          # IDEMPOTENT: a re-tag re-runs this job, but the version may already be on
+          # PyPI (tracelane 0.1.0 shipped on the first successful run). Without this,
+          # a re-run 400s on "file already exists" — a false-red on a re-tag. Skips
+          # any file already on the index; only new versions upload. Mirrors the npm skip.
+          skip-existing: true
+
+  publish-pypi-verifier:
+    name: Publish tracelane-audit-verifier to PyPI (Trusted Publishing / OIDC)
+    # Gated on the SIGNED-TAG check only, NOT on build-rust/sign-and-release.
+    # These packages are TS/Python (verifier/SDK/CLI) built in THIS job — they
+    # consume no gateway binary or GitHub-release artifact, so chaining them
+    # behind the Rust binary build was a false coupling: a residual gateway
+    # cross-compile failure must not strand a verifier hotfix. The signed tag is
+    # the real authorization gate; each job's own build step is its compile gate.
+    needs: verify-signed-tag
+    runs-on: ubuntu-latest
+    # PyPI project "tracelane-audit-verifier" — a SEPARATE pending trusted
+    # publisher from "tracelane" above. PyPI keys pending-publisher identity
+    # on the exact (owner, repo, workflow filename, environment) tuple; both
+    # jobs share owner=tracelane, repo=tracelane, workflow=release.yml, so
+    # the environment must be distinct or PyPI rejects the second
+    # registration with "a pending trusted publisher matching this
+    # configuration has already been registered for a different project
+    # name." Register at pypi.org/manage/account/publishing/ with EXACTLY:
+    #   PyPI project name : tracelane-audit-verifier
+    #   Owner              : tracelane
+    #   Repository name    : tracelane
+    #   Workflow name      : release.yml
+    #   Environment name   : pypi-audit-verifier   (must match below verbatim)
+    environment: pypi-audit-verifier
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build audit verifier
+        run: python -m build packages/verifier-python/
+
+      - name: Publish to PyPI via OIDC (no long-lived token)
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        with:
+          packages-dir: packages/verifier-python/dist/
+          # IDEMPOTENT: tracelane-audit-verifier 0.2.1 shipped on the first run; a
+          # re-tag would 400 on "file already exists" without this. Skip existing.
+          skip-existing: true

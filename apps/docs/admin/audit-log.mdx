@@ -1,0 +1,134 @@
+---
+title: Admin audit log
+description: Query the durable trail of mutating admin actions written by every wired endpoint into `admin_audit_log` (ADR-031).
+sidebarTitle: Admin audit log
+---
+
+# Admin audit log
+
+> **Authoritative design:** [ADR-031](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-031-admin-audit-and-ch-resource-caps.md). **Schema:** [migration 11](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql).
+
+Every mutating admin action — API-key creation, BYOK provider-key
+rotation, prompt promotion, billing subscription change, member
+invite — writes one row to `admin_audit_log` (Postgres). The row
+captures the actor, the target, before/after JSON snapshots, the
+request IP, and the user agent. The table is indexed for the most
+common query: "show me everything that happened to this workspace in
+the last 30 days."
+
+## Schema at a glance
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `BIGSERIAL` PK | monotonically increasing row id |
+| `occurred_at` | `TIMESTAMPTZ` (default `now()`) | when the action happened |
+| `actor_user_id` | `TEXT` | WorkOS user id (opaque string `user_01H...`) |
+| `actor_workspace_id` | `UUID` (nullable) | internal `tenants.id`; null for cross-workspace operator actions |
+| `action` | `TEXT` | `<target>.<verb>` (see below) |
+| `target_type` | `TEXT` | `api_key` / `prompt` / `subscription` / `provider_key` / `member` |
+| `target_id` | `TEXT` | the mutated row's id |
+| `before_json` | `JSONB` (nullable) | row snapshot before the mutation; NULL for creates |
+| `after_json` | `JSONB` (nullable) | row snapshot after the mutation; NULL for deletes |
+| `ip_addr` | `INET` (nullable) | request first-hop IP (`x-forwarded-for`) |
+| `user_agent` | `TEXT` (nullable) | request `User-Agent` header |
+
+Indexes:
+- `idx_admin_audit_workspace (actor_workspace_id, occurred_at DESC)` — workspace-scoped scan
+- `idx_admin_audit_target (target_type, target_id, occurred_at DESC)` — "what ever happened to this resource"
+
+## Action naming convention
+
+`<target>.<verb>`. The verb is lowercase + concise; the target groups
+related actions. V1 wired examples:
+
+| `action` | `target_type` | `target_id` | Source |
+|---|---|---|---|
+| `api_key.create` | `api_key` | apiKey UUID | `POST /api/settings/api-keys` |
+| `api_key.revoke` | `api_key` | apiKey UUID | `DELETE /api/settings/api-keys/[keyId]` |
+| `prompt.promote` | `prompt` | prompt name | `POST /api/prompts/[name]/promote` |
+
+V1.1 sweep targets (planned, not yet wired):
+
+| `action` | Source |
+|---|---|
+| `byok.provider_key.create` / `.delete` | Rust gateway `/v1/byok/provider-keys` |
+| `cmk_key.rotate` | `POST /api/settings/cmk-keys/[keyId]/rotate` |
+| `billing.subscription.cancel` / `.upgrade` | `POST /api/billing/portal` callback |
+| `member.invite` / `.remove` | `POST /api/settings/team/invite` |
+
+## Querying the log
+
+### "What did I do to this workspace in the last 30 days?"
+
+```sql
+SELECT occurred_at, action, target_type, target_id, actor_user_id
+FROM admin_audit_log
+WHERE actor_workspace_id = $1
+  AND occurred_at >= now() - INTERVAL '30 days'
+ORDER BY occurred_at DESC
+LIMIT 200;
+```
+
+### "What ever happened to this specific resource?"
+
+```sql
+SELECT occurred_at, action, actor_user_id, before_json, after_json
+FROM admin_audit_log
+WHERE target_type = 'api_key'
+  AND target_id = $1
+ORDER BY occurred_at DESC;
+```
+
+### "Who is changing things from outside our office IPs?"
+
+```sql
+SELECT occurred_at, actor_user_id, action, ip_addr
+FROM admin_audit_log
+WHERE actor_workspace_id = $1
+  AND ip_addr IS NOT NULL
+  AND NOT (ip_addr <<= INET '203.0.113.0/24')
+ORDER BY occurred_at DESC;
+```
+
+## What the log is, and is not
+
+**Is:** A durable record of *who did what* in the dashboard /
+gateway control surface. Suitable for compliance attestation,
+internal incident review, and the eventual SOC 2 audit.
+
+**Is not:** The tamper-evident *agent* event ledger
+([ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)).
+That ledger captures the runtime behaviour of customer agents (LLM
+calls, tool calls, guardrail decisions) with a tamper-evident SHA-256
+hash chain and customer-runnable verifier CLIs (Ed25519 batch signing
++ Sigstore Rekor v2 anchoring live, best-effort, on the Audit add-on).
+The admin audit
+log is the application-control mirror — a separate, simpler promise
+backed by Postgres + indexes, not by cryptographic anchoring.
+
+## Retention
+
+V1 ships without an automated retention/archive job. The table is
+expected to grow ~100 rows/workspace/day at active use, ~36 K rows
+per workspace per year — well within Postgres comfort for the V1
+single-Neon-region deployment. A V1.1 archive job moves rows older
+than 18 months to R2 cold-tier following the [ADR-022](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-022-clickhouse-tiered-storage.md) tiered-storage pattern.
+
+## V1 vs V1.1 wiring status
+
+ADR-031 §"V1 wiring scope" tracks the wired-and-pending list. V1
+ships three demo call sites (api-keys POST + DELETE, prompts
+promote); V1.1 sweep wires the remaining ~12 mutating admin
+endpoints. Each unwired endpoint still writes its mutation to
+Postgres; only the audit trail row is missing — call this out in any
+partner agreement that promises a complete audit-trail surface at
+day one.
+
+## Failure mode: write failure does not fail the request
+
+`recordAdminAction()` (TS) and `record_admin_action()` (Rust) are
+best-effort: a Postgres blip writes a `console.error` /
+`tracing::error!` line and lets the calling route succeed. Rationale:
+we'd rather lose one audit row than return a 5xx to the user on a
+transient connection error. Operators tail the error log to catch
+sustained write failures.

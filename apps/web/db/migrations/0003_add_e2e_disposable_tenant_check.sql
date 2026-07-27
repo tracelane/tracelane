@@ -1,0 +1,1 @@
+ALTER TABLE "tenants" ADD CONSTRAINT "tenants_id_not_e2e_disposable" CHECK ("tenants"."id" <> '00000000-0000-4000-8000-0000e2e2e2e2'::uuid);

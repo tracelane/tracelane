@@ -1,0 +1,47 @@
+---
+title: Migrating from LiteLLM
+description: Translate litellm_config.yaml to a Tracelane gateway config.
+---
+
+LiteLLM uses a YAML `model_list` to map logical model names to provider
+upstreams. Tracelane has a one-command import:
+
+```bash
+tlane import-litellm litellm_config.yaml --output tracelane.yaml
+tlane import-litellm litellm_config.yaml --dry-run
+```
+
+The CLI preserves provider, model alias, and rate-limit metadata.
+Caller-side code that calls `litellm.completion(...)` keeps working
+through Tracelane's OpenAI-compatible `/v1/chat/completions`
+endpoint — no SDK swap needed.
+
+## Mapping
+
+| LiteLLM key | Tracelane key |
+|---|---|
+| `model_list[].model_name` | `models.<name>` |
+| `model_list[].litellm_params.model` | `models.<name>.upstream_model` |
+| `model_list[].litellm_params.api_base` | `models.<name>.base_url` (or env override) |
+| `model_list[].litellm_params.api_key` | env var; never inlined in YAML |
+| `router_settings.fallbacks` | `models.<name>.fallbacks[]` |
+| `router_settings.timeout` | `models.<name>.timeout_ms` |
+| `router_settings.num_retries` | (not 1:1 — handled by predictive layer) |
+
+## Security uplift
+
+LiteLLM has had a series of CVEs around `/config/update`-style admin
+endpoints and import-by-string of untrusted config. Tracelane:
+
+- Has no `/config/update` endpoint — config is reload-from-disk only
+- Never `eval`s or imports config strings as Python
+- Scans releases for new `.pth` files
+- Requires 2 maintainer approvals on release tags
+
+These are enforced by CI, not just convention.
+
+## Related
+
+- [Quickstart](/quickstart)
+- [Providers](/providers)
+- [Architecture](/architecture)

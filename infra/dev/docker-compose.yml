@@ -1,0 +1,94 @@
+services:
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native TCP interface
+    environment:
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  nats:
+    image: nats:2.10-alpine
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    volumes:
+      - nats_data:/data
+    # `nats-server --signal ldm=1` was WRONG here — it signals lame-duck-mode
+    # shutdown to the running server, so the first healthcheck killed nats
+    # (container exited 0 → `dependency failed to start`). Probe the monitoring
+    # HTTP /healthz instead (enabled by --http_port 8222); the alpine image has
+    # busybox wget. Same endpoint the span-publish-integration CI job uses.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats-init:
+    image: natsio/nats-box:latest
+    depends_on:
+      nats:
+        condition: service_healthy
+    command: |
+      nats stream add TRACELANE_SPANS
+        --server nats://nats:4222
+        --subjects "tracelane.spans.>"
+        --storage file
+        --retention limits
+        --max-age 90d
+        --replicas 1
+    restart: "no"
+
+  # Postgres (Neon-compatible) for auth + billing metadata
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: tracelane
+      POSTGRES_USER: tracelane
+      POSTGRES_PASSWORD: tracelane_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracelane"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Grafana for local metric dashboards
+  grafana:
+    image: grafana/grafana:11.4-ubuntu
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - clickhouse
+
+volumes:
+  clickhouse_data:
+  nats_data:
+  postgres_data:
+  grafana_data:

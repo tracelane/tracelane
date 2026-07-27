@@ -1,0 +1,18 @@
+[package]
+name = "tracelane-shared"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared types, OTel semconv helpers, and schemas for Tracelane crates"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+# Needed by `redact::RedactingMakeWriter` (A10). Used by gateway + ingest
+# tracing subscribers; pulling the dep into shared keeps the byte-scan
+# layer's `MakeWriter` impl in one place.
+tracing-subscriber = { workspace = true }

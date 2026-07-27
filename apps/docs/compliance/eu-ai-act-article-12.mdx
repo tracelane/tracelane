@@ -1,0 +1,146 @@
+---
+title: EU AI Act Article 12 — recordkeeping & independent verification
+description: How Tracelane satisfies Article 12 obligations for high-risk AI systems, with a regulator-runnable verifier CLI.
+sidebarTitle: EU AI Act Article 12
+---
+
+# EU AI Act Article 12 — recordkeeping & independent verification
+
+> **Applicability (high-risk / Annex III).** Article 12 recordkeeping
+> obligations for high-risk AI systems apply on a still-provisional timeline
+> (target 2027-12-02, pending final adoption) — the 2026-08-02 date is the
+> general-purpose AI milestone, not the Article 12 high-risk enforcement date.
+> Tracelane's Audit add-on ships Article 12 verifier support today.
+> **Authoritative:**
+> [ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)
+> (ledger design), [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md)
+> (verifier CLI).
+
+Article 12 of the EU AI Act requires high-risk AI systems to maintain
+automatically-generated logs that can be independently verified by a
+regulator. Tracelane's Audit add-on ships the data, the cryptographic
+proofs, and the regulator-runnable verifier in one package.
+
+## Article 12 obligations and how Tracelane satisfies them
+
+### 12(2)(a) — automatic generation of logs over the lifetime of the system
+
+| Tracelane mechanism |
+|---|
+| The gateway writes one audit-log row per gateway-proxied event — LLM provider calls and guardrail-layer verdicts — signed into a per-tenant SHA-256 hash chain at write time. Tool-call / A2A / MCP event kinds exist in the schema but are chained only when routed through the gateway; SDK/OTLP-captured spans are full-fidelity but not yet chained. See `crates/gateway/src/audit.rs::AuditChain::append`. |
+
+### 12(2)(b) — log enables identification of situations the system may pose a risk
+
+| Tracelane mechanism |
+|---|
+| Every row carries `event_type`, `actor`, full canonical `payload`, plus structured GenAI semconv attributes. Guardrail blocks and predictive-layer interventions are stored as first-class event types so a regulator-side query can identify "every time the system refused a customer request" in milliseconds. |
+
+### 12(2)(c) — log retention for at least six months
+
+| Tracelane mechanism |
+|---|
+| The Audit add-on SKU hardcodes **`audit_retention_days >= 180`** in `crates/gateway/src/audit_retention.rs::AUDIT_ADDON_MIN_RETENTION_DAYS`. The `resolve_audit_retention(base_tier_days, has_audit_addon, contractual_override)` resolver panics fail-loud if any future caller attempts to set a lower override. See [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md) §Retention enforcement. |
+
+### 12(3)(a) — log conformity with established procedures
+
+| Tracelane mechanism |
+|---|
+| The hash-chain row format and Merkle-root-over-Rekor anchor procedure are published in [ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md) (CC0). Three reference verifiers (Rust / Python / TypeScript) live at `packages/verifier-{rust,python,typescript}/` and produce byte-identical `VerifyReport` JSON for the same input. |
+
+### 12(3)(b) — log access by the deploying operator
+
+| Tracelane mechanism |
+|---|
+| `GET /api/audit/range?workspace=<uuid>&from=<iso>&to=<iso>` returns the raw NDJSON. The audit-read API key (issued via Tracelane support, scope: `audit:read` for a specific workspace) authorises the call. See [`/audit/verifier-cli`](/audit/verifier-cli) for the contract. |
+
+### 12(3)(c) — log access by the market-surveillance authority
+
+| Tracelane mechanism |
+|---|
+| Same endpoint + read-key issuance flow as 12(3)(b). When a regulator presents formal authority to inspect a specific workspace, Tracelane support issues a time-bounded `audit:read` key scoped to that workspace; the regulator runs `tracelane-audit verify` independently. The verifier binary is Cosign-signed + SLSA L3 + Trusted-Published to crates.io, so the regulator does not have to trust Tracelane's HTTPS endpoints to verify the binary itself. |
+
+### 12(3)(d) — automatic prevention of unauthorised access
+
+| Tracelane mechanism |
+|---|
+| Per-row authorisation is enforced at the gateway by `WHERE tenant_id = ?` on every ClickHouse query (CI guard `tenant-isolation-check` blocks any new query that omits this filter). Cross-tenant chain integrity is the V1.5 AUDIT-001 fix; V1's per-tenant `seq` + per-tenant Ed25519 keypair (ADR-018 + ) covers the integrity half. |
+
+## Field mapping table (verifier output → Article 12 obligation)
+
+> **What is live.** The hash-chain integrity proof (`hash_chain_valid`) is
+> **live** and independently verifiable offline. For Audit-add-on workspaces the
+> Ed25519 Merkle-root signing (`signatures_valid`) and Sigstore Rekor v2 public
+> anchoring (`rekor_anchors_resolved`) below are **live in production**
+> (best-effort: if the public log is unreachable a batch stays
+> signed-but-not-yet-anchored and still verifies via the chain + Ed25519). eIDAS
+> QTSP timestamping remains on the roadmap.
+
+| `VerifyReport` field | What it proves | Article 12 obligation |
+|---|---|---|
+| `rows_seen` | log was generated automatically | 12(2)(a) |
+| `hash_chain_valid` | (live) the log has not been mutated since write | 12(3)(a), 12(3)(d) |
+| `signatures_valid` | every Merkle root is Ed25519-signed by the workspace's per-tenant key (live) | 12(3)(a) |
+| `rekor_anchors_resolved` | anchored batches are independently verifiable against the public Sigstore Rekor v2 log, offline from the exported inclusion proof + checkpoint (live, best-effort) | 12(3)(a), 12(3)(c) |
+| `errors[].seq` + `errors[].kind` + `errors[].detail` | the *specific* row that failed verification, identifying any tampering attempt | 12(3)(a), 12(3)(d) |
+
+## Conformance statement
+
+Tracelane publishes a written conformance statement at
+[`/audit/conformance-statement`](/audit/conformance-statement)
+restating the obligations above in the format an EU regulator's
+counsel expects to see.
+
+## Running the verifier (regulator quick-start)
+
+```bash
+# 1. Download the static binary + Cosign bundle from
+#    https://github.com/tracelane/tracelane/releases (look for the
+#    `tracelane-audit-...-musl` artefact + its .cosign.bundle).
+
+# 2. Verify the binary itself.
+cosign verify-blob \
+  --bundle tracelane-audit-x86_64-unknown-linux-musl.cosign.bundle \
+  --certificate-identity-regexp 'github.com/tracelane/tracelane/.github/workflows/release-audit-cli.yml' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  tracelane-audit-x86_64-unknown-linux-musl
+
+# 3. Run the verifier against the workspace + window under audit.
+chmod +x tracelane-audit-x86_64-unknown-linux-musl
+./tracelane-audit-x86_64-unknown-linux-musl verify \
+  --workspace 00000000-0000-0000-0000-00000000000a \
+  --from 2026-05-01T00:00:00Z \
+  --to   2026-05-26T00:00:00Z \
+  --api-url https://api.tracelane.dev \
+  --read-key tlane_audit_read_...
+# Exit 0 → PASS. Exit 1 → FAIL with field-level diff. Exit 2 → I/O.
+```
+
+For air-gapped verification, request an NDJSON export over secure
+courier and run with `--file <path> --offline`. The chain + Merkle
+checks run locally and are the live integrity proof. Rekor
+inclusion-proof verification is live for anchored batches and runs
+offline from the bundled inclusion proof + signed checkpoint (no live
+Sigstore call needed); `--offline` skips the anchor layer entirely,
+leaving the chain-integrity check.
+
+## V1 launch deferrals
+
+Per [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md):
+
+- **`tracelane-audit export --format pdf`** — regulator-ready
+  conformance packet PDF. The V1 `--format text` and `--format json`
+  outputs are human-readable; auditors can render to PDF via any
+  external tool. V1.1 ships a built-in PDF renderer that produces
+  the conformance packet directly.
+- **Automated audit-data retention cleanup job.** The
+  `resolve_audit_retention` resolver is in place; the cron + DELETE
+  pipeline ships in V1.1. V1's invariant: no audit data is deleted
+  in V1, so the 180-day floor is trivially satisfied for any
+  workspace created post-launch.
+
+## Further reading
+
+- [EU AI Act, full Article 12](https://artificialintelligenceact.eu/article/12/)
+- [Tracelane audit ledger design (ADR-018)](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)
+- [tracelane-audit CLI usage](/audit/verifier-cli)
+- [Conformance statement](/audit/conformance-statement)

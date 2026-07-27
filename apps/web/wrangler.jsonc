@@ -1,0 +1,32 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "tracelane-web",
+	"main": ".open-next/worker.js",
+	// nodejs_compat is mandatory: WorkOS AuthKit + node:crypto (api-key HMAC,
+	// Polar webhook verify, CMK PEM parse) resolve through it. The 2025-09-23
+	// compatibility_date also auto-populates process.env from vars/secrets, which
+	// is how our `process.env.*` reads (DATABASE_URL, WORKOS_*, pepper, etc.) work
+	// on the Worker. OpenNext additionally bridges env onto process.env per request.
+	"compatibility_date": "2025-09-23",
+	"compatibility_flags": ["nodejs_compat"],
+	// Static assets emitted by the OpenNext build, served by the Worker's asset
+	// handler. The ASSETS binding is what OpenNext's worker entry expects.
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	},
+	"observability": {
+		"enabled": true
+	}
+	// Runtime config (incl. the PUBLIC NEXT_PUBLIC_* gateway/redirect URLs) is set
+	// via `wrangler secret put` — plaintext `vars` here are NOT bridged onto
+	// `process.env` by OpenNext, but secrets ARE (that is how DATABASE_URL /
+	// WORKOS_* reach `process.env.*` on the Worker). The server route handlers
+	// read `process.env.NEXT_PUBLIC_GATEWAY_URL` at RUNTIME (OpenNext does not
+	// build-inline it); when unset it falls back to `http://localhost:8080`,
+	// which Cloudflare blocks with error 1003 on a Worker subrequest — silently
+	// killing checkout AND every gateway read (`lib/gateway.ts` throws in prod).
+	// REQUIRED secrets: NEXT_PUBLIC_GATEWAY_URL, NEXT_PUBLIC_WORKOS_REDIRECT_URI,
+	// DATABASE_URL, WORKOS_API_KEY/CLIENT_ID/REDIRECT_URI/COOKIE_*, POLAR_*,
+	// TRACELANE_APIKEY_PEPPER (see `wrangler secret list`).
+}

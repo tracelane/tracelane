@@ -1,0 +1,233 @@
+---
+title: SPIFFE/SPIRE ingest mTLS — operator runbook
+description: Bring up SPIRE in a customer cluster, register Tracelane ingest workload entries, and rotate trust bundles without dropping spans.
+sidebarTitle: SPIFFE ingest (operator)
+---
+
+# SPIFFE/SPIRE ingest mTLS — operator runbook
+
+> **Audience:** SREs running self-hosted Tracelane or operating the Audit SKU
+> in a customer cluster. **Authoritative design:** [ADR-028](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-028-spiffe-ingest-mtls.md).
+
+The Tracelane ingest worker authenticates every connection with a SPIFFE
+X.509-SVID issued by [SPIRE](https://spiffe.io). This page covers the
+three operational moments where you'll touch SPIRE: **bringing it up**,
+**registering Tracelane workloads**, and **rotating the trust bundle**
+without service interruption.
+
+## Architecture in one diagram
+
+```
+                ┌─────────────────────────────────────┐
+                │  SPIRE Server (control plane)       │
+                │  - Issues SVIDs                     │
+                │  - Holds the trust-domain CA        │
+                └────────────┬────────────────────────┘
+                             │   (server API; mTLS or
+                             │    upstream-CA-signed)
+                             ▼
+   ┌──────────┐   ┌──────────────────────────────────┐
+   │ Customer │   │  SPIRE Agent (per node)          │
+   │  Agent   │   │  - Attests workload via PID/UID  │
+   │  (SDK)   │   │    or k8s-sa selector            │
+   └────┬─────┘   │  - Holds Workload API socket at  │
+        │         │    /tmp/spire-agent/public/api.sock │
+        │ mTLS    └──────┬───────────────────────────┘
+        ▼ (SVID)         │ UDS (FetchX509SVID + Bundles)
+   ┌─────────────────────┴──────────────────────────┐
+   │  Tracelane ingest worker (Rust)                │
+   │  - rustls 0.23 + ring; TLS 1.3 only            │
+   │  - SpireClientCertVerifier (per-conn snapshot) │
+   │  - BundleRefresher (8-attempt bounded retry)   │
+   │  - verify_spiffe_svid (X.509 + SPIFFE §4.3)    │
+   └────────────────────────────────────────────────┘
+```
+
+## 1. Bring up SPIRE in a customer cluster
+
+### Kubernetes (recommended)
+
+The [SPIRE Helm chart](https://artifacthub.io/packages/helm/spiffe/spire)
+is the supported path. Minimum settings for a Tracelane install:
+
+```yaml
+# values.yaml
+spire-server:
+  trustDomain: tracelane.dev
+  # If you're federating with our control plane (Audit SKU): set
+  # federation.bundleEndpoint to the URL we send during onboarding.
+spire-agent:
+  trustDomain: tracelane.dev
+  # Mount the Workload API socket where the ingest container expects it.
+  socketPath: /tmp/spire-agent/public/api.sock
+```
+
+```bash
+helm repo add spiffe https://spiffe.github.io/helm-charts-hardened
+helm install spire spiffe/spire -n spire --create-namespace -f values.yaml
+```
+
+### Bare metal / single-VM (Hetzner-style)
+
+Match the founder's V1 layout:
+
+```bash
+# 1. Install SPIRE 1.10 from the upstream release.
+curl -sL https://github.com/spiffe/spire/releases/download/v1.10.0/spire-1.10.0-linux-amd64-musl.tar.gz \
+  | tar xz
+sudo cp spire-1.10.0/bin/spire-{server,agent} /usr/local/bin/
+
+# 2. Server config (single-line summary; see SPIRE docs for full schema):
+sudo tee /etc/spire/server/server.conf <<'EOF'
+server { trust_domain = "tracelane.dev" data_dir = "/var/lib/spire/server" log_level = "INFO" }
+plugins {
+  DataStore "sql" { plugin_data { database_type = "sqlite3" connection_string = "/var/lib/spire/server/data.db" } }
+  NodeAttestor "join_token" { plugin_data {} }
+  KeyManager "disk" { plugin_data { keys_path = "/var/lib/spire/server/keys.json" } }
+}
+EOF
+sudo systemctl enable --now spire-server
+
+# 3. Agent (one per node ingest runs on).
+sudo tee /etc/spire/agent/agent.conf <<'EOF'
+agent { trust_domain = "tracelane.dev" socket_path = "/tmp/spire-agent/public/api.sock" }
+plugins {
+  NodeAttestor "join_token" { plugin_data {} }
+  WorkloadAttestor "unix" { plugin_data {} }
+  KeyManager "disk" { plugin_data { directory = "/var/lib/spire/agent/keys" } }
+}
+EOF
+
+# 4. Bootstrap: server mints a join token, agent uses it once.
+sudo -u spire spire-server token generate -spiffeID spiffe://tracelane.dev/agent/$(hostname)
+# → 2387f9a4-...  (use this in the agent's first boot only)
+```
+
+## 2. Register the Tracelane ingest workload
+
+Every ingest worker process needs an entry that maps a **selector** (how
+SPIRE recognises the workload) to a **SPIFFE ID** (the identity it'll
+hand out). Tracelane's expected SPIFFE ID format is:
+
+```
+spiffe://tracelane.dev/tenant/<workspace-uuid>/ingest-worker
+```
+
+The `tenant/<uuid>/ingest-worker` path shape is enforced by
+`crates/ingest/src/auth.rs::parse_spiffe_id`. Any other shape (e.g.
+`/workspace/<uuid>` or missing `ingest-worker` suffix) is rejected
+**fail-closed** with `401 Unauthorized`.
+
+### Kubernetes selector
+
+```bash
+kubectl exec -n spire deploy/spire-server -- \
+  spire-server entry create \
+    -spiffeID    spiffe://tracelane.dev/tenant/$WORKSPACE_UUID/ingest-worker \
+    -parentID    spiffe://tracelane.dev/agent/k8s/$NODE_NAME \
+    -selector    k8s:ns:tracelane \
+    -selector    k8s:sa:ingest \
+    -ttl         3600   # 1h — SPIRE default; matches our trust-bundle rotation cadence
+```
+
+### Unix selector (bare metal / VM)
+
+```bash
+sudo -u spire spire-server entry create \
+  -spiffeID  spiffe://tracelane.dev/tenant/$WORKSPACE_UUID/ingest-worker \
+  -parentID  spiffe://tracelane.dev/agent/$(hostname) \
+  -selector  unix:uid:$(id -u tracelane-ingest) \
+  -selector  unix:path:/usr/local/bin/ingest \
+  -ttl       3600
+```
+
+The `unix:path` selector pins the binary on disk so a different
+process running as the same UID cannot fetch the SVID. Keep the
+`ingest` binary owned by root, `0755`, and only the `tracelane-ingest`
+service user able to execute it.
+
+## 3. Tracelane ingest environment
+
+Set these env vars on the ingest container / systemd unit:
+
+| Variable | Required | Example | Notes |
+|---|---|---|---|
+| `TRACELANE_SPIRE_SOCKET` | **yes (prod)** | `/tmp/spire-agent/public/api.sock` | Release builds bail at startup without it. |
+| `TRACELANE_TRUST_DOMAIN` | **yes** | `tracelane.dev` | Must equal the compile-time `auth::TRUST_DOMAIN`. |
+| `TRACELANE_OTLP_PORT` | no | `4318` | OTLP HTTP receive port. |
+
+A misconfigured `TRACELANE_TRUST_DOMAIN` is caught at boot
+(`crates/ingest/src/main.rs:194-199`) — ingest refuses to start rather
+than silently authenticate with the wrong trust domain.
+
+## 4. Rotate the trust bundle without dropping spans
+
+SPIRE rotates the CA on a 1h cadence by default. The ingest worker's
+`BundleRefresher` consumes the `FetchX509Bundles` stream and swaps the
+new `RootCertStore` in atomically via `ArcSwap`. **In-flight
+connections keep their old bundle**; new handshakes pick up the rotated
+roots. Zero rotation downtime in normal operation.
+
+### What you should see in logs
+
+```
+INFO  tls trust_domain=tracelane.dev cert_count=2 trust bundle rotated
+```
+
+### What you should NOT see
+
+```
+WARN  tls failures=N SPIRE bundle stream errored; backing off
+ERROR tls SPIRE bundle refresher gave up after 8 consecutive failures
+```
+
+The `gave up` line means the refresher exhausted its retry budget
+(`MAX_REFRESH_FAILURES = 8`, exponential backoff `500ms → 60s`, total
+~3.5 min). When that fires, `tokio::try_join!` in `main.rs` propagates
+the error and the ingest process exits non-zero. **This is intentional
+fail-closed** — a frozen trust bundle is worse than a controlled
+outage because SVIDs expire on a 1h cadence and a stale bundle would
+silently accept rotated-away certs. The supervisor (systemd /
+Kubernetes) restarts the process; once SPIRE is reachable again the
+refresher boots clean.
+
+## 5. Observability
+
+Every authentication outcome bumps the
+`tracelane_ingest_auth_total{result=...}` counter. Five-bucket label
+set per ADR-028 §Observability:
+
+| Label | Means |
+|---|---|
+| `ok` | Identity extracted; tenant attribution succeeded. |
+| `wrong_trust_domain` | SVID was for a trust domain we don't accept. |
+| `invalid_path` | Cert was structurally wrong (CA bit set, missing KeyUsage, malformed UUID, etc.). |
+| `expired_svid` | SVID outside its validity window (clock skew or stale cert). |
+| `no_svid` | No PeerCertDer reached the auth layer (TLS handshake failed, or `peer_certificates()` was empty). |
+
+Recommended Prometheus alerts:
+
+```promql
+# Sustained no_svid spike: SPIRE outage or misconfigured client.
+rate(tracelane_ingest_auth_total{result="no_svid"}[5m]) > 1
+
+# Wrong trust domain: someone is hitting us with a foreign SVID.
+increase(tracelane_ingest_auth_total{result="wrong_trust_domain"}[15m]) > 0
+```
+
+## 6. Troubleshooting
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| `401 Unauthorized` with `WWW-Authenticate: SPIFFE-mTLS` | Client cert not SVID, wrong trust domain, expired | Counter label tells you which bucket; gateway logs include the SPIFFE URI (truncated). |
+| `bail!: TRACELANE_SPIRE_SOCKET is required in release builds` | Missing env var | Set `TRACELANE_SPIRE_SOCKET`. |
+| `bail!: TRACELANE_TRUST_DOMAIN must equal auth::TRUST_DOMAIN` | Mismatched env vs. compile-time constant | Set `TRACELANE_TRUST_DOMAIN=tracelane.dev`. |
+| `SPIRE bundle refresher gave up after 8 consecutive failures` | SPIRE server unreachable >3.5min | Check `systemctl status spire-server`; restart ingest after fixing. |
+| `connect SPIRE Workload API socket: ...` at startup | Agent not running, wrong socket path, permission denied | `ls -l /tmp/spire-agent/public/api.sock`; agent must be running as same group as ingest. |
+
+## 7. Further reading
+
+- [ADR-028](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-028-spiffe-ingest-mtls.md) — full design decision.
+- [SPIFFE X.509-SVID spec §4](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md) — wire format.
+- [SPIRE Workload API spec](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md) — gRPC contract.
+- [Migration guide](/migration/spiffe-bootstrap) — moving an existing customer cluster onto Tracelane ingest mTLS.

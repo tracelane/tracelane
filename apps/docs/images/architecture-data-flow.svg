@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="880" height="540" viewBox="0 0 880 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#94A3B8"/>
+    </marker>
+    <marker id="ap" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#A78BFA"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="880" height="540" fill="#F8FAFC" rx="12"/>
+
+  <!-- ── AGENT ───────────────────────────────────────────────── -->
+  <rect x="24" y="24" width="636" height="60" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+  <text x="342" y="49" text-anchor="middle" font-size="13" font-weight="600" fill="#312E81" font-family="'Inter',system-ui,sans-serif">Your AI Agent</text>
+  <text x="342" y="68" text-anchor="middle" font-size="11" fill="#6366F1" font-family="'Inter',system-ui,sans-serif">Python SDK · TypeScript SDK · any OpenAI-compatible client</text>
+
+  <!-- Arrow: Agent → Gateway -->
+  <line x1="342" y1="84" x2="342" y2="110" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="350" y="101" font-size="10" fill="#94A3B8" font-family="'Inter',system-ui,sans-serif">HTTPS</text>
+
+  <!-- ── GATEWAY ─────────────────────────────────────────────── -->
+  <rect x="24" y="114" width="636" height="128" rx="8" fill="white" stroke="#93C5FD" stroke-width="2"/>
+  <text x="34" y="131" font-size="9" font-weight="700" letter-spacing="1" fill="#94A3B8" font-family="'Inter',system-ui,sans-serif">TRACELANE GATEWAY  ·  Rust · Axum · tokio  ·  ≥5 K RPS single instance</text>
+
+  <!-- Predictive sub-box -->
+  <rect x="34" y="138" width="298" height="92" rx="6" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+  <text x="183" y="158" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1E40AF" font-family="'Inter',system-ui,sans-serif">Predictive Layer</text>
+  <text x="183" y="175" text-anchor="middle" font-size="10" fill="#3B82F6" font-family="'Inter',system-ui,sans-serif">PR1 MCP rug-pull · PR2 lethal trifecta · PR3 A2UI</text>
+  <text x="183" y="191" text-anchor="middle" font-size="10" fill="#3B82F6" font-family="'Inter',system-ui,sans-serif">PR4 Llama Prompt Guard 2 ONNX · PR7 SLM judge</text>
+  <text x="183" y="207" text-anchor="middle" font-size="10" fill="#3B82F6" font-family="'Inter',system-ui,sans-serif">PR5 browser loop · PR6 A2A handoff · PR8 arg-drift</text>
+  <text x="183" y="223" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">inline pre-flight policy</text>
+
+  <!-- Provider Router sub-box -->
+  <rect x="346" y="138" width="302" height="92" rx="6" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1"/>
+  <text x="497" y="158" text-anchor="middle" font-size="11.5" font-weight="600" fill="#166534" font-family="'Inter',system-ui,sans-serif">Provider Router</text>
+  <text x="497" y="175" text-anchor="middle" font-size="10" fill="#15803D" font-family="'Inter',system-ui,sans-serif">Anthropic · OpenAI · Google Vertex · AWS Bedrock</text>
+  <text x="497" y="191" text-anchor="middle" font-size="10" fill="#15803D" font-family="'Inter',system-ui,sans-serif">Azure · Cohere · + 28 OpenAI-compatible providers</text>
+  <text x="497" y="207" text-anchor="middle" font-size="10" fill="#15803D" font-family="'Inter',system-ui,sans-serif">BYOK envelope-enc · failover · rate-limiting</text>
+  <text x="497" y="223" text-anchor="middle" font-size="9.5" font-weight="600" fill="#16A34A" font-family="'Inter',system-ui,sans-serif">zero-allocation hot path · bytes::Bytes</text>
+
+  <!-- ── LLM PROVIDER (external, right) ──────────────────────── -->
+  <rect x="712" y="114" width="144" height="128" rx="8" fill="#FDF4FF" stroke="#E9D5FF" stroke-width="1.5"/>
+  <text x="784" y="148" text-anchor="middle" font-size="11.5" font-weight="600" fill="#7E22CE" font-family="'Inter',system-ui,sans-serif">LLM Provider</text>
+  <text x="784" y="166" text-anchor="middle" font-size="10" fill="#A855F7" font-family="'Inter',system-ui,sans-serif">cloud or self-hosted</text>
+  <text x="784" y="190" text-anchor="middle" font-size="9.5" fill="#C084FC" font-family="'Inter',system-ui,sans-serif">request forwarded</text>
+  <text x="784" y="207" text-anchor="middle" font-size="9.5" fill="#C084FC" font-family="'Inter',system-ui,sans-serif">response proxied</text>
+  <text x="784" y="224" text-anchor="middle" font-size="9.5" fill="#C084FC" font-family="'Inter',system-ui,sans-serif">back to agent</text>
+
+  <!-- Arrow: Provider Router → LLM Provider -->
+  <line x1="648" y1="184" x2="710" y2="184" stroke="#A78BFA" stroke-width="1.5" marker-end="url(#ap)"/>
+  <text x="654" y="177" font-size="9" fill="#A78BFA" font-family="'Inter',system-ui,sans-serif">forward</text>
+
+  <!-- Arrow: Gateway → Ingest (OTLP spans) -->
+  <line x1="200" y1="242" x2="200" y2="270" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="210" y="259" font-size="9.5" fill="#94A3B8" font-family="'Inter',system-ui,sans-serif">OTLP · NATS JetStream</text>
+
+  <!-- ── INGEST WORKERS ─────────────────────────────────────── -->
+  <rect x="24" y="274" width="636" height="56" rx="8" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1.5"/>
+  <text x="342" y="298" text-anchor="middle" font-size="12" font-weight="600" fill="#92400E" font-family="'Inter',system-ui,sans-serif">Ingest Workers</text>
+  <text x="342" y="315" text-anchor="middle" font-size="10" fill="#B45309" font-family="'Inter',system-ui,sans-serif">Rust · NATS JetStream consumer · ≥50 K spans/sec · ClickHouse batch writes · R2 1 MB flush · tail-based sampling</text>
+
+  <!-- Arrows: Ingest → 3 storage boxes -->
+  <line x1="134" y1="330" x2="134" y2="358" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="342" y1="330" x2="342" y2="358" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="550" y1="330" x2="550" y2="358" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- ── STORAGE TRIO ──────────────────────────────────────── -->
+  <rect x="24" y="362" width="204" height="68" rx="8" fill="#F8FAFC" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="126" y="388" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1F2937" font-family="'Inter',system-ui,sans-serif">ClickHouse</text>
+  <text x="126" y="405" text-anchor="middle" font-size="10" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">hot tier · ≤90 days</text>
+  <text x="126" y="421" text-anchor="middle" font-size="9.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">50 K+ spans/sec · OLAP</text>
+
+  <rect x="240" y="362" width="204" height="68" rx="8" fill="#F8FAFC" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="342" y="388" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1F2937" font-family="'Inter',system-ui,sans-serif">Cloudflare R2</text>
+  <text x="342" y="405" text-anchor="middle" font-size="10" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">cold tier · 1 MB batches</text>
+  <text x="342" y="421" text-anchor="middle" font-size="9.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">queryable via tlane export</text>
+
+  <rect x="456" y="362" width="204" height="68" rx="8" fill="#F8FAFC" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="558" y="388" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1F2937" font-family="'Inter',system-ui,sans-serif">Postgres</text>
+  <text x="558" y="405" text-anchor="middle" font-size="10" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">metadata · prompts · keys</text>
+  <text x="558" y="421" text-anchor="middle" font-size="9.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">OLTP · high integrity</text>
+
+  <!-- Arrows: Storage → Consumers -->
+  <line x1="126" y1="430" x2="126" y2="458" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="342" y1="430" x2="342" y2="458" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="558" y1="430" x2="558" y2="458" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="55" y="447" font-size="9" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">reads</text>
+
+  <!-- ── CONSUMER TRIO ─────────────────────────────────────── -->
+  <rect x="24" y="462" width="204" height="58" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+  <text x="126" y="487" text-anchor="middle" font-size="11.5" font-weight="600" fill="#3730A3" font-family="'Inter',system-ui,sans-serif">Dashboard</text>
+  <text x="126" y="505" text-anchor="middle" font-size="10" fill="#6366F1" font-family="'Inter',system-ui,sans-serif">Next.js 15 · transcript-spine viewer</text>
+
+  <rect x="240" y="462" width="204" height="58" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+  <text x="342" y="487" text-anchor="middle" font-size="11.5" font-weight="600" fill="#3730A3" font-family="'Inter',system-ui,sans-serif">MCP Server</text>
+  <text x="342" y="505" text-anchor="middle" font-size="10" fill="#6366F1" font-family="'Inter',system-ui,sans-serif">TypeScript · OAuth 2.1 · read-only</text>
+
+  <rect x="456" y="462" width="204" height="58" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+  <text x="558" y="487" text-anchor="middle" font-size="11.5" font-weight="600" fill="#3730A3" font-family="'Inter',system-ui,sans-serif">tlane CLI</text>
+  <text x="558" y="505" text-anchor="middle" font-size="10" fill="#6366F1" font-family="'Inter',system-ui,sans-serif">verify · export · import · replay</text>
+
+</svg>

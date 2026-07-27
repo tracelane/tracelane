@@ -1,0 +1,10 @@
+{
+	"$schema": "https://unpkg.com/knip@6/schema.json",
+	"ignore": [
+		"open-next.config.ts",
+		"lib/e2e-db.stub.ts"
+	],
+	"ignoreDependencies": [
+		"tailwindcss"
+	]
+}

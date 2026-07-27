@@ -1,0 +1,79 @@
+---
+title: Concepts
+description: Traces, spans, and sessions; organizations, projects, and environments; how quotas are metered.
+---
+
+Five words carry most of Tracelane's data model: **span**, **trace**, **session**,
+**organization**, and **project**. Get these right and the dashboard, the API, and
+your bill all read the same way.
+
+## Span, trace, session
+
+<CardGroup cols={3}>
+  <Card title="Span" icon="minus">
+    One recorded operation — a single LLM call, tool call, or agent step. A span
+    carries `model`, tokens, cost, latency, status, and any guardrail verdicts.
+  </Card>
+  <Card title="Trace" icon="diagram-project">
+    One agent **run** — a root span plus its child spans, linked by
+    `parent_span_id`. `/traces` shows one row per trace with rolled-up cost,
+    tokens, duration, and error count.
+  </Card>
+  <Card title="Session" icon="comments">
+    A multi-turn **conversation** — several traces grouped by
+    `gen_ai.conversation_id`. `/sessions` shows per-session turns, cost, and tokens.
+  </Card>
+</CardGroup>
+
+**A trace is not a span.** A single agent run that makes 6 LLM calls and 3 tool
+calls is **one trace** containing **~10 spans**. The list views count traces; the
+detail view (the transcript spine) renders the spans inside one trace.
+
+```
+session  (conversation)
+└─ trace  (one agent run)
+   ├─ span  gen_ai.chat        model=claude-sonnet-4-6  tokens=1,204  cost=$0.006
+   ├─ span  tool.call          name=search              latency=210ms
+   └─ span  gen_ai.chat        model=claude-sonnet-4-6  tokens=880    cost=$0.004
+```
+
+## Organization, project, environment
+
+- **Organization** — your workspace. An org maps 1:1 to a WorkOS Organization and
+  to an internal **tenant** UUID. All isolation is per-tenant: every ClickHouse
+  query runs `WHERE tenant_id = ?`, with the tenant taken from your validated JWT,
+  never a request body. (The WorkOS `org_id` is resolved to the internal tenant
+  UUID before any query — see [Tenant isolation](/security/tenant-isolation).)
+- **Project** — a logical app or agent **within** an org. Project scope adds a
+  `project_id` dimension on spans, and queries extend to
+  `WHERE tenant_id = ? AND project_id = ?`.
+- **Environment** — a promotion stage for prompt versions (`staging` →
+  `production`). Environments apply to [prompt promotion](/prompt-promotion), not
+  to trace storage.
+
+## How usage is metered
+
+Billing is measured in **traces**, not spans and not raw gateway calls. Each plan
+includes a monthly **trace** quota *and* a separate **gateway-call** quota (for
+example, Builder includes 150K traces + 150K gateway calls). Above the included
+trace quota, overage meters at **$1.20 per 10K traces**, up to a **5× hard cap** —
+past which the gateway returns HTTP 429. See [Pricing](/pricing) for the exact
+per-tier numbers (they are the source of truth).
+
+Tenants with no billing account — OSS self-host and unbilled workspaces — are
+**never metered**.
+
+<Note>
+**What this page does not settle yet.** Per-project API keys and the `project_id`
+dimension are newly landed and rolling out. The exact accounting rules for
+partial-trace and failed-request metering are defined by the pricing configuration
+in Polar, not by this page — always reconcile any usage number against
+[Pricing](/pricing) and your Polar dashboard.
+</Note>
+
+## Related
+
+- [Quickstart](/quickstart) — send your first traced call
+- [Pricing](/pricing) — quotas, overage, seat caps
+- [Architecture](/architecture) — how traces are captured and stored
+- [Audit ledger](/audit-ledger) — how each event is made provable

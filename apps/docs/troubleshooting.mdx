@@ -1,0 +1,181 @@
+---
+title: Troubleshooting
+description: Common errors, debug checklist, and where to look when things go wrong.
+---
+
+## Debug checklist
+
+When something isn't working, run through this list first:
+
+```bash
+# 1. Is the gateway running and healthy?
+curl $TRACELANE_GATEWAY_URL/health
+# Expected: {"status":"ok","service":"tracelane-gateway"}
+
+# 2. Is the API key valid?
+curl $TRACELANE_GATEWAY_URL/v1/chat/completions \
+  -H "Authorization: Bearer $TRACELANE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
+# Expected: a valid chat completion response
+
+# 3. Are traces landing?
+curl "$TRACELANE_GATEWAY_URL/v1/audit/export?since=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-5M +%Y-%m-%dT%H:%M:%SZ)" \
+  -H "Authorization: Bearer $TRACELANE_API_KEY" | head -3
+# Expected: NDJSON lines (empty if no traffic in the last 5 minutes is OK)
+```
+
+## Common errors
+
+### `401 Unauthorized`
+
+**Cause:** API key is missing, malformed, or revoked.
+
+**Fix:**
+- Confirm `TRACELANE_API_KEY` starts with `tlane_`.
+- Check the key hasn't been revoked in **Settings → API Keys**.
+- For JWT auth: confirm the `organizationId` claim is present and the JWKS URL
+  is reachable from the gateway.
+
+```bash
+# Decode the JWT to inspect claims (no signature check)
+echo $JWT | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+### `403 Forbidden — entitlement check failed`
+
+**Cause:** The feature you're trying to use requires a higher plan.
+
+**Fix:** Check your current plan in **Settings → Billing**. See the [pricing
+page](https://tracelane.dev/#pricing) for which features are on which tier.
+
+### `429 Too Many Requests`
+
+**Cause:** Per-tenant rate limit exceeded.
+
+**Fix:** The gateway uses a token-bucket rate limiter per tenant. Implement
+exponential backoff with jitter. The `Retry-After` header gives the wait time
+in seconds.
+
+```python
+import time, httpx, random
+
+for attempt in range(5):
+    res = client.messages.create(...)
+    if res.status_code != 429:
+        break
+    wait = int(res.headers.get("retry-after", 2 ** attempt))
+    time.sleep(wait + random.uniform(0, 1))
+```
+
+### `502 Bad Gateway` from provider
+
+**Cause:** The upstream LLM provider returned an error (5xx, rate limit, or timeout).
+
+**Fix:** The gateway automatically fails over on upstream **500 / 502 / 503 /
+504** along a fixed cross-provider chain (**Anthropic → OpenAI → Google**). A
+429 is not eligible for failover — it is returned to you with `Retry-After`. If
+failover is exhausted, or the request targets a single provider with no
+downstream in the chain, the upstream error is proxied back. Per-model,
+config-driven failover chains are on the roadmap — see
+[Failover](/providers#failover).
+
+### `predictive.verdict = block` — request blocked by guardrail
+
+**Cause:** A predictive guardrail blocked the request before it reached the provider.
+
+**Fix:** Check which guard fired — it's recorded in the trace span attributes
+(and, when present, the `x-tracelane-guard` response header). Use `tlane explain`
+or the MCP tool `explain_guardrail_block` for a detailed breakdown.
+
+```bash
+# Get full explanation
+tlane explain <span_id>
+```
+
+Switching a guard from `block` to `warn` is a workspace policy setting;
+per-guard `tracelane.yaml` toggles are on the roadmap.
+
+### Traces not appearing in the dashboard
+
+**Possible causes:**
+
+1. **SDK not initialized** — confirm `tracelane.init(endpoint=…, api_key=…)`
+   runs at startup (both arguments are required; there is no env-var auto-read).
+2. **Client not wrapped** — constructing a client does not capture it. Call the
+   matching `instrument_*` on each client after `init()`. `auto_instrument()`
+   only covers anthropic, openai, litellm, and claude_code — everything else
+   needs an explicit `instrument_*` call.
+3. **Wrong endpoint** — for the SDK, `endpoint` must be an OTLP receiver you run;
+   for the gateway-proxy path, your client's base URL must point to the gateway,
+   not the dashboard.
+4. **On Tracelane Cloud** — Cloud does not expose a public OTLP endpoint, so the
+   SDK's `init({ endpoint })` path won't reach it. Use the gateway-proxy path
+   (point your client's base URL at the gateway) for Cloud.
+5. **Ingest lag** — spans can take up to 5 seconds to appear after the request.
+   Wait 10 seconds and refresh.
+6. **Sampling rate** — if `sample_rate < 1.0`, only a fraction of requests are
+   captured.
+
+To force pending spans out (e.g. in a short-lived script), call `shutdown()` at
+exit and confirm your OTLP receiver / gateway logs show the delivery:
+
+```python
+from tracelane import shutdown
+shutdown()  # flushes the batch span processor
+```
+
+### ClickHouse connection errors (self-host)
+
+```
+Error: ClickHouse: Failed to connect to ch.example.com:8123
+```
+
+**Fix:**
+- Confirm `CLICKHOUSE_URL` is reachable from the gateway container.
+- For Neon ClickHouse: confirm the connection string uses HTTP, not HTTPS,
+  unless your cluster terminates TLS.
+- Check `docker compose logs clickhouse` for startup errors.
+
+### WorkOS webhook not provisioning tenants
+
+**Symptoms:** User signs in but has no tenant row in Postgres; dashboard shows
+"No organization in session" error.
+
+**Fix:**
+1. In WorkOS dashboard → **Webhooks**, confirm the webhook is pointing to
+   `https://gateway.<your-domain>/v1/webhooks/workos` and is `active`.
+2. Check gateway logs for `workos_webhook` entries:
+   ```bash
+   cargo run -p gateway 2>&1 | grep workos_webhook
+   ```
+3. Confirm `WORKOS_WEBHOOK_SECRET` matches what's shown in the WorkOS dashboard.
+4. Replay the failed webhook events from the WorkOS dashboard.
+
+## Enable debug logging
+
+```bash
+# Gateway — verbose JSON logs
+RUST_LOG=debug cargo run -p gateway
+
+# SDK — Python (the OTLP exporter logs to the root logger)
+import logging
+logging.basicConfig(level=logging.DEBUG)
+import tracelane
+tracelane.init(endpoint="http://localhost:4318", api_key="tlane_...")
+
+# SDK — TypeScript
+TRACELANE_LOG_LEVEL=debug node your-agent.js
+```
+
+## Get help
+
+- **GitHub Issues:** [github.com/tracelane/tracelane/issues](https://github.com/tracelane/tracelane/issues)
+- **Discussions:** [github.com/tracelane/tracelane/discussions](https://github.com/tracelane/tracelane/discussions)
+- **Email:** support@tracelane.dev (Business+ SLA applies)
+
+## Related
+
+- [Self-hosting](/self-hosting)
+- [API reference](/api-reference)
+- [Security](/security)

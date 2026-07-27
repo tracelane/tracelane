@@ -1,0 +1,128 @@
+---
+title: Migrating from LangSmith
+description: Replace LangSmith tracing with Tracelane in minutes — keep your LangChain code unchanged.
+---
+
+LangSmith traces LangChain pipelines well but stops there. It has no gateway
+(you still pay full retail to providers), no predictive guardrails, no
+tamper-evident audit trail, and no support for frameworks outside the LangChain
+ecosystem.
+
+Tracelane's LangChain adapter is a drop-in replacement for LangSmith tracing.
+
+## What changes
+
+| Capability | LangSmith | Tracelane |
+|---|---|---|
+| Frameworks supported | LangChain only | 18+ (OpenAI, Anthropic, CrewAI, AutoGen, MCP, …) |
+| LLM gateway / BYOK | No | Yes — 30+ providers, 0 % markup |
+| Predictive guardrails | No | 8 inline guards, combined inline at the gateway |
+| Tamper-evident audit log | No | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
+| Prompt versioning + gates | Limited | Prompt promotion + auto-rollback live; eval-gate enforcement dark-launched (V1.1) |
+| Time-travel replay | No | Yes — model-swap, prompt-swap |
+| Self-hostable | Enterprise Self-Hosted SKU only | Yes — Apache 2.0, Docker Compose + Helm |
+
+## Step 1 — Install the SDK
+
+```bash
+pip install tracelane
+```
+
+## Step 2 — Replace the LangSmith init
+
+Before:
+
+```python
+from langsmith import Client
+client = Client()
+# LangSmith tracing wired via environment:
+# LANGCHAIN_TRACING_V2=true
+# LANGCHAIN_API_KEY=ls__...
+```
+
+After:
+
+Tracelane captures your LangChain traces by routing the calls through the
+gateway (next step) — there is no tracing env var and no SDK auto-instrumentation
+of LangChain to wire up. Just set your key:
+
+```bash
+export TRACELANE_API_KEY=tlane_...
+```
+
+Remove `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, and `LANGSMITH_PROJECT`
+from your environment.
+
+## Step 3 — Point your LangChain clients at the gateway
+
+The Tracelane gateway is OpenAI-compatible. LangChain's `ChatOpenAI` and
+`ChatAnthropic` accept a `base_url` / `api_base` override:
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+# OpenAI-compatible providers
+llm = ChatOpenAI(
+    model="gpt-4o",
+    base_url="https://gateway.tracelane.dev/v1",
+    api_key="tlane_...",  # Tracelane wraps your provider key via BYOK
+)
+
+# Anthropic
+llm = ChatAnthropic(
+    model="claude-sonnet-4-6",
+    base_url="https://gateway.tracelane.dev",
+    api_key="tlane_...",
+)
+```
+
+Your LCEL chains, agents, and tools continue to work unchanged.
+
+## Step 4 — (Optional) Remove the LangSmith SDK
+
+```bash
+pip uninstall langsmith
+```
+
+If you used `@traceable` decorators for custom spans, replace with Tracelane's
+OTel-based custom span API:
+
+```python
+# LangSmith
+from langsmith import traceable
+
+@traceable
+def my_function(x):
+    ...
+
+# Tracelane — standard OpenTelemetry API
+from opentelemetry import trace
+
+tracer = trace.get_tracer("my-app")
+with tracer.start_as_current_span("my_function") as span:
+    span.set_attribute("input", x)
+    ...
+```
+
+## Migrating existing LangSmith traces
+
+Export from LangSmith and import into Tracelane:
+
+```bash
+# Export from LangSmith (LangSmith CLI)
+langsmith export --project my-project --output langsmith_export.jsonl
+
+# Import into Tracelane
+tlane import langsmith langsmith_export.jsonl
+```
+
+Historical traces are read-only after import — they appear in the Traces view
+with an `imported` tag.
+
+## Related
+
+- [SDK — Python](/sdk-python)
+- [Architecture](/architecture)
+- [Prompt Promotion](/prompt-promotion)
+- [Migrating from LiteLLM](/migrations/from-litellm)

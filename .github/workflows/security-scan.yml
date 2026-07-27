@@ -1,0 +1,153 @@
+name: Security Scan
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # Daily 06:00 UTC
+  workflow_dispatch:
+
+# Moved off per-push (2026-06-06 CI cost pass): the heaviest workflow — 7 jobs,
+# two `cargo install`-from-source (cargo-audit, cargo-deny) + grype DB refresh.
+# Runs nightly + on demand. NB this trades per-push vuln/secret detection for a
+# ≤24h-delayed nightly scan; pre-commit gitleaks remains the per-push secret
+# backstop, and `gh workflow run "Security Scan"` runs it on demand before a cut.
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: cargo audit (Rust deps)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+
+      - name: pnpm audit (Node deps)
+        run: pnpm audit --audit-level=high
+
+  container-scan:
+    name: Container image scan (Grype)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # Run the version-pinned grype binary directly. IMPORTANT: grype v0.112
+      # does NOT auto-discover ./.grype.yaml from cwd for a `dir:` source — it
+      # was silently scanning node_modules + ignoring our ignore/exclude rules
+      # (verified 2026-07-06: excluded npm pkgs were still flagged). Pass it
+      # EXPLICITLY with --config so the ignores (go-module/wasmtime/vite/vitest/
+      # rustls-webpki) + excludes (target/node_modules) actually apply.
+      - name: Install grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.112.0/install.sh \
+            | sh -s -- -b /usr/local/bin v0.112.0
+      - name: Grype filesystem scan
+        # --exclude on the CLI (reliable) drops the dev-tool npm trees the config
+        # `exclude:` didn't; --config carries the Rust-crate ignores (wasmtime/
+        # rustls-webpki off-by-default/transitive-unreachable). vite/vitest/
+        # esbuild/babel live only under node_modules (build/test tooling).
+        # --config is REQUIRED (grype v0.112 does not auto-discover ./.grype.yaml
+        # for a `dir:` source). The .grype.yaml ignore rules are PACKAGE-ONLY —
+        # see its schema note: `vulnerability: "*"` was a literal match on a vuln
+        # verified locally against grype v0.112: exit 0). Kept FATAL — the ignores
+        # are real, not a `continue-on-error` bypass.
+        run: grype dir:. --fail-on high --config .grype.yaml --exclude './**/node_modules/**'
+
+  osv-scan:
+    name: OSV-Scanner (vuln database scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # The google/osv-scanner-action pin was unresolvable ("Top level 'runs:'
+      # section is required" — the action moved to a reusable-workflow
+      # interface). Run the version-pinned binary directly instead.
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/download/v1.9.2/osv-scanner_linux_amd64 \
+            -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+      - name: OSV-Scanner
+        # --config loads osv-scanner.toml (justified ignores aligned with
+        # cargo-audit/pnpm-audit; the one real finding, jsonwebtoken, was
+        # bumped not ignored). See .
+        run: osv-scanner scan --recursive --skip-git --config osv-scanner.toml ./
+
+  # NOTE: the fast secret scan (gitleaks) + .pth scan moved to ci.yml as a
+  # per-push gate (2026-06-06) — secret detection is the one check where
+  # push-time matters. This nightly workflow keeps the SLOW Rust vuln scans
+  # (cargo-audit, cargo-deny, grype, osv-scanner) + no-openssl.
+
+  no-openssl-check:
+    name: Verify no openssl in Rust deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+
+      - name: Check openssl not in dependency tree
+        run: |
+          # openssl-probe is a benign probe utility (detects system paths, no crypto).
+          # openssl-sys would mean actual OpenSSL linkage — that is what we block.
+          if cargo tree 2>/dev/null | grep -i "openssl" \
+              | grep -v "aws-lc-sys\|ring\|rustls\|openssl-probe"; then
+            echo "ERROR: openssl found in dependency tree — use ring/rustls/aws-lc-rs only"
+            exit 1
+          fi
+          echo "openssl check: clean (only ring/rustls/aws-lc-rs + probe present)"
+
+  cargo-deny:
+    # A16: `cargo-deny` is strictly stronger than the `cargo tree | grep`
+    # heuristic above — checks `bans`, `licenses`, `advisories`, and `sources`
+    # against the canonical config in `deny.toml` (cargo-deny's default config
+    # name — was misnamed `cargo-deny.toml`, so the local verify-all gate ran
+    # config-less and rejected every license). Both jobs run so any future
+    # regression in either dimension is caught.
+    name: cargo-deny (bans + licenses + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.19.8
+
+      - name: Run cargo-deny
+        # `--all-features` so the deny gate covers feature-gated deps too
+        # (wasmtime, ort, etc.). Exits non-zero on any violation. Uses the
+        # default `deny.toml` (no --config) so it matches the local verify-all gate.
+        run: cargo deny --all-features check

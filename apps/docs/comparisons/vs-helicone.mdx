@@ -1,0 +1,52 @@
+---
+title: Tracelane vs Helicone
+description: Apache 2.0 full-stack alternative to Helicone. One-command config + env migration via `tlane migrate helicone`.
+---
+
+Helicone was reported to have been acquired by Mintlify in early 2026 (per press coverage; treat the specifics as unconfirmed).
+
+Helicone's `ai-gateway` is GPL-3.0 — viral copyleft that is unworkable for many enterprise legal reviews. Tracelane is Apache 2.0 across the entire stack.
+
+## How we compare
+
+| Claim | Tracelane | Helicone |
+|---|---|---|
+| License (full stack) | Apache 2.0 | Helicone OSS observability MIT; ai-gateway GPL-3.0 |
+| Maintenance posture | Active development | Reported Mintlify acquisition (early 2026) |
+| Gateway language | Rust | Rust (GPL-3.0 ai-gateway) |
+| Wire format | OTel GenAI semconv (canonical) | Helicone proprietary + OpenTelemetry partial |
+| Predictive guardrails | Inline heuristic guardrails | — |
+| Tamper-evident audit ledger | $999 add-on SKU (tamper-evident hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap) | — |
+| Auto-rollback on objective metrics | Yes, EWMA-based | — |
+| Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
+| Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |
+| BYOK | Envelope encryption, AAD bound to (tenant_id, provider_id) | Supported |
+
+## Migration
+
+```bash
+tlane migrate helicone --apply
+```
+
+This scans your `.env*` files and SDK call sites, then rewrites the Helicone base URL and
+auth headers (`Helicone-Auth`) to their Tracelane equivalents — a config + environment
+migration, shown as a diff before writing. It does **not** import historical trace data.
+Most teams cut over the same afternoon; new traces flow from the moment you redeploy.
+
+## FAQ
+
+<AccordionGroup>
+
+<Accordion title="Does Tracelane copy any Helicone code?">
+No. Helicone's `ai-gateway` is GPL-3.0. Copying any of it would taint the Apache 2.0 Tracelane stack with viral copyleft. We reference patterns at most; we copy zero code. CLAUDE.md banned-dependency list enforces this.
+</Accordion>
+
+<Accordion title="Is Tracelane feature-equivalent to Helicone?">
+Tracelane covers 30+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. It adds inline predictive guardrails, tamper-evident audit ledger, and the Prompt Promotion workflow Helicone does not ship.
+</Accordion>
+
+<Accordion title="What happens to my historical Helicone data?">
+Your historical traces stay where they are — `tlane migrate helicone` is a config + environment migration, not a trace-data importer, so it does not pull your past Helicone traces across. New traces flow into Tracelane from the moment you redeploy. A historical-trace importer (Helicone JSON dump → OTel GenAI semconv) is on the roadmap; until it ships, export from Helicone for archival and start fresh in Tracelane.
+</Accordion>
+
+</AccordionGroup>

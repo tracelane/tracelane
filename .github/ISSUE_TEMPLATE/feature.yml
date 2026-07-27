@@ -1,0 +1,61 @@
+name: Feature request
+description: Suggest a new capability or improvement
+labels: ["enhancement", "triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature. Please describe the problem you're trying to solve,
+        not just the solution — that helps us find the best approach.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What problem does this feature solve? What's the current pain point?
+      placeholder: "When I'm running a LangGraph agent, I can't tell which step caused the cost overrun because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe what you'd like to see. Include mockups or examples if helpful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you've considered.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component does this affect?
+      options:
+        - Gateway
+        - Ingest / observability
+        - Dashboard
+        - MCP server
+        - Python SDK
+        - TypeScript SDK
+        - CLI (`tlane`)
+        - Predictive guardrails
+        - Eval suite
+        - Documentation
+        - New component
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compat
+    attributes:
+      label: Compatibility
+      options:
+        - label: This is a breaking change
+        - label: This requires a schema migration
+        - label: This affects the hot-path performance budget

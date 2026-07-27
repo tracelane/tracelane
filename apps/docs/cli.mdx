@@ -1,0 +1,148 @@
+---
+title: tlane — CLI
+description: Project bootstrap, trace inspection, evals, prompt versioning, audit verification, migrations.
+---
+
+The `tlane` CLI is the operator-side companion to the Tracelane gateway.
+
+```bash
+npm install -g @tracelanedev/cli
+# or
+npx tlane <command>
+```
+
+All commands respect:
+
+| Var | Purpose | Default |
+|---|---|---|
+| `TRACELANE_API_KEY` | Tenant API key (`tlane_<base62>`) | required for live commands |
+| `TRACELANE_GATEWAY_URL` | Gateway base URL | `https://gateway.tracelane.dev` |
+| `TRACELANE_TRACE_CONTENT` | Capture full prompt/response in spans | `false` |
+
+## Commands
+
+### `tlane init`
+
+Initialise Tracelane in the current project. Creates `.env` with
+`TRACELANE_*` placeholders, installs the right SDK, and instruments any
+detected agent framework.
+
+```bash
+tlane init
+tlane init --endpoint https://gateway.acme.internal
+```
+
+### `tlane trace <traceId>`
+
+Fetch and render a trace. Fetches the trace directly from the Tracelane API
+using `TRACELANE_API_KEY` (tenant-scoped, same auth as the dashboard).
+
+```bash
+tlane trace 9f2c8a1b...                         # default: table
+tlane trace 9f2c8a1b... --format json
+tlane trace 9f2c8a1b... --format timeline       # ASCII waterfall
+```
+
+### `tlane eval run` / `tlane eval list`
+
+Drive the Python eval orchestrator. `eval run` is what CI calls.
+
+```bash
+tlane eval run                                 # all suites
+tlane eval run --suite predictive --tag PR1
+tlane eval list --status red
+```
+
+Suites: `all`, `gateway`, `ingest`, `predictive`, `pain-points`,
+`fault-tolerance`. The merge gate is `--suite all`.
+
+### `tlane prompt list | show | promote | rollback | diff`
+
+Front-end for [B1 Prompt Promotion](/decisions/index).
+
+```bash
+tlane prompt list
+tlane prompt show pricing-v3
+tlane prompt promote pricing-v3 --to staging
+tlane prompt promote pricing-v3 --to production --eval-passed PP-PR1
+tlane prompt rollback pricing-v3 --env production
+tlane prompt diff pricing-v3 --from v7 --to v8
+```
+
+### `tlane verify <ledger.ndjson>`
+
+Verify a tamper-evident audit ledger. Re-runs the per-tenant SHA-256
+hash chain and checks the Ed25519 per-tenant signatures (both live), and
+prints the first divergence with line number. Anchored batches carry a
+resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), which
+`tlane verify` checks when present; universal per-run anchoring is on the
+roadmap.
+
+```bash
+tlane verify audit-2026-04.ndjson
+tlane verify audit-2026-04.ndjson --rekor-offline
+tlane verify audit-2026-04.ndjson --strict
+```
+
+The verifier is byte-identical across Rust, Python, and TypeScript.
+
+### `tlane export <pack> --output <dir>`
+
+Generate compliance evidence packs.
+
+| Pack | Coverage |
+|---|---|
+| `eu-ai-act-art12` | Transparency + audit logging |
+| `dpdp-phase-2` | India DPDP — data localisation + consent |
+
+```bash
+tlane export eu-ai-act-art12 --output ./evidence
+```
+
+### `tlane migrate helicone`
+
+Translate a Helicone configuration to Tracelane.
+
+```bash
+tlane migrate helicone                           # dry-run
+tlane migrate helicone --apply                   # write .env.tracelane
+tlane migrate helicone --apply --with-config --src src/
+```
+
+### `tlane import-litellm <litellm_config.yaml>`
+
+Translate a LiteLLM `model_list` to Tracelane gateway routing.
+
+```bash
+tlane import-litellm litellm_config.yaml --output tracelane.yaml
+```
+
+### `tlane replay <traceId>`
+
+Read-only time-travel viewer — fetches a recorded trace's spans and renders them
+step-by-step. It does **not** re-issue the request to a provider; cross-model
+re-execution is on the roadmap.
+
+```bash
+tlane replay 9f2c8a1b...
+tlane replay 9f2c8a1b... --format json
+tlane replay 9f2c8a1b... --endpoint https://gateway.tracelane.dev
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | User error (bad args, missing file, server 4xx) |
+| 2 | Operator error (gateway 5xx, network, auth) |
+| 3 | Eval / verifier divergence |
+| 4 | Compliance pack incomplete |
+
+CI: code 3 = hard merge block, code 4 = warning gate.
+
+## Related
+
+- [Quickstart](/quickstart)
+- [API reference](/api-reference)
+- [Onboarding](/onboarding)

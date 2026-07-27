@@ -1,0 +1,141 @@
+{
+	"name": "@tracelanedev/sdk",
+	"version": "0.1.0",
+	"description": "Tracelane TypeScript SDK — auto-instrument AI agent frameworks",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tracelane/tracelane.git",
+		"directory": "packages/sdk-typescript"
+	},
+	"homepage": "https://tracelane.dev",
+	"bugs": "https://github.com/tracelane/tracelane/issues",
+	"main": "./dist/index.js",
+	"module": "./dist/index.mjs",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": { "types": "./dist/index.d.mts", "default": "./dist/index.mjs" },
+			"require": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+		},
+		"./anthropic": {
+			"import": { "types": "./dist/instrumentations/anthropic.d.mts", "default": "./dist/instrumentations/anthropic.mjs" },
+			"require": { "types": "./dist/instrumentations/anthropic.d.ts", "default": "./dist/instrumentations/anthropic.js" }
+		},
+		"./openai": {
+			"import": { "types": "./dist/instrumentations/openai.d.mts", "default": "./dist/instrumentations/openai.mjs" },
+			"require": { "types": "./dist/instrumentations/openai.d.ts", "default": "./dist/instrumentations/openai.js" }
+		},
+		"./litellm": {
+			"import": { "types": "./dist/instrumentations/litellm.d.mts", "default": "./dist/instrumentations/litellm.mjs" },
+			"require": { "types": "./dist/instrumentations/litellm.d.ts", "default": "./dist/instrumentations/litellm.js" }
+		},
+		"./langchain": {
+			"import": { "types": "./dist/instrumentations/langchain.d.mts", "default": "./dist/instrumentations/langchain.mjs" },
+			"require": { "types": "./dist/instrumentations/langchain.d.ts", "default": "./dist/instrumentations/langchain.js" }
+		},
+		"./openrouter": {
+			"import": { "types": "./dist/instrumentations/openrouter.d.mts", "default": "./dist/instrumentations/openrouter.mjs" },
+			"require": { "types": "./dist/instrumentations/openrouter.d.ts", "default": "./dist/instrumentations/openrouter.js" }
+		},
+		"./langgraph": {
+			"import": { "types": "./dist/instrumentations/langgraph.d.mts", "default": "./dist/instrumentations/langgraph.mjs" },
+			"require": { "types": "./dist/instrumentations/langgraph.d.ts", "default": "./dist/instrumentations/langgraph.js" }
+		},
+		"./openai_agents": {
+			"import": { "types": "./dist/instrumentations/openai_agents.d.mts", "default": "./dist/instrumentations/openai_agents.mjs" },
+			"require": { "types": "./dist/instrumentations/openai_agents.d.ts", "default": "./dist/instrumentations/openai_agents.js" }
+		},
+		"./vercel_ai": {
+			"import": { "types": "./dist/instrumentations/vercel_ai.d.mts", "default": "./dist/instrumentations/vercel_ai.mjs" },
+			"require": { "types": "./dist/instrumentations/vercel_ai.d.ts", "default": "./dist/instrumentations/vercel_ai.js" }
+		},
+		"./mcp": {
+			"import": { "types": "./dist/instrumentations/mcp.d.mts", "default": "./dist/instrumentations/mcp.mjs" },
+			"require": { "types": "./dist/instrumentations/mcp.d.ts", "default": "./dist/instrumentations/mcp.js" }
+		},
+		"./claude_code": {
+			"import": { "types": "./dist/instrumentations/claude_code.d.mts", "default": "./dist/instrumentations/claude_code.mjs" },
+			"require": { "types": "./dist/instrumentations/claude_code.d.ts", "default": "./dist/instrumentations/claude_code.js" }
+		},
+		"./cursor": {
+			"import": { "types": "./dist/instrumentations/cursor.d.mts", "default": "./dist/instrumentations/cursor.mjs" },
+			"require": { "types": "./dist/instrumentations/cursor.d.ts", "default": "./dist/instrumentations/cursor.js" }
+		},
+		"./pinecone": {
+			"import": { "types": "./dist/instrumentations/pinecone.d.mts", "default": "./dist/instrumentations/pinecone.mjs" },
+			"require": { "types": "./dist/instrumentations/pinecone.d.ts", "default": "./dist/instrumentations/pinecone.js" }
+		},
+		"./qdrant": {
+			"import": { "types": "./dist/instrumentations/qdrant.d.mts", "default": "./dist/instrumentations/qdrant.mjs" },
+			"require": { "types": "./dist/instrumentations/qdrant.d.ts", "default": "./dist/instrumentations/qdrant.js" }
+		},
+		"./composio": {
+			"import": { "types": "./dist/instrumentations/composio.d.mts", "default": "./dist/instrumentations/composio.mjs" },
+			"require": { "types": "./dist/instrumentations/composio.d.ts", "default": "./dist/instrumentations/composio.js" }
+		},
+		"./browserbase": {
+			"import": { "types": "./dist/instrumentations/browserbase.d.mts", "default": "./dist/instrumentations/browserbase.mjs" },
+			"require": { "types": "./dist/instrumentations/browserbase.d.ts", "default": "./dist/instrumentations/browserbase.js" }
+		},
+		"./e2b": {
+			"import": { "types": "./dist/instrumentations/e2b.d.mts", "default": "./dist/instrumentations/e2b.mjs" },
+			"require": { "types": "./dist/instrumentations/e2b.d.ts", "default": "./dist/instrumentations/e2b.js" }
+		},
+		"./mem0": {
+			"import": { "types": "./dist/instrumentations/mem0.d.mts", "default": "./dist/instrumentations/mem0.mjs" },
+			"require": { "types": "./dist/instrumentations/mem0.d.ts", "default": "./dist/instrumentations/mem0.js" }
+		},
+		"./letta": {
+			"import": { "types": "./dist/instrumentations/letta.d.mts", "default": "./dist/instrumentations/letta.mjs" },
+			"require": { "types": "./dist/instrumentations/letta.d.ts", "default": "./dist/instrumentations/letta.js" }
+		},
+		"./firecrawl": {
+			"import": { "types": "./dist/instrumentations/firecrawl.d.mts", "default": "./dist/instrumentations/firecrawl.mjs" },
+			"require": { "types": "./dist/instrumentations/firecrawl.d.ts", "default": "./dist/instrumentations/firecrawl.js" }
+		}
+	},
+	"scripts": {
+		"build": "tsup",
+		"prepublishOnly": "pnpm run build",
+		"dev": "tsup --watch",
+		"lint": "biome check src/",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run --passWithNoTests"
+	},
+	"peerDependencies": {
+		"@anthropic-ai/sdk": ">=0.26.0",
+		"openai": ">=4.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@anthropic-ai/sdk": { "optional": true },
+		"openai": { "optional": true }
+	},
+	"dependencies": {
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/sdk-node": "^0.221.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+		"@opentelemetry/semantic-conventions": "^1.27.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"@opentelemetry/sdk-trace-base": "^2.0.0",
+		"@types/node": "^22.0.0",
+		"tsup": "^8.0.0",
+		"typescript": "^5.5.0",
+		"vitest": "^2.0.0"
+	},
+	"files": ["dist"],
+	"engines": { "node": "^18.19.0 || >=20.6.0" },
+	"license": "Apache-2.0",
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"keywords": [
+		"tracelane",
+		"opentelemetry",
+		"ai-observability",
+		"llm-tracing",
+		"instrumentation"
+	]
+}

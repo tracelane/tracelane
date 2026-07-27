@@ -1,0 +1,141 @@
+---
+title: Security
+description: Data residency, encryption, credential handling, and supply chain posture.
+---
+
+## Data residency
+
+| Data type | Where it lives | Retention |
+|---|---|---|
+| Spans (hot) | ClickHouse (your region) | Per plan: 7 days (Free) → 365 days (Enterprise) — see [pricing](/pricing) |
+| Spans (cold) | Cloudflare R2 (your bucket) | Until you delete the bucket object (no TTL) |
+| Tenant metadata, API keys | Neon Postgres (your region) | Until account deletion |
+| Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
+| Provider API keys | Postgres (envelope-encrypted) | Until revoked |
+| Prompt/completion text | ClickHouse spans | Same as spans (redact with `trace_content=false`) |
+
+<Note>
+**Current behavior:** hot spans carry a **365-day** storage backstop today, and
+per-plan trimming (7–365 days by tier) is rolling out — so until it ships, data may
+be retained **up to 365 days** regardless of plan. Longer-than-your-plan retention is
+never a shortcut around erasure: the delete below removes data immediately on request.
+</Note>
+
+For GDPR/CCPA right-to-erasure: `DELETE FROM tracelane.spans WHERE tenant_id = ?`
+plus a Postgres tenant deletion cascades all associated rows.
+
+## Provider key handling
+
+Provider API keys (Anthropic, OpenAI, etc.) are **envelope-encrypted at rest**
+with AES-256-GCM (`ring` AEAD). The workflow:
+
+1. Each provider key is sealed with AES-256-GCM under the deployment envelope
+   master key (`TRACELANE_CMK_KEY`).
+2. The ciphertext is bound with Additional Authenticated Data (AAD) =
+   `provider-key:<tenant_id>:<provider_id>`, so a ciphertext cannot be replayed
+   under another tenant or provider.
+3. The ciphertext (plus 16-byte GCM tag) is stored in Postgres. The plaintext
+   key never persists.
+4. On request dispatch, the provider key is decrypted in-memory, used for the
+   single request, and the plaintext is zeroed.
+
+You may also register a Customer-Managed Key **public-key fingerprint** in
+Settings → BYOK Keys for audit and labeling; it is recorded but does not itself
+wrap provider keys in V1. See [BYOK](/byok).
+
+Provider keys **never** appear in:
+- Logs (a `tracing` redaction layer scrubs `Authorization`, `x-api-key`,
+  `Bearer …`, OpenAI org IDs `org-…`, AWS access keys `AKIA…`)
+- Spans or trace attributes
+- Error messages or stack traces
+- Internal error/telemetry records (redacted before storage)
+
+## Transport
+
+- **TLS 1.3 minimum** on all external traffic. TLS 1.2 rejected.
+- **mTLS** on the ingest path between the gateway and ingest workers.
+- **HSTS** enforced on the dashboard domain.
+- No unencrypted HTTP accepted in production (redirect to HTTPS).
+
+## Tenant isolation
+
+Tenant isolation is **structural**, not policy-enforced:
+
+- Every ClickHouse query starts `WHERE tenant_id = ?` — CI grep blocks any new
+  SQL without it (see `scripts/ci/check-tenant-isolation.py`).
+- `tenant_id` always comes from the verified JWT claim (`organizationId` from
+  WorkOS), never from the request body, URL parameter, or MCP tool argument.
+- Postgres tables use foreign-key cascades — deleting a tenant row deletes all
+  associated API keys, CMK keys, and billing records atomically.
+- ClickHouse row-level policies (`getClientHeader('X-Tenant-Id')`) back the
+  prompt-promotion tables; the span hot tier is isolated by the mandatory
+  `WHERE tenant_id = ?` query wrapper (`TenantQuery`) plus the CI grep, not a
+  storage-engine policy on `spans`.
+
+## PII handling
+
+User-supplied span content (prompt/completion text) is wrapped in
+`<UNTRUSTED_USER_DATA>…</UNTRUSTED_USER_DATA>` before any internal LLM reads it.
+
+Redact at SDK level:
+
+```bash
+# Suppress all prompt/completion text from being sent
+TRACELANE_TRACE_CONTENT=false
+```
+
+An inline output PII-redaction pass (`[REDACTED:<type>]`) is on the roadmap.
+PR7 today is the entitlement-gated predictive trajectory guard, not an
+always-on span-output scrubber.
+
+## Authentication
+
+- **Dashboard:** WorkOS AuthKit — SSO (Google, Microsoft, GitHub), SAML, email OTP.
+- **Gateway:** `tlane_*` API keys (SHA-256 hash stored, raw key shown once) or
+  WorkOS JWT (`organizationId` claim used as `tenant_id`).
+- **MCP server:** `tlane_*` API key via env var (V1); OAuth 2.1 PKCE (V2).
+
+## SSRF protection
+
+The gateway's outbound HTTP client blocks all private + link-local destinations:
+RFC1918 (`10/8`, `172.16/12`, `192.168/16`), `100.64/10` (CGNAT), `169.254/16`
+(metadata services), IPv6 loopback and ULA (`::1`, `fc00::/7`).
+
+`file://` and `gopher://` schemes are rejected. Redirect chains are capped at 3.
+
+## Vulnerability scanning
+
+Every commit runs three independent scanners:
+
+| Scanner | What it checks |
+|---|---|
+| OSV-Scanner | CVEs in Rust, Node, and Python lockfiles |
+| Grype (`anchore/scan-action`) | Container image layers |
+| Syft (`anchore/sbom-action`) | CycloneDX SBOM attached to every release |
+
+Trivy is **not used** (CVE-2026-33634).
+
+## Supply chain
+
+- **All GitHub Actions are SHA-pinned** — no tag-pinned actions anywhere.
+- **Sigstore Cosign keyless** signing on every release artifact.
+- **SLSA Build Level 3** provenance via `slsa-framework/slsa-github-generator`.
+- **Trusted Publishing OIDC** for crates.io, npm, and PyPI — no long-lived tokens.
+- **CycloneDX SBOM** attached to every release.
+- **OpenSSF Scorecard** target ≥ 9.0.
+- **Container base:** Chainguard Wolfi only (`cgr.dev/chainguard/rust`,
+  `cgr.dev/chainguard/static`, `cgr.dev/chainguard/node`,
+  `cgr.dev/chainguard/python`).
+
+## Reporting vulnerabilities
+
+See [SECURITY.md](https://github.com/tracelane/tracelane/blob/main/SECURITY.md)
+for our responsible disclosure policy. We target a 72-hour acknowledgement SLA
+and 30-day patch SLA for critical vulnerabilities.
+
+## Related
+
+- [BYOK](/byok)
+- [Audit ledger](/audit-ledger)
+- [Architecture](/architecture)
+- [Self-hosting](/self-hosting)

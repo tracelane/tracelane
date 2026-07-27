@@ -1,0 +1,68 @@
+---
+title: SLO dashboard
+description: Track error-budget burn rate for your AI agents on the SLO dashboard.
+---
+
+The SLO dashboard tracks the error-budget burn rate for your AI agents against
+an availability target, so you can see when the budget is burning faster than
+expected — before you miss it for the month.
+
+## Core concepts
+
+| Term | Definition |
+|---|---|
+| **SLI** | Service Level Indicator — the metric being measured (e.g. success rate) |
+| **SLO** | Service Level Objective — the target (e.g. 99% success over 30 days) |
+| **Error budget** | 100% − SLO target. At 99% SLO, 1% of requests can fail per month. |
+| **Burn rate** | How fast the error budget is being consumed relative to the budget window. |
+
+A burn rate of 1.0 means you are exactly on track to use the full budget by
+the end of the window. A burn rate of 14.4 means you will exhaust the monthly
+budget in 2 hours if the current rate continues.
+
+## Configuration & alerting (roadmap)
+
+Today the dashboard tracks the burn rate against a default availability target.
+Per-SLO configuration (custom SLIs, targets, windows) and **burn-rate alerting**
+are on the near-term roadmap. When alerting ships, breaches are delivered to a
+**webhook you control** (Slack-compatible) or your existing monitoring
+integration. Watch the changelog for availability.
+
+## Dashboard
+
+The `/slo` page in the dashboard shows:
+
+- **Error budget remaining** — percentage and absolute count against the
+  availability target.
+- **Burn rate** — how fast the error budget is being consumed relative to the
+  window.
+- **Per (provider, model) latency** — p50 / p95 / p99 and error rate from the
+  hourly rollups.
+- **Top failing requests** — the traces that contributed most to budget burn,
+  linked directly to the trace viewer.
+
+## API
+
+```bash
+curl "https://gateway.tracelane.dev/v1/slo" -H "Authorization: Bearer tlane_..."
+```
+
+Returns hourly SLO rollups per (provider, model):
+
+```json
+[
+  { "bucket_hour": "2026-07-15T14:00:00Z", "provider": "anthropic",
+    "model": "claude-sonnet-4-6", "p50_ms": 812.0, "p95_ms": 2140.0,
+    "p99_ms": 5300.0, "requests": 1284, "errors": 9,
+    "error_rate_pct": 0.70, "total_input_tokens": 0, "total_output_tokens": 41233 }
+]
+```
+
+Burn rate is derived client-side against a fixed **99.9%** availability target
+(`apps/web/app/slo/budget.ts`); there is no per-SLO `objective` field.
+
+## Related
+
+- [Architecture](/architecture) — performance budgets
+- [Predictive guardrails](/predictive-guardrails)
+- [API reference](/api-reference)

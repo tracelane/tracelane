@@ -1,0 +1,220 @@
+---
+title: Audit ledger
+description: Tamper-evident SHA-256 hash chain over every gateway-proxied call and guardrail verdict, independently verifiable. Ed25519 batch signing is live; Sigstore Rekor v2 public anchoring is live (best-effort) for the Audit add-on.
+---
+
+Every request through the Tracelane gateway is appended to a per-tenant,
+append-only SHA-256 **hash chain**. The chain is **tamper-evident**: any change
+to a past event — deletion, insertion, reorder, or modification — breaks the
+recomputed hash, and anyone holding an export can detect it without trusting
+Tracelane.
+
+<Note>
+**What the chain covers.** The chain records **every gateway-proxied call and
+guardrail verdict**. Spans captured via the OTLP/SDK path (self-host
+instrumentation — tool calls, agent steps, LLM calls not proxied through the
+gateway) are **full-fidelity in your trace store but not yet in the hash
+chain**; chaining them is on the roadmap.
+
+**What is live.** The SHA-256 hash chain is **appended for every tenant** (the
+chain itself is universal). For **Audit add-on** workspaces, each batch's Merkle
+root is additionally **Ed25519-signed and best-effort anchored to the public
+Sigstore Rekor v2 log** (`log2025-1.rekor.sigstore.dev`; first production anchor:
+log index `19398597`, 2026-07-13). Anchoring is **per Merkle batch (every 100
+events) — never per-event or per-trace**, and coverage is **not yet universal**:
+it grows as each batch closes and anchors. Anchoring is **best-effort** — if the
+public log is unreachable a batch stays signed-locally-but-not-yet-anchored, and
+the hash chain + Ed25519 signature still verify. **eIDAS QTSP timestamping remains
+on the roadmap.** Exporting the ledger for offline verification
+(`/v1/audit/export`, `tlane verify`) requires the **Audit add-on** (fail-closed);
+the hash chain is appended for every tenant, but offline self-verification is an
+Audit-add-on capability.
+</Note>
+
+The cryptographic-anchoring layer (Ed25519 + Rekor) is part of the standalone
+**Audit add-on** at $999/mo (Business+ base required).
+
+## How it works
+
+<Frame>
+  <img src="/images/audit-ledger-chain.svg" alt="Audit ledger chain: events → SHA-256 hash chain (live) → Merkle root → Ed25519 → Sigstore Rekor (live, best-effort)" />
+</Frame>
+
+```
+Request arrives at gateway
+        │
+        ▼
+  Audit event written to ClickHouse (hot tier)
+        │
+        ▼
+  Event appended to the per-tenant SHA-256 hash chain     ← LIVE
+  (each row hash binds the prior hash; domain-separated,
+   length-prefixed; universal, free tier included)
+        │
+        ▼
+  ── Audit SKU: cryptographic anchoring ──                 ← LIVE (Ed25519 + Rekor, best-effort)
+  Every N events (default: 100), a batch is assembled:
+    Merkle root of the batch
+    Ed25519 signature over the root (tenant's audit keypair)
+        │
+        ▼
+  Signed batch header posted to Sigstore Rekor
+  → Rekor returns an entry_id (globally timestamped, immutable)
+        │
+        ▼
+  entry_id written back to ClickHouse batch record
+```
+
+The result: the hash chain is self-verifying. Given any NDJSON export,
+`tlane verify` recomputes the chain and returns exit 0 (no gaps, no mutations)
+or exit 1 with a specific fault description. For Audit-add-on batches the same
+verifier additionally validates the Ed25519 signatures and, for anchored
+batches, the Rekor inclusion proofs.
+
+## Export
+
+<Note>
+`/v1/audit/export` (and `/v1/audit/summary`) require the **Audit add-on**
+entitlement and fail closed (HTTP 403) without it. The hash chain is appended
+for every tenant, but exporting the ledger for offline verification is an
+Audit-add-on capability. For anchored batches the export bundle includes the
+Rekor inclusion proof + signed checkpoint.
+</Note>
+
+```bash
+# Export all audit events since a date as NDJSON
+tlane export --since 2026-01-01 --format ndjson > audit.ndjson
+
+# Export as a ZIP package (manifest + batch headers; Rekor receipts for
+# anchored batches)
+tlane export --since 2026-01-01 --pack eu-ai-act-art12 > audit.zip
+
+# Available packs
+# eu-ai-act-art12     → EU AI Act Article 12 (agentic systems)
+# dpdp-phase-2        → India DPDP Phase 2
+```
+
+Or via API:
+
+```bash
+curl "https://gateway.tracelane.dev/v1/audit/export?since=2026-01-01" \
+  -H "Authorization: Bearer tlane_..." \
+  -o audit.ndjson
+```
+
+## Verify
+
+```bash
+# Verify NDJSON export hash chain (exits 0 on pass, 1 on fail)
+tlane verify audit.ndjson
+
+# Verbose output
+tlane verify --verbose audit.ndjson
+```
+
+Output on pass:
+
+```
+✓  Checked 42 batches, 4 200 events
+✓  All SHA-256 hashes match
+✓  No sequence gaps (event 1 … 4200 contiguous)
+✓  Ed25519 batch signatures — verified (per-tenant key)
+✓  Rekor inclusion proofs — verified for anchored batches (best-effort; unanchored batches verify via chain + Ed25519)
+Audit log is tamper-evident and intact.
+```
+
+Output on failure:
+
+```
+✗  Batch 17: SHA-256 mismatch on event 1 698
+     Expected: a3f1…
+     Got:      b9c2…
+     Possible cause: event modified or injected after anchoring.
+Exit code: 1
+```
+
+## Verifier availability
+
+The verifier ships in three languages so you can run it in your own pipeline
+without trusting Tracelane's toolchain:
+
+| Package | Install |
+|---|---|
+| Rust (reference) | `cargo install tlane-verifier` |
+| Python | `pip install tracelane-verifier` |
+| TypeScript | `npm install @tracelanedev/audit-verifier` |
+
+All three recompute the SHA-256 hash chain and produce identical output for the
+same input. The Rust verifier is the reference implementation; the Python and
+TypeScript versions are tested against the same conformance vectors in
+`evals/audit-ledger/`. (Ed25519 signature and — for anchored batches — Rekor
+inclusion-proof validation run in all three today.)
+
+## Audit event schema
+
+Each NDJSON line is one audit event:
+
+```json
+{
+  "event_id": "uuid-v7",
+  "tenant_id": "uuid",
+  "timestamp_us": 1748000000000000,
+  "kind": "llm_request",
+  "model": "claude-sonnet-4-6",
+  "provider": "anthropic",
+  "input_tokens": 512,
+  "output_tokens": 128,
+  "predictive_verdict": "warn",
+  "predictive_rule": "PR2",
+  "prompt_version_id": "uuid",
+  "trace_id": "uuid",
+  "span_id": "uuid",
+  "batch_seq": 42,
+  "sha256": "a3f1..."
+}
+```
+
+`kind` values: `llm_request`, `tool_call`, `a2a_handoff`, `prompt_promotion`,
+`rollback`, `api_key_created`, `api_key_revoked`, `cmk_rotation`, `policy_change`.
+
+## Batch header schema
+
+Each Audit-add-on batch carries a header. `ed25519_signature` is populated on
+every signed batch; `rekor_entry_id` is populated once the batch anchors (empty
+until then, not absent):
+
+```json
+{
+  "batch_seq": 42,
+  "tenant_id": "uuid",
+  "event_count": 100,
+  "first_event_id": "uuid",
+  "last_event_id": "uuid",
+  "merkle_root": "sha256-hex",
+  "ed25519_signature": "base64 (Audit add-on)",
+  "rekor_entry_id": "hex — populated on anchored batches"
+}
+```
+
+## Public key management
+
+The per-tenant Ed25519 audit keypair is live. Fetch the public key from
+`GET /v1/audit/pubkey` (or **Settings → Audit**) — it is the trust root the
+verifier uses to accept anchors. The private key is stored encrypted under your
+CMK when BYOK is enabled. Rotate it from **Settings → BYOK Keys** — the old key
+remains valid for verifying historical exports; only new batches use the new key.
+
+```bash
+# Export your current audit public key
+tlane export --public-key > audit-pubkey.pem
+
+# Verify a specific export with an explicit public key
+tlane verify --public-key audit-pubkey.pem audit.ndjson
+```
+
+## Related
+
+- [BYOK](/byok)
+- [Security](/security)
+- [CLI](/cli)
+- [API reference](/api-reference)

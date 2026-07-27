@@ -1,0 +1,9 @@
+outs:
+- md5: TODO-run-dvc-add-after-training
+  size: 0
+  path: trace_pairs.ndjson
+  desc: "Trajectory Guard training pairs (normal vs. failure) — 50K pairs"
+  meta:
+    generated_by: ml/trajectory_guard/dataset.py --synthetic
+    records: 50000
+    dvc_pull: dvc pull eval_corpus/trace_pairs.dvc

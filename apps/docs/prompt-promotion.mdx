@@ -1,0 +1,247 @@
+---
+title: Prompt Promotion
+description: Ship prompts like code — versioned promotion with a tamper-evident record. Eval-gate blocking, canary splits, and autonomous rollback are on the V1.1 roadmap.
+---
+
+Prompt Promotion is the B1 workflow that lets you move prompt versions from
+`staging` to `production` through automated eval checks, with auto-rollback
+if post-promotion metrics regress.
+
+**Pricing:** Read-only (view active version + history) on **Builder $59**.
+Full promotion workflow — create, gate, promote, auto-rollback — on **Team $249+**.
+
+## Core concepts
+
+| Concept | Description |
+|---|---|
+| **Prompt** | A named template managed by Tracelane (`/v1/prompts/:name`) |
+| **Version** | An immutable snapshot of a prompt's content, SHA-256 hashed |
+| **Environment** | `staging`, `canary`, or `production` |
+| **Eval gate** | A set of eval assertions that must pass before promotion |
+| **Auto-rollback** | Automatic revert if a metric drifts past a σ threshold post-promotion |
+
+## Workflow overview
+
+<Frame>
+  <img src="/images/prompt-promotion-flow.svg" alt="Prompt promotion flow: author → staging → eval gate → production → monitor → auto-rollback" />
+</Frame>
+
+```
+  Author a new version
+        │
+        ▼
+  Deploy to staging
+        │
+        ▼
+  Eval gate runs (all assertions must be green)
+        │ pass          │ fail
+        ▼               ▼
+  Promote to        Blocked — fix
+  production        the prompt
+        │
+        ▼
+  Monitor metrics (error rate, latency, token spend, eval score)
+        │ drifts > threshold
+        ▼
+  Auto-rollback fires → previous version restored
+```
+
+## Create and version prompts
+
+```bash
+# tlane CLI
+tlane prompt create my-agent-system \
+  --content "You are a helpful assistant..." \
+  --model-pin claude-sonnet-4-6
+
+# Push a new version to staging
+tlane prompt push my-agent-system \
+  --file prompts/system.txt \
+  --env staging
+```
+
+Or via the API:
+
+```bash
+curl -X POST https://gateway.tracelane.dev/v1/prompts/my-agent-system \
+  -H "Authorization: Bearer tlane_..." \
+  -d '{
+    "content": "You are a helpful assistant...",
+    "model_pin": "claude-sonnet-4-6",
+    "env": "staging"
+  }'
+```
+
+## Eval gates
+
+<Warning>
+**Roadmap (V1.1) — eval-gate blocking is not yet shipped.** What is **live today**
+is the versioned promotion itself: promote, rollback, and a **tamper-evident
+promotion record**. The eval **gate** does not yet run — there is no producer of
+`eval_runs` in production, so today every promotion is recorded as a tamper-evident
+**manual-override** decision with `eval_run_id: null`. The `tracelane.yaml` gate
+config, the streaming eval panel, and the `blocked_by_eval` response below are the
+**V1.1 shape**, shown here so the contract is stable — they are not exercised
+features yet. Nothing on this page auto-blocks a promotion today.
+</Warning>
+
+When eval gates ship (V1.1), a staging → production promotion will run your eval
+suite against the candidate version first, blocking promotion if any assertion
+fails. The planned configuration lives in `tracelane.yaml`:
+
+```yaml
+# V1.1 (roadmap) — no reader in the current gateway.
+prompts:
+  my-agent-system:
+    eval_gate:
+      suite: evals/smoke/
+      pass_threshold: 1.0      # 100% of assertions must pass
+      timeout_seconds: 120
+    auto_rollback:
+      metric: eval_score
+      window_minutes: 30
+      sigma_threshold: 2.0
+```
+
+The eval suite referenced here is the same format as the CI merge-gate suite.
+See [`evals/pain-points/INDEX.md`](https://github.com/tracelane/tracelane/blob/main/evals/pain-points/INDEX.md).
+
+## Promote via dashboard
+
+1. Open **Prompts → [prompt name]**.
+2. The panel shows the active version for each environment.
+3. Click **Promote staging → production**.
+4. The version is atomically swapped in production and a **tamper-evident
+   promotion record** is written. _(V1.1: when eval gates ship, the panel will
+   stream eval results here first and block on failure — today the promotion is
+   a recorded manual-override.)_
+
+## Promote via API
+
+```bash
+curl -X POST https://app.tracelane.dev/api/prompts/my-agent-system/promote \
+  -H "Authorization: Bearer $SESSION_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_env": "staging",
+    "to_env": "production",
+    "eval_run_id": "run_abc123",   # optional: attach a prior eval run
+    "notes": "Better refusal rate on jailbreak suite"
+  }'
+```
+
+Response on success:
+
+```json
+{
+  "promotion_id": "promo_xyz",
+  "decision": "promoted",
+  "from_version_id": "v_old",
+  "to_version_id": "v_new",
+  "eval_run_id": "run_abc123"
+}
+```
+
+Response on eval gate block _(V1.1 shape — the gate does not block promotions today)_:
+
+```json
+{
+  "promotion_id": "promo_xyz",
+  "decision": "blocked_by_eval",
+  "failed_assertions": ["PP-G1", "PP-PR4"],
+  "eval_run_id": "run_abc123"
+}
+```
+
+## Auto-rollback
+
+<Note>
+**How it works today:** rollback decisions are computed from metric observations
+**you report** to the observe endpoint. When you post an observation, Tracelane
+compares it to the pre-promotion baseline and, if it drifts more than
+`sigma_threshold` standard deviations within the observation window, returns a
+rollback decision (and reverts, under `rollback_mode: auto`). **Autonomous
+background monitoring** — Tracelane firing a rollback with no observation pushed
+to it — is on the **V1.1 roadmap**; today the drift math runs on the observations
+you feed it, not on a standalone monitor loop.
+</Note>
+
+When an observation drifts more than `sigma_threshold` standard deviations from
+the pre-promotion baseline within the observation window, the rollback fires per
+`rollback_mode`.
+
+| `rollback_mode` | What happens |
+|---|---|
+| `auto` | Reverted immediately without human input |
+| `suggested` | Dashboard shows a rollback suggestion; human confirms |
+| `human_confirmed` | Suggestion was accepted |
+| `dismissed` | Suggestion was dismissed |
+
+The history entry on the prompt detail page shows the trigger metric, observed
+value, sigma drift, and the version pair:
+
+```
+Auto-rollback fired (eval_score)  — 2.3σ drift, value 0.71 — v→a3b2c1 from v→d4e5f6
+```
+
+## Canary splits (Team+) — roadmap (V1.1)
+
+<Warning>
+**Not yet shipped.** Prompt-version traffic splitting — routing a percentage of
+requests to a candidate version — is on the V1.1 roadmap. There is no
+`traffic_pct` splitter in the current gateway. A `canary` **environment pointer**
+exists (you can pin and read a `canary` version), but traffic is **not** split by
+percentage today; promote/rollback operate on the full environment.
+</Warning>
+
+When it ships, you will route a percentage of traffic to a candidate version
+before full promotion:
+
+```yaml
+# V1.1 (roadmap) — no traffic_pct splitter in the current gateway.
+prompts:
+  my-agent-system:
+    canary:
+      version_id: v_new
+      traffic_pct: 10     # 10% → canary, 90% → production
+      min_requests: 500   # don't evaluate until enough data
+```
+
+After sufficient traffic, you will promote the canary to production via the same
+promote endpoint with `from_env: "canary"`.
+
+## Read the active version from your agent
+
+```python
+import httpx
+
+res = httpx.get(
+    "https://gateway.tracelane.dev/v1/prompts/my-agent-system",
+    params={"env": "production"},
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+prompt = res.json()["content"]
+```
+
+```typescript
+const res = await fetch(`${GATEWAY_URL}/v1/prompts/my-agent-system?env=production`, {
+  headers: { Authorization: `Bearer ${apiKey}` },
+});
+const { content } = await res.json();
+```
+
+The gateway caches prompt versions in memory — the hot path latency to resolve
+a prompt is `<1ms` p95.
+
+## Audit trail
+
+Every promotion, block, and rollback is written to the tamper-evident audit
+ledger with the version SHA-256, eval run ID, and actor. Use `tlane verify`
+to confirm the log has not been altered.
+
+## Related
+
+- [Eval gates](/eval-gates)
+- [Audit ledger](/audit-ledger)
+- [Predictive guardrails](/predictive-guardrails)
+- [API reference](/api-reference)

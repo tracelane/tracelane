@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="880" height="480" viewBox="0 0 880 480" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a"  markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#94A3B8"/>
+    </marker>
+    <marker id="ag" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#16A34A"/>
+    </marker>
+    <marker id="ar" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#DC2626"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="880" height="480" fill="#F8FAFC" rx="12"/>
+
+  <!-- Title -->
+  <text x="440" y="26" text-anchor="middle" font-size="13" font-weight="600" fill="#111827" font-family="'Inter',system-ui,sans-serif">Predictive Guardrail Layer — 8 Inline Guards</text>
+
+  <!-- ── REQUEST box ────────────────────────────────────────── -->
+  <rect x="24" y="38" width="832" height="48" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+  <text x="440" y="60" text-anchor="middle" font-size="12" font-weight="600" fill="#312E81" font-family="'Inter',system-ui,sans-serif">Incoming Request</text>
+  <text x="440" y="77" text-anchor="middle" font-size="10" fill="#6366F1" font-family="'Inter',system-ui,sans-serif">prompt + context + tool definitions + agent metadata</text>
+
+  <!-- Arrows: request → guards -->
+  <line x1="220" y1="86" x2="220" y2="110" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="440" y1="86" x2="440" y2="110" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="660" y1="86" x2="660" y2="110" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- ── ROW 1 GUARDS ───────────────────────────────────────── -->
+  <!-- PR1 -->
+  <rect x="24"  y="114" width="194" height="108" rx="8" fill="white" stroke="#FEE2E2" stroke-width="1.5"/>
+  <rect x="24"  y="114" width="194" height="28"  rx="8" fill="#FEE2E2"/>
+  <rect x="24"  y="134" width="194" height="8"   fill="#FEE2E2"/>
+  <text x="121" y="133" text-anchor="middle" font-size="10.5" font-weight="700" fill="#991B1B" font-family="'Inter',system-ui,sans-serif">PR1 — MCP Rug-pull</text>
+  <text x="121" y="156" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Tool schema / desc / hash</text>
+  <text x="121" y="172" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">mutation mid-session</text>
+  <text x="121" y="192" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;2 ms p95</text>
+  <rect x="34" y="202" width="74" height="14" rx="3" fill="#FEE2E2"/>
+  <text x="71"  y="213" text-anchor="middle" font-size="9" font-weight="600" fill="#DC2626" font-family="'Inter',system-ui,sans-serif">default: block</text>
+
+  <!-- PR2 -->
+  <rect x="234" y="114" width="194" height="108" rx="8" fill="white" stroke="#FEE2E2" stroke-width="1.5"/>
+  <rect x="234" y="114" width="194" height="28"  rx="8" fill="#FEE2E2"/>
+  <rect x="234" y="134" width="194" height="8"   fill="#FEE2E2"/>
+  <text x="331" y="133" text-anchor="middle" font-size="10.5" font-weight="700" fill="#991B1B" font-family="'Inter',system-ui,sans-serif">PR2 — Lethal Trifecta</text>
+  <text x="331" y="156" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Untrusted input + private</text>
+  <text x="331" y="172" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">data + external write</text>
+  <text x="331" y="192" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;3 ms p95</text>
+  <rect x="244" y="202" width="74" height="14" rx="3" fill="#FEE2E2"/>
+  <text x="281"  y="213" text-anchor="middle" font-size="9" font-weight="600" fill="#DC2626" font-family="'Inter',system-ui,sans-serif">default: block</text>
+
+  <!-- PR3 -->
+  <rect x="444" y="114" width="194" height="108" rx="8" fill="white" stroke="#FEF9C3" stroke-width="1.5"/>
+  <rect x="444" y="114" width="194" height="28"  rx="8" fill="#FEF9C3"/>
+  <rect x="444" y="134" width="194" height="8"   fill="#FEF9C3"/>
+  <text x="541" y="133" text-anchor="middle" font-size="10.5" font-weight="700" fill="#713F12" font-family="'Inter',system-ui,sans-serif">PR3 — A2UI Catalog</text>
+  <text x="541" y="156" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Agent UI surfaces vs</text>
+  <text x="541" y="172" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">published catalog</text>
+  <text x="541" y="192" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;1 ms p95</text>
+  <rect x="454" y="202" width="60" height="14" rx="3" fill="#FEF9C3"/>
+  <text x="484"  y="213" text-anchor="middle" font-size="9" font-weight="600" fill="#A16207" font-family="'Inter',system-ui,sans-serif">default: warn</text>
+
+  <!-- PR4 -->
+  <rect x="654" y="114" width="202" height="108" rx="8" fill="white" stroke="#FEE2E2" stroke-width="1.5"/>
+  <rect x="654" y="114" width="202" height="28"  rx="8" fill="#FEE2E2"/>
+  <rect x="654" y="134" width="202" height="8"   fill="#FEE2E2"/>
+  <text x="755" y="133" text-anchor="middle" font-size="10.5" font-weight="700" fill="#991B1B" font-family="'Inter',system-ui,sans-serif">PR4 — Prompt Injection</text>
+  <text x="755" y="156" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Llama Prompt Guard 2</text>
+  <text x="755" y="172" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">22 M ONNX · score &gt;0.85</text>
+  <text x="755" y="192" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;8 ms p95</text>
+  <rect x="664" y="202" width="74" height="14" rx="3" fill="#FEE2E2"/>
+  <text x="701"  y="213" text-anchor="middle" font-size="9" font-weight="600" fill="#DC2626" font-family="'Inter',system-ui,sans-serif">default: block</text>
+
+  <!-- ── ROW 2 GUARDS ───────────────────────────────────────── -->
+  <!-- PR5 -->
+  <rect x="24"  y="246" width="194" height="108" rx="8" fill="white" stroke="#FEF9C3" stroke-width="1.5"/>
+  <rect x="24"  y="246" width="194" height="28"  rx="8" fill="#FEF9C3"/>
+  <rect x="24"  y="266" width="194" height="8"   fill="#FEF9C3"/>
+  <text x="121" y="265" text-anchor="middle" font-size="10.5" font-weight="700" fill="#713F12" font-family="'Inter',system-ui,sans-serif">PR5 — Browser Loop</text>
+  <text x="121" y="288" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Sliding window (URL,</text>
+  <text x="121" y="304" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">DOM-action) unique ratio</text>
+  <text x="121" y="324" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;2 ms p95</text>
+  <rect x="34" y="334" width="60" height="14" rx="3" fill="#FEF9C3"/>
+  <text x="64"  y="345" text-anchor="middle" font-size="9" font-weight="600" fill="#A16207" font-family="'Inter',system-ui,sans-serif">default: warn</text>
+
+  <!-- PR6 -->
+  <rect x="234" y="246" width="194" height="108" rx="8" fill="white" stroke="#FEE2E2" stroke-width="1.5"/>
+  <rect x="234" y="246" width="194" height="28"  rx="8" fill="#FEE2E2"/>
+  <rect x="234" y="266" width="194" height="8"   fill="#FEE2E2"/>
+  <text x="331" y="265" text-anchor="middle" font-size="10.5" font-weight="700" fill="#991B1B" font-family="'Inter',system-ui,sans-serif">PR6 — A2A Handoff</text>
+  <text x="331" y="288" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Envelope schema · signed</text>
+  <text x="331" y="304" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">origin · no circular loops</text>
+  <text x="331" y="324" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;2 ms p95</text>
+  <rect x="244" y="334" width="74" height="14" rx="3" fill="#FEE2E2"/>
+  <text x="281"  y="345" text-anchor="middle" font-size="9" font-weight="600" fill="#DC2626" font-family="'Inter',system-ui,sans-serif">default: block</text>
+
+  <!-- PR7 -->
+  <rect x="444" y="246" width="194" height="108" rx="8" fill="white" stroke="#FEF9C3" stroke-width="1.5"/>
+  <rect x="444" y="246" width="194" height="28"  rx="8" fill="#FEF9C3"/>
+  <rect x="444" y="266" width="194" height="8"   fill="#FEF9C3"/>
+  <text x="541" y="265" text-anchor="middle" font-size="10.5" font-weight="700" fill="#713F12" font-family="'Inter',system-ui,sans-serif">PR7 — Output Policy</text>
+  <text x="541" y="288" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Regex (PII, creds) then</text>
+  <text x="541" y="304" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">1B SLM judge on L4 GPU</text>
+  <text x="541" y="324" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;12 ms p95</text>
+  <rect x="454" y="334" width="60" height="14" rx="3" fill="#FEF9C3"/>
+  <text x="484"  y="345" text-anchor="middle" font-size="9" font-weight="600" fill="#A16207" font-family="'Inter',system-ui,sans-serif">default: warn</text>
+
+  <!-- PR8 -->
+  <rect x="654" y="246" width="202" height="108" rx="8" fill="white" stroke="#FEF9C3" stroke-width="1.5"/>
+  <rect x="654" y="246" width="202" height="28"  rx="8" fill="#FEF9C3"/>
+  <rect x="654" y="266" width="202" height="8"   fill="#FEF9C3"/>
+  <text x="755" y="265" text-anchor="middle" font-size="10.5" font-weight="700" fill="#713F12" font-family="'Inter',system-ui,sans-serif">PR8 — Argument Drift</text>
+  <text x="755" y="288" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">Mahalanobis distance on</text>
+  <text x="755" y="304" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="'Inter',system-ui,sans-serif">tool-call args · 4σ alert</text>
+  <text x="755" y="324" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0F62FE" font-family="'Inter',system-ui,sans-serif">&lt;3 ms p95</text>
+  <rect x="664" y="334" width="60" height="14" rx="3" fill="#FEF9C3"/>
+  <text x="694"  y="345" text-anchor="middle" font-size="9" font-weight="600" fill="#A16207" font-family="'Inter',system-ui,sans-serif">default: warn</text>
+
+  <!-- ── OUTCOME ROW ─────────────────────────────────────────── -->
+  <!-- All pass → Provider -->
+  <line x1="440" y1="354" x2="440" y2="380" stroke="#16A34A" stroke-width="2" marker-end="url(#ag)"/>
+
+  <rect x="24"  y="384" width="544" height="52" rx="8" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="296" y="409" text-anchor="middle" font-size="12" font-weight="600" fill="#166534" font-family="'Inter',system-ui,sans-serif">All guards pass → Provider Router → LLM</text>
+  <text x="296" y="427" text-anchor="middle" font-size="10" fill="#16A34A" font-family="'Inter',system-ui,sans-serif">inline pre-flight, observe-first  ·  fail-open on ONNX crash (FT-05)</text>
+
+  <!-- Any block → Rejected -->
+  <rect x="584" y="384" width="272" height="52" rx="8" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+  <text x="720" y="409" text-anchor="middle" font-size="12" font-weight="600" fill="#991B1B" font-family="'Inter',system-ui,sans-serif">Any guard blocks → Rejected</text>
+  <text x="720" y="427" text-anchor="middle" font-size="10" fill="#DC2626" font-family="'Inter',system-ui,sans-serif">verdict + rule ID returned to caller</text>
+
+  <!-- Line from block guards to rejection box -->
+  <line x1="755" y1="354" x2="720" y2="382" stroke="#DC2626" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ar)"/>
+
+</svg>

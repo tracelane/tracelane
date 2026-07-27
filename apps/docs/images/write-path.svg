@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 540" role="img"
+     aria-labelledby="wp-title wp-desc" font-family="ui-sans-serif, system-ui, sans-serif">
+  <title id="wp-title">Tracelane write path</title>
+  <desc id="wp-desc">A request flows from the client into the Rust gateway, which
+    authenticates the WorkOS JWT into an internal tenant UUID, applies rate and quota
+    limits, runs inline pre-flight guardrail rails, appends the per-tenant audit hash
+    chain, and dispatches to the upstream provider. Emitted spans travel over NATS
+    JetStream to the Rust ingest workers, which validate, tail-sample, and continue the
+    chain, then write to ClickHouse hot storage and R2 cold storage batched at one
+    megabyte in the EU.</desc>
+  <style>
+    :root{ --ink:#141c24; --muted:#4f5f6c; --line:#87949f; --lava:#ff3621; --seal:#149861; --panel:#ffffff; }
+    @media (prefers-color-scheme: dark){
+      :root{ --ink:#e6edf3; --muted:#9fb0bd; --line:#4f5f6c; --lava:#ff6a3d; --seal:#37c491; --panel:#0e1520; }
+    }
+    .lbl{ fill:var(--ink); font-size:14px; font-weight:600; }
+    .sub{ fill:var(--muted); font-size:11px; font-weight:500; }
+    .ref{ fill:var(--muted); font-size:10px; font-family:ui-monospace, "SF Mono", Menlo, monospace; }
+    .grp{ fill:var(--ink); font-size:12px; font-weight:700; letter-spacing:.04em; }
+    .box{ fill:var(--panel); fill-opacity:.55; stroke:var(--line); stroke-width:1.4; }
+    .step{ fill:none; stroke:var(--line); stroke-width:1.2; }
+    .flow{ fill:none; stroke:var(--lava); stroke-width:2.2; }
+    .seal{ fill:none; stroke:var(--seal); stroke-width:1.6; }
+    .sealt{ fill:var(--seal); font-size:11px; font-weight:700; }
+  </style>
+  <defs>
+    <marker id="wp-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--lava)"/>
+    </marker>
+  </defs>
+
+  <!-- Client -->
+  <rect class="box" x="16" y="212" width="118" height="96" rx="10"/>
+  <text class="lbl" x="75" y="250" text-anchor="middle">Client</text>
+  <text class="sub" x="75" y="270" text-anchor="middle">agent / SDK</text>
+  <text class="sub" x="75" y="285" text-anchor="middle">OpenAI-compatible</text>
+
+  <!-- Gateway -->
+  <rect class="box" x="176" y="40" width="300" height="440" rx="12"/>
+  <text class="grp" x="196" y="66">RUST GATEWAY</text>
+  <text class="ref" x="196" y="82">crates/gateway/src/server.rs</text>
+
+  <rect class="step" x="196" y="96" width="260" height="58" rx="8"/>
+  <text class="lbl" x="208" y="118">1 · Auth</text>
+  <text class="sub" x="208" y="134">WorkOS JWT → internal tenant UUID</text>
+  <text class="ref" x="208" y="148">auth/api_key.rs · TenantId::from_jwt_claim</text>
+
+  <rect class="step" x="196" y="162" width="260" height="46" rx="8"/>
+  <text class="lbl" x="208" y="182">2 · Rate &amp; quota</text>
+  <text class="ref" x="208" y="198">rate_limiter.rs (per-tenant token bucket)</text>
+
+  <rect class="step" x="196" y="216" width="260" height="58" rx="8"/>
+  <text class="lbl" x="208" y="238">3 · Inline pre-flight policy</text>
+  <text class="sub" x="208" y="254">guardrail rails R1–R8 · predictive (observe-first)</text>
+  <text class="ref" x="208" y="268">guardrail/ · predictive/</text>
+
+  <rect class="seal" x="196" y="282" width="260" height="58" rx="8"/>
+  <text class="sealt" x="208" y="304">4 · Audit chain append</text>
+  <text class="sub" x="208" y="320">SHA-256 row_hash, domain-separated</text>
+  <text class="ref" x="208" y="334">audit_format/mod.rs:102 · audit.rs</text>
+
+  <rect class="step" x="196" y="348" width="260" height="58" rx="8"/>
+  <text class="lbl" x="208" y="370">5 · Provider dispatch + failover</text>
+  <text class="sub" x="208" y="386">Anthropic → OpenAI → Google (500/502/503/504)</text>
+  <text class="ref" x="208" y="400">providers/ · failover.rs</text>
+
+  <text class="sub" x="326" y="428" text-anchor="middle">↑ upstream LLM (BYOK)</text>
+  <text class="sub" x="326" y="446" text-anchor="middle">↓ emit OTel-GenAI spans</text>
+
+  <!-- NATS -->
+  <rect class="box" x="516" y="212" width="118" height="96" rx="10"/>
+  <text class="lbl" x="575" y="250" text-anchor="middle">NATS</text>
+  <text class="lbl" x="575" y="268" text-anchor="middle">JetStream</text>
+  <text class="ref" x="575" y="286" text-anchor="middle">span transport</text>
+
+  <!-- Ingest -->
+  <rect class="box" x="676" y="40" width="256" height="440" rx="12"/>
+  <text class="grp" x="694" y="66">RUST INGEST</text>
+  <text class="ref" x="694" y="82">crates/ingest/src/</text>
+
+  <rect class="step" x="694" y="96" width="220" height="58" rx="8"/>
+  <text class="lbl" x="706" y="118">OTLP receiver · SPIFFE mTLS</text>
+  <text class="sub" x="706" y="134">fail-closed 401 (release-enforced)</text>
+  <text class="ref" x="706" y="148">otlp_receiver.rs:103 · auth.rs</text>
+
+  <rect class="step" x="694" y="162" width="220" height="46" rx="8"/>
+  <text class="lbl" x="706" y="182">Decode &amp; validate</text>
+  <text class="ref" x="706" y="198">otlp_decode.rs:86</text>
+
+  <rect class="step" x="694" y="216" width="220" height="46" rx="8"/>
+  <text class="lbl" x="706" y="236">Tail sampler (full-fidelity default)</text>
+  <text class="ref" x="706" y="252">tail_sampler.rs</text>
+
+  <rect class="step" x="694" y="270" width="220" height="58" rx="8"/>
+  <text class="lbl" x="706" y="292">NATS consumer · ack-after-write</text>
+  <text class="sub" x="706" y="308">durable CH flush before ack</text>
+  <text class="ref" x="706" y="322">nats_consumer.rs · span_envelope.rs</text>
+
+  <rect class="step" x="694" y="336" width="220" height="58" rx="8"/>
+  <text class="lbl" x="706" y="358">Chain continuation</text>
+  <text class="sub" x="706" y="374">prev_hash from prior batch</text>
+  <text class="ref" x="706" y="388">clickhouse_writer.rs</text>
+
+  <!-- Storage -->
+  <rect class="box" x="694" y="410" width="106" height="54" rx="9"/>
+  <text class="lbl" x="747" y="432" text-anchor="middle">ClickHouse</text>
+  <text class="sub" x="747" y="448" text-anchor="middle">hot tier</text>
+
+  <rect class="box" x="812" y="410" width="106" height="54" rx="9"/>
+  <text class="lbl" x="865" y="430" text-anchor="middle">R2 cold</text>
+  <text class="sub" x="865" y="445" text-anchor="middle">1 MB batched · EU</text>
+  <text class="ref" x="865" y="459" text-anchor="middle">r2_batcher.rs</text>
+
+  <!-- Flow arrows (lava, primary path) -->
+  <path class="flow" marker-end="url(#wp-arrow)" d="M134 260 H176"/>
+  <path class="flow" marker-end="url(#wp-arrow)" d="M476 260 H516"/>
+  <path class="flow" marker-end="url(#wp-arrow)" d="M634 260 H676"/>
+  <path class="flow" marker-end="url(#wp-arrow)" d="M747 394 V410"/>
+  <path class="flow" marker-end="url(#wp-arrow)" d="M800 437 H812"/>
+  <text class="ref" x="497" y="252" text-anchor="middle" fill="var(--lava)">spans</text>
+</svg>

@@ -1,0 +1,301 @@
+---
+title: Python SDK
+description: Instrumentation for Python AI agents. Explicit init + per-library wrapping.
+---
+
+## Install
+
+```bash
+pip install tracelane
+```
+
+All framework adapters ship in the package. Nothing is patched on import —
+instrumentation is explicit: call `init()`, then either `auto_instrument()`
+(best-effort for a small set of libraries) or the individual `instrument_*`
+functions for exactly what you want traced.
+
+## Initialize
+
+Call `tracelane.init(...)` once at application start — before the code you want
+traced runs. `endpoint` and `api_key` are required (there is no env-var
+auto-read).
+
+```python
+from tracelane import init
+
+init(
+    endpoint="http://localhost:4318",   # OTLP HTTP receiver YOU can reach
+    api_key="tlane_...",                # from Settings → API Keys
+    service_name="my-agent",            # shows in trace viewer
+)
+```
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `endpoint` | yes | — | OTLP HTTP endpoint you can reach. Spans POST to `${endpoint}/v1/traces`. |
+| `api_key` | yes | — | Your `tlane_*` key. Sent as the `x-tracelane-api-key` header. |
+| `service_name` | no | `"unknown-service"` | Service name on spans |
+| `sample_rate` | no | `1.0` | Fraction of traces to capture (0.0–1.0; tail sampler decides) |
+| `auto_instrument` | no | `False` | If `True`, run `auto_instrument()` after init (see below) |
+
+`endpoint` is an OTLP receiver you run — a local collector or a self-hosted
+Tracelane ingest. Tracelane Cloud's ingest is **not** a public OTLP endpoint;
+for Cloud, point your client at the gateway instead (see [Quickstart](/quickstart)).
+
+## Instrument what you want traced
+
+Constructing a client does not patch it. After `init()`, you have two options.
+
+### Option A — `auto_instrument()` (best-effort, 4 libraries)
+
+```python
+from tracelane import init, auto_instrument
+
+init(endpoint="http://localhost:4318", api_key="tlane_...")
+auto_instrument()
+```
+
+`auto_instrument()` attempts **only** `anthropic`, `openai`, `litellm`, and
+`claude_code`, and only if each is installed. `langgraph` is a no-op here (call
+`instrument_langgraph(graph)` yourself after compiling). **Every other library —
+LangChain, LlamaIndex, CrewAI, AutoGen, Pinecone, MCP, … — is NOT touched by
+`auto_instrument()`**; use the explicit calls below.
+
+### Option B — explicit `instrument_*` calls
+
+There are 28 `instrument_*` functions. Each takes the object you constructed and
+patches it in place. Call after `init()`.
+
+## Adapters
+
+### LLM providers
+
+```python
+from tracelane import (
+    init, instrument_anthropic, instrument_openai,
+    instrument_bedrock, instrument_vertexai, instrument_azure_openai,
+)
+
+init(endpoint="http://localhost:4318", api_key="tlane_...")
+
+# Anthropic — claude-* models
+from anthropic import Anthropic
+client = Anthropic()
+instrument_anthropic(client)   # now messages.create() emits spans
+client.messages.create(model="claude-sonnet-4-6", messages=[...], max_tokens=1024)
+
+# OpenAI — gpt-*, o1*, o3*, embeddings
+from openai import OpenAI
+oai = OpenAI()
+instrument_openai(oai)
+oai.chat.completions.create(model="gpt-4o", messages=[...])
+
+# AWS Bedrock
+import boto3
+bedrock = boto3.client("bedrock-runtime")
+instrument_bedrock(bedrock)    # invoke_model calls captured
+
+# Google Vertex AI
+from vertexai.generative_models import GenerativeModel
+model = GenerativeModel("gemini-2.0-flash")
+instrument_vertexai(model)
+
+# Azure OpenAI
+from openai import AzureOpenAI
+az = AzureOpenAI()
+instrument_azure_openai(az)
+```
+
+### Agent frameworks
+
+Construct the chain/graph/agent, then instrument it — none of this is
+instrumented for you.
+
+```python
+from tracelane import (
+    instrument_langchain, instrument_langgraph, instrument_llamaindex,
+    instrument_crewai, instrument_autogen, instrument_pydantic_ai,
+    instrument_openai_agents, instrument_magentic_one, instrument_smolagents,
+    instrument_haystack,
+)
+
+# LangChain
+from langchain_anthropic import ChatAnthropic
+model = ChatAnthropic(model="claude-sonnet-4-6")
+instrument_langchain(model)
+
+# LangGraph
+from langgraph.graph import StateGraph
+graph = build_graph().compile()
+instrument_langgraph(graph)      # graph steps emit spans
+
+# LlamaIndex
+from llama_index.core import VectorStoreIndex
+index = VectorStoreIndex.from_documents(docs)
+instrument_llamaindex(index)
+
+# CrewAI
+from crewai import Agent
+agent = Agent(role="researcher", goal="...", backstory="...")
+instrument_crewai(agent)
+
+# AutoGen
+import autogen
+assistant = autogen.AssistantAgent(name="assistant")
+instrument_autogen(assistant)
+
+# Pydantic AI
+from pydantic_ai import Agent
+agent = Agent("anthropic:claude-sonnet-4-6")
+instrument_pydantic_ai(agent)
+
+# OpenAI Agents SDK
+from agents import Runner
+instrument_openai_agents(Runner)  # wrap the Runner class
+
+# Magentic-One
+from autogen_ext.agents.magentic_one import MagenticOne
+m1 = MagenticOne(client=oai_client)
+instrument_magentic_one(m1)
+
+# smolagents (HuggingFace)
+from smolagents import CodeAgent, HfApiModel
+sa = CodeAgent(tools=[], model=HfApiModel())
+instrument_smolagents(sa)
+
+# Haystack
+from haystack import Pipeline
+pipe = Pipeline()
+instrument_haystack(pipe)
+```
+
+### Memory & vector stores
+
+```python
+from tracelane import instrument_pinecone, instrument_qdrant, instrument_mem0
+
+# Pinecone
+from pinecone import Pinecone
+index = Pinecone(api_key="...").Index("my-index")
+instrument_pinecone(index)    # upsert, query, fetch, delete captured
+
+# Qdrant
+from qdrant_client import QdrantClient
+qc = QdrantClient(":memory:")
+instrument_qdrant(qc)         # search, upsert, delete captured
+
+# Mem0 (memory layer)
+from mem0 import Memory
+mem = Memory()
+instrument_mem0(mem)          # add, search, get captured with memory IDs
+```
+
+### Tools & browser
+
+```python
+from tracelane import (
+    instrument_browserbase, instrument_e2b, instrument_firecrawl,
+    instrument_composio, instrument_mcp, instrument_claude_code, instrument_letta,
+)
+
+# Browserbase — managed browser sessions
+from browserbase import Browserbase
+bb = Browserbase(api_key="...")
+instrument_browserbase(bb)
+
+# E2B — code execution sandbox
+from e2b import Sandbox
+instrument_e2b(Sandbox)       # wrap the Sandbox class
+
+# Firecrawl — web scraping
+from firecrawl import FirecrawlApp
+app = FirecrawlApp(api_key="...")
+instrument_firecrawl(app)     # scrape, crawl, search captured
+
+# Composio — tool integrations
+from composio_langchain import ComposioToolSet
+toolset = ComposioToolSet()
+instrument_composio(toolset)
+
+# MCP — Model Context Protocol
+from mcp import ClientSession
+# after you have a ClientSession `session`:
+instrument_mcp(session)       # tool_call and tool_result messages traced
+
+# Claude Code (SDK mode) — module-level, no argument
+instrument_claude_code()
+
+# Letta (MemGPT)
+from letta import create_client
+letta = create_client()
+instrument_letta(letta)
+```
+
+## Custom spans
+
+The SDK sets up a standard OpenTelemetry tracer provider, so custom spans use
+the OpenTelemetry Python API directly — the SDK ships no custom-span wrapper:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("my-agent")
+with tracer.start_as_current_span("retrieval") as span:
+    span.set_attribute("retrieval.top_k", 10)
+    span.set_attribute("retrieval.index", "prod-v3")
+    results = vector_store.search(query, top_k=10)
+```
+
+## Sampling
+
+```python
+# Trace 10% of requests in production, 100% in dev
+import os
+from tracelane import init
+
+init(
+    endpoint="http://localhost:4318",
+    api_key="tlane_...",
+    sample_rate=0.1 if os.getenv("ENV") == "production" else 1.0,
+)
+```
+
+## Shutdown
+
+```python
+# Flush pending spans and shut down the OTel SDK — call at process exit
+from tracelane import shutdown
+
+shutdown()
+```
+
+## Testing
+
+Nothing is patched until you call `init()` and `instrument_*`, so a test that
+skips them emits no spans — no disable flag needed. To assert on emitted spans,
+register your own provider with a standard in-memory exporter before
+instrumenting, then read the finished spans:
+
+```python
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry import trace
+
+exporter = InMemorySpanExporter()
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))
+trace.set_tracer_provider(provider)
+
+# ... construct + instrument_anthropic(client), run the code under test ...
+
+spans = exporter.get_finished_spans()
+assert len(spans) == 3
+```
+
+## Related
+
+- [TypeScript SDK](/sdk-typescript)
+- [Quickstart](/quickstart)
+- [Predictive guardrails](/predictive-guardrails)
+- [Providers](/providers)

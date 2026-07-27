@@ -1,0 +1,125 @@
+---
+title: BYOK — Bring Your Own Key
+description: Envelope-encrypt provider API keys with AES-256-GCM (AAD bound to tenant + provider).
+---
+
+BYOK envelope-encrypts your provider API keys at rest with **AES-256-GCM**. On
+self-hosted deployments you supply the 32-byte envelope master key
+(`TRACELANE_CMK_KEY`). You may also register a Customer-Managed Key (CMK)
+**public-key fingerprint** for audit and labeling. Tracelane holds the
+ciphertext and decrypts it in-memory only at request dispatch.
+
+Available on **Business $899/mo and above** (read-only key list on Team $249+).
+
+## How envelope encryption works
+
+Provider keys are sealed with **AES-256-GCM** (ring AEAD) under Tracelane's
+envelope master key. Each ciphertext is bound with Additional Authenticated
+Data (AAD) = `provider-key:<tenant_id>:<provider_id>`, so a ciphertext from one
+tenant/provider cannot be replayed under another — a mismatched context fails
+the GCM authentication tag.
+
+```
+Provider key (plaintext)
+   │  AES-256-GCM seal, AAD = provider-key:<tenant>:<provider>
+   ▼
+Ciphertext + 16-byte GCM tag  ──►  stored in Postgres
+   │  decrypted in-memory just-in-time on dispatch, then zeroed
+   ▼  never written to logs, spans, or errors
+```
+
+On self-hosted deployments the master key is `TRACELANE_CMK_KEY` (32-byte hex).
+On managed deployments it can be backed by a KMS (roadmap).
+
+## Public-key fingerprint (audit)
+
+You may register a Customer-Managed Key **public-key fingerprint** for audit
+and labeling. It is recorded but does not itself wrap provider keys in V1 —
+provider keys are sealed with the symmetric master key above.
+
+| Accepted public-key format | Key size |
+|---|---|
+| Ed25519 | 256-bit |
+| RSA-4096 | 4096-bit |
+
+## Register a key
+
+### Dashboard (Settings → BYOK Keys)
+
+1. Generate a key pair:
+
+```bash
+# Ed25519 (recommended)
+openssl genpkey -algorithm ed25519 -out cmk-private.pem
+openssl pkey -in cmk-private.pem -pubout -out cmk-public.pem
+
+# RSA-4096
+openssl genrsa -out cmk-private.pem 4096
+openssl rsa -in cmk-private.pem -pubout -out cmk-public.pem
+```
+
+2. In the dashboard: **Settings → BYOK Keys → Add Key**.
+3. Paste the contents of `cmk-public.pem`, choose a scope, click **Register Key**.
+4. Store `cmk-private.pem` in your secrets manager (AWS Secrets Manager, Vault, etc.)
+   — never commit it to source control.
+
+### API
+
+```bash
+curl -X POST https://app.tracelane.dev/api/settings/cmk-keys \
+  -H "Authorization: Bearer $SESSION_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alias": "prod-cmk-2026",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+    "purpose": "provider-keys"
+  }'
+```
+
+## Scope
+
+| Scope | What is encrypted | Status |
+|---|---|---|
+| `provider-keys` | Provider API keys (Anthropic, OpenAI, …) | Live |
+| `trace-payload` / `all` | Prompt + completion text in stored spans | Roadmap |
+
+To keep prompt/completion text out of storage today, set
+`TRACELANE_TRACE_CONTENT=false` in the SDK — content is dropped at capture,
+not stored-then-encrypted.
+
+## Rotate & revoke
+
+Registering, listing, and removing CMK **fingerprints** is available today via
+the dashboard (**Settings → BYOK Keys**) and the API. Zero-downtime key
+rotation with background re-encryption of existing ciphertext, and automatic
+revocation once every ciphertext has been re-wrapped, are on the roadmap —
+there is no automated rewrap job in V1. Provider-key ciphertext is sealed under
+the deployment envelope master key (`TRACELANE_CMK_KEY`).
+
+## Audit trail
+
+Every CMK fingerprint operation (register, remove) is written to the
+tamper-evident audit ledger with the CMK fingerprint. Use `tlane verify` to
+confirm the log has not been altered.
+
+## Self-host
+
+On self-hosted deployments, the gateway loads the BYOK master key from env:
+
+```bash
+# AES-256-GCM key for local envelope encryption (hex, 32 bytes)
+TRACELANE_CMK_KEY=<hex>
+```
+
+Generate with:
+
+```bash
+openssl rand -hex 32
+```
+
+## Related
+
+- [Architecture](/architecture)
+- [Audit ledger](/audit-ledger)
+- [Security](/security)
+- [API reference](/api-reference)

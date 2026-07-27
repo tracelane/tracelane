@@ -1,0 +1,20 @@
+{
+  "name": "@tracelanedev/evals",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tracelane eval suite \u2014 50 pain-point assertions + gateway + ingest + PII + PI evals",
+  "scripts": {
+    "test": "echo 'evals are the canonical-repo merge gate (they assert internal ADRs/infra); reference-only in the public mirror' && exit 0",
+    "eval:run": "tsx src/runner.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0",
+    "tsx": "^4.0.0"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  }
+}

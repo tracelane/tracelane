@@ -1,0 +1,317 @@
+@import "tailwindcss";
+
+/*
+ * Tracelane "Tinted Slate + Lava" design system — ADR-053 (palette) over the
+ * ADR-045 role architecture / design-system spec §1.
+ *
+ * Semantic tokens, named by ROLE (--surface / --ink / --accent / --seal), never
+ * by color — a palette remap never touches component code. LIGHT is the default
+ * (a neutral #f4f4f5 grey canvas is the brand's primary surface — no blue tint;
+ * pure-white cards float on it, so white-on-grey does the card/canvas separation,
+ * not borders); the `.dark` / `[data-theme="dark"]` block is the paired
+ * alternative and is deliberately left UNCHANGED by the grey-canvas swap.
+ *
+ * Discipline: Lava is the rationed BRAND/CTA accent, split DUAL-TONE by role so
+ * it stays legible on the light grey canvas (founder-decided):
+ *   --lava-fill / --accent = the SOFT coral fill (#ff8566 light): buttons, chart
+ *                   bars, ring bands/core, active pills, lollipop dots. --accent-on
+ *                   (white) is the label/icon on top.
+ *   --lava-deep / --accent-ink = the DEEP lava (#c8300f light) for TEXT/NUMBERS
+ *                   and thin lines: KPI figures, table numerics, links, the
+ *                   trace-line — a soft fill washes out as text, a deep tone reads
+ *                   AND clears AA-4.5 on white (the AA floor, not a preference).
+ *   --lava-soft / --accent-soft = #ffe4dd, soft-pill backgrounds / selected-row
+ *                   tint / the outer ring band.
+ *   .cta-lava     = the one gradient allowed on a control (hero/primary CTA):
+ *                   135deg --accent-2 → --accent → --accent-strong, white label,
+ *                   soft lava glow (see @layer components below).
+ *   --accent-field= pure decoration (hairlines, node pins), never load-bearing.
+ * --seal + --ok = Verify green (#149861), the rationed PROVENANCE/verified/ok
+ * signature — provenance card borders, the tamper-evident chip, the hash-chain
+ * thread, semantic ok. Use --seal-ink for provenance text/lines.
+ *
+ * `inline` makes the Tailwind v4 color utilities reference the live CSS vars.
+ */
+@theme inline {
+	/* surfaces + ink */
+	--color-bg: var(--bg);
+	--color-surface: var(--surface);
+	--color-surface-2: var(--surface-2);
+	--color-surface-3: var(--surface-3);
+	--color-canvas: var(--canvas);
+	--color-surface-inverse: var(--surface-inverse);
+	--color-ink-inverse: var(--ink-inverse);
+	--color-line: var(--line);
+	--color-line-2: var(--line-2);
+	--color-ink: var(--ink);
+	--color-ink-2: var(--ink-2);
+	--color-ink-3: var(--ink-3);
+
+	/* lava accents — dual-tone source tokens (fill vs deep text) + roles */
+	--color-lava-fill: var(--lava-fill);
+	--color-lava-deep: var(--lava-deep);
+	--color-lava-soft: var(--lava-soft);
+	--color-accent: var(--accent);
+	--color-accent-ink: var(--accent-ink);
+	--color-accent-on: var(--accent-on);
+	--color-accent-soft: var(--accent-soft);
+	--color-accent-line: var(--accent-line);
+	--color-accent-field: var(--accent-field);
+	--color-seal: var(--seal);
+	--color-seal-ink: var(--seal-ink);
+	--color-seal-soft: var(--seal-soft);
+	--color-seal-line: var(--seal-line);
+
+	/* selected/active "solid inverted" pill (shared time-range control): black in
+	   light, a light pill in dark — theme-flipped so it never reads black-on-black. */
+	--color-selected: var(--selected);
+	--color-selected-on: var(--selected-on);
+
+	/* semantic status (pair with icon/shape — never color alone) */
+	--color-ok: var(--ok);
+	--color-ok-soft: var(--ok-soft);
+	--color-danger: var(--danger);
+	--color-danger-on: var(--danger-on);
+	--color-danger-soft: var(--danger-soft);
+	--color-warn: var(--warn);
+	--color-warn-soft: var(--warn-soft);
+	--color-info: var(--info);
+	--color-info-soft: var(--info-soft);
+
+	/* shadcn-compat aliases so existing apps/web components keep working */
+	--color-background: var(--bg);
+	--color-foreground: var(--ink);
+	--color-muted: var(--surface-2);
+	--color-muted-foreground: var(--ink-2);
+	--color-border: var(--line);
+	--color-primary: var(--accent);
+	--color-primary-foreground: var(--accent-on);
+	--color-destructive: var(--danger);
+
+	/* type (ADR-053): Inter UI + JetBrains Mono data/code (no serif in the app —
+	   Source Serif 4 is marketing-only). globals.css points these at the actual
+	   next/font vars; these named fallbacks apply before the faces load. */
+	--font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+	--font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+/* LIGHT — DEFAULT (Tinted Slate + Lava, ADR-053). The tinted #f4f6fa slate is
+   the brand's primary surface; the dark block below is the paired alternative.
+   Lava/Verify deepened where used as thin text/lines so they clear ≥4.5:1. */
+:root {
+	color-scheme: light;
+	--bg: #e8e8ea; /* neutral grey page margin — the framed canvas floats on it (no blue) */
+	--canvas: #f4f4f5; /* rounded app-frame inner surface — the neutral grey canvas (founder) */
+	--surface: #ffffff; /* cards stay pure white — white-on-grey is the card/canvas separation */
+	--surface-2: #ececee; /* neutral grey tray (nav menu, icon buttons, hovers) — was blue-tinted */
+	--surface-3: #e4e4e7; /* neutral grey, one step deeper */
+	--surface-inverse: #17171a; /* neutral near-black: dark cards (error-budget/burn) + active nav pill */
+	--ink-inverse: #f5f5f6; /* text/icons ON --surface-inverse */
+	--line: #e9e9eb; /* neutral grey hairline (founder --border) */
+	--line-2: #e0e0e2; /* neutral grey, one step stronger (founder --border-2) */
+	--ink: #1c2530;
+	--logo-ink: #0c0d0f; /* brand lockup mono — the logo-lock near-black (matches tracelane.dev) */
+	--ink-2: #3d4854;
+	--ink-3: #7c8794;
+	/* Lava dual-tone (founder-decided): soft fill vs deep text. The named --lava-*
+	   are the source of truth; the --accent* roles point at them so every existing
+	   bg-accent / text-accent-ink consumer inherits with zero component churn. */
+	--lava-fill: #ff8566; /* soft coral-lava — all FILLS */
+	--lava-deep: #c8300f; /* deep lava — all TEXT/NUMBERS + thin lines. AA floor:
+	                         5.4:1 on white, ~4.5:1 on the lava-soft pill (the
+	                         softer #e0472f was 4.1:1/3.4:1 — below AA-4.5). */
+	--lava-soft: #ffe4dd; /* soft-pill background */
+	--accent: var(--lava-fill); /* Lava — solid fill */
+	--accent-2: #ff8571; /* Lava-2 — gradient light stop */
+	--accent-strong: #f0533b; /* Lava-deep — gradient dark stop */
+	--accent-ink: var(--lava-deep); /* Lava for accent TEXT/line on light */
+	--accent-on: #ffffff; /* label placed ON a Lava fill */
+	--accent-soft: var(--lava-soft); /* selected-row tint / chip bg / outer ring band */
+	--accent-line: #ffd0c6;
+	--accent-field: #ff8571; /* decoration only: hairlines, node pins */
+	--accent-glow: rgba(255, 106, 82, 0.45); /* CTA drop-glow */
+	--accent-glow-2: rgba(255, 106, 82, 0.55); /* CTA drop-glow, hover */
+	--seal: #1f9d64; /* Verify green — provenance signature */
+	--seal-ink: #157f4f; /* deepened Verify for provenance TEXT on light (AA) */
+	--seal-on: #ffffff;
+	--seal-soft: #e2f3ea;
+	--seal-line: #bfe3d2;
+	--ok: #1f9d64; /* ok = Verify green (ADR-053) */
+	--ok-soft: #e2f3ea;
+	--danger: #cf222e;
+	--danger-on: #ffffff; /* label placed ON a solid danger fill (matches --accent-on) */
+	--danger-soft: #fdeced;
+	--warn: #b45309;
+	--warn-soft: #fdf6e8;
+	--info: #7c5cff; /* tool-span violet — AFT-1 id hue */
+	--info-soft: #efecff;
+	--selected: #17171a; /* selected/active pill fill — neutral black on light */
+	--selected-on: #ffffff; /* label on the selected pill */
+}
+
+/* DARK — paired alternative (Tinted Slate dark; brighter Lava/Verify for AA on
+   the near-black slate canvas). */
+[data-theme="dark"],
+.dark {
+	color-scheme: dark;
+	--bg: #0b0f14; /* tinted slate near-black */
+	--canvas: #0f141b; /* app-frame inner surface (dark) */
+	--surface: #141b26; /* cards — lifted for clearer elevation over the canvas */
+	--surface-2: #1d2836; /* tray / hover / chip — lifted so affordances read */
+	--surface-3: #26313f;
+	--surface-inverse: #05080c; /* dark cards + active nav pill (dark theme) */
+	--ink-inverse: #e7edf3;
+	--line: #2a3646; /* crisper card + table hairline on the dark cards */
+	--line-2: #394857; /* the STRONGER border — must be LIGHTER than --line in dark
+	                      (was #1a222d, darker than --line — an inverted hierarchy) */
+	--ink: #e7edf3;
+	--logo-ink: #f5f5f6; /* brand lockup mono — inverts to off-white on dark (logo lock) */
+	--ink-2: #9aa7b4;
+	--ink-3: #828f9d; /* tertiary/label text — lifted to clear AA on the dark cards */
+	--accent: #ff5a3d; /* brightened Lava fill for dark */
+	--accent-2: #ff7a52;
+	--accent-strong: #e8330e;
+	--accent-ink: #ff8a63; /* Lava as TEXT/line on dark */
+	--accent-on: #ffffff;
+	--accent-soft: #2a0f0a;
+	--accent-line: #4a1f14;
+	--accent-field: #ff7a52;
+	--accent-glow: rgba(255, 90, 61, 0.45);
+	--accent-glow-2: rgba(255, 90, 61, 0.55);
+	--seal: #1fb87a; /* brightened Verify for dark */
+	--seal-ink: #3fd39a;
+	--seal-on: #04140d;
+	--seal-soft: #0a2419;
+	--seal-line: #14432f;
+	--ok: #1fb87a;
+	--ok-soft: #0a2419;
+	--danger: #f0555a;
+	--danger-on: #ffffff; /* white label on the danger fill (matches --accent-on) */
+	--danger-soft: #2a1012;
+	--warn: #e0a020;
+	--warn-soft: #2a1f08;
+	--info: #9d7bff;
+	--info-soft: #1a142e;
+	/* New tokens only — the existing dark palette above is deliberately unchanged.
+	   Lava source vars mirror the dark --accent* so bg-lava-* utilities resolve in
+	   dark too; --accent* stay literal above (not rewired) so nothing dark shifts. */
+	--lava-fill: #ff5a3d;
+	--lava-deep: #ff8a63;
+	--lava-soft: #2a0f0a;
+	--selected: #e7edf3; /* selected pill INVERTS in dark: light pill... */
+	--selected-on: #0b0f14; /* ...with dark text — high separation on the dark track */
+}
+
+@layer components {
+	/*
+	 * Lava CTA (ADR-053) — the ONE gradient permitted on an interactive control.
+	 * Solid `bg-accent` stays the default primary; `.cta-lava` is the elevated
+	 * hero/primary action. White label, soft lava glow that lifts on hover.
+	 * transition is scoped here (the base uses transition-colors, which won't
+	 * animate box-shadow/transform).
+	 */
+	.cta-lava {
+		background-image: linear-gradient(
+			135deg,
+			var(--accent-2) 0%,
+			var(--accent) 55%,
+			var(--accent-strong) 100%
+		);
+		color: var(--accent-on);
+		box-shadow: 0 4px 14px -4px var(--accent-glow);
+		transition: box-shadow 150ms cubic-bezier(0.2, 0, 0, 1), transform 150ms
+			cubic-bezier(0.2, 0, 0, 1);
+	}
+	.cta-lava:hover {
+		transform: translateY(-1px);
+		box-shadow: 0 8px 22px -6px var(--accent-glow-2);
+	}
+	.cta-lava:active {
+		transform: translateY(0);
+	}
+
+	/*
+	 * Provenance card top-accent (ADR-053) — a 3px Verify-green gradient painted
+	 * as the card's top edge (one of the three permitted gradient sites). A
+	 * background strip (not a border/pseudo) so it clips cleanly to the rounded
+	 * corners with no overflow and never clips card content. Pair with
+	 * `border-t-0` so the gradient IS the top edge.
+	 */
+	.card-provenance-top {
+		background-image: linear-gradient(90deg, var(--seal), var(--seal-ink));
+		background-size: 100% 3px;
+		background-position: top;
+		background-repeat: no-repeat;
+	}
+
+	/*
+	 * Premium metric tile (ADR-053) — the shared <StatCard> surface. Quiet
+	 * elevation: a subtle surface→surface-2 gradient + hairline + a soft 1px
+	 * shadow. NOT literal glass (backdrop-blur costs frames and reads as nothing
+	 * on a flat page bg); this is a cheap-to-paint tile that still feels lifted.
+	 * `--interactive` adds a 1px hover-lift for click-through tiles.
+	 */
+	.stat-tile {
+		border-radius: 0.75rem;
+		border: 1px solid var(--line);
+		/* Pure white result tiles (founder review): no surface→surface-2 tint —
+		   elevation comes from the hairline border + soft shadow only. */
+		background-color: var(--surface);
+		box-shadow: 0 1px 2px -1px rgba(20, 28, 36, 0.06);
+	}
+	.stat-tile--interactive {
+		cursor: pointer;
+		transition: box-shadow 160ms cubic-bezier(0.2, 0, 0, 1), transform 160ms
+			cubic-bezier(0.2, 0, 0, 1), border-color 160ms cubic-bezier(0.2, 0, 0, 1);
+	}
+	.stat-tile--interactive:hover {
+		transform: translateY(-1px);
+		border-color: var(--line-2);
+		box-shadow: 0 2px 6px -2px rgba(20, 28, 36, 0.08), 0 10px 24px -12px
+			rgba(20, 28, 36, 0.12);
+	}
+	[data-theme="dark"] .stat-tile,
+	.dark .stat-tile {
+		background-image: linear-gradient(
+			180deg,
+			var(--surface-2) 0%,
+			var(--surface) 150%
+		);
+		box-shadow: 0 1px 2px -1px rgba(0, 0, 0, 0.4), inset 0 1px 0 0
+			rgba(255, 255, 255, 0.02);
+	}
+	[data-theme="dark"] .stat-tile--interactive:hover,
+	.dark .stat-tile--interactive:hover {
+		box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.5), 0 12px 28px -12px
+			rgba(0, 0, 0, 0.5);
+	}
+
+	/* (The former .brand-logo/.brand-logo-icon PNG background rules were removed —
+	   the <Logo> component now renders the mark + wordmark as inline SVG + text
+	   (Source Serif 4), monochrome via --logo-ink, matching the marketing site's
+	   lockup one-to-one. The public/brand/logo-*.png assets are now unused.) */
+}
+
+@layer base {
+	* {
+		border-color: var(--line);
+	}
+	body {
+		background-color: var(--bg);
+		color: var(--ink);
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums; /* mandatory for all data */
+		-webkit-font-smoothing: antialiased;
+		letter-spacing: -0.006em;
+	}
+	/* Verify-green focus ring (ADR-053) — one uniform focus affordance across
+	   links, buttons, and disclosure controls. */
+	a:focus-visible,
+	button:focus-visible,
+	summary:focus-visible,
+	[role="button"]:focus-visible {
+		outline: 2px solid var(--seal);
+		outline-offset: 3px;
+		border-radius: 2px;
+	}
+}

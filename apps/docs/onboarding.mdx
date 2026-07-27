@@ -1,0 +1,124 @@
+---
+title: Onboarding
+description: Customer browser flow + operator self-host checklist.
+---
+
+Two roles use this page: customers signing up at app.tracelane.dev, and
+operators self-hosting Tracelane.
+
+## Customer browser flow
+
+1. Visit [app.tracelane.dev/signup](https://app.tracelane.dev/signup).
+2. Sign in with WorkOS Connect (Google / Microsoft / SAML).
+3. The first sign-in for a domain creates a tenant; subsequent users on the
+   same domain join it.
+4. Pick a plan (Builder $59 / Team $249 / Business $899 / Enterprise).
+5. Generate a tenant API key (`tlane_<base62>`). Copy it once — we hash + store.
+6. Drop it in your env as `TRACELANE_API_KEY`.
+7. Make a call. The trace shows up at [app.tracelane.dev/traces](https://app.tracelane.dev/traces) within a second.
+
+You're done. Predictive guardrails default to `warn`; flip them to `block`
+in the dashboard once you've reviewed your first day of traces.
+
+## Operator self-host checklist
+
+Eight steps to running Tracelane on your own infra.
+
+<Steps>
+
+<Step title="Reserve infra">
+  - Postgres 16 (Neon, RDS, or self-hosted) — tenant + user metadata
+  - ClickHouse 24+ — span/audit hot tier
+  - R2 (or S3) — span/audit cold tier
+  - L4 GPU pool — optional, only for the roadmap SLM-judge inference tier; not required at V1
+  - Outbound network to Sigstore Rekor (`rekor.sigstore.dev`) — for best-effort, opt-in Rekor v2 anchoring of audit batches; universal per-run anchoring is on the roadmap
+</Step>
+
+<Step title="Set secrets">
+  - `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET` — billing (Polar.sh)
+  - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_WEBHOOK_SECRET` — auth
+  - `TRACELANE_CMK_KEY` — provider-key envelope encryption (32 bytes hex, AES-256-GCM via `ring`)
+  - `JWT_SIGNING_KEY` — internal JWT
+  - `CLICKHOUSE_URL`, `POSTGRES_URL`, `R2_*` — datastore endpoints
+</Step>
+
+<Step title="Migrations apply automatically">
+  Migrations apply automatically when the gateway boots (`db::apply_migrations`,
+  idempotent) — there is no separate migrate command. Just start the gateway
+  once against a reachable Postgres + ClickHouse.
+</Step>
+
+<Step title="Configure WorkOS Connect">
+  In the WorkOS dashboard:
+  - Add your domain
+  - Configure SAML or OAuth providers
+  - Set the redirect URI to your dashboard's WorkOS callback — the Next.js app handles the SSO callback, not the gateway
+  - Add the webhook URL `https://gateway.<your-domain>/v1/webhooks/workos`
+  - Set the webhook events: `user.created`, `user.updated`, `organization.created`
+</Step>
+
+<Step title="Configure Polar">
+  Tracelane v2 pricing (ADR-020) requires nine `lookup_key`s. Create each as
+  a separate product in the [Polar.sh](https://polar.sh) dashboard, with the
+  `lookup_key` set on each product's `product_metadata`:
+
+  | Product | `lookup_key` | Price |
+  |---|---|---|
+  | Builder plan | `builder_v1` | $59/mo |
+  | Team plan | `team_v1` | $249/mo |
+  | Business plan | `business_v1` | $899/mo |
+  | Enterprise plan | `enterprise_v1` | from $2,999/mo (custom) |
+  | Audit add-on | `audit_addon_v1` | $999/mo |
+  | Trace overage meter | `overage_v1` | $1.20 per 10K traces (metered) |
+  | Team extra seat | `team_extra_seat_v1` | $19/mo per seat (quantity) |
+  | Business extra seat | `business_extra_seat_v1` | $19/mo per seat (quantity) |
+  | HIPAA-on-GCP add-on | `hipaa_gcp_addon_v1` | $2,000/mo (Enterprise only) |
+
+  Then:
+  - Create Polar meters with these event names: `tokens_processed`, `audit_anchors`, `traces_metered`
+  - Add the Tracelane webhook URL `https://gateway.<your-domain>/v1/webhooks/polar`
+  - Subscribe to events: `subscription.created`, `subscription.updated`, `subscription.active`, `subscription.canceled`, `order.created`, `order.paid`
+  - Configure the Polar-hosted customer portal — branding, allowed actions
+  - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
+
+  See [decisions/ADR-020-pricing-v2-honest-caps.md](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-020-pricing-v2-honest-caps.md)
+  for the rationale behind seat caps, capped overage, and tier-specific retention.
+</Step>
+
+<Step title="Deploy gateway + ingest">
+  ```bash
+  cargo build --release --workspace
+  ./target/release/gateway   # serves :8080
+  ./target/release/ingest    # serves OTLP :4317 + NATS consumer
+  ```
+  Or use the supplied Helm chart at `infra/helm/`.
+</Step>
+
+<Step title="Deploy dashboard + MCP server">
+  ```bash
+  pnpm install
+  pnpm build
+  pnpm start
+  ```
+  Both run as Next.js apps; the MCP server is also published as
+  `npx @tracelanedev/mcp` for local-only use.
+</Step>
+
+<Step title="Production checklist">
+  - All agent-tool safety guards set to `warn` initially; flip to `block` after one day of traces.
+  - Audit log hash-chain integrity confirmed (`tlane verify <ledger>` returns 0). The SHA-256 hash chain and Ed25519 per-tenant signing are live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
+  - SBOM published — `infra/sbom/` has CycloneDX outputs from CI.
+  - Sigstore-signed releases verified — `cosign verify` on each release artifact.
+  - `cargo audit` and `pnpm audit` clean on the deployed commit.
+  - Backups: ClickHouse → R2, Postgres → daily snapshot.
+  - Alerting: error + uptime monitoring wired before GA (tooling being finalized).
+</Step>
+
+</Steps>
+
+## Related
+
+- [Architecture](/architecture) — what each component does
+- [API reference](/api-reference) — full REST surface
+- [CLI](/cli) — `tlane verify`, `tlane export`, `tlane migrate`
+- [Agent-tool safety guardrails](/predictive-guardrails) — MCP tool-definition-drift + schema validation, inline

@@ -1,0 +1,75 @@
+// SPIRE Workload API — subset used by Tracelane ingest for SPIFFE X.509-SVID
+// retrieval and trust-bundle rotation.
+//
+// Vendored from github.com/spiffe/spire-api-sdk (Apache 2.0). Only the X.509
+// surface is included; JWT-SVID and SPIFFE-Federation RPCs are intentionally
+// dropped to minimise generated-code surface area.
+//
+// SPEC: https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md
+//
+// Wire compatibility: stable since 2019. Server identifies these RPCs by the
+// fully-qualified service name `SpiffeWorkloadAPI`.
+//
+// Required gRPC metadata on every request:
+//   workload.spiffe.io: true
+
+syntax = "proto3";
+
+// NO `package` declaration, on purpose. The real SPIRE agent serves the service
+// at gRPC path `/SpiffeWorkloadAPI/FetchX509SVID` (no package prefix). Declaring
+// `package SpiffeWorkloadAPI;` makes tonic call `/SpiffeWorkloadAPI.SpiffeWorkloadAPI/…`,
+// which SPIRE rejects at runtime with `Unimplemented: unknown service` (the mock
+// in spire_mock.rs can't catch this — it uses the same generated stub on both
+// sides; only a real SPIRE agent exposes the mismatch). Do NOT re-add a package.
+
+// Subset of the Workload API service.
+service SpiffeWorkloadAPI {
+  // Streams X.509-SVIDs for this workload. The server SHOULD emit an
+  // initial response immediately and then push a new response whenever
+  // the SVID or the trust bundle rotates. Connection stays open for the
+  // lifetime of the workload.
+  rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
+
+  // Streams trust bundles only (no SVID material). Used by the refresher
+  // task to update the rustls ClientCertVerifier without re-fetching the
+  // workload's own private key.
+  rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
+}
+
+message X509SVIDRequest {}
+
+message X509SVIDResponse {
+  // One entry per SVID issued to this workload. In practice, one per
+  // matching SPIRE registration entry — usually just one for ingest.
+  repeated X509SVID svids = 1;
+  // CRLs are unused by Tracelane (we rely on short SVID TTLs instead).
+  repeated bytes crl = 2;
+  // Federated trust bundles keyed by trust-domain name.
+  map<string, bytes> federated_bundles = 3;
+}
+
+message X509SVID {
+  // SPIFFE ID of the SVID, e.g. "spiffe://tracelane.dev/tenant/<uuid>/ingest-worker".
+  string spiffe_id = 1;
+  // ASN.1 DER-encoded certificate chain. Leaf first, then any intermediates.
+  // No trust anchor (CA) — that is delivered separately in `bundle`.
+  bytes x509_svid = 2;
+  // PKCS#8 DER-encoded private key for the SVID leaf. MUST be wrapped in
+  // SecretString on receipt and zeroized on drop.
+  bytes x509_svid_key = 3;
+  // ASN.1 DER-encoded trust bundle for the workload's own trust domain.
+  // Concatenated certificates — split on certificate boundaries.
+  bytes bundle = 4;
+  // Optional registration-entry hints (e.g. for SVID selection). Unused.
+  repeated string hint = 5;
+}
+
+message X509BundlesRequest {}
+
+message X509BundlesResponse {
+  // CRLs, unused.
+  repeated bytes crl = 1;
+  // Trust bundles keyed by trust-domain name. Tracelane only inspects
+  // the entry for "tracelane.dev".
+  map<string, bytes> bundles = 2;
+}

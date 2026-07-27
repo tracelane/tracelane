@@ -1,0 +1,62 @@
+---
+title: Tracelane
+description: The flight recorder for AI agents — full-fidelity traces, a tamper-evident audit ledger, and agent-tool attack detection. Apache 2.0, OTel-native.
+---
+
+Tracelane is a Rust gateway and ClickHouse-backed observability tier that
+captures every LLM and tool call at full fidelity, with a tamper-evident audit
+ledger that makes each run provable. Its sharpest edge is **MCP and agent-tool
+safety**: it surfaces tool-definition-drift, rug-pull substitution, and
+hallucinated tool-call arguments as first-class signals and records each with a
+tamper-evident signature. Heuristic checks for the lethal trifecta, prompt
+injection, A2A/A2UI drift, browser stuck-loops, and argument drift observe
+alongside; gateway-level enforcement is opt-in (observe-first by default), and
+an ML ensemble is on the roadmap.
+
+You point traffic at us, get low-overhead gateway routing, full-fidelity
+trace capture, tamper-evident audit logs, and merge-gate evals. Premium
+positioning, Apache 2.0, no SaaS-blocked license games.
+
+<CardGroup cols={2}>
+  <Card title="60-second quickstart" icon="rocket" href="/quickstart">
+    Drop two env vars in, get your first trace.
+  </Card>
+  <Card title="Architecture" icon="layer-group" href="/architecture">
+    Five components, one monorepo, OTel under the hood.
+  </Card>
+  <Card title="Agent-tool safety" icon="shield-check" href="/predictive-guardrails">
+    MCP tool-definition-drift + schema validation at the gateway. Each rail backed by a green eval.
+  </Card>
+  <Card title="30+ providers" icon="plug" href="/providers">
+    BYOK across Anthropic, OpenAI, Google, Bedrock, Azure, Cohere + any OpenAI-compatible endpoint.
+  </Card>
+</CardGroup>
+
+## Why Tracelane
+
+<CardGroup cols={2}>
+  <Card title="Apache 2.0, full stop" icon="scale-balanced">
+    Not GPL-3.0 viral. Not ELv2 SaaS-blocked. Run it however you want.
+  </Card>
+  <Card title="Caught at the gateway, not after" icon="bolt">
+    Tool-definition-drift is flagged or halted inline at the gateway, not
+    reconstructed from an incident write-up.
+  </Card>
+  <Card title="Evals are the merge gate" icon="circle-check">
+    50 pain-point assertions. CI fails if any regress — a red eval blocks the
+    merge.
+  </Card>
+  <Card title="Tamper-evident ledger" icon="lock">
+    SHA-256 hash chain and Ed25519 per-tenant signing, with byte-identical
+    verifiers in Rust + Python + TypeScript. Anchored batches carry a resolved
+    Sigstore Rekor v2 inclusion proof (best-effort, opt-in); universal per-run
+    anchoring is on the roadmap.
+  </Card>
+</CardGroup>
+
+## Where to next
+
+- New here? Start with the [60-second quickstart](/quickstart).
+- Operating it yourself? Read [Onboarding](/onboarding) for the self-host checklist.
+- Migrating from Helicone, LiteLLM, or Langfuse? See [Migrations](/migrations/from-helicone).
+- Auditing the design choices? Browse [Decisions](/decisions/index).
