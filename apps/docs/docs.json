@@ -95,7 +95,9 @@
 	},
 	"footer": {
 		"socials": {
-			"github": "https://github.com/tracelane/tracelane"
+			"github": "https://github.com/tracelane/tracelane",
+			"x": "https://x.com/xsanjeevlabs",
+			"linkedin": "https://www.linkedin.com/in/sanjeevlabs"
 		}
 	},
 	"search": {
