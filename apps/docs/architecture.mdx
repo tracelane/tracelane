@@ -28,7 +28,8 @@ Tracelane is five components in one monorepo:
     <code>apps/mcp/</code>
   </Card>
   <Card title="Python eval orchestrator" icon="flask">
-    Wraps DeepEval + Ragas + Inspect AI behind a unified API. The merge gate.
+    Wraps DeepEval + Ragas + Inspect AI behind a unified API. Runs in CI on
+    every push.
     <code>evals/</code>
   </Card>
 </CardGroup>
@@ -140,17 +141,17 @@ Python / TypeScript verifiers.
 
 These are **internal CI targets**, not measured public benchmarks — `benchmark-runner`
 rejects PRs that push any p95 over budget. Published, independently measured figures will
-ship with the [Reliability Benchmark v1.0](/benchmarks); until then we quote no public
+ship with the Reliability Benchmark v1.0; until then we quote no public
 performance numbers.
 
 | Metric (internal target) | p50 | p95 | p99 |
 |---|---|---|---|
-| Gateway overhead (excl. provider time) | <5ms | <15ms | <25ms |
-| Ingest end-to-end | <1s | <3s | <5s |
-| Dashboard 10K-span trace load | <200ms | <500ms | <1s |
-| MCP query (filtered, indexed) | <50ms | <150ms | <300ms |
-| Predictive layer (inline, combined) | <30ms | <50ms | <100ms |
-| SLM judge (1B encoder, L4 GPU) | <50ms | <100ms | <200ms |
+| Gateway overhead (excl. provider time) | `<5ms` | `<15ms` | `<25ms` |
+| Ingest end-to-end | `<1s` | `<3s` | `<5s` |
+| Dashboard 10K-span trace load | `<200ms` | `<500ms` | `<1s` |
+| MCP query (filtered, indexed) | `<50ms` | `<150ms` | `<300ms` |
+| Predictive layer (inline, combined) | `<30ms` | `<50ms` | `<100ms` |
+| SLM judge (1B encoder, L4 GPU) | `<50ms` | `<100ms` | `<200ms` |
 
 Throughput floors are likewise internal targets pending the Reliability Benchmark v1.0:
 - High-throughput single-node and multi-node ingest

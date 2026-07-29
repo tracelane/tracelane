@@ -11,18 +11,18 @@ description: Predictable AI agent reliability. Honest pricing — capped overage
 |---|---|---|
 | **OSS self-host** | $0 forever | 30+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
 | **Free hosted** | $0 | 10K traces + 10K gateway calls/mo, 60 RPM, 7-day retention, no commercial use, rule-based PR1+PR2. |
-| **Qualified-free** | $0 | Full Builder tier for verified OSS projects, .edu emails, startups with <$1M ARR. |
+| **Qualified-free** | $0 | Full Builder tier for verified OSS projects, .edu emails, startups with under $1M ARR. |
 | **Builder** | $59/mo | 150K traces + 150K gateway/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), 30-day retention, predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
 | **Team** | $249/mo | 1M traces + 1M gateway/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 90-day retention, predictive PR1–PR6, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 99% uptime target, predictive pre-flight guardrails with tamper-evident promotion record. |
 | **Business** | $899/mo | 5M traces + 5M gateway/mo, 60K RPM, 180-day retention, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 99.9% uptime target, cohort baselines when your cohort reaches 30 customers (on the roadmap). |
 | **Enterprise** | From $2,999/mo | 25M+ traces custom, 365-day retention, PR1–PR6 at launch, PR7–PR12 on the roadmap, dedicated tenancy option, 99.95% uptime target, EU AI Act Article 12, DPDP, GDPR DPA, ISO 27001 inherited from Hetzner, SOC 2 Type I planned, ISO 42001 planned, HIPAA via opt-in GCP +$2,000/mo. |
+| **Audit SKU** | +$999/mo | EU AI Act Article 12 compliance. Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), eIDAS-grade timestamps via QTSP daily batch, regulatory export pack. See [Audit Ledger](/audit-ledger) for protocol details. |
 
 <Note>
 Uptime targets are objectives, not contractual SLAs with service credits — a
 formal SLA with credits is available on Enterprise contracts. SOC 2 Type I is
 planned (not yet under audit). See [SLO](/slo) for the live error-budget dashboard.
 </Note>
-| **Audit SKU** | +$999/mo | EU AI Act Article 12 compliance. Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), eIDAS-grade timestamps via QTSP daily batch, regulatory export pack. See [Audit Ledger](/audit-ledger) for protocol details. |
 
 ## How we compare
 
@@ -70,7 +70,7 @@ Tamper-evident agent ledger for regulated AI deployments under EU AI Act Article
 </Accordion>
 
 <Accordion title="Is there a free trial for paid tiers?">
-Free hosted (10K traces/mo) is permanently free for non-commercial use. Qualified-free (full Builder tier) for verified OSS projects, .edu emails, and startups with <$1M ARR. No paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+Free hosted (10K traces/mo) is permanently free for non-commercial use. Qualified-free (full Builder tier) for verified OSS projects, .edu emails, and startups with under $1M ARR. No paid-tier free trial — the free hosted tier and OSS self-host are the trial.
 </Accordion>
 
 <Accordion title="Can I self-host?">

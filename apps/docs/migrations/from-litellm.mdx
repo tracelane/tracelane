@@ -34,11 +34,14 @@ LiteLLM has had a series of CVEs around `/config/update`-style admin
 endpoints and import-by-string of untrusted config. Tracelane:
 
 - Has no `/config/update` endpoint — config is reload-from-disk only
-- Never `eval`s or imports config strings as Python
-- Scans releases for new `.pth` files
-- Requires 2 maintainer approvals on release tags
+- Never `eval`s or imports config strings as Python — the gateway is Rust, with
+  no interpreter on the request path at all
+- Scans every build for stray `.pth` files (a CI step that exits non-zero on any
+  hit)
 
-These are enforced by CI, not just convention.
+The first two are structural — there is no such endpoint and no interpreter to
+exploit. The `.pth` scan is a CI step; it reports on every push but is not yet
+wired as a blocking required status check.
 
 ## Related
 

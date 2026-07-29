@@ -47,9 +47,12 @@ compromised or hallucinated tool call at the gateway, inline, rather than
 reconstruct it from an incident after the fact. The budget is real
 (`combined, inline`) and `benchmark-runner` enforces it.
 
-**Evals are the merge gate.** A claim that a guard exists is gated on
-its eval being green on `main`; a red eval blocks the merge that would
-ship the claim.
+**Every claim carries an eval.** A claim that a guard exists is written
+down as an assertion in `evals/`, and the suite runs in CI on every push.
+Behavioral assertions that need a live gateway report as **skipped**, never
+as a fabricated pass. The suite is not yet enforced as a blocking required
+check — it reports, and a red result is acted on rather than automatically
+refused.
 
 ## Related
 

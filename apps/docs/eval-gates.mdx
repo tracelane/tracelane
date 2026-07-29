@@ -1,6 +1,6 @@
 ---
 title: Eval gates
-description: Automated eval checks that block prompt promotion if any assertion fails.
+description: Automated eval checks designed to block prompt promotion when an assertion fails. Gate enforcement is V1.1 — promotions today record a tamper-evident manual override.
 ---
 
 An eval gate is a set of assertions that must pass before a prompt version can
@@ -125,10 +125,18 @@ is set. Add to `.github/workflows/ci.yml`:
 
 `--gate` sets a non-zero exit code on any failure, blocking merge.
 
-## Merge gate (50 pain-point evals)
+## Tracelane's own eval suite
 
-The project's own CI uses the same eval framework. 50 pain-point assertions + 8
-fault-tolerance chaos evals run on every PR. A red eval blocks merge.
+The project's own CI uses the same eval framework: 69 pain-point assertions +
+10 fault-tolerance chaos evals, run on every push.
+
+<Note>
+**These report; they do not block.** The suite is not wired as a blocking
+required status check, so a red eval does not automatically refuse a change —
+it is surfaced and acted on. Assertions that need a live gateway are reported
+as **skipped** in CI, never as a fabricated pass; see the status vocabulary in
+`evals/pain-points/INDEX.md`.
+</Note>
 
 Run the full suite locally:
 
@@ -136,7 +144,7 @@ Run the full suite locally:
 pnpm eval:run --suite=all
 ```
 
-See the [Eval Scoreboard](/evals) in the dashboard for live status.
+The Eval Scoreboard in the dashboard shows live status for your own eval runs.
 
 ## Related
 

@@ -42,9 +42,11 @@ positioning, Apache 2.0, no SaaS-blocked license games.
     Tool-definition-drift is flagged or halted inline at the gateway, not
     reconstructed from an incident write-up.
   </Card>
-  <Card title="Evals are the merge gate" icon="circle-check">
-    50 pain-point assertions. CI fails if any regress — a red eval blocks the
-    merge.
+  <Card title="Every claim carries an eval" icon="circle-check">
+    69 pain-point assertions and 10 fault-tolerance chaos evals run in CI on
+    every push. Structural assertions run green; behavioral ones report as
+    **skipped** without a live gateway rather than as a pass. The suite reports
+    — it is not yet wired as a blocking required check.
   </Card>
   <Card title="Tamper-evident ledger" icon="lock">
     SHA-256 hash chain and Ed25519 per-tenant signing, with byte-identical

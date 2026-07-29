@@ -42,12 +42,7 @@
 					},
 					{
 						"group": "Operations",
-						"pages": [
-							"self-hosting",
-							"security",
-							"troubleshooting",
-							"changelog"
-						]
+						"pages": ["self-hosting", "security", "troubleshooting"]
 					},
 					{
 						"group": "Migrations",
@@ -90,22 +85,17 @@
 			{
 				"label": "GitHub",
 				"href": "https://github.com/tracelane/tracelane"
-			},
-			{
-				"label": "Status",
-				"href": "https://status.tracelane.dev"
 			}
 		],
 		"primary": {
 			"type": "button",
-			"label": "Sign up",
-			"href": "https://app.tracelane.dev/signup"
+			"label": "Sign in",
+			"href": "https://app.tracelane.dev/sign-in"
 		}
 	},
 	"footer": {
 		"socials": {
-			"github": "https://github.com/tracelane/tracelane",
-			"x": "https://x.com/tracelanedev"
+			"github": "https://github.com/tracelane/tracelane"
 		}
 	},
 	"search": {
