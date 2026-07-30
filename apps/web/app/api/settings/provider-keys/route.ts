@@ -27,6 +27,17 @@ interface ProviderKeySummary {
 	last4: string;
 }
 
+/**
+ * rest of `/api/settings/*` already emits. Shared by GET/POST so a member sees
+ * the same honest "owner-only" signal whichever verb they hit.
+ */
+function roleForbidden(): NextResponse {
+	return NextResponse.json(
+		{ error: "role_forbidden", required_role: "owner" },
+		{ status: 403 },
+	);
+}
+
 export async function GET(): Promise<NextResponse> {
 	const { token } = await requireGatewayToken();
 
@@ -36,6 +47,12 @@ export async function GET(): Promise<NextResponse> {
 	});
 
 	if (!upstream.ok) {
+		// 403 is not a failure — it is the gateway's owner-only gate on BYOK
+		// provider keys (`provider_keys_api.rs::authenticate`, IDENTITY_TEAM_SPEC
+		// §1). Pass the typed shape through so the UI can render a locked state
+		// instead of "Failed to load" (which sent a member debugging a non-bug).
+		// Body is ours, never the upstream's.
+		if (upstream.status === 403) return roleForbidden();
 		return NextResponse.json(
 			{ error: "provider keys unavailable" },
 			{ status: upstream.status >= 500 ? 502 : upstream.status },
@@ -85,6 +102,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	});
 
 	if (!upstream.ok) {
+		if (upstream.status === 403) return roleForbidden();
 		const status =
 			upstream.status === 400
 				? 400

@@ -284,7 +284,6 @@ pub struct SloRow {
 }
 
 /// Window-WIDE SLO summary — the true merged quantiles for the headline tiles
-/// (B-118 #9), distinct from the per-bucket [`SloRow`]. One row per window.
 #[derive(Debug, Clone, Deserialize, Serialize, clickhouse::Row)]
 pub struct SloSummary {
     pub p50_ms: f64,
@@ -1385,7 +1384,6 @@ WHERE tenant_id = ?",
 
 /// Build the window-WIDE SLO summary SELECT — the TRUE p50/p95/p99 over the
 /// whole window via `quantileMerge` over the stored `quantileState`, NOT a
-/// weighted mean of per-hour bucket percentiles (B-118 #9: the dashboard tile
 /// computed `Σ(pXX·requests)/Σrequests` client-side — a percentile-of-percentiles
 /// that diverges from the true quantile). One row. `?` order mirrors
 /// `build_slo_sql`: tenant, (since_secs | hours), [until_secs], [provider],
@@ -3089,7 +3087,6 @@ async fn slo_handler(
 /// GET /v1/slo/summary — the window-WIDE TRUE p50/p95/p99 (quantileMerge over the
 /// stored per-hour quantile states) for the headline latency tiles. The dashboard
 /// previously computed a request-weighted mean of the per-hour bucket percentiles
-/// (B-118 #9), which is a percentile-of-percentiles and diverges from the true
 /// quantile. Tenant id comes only from `Claims.tenant_id`. Same query params as
 /// `/v1/slo` so it scopes to the same window/provider/model.
 async fn slo_summary_handler(

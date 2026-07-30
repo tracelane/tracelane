@@ -83,6 +83,21 @@ describe("POST /api/settings/provider-keys", () => {
 		expect(res.status).toBe(502);
 	});
 
+	it("passes an upstream 403 through as typed role_forbidden", async () => {
+		fetchMock.mockResolvedValue({
+			ok: false,
+			status: 403,
+			json: async () => ({ error: "role_forbidden" }),
+		});
+		const res = await POST(
+			postReq({ provider_id: "anthropic", plaintext: "sk-ant-x" }),
+		);
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as { error: string }).error).toBe(
+			"role_forbidden",
+		);
+	});
+
 	it("forwards the Bearer token + body, with NO tenant in the body", async () => {
 		fetchMock.mockResolvedValue({
 			ok: true,
@@ -156,5 +171,31 @@ describe("GET /api/settings/provider-keys", () => {
 		});
 		const res = await GET();
 		expect(res.status).toBe(502);
+	});
+
+	// The reported bug: the gateway gates GET on owner (`provider_keys_api.rs`
+	// `authenticate` → `can_admin`), so an invited member got a 403 that the UI
+	// rendered as "Failed to load provider keys." A 403 is a locked state, not a
+	// fault — it must arrive typed so the UI can say so.
+	it("passes an upstream 403 through as typed role_forbidden, not a failure", async () => {
+		fetchMock.mockResolvedValue({
+			ok: false,
+			status: 403,
+			json: async () => ({
+				error: "role_forbidden",
+				required_role: "owner",
+				leak: "UPSTREAM_BODY",
+			}),
+		});
+		const res = await GET();
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as {
+			error: string;
+			required_role: string;
+		};
+		expect(body.error).toBe("role_forbidden");
+		expect(body.required_role).toBe("owner");
+		// Body is ours, never the upstream's (security.md R2 C-3).
+		expect(JSON.stringify(body)).not.toContain("UPSTREAM_BODY");
 	});
 });

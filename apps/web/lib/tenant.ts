@@ -11,7 +11,6 @@ import { tenants, users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 /**
- * Best-effort upsert of the `users` mirror row (B-101). WorkOS is the system of
  * record (spec principle #1); this table is a convenience cache (the account
  * page's name seed, ledger-FK integrity). The gateway webhook CAN'T populate it
  * — WorkOS `user.created` carries no org, and membership events aren't
@@ -55,19 +54,51 @@ export async function upsertUserMirror(opts: {
  * absent. Idempotent: concurrent first-calls collapse on the unique
  * `workos_org_id` index (the loser re-selects the winner's row).
  *
+ * `name` is the WorkOS organization's display name, mirrored into `tenants.name`
+ * so the shell can label the workspace from ONE cheap Postgres read instead of a
+ * WorkOS API call per render. Pass it whenever the caller already has it — the
+ * onboarding route just created the org with that exact name, so this costs
+ * nothing. Omit it and the row keeps whatever name it has.
+ *
+ * The name is a display CACHE, never an identity: nothing authorizes on it, and
+ * WorkOS stays the source of truth (the rename endpoint writes both).
+ *
+ * Before this, the row was created with `{ workosOrgId }` alone and the ONLY
+ * writer of `tenants.name` was the rename endpoint — so any workspace that was
+ * never renamed had an empty name forever, and the nav pill fell back to the
+ * literal "Workspace" for every member (`OrgSwitcher.tsx:23`).
+ *
  * @throws if the row can neither be found nor inserted (should never happen).
  */
-export async function upsertTenantId(workosOrgId: string): Promise<string> {
+export async function upsertTenantId(
+	workosOrgId: string,
+	name?: string | null,
+): Promise<string> {
 	const existing = await db
-		.select({ id: tenants.id })
+		.select({ id: tenants.id, name: tenants.name })
 		.from(tenants)
 		.where(eq(tenants.workosOrgId, workosOrgId))
 		.limit(1);
-	if (existing[0]) return existing[0].id;
+	if (existing[0]) {
+		// Heal a row that predates name mirroring. Only fills an EMPTY name — a
+		// stored name is the rename path's output and must not be clobbered by a
+		// stale caller. Best-effort: a failure here must never break a render.
+		if (name?.trim() && !existing[0].name?.trim()) {
+			try {
+				await db
+					.update(tenants)
+					.set({ name: name.trim() })
+					.where(eq(tenants.workosOrgId, workosOrgId));
+			} catch {
+				// Display-name cache only; WorkOS remains the source of truth.
+			}
+		}
+		return existing[0].id;
+	}
 
 	const inserted = await db
 		.insert(tenants)
-		.values({ workosOrgId })
+		.values({ workosOrgId, name: name?.trim() || null })
 		.onConflictDoNothing({ target: tenants.workosOrgId })
 		.returning({ id: tenants.id });
 	if (inserted[0]) return inserted[0].id;

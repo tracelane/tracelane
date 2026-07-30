@@ -153,7 +153,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				throw err;
 			},
 		),
-		// B-118 #9: the TRUE window-wide p50/p95/p99 (server-side quantileMerge
 		// over the stored per-hour states), for the headline tiles. Null on an
 		// unreachable gateway → the tiles fall back to the weighted-mean below.
 		gatewayGet<SloSummary>(`/v1/slo/summary?hours=${hours}`).then(
@@ -203,7 +202,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	]);
 
 	const dash = slo.warming; // gateway unreachable → em-dash the SLO-derived cards
-	// B-118 #4: exclude non-LLM (provider="") rows — tool/child spans land in the
 	// empty-provider bucket. Including them made "Requests" a raw SPAN count that
 	// double-counted tool spans (also shown as "Tool usage") and over-counted
 	// multi-span SDK/agent traces, and diluted the error rate. Every SLO-derived
@@ -214,7 +212,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	const totalRequests = rows.reduce((s, r) => s + r.requests, 0);
 	const totalErrors = rows.reduce((s, r) => s + r.errors, 0);
 	const errorPct = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
-	// B-118 #9: headline p50/p95/p99 are the TRUE window quantiles from the server
 	// (quantileMerge over the stored per-hour states), NOT a request-weighted mean
 	// of the per-hour bucket percentiles. A weighted mean of percentiles is a
 	// percentile-of-percentiles and diverges from the real quantile. The wmean is

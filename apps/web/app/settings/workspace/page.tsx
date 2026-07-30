@@ -13,6 +13,7 @@ import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { absoluteDate } from "@/lib/format-date";
+import { upsertTenantId } from "@/lib/tenant";
 import { Card } from "@tracelanedev/ui";
 import { eq } from "drizzle-orm";
 import type { Metadata } from "next";
@@ -67,6 +68,14 @@ export default async function WorkspacePage() {
 	]);
 
 	const tenant = tenantRows[0];
+
+	// Self-heal `tenants.name` for workspaces created before the name was
+	// mirrored at creation (their only writer was the rename endpoint, so a
+	// never-renamed workspace had an empty name forever and the nav pill fell
+	// back to the literal "Workspace"). We already hold the authoritative WorkOS
+	// name from the fetch above, so this costs no extra API call — and
+	// `upsertTenantId` only fills an EMPTY name, never overwrites a real one.
+	if (org?.name) await upsertTenantId(session.tenantId, org.name);
 
 	return (
 		<div className="space-y-1">

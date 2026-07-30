@@ -86,6 +86,12 @@ fi
 if [[ -f scripts/ci/check-provider-count.py ]] && command -v python3 >/dev/null 2>&1; then
     run "provider-count guard"     python3 scripts/ci/check-provider-count.py
 fi
+# Together, Fireworks and OpenRouter routed (and counted toward "35") while the
+# BYOK allowlist rejected their key upload with 400, so no customer could store
+# one. Three hand-maintained lists that must agree — registry, allowlist, dropdown.
+if [[ -f scripts/ci/check-byok-provider-coverage.py ]] && command -v python3 >/dev/null 2>&1; then
+    run "byok-provider-coverage guard" python3 scripts/ci/check-byok-provider-coverage.py
+fi
 # Mirrored from ci.yml: these guards were CI-ONLY and therefore enforced
 # NOWHERE while the CI workflow was disabled (dark 2026-06-20→). Local gate now
 # carries the load-bearing ones so a disabled CI can't silently un-guard them.
@@ -104,7 +110,6 @@ if command -v python3 >/dev/null 2>&1; then
     # AFT-1 vocabulary: detectors ⊆ taxonomy map, live⟺detector, seeder ⊆ map —
     # the canonical-id vocabulary can never silently drift from the detectors again.
     run "aft-vocabulary guard"         python3 scripts/ci/check-aft-vocabulary.py
-    # B-126: exactly ONE model→provider prefix table (provider_id_for_model); the
     # dispatch + key-lookup + span-attribution must delegate to it. A second table
     # is the cross-provider BYOK-misroute drift surface.
     run "provider-mapping guard"       python3 scripts/ci/check-provider-mapping-single-source.py

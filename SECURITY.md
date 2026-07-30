@@ -211,4 +211,5 @@ CVE-2026-33634 compromised LiteLLM v1.82.7/1.82.8 via a poisoned Trivy GitHub Ac
 (`aquasecurity/trivy-action`). The compromised action was distributed through GitHub's
 action marketplace. We use Grype (Anchore) with a pinned release binary instead, and
 all our CI actions are SHA-pinned to a specific commit rather than a floating tag.
-This choice is documented in [decisions/ADR-007-grype-not-trivy.md](decisions/ADR-007-grype-not-trivy.md).
+This choice is summarised in the
+[architectural decisions](https://docs.tracelane.dev/decisions) index.

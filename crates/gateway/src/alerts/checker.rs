@@ -28,7 +28,6 @@ const ERROR_RATE_SQL: &str = "SELECT if(count() = 0, 0.0, \
     WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai_provider_name') != '' \
     AND start_time >= now() - toIntervalMinute(?)";
 // burn = error_fraction / error_budget, where error_budget = 1 - SLO_target.
-// B-118 #6: the budget is the tenant's PLAN target (ADR-020: Team 99% /
 // Business 99.9% / Enterprise 99.95%), resolved per-tenant in Rust — NOT a
 // hardcoded 0.001 (99.9%), which overstated a Team tenant's burn 10×. This SQL
 // returns the raw error fraction; `burn_rate()` divides by the tenant budget.
@@ -281,7 +280,6 @@ impl AlertChecker {
 mod tests {
     use super::plan_key_to_error_budget;
 
-    /// B-118 #6: burn is divided by the tenant's PLAN error budget (ADR-020),
     /// not a hardcoded 99.9%. The discriminating case: a Team tenant's target is
     /// 99% (budget 0.01), so the same error fraction yields a burn 10× lower than
     /// the old hardcoded 0.001 divisor — the exact overstatement this fixes.

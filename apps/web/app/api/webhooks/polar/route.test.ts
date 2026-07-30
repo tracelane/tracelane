@@ -31,6 +31,7 @@ import { POST } from "./route";
 const SECRET_ENV = "polar_whs_unit_test_do_not_use_in_prod";
 const HMAC_KEY = Buffer.from(SECRET_ENV, "utf-8");
 const ORG = "org_polar_test";
+const TENANT_DB_ID = "11111111-2222-3333-4444-555555555555";
 
 const SAVED = {
 	secret: process.env.POLAR_WEBHOOK_SECRET,
@@ -151,9 +152,18 @@ describe("POST /api/webhooks/polar", () => {
 		expect(h.db?.db.insert).toHaveBeenCalledTimes(1); // only the dedup record
 	});
 
-	it("200 + LOUD error log on an add-on lookup_key (grant wiring is P2)", async () => {
-		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-		setDb([[], []]); // dedup empty, record
+	// logged loudly and granted nothing, so a $999 Audit SKU purchase unlocked
+	// which removed that log line and left this test red on a clean tree — a red
+	// test on the payment path. It now asserts the GRANT, which is the behaviour
+	// that must never regress.
+	it("audit_addon_v1 purchase GRANTS f_audit_addon", async () => {
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		setDb([
+			[], // dedup select → not seen
+			[{ id: TENANT_DB_ID, plan: "team" }], // correlateTenant
+			[], // entitlement upsert
+			[], // record webhook_events
+		]);
 		const res = await POST(
 			makeReq(
 				subEvent({
@@ -165,9 +175,31 @@ describe("POST /api/webhooks/polar", () => {
 			),
 		);
 		expect(res.status).toBe(200);
+		// The add-on must NOT touch tenants.plan — it is orthogonal to the tier.
+		expect(h.db?.db.update).not.toHaveBeenCalled();
+		expect(info).toHaveBeenCalledWith(
+			expect.stringContaining("audit add-on GRANTED (f_audit_addon=true)"),
+		);
+		info.mockRestore();
+	});
+
+	it("an unrecognised add-on stays a LOUD no-op (needs manual ops)", async () => {
+		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+		setDb([[], []]); // dedup empty, record
+		const res = await POST(
+			makeReq(
+				subEvent({
+					product: {
+						organization_id: ORG,
+						metadata: { lookup_key: "hipaa_gcp_addon_v1" },
+					},
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
 		expect(h.db?.db.update).not.toHaveBeenCalled();
 		expect(spy).toHaveBeenCalledWith(
-			expect.stringContaining("ADD-ON lookup_key received (audit_addon_v1)"),
+			expect.stringContaining("grant NOT auto-wired"),
 		);
 		spy.mockRestore();
 	});

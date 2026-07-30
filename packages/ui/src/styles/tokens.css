@@ -204,6 +204,43 @@
 
 @layer components {
 	/*
+	 * ── Motion + elevation primitives (cosmetic pass 2026-07-28) ─────────────
+	 * One easing curve and two shadow recipes, so every lifted surface in the app
+	 * agrees. Previously each component inlined its own cubic-bezier and its own
+	 * one-layer shadow, which is why tiles, cards and the CTA felt subtly
+	 * different when they moved.
+	 *
+	 * `--shadow-rest/-lift` are TWO-layer: a tight contact shadow (grounds the
+	 * edge) plus a wide ambient one (gives depth). A single-layer shadow reads
+	 * flat and slightly muddy; the pair is what makes a surface look lifted
+	 * rather than outlined. Still cheap — no blur filters, no backdrop-filter
+	 * (ADR-053 rejected literal glass on purpose: it costs frames and reads as
+	 * nothing on a flat page).
+	 */
+	:root {
+		--ease-out: cubic-bezier(0.2, 0, 0, 1);
+		--dur-fast: 140ms;
+		--dur-base: 180ms;
+		--radius-card: 0.875rem;
+		--shadow-rest: 0 1px 2px -1px rgba(20, 28, 36, 0.07), 0 4px 12px -6px
+			rgba(20, 28, 36, 0.06);
+		--shadow-lift: 0 2px 6px -2px rgba(20, 28, 36, 0.09), 0 14px 32px -14px
+			rgba(20, 28, 36, 0.16);
+		/* Specular top hairline — the "wet"/liquid edge. On light surfaces a white
+		   inset does nothing, so light mode uses a faint cool-white that reads as a
+		   polished edge against the tinted-slate palette. */
+		--sheen: inset 0 1px 0 0 rgba(255, 255, 255, 0.9);
+	}
+	[data-theme="dark"],
+	.dark {
+		--shadow-rest: 0 1px 2px -1px rgba(0, 0, 0, 0.45), 0 4px 14px -6px
+			rgba(0, 0, 0, 0.4);
+		--shadow-lift: 0 2px 8px -2px rgba(0, 0, 0, 0.5), 0 16px 34px -14px
+			rgba(0, 0, 0, 0.55);
+		--sheen: inset 0 1px 0 0 rgba(255, 255, 255, 0.045);
+	}
+
+	/*
 	 * Lava CTA (ADR-053) — the ONE gradient permitted on an interactive control.
 	 * Solid `bg-accent` stays the default primary; `.cta-lava` is the elevated
 	 * hero/primary action. White label, soft lava glow that lifts on hover.
@@ -218,16 +255,53 @@
 			var(--accent-strong) 100%
 		);
 		color: var(--accent-on);
-		box-shadow: 0 4px 14px -4px var(--accent-glow);
-		transition: box-shadow 150ms cubic-bezier(0.2, 0, 0, 1), transform 150ms
-			cubic-bezier(0.2, 0, 0, 1);
+		/* + a specular top hairline, so the CTA reads as a lit surface rather than
+		   a flat gradient swatch. */
+		box-shadow: 0 4px 14px -4px var(--accent-glow), inset 0 1px 0 0
+			rgba(255, 255, 255, 0.28);
+		transition: box-shadow var(--dur-fast) var(--ease-out), transform
+			var(--dur-fast) var(--ease-out);
+		/* Anchors the sheen sweep below and clips it to the button's radius. */
+		position: relative;
+		overflow: hidden;
+		isolation: isolate;
+	}
+	/*
+	 * Sheen sweep — a soft specular band that crosses the CTA once on hover.
+	 * Animates `transform` ONLY (compositor-only, no repaint, no layout), so it
+	 * costs nothing on the hot path. `pointer-events: none` keeps it inert, and
+	 * it is skipped entirely under reduced-motion.
+	 */
+	.cta-lava::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		z-index: -1;
+		background-image: linear-gradient(
+			105deg,
+			transparent 35%,
+			rgba(255, 255, 255, 0.32) 50%,
+			transparent 65%
+		);
+		transform: translateX(-100%);
+		pointer-events: none;
+	}
+	.cta-lava:hover::after {
+		transform: translateX(100%);
+		transition: transform 620ms var(--ease-out);
 	}
 	.cta-lava:hover {
 		transform: translateY(-1px);
-		box-shadow: 0 8px 22px -6px var(--accent-glow-2);
+		box-shadow: 0 8px 22px -6px var(--accent-glow-2), inset 0 1px 0 0
+			rgba(255, 255, 255, 0.38);
 	}
 	.cta-lava:active {
 		transform: translateY(0);
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.cta-lava::after {
+			display: none;
+		}
 	}
 
 	/*
@@ -252,23 +326,28 @@
 	 * `--interactive` adds a 1px hover-lift for click-through tiles.
 	 */
 	.stat-tile {
-		border-radius: 0.75rem;
+		border-radius: var(--radius-card);
 		border: 1px solid var(--line);
 		/* Pure white result tiles (founder review): no surface→surface-2 tint —
-		   elevation comes from the hairline border + soft shadow only. */
+		   elevation comes from the hairline border + layered shadow + the specular
+		   top edge only. */
 		background-color: var(--surface);
-		box-shadow: 0 1px 2px -1px rgba(20, 28, 36, 0.06);
+		box-shadow: var(--shadow-rest), var(--sheen);
 	}
 	.stat-tile--interactive {
 		cursor: pointer;
-		transition: box-shadow 160ms cubic-bezier(0.2, 0, 0, 1), transform 160ms
-			cubic-bezier(0.2, 0, 0, 1), border-color 160ms cubic-bezier(0.2, 0, 0, 1);
+		transition: box-shadow var(--dur-base) var(--ease-out), transform
+			var(--dur-base) var(--ease-out), border-color var(--dur-base)
+			var(--ease-out);
 	}
 	.stat-tile--interactive:hover {
-		transform: translateY(-1px);
+		transform: translateY(-2px);
 		border-color: var(--line-2);
-		box-shadow: 0 2px 6px -2px rgba(20, 28, 36, 0.08), 0 10px 24px -12px
-			rgba(20, 28, 36, 0.12);
+		box-shadow: var(--shadow-lift), var(--sheen);
+	}
+	.stat-tile--interactive:active {
+		transform: translateY(0);
+		box-shadow: var(--shadow-rest), var(--sheen);
 	}
 	[data-theme="dark"] .stat-tile,
 	.dark .stat-tile {
@@ -277,13 +356,26 @@
 			var(--surface-2) 0%,
 			var(--surface) 150%
 		);
-		box-shadow: 0 1px 2px -1px rgba(0, 0, 0, 0.4), inset 0 1px 0 0
-			rgba(255, 255, 255, 0.02);
 	}
-	[data-theme="dark"] .stat-tile--interactive:hover,
-	.dark .stat-tile--interactive:hover {
-		box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.5), 0 12px 28px -12px
-			rgba(0, 0, 0, 0.5);
+	@media (prefers-reduced-motion: reduce) {
+		.stat-tile--interactive:hover {
+			transform: none;
+		}
+	}
+
+	/*
+	 * Shared <Card> surface. Same radius + resting elevation + specular edge as
+	 * .stat-tile, so a card and a metric tile sitting side by side read as the
+	 * same material instead of two different ones.
+	 */
+	.surface-card {
+		border-radius: var(--radius-card);
+		box-shadow: var(--shadow-rest), var(--sheen);
+	}
+	/* The provenance variant paints a 3px Verify-green top edge — a white specular
+	   hairline on top of it would mud the seal colour, so drop the sheen there. */
+	.surface-card.card-provenance-top {
+		box-shadow: var(--shadow-rest);
 	}
 
 	/* (The former .brand-logo/.brand-logo-icon PNG background rules were removed —
@@ -312,6 +404,13 @@
 	[role="button"]:focus-visible {
 		outline: 2px solid var(--seal);
 		outline-offset: 3px;
+	}
+	/* `border-radius` here applies to the ELEMENT, not the outline — setting it
+	   globally squared off every rounded button and pill the moment it took focus
+	   (a rounded-full control snapped to 2px). The outline already follows the
+	   element's own radius, so it is only needed for inline links, which have
+	   none of their own. */
+	a:focus-visible {
 		border-radius: 2px;
 	}
 }

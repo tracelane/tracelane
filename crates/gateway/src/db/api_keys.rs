@@ -134,7 +134,6 @@ fn pepper() -> Result<&'static SecretBox<[u8; 32]>> {
 }
 
 // ---------------------------------------------------------------------
-// Auth-result cache (B-119 fix B)
 // ---------------------------------------------------------------------
 //
 // The measured gateway overhead was 62ms of Argon2id + PG round-trips on EVERY

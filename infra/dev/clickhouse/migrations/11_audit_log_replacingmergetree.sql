@@ -1,6 +1,4 @@
--- 11: audit_log MergeTree -> ReplacingMergeTree (B-108 forward fix, ADR-065 F1).
 --
--- WHY: the cross-process seq-assignment race (B-108) is closed by a per-tenant
 -- Postgres-serialized append (FOR UPDATE row lock) — crates/gateway/src/audit.rs
 -- append_pg_serialized + db/audit_chain_state.rs append_atomic). That fix writes
 -- the ClickHouse row DURABLY *before* it advances + commits the Postgres head

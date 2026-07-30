@@ -9,7 +9,7 @@ Read [`CLAUDE.md`](./CLAUDE.md) — it is the operating manual for all developme
 work in this repository. Contributions that violate conventions in CLAUDE.md
 will not be merged.
 
-Read the relevant [`decisions/`](./decisions/) ADRs before proposing
+Read the [architectural decisions](https://docs.tracelane.dev/decisions) index before proposing
 architectural changes. If you disagree with a decision, open an issue first.
 
 ---
@@ -162,8 +162,8 @@ Open a GitHub issue using the bug report template. Include:
 ### Feature requests
 
 Open a GitHub issue using the feature request template. Before doing so:
-- Check `evals/pain-points/INDEX.md` — if the feature addresses a listed pain
-  point, it may already be on the roadmap
+- Browse `evals/pain-points/` — if the feature addresses an assertion that
+  already has an eval there, it may already be on the roadmap
 - Describe the user pain, not just the solution
 
 ### Pull requests

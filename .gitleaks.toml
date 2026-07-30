@@ -24,7 +24,6 @@ useDefault = true
 #
 # Prefix-anchored with a length FLOOR, not a pinned length — Google publishes
 # no format spec and treats the key as opaque, so a pinned length lets a
-# slightly-different key through. See B-112 (the internal google-key-redaction incident review).
 [[rules]]
 id = "tracelane-google-auth-key-aq"
 description = "Google Authentication Key (AQ. format, 2026) — no upstream rule exists"
@@ -57,12 +56,12 @@ regexes = [
   # files wholesale would hide a genuine key committed there later. These also
   # surfaced in the public-export staging tree, where they would have given the
   # public repo a red secret-scan on day one.
-  '''FAKEunittestonly''',                            # provider_keys.rs — B-116 fingerprint test PEM
+  '''FAKEunittestonly''',                            # provider_keys.rs — fingerprint test PEM
   '''NOT-A-REAL-KEY-do-not-use''',                   # vertex.rs — service-account parse test PEM
   '''AQ\.AbSomeApiKeyNotAServiceAccount''',          # vertex.rs — "an API key is not an SA" test
   '''AQ\.AbFAKEauthkeyshapedvaluefortesting00000''', # providers/mod.rs — safe_reason cannot admit a credential
-  '''FAKEtestkeyDONOTUSE''',                         # B-125 provider-error redaction tests (server.rs poison, redact.rs xai/tlane) — clearly-fake `sk-proj…/AIza…/xai-…/tlane_…FAKEtestkeyDONOTUSE…`
-  '''FAKEleakDONOTUSE''',                            # B-125 verbose-5xx smoke proof (smoke_tests.rs) — fake `sk-projFAKEleakDONOTUSE…`
+  '''FAKEtestkeyDONOTUSE''',                         # provider-error redaction tests (server.rs poison, redact.rs xai/tlane) — clearly-fake `sk-proj…/AIza…/xai-…/tlane_…FAKEtestkeyDONOTUSE…`
+  '''FAKEleakDONOTUSE''',                            # verbose-5xx smoke proof (smoke_tests.rs) — fake `sk-projFAKEleakDONOTUSE…`
 
   # FALSE POSITIVE: a UI line that RENDERS the first 16 chars of a tenant's
   # PUBLIC audit key (`keyId = tenantPubkeyB64.slice(0, 16)`); the `generic-api-key`

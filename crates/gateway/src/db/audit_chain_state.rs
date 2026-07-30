@@ -10,7 +10,6 @@
 //!   used to seed the in-memory `DashMap<TenantId, TenantChainState>`.
 //! - [`upsert`] — write the latest `(last_seq, last_row_hash)` for
 //!   one tenant after each successful append. ON CONFLICT DO UPDATE.
-//! - [`append_atomic`] — **B-108 forward fix (ADR-065 F1).** Claim + advance
 //!   the chain head for one tenant inside a single Postgres transaction whose
 //!   `SELECT … FOR UPDATE` row lock serializes concurrent appends for that
 //!   tenant **across processes** (the process-local `parking_lot::Mutex` could
@@ -158,7 +157,6 @@ pub struct AtomicAppend {
     pub row_hash: [u8; 32],
 }
 
-/// **B-108 forward fix (ADR-065 F1) — per-tenant Postgres-serialized append.**
 ///
 /// Claim the next seq for `tenant_id`, invoke `write_ch` to durably write the
 /// ClickHouse row, then advance the persisted head — all inside ONE Postgres
@@ -211,7 +209,6 @@ where
 
     // ADR-069 idempotency: on the async consumer path, dedup on `event_id` INSIDE
     // the tx so a JetStream redelivery consumes no seq and writes no row (the
-    // B-108 dup-seq class). A conflict (0 rows) → already appended → roll back and
     // report skip (`Ok(None)`). The synchronous path passes `None` and skips this
     // block entirely, so its behavior is byte-unchanged.
     if let Some(eid) = event_id {

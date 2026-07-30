@@ -111,7 +111,6 @@ pub struct AppState {
     /// Monthly trace-quota tracker enforcing the hard 5× cap.
     /// Hot-path budget <500ns p99 (see `benches/rate_limiter.rs`).
     pub quota_tracker: Arc<QuotaTracker>,
-    /// B-109: ClickHouse URL the `quota_tracker` rehydrates the durable monthly
     /// baseline from on (re)start / month rollover, so a restart or blue-green
     /// deploy no longer forgives accrued quota. `None` (dev / no CH) disables
     /// rehydration — the counter starts at 0. Mirrors `config.clickhouse_url`.
@@ -356,7 +355,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let kill_switch = Arc::new(crate::kill_switch::KillSwitch::from_env());
     let predictive = Arc::new(PredictiveLayer::new().with_kill_switch(kill_switch.clone()));
 
-    // ADR-069: async audit append (B-119). Create the JetStream context + the
     // durable TRACELANE_AUDIT stream BEFORE serving (so the first publish lands),
     // enable the acked-publish path on the audit chain, and spawn the sole
     // head-writer consumer. On any setup failure the audit path stays SYNCHRONOUS
@@ -499,22 +497,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(chat_completions_handler))
         .with_state(state.clone());
 
-    // Polar webhook — own narrow state so the handler doesn't pull the
-    // full AppState. Mounted only when POLAR_WEBHOOK_SECRET is set;
-    // without a configured secret we cannot verify signatures so the
-    // route stays unmounted (better than 503-ing every request).
-    if let Some(wh_cfg) = crate::billing::WebhookConfig::from_env() {
-        let wh_state = crate::billing::WebhookState {
-            config: Arc::new(wh_cfg),
-        };
-        let wh_app = Router::new()
-            .route("/v1/webhooks/polar", post(crate::billing::webhook::handler))
-            .with_state(wh_state);
-        app = app.merge(wh_app);
-        tracing::info!("Polar webhook handler mounted at /v1/webhooks/polar");
-    } else {
-        tracing::info!("POLAR_WEBHOOK_SECRET not set — webhook handler not mounted");
-    }
+    // Polar webhooks are handled by the SINGLE receiver in the web tier
+    // (`apps/web/app/api/webhooks/polar`), which correlates the tenant by the
+    // checkout's `customer.external_id` and owns the `tenants` / entitlements
+    // writes via Drizzle. The gateway once mounted a SECOND receiver here, but
+    // it keyed correlation only on `polar_customer_id` — a column no real
+    // checkout ever populates — so it could never flip a real subscription, and
+    // correct path. Polar is registered against the web route; the gateway never
+    // received a delivery. (WorkOS webhooks stay on the gateway — separate path.)
 
     // Polar billing-portal endpoint — POST /v1/billing/portal.
     // Tenants exchange their bearer token for a Polar-hosted self-
@@ -949,7 +939,6 @@ async fn chat_completions_handler(
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
     // --- Step 2: Rate limit + quota (one warm entitlement resolve) ---
-    // B-119 fix A: derive BOTH the rate-limit tier and the monthly quota config
     // from a single warm entitlement-cache read (in-process Moka, LISTEN/NOTIFY-
     // invalidated) — never a per-request Postgres round-trip. `plan_lookup_key`
     // (`builder_v1`, …) is the authoritative plan (ADR-020) and supersedes the
@@ -989,7 +978,6 @@ async fn chat_completions_handler(
         || QuotaConfig::from_plan_tier_str("free"),
         |e| e.quota_config(),
     );
-    // B-109 durability: rehydrate the counter from the durable ClickHouse trace
     // count once per tenant per month per process, so a restart / blue-green
     // deploy no longer forgives accrued usage. `needs_seed` keeps the warm path
     // free of the CH read.
@@ -1134,7 +1122,6 @@ async fn chat_completions_handler(
         }
     }
 
-    // B-127: resolve the provider ONCE from the single canonical map and FAIL
     // CLOSED on an unmatched model. There is NO default provider — routing an
     // unknown model to Anthropic (or any provider) would fetch that provider's
     // BYOK key for a model the caller never asked for (credential misrouting).
@@ -1149,9 +1136,40 @@ async fn chat_completions_handler(
     // from THIS provider_id, so a miss yields an empty key (upstream 401), never
     // another provider's key.
     let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
-    let provider_key = resolve_provider_key(tenant_id, provider_id, key_env)
-        .await
-        .unwrap_or_default();
+    // First-value path: a launch-day user who has not added BYOK yet must be told
+    // to ADD a key, not that their key was "rejected". Dispatching an empty
+    // credential and relaying the upstream 401 read as "my key is broken" for a
+    // user who had no key at all. Fail here, before the upstream round-trip.
+    let provider_key = match resolve_provider_key(tenant_id, provider_id, key_env).await {
+        ProviderKey::Found(k) => k,
+        outcome => {
+            let (status, code, message) = match outcome {
+                ProviderKey::NotConfigured => (
+                    StatusCode::BAD_REQUEST,
+                    "provider_not_configured",
+                    "no API key is configured for this provider — add one in Settings → LLM Providers, then retry",
+                ),
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "provider_key_unusable",
+                    "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
+                ),
+            };
+            tracing::warn!(provider = provider_id, code, "provider key unresolvable");
+            // Emit the ERROR span so this is visible in /traces and countable —
+            // the most common first-run failure is invisible in the product.
+            if let Some(ref nats_client) = state.nats {
+                let span = build_error_span(tenant_id, trace_id, &model, request_start, code);
+                let nats = Arc::clone(nats_client);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
+                        tracing::warn!(error = %e, "error-span NATS publish failed");
+                    }
+                });
+            }
+            return provider_error_response(status, code, Some(message), Some(provider_id), None);
+        }
+    };
 
     let mut chat_request =
         match serde_json::from_value::<tracelane_shared::ChatRequest>(body.clone()) {
@@ -1221,7 +1239,6 @@ async fn chat_completions_handler(
                 correlation_id = %correlation_id,
                 "request blocked by inline guardrail"
             );
-            // B-118 #5: if the blocking reason maps to a canonical AFT-1 signature
             // (tool-description injection → AFT-TOOL-POISON-001), emit an
             // error-status span carrying that `aft_id` BEFORE the 403 short-circuit
             // — otherwise the blocked hit is invisible on /signatures (the very
@@ -1374,16 +1391,18 @@ async fn chat_completions_handler(
             {
                 continue;
             }
-            // B-127: fail closed on an unroutable failover candidate — skip it,
             // never default to a provider (its key would be the wrong one).
             let Some(fo_pid) = crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
             else {
                 continue;
             };
             let fo_env = crate::providers::ProviderRegistry::env_var_for_provider_id(fo_pid);
-            let fo_key = resolve_provider_key(tenant_id, fo_pid, fo_env)
-                .await
-                .unwrap_or_default();
+            // Failover keeps its skip-on-unresolvable behaviour: a provider we
+            // cannot key for is simply not a failover candidate.
+            let fo_key = match resolve_provider_key(tenant_id, fo_pid, fo_env).await {
+                ProviderKey::Found(k) => k,
+                _ => String::new(),
+            };
             if fo_key.is_empty() {
                 tracing::debug!(
                     provider = fo_provider,
@@ -1438,7 +1457,6 @@ async fn chat_completions_handler(
                 status_code,
             );
 
-            // B-118 #3: also publish an ERROR-status span so this failure is COUNTABLE
             // by the error-rate metric (countIf(status_code = 2)). The event above is
             // the breaker trip input; a span is what /slo + /traces actually render.
             // Without it a hard dispatch failure was invisible — a structural 0% error
@@ -1452,6 +1470,13 @@ async fn chat_completions_handler(
                 "provider_rate_limited"
             } else if http.is_some_and(crate::providers::ProviderHttpError::is_model_not_found) {
                 "model_not_found"
+            } else if http
+                .is_some_and(crate::providers::ProviderHttpError::is_unclassified_client_error)
+            {
+                // classify is NOT an outage, and folding it into
+                // `provider_unavailable` inflated the error-rate metric with
+                // client-side failures.
+                "provider_request_rejected"
             } else {
                 "provider_unavailable"
             };
@@ -1485,7 +1510,6 @@ async fn chat_completions_handler(
                 );
             }
 
-            // B-113: an upstream 429 is NOT an outage — the caller is over quota or
             // rate-limited. Reporting "provider unavailable" sends them to debug
             // the wrong system entirely. Mirrors the breaker's 503 + Retry-After
             // shape (ADR-036/037), but 429 because the limit is the caller's, not
@@ -1506,7 +1530,6 @@ async fn chat_completions_handler(
                 );
             }
 
-            // B-113: an upstream 404 means the model does not exist for this
             // account — the caller must change the model string, not retry. As a
             // 502 it read as a Tracelane outage. Observed live: AI Studio 404s
             // gemini-2.5-flash as "no longer available to new users".
@@ -1518,6 +1541,39 @@ async fn chat_completions_handler(
                     Some(
                         "the upstream provider does not recognise this model for this account — check the model name and that your provider account has access to it",
                     ),
+                    Some(upstream),
+                    None,
+                );
+            }
+
+            // (see `is_unclassified_client_error` — a 400 is a dead key on xAI and
+            // a malformed payload everywhere, and the discriminating text is in a
+            // body we must not propagate), but a 4xx does prove the upstream
+            // rejected the REQUEST. Reporting that as `502 provider unavailable`
+            // blamed Tracelane for a client-side problem and sent callers to check
+            // our status page. Mirror the upstream 4xx and name both candidates.
+            if let Some(e) = http.filter(|e| e.is_unclassified_client_error()) {
+                tracing::warn!(
+                    provider = upstream,
+                    status = e.status,
+                    "upstream rejected the request (unclassified 4xx)"
+                );
+                let message = format!(
+                    "the upstream provider rejected this request with HTTP {}. \
+                     This is not a Tracelane outage — it is usually either a provider \
+                     key that is invalid or expired for this account, or a request the \
+                     provider could not accept (model, parameters, or payload). \
+                     Verify the key for this provider, then the request itself.",
+                    e.status
+                );
+                return provider_error_response(
+                    // Mirror the upstream status so the caller sees exactly what the
+                    // provider said. 401/403/404/429 are claimed by the branches
+                    // above and can never reach here; anything unrepresentable
+                    // degrades to 400 (still client-class, never 5xx).
+                    StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST),
+                    "provider_request_rejected",
+                    Some(&message),
                     Some(upstream),
                     None,
                 );
@@ -1632,12 +1688,10 @@ async fn chat_completions_handler(
 /// Billing is fire-and-forget into a `tokio::spawn`, and a SUCCESSFUL meter logs
 /// nothing (`Recorder::flush` only warns on failure), so from outside the process
 /// "we billed" and "we never billed" were byte-identical. That is not a detail —
-/// it is *why* B-110 survived for months: billing sat on 2 of the stream's 4
 /// termination paths and no operator, log, or metric could have told.
 ///
 /// This counter measures **intent-to-bill at the call site** — incremented BEFORE
 /// the spawn, deliberately, so it is independent of whether the tenant has a Polar
-/// customer. That is the right boundary: the call site is what B-110 broke;
 /// delivery to Polar is the `Recorder`'s job, is tested separately, and has worked
 /// on the `Done` path throughout.
 static BILLING_RECORDS_SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1654,7 +1708,6 @@ const BILLING_LOG_NEVER: u64 = u64::MAX;
 /// evidence at a readable rate.
 const BILLING_LOG_INTERVAL_SECS: u64 = 60;
 
-/// Read the billing-spawn counter. Test seam for B-110's regression test.
 #[cfg(test)]
 fn billing_records_spawned() -> u64 {
     BILLING_RECORDS_SPAWNED.load(std::sync::atomic::Ordering::Relaxed)
@@ -1880,7 +1933,6 @@ fn build_gateway_span(
         // A FAILED request (upstream 4xx/5xx/timeout, mid-stream provider error, or
         // dispatch exhaustion) MUST record status Error — otherwise /slo's
         // countIf(status_code = 2) error rate is STRUCTURALLY pinned at ~0% for all
-        // gateway-proxied traffic (B-118 #3: every span was hardcoded Ok, so a real
         // provider outage read as "0% errors · no errors in window"). Ok is emitted
         // only on a genuinely successful round-trip.
         status: match error_reason {
@@ -1900,7 +1952,6 @@ fn build_gateway_span(
 /// provider round-trip (dispatch exhaustion, upstream 401/429/404/5xx, timeout).
 /// Zero tokens, no cost, no optional attribution — its whole job is to make the
 /// failure COUNTABLE (status_code = 2) so the error-rate metric reflects reality
-/// B-127: the fail-closed response for a model that matches NO provider in the
 /// canonical map. Returned INSTEAD of routing to a default provider — no key is
 /// resolved, no upstream call is made. 400 (the caller sent an unroutable model).
 /// The model string is echoed back (it is the caller's own input, not a secret)
@@ -1928,7 +1979,6 @@ fn unroutable_model_response(model: &str) -> axum::response::Response {
     resp
 }
 
-/// B-125: build a client-facing provider-error response with a defense-in-depth
 /// redaction backstop.
 ///
 /// The body is **allowlist-constructed** — our typed `error` code, an optional
@@ -2009,7 +2059,6 @@ fn build_error_span(
 /// canonical AFT-1 failure signature (today: tool-description injection →
 /// `AFT-TOOL-POISON-001`). Like [`build_error_span`] but carries the `aft_id` so
 /// the blocked hit still lands in `spans.aft_ids` and the tenant sees it on
-/// /signatures — a blocked injection is "your hit," not a silent 403 (B-118 #5).
 fn build_blocked_aft_span(
     tenant_id: &TenantId,
     trace_id: Uuid,
@@ -2045,7 +2094,6 @@ fn build_blocked_aft_span(
 /// Map a model name to a canonical provider name (OTel `gen_ai.system` /
 /// `gen_ai.provider.name` value) for span attribution.
 ///
-/// B-126: this DELEGATES to the canonical `ProviderRegistry::provider_id_for_model`
 /// rather than carrying its own prefix table. A private copy had drifted — it only
 /// knew 8 providers and stamped every other model (groq, mistral, perplexity, xai,
 /// and ~24 more of the 35) as `"unknown"` on the span, so the dashboard's provider
@@ -2053,7 +2101,6 @@ fn build_blocked_aft_span(
 /// Only the two names that differ from the provider_id (AWS/GCP house style) are
 /// remapped; the rest of the provider_id set already equals the gen_ai.system value.
 fn provider_name_from_model(model: &str) -> &'static str {
-    // B-127: an unmatched model has no provider — attribute it "unknown" (this is
     // a span label, never a key lookup, so "unknown" is safe; the key path already
     // fail-closed on None before reaching here).
     match crate::providers::ProviderRegistry::provider_id_for_model(model) {
@@ -2064,15 +2111,35 @@ fn provider_name_from_model(model: &str) -> &'static str {
     }
 }
 
+/// Outcome of resolving a provider key. Distinguishes "the tenant never added
+/// one" from "one exists but we cannot use it" — the two need OPPOSITE user
+/// actions (add a key vs rotate an existing one), and collapsing them into a
+/// single `None` is what made an unconfigured provider report
+/// `provider_key_rejected` ("verify the key for this provider") to a user who
+/// had no key to verify.
+enum ProviderKey {
+    /// A usable key. An EMPTY string is a legitimate value for the no-key
+    /// providers (Ollama) — it means "this provider needs no credential".
+    Found(String),
+    /// No BYOK row and no env fallback: the tenant has not configured this
+    /// provider. Actionable in Settings → LLM Providers.
+    NotConfigured,
+    /// A BYOK row exists but could not be decrypted (AAD / master-key
+    /// mismatch). A key IS configured — telling the user to add one would send
+    /// them the wrong way.
+    Unusable,
+}
+
 /// A4: resolve the provider-API plaintext key. Order:
 ///   1. Hot-path cache (`db::provider_keys::lookup_cached`).
 ///   2. Per-tenant BYOK row from `provider_keys` (decrypted with AAD).
 ///   3. Process env var (legacy single-tenant fallback).
 ///   4. Empty string (Ollama / no-key providers).
 ///
-/// Returns `Some(plaintext)` when we have a key to use; `None` only
-/// when there genuinely is no provider key resolvable (caller will
-/// surface a provider 401 to the customer).
+/// Returns [`ProviderKey::Found`] when we have a key to use, and a typed
+/// failure otherwise so the caller can tell the customer what to actually DO
+/// (add a key vs rotate one) instead of dispatching an empty credential and
+/// relaying the upstream 401.
 ///
 /// The `SecretString` is cloned into a plain `String` only at the very
 /// last hop so reqwest can attach it as a header value.
@@ -2080,12 +2147,12 @@ async fn resolve_provider_key(
     tenant_id: &TenantId,
     provider_id: &str,
     env_var: &str,
-) -> Option<String> {
+) -> ProviderKey {
     use secrecy::ExposeSecret as _;
     use std::sync::Arc;
 
     if let Some(secret) = crate::db::provider_keys::lookup_cached(tenant_id, provider_id) {
-        return Some(secret.expose_secret().to_string());
+        return ProviderKey::Found(secret.expose_secret().to_string());
     }
 
     if let (Some(pool), Some(master)) = (crate::db::global_pool(), crate::byok::master_key()) {
@@ -2100,7 +2167,7 @@ async fn resolve_provider_key(
                             provider_id,
                             Arc::clone(&secret),
                         );
-                        return Some(secret.expose_secret().to_string());
+                        return ProviderKey::Found(secret.expose_secret().to_string());
                     }
                     Err(e) => {
                         tracing::error!(
@@ -2109,7 +2176,7 @@ async fn resolve_provider_key(
                             provider_id,
                             "BYOK decrypt failed — refusing env fallback (auth-fail safer)"
                         );
-                        return None;
+                        return ProviderKey::Unusable;
                     }
                 }
             }
@@ -2126,20 +2193,21 @@ async fn resolve_provider_key(
     }
 
     if env_var.is_empty() {
-        return Some(String::new()); // Ollama
+        return ProviderKey::Found(String::new()); // Ollama
     }
-    std::env::var(env_var).ok()
+    match std::env::var(env_var) {
+        Ok(k) => ProviderKey::Found(k),
+        Err(_) => ProviderKey::NotConfigured,
+    }
 }
 
 /// Current UTC calendar month as `YYYYMM` (e.g. `202607`) — the seed key for the
-/// durable monthly quota counter's month-boundary reset (B-109).
 fn current_year_month() -> u32 {
     use chrono::Datelike as _;
     let now = chrono::Utc::now();
     now.year() as u32 * 100 + now.month()
 }
 
-/// B-109 durability: read the tenant's trace count for the current calendar month
 /// from ClickHouse — the durable baseline the in-memory quota counter is seeded
 /// from so a restart / blue-green deploy no longer forgives accrued usage. Runs
 /// once per tenant per month per process (gated by `QuotaTracker::needs_seed`),
@@ -2360,7 +2428,6 @@ async fn dispatch_with_retry(
 
 /// Routes a chat request to the correct provider adapter.
 ///
-/// B-126: the provider is resolved by the SINGLE canonical model→provider table
 /// `ProviderRegistry::provider_id_for_model`, then this match selects the typed
 /// adapter by that provider_id. It deliberately does NOT re-match model prefixes
 /// — a second model-prefix table is exactly what drifted (Groq family dispatched
@@ -2377,7 +2444,6 @@ async fn dispatch_to_provider(
 ) -> anyhow::Result<crate::providers::ProviderStream> {
     use crate::providers::ProviderRegistry;
 
-    // B-127: fail closed. No default provider — an unmatched model bails here too
     // (defense in depth; the handler already rejected it before resolving a key).
     let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
         anyhow::bail!("unroutable model '{model}': no provider configured");
@@ -2418,7 +2484,6 @@ async fn dispatch_to_provider(
         "together" => registry.together.chat(request, api_key, tenant_id).await,
         "fireworks" => registry.fireworks.chat(request, api_key, tenant_id).await,
         "openrouter" => registry.openrouter.chat(request, api_key, tenant_id).await,
-        // B-127: NO default-to-anthropic. A provider_id the dispatch doesn't know
         // is a bug in the map, not "probably Anthropic" — bail rather than ship a
         // request to the wrong provider with the wrong key.
         _ => anyhow::bail!("unroutable provider_id '{provider_id}' for model '{model}'"),
@@ -2452,7 +2517,6 @@ fn provider_stream_to_sse(
     prompt_router: Arc<crate::prompt_router::PromptRouter>,
     prompt_obs: Option<PromptObservation>,
     guardrail_fired: bool,
-    // B-118 #5: the predictive AFT hit id (observe-first) — threaded onto the published
     // span so the /signatures page shows the tenant's OWN matched signatures instead of
     // demo-seed only. None when no detector matched.
     warn_aft_id: Option<&'static str>,
@@ -2469,7 +2533,6 @@ fn provider_stream_to_sse(
         // content-filter block leaves them None (partial — the stream was cut).
         let mut cache_read: Option<u32> = None;
         let mut cache_creation: Option<u32> = None;
-        // B-118 #3: set on a mid-stream provider Error so the post-loop span records
         // status Error, not Ok (a streaming failure must move the error-rate metric).
         let mut stream_error: Option<&str> = None;
         let mut cost_usd: Option<f64> = None;
@@ -2526,7 +2589,6 @@ fn provider_stream_to_sse(
                 }
                 Some(Err(err)) => {
                     tracing::warn!(error = %err, "SSE stream error from provider");
-                    // B-118 #1 (mid-stream sub-path): a TRANSPORT-level stream error
                     // — a provider that severs the connection mid-response (TCP
                     // reset, provider crash, truncated body) — surfaces here as
                     // `Some(Err)`, distinct from an explicit `ProviderEvent::Error`
@@ -2678,7 +2740,6 @@ fn provider_stream_to_sse(
                                 });
                                 yield Ok(Event::default().data(data.to_string()));
                                 yield Ok(Event::default().data("[DONE]"));
-                                // Billing fires POST-LOOP (B-110) — see the note there.
                                 break;
                             }
                         }
@@ -2702,7 +2763,6 @@ fn provider_stream_to_sse(
                         yield Ok(Event::default().data(data.to_string()));
                         yield Ok(Event::default().data("[DONE]"));
 
-                        // Billing fires POST-LOOP (B-110) — see the note there.
 
                         // B1 auto-rollback drift feed — streaming path, same
                         // as buffered path (fire-and-forget).
@@ -2756,7 +2816,6 @@ fn provider_stream_to_sse(
         // Meter usage ONCE, after the stream loop terminates for ANY reason —
         // exactly like the span publish below, and for exactly the same reason.
         //
-        // B-110: billing used to live INSIDE the match arms, firing only on `Done`
         // and on a mid-stream `Block`. The other two exits — a provider `Error`,
         // and a natural stream-end with no `Done` event — silently skipped it. That
         // is not hypothetical: **Gemini never emits `ProviderEvent::Done`**, it ends
@@ -2879,7 +2938,6 @@ async fn buffer_provider_stream(
     conversation_id: Option<&str>,
     prompt_obs: Option<PromptObservation>,
     guardrail_fired: bool,
-    // B-118 #5: the predictive AFT hit id (observe-first) — threaded onto the published
     // span so the /signatures page shows the tenant's OWN matched signatures instead of
     // demo-seed only. None when no detector matched.
     warn_aft_id: Option<&'static str>,
@@ -2895,7 +2953,6 @@ async fn buffer_provider_stream(
     let mut output_tokens = 0u32;
     let mut cache_read: Option<u32> = None;
     let mut cache_creation: Option<u32> = None;
-    // B-118 #3: set on a mid-stream provider error so the span below records status
     // Error (a buffered-collection failure must move the error-rate metric).
     let mut buffered_error: Option<&str> = None;
     let mut cost_usd: Option<f64> = None;
@@ -2937,7 +2994,6 @@ async fn buffer_provider_stream(
             }
             Ok(ProviderEvent::Error { message, .. }) => {
                 // Symmetry with the transport-`Err` arm below and the streaming
-                // path (B-118 #1): an explicit provider error EVENT in a buffered
                 // stream must mark the span Error too, not fall into `Ok(_)` and
                 // read as a success.
                 tracing::warn!(message, "provider error event in buffered response");
@@ -3107,7 +3163,6 @@ mod tests {
     /// as "unknown" on the span. It now delegates to provider_id_for_model.
     #[test]
     fn provider_name_from_model_matches_dispatch_not_unknown() {
-        // Groq-family (the B-126 trigger) + other previously-"unknown" providers.
         assert_eq!(provider_name_from_model("llama-3.3-70b-versatile"), "groq");
         assert_eq!(provider_name_from_model("qwen-2.5-32b"), "groq");
         assert_eq!(provider_name_from_model("mistral-large-latest"), "mistral");
@@ -3132,7 +3187,6 @@ mod tests {
             crate::providers::ProviderRegistry::provider_id_for_model("llama-3.3-70b-versatile")
                 .unwrap()
         );
-        // B-127: an unmatched model attributes "unknown" (never a default provider).
         assert_eq!(provider_name_from_model("totally-unknown-xyz"), "unknown");
     }
 
@@ -3153,7 +3207,6 @@ mod tests {
     /// terminal item is a transport-level `Err`, which is exactly what a real
     /// provider connection reset / truncated body yields at the `ProviderStream`
     /// level (the adapter propagates the byte-stream error via `?` inside its
-    /// `try_stream!`). Drives the `Some(Err)` arm (B-118 #1 mid-stream sub-path).
     fn mock_stream_severing(
         ok_events: Vec<crate::providers::ProviderEvent>,
     ) -> crate::providers::ProviderStream {
@@ -3254,8 +3307,6 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    // ── B-110: billing must fire on EVERY stream termination path ────────────
-
     /// `BILLING_RECORDS_SPAWNED` is process-global, so these tests must not run
     /// concurrently or their before/after deltas interleave and read each other's
     /// increments (they passed alone and failed together until this was added —
@@ -3269,7 +3320,6 @@ mod tests {
     /// Drive the real `provider_stream_to_sse` with billing wired, returning how
     /// many billing records it spawned. The `Recorder` is real but inert: its
     /// spawned task exits at `global_pool() == None` in tests, so nothing reaches
-    /// Polar — we are asserting the CALL SITE fires, which is exactly what B-110
     /// got wrong.
     async fn billing_spawns_for(events: Vec<crate::providers::ProviderEvent>) -> u64 {
         // Held across the whole measurement so the delta is ours alone.
@@ -3309,12 +3359,109 @@ mod tests {
         billing_records_spawned() - before
     }
 
-    /// THE B-110 REGRESSION: a stream that ends WITHOUT a `Done` event must still
     /// be metered. This is not hypothetical — Gemini never emits `Done`, it just
     /// ends the stream, so every Gemini streaming request was billed to nobody
     /// while its span recorded the usage. Fails on the pre-fix code, where billing
     /// lived inside the `Done` arm.
-    /// B-125 mechanical control: the provider-error response must NEVER emit a
+    /// Regression: an UNCONFIGURED provider must resolve to `NotConfigured`, not
+    /// to an empty key that gets dispatched upstream and comes back as
+    /// `provider_key_rejected` ("verify the key for this provider") — advice
+    /// aimed at a key the caller never had. Found on the first-value path:
+    /// PRODDEMO2 has vertex + anthropic keys and NO openai key, and an openai
+    /// call reported the tenant's key as rejected.
+    ///
+    /// Uses an env var that cannot exist rather than mutating the environment,
+    /// so the test leaks no process state (rules/testing.md).
+    #[tokio::test]
+    async fn unconfigured_provider_resolves_to_not_configured_not_empty_key() {
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(0xC0FFEE));
+
+        // No BYOK row (no pool in unit tests) + an env var that is never set.
+        let outcome = resolve_provider_key(
+            &tenant,
+            "openai",
+            "TRACELANE_UNIT_TEST_PROVIDER_KEY_VAR_THAT_IS_NEVER_SET",
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProviderKey::NotConfigured),
+            "an unconfigured provider must be NotConfigured — collapsing it into an empty key is what produced the misleading provider_key_rejected"
+        );
+
+        // A no-key provider (Ollama: empty env var name) is still a real
+        // resolution — an empty string here is correct, not "not configured".
+        assert!(
+            matches!(
+                resolve_provider_key(&tenant, "ollama", "").await,
+                ProviderKey::Found(ref k) if k.is_empty()
+            ),
+            "a no-credential provider must resolve to Found(\"\"), not NotConfigured"
+        );
+    }
+
+    /// The two failure modes must stay distinct: `NotConfigured` tells the user
+    /// to ADD a key, `Unusable` tells them to ROTATE one. Emitting the same code
+    /// for both sends half of them the wrong way.
+    #[test]
+    fn provider_key_failure_modes_carry_different_codes() {
+        let not_configured = provider_error_response(
+            StatusCode::BAD_REQUEST,
+            "provider_not_configured",
+            Some("add one in Settings → LLM Providers"),
+            Some("openai"),
+            None,
+        );
+        let unusable = provider_error_response(
+            StatusCode::BAD_GATEWAY,
+            "provider_key_unusable",
+            Some("rotate it in Settings → LLM Providers"),
+            Some("openai"),
+            None,
+        );
+        assert_eq!(not_configured.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(unusable.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// (never 502 "provider unavailable", which blamed us for a client-side
+    /// failure) and names BOTH candidate causes without claiming to know which.
+    #[tokio::test]
+    async fn unclassified_4xx_names_both_causes_and_is_not_an_outage() {
+        let message = format!(
+            "the upstream provider rejected this request with HTTP {}. \
+             This is not a Tracelane outage — it is usually either a provider \
+             key that is invalid or expired for this account, or a request the \
+             provider could not accept (model, parameters, or payload). \
+             Verify the key for this provider, then the request itself.",
+            400
+        );
+        let resp = provider_error_response(
+            StatusCode::BAD_REQUEST,
+            "provider_request_rejected",
+            Some(&message),
+            Some("xai"),
+            None,
+        );
+        assert!(
+            resp.status().is_client_error(),
+            "an upstream 4xx must not surface as a 5xx"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("provider_request_rejected") && s.contains("xai"),
+            "got: {s}"
+        );
+        // Names the upstream status, and both causes — not one of them.
+        assert!(s.contains("400"), "must name the upstream status: {s}");
+        assert!(s.contains("expired") && s.contains("payload"), "got: {s}");
+        assert!(
+            !s.contains("provider_key_rejected"),
+            "an unparsed 4xx must not claim the key was rejected: {s}"
+        );
+    }
+
     /// key-shaped string or an upstream auth header, even if a future bug
     /// interpolates a raw upstream body (which echoes the tenant's BYOK key +
     /// `www-authenticate`) into a client-facing field. Asserts the allowlist +
@@ -3378,7 +3525,6 @@ mod tests {
         assert_eq!(n, 1, "Done path must bill exactly once, not zero or twice");
     }
 
-    /// B-118 #1 (mid-stream sub-path): a transport sever mid-stream (a `Some(Err)`
     /// item — a real provider connection reset / truncated body) must terminate
     /// the SSE cleanly — yield `[DONE]`, no hang, no panic — via the `Some(Err)`
     /// arm. The span that arm builds carries `stream_error` → Error status, which
@@ -3393,7 +3539,6 @@ mod tests {
         );
     }
 
-    /// B-118 #1 + #5: the span builder maps failure reasons to Error status
     /// (`countIf(status_code = 2)`) and a clean finish to Ok — the exact mapping a
     /// mid-stream sever rides on (the `Some(Err)` arm sets
     /// `stream_error = Some("provider_stream_error")`). Also asserts the

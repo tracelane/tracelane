@@ -15,7 +15,6 @@
  *   - **Neon (Postgres):** the SAME `select … from tenants` read that
  *     `upsertTenantId` / `getAuditAccess` / `PromoteGateBanner` do first on every
  *     `@/db` page. A stale/dead `DATABASE_URL` fails HERE, exactly as it did on
- *     the broken pages — so a monitor pinging this endpoint catches B-120's class.
  *   - **Gateway (ClickHouse-backed reads):** the gateway `/health` the dashboard
  *     / SLO / traces surfaces depend on.
  *
@@ -55,7 +54,6 @@ function reason(err: unknown): string {
 async function checkNeon(): Promise<CheckResult> {
 	try {
 		// Parameterised Drizzle query (no raw SQL); existence probe, returns no
-		// tenant data. Mirrors the `select … from tenants` that broke in B-120.
 		await db.select({ id: tenants.id }).from(tenants).limit(1);
 		return "ok";
 	} catch (err) {

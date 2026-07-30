@@ -28,6 +28,13 @@ export async function DELETE(
 	);
 
 	if (!upstream.ok) {
+		// Owner-only gate (see the GET/POST route) — typed, not a generic failure.
+		if (upstream.status === 403) {
+			return NextResponse.json(
+				{ error: "role_forbidden", required_role: "owner" },
+				{ status: 403 },
+			);
+		}
 		return NextResponse.json(
 			{ error: "failed to revoke provider key" },
 			{ status: upstream.status >= 500 ? 502 : upstream.status },

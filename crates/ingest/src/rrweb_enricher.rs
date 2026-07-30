@@ -148,7 +148,8 @@ fn compute_enrichment(events: &[RrwebEvent]) -> BrowserEnrichment {
         enrichment.dom_hash = Some(hex::encode(d.as_ref()));
     }
 
-    // Count incremental snapshot mutations
+    // Baseline DOM size from the first full snapshot — the denominator of
+    // `dom_mutation_score` below.
     let snapshot_node_count = events
         .iter()
         .filter(|e| e.event_type == RrwebEventType::FullSnapshot)
@@ -157,6 +158,7 @@ fn compute_enrichment(events: &[RrwebEvent]) -> BrowserEnrichment {
         .next()
         .unwrap_or(1); // avoid div-by-zero
 
+    // Numerator: nodes added across the incremental snapshots.
     let mutation_count = events
         .iter()
         .filter(|e| e.event_type == RrwebEventType::IncrementalSnapshot)

@@ -1,8 +1,6 @@
--- 0020 (B-119 fix C / ADR-069): idempotency backstop for the async audit consumer.
 --
 -- The consumer assigns `seq` at head-advance inside `append_atomic`'s tx. A
 -- JetStream redelivery (a crash between the append COMMIT and the message ack)
--- must NOT mint a duplicate seq — that is the B-108 dup-seq class. Inside the
 -- same append transaction the consumer does
 --   INSERT INTO audit_appended (event_id) VALUES ($1) ON CONFLICT DO NOTHING
 -- and if it conflicts (0 rows), the event was already appended → the tx rolls

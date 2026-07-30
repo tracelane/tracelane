@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""B-126 guard: exactly ONE model→provider prefix table.
+"""Guard: exactly ONE model→provider prefix table.
 
-The B-126 bug (cross-provider BYOK misroute + "unknown" span provider) was caused
+The bug (cross-provider BYOK misroute + "unknown" span provider) was caused
 by FOUR hand-maintained model→provider `match model { m.starts_with(..) => .. }`
 tables that drifted: a model dispatched to Groq while its key was resolved under
 "anthropic". The fix collapses the model-prefix logic into ONE canonical function,
@@ -94,7 +94,7 @@ def main() -> int:
             continue
         if f"{CANONICAL}(" not in body:
             errors.append(
-                f"`{name}` must DELEGATE to `{CANONICAL}(` (B-126: one source of "
+                f"`{name}` must DELEGATE to `{CANONICAL}(` (one source of "
                 f"truth) — it does not reference it"
             )
         sw = count_starts_with(body)
@@ -103,7 +103,7 @@ def main() -> int:
                 f"`{name}` reintroduced model-prefix matching "
                 f"({sw} `.starts_with(`). Route on the provider_id from "
                 f"`{CANONICAL}` instead — a second model-prefix table is the exact "
-                f"B-126 drift surface."
+                f"drift surface."
             )
 
     # 3. No OTHER function may be a model-prefix table.
@@ -117,16 +117,15 @@ def main() -> int:
                 errors.append(
                     f"`{fn}` in {path.relative_to(REPO)} carries a model-prefix table "
                     f"({count_starts_with(body)} `.starts_with(` arms). There must be "
-                    f"exactly ONE ({CANONICAL}); delegate to it instead (B-126)."
+                    f"exactly ONE ({CANONICAL}); delegate to it instead."
                 )
 
-    # 4. B-127 FAIL-CLOSED: the canonical map must return Option (None on unmatched),
     #    and NO default-to-a-provider may survive anywhere in provider/key resolution.
     #    Defaulting to a provider on an unmatched model is credential misrouting.
     canon_sig = re.search(rf"fn\s+{CANONICAL}\s*\([^)]*\)\s*->\s*([^\{{]+)\{{", mod_src)
     if not canon_sig or "Option" not in canon_sig.group(1):
         errors.append(
-            f"B-127: `{CANONICAL}` must return `Option<&'static str>` (fail closed on "
+            f"`{CANONICAL}` must return `Option<&'static str>` (fail closed on "
             f"an unmatched model), not a bare `&str` that forces a default provider."
         )
     FORBIDDEN = [
@@ -164,22 +163,20 @@ def main() -> int:
         for pat, desc in FORBIDDEN:
             if re.search(pat, src):
                 errors.append(
-                    f"B-127 fail-closed VIOLATED in {path.relative_to(REPO)}: {desc}. "
+                    f"fail-closed VIOLATED in {path.relative_to(REPO)}: {desc}. "
                     f"An unmatched model/provider must fail closed (typed unroutable "
                     f"error), never route to a default provider's key."
                 )
 
     if errors:
-        print(
-            "FAIL: provider-mapping single-source + fail-closed guard (B-126/B-127)\n"
-        )
+        print("FAIL: provider-mapping single-source + fail-closed guard\n")
         for e in errors:
             print(f"  - {e}")
         return 1
 
     print(
         f"OK: single model→provider table ({CANONICAL}, returns Option/fail-closed); "
-        f"{', '.join(DELEGATES)} delegate; no default-to-provider (B-126/B-127 guard)."
+        f"{', '.join(DELEGATES)} delegate; no default-to-provider (guard)."
     )
     return 0
 

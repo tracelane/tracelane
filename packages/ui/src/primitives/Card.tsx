@@ -15,7 +15,7 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(
 		<div
 			ref={ref}
 			className={cn(
-				"rounded-xl border border-line bg-surface",
+				"surface-card border border-line bg-surface",
 				provenance && "border-t-0 card-provenance-top",
 				className,
 			)}

@@ -25,13 +25,23 @@ interface ProviderKeySummary {
 /**
  * Providers accepted by the gateway allowlist
  * (`crates/gateway/src/byok_api/provider_keys_api.rs::is_known_provider`).
- * Keep this in sync with that match arm — the gateway re-validates and
- * rejects unknown ids with 400. `hint` is a UX nicety for the common ones.
+ * The gateway re-validates and rejects unknown ids with 400.
+ *
+ * Together, Fireworks and OpenRouter routed but could not accept a key, and
+ * Vertex could not be added from here. "Keep this in sync" is no longer left to
+ * memory: `scripts/ci/check-byok-provider-coverage.py` derives the routable set
+ * from the registry and fails the build if either list drifts, in either
+ * direction. `hint` is a UX nicety for the common ones.
  */
 const PROVIDERS: ReadonlyArray<{ id: string; label: string; hint?: string }> = [
 	{ id: "anthropic", label: "Anthropic", hint: "starts with sk-ant-" },
 	{ id: "openai", label: "OpenAI", hint: "starts with sk-" },
 	{ id: "google", label: "Google (Gemini)" },
+	{ id: "vertex", label: "Google Vertex AI" },
+	{ id: "groq", label: "Groq" },
+	{ id: "together", label: "Together AI" },
+	{ id: "fireworks", label: "Fireworks AI" },
+	{ id: "openrouter", label: "OpenRouter" },
 	{ id: "bedrock", label: "AWS Bedrock" },
 	{ id: "azure", label: "Azure OpenAI" },
 	{ id: "cohere", label: "Cohere" },
@@ -63,9 +73,16 @@ const PROVIDERS: ReadonlyArray<{ id: string; label: string; hint?: string }> = [
 
 const PROVIDER_LABEL = new Map(PROVIDERS.map((p) => [p.id, p.label]));
 
+/** Thrown by the fetchers so the UI can tell "locked" (403) from "broken". */
+class HttpError extends Error {
+	constructor(readonly status: number) {
+		super(`HTTP ${status}`);
+	}
+}
+
 async function fetchProviderKeys(): Promise<ProviderKeySummary[]> {
 	const res = await fetch("/api/settings/provider-keys");
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	if (!res.ok) throw new HttpError(res.status);
 	return res.json() as Promise<ProviderKeySummary[]>;
 }
 
@@ -110,7 +127,7 @@ function AddKeyDialog({
 
 	return (
 		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="bg-surface border border-line rounded-lg p-6 w-full max-w-md shadow-2xl space-y-4">
+			<div className="surface-card bg-surface border border-line p-6 w-full max-w-md shadow-2xl space-y-4">
 				<h3 className="text-base font-semibold text-ink">Add provider key</h3>
 				<form
 					onSubmit={(e) => {
@@ -192,19 +209,49 @@ function AddKeyDialog({
 	);
 }
 
-export function ProviderKeyManager() {
+/**
+ * Owner-only empty state. Provider keys are the tenant's upstream credentials,
+ * so IDENTITY_TEAM_SPEC §1 scopes both viewing and mutating them to the owner
+ * — a member hitting this page is blocked by design, not by a fault.
+ */
+function OwnerOnlyPanel() {
+	return (
+		<div className="surface-card border border-dashed border-line bg-surface/40 p-8 text-center shadow-none">
+			<p className="text-sm text-ink-2">
+				Provider keys are visible to workspace owners only.
+			</p>
+			<p className="text-xs text-ink-3 mt-1">
+				Your workspace&rsquo;s keys are already in use for the calls you make
+				through the gateway — you just can&rsquo;t view or change them. Ask an
+				owner if a key needs adding or rotating.
+			</p>
+		</div>
+	);
+}
+
+export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 	const qc = useQueryClient();
 	const [showAdd, setShowAdd] = useState(false);
 
 	const {
 		data: keys = [],
 		isLoading,
-		isError,
+		error,
 	} = useQuery({
 		queryKey: ["provider-keys"],
 		queryFn: fetchProviderKeys,
 		staleTime: 30_000,
+		// Non-owners are gated at the gateway; don't fire a request that can only
+		// 403. The query still runs for owners, and a 403 slipping through (stale
+		// session role) is handled below — the server stays authoritative.
+		enabled: canManage,
+		retry: false,
 	});
+
+	// 403 => locked, not broken. Covers a session minted before a role change.
+	const locked =
+		!canManage || (error instanceof HttpError && error.status === 403);
+	const isError = error != null && !locked;
 
 	const uploadMutation = useMutation({
 		mutationFn: uploadProviderKey,
@@ -218,6 +265,16 @@ export function ProviderKeyManager() {
 		mutationFn: revokeProviderKey,
 		onSuccess: () => void qc.invalidateQueries({ queryKey: ["provider-keys"] }),
 	});
+
+	// All hooks above this line — the locked branch is a render-time choice only.
+	if (locked) {
+		return (
+			<div className="space-y-4">
+				<h3 className="text-sm font-semibold text-ink">Your keys</h3>
+				<OwnerOnlyPanel />
+			</div>
+		);
+	}
 
 	return (
 		<div className="space-y-4">
@@ -245,7 +302,7 @@ export function ProviderKeyManager() {
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
-				<div className="rounded-lg border border-dashed border-line p-8 text-center">
+				<div className="surface-card border border-dashed border-line bg-surface/40 p-8 text-center shadow-none">
 					<p className="text-sm text-ink-2">No provider keys yet.</p>
 					<p className="text-xs text-ink-3 mt-1">
 						Add your Anthropic, OpenAI, or other provider key to start routing
@@ -255,7 +312,7 @@ export function ProviderKeyManager() {
 			)}
 
 			{keys.length > 0 && (
-				<div className="rounded-lg border border-line overflow-hidden">
+				<div className="surface-card border border-line overflow-hidden">
 					<table className="w-full text-left">
 						<thead className="bg-surface text-xs text-ink-2">
 							<tr>

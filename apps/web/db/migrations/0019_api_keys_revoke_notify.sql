@@ -1,4 +1,3 @@
--- 0019 (B-119 fix B): emit a `key_revoked` NOTIFY on every api-key revocation so
 -- the gateway's in-process auth-result cache evicts IMMEDIATELY (not TTL-bound).
 --
 -- Covers ALL revoke paths — web team-member removal, account self-delete,

@@ -102,7 +102,6 @@ ClickHouse              Cloudflare
 | `crates/gateway/` | Rust | BYOK LLM proxy, predictive layer |
 | `crates/ingest/` | Rust | OTLP receiver, NATS consumer, ClickHouse writer |
 | `crates/shared/` | Rust | Shared types (ChatRequest, TracelaneSpan, TenantId) |
-| `crates/mcp-rs/` | Rust | Native MCP protocol implementation |
 | `crates/policy/` | Rust | Cedar policy engine integration |
 | `apps/web/` | TypeScript | Next.js 15 dashboard |
 | `apps/mcp/` | TypeScript | Tenant-scoped MCP server |
@@ -113,7 +112,6 @@ ClickHouse              Cloudflare
 | `ml/` | Python | Trajectory Guard, SLM judge |
 | `spec/openagenttrace/` | Markdown | OpenAgentTrace v0.1 spec |
 | `spec/aft-1/` | Markdown | Agent Failure Taxonomy 22 failure modes |
-| `decisions/` | Markdown | ADR-001 through ADR-006+ |
 | `infra/dev/` | YAML/SQL | Docker Compose + ClickHouse schema |
 
 ## Development
@@ -163,7 +161,9 @@ cosign verify-blob \
 ```
 
 All binaries are Cosign-signed (keyless OIDC), SLSA Level 3 provenance attached,
-CycloneDX SBOM included. We use Grype (not Trivy) in CI — see [ADR-007](decisions/ADR-007-grype-not-trivy.md).
+CycloneDX SBOM included. We use Grype + Syft + OSV-Scanner (not Trivy) in CI.
+The reasoning is summarised in the
+[architectural decisions](https://docs.tracelane.dev/decisions) index.
 
 ## Migrating from Helicone
 

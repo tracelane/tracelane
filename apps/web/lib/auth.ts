@@ -58,7 +58,6 @@ export async function requireSession(): Promise<Session> {
 	// request, never a real tenant.
 	if (e2eAuthEnabled()) return e2eTestSession();
 
-	// B-100: `withAuth({ensureSignedIn:true})`'s internal auto-redirect throws a
 	// form that OpenNext/CF does NOT turn into a 307 — so an unauthenticated hit
 	// on a page that calls `requireSession()` 500s instead of redirecting to
 	// sign-in. Resolve the session WITHOUT the auto-redirect, then redirect

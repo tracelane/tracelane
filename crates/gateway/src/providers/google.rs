@@ -96,7 +96,6 @@ impl GoogleProvider {
             // token, gated by `safe_reason` (SHOUTY_SNAKE_CASE only), which an API
             // key cannot satisfy. The free-text `message` is never touched.
             //
-            // B-115: this is load-bearing. Google answers an invalid/retired API
             // key with 400 INVALID_ARGUMENT / API_KEY_INVALID — not 401 — so
             // status alone cannot tell a dead key from a malformed request, and
             // Google retires ALL classic `AIza` keys in Sept 2026.
@@ -202,7 +201,6 @@ fn parse_gemini_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     // Usage metadata — AFTER content so a chunk carrying both loses nothing.
     if let Some(meta) = v.get("usageMetadata") {
         let input = meta["promptTokenCount"].as_u64().unwrap_or(0) as u32;
-        // B-104: thinking models (gemini-2.5-*) report reasoning tokens in a
         // SEPARATE `thoughtsTokenCount`, DISJOINT from `candidatesTokenCount`
         // (Gemini: totalTokenCount = prompt + thoughts + candidates) yet billed as
         // OUTPUT. Reading candidatesTokenCount alone under-counts billable output by
@@ -457,7 +455,6 @@ mod tests {
             .expect("a UsageUpdate event")
     }
 
-    /// B-104: a Gemini thinking-model chunk reports reasoning tokens in a SEPARATE
     /// `thoughtsTokenCount` (disjoint from `candidatesTokenCount`) but billed as
     /// output. Extraction must FOLD thoughts into output_tokens, else 2.5 output
     /// under-counts by the reasoning volume.

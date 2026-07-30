@@ -10,7 +10,6 @@
 /crates/ingest/        @sanjeevlabs
 /crates/shared/        @sanjeevlabs
 /crates/policy/        @sanjeevlabs
-/crates/mcp-rs/        @sanjeevlabs
 
 # ML models — trajectory guard and SLM judge
 /ml/                   @sanjeevlabs
@@ -29,7 +28,6 @@
 /spec/                 @sanjeevlabs
 
 # Decisions and docs
-/decisions/            @sanjeevlabs
 /docs/                 @sanjeevlabs
 
 # Infrastructure

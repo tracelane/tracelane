@@ -99,7 +99,6 @@ async fn upload(
         }
     };
 
-    // B-116: provider-aware — an opaque key's tail is a fingerprint, a JSON
     // credential's tail is just its closing brace. `fingerprint_of` knows which.
     let last4 = crate::db::provider_keys::fingerprint_of(&req.provider_id, &req.plaintext);
     let secret = SecretString::from(std::mem::take(&mut req.plaintext));
@@ -229,6 +228,16 @@ fn is_known_provider(p: &str) -> bool {
             | "openai"
             | "google"
             | "vertex"
+            // `api_key_env_var` entry, but were missing here — so
+            // `POST /v1/byok/provider-keys` 400'd "unknown provider_id" and a
+            // customer could not store a key for them AT ALL. Groq was the worst
+            // routing so a stored Groq key would resolve, but there was no way to
+            // store one. Enforced against the registry by
+            // `scripts/ci/check-byok-provider-coverage.py`.
+            | "groq"
+            | "together"
+            | "fireworks"
+            | "openrouter"
             | "bedrock"
             | "azure"
             | "cohere"
@@ -279,6 +288,17 @@ mod tests {
             "huggingface",
         ] {
             assert!(is_known_provider(p), "{p}");
+        }
+    }
+
+    /// `env_var_for_provider_id` entry, but were missing from the allowlist — so
+    /// a customer could not store a key for them at all. Groq was the sharpest
+    /// key WOULD resolve, but there was no way to store one.
+    /// `scripts/ci/check-byok-provider-coverage.py` enforces the full set.
+    #[test]
+    fn is_known_provider_accepts_the_openai_compatible_majors() {
+        for p in ["groq", "together", "fireworks", "openrouter", "vertex"] {
+            assert!(is_known_provider(p), "{p} routes but cannot store a key");
         }
     }
 

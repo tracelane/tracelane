@@ -129,7 +129,6 @@ SETTINGS index_granularity = 8192;
 -- Append-only; hash_chain forms a Merkle chain per tenant.
 -- Ed25519 Merkle commitments anchored to Rekor (Week 5).
 --
--- ReplacingMergeTree(event_time) (B-108 forward fix, ADR-065 F1): the
 -- per-tenant Postgres-serialized append writes the CH row durably BEFORE it
 -- advances + commits the Postgres head, so a crash between the CH write and the
 -- commit can leave an orphan row at a seq a later retry re-mints. Keying replace

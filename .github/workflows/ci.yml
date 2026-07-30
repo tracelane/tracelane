@@ -297,8 +297,20 @@ jobs:
       - name: Ban `?? "http://localhost"` gateway fallback (use fail-loud gatewayBaseUrl)
         run: python3 scripts/ci/check-no-localhost-gateway-fallback.py
 
+  docs-site-check:
+    name: Docs site guard (nav 404s · missing logo · MDX parse · dead links)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      # Selftest FIRST — plant a violation per check and assert each goes red.
+      # A guard that has never been observed blocking is not a guard.
+      - name: Selftest (prove the guard bites)
+        run: python3 scripts/ci/check-docs-site.py --selftest
+      - name: Docs site — nav pages exist, assets exist, MDX parses, links resolve
+        run: python3 scripts/ci/check-docs-site.py
+
   provider-mapping-single-source:
-    name: Provider mapping single-source guard (B-126)
+    name: Provider mapping single-source guard
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2

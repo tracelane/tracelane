@@ -91,7 +91,6 @@ fn price_card(model: &str) -> Option<PriceCard> {
     }
 
     // ── Google Gemini ── list prices per Mtok, re-verified against
-    // ai.google.dev/gemini-api/docs/pricing (2026-07-17, B-111). Vertex charges the
     // SAME per-token rates on the `global` endpoint, so one catalog serves both
     // `gemini-*` (AI Studio) and `vertex/gemini-*`; regional Vertex endpoints carry
     // a ~10% premium that is not modelled (we default to `global`).
@@ -103,9 +102,7 @@ fn price_card(model: &str) -> Option<PriceCard> {
     // `promptTokenCount` already includes any cached prefix and the adapter does not
     // populate a cache counter for gemini, so cache tiers are 0.0 (bill input+output
     // at the full rate — no double-count). Output tokens here already include
-    // thinking (`thoughtsTokenCount`), folded in at extraction (B-104).
     if m.contains("gemini") {
-        // B-111: a floating alias resolves to a DIFFERENT concrete model over time,
         // and the caller passes the REQUEST model (`server.rs:1592`), so there is
         // nothing here to resolve it against. Pricing it from any fixed card would
         // be wrong-by-construction the moment Google repoints the alias — so it is
@@ -266,7 +263,6 @@ mod tests {
         assert!(approx(c, 0.006), "got {c}");
     }
 
-    /// B-111: the models a NEW Google key can actually call are gemini-3.x — the
     /// 2.5 cards shipped in `46e2043` cover models that 404 (deprecated for new
     /// users) or 429 (billing-gated). This is the live capability matrix, encoded:
     /// if these ever return None again, gemini traffic silently bills $0.
@@ -335,7 +331,6 @@ mod tests {
 
     #[test]
     fn gemini_25_pro_priced_from_verified_list_rate() {
-        // B-104: gemini-2.5-pro base tier (1.25/10.0): (677*1.25 + 575*10)/1e6.
         // 575 output = candidates+thoughts (the extraction fix feeds cost).
         let c = cost_usd("gemini-2.5-pro", &usage(677, 575, None, None)).unwrap();
         assert!(approx(c, 0.006_596_25), "got {c}");

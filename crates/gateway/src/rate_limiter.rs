@@ -265,7 +265,6 @@ pub struct QuotaTracker {
     /// implementing `Hash + Eq` (it currently does, but keeping this
     /// loose mirrors the existing RateLimiter pattern).
     usage: Arc<DashMap<String, AtomicU64>>,
-    /// B-109 durability: per-tenant `YYYYMM` the in-memory counter was last
     /// seeded from the durable ClickHouse trace count for. Empty = never seeded
     /// this process (fresh start / post-deploy). Drives both restart-durability
     /// (re-seed after a restart) and the month-boundary reset (`reset_for_period`
@@ -327,7 +326,6 @@ impl QuotaTracker {
         }
     }
 
-    /// B-109 durability: does this tenant's counter need (re)seeding for
     /// `year_month` (`YYYYMM`)? True if never seeded this process (post-restart)
     /// or last seeded for a different month (month boundary). The hot path calls
     /// this FIRST so the durable ClickHouse baseline read happens once per tenant
@@ -341,9 +339,7 @@ impl QuotaTracker {
             .unwrap_or(true)
     }
 
-    /// B-109 durability: seed the in-memory monthly counter from a durable
     /// `baseline` (the ClickHouse trace count for `year_month`) so a restart or
-    /// blue-green deploy no longer forgives accrued usage — the pre-B-109 counter
     /// silently reset to 0 on every restart, making the hard cap bypassable by a
     /// redeploy.
     ///
@@ -605,10 +601,8 @@ mod tests {
         assert_eq!(q.check(&t2, cfg), QuotaDecision::Allow);
     }
 
-    /// B-109 regression: the counter is durable across "restart" (re-seeds from a
     /// baseline instead of resetting to 0), race-safe (a redundant same-month seed
     /// does not clobber live increments), and month-aware (a new month re-seeds).
-    /// Pre-B-109 the counter zeroed on every restart, making the hard cap
     /// bypassable by a redeploy.
     #[test]
     fn seed_is_durable_race_safe_and_month_aware() {

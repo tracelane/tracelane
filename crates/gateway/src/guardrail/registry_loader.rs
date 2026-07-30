@@ -6,16 +6,29 @@
 //!
 //! Safe-default (founder rule): a tenant with no registered tools resolves to an
 //! empty → **permissive** registry (untagged tools hold no caps, not blocked).
-//! ≥ 1 row → **enforcing**. A resolver error (store outage) **falls back to
-//! permissive** — never block traffic because the registry store is down. This
-//! is the prerequisite the founder sequenced before R3, so R3 (definition
-//! pinning) and R4 (enforce) run against real registry data, not a stub.
+//! ≥ 1 row → **enforcing**.
+//!
+//! *enforcing* tenant to permissive (that would disable R3 definition-pinning +
+//! R4 lethal-trifecta enforcement on a DB blip). On error we reuse the tenant's
+//! **last-known** registry (survives the moka TTL, mirrors `entitlement_cache`,
+//! ADR-035) so a configured tenant keeps its real posture. With **no** last-known
+//! (cold cache + store down) we fall back to **PERMISSIVE** (available), not
+//! enforcing: a tenant only becomes enforcing by registering tools, and such a
+//! tenant — once loaded — is covered by `last_known`. Failing a cold/unconfigured
+//! tenant CLOSED would turn a Postgres blip into customer-facing 403s on agentic
+//! traffic for any R4-entitled (paid) tenant — under ENFORCING every untagged
+//! tool resolves to all-caps, so R4 blocks a converged trifecta. The load-bearing
+//! to permissive); the cold edge stays available. (This was briefly cold→enforcing
+//! on 2026-07-28; reverted the same day after confirming R4 halts (403) and is
+//! plan-default-on for paid tiers — a DB blip must not become a launch-night
+//! outage. Empirical fail-closed validation for configured tenants is tracked as
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use moka::future::Cache;
 use uuid::Uuid;
 
@@ -35,6 +48,9 @@ pub type RegistryResolveFn = Arc<
 /// In-process per-tenant capability-registry cache.
 pub struct RegistryLoader {
     cache: Cache<Uuid, Arc<CapabilityRegistry>>,
+    /// Last successfully-resolved registry per tenant. Survives the moka TTL so
+    /// a store outage preserves each tenant's real posture instead of failing
+    last_known: Arc<DashMap<Uuid, Arc<CapabilityRegistry>>>,
     resolve: RegistryResolveFn,
 }
 
@@ -46,33 +62,58 @@ impl RegistryLoader {
                 .max_capacity(MAX_CAPACITY)
                 .time_to_live(TTL)
                 .build(),
+            last_known: Arc::new(DashMap::new()),
             resolve,
         }
     }
 
     /// Resolve a tenant's capability registry. Warm reads never hit Postgres.
-    /// On a resolver error (store outage) returns an empty **permissive**
-    /// registry — fail-safe: never block traffic because the store is down.
+    ///
+    /// return an empty permissive registry (that would silently disable R3/R4
+    /// enforcement for a *configured* tenant on a DB blip). Instead we reuse the
+    /// tenant's last-known registry if we have one (posture preserved). With no
+    /// last-known (cold + store down) we fall back to **PERMISSIVE** (available),
+    /// not enforcing — failing a cold/unconfigured tenant closed would turn a DB
+    /// blip into 403s on agentic traffic for any R4-entitled tenant. See the
+    /// module docs for the full rationale.
     pub async fn resolve(&self, tenant: Uuid) -> Arc<CapabilityRegistry> {
         if let Some(reg) = self.cache.get(&tenant).await {
             return reg;
         }
         let reg = match (self.resolve)(tenant).await {
-            Ok(r) => Arc::new(r),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    tenant = %tenant,
-                    "tool-capability registry load failed — falling back to PERMISSIVE (no enforcement)"
-                );
-                Arc::new(CapabilityRegistry::new())
+            Ok(r) => {
+                let arc = Arc::new(r);
+                self.last_known.insert(tenant, arc.clone());
+                arc
             }
+            Err(err) => match self.last_known.get(&tenant) {
+                Some(known) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant = %tenant,
+                        posture = known.posture().as_str(),
+                        "tool-capability registry load failed — reusing last-known registry (posture preserved, fail-closed)"
+                    );
+                    known.value().clone()
+                }
+                None => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant = %tenant,
+                        "tool-capability registry load failed with no last-known — falling back to PERMISSIVE (cold; a configured tenant is preserved via last_known, so this cannot silently disable an enforcing tenant)"
+                    );
+                    Arc::new(CapabilityRegistry::new())
+                }
+            },
         };
         self.cache.insert(tenant, reg.clone()).await;
         reg
     }
 
-    /// Evict a tenant's cached registry (call on a registration change).
+    /// Evict a tenant's cached registry (call on a registration change). Only
+    /// evicts the short-TTL cache — the last-known store is preserved so a
+    /// store outage right after an invalidation still fails closed to the real
+    /// posture, not permissive.
     pub async fn invalidate(&self, tenant: Uuid) {
         self.cache.invalidate(&tenant).await;
     }
@@ -167,7 +208,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_outage_falls_back_to_permissive() {
+    async fn resolver_outage_cold_falls_back_to_permissive() {
+        // PERMISSIVE (available), NOT enforcing. Failing a cold/unconfigured
+        // tenant closed would turn a DB blip into 403s on agentic traffic for any
+        // R4-entitled tenant (under enforcing, untagged tools → all-caps → R4
+        // blocks a converged trifecta). The fail-open a *configured* tenant cared
+        // about is covered by last_known (next test).
         let loader = RegistryLoader::new(Arc::new(|_tenant| {
             Box::pin(async { anyhow::bail!("postgres unreachable") })
         }));
@@ -175,7 +221,51 @@ mod tests {
         assert_eq!(
             reg.posture(),
             RegistryPosture::Permissive,
-            "store outage must NOT block traffic — fall back to permissive"
+            "cold store outage falls back to permissive (available) — a blip must not 403 agentic traffic"
+        );
+        assert!(
+            !reg.resolve("mystery_tool").is_enforced_unknown(),
+            "untagged tool under a cold permissive fallback → not fail-closed (no all-caps)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_outage_preserves_last_known_enforcing() {
+        // posture through a later store outage — never drop to permissive.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let loader = RegistryLoader::new(Arc::new(move |_tenant| {
+            let c = c.clone();
+            Box::pin(async move {
+                // First call succeeds (enforcing tenant); every later call errors.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut reg = CapabilityRegistry::new();
+                    reg.register("send_email", CapabilitySet::CAN_EXFILTRATE);
+                    Ok(reg)
+                } else {
+                    anyhow::bail!("postgres unreachable")
+                }
+            })
+        }));
+        let tenant = Uuid::from_u128(4);
+
+        // Warm load → enforcing, stored in last_known.
+        let first = loader.resolve(tenant).await;
+        assert_eq!(first.posture(), RegistryPosture::Enforcing);
+
+        // Evict the short-TTL cache; last_known persists. Next resolve hits the
+        // (now-erroring) resolver and must reuse the last-known enforcing registry.
+        loader.invalidate(tenant).await;
+        let after_outage = loader.resolve(tenant).await;
+        assert_eq!(
+            after_outage.posture(),
+            RegistryPosture::Enforcing,
+            "outage after a successful load must preserve the enforcing posture, not fail open"
+        );
+        assert_eq!(
+            after_outage.resolve("send_email").effective(),
+            CapabilitySet::CAN_EXFILTRATE,
+            "last-known caps preserved through the outage"
         );
     }
 }

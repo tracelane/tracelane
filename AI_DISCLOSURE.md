@@ -27,7 +27,8 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
   automatically.
 - **Security:** Security-critical paths are additionally reviewed by the
   `security-reviewer` subagent using claude-opus-4-7 for deeper reasoning.
-- **Reproducibility:** All AI-generated decisions are documented in `decisions/`
+- **Reproducibility:** All AI-generated decisions are documented as ADRs, summarised at
+  <https://docs.tracelane.dev/decisions>
   ADRs so future maintainers understand the reasoning.
 - **License:** AI-generated code is original work contributed by the founder.
   No GPL, ELv2, or other restrictively-licensed code was used as input.

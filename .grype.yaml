@@ -1,0 +1,67 @@
+# Grype configuration for the Container/filesystem scan (security-scan.yml).
+#
+# The repo is Rust + TypeScript + Python. It ships NO Go. Every HIGH/Critical
+# Grype finding is in `stdlib` (the Go standard library) embedded in the
+# vendored **esbuild** binary (node_modules/.pnpm/esbuild@*) — a build-time
+# bundler used by vitest/tsup, never shipped in any product artifact. The Go
+# net/http2/crypto CVEs it carries are unreachable in our context.
+#
+# We therefore ignore Go-module findings (justified, auditable) and exclude
+# build/dev artifact trees from the scan. Cargo and npm dependency CVEs are
+# still covered by cargo-audit / cargo-deny / pnpm-audit / OSV-Scanner.
+#
+# PACKAGE-ONLY matcher — do NOT add `vulnerability: "*"`. Grype treats the
+# `vulnerability` field as a LITERAL vuln-id comparison, so `"*"` matches a vuln
+# *named* "*" (i.e. nothing), silently disabling the rule (grype loads the
+# config fine — verified via `-vv` config dump — but matched nothing). Omitting
+# `vulnerability` ignores ALL vulns for the matched package. The CI step passes
+# this file with `--config .grype.yaml` (v0.112 does not auto-discover it).
+
+ignore:
+  # All Go stdlib CVEs come from the vendored esbuild dev-tool binary.
+  - package:
+      type: go-module
+  # rustls-webpki 0.102.x — transitive via async-nats 0.42 (NATS URL is
+  # operator-controlled, not untrusted input; CRL-parse path unreachable).
+  # Same posture as .cargo/audit.toml (RUSTSEC-2026-0049/0098/0099/0104) +
+  # osv-scanner.toml; real fix = the async-nats >=0.47 upgrade. By-name (not a
+  # single GHSA) because Grype reports several webpki advisories under aliases
+  # that don't match the RUSTSEC/OSV ids the other scanners list.
+  - package:
+      name: rustls-webpki
+  # wasmtime 20.0.x — reachable ONLY via the off-by-default `wasm-plugin`
+  # feature (module is `#![cfg(feature = "wasm-plugin")]`, not compiled into any
+  # V1 ship binary). Grype scans Cargo.lock + re-flags these advisories because
+  # it does NOT read .cargo/audit.toml / osv-scanner.toml (which already accept
+  - package:
+      name: wasmtime
+  # vite / vitest — dev/test tooling only (vitest), never shipped in any product
+  # artifact. Grype catalogs them from pnpm-lock.yaml (not just node_modules),
+  # so the exclude below is insufficient — the ignore is what suppresses them.
+  # Mirrors osv-scanner.toml; tied to the vitest-major migration.
+  - package:
+      name: vite
+  - package:
+      name: vitest
+  # brace-expansion 2.1.4 — the one residual of the 2026-07-30 bump pass (postcss,
+  # valibot and the brace-expansion 5.x copy were all raised to fixed versions, not
+  # ignored). 2.1.4 carries the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH),
+  # but the GHSA range is a flat `<= 5.0.7` — not branch-aware — so it keeps matching
+  # every 2.x maintenance release. Cannot raise to 5.x: minimatch@8.0.7 consumes the
+  # callable default export that 5.x replaced with a named one. Build-only chain
+  # (@opennextjs/aws -> @node-minify/core@8 -> glob@9 -> minimatch@8); never shipped.
+  # This rule names the ADVISORY as well as the package (unlike the package-only rules
+  # above) so any OTHER brace-expansion advisory still fires. The genuinely vulnerable
+  # 2.1.2 cannot return: pnpm overrides floor the 2.x line at >=2.1.4 and the >=3 line
+  # at >=5.0.8. Mirrors osv-scanner.toml + package.json auditConfig.ignoreGhsas.
+  - vulnerability: GHSA-mh99-v99m-4gvg
+    package:
+      name: brace-expansion
+
+exclude:
+  - "./target/**"
+  - "./**/node_modules/**"
+  - "./.git/**"
+
+# Keep the high cutoff the CI step sets (--fail-on high).
+fail-on-severity: high

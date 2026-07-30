@@ -8,8 +8,14 @@
  * `/api/audit/handbook`. No client JS — plain links.
  */
 
+import Link from "next/link";
+
 const linkCls =
 	"inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-[13px] font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
+// Present-but-locked affordance for the paid handbook — visible so the value is
+// legible to non-SKU tenants (a hidden feature can't sell), links to billing.
+const lockedCls =
+	"inline-flex items-center gap-1.5 rounded-lg border border-dashed border-line bg-surface-2/40 px-3 py-1.5 text-[13px] font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
 
 export function AuditHelpBar({ exportEntitled }: { exportEntitled: boolean }) {
 	return (
@@ -43,10 +49,18 @@ export function AuditHelpBar({ exportEntitled }: { exportEntitled: boolean }) {
 				<a href="/audit-user-guide.pdf" download className={linkCls}>
 					Download PDF
 				</a>
-				{exportEntitled && (
+				{exportEntitled ? (
 					<a href="/api/audit/handbook" className={linkCls}>
 						Compliance Handbook (PDF)
 					</a>
+				) : (
+					<Link
+						href="/settings/billing"
+						title="Auditor-formatted Compliance & Evidence Handbook — included with the $999/mo Audit add-on"
+						className={lockedCls}
+					>
+						🔒 Compliance Handbook · Audit SKU
+					</Link>
 				)}
 			</div>
 		</div>

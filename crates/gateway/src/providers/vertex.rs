@@ -6,7 +6,6 @@
 //! identical Gemini request/response contract as AI Studio (`google.rs`) —
 //! same `contents`/`systemInstruction`/`tools`/`generationConfig` fields, same
 //! `usageMetadata` shape — so this module reuses `GeminiRequest::from_universal`
-//! and `build_gemini_stream` wholesale, inheriting the B-104 `thoughtsTokenCount`
 //! fold for free. Only three things differ: host, path, and auth.
 //!
 //! Auth is the whole reason this is a separate adapter. **Vertex rejects API

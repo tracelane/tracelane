@@ -185,9 +185,9 @@ pub fn install_self_host_auth(tenant_id: TenantId, master_key: Option<SecretStri
 fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
     use secrecy::ExposeSecret as _;
     if let Some(mk) = &sh.master_key {
-        // Constant-time compare (same manual pattern as billing::webhook, so no
-        // deprecated `ring::constant_time` and no new dep) — avoids leaking the
-        // master key via early-return timing on the byte comparison.
+        // Constant-time compare (manual pattern, so no deprecated
+        // `ring::constant_time` and no new dep) — avoids leaking the master key
+        // via early-return timing on the byte comparison.
         if !constant_time_eq(token.as_bytes(), mk.expose_secret().as_bytes()) {
             bail!("invalid self-host credentials");
         }
@@ -201,9 +201,9 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
     })
 }
 
-/// Constant-time byte-slice equality (matches `billing::webhook::constant_time_eq`).
-/// A length mismatch returns early — that reveals only the length, and the
-/// per-byte comparison over the shared length is branch-free.
+/// Constant-time byte-slice equality. A length mismatch returns early — that
+/// reveals only the length, and the per-byte comparison over the shared length
+/// is branch-free.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

@@ -45,7 +45,6 @@ struct SpanRow {
     status_code: u8,
     status_message: String,
     attributes: String,
-    // B-118 #5: the dedicated columns the /signatures page queries
     // (`has(aft_ids, ?)` + `intervention`). Populated from the predictive AFT hit the
     // gateway records in the span; empty when no detector matched.
     aft_ids: Vec<String>,
@@ -81,7 +80,6 @@ impl From<TracelaneSpan> for SpanRow {
                 );
                 String::new()
             }),
-            // B-118 #5: map the predictive AFT hit into the signatures columns. A single
             // matched id today (the evaluator returns the most-severe Decision); the
             // column is an Array so a future multi-signature span needs no schema change.
             // intervention stays the recorded severity (0 today = observe-first "flag",

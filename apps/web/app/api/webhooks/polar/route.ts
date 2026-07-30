@@ -9,9 +9,11 @@
  *   4. Idempotency: dedup on (source='polar', webhook-id header) BEFORE
  *      dispatch; record AFTER successful dispatch (at-least-once > at-most-once).
  *      Polar's envelope carries no top-level id — the delivery id is the header.
- *   5. Dispatch subscription.* → update tenants (plan, polar_customer_id,
- *      polar_subscription_id) + upsert workspace_entitlements.plan_lookup_key.
- *      Polar = plan membership only; per-feature flags are NOT set here.
+ *   5. Dispatch subscription.* → BASE plan events update tenants (plan,
+ *      polar_customer_id, polar_subscription_id) + upsert
+ *      workspace_entitlements.plan_lookup_key (plan membership only).
+ *      ADD-ON events (a separate Polar subscription — the $999 Audit SKU) grant
+ *      the matching workspace_entitlements boolean and NEVER touch the base plan
  *   6. Unknown plan key / unresolved tenant → log + 200 (no infinite retry).
  *
  * E2E is gated on the founder: register the webhook in the Polar dashboard and
@@ -117,7 +119,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	}
 
 	if (!orgCheckBypassed()) {
-		const expected = process.env.POLAR_EXPECTED_ORGANIZATION_ID;
+		// `.trim()` is REQUIRED: `wrangler secret put` / `echo` can append a
+		// trailing newline to the stored value, and a clean `actual` (parsed from
+		// JSON) would then never equal `"<uuid>\n"` — a silent 401 storm. The
+		// secret path already trims (`decodeWebhookSecret`); this makes the org
+		const expected = process.env.POLAR_EXPECTED_ORGANIZATION_ID?.trim();
 		if (!expected) {
 			console.error("[polar-webhook] POLAR_EXPECTED_ORGANIZATION_ID unset");
 			return NextResponse.json(
@@ -125,8 +131,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 				{ status: 503 },
 			);
 		}
-		if (extractOrganizationId(event.data) !== expected) {
-			console.warn("[polar-webhook] organization_id mismatch — refusing");
+		// An org id is a public identifier, not a credential — log actual vs
+		// expected on mismatch so a config error is diagnosable (an unlogged
+		const actual = extractOrganizationId(event.data);
+		if (actual !== expected) {
+			console.warn(
+				`[polar-webhook] organization_id mismatch — refusing (expected=${expected} actual=${actual ?? "null"})`,
+			);
 			return NextResponse.json(
 				{ error: "organization_id mismatch" },
 				{ status: 401 },
@@ -200,6 +211,15 @@ async function handleSubscriptionChange(
 	const lookupKeyVal = product?.metadata?.lookup_key;
 	const lookupKey = typeof lookupKeyVal === "string" ? lookupKeyVal : null;
 
+	// Add-on subscriptions (the $999 Audit SKU, seat/overage meters, HIPAA-GCP)
+	// are a SEPARATE Polar subscription from the base plan. Route them BEFORE the
+	// plan resolver — which would otherwise class every add-on as "unknown" and
+	// They must never touch tenants.plan / polar_subscription_id.
+	if (isAddOnLookupKey(lookupKey)) {
+		await handleAddOnChange(eventType, data, lookupKey as string, status);
+		return;
+	}
+
 	const resolution: PlanResolution = resolvePlan({
 		eventType,
 		status,
@@ -207,57 +227,24 @@ async function handleSubscriptionChange(
 	});
 
 	if (resolution.kind === "unknown") {
-		// An add-on / meter purchase is a real event we don't yet apply (grant
-		// wiring is P2) — log it LOUDLY so a surprise purchase is visible, vs a
-		// genuinely unknown key which is a quieter warn.
-		if (isAddOnLookupKey(resolution.rawKey)) {
-			console.error(
-				`[polar-webhook] ADD-ON lookup_key received (${resolution.rawKey}) — add-on grant wiring is not implemented (P2); plan unchanged. A purchase may need manual handling.`,
-			);
-		} else {
-			console.warn(
-				"[polar-webhook] unknown lookup_key — acked, no plan change:",
-				resolution.rawKey,
-			);
-		}
+		// Genuinely unknown key (add-ons are handled above) — ack, no plan change.
+		console.warn(
+			"[polar-webhook] unknown lookup_key — acked, no plan change:",
+			resolution.rawKey,
+		);
 		return;
 	}
 
-	// Correlate the tenant: the gateway sets the Polar customer external_id to
-	// the internal tenant id (crates/gateway/src/billing/polar_client.rs). Fall
-	// back to an existing polar_customer_id mapping.
-	const customer = data.customer as { external_id?: unknown } | undefined;
-	// external_id must be OUR tenant UUID — a malformed value can never match
-	// a tenants.id row, and unvalidated it produces a driver-level error →
-	// 5xx → Polar retry loop. Non-UUID ⇒ treat as absent (acked below).
-	const UUID_RE =
-		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-	const tenantExternalId =
-		typeof customer?.external_id === "string" &&
-		UUID_RE.test(customer.external_id)
-			? customer.external_id
-			: null;
-
-	if (!tenantExternalId && !customerId) {
-		console.warn("[polar-webhook] no tenant correlation key — acked");
-		return;
-	}
-
-	const tenantRows = await db
-		.select({ id: tenants.id })
-		.from(tenants)
-		.where(
-			tenantExternalId
-				? eq(tenants.id, tenantExternalId)
-				: eq(tenants.polarCustomerId, customerId as string),
-		)
-		.limit(1);
-
-	const tenant = tenantRows[0];
+	// Correlate the tenant (external_id = our tenant UUID; polar_customer_id
+	// fallback). Null ⇒ ack (no retry loop).
+	const tenant = await correlateTenant(data);
 	if (!tenant) {
+		const customer = data.customer as { external_id?: unknown } | undefined;
 		console.warn(
 			"[polar-webhook] no tenant for subscription — acked:",
-			tenantExternalId ?? customerId,
+			(typeof customer?.external_id === "string"
+				? customer.external_id
+				: null) ?? customerId,
 		);
 		return;
 	}
@@ -276,7 +263,9 @@ async function handleSubscriptionChange(
 		.where(eq(tenants.id, tenant.id));
 
 	// Polar = plan membership only: set plan_lookup_key, never per-feature flags
-	// (those are workspace overrides under deny-overrides-grant).
+	// (those are workspace overrides under deny-overrides-grant). onConflict sets
+	// ONLY plan_lookup_key, so a previously-granted add-on flag (f_audit_addon)
+	// survives a plan change.
 	await db
 		.insert(workspaceEntitlements)
 		.values({ tenantId: tenant.id, planLookupKey: resolution.lookupKey })
@@ -284,4 +273,104 @@ async function handleSubscriptionChange(
 			target: workspaceEntitlements.tenantId,
 			set: { planLookupKey: resolution.lookupKey, updatedAt: new Date() },
 		});
+}
+
+/**
+ * Correlate the tenant for a subscription/add-on event. The gateway sets the
+ * Polar customer `external_id` to the internal tenant UUID
+ * (crates/gateway/src/billing/polar_client.rs); fall back to an existing
+ * `polar_customer_id` mapping. A non-UUID external_id is treated as absent — it
+ * can never match a tenants.id row, and unvalidated it produces a driver-level
+ * error → 5xx → Polar retry loop. Returns the tenant row (id + current plan) or
+ * null (the caller acks 200).
+ */
+async function correlateTenant(
+	data: Record<string, unknown>,
+): Promise<{ id: string; plan: string | null } | null> {
+	const customerId =
+		typeof data.customer_id === "string" ? data.customer_id : null;
+	const customer = data.customer as { external_id?: unknown } | undefined;
+	const UUID_RE =
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	const tenantExternalId =
+		typeof customer?.external_id === "string" &&
+		UUID_RE.test(customer.external_id)
+			? customer.external_id
+			: null;
+	if (!tenantExternalId && !customerId) return null;
+	const [row] = await db
+		.select({ id: tenants.id, plan: tenants.plan })
+		.from(tenants)
+		.where(
+			tenantExternalId
+				? eq(tenants.id, tenantExternalId)
+				: eq(tenants.polarCustomerId, customerId as string),
+		)
+		.limit(1);
+	return row ?? null;
+}
+
+/**
+ * Apply an add-on subscription (a SEPARATE Polar subscription from the base
+ * plan). Only add-ons with a WIRED boolean grant mutate state — currently the
+ * $999 Audit SKU (`audit_addon_v1` → `workspace_entitlements.f_audit_addon`),
+ * which unlocks the Article-12 evidence-pack export + Compliance Handbook and
+ * forces full-capture (see `lib/entitlements.ts`). Everything else (overage /
+ * seat meters — metered, not a boolean; HIPAA-GCP — needs a manual BAA + GCP
+ * deploy, never an auto-flip) is logged LOUDLY for manual handling and leaves
+ * state unchanged.
+ *
+ * NEVER touches `tenants.plan` / `polar_subscription_id` — those belong to the
+ * base plan's own subscription. Cancellation of the add-on (canceled/revoked)
+ * sets the grant FALSE, so a churned Audit SKU actually re-locks the export.
+ *
+ * The upsert preserves the tenant's real `plan_lookup_key`: on CONFLICT it sets
+ * ONLY `f_audit_addon`; on INSERT (no row yet) `plan_lookup_key` is derived from
+ * the tenant's current plan (the column is NOT NULL + FK to plan_entitlements).
+ */
+async function handleAddOnChange(
+	eventType: string,
+	data: Record<string, unknown>,
+	lookupKey: string,
+	status: string | null,
+): Promise<void> {
+	if (lookupKey !== "audit_addon_v1") {
+		// Known add-on, but its grant is not a simple auto-flippable boolean.
+		console.error(
+			`[polar-webhook] add-on ${lookupKey} purchased — grant NOT auto-wired (metered, or needs manual ops e.g. HIPAA BAA + GCP deploy). State unchanged; may need manual handling.`,
+		);
+		return;
+	}
+
+	const tenant = await correlateTenant(data);
+	if (!tenant) {
+		console.warn(
+			`[polar-webhook] audit add-on: no tenant correlation — acked (${lookupKey})`,
+		);
+		return;
+	}
+
+	const canceled =
+		/canceled|revoked/.test(eventType) ||
+		status === "canceled" ||
+		status === "revoked";
+	const active = !canceled;
+	// plan_lookup_key is NOT NULL + FK; on INSERT derive it from the current plan.
+	const planKey = `${tenant.plan ?? "free"}_v1`;
+
+	await db
+		.insert(workspaceEntitlements)
+		.values({
+			tenantId: tenant.id,
+			planLookupKey: planKey,
+			fAuditAddon: active,
+		})
+		.onConflictDoUpdate({
+			target: workspaceEntitlements.tenantId,
+			set: { fAuditAddon: active, updatedAt: new Date() },
+		});
+
+	console.info(
+		`[polar-webhook] audit add-on ${active ? "GRANTED" : "REVOKED"} (f_audit_addon=${active}) for tenant ${tenant.id}`,
+	);
 }

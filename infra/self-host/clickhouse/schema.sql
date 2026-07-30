@@ -118,7 +118,6 @@ SETTINGS index_granularity = 8192;
 -- Append-only; hash_chain forms a Merkle chain per tenant.
 -- Ed25519 Merkle commitments anchored to Rekor (Week 5).
 --
--- ReplacingMergeTree(event_time) (B-108 forward fix, ADR-065 F1): the gateway
 -- writes the CH row durably before it advances the Postgres chain head, so a
 -- crash-retry can leave an orphan at a re-minted seq. Version = event_time makes
 -- the retry the winner; verification reads use FINAL so the orphan is invisible

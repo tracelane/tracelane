@@ -3,7 +3,6 @@
 -- round-trip; span field `gateway_overhead_us`, CH migration 13) becomes a
 -- budgetable alert metric so a latency-tax regression (the ~6s
 -- transcontinental-Postgres overhead) FIRES instead of hiding. Budget: < 10ms
--- (tightened from 15ms after B-119/ADR-069 async audit; measured p99 4.6ms).
 --
 -- The 0012 inline CHECK is auto-named, so look it up dynamically and drop by
 -- name (a hard-coded name misses it), then re-add with the sixth metric.

@@ -259,3 +259,30 @@ reason = "wasmtime 20.0.x — only reachable via the off-by-default `wasm-plugin
 [[IgnoredVulns]]
 id = "GHSA-frvp-7c67-39w9"
 reason = "moderate; apps/mcp @hono/node-server — patched only in the 2.x major; bump with the MCP SDK refresh. Below the pnpm-audit high gate."
+
+# brace-expansion: the ONLY residual after the 2026-07-30 bump pass. Three of the
+# four advisories that reddened the public scan were fixed by raising versions, not
+# ignored: postcss 8.4.31+8.5.12 -> 8.5.25 (GHSA-6g55-p6wh-862q, GHSA-r28c-9q8g-f849),
+# valibot 1.4.0 -> 1.4.2 (GHSA-5qjj-4xww-7phc), brace-expansion 5.0.7 -> 5.0.9.
+#
+# The 2.x copy CANNOT be raised past 2.x: brace-expansion 5.x replaced the callable
+# default export (`module.exports = expandTop`) with a named one (`exports.expand`),
+# and minimatch@8.0.7 consumes it as a default — forcing >=5 there throws
+# "TypeError: (0 , brace_expansion_1.default) is not a function" at build time
+# (falsification-tested 2026-07-30 against the real packages).
+#
+# 2.1.4 DOES carry the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH = 4_000_000;
+# a PoC that fatally OOMs 2.1.2 under --max-old-space-size=256 returns bounded on
+# 2.1.4). The GHSA range is a flat `<= 5.0.7`, i.e. NOT branch-aware, so it keeps
+# matching every 1.x/2.x/3.x maintenance release regardless of the fix.
+#
+# Safe to ignore by id because the OTHER copy cannot regress into it: the pnpm
+# override `brace-expansion@>=3: ">=5.0.8"` is a hard floor, so the >=3 line can
+# never resolve below the real fix while this ignore is in place. Chain is
+# build-only (apps/web devDep -> @opennextjs/cloudflare -> @opennextjs/aws ->
+# @node-minify/core@8.0.6 -> glob@9.3.5 -> minimatch@8.0.7); never in a shipped
+# artifact. Removable once @opennextjs/aws moves to @node-minify/core >=10, which
+# drops glob entirely.
+[[IgnoredVulns]]
+id = "GHSA-mh99-v99m-4gvg"
+reason = "brace-expansion 2.1.4 (build-only, via @opennextjs/aws -> @node-minify/core@8 -> glob@9 -> minimatch@8) carries the backported CVE-2026-14257 fix; the GHSA range <=5.0.7 is not branch-aware so it still matches. Cannot raise to 5.x: minimatch@8 needs the callable default export 5.x dropped. The >=3 copy is floored at >=5.0.8 by pnpm override, so this ignore masks no unfixed instance."

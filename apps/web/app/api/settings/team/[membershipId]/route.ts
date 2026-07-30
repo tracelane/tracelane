@@ -68,10 +68,11 @@ export async function DELETE(
 		);
 	}
 
-	// Last-owner protection (§1). ponytail: bound = the 2-owner concurrent race
-	// (both remove the OTHER of the last two, each sees 2, both pass → 0).
-	// Owner-initiated + low-frequency; add a Postgres advisory lock on
-	// (tenant,"owners") if it must be exact.
+	// Last-owner protection (§1).
+	// ponytail: bound = the 2-owner concurrent race (both remove the OTHER of
+	// the last two, each sees 2, both pass → 0 privileged members, which the
+	// low-frequency; add a Postgres advisory lock on (tenant,"owners") if it
+	// must be exact.
 	const privilegedCount = members.filter((m) =>
 		isPrivilegedRole(m.role.slug),
 	).length;

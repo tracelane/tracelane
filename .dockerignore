@@ -1,0 +1,36 @@
+# Keep the Rust image build context small + keep docs out of layers.
+#
+# PUBLIC variant, shipped by build-public-export.sh step 3 (like gitignore.public).
+# It drops a block of exclusions for paths that do not exist in this repository —
+# they excluded nothing here, and enumerating them served no build purpose. The
+# blanket `*.md` below already covers every Markdown file regardless of name.
+.git/
+**/target/
+**/node_modules/
+**/.next/
+**/__pycache__/
+.env
+.env.*
+# TLS material — never in an image layer (no Rust build embeds certs). The
+# gateway/ingest build context is the repo root, so exclude these explicitly.
+*.pem
+*.key
+*.crt
+# Docs must never enter an image layer.
+*.md
+# Not needed to build the Rust binaries (gateway/ingest + their workspace members).
+apps/
+# ...EXCEPT the authoritative Drizzle migrations: the gateway embeds them at
+# compile time via db::apply_migrations include_str!("../../../../apps/web/db/
+# migrations/*.sql"). Re-include just that dir; the rest of the Next.js app stays out.
+!apps/web/db/migrations
+!apps/web/db/migrations/**
+evals/
+ml/
+bench/
+docs/
+runbooks/
+spec/
+packages/sdk-python/
+packages/sdk-typescript/
+packages/cli/

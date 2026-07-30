@@ -103,7 +103,6 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // Studio issues only these now, and Gemini rejects all Standard keys
         // from Sept 2026. Length floor, not a pinned length: the format is
         // undocumented (Google treats the key as opaque), so a pinned length
-        // would let a slightly-different key through SILENTLY. See B-112
         // (the internal google-key-redaction incident review).
         (
             r"AQ\.[A-Za-z0-9_\-]{20,}",
@@ -505,7 +504,6 @@ mod tests {
         assert!(!r.contains("SyAbCdEf"), "got: {r}");
     }
 
-    /// B-112: AI Studio issues only `AQ.` Authentication Keys now, and Gemini
     /// rejects all classic `AIza` keys from Sept 2026 — so this is the format
     /// customer keys will actually have.
     #[test]

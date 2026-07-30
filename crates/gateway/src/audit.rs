@@ -679,7 +679,6 @@ impl AuditChain {
 
     /// Append one audit event, advancing the tenant's tamper-evident hash chain.
     ///
-    /// **B-108 forward fix (ADR-065 F1):** when a Postgres pool is configured
     /// (always true in prod), seq assignment + chain-head advance are
     /// serialized **across processes** by a per-tenant `SELECT … FOR UPDATE`
     /// row lock ([`append_pg_serialized`](Self::append_pg_serialized)), and the
@@ -845,7 +844,6 @@ impl AuditChain {
     /// Legacy in-memory append (no Postgres pool → single-process dev / OSS
     /// self-host). Advances the per-tenant `DashMap` chain state under a
     /// `parking_lot::Mutex` and fires the CH write + anchor as fire-and-forget
-    /// tasks. The cross-process race (B-108) cannot arise without a shared
     /// Postgres, so this path is unchanged. **Not used when `pg_pool` is set.**
     fn append_in_memory(&self, event: AuditEvent, payload_json: String) -> Result<()> {
         let (row_hash, seq, prev_hash_snapshot, should_anchor, pending_snapshot, batch_start) = {
@@ -2026,7 +2024,6 @@ mod tests {
         assert_eq!(s2.lock().seq, 1);
     }
 
-    // ---- B-108 forward-fix integration harness (ADR-065 F1) --------------
     //
     // These `#[ignore]`d tests need a live Postgres (audit_chain_state) AND a
     // live ClickHouse (audit_log as ReplacingMergeTree). Run them from the dev
@@ -2279,7 +2276,6 @@ mod tests {
         );
     }
 
-    /// **B-108 cross-process seq race (the whole point of ADR-065 F1).**
     ///
     /// `audit_keys.rs` `get_or_create` anchor-KEY race (a different table,
     /// `tenant_audit_keys`, whose failure is a duplicate *keypair*, closed by
@@ -2379,7 +2375,6 @@ mod tests {
         assert_eq!(head.last_seq, total - 1, "PG head == last assigned seq");
     }
 
-    /// **B-108 crash-mid-append + restart reconcile (ADR-065 HOLE C).**
     ///
     /// Simulate a crash AFTER the durable ClickHouse write but BEFORE the
     /// Postgres head advance/commit: a durable CH row exists at seq N that

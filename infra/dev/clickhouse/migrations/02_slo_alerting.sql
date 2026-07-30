@@ -91,7 +91,6 @@ GROUP BY tenant_id, bucket_hour, provider, model;
 
 -- ── SLO alert records ─────────────────────────────────────────────────────────
 -- Alert-event sink for the ADR-061 alert job (one row per breach). NOTE: the
--- job is not built yet (B-103) — this table is provisioned ahead of it; there
 -- is no writer today.
 -- Append-only; one row per breach event.
 CREATE TABLE IF NOT EXISTS tracelane.slo_alerts

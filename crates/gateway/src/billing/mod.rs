@@ -27,14 +27,16 @@ pub mod checkout;
 pub mod meter;
 pub mod polar_client;
 pub mod portal;
-pub mod webhook;
 
 pub use meter::{Meter, Recorder};
 pub use polar_client::{
     BillingError, BillingResult, PolarClient, PolarCustomerId, PolarSubscriptionId,
 };
 pub use portal::PortalState;
-pub use webhook::{WebhookConfig, WebhookState};
+
+// NOTE: the Polar webhook RECEIVER lives in the web tier
+// (`apps/web/app/api/webhooks/polar`), the single correct handler. The former
+// gateway `webhook` module (a second, incomplete receiver keyed only on
 
 /// Plan tier the customer is on. The string form is the
 /// `lookup_key` value in the Polar product's metadata.

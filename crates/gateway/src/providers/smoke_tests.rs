@@ -155,7 +155,6 @@ async fn openai_401_surfaces_typed_auth_rejection() {
 #[tokio::test]
 async fn openai_500_is_not_an_auth_rejection() {
     // A 5xx outage is an availability failure → 502, NOT provider_key_rejected.
-    // B-125: a VERBOSE 5xx body (echoing a BYOK key) + a `www-authenticate` header
     // must NOT leak into the error surfaced to the gateway — only status + a safe
     // reason token survive; the client then gets our normalized `provider
     // unavailable`, never the provider's payload.
@@ -188,7 +187,6 @@ sk-projFAKEleakDONOTUSE0123456789abcdef rejected upstream\",\"type\":\"server_er
         .expect("typed ProviderHttpError");
     assert_eq!(http.status, 500);
     assert!(!http.is_auth_rejection());
-    // B-125: neither the verbose body's key nor the auth header survives.
     let chain = format!("{err:#}");
     assert!(
         !chain.contains("sk-projFAKEleak"),

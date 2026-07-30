@@ -157,7 +157,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	}
 
 	await switchToOrganization(org.id);
-	const tenantId = await upsertTenantId(org.id);
+	// Pass the name we just created the org with — mirroring it here is free
+	// (no extra WorkOS call) and is what lets the shell label the workspace from
+	// one Postgres read instead of falling back to the literal "Workspace".
+	const tenantId = await upsertTenantId(org.id, name);
 	await upsertUserMirror({
 		tenantDbId: tenantId,
 		workosUserId: user.id,

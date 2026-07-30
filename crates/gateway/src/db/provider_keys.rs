@@ -148,7 +148,6 @@ pub fn last4_of(plaintext: &str) -> String {
 
 /// A short, non-secret, human-matchable fingerprint for a stored credential.
 ///
-/// B-116: `last4_of` assumes a credential is an opaque string — true for every
 /// provider until the Vertex adapter introduced the first **structured** one, a
 /// ~2.4KB service-account JSON. Its last four characters are `m"\n}` — the tail of
 /// `"googleapis.com"`, a quote, an internal newline, and the closing brace. That
@@ -270,8 +269,6 @@ mod tests {
         assert_eq!(last4_of("ab"), "……");
     }
 
-    // ── B-116: fingerprints for structured credentials ───────────────────────
-
     /// An obviously-fake service account shaped like the real thing. `key_id` is
     /// the `private_key_id` — a PUBLIC identifier (gcloud prints it), not key
     /// material.
@@ -283,7 +280,6 @@ mod tests {
         )
     }
 
-    /// THE B-116 REGRESSION: the raw tail of a service-account JSON is its
     /// closing syntax, not a fingerprint. Must be a clean 4 chars of the
     /// `private_key_id` — the value GCP's own console shows.
     #[test]

@@ -8,6 +8,7 @@
  */
 
 import { ProviderKeyManager } from "@/components/settings/ProviderKeyManager";
+import { canAdmin, requireSession } from "@/lib/auth";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = { title: "LLM Providers — Settings" };
@@ -15,7 +16,11 @@ export const metadata: Metadata = { title: "LLM Providers — Settings" };
 // Touches the gateway via a session-bound proxy; never statically rendered.
 export const dynamic = "force-dynamic";
 
-export default function ProvidersPage() {
+export default async function ProvidersPage() {
+	// Same source the Team page gates on. UI-only: the gateway's owner-only gate
+	// (`provider_keys_api.rs::authenticate`) stays authoritative.
+	const session = await requireSession();
+
 	return (
 		<div className="space-y-1">
 			<h2 className="text-sm font-semibold text-ink">LLM Provider Keys</h2>
@@ -34,7 +39,7 @@ export default function ProvidersPage() {
 					Encryption Keys →
 				</a>
 			</p>
-			<ProviderKeyManager />
+			<ProviderKeyManager canManage={canAdmin(session.role)} />
 		</div>
 	);
 }

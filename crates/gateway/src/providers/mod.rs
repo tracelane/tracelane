@@ -38,7 +38,6 @@ pub struct ProviderHttpError {
     /// Machine-readable upstream reason token (e.g. `API_KEY_INVALID`), when the
     /// provider supplies one AND it passes [`safe_reason`].
     ///
-    /// B-115: a status code alone is not enough. Google answers an invalid/retired
     /// API key with **400 `INVALID_ARGUMENT` / `API_KEY_INVALID`** — verified live
     /// 2026-07-17 — not 401. A bare 400 is ambiguous (malformed request vs dead
     /// key), so without the reason we cannot tell a customer their key died, and
@@ -98,7 +97,6 @@ impl ProviderHttpError {
     ///
     /// Two shapes:
     ///   - **401 / 403** — the classic status-level rejection.
-    ///   - **400 + a key-invalid reason** — Google's shape (B-115). A bare 400 is
     ///     NOT a rejection (it is usually a malformed request); only a 400 whose
     ///     reason names the key qualifies.
     #[must_use]
@@ -115,19 +113,43 @@ impl ProviderHttpError {
 
     /// True when the upstream rate-limited or exhausted quota (429). The caller
     /// should surface 429 — telling a caller "provider unavailable" when they are
-    /// simply over quota sends them debugging the wrong system (B-113).
     #[must_use]
     pub fn is_rate_limited(&self) -> bool {
         self.status == 429
     }
 
     /// True when the upstream says the model does not exist (404). Distinct from
-    /// an outage: the caller must change their model string, not retry (B-113).
     /// Observed live 2026-07-17 — AI Studio 404s models "no longer available to
     /// new users", which as a 502 read as a Tracelane outage.
     #[must_use]
     pub fn is_model_not_found(&self) -> bool {
         self.status == 404
+    }
+
+    /// True for any upstream **4xx we could not classify** with the three
+    ///
+    /// This is deliberately **NOT** a reclassification of 400 as an auth
+    /// rejection. xAI answers an invalid key with `400 {"code":
+    /// "invalid-argument", "error":"Incorrect API key provided."}` — verified
+    /// live 2026-07-28 — but a malformed payload is *also* a 400, and calling
+    /// that a key problem sends the caller to rotate a perfectly good key. We
+    /// cannot tell the two apart without reading the free-text body, which
+    /// `security.md` R2 C-3 forbids propagating (it can echo the credential).
+    ///
+    /// So we assert only what the status alone proves: the upstream rejected
+    /// the **request**, which is a client-class problem, not a Tracelane
+    /// outage. The caller gets a 4xx naming the upstream status and both
+    /// candidate causes — strictly more honest than the `502 provider
+    /// unavailable` this used to fall through to, which blamed us.
+    ///
+    /// `400 API_KEY_INVALID` still resolve to `provider_key_rejected` above and
+    /// never reach here.
+    #[must_use]
+    pub fn is_unclassified_client_error(&self) -> bool {
+        (400..500).contains(&self.status)
+            && !self.is_auth_rejection()
+            && !self.is_rate_limited()
+            && !self.is_model_not_found()
     }
 }
 
@@ -157,7 +179,6 @@ mod provider_http_error_tests {
         }
     }
 
-    /// B-115: Google answers an invalid/retired API key with 400 API_KEY_INVALID,
     /// NOT 401 — verified live 2026-07-17. Google retires ALL classic `AIza` keys
     /// in Sept 2026, so without this every affected customer would get an opaque
     /// 502 reading as a Tracelane outage.
@@ -171,6 +192,45 @@ mod provider_http_error_tests {
         assert!(err(400, Some("API_KEY_INVALID")).is_auth_rejection());
         assert!(err(400, Some("API_KEY_EXPIRED")).is_auth_rejection());
         assert!(err(400, Some("CREDENTIAL_MISSING")).is_auth_rejection());
+    }
+
+    /// outage — but must NOT be reclassified as an auth rejection either, or a
+    /// malformed payload would send the caller to rotate a good key.
+    #[test]
+    fn unclassified_4xx_is_client_class_but_never_an_auth_rejection() {
+        // xAI's dead-key shape (400, unparseable reason) and a genuinely
+        // malformed request are INDISTINGUISHABLE here — both land in this
+        // bucket, and neither claims to know which it is.
+        for s in [400u16, 402, 409, 413, 415, 422, 451] {
+            let e = err(s, None);
+            assert!(
+                e.is_unclassified_client_error(),
+                "{s} should be client-class"
+            );
+            assert!(!e.is_auth_rejection(), "{s} must NOT claim the key is bad");
+        }
+    }
+
+    /// The three parsed paths keep their own handling — this bucket is strictly
+    #[test]
+    fn classified_statuses_never_fall_into_the_unclassified_bucket() {
+        for e in [
+            err(401, None),
+            err(403, None),
+            err(429, None),
+            err(404, None),
+            err(400, Some("API_KEY_INVALID")), // parsed path
+        ] {
+            assert!(!e.is_unclassified_client_error());
+        }
+    }
+
+    /// 5xx is a real outage and must stay a 502 — the fallback below this bucket.
+    #[test]
+    fn server_errors_are_not_client_class() {
+        for s in [500u16, 502, 503, 504] {
+            assert!(!err(s, None).is_unclassified_client_error());
+        }
     }
 
     #[test]
@@ -562,7 +622,6 @@ impl ProviderRegistry {
     /// specific model variant. Mirrors the match arms in
     /// `api_key_env_var` — keep both in sync.
     /// The SINGLE canonical model→provider map. Returns `None` for an unmatched
-    /// model — B-127: it MUST NOT default to a provider. Defaulting would fetch
     /// that provider's key for a model the caller never meant (credential
     /// misrouting). Every consumer fail-closes on `None` with a typed
     /// `unroutable_model` error. Enforced by
@@ -628,7 +687,6 @@ impl ProviderRegistry {
             m if m.starts_with("llama") || m.starts_with("qwen") || m.starts_with("gemma") => {
                 "groq"
             }
-            // B-127: FAIL CLOSED. No `_ => "anthropic"` — an unmatched model is
             // unroutable, not "probably Anthropic". Returning a default here would
             // send the Anthropic key (or whichever provider) to a model the caller
             // never asked for. Callers reject with 400 unroutable_model.
@@ -640,7 +698,6 @@ impl ProviderRegistry {
     /// Resolve the env-var name to read a provider API key from (legacy
     /// single-tenant env fallback).
     ///
-    /// B-126: DELEGATES to the single canonical `provider_id_for_model` table,
     /// then maps provider_id → env var. NO model-prefix matching lives here — that
     /// was the drift surface (the Groq family dispatched to Groq but resolved
     /// `ANTHROPIC_API_KEY` here). Enforced by
@@ -690,7 +747,6 @@ impl ProviderRegistry {
             "together" => "TOGETHER_API_KEY",
             "fireworks" => "FIREWORKS_API_KEY",
             "openrouter" => "OPENROUTER_API_KEY",
-            // B-127: never default to ANTHROPIC_API_KEY. This is only ever called
             // with a provider_id that provider_id_for_model already matched, so `_`
             // is unreachable; an empty env is the fail-safe (no key), NOT a
             // different provider's key.
@@ -738,7 +794,6 @@ impl MockProvider {
 mod model_routing_consistency_tests {
     use super::ProviderRegistry;
 
-    /// Regression (B-126): the dispatch match in `server.rs` routes
     /// `llama*` / `qwen* `/ `gemma*` to `registry.groq`, but the BYOK
     /// key-lookup functions used to default them to `anthropic` /
     /// `ANTHROPIC_API_KEY`. A stored Groq key then never resolved (401), and
@@ -824,7 +879,6 @@ mod model_routing_consistency_tests {
         }
     }
 
-    /// B-127: unmatched/bare-name models FAIL CLOSED (None), NOT default to
     /// anthropic. Sending an unknown model to Anthropic with the Anthropic key is
     /// credential misrouting; rejecting is strictly safer. (These are top models
     /// with no bare-name arm — reachable via a provider prefix instead.)
@@ -900,12 +954,10 @@ mod model_routing_consistency_tests {
         ("openrouter", "openrouter/meta-llama/llama-3.3-70b"),
     ];
 
-    /// B-127 cross-leak CI GATE — the mechanical prevention, parameterized over
     /// the FULL provider matrix (N×N, N=35 → 1225 ordered pairs). For every pair
     /// (A, B) with A≠B, calling B's model MUST resolve B's own key env, never A's.
     /// Since the key env is derived from the single canonical
     /// `provider_id_for_model`, this proves at the resolution layer that no
-    /// provider's model can fetch another provider's key — the exact B-126/B-127
     /// credential-misrouting class cannot silently return. Providers with real
     /// keys are additionally exercised on the wire (see the multi-provider proof);
     /// the rest are asserted-by-construction here.

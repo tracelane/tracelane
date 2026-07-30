@@ -137,8 +137,10 @@ impl PolarClient {
     /// Returns the URL the customer should be redirected to. Polar
     /// handles payment-method capture + Stripe under the hood; on
     /// successful purchase Polar fires a `subscription.created`
-    /// webhook which our `webhook::handler` dispatches to flip the
-    /// tenant's `plan_tier`.
+    /// webhook which the WEB-tier receiver
+    /// (`apps/web/app/api/webhooks/polar`) dispatches to flip the
+    /// tenant's `plan_tier` (correlating by the `external_customer_id`
+    /// we set here). The gateway no longer receives Polar webhooks
     ///
     /// `tenant_id` is bound to the session via `external_customer_id`
     /// so the webhook event carries it back without a separate

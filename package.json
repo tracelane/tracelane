@@ -35,14 +35,17 @@
 			"protobufjs": ">=7.6.5 <8",
 			"hono": ">=4.12.27 <5",
 			"sharp": ">=0.35.0",
-			"brace-expansion@2": ">=2.1.2 <3",
-			"brace-expansion@>=3 <5.0.7": ">=5.0.7",
+			"brace-expansion@2": ">=2.1.4 <3",
+			"brace-expansion@>=3": ">=5.0.8",
+			"postcss": ">=8.5.18",
+			"valibot": ">=1.4.2",
 			"body-parser": ">=2.3.0"
 		},
 		"auditConfig": {
 			"ignoreGhsas": [
 				"GHSA-5xrq-8626-4rwp",
-				"GHSA-fx2h-pf6j-xcff"
+				"GHSA-fx2h-pf6j-xcff",
+				"GHSA-mh99-v99m-4gvg"
 			]
 		}
 	}

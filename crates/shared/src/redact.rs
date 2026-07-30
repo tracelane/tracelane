@@ -28,7 +28,6 @@
 //!   - AWS secret access key: 40-char base64 following
 //!     `aws_secret_access_key`, `secret_access_key`, or `X-Amz-Signature`
 //!
-//! Added 2026-07-17 (B-112) — Google now issues a SECOND key format that the
 //! `AIza` rule above silently misses. Two complementary rules cover it:
 //!   - `?key=<value>` / `&key=<value>` (credential in a URL query string) →
 //!     `key=[REDACTED]`. The Google adapter passes the API key this way
@@ -152,7 +151,6 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
             }
         }
 
-        // ── 6d. `xai-<20+ chars>` (xAI / Grok BYOK secret key). B-125: BYOK
         // formats beyond `sk-`/`AIza` must redact too, since an upstream
         // provider-error body can echo the tenant's own key.
         if try_match_prefix(input, i, b"xai-") {
@@ -170,7 +168,6 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
         // keys are `gsk_` + ~52 base62 chars. NOTE: Mistral keys are a prefixless
         // 32-char token and CANNOT be pattern-redacted without unacceptable false
         // positives — they are protected by SecretString + never-logged +
-        // provider-error body allowlisting (B-125), not by this layer.
         if try_match_prefix(input, i, b"gsk_") {
             let val_start = i + 4;
             let end = skip_token(input, val_start);
@@ -316,7 +313,6 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
         // `…:streamGenerateContent?alt=sse&key=<API_KEY>` (`google.rs:74`), and a
         // transport error's `Display` can drag that whole URL into a log line.
         //
-        // B-112: this matches the PARAMETER, never the value shape, and that is
         // the point. Block 8 keys off the literal `AIza` prefix of the classic
         // 39-char Google key; Google now issues keys with a different prefix and
         // length, which block 8 silently misses — verified against a real key
@@ -673,9 +669,6 @@ mod tests {
         );
     }
 
-    // ---- B-112: modern Google key format + the `?key=` URL vector ----
-
-    /// The regression that motivated B-112: Google issues keys that the `AIza`
     /// matcher does not recognise (verified 2026-07-17 against a real key —
     /// longer than the classic 39 chars, different prefix, contains a dot).
     /// Block 8 cannot see it; block 12 must, because the adapter puts the key
@@ -937,7 +930,6 @@ mod tests {
 
     #[test]
     fn scrubs_xai_byok_key() {
-        // B-125: xAI/Grok BYOK key format — an upstream 401 body can echo it.
         // Clearly-fake value per rules/testing.md.
         let input = "Incorrect API key: xai-FAKEtestkeyDONOTUSE0123456789abcdef rejected";
         let out = scrub_str(input);

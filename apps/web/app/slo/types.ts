@@ -24,7 +24,6 @@ export type SloRow = {
 
 /** Window-wide SLO summary — the TRUE merged quantiles (GET /v1/slo/summary),
  *  distinct from the per-bucket {@link SloRow}. Used for the headline tiles so
- *  they show a real p95, not a weighted mean of per-hour percentiles (B-118 #9). */
 export type SloSummary = {
 	p50_ms: number;
 	p95_ms: number;

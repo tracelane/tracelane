@@ -1,14 +1,14 @@
 /**
  * In-memory fixed-window rate limiter for auth-adjacent web routes
  * side (the gateway has its own for WorkOS webhooks).
- *
- * ponytail: per-instance, not global. On serverless (CF Workers) each isolate
- * keeps its own counters, so this throttles a warm-isolate burst but is NOT a
- * hard global cap — a distributed attacker across isolates can exceed it. The
- * hard bound on invite abuse is the seat cap (pending invites count toward it,
- * and invite is owner-only). Upgrade to a KV / Durable-Object / Postgres
- * counter if a strict global limit is ever required.
  */
+
+// ponytail: per-instance, not global. On serverless (CF Workers) each isolate
+// keeps its own counters, so this throttles a warm-isolate burst but is NOT a
+// hard global cap — a distributed attacker across isolates can exceed it. The
+// hard bound on invite abuse is the seat cap (pending invites count toward it,
+// and invite is owner-only). Upgrade to a KV / Durable-Object / Postgres
+// counter if a strict global limit is ever required.
 
 type Window = { count: number; resetAt: number };
 

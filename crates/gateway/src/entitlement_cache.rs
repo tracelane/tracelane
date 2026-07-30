@@ -180,11 +180,9 @@ pub struct ResolvedEntitlements {
     pub f_full_capture: bool,
     /// ADR-059 user-facing alerting entitlement (dark by default on every plan).
     pub f_alerts: bool,
-    /// B-109: monthly included trace quota (deny-overrides-grant from
     /// `workspace_entitlements` ⊕ `plan_entitlements`). The gateway hard-cap 429
     /// threshold = `trace_quota_monthly` × `overage_hard_cap_multiplier`.
     pub trace_quota_monthly: i64,
-    /// B-109: hard-cap multiplier as integer tenths (5.0× → 50, 1.0× → 10) so the
     /// hot-path decision stays integer-only and this struct keeps deriving `Eq`.
     pub overage_hard_cap_multiplier_tenths: i32,
 }
@@ -217,7 +215,6 @@ impl ResolvedEntitlements {
             retention_days: 7,
             f_full_capture: false,
             f_alerts: false,
-            // B-109: free-plan quota defaults (10K traces, 1.0× hard cap = 429
             // exactly at the included quota) — fail-restricted, mirrors
             // plan_entitlements.free_v1.
             trace_quota_monthly: 10_000,
@@ -249,10 +246,8 @@ impl ResolvedEntitlements {
         }
     }
 
-    /// B-109: derive the gateway monthly-quota config from the resolved
     /// entitlements. The 429 hard cap = `trace_quota_monthly` × multiplier, both
     /// sourced from `workspace_entitlements` ⊕ `plan_entitlements` (never the
-    /// hardcoded plan map — that drift was the pre-B-109 gap; CLAUDE.md control-
     /// plane rule). A zero/negative quota (only the OSS self-host path) means
     /// "no quota enforced".
     pub fn quota_config(&self) -> crate::rate_limiter::QuotaConfig {
@@ -555,7 +550,6 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     });
 
     // One dedicated direct LISTEN connection carries both control-plane channels:
-    // entitlement invalidation AND api-key revocation (B-119 fix B) — no second
     // direct connection needed.
     client
         .batch_execute("LISTEN entitlements_changed; LISTEN key_revoked")
@@ -565,7 +559,6 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     while let Some(msg) = rx.recv().await {
         match msg {
             AsyncMessage::Notification(note) => match note.channel() {
-                // B-119 fix B: an api key was revoked — payload is hex(lookup_hash),
                 // the auth-cache key. Evict it so revocation stays immediate.
                 "key_revoked" => match hex::decode(note.payload()) {
                     Ok(v) if v.len() == 32 => {
@@ -738,7 +731,6 @@ mod tests {
         }
     }
 
-    /// B-109: the gateway quota is entitlement-driven — `quota_config()` reads the
     /// resolved `trace_quota_monthly` × multiplier, NOT the hardcoded plan map.
     #[test]
     fn quota_config_derives_from_entitlements_not_hardcoded() {
