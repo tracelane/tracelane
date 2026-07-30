@@ -39,6 +39,9 @@
 			"brace-expansion@>=3": ">=5.0.8",
 			"postcss": ">=8.5.18",
 			"valibot": ">=1.4.2",
+			"qs": ">=6.15.2",
+			"ip-address": ">=10.1.1",
+			"@opentelemetry/core": ">=2.8.0 <3",
 			"body-parser": ">=2.3.0"
 		},
 		"auditConfig": {
