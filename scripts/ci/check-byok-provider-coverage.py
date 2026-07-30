@@ -48,21 +48,23 @@ def die(msg: str) -> NoReturn:
 
 def routable_ids(src: str) -> set[str]:
     """Provider ids from the `env_var_for_provider_id` match — the single source."""
-    body = re.search(r"fn env_var_for_provider_id\b(.*?)\n    \}\n", src, re.S)
+    body = re.search(r"fn env_var_for_provider_id\b(.*?)\n    \}\n", src, re.DOTALL)
     if not body:
         die("could not locate `fn env_var_for_provider_id` in providers/mod.rs")
     return set(re.findall(r'"([a-z0-9_-]+)"\s*=>\s*"', body.group(1)))
 
 
 def allowlist_ids(src: str) -> set[str]:
-    body = re.search(r"fn is_known_provider\b.*?matches!\((.*?)\n    \)", src, re.S)
+    body = re.search(
+        r"fn is_known_provider\b.*?matches!\((.*?)\n    \)", src, re.DOTALL
+    )
     if not body:
         die("could not locate `fn is_known_provider` in provider_keys_api.rs")
     return set(re.findall(r'"([a-z0-9_-]+)"', body.group(1)))
 
 
 def ui_ids(src: str) -> set[str]:
-    body = re.search(r"const PROVIDERS[^=]*=\s*\[(.*?)\n\];", src, re.S)
+    body = re.search(r"const PROVIDERS[^=]*=\s*\[(.*?)\n\];", src, re.DOTALL)
     if not body:
         die("could not locate `const PROVIDERS` in ProviderKeyManager.tsx")
     return set(re.findall(r'id:\s*"([a-z0-9_-]+)"', body.group(1)))

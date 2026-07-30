@@ -160,9 +160,22 @@ fi
 
 # ── Python ────────────────────────────────────────────────────────────────────
 # ruff was CI-ONLY (ci.yml `python` job) — dark with CI. Mirror it.
+#
+# The local ruff MUST be the version ci.yml pins, or this is not a mirror of the
+# gate — it is a different tool reporting green while CI reports red. That is not
+# hypothetical: local ruff 0.15.15 passed `scripts/ci/check-byok-provider-coverage.py`
+# while CI's pinned 0.16.0 failed it with 3× FURB167 (`re.S` -> `re.DOTALL`), and
+# the public push went out red. The pin is read FROM ci.yml so there is one source
+# of truth and this cannot drift silently again.
 if command -v ruff >/dev/null 2>&1; then
-    run "ruff check"               ruff check .
-    run "ruff format --check"      ruff format --check .
+    _ruff_pin=$(grep -oE 'ruff==[0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml 2>/dev/null | head -1 | cut -d= -f3)
+    _ruff_have=$(ruff --version 2>/dev/null | awk '{print $2}')
+    if [[ -n "$_ruff_pin" && -n "$_ruff_have" && "$_ruff_pin" != "$_ruff_have" ]]; then
+        skip "ruff" "VERSION MISMATCH: local $_ruff_have, ci.yml pins $_ruff_pin — this check is NOT the CI gate. Run: pip install ruff==$_ruff_pin"
+    else
+        run "ruff check"               ruff check .
+        run "ruff format --check"      ruff format --check .
+    fi
 else
     skip "ruff" "ruff not installed"
 fi
