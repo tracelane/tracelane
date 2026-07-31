@@ -20,7 +20,7 @@
 #      apps/web/db/migrations, which the gateway `include_str!`s at compile time.
 # Keep the two files in step: a second, divergent build definition for the same
 # binary is what let this rot unnoticed.
-FROM cgr.dev/chainguard/rust:latest-dev AS builder
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:812b1f7bad6a00a1ea4dae924eb9a3621402d6912b37de1d0847d77555282a42 AS builder
 USER root
 # aws-lc-rs / ring (via rustls + jsonwebtoken's aws_lc_rs feature) compile C -> cmake.
 RUN apk add --no-cache cmake
@@ -44,7 +44,7 @@ RUN --mount=type=cache,target=/build/target,sharing=locked \
     cp /build/target/release/gateway /gateway
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:57e5704e70a85b90191182eb6110d1c817df0d8e96035cb041195c5a351f0861 AS runtime
 
 LABEL org.opencontainers.image.title="Tracelane Gateway" \
       org.opencontainers.image.description="Predictive reliability gateway for AI agents" \

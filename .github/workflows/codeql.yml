@@ -14,10 +14,31 @@
 name: CodeQL
 
 on:
+  # Path filter is `paths-ignore`, NOT `paths`, and that direction is deliberate:
+  # this is a security scanner, so the default must be SCAN and the exception
+  # must be an explicit, enumerated skip. An allowlist would silently stop
+  # scanning the first time someone adds a source directory nobody remembered to
+  # list — the scanner would go quiet and look healthy. Everything below is a
+  # tracker, a runbook, or prose that CodeQL does not analyse in any case.
+  #
+  # Costs 5 billable job-minutes a run (rust 2 + js/ts 2 + python 1), and a large
+  # share of pushes here touch documentation only, so this is real spend against
+  # a finite monthly Actions allowance rather than a tidy-up.
+  # The weekly `schedule` below is intentionally NOT filtered: it runs regardless
+  # so a newly-published query still reaches existing code.
   push:
     branches: [main]
+    # Filter by TYPE, not by filename. CodeQL analyses rust / javascript-typescript
+    # / python — it cannot analyse Markdown at all, so "no .md or .mdx" is both
+    # complete and exact. Filtering by type also names nothing: an enumerated list
+    # of internal document filenames would leak the private doc taxonomy into a
+    # file that ships publicly, and the export leak-guard correctly blocks that.
+    paths-ignore: &prose
+      - "**/*.md"
+      - "**/*.mdx"
   pull_request:
     branches: [main]
+    paths-ignore: *prose
   schedule:
     # Weekly, so a newly-published query catches existing code without a push.
     - cron: "27 4 * * 1"

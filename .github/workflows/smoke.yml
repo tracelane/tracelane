@@ -10,6 +10,22 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
+    # Allowlist (not paths-ignore) because this is a TARGETED integration test,
+    # not a scanner: it proves an OTLP span reaches ClickHouse, so only the
+    # ingest path and the harness itself can affect its result. The fail-safe
+    # argument that makes CodeQL a `paths-ignore` does not apply — a new
+    # directory outside this list cannot change what this test asserts.
+    #
+    # HONEST ABOUT THE BENEFIT: this saves ~0 minutes. The job is already gated
+    # by `if:` to dispatch-or-`smoke`-label, and a job skipped by `if:` is not
+    # billed. What it removes is the run RECORD — 10 of 10 prior runs were
+    # `skipped`, which reads as background noise and is exactly how a control
+    # that never executes stays unnoticed. Fewer, more meaningful rows.
+    paths:
+      - "crates/ingest/**"
+      - "crates/shared/**"
+      - "scripts/smoke/**"
+      - ".github/workflows/smoke.yml"
 
 permissions:
   contents: read

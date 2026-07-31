@@ -56,15 +56,32 @@ on:
     - cron: "0 3 * * 0" # weekly, Sun 03:00 UTC — full + behavioral, all paths (budget: not daily)
   workflow_dispatch: {} # manual full run (use to validate the runner end-to-end)
 
-# Runs QUEUE, they do NOT cancel each other. Was `cancel-in-progress: true`, but
-# on the self-hosted runner a cancelled L16 sweep ORPHANS its `next dev`(turbopack)
-# + Playwright + chrome-headless children (SIGKILL skips cleanup) — they keep
-# running for 30+ min, pin the box at load 25, and knock the runner offline. False
-# = a superseding push waits its turn instead of stranding a half-killed sweep.
-# (2026-07-13; revisit if a proper per-job process-group cleanup lands.)
+# Superseded runs are CANCELLED. Re-enabled 2026-07-31 after the precondition it
+# was disabled for stopped holding.
+#
+# It was set false on 2026-07-13 because on the SELF-HOSTED runner a cancelled
+# L16 sweep orphans its `next dev`(turbopack) + Playwright + chrome-headless
+# children (SIGKILL skips cleanup): they run 30+ min, pin the box at load 25 and
+# knock the runner offline. That hazard is real but is specific to a persistent
+# machine — a GitHub-hosted runner discards the whole VM, so an orphan cannot
+# survive a cancel.
+#
+# Verified before flipping: `vars.CI_RUNNER` is UNSET on this repo, and the one
+# registered self-hosted runner (`tl-node-1`) carries labels
+# `self-hosted,Linux,X64,tl-node-1` — it does NOT carry `ubuntu-latest`, so it
+# cannot pick up any job here. Every job is GitHub-hosted.
+#
+# PRECONDITION, and it is load-bearing: if `CI_RUNNER` is ever set back to
+# `tl-node-1`, the 10 jobs using the `${{ vars.CI_RUNNER || 'ubuntu-latest' }}`
+# indirection move to the persistent box and this flip RE-ARMS the orphan
+# problem. Set `cancel-in-progress: false` again in the same change, or drop the
+# indirection first.
+#
+# Why it matters now: queued-not-cancelled means a rapid push series pays full
+# price for every intermediate run, and the 2,000-minute Free allowance is the
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -273,105 +290,71 @@ jobs:
       - name: pytest
         run: pytest
 
-  no-auth-stub:
-    name: SPIFFE auth stub regression guard (ADR-028)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+  guards:
+    name: Repo guards (15 structural checks)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block Ok(()) regression in crates/ingest/src/auth.rs
+
+      - name: SPIFFE auth stub regression guard (ADR-028)
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/no-auth-stub.sh
 
-  no-raw-ch-query:
-    name: ClickHouse query cap-wrapper guard (ADR-031)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block raw ClickHouse .query() outside the cap wrapper
+      - name: ClickHouse query cap-wrapper guard (ADR-031)
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/no-raw-ch-query.sh
 
-  gateway-fallback-check:
-    name: Gateway-URL fallback guard (no silent localhost → CF 1003)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Ban `?? "http://localhost"` gateway fallback (use fail-loud gatewayBaseUrl)
+      - name: Gateway-URL fallback guard (no silent localhost → CF 1003)
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-no-localhost-gateway-fallback.py
 
-  docs-site-check:
-    name: Docs site guard (nav 404s · missing logo · MDX parse · dead links)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      # Selftest FIRST — plant a violation per check and assert each goes red.
-      # A guard that has never been observed blocking is not a guard.
-      - name: Selftest (prove the guard bites)
+      - name: Docs site guard — selftest (prove the checks bite)
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-docs-site.py --selftest
-      - name: Docs site — nav pages exist, assets exist, MDX parses, links resolve
+
+      - name: Docs site guard (nav 404s · missing logo · MDX parse · dead links)
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-docs-site.py
 
-  provider-mapping-single-source:
-    name: Provider mapping single-source guard
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: One canonical model→provider table (dispatch/key-lookup/attribution delegate)
+      - name: Provider mapping single-source guard
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-provider-mapping-single-source.py
 
-  tenant-isolation-check:
-    name: Tenant Isolation (ClickHouse SQL guard)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Verify all ClickHouse queries have tenant_id filter
+      - name: Tenant Isolation (ClickHouse SQL guard)
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-tenant-isolation.py
 
-  tenant-id-provenance:
-    name: org_id→tenant-UUID provenance guard (the #1 recurring bug class)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block raw session.tenantId (WorkOS org_id) bound to a ClickHouse tenant filter
+      - name: org_id→tenant-UUID provenance guard
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/check-tenant-id-provenance.sh
 
-  tenants-pk-guard:
-    name: tenants PK is `id` not `tenant_id` (old-shape SQL guard)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block SQL that treats the tenants PK as tenant_id (bitten 4x — derived-id vs PK seam)
+      - name: tenants PK is `id` not `tenant_id` (old-shape SQL guard)
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/check-tenants-pk-column.sh
 
-  no-llm-in-recovery:
-    name: Token-free recovery guard (ADR-037)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block LLM/MCP/provider imports in recovery paths
+      - name: Token-free recovery guard (ADR-037)
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/no-llm-in-recovery.sh
 
-  span-publish-ordering:
-    name: Span-before-guardrail ordering guard (#81 span-drop)
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Assert the buffered span publishes before the content-filter block
+      - name: Span-before-guardrail ordering guard (#81 span-drop)
+        if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-span-publish-ordering.py
 
-  genai-attr-keys:
-    name: GenAI attribute-key guard (ADR-043 / )
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block ClickHouse SQL reading bare llm.* GenAI attrs without the gen_ai_* primary
+      - name: GenAI attribute-key guard (ADR-043)
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/check-genai-attr-keys.sh
 
-  no-e2e-auth-in-prod:
-    name: E2E auth-bypass flag confinement guard
-    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - name: Block the E2E auth-bypass flag anywhere a prod build can see it
+      - name: E2E auth-bypass flag confinement guard
+        if: ${{ !cancelled() }}
         run: ./scripts/ci/no-e2e-auth-in-prod.sh
+
+      - name: Dockerfile digest-pin guard — selftest (prove it bites)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-dockerfile-digest-pins.py --selftest
+
+      - name: Dockerfile digest-pin guard (no FROM without @sha256:)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-dockerfile-digest-pins.py
 
   # Fast per-push secret + supply-chain gate. Secret detection is the one scan
   # where push-time matters (especially ahead of the public extraction, ).

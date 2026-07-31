@@ -119,7 +119,12 @@ describe("PP-TENANT-ISOLATION: V1 tenant isolation surfaces (ADR-031)", () => {
 			path.join(ROOT, ".github/workflows/ci.yml"),
 			"utf8",
 		);
-		expect(ci).toContain("no-raw-ch-query:");
+		// Assert the guard RUNS in CI, not that a job is named after it. The 15
+		// one-script guard jobs were collapsed into a single `guards` job (GitHub
+		// bills per job rounded up to a minute, so 15 jobs cost ~15 minutes to do
+		// ~4 seconds of work). Asserting the job NAME made this eval fail on a
+		// refactor that did not weaken the guard at all — the script reference is
+		// the real invariant and survives job-vs-step restructuring.
 		expect(ci).toContain("scripts/ci/no-raw-ch-query.sh");
 	});
 
