@@ -34,6 +34,9 @@ curl -fsSLO https://github.com/tracelane/tracelane/releases/latest/download/trac
 chmod +x tracelane-audit-x86_64-unknown-linux-musl
 
 # Optional: verify the binary itself before running.
+# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
+# whole 2.x line up to and including 2.6.4 — carries verification-side
+# advisories (CVE-2026-24122) that can accept signatures it should reject.
 cosign verify-blob \
   --bundle tracelane-audit-x86_64-unknown-linux-musl.cosign.bundle \
   --certificate-identity-regexp 'github.com/tracelane/tracelane/.github/workflows/release-audit-cli.yml' \
@@ -41,15 +44,18 @@ cosign verify-blob \
   tracelane-audit-x86_64-unknown-linux-musl
 ```
 
-Four targets ship on every release tag (`v*-audit-cli`):
+Four targets are built for each `v*-audit-cli` release tag. **No such tag has
+been cut yet**, so these artefacts are not downloadable today — build from source
+(below) until the first tagged release:
 
 - `x86_64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc.exe`
 
-Each artefact is **Cosign-signed (keyless)** + **SLSA Build Level 3
-provenance** + **CycloneDX SBOM**.
+Each artefact will be **Cosign-signed (keyless)** + **SLSA Build Level 3
+provenance** + **CycloneDX SBOM** — the release workflow is configured for all
+three and has not yet run on a tag.
 
 ### From crates.io
 

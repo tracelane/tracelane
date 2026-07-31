@@ -57,7 +57,7 @@ proofs, and the regulator-runnable verifier in one package.
 
 | Tracelane mechanism |
 |---|
-| Same endpoint + read-key issuance flow as 12(3)(b). When a regulator presents formal authority to inspect a specific workspace, Tracelane support issues a time-bounded `audit:read` key scoped to that workspace; the regulator runs `tracelane-audit verify` independently. The verifier binary is Cosign-signed + SLSA L3 + Trusted-Published to crates.io, so the regulator does not have to trust Tracelane's HTTPS endpoints to verify the binary itself. |
+| Same endpoint + read-key issuance flow as 12(3)(b). When a regulator presents formal authority to inspect a specific workspace, Tracelane support issues a time-bounded `audit:read` key scoped to that workspace; the regulator runs `tracelane-audit verify` independently. The verifier binary is built by a release workflow configured for Cosign signing + SLSA L3 + Trusted Publishing to crates.io; that workflow has not yet run on a tag, so today the regulator builds it from source (Apache-2.0, reproducible) rather than downloading a signed artefact. |
 
 ### 12(3)(d) — automatic prevention of unauthorised access
 
@@ -98,6 +98,9 @@ counsel expects to see.
 #    `tracelane-audit-...-musl` artefact + its .cosign.bundle).
 
 # 2. Verify the binary itself.
+# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
+# whole 2.x line up to and including 2.6.4 — carries verification-side
+# advisories (CVE-2026-24122) that can accept signatures it should reject.
 cosign verify-blob \
   --bundle tracelane-audit-x86_64-unknown-linux-musl.cosign.bundle \
   --certificate-identity-regexp 'github.com/tracelane/tracelane/.github/workflows/release-audit-cli.yml' \

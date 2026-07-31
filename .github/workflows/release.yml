@@ -205,7 +205,10 @@ jobs:
 
             All binaries are signed with [Sigstore Cosign](https://sigstore.dev) keyless OIDC.
 
-            Verify a binary:
+            Verify a binary. **Use cosign >= 3.0.6** — every earlier build,
+            including the whole 2.x line up to and including 2.6.4, carries
+            verification-side advisories (CVE-2026-24122) that can accept a
+            signature it should reject.
             ```bash
             cosign verify-blob \
               --bundle <binary>.cosign.bundle \

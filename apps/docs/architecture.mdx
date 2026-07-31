@@ -168,7 +168,8 @@ Throughput floors are likewise internal targets pending the Reliability Benchmar
 - **Prompt-injection-aware.** User-supplied span content is wrapped in
   `<UNTRUSTED_USER_DATA>` before any agent reads it.
 - **Trusted Publishing OIDC only.** No long-lived PyPI/npm/crates.io tokens.
-- **Sigstore-signed releases** with CycloneDX SBOM attached.
+- **Sigstore signing + CycloneDX SBOM.** Live on the container image and the
+  weekly repository SBOM; on tagged release artifacts from the first release.
 
 ## Subagents (Claude Code)
 

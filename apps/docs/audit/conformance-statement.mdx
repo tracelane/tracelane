@@ -146,10 +146,12 @@ Under formal authority, market-surveillance representatives request
 a time-bounded `audit:read` key scoped to the workspace under
 inspection through `security@tracelane.dev`. Tracelane issues the
 key within one business day. Authorities run `tracelane-audit
-verify` from the published static binary; the verifier is
-Cosign-signed via GitHub Actions OIDC and bears SLSA Build Level 3
-provenance, so the binary itself requires no trust in any
-Tracelane-operated infrastructure to verify. The checks the authority
+verify`. The release workflow that publishes the static binary is
+configured to Cosign-sign it via GitHub Actions OIDC and attach SLSA
+Build Level 3 provenance; that workflow has not yet run on a tag, so
+today the binary is built from source (Apache-2.0) rather than
+downloaded as a signed artefact. Either way the verification itself
+requires no trust in any Tracelane-operated infrastructure. The checks the authority
 runs are all offline (no Tracelane endpoint needed): the hash-chain
 replay, the per-batch Ed25519 signature against the workspace's own
 public key, and — for anchored batches — the Sigstore Rekor v2

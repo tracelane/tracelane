@@ -32,6 +32,9 @@ Tracelane is a Rust gateway with Trusted Publishing OIDC, Cosign keyless signing
 tlane import litellm --from ./litellm_config.yaml --out ./tracelane.toml
 
 # 2. Verify the gateway binary signature (Cosign keyless)
+# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
+# whole 2.x line up to and including 2.6.4 — carries verification-side
+# advisories (CVE-2026-24122) that can accept signatures it should reject.
 cosign verify-blob --certificate-identity-regexp \
   'https://github.com/tracelane/tracelane/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -54,7 +57,7 @@ It translates `litellm_config.yaml` 1:1 for provider routing, failover chains, a
 </Accordion>
 
 <Accordion title="What is Tracelane's vuln-scanning stack?">
-OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. Every release ships a signed SBOM as a Cosign attestation. See [Security](/security).
+OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. The container image ships a signed CycloneDX SBOM as a Cosign attestation, and the repository SBOM is regenerated and signed weekly; tagged-release SBOMs follow from the first release. See [Security](/security).
 </Accordion>
 
 </AccordionGroup>

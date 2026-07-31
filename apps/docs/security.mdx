@@ -111,17 +111,23 @@ Every commit runs three independent scanners:
 |---|---|
 | OSV-Scanner | CVEs in Rust, Node, and Python lockfiles |
 | Grype (`anchore/scan-action`) | Container image layers |
-| Syft (`anchore/sbom-action`) | CycloneDX SBOM attached to every release |
+| Syft (`anchore/sbom-action`) | CycloneDX SBOM — generated weekly for the repo and attached to container images |
 
 Trivy is **not used** (CVE-2026-33634).
 
 ## Supply chain
 
 - **All GitHub Actions are SHA-pinned** — no tag-pinned actions anywhere.
-- **Sigstore Cosign keyless** signing on every release artifact.
+- **Sigstore Cosign keyless** signing. **Live today** on the published container
+  image and on the weekly repository SBOM. Signing of tagged release *binaries*
+  is configured and not yet exercised — the first tagged release will produce it.
 - **SLSA Build Level 3** provenance via `slsa-framework/slsa-github-generator`.
-- **Trusted Publishing OIDC** for crates.io, npm, and PyPI — no long-lived tokens.
-- **CycloneDX SBOM** attached to every release.
+  **Live today** on the container image; on release binaries from the first
+  tagged release.
+- **Trusted Publishing OIDC** for npm and PyPI — no long-lived tokens. crates.io
+  is configured but not yet used (no crate published).
+- **CycloneDX SBOM** — generated weekly for the repository and Cosign-signed, and
+  attached to the container image.
 - **OpenSSF Scorecard** target ≥ 9.0.
 - **Container base:** Chainguard Wolfi only (`cgr.dev/chainguard/rust`,
   `cgr.dev/chainguard/static`, `cgr.dev/chainguard/node`,

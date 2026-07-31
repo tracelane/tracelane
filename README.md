@@ -153,6 +153,9 @@ Full guide: [docs/migrations/from-litellm.md](docs/migrations/from-litellm.md)
 ### Verifying Tracelane releases
 
 ```bash
+# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
+# whole 2.x line up to and including 2.6.4 — carries verification-side
+# advisories (CVE-2026-24122) that can accept signatures it should reject.
 cosign verify-blob \
   --bundle gateway-x86_64-unknown-linux-gnu.cosign.bundle \
   --certificate-identity-regexp="https://github.com/tracelane/tracelane/.*" \
