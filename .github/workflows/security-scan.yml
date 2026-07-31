@@ -68,10 +68,36 @@ jobs:
       # (verified 2026-07-06: excluded npm pkgs were still flagged). Pass it
       # EXPLICITLY with --config so the ignores (go-module/wasmtime/vite/vitest/
       # rustls-webpki) + excludes (target/node_modules) actually apply.
-      - name: Install grype
+      - name: Install grype (digest-verified tarball, no piped installer)
+        # Was: `curl -sSfL .../install.sh | sh -s -- -b /usr/local/bin v0.112.0`.
+        # That pipes a script fetched at run time straight into a shell, with the
+        # runner's token in scope — on the workflow whose entire job is finding
+        # supply-chain problems. The tag pinned WHICH script, not WHAT it
+        # contained: a rewritten install.sh under that tag, or any compromise of
+        # the raw.githubusercontent path, executes with no check.
+        #
+        # Now: fetch the release tarball, verify it against the SHA-256 anchore
+        # publishes in grype_<v>_checksums.txt, and only then extract. Nothing is
+        # executed before it has been verified. (Scorecard PinnedDependenciesID
+        # `downloadThenRun`, security-scan.yml:66)
+        #
+        # To bump: change GRYPE_VERSION, then take the new digest from
+        #   curl -sSL https://github.com/anchore/grype/releases/download/v<V>/grype_<V>_checksums.txt \
+        #     | grep linux_amd64.tar.gz
+        # Keep it in step with the pin in scripts/verify-all.sh.
+        env:
+          GRYPE_VERSION: "0.112.0"
+          GRYPE_SHA256: "acb14a030010fe9bdb9594b4ae108d9d14ef2f926d936aa0916dc62c89c058ea"
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.112.0/install.sh \
-            | sh -s -- -b /usr/local/bin v0.112.0
+          set -euo pipefail
+          tarball="grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/${tarball}" \
+            -o "$RUNNER_TEMP/$tarball"
+          echo "${GRYPE_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" grype
+          sudo install -m 0755 "$RUNNER_TEMP/grype" /usr/local/bin/grype
+          grype version
       - name: Grype filesystem scan
         # --exclude on the CLI (reliable) drops the dev-tool npm trees the config
         # `exclude:` didn't; --config carries the Rust-crate ignores (wasmtime/
