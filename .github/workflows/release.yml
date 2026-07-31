@@ -397,7 +397,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install --require-hashes -r scripts/ci/requirements/build.txt
 
       - name: Build Python SDK
         run: python -m build packages/sdk-python/
@@ -447,7 +447,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install --require-hashes -r scripts/ci/requirements/build.txt
 
       - name: Build audit verifier
         run: python -m build packages/verifier-python/

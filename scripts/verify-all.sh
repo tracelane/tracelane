@@ -168,7 +168,15 @@ fi
 # the public push went out red. The pin is read FROM ci.yml so there is one source
 # of truth and this cannot drift silently again.
 if command -v ruff >/dev/null 2>&1; then
-    _ruff_pin=$(grep -oE 'ruff==[0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml 2>/dev/null | head -1 | cut -d= -f3)
+    # Single source of truth for the pin moved into the hash-pinned CI
+    # requirements file. Read it from there, and FAIL LOUD if it cannot be
+    # found — a silent empty pin turns this mirror check into a no-op, which
+    # is the CLASS-1 shape the check exists to avoid.
+    _ruff_req=scripts/ci/requirements/python-ci.txt
+    _ruff_pin=$(grep -oE '^ruff==[0-9]+\.[0-9]+\.[0-9]+' "$_ruff_req" 2>/dev/null | head -1 | cut -d= -f3)
+    if [ -z "${_ruff_pin:-}" ]; then
+        echo "  ruff pin NOT FOUND in $_ruff_req — cannot mirror CI" >&2
+    fi
     _ruff_have=$(ruff --version 2>/dev/null | awk '{print $2}')
     if [[ -n "$_ruff_pin" && -n "$_ruff_have" && "$_ruff_pin" != "$_ruff_have" ]]; then
         skip "ruff" "VERSION MISMATCH: local $_ruff_have, ci.yml pins $_ruff_pin — this check is NOT the CI gate. Run: pip install ruff==$_ruff_pin"

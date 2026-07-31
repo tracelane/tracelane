@@ -50,7 +50,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install OTLP exporter (for the span sender)
-        run: pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+        run: pip install --require-hashes -r scripts/ci/requirements/smoke.txt
 
       - name: Run the e2e smoke
         run: bash scripts/smoke/e2e-smoke.sh

@@ -286,10 +286,17 @@ jobs:
         # Editable installs so pytest's imports resolve across evals/orchestrator,
         # verifier-python (tracelane_audit_verifier), and sdk-python (tracelane).
         run: |
-          # ruff PINNED exact — an unpinned `pip install ruff` silently upgraded to
-          # 0.16.0 and broke CI with new default rules (a non-reproducible linter,
-          # the green-while-broken class). Bump deliberately, never implicitly.
-          pip install ruff==0.16.0 pytest pytest-asyncio
+          # Hash-pinned: `--require-hashes` refuses any artifact whose sha256 is
+          # not listed, so a compromised or substituted wheel cannot install.
+          # ruff stays PINNED EXACT inside that file — an unpinned `pip install
+          # ruff` silently upgraded to 0.16.0 and broke CI with new default rules
+          # (a non-reproducible linter, the green-while-broken class).
+          # scripts/verify-all.sh reads the ruff pin from this same file, so the
+          # local mirror cannot drift from CI. Regenerate with:
+          #   uv pip compile <(printf 'ruff==<v>\npytest\npytest-asyncio\n') \
+          #     --generate-hashes --python-version 3.12 \
+          #     -o scripts/ci/requirements/python-ci.txt
+          pip install --require-hashes -r scripts/ci/requirements/python-ci.txt
           pip install -e evals/
           pip install -e packages/verifier-python/
           pip install -e packages/sdk-python/
