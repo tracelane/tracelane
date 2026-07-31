@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tracelane-audit-verifier"
-version = "0.2.1"
+version = "0.2.2"
 description = "Reference verifier for Tracelane tamper-evident audit ledgers"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tracelane"
-version = "0.1.0"
+version = "0.2.2"
 description = "Tracelane Python SDK — auto-instrument AI agent frameworks"
 readme = "README.md"
 license = { text = "Apache-2.0" }
