@@ -79,6 +79,16 @@ on:
 #
 # Why it matters now: queued-not-cancelled means a rapid push series pays full
 # price for every intermediate run, and the 2,000-minute Free allowance is the
+# Least privilege. The ONLY token use in this workflow is the `changes` job's
+# `gh api repos/.../compare` — a read. No job creates a release, pushes a
+# package, or uploads SARIF, so nothing here needs write. Declared explicitly
+# rather than left to the repository default, which is what OpenSSF Scorecard
+# flags: an unset top-level `permissions` inherits whatever the repo default
+# happens to be, so the grant is invisible in the file and can widen without a
+# diff. (Scorecard TokenPermissionsID, ci.yml:1)
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

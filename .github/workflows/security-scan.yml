@@ -14,6 +14,13 @@ concurrency:
   group: security-scan-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job here is checkout + scan. Nothing uploads SARIF,
+# creates a release, or writes a package, so read is sufficient. Declared
+# explicitly so the grant is visible in the file rather than inherited from the
+# repository default. (Scorecard TokenPermissionsID, security-scan.yml:1)
+permissions:
+  contents: read
+
 jobs:
   dependency-audit:
     name: Dependency audit

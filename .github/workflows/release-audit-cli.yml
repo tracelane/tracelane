@@ -20,15 +20,22 @@ on:
         required: true
         type: string
 
+# Least privilege at the top; writes granted at the JOB that needs them.
+# Verified per job (Scorecard TokenPermissionsID, release-audit-cli.yml:24):
+#   build              -> contents:write (Upload to release, tag refs only)
+#                       + id-token:write (cosign sign-blob keyless)
+#   slsa-provenance    -> declares contents:read
+#   slsa-l3 / publish-crates-io -> declare their own
 permissions:
-  contents: write     # release upload
-  id-token: write     # Cosign keyless + crates.io OIDC + SLSA generator
-  attestations: write # SLSA generator
+  contents: read
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write   # `Upload to release` (tag refs only)
+      id-token: write   # cosign sign-blob keyless OIDC
     strategy:
       fail-fast: false
       matrix:

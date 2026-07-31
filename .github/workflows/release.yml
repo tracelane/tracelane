@@ -12,10 +12,17 @@ on:
   # path (see verify-signed-tag).
   workflow_dispatch:
 
+# Least privilege at the top; every write is granted at the JOB that needs it.
+# Top-level `contents: write` handed release-creating scope to EVERY job in this
+# file — including verify-signed-tag and the four build-rust matrix jobs, which
+# only read. Verified per job before narrowing (Scorecard TokenPermissionsID,
+# release.yml:9):
+#   verify-signed-tag / build-rust  -> read (checkout, build, upload-artifact)
+#   sign-and-release                -> contents:write (creates the Release)
+#                                    + id-token:write (cosign sign-blob keyless)
+#   slsa-provenance / slsa-framework-generator / publish-* -> declare their own
 permissions:
-  contents: write
-  id-token: write      # Required for Trusted Publishing OIDC, Sigstore keyless, and SLSA provenance
-  attestations: write  # Required for actions/attest-build-provenance (SLSA L3)
+  contents: read
 
 jobs:
   verify-signed-tag:
@@ -142,6 +149,9 @@ jobs:
   sign-and-release:
     name: Sign artifacts and publish release
     needs: build-rust
+    permissions:
+      contents: write   # softprops/action-gh-release creates the GitHub Release
+      id-token: write   # cosign sign-blob keyless OIDC
     # Tag refs only — a dispatch dry run builds and stops. Unlike the publish-*
     # jobs it cannot inherit the skip from verify-signed-tag (it hangs off
     # build-rust, which DOES run on dispatch), so it is gated explicitly.
