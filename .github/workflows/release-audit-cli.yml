@@ -114,6 +114,12 @@ jobs:
           path: crates/tracelane-audit-cli
 
       - name: Upload to release
+        # Tag refs only. This step lives in the (ungated) `build` job, so without
+        # this it would run on a workflow_dispatch dry run and CREATE A PUBLIC
+        # GITHUB RELEASE named after the free-form `tag` input. Gating the
+        # downstream jobs alone is not enough — check every step with an external
+        # effect, not just every job.
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@69320dbe05506a9a39fc8ae11030b214ec2d1f87  # v2.0.5
         with:
           files: |

@@ -59,8 +59,19 @@ export function decodeWebhookSecret(raw: string): Buffer {
  */
 export function logSafe(v: unknown): string {
 	if (typeof v !== "string") return v === null ? "null" : typeof v;
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping C0 controls is the point
-	return v.replace(/[\u0000-\u001f\u007f]/g, "\ufffd").slice(0, 200);
+	return (
+		v
+			// The CR/LF replacement is written OUT explicitly rather than folded into
+			// the control-char range below: a bare `[\u0000-\u001f]` range is not
+			// matched by CodeQL's log-injection sanitizer model, so the alert stayed
+			// open even though the newlines were in fact being stripped. Explicit is
+			// also clearer about which character is the actual attack.
+			.replace(/[\r\n]/g, "\ufffd")
+			// Remaining C0 controls (ESC — terminal escape sequences — and DEL).
+			// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping C0 controls is the point
+			.replace(/[\u0000-\u001f\u007f]/g, "\ufffd")
+			.slice(0, 200)
+	);
 }
 
 export type VerifyResult = { ok: true } | { ok: false; reason: string };
