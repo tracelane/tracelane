@@ -61,11 +61,14 @@ export function logSafe(v: unknown): string {
 	if (typeof v !== "string") return v === null ? "null" : typeof v;
 	return (
 		v
-			// The CR/LF replacement is written OUT explicitly rather than folded into
-			// the control-char range below: a bare `[\u0000-\u001f]` range is not
-			// matched by CodeQL's log-injection sanitizer model, so the alert stayed
-			// open even though the newlines were in fact being stripped. Explicit is
-			// also clearer about which character is the actual attack.
+			// CR/LF is split out from the C0 range below because it names the actual
+			// attack: a newline in a Polar-relayed, customer-controlled field forges a
+			// whole extra log entry. The range would cover it either way.
+			// NOTE: CodeQL's js/log-injection sanitiser does not recognise this
+			// function in EITHER form (character class or explicit split) — verified
+			// against real scans of both. The alerts are dismissed with that reason
+			// rather than reshaping a provably-correct sanitiser to match a tool
+			// model; `logSafe` is covered by tests in polar-webhook.test.ts.
 			.replace(/[\r\n]/g, "\ufffd")
 			// Remaining C0 controls (ESC — terminal escape sequences — and DEL).
 			// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping C0 controls is the point

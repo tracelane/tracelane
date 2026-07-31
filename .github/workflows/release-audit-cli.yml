@@ -69,6 +69,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Add build target to the pinned toolchain
+        # `dtolnay/rust-toolchain@stable` installs `targets:` onto the STABLE
+        # toolchain, but rust-toolchain.toml pins this repo to 1.95 — a DIFFERENT
+        # toolchain, and the one cargo actually runs. So `cargo build --target
+        # <x>` finds no std for <x> and fails E0463 "can't find crate for `core`".
+        # `rustup target add` from inside the repo applies to the ACTIVE toolchain.
+        # release.yml already carried this fix; this workflow never got it, and
+        # because it had never once run, nobody found out. Host-target rows are a
+        # harmless no-op.
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build release binary
         shell: bash
         run: |
