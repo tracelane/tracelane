@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20  # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2 (cosign 3.0.6)
 
       - name: Generate full-repo SBOM (CycloneDX JSON)
         uses: anchore/sbom-action@d94f46e13c6c62f59525ac9a1e147a99dc0b9bf5  # v0.17.0
@@ -36,6 +36,13 @@ jobs:
         with:
           format: spdx-json
           output-file: sbom.spdx.json
+
+      - name: Record the cosign version actually installed
+        # The installer's DEFAULT cosign version is what we get (no
+        # `cosign-release` input, per sigstore's own guidance). Print it so the
+        # run RECORDS which binary signed, rather than us inferring it from the
+        # action tag — cosign-installer v4.1.2 is expected to give cosign 3.0.6.
+        run: cosign version
 
       - name: Sign SBOM with Sigstore Cosign (keyless OIDC)
         run: |
