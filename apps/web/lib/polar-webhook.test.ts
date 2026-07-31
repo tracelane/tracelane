@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
 	decodeWebhookSecret,
+	logSafe,
 	resolvePlan,
 	verifySignature,
 } from "./polar-webhook";
@@ -211,5 +212,41 @@ describe("resolvePlan", () => {
 				lookupKey: null,
 			}),
 		).toEqual({ kind: "unknown", rawKey: null });
+	});
+});
+
+describe("logSafe — log-injection guard", () => {
+	// Negative cases first (.claude/rules/testing.md): the forged-entry shapes
+	// this exists to stop. A raw CR/LF in a Polar-relayed, customer-controlled
+	// field would otherwise write a second, entirely fabricated log line.
+	it("collapses CR/LF so a customer-controlled field cannot forge a log entry", () => {
+		const forged = "audit_v1\n[polar-webhook] plan upgraded to enterprise";
+		const safe = logSafe(forged);
+		expect(safe).not.toContain("\n");
+		expect(safe.split("\n")).toHaveLength(1);
+		// The text survives (still diagnosable) — only the line break is neutralised.
+		expect(safe).toContain("audit_v1");
+		expect(safe).toContain("plan upgraded to enterprise");
+	});
+
+	it("strips CR and the other C0 controls, not just LF", () => {
+		expect(logSafe("a\rb")).toBe("a\ufffdb");
+		expect(logSafe("a\u0000b")).toBe("a\ufffdb");
+		expect(logSafe("a\u001bb")).toBe("a\ufffdb"); // ESC — terminal escape sequences
+		expect(logSafe("a\u007fb")).toBe("a\ufffdb"); // DEL
+	});
+
+	it("caps length so one field cannot push the real entry out of view", () => {
+		expect(logSafe("x".repeat(5000))).toHaveLength(200);
+	});
+
+	it("renders non-strings as their type instead of coercing", () => {
+		expect(logSafe(null)).toBe("null");
+		expect(logSafe(undefined)).toBe("undefined");
+		expect(logSafe({ evil: "\ntoString" })).toBe("object");
+	});
+
+	it("leaves an ordinary value untouched", () => {
+		expect(logSafe("audit_addon_v1")).toBe("audit_addon_v1");
 	});
 });

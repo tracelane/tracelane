@@ -6,7 +6,7 @@
  * steps. Refuses to clobber an existing config unless `--force` is given.
  */
 
-import { existsSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 import type { Command } from "commander";
@@ -50,18 +50,28 @@ export function registerInitCommand(program: Command): void {
 		.option("--force", "Overwrite an existing tracelane.config.json")
 		.action((opts) => {
 			const target = resolve(process.cwd(), CONFIG_FILENAME);
-			if (existsSync(target) && !opts.force) {
-				console.error(
-					`${CONFIG_FILENAME} already exists. Re-run with --force to overwrite.`,
-				);
-				process.exit(1);
-			}
 			const config = buildInitConfig({
 				endpoint: opts.endpoint,
 				serviceName: opts.serviceName,
 				sampleRate: Number(opts.sampleRate),
 			});
-			writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`);
+			const body = `${JSON.stringify(config, null, 2)}\n`;
+			// `wx` fails if the path exists, so the exists-check and the write are
+			// ONE atomic syscall. The previous `existsSync(target)` + `writeFileSync`
+			// was a TOCTOU race (CodeQL js/file-system-race, high): anything created
+			// in the window between the two — including a symlink into a path the
+			// user did not intend to write — was overwritten without --force.
+			try {
+				writeFileSync(target, body, { flag: opts.force ? "w" : "wx" });
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+					console.error(
+						`${CONFIG_FILENAME} already exists. Re-run with --force to overwrite.`,
+					);
+					process.exit(1);
+				}
+				throw err;
+			}
 			console.log(`Wrote ${target}`);
 			console.log("\nNext steps:");
 			console.log("  1. Install the SDK:");

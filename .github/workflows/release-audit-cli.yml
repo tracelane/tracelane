@@ -123,6 +123,11 @@ jobs:
   slsa-provenance:
     name: SLSA L3 provenance subjects
     needs: build
+    # Tag refs only. `workflow_dispatch` is a BUILD-ONLY dry run: without these
+    # gates a dispatch fell straight through to publish-crates-io and attempted a
+    # real publish — and crates.io versions are immutable (yank-only). This
+    # workflow had never run at all, so that footgun was never observed.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     outputs:
       hashes: ${{ steps.collect.outputs.hashes }}
@@ -157,6 +162,7 @@ jobs:
   slsa-l3:
     name: SLSA L3 provenance generator
     needs: slsa-provenance
+    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see slsa-provenance)
     permissions:
       id-token: write
       contents: write
@@ -169,6 +175,12 @@ jobs:
   publish-crates-io:
     name: Trusted-Publish to crates.io
     needs: [build, slsa-l3]
+    # Tag refs only (see slsa-provenance). NOTE for the first real tag: crates.io
+    # Trusted Publishing cannot create a NEW crate (RFC 3691 — no PyPI-style
+    # pending pre-registration), so if `tracelane-audit` is not yet on crates.io
+    # this job 403s until one manual token publish seeds it. Same reason
+    # publish-crate was dropped from release.yml for v0.2.1.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     environment: crates-io
     permissions:

@@ -38,6 +38,31 @@ export function decodeWebhookSecret(raw: string): Buffer {
 	return Buffer.from(raw.trim(), "utf-8");
 }
 
+/**
+ * Make a webhook-supplied value safe to interpolate into a log line.
+ *
+ * Every call site sits AFTER HMAC signature verification, so the value is
+ * Polar-authenticated — but Polar relays fields a *customer* controls (product
+ * lookup keys, `external_id`), and a CR/LF in one of those forges a complete,
+ * convincing extra entry in a line-oriented log stream (CodeQL js/log-injection,
+ * 4 alerts on the public mirror). Strips CR, LF and the other C0 controls, and
+ * caps length so one long field cannot push the real entry out of view.
+ *
+ * @param v - untrusted value of any shape. Non-strings render as their type
+ *            name (`null` as `"null"`) rather than being coerced.
+ * @returns a single-line string of at most 200 chars, safe as a log field.
+ *
+ * @example
+ * logSafe("ok");                       // "ok"
+ * logSafe("a\nWARN forged");           // "a\ufffdWARN forged"  (one line)
+ * logSafe(null);                       // "null"
+ */
+export function logSafe(v: unknown): string {
+	if (typeof v !== "string") return v === null ? "null" : typeof v;
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping C0 controls is the point
+	return v.replace(/[\u0000-\u001f\u007f]/g, "\ufffd").slice(0, 200);
+}
+
 export type VerifyResult = { ok: true } | { ok: false; reason: string };
 
 /** Parse the `webhook-signature` header into its `v1,` entries (bounded). */

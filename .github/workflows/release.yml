@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  # BUILD-ONLY dry run. This workflow was tag-triggered ONLY, so the sole way to
+  # exercise it was to cut a real signed tag — which is why six release tags were
+  # burned debugging a single linker flag while it stayed red.
+  # Dispatch runs the compile/link matrix and nothing else: every publishing job
+  # below is gated on `refs/tags/`, and the crypto gate is untouched on the tag
+  # path (see verify-signed-tag).
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,6 +21,11 @@ jobs:
   verify-signed-tag:
     name: Verify release tag is signed
     runs-on: ubuntu-latest
+    # Only meaningful on a tag ref. On `workflow_dispatch` this job SKIPS, which
+    # is what keeps a dry run from publishing: every publish-* job `needs:` this
+    # one, and a skipped need skips the dependant. The tag path is unchanged —
+    # the cryptographic gate below still runs and still fails closed.
+    if: startsWith(github.ref, 'refs/tags/')
     # The release gate is CRYPTOGRAPHIC, not human — and it is ENFORCED HERE, in this
     # job, NOT by a ruleset. (GitHub's `required_signatures` ruleset rule is
     # commit-oriented and was empirically proven NOT to block unsigned tags — via API
@@ -61,7 +73,15 @@ jobs:
   build-rust:
     name: Build Rust binaries
     needs: verify-signed-tag
+    # `!= 'failure'` (not `== 'success'`) so a dispatch dry run, where
+    # verify-signed-tag is SKIPPED, still builds — while a tag whose signature
+    # check FAILED still blocks here, including a dispatch aimed at a tag ref.
+    if: ${{ !cancelled() && needs.verify-signed-tag.result != 'failure' }}
     strategy:
+      # One target's failure must not cancel the others: the v0.2.1 run lost the
+      # aarch64-darwin result to fail-fast, hiding whether the break was
+      # aarch64-wide or linux-only. Full matrix results > a few saved minutes.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -101,6 +121,16 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build gateway release binary
+        env:
+          # Installing gcc-aarch64-linux-gnu above is NOT enough — it made the C
+          # deps (aws-lc-sys, ring, blake3) cross-build correctly via the `cc`
+          # crate, but cargo was never told which linker to use for the final
+          # Rust link, so it fell back to the host x86_64 `cc`/`gcc-ld` and every
+          # aarch64 object came back "incompatible with elf64-x86-64".
+          # The cross toolchain was present, reported, and not load-bearing.
+          # Harmless on the other three matrix rows: cargo only reads the env var
+          # matching the target it is building.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --package gateway --target ${{ matrix.target }}
 
       - name: Upload binary artifact
@@ -112,6 +142,10 @@ jobs:
   sign-and-release:
     name: Sign artifacts and publish release
     needs: build-rust
+    # Tag refs only — a dispatch dry run builds and stops. Unlike the publish-*
+    # jobs it cannot inherit the skip from verify-signed-tag (it hangs off
+    # build-rust, which DOES run on dispatch), so it is gated explicitly.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -175,6 +209,7 @@ jobs:
   slsa-provenance:
     name: Generate SLSA Build Level 3 provenance
     needs: build-rust
+    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see sign-and-release)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -220,6 +255,7 @@ jobs:
   slsa-framework-generator:
     name: SLSA L3 provenance (slsa-github-generator)
     needs: [build-rust, slsa-provenance]
+    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see sign-and-release)
     permissions:
       actions: read
       id-token: write

@@ -356,8 +356,15 @@ export function registerPromptCommand(program: Command): void {
 					const fsp = await import("node:fs/promises");
 					const path = await import("node:path");
 					const dir = await fsp.mkdtemp(path.join(tmp.tmpdir(), "tlane-diff-"));
-					const fa = path.join(dir, `${name}.${opts.fromEnv}`);
-					const fb = path.join(dir, `${name}.${opts.toEnv}`);
+					// `name` and the env flags are free-form CLI input that we are
+					// interpolating into a PATH, so a `../` in either would escape the
+					// temp dir and the write would land wherever it pointed. basename()
+					// after the join pins both files inside `dir` (CodeQL
+					// js/http-to-file-access). Labels only — the request path uses its
+					// own encodeURIComponent above.
+					const leaf = (s: string) => path.join(dir, path.basename(s));
+					const fa = leaf(`${name}.${opts.fromEnv}`);
+					const fb = leaf(`${name}.${opts.toEnv}`);
 					await fsp.writeFile(fa, a.content);
 					await fsp.writeFile(fb, b.content);
 					const result = spawnSync(

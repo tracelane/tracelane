@@ -7,13 +7,20 @@
  * evidence files (it previously wrote only placeholder manifest entries).
  */
 
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Command } from "commander";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEvalIndex } from "../src/commands/eval.js";
 import { buildDpdpPhase2Pack } from "../src/commands/export.js";
-import { buildInitConfig } from "../src/commands/init.js";
+import { buildInitConfig, registerInitCommand } from "../src/commands/init.js";
 import { fetchTrace, renderTrace } from "../src/commands/trace.js";
 
 describe("tlane init — buildInitConfig", () => {
@@ -176,5 +183,63 @@ describe("tlane export — DPDP Phase 2 pack writes real evidence files", () => 
 		expect(files).toContain("dpdp-02-consent.md");
 		expect(files).toContain("dpdp-03-rights.md");
 		expect(files).toContain("manifest.json");
+	});
+});
+
+
+describe("tlane init — writes atomically (no check-then-write race)", () => {
+	// Regression for CodeQL js/file-system-race (high): the command used to
+	// `existsSync(target)` and THEN `writeFileSync`, so anything appearing in the
+	// window between the two — including a symlink to a path the user never meant
+	// to touch — was overwritten without --force. The write is now a single `wx`
+	// syscall, which is why the refusal is asserted through the EEXIST path.
+	let dir: string;
+	let cwd: string;
+
+	beforeEach(() => {
+		cwd = process.cwd();
+		dir = mkdtempSync(join(tmpdir(), "tlane-init-"));
+		process.chdir(dir);
+	});
+	afterEach(() => {
+		process.chdir(cwd);
+		rmSync(dir, { recursive: true, force: true });
+		vi.restoreAllMocks();
+	});
+
+	const runInit = async (argv: string[]) => {
+		const program = new Command();
+		program.exitOverride();
+		registerInitCommand(program);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+			throw new Error(`process.exit:${code}`);
+		}) as never);
+		return program.parseAsync(["node", "tlane", "init", ...argv]);
+	};
+
+	it("refuses to clobber an existing config and leaves it byte-identical", async () => {
+		const target = join(dir, "tracelane.config.json");
+		writeFileSync(target, '{"do":"not clobber"}');
+		await expect(runInit([])).rejects.toThrow("process.exit:1");
+		expect(readFileSync(target, "utf-8")).toBe('{"do":"not clobber"}');
+	});
+
+	it("writes the config when none exists", async () => {
+		await runInit(["--service-name", "agent-x"]);
+		const written = JSON.parse(
+			readFileSync(join(dir, "tracelane.config.json"), "utf-8"),
+		);
+		expect(written.serviceName).toBe("agent-x");
+	});
+
+	it("--force overwrites an existing config", async () => {
+		const target = join(dir, "tracelane.config.json");
+		writeFileSync(target, '{"stale":true}');
+		await runInit(["--force", "--service-name", "agent-y"]);
+		const written = JSON.parse(readFileSync(target, "utf-8"));
+		expect(written.serviceName).toBe("agent-y");
+		expect(written.stale).toBeUndefined();
 	});
 });

@@ -492,10 +492,15 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
+        // Per .claude/rules/testing.md a test credential must not LOOK like a
+        // real one. The old "pw-regress" was short enough to read as a genuine
+        // hard-coded password and tripped CodeQL rust/hard-coded-cryptographic-value
+        // as CRITICAL on the public mirror. It is a wiremock stub — it
+        // authenticates nothing — so it now says so.
         let client = ch_client(
             &server.uri(),
             "tracelane-regress",
-            "pw-regress",
+            "unit-test-password-do-not-use-in-prod",
             "tracelane",
         );
         let _ = client.query("SELECT 1").execute().await;

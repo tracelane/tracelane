@@ -27,6 +27,7 @@ import {
 	type PlanResolution,
 	decodeWebhookSecret,
 	isAddOnLookupKey,
+	logSafe,
 	resolvePlan,
 	verifySignature,
 } from "@/lib/polar-webhook";
@@ -136,7 +137,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		const actual = extractOrganizationId(event.data);
 		if (actual !== expected) {
 			console.warn(
-				`[polar-webhook] organization_id mismatch — refusing (expected=${expected} actual=${actual ?? "null"})`,
+				`[polar-webhook] organization_id mismatch — refusing (expected=${expected} actual=${logSafe(actual)})`,
 			);
 			return NextResponse.json(
 				{ error: "organization_id mismatch" },
@@ -188,7 +189,10 @@ async function dispatch(event: {
 		return;
 	}
 	if (event.type.startsWith("order.")) {
-		console.info("[polar-webhook] order event (no action in V1):", event.type);
+		console.info(
+			"[polar-webhook] order event (no action in V1):",
+			logSafe(event.type),
+		);
 		return;
 	}
 	// Unhandled event types are acked (recorded) without action.
@@ -230,7 +234,7 @@ async function handleSubscriptionChange(
 		// Genuinely unknown key (add-ons are handled above) — ack, no plan change.
 		console.warn(
 			"[polar-webhook] unknown lookup_key — acked, no plan change:",
-			resolution.rawKey,
+			logSafe(resolution.rawKey),
 		);
 		return;
 	}
@@ -242,9 +246,11 @@ async function handleSubscriptionChange(
 		const customer = data.customer as { external_id?: unknown } | undefined;
 		console.warn(
 			"[polar-webhook] no tenant for subscription — acked:",
-			(typeof customer?.external_id === "string"
-				? customer.external_id
-				: null) ?? customerId,
+			logSafe(
+				(typeof customer?.external_id === "string"
+					? customer.external_id
+					: null) ?? customerId,
+			),
 		);
 		return;
 	}
