@@ -3,6 +3,22 @@
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] - 2026-07-31
+
+### Fixed
+- **`tlane init` no longer has a check-then-write race.** It used `existsSync`
+  followed by `writeFileSync`; anything created between the two — including a
+  symlink pointing somewhere you did not intend to write — was overwritten
+  *without* `--force`. The write is now a single exclusive-create (`wx`) syscall,
+  so the refusal is enforced by the write itself and the window cannot exist.
+  `--force` still overwrites. Regression test asserts an existing config stays
+  byte-identical. (CodeQL `js/file-system-race`)
+- **`tlane prompt diff` pins its temp filenames.** The prompt name and the
+  `--from-env` / `--to-env` values are free-form input that was interpolated into
+  a path, so a `../` escaped the temp directory. Both files are now pinned inside
+  the freshly created directory with `path.basename()`. (CodeQL
+  `js/http-to-file-access`)
+
 ## [0.2.1] - 2026-07-25
 
 ### Fixed

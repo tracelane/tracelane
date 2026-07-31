@@ -3,6 +3,13 @@
 All notable changes to `tracelane-audit-verifier` (Rust reference verifier) are
 documented here. Versioned in lockstep with the TypeScript and Python verifiers.
 
+## [0.2.2] - 2026-07-31
+
+### Changed
+- Version-only release. No source changes since 0.2.1 — re-cut so the published
+  artifact comes from the signed-tag release path, which v0.2.1 never reached
+  (no GitHub Release, Cosign signature, SBOM, or SLSA provenance was produced).
+
 ## [0.2.1] - 2026-07-25
 
 ### Fixed

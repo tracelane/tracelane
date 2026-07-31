@@ -4,6 +4,13 @@ All notable changes to `@tracelanedev/audit-verifier` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this package
 is versioned in lockstep with the Rust and Python reference verifiers.
 
+## [0.2.2] - 2026-07-31
+
+### Changed
+- Version-only release. No source changes since 0.2.1 — re-cut so the published
+  artifact comes from the signed-tag release path, which v0.2.1 never reached
+  (no GitHub Release, Cosign signature, SBOM, or SLSA provenance was produced).
+
 ## [0.2.1] - 2026-07-25
 
 ### Fixed

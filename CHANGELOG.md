@@ -12,6 +12,37 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-31
+
+First release to ship **signed** artifacts. v0.2.1 published packages to npm and
+PyPI but never produced a GitHub Release, Cosign signatures, a release SBOM, or
+SLSA provenance — the release job failed before reaching them. That is closed here.
+
+### Fixed
+
+- **`tlane init` writes atomically.** The config write checked `existsSync` and
+  then wrote, a race in which anything created in between — including a symlink
+  to a path you did not intend to write — was overwritten *without* `--force`. It
+  is now a single exclusive-create syscall, so the refusal is enforced by the
+  write itself. `--force` still overwrites.
+- **`tlane prompt diff` pins its temporary filenames.** The prompt name and the
+  two environment flags were interpolated into a temp-file path, so a `../` could
+  escape the temp directory. Both sides are now pinned inside the freshly created
+  directory.
+
+### Security
+
+- Webhook log fields are stripped of CR/LF and control characters before logging,
+  so a provider-relayed, customer-controlled value cannot forge a log entry.
+
+### Changed
+
+- All published packages are unified at 0.2.2 so that the version of every
+  artifact matches the release tag it came from. The SDKs and the three verifiers
+  have no source changes since 0.2.1; they are re-cut so their artifacts come
+  from the signed-tag path.
+
+
 ### Added
 
 - **Rust gateway** — OpenAI-, Anthropic-, and Google-shaped request proxying across
