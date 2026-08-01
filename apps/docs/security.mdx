@@ -111,23 +111,41 @@ Every commit runs three independent scanners:
 |---|---|
 | OSV-Scanner | CVEs in Rust, Node, and Python lockfiles |
 | Grype (`anchore/scan-action`) | Container image layers |
-| Syft (`anchore/sbom-action`) | CycloneDX SBOM — generated weekly for the repo and attached to container images |
+| Syft (`anchore/sbom-action`) | CycloneDX SBOM — attached to every tagged release, generated weekly for the repo, and attached to container images |
 
 Trivy is **not used** (CVE-2026-33634).
 
 ## Supply chain
 
 - **All GitHub Actions are SHA-pinned** — no tag-pinned actions anywhere.
-- **Sigstore Cosign keyless** signing. **Live today** on the published container
-  image and on the weekly repository SBOM. Signing of tagged release *binaries*
-  is configured and not yet exercised — the first tagged release will produce it.
-- **SLSA Build Level 3** provenance via `slsa-framework/slsa-github-generator`.
-  **Live today** on the container image; on release binaries from the first
-  tagged release.
+- **Sigstore Cosign keyless** signing — **live on tagged release binaries** as of
+  `v0.2.3`, alongside the published container image and the weekly repository
+  SBOM. Every release binary ships a `.cosign.bundle` beside it; verify with
+  cosign >= 3.0.6:
+
+  ```bash
+  cosign verify-blob \
+    --bundle gateway-x86_64-unknown-linux-gnu.cosign.bundle \
+    --certificate-identity-regexp="https://github.com/tracelane/tracelane/.*" \
+    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+    gateway-x86_64-unknown-linux-gnu
+  ```
+
+- **SLSA Build Level 3** provenance — **live on tagged release binaries** as of
+  `v0.2.3` and on the container image. Release-binary provenance is published as
+  a GitHub attestation (`https://slsa.dev/provenance/v1`), naming the builder as
+  `.github/workflows/release.yml@refs/tags/<tag>` and binding the binary's
+  SHA-256:
+
+  ```bash
+  gh attestation verify gateway-x86_64-unknown-linux-gnu --repo tracelane/tracelane
+  ```
+
 - **Trusted Publishing OIDC** for npm and PyPI — no long-lived tokens. crates.io
   is configured but not yet used (no crate published).
-- **CycloneDX SBOM** — generated weekly for the repository and Cosign-signed, and
-  attached to the container image.
+- **CycloneDX SBOM** — **attached to every tagged release** as of `v0.2.3`
+  (`sbom.cyclonedx.json`, CycloneDX 1.6, Cosign-signed with its own bundle),
+  generated weekly for the repository, and attached to the container image.
 - **OpenSSF Scorecard** target ≥ 9.0.
 - **Container base:** Chainguard Wolfi only (`cgr.dev/chainguard/rust`,
   `cgr.dev/chainguard/static`, `cgr.dev/chainguard/node`,

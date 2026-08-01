@@ -108,10 +108,11 @@ Eight steps to running Tracelane on your own infra.
 <Step title="Production checklist">
   - All agent-tool safety guards set to `warn` initially; flip to `block` after one day of traces.
   - Audit log hash-chain integrity confirmed (`tlane verify <ledger>` returns 0). The SHA-256 hash chain and Ed25519 per-tenant signing are live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
-  - SBOM published — `infra/sbom/` has CycloneDX outputs from CI.
-  - Sigstore signing verified on the container image (`cosign verify` on the
-    published image digest). Release-artifact signing is configured and not yet
-    exercised — no tagged release has been cut.
+  - SBOM published — every tagged release carries a Cosign-signed
+    `sbom.cyclonedx.json`, and `infra/sbom/` has CycloneDX outputs from CI.
+  - Sigstore signing verified on **release artifacts** (`cosign verify-blob`
+    against the `.cosign.bundle` beside each binary, cosign >= 3.0.6) and on the
+    container image (`cosign verify` on the published image digest).
   - `cargo audit` and `pnpm audit` clean on the deployed commit.
   - Backups: ClickHouse → R2, Postgres → daily snapshot.
   - Alerting: error + uptime monitoring wired before GA (tooling being finalized).

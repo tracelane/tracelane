@@ -57,7 +57,7 @@ It translates `litellm_config.yaml` 1:1 for provider routing, failover chains, a
 </Accordion>
 
 <Accordion title="What is Tracelane's vuln-scanning stack?">
-OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. The container image ships a signed CycloneDX SBOM as a Cosign attestation, and the repository SBOM is regenerated and signed weekly; tagged-release SBOMs follow from the first release. See [Security](/security).
+OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. Every tagged release ships a Cosign-signed CycloneDX SBOM (`sbom.cyclonedx.json` plus its `.cosign.bundle`) as of `v0.2.3`; the container image ships a signed CycloneDX SBOM as a Cosign attestation, and the repository SBOM is regenerated and signed weekly. See [Security](/security).
 </Accordion>
 
 </AccordionGroup>
