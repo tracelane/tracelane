@@ -138,7 +138,10 @@ jobs:
         # downstream jobs alone is not enough — check every step with an external
         # effect, not just every job.
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@69320dbe05506a9a39fc8ae11030b214ec2d1f87  # v2.0.5
+        # v3.0.2 — same pin as release.yml. The old `69320dbe…` (v2.0.5,
+        # 2024-05-07) resolved, so it was not the release.yml defect, but this
+        # is not what its first run should exercise.
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           files: |
             dist/tracelane-audit-${{ matrix.target }}*

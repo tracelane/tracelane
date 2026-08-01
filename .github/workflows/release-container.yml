@@ -105,6 +105,17 @@ jobs:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: ${{ matrix.image }}-sbom.cdx.json
+          # On a TAG ref, sbom-action tries to attach the SBOM to the GitHub
+          # Release of the same name. This job holds `contents: read`, so on the
+          # v0.2.2 tag it printed "Attaching SBOMs to release: 'v0.2.2'" and then
+          # `##[error]Resource not accessible by integration` — the gateway leg
+          # failed AFTER a successful build+push+sign, which is why the dispatch
+          # dry run (a branch ref, no release to attach to) was green and the tag
+          # was not. The image SBOM belongs on the IMAGE as the cosign attestation
+          # in the next step, not as a release asset — release assets are
+          # release.yml's job. Turning this off keeps `contents: read` rather than
+          # widening this job's token to fix a thing we do not want.
+          upload-release-assets: false
 
       - name: Attach SBOM attestation (Cosign)
         env:

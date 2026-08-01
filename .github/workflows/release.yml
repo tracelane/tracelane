@@ -220,7 +220,26 @@ jobs:
             sbom.cyclonedx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@e7a8f85174e1f197b1c2f01bb60e1c350ccad01f  # v2.2.0
+        # v3.0.2. The previous pin `e7a8f851…` labelled "v2.2.0" DID NOT EXIST —
+        # `GET /repos/softprops/action-gh-release/commits/e7a8f851…` returns 422
+        # "No commit found for SHA". It satisfied the SHA-pin grep (40 hex chars)
+        # and could not run: the v0.2.2 tag died at `Set up job` in 4s with
+        # "Unable to resolve action … unable to find version", the release carried
+        # ZERO assets, and the SLSA generator's upload-assets then had no release
+        # to attach to. Format-pinning is not existence — every pin in this repo
+        # is now verified against the API by pre-release-checks.sh check [5].
+        #
+        # Resolution note, because it is the same trap one level down:
+        # `git/ref/tags/v3.0.2` returns an ANNOTATED TAG OBJECT (fe965f7a…), not
+        # a commit. `uses:` needs the COMMIT, so the tag object must be
+        # dereferenced (`git/tags/<sha>` -> .object.sha = 3d0d9888…).
+        #
+        # v3 vs v2: v3.0.0's ONLY documented change is the action runtime moving
+        # Node 20 -> Node 24, which the hosted runners already force (the v0.2.2
+        # logs carry "actions target Node.js 20 but are being forced to run on
+        # Node.js 24"). v3.0.2 is a patch hardening streamed ASSET UPLOADS — the
+        # exact path this job depends on.
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           # `release/*` — the uniquely-named staging dir, NOT `artifacts/**/*`
           # (four basename-identical `gateway` files; see the staging step above).
