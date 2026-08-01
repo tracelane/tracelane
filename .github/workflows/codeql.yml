@@ -1,3 +1,8 @@
+# Public Actions are unlimited and free; private are capped at 2,000 min/month
+# are shared — the public repo is built from this tree — so the trigger list
+# cannot be edited to cut private cost without also disabling the PUBLIC run,
+# which is now the only always-on gate. The split is therefore a job-level
+# repository condition, which exports unchanged and evaluates true on public.
 # CodeQL — static analysis for the three languages in this repo.
 #
 # Free on public repositories; results land in the Security tab and are one of
@@ -48,6 +53,8 @@ permissions:
 
 jobs:
   analyze:
+    # PUBLIC-ONLY: same code. Accepted delta - apps/web/e2e and scripts/export are private-only and go unscanned (test + tooling code).
+    if: github.repository == 'tracelane/tracelane'
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 45

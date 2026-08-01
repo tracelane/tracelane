@@ -17,6 +17,7 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki: vulnerability
     "RUSTSEC-2026-0099",  # rustls-webpki: vulnerability
     "RUSTSEC-2025-0134",  # rustls-pemfile: informational/deprecated warning
+    "RUSTSEC-2026-0222",  # wasmtime — type indices mixed between engines (2026-08-01)
     "RUSTSEC-2024-0438",  # wasmtime
     "RUSTSEC-2024-0439",  # wasmtime
     "RUSTSEC-2025-0046",  # wasmtime

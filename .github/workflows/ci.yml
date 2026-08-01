@@ -1,3 +1,6 @@
+# Workflow files are SHARED with the public repo, so the trigger list cannot be
+# edited to cut private cost without disabling the public run too. The split is
+# a job-level repository condition on the three root jobs.
 name: CI
 
 # This workflow does NOT name a box. CI home = GitHub Actions, LIVE + tiered.
@@ -104,6 +107,15 @@ jobs:
   # cross-cutting file, API error) runs ALL areas, so the gate is never weakened,
   # only made cheaper when it safely can be.
   changes:
+    # only for pull_request / schedule / workflow_dispatch, NOT push — a private
+    # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
+    # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
+    # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
+    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # Gating these three root jobs is sufficient: every other job `needs: changes`,
+    # and a skipped need skips the dependant.
+    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
     name: Detect changed areas
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     outputs:
@@ -308,6 +320,15 @@ jobs:
         run: pytest
 
   guards:
+    # only for pull_request / schedule / workflow_dispatch, NOT push — a private
+    # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
+    # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
+    # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
+    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # Gating these three root jobs is sufficient: every other job `needs: changes`,
+    # and a skipped need skips the dependant.
+    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
     name: Repo guards (15 structural checks)
     runs-on: ubuntu-latest
     steps:
@@ -378,6 +399,15 @@ jobs:
   # The slow Rust vuln scans (cargo-audit, cargo-deny, grype, osv) stay nightly
   # in security-scan.yml. Always-on; ~1 min.
   secret-scan:
+    # only for pull_request / schedule / workflow_dispatch, NOT push — a private
+    # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
+    # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
+    # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
+    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # Gating these three root jobs is sufficient: every other job `needs: changes`,
+    # and a skipped need skips the dependant.
+    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
     name: Secret + supply-chain scan (fast)
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:

@@ -1,3 +1,10 @@
+# Public Actions are unlimited and free; private are capped at 2,000 min/month
+# are shared — the public repo is built from this tree — so the trigger list
+# cannot be edited to cut private cost without also disabling the PUBLIC run,
+# which is now the only always-on gate. The split is therefore a job-level
+# repository condition, which exports unchanged and evaluates true on public.
+#
+# PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
 name: Security Scan
 
 on:
@@ -23,6 +30,8 @@ permissions:
 
 jobs:
   dependency-audit:
+    # PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
+    if: github.repository == 'tracelane/tracelane'
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
@@ -57,6 +66,8 @@ jobs:
         run: pnpm audit --audit-level=high
 
   container-scan:
+    # PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
+    if: github.repository == 'tracelane/tracelane'
     name: Container image scan (Grype)
     runs-on: ubuntu-latest
     steps:
@@ -111,6 +122,8 @@ jobs:
         run: grype dir:. --fail-on high --config .grype.yaml --exclude './**/node_modules/**'
 
   osv-scan:
+    # PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
+    if: github.repository == 'tracelane/tracelane'
     name: OSV-Scanner (vuln database scan)
     runs-on: ubuntu-latest
     steps:
@@ -136,6 +149,8 @@ jobs:
   # (cargo-audit, cargo-deny, grype, osv-scanner) + no-openssl.
 
   no-openssl-check:
+    # PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
+    if: github.repository == 'tracelane/tracelane'
     name: Verify no openssl in Rust deps
     runs-on: ubuntu-latest
     steps:
@@ -159,6 +174,8 @@ jobs:
           echo "openssl check: clean (only ring/rustls/aws-lc-rs + probe present)"
 
   cargo-deny:
+    # PUBLIC-ONLY: private Cargo.lock/pnpm-lock.yaml are BYTE-IDENTICAL to public and every scanner config is exported, so a private run scans the same dependency set for 248 billable min/month.
+    if: github.repository == 'tracelane/tracelane'
     # A16: `cargo-deny` is strictly stronger than the `cargo tree | grep`
     # heuristic above — checks `bans`, `licenses`, `advisories`, and `sources`
     # against the canonical config in `deny.toml` (cargo-deny's default config

@@ -1,3 +1,10 @@
+# Public Actions are unlimited and free; private are capped at 2,000 min/month
+# are shared — the public repo is built from this tree — so the trigger list
+# cannot be edited to cut private cost without also disabling the PUBLIC run,
+# which is now the only always-on gate. The split is therefore a job-level
+# repository condition, which exports unchanged and evaluates true on public.
+#
+# PUBLIC-ONLY: duplicates the public scan, and several checks (Branch-Protection, Code-Review) cannot evaluate on the private repo at all - the API 403s.
 name: openssf-scorecard
 # OpenSSF Scorecard analysis.
 #
@@ -36,6 +43,8 @@ permissions: read-all
 
 jobs:
   analysis:
+    # PUBLIC-ONLY: duplicates the public scan, and several checks (Branch-Protection, Code-Review) cannot evaluate on the private repo at all - the API 403s.
+    if: github.repository == 'tracelane/tracelane'
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:
