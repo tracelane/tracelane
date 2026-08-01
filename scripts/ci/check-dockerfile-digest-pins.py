@@ -11,8 +11,10 @@ For a product whose pitch is provenance, an unpinned base is not a lint nit: it
 is the artifact being signed without being reproducible.
 
 `CLAUDE.md` already requires "Pin every external version". This makes that
-enforceable for container bases, the way the SHA-pin rule is already enforced for
-GitHub Actions.
+enforceable for container bases. (An earlier version of this note claimed the
+SHA-pin rule was "already enforced" for GitHub Actions — it was not; it was a
+manual grep in the startup audit until check-action-sha-pins.py landed
+2026-08-01.)
 
 Scope: every `Dockerfile` and `*.Dockerfile` tracked in the repo, so a new one
 cannot quietly skip the rule. `FROM <stage>` references (a named earlier stage,

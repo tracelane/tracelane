@@ -8,7 +8,8 @@ operators self-hosting Tracelane.
 
 ## Customer browser flow
 
-1. Visit [app.tracelane.dev/signup](https://app.tracelane.dev/signup).
+1. Visit [app.tracelane.dev/sign-in](https://app.tracelane.dev/sign-in) — the same
+   route handles first-time sign-up and returning sign-in.
 2. Sign in with WorkOS Connect (Google / Microsoft / SAML).
 3. The first sign-in for a domain creates a tenant; subsequent users on the
    same domain join it.
@@ -89,7 +90,7 @@ Eight steps to running Tracelane on your own infra.
   ```bash
   cargo build --release --workspace
   ./target/release/gateway   # serves :8080
-  ./target/release/ingest    # serves OTLP :4317 + NATS consumer
+  ./target/release/ingest    # serves OTLP HTTP :4318 + NATS consumer
   ```
   Or use the supplied Helm chart at `infra/helm/`.
 </Step>

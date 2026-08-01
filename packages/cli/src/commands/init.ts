@@ -40,10 +40,16 @@ export function registerInitCommand(program: Command): void {
 	program
 		.command("init")
 		.description("Initialise Tracelane in the current project")
+		// NB: the default is an ingest receiver YOU run. Tracelane Cloud has no
+		// public OTLP ingress — hosted traces are captured at the gateway, so a
+		// Cloud user sets no endpoint here and points their OpenAI-compatible
+		// client at https://gateway.tracelane.dev/v1 instead. The pre-0.2.2
+		// default was `https://ingest.tracelane.dev`, a hostname that has never
+		// resolved (NXDOMAIN), so `tlane init` scaffolded a dead config.
 		.option(
 			"--endpoint <url>",
-			"Tracelane ingest endpoint",
-			"https://ingest.tracelane.dev",
+			"OTLP endpoint of the ingest receiver you run",
+			"http://localhost:4318",
 		)
 		.option("--service-name <name>", "OTel service.name", "my-agent")
 		.option("--sample-rate <rate>", "Head sample rate 0.0–1.0", "1.0")

@@ -2,7 +2,12 @@
  * Tracelane TypeScript SDK.
  *
  * Auto-instruments AI agent frameworks by wrapping their HTTP clients.
- * Spans are emitted via OTLP to the Tracelane gateway's OTLP receiver.
+ * Spans are emitted via OTLP to an ingest receiver you run.
+ *
+ * Tracelane Cloud has no public OTLP ingress — on Cloud, point your
+ * OpenAI-compatible client at `https://gateway.tracelane.dev/v1` and the
+ * gateway captures the trace; this SDK is for self-host and for framework
+ * instrumentation you export to your own collector.
  *
  * @example
  * ```ts
@@ -10,7 +15,7 @@
  *
  * // Call once at application startup
  * init({
- *   endpoint: "https://ingest.tracelane.dev",
+ *   endpoint: "http://localhost:4318", // an OTLP receiver you run
  *   apiKey: process.env.TRACELANE_API_KEY!,
  * });
  * ```

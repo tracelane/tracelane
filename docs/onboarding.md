@@ -9,7 +9,8 @@ to "I have a live API key and my first request is in the dashboard."
 
 ### 1. Sign up
 
-Navigate to [`https://app.tracelane.dev/signup`](https://app.tracelane.dev/signup).
+Navigate to [`https://app.tracelane.dev/sign-in`](https://app.tracelane.dev/sign-in)
+(the same route handles first-time sign-up and returning sign-in).
 Authenticate via WorkOS Connect (Google / Microsoft / GitHub / SAML
 for enterprises). On success, WorkOS posts `organization.created` and
 `user.created` events to our webhook, which:

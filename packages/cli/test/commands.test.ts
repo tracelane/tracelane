@@ -26,11 +26,11 @@ import { fetchTrace, renderTrace } from "../src/commands/trace.js";
 describe("tlane init — buildInitConfig", () => {
 	it("strips a trailing slash and defaults sample rate to 1.0", () => {
 		const c = buildInitConfig({
-			endpoint: "https://ingest.tracelane.dev/",
+			endpoint: "http://localhost:4318/",
 			serviceName: "agent-x",
 		});
 		expect(c).toEqual({
-			endpoint: "https://ingest.tracelane.dev",
+			endpoint: "http://localhost:4318",
 			serviceName: "agent-x",
 			sampleRate: 1.0,
 		});

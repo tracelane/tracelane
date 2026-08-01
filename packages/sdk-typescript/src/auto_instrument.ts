@@ -13,7 +13,7 @@
  * import { init, instrumentAnthropic } from "@tracelanedev/sdk";
  * import Anthropic from "@anthropic-ai/sdk";
  *
- * init({ endpoint: "https://ingest.tracelane.dev", apiKey: process.env.TRACELANE_API_KEY! });
+ * init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY! });
  *
  * const client = new Anthropic();
  * instrumentAnthropic(client); // client.messages.create() now emits spans
@@ -31,7 +31,7 @@ export function autoInstrument(): never {
 		"autoInstrument() is not available yet — zero-config auto-instrumentation ships in " +
 			"tracelane v1.1. For now: call init() once, then wrap each client explicitly, e.g.\n" +
 			'  import { init, instrumentAnthropic } from "@tracelanedev/sdk";\n' +
-			'  init({ endpoint: "https://ingest.tracelane.dev", apiKey: process.env.TRACELANE_API_KEY });\n' +
+			'  init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY });\n' +
 			"  const client = new Anthropic();\n" +
 			"  instrumentAnthropic(client);\n" +
 			"See the instrument* exports (instrumentOpenAI, instrumentLangGraph, …) — one per supported library.",

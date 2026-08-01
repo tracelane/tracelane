@@ -22,7 +22,11 @@ class TracelaneConfig:
     """Configuration for the Tracelane SDK."""
 
     endpoint: str
-    """OTLP endpoint, e.g. https://ingest.tracelane.dev or http://localhost:4318"""
+    """OTLP endpoint of an ingest receiver you run, e.g. http://localhost:4318.
+
+    Tracelane Cloud exposes no public OTLP ingress — on Cloud, point your
+    OpenAI-compatible client at https://gateway.tracelane.dev/v1 instead.
+    """
 
     api_key: str
     """Tracelane API key for tenant authentication."""

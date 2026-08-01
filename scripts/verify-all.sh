@@ -112,6 +112,7 @@ if command -v python3 >/dev/null 2>&1; then
     run "aft-vocabulary guard"         python3 scripts/ci/check-aft-vocabulary.py
     # dispatch + key-lookup + span-attribution must delegate to it. A second table
     # is the cross-provider BYOK-misroute drift surface.
+    run "action-sha-pin guard"      python3 scripts/ci/check-action-sha-pins.py
     run "provider-mapping guard"       python3 scripts/ci/check-provider-mapping-single-source.py
     # No UI/API reads of dead/legacy entitlement columns (tenants.auditEnabled) —
     # the "invisible entitlement-gated UI" class (internal incident review).

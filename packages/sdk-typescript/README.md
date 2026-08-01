@@ -125,7 +125,7 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { init } = await import("@tracelanedev/sdk");
     init({
-      endpoint: "https://ingest.tracelane.dev",
+      endpoint: "http://localhost:4318", // an OTLP receiver you run
       apiKey: process.env.TRACELANE_API_KEY!,
       serviceName: "my-nextjs-app",
     });

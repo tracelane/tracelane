@@ -5,23 +5,20 @@ description: Get your first Tracelane trace in 60 seconds — install the SDK, s
 
 The shortest path from zero to a Tracelane trace.
 
-## Step 1 — Install the SDK
+## Step 1 — Install the CLI
 
-<CodeGroup>
-
-```bash TypeScript
-npm install @tracelanedev/sdk
-```
-
-```bash Python
-pip install tracelane
-```
-
-```bash CLI only
+```bash
 npm install -g @tracelanedev/cli
 ```
 
-</CodeGroup>
+That is everything the hosted path needs. There is **no SDK to add and no code
+to change** — Step 3 points your existing OpenAI-compatible client at the
+gateway and the gateway captures the trace.
+
+The `@tracelanedev/sdk` (TypeScript) and `tracelane` (Python) packages are a
+separate, optional path: they export OTel spans to an OTLP receiver **you** run,
+which is the self-host configuration. See
+[TypeScript SDK](/sdk-typescript) and [Python SDK](/sdk-python).
 
 ## Step 2 — Set two env vars
 
@@ -30,7 +27,8 @@ export TRACELANE_API_KEY=tlane_<your_key>
 export TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev
 ```
 
-The API key comes from sign-up at [app.tracelane.dev](https://app.tracelane.dev/signup).
+The API key comes from sign-up at [app.tracelane.dev/sign-in](https://app.tracelane.dev/sign-in)
+— the same route handles first-time sign-up and returning sign-in.
 The gateway URL only changes for self-host.
 
 ## Step 3 — Point your client at the gateway
@@ -74,12 +72,15 @@ client.chat.completions.create(
 
 ## Step 4 — See the trace
 
-```bash
-tlane trace --latest --format timeline
-```
+Open the trace viewer at
+[app.tracelane.dev/traces](https://app.tracelane.dev/traces) — the call from
+Step 3 lands within a second.
 
-Or open the trace viewer in the dashboard at
-[app.tracelane.dev/traces](https://app.tracelane.dev/traces).
+Or render it in the terminal, using a trace id from that list:
+
+```bash
+tlane trace <traceId> --format timeline   # ASCII waterfall
+```
 
 ## What you got for free
 

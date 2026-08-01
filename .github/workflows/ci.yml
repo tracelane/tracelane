@@ -112,7 +112,8 @@ jobs:
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
-    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # ingest-release-tenant-guard can run — all four proven green together in
+    # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
     if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
@@ -325,7 +326,8 @@ jobs:
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
-    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # ingest-release-tenant-guard can run — all four proven green together in
+    # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
     if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
@@ -386,6 +388,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./scripts/ci/no-e2e-auth-in-prod.sh
 
+      - name: Action SHA-pin guard — selftest (prove it bites)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-action-sha-pins.py --selftest
+
+      - name: Action SHA-pin guard (no tag-pinned `uses:`)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-action-sha-pins.py
+
       - name: Dockerfile digest-pin guard — selftest (prove it bites)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-dockerfile-digest-pins.py --selftest
@@ -404,7 +414,8 @@ jobs:
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
-    # ingest-release-tenant-guard can run — all four proven green 2026-08-01.
+    # ingest-release-tenant-guard can run — all four proven green together in
+    # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
     if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
@@ -495,3 +506,122 @@ jobs:
           pnpm bench:ingest
       - name: Enforce performance budgets (punchlist #5)
         run: pnpm bench:budgets
+
+  # live-eval-gate / l16-e2e-gate / span-publish-integration /
+  # ingest-release-tenant-guard. Measured across every cron firing to date, the
+  # tier executed in exactly ONE of four:
+  #   28732121265 (2026-07-05) ✅ all four ran, green
+  #   29181743552 (2026-07-12) `changes` FAILED → all four SKIPPED; run still reported a conclusion
+  #   29675298614 (2026-07-19) cancelled
+  #   30190109992 (2026-07-26) `changes` FAILED → all four SKIPPED; run still reported a conclusion
+  # ~25% coverage while the board reads "weekly behavioral net". "Ever green"
+  # passes on a technicality; the protection does not hold.
+  #
+  # A skipped `needs:` skips the dependant. The private-minute policy relies on
+  # that deliberately (see the `changes` job condition) — and it is the same
+  # mechanism that makes the tier vanish without a mark. Both cron failures were
+  # INFRASTRUCTURAL: every cheap guard failed too, so the run read as generally
+  # broken and the one thing that went missing was invisible inside the noise.
+  # Hence this job NAMES which of the four did not run and WHY, rather than only
+  # failing — a red run that does not say what is absent reproduces the defect.
+  #
+  # Cost: one job on schedule + dispatch ≈ 5 billable min/month (GitHub rounds
+  # every job up to a whole minute, so cost is job COUNT).
+  behavioral-tier-ran:
+    name: Behavioral tier actually ran (B-169)
+    needs:
+      [
+        changes,
+        live-eval-gate,
+        l16-e2e-gate,
+        span-publish-integration,
+        ingest-release-tenant-guard,
+      ]
+    # `always()` is load-bearing: without it a skipped need skips THIS job too,
+    # which is exactly the failure it exists to detect — decorative from birth in
+    # the one case it was built for.
+    #
+    # Scoped to schedule + workflow_dispatch because those are the events where
+    # the `changes` job fail-safes to run-all (`else run_all "event=$EVENT"`), so
+    # all four are EXPECTED and `skipped` is unambiguously wrong. On push/PR the
+    # tier is path-gated and `skipped` is the CORRECT answer — asserting there
+    # would fire on every docs PR and get overridden, which is how a guard dies.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert all four behavioral jobs executed
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          OUT_RUST: ${{ needs.changes.outputs.rust }}
+          OUT_WEB: ${{ needs.changes.outputs.web }}
+          OUT_LIVE: ${{ needs.changes.outputs.live_stack }}
+          # Bracket form, not `needs.l16-e2e-gate.result`: `-` is subtraction in
+          # the expression grammar, so a hyphenated job id must be indexed.
+          R_LIVE_EVAL: ${{ needs['live-eval-gate'].result }}
+          R_L16: ${{ needs['l16-e2e-gate'].result }}
+          R_SPAN: ${{ needs['span-publish-integration'].result }}
+          R_INGEST: ${{ needs['ingest-release-tenant-guard'].result }}
+        run: |
+          set -uo pipefail
+          missing=0
+          rows=""
+
+          # A job that RAN and FAILED still EXECUTED. The run is already red from
+          # that job, and failing here too would blur which of the two problems
+          # this is. Only non-execution (skipped / cancelled) is this job's
+          # business — "did the net get cast", not "did it catch anything".
+          check() {
+            label="$1"; result="$2"; gate_name="$3"; gate_val="$4"
+            case "$result" in
+              success)
+                rows="${rows}| \`${label}\` | ✅ ran (success) | — |\n" ;;
+              failure)
+                rows="${rows}| \`${label}\` | ⚠️ ran (FAILED — see that job) | — |\n" ;;
+              *)
+                missing=$((missing + 1))
+                if [ "$CHANGES_RESULT" != "success" ]; then
+                  why="\`changes\` concluded **${CHANGES_RESULT}** — it gates this job through \`needs:\`, so it never got a chance"
+                elif [ "$gate_val" != "true" ]; then
+                  why="\`changes\` succeeded but emitted \`${gate_name}=${gate_val:-<empty>}\` — on \`${GITHUB_EVENT_NAME}\` it must fail-safe to \`true\`"
+                else
+                  why="\`${gate_name}=true\` and \`changes\` succeeded, yet the result is **${result}** — unexplained; read the run graph"
+                fi
+                rows="${rows}| \`${label}\` | ❌ **${result}** | ${why} |\n" ;;
+            esac
+          }
+
+          check live-eval-gate              "$R_LIVE_EVAL" live_stack "$OUT_LIVE"
+          check l16-e2e-gate                "$R_L16"       web        "$OUT_WEB"
+          check span-publish-integration    "$R_SPAN"      rust       "$OUT_RUST"
+          check ingest-release-tenant-guard "$R_INGEST"    rust       "$OUT_RUST"
+
+          # Printed on EVERY run, pass or fail. A control that is silent when
+          # healthy is indistinguishable from one that is broken, and the step
+          # summary is what makes it readable without opening logs — the reason
+          # the 2026-07-12 and 07-26 disappearances went unnoticed.
+          {
+            echo "### Behavioral tier — did it actually run?"
+            echo ""
+            echo "Event \`${GITHUB_EVENT_NAME}\` · \`changes\` concluded **${CHANGES_RESULT}**"
+            echo ""
+            echo "| job | executed? | why not |"
+            echo "|---|---|---|"
+            printf '%b' "$rows"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ "$missing" -gt 0 ]; then
+            {
+              echo ""
+              echo "**${missing} of 4 behavioral jobs DID NOT EXECUTE.**"
+              echo ""
+              echo "This run must not be read as a behavioral pass. On \`schedule\` this is the"
+              echo "only place these four run at all (private push-CI is off per B-153), so a"
+              echo "skip here is a week with no behavioral coverage — not a cheaper week."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error::Behavioral tier incomplete — ${missing}/4 jobs did not execute (see the job summary for which and why)."
+            exit 1
+          fi
+          echo "✓ all 4 behavioral jobs executed"

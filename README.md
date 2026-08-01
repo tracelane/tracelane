@@ -9,7 +9,7 @@
 [![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
 [![Discord](https://img.shields.io/discord/tracelane?label=Discord&logo=discord&logoColor=white)](https://discord.gg/tracelane)
 
-**[Get started free →](https://app.tracelane.dev/signup)** · [Docs](https://docs.tracelane.dev) · [Discord](https://discord.gg/tracelane)
+**[Get started free →](https://app.tracelane.dev/sign-in)** · [Docs](https://docs.tracelane.dev) · [Discord](https://discord.gg/tracelane)
 
 ---
 

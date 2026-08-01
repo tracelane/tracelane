@@ -11,7 +11,7 @@ Example (explicit — traces exactly what you wrap)::
     import anthropic
 
     init(
-        endpoint="https://ingest.tracelane.dev",
+        endpoint="http://localhost:4318",
         api_key=os.environ["TRACELANE_API_KEY"],
     )
     client = anthropic.Anthropic()
@@ -79,7 +79,7 @@ def auto_instrument() -> None:
 
         from tracelane import init, auto_instrument
 
-        init(endpoint="https://ingest.tracelane.dev", api_key="...")
+        init(endpoint="http://localhost:4318", api_key="...")
         auto_instrument()   # wraps installed anthropic/openai/litellm/claude_code
     """
     _try_instrument_anthropic()

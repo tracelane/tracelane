@@ -3,14 +3,15 @@
  *
  * Uses the official @opentelemetry/sdk-node and OTLP HTTP exporter.
  * Never calls home from the SDK — all telemetry goes to the configured
- * endpoint only, which defaults to the Tracelane ingest OTLP port.
+ * endpoint only. There is no default: `endpoint` is required and must be an
+ * OTLP receiver you run (Tracelane Cloud exposes no public OTLP ingress).
  */
 
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 
 export interface TracelaneConfig {
-	/** OTLP endpoint, e.g. https://ingest.tracelane.dev or http://localhost:4318 */
+	/** OTLP endpoint of an ingest receiver you run, e.g. http://localhost:4318 */
 	endpoint: string;
 	/** Tracelane API key for tenant authentication */
 	apiKey: string;
