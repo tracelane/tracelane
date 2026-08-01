@@ -1,6 +1,6 @@
 # Tracelane
 
-**Predictive reliability platform for AI agents.**
+**flight recorder for AI agents.**
 
 [![CI](https://github.com/tracelane/tracelane/actions/workflows/ci.yml/badge.svg)](https://github.com/tracelane/tracelane/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
