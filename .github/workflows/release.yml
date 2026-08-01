@@ -165,6 +165,30 @@ jobs:
         with:
           path: artifacts/
 
+      # ALL FOUR downloaded binaries are literally named `gateway` — the matrix
+      # uploads `target/<target>/release/gateway` under artifact name
+      # `gateway-<target>`, so download-artifact yields
+      # artifacts/gateway-<target>/gateway ×4. A GitHub Release's asset namespace
+      # is FLAT and keyed by BASENAME, so uploading all four would resolve to a
+      # single asset called `gateway` (softprops deletes-and-replaces on a name
+      # collision) — the release would go green carrying ONE binary and ONE
+      # bundle instead of four and four. Never observed, because this job has
+      # been SKIPPED on all 8 runs of this workflow's life. Flatten to unique
+      # names first, and fail closed if the count is not 4.
+      - name: Give every binary a unique release-asset name
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for d in artifacts/gateway-*/; do
+            target="$(basename "$d")"          # gateway-<target>
+            cp "${d}gateway" "release/${target}"
+            chmod +x "release/${target}"
+          done
+          ls -l release/
+          n=$(find release -maxdepth 1 -type f -name 'gateway-*' | wc -l)
+          echo "staged ${n} binaries"
+          [ "$n" -eq 4 ] || { echo "::error title=Incomplete binary set::expected 4 target binaries, staged ${n} — refusing to publish a partial release"; exit 1; }
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20  # v3.5.0
 
@@ -176,13 +200,16 @@ jobs:
 
       - name: Sign binaries with Sigstore Cosign (keyless OIDC)
         run: |
-          for binary in artifacts/gateway-*/gateway; do
+          set -euo pipefail
+          for binary in release/gateway-*; do
+            case "$binary" in *.cosign.bundle) continue ;; esac
             cosign sign-blob \
               --yes \
               --oidc-issuer=https://token.actions.githubusercontent.com \
               --bundle="${binary}.cosign.bundle" \
               "${binary}"
           done
+          ls -l release/
 
       - name: Sign SBOM
         run: |
@@ -195,8 +222,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@e7a8f85174e1f197b1c2f01bb60e1c350ccad01f  # v2.2.0
         with:
+          # `release/*` — the uniquely-named staging dir, NOT `artifacts/**/*`
+          # (four basename-identical `gateway` files; see the staging step above).
+          # Expected asset count: 4 binaries + 4 .cosign.bundle + the SBOM and its
+          # bundle = 10.
           files: |
-            artifacts/**/*
+            release/*
             sbom.cyclonedx.json
             sbom.cyclonedx.json.cosign.bundle
           generate_release_notes: true
