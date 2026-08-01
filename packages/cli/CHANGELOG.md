@@ -3,9 +3,25 @@
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.2.2] - 2026-07-31
+## [0.2.3] - 2026-08-01
+
+### Changed
+- Version-only release. No source changes since 0.2.2 — re-cut because the 0.2.2
+  tag published this package to npm but produced no signed release artifacts
+  (the release job could not resolve one of its pinned actions). 0.2.3 is the
+  same code from a release that carries a GitHub Release, Cosign signatures, an
+  SBOM and SLSA provenance.
+
+## [0.2.2] - 2026-08-01
 
 ### Fixed
+- **`tlane init` no longer defaults to a hostname that does not exist.** The
+  `--endpoint` default was `https://ingest.tracelane.dev`, which has never
+  resolved (NXDOMAIN), so `tlane init` scaffolded a `tracelane.config.json`
+  pointing at nothing. It now defaults to `http://localhost:4318` — an OTLP
+  receiver you run. Tracelane Cloud exposes no public OTLP ingress; on Cloud,
+  point an OpenAI-compatible client at `https://gateway.tracelane.dev/v1` and
+  the gateway captures the trace.
 - **`tlane init` no longer has a check-then-write race.** It used `existsSync`
   followed by `writeFileSync`; anything created between the two — including a
   symlink pointing somewhere you did not intend to write — was overwritten

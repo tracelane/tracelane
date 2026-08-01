@@ -12,11 +12,18 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-07-31
+## [0.2.3] - 2026-08-01
 
-First release to ship **signed** artifacts. v0.2.1 published packages to npm and
-PyPI but never produced a GitHub Release, Cosign signatures, a release SBOM, or
-SLSA provenance — the release job failed before reaching them. That is closed here.
+**First release to ship signed artifacts.** 0.2.1 and 0.2.2 both published
+packages to npm and PyPI while producing no GitHub Release, no Cosign
+signatures, no release SBOM and no SLSA provenance. 0.2.3 is 0.2.2's payload
+plus the two defects that stopped it: a release action pinned to a commit SHA
+that does not exist upstream, and a container SBOM step that tried to write
+release assets from a read-only job. The four cross-compiled binaries are now
+published under per-target names — previously all four shared one filename, so
+a flat release-asset namespace would have kept only one.
+
+Every published package moves to 0.2.3.
 
 ### Fixed
 
@@ -37,10 +44,17 @@ SLSA provenance — the release job failed before reaching them. That is closed 
 
 ### Changed
 
-- All published packages are unified at 0.2.2 so that the version of every
+- All published packages are unified at 0.2.3 so that the version of every
   artifact matches the release tag it came from. The SDKs and the three verifiers
   have no source changes since 0.2.1; they are re-cut so their artifacts come
   from the signed-tag path.
+
+## [0.2.2] - 2026-08-01
+
+Published to npm and PyPI; produced no signed artifacts — no GitHub Release, no
+Cosign signatures, no SBOM, no SLSA provenance — for the reasons fixed in 0.2.3.
+The tag was signed and verified; the failure was downstream of the signature
+gate. Prefer 0.2.3: it carries the same code with a verifiable release.
 
 
 ### Added
