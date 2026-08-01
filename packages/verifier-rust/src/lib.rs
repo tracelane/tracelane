@@ -531,7 +531,7 @@ const LOG_HOST: &str = "log2025-1.rekor.sigstore.dev";
 /// (base64 "t8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=").
 fn log_ed25519_pubkey() -> [u8; 32] {
     // A fixed compile-time constant, never runtime input. `match` + `unreachable!`
-    // keeps the no-unwrap/expect invariant (CLAUDE.md); a malformed literal is a
+    // keeps this crate's no-unwrap/expect invariant; a malformed literal is a
     // source-edit bug caught by `pinned_log_key_decodes_to_32_bytes` below.
     match base64_decode("t8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=") {
         Ok(bytes) if bytes.len() == 32 => {
@@ -1098,7 +1098,7 @@ fn verify_chain(
         // `errors.is_empty()`). Do NOT change consumers to trust the error list
         // alone. (per the ADR-050 security review.)
         // The entry was created earlier this iteration by `or_insert_with`, so it
-        // is always present. `if let` keeps the no-panic invariant (CLAUDE.md: no
+        // is always present. `if let` keeps the no-panic invariant (no
         // unwrap/expect outside tests); a missing entry would fail-safe — the next
         // row's prev_hash check fails → RED — never a false GREEN.
         if let Some(entry) = tenant_state.get_mut(&row.tenant_id) {

@@ -45,8 +45,8 @@ jobs:
     # as a 0-reviewer environment (branch policy v*/main only) — deliberately NO manual
     # approval step. Residual: an attacker who can also rewrite this workflow (full
     # main-write compromise) bypasses it — mitigated by 2FA + credential hygiene, not
-    # here. Founder action: set the `RELEASE_TAG_ALLOWED_SIGNERS` repo variable to the
-    # maintainer's SSH signing pubkey line (`<git-user-email> ssh-ed25519 AAAA…`).
+    # here. Required repo setup: set the `RELEASE_TAG_ALLOWED_SIGNERS` repo variable
+    # to the maintainer's SSH signing pubkey line (`<git-user-email> ssh-ed25519 AAAA…`).
     environment:
       name: production-release
       url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}

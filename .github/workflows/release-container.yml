@@ -19,13 +19,29 @@ on:
 permissions:
   contents: read
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}/gateway
-
 jobs:
   build-push-sign:
-    name: Build · push · sign · SBOM · provenance
+    name: Build · push · sign · SBOM · provenance (${{ matrix.image }})
     runs-on: ubuntu-latest
+    # BOTH images, because infra/self-host/docker-compose.yml pulls BOTH.
+    # Until 2026-08-01 this workflow built only `gateway`, so
+    # ghcr.io/<owner>/<repo>/ingest never existed and every self-hoster running
+    # our own compose file got a pull error on a service we told them to run.
+    strategy:
+      # One image's failure must not hide the other's result (same reasoning as
+      # release.yml's build-rust matrix).
+      fail-fast: false
+      matrix:
+        include:
+          # The root Dockerfile is the one the 2026-07-31 green run used; keep it
+          # as the gateway's build file rather than swapping in a near-identical
+          # copy on release eve.
+          - image: gateway
+            dockerfile: ./Dockerfile
+          - image: ingest
+            dockerfile: ./infra/docker/ingest.Dockerfile
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/${{ matrix.image }}
     permissions:
       contents: read
       packages: write # push to GHCR
@@ -51,16 +67,22 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE }}
+          # `latest` is REQUIRED, not a convenience: infra/self-host/docker-compose.yml
+          # defaults to `<image>:latest`, so without it the compose file names a tag
+          # this workflow never produces — the image can exist and the documented
+          # pull still 404s. Tag refs only, so a dispatch dry run never moves
+          # `latest` to an untagged main build.
           tags: |
             type=semver,pattern={{version}}
             type=sha,format=long
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push (by digest)
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -82,12 +104,12 @@ jobs:
         with:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
-          output-file: gateway-sbom.cdx.json
+          output-file: ${{ matrix.image }}-sbom.cdx.json
 
       - name: Attach SBOM attestation (Cosign)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign attest --yes --type cyclonedx --predicate gateway-sbom.cdx.json "${IMAGE}@${DIGEST}"
+        run: cosign attest --yes --type cyclonedx --predicate ${{ matrix.image }}-sbom.cdx.json "${IMAGE}@${DIGEST}"
 
       - name: SLSA Build Level 3 provenance (image digest)
         uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v1.4.3
