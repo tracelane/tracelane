@@ -21,7 +21,7 @@ use tracing::instrument;
 use tracelane_shared::TenantId;
 
 /// Per-tenant rate limit tiers (requests per minute).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RateLimitTier {
     Free = 0,
@@ -29,6 +29,11 @@ pub enum RateLimitTier {
     Team = 2,
     Business = 3,
     Enterprise = 4,
+    /// tenant that exists in Postgres — the caller grants it only when the
+    /// entitlement cache is absent, which is exactly "no control plane, so not
+    /// hosted". Never returned by `from_plan_tier_str`, so no plan string can
+    /// select it.
+    Bench = 5,
 }
 
 impl RateLimitTier {
@@ -40,6 +45,7 @@ impl RateLimitTier {
             Self::Team => 6_000,
             Self::Business => 60_000,
             Self::Enterprise => u32::MAX,
+            Self::Bench => u32::MAX,
         }
     }
 
@@ -124,7 +130,16 @@ impl RateLimiter {
     /// Returns `Throttle { retry_after_secs }` when the bucket is empty.
     #[instrument(skip(self), fields(tenant_id = %tenant_id))]
     pub fn check(&self, tenant_id: &TenantId, tier: RateLimitTier) -> RateLimitDecision {
-        if matches!(tier, RateLimitTier::Enterprise) {
+        //
+        // Granting the tier was not enough. Both report `u32::MAX` rpm, but only
+        // `Enterprise` was listed here — so `Bench` fell through to the token
+        // bucket, where `capacity = f64::from(u32::MAX)` with float refill does
+        // NOT behave as unlimited. Live consequence: the acceptance-bar request
+        // returned 200, k6 then aborted with "NO requests completed", and a
+        // single request after the burst returned 429. The tier was granted and
+        // then ignored one layer down — the third rejection-measurement trap in
+        // the same benchmark path (see docs/TRAPS.md).
+        if matches!(tier, RateLimitTier::Enterprise | RateLimitTier::Bench) {
             return RateLimitDecision::Allow;
         }
 
@@ -432,6 +447,46 @@ mod tests {
             RateLimitTier::from_plan_tier_str("nonsense"),
             RateLimitTier::Free
         ));
+    }
+
+    #[test]
+    fn bench_tier_is_never_throttled() {
+        // N is deliberately far past every other tier's ceiling (Business =
+        // 60_000) so this cannot pass by sitting under some other limit.
+        let rl = RateLimiter::new();
+        let t = TenantId::from_jwt_claim(uuid::Uuid::nil());
+        for i in 0..1_000u32 {
+            assert_eq!(
+                rl.check(&t, RateLimitTier::Bench),
+                RateLimitDecision::Allow,
+                "Bench tier throttled at request {i}"
+            );
+        }
+        // MECHANISM, not just the outcome. Asserting only "Allow" is NOT
+        // discriminating: `capacity = f64::from(u32::MAX)` is ~4.29e9 tokens, so
+        // a bucket-path Bench tier also returns Allow for any test-sized N — the
+        // first version of this test passed with the bug still present. What
+        // separates fixed from broken is whether `check` short-circuits BEFORE
+        // touching the bucket map at all.
+        assert!(
+            rl.buckets.is_empty(),
+            "Bench created a rate-limit bucket — it is going through the token-bucket \
+             path instead of the :135 early-return, so it is NOT treated as unlimited"
+        );
+        // Discriminating control: the same limiter DOES throttle Free, so the
+        // assertion above is not passing because throttling is broken entirely.
+        let f = TenantId::from_jwt_claim(uuid::Uuid::from_u128(1));
+        let mut throttled = false;
+        for _ in 0..200 {
+            if rl.check(&f, RateLimitTier::Free) != RateLimitDecision::Allow {
+                throttled = true;
+                break;
+            }
+        }
+        assert!(
+            throttled,
+            "Free tier never throttled — the control is vacuous"
+        );
     }
 
     #[test]

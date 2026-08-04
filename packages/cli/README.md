@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/tlane?style=flat-square)](https://www.npmjs.com/package/tlane)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](../../LICENSE)
 
-Developer toolbox for the Tracelane predictive reliability platform. A single binary covering trace inspection, audit verification, prompt promotion, agent replay, one-line migrations, and CI eval gates.
+Developer toolbox for Tracelane, the flight recorder for AI agents. A single binary covering trace inspection, audit verification, prompt promotion, agent replay, one-line migrations, and CI eval gates.
 
 ## Installation
 

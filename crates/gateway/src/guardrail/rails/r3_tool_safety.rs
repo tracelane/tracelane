@@ -188,7 +188,6 @@ impl Rail for R3Schema {
 
 // ── R3Pinning (gated) ─────────────────────────────────────────────────────────
 
-/// R3 definition pinning — rug-pull detection (gated `R3DefinitionPinning`).
 #[derive(Debug, Clone, Default)]
 pub struct R3Pinning;
 
@@ -244,7 +243,16 @@ impl Rail for R3Pinning {
         FailMode::Closed
     }
     fn feature(&self) -> Option<GuardrailFeature> {
-        Some(GuardrailFeature::R3DefinitionPinning)
+        // basic-correctness rails are free in OSS and on every hosted tier;
+        // product/quality/data-governance rails (R2 PII, R5 format, R6
+        // sysprompt-leak, R7 topic) stay entitlement-gated. A flagship
+        // agent-safety capability a free tier never sees is worthless as proof,
+        // and R8 injection was already free — gating the same attack family on
+        // the other side of the paywall was an incoherent line.
+        //
+        // `f_guardrail_r3_pinning` is retained in the schema but is NO LONGER READ for
+        // this rail; do not re-gate on it without reopening that ruling.
+        None
     }
     fn evaluate<'a>(&'a self, ctx: &'a GuardrailContext<'a>) -> RailFuture<'a> {
         Box::pin(async move { Ok::<_, RailError>(self.evaluate_sync(ctx)) })

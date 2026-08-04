@@ -2,7 +2,7 @@
 	"name": "tracelane",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Predictive reliability platform for AI agents",
+	"description": "The flight recorder for AI agents",
 	"scripts": {
 		"dev": "pnpm --filter @tracelanedev/web dev",
 		"dev:mcp": "pnpm --filter @tracelanedev/mcp dev",
@@ -28,7 +28,7 @@
 	},
 	"pnpm": {
 		"overrides": {
-			"fast-uri": ">=3.1.4",
+			"fast-uri": ">=4.1.2",
 			"fast-xml-builder": ">=1.1.7",
 			"shell-quote": ">=1.9.0",
 			"@grpc/grpc-js": ">=1.14.4 <2",
@@ -42,7 +42,8 @@
 			"qs": ">=6.15.2",
 			"ip-address": ">=10.1.1",
 			"@opentelemetry/core": ">=2.8.0 <3",
-			"body-parser": ">=2.3.0"
+			"body-parser": ">=2.3.0",
+			"undici": ">=7.29.0"
 		},
 		"auditConfig": {
 			"ignoreGhsas": [

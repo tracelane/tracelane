@@ -3,9 +3,15 @@
 `tracelane-mcp` exposes Tracelane's trace store and guardrail engine as
 [Model Context Protocol](https://modelcontextprotocol.io) tools.
 
-It is read-only, tenant-scoped, and distributed as an npm package.
+It is read-only, tenant-scoped, and intended for npm distribution (not yet published).
 
 ---
+
+> **Not published to npm yet.** `@tracelanedev/mcp` is not on the registry
+> today, so `npx @tracelanedev/mcp` returns a 404. Until it ships, run from a
+> clone: `pnpm install && pnpm --filter @tracelanedev/mcp build && node
+> apps/mcp/dist/index.js`. The `npx` commands below are the form to use once
+> the package is published.
 
 ## Installation
 

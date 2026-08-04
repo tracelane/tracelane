@@ -425,6 +425,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // the NoOp store (CLICKHOUSE_URL unset).
     prompt_router.load_from_clickhouse().await;
 
+    //
+    // The request-time check is `state.entitlements.is_none()`, which is `Some`
+    // iff the Postgres pool initialised. But :244-258 logs a warn and CONTINUES
+    // when pool init fails on a hosted node — leaving `entitlements = None` on a
+    // node that IS hosted. A legacy JWT carrying a direct `tenant_id` UUID
+    // authenticates without touching Postgres (auth/mod.rs:361-388), so in that
+    // window a real tenant could have reached the bench tier with the flag set.
+    // Four things had to line up, but "structurally impossible" was not true.
+    //
+    // Refusing to boot closes it: on any node configured for hosted (POSTGRES_URL
+    // / PGHOST present) the bench flag is now a hard startup failure, so the
+    // combination cannot exist at request time regardless of pool health.
+    if config.bench_mock_upstream
+        && (std::env::var("POSTGRES_URL").is_ok() || std::env::var("PGHOST").is_ok())
+    {
+        anyhow::bail!(
+            "TRACELANE_BENCH_MOCK_UPSTREAM=1 with a Postgres control plane configured \
+             (POSTGRES_URL/PGHOST) — refusing to start. The bench mock and its \
+             unlimited-rate tier are for a NON-hosted bench node only; see \
+             bench/gateway/BENCH_TODO.md for the sanctioned ephemeral-container run."
+        );
+    }
     if config.bench_mock_upstream {
         tracing::warn!(
             "TRACELANE_BENCH_MOCK_UPSTREAM is ENABLED — requests for `__bench_mock*` \
@@ -945,13 +967,57 @@ async fn chat_completions_handler(
     // legacy `tenants.plan_tier` column the old per-request `resolve_tenant_tier`
     // PG read used. No cache (dev / no-Postgres) or a resolve failure fails
     // restricted to Free / free quota (deny_all() → `free_v1`; never over-grant).
-    let entitlements = match &state.entitlements {
-        Some(cache) => Some(cache.resolved(*tenant_id.as_uuid()).await),
-        None => None,
+    // Bound here (moved up from the dispatch section) so the ONE bench gate can
+    // be evaluated before the rate-limit check without re-deriving the model —
+    // a second model expression is the same drift class the unified gate closed.
+    let mut model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("claude-sonnet-4-6")
+        .to_owned();
+
+    // tenant_id is bound from claims, so an unauthenticated request can never
+    // reach it. Consumed by the rate-limit tier below AND by the routing/BYOK
+    // bypass further down — one expression, two uses.
+    let bench_mock = bench_mock_active(state.bench_mock_upstream, &model);
+
+    // enforcement points. Four limiters rejected the benchmark in sequence
+    // (router 400 -> free-tier 429 -> Bench-tier-ignored 429 -> monthly quota
+    // 429); each patch revealed the next. Every per-tenant check reads from
+    // here, so granting here closes all of them at one auditable site — and
+    // keeps bench logic out of the hot path, where a bypass could leak.
+    //
+    // Triple-gated (.claude/rules/tenancy.md): the env flag and the reserved
+    // model are folded into `bench_mock`; `state.entitlements.is_none()` is the
+    // structural third — `Some` iff a Postgres control plane exists — and a
+    // STARTUP REFUSAL makes flag+Postgres unbootable, so a real tenant cannot
+    // reach this branch even if a hosted pool init failed.
+    let entitlements = if bench_mock && state.entitlements.is_none() {
+        Some(std::sync::Arc::new(
+            crate::entitlement_cache::ResolvedEntitlements::bench_unlimited(),
+        ))
+    } else {
+        match &state.entitlements {
+            Some(cache) => Some(cache.resolved(*tenant_id.as_uuid()).await),
+            None => None,
+        }
     };
-    let tier = entitlements.as_ref().map_or(RateLimitTier::Free, |e| {
-        RateLimitTier::from_plan_tier_str(e.plan_lookup_key.trim_end_matches("_v1"))
-    });
+    // reserved `__bench_mock*` model are folded into `bench_mock`; (3) is the
+    // structural one — `state.entitlements` is `Some` iff a Postgres control
+    // plane exists (`server.rs:278`, `db::global_pool().map(...)`), which is
+    // precisely what makes a deployment HOSTED. So a tenant that exists in
+    // Postgres CANNOT acquire the bench tier even with the flag set and the
+    // reserved model: the `is_none()` arm is unreachable for it. That is a
+    // structural impossibility, not a check that could be bypassed.
+    //
+    // Without this the benchmark is rate-limited into measuring 429s: self-host
+    // has no cache, so it fell to Free = 60 rpm while k6 drove 27k/s, and 99.99%
+    // of a 812k-request run was throttled (checks: 53 passed / 812,220 failed).
+    // No bench branch here — the tier is a property of the grant above.
+    // No entitlement at all (OSS self-host, non-bench) still fails closed to Free.
+    let tier = entitlements
+        .as_ref()
+        .map_or(RateLimitTier::Free, |e| e.rate_limit_tier());
     let rl = state.rate_limiter.check(tenant_id, tier);
     if let RateLimitDecision::Throttle { retry_after_secs } = rl {
         // Count the rejection for the Gateway-ops live counter. A 429 emits no
@@ -1101,11 +1167,6 @@ async fn chat_completions_handler(
     // --- Step 5: Provider dispatch ---
     // `mut`: on a successful cross-provider failover below we reassign this to
     // the provider that actually served the request, so the span, the echoed
-    let mut model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("claude-sonnet-4-6")
-        .to_owned();
 
     // x402: extract payment event if present and record async.
     // Runs before provider dispatch so intent is captured even on provider error.
@@ -1126,48 +1187,82 @@ async fn chat_completions_handler(
     // unknown model to Anthropic (or any provider) would fetch that provider's
     // BYOK key for a model the caller never asked for (credential misrouting).
     // Rejecting is categorically safer than shipping the wrong provider's key.
-    let Some(provider_id) = crate::providers::ProviderRegistry::provider_id_for_model(&model)
-    else {
-        return unroutable_model_response(&model);
+    //
+    // POSITION IS THE SECURITY PROPERTY. This sits AFTER Step 1 auth (:925) and
+    // after `tenant_id` is taken from `claims` (:947), so an unauthenticated
+    // request can never reach the mock arm — it is rejected upstream with 401
+    // exactly as before. Asserted by `bench_mock_requires_auth_first`, not by
+    // this comment.
+    //
+    // DOUBLE-GATED, both directions fail closed:
+    //   flag ON  + `__bench_mock*`  -> bypass (the only way in)
+    //   flag ON  + real model       -> normal path, untouched
+    //   flag OFF + `__bench_mock*`  -> falls through -> 400 unroutable_model
+    //   flag OFF + real model       -> normal path, untouched
+    //
+    // Why the bypass is needed at all: `provider_id_for_model` fails closed and
+    // `providers/mod.rs` has no `__bench_mock` arm, so the reserved model was
+    // rejected 211 lines BEFORE the mock branch at :1358 — the benchmark has
+    // never been reachable. BYOK resolution below is a second blocker on the
+    // same path, so both are bypassed together.
+    let provider_id = if bench_mock {
+        BENCH_MOCK_PROVIDER_ID
+    } else {
+        match crate::providers::ProviderRegistry::provider_id_for_model(&model) {
+            Some(p) => p,
+            None => return unroutable_model_response(&model),
+        }
     };
     // A4: BYOK lookup first — per-tenant ciphertext in `provider_keys` decrypted
     // with AAD bound to (tenant_id, provider_id). On miss (no row, decrypt fail,
     // pool unavailable) fall back to the legacy env var. The env var is derived
     // from THIS provider_id, so a miss yields an empty key (upstream 401), never
     // another provider's key.
-    let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
-    // First-value path: a launch-day user who has not added BYOK yet must be told
-    // to ADD a key, not that their key was "rejected". Dispatching an empty
-    // credential and relaying the upstream 401 read as "my key is broken" for a
-    // user who had no key at all. Fail here, before the upstream round-trip.
-    let provider_key = match resolve_provider_key(tenant_id, provider_id, key_env).await {
-        ProviderKey::Found(k) => k,
-        outcome => {
-            let (status, code, message) = match outcome {
-                ProviderKey::NotConfigured => (
-                    StatusCode::BAD_REQUEST,
-                    "provider_not_configured",
-                    "no API key is configured for this provider — add one in Settings → LLM Providers, then retry",
-                ),
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    "provider_key_unusable",
-                    "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
-                ),
-            };
-            tracing::warn!(provider = provider_id, code, "provider key unresolvable");
-            // Emit the ERROR span so this is visible in /traces and countable —
-            // the most common first-run failure is invisible in the product.
-            if let Some(ref nats_client) = state.nats {
-                let span = build_error_span(tenant_id, trace_id, &model, request_start, code);
-                let nats = Arc::clone(nats_client);
-                tokio::spawn(async move {
-                    if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-                        tracing::warn!(error = %e, "error-span NATS publish failed");
-                    }
-                });
+    // to resolve. Skipping the lookup also keeps the benchmark honest — it must
+    // not measure a Postgres round-trip the mocked request would never make.
+    let provider_key = if bench_mock {
+        String::new()
+    } else {
+        let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
+        // First-value path: a launch-day user who has not added BYOK yet must be told
+        // to ADD a key, not that their key was "rejected". Dispatching an empty
+        // credential and relaying the upstream 401 read as "my key is broken" for a
+        // user who had no key at all. Fail here, before the upstream round-trip.
+        match resolve_provider_key(tenant_id, provider_id, key_env).await {
+            ProviderKey::Found(k) => k,
+            outcome => {
+                let (status, code, message) = match outcome {
+                    ProviderKey::NotConfigured => (
+                        StatusCode::BAD_REQUEST,
+                        "provider_not_configured",
+                        "no API key is configured for this provider — add one in Settings → LLM Providers, then retry",
+                    ),
+                    _ => (
+                        StatusCode::BAD_GATEWAY,
+                        "provider_key_unusable",
+                        "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
+                    ),
+                };
+                tracing::warn!(provider = provider_id, code, "provider key unresolvable");
+                // Emit the ERROR span so this is visible in /traces and countable —
+                // the most common first-run failure is invisible in the product.
+                if let Some(ref nats_client) = state.nats {
+                    let span = build_error_span(tenant_id, trace_id, &model, request_start, code);
+                    let nats = Arc::clone(nats_client);
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
+                            tracing::warn!(error = %e, "error-span NATS publish failed");
+                        }
+                    });
+                }
+                return provider_error_response(
+                    status,
+                    code,
+                    Some(message),
+                    Some(provider_id),
+                    None,
+                );
             }
-            return provider_error_response(status, code, Some(message), Some(provider_id), None);
         }
     };
 
@@ -1336,7 +1431,10 @@ async fn chat_completions_handler(
     // round-trip (incl. A7 retry / cross-provider failover). Stamped once, here.
     let dispatch_ts = chrono::Utc::now();
     // A7: one retry against the same provider on transient failure.
-    let mut provider_result = if state.bench_mock_upstream && is_bench_mock_model(&model) {
+    // routing bypass rather than re-deriving the condition here. A second inline
+    // copy of the gate is the drift the unified gate exists to prevent — extend
+    // `bench_mock_active` and only one of the two decisions would follow it.
+    let mut provider_result = if bench_mock {
         // Bench-only instant upstream (TRACELANE_BENCH_MOCK_UPSTREAM). Replaces
         // ONLY the network dispatch with an instant canned stream, so a load
         // test's measured latency is gateway overhead (auth, parse, untrusted
@@ -1344,7 +1442,7 @@ async fn chat_completions_handler(
         // flag is off by default and the model must be `__bench_mock*`, so a
         // normal tenant request can never reach here. See bench/gateway/README.
         crate::providers::MockProvider::new("ok")
-            .chat_mock(chat_request.clone(), &provider_key, tenant_id)
+            .chat_mock(&chat_request, &provider_key, tenant_id)
             .await
     } else {
         dispatch_with_retry(
@@ -2365,6 +2463,23 @@ fn is_bench_mock_model(model: &str) -> bool {
     model.starts_with("__bench_mock")
 }
 
+///
+/// Deliberately NOT a real provider id. It is used only for span/log
+/// attribution on a request whose dispatch is replaced by the in-gateway mock,
+/// so it must never collide with a routable provider — if it did, a mocked
+/// request could attribute cost or a BYOK lookup to a real provider.
+/// `bench_mock_provider_id_is_not_routable` asserts the non-collision.
+const BENCH_MOCK_PROVIDER_ID: &str = "__bench_mock";
+
+/// without standing up the handler.
+///
+/// BOTH conditions must hold. Either alone fails closed:
+/// - flag ON + real model  -> `false`, normal routing/BYOK path untouched
+/// - flag OFF + mock model -> `false`, falls through to 400 `unroutable_model`
+fn bench_mock_active(flag: bool, model: &str) -> bool {
+    flag && is_bench_mock_model(model)
+}
+
 /// A7: retry the same-provider dispatch once on transient failure with a
 /// 100ms backoff. Within the FT-01 200ms total budget. The original error
 /// is preserved if the retry also fails.
@@ -3223,7 +3338,7 @@ mod tests {
         Arc::new(crate::guardrail::GuardrailEngine::new(
             chain,
             None,
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             Arc::new(crate::guardrail::CapabilityRegistry::new()),
         ))
     }
@@ -3713,6 +3828,246 @@ mod tests {
         assert!(!is_bench_mock_model("claude-sonnet-4-6"));
         assert!(!is_bench_mock_model("gpt-5"));
         assert!(!is_bench_mock_model("mock-instant")); // un-prefixed ≠ reserved
+    }
+
+    #[test]
+    fn bench_mock_gate_all_four_quadrants() {
+        // Gate half #1 (env flag) x half #2 (reserved prefix). Only ON+reserved
+        // opens the bypass; the other three MUST fail closed, because the
+        // bypass skips BOTH routing and BYOK resolution.
+        assert!(
+            bench_mock_active(true, "__bench_mock_instant"),
+            "ON + reserved must bypass"
+        );
+        assert!(
+            !bench_mock_active(true, "claude-sonnet-4-6"),
+            "ON + real model must take the normal path"
+        );
+        assert!(
+            !bench_mock_active(false, "__bench_mock_instant"),
+            "OFF + reserved must fall through to unroutable_model"
+        );
+        assert!(
+            !bench_mock_active(false, "claude-sonnet-4-6"),
+            "OFF + real model must take the normal path"
+        );
+    }
+
+    #[test]
+    fn bench_mock_gate_is_expressed_exactly_once() {
+        // Verifier finding (a): the dispatch site used to re-derive
+        // `state.bench_mock_upstream && is_bench_mock_model(&model)` inline
+        // instead of consuming the unified `bench_mock`. Both agreed at the
+        // time, so nothing was broken — but extending `bench_mock_active`
+        // (an allowlisted tenant, a renamed env var) would have moved the
+        // routing/BYOK bypass without moving the dispatch decision, splitting
+        // one gate into two that disagree.
+        //
+        // The gate must exist in exactly ONE place: `bench_mock_active`.
+        // Scan only the NON-TEST portion: `include_str!` pulls in this test's
+        // own source, so the literal below would count itself (a self-match —
+        // the same reason `pre-public-push.sh` excludes its own file).
+        let full = include_str!("server.rs");
+        // NB: the first `#[cfg(test)]` is at ~:1784, but `bench_mock_active` is
+        // defined AFTER it — so the truncated slice is valid for counting the
+        // inline gate (which lives at ~:1164) but NOT for counting the
+        // definition. Count each against the range that actually contains it.
+        let non_test = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
+        let needle = concat!("state.", "bench_mock_upstream &&");
+        let inline = non_test.matches(needle).count();
+        assert_eq!(
+            inline, 0,
+            "the bench gate is re-derived inline {inline}x — consume the unified \
+             `bench_mock` binding instead, or the two decisions can drift apart"
+        );
+        // ...and `bench_mock_active` is the single definition of it.
+        // Split literal, same self-match reason as `needle` above. NOTE: do not
+        // write the un-split form anywhere in this file, comments included —
+        // this assertion counts source text, so even a comment mentioning it
+        // trips the check. (It did, twice, while this test was written.) The
+        // durable form of this guard is a CI script scanning from OUTSIDE the
+        // file; tracked rather than built, to keep this PR to its four
+        // constraints.
+        let def = concat!("fn ", "bench", "_mock_active(");
+        assert_eq!(
+            full.matches(def).count(),
+            1,
+            "bench_mock_active must have exactly one definition"
+        );
+    }
+
+    /// Mirrors the THIRD condition (`bench_mock && entitlements.is_none()`) so
+    /// production site this models is the ENTITLEMENT-SELECTION branch, not the
+    /// tier branch — the tier is now derived from the grant via
+    /// `rate_limit_tier()`. `bench_grant_branch_matches_production_shape`
+    /// asserts the modelled condition still matches production verbatim.
+    fn bench_tier_for(bench_mock: bool, has_entitlement_cache: bool) -> RateLimitTier {
+        if bench_mock && !has_entitlement_cache {
+            RateLimitTier::Bench
+        } else {
+            RateLimitTier::Free
+        }
+    }
+
+    #[test]
+    fn bench_grant_is_the_single_site_and_drives_every_limiter() {
+        use crate::entitlement_cache::ResolvedEntitlements as RE;
+        let g = RE::bench_unlimited();
+
+        // MECHANISM, not outcome. Assert each enforcement point SHORT-CIRCUITS
+        // off this one grant — not that N requests happen to pass. Outcome tests
+        // were vacuous twice here: 100k requests pass a 4.29e9-token bucket, and
+        // the first 10k pass a 10k quota.
+        assert_eq!(
+            g.rate_limit_tier(),
+            RateLimitTier::Bench,
+            "grant does not confer the Bench tier — the rate limiter will throttle"
+        );
+        assert_eq!(
+            g.quota_config().trace_quota_monthly,
+            0,
+            "grant does not carry the unlimited-quota sentinel (0) — QuotaTracker::check \
+             will NOT early-return and the monthly cap will 429 after 10k"
+        );
+        // The reserved key cannot confer a commercial tier if it ever leaked.
+        assert_eq!(
+            RateLimitTier::from_plan_tier_str("__bench"),
+            RateLimitTier::Free
+        );
+        assert!(g.is_bench());
+
+        // A REAL grant must do none of this.
+        let real = RE::deny_all();
+        assert!(!real.is_bench());
+        assert_eq!(real.rate_limit_tier(), RateLimitTier::Free);
+        assert_eq!(real.quota_config().trace_quota_monthly, 10_000);
+
+        // The hot path must construct the grant in exactly ONE place — the whole
+        let src = include_str!("server.rs");
+        let non_test = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        assert_eq!(
+            non_test
+                .matches(concat!("ResolvedEntitlements::", "bench_unlimited()"))
+                .count(),
+            1,
+            "the bench grant is constructed more than once in the hot path"
+        );
+    }
+
+    #[test]
+    fn bench_tier_is_unreachable_for_a_postgres_backed_tenant() {
+        // `Some` iff a Postgres control plane exists (server.rs:278), which is
+        // what makes a deployment HOSTED. So even with the env flag set AND the
+        // reserved model, a tenant that exists in Postgres cannot acquire the
+        // bench tier — the branch is structurally unreachable for it.
+        assert_eq!(
+            bench_tier_for(true, true),
+            RateLimitTier::Free,
+            "a Postgres-backed (hosted) tenant acquired the bench tier — the flag \
+             must not be sufficient; the absent entitlement cache is the structural gate"
+        );
+        // ...and it IS granted in the bench/self-host case (no cache).
+        assert_eq!(bench_tier_for(true, false), RateLimitTier::Bench);
+        // Neither half alone is enough.
+        assert_eq!(bench_tier_for(false, false), RateLimitTier::Free);
+        assert_eq!(bench_tier_for(false, true), RateLimitTier::Free);
+    }
+
+    #[test]
+    fn bench_grant_branch_matches_production_shape() {
+        // Guards the ENTITLEMENT-SELECTION branch — the one site that constructs
+        // selection; that decision now lives on the grant itself as
+        // `rate_limit_tier()`, so the label was corrected to match what it
+        // actually guards. Verifier finding: label drift.)
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains(concat!(
+                "if bench_mock && state.",
+                "entitlements.is_none() {"
+            )),
+            "the production bench-tier condition changed — update bench_tier_for to match"
+        );
+    }
+
+    #[test]
+    fn bench_flag_with_hosted_postgres_is_a_startup_refusal() {
+        // Verifier finding 1: the request-time `entitlements.is_none()` check is
+        // NOT a structural impossibility on a hosted node whose pool init failed
+        // (server.rs:244-258 warns and continues). The startup refusal below is
+        // what makes it one. Assert the guard exists verbatim — if it is removed,
+        // the "structurally unreachable" claim silently becomes false again.
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains(concat!(
+                "config.bench_mock_upstream\n",
+                "        && (std::env::var(\"POSTGRES_URL\")"
+            )),
+            "the startup refusal for bench-flag + hosted Postgres is gone — condition 3 \
+             is back to a request-time observation that a failed pool init can defeat"
+        );
+    }
+
+    #[test]
+    fn bench_tier_is_not_selectable_from_any_plan_string() {
+        // No Polar/plan string may yield Bench — it is not a commercial tier.
+        for p in [
+            "free",
+            "builder",
+            "team",
+            "business",
+            "enterprise",
+            "bench",
+            "Bench",
+            "free_v1",
+            "enterprise_v1",
+            "",
+            "unknown",
+        ] {
+            assert_ne!(
+                RateLimitTier::from_plan_tier_str(p),
+                RateLimitTier::Bench,
+                "plan string {p:?} selected the benchmark tier"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_mock_provider_id_is_not_routable() {
+        // The synthetic id must never collide with a real provider, or a mocked
+        // request could attribute cost or a BYOK lookup to one.
+        assert!(
+            crate::providers::ProviderRegistry::provider_id_for_model(BENCH_MOCK_PROVIDER_ID)
+                .is_none(),
+            "BENCH_MOCK_PROVIDER_ID collides with a routable provider"
+        );
+        assert!(BENCH_MOCK_PROVIDER_ID.starts_with("__bench_mock"));
+    }
+
+    #[test]
+    fn bench_mock_bypass_sits_after_auth_and_tenant_resolution() {
+        // reach the mock arm. This is a STRUCTURAL assertion on source order,
+        // not an HTTP-level proof — the crate has no handler test harness
+        // (no tower::ServiceExt/oneshot anywhere), so building one is its own
+        // change. It is still a test, not a comment: moving the bypass above
+        // auth or above tenant resolution fails it.
+        let src = include_str!("server.rs");
+        let auth = src
+            .find("// --- Step 1: Auth ---")
+            .expect("auth step marker");
+        let tenant = src
+            .find("let tenant_id = &claims.tenant_id")
+            .expect("tenant binding");
+        let gate = src
+            .find("let bench_mock = bench_mock_active(")
+            .expect("bench-mock gate");
+        assert!(
+            gate > auth,
+            "bench-mock gate moved ABOVE Step 1 auth — unauthenticated requests could reach the mock"
+        );
+        assert!(
+            gate > tenant,
+            "bench-mock gate moved ABOVE tenant resolution — the mock would run without a resolved tenant"
+        );
     }
 
     #[test]

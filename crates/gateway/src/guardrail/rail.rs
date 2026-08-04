@@ -58,7 +58,7 @@ impl GuardrailFeature {
 /// from `workspace_entitlements` once per request (P0.6) and passed to the
 /// dispatcher so per-rail gating is a synchronous lookup. A rail whose
 /// `feature()` is `None` is always allowed (free default).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RailGate {
     granted: u8,
 }
@@ -144,7 +144,8 @@ impl RailGate {
 
     /// Resolve the gate for a tenant from the entitlement cache (§2.7). Warm
     /// reads never hit Postgres. A `None` cache (OSS self-host / dev with no
-    /// Postgres) grants every gated rail — self-host gets full enforcement.
+    /// Postgres) resolves to the FREE tier: the five ungated rails still run
+    /// (they never consult this gate), and the four paid rails require a
     pub async fn resolve(
         cache: Option<&crate::entitlement_cache::EntitlementCache>,
         tenant: uuid::Uuid,
@@ -154,7 +155,26 @@ impl RailGate {
                 let resolved = c.resolved(tenant).await;
                 Self::from_resolved(&resolved)
             }
-            None => Self::all(),
+            //
+            // This previously returned `Self::all()`, granting every gated rail
+            // when no control plane exists — so an OSS self-host received the
+            // Team-tier rails (R2 PII, R5 format, R6 sysprompt-leak, R7 topic)
+            // and ran MORE guardrails than a paying Builder customer. That is
+            // the exact inversion `.claude/rules/tenancy.md` forbids: a no-cache
+            // path that GRANTS instead of denying produces no error, no alert
+            // and no complaint, so nothing ever looked wrong.
+            //
+            // `free_defaults_only()` is now precisely the right answer and needs
+            // no OSS-specific grant path: the five free rails (R1 cost,
+            // R3 schema, R3 pinning, R4 trifecta, R8 injection) are UNGATED —
+            // they return `None` from `Rail::feature()` and never consult this
+            // gate at all — so an empty gate still runs every one of them. The
+            // four paid rails (R2, R5, R6, R7) require a real control-plane
+            // grant, here as everywhere else.
+            //
+            // Building a separate "OSS rail set" here would reintroduce the
+            // second grant path this fix removes. Do not.
+            None => Self::free_defaults_only(),
         }
     }
 }
@@ -188,6 +208,65 @@ pub trait Rail: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //
+    // MECHANISM assertions. The bug these replace was invisible precisely
+    // because outcomes looked fine: every rail ran, nothing errored, nobody was
+    // billed wrongly. So assert the GATE STATE, not that requests succeed.
+
+    #[tokio::test]
+    async fn no_cache_resolves_to_free_tier_never_all() {
+        let gate = RailGate::resolve(None, uuid::Uuid::from_u128(1)).await;
+
+        // Every PAID rail must be denied without a control plane.
+        for paid in [
+            GuardrailFeature::R2SecretsPii,
+            GuardrailFeature::R5Format,
+            GuardrailFeature::R6SysPromptLeak,
+            GuardrailFeature::R7TopicCompetitor,
+        ] {
+            assert!(
+                !gate.allows(paid),
+                "no-cache granted paid rail {paid:?} — the no-cache inversion is back"
+            );
+            assert!(!gate.enables(Some(paid)));
+        }
+
+        // And it is exactly the free gate — not "all minus a few".
+        assert_eq!(
+            gate,
+            RailGate::free_defaults_only(),
+            "no-cache must be the free gate exactly"
+        );
+    }
+
+    /// The five free rails do not consult the gate at all, so an empty gate
+    /// still runs them. This is what makes a separate OSS grant path
+    /// unnecessary — and it is the half that would break if someone "fixed"
+    /// the inversion by gating the free five instead.
+    #[test]
+    fn free_five_run_under_an_empty_gate() {
+        let gate = RailGate::free_defaults_only();
+        assert!(
+            gate.enables(None),
+            "an ungated rail must run with zero grants"
+        );
+    }
+
+    /// The founder ruling of 2026-08-04, pinned: agent-safety + basic
+    /// correctness are FREE. If someone re-gates either rail, this fails.
+    #[test]
+    fn agent_safety_rails_are_ungated() {
+        use crate::guardrail::rails::{r3_tool_safety::R3Pinning, r4_trifecta::R4Trifecta};
+        assert!(
+            Rail::feature(&R3Pinning).is_none(),
+            "R3 tool-definition pinning (MCP rug-pull) must stay FREE"
+        );
+        assert!(
+            Rail::feature(&R4Trifecta::default()).is_none(),
+            "R4 lethal-trifecta must stay FREE"
+        );
+    }
 
     #[test]
     fn free_default_rail_always_enabled() {

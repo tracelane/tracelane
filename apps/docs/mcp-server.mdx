@@ -10,6 +10,21 @@ live access to your production traces during debugging.
 **Read-only by design.** The server can never modify traces, change configuration,
 or access another tenant's data.
 
+<Warning>
+**Not published to npm yet.** `@tracelanedev/mcp` is not on the registry today,
+so `npx @tracelanedev/mcp` returns a 404. Until it ships, run it from a clone —
+see the commands directly below. The `npx` forms further down are what to use
+once the package is published.
+</Warning>
+
+Run from a clone until the npm package ships:
+
+```bash
+git clone https://github.com/tracelane/tracelane && cd tracelane
+pnpm install && pnpm --filter @tracelanedev/mcp build
+node apps/mcp/dist/index.js
+```
+
 ## Install
 
 ```bash

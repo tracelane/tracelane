@@ -54,7 +54,39 @@ At launch a workspace is single-user — one login per workspace. Team collabora
 </Accordion>
 
 <Accordion title="What inline guardrails run on every request?">
-A layer of heuristic guardrails runs inline at the gateway on every request — MCP rug-pull detection, lethal-trifecta taint tracking, prompt-injection patterns, browser stuck-loop, A2A/A2UI validation, argument drift, and tool-schema checks — each can flag or halt the request at the gateway, inline, per the configured policy. A multi-model ML ensemble (Llama Prompt Guard 2 ONNX + a fine-tuned classifier) is on the roadmap to augment the heuristic layer.
+Heuristic guardrails run inline at the gateway on every request. **Every
+agent-safety rail is free** — on the hosted free tier and in an Apache-2.0
+self-host alike:
+
+| Free on every deployment | What it catches |
+| --- | --- |
+| MCP rug-pull detection *(needs pinning — see below)* | a tool whose definition changes after you approved it |
+| Lethal-trifecta taint tracking | untrusted input reaching a tool that can exfiltrate |
+| Prompt-injection patterns | injection in prompts, tool descriptions and results |
+| Tool-schema validation | malformed or unexpected tool calls |
+| Cost ceiling | a request that would exceed the configured spend limit |
+
+Team and above add the data-governance and quality rails: secrets/PII detection
+and redaction, output-format policy, system-prompt-leak detection, and
+topic/competitor policy.
+
+**One honest caveat on rug-pull detection:** it compares a tool definition
+against the one you pinned, and there is **no customer-facing way to pin one
+yet** — the capability registry is read-only from the gateway's side today. The
+rail is free and runs on every request, but until the pinning write path ships
+it has nothing to compare against for a self-serve tenant. Tracked; not
+something you should plan around this quarter.
+
+Each rail can flag or halt the request at the gateway, inline, per the
+configured policy — detection is observe-first by default, because a
+false-positive block is worse than the failure it prevents.
+
+A multi-model ML ensemble (Llama Prompt Guard 2 ONNX + a fine-tuned classifier)
+is on the roadmap to augment the heuristic layer. Browser stuck-loop prediction,
+A2A/A2UI catalog conformance and argument-drift detection are also roadmap: the
+detectors exist, but they gate on payload fields (`mcp_server_name`,
+`tool_name`, `protocol`) that a `/v1/chat/completions` request does not carry, so
+they do not fire on LLM traffic today.
 </Accordion>
 
 <Accordion title="How does Tracelane compare to LangSmith Engine (launched May 13, 2026)?">
@@ -86,3 +118,4 @@ Hetzner does not sign Business Associate Agreements. Our HIPAA-eligible deployme
 ---
 
 Prices billed via [Polar.sh](https://polar.sh) (Merchant of Record). Early Member rate locked before May 27, 2026. EU VAT, US sales tax, and India GST handled by Polar.sh.
+

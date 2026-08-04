@@ -362,7 +362,34 @@ jobs:
 
       - name: Tenant Isolation (ClickHouse SQL guard)
         if: ${{ !cancelled() }}
-        run: python3 scripts/ci/check-tenant-isolation.py
+        # --selftest FIRST: it plants violations (incl. an unscoped query beside
+        # a scoped one in the same file — the case the pre-2026-08-03 whole-file
+        # guard could not catch) and asserts the guard reports them. A guard that
+        # has never been observed blocking is not a guard, so the falsification
+        # runs on every CI run, not once at authoring time. Same step = no extra
+        # billable job-minute.
+        run: |
+          python3 scripts/ci/check-tenant-isolation.py --selftest
+          python3 scripts/ci/check-tenant-isolation.py
+
+      - name: pre-public-push guard parity
+        if: ${{ !cancelled() }}
+        # implementations; patching one does nothing to what ships. Selftest
+        # first (both halves), then the real parity check. Existing job — no
+        # extra billable job-minute.
+        run: |
+          python3 scripts/ci/check-guard-parity.py --selftest
+          python3 scripts/ci/check-guard-parity.py
+
+      - name: Benchmark 2xx-gate selftest
+        if: ${{ !cancelled() }}
+        # Both halves. The previous gate was only tested for BLOCKING a bad run
+        # and shipped unable to PASS a good one (it read metrics[n].count where
+        # every k6 version puts metrics[n].values.count), so it refused valid
+        # runs too — a wall, not a gate. The PASS half is the half that catches
+        # that. Runs against real captured k6 payloads in bench/gateway/testdata.
+        # Added to an existing job: no extra billable job-minute.
+        run: node bench/gateway/summary-gate.selftest.mjs
 
       - name: org_id→tenant-UUID provenance guard
         if: ${{ !cancelled() }}

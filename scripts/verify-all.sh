@@ -79,7 +79,28 @@ fi
 run "no-auth-stub guard"           bash scripts/ci/no-auth-stub.sh
 run "no-raw-ch-query guard"        bash scripts/ci/no-raw-ch-query.sh
 run "no-llm-in-recovery guard"     bash scripts/ci/no-llm-in-recovery.sh
+if [[ -f scripts/hooks/protect-uncommitted-from-git-restore.sh ]]; then
+    run "git-restore guard selftest" bash scripts/hooks/protect-uncommitted-from-git-restore.sh --selftest
+fi
+if [[ -f scripts/hooks/protect-ponytail-markers.sh ]]; then
+    run "ponytail guard selftest"    bash scripts/hooks/protect-ponytail-markers.sh --selftest
+fi
+if [[ -f scripts/ci/check-guard-parity.py ]] && command -v python3 >/dev/null 2>&1; then
+    # it must PASS when they agree and BLOCK when either drifts.
+    run "guard-parity selftest" python3 scripts/ci/check-guard-parity.py --selftest
+    run "guard-parity"          python3 scripts/ci/check-guard-parity.py
+fi
+if [[ -f bench/gateway/summary-gate.selftest.mjs ]] && command -v node >/dev/null 2>&1; then
+    # The benchmark 2xx gate. Its predecessor was only ever tested for BLOCKING,
+    # and shipped unable to PASS any run at all — it read metrics[n].count where
+    # k6 puts metrics[n].values.count, on every k6 version. This selftest runs
+    # both halves against real captured k6 payloads.
+    run "bench 2xx-gate selftest" node bench/gateway/summary-gate.selftest.mjs
+fi
 if [[ -f scripts/ci/check-tenant-isolation.py ]] && command -v python3 >/dev/null 2>&1; then
+    # Selftest first — it plants violations and asserts the guard reports them.
+    # A guard nobody has watched fail is assumed decorative.
+    run "tenant-isolation selftest" python3 scripts/ci/check-tenant-isolation.py --selftest
     run "tenant-isolation guard"   python3 scripts/ci/check-tenant-isolation.py
 fi
 # to the marketing site as "35+ providers"). Hand-maintained, they rot silently —

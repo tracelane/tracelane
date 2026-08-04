@@ -56,7 +56,7 @@ export const metadata: Metadata = {
 		template: "%s — Tracelane",
 	},
 	description:
-		"Predictive reliability platform for AI agents. Full-fidelity traces, provider failover, and inline guardrails.",
+		"The flight recorder for AI agents. Full-fidelity traces, a tamper-evident audit ledger you can verify offline, and inline heuristic guardrails.",
 	// Official Chisel brand assets (public/brand). The favicon swaps by browser
 	// scheme (light asset = dark mark for light chrome, and vice-versa); the
 	// apple-touch icon is the self-contained rounded-square app icon.

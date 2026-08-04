@@ -12,8 +12,8 @@ evals are red on `main`.
 
 ```
 evals/
-├── pain-points/       # 50 pain-point assertions (PP-G1 to PP-PR12)
-├── fault-tolerance/   # 8 chaos-style fault tolerance evals (FT-01 to FT-08)
+├── pain-points/       # 69 pain-point assertions (PP-G1 to PP-PR12)
+├── fault-tolerance/   # 10 chaos-style fault tolerance evals (FT-01 to FT-10)
 ├── gateway-correctness/  # Provider translation correctness across 30+ providers
 ├── ingest-schema/     # Schema evolution backwards compatibility
 ├── pii-redaction/     # PII recall tests (100% recall on synthetic patterns)
@@ -26,10 +26,14 @@ evals/
 ## Running evals
 
 ```bash
-pnpm eval:run --suite=all          # Full suite (merge gate)
-pnpm eval:run --suite=pain-points  # Pain-point evals only
+# Suites the runner accepts (anything else exits 2 — evals/src/runner.ts):
+#   all · pain-points · fault-tolerance · gateway-correctness
+#   ingest-schema · pii-redaction · prompt-injection
+pnpm eval:run --suite=all              # Full suite (merge gate)
+pnpm eval:run --suite=pain-points      # Pain-point evals only
 pnpm eval:run --suite=fault-tolerance  # Chaos evals only
-pnpm eval:run --filter=PP-G3       # Single eval by ID
+# NOTE: there is no --filter flag. To run one eval, use vitest directly:
+#   pnpm vitest run evals/pain-points/PP-G3.eval.ts
 ```
 
 ## Eval status legend

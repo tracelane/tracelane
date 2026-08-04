@@ -7,11 +7,14 @@ Tracelane is a Rust gateway and ClickHouse-backed observability tier that
 captures every LLM and tool call at full fidelity, with a tamper-evident audit
 ledger that makes each run provable. Its sharpest edge is **MCP and agent-tool
 safety**: it surfaces tool-definition-drift, rug-pull substitution, and
-hallucinated tool-call arguments as first-class signals and records each with a
-tamper-evident signature. Heuristic checks for the lethal trifecta, prompt
-injection, A2A/A2UI drift, browser stuck-loops, and argument drift observe
-alongside; gateway-level enforcement is opt-in (observe-first by default), and
-an ML ensemble is on the roadmap.
+hallucinated tool-call arguments as first-class signals (drift/rug-pull compare
+against a pinned definition; the customer-facing pinning write path is roadmap) and records each with a
+tamper-evident signature. Heuristic checks for the lethal trifecta and prompt
+injection observe alongside, on every request and on every tier. A2A/A2UI drift,
+browser stuck-loops and argument drift are **roadmap**: those detectors gate on
+payload fields a `/v1/chat/completions` request does not carry, so they do not
+fire on LLM traffic today. Gateway-level enforcement is opt-in (observe-first by
+default), and an ML ensemble is on the roadmap.
 
 You point traffic at us, get low-overhead gateway routing, full-fidelity
 trace capture, tamper-evident audit logs, and merge-gate evals. Premium

@@ -38,7 +38,7 @@ if [ ${#DOCS[@]} -gt 0 ]; then
   scan "unlimited-seats-every"    'unlimited seats every'                               "${DOCS[@]}"
   scan "block/stop/prevent-fail"  'block failures|blocks failures|stop failures|prevent failures' "${DOCS[@]}"
   scan "before-they-execute"      'before they execute|before they happen'             "${DOCS[@]}"
-  scan "unverified-perf"          'sub-50ms|sub-millisecond|5K RPS|5,000 RPS|<10ms p99' "${DOCS[@]}"
+  scan "unverified-perf"          'sub-50ms|sub-millisecond|sub-10ms|under 10 ?ms|5K RPS|5,000 RPS|<10ms p99' "${DOCS[@]}"
   scan "tamper-proof"             'tamper-proof'                                         "${DOCS[@]}"
   scan "100-percent"              '100% reliable|100% accurate|100% safe|100% prevention' "${DOCS[@]}"
   scan "old-B1-wedge"             'Prompt Promotion \+ Eval Gates \+ Auto-Rollback'     "${DOCS[@]}"

@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/build/target,sharing=locked \
 FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:57e5704e70a85b90191182eb6110d1c817df0d8e96035cb041195c5a351f0861 AS runtime
 
 LABEL org.opencontainers.image.title="Tracelane Gateway" \
-      org.opencontainers.image.description="Predictive reliability gateway for AI agents" \
+      org.opencontainers.image.description="The flight recorder for AI agents — Rust gateway" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/tracelane/tracelane"
 

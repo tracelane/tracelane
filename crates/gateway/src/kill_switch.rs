@@ -106,20 +106,19 @@ impl KillSwitch {
     fn spawn_refresh(&self, api_key: String, host: String) {
         let flags = self.flags.clone();
         tokio::spawn(async move {
-            // Operator-configured host (not customer-supplied) → a plain client
-            // with a tight timeout is appropriate; SSRF guard is for
-            // customer-supplied URLs (security.md).
-            let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "kill-switch: client build failed; defaults only");
-                    return;
-                }
+            // `POSTHOG_HOST` is operator-supplied, and `ssrf_guard`'s module
+            // contract requires `validate_url` before ANY outbound request to
+            // an operator- OR customer-supplied URL. The previous "operator
+            // hosts are exempt" reasoning was the bypass: an env var is not a
+            // trust boundary, and this task loops forever, so one bad host is
+            // an indefinite SSRF beacon against the node's own network.
+            //
+            // ONE call builds the client AND clears the gate, so the gate
+            // cannot be dropped from this call site without a test noticing
+            // (a guard whose INVOCATION is untested is not a guard).
+            let Some((client, url)) = refresh_target(&host).await else {
+                return;
             };
-            let url = format!("{}/decide/?v=3", host.trim_end_matches('/'));
             loop {
                 match fetch_flags(&client, &url, &api_key).await {
                     Ok(snapshot) => flags.store(Arc::new(snapshot)),
@@ -131,6 +130,47 @@ impl KillSwitch {
             }
         });
     }
+}
+
+/// Build the PostHog `/decide` URL from an operator-supplied host.
+fn decide_url(host: &str) -> String {
+    format!("{}/decide/?v=3", host.trim_end_matches('/'))
+}
+
+/// Build the refresh client and clear the SSRF gate, or refuse.
+///
+/// Factored out of [`KillSwitch::spawn_refresh`] so it is unit-testable
+/// without spawning a task or hitting the network — the same pattern as
+/// `validate_slack_webhook` in `server.rs`. Client construction and the SSRF
+/// gate are deliberately in ONE function so that a test of this function
+/// covers the gate's INVOCATION, not merely its logic.
+///
+/// Returns `None` (and logs at `error`) when the URL is rejected. The caller
+/// MUST NOT start the refresh loop on `None`: every `kill.*` flag then serves
+/// its documented safe default, which is exactly the no-PostHog behaviour of
+/// [`KillSwitch::disabled`]. Fail-safe, not fail-open.
+async fn refresh_target(host: &str) -> Option<(reqwest::Client, String)> {
+    let client = match crate::ssrf_guard::safe_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "kill-switch: client build failed; defaults only");
+            return None;
+        }
+    };
+
+    let url = decide_url(host);
+    if let Err(e) = crate::ssrf_guard::validate_url(&url).await {
+        tracing::error!(
+            error = %e,
+            "kill-switch: POSTHOG_HOST rejected by the SSRF guard — refresh task NOT started; \
+             all kill.* flags serve safe defaults. Fix POSTHOG_HOST."
+        );
+        return None;
+    }
+    Some((client, url))
 }
 
 /// POST PostHog `/decide` and parse `featureFlags` into a bool map. A flag whose
@@ -165,6 +205,54 @@ async fn fetch_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // SSRF regression (PART-1 #1): `spawn_refresh` used to build a bare
+    // `reqwest::Client::builder()` and never call `validate_url`, on the
+    // reasoning that POSTHOG_HOST is "operator-supplied". An env var is not
+    // a trust boundary, and this task loops forever — one bad host is an
+    // indefinite SSRF beacon. These tests fail if the gate is removed.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn decide_url_trims_trailing_slash() {
+        assert_eq!(
+            decide_url("https://eu.i.posthog.com"),
+            "https://eu.i.posthog.com/decide/?v=3"
+        );
+        assert_eq!(
+            decide_url("https://eu.i.posthog.com/"),
+            "https://eu.i.posthog.com/decide/?v=3"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_target_rejects_cloud_metadata() {
+        // 169.254.169.254 — AWS/GCP IMDS. The canonical SSRF target.
+        assert!(refresh_target("http://169.254.169.254").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_target_rejects_rfc1918() {
+        assert!(refresh_target("http://10.0.0.5").await.is_none());
+        assert!(refresh_target("http://192.168.1.1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_target_rejects_non_http_scheme() {
+        assert!(refresh_target("file:///etc/passwd").await.is_none());
+        assert!(refresh_target("gopher://169.254.169.254").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_target_allows_public_address() {
+        // Public IP literal — no DNS needed, so this is hermetic. Proves the
+        // gate is discriminating rather than refusing everything (without
+        // which every assertion above would pass vacuously).
+        let t = refresh_target("https://8.8.8.8").await;
+        assert!(t.is_some());
+        assert_eq!(t.unwrap().1, "https://8.8.8.8/decide/?v=3");
+    }
 
     #[test]
     fn unconfigured_serves_safe_defaults() {

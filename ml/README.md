@@ -6,17 +6,21 @@ Tracelane's ML pipeline for the predictive guardrail layer.
 
 ### trajectory_guard/
 
-Siamese recurrent autoencoder (arXiv 2601.00516) for trajectory-level
-anomaly detection. Trained on 50K trace pairs (normal vs. failure modes).
-Exported to ONNX for inference in the Rust gateway (<30ms p99, Week 8).
+**STATUS: NOT TRAINED, NOT SHIPPED — this directory is a training pipeline, not a model.**
+No `.onnx` weights are tracked in this repository and the gateway loads none.
+
+*Design* (unbuilt): a Siamese recurrent autoencoder (arXiv 2601.00516) for
+trajectory-level anomaly detection, to be trained on trace pairs (normal vs.
+failure modes) and exported to ONNX for inference in the Rust gateway. The
+corresponding gateway predictors are fail-open stubs today.
 
 **AFT:** AFT-TRAJ-ANOMALY-001
 
 ### slm_judge/
 
-Distilled 1B encoder judge. Distilled from Llama-Guard 8B + NemoGuard 8B.
-Evaluates: flow adherence, tool-selection sanity, hallucination grounding.
-Target: <50ms p99, ≥1K req/sec on single L4 GPU. Deployed on Modal/RunPod.
+**STATUS: NOT TRAINED, NOT DEPLOYED.** *Design* (unbuilt): a distilled 1B
+encoder judge intended to evaluate flow adherence, tool-selection sanity and
+hallucination grounding. Nothing is distilled, deployed, or serving today.
 
 **Eval:** PP-PR10
 

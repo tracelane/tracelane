@@ -10,7 +10,7 @@ export default function manifest(): MetadataRoute.Manifest {
 		name: "Tracelane",
 		short_name: "Tracelane",
 		description:
-			"Predictive reliability platform for AI agents. Full-fidelity traces, provider failover, and inline guardrails.",
+			"The flight recorder for AI agents. Full-fidelity traces, a tamper-evident audit ledger you can verify offline, and inline heuristic guardrails.",
 		start_url: "/",
 		display: "standalone",
 		background_color: "#f4f6fa",

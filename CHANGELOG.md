@@ -12,6 +12,58 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed — BREAKING for self-host
+
+**Guardrail rails are now split into a free set and a paid set, and a gateway
+with no control plane resolves to the FREE set instead of granting everything.**
+
+Free on every deployment — OSS self-host and every hosted tier, including free:
+
+| rail | what it does |
+|---|---|
+| `R1_cost` | request cost ceiling |
+| `R3_schema` | tool-call schema validation |
+| `R3_pinning` | **MCP tool-definition drift / rug-pull detection** |
+| `R4_trifecta` | **lethal-trifecta taint tracking** |
+| `R8_injection` | prompt-injection patterns |
+
+Gated behind a control-plane entitlement (`f_guardrail_*`):
+`R2_secrets_pii` · `R5_format` · `R6_sysprompt_leak` · `R7_topic_competitor`.
+
+The dividing line: **agent-safety and basic correctness are free; product,
+quality and data-governance rails are paid.** `R3_pinning` and `R4_trifecta`
+moved from paid to free in this release — a flagship agent-safety capability
+that a free tier never sees is not a capability anyone can evaluate, and
+`R8_injection` was already free, so gating the same attack family on the other
+side of the paywall was an incoherent line.
+
+**UPGRADE NOTE — self-host deployments lose four rails.** Before this release, a
+gateway started without a Postgres control plane granted *every* rail, so an OSS
+self-host ran the full set — more guardrails than a paying Builder-tier customer.
+That was a bug (an entitlement default that granted instead of denying), not a
+policy. After upgrading, a self-host install without a control plane runs the
+five free rails; `R2_secrets_pii`, `R5_format`, `R6_sysprompt_leak` and
+`R7_topic_competitor` stop running unless entitlements grant them. If you relied
+on any of those four, see below.
+
+**Open-core honesty — can a self-hoster still enable the paid four?** Yes, in one
+of the two self-host configurations, and we would rather say so than let you
+discover it:
+
+- **Single-tenant self-host** (`TRACELANE_SELF_HOST=1`, the `infra/self-host`
+  compose path) **cannot**: that mode refuses to start if a control-plane
+  Postgres is present at all, so it always resolves to the free five.
+- **Multi-tenant self-host** (leave `TRACELANE_SELF_HOST` unset and run your own
+  Postgres) **can**: the gate reads `plan_entitlements` / `workspace_entitlements`
+  from *your* database. There is no license key, no signature check and no
+  phone-home anywhere in the entitlement path — a single `UPDATE
+  plan_entitlements SET f_guardrail_r2 = true …` enables all four.
+
+So the gate binds **hosted** customers commercially, not self-hosters
+technically. Making it bind self-hosters would need a license boundary this
+project does not have and, per `LICENSE-PLEDGE.md`, will not add. Everything
+here is Apache 2.0; there is no separate enterprise tree.
+
 ## [0.2.3] - 2026-08-01
 
 **First release to ship signed artifacts.** 0.2.1 and 0.2.2 both published
@@ -60,14 +112,14 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
 ### Added
 
 - **Rust gateway** — OpenAI-, Anthropic-, and Google-shaped request proxying across
-  30+ providers (6 native adapters plus any OpenAI-compatible endpoint), with
+  30+ providers (7 native adapters plus any OpenAI-compatible endpoint), with
   provider failover, retry with jittered backoff, and per-`(provider, region)`
   circuit breakers. Low, bounded overhead on the hot path.
 - **BYOK key custody** — provider keys are envelope-encrypted at rest (`aws-lc-rs`
   AEAD), with AAD bound to `(tenant_id, provider_id)`. Keys never appear in logs,
   spans, or error bodies.
 - **Full-fidelity observability** — OTel GenAI + OpenInference semantic conventions
-  over ClickHouse, with a WebGL/transcript-spine trace viewer and Cmd+K navigation
+  over ClickHouse, with a transcript-spine trace viewer and Cmd+K navigation
   in the Next.js dashboard.
 - **Tamper-evident audit ledger** — per-tenant Merkle-batched hash chain with an
   offline, no-account verifier (`@tracelanedev/cli` `tlane verify --offline`) for EU AI

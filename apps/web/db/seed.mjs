@@ -49,6 +49,12 @@ const sql = neon(url);
 // then the six gated guardrail rails (ADR-064): r2, r3_pinning, r4, r5, r6, r7.
 //   Free/Builder = none · Team+ = ALL 6 gated rails (r2/r3_pinning/r4/r5/r6/r7)
 //   (ADR-064 amended 2026-07-14: r2/r4 moved down from Business to Team).]
+// EVERY plan, free_v1 included. Those two rails are now UNGATED in the gateway
+// (`Rail::feature()` returns None), so they run regardless of this column — the
+// column is kept only so the control plane cannot contradict the binary. The
+// agent-safety + basic-correctness rails (R1, R3_schema, R3_pinning,
+// R4_trifecta, R8) are free everywhere; the product/quality/data-governance
+// rails (R2 PII, R5 format, R6 sysprompt-leak, R7 topic) remain gated.
 const PLANS = [
 	[
 		"free_v1",
@@ -62,8 +68,8 @@ const PLANS = [
 		false,
 		false,
 		false,
-		false,
-		false,
+		true,
+		true,
 		false,
 		false,
 		false,
@@ -80,8 +86,8 @@ const PLANS = [
 		false,
 		false,
 		false,
-		false,
-		false,
+		true,
+		true,
 		false,
 		false,
 		false,

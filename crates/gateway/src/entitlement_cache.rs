@@ -222,6 +222,110 @@ impl ResolvedEntitlements {
         }
     }
 
+    ///
+    /// Resolved at the ENTITLEMENT LAYER — the single site every per-tenant
+    /// check reads from — instead of N bypasses at N enforcement points. Four
+    /// separate limiters rejected the benchmark in sequence (router 400,
+    /// free-tier rate limit 429, Bench-tier-ignored 429, monthly quota 429);
+    /// patching each one scatters bench logic across the hot path and is how a
+    /// bypass eventually leaks to a real tenant.
+    ///
+    /// The caller is responsible for the triple gate — see
+    /// `.claude/rules/tenancy.md`. This constructor is inert on its own: it
+    /// grants nothing unless something calls it, and the ONLY caller is the
+    /// bench branch in `chat_completions_handler`, which requires
+    /// `entitlements.is_none()` (no Postgres control plane) AND the reserved
+    /// `__bench_mock*` model AND the env flag — with a STARTUP REFUSAL making
+    /// the flag+Postgres combination impossible to boot.
+    ///
+    /// `plan_lookup_key` is deliberately `"__bench"`, not a real plan string:
+    /// `RateLimitTier::from_plan_tier_str` maps it to `Free`, so even if this
+    /// grant leaked into a tier lookup it could not confer a commercial tier.
+    /// The unlimited limits come from the explicit fields below, not the key.
+    #[must_use]
+    /// TEST ONLY — a cache granting the four PAID rails (R2 PII, R5 format,
+    /// R6 sysprompt-leak, R7 topic).
+    ///
+    /// cache granted every rail, so tests exercising a PAID rail could pass
+    /// `None` and still get it. That is exactly the bug. Tests that assert paid
+    /// behaviour must now GRANT it explicitly — which also means each such test
+    /// documents, at its call site, that the behaviour it checks is paid.
+    #[cfg(test)]
+    pub(crate) fn paid_rails_cache() -> std::sync::Arc<EntitlementCache> {
+        let grant: ResolveFn = std::sync::Arc::new(|_tenant| {
+            Box::pin(async {
+                let mut e = ResolvedEntitlements::deny_all();
+                e.f_guardrail_r2 = true;
+                e.f_guardrail_r5 = true;
+                e.f_guardrail_r6 = true;
+                e.f_guardrail_r7 = true;
+                Ok(e)
+            })
+        });
+        std::sync::Arc::new(EntitlementCache::new(grant))
+    }
+
+    pub fn bench_unlimited() -> Self {
+        Self {
+            plan_lookup_key: "__bench".to_string(),
+            // Predictive/paid features stay OFF: the benchmark measures the
+            // gateway's own overhead, not optional inference. Granting them
+            // would inflate the number and make it unrepresentative.
+            f_pr7_trajectory: false,
+            f_pr8_argdrift: false,
+            f_pr9_a2a_handoff: false,
+            f_pr10_inline_slm_judge: false,
+            f_pr11_slo_drift: false,
+            f_pr12_langgraph_branch: false,
+            f_cohort_baselines: false,
+            f_hipaa_gcp_addon: false,
+            f_audit_addon: false,
+            f_audit_selfverify: true,
+            f_prompt_promotion_write: false,
+            // Rails ON: the benchmark must measure the guardrail work a real
+            // RailGate did implicitly — now it is explicit and bench-scoped.
+            f_guardrail_r2: true,
+            f_guardrail_r3_pinning: true,
+            f_guardrail_r4: true,
+            f_guardrail_r5: true,
+            f_guardrail_r6: true,
+            f_guardrail_r7: true,
+            retention_days: 7,
+            f_full_capture: false,
+            f_alerts: false,
+            // The point of the grant: no rate-limit tier and no monthly quota
+            // can reject the run. `trace_quota_monthly: 0` is the documented
+            // "unlimited" sentinel — `QuotaTracker::check` early-returns Allow
+            // on 0 (rate_limiter.rs:312), so this short-circuits the quota the
+            // same way the tier short-circuits the limiter.
+            trace_quota_monthly: 0,
+            overage_hard_cap_multiplier_tenths: 10,
+        }
+    }
+
+    /// Is this the bench grant? Keyed on the reserved `plan_lookup_key`, which
+    /// no Polar plan can produce.
+    #[must_use]
+    pub fn is_bench(&self) -> bool {
+        self.plan_lookup_key == "__bench"
+    }
+
+    /// The rate-limit tier this grant confers.
+    ///
+    /// Lives HERE, on the grant, rather than as a branch in the hot path: the
+    /// tier is a property of the entitlement, so `chat_completions_handler` no
+    /// longer mentions bench when resolving limits at all. One auditable site.
+    #[must_use]
+    pub fn rate_limit_tier(&self) -> crate::rate_limiter::RateLimitTier {
+        if self.is_bench() {
+            crate::rate_limiter::RateLimitTier::Bench
+        } else {
+            crate::rate_limiter::RateLimitTier::from_plan_tier_str(
+                self.plan_lookup_key.trim_end_matches("_v1"),
+            )
+        }
+    }
+
     /// Project a single feature flag.
     pub fn has(&self, feature: FeatureKey) -> bool {
         match feature {

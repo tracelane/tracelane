@@ -18,6 +18,7 @@ import { check } from "k6";
 //   VUS         virtual users                   (default 50)
 //   DURATION    test duration                   (default 30s)
 import http from "k6/http";
+import { summaryGate } from "./summary-gate.mjs";
 
 const TARGET = __ENV.TARGET || "http://127.0.0.1:8080";
 const ENDPOINT = __ENV.ENDPOINT || "/v1/chat/completions";
@@ -33,14 +34,26 @@ const PAYLOAD =
 export const options = {
 	vus: Number(__ENV.VUS || 50),
 	duration: __ENV.DURATION || "30s",
-	// Thresholds are informational for standalone runs (k6 still exports the
-	// summary on breach). The CLAUDE.md hard budget for gateway overhead is
-	// p99 <25ms; PP-G7's eval asserts the tighter <10ms target separately.
+	// The CLAUDE.md hard budget for gateway overhead is p99 <25ms; PP-G7's eval
+	// asserts the tighter <10ms target separately.
+	//
+	// `abortOnFail` on the 2xx rate is deliberate and UNCONDITIONAL: a run whose
+	// requests are being rejected must stop, not finish and hand back numbers.
 	thresholds: {
 		http_req_duration: ["p(99)<25"],
-		http_req_failed: ["rate<0.001"],
+		http_req_failed: [{ threshold: "rate<0.001", abortOnFail: true }],
 	},
+	// p99 is not in k6's default trend stats — without this the summary export
+	// omits it entirely and a "p99" can only be invented.
+	summaryTrendStats: ["avg", "min", "med", "p(90)", "p(95)", "p(99)", "max"],
 };
+
+// The 2xx gate lives in ./summary-gate.mjs so it can be falsified by plain
+// `node` against real captured k6 payloads. See summary-gate.selftest.mjs —
+// the inline version this replaced could not pass ANY run.
+export function handleSummary(data) {
+	return summaryGate(data, __ENV.SUMMARY_EXPORT);
+}
 
 export default function () {
 	const res = http.post(`${TARGET}${ENDPOINT}`, PAYLOAD, {

@@ -217,7 +217,7 @@ impl GuardrailEngine {
         } = inputs;
 
         // Entitlement gate resolved off the warm cache (no Postgres on the hot
-        // path); None cache → all rails granted (OSS self-host).
+        // regardless; R2/R5/R6/R7 need a control-plane grant.
         let gate = RailGate::resolve(self.entitlements.as_deref(), *tenant_id.as_uuid()).await;
 
         // Per-workspace capability registry (loader if wired; else shared).
@@ -543,14 +543,19 @@ mod tests {
         assert!(eval.ledger_recorded);
     }
 
-    /// Entitlement gate end to end: a tenant WITHOUT the R4 grant gets R4
-    /// skipped — even a tainted-exfil request is allowed. Proves §2.7 gating on
-    /// the real engine path.
+    /// with **every gated feature denied** still gets trifecta protection.
+    ///
+    /// This test previously asserted the OPPOSITE — that R4 is skipped without a
+    /// grant — which was the paid-R4 policy. That policy was overturned: R8
+    /// prompt-injection was already free, so gating the same agent-attack family
+    /// behind the paywall was an incoherent line. Kept (not deleted) and
+    /// inverted, so the ruling is pinned by an executable assertion rather than
+    /// by prose.
     #[tokio::test]
-    async fn r4_disabled_without_entitlement_allows_even_tainted_exfil() {
+    async fn r4_runs_for_a_tenant_with_no_entitlements_at_all() {
         use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
 
-        // Resolver that denies every gated feature (R4 not granted).
+        // Resolver that denies EVERY gated feature. R4 must still run.
         let deny: crate::entitlement_cache::ResolveFn =
             Arc::new(|_tenant| Box::pin(async { Ok(ResolvedEntitlements::deny_all()) }));
         let entitlements = Arc::new(EntitlementCache::new(deny));
@@ -571,15 +576,11 @@ mod tests {
                 actor: "apikey:d",
             })
             .await;
+
+        // MECHANISM: R4 actually ran despite zero entitlements.
         assert!(
-            !eval.is_block(),
-            "R4 not entitled → skipped → tainted exfil allowed"
-        );
-        // R4 gated off → did NOT run. (R1, a free default, still runs and
-        // allows — records is non-empty, but no R4 record exists.)
-        assert!(
-            eval.outcome.records.iter().all(|r| r.rail != "R4_trifecta"),
-            "R4 gated off → must not run"
+            eval.outcome.records.iter().any(|r| r.rail == "R4_trifecta"),
+            "R4 is FREE — it must run with every gated feature denied"
         );
         assert!(eval.ledger_recorded);
     }
@@ -658,7 +659,12 @@ mod tests {
     #[tokio::test]
     async fn r2_secret_in_request_redacts_and_records() {
         let chain = Arc::new(AuditChain::new(100, None, None).expect("audit chain"));
-        let engine = GuardrailEngine::new(chain, None, None, enforcing_registry());
+        let engine = GuardrailEngine::new(
+            chain,
+            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
+            enforcing_registry(),
+        );
 
         let req = ChatRequest {
             model: "claude-sonnet-4-6".to_string(),
@@ -724,7 +730,7 @@ mod tests {
             }))],
             chain,
             None,
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             Arc::new(CapabilityRegistry::new()),
         );
 

@@ -43,7 +43,7 @@ Output: a printable "first-trace checklist" that mirrors the
 ### `tlane trace <traceId>`
 
 Fetch a trace by its OTLP `trace_id` and render it. The MCP server is the
-canonical read path; the CLI proxies through `npx @tracelanedev/mcp` so the same
+canonical read path; the CLI proxies through the MCP server (run from source until published) so the same
 auth + filtering rules apply.
 
 ```bash

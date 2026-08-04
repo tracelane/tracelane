@@ -769,9 +769,12 @@ impl MockProvider {
     }
 
     #[instrument(skip(self, _request, _api_key), fields(tenant_id = %tenant_id))]
+    // Borrows the request: taking it by value forced the caller to
+    // `.clone()`, so every benchmarked request paid for a ChatRequest copy that
+    // a real dispatch never makes — the harness would attribute that clone to
     pub async fn chat_mock(
         &self,
-        _request: ChatRequest,
+        _request: &ChatRequest,
         _api_key: &str,
         tenant_id: &TenantId,
     ) -> Result<ProviderStream> {

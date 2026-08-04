@@ -48,6 +48,12 @@ describe("PP-G7: Gateway overhead <10ms p99", () => {
 				});
 
 				// Hard budget from CLAUDE.md §Performance budgets
+				// passes --summary-export as a CLI FLAG, which k6 writes independently of
+				// this script's handleSummary gate — so THIS assertion is what stops a
+				// 429/401 run publishing a latency number through the evals path.
+				// (Matches PP-G3.eval.ts:54. Two runs already produced clean-looking
+				//  latency from ~100% non-2xx traffic.)
+				expect(k6.error_rate).toBeLessThan(0.001);
 				expect(k6.p99_latency_ms).toBeLessThan(10);
 			} finally {
 				gateway.stop();
@@ -68,6 +74,12 @@ describe("PP-G7: Gateway overhead <10ms p99", () => {
 					vus: 50,
 				});
 
+				// passes --summary-export as a CLI FLAG, which k6 writes independently of
+				// this script's handleSummary gate — so THIS assertion is what stops a
+				// 429/401 run publishing a latency number through the evals path.
+				// (Matches PP-G3.eval.ts:54. Two runs already produced clean-looking
+				//  latency from ~100% non-2xx traffic.)
+				expect(k6.error_rate).toBeLessThan(0.001);
 				expect(k6.p95_latency_ms).toBeLessThan(7);
 			} finally {
 				gateway.stop();
@@ -89,6 +101,12 @@ describe("PP-G7: Gateway overhead <10ms p99", () => {
 				});
 
 				// p50 target: <5ms per CLAUDE.md; using 3ms as the p50 overhead ceiling
+				// passes --summary-export as a CLI FLAG, which k6 writes independently of
+				// this script's handleSummary gate — so THIS assertion is what stops a
+				// 429/401 run publishing a latency number through the evals path.
+				// (Matches PP-G3.eval.ts:54. Two runs already produced clean-looking
+				//  latency from ~100% non-2xx traffic.)
+				expect(k6.error_rate).toBeLessThan(0.001);
 				expect(k6.p50_latency_ms).toBeLessThan(3);
 			} finally {
 				gateway.stop();

@@ -20,6 +20,7 @@ import { check } from "k6";
 //   VUS         pre-allocated VUs         (default 200)
 //   MAX_VUS     ceiling VUs               (default 2000)
 import http from "k6/http";
+import { summaryGate } from "./summary-gate.mjs";
 
 const TARGET = __ENV.TARGET || "http://127.0.0.1:8080";
 const ENDPOINT = __ENV.ENDPOINT || "/v1/chat/completions";
@@ -43,9 +44,10 @@ export const options = {
 			maxVUs: Number(__ENV.MAX_VUS || 2000),
 		},
 	},
+	summaryTrendStats: ["avg", "min", "med", "p(90)", "p(95)", "p(99)", "max"],
 	thresholds: {
 		http_req_duration: ["p(99)<25"],
-		http_req_failed: ["rate<0.001"],
+		http_req_failed: [{ threshold: "rate<0.001", abortOnFail: true }],
 	},
 };
 
@@ -57,4 +59,11 @@ export default function () {
 		},
 	});
 	check(res, { "status is 2xx": (r) => r.status >= 200 && r.status < 300 });
+}
+
+// Same unconditional 2xx gate as overhead-measurement.js. This script shipped
+// with NO gate, which is why its p99 result came back with an unvalidated
+// success rate and had to be logged as a question rather than a number.
+export function handleSummary(data) {
+	return summaryGate(data, __ENV.SUMMARY_EXPORT);
 }

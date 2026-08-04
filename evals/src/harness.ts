@@ -385,7 +385,10 @@ export async function runK6(opts: {
 			p50_latency_ms: dur["med"] ?? dur["p(50)"] ?? Number.NaN,
 			p95_latency_ms: dur["p(95)"] ?? Number.NaN,
 			p99_latency_ms: dur["p(99)"] ?? Number.NaN,
-			error_rate: failed?.["rate"] ?? 0,
+			// Fail CLOSED: a summary with no http_req_failed metric proves nothing
+			// about success, and defaulting to 0 would let PP-G7's `error_rate <
+			// 0.001` assertion pass on a run whose requests were all rejected.
+			error_rate: failed?.["rate"] ?? 1,
 			requests_completed: reqs["count"] ?? 0,
 			rps_sustained: reqs["rate"] ?? 0,
 		};

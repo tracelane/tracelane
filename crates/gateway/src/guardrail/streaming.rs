@@ -281,13 +281,14 @@ mod tests {
     use ulid::Ulid;
     use uuid::Uuid;
 
+    // None cache resolves to the free tier instead of granting everything.
     fn engine_with(rails: Vec<Box<dyn crate::guardrail::rail::Rail>>) -> Arc<GuardrailEngine> {
         let chain = Arc::new(AuditChain::new(100, None, None).expect("chain"));
         Arc::new(GuardrailEngine::with_rails(
             rails,
             chain,
             None,
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             Arc::new(CapabilityRegistry::new()),
         ))
     }
@@ -486,8 +487,13 @@ mod tests {
         use crate::guardrail::rails::r7_topic_competitor::R7Config;
         let chain = Arc::new(AuditChain::new(100, None, None).expect("chain"));
         let engine = Arc::new(
-            GuardrailEngine::new(chain, None, None, Arc::new(CapabilityRegistry::new()))
-                .with_r7_config(Arc::new(R7Config::new::<&str>(&[], &["Globex"]))),
+            GuardrailEngine::new(
+                chain,
+                None,
+                Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
+                Arc::new(CapabilityRegistry::new()),
+            )
+            .with_r7_config(Arc::new(R7Config::new::<&str>(&[], &["Globex"]))),
         );
         let mut guard = ResponseGuard::with_holdback(engine, inputs(Some("sys")), Vec::new(), 16);
         let (out, blocked) = drive(
