@@ -9,6 +9,7 @@ tools:
   - glob
   - grep
 isolation: worktree
+classification: INTERNAL
 ---
 
 # Incident Responder

@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Code of Conduct
 
 Tracelane adopts the Contributor Covenant Code of Conduct, version 2.1.

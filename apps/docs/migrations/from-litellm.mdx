@@ -1,47 +1,78 @@
 ---
 title: Migrating from LiteLLM
-description: Import your litellm_config.yaml into Tracelane with tlane import-litellm and keep existing litellm.completion callers working through the gateway.
+description: Translate your litellm_config.yaml with tlane import-litellm, and keep existing litellm.completion callers working by pointing them at the Tracelane gateway.
+classification: PUBLIC
 ---
 
 LiteLLM uses a YAML `model_list` to map logical model names to provider
-upstreams. Tracelane has a one-command import:
+upstreams. `tlane import-litellm` reads that file and prints the equivalent
+Tracelane routing stanza:
 
 ```bash
-tlane import-litellm litellm_config.yaml --output tracelane.yaml
-tlane import-litellm litellm_config.yaml --dry-run
+tlane import-litellm --config litellm_config.yaml --output tracelane.yaml
+tlane import-litellm --config litellm_config.yaml --dry-run
 ```
 
-The CLI preserves provider, model alias, and rate-limit metadata.
-Caller-side code that calls `litellm.completion(...)` keeps working
-through Tracelane's OpenAI-compatible `/v1/chat/completions`
-endpoint — no SDK swap needed.
+`--config` is the flag the command expects; a bare path argument is not read.
+
+Caller-side code that calls `litellm.completion(...)` keeps working once you set
+its `api_base` to Tracelane's OpenAI-compatible `/v1/chat/completions` endpoint —
+you keep the LiteLLM SDK, no swap needed.
+
+<Warning>
+**What the emitted file is, and is not.** `tracelane.yaml` is a translation aid
+you read, not a file the gateway loads: the gateway has **no config-file reader**
+— it is configured entirely from environment variables at process start. Use the
+output to see which providers, limits and failover values to carry across; then
+set them in the environment.
+
+The importer's built-in parser reads JSON-formatted config directly, and for YAML
+it currently handles only a flat `key: value` subset — a nested `model_list:`
+block is not yet parsed, and will emit an empty `providers:` list. Convert first
+(`yq -o=json litellm_config.yaml`) and check `providers:` is non-empty before you
+trust the output.
+</Warning>
 
 ## Mapping
 
-| LiteLLM key | Tracelane key |
+What the importer actually reads, and the key it emits
+(`packages/cli/src/commands/import-litellm.ts`):
+
+| LiteLLM key | Emitted as |
 |---|---|
-| `model_list[].model_name` | `models.<name>` |
-| `model_list[].litellm_params.model` | `models.<name>.upstream_model` |
-| `model_list[].litellm_params.api_base` | `models.<name>.base_url` (or env override) |
-| `model_list[].litellm_params.api_key` | env var; never inlined in YAML |
-| `router_settings.fallbacks` | `models.<name>.fallbacks[]` |
-| `router_settings.timeout` | `models.<name>.timeout_ms` |
-| `router_settings.num_retries` | (not 1:1 — handled by predictive layer) |
+| `model_list[].litellm_params.model` | `gateway.providers[].model`, and its prefix (`openai/`, `anthropic/`, `bedrock/`, …) selects `gateway.providers[].name` |
+| `model_list[].model_name` | fallback for `model` only when `litellm_params.model` is absent — the alias itself is not carried over |
+| `model_list[].litellm_params.api_base` | `gateway.providers[].api_base` |
+| `model_list[].litellm_params.rpm` / `.tpm` | `gateway.providers[].rpm_limit` / `.tpm_limit` |
+| `model_list[].litellm_params.api_key` | not translated — the CLI prints a note telling you to move keys to env vars |
+| `router_settings.routing_strategy` | `gateway.failover.strategy` |
+| `router_settings.num_retries` | `gateway.failover.max_retries` (default `3`) |
+| `router_settings.retry_after` | `gateway.failover.retry_delay_ms` (seconds × 1000) |
+| `general_settings.rate_limit_policy` | presence sets `gateway.rate_limit.requests_per_minute: 60` |
+| `litellm_settings.*_callback` containing `otel` | `gateway.telemetry.otlp_endpoint` |
 
-## Security uplift
+`router_settings.timeout` and `router_settings.fallbacks` are **not** read by the
+importer — carry those across by hand.
 
-LiteLLM has had a series of CVEs around `/config/update`-style admin
-endpoints and import-by-string of untrusted config. Tracelane:
+## What the gateway gives you structurally
 
-- Has no `/config/update` endpoint — config is reload-from-disk only
-- Never `eval`s or imports config strings as Python — the gateway is Rust, with
-  no interpreter on the request path at all
-- Scans every build for stray `.pth` files (a CI step that exits non-zero on any
-  hit)
+These are properties of Tracelane's own request path. We make no claim here about
+any other proxy's security history — check that against its own advisories.
 
-The first two are structural — there is no such endpoint and no interpreter to
-exploit. The `.pth` scan is a CI step; it reports on every push but is not yet
-wired as a blocking required status check.
+- **No endpoint that rewrites gateway config.** Model-to-provider routing is
+  compiled into the binary and fails closed on an unknown model (`400
+  unroutable_model`, no default upstream) — there is no config file to reload and
+  no endpoint that loads one. The `/v1/*` write routes that do exist (BYOK keys,
+  prompt versions, alert rules) are authenticated, tenant-scoped and ledgered;
+  none of them is global configuration.
+- **No interpreter on the request path.** The gateway is a single Rust binary; it
+  never `eval`s or imports config as code, because there is nothing to eval it
+  with.
+- **`.pth` supply-chain scan.** CI fails the step on any stray `.pth` file in the
+  tree (`.github/workflows/ci.yml`, `secret-scan` job).
+
+The first two are structural. The `.pth` scan is a CI step that exits non-zero on
+a hit; it is not yet wired as a blocking required status check.
 
 ## Related
 

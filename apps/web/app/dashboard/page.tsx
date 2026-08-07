@@ -111,13 +111,12 @@ function fmtCost(usd: number): string {
 const TILE_LINK_CLS =
 	"block rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
 
-/** Section divider label — reused for every bento group. */
+/** Section divider label — reused for every bento group. The eyebrow type
+ *  (10px/700/.12em) plus the trailing hairline rule, per visual-pass-01. */
 function SectionLabel({ children }: { children: string }) {
 	return (
 		<div className="mt-1 flex items-center gap-3">
-			<span className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-				{children}
-			</span>
+			<span className="t-eyebrow">{children}</span>
 			<span className="h-px flex-1 bg-line" />
 		</div>
 	);
@@ -366,9 +365,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			    page-level range control. Every value real; "—" when unreachable. */}
 			<div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
 				<div>
-					<h1 className="text-3xl font-semibold tracking-tight text-ink">
-						Welcome back
-					</h1>
+					<h1 className="t-h1">Welcome back</h1>
 					<p className="mt-1.5 text-sm text-ink-3">
 						Your agent fleet, at a glance.
 					</p>
@@ -439,9 +436,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 								<div className="text-[11.5px] text-ink-3" title={k.hint}>
 									{k.label}
 								</div>
-								<div className="mt-1 text-[26px] font-semibold leading-none tabular-nums text-ink">
-									{k.value}
-								</div>
+								<div className="mt-1 t-metric text-ink">{k.value}</div>
 							</div>
 						</div>
 					</Link>
@@ -460,9 +455,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						<div className="mb-1 flex items-center justify-between gap-2">
 							<div className="flex items-center gap-2">
 								<MetricIcon name="time" size={28} />
-								<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-									Where the time goes
-								</h2>
+								<h2 className="t-card-title">Where the time goes</h2>
 							</div>
 							<span className="text-[10px] text-ink-3">
 								gateway vs upstream
@@ -512,7 +505,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				<Card className="flex h-full flex-col p-4 sm:col-span-2 lg:col-span-6">
 					<div className="mb-1 flex items-center gap-2">
 						<MetricIcon name="traffic" size={28} />
-						<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+						<h2 className="t-card-title">
 							Traffic over time — last {rLabel} · UTC
 						</h2>
 					</div>
@@ -535,11 +528,11 @@ async function DashboardData({ range }: { range: string | undefined }) {
 
 				{/* Error budget — the SLO burn snapshot as the mockup's dark card. Real
 				    arithmetic over the captured error rate; "—" when unreachable. */}
-				<div className="flex h-full flex-col rounded-xl bg-surface-inverse p-5 lg:col-span-3">
+				<div className="card-lava-top flex h-full flex-col rounded-xl bg-surface-inverse p-5 lg:col-span-3">
 					<div className="flex items-center justify-between gap-3">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="error-budget" size={28} onInverse />
-							<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-inverse opacity-60">
+							<p className="t-card-title text-ink-inverse opacity-60">
 								Error budget ({rShort})
 							</p>
 						</div>
@@ -586,7 +579,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				<Card className="flex h-full flex-col p-4 sm:col-span-2 lg:col-span-4">
 					<div className="mb-1 flex items-center gap-2">
 						<MetricIcon name="latency" size={28} />
-						<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+						<h2 className="t-card-title">
 							Latency over time — last {rLabel} · UTC
 						</h2>
 					</div>
@@ -631,9 +624,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="request-flow" size={28} />
-							<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-								Request flow
-							</h2>
+							<h2 className="t-card-title">Request flow</h2>
 						</div>
 						<span className="text-[10px] text-ink-3">
 							gateway → model → outcome
@@ -659,9 +650,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="guardrail" size={28} />
-							<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-								Guardrail activity
-							</h2>
+							<h2 className="t-card-title">Guardrail activity</h2>
 						</div>
 						<span className="text-[10px] text-ink-3">{rShort}</span>
 					</div>
@@ -676,7 +665,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 					) : (
 						<div className="flex flex-1 flex-col justify-center">
-							<div className="font-mono text-2xl font-semibold tabular-nums text-accent-ink">
+							<div className="font-mono t-metric text-accent-ink">
 								{guardrails.block_rate_pct.toFixed(1)}%
 							</div>
 							<p className="text-[11.5px] text-ink-3">block rate</p>
@@ -721,9 +710,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					<div className="flex items-center justify-between px-4 pt-3.5 pb-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="model-breakdown" size={28} />
-							<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-								Traffic by model
-							</h2>
+							<h2 className="t-card-title">Traffic by model</h2>
 						</div>
 						<Link
 							href="/slo"
@@ -772,7 +759,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											)}
 											<div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-2">
 												<div
-													className="h-full rounded-full bg-line-2"
+													className="h-full rounded-full bar-lava"
 													style={{
 														width: `${maxModelReq > 0 ? (m.requests / maxModelReq) * 100 : 0}%`,
 													}}
@@ -816,9 +803,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="provider" size={28} />
-							<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-								Provider health
-							</h2>
+							<h2 className="t-card-title">Provider health</h2>
 						</div>
 						<span className="text-[10px] text-ink-3">req · err</span>
 					</div>
@@ -848,7 +833,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 									</div>
 									<div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-2">
 										<div
-											className="h-full rounded-full bg-line-2"
+											className="h-full rounded-full bar-lava"
 											style={{
 												width: `${maxProvReq > 0 ? (p.requests / maxProvReq) * 100 : 0}%`,
 											}}
@@ -866,9 +851,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					<div className="flex items-center justify-between px-4 pt-3.5 pb-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="failure-signatures" size={28} />
-							<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-								Top failure signatures
-							</h2>
+							<h2 className="t-card-title">Top failure signatures</h2>
 						</div>
 						<Link
 							href="/signatures"
@@ -946,9 +929,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				<div className="flex items-center justify-between">
 					<div className="flex items-center gap-2">
 						<MetricIcon name="tool-usage" size={28} />
-						<h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-							Tool usage ({rShort})
-						</h2>
+						<h2 className="t-card-title">Tool usage ({rShort})</h2>
 					</div>
 					<Link
 						href="/traces"
@@ -1028,7 +1009,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											</td>
 											<td
 												className={`px-4 py-2.5 text-right font-mono text-xs tabular-nums ${
-													t.errors > 0 ? "text-danger" : "text-ink-3"
+													t.errors > 0 ? "text-danger-ink" : "text-ink-3"
 												}`}
 											>
 												{t.errors > 0 ? `${errPct}%` : "—"}

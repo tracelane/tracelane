@@ -246,7 +246,7 @@ export default async function SessionsPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex flex-wrap items-center justify-between gap-3">
 				<div>
-					<h1 className="text-2xl font-semibold text-ink">Sessions</h1>
+					<h1 className="t-h1">Sessions</h1>
 					<p className="mt-1 text-sm text-ink-2">
 						Multi-turn conversations grouped from related traces.
 					</p>

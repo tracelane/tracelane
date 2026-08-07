@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # crates/ingest
 
 Tracelane's Rust ingest workers — span processing pipeline.
@@ -6,9 +7,10 @@ Tracelane's Rust ingest workers — span processing pipeline.
 
 - Consume spans from NATS JetStream (emitted by the gateway)
 - Parse and validate against OpenInference + OTel GenAI semconv
-- Apply tail-sampling policy (100% errors/high-cost/predictive-flagged; 5–10% nominal)
+- Apply tail-sampling policy when enabled. NOTE: full-fidelity capture is the shipped default — a recorder that drops clean spans is not a recorder
 - Batch-write to ClickHouse (hot tier, 90-day retention)
-- Pack and write cold spans to Cloudflare R2 (Parquet, 1MB batches)
+- Cold-span packing to Cloudflare R2 (Parquet) is implemented but **not active** —
+  `main.rs:350` drops the sender, so no span is written to R2 today
 
 ## Key modules
 
@@ -18,7 +20,7 @@ Tracelane's Rust ingest workers — span processing pipeline.
 | `nats_consumer.rs` | JetStream consumer — durable, at-least-once, manual ack on CH write |
 | `otlp_receiver.rs` | gRPC OTLP receiver — accepts spans directly from SDKs |
 | `clickhouse_writer.rs` | Batched ClickHouse writer — retry loop, back-pressure on downtime (FT-03) |
-| `tail_sampler.rs` | Sampling policy — 100% error/cost/predictive, configurable nominal rate |
+| `tail_sampler.rs` | Sampling policy — off by default; when enabled, keeps 100% of error/cost/predictive-flagged spans |
 | `config.rs` | Environment-based config — NATS_URL, CLICKHOUSE_URL, tenant-specific overrides |
 | `auth.rs` | Ingest-side auth — validates SPIFFE mTLS certificates for internal emitters |
 

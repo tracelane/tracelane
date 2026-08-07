@@ -9,7 +9,7 @@
 
 export function WarmingBanner() {
 	return (
-		<div className="mb-6 flex items-center gap-2 rounded-lg border border-warn/30 bg-warn/5 px-4 py-3 text-sm text-warn/90">
+		<div className="mb-6 flex items-center gap-2 rounded-lg border border-warn/30 bg-warn/5 px-4 py-3 text-sm text-warn-ink/90">
 			<svg
 				aria-hidden="true"
 				className="h-4 w-4 shrink-0"

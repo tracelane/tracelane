@@ -84,6 +84,12 @@ export interface VerifyReport {
 	rekor_anchors_resolved: number;
 	/** Anchors whose FULL public-inclusion proof + checkpoint verified (Layer 2+3). */
 	anchors_included: number;
+	/** Anchor records PRESENT in the ledger that were skipped because no trusted
+	 * `tenantPubkey` was supplied. `> 0` means signature and anchor verification
+	 * did not run — `signatures_valid` is then vacuous and a caller MUST NOT
+	 * report a pass. Surfacing the count is what lets the CLI fail closed instead
+	 * of printing `signatures_valid: true` over an unchecked (or forged) anchor. */
+	anchors_unverified: number;
 	/** True if any anchor committed to "anchored" but its rekor bundle is absent
 	 * (a strip/downgrade attack). ADR-062. */
 	strip_detected: boolean;
@@ -449,6 +455,7 @@ export async function verifyLedgerText(
 		rekor_anchors_seen: 0,
 		rekor_anchors_resolved: 0,
 		anchors_included: 0,
+		anchors_unverified: 0,
 		strip_detected: false,
 		verified_from_seq: 0,
 		trust_established: true,
@@ -796,8 +803,14 @@ function verifyAnchorsOffline(
 		}
 
 		// Layer 2 (trusted-key gate). No trusted key → chain-only: assert
-		// nothing (never green), do not count as seen/resolved.
-		if (!tenantPubkey) continue;
+		// nothing (never green), do not count as seen/resolved. Record that we
+		// SKIPPED a real anchor so the caller can fail closed — silently
+		// skipping is how `signatures_valid: true` got printed over a forged
+		// anchor (P0, 2026-08-07).
+		if (!tenantPubkey) {
+			report.anchors_unverified++;
+			continue;
+		}
 		let bundlePubkey: Uint8Array;
 		try {
 			bundlePubkey = base64Decode(a.ed25519.pubkey);

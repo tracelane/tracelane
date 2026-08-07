@@ -64,7 +64,7 @@ async fn upload(
     State(_state): State<AppState>,
     Json(mut req): Json<UploadRequest>,
 ) -> impl IntoResponse {
-    let tenant = match authenticate(&headers).await {
+    let tenant = match authenticate_with(&headers, Access::Mutate).await {
         Ok(t) => t,
         Err(e) => return e,
     };
@@ -134,7 +134,7 @@ async fn upload(
 }
 
 async fn list(headers: HeaderMap, State(_state): State<AppState>) -> impl IntoResponse {
-    let tenant = match authenticate(&headers).await {
+    let tenant = match authenticate_with(&headers, Access::Read).await {
         Ok(t) => t,
         Err(e) => return e,
     };
@@ -164,7 +164,7 @@ async fn revoke(
     headers: HeaderMap,
     State(_state): State<AppState>,
 ) -> impl IntoResponse {
-    let tenant = match authenticate(&headers).await {
+    let tenant = match authenticate_with(&headers, Access::Mutate).await {
         Ok(t) => t,
         Err(e) => return e,
     };
@@ -187,8 +187,18 @@ fn error(status: StatusCode, msg: &str) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
-async fn authenticate(
+/// What the caller is allowed to do on this surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// May read the key list (provider ids + last4 — never a credential).
+    Read,
+    /// May also upload and revoke.
+    Mutate,
+}
+
+async fn authenticate_with(
     headers: &HeaderMap,
+    need: Access,
 ) -> Result<tracelane_shared::TenantId, axum::response::Response> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -199,9 +209,30 @@ async fn authenticate(
     }
     match crate::auth::validate_authorization(auth).await {
         Ok(claims) => {
-            // IDENTITY_TEAM_SPEC §1: BYOK provider keys are owner-only (view +
-            // mutate). One gate here covers upload/list/revoke.
-            if !claims.can_admin() {
+            // `can_admin()` grandfathers `role == None` to full access, and
+            // API-key auth ALWAYS has `role == None` — while `can_mint_keys()`
+            // deliberately lets a MEMBER mint keys. So member → mint a key →
+            // upload/revoke provider credentials composed into an escalation:
+            // revoking is a denial of service on every BYOK request, and
+            // replacing a key redirects upstream traffic through a credential
+            // the caller controls.
+            //
+            // Mutation therefore requires a VERIFIED OWNER JWT
+            // (`Claims::is_verified_owner` — the same predicate the guardrail
+            // caps gate uses, defined once in `auth`). Reading the list stays on
+            // `can_admin()`: it returns provider ids and last4 only, never a
+            // credential, and an API key already belongs to the tenant.
+            //
+            // Consequence, stated rather than discovered: **scripted BYOK key
+            // rotation with an API key no longer works** and needs an owner
+            // session. That is the intended trade — a credential-management
+            // surface should not be reachable by a token a member can mint for
+            // themselves.
+            let ok = match need {
+                Access::Read => claims.can_admin(),
+                Access::Mutate => claims.is_verified_owner(),
+            };
+            if !ok {
                 return Err((
                     StatusCode::FORBIDDEN,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],

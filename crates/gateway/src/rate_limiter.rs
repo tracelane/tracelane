@@ -138,7 +138,7 @@ impl RateLimiter {
         // returned 200, k6 then aborted with "NO requests completed", and a
         // single request after the burst returned 429. The tier was granted and
         // then ignored one layer down — the third rejection-measurement trap in
-        // the same benchmark path (see docs/TRAPS.md).
+        // the same benchmark path (see docs/reference/TRAPS.md).
         if matches!(tier, RateLimitTier::Enterprise | RateLimitTier::Bench) {
             return RateLimitDecision::Allow;
         }

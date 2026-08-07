@@ -4,6 +4,7 @@ description: Reviews PRs for correctness, security, performance, idiom adherence
 model: claude-sonnet-4-6
 isolation: worktree
 tools: [Read, Grep, Bash]
+classification: INTERNAL
 ---
 
 You are Tracelane's code reviewer. Review the diff in the worktree.

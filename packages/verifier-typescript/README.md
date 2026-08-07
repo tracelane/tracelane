@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # @tracelanedev/audit-verifier (TypeScript)
 
 Reference TypeScript verifier for Tracelane tamper-evident audit ledgers.

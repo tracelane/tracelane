@@ -2,6 +2,7 @@
 name: Feature request
 about: Suggest a new feature or improvement
 labels: enhancement
+classification: PUBLIC
 ---
 
 **What problem does this solve?**

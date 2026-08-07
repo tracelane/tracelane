@@ -17,7 +17,7 @@ function ActivityIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -35,7 +35,7 @@ function BarChartIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -55,7 +55,7 @@ function BellIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -74,7 +74,7 @@ function GitBranchIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -95,7 +95,7 @@ function KeyIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -115,7 +115,7 @@ function ShieldIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -133,7 +133,7 @@ function ShieldCheckIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -152,7 +152,7 @@ function CreditCardIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -171,7 +171,7 @@ function SessionsIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -190,7 +190,7 @@ function ServerIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -211,7 +211,7 @@ function UsersIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -232,7 +232,7 @@ function BuildingIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -255,7 +255,7 @@ function SignatureIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -273,7 +273,7 @@ function GatewayIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -293,7 +293,7 @@ function DashboardIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"

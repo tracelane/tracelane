@@ -235,6 +235,11 @@ pub struct VerifyReport {
     /// (ADR-062 Layer 2+3). `> 0` is the only basis for a green "publicly
     /// anchored" claim.
     pub anchors_included: u64,
+    /// Anchor records PRESENT in the ledger that were SKIPPED because no trusted
+    /// `tenant_pubkey` was supplied. `> 0` means signature + anchor verification
+    /// never ran, so `signatures_valid` is vacuous and a caller MUST NOT report a
+    /// pass (P0, 2026-08-07 — the CLI printed PASS over a forged anchor).
+    pub anchors_unverified: u64,
     /// An anchor committed to "anchored" but its rekor bundle is absent
     /// (a strip/downgrade attack — ADR-062).
     pub strip_detected: bool,
@@ -274,6 +279,7 @@ impl VerifyReport {
             rekor_anchors_seen: 0,
             rekor_anchors_resolved: 0,
             anchors_included: 0,
+            anchors_unverified: 0,
             strip_detected: false,
             verified_from_seq: 0,
             trust_established: true,
@@ -1299,8 +1305,11 @@ fn verify_anchors_offline(
             continue;
         }
 
-        // Layer 2 (trusted-key gate). No trusted key → chain-only.
+        // Layer 2 (trusted-key gate). No trusted key → chain-only. Record the
+        // SKIP so the caller can fail closed; silently skipping is how a forged
+        // anchor read as PASS (P0, 2026-08-07).
         let Some(tenant_pubkey) = opts.tenant_pubkey else {
+            report.anchors_unverified += 1;
             continue;
         };
         let bundle_pubkey = match base64_decode(&a.ed25519.pubkey) {

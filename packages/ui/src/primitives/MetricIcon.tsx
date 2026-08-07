@@ -7,9 +7,12 @@ import { cn } from "../lib/cn";
  * Billing). A single component so the icon language reads as one system, not a
  * per-page snowflake.
  *
- * Look (design-system §icons): a circular soft-tinted chip (`--surface-2` grey)
- * with a single-color line icon inside. The icon is `currentColor` = `--ink-2`,
- * so it is INK on the light canvas and INVERTS to a light ink on the dark theme
+ * Look (design-system §icons, visual-pass-01): a circular soft-BLUE well
+ * (`--surface-2` = #eef3fa light) with a single-color line icon inside at
+ * stroke 1.6 — thinned from 1.75 so the glyph reads lean rather than chunky at
+ * 13–18px. The icon is `currentColor` = `--ink`, never grey; a greyed glyph
+ * read as disabled next to the figure it labels.
+ * It INVERTS to a light ink on the dark theme
  * automatically (both tokens flip in the `.dark` block) — never lava-colored;
  * Lava stays rationed for data / CTAs. On a dark CARD (the error-budget tile,
  * which is `--surface-inverse` regardless of theme) pass `onInverse` to flip the
@@ -178,7 +181,10 @@ export function MetricIcon({
 			aria-hidden="true"
 			className={cn(
 				"grid shrink-0 place-items-center rounded-full",
-				onInverse ? "bg-white/10 text-ink-inverse" : "bg-surface-2 text-ink-2",
+				// visual-pass-01: the glyph is INK, never grey. The chip keeps its
+				// soft-blue well (--surface-2, now #eef3fa) so the icon reads as a
+				// deliberate mark on a tinted disc rather than a faded one.
+				onInverse ? "bg-white/10 text-ink-inverse" : "bg-surface-2 text-ink",
 				className,
 			)}
 			style={{ width: size, height: size } as CSSProperties}
@@ -189,7 +195,7 @@ export function MetricIcon({
 				viewBox="0 0 24 24"
 				fill="none"
 				stroke="currentColor"
-				strokeWidth={1.75}
+				strokeWidth={1.6}
 				strokeLinecap="round"
 				strokeLinejoin="round"
 				role="presentation"

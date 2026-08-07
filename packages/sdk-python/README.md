@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # tracelane — Python SDK
 
 [![PyPI](https://img.shields.io/pypi/v/tracelane)](https://pypi.org/project/tracelane/)
@@ -144,7 +145,7 @@ init(
   call sites.
 - **Redaction** — set `TRACELANE_TRACE_CONTENT=false` to redact prompt and
   completion text from captured traces (honored on the gateway path).
-- No dependency on `litellm` (CVE-2026-42208) or `arize-phoenix` (ELv2).
+- No dependency on `litellm` or `arize-phoenix`.
 
 ## Documentation
 

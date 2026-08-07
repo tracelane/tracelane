@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # tracelane-audit-verifier (Python)
 
 Reference Python verifier for Tracelane tamper-evident audit ledgers.

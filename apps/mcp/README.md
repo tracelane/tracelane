@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # `@tracelanedev/mcp` — Tracelane MCP Server
 
 [![npm](https://img.shields.io/npm/v/@tracelanedev/mcp?style=flat-square)](https://www.npmjs.com/package/@tracelanedev/mcp)
@@ -44,7 +45,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
-Or via Streamable HTTP (V1.5+):
+Or via Streamable HTTP (not yet available — stdio is the supported transport):
 
 ```json
 {
@@ -91,7 +92,7 @@ Once connected, you can ask Claude:
 | Transport | When to use |
 |---|---|
 | **Stdio** | Local use — Claude Desktop, Claude Code, Cursor. Zero network exposure. |
-| **Streamable HTTP** | Hosted deployment at `mcp.tracelane.dev`. Multi-tenant. OAuth 2.1 PKCE auth in V2. |
+| **Streamable HTTP** | Not yet available. stdio is the supported transport today. |
 
 ## Security invariants
 

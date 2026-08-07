@@ -261,7 +261,7 @@ export function PromotionPanel({
 
 			{status === "success" && result ? (
 				<div className="rounded-md border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
-					<p className="font-semibold text-ok">
+					<p className="font-semibold text-ok-ink">
 						{result.decision === "manual_override"
 							? "Manual override applied"
 							: "Promoted successfully"}
@@ -278,7 +278,7 @@ export function PromotionPanel({
 
 			{status === "blocked" && result ? (
 				<div className="rounded-md border border-warn bg-warn-soft/40 p-3 text-xs space-y-1">
-					<p className="font-semibold text-warn">
+					<p className="font-semibold text-warn-ink">
 						{result.decision === "blocked_by_eval"
 							? "Blocked by eval gate"
 							: "Blocked by policy"}
@@ -306,7 +306,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "error" ? (
-				<div className="rounded-md border border-danger bg-danger-soft/40 p-3 text-xs text-danger">
+				<div className="rounded-md border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
 					{errorMsg || "Unexpected failure — check gateway logs."}
 				</div>
 			) : null}

@@ -9,10 +9,10 @@ const badge = cva(
 			// status tones pair with an icon/shape at the call site — never colour alone.
 			tone: {
 				neutral: "bg-surface-2 text-ink-2",
-				ok: "bg-ok-soft text-ok",
-				danger: "bg-danger-soft text-danger",
-				warn: "bg-warn-soft text-warn",
-				info: "bg-info-soft text-info",
+				ok: "bg-ok-soft text-ok-ink",
+				danger: "bg-danger-soft text-danger-ink",
+				warn: "bg-warn-soft text-warn-ink",
+				info: "bg-info-soft text-info-ink",
 				seal: "bg-seal-soft text-seal-ink", // provenance chip
 				accent: "bg-accent-soft text-accent-ink", // active / function
 			},

@@ -97,10 +97,10 @@ export function WorkspaceManager({ initialName }: { initialName: string }) {
 					>
 						{rename.isPending ? "Saving…" : "Save"}
 					</button>
-					{saved && <span className="text-xs text-ok">Saved</span>}
+					{saved && <span className="text-xs text-ok-ink">Saved</span>}
 				</div>
 				{rename.error && (
-					<p className="text-xs text-danger">
+					<p className="text-xs text-danger-ink">
 						{(rename.error as Error).message}
 					</p>
 				)}
@@ -131,7 +131,7 @@ export function WorkspaceManager({ initialName }: { initialName: string }) {
 					))}
 				</div>
 				{portal.error && (
-					<p className="text-xs text-danger">
+					<p className="text-xs text-danger-ink">
 						{(portal.error as Error).message}
 					</p>
 				)}

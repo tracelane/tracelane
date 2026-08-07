@@ -105,7 +105,7 @@ export function TranscriptSpine({
 			{(hasError || verified !== undefined) && (
 				<div className="mb-3 flex items-center gap-2">
 					{hasError && (
-						<span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-1.5 py-0.5 text-[11px] font-semibold text-danger">
+						<span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-1.5 py-0.5 text-[11px] font-semibold text-danger-ink">
 							▲ error inside
 						</span>
 					)}
@@ -214,11 +214,17 @@ export function TranscriptSpine({
 											{s.durationMs}&nbsp;ms
 										</span>
 									</div>
-									{/* latency bar — neutral magnitude fill (ADR-053: Lava is
-										CTA-only, never a decorative data-bar). */}
+									{/* latency bar — lava-gradient magnitude fill (visual-pass-01).
+										REVERSES the rule that stood here ("ADR-053: Lava is
+										CTA-only, never a decorative data-bar"): the founder's
+										visual pass widens ADR-053's permitted static-gradient
+										sites to include neutral magnitude bars. Semantically
+										COLOURED bars (the AFT-1 tool-span violet) keep their
+										hue — lava replaces neutral greys only, never an
+										information channel. Pending the ADR-053 amendment. */}
 									<div className="mt-1 h-1 rounded-full bg-surface-2">
 										<div
-											className="h-1 rounded-full bg-ink-3"
+											className="h-1 rounded-full bar-lava"
 											style={{ width: `${(s.durationMs / maxMs) * 100}%` }}
 										/>
 									</div>

@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # @tracelanedev/ui — Neon design system
 
 The Tracelane Neon design system (**ADR-045**, built to the design-system spec):

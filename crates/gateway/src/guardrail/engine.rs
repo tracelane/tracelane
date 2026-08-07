@@ -95,6 +95,8 @@ pub struct GuardrailEngine {
     /// When present, resolves the registry per tenant; falls back to permissive
     /// on a store outage. `None` → use the shared `registry`.
     registry_loader: Option<Arc<RegistryLoader>>,
+    /// wired (no control plane), and observation is simply skipped.
+    tool_observer: Option<Arc<crate::guardrail::tool_observer::ToolObserver>>,
     /// `None` in dev / OSS self-host (no Postgres) → every gated rail granted
     /// ([`RailGate::resolve`]).
     entitlements: Option<Arc<EntitlementCache>>,
@@ -173,8 +175,31 @@ impl GuardrailEngine {
             recorder: GuardrailRecorder::new(audit_chain, ch),
             registry,
             registry_loader: None,
+            tool_observer: None,
             entitlements,
             r7_config: Arc::new(R7Config::default()),
+        }
+    }
+
+    /// never recorded and the approve list stays empty — the rail still works
+    /// for anything already pinned.
+    #[must_use]
+    pub fn with_tool_observer(
+        mut self,
+        observer: Arc<crate::guardrail::tool_observer::ToolObserver>,
+    ) -> Self {
+        self.tool_observer = Some(observer);
+        self
+    }
+
+    ///
+    /// Called by the tool-pin write path so a new pin takes effect on the NEXT
+    /// request instead of after the cache TTL. Without it a customer pins a
+    /// tool, sees nothing change, and cannot tell that from a broken rail.
+    /// No-op when no loader is wired (self-host with no control plane).
+    pub async fn invalidate_registry(&self, tenant: Uuid) {
+        if let Some(loader) = &self.registry_loader {
+            loader.invalidate(tenant).await;
         }
     }
 
@@ -231,6 +256,15 @@ impl GuardrailEngine {
             rag_context,
             session,
         );
+
+        // The hash is already computed (capability.rs:297), so this is a
+        // DashMap update and no I/O. Best-effort by construction — observation
+        // must never affect a response.
+        if let Some(obs) = &self.tool_observer {
+            for td in &ctx.tool_defs {
+                obs.observe(tenant_id, td.name, td.def_hash.to_hex().as_ref());
+            }
+        }
 
         let outcome = self
             .dispatcher

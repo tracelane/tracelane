@@ -2,11 +2,12 @@
 title: Tenant isolation — V1 guarantees
 description: Three independent isolation surfaces — ClickHouse resource caps, R2 per-tenant buckets, Postgres row-level scoping — scope every Tracelane read and write.
 sidebarTitle: Tenant isolation
+classification: PUBLIC
 ---
 
 # Tenant isolation — V1 guarantees
 
-> **Authoritative design:** [ADR-031](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-031-admin-audit-and-ch-resource-caps.md). **Composes with:** [ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md) (tamper-evident agent ledger).
+> **Authoritative design:** [ADR-031](/decisions/index). **Composes with:** [ADR-018](/decisions/index) (tamper-evident agent ledger).
 
 Tracelane is multi-tenant from day one. Every read, every write, and
 every admin mutation is scoped to one workspace UUID at three

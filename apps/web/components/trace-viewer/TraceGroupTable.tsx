@@ -96,7 +96,7 @@ export function TraceGroupTable({
 								</td>
 								<td className="px-4 py-2.5 text-right">
 									<span
-										className={`font-mono text-xs tabular-nums ${errPct > 5 ? "text-danger" : errPct > 1 ? "text-warn" : "text-ok"}`}
+										className={`font-mono text-xs tabular-nums ${errPct > 5 ? "text-danger-ink" : errPct > 1 ? "text-warn-ink" : "text-ok-ink"}`}
 									>
 										{errPct.toFixed(1)}%
 									</span>

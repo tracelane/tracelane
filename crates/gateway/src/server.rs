@@ -484,6 +484,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             ));
             engine = engine.with_registry_loader(loader);
             tracing::info!("inline guardrails: per-workspace capability-registry loader wired");
+
+            // tenant can approve them instead of hand-authoring tool JSON.
+            // Postgres-gated for the same reason as the loader — there is
+            // nowhere to flush to otherwise. Capture is a DashMap update on the
+            // hot path (the hash is already computed); the flush is off-path and
+            // best-effort, so a database problem can never affect a response.
+            let observer = Arc::new(crate::guardrail::tool_observer::ToolObserver::new());
+            crate::guardrail::tool_observer::spawn_flusher(
+                Arc::clone(&observer),
+                std::time::Duration::from_secs(30),
+            );
+            engine = engine.with_tool_observer(observer);
+            tracing::info!(
+                "inline guardrails: tool observation wired (flush every 30s, best-effort)"
+            );
         }
         tracing::info!(
             rails = engine.rail_count(),
@@ -639,6 +654,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let byok_app = crate::byok_api::provider_keys_api::router(state.clone());
         app = app.merge(byok_app);
         tracing::info!("BYOK management mounted at /v1/byok/provider-keys (POST/GET/DELETE)");
+
+        // (registry_loader), the table and the comparison all shipped earlier;
+        // with no way to CREATE a pin the rail was correct and permanently
+        // inert. Postgres-gated for the same reason as BYOK above: a self-host
+        // with no control plane has nowhere to store a pin.
+        let pins_app = crate::guardrail::tool_pins_api::router(state.clone());
+        app = app.merge(pins_app);
+        tracing::info!("Tool pinning mounted at /v1/guardrails/tool-pins (POST/GET/DELETE)");
     }
 
     // because the Cloudflare Workers runtime can't run the web minter's WASM

@@ -265,7 +265,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 
 			{span.aft_ids.length > 0 && (
 				<div>
-					<h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-danger">
+					<h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-danger-ink">
 						Guardrail Interventions
 					</h3>
 					<div className="space-y-1">
@@ -275,7 +275,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 								className="flex items-center gap-2 text-xs"
 								title={`${id}: ${aftLabel(id)}`}
 							>
-								<span className="font-mono font-semibold text-danger">
+								<span className="font-mono font-semibold text-danger-ink">
 									{id}
 								</span>
 								<span className="text-ink-3">{aftLabel(id)}</span>
@@ -287,8 +287,8 @@ export function SpanInspector({ span }: { span: Span | null }) {
 						<span
 							className={
 								span.intervention === 2
-									? "font-medium text-danger"
-									: "font-medium text-warn"
+									? "font-medium text-danger-ink"
+									: "font-medium text-warn-ink"
 							}
 						>
 							{span.intervention === 2 ? "blocked" : "warned"}

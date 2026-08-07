@@ -24,6 +24,7 @@ function report(over: Partial<VerifyReport>): VerifyReport {
 		rekor_anchors_seen: 0,
 		rekor_anchors_resolved: 0,
 		anchors_included: 0,
+		anchors_unverified: 0,
 		strip_detected: false,
 		verified_from_seq: 0,
 		trust_established: true,

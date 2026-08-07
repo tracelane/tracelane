@@ -1,6 +1,7 @@
 ---
 title: Tracelane MCP server for AI IDE clients
 description: Give Claude Desktop, Cursor, and other MCP clients read-only, tenant-scoped access to your Tracelane traces and guardrail verdicts for live debugging.
+classification: PUBLIC
 ---
 
 The Tracelane MCP server exposes your agent traces and guardrail verdicts as
@@ -155,7 +156,7 @@ Resolution: review span 7–9 for unintended data exfiltration.
 mcp.tracelane.list_evals({ suite: "pain-points" })
 ```
 
-Returns the eval scoreboard — all 50 pain-point evals + 8 fault-tolerance evals
+Returns the eval scoreboard — all 69 pain-point evals + 10 fault-tolerance evals
 with current status (green / mock / stub / not-written).
 
 ### `get_eval_result`

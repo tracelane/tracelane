@@ -2,7 +2,7 @@
 //! agent ledgers (ADR-034).
 //!
 //! Composes the shipped `tracelane-audit-verifier` crate with an HTTP
-//! fetch step against `/api/audit/range`, an argument parser, and a
+//! fetch step against `/v1/audit/export`, an argument parser, and a
 //! PASS/FAIL renderer with field-level diff on failure. Intended to
 //! be distributed as a single static (musl-linked) binary that an EU
 //! regulator can `curl | sha256sum | run` without trusting Tracelane's
@@ -37,9 +37,9 @@ use uuid::Uuid;
 #[command(
     name = "tracelane-audit",
     version,
-    about = "Verify a Tracelane tamper-evident audit ledger (EU AI Act Article 12).",
+    about = "Verify a Tracelane tamper-evident audit ledger, offline.",
     long_about = "Independently verify the integrity of a Tracelane tamper-evident audit \
-                  ledger range. Fetches NDJSON from /api/audit/range (or reads a local file \
+                  ledger range. Fetches NDJSON from /v1/audit/export (or reads a local file \
                   with --file), recomputes the per-tenant hash chain and the Merkle root \
                   per anchor batch, verifies the per-batch Ed25519 signature against the \
                   workspace's own public key (--tenant-pubkey), and for anchored batches \
@@ -76,8 +76,10 @@ struct VerifyArgs {
     #[arg(long, value_name = "URL", default_value = "https://api.tracelane.dev")]
     api_url: String,
 
-    /// Audit-read API key (issued by Tracelane support; scope:
-    /// audit:read for one workspace).
+    /// Workspace API key used for the online fetch. NOTE: API keys are
+    /// workspace-scoped and revocable, but carry NO per-scope restriction and
+    /// NO expiry — a key handed to a third party grants the workspace's full
+    /// API surface. Prefer `--file` with an export you produced yourself.
     #[arg(long, value_name = "KEY", env = "TRACELANE_AUDIT_READ_KEY")]
     read_key: Option<String>,
 
@@ -185,7 +187,11 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Verify(args) => match run_verify(args) {
             Ok(report) => {
-                if report.hash_chain_valid && report.signatures_valid && report.errors.is_empty() {
+                if report.anchors_unverified == 0
+                    && report.hash_chain_valid
+                    && report.signatures_valid
+                    && report.errors.is_empty()
+                {
                     ExitCode::from(0)
                 } else {
                     ExitCode::from(1)
@@ -206,7 +212,7 @@ fn run_verify(args: VerifyArgs) -> Result<VerifyReport> {
             eprintln!("tracelane-audit: verifying local file {}", path.display());
             path
         }
-        None => fetch_audit_range(&args).context("fetch /api/audit/range")?,
+        None => fetch_audit_range(&args).context("fetch /v1/audit/export")?,
     };
 
     // ── Build VerifyOptions ───────────────────────────────────────────
@@ -259,10 +265,17 @@ fn fetch_audit_range(args: &VerifyArgs) -> Result<PathBuf> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--to is required unless --file is given"))?;
 
+    // The online fetch targets the endpoint the gateway actually mounts:
+    // GET /v1/audit/export?since=&until= (crates/gateway/src/audit_export.rs).
+    // It previously pointed at a route that has never existed —
+    // so every online verify 404'd. The tenant is derived from the validated
+    // credential, so `--workspace` is not a query parameter; it is kept only to
+    // label the report. The endpoint is gated on the Audit add-on and returns 403
+    // `entitlement_required` without it.
+    let _ = workspace;
     let url = format!(
-        "{base}/api/audit/range?workspace={ws}&from={from}&to={to}",
+        "{base}/v1/audit/export?since={from}&until={to}",
         base = args.api_url.trim_end_matches('/'),
-        ws = workspace,
         from = urlencode(from),
         to = urlencode(to),
     );
@@ -331,7 +344,15 @@ fn print_text(report: &VerifyReport) {
     let _ = writeln!(out, "Ledger:                {}", report.ledger_path);
     let _ = writeln!(out, "Rows seen:             {}", report.rows_seen);
     let _ = writeln!(out, "Hash chain valid:      {}", report.hash_chain_valid);
-    let _ = writeln!(out, "Signatures valid:      {}", report.signatures_valid);
+    let _ = writeln!(
+        out,
+        "Signatures valid:      {}",
+        if report.anchors_unverified > 0 {
+            "NOT CHECKED — no --tenant-pubkey".to_string()
+        } else {
+            report.signatures_valid.to_string()
+        }
+    );
     let _ = writeln!(
         out,
         "Rekor anchors seen:    {} (resolved {})",
@@ -339,7 +360,19 @@ fn print_text(report: &VerifyReport) {
     );
     let _ = writeln!(out);
 
-    if report.errors.is_empty() && report.hash_chain_valid && report.signatures_valid {
+    if report.anchors_unverified > 0 {
+        // FAIL CLOSED (P0, 2026-08-07): anchor records were present but signature
+        // and anchor verification never ran, so a forged anchor would not have
+        // been caught. `signatures_valid` is vacuously true in chain-only mode.
+        let _ = writeln!(
+            out,
+            "INCOMPLETE — {} anchor record(s) NOT verified: no trusted tenant key supplied.\n\
+             The hash chain checked out, but signature and Rekor-anchor verification did not run.\n\
+             Re-run with --tenant-pubkey <base64> (obtain out-of-band from the Tracelane\n\
+             dashboard Settings → Audit signing key, or GET /v1/audit/pubkey).",
+            report.anchors_unverified
+        );
+    } else if report.errors.is_empty() && report.hash_chain_valid && report.signatures_valid {
         let _ = writeln!(out, "PASS — every check passed.");
     } else {
         let _ = writeln!(out, "FAIL — {} error(s) detected:", report.errors.len());

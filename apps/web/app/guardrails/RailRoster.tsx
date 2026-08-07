@@ -245,7 +245,7 @@ function RailRow({
 							href={blockHref(range)}
 							onClick={(e) => e.stopPropagation()}
 							title="See the blocked verdicts →"
-							className="font-mono tabular-nums text-danger underline decoration-danger/30 underline-offset-2 hover:decoration-danger focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="font-mono tabular-nums text-danger-ink underline decoration-danger/30 underline-offset-2 hover:decoration-danger focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 						>
 							{live.blocks.toLocaleString()}
 						</Link>
@@ -274,7 +274,7 @@ function RailRow({
 								</p>
 							)}
 							{live && live.fail_opens > 0 && (
-								<p className="text-xs text-warn">
+								<p className="text-xs text-warn-ink">
 									{live.fail_opens.toLocaleString()} verdict
 									{live.fail_opens === 1 ? "" : "s"} failed open (the rail
 									errored and the request proceeded).

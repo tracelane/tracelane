@@ -45,7 +45,7 @@ function SignOutIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -65,7 +65,7 @@ function LifeBuoyIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -88,7 +88,7 @@ function SettingsGearIcon() {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-4 w-4 shrink-0"
@@ -107,7 +107,7 @@ function MenuIcon({ open }: { open: boolean }) {
 			viewBox="0 0 24 24"
 			fill="none"
 			stroke="currentColor"
-			strokeWidth={2}
+			strokeWidth={1.6}
 			strokeLinecap="round"
 			strokeLinejoin="round"
 			className="h-5 w-5"
@@ -168,11 +168,14 @@ export function TopNav({ orgSlot }: { orgSlot?: ReactNode }) {
 	// Liquid-glass nav (founder): frosted, translucent chrome that content scrolls
 	// UNDER. sticky+z-30+isolate makes it a floating stacking context above page
 	// content — so the glass reads AND nothing in <main> can ever paint over the
-	// brand. backdrop-blur is confined to this one small bar (the ADR-051 blur ban
-	// keeps it off the scrolling cards / 2000-span table); a solid-ish bg-surface/85
-	// fallback covers no-backdrop-filter browsers.
+	// brand. backdrop-blur is confined to this one small bar (the blur ban is
+	// ADR-053:40, not ADR-051 — 051 is the billing/EE split; the old citation here
+	// was wrong — and it keeps blur off the scrolling cards / 2000-span table); a
+	// solid-ish bg-surface/85 fallback covers no-backdrop-filter browsers.
+	// visual-pass-01 did NOT add or remove this blur: it predates the pass, and
+	// the pass's "no blur" gate is about not introducing NEW blur surfaces.
 	return (
-		<div className="sticky top-2 z-30 isolate mb-5 flex items-center gap-3 rounded-2xl border border-line bg-surface/85 px-3 py-2 shadow-[0_1px_2px_rgba(20,28,36,0.04)] backdrop-blur-xl supports-[backdrop-filter]:bg-surface/70">
+		<div className="sticky top-2 z-30 isolate mb-5 flex items-center gap-3 rounded-2xl border border-line bg-surface/85 px-3 py-2 shadow-[0_1px_2px_rgba(24,50,96,0.05)] backdrop-blur-xl supports-[backdrop-filter]:bg-surface/70">
 			<Link
 				href="/dashboard"
 				aria-label="Tracelane — dashboard"
@@ -204,7 +207,7 @@ export function TopNav({ orgSlot }: { orgSlot?: ReactNode }) {
 				<a
 					href="/sign-out"
 					aria-label="Sign out"
-					className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink"
+					className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3 hover:text-ink"
 				>
 					<SignOutIcon />
 				</a>
@@ -213,7 +216,7 @@ export function TopNav({ orgSlot }: { orgSlot?: ReactNode }) {
 					onClick={() => setOpen((o) => !o)}
 					aria-label={open ? "Close navigation menu" : "Open navigation menu"}
 					aria-expanded={open}
-					className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink lg:hidden"
+					className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3 hover:text-ink lg:hidden"
 				>
 					<MenuIcon open={open} />
 				</button>

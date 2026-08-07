@@ -2,11 +2,12 @@
 title: Admin audit log
 description: Query the Postgres admin_audit_log table capturing every mutating admin action — API keys, BYOK rotation, prompt promotion, billing, members.
 sidebarTitle: Admin audit log
+classification: PUBLIC
 ---
 
 # Admin audit log
 
-> **Authoritative design:** [ADR-031](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-031-admin-audit-and-ch-resource-caps.md). **Schema:** [migration 11](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql).
+> **Authoritative design:** [ADR-031](/decisions/index). **Schema:** [migration 11](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql).
 
 Every mutating admin action — API-key creation, BYOK provider-key
 rotation, prompt promotion, billing subscription change, member
@@ -93,11 +94,11 @@ ORDER BY occurred_at DESC;
 ## What the log is, and is not
 
 **Is:** A durable record of *who did what* in the dashboard /
-gateway control surface. Suitable for compliance attestation,
-internal incident review, and the eventual SOC 2 audit.
+gateway control surface — the table you query during an internal
+incident review.
 
 **Is not:** The tamper-evident *agent* event ledger
-([ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)).
+([ADR-018](/decisions/index)).
 That ledger captures the runtime behaviour of customer agents (LLM
 calls, tool calls, guardrail decisions) with a tamper-evident SHA-256
 hash chain and customer-runnable verifier CLIs (Ed25519 batch signing
@@ -112,7 +113,7 @@ V1 ships without an automated retention/archive job. The table is
 expected to grow ~100 rows/workspace/day at active use, ~36 K rows
 per workspace per year — well within Postgres comfort for the V1
 single-Neon-region deployment. A V1.1 archive job moves rows older
-than 18 months to R2 cold-tier following the [ADR-022](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-022-clickhouse-tiered-storage.md) tiered-storage pattern.
+than 18 months to R2 cold-tier following the [ADR-022](/decisions/index) tiered-storage pattern.
 
 ## V1 vs V1.1 wiring status
 

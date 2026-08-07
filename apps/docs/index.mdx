@@ -1,14 +1,16 @@
 ---
 title: Tracelane — flight recorder for AI agents
 description: The flight recorder for AI agents — full-fidelity traces, a tamper-evident audit ledger, and agent-tool attack detection. Apache 2.0, OTel-native.
+classification: PUBLIC
 ---
 
 Tracelane is a Rust gateway and ClickHouse-backed observability tier that
 captures every LLM and tool call at full fidelity, with a tamper-evident audit
 ledger that makes each run provable. Its sharpest edge is **MCP and agent-tool
 safety**: it surfaces tool-definition-drift, rug-pull substitution, and
-hallucinated tool-call arguments as first-class signals (drift/rug-pull compare
-against a pinned definition; the customer-facing pinning write path is roadmap) and records each with a
+hallucinated tool-call arguments as first-class signals (drift and rug-pull compare
+against a definition you approved in one click from the tools Tracelane has
+observed on your own traffic) and records each with a
 tamper-evident signature. Heuristic checks for the lethal trifecta and prompt
 injection observe alongside, on every request and on every tier. A2A/A2UI drift,
 browser stuck-loops and argument drift are **roadmap**: those detectors gate on

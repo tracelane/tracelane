@@ -1,6 +1,7 @@
 ---
 title: tlane CLI reference and commands
 description: The tlane CLI for project bootstrap, trace inspection, eval runs, prompt versioning, audit verification, and vendor migrations from Helicone or LiteLLM.
+classification: PUBLIC
 ---
 
 The `tlane` CLI is the operator-side companion to the Tracelane gateway.
@@ -23,13 +24,20 @@ All commands respect:
 
 ### `tlane init`
 
-Initialise Tracelane in the current project. Creates `.env` with
-`TRACELANE_*` placeholders, installs the right SDK, and instruments any
-detected agent framework.
+Writes a `tracelane.config.json` (endpoint, `serviceName`, `sampleRate`) to the
+working directory and prints the SDK install + wire-up steps. It does not
+install anything or edit your source. Refuses to clobber an existing config
+unless `--force` is given.
+
+`--endpoint` is the OTLP endpoint of an ingest receiver **you** run (default
+`http://localhost:4318`). Tracelane Cloud has no public OTLP ingress — hosted
+traces are captured at the gateway, so on Cloud you leave `--endpoint` unset and
+point your OpenAI-compatible client at `https://gateway.tracelane.dev/v1`.
 
 ```bash
 tlane init
-tlane init --endpoint https://gateway.acme.internal
+tlane init --endpoint http://otel-collector.internal:4318 --service-name checkout-agent
+tlane init --sample-rate 0.25 --force
 ```
 
 ### `tlane trace <traceId>`
@@ -45,76 +53,112 @@ tlane trace 9f2c8a1b... --format timeline       # ASCII waterfall
 
 ### `tlane eval run` / `tlane eval list`
 
-Drive the Python eval orchestrator. `eval run` is what CI calls.
+Drive the eval suite. `eval run` shells out to the repo's vitest runner and is
+what CI calls; `eval list` reads the local eval index.
 
 ```bash
 tlane eval run                                 # all suites
-tlane eval run --suite predictive --tag PR1
-tlane eval list --status red
+tlane eval run --suite pp                      # pain-points only
+tlane eval run --suite ft --dry-run            # print the command, don't run it
+tlane eval list
 ```
 
-Suites: `all`, `gateway`, `ingest`, `predictive`, `pain-points`,
-`fault-tolerance`. Tracelane's own CI runs `--suite all`.
+Suite ids are `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
+`is` (ingest-schema), `pp` (pain-points), `pir` (pii-redaction),
+`pi` (prompt-injection). An unrecognised id is a hard error (exit 2), never a
+silent run-everything. Tracelane's own CI runs `--suite all`.
+
+`eval run` and `eval list` take no other flags, and both need a checkout of the
+Tracelane repository — the eval suites are not part of the npm package.
 
 ### `tlane prompt list | show | promote | rollback | diff`
 
 Front-end for [B1 Prompt Promotion](/decisions/index).
 
+Every subcommand takes the prompt **name** as a positional argument, plus the
+shared `--gateway <url>` / `--token <bearer>` (defaulting to
+`$TRACELANE_GATEWAY_URL` and `$TRACELANE_TOKEN`).
+
 ```bash
-tlane prompt list
+tlane prompt list pricing-v3 --limit 100
 tlane prompt show pricing-v3
-tlane prompt promote pricing-v3 --to staging
-tlane prompt promote pricing-v3 --to production --eval-passed PP-PR1
-tlane prompt rollback pricing-v3 --env production
-tlane prompt diff pricing-v3 --from v7 --to v8
+tlane prompt show pricing-v3 --env production
+tlane prompt promote pricing-v3 --from staging --to production --version-id <uuid>
+tlane prompt promote pricing-v3 --to production --version-id <uuid> --eval-run <uuid>
+tlane prompt rollback pricing-v3 --env production --version-id <uuid> --reason "sigma drift"
+tlane prompt diff pricing-v3 --from-env staging --to-env production
 ```
+
+`promote` and `rollback` both exit 2 without `--version-id`; `diff` requires
+both `--from-env` and `--to-env`. The gate flag is `--eval-run <uuid>` — an
+eval-run id, not an eval name.
 
 ### `tlane verify <ledger.ndjson>`
 
-Verify a tamper-evident audit ledger. Re-runs the per-tenant SHA-256
-hash chain and checks the Ed25519 per-tenant signatures (both live), and
-prints the first divergence with line number. Anchored batches carry a
-resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), which
-`tlane verify` checks when present; universal per-run anchoring is on the
-roadmap.
+Verify a tamper-evident audit ledger. Re-runs the per-tenant SHA-256 hash chain, and
+— when you supply the trusted key — checks the Ed25519 per-tenant signatures and any
+resolved Sigstore Rekor v2 inclusion proof. Divergences print with their `seq` (first 10).
 
 ```bash
-tlane verify audit-2026-04.ndjson
-tlane verify audit-2026-04.ndjson --rekor-offline
-tlane verify audit-2026-04.ndjson --strict
+# The real invocation. --tenant-pubkey is the trust root.
+tlane verify audit-2026-04.ndjson --tenant-pubkey <base64>
+tlane verify audit-2026-04.ndjson --tenant-pubkey <base64> --json
 ```
 
-The verifier is byte-identical across Rust, Python, and TypeScript.
+**`--tenant-pubkey` is what makes the run mean something.** Without it the verifier checks the hash chain only: signature and Rekor-anchor verification never run, so a forged anchor would not be caught. The CLI therefore exits **non-zero with `INCOMPLETE`** whenever a ledger contains anchor records and no trusted key was supplied. Get the key out-of-band from Settings → Audit signing key, or `GET /v1/audit/pubkey` — not from the export itself.
 
-### `tlane export <pack> --output <dir>`
+All three verifiers (Rust, Python, TypeScript) agree verdict-for-verdict on the shared
+conformance vectors in `evals/audit-ledger/`.
 
-Generate compliance evidence packs.
+### `tlane export --pack <name>`
 
-| Pack | Coverage |
+Generate a **documentation pack**: static markdown templates describing how
+Tracelane logs, which models it routes to, and how it handles data, plus a
+`manifest.json`, emitted as a ZIP.
+
+**It reads no ledger and makes no network calls, so it contains none of your
+data.** For your actual ledger, export it from `/v1/audit/export` and run
+`tlane verify`.
+
+| Pack (the value for `--pack`) | What the templates describe |
 |---|---|
-| `eu-ai-act-art12` | Transparency + audit logging |
-| `dpdp-phase-2` | India DPDP — data localisation + consent |
+| `eu-ai-act-art12` | Hash chain and anchoring design, model registry, data-processing record, guardrail catalogue |
+| `dpdp-phase-2` | Storage-region configuration, processor/controller split, rights-request procedure |
+
+`--pack` is required. `--output-dir` is the staging directory for the pack files
+(default `./compliance-pack`); the ZIP is written to the working directory
+unless you pass `--no-zip`, which keeps the directory instead. There is no
+positional pack argument and no `--output` flag.
 
 ```bash
-tlane export eu-ai-act-art12 --output ./evidence
+tlane export --pack eu-ai-act-art12 --output-dir ./docs-pack
+tlane export --pack dpdp-phase-2 --output-dir ./docs-pack --no-zip
 ```
 
 ### `tlane migrate helicone`
 
-Translate a Helicone configuration to Tracelane.
+Rewrite a project's Helicone wiring in place. Scans the project root for env
+files and source files carrying Helicone references, prints a diff, and — with
+`--apply` — writes the rewritten files after an interactive confirm.
 
 ```bash
-tlane migrate helicone                           # dry-run
-tlane migrate helicone --apply                   # write .env.tracelane
-tlane migrate helicone --apply --with-config --src src/
+tlane migrate helicone                              # dry-run diff, writes nothing
+tlane migrate helicone --apply                      # apply after confirmation
+tlane migrate helicone --dir ./services/api --apply # scan a different root
+tlane migrate helicone --endpoint https://gateway.acme.internal --apply
 ```
 
-### `tlane import-litellm <litellm_config.yaml>`
+Flags are `--apply`, `--dir <path>` (default: cwd) and `--endpoint <url>`.
 
-Translate a LiteLLM `model_list` to Tracelane gateway routing.
+### `tlane import-litellm --config <path>`
+
+Translate a LiteLLM `model_list` to Tracelane gateway routing. The config path
+is a flag, not a positional argument — a path passed positionally is ignored and
+the default `litellm_config.yaml` is read instead.
 
 ```bash
-tlane import-litellm litellm_config.yaml --output tracelane.yaml
+tlane import-litellm --config ./litellm_config.yaml --output tracelane.yaml
+tlane import-litellm --config ./litellm_config.yaml --dry-run
 ```
 
 ### `tlane replay <traceId>`
@@ -134,12 +178,11 @@ tlane replay 9f2c8a1b... --endpoint https://gateway.tracelane.dev
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | User error (bad args, missing file, server 4xx) |
-| 2 | Operator error (gateway 5xx, network, auth) |
-| 3 | Eval / verifier divergence |
-| 4 | Compliance pack incomplete |
+| 1 | Logical failure — verification failed or `INCOMPLETE`, unknown pack, server error |
+| 2 | Bad invocation or I/O — missing file, missing required flag, unknown eval suite |
 
-CI: code 3 = hard merge block, code 4 = warning gate.
+Those are the only codes the CLI emits. `tlane eval run` is the exception: it
+passes through the underlying test runner's exit code.
 
 ## Related
 

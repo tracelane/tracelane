@@ -15,6 +15,7 @@ import {
 import { withAuth } from "@workos-inc/authkit-nextjs";
 import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
+import { cache } from "react";
 
 export type Session = {
 	tenantId: string;
@@ -143,21 +144,35 @@ export async function optionalSession(): Promise<Session | null> {
  * Redirects (307) to /onboarding when signed in without an org, and to
  * /sign-in if the session somehow lacks an access token — matching
  * `requireSession`'s `redirect()` contract (never swallow NEXT_REDIRECT).
+ *
+ * MEMOIZED PER REQUEST with React `cache()`. Every `gatewayGet` calls this, and
+ * /dashboard makes eight of them — so without memoization one dashboard render
+ * ran `withAuth()` eight times, and `withAuth` calls iron-session `unsealData`
+ * on EVERY invocation (authkit-nextjs 4.0.1 `dist/esm/session.js:343,399` — it
+ * carries no `cache()` of its own; verified, not assumed). That is eight
+ * AES-decrypt + key-derive cycles per page on a Worker's single CPU budget, for
+ * one unchanging session.
+ *
+ * `cache()` is per-REQUEST, not global: two different users in flight never
+ * share an entry, so this cannot leak a session across tenants. The redirect
+ * paths still throw NEXT_REDIRECT on the first call, which is what propagates.
  */
-export async function requireGatewayToken(): Promise<{
-	token: string;
-	tenantId: string;
-}> {
-	// Returns a deliberately-fake token (the gateway 401s it → pages degrade to
-	// the warming/empty state) bound to the disposable test tenant.
-	if (e2eAuthEnabled()) return e2eTestGatewayToken();
+export const requireGatewayToken = cache(
+	async function requireGatewayToken(): Promise<{
+		token: string;
+		tenantId: string;
+	}> {
+		// Returns a deliberately-fake token (the gateway 401s it → pages degrade to
+		// the warming/empty state) bound to the disposable test tenant.
+		if (e2eAuthEnabled()) return e2eTestGatewayToken();
 
-	const { organizationId, accessToken } = await withAuth({
-		ensureSignedIn: true,
-	});
+		const { organizationId, accessToken } = await withAuth({
+			ensureSignedIn: true,
+		});
 
-	if (!organizationId) redirect("/onboarding");
-	if (!accessToken) redirect("/sign-in");
+		if (!organizationId) redirect("/onboarding");
+		if (!accessToken) redirect("/sign-in");
 
-	return { token: accessToken, tenantId: organizationId };
-}
+		return { token: accessToken, tenantId: organizationId };
+	},
+);

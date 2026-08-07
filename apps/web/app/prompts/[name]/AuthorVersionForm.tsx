@@ -121,7 +121,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 			{status === "success" && result ? (
 				<div className="space-y-3">
 					<div className="rounded-md border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
-						<p className="font-semibold text-ok">
+						<p className="font-semibold text-ok-ink">
 							Version {result.version_number} authored
 						</p>
 						<p className="text-ink-2">
@@ -217,7 +217,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 					</div>
 
 					{status === "error" ? (
-						<div className="rounded-md border border-danger bg-danger-soft/40 p-3 text-xs text-danger">
+						<div className="rounded-md border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
 							{errorMsg || "Unexpected failure — check gateway logs."}
 						</div>
 					) : null}

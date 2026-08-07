@@ -343,6 +343,11 @@ class VerifyReport:
     rekor_anchors_resolved: int = 0
     # Anchors whose FULL public-inclusion proof + checkpoint verified (Layer 2+3).
     anchors_included: int = 0
+    #: Anchor records PRESENT but SKIPPED for want of a trusted ``tenant_pubkey``.
+    #: ``> 0`` means signature + anchor verification never ran, so
+    #: ``signatures_valid`` is vacuous and a caller MUST NOT report a pass
+    #: (P0, 2026-08-07 — a CLI printed PASS over a forged anchor).
+    anchors_unverified: int = 0
     # True if any anchor committed to "anchored" but its rekor bundle is absent
     # (a strip/downgrade attack). ADR-062.
     strip_detected: bool = False
@@ -722,6 +727,9 @@ def _verify_anchors_offline(
         # Layer 2 (trusted-key gate). No trusted key -> chain-only: assert
         # nothing (never green), do not count as seen/resolved.
         if tenant_pubkey is None:
+            # Record the SKIP so callers fail closed; silently skipping is how a
+            # forged anchor read as PASS (P0, 2026-08-07).
+            report.anchors_unverified += 1
             continue
         ed25519_block = a.get("ed25519", {})
         try:

@@ -1,29 +1,32 @@
 ---
 title: Migrating from Datadog LLM Observability
-description: Replace Datadog LLM Observability with Tracelane — purpose-built for AI agents, with predictive guardrails, prompt versioning, and tamper-evident audit.
+description: Move AI-agent tracing from Datadog LLM Observability to Tracelane — OTel GenAI semconv spans, a BYOK gateway, prompt versioning, and a tamper-evident audit ledger.
+classification: PUBLIC
 ---
 
-Datadog's LLM Observability added AI tracing to a platform designed for
-traditional APM. It understands LLM calls but has no model for MCP tools, A2A
-handoffs, browser agents, agent loops, or the failure modes specific to
-multi-step agents. Predictive guardrails, prompt versioning, and tamper-evident
-audit trails are absent entirely.
+This page is the mechanical walkthrough for moving AI-agent tracing off Datadog
+LLM Observability: swap the `ddtrace.llmobs` init for Tracelane's, replace the
+proprietary decorators with OpenTelemetry GenAI semconv spans, and rebuild the
+handful of views you relied on. You can also run both side by side — see
+[Keeping Datadog for infrastructure APM](#keeping-datadog-for-infrastructure-apm).
 
-You also pay Datadog APM pricing on top of your GPU bills.
+We do not restate Datadog's feature set or pricing here — both move, and their
+own documentation is the only accurate source for them. Below is what Tracelane
+brings, so you can compare it against your current bill and plan yourself.
 
-## What changes
+## What Tracelane gives you
 
-| Capability | Datadog LLM Obs. | Tracelane |
-|---|---|---|
-| LLM call tracing | Yes | Yes |
-| Agent-specific failure modes | No | 8 predictive guards — MCP rug-pull, lethal trifecta, A2A, loops, … |
-| Predictive guardrails inline | No | Yes — combined inline at the gateway |
-| Prompt versioning + eval gates | No | Prompt promotion + auto-rollback (B1); eval gates dark-launched V1.1 |
-| Time-travel replay | No | Yes — model-swap, prompt-swap |
-| BYOK gateway (0 % markup) | No | Yes — 30+ providers |
-| Tamper-evident audit ledger | No | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
-| Self-hostable | Datadog infra only | Yes — Docker Compose + Helm |
-| Pricing model | Per GB ingested | Per span · predictable |
+| Capability | Tracelane |
+|---|---|
+| LLM call tracing | OTel GenAI semconv spans — portable to any OTel-compatible backend |
+| Agent-specific signals | Inline heuristic rails at the gateway; MCP/agent-tool detectors fire on tool traffic, not chat completions |
+| Inline guardrails | Rails run in-request and verdicts are written to the ledger. The predictive layer is **observe-first by default** — a `Block` is recorded and the request still proceeds unless enforcement is explicitly enabled |
+| Prompt versioning + eval gates | Prompt promotion + auto-rollback (B1); eval gates dark-launched V1.1 |
+| Time-travel replay | Read-only re-render; cross-model re-execution is on the roadmap |
+| BYOK gateway | 30+ providers, 0 % markup on your provider keys |
+| Tamper-evident audit ledger | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
+| Self-hostable | Apache 2.0, single-node Docker Compose (`infra/self-host/docker-compose.yml`). No Helm chart is published |
+| Pricing model | Per span — see [Pricing](/pricing) |
 
 ## Step 1 — Install Tracelane
 
@@ -106,12 +109,17 @@ instrument_anthropic(client)  # now this client's calls are traced
 Datadog dashboards use proprietary widgets. Tracelane provides:
 
 - **Traces view** — transcript-spine span tree for deep agent traces
-- **SLO dashboard** — error rate, latency, token spend per model/provider
-- **Eval Scoreboard** — 50 pain-point evals + 8 fault-tolerance chaos evals
-- **Trust Center** — audit ledger exports, verifier downloads
+- **SLO dashboard** — error rate, latency, token spend per model/provider. The
+  availability target is the product default (99.9 %); a per-tenant SLO target is
+  not configurable yet
+- **Eval suite** — 69 pain-point + 10 fault-tolerance evals, run in CI (no in-app scoreboard yet)
+- **Audit ledger** — in-app ledger view and NDJSON export (`/audit`)
 
-If you have custom Datadog monitors, recreate critical ones as Tracelane SLO
-thresholds or eval assertions.
+If you have custom Datadog monitors, the closest equivalent is an **alert rule**:
+a threshold on one of six metrics — `error_rate`, `burn_rate`, `latency_p95`,
+`overhead_p99`, `cost_usd`, `quota_pct` — delivered to your own Slack- or
+Discord-compatible webhook. Alert rules are entitlement-gated; check whether your
+plan includes them. Anything outside those six is an eval assertion or nothing.
 
 ## Keeping Datadog for infrastructure APM
 

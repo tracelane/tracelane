@@ -1,51 +1,109 @@
 ---
-title: Tracelane vs LangSmith Engine
-description: Compare Tracelane's pre-flight predictive guardrails and tamper-evident promotion record with LangSmith Engine's post-failure clustering and PR drafts.
+title: Tracelane for LangSmith users
+description: What Tracelane ships — a tamper-evident flight recorder for AI agents, BYOK at 0% markup, OTel GenAI semconv, and an Apache 2.0 self-host.
+classification: PUBLIC
 ---
 
-LangSmith launched Engine on May 13, 2026. Engine clusters production failures, drafts PRs against connected GitHub code, and proposes online evaluators inside the LangSmith UI.
+Teams evaluating Tracelane often already run LangSmith. Rather than summarise someone
+else's product — which we cannot keep accurate and you should not have to trust — this
+page states plainly what Tracelane ships and what it does not, so you can compare it
+against whatever you run today.
 
-Tracelane sits one step earlier in the agent lifecycle. Predictive pre-flight guardrails at the gateway, inline, with a tamper-evident promotion record on every deploy.
+For LangSmith's current capabilities, pricing and terms, read
+[LangChain's own documentation](https://docs.langchain.com/langsmith).
 
-## How we compare
+## What Tracelane is
 
-| Claim | Tracelane | LangSmith Engine |
-|---|---|---|
-| When intervention happens | Pre-flight (before model call) | Post-failure (after trace lands) |
-| Where intervention happens | Inline at gateway | LangSmith trace UI + GitHub PR draft |
-| Tamper-evidence | Hash-chained promotion record + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap | None |
-| Key custody | BYOK 0% markup | LangSmith-managed inference per ToS |
-| Wire format | OTel GenAI semconv (neutral) | LangSmith proprietary |
-| Self-host | Apache 2.0 full stack | Cloud + Enterprise Self-Hosted SKU |
-| Auto-rollback | EWMA on cost / latency / error / guardrail-fire rate | Manual prompt promotion |
-| Inline guardrails | Heuristic guardrails (multi-model ML ensemble on the roadmap) | None |
-| LangChain SDK dependency | None — framework-agnostic | Required |
-| Entry price (paid) | $59/mo Builder | Per-seat (see LangSmith pricing) |
+Tracelane is a **flight recorder for AI agents**: full-fidelity capture of every model
+call, plus a tamper-evident ledger that a third party can verify offline, without
+access to our systems and without trusting us.
 
-*Engine facts verified against [langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview) (May 13, 2026).*
+## What Tracelane ships
 
-## When to pick each
+### A tamper-evident audit ledger
 
-**Pick LangSmith Engine if** you are already on LangSmith, your team uses the LangChain SDK, and you want clustering + PR drafting inside one tool. Engine's strength is reactive analysis of issues that already landed.
+Every audit event lands in a Merkle-batched hash chain. Each tenant gets its own Ed25519
+signing key, and the chain is signed per tenant.
 
-**Pick Tracelane if** you want a neutral OTel GenAI semconv wire format, BYOK key custody with zero markup, pre-flight policy enforcement at the gateway, a tamper-evident audit ledger designed for EU AI Act Article 12 record-keeping (the Annex III high-risk timeline is provisional — expected around December 2027), and a self-hostable Apache 2.0 stack.
+The property that matters: **you can verify it without us.** Export the ledger and run
+`tlane verify --tenant-pubkey <your key>` on your own machine. The verification is
+offline and independent — if a record had been altered or removed, the chain check fails.
+Anchored batches additionally carry a resolved Sigstore Rekor v2 inclusion proof on a
+best-effort basis; universal per-run anchoring is on the roadmap.
 
-**Run both** if you want both moments — Tracelane in front for prevention, LangSmith behind for post-hoc analysis.
+See [Audit Ledger](/audit-ledger) for the format and the verification procedure.
+
+### Full-fidelity capture, on a neutral wire format
+
+Traces are emitted as OTel GenAI semantic conventions — an open standard, not a
+Tracelane-specific envelope. Capture defaults to full fidelity rather than sampled, so
+the recorder does not silently drop the trace you later need.
+
+### Observe-first guardrails
+
+Guardrails run inline at the gateway and are **deliberately observe-first**: they detect
+and record rather than block by default. This is a considered position, not a missing
+feature — for most teams a false-positive block is worse than the failure it would have
+prevented. Detection today is heuristic and deterministic; a multi-model ML ensemble is
+on the roadmap and is not shipped.
+
+### BYOK at 0% markup
+
+Bring your own provider keys across 30+ providers. Keys are stored with envelope
+encryption, with the AAD bound to `(tenant_id, provider_id)`. We add no markup to your
+provider spend.
+
+### Auto-rollback on objective metrics
+
+Prompt promotions can roll back automatically on EWMA thresholds over cost, latency,
+error rate and guardrail-fire rate — objective signals, not a human noticing a
+regression days later.
+
+### Apache 2.0, self-hostable
+
+The entire stack is Apache 2.0 and runs self-hosted on single-node Docker Compose. Paid
+plans start at $59/mo (Builder); self-hosting the open-source stack is free.
+
+## What Tracelane does not do
+
+- **Failure clustering.** Not shipped. Clustering-adjacent capabilities are on the V1.5
+  roadmap.
+- **Automated PR drafting against your repo.** Not shipped, and not on the near roadmap.
+- **Blocking enforcement by default.** Deliberate — see observe-first above.
 
 ## FAQ
 
 <AccordionGroup>
 
 <Accordion title="Does Tracelane do failure clustering today?">
-No. Engine ships clustering today; Tracelane does not. Tracelane positions on the pre-flight moment, not the post-failure clustering moment. Clustering-adjacent capabilities are on the V1.5 roadmap.
+No. Tracelane positions on full-fidelity capture and the tamper-evident record, not on
+post-failure clustering. Clustering-adjacent capabilities are on the V1.5 roadmap. If
+clustering is your primary need today, Tracelane is not yet the tool for that job.
 </Accordion>
 
 <Accordion title="Can I migrate from LangSmith to Tracelane?">
-Yes. `tlane import langsmith` reads your existing project, traces, and prompt versions. OTel GenAI semconv is the wire format, so once instrumented you can dual-write during cutover.
+Not with a one-command importer — that is on the roadmap. `tlane migrate helicone` and
+`tlane import-litellm` ship today; a LangSmith equivalent does not.
+
+Because the wire format is OTel GenAI semconv, the practical path is to instrument once
+and dual-write during cutover, then cut the old destination when you are satisfied.
+</Accordion>
+
+<Accordion title="Can I run Tracelane alongside what I already have?">
+Yes. Tracelane sits at the gateway and emits OTel GenAI semconv, so it can run in
+parallel with an existing tracing destination during evaluation. Nothing requires you to
+cut over before you have compared them on your own traffic.
 </Accordion>
 
 <Accordion title="What does 'tamper-evident promotion record' mean?">
-Every promotion event (staging → production) is recorded in a tamper-evident Merkle-batched hash chain with Ed25519 per-tenant signing (live). Anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis (independently verifiable via `tlane audit prove --promotion-id ...`); universal per-run anchoring is on the roadmap. See [Audit Ledger](/audit-ledger).
+Every promotion event (staging → production) is recorded in a tamper-evident
+Merkle-batched hash chain with Ed25519 per-tenant signing. Anchored batches carry a
+resolved Sigstore Rekor v2 inclusion proof on a best-effort basis; universal per-run
+anchoring is on the roadmap.
+
+"Tamper-evident" means alteration is *detectable*, not that it is prevented. The check is
+independently reproducible with `tlane verify --tenant-pubkey` against the exported
+ledger. See [Audit Ledger](/audit-ledger).
 </Accordion>
 
 </AccordionGroup>

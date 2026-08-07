@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Changelog
 
 All notable changes to `@tracelanedev/audit-verifier` are documented here.

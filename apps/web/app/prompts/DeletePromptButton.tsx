@@ -49,7 +49,7 @@ export function DeletePromptButton({ name }: { name: string }) {
 			disabled={busy}
 			aria-label={`Delete prompt ${name}`}
 			title={err ?? "Delete prompt"}
-			className="rounded-md border border-line px-2 py-1 text-xs font-medium text-ink-3 transition-colors hover:border-danger hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+			className="rounded-md border border-line px-2 py-1 text-xs font-medium text-ink-3 transition-colors hover:border-danger hover:text-danger-ink disabled:cursor-not-allowed disabled:opacity-40"
 		>
 			{busy ? "Deleting…" : "Delete"}
 		</button>

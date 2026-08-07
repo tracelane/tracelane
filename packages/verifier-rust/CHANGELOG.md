@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Changelog
 
 All notable changes to `tracelane-audit-verifier` (Rust reference verifier) are

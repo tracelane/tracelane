@@ -33,6 +33,8 @@ pub mod rails;
 pub mod recorder;
 pub mod registry_loader;
 pub mod streaming;
+pub mod tool_observer;
+pub mod tool_pins_api;
 pub mod verdict;
 
 pub use capability::{CapabilityRegistry, CapabilitySet, RegistryPosture, ToolCapability, ToolDef};

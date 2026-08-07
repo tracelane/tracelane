@@ -127,9 +127,7 @@ async function GatewayData({ range }: { range?: string }) {
 				>
 					<div className="flex items-center gap-2">
 						<MetricIcon name="time" size={26} />
-						<p className="text-[11px] font-medium uppercase tracking-wide text-ink-3">
-							Prompt-cache hit
-						</p>
+						<p className="t-card-title text-ink-3">Prompt-cache hit</p>
 					</div>
 					<div className="flex flex-1 items-center justify-center">
 						<Gauge
@@ -210,7 +208,9 @@ async function GatewayData({ range }: { range?: string }) {
 									{p.errors > 0 ? (
 										<Badge tone="danger">{pct(p.error_rate_pct)}</Badge>
 									) : (
-										<span className="font-mono tabular-nums text-ok">0%</span>
+										<span className="font-mono tabular-nums text-ok-ink">
+											0%
+										</span>
 									)}
 								</td>
 								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
@@ -350,7 +350,7 @@ export default async function GatewayPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
 				<div className="max-w-2xl">
-					<h1 className="text-2xl font-semibold text-ink">Gateway</h1>
+					<h1 className="t-h1">Gateway</h1>
 					<p className="mt-1 text-sm text-ink-2">
 						Per-provider routing health — volume, errors, failover and breaker
 						state. Latency SLOs live on the{" "}

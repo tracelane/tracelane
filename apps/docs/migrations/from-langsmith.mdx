@@ -1,26 +1,29 @@
 ---
 title: Migrating from LangSmith
-description: Replace LangSmith tracing with Tracelane in minutes using the drop-in LangChain adapter — 18+ frameworks, gateway routing, and tamper-evident audit.
+description: Move LangChain tracing from LangSmith to Tracelane — route your chains through the gateway and get 18+ framework adapters, BYOK routing, and a tamper-evident audit ledger.
+classification: PUBLIC
 ---
 
-LangSmith traces LangChain pipelines well but stops there. It has no gateway
-(you still pay full retail to providers), no predictive guardrails, no
-tamper-evident audit trail, and no support for frameworks outside the LangChain
-ecosystem.
+If you are moving LangChain tracing off LangSmith, this page is the mechanical
+walkthrough: stop the LangSmith exporter, point your chains at the Tracelane
+gateway, and (optionally) port your `@traceable` spans to the OpenTelemetry API.
 
-Tracelane's LangChain adapter is a drop-in replacement for LangSmith tracing.
+We do not restate LangSmith's feature set here. It is an actively developed
+product — check what your plan covers against LangSmith's own documentation
+rather than trusting our summary of someone else's product. Below is what
+Tracelane brings, so you can compare it yourself.
 
-## What changes
+## What Tracelane gives you
 
-| Capability | LangSmith | Tracelane |
-|---|---|---|
-| Frameworks supported | LangChain only | 18+ (OpenAI, Anthropic, CrewAI, AutoGen, MCP, …) |
-| LLM gateway / BYOK | No | Yes — 30+ providers, 0 % markup |
-| Predictive guardrails | No | 8 inline guards, combined inline at the gateway |
-| Tamper-evident audit log | No | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
-| Prompt versioning + gates | Limited | Prompt promotion + auto-rollback live; eval-gate enforcement dark-launched (V1.1) |
-| Time-travel replay | No | Yes — model-swap, prompt-swap |
-| Self-hostable | Enterprise Self-Hosted SKU only | Yes — Apache 2.0, Docker Compose + Helm |
+| Capability | Tracelane |
+|---|---|
+| Framework adapters | 18+ `instrument_*` adapters (OpenAI, Anthropic, LangChain, LangGraph, CrewAI, AutoGen, MCP, …) |
+| LLM gateway / BYOK | 30+ providers, 0 % markup on your provider keys |
+| Inline guardrails | Heuristic rails at the gateway, verdicts written to the ledger. The predictive layer is **observe-first by default** — a `Block` is recorded and the request still proceeds unless enforcement is explicitly enabled |
+| Tamper-evident audit log | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
+| Prompt versioning + gates | Prompt promotion + auto-rollback live; eval-gate enforcement dark-launched (V1.1) |
+| Time-travel replay | Read-only re-render; cross-model re-execution is on the roadmap |
+| Self-hostable | Apache 2.0, single-node Docker Compose (`infra/self-host/docker-compose.yml`). No Helm chart is published |
 
 ## Step 1 — Install the SDK
 
@@ -43,8 +46,11 @@ client = Client()
 After:
 
 Tracelane captures your LangChain traces by routing the calls through the
-gateway (next step) — there is no tracing env var and no SDK auto-instrumentation
-of LangChain to wire up. Just set your key:
+gateway (next step) — there is no tracing env var to set, and `auto_instrument()`
+deliberately does not touch LangChain (graphs and chains are user-constructed, so
+there is no default object to wrap). If you want SDK-side spans in addition to
+the gateway's, call `instrument_langchain(client)` yourself after you build the
+client. Otherwise just set your key:
 
 ```bash
 export TRACELANE_API_KEY=tlane_...
@@ -55,24 +61,25 @@ from your environment.
 
 ## Step 3 — Point your LangChain clients at the gateway
 
-The Tracelane gateway is OpenAI-compatible. LangChain's `ChatOpenAI` and
-`ChatAnthropic` accept a `base_url` / `api_base` override:
+The Tracelane gateway is OpenAI-compatible. Point LangChain's `ChatOpenAI` at it —
+**including for Anthropic models**. The gateway mounts `/v1/chat/completions` only; it
+does not expose `/v1/messages`, so `ChatAnthropic` (which drives the Anthropic SDK and
+sends `x-api-key`) will not reach it. Routing is by model prefix.
 
 ```python
 from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 
 # OpenAI-compatible providers
 llm = ChatOpenAI(
     model="gpt-4o",
     base_url="https://gateway.tracelane.dev/v1",
-    api_key="tlane_...",  # Tracelane wraps your provider key via BYOK
+    api_key="tlane_...",  # Tracelane resolves your provider key via BYOK
 )
 
-# Anthropic
-llm = ChatAnthropic(
+# Anthropic models — same endpoint, the model prefix selects the provider
+claude = ChatOpenAI(
     model="claude-sonnet-4-6",
-    base_url="https://gateway.tracelane.dev",
+    base_url="https://gateway.tracelane.dev/v1",
     api_key="tlane_...",
 )
 ```
@@ -107,18 +114,15 @@ with tracer.start_as_current_span("my_function") as span:
 
 ## Migrating existing LangSmith traces
 
-Export from LangSmith and import into Tracelane:
+**There is no trace import path today.** Tracelane ships no LangSmith importer,
+and the two importers it does ship — `tlane import-helicone` and
+`tlane import-litellm` — translate *configuration*, not trace history. Nothing in
+Tracelane ingests a LangSmith export, and there is no `imported` tag on traces.
 
-```bash
-# Export from LangSmith (LangSmith CLI)
-langsmith export --project my-project --output langsmith_export.jsonl
-
-# Import into Tracelane
-tlane import langsmith langsmith_export.jsonl
-```
-
-Historical traces are read-only after import — they appear in the Traces view
-with an `imported` tag.
+Plan for a cut-over rather than a backfill: keep your LangSmith history where it
+is for as long as you need to read it, and let Tracelane accumulate from the
+moment you point your chains at the gateway. If a historical import matters to
+your migration, tell us — it is not built.
 
 ## Related
 

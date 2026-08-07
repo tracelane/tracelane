@@ -435,7 +435,7 @@ export default async function TracesPage({
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex items-center justify-between">
-				<h1 className="text-2xl font-semibold text-ink">Traces</h1>
+				<h1 className="t-h1">Traces</h1>
 				<div className="flex items-center gap-4">
 					<div className="flex items-center gap-2 text-xs">
 						<a

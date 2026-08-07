@@ -142,7 +142,7 @@ export function SupportForm() {
 				<span
 					className={cn(
 						"text-xs tabular-nums",
-						message.length > MAX ? "text-danger" : "text-ink-3",
+						message.length > MAX ? "text-danger-ink" : "text-ink-3",
 					)}
 				>
 					{message.length} / {MAX}
@@ -158,7 +158,7 @@ export function SupportForm() {
 			/>
 
 			{status === "error" && (
-				<p className="mt-2 text-sm text-danger">
+				<p className="mt-2 text-sm text-danger-ink">
 					Couldn&apos;t send — please try again.
 				</p>
 			)}

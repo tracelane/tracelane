@@ -2,12 +2,13 @@
 title: tracelane-audit verifier CLI
 description: Install, run, and CI-integrate the tracelane-audit verifier — a static Rust binary that offline-checks hash chain, Ed25519 signatures, and Rekor anchors.
 sidebarTitle: Verifier CLI
+classification: PUBLIC
 ---
 
 # `tracelane-audit` verifier CLI
 
-> **Authoritative:** [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md).
-> Wraps the shipped [`tracelane-audit-verifier`](https://crates.io/crates/tracelane-audit-verifier) Rust crate
+> **Authoritative:** [ADR-034](/decisions/index).
+> Wraps the shipped [`tracelane-audit-verifier`](https://pypi.org/project/tracelane-audit-verifier/) Rust crate
 > with an argument parser, an HTTP fetch step, and PASS/FAIL rendering.
 
 > **What the verifier checks — all offline.** Three independent layers,
@@ -34,9 +35,7 @@ curl -fsSLO https://github.com/tracelane/tracelane/releases/latest/download/trac
 chmod +x tracelane-audit-x86_64-unknown-linux-musl
 
 # Optional: verify the binary itself before running.
-# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
-# whole 2.x line up to and including 2.6.4 — carries verification-side
-# advisories (CVE-2026-24122) that can accept signatures it should reject.
+# Use a current cosign release to verify.
 cosign verify-blob \
   --bundle tracelane-audit-x86_64-unknown-linux-musl.cosign.bundle \
   --certificate-identity-regexp 'github.com/tracelane/tracelane/.github/workflows/release-audit-cli.yml' \
@@ -53,14 +52,16 @@ been cut yet**, so these artefacts are not downloadable today — build from sou
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc.exe`
 
-Each artefact will be **Cosign-signed (keyless)** + **SLSA Build Level 3
-provenance** + **CycloneDX SBOM** — the release workflow is configured for all
-three and has not yet run on a tag.
+Each artefact will be **Cosign-signed (keyless)** + carry **attested build
+provenance** (GitHub `attest-build-provenance`) + a **CycloneDX SBOM**. A verified
+**SLSA Level 3** attestation is not claimed — the `slsa-github-generator` job exists
+but its `final` step does not currently succeed. See
+[SECURITY.md](https://github.com/tracelane/tracelane/blob/main/SECURITY.md).
 
-### From crates.io
+### From source
 
 ```bash
-cargo install tracelane-audit
+cargo build --release -p tracelane-audit
 ```
 
 ## CLI surface
@@ -101,14 +102,18 @@ tracelane-audit verify \
   --workspace 00000000-0000-0000-0000-00000000000a \
   --from 2026-05-01T00:00:00Z \
   --to   2026-05-26T00:00:00Z \
-  --read-key $TRACELANE_AUDIT_READ_KEY
+  --read-key $TRACELANE_AUDIT_READ_KEY \
+  --tenant-pubkey I5rZ...workspace-ed25519-pubkey-base64
 ```
 
 ### Offline — verify a previously-exported NDJSON
 
 ```bash
-tracelane-audit verify --file ./audit-range.ndjson --offline
+tracelane-audit verify --file ./audit-range.ndjson \
+  --tenant-pubkey I5rZ...workspace-ed25519-pubkey-base64
 ```
+
+**Without `--tenant-pubkey` the anchor layer does not run at all**, so a forged anchor would not be caught. The verifier therefore exits **non-zero with `INCOMPLETE`** when a ledger carries anchor records and no trusted key was supplied. Obtain the key out-of-band (dashboard Settings → Audit signing key, or `GET /v1/audit/pubkey`) — never from the export you are auditing.
 
 All verification is offline from the exported bundle — Rekor anchoring
 is verified from the inclusion proof + signed checkpoint carried in the
@@ -123,7 +128,8 @@ without it the anchor layer is reported unverified.
 ### JSON output for piping
 
 ```bash
-tracelane-audit verify --file ./audit-range.ndjson --format json \
+tracelane-audit verify --file ./audit-range.ndjson \
+  --tenant-pubkey I5rZ... --format json \
   | jq '.errors[] | select(.kind == "row_hash_mismatch")'
 ```
 
@@ -187,7 +193,8 @@ jobs:
 ### Slack alert on FAIL
 
 ```bash
-if ! tracelane-audit verify --workspace $WS --from $FROM --to $TO; then
+if ! tracelane-audit verify --workspace $WS --from $FROM --to $TO \
+     --tenant-pubkey "$TRACELANE_AUDIT_PUBKEY"; then
   curl -X POST -H 'Content-Type: application/json' \
     -d '{"text":"🚨 Audit verification FAILED for workspace '"$WS"'"}' \
     $SLACK_WEBHOOK_URL

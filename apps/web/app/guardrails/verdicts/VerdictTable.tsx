@@ -304,7 +304,7 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 											</span>
 										)}
 										{failedOpen && (
-											<p className="mt-1 text-[11px] text-warn">
+											<p className="mt-1 text-[11px] text-warn-ink">
 												failed open: {v.fail_open_rails.join(", ")}
 											</p>
 										)}
@@ -319,7 +319,7 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 										<td colSpan={6} className="bg-surface-2/30 px-4 py-4">
 											<div className="space-y-3">
 												<div>
-													<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-3">
+													<p className="t-card-title text-ink-3">
 														Rails evaluated ({rails.length})
 													</p>
 													<div className="mt-1.5 grid gap-2 sm:grid-cols-2">

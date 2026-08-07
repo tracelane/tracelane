@@ -1,118 +1,163 @@
 ---
-title: Audit conformance statement
-description: Written conformance statement showing how the Tracelane Audit add-on SKU satisfies EU AI Act Article 12 recordkeeping obligations for high-risk AI.
-sidebarTitle: Conformance statement
+title: Audit control mapping — EU AI Act Article 12
+description: A technical control mapping — which shipped Tracelane Audit capabilities relate to each Article 12 recordkeeping topic, cited to source, and what each one does not cover.
+sidebarTitle: Audit control mapping
+classification: PUBLIC
 ---
 
-# Audit conformance statement
+# Audit control mapping — EU AI Act Article 12
 
 **Effective date:** 2026-06-16 (V1 launch). **Coverage:** every
 workspace with the **Audit add-on SKU** (`f_audit_addon = TRUE` in
 `workspace_entitlements`).
 
-Tracelane attests that the Audit add-on SKU satisfies the EU AI Act
-Article 12 recordkeeping obligations for high-risk AI systems
-deployed on the Tracelane platform. This statement is the written
-artefact intended for:
+> **What this page is — and is not.** This is a **technical control
+> mapping**: it describes what Tracelane ships, cited to source, grouped
+> under the Article 12 topics engineering and compliance teams most often
+> ask about. It is **not** a conformance statement, a certification, an
+> attestation, or legal advice, and Tracelane makes no representation
+> that deploying these controls satisfies any regulatory obligation.
+> Whether your deployment meets an obligation is a determination for you
+> and your assessor. Every capability below is either linked to the
+> source that implements it or explicitly marked as not shipped.
 
-- Internal compliance teams preparing an Article 12 attestation.
-- External auditors performing pre-engagement diligence.
-- Market-surveillance authorities exercising Article 12(3)(c)
-  inspection rights.
-
-For the underlying cryptographic mechanisms, see
-[ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)
-and [ADR-034](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-034-audit-verifier-cli.md).
+Written for engineering and compliance teams evaluating what the Audit
+add-on actually records, and for third-party reviewers who need to
+verify a ledger export independently.
 
 > **Status — what is live vs. on the roadmap.** The **per-tenant
 > SHA-256 hash chain is live and universal** (every workspace,
 > including the free tier) and is independently verifiable today by
 > recomputing the chain offline. **Ed25519 Merkle-root batch signing,
 > Merkle aggregation, and Sigstore Rekor v2 public-transparency
-> anchoring are now live in production** for Audit-add-on workspaces:
+> anchoring are live in production** for Audit-add-on workspaces:
 > each batch's Merkle root is Ed25519-signed and best-effort anchored
 > to the public Sigstore Rekor v2 log
 > ([`log2025-1.rekor.sigstore.dev`](https://log2025-1.rekor.sigstore.dev)),
 > and each anchor's inclusion proof + signed checkpoint are captured so
-> a regulator can re-verify **offline** against the public log. **eIDAS
-> QTSP timestamping remains on the roadmap.** Two honest scope notes:
-> (1) anchoring is **best-effort** — if the public log is unreachable a
-> batch stays signed-locally-but-not-yet-anchored, and the hash chain +
-> Ed25519 signature still hold (the tamper-evidence guarantee never
-> depends on the external log being up); (2) the chain today covers
-> **gateway-proxied** events (LLM provider calls + guardrail verdicts
-> routed through the Tracelane gateway) — spans captured via the
-> SDK/OTLP self-host path are recorded full-fidelity but are **not yet
-> chained or anchored** (batch-digest coverage of that path is the next
-> increment). The tamper-evidence guarantee rests on the live hash
-> chain + offline recompute; the Ed25519 signature and Rekor inclusion
-> proof are additional, independently-verifiable layers on top.
+> a reviewer can re-verify **offline** against the public log. Two honest
+> scope notes: (1) anchoring is **best-effort** — if the public log is
+> unreachable a batch stays signed-locally-but-not-yet-anchored, and the
+> hash chain + Ed25519 signature still hold (the tamper-evidence
+> guarantee never depends on the external log being up); (2) the chain
+> today covers **gateway-proxied** events (LLM provider calls, guardrail
+> verdicts and prompt-promotion verdicts routed through the Tracelane
+> gateway) — spans captured via the SDK/OTLP self-host path are recorded
+> full-fidelity but are **not chained or anchored** (batch-digest
+> coverage of that path is the next increment). The tamper-evidence
+> guarantee rests on the live hash chain + offline recompute; the Ed25519
+> signature and Rekor inclusion proof are additional,
+> independently-verifiable layers on top.
 
-For the regulator-runnable verifier, see [`/audit/verifier-cli`](/audit/verifier-cli).
+For the reviewer-runnable verifier, see [`/audit/verifier-cli`](/audit/verifier-cli).
 
-## Statement
-
-For each high-risk AI system deployed against a Tracelane workspace
-with the Audit add-on SKU active, Tracelane represents and warrants
-that:
+## Control mapping
 
 ### Article 12(2)(a) — automatic log generation
 
-Every runtime event the deployed AI system emits to the Tracelane
-gateway — including LLM provider calls, tool invocations,
-guardrail-layer decisions, agent-to-agent handoffs, and MCP
-invocations — is written into a per-tenant tamper-evident audit
-ledger. Writes are synchronous with the agent event; no asynchronous
-deferral that could be selectively suppressed exists. The
-implementation is open-source under Apache-2.0 at
-`crates/gateway/src/audit.rs` and is independently verifiable.
+**Exactly three runtime events are written into the per-tenant
+tamper-evident ledger**, and it is worth being precise about which:
+
+| Event type | Emitted by | What it records |
+|---|---|---|
+| `chat.completions.request` | `crates/gateway/src/server.rs:1191` | every LLM provider call proxied by the gateway |
+| `guardrail.verdict` | `crates/gateway/src/guardrail/recorder.rs:123` | every guardrail-layer decision |
+| `eval.verdict` | `crates/gateway/src/prompt_routes.rs:89` | prompt promotion / rollback decisions |
+
+Tool invocations, agent-to-agent handoffs and MCP invocations are
+**captured as spans but are not chained** — they are not in the ledger
+today.
+
+**How the write happens (ADR-069).** The write is **asynchronous by
+design**. The gateway hot path performs an **acked** JetStream publish
+*before* it dispatches to the provider (`crates/gateway/src/audit.rs:493`),
+so the event is durably captured before the request is served; a publish
+failure returns `503 audit_unavailable` rather than serving an unrecorded
+request (`server.rs:1201`). The head-advance itself — sequence assignment
+under a per-tenant row lock, the ClickHouse row, the Postgres head, the
+commit — runs **off the request path** in a single head-writer consumer
+(`crates/gateway/src/audit_consumer.rs`), which acks the JetStream
+message only after the append commits. A crash between commit and ack
+replays into an idempotent no-op: no gap, no duplicate sequence number.
+
+**Two honest notes on the failure modes.**
+
+1. A `kill.audit.async` kill-switch flag (`audit.rs:389-390`, read at
+   `audit.rs:497`) forces the synchronous append fleet-wide with no
+   redeploy. That fallback path is deliberately **fail-open**: if the
+   append fails it logs a warning and the request is served **with no
+   audit record** (`audit.rs:500-508`). The same fallback applies to any
+   deployment without JetStream wired — dev and self-host.
+2. An operator with control of that flag can therefore change the
+   failure mode, and the flag's state is not itself recorded in the
+   ledger. What the chain proves is that the records it *does* contain
+   have not been altered — not that no record was ever suppressed
+   upstream of it.
+
+The implementation is open-source under Apache-2.0 at
+`crates/gateway/src/audit.rs` and is independently reviewable.
 
 ### Article 12(2)(b) — risk-situation identification
 
-Every audit row carries a structured `event_type` enum, the
-identifying `actor` of the runtime component, the full canonical
-`payload` (subject to the PII-redaction policy at
-`crates/policy/src/pii.rs`), and the OTel-GenAI semantic-convention
-attributes for LLM provider calls (model, token counts, intervention
-decisions). A regulator-side query "every time the system blocked a
-user request and the reason" returns in sub-second time against any
-Tracelane workspace.
+Every ledger row carries a structured `event_type`, the identifying
+`actor` (the subject of the validated claim), the `event_time`, the
+per-tenant `seq`, and the `prev_hash` / `row_hash` pair that chains it.
 
-### Article 12(2)(c) — six-month retention minimum
+The `payload` is **metadata by construction — never prompt or response
+content**. For a `chat.completions.request` row it is `model`,
+`warn_aft_id` (the AFT-1 identifier when a guardrail fired, otherwise
+null) and `trace_id`, plus `business_reference` when the caller supplied
+one (`crates/gateway/src/server.rs:1172-1190`). Payloads pass through PII
+redaction (`crates/policy/src/pii.rs`) and then a structural cap: any
+string **value** longer than 256 characters is replaced by a
+`[content-redacted: len=N, sha256=…]` marker (ADR-068,
+`crates/gateway/src/audit.rs:70`), so long content cannot enter the
+ledger even by accident — while the length and hash preserve the ability
+to prove a specific value was present. A `guardrail.verdict` payload is
+the serialized verdict (rail, decision, matched signature); an
+`eval.verdict` payload is the promotion decision.
+
+The practical consequence: the ledger answers *"which calls ran, when,
+by whom, against which model, and what did the guardrail layer decide"*
+— cryptographically. It does **not** contain the prompts or completions
+themselves. Those live full-fidelity in the span store, which is
+queryable but not chained.
+
+### Article 12(2)(c) — retention floor
 
 Tracelane hardcodes `AUDIT_ADDON_MIN_RETENTION_DAYS = 180` in
-`crates/gateway/src/audit_retention.rs`. The `resolve_audit_retention`
-function panics fail-loud if any caller attempts to set a
-contractual override shorter than 180 days for an Audit-add-on
-workspace. This is enforced *in source*, not only in configuration
-— a configuration error cannot accidentally shorten retention below
-the floor.
+`crates/gateway/src/audit_retention.rs:17`. The `resolve_audit_retention`
+function asserts fail-loud if any caller attempts to set a contractual
+override shorter than 180 days for an Audit-add-on workspace
+(`audit_retention.rs:47`), and otherwise resolves to
+`max(base_tier_days, 180)`. This is enforced *in source*, not only in
+configuration — a configuration error cannot accidentally shorten
+retention below the floor.
 
 Workspaces without the Audit add-on are subject to the base-tier
-retention from
-[ADR-020](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-020-pricing-v2-honest-caps.md)
-(free 7d / builder 30d / team 90d / business 180d / enterprise 365d)
-and are **not** covered by this conformance statement.
+retention (free 7d / builder 30d / team 90d / business 180d /
+enterprise 365d) and are **not** covered by this mapping.
 
-### Article 12(3)(a) — log conformity with established procedures
+### Article 12(3)(a) — reproducible verification procedure
 
-The audit-ledger format (row hash function, per-tenant chain
-construction, Merkle aggregation, Rekor anchor procedure) is
-documented in [ADR-018](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-018-tamper-evident-ledger-v1.md)
-(license: CC0 — public domain). Three independent reference
-verifiers (Rust, Python, TypeScript) at `packages/verifier-{rust,
-python,typescript}/` produce byte-identical `VerifyReport` JSON for
-the same input, demonstrating that the procedure is
-specification-driven, not implementation-locked. The live conformity
-check is the per-tenant SHA-256 hash-chain replay, the per-batch
-Ed25519 Merkle-root signature, and — for anchored batches — the
-Sigstore Rekor v2 inclusion proof, all verified offline.
+The audit-ledger format — row hash function, per-tenant chain
+construction, Merkle aggregation, Rekor anchor procedure — is pinned by
+**three independent reference verifiers** (Rust, Python, TypeScript) at
+`packages/verifier-{rust,python,typescript}/`, which produce
+byte-identical `VerifyReport` JSON for the same input. The
+`verifier-roundtrip` CI job runs all three over the shared vectors in
+`evals/audit-ledger/` on every change and fails if they disagree,
+demonstrating that the procedure is specification-driven, not
+implementation-locked. The live conformity check is the per-tenant
+SHA-256 hash-chain replay, the per-batch Ed25519 Merkle-root signature,
+and — for anchored batches — the Sigstore Rekor v2 inclusion proof, all
+verified offline.
 
 Tracelane operates **no private fork** of Sigstore Rekor: each
 Merkle-root anchor is published to the public
 [`log2025-1.rekor.sigstore.dev`](https://log2025-1.rekor.sigstore.dev)
 transparency log operated by the Linux Foundation Open Source Security
-Foundation (OpenSSF), so a regulator can re-verify each anchor
+Foundation (OpenSSF), so a reviewer can re-verify each anchor
 independently — offline against the bundled inclusion proof + signed
 checkpoint — without trusting any Tracelane HTTPS endpoint. Public
 anchoring **is operating in production** (first anchor: log index
@@ -134,67 +179,94 @@ accepting the legitimately-anchored `anchored.v1.ndjson`.
 
 ### Article 12(3)(b) — operator log access
 
-`GET /api/audit/range?workspace=<uuid>&from=<iso>&to=<iso>` returns
-the NDJSON ledger range for the queried workspace. Access requires
-an `audit:read`-scoped API key issued by Tracelane support and
-bound to the calling workspace. Keys are issued with a documented
-time bound (default 30 days; longer on contract).
+`GET /v1/audit/export?since=<iso8601>&until=<iso8601>&limit=<n>` streams
+the complete per-tenant ledger as NDJSON, seq-paginated and uncapped
+(`crates/gateway/src/audit_export.rs`). Each line carries the exact field
+set the three reference verifiers consume: `format, tenant_id, seq,
+event_time, event_type, actor, payload, prev_hash, row_hash,
+rekor_entry_id`. The dashboard's Download control on `/audit` proxies the
+same endpoint.
 
-### Article 12(3)(c) — market-surveillance authority access
+Authentication is the ordinary bearer credential — a WorkOS JWT or a
+`tlane_…` API key — and the tenant is resolved **only** from the
+validated claim, never from a query parameter or request body. The
+endpoint is gated on the Audit add-on entitlement
+(`FeatureKey::AuditAddon`): an unentitled caller receives
+`403 entitlement_required` and **zero ledger bytes**, and if the
+entitlement source is unavailable the export is refused rather than
+served (fail-closed).
 
-Under formal authority, market-surveillance representatives request
-a time-bounded `audit:read` key scoped to the workspace under
-inspection through `security@tracelane.dev`. Tracelane issues the
-key within one business day. Authorities run `tracelane-audit
-verify`. The release workflow that publishes the static binary is
-configured to Cosign-sign it via GitHub Actions OIDC and attach SLSA
-Build Level 3 provenance; that workflow has not yet run on a tag, so
-today the binary is built from source (Apache-2.0) rather than
-downloaded as a signed artefact. Either way the verification itself
-requires no trust in any Tracelane-operated infrastructure. The checks the authority
-runs are all offline (no Tracelane endpoint needed): the hash-chain
-replay, the per-batch Ed25519 signature against the workspace's own
-public key, and — for anchored batches — the Sigstore Rekor v2
-inclusion proof + signed checkpoint against the pinned public-log key.
-These Rekor proofs are produced in production today; the authority
-re-verifies each anchor against the public transparency log entirely
-offline from the exported bundle.
+One honest limitation on the credential model: API keys are
+**workspace-scoped and revocable, but they are not per-endpoint-scoped
+and carry no expiry** — the `api_keys` table has neither a scope nor an
+`expires_at` column (`apps/web/db/schema.ts`). Access for a review is
+therefore narrowed operationally: mint a key for the workspace under
+review, and revoke it when the review closes.
 
-### Article 12(3)(d) — automatic prevention of unauthorised access
+### Article 12(3)(c) — independent third-party review
 
-Tenant isolation is enforced at three independent layers, documented
-in [ADR-031](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-031-admin-audit-and-ch-resource-caps.md)
-and [`/security/tenant-isolation`](/security/tenant-isolation):
+A workspace owner exports the range under review (§12(3)(b)) and hands
+the reviewer two things: the NDJSON export, and the workspace's Ed25519
+public key delivered **out-of-band** (a key taken from the bundle itself
+would prove nothing). The reviewer then runs:
+
+```bash
+tracelane-audit verify --file ledger.ndjson --tenant-pubkey <key>
+```
+
+Every check it performs is **offline** — no Tracelane endpoint is
+contacted and no trust in Tracelane-operated infrastructure is required:
+the hash-chain replay, the per-batch Ed25519 signature against the
+workspace's own public key, and — for anchored batches — the Sigstore
+Rekor v2 inclusion proof + signed checkpoint against the pinned
+public-log key. These Rekor proofs are produced in production today and
+travel inside the export bundle.
+
+The release workflow that publishes the static verifier binary is
+configured to Cosign-sign it via GitHub Actions OIDC and attach build
+provenance and a CycloneDX SBOM; that workflow has not yet run on a tag,
+so today the binary is built from source (Apache-2.0) rather than
+downloaded as a signed artefact. The verification itself is unaffected
+either way.
+
+### Article 12(3)(d) — prevention of unauthorised access
+
+Tenant isolation is enforced at three independent layers — see
+[`/security/tenant-isolation`](/security/tenant-isolation):
 
 1. ClickHouse-side: every query carries a `WHERE tenant_id = ?`
-   filter (CI grep blocks any new query that omits it) plus per-tier
+   filter (a CI grep blocks any new query that omits it) plus per-tier
    resource caps.
 2. R2-side: every object key is prefixed `tenants/<workspace_uuid>/`
    with a debug-`assert!` + release-refuse on prefix violation.
 3. Postgres-side: row-level + admin-audit-log surfaces.
 
-## Limitations and V1.1 follow-ups
+## Known gaps and V1.1 follow-ups
 
-This conformance statement covers V1 launch. The following items
-ship in V1.1 (target: M+1 to M+3 post-launch). None are required to
-satisfy Article 12 obligations at V1 launch; all strengthen the
-posture or close gaps already-acceptable-under-the-Act:
+This mapping describes V1 launch. The following are **not shipped
+today**:
 
+- **Ledger coverage of the SDK/OTLP path.** Only gateway-proxied events
+  are chained. Spans captured via the SDK or OTLP direct path are
+  recorded full-fidelity but are not chained or anchored.
+- **Ledger coverage of tool, A2A and MCP invocations.** Recorded as
+  spans; not written as ledger events.
 - **Automated audit-data retention cleanup job.** V1 does not delete
-  audit data; the 180-day floor is trivially satisfied. V1.1 ships
+  audit data, so the 180-day floor is trivially satisfied; V1.1 ships
   the cron + DELETE pipeline using `resolve_audit_retention`.
-- **PDF conformance packet export.** `tracelane-audit export
-  --format pdf` ships in V1.1. V1 produces the equivalent
-  human-readable content via `--format text` and `--format json`.
-- **AUDIT-001 per-tenant chain isolation hardening.** V1's per-tenant
-  `seq` + per-tenant Ed25519 keypair already enforce per-tenant
-  cryptographic integrity. V1.5 ships the per-tenant chain
+- **PDF export.** `tracelane-audit export --format pdf` is queued for
+  V1.1. V1 produces the equivalent human-readable content via
+  `--format text` and `--format json`.
+- **Per-tenant chain-state isolation hardening (AUDIT-001).** V1's
+  per-tenant `seq` + per-tenant Ed25519 keypair already enforce
+  per-tenant cryptographic integrity; the
   `DashMap<TenantId, ChainState>` refactor for additional defence in
-  depth against operator-side errors.
+  depth against operator-side errors is queued for V1.5.
+- **Signed, published verifier binaries.** Configured but not yet run on
+  a tag — see §12(3)(c).
 
 ## Contact
 
-For Article 12 compliance questions, key issuance for
-market-surveillance review, or to request the conformance packet in
-an alternative format: `security@tracelane.dev` (PGP key fingerprint
-on the GitHub Security page).
+For technical questions about what the ledger records, or to request the
+export in an alternative format: `security@tracelane.dev` (PGP key
+fingerprint on the GitHub Security page).

@@ -1,11 +1,12 @@
 ---
 title: BYOK — Bring Your Own Key
 description: Envelope-encrypt provider API keys with AES-256-GCM, AAD bound to tenant and provider, decrypted in-memory only at gateway request dispatch time.
+classification: PUBLIC
 ---
 
 BYOK envelope-encrypts your provider API keys at rest with **AES-256-GCM**. On
 self-hosted deployments you supply the 32-byte envelope master key
-(`TRACELANE_CMK_KEY`). You may also register a Customer-Managed Key (CMK)
+(`TRACELANE_BYOK_MASTER_KEY`). Registering your own Customer-Managed Key (CMK)
 **public-key fingerprint** for audit and labeling. Tracelane holds the
 ciphertext and decrypts it in-memory only at request dispatch.
 
@@ -28,7 +29,7 @@ Ciphertext + 16-byte GCM tag  ──►  stored in Postgres
    ▼  never written to logs, spans, or errors
 ```
 
-On self-hosted deployments the master key is `TRACELANE_CMK_KEY` (32-byte hex).
+On self-hosted deployments the master key is `TRACELANE_BYOK_MASTER_KEY` (32 bytes, base64-encoded).
 On managed deployments it can be backed by a KMS (roadmap).
 
 ## Public-key fingerprint (audit)
@@ -94,7 +95,7 @@ the dashboard (**Settings → BYOK Keys**) and the API. Zero-downtime key
 rotation with background re-encryption of existing ciphertext, and automatic
 revocation once every ciphertext has been re-wrapped, are on the roadmap —
 there is no automated rewrap job in V1. Provider-key ciphertext is sealed under
-the deployment envelope master key (`TRACELANE_CMK_KEY`).
+the deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
 
 ## Audit trail
 
@@ -107,14 +108,14 @@ confirm the log has not been altered.
 On self-hosted deployments, the gateway loads the BYOK master key from env:
 
 ```bash
-# AES-256-GCM key for local envelope encryption (hex, 32 bytes)
-TRACELANE_CMK_KEY=<hex>
+# AES-256-GCM key for local envelope encryption (32 bytes, base64)
+TRACELANE_BYOK_MASTER_KEY=<32-bytes-base64>
 ```
 
 Generate with:
 
 ```bash
-openssl rand -hex 32
+openssl rand -base64 32
 ```
 
 ## Related

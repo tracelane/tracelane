@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Tracelane
 
 **flight recorder for AI agents.**
@@ -19,7 +20,7 @@ Tracelane sits between your AI agents and your LLM providers. You get:
 - **Full-fidelity traces** — every LLM call, tool invocation, agent step, and retry captured as OTel spans using the GenAI semantic conventions. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
 - **Tamper-evident audit ledger** — every recorded event is hash-chained per tenant and batch-anchored to a public transparency log. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us. That is the part you can hand to an auditor.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
-- **CI-gate evals** — 69 pain-point assertions run in CI. Note the honest scope: the merge-gate job runs with **mock providers**, so the behavioural half of each assertion is skipped there; a separate live-stack job exercises real behaviour.
+- **Pain-point evals** — 69 assertions run in CI on every PR. Note the honest scope: they **report, they do not block** — no required status check gates a merge on them. The default job also runs with **mock providers**, so the behavioural half of each assertion is skipped there; a separate live-stack job exercises real behaviour.
 - **Time-travel trace viewer** — step through any recorded agent trace span-by-span with `tlane replay` (read-only). Cross-model re-execution is on the roadmap.
 
 **On the roadmap, not shipped** — named here because they appear elsewhere in our docs
@@ -120,7 +121,7 @@ ClickHouse              Cloudflare
 | `crates/gateway/` | Rust | BYOK LLM proxy, inline guardrails, audit chain |
 | `crates/ingest/` | Rust | OTLP receiver, NATS consumer, ClickHouse writer |
 | `crates/shared/` | Rust | Shared types (ChatRequest, TracelaneSpan, TenantId) |
-| `crates/tracelane-audit-cli/` | Rust | `tlane-audit` — standalone offline ledger verifier |
+| `crates/tracelane-audit-cli/` | Rust | `tracelane-audit` — standalone offline ledger verifier |
 | `crates/policy/` | Rust | PII redactors (wired into the audit + guardrail paths) + a Cedar policy-engine scaffold that is **not** wired in V1 |
 | `apps/web/` | TypeScript | Next.js 15 dashboard |
 | `apps/mcp/` | TypeScript | Tenant-scoped MCP server |
@@ -150,16 +151,17 @@ cargo run -p gateway
 # Run ingest
 cargo run -p ingest
 
-# Run eval suite (merge gate)
+# Run eval suite (reports; no required status check blocks a merge on it)
 pnpm eval:run --suite=all
 ```
 
 ## Migrating from LiteLLM
 
-Two critical CVEs in 30 days (CVE-2026-33634 CVSS 9.4, CVE-2026-42208 CVSS 9.3)
-made LiteLLM the most-discussed migration target in enterprise AI in 2026.
+Tracelane's gateway is memory-safe Rust with no admin configuration endpoints, no
+`eval`, and no import-by-string of untrusted config. If you are moving an existing
+LiteLLM deployment, the importer reads your config directly.
 
-Migrate in under 5 minutes:
+One command reads your existing config and emits a Tracelane gateway config:
 
 ```bash
 npx @tracelanedev/cli import-litellm --config litellm_config.yaml
@@ -171,14 +173,12 @@ schema (`{name, description, input_schema}`). An OpenAI-shaped
 `tools: [{type: "function", function: {...}}]` array is rejected with a 400 today —
 normalising both shapes is tracked and is the first thing we will fix if it blocks you.
 
-Full guide: [docs/migrations/from-litellm.md](docs/migrations/from-litellm.md)
+Full guide: [docs.tracelane.dev/migrations/from-litellm](https://docs.tracelane.dev/migrations/from-litellm)
 
 ### Verifying Tracelane releases
 
 ```bash
-# Requires cosign >= 3.0.6 to VERIFY. Every earlier build — including the
-# whole 2.x line up to and including 2.6.4 — carries verification-side
-# advisories (CVE-2026-24122) that can accept signatures it should reject.
+# Use a current cosign release to verify.
 cosign verify-blob \
   --bundle gateway-x86_64-unknown-linux-gnu.cosign.bundle \
   --certificate-identity-regexp="https://github.com/tracelane/tracelane/.*" \
@@ -197,18 +197,18 @@ verified SLSA Level 3 attestation**. The provenance you can actually verify toda
 
 ## Migrating from Helicone
 
-Helicone was acquired by Mintlify (March 2026) and is in maintenance mode. One command rewrites your
-Helicone base URL and auth headers to Tracelane (config + environment only — no trace re-import needed):
+One command rewrites your Helicone base URL and auth headers to Tracelane (config +
+environment only — no trace re-import needed):
 
 ```bash
 npx @tracelanedev/cli migrate helicone --apply
 ```
 
-Full guide: [docs/migrations/from-helicone.md](docs/migrations/from-helicone.md)
+Full guide: [docs.tracelane.dev/migrations/from-helicone](https://docs.tracelane.dev/migrations/from-helicone)
 
 ## Pricing
 
-OSS self-host is **$0 forever** under Apache 2.0 — full stack, no commercial restriction. Hosted tiers (free / $59 Builder / $249 Team / $899 Business / $2,999+ Enterprise + $999/mo Audit add-on) with capped overage and bundled seats are documented at **[tracelane.dev/pricing](https://tracelane.dev/pricing)** (single source).
+OSS self-host is **$0 forever** under Apache 2.0, with no commercial restriction. What it runs is the headless stack — ClickHouse, NATS, gateway and ingest; there is no dashboard container, and the web UI is hosted-only today (see [Self-host](#quick-start) above). Hosted tiers (free / $59 Builder / $249 Team / $899 Business / $2,999+ Enterprise + $999/mo Audit add-on) with capped overage and bundled seats are documented at **[tracelane.dev/pricing](https://tracelane.dev/pricing)**, and the same ladder is published at [docs.tracelane.dev/pricing](https://docs.tracelane.dev/pricing).
 
 ## Community
 
@@ -224,7 +224,9 @@ OSS self-host is **$0 forever** under Apache 2.0 — full stack, no commercial r
 
 Apache 2.0. See [LICENSE](./LICENSE) and [LICENSE-PLEDGE.md](./LICENSE-PLEDGE.md).
 
-The license will never be changed. See the pledge for the BSL trigger clause
-that makes this legally binding.
+Apache 2.0 grants are perpetual and irrevocable, so every release already published
+under Apache 2.0 stays Apache 2.0 — neither we nor any future owner can take that back.
+[LICENSE-PLEDGE.md](./LICENSE-PLEDGE.md) sets out what we commit to beyond that, and is
+explicit about where the commitment is enforceable and where it is only a promise.
 
 

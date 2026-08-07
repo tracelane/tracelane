@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # crates/gateway
 
 Tracelane's Rust gateway — the performance-critical hot path.
@@ -17,7 +18,7 @@ Tracelane's Rust gateway — the performance-critical hot path.
 | `server.rs` | Axum router — auth middleware, rate limit, predictive layer, provider proxy |
 | `providers/` | Provider adapters (Anthropic, OpenAI, Gemini, Bedrock, Together, …) |
 | `predictive/` | 8-predictor guardrail layer — MCP hash watcher, taint tracker, A2UI, A2A, … |
-| `audit.rs` | SHA-256 hash chain — compute_row_hash(), Rekor anchoring queue (Week 7) |
+| `audit.rs` | SHA-256 hash chain — compute_row_hash(), Rekor anchoring queue |
 | `auth/` | WorkOS JWKS, API key, SPIFFE mTLS — tenant_id always from JWT claim |
 | `rate_limiter.rs` | Per-tenant token bucket — free/builder/team/business RPM limits |
 | `otlp_emit.rs` | OTLP span emission to NATS — zero-copy on hot path |
@@ -26,7 +27,7 @@ Tracelane's Rust gateway — the performance-critical hot path.
 
 - Gateway overhead: <5ms p50, <15ms p95, <25ms p99
 - Predictive layer: <30ms p50, <50ms p99
-- Throughput target: ≥5K RPS single instance (validated by PP-G3; measured results pending the Reliability Benchmark)
+- Throughput: measured figures publish with the Reliability Benchmark v1.0. `PP-G3` is a live-perf eval that is SKIPPED in CI (it needs a real gateway), so no throughput number here is currently backed by a measurement.
 
 ## Security invariants
 

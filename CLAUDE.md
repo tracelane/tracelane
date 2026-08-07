@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Tracelane — CLAUDE.md
 
 Technical operating manual for Claude Code (and humans) working in this repository.
@@ -163,9 +164,9 @@ alert. The gateway's `auth::resolve_tenant_id` is the only bridge
 (`crates/gateway/src/auth/mod.rs:361-388`); `scripts/ci/check-tenant-id-provenance.sh`
 guards `apps/web`, `apps/mcp`, `packages/cli` plus two gateway audit endpoints.
 
-**The tenant-isolation guard is FILE-scoped, not query-scoped.**
-`scripts/ci/check-tenant-isolation.py:100` searches the whole file, so nine scoped queries
-beside one unscoped query **passes clean**. Do not rely on it as a per-query check.
+**The tenant-isolation guard is per-query.** `scripts/ci/check-tenant-isolation.py`
+takes the containing string literal as the query unit and resolves one interpolation hop;
+its `--selftest` plants an unscoped query beside scoped ones and proves it blocks.
 
 ### 3.5 `NEXT_PUBLIC_*` is constant-folded at BUILD time
 
@@ -235,7 +236,7 @@ Stated plainly, because several committed documents in this repository still ove
 |---|---|
 | 3 ML predictors (SLM judge, trajectory guard, prompt guard) | **Unconditional stubs.** `SlmJudge::judge` returns `1.0/1.0/1.0` on **both** branches — shipping a trained model would not switch it on (`crates/gateway/src/predictive/slm_judge.rs:57-73`). No model weights are committed anywhere, and the gateway has **no ONNX runtime dependency**, so in-process inference is impossible as the crate stands |
 | Prompt-guard sidecar | Not in any compose file; its URL defaults to the gateway's own port (self-call → non-2xx → fail-open) |
-| A2UI / stuck-loop / MCP rug-pull / A2A / taint detection | Gated on payload fields **no live ingress produces** (`protocol`, `tool_name`, `mcp_server_name`, `tracelane_message_type`). The gateway has exactly one proxied route. `apps/docs/predictive-guardrails.mdx` correctly labels these **Roadmap** |
+| A2UI / stuck-loop / MCP rug-pull / A2A / taint detection | Gated on payload fields **no live ingress produces** (`protocol`, `tool_name`, `mcp_server_name`, `tracelane_message_type`). The gateway has exactly one proxied route. `apps/docs/archive/predictive-guardrails.mdx` correctly labels these **Roadmap** |
 | Detection enforcement | **Observe-first by default** — a `Block` verdict is logged, not a 403, unless `TRACELANE_PREDICTIVE_ENFORCE` is set (`server.rs:486`, `:1052`). This is the intended posture, not a bug |
 | Tool-pinning and trifecta rails | No customer-facing write path for `tool_capabilities` yet, so these are inert for real tenants |
 | `crates/policy` | A Cedar **scaffold**, not wired, with no `cedar-policy` dependency. Every method returns `Deny` (fail-closed) |
@@ -358,8 +359,7 @@ publish these as achieved numbers.
   operator- or customer-supplied URL, and build clients with `safe_client_builder()`.
   **Redirects are disabled entirely** on that client — per-hop validation could not detect a
   DNS-rebind TOCTOU. Blocked ranges include RFC1918, CGNAT, link-local, loopback, IPv4-mapped
-  IPv6, and cloud metadata endpoints. *(Two operator-URL call sites currently bypass this and
-  are a known gap.)*
+  IPv6, and cloud metadata endpoints.
 - **Prompt-injection aware:** user-supplied span content is wrapped in an
   `<UNTRUSTED_USER_DATA>` sentinel before any model consumes it.
 - **Transport:** mTLS for ingest; TLS 1.3 minimum end-to-end. The gateway itself does not

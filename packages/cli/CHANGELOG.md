@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Changelog
 
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.

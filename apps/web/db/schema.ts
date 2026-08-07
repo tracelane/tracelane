@@ -637,3 +637,41 @@ export const supportRequests = pgTable(
 );
 
 export type SupportRequest = typeof supportRequests.$inferSelect;
+
+/**
+ *
+ * Deliberately stores NO schema or description text: R3 records the hash, never
+ * the tool text, and the observe path must not weaken that. Approving copies the
+ * `defHash` the gateway computed at request time, so a client-supplied hash can
+ * never become a pin.
+ *
+ * The primary key includes `defHash`, so a CHANGED definition is a new row
+ * rather than an update — the pending list then shows a tool with a second
+ * definition, which is the rug-pull signal a tenant needs before approving.
+ */
+export const observedTools = pgTable(
+	"observed_tools",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		toolName: text("tool_name").notNull(),
+		defHash: text("def_hash").notNull(),
+		firstSeen: timestamp("first_seen", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		lastSeen: timestamp("last_seen", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		// Advisory only — incremented per flush, not per request, and under N
+		// gateway replicas it under-counts. A "seen a lot" hint for the approve
+		// UI; never a billing or quota input.
+		seenCount: bigint("seen_count", { mode: "number" }).notNull().default(1),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.toolName, t.defHash] }),
+		index("observed_tools_tenant_last_seen_idx").on(t.tenantId, t.lastSeen),
+	],
+);
+
+export type ObservedTool = typeof observedTools.$inferSelect;

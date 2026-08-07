@@ -1,19 +1,24 @@
 ---
 title: Tracelane vs Helicone
-description: Apache 2.0 full-stack alternative to Helicone's GPL-3.0 ai-gateway, with one-command tlane migrate helicone for env vars and custom properties.
+description: Apache 2.0 across the entire stack, with one-command tlane migrate helicone for config, env vars and SDK call sites.
+classification: PUBLIC
 ---
 
 Helicone was reported to have been acquired by Mintlify in early 2026 (per press coverage; treat the specifics as unconfirmed).
 
-Helicone's `ai-gateway` is GPL-3.0 — viral copyleft that is unworkable for many enterprise legal reviews. Tracelane is Apache 2.0 across the entire stack.
+Tracelane is Apache 2.0 across the entire stack — gateway, ingest, SDKs and self-host.
+If licensing matters to your review, read each project's `LICENSE` file and take your own
+counsel's view: Tracelane's is [Apache-2.0](https://github.com/tracelane/tracelane/blob/main/LICENSE),
+and Helicone's `ai-gateway` carries a
+[GPL-3.0 `LICENSE`](https://github.com/Helicone/ai-gateway/blob/main/LICENSE).
 
 ## How we compare
 
 | Claim | Tracelane | Helicone |
 |---|---|---|
-| License (full stack) | Apache 2.0 | Helicone OSS observability MIT; ai-gateway GPL-3.0 |
+| License (full stack) | Apache 2.0 | `Helicone/helicone` Apache-2.0; `Helicone/ai-gateway` GPL-3.0 (per each repo's `LICENSE`) |
 | Maintenance posture | Active development | Reported Mintlify acquisition (early 2026) |
-| Gateway language | Rust | Rust (GPL-3.0 ai-gateway) |
+| Gateway language | Rust | Rust |
 | Wire format | OTel GenAI semconv (canonical) | Helicone proprietary + OpenTelemetry partial |
 | Predictive guardrails | Inline heuristic guardrails | — |
 | Tamper-evident audit ledger | $999 add-on SKU (tamper-evident hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap) | — |
@@ -21,6 +26,10 @@ Helicone's `ai-gateway` is GPL-3.0 — viral copyleft that is unworkable for man
 | Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
 | Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |
 | BYOK | Envelope encryption, AAD bound to (tenant_id, provider_id) | Supported |
+
+*A `—` in the Helicone column means we found no such capability documented in Helicone's
+public docs when this page was last reviewed — not that it does not exist. Check
+[Helicone's documentation](https://docs.helicone.ai) for their current surface.*
 
 ## Migration
 
@@ -38,11 +47,13 @@ Most teams cut over the same afternoon; new traces flow from the moment you rede
 <AccordionGroup>
 
 <Accordion title="Does Tracelane copy any Helicone code?">
-No. Helicone's `ai-gateway` is GPL-3.0. Copying any of it would taint the Apache 2.0 Tracelane stack with viral copyleft. We reference patterns at most; we copy zero code. CLAUDE.md banned-dependency list enforces this.
+No. Tracelane's gateway is original work under Apache 2.0, and we take no Helicone package as a dependency.
+
+You do not have to take that on trust. Our `deny.toml` sets a license allowlist for the whole Rust dependency tree, and GPL/AGPL are denied by omission from it — a copyleft crate cannot enter the build without the `cargo-deny (bans + licenses + advisories)` CI job failing. Every third-party dependency and its license is also enumerated in the CycloneDX SBOM published with each release, so you can audit the tree yourself.
 </Accordion>
 
 <Accordion title="Is Tracelane feature-equivalent to Helicone?">
-Tracelane covers 30+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. It adds inline predictive guardrails, tamper-evident audit ledger, and the Prompt Promotion workflow Helicone does not ship.
+Tracelane covers 30+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline, inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
 </Accordion>
 
 <Accordion title="What happens to my historical Helicone data?">

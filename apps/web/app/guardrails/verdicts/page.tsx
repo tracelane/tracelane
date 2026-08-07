@@ -147,7 +147,7 @@ export default async function GuardrailVerdictsPage({
 				>
 					← Guardrails
 				</Link>
-				<h1 className="text-2xl font-semibold text-ink">Guardrail verdicts</h1>
+				<h1 className="t-h1">Guardrail verdicts</h1>
 			</div>
 			<p className="mb-5 max-w-2xl text-sm text-ink-2">
 				Why each request was allowed, blocked, redacted or warned. Click a row

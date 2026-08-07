@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Providers
 
 Tracelane gateway speaks to **30+ LLM providers** through a single API surface
@@ -119,7 +120,8 @@ See [`crates/gateway/src/providers/failover.rs`](./../crates/gateway/src/provide
 ## BYOK only (V1)
 
 V1 ships **bring-your-own-key (BYOK) only**. Provider API keys are
-envelope-encrypted at rest with libsodium and decrypted in-memory just-in-time
+envelope-encrypted (AEAD) at rest — AES-256-GCM via `ring`, bound to
+`(tenant_id, provider_id)` by AAD — and decrypted in-memory just-in-time
 on dispatch — they never appear in logs, spans, or error messages. The
 `tracing` redaction filter strips them from any structured field that lands
 in OTLP exports.

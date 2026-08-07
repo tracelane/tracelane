@@ -1,6 +1,7 @@
 ---
 title: Self-hosting Tracelane with Docker Compose
 description: Run Tracelane on your own infrastructure using Docker Compose — from a $6/mo Hetzner VPS to a hardened production stack with ClickHouse and Postgres.
+classification: PUBLIC
 ---
 
 Tracelane is fully self-hostable. The same binary that powers
@@ -79,7 +80,7 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 | `POLAR_ACCESS_TOKEN` | Polar.sh organization access token (billing) |
 | `POLAR_WEBHOOK_SECRET` | Polar webhook secret (`polar_whs_…`) |
 | `POLAR_EXPECTED_ORGANIZATION_ID` | Polar organization id the webhook secret was issued for |
-| `TRACELANE_CMK_KEY` | 32-byte hex master key for BYOK envelope encryption |
+| `TRACELANE_BYOK_MASTER_KEY` | 32-byte hex master key for BYOK envelope encryption |
 | `TRACELANE_REKOR_SIGNING_KEY` | PKCS#8 DER base64 Ed25519 key for audit anchoring |
 
 ### Optional
@@ -199,7 +200,7 @@ curl "http://localhost:8080/v1/audit/export?since=$(date -u +%Y-%m-%dT%H:%M:%SZ 
 
 Before accepting production traffic:
 
-- [ ] `TRACELANE_CMK_KEY` set and rotated (32 random bytes, stored in secrets manager)
+- [ ] `TRACELANE_BYOK_MASTER_KEY` set and rotated (32 random bytes, stored in secrets manager)
 - [ ] `TRACELANE_REKOR_SIGNING_KEY` generated and stored
 - [ ] WorkOS webhook verified (send a test event, confirm tenant is provisioned)
 - [ ] Polar products + meters + webhook configured and verified
@@ -209,7 +210,7 @@ Before accepting production traffic:
 - [ ] TLS termination at reverse proxy (Caddy, Nginx, or Cloudflare Tunnel)
 - [ ] `TRACELANE_DEV_AUTH=0` (disables dev auth bypass)
 - [ ] OSV-Scanner + Grype clean on deployed commit
-- [ ] All 50 pain-point evals green: `pnpm eval:run --suite=all`
+- [ ] All 69 pain-point evals green: `pnpm eval:run --suite=all`
 
 ## Upgrading
 

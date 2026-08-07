@@ -1,3 +1,4 @@
+<!-- tracelane:classification: INTERNAL -->
 # `crates/shared`
 
 Shared types and helpers used by **all** Tracelane Rust crates (gateway,
@@ -11,4 +12,4 @@ and model spans with exactly the same code.
 - **`redact`** — credential / API-key scrubbing for the `tracing` subscriber (`sk-`, `org-`, `AKIA`, `AIza`, Stripe/Polar, bearer, JWT shapes). Defense in depth — the first line is not logging secrets at all.
 
 ~28 public items. No hot-path allocation concerns here; this crate is types +
-pure functions. See `../../docs/REPO_MAP.md` and `../../.claude/rules/security.md`.
+pure functions. See the root `README.md` and `SECURITY.md`.

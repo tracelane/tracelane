@@ -111,9 +111,9 @@ export function ProfileManager({
 					>
 						{save.isPending ? "Saving…" : "Save"}
 					</button>
-					{save.isSuccess && <span className="text-xs text-ok">Saved</span>}
+					{save.isSuccess && <span className="text-xs text-ok-ink">Saved</span>}
 					{save.error && (
-						<span className="text-xs text-danger">
+						<span className="text-xs text-danger-ink">
 							{(save.error as Error).message}
 						</span>
 					)}
@@ -122,7 +122,7 @@ export function ProfileManager({
 
 			{/* Danger zone */}
 			<section className="space-y-4 rounded-lg border border-danger/40 p-4">
-				<h3 className="text-xs font-semibold text-danger">Danger zone</h3>
+				<h3 className="text-xs font-semibold text-danger-ink">Danger zone</h3>
 
 				<div className="space-y-2">
 					<p className="text-xs text-ink-2">
@@ -144,12 +144,12 @@ export function ProfileManager({
 							delAccount.isPending
 						}
 						onClick={() => delAccount.mutate(confirmEmail.trim())}
-						className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+						className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{delAccount.isPending ? "Deleting…" : "Delete my account"}
 					</button>
 					{delAccount.error && (
-						<p className="text-xs text-danger">
+						<p className="text-xs text-danger-ink">
 							{(delAccount.error as Error).message}
 						</p>
 					)}
@@ -173,12 +173,12 @@ export function ProfileManager({
 							type="button"
 							disabled={!confirmOrg.trim() || delOrg.isPending}
 							onClick={() => delOrg.mutate(confirmOrg.trim())}
-							className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+							className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 						>
 							{delOrg.isPending ? "Deleting…" : "Delete organization"}
 						</button>
 						{delOrg.error && (
-							<p className="text-xs text-danger">
+							<p className="text-xs text-danger-ink">
 								{(delOrg.error as Error).message}
 							</p>
 						)}

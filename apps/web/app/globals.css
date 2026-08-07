@@ -16,6 +16,14 @@
  * Tinted-Slate-+-Lava palette, the @theme utilities, and the light-default
  * base all come from the imported tokens.css (ADR-053) — this app no longer
  * defines its own tokens.
+ *
+ * visual-pass-01 changes NO FONT FACE (founder: "keep existing font"). All three
+ * roles are exactly as they were on main; only type SIZES, WEIGHTS and SPACING
+ * move, in tokens.css:
+ *   --font-sans    Plus Jakarta Sans  every UI string.
+ *   --font-mono    JetBrains Mono     every numeral / id / hash / model / seq.
+ *   --font-display Plus Jakarta Sans  the <Logo> wordmark (brand lockup, shared
+ *                  with the marketing site — must not drift).
  */
 :root {
 	--font-sans: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;

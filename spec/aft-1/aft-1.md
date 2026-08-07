@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Agent Failure Taxonomy — AFT-1
 
 **Status:** Draft v0.3

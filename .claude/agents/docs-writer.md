@@ -4,6 +4,7 @@ description: Writes user-facing docs in Mintlify-style MDX
 model: claude-sonnet-4-6
 isolation: none
 tools: [Read, Write]
+classification: INTERNAL
 ---
 
 Write Mintlify-style MDX docs at `apps/docs/`.

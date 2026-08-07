@@ -61,6 +61,13 @@ export function gatewayBaseUrl(): string {
 	return raw.replace(/\/$/, "");
 }
 
+/**
+ * Hard ceiling on a single gateway subrequest. A safety net, not a tuning knob:
+ * the gateway answers in ~1ms on-node, so this only ever fires on a genuine
+ * stall. See the note at the `signal:` site in `gatewayGet`.
+ */
+const GATEWAY_TIMEOUT_MS = 10_000;
+
 /** Typed gateway error carrying the upstream HTTP status. */
 export class GatewayError extends Error {
 	constructor(
@@ -89,6 +96,14 @@ export async function gatewayGet<T>(path: string): Promise<T> {
 		res = await fetch(`${base}${path}`, {
 			headers: { authorization: `Bearer ${token}` },
 			cache: "no-store",
+			// Bound the tail. There was NO timeout here, so a single stalled
+			// subrequest held the whole page open — and /dashboard fans out to
+			// eight of these in a Promise.all, so it waits for the slowest one.
+			// The gateway answers /health in 0.9ms on-node, so 10s is three orders
+			// of magnitude above any legitimate response: it cannot fire in normal
+			// operation, it only converts an indefinite hang into a GatewayError
+			// that degrades the affected card to its warming state.
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
 	} catch (err) {
 		throw new GatewayError(
@@ -124,6 +139,7 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 			},
 			body: JSON.stringify(body),
 			cache: "no-store",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
 	} catch (err) {
 		throw new GatewayError(
@@ -166,6 +182,7 @@ export async function gatewayGetText(path: string): Promise<string> {
 		res = await fetch(`${base}${path}`, {
 			headers: { authorization: `Bearer ${token}` },
 			cache: "no-store",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
 	} catch (err) {
 		throw new GatewayError(

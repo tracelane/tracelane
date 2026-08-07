@@ -53,7 +53,7 @@ function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 			<td className="px-4 py-3">
 				<Link
 					href={`/traces/${encodeURIComponent(turn.trace_id)}`}
-					className="font-mono text-xs text-info hover:underline"
+					className="font-mono text-xs text-info-ink hover:underline"
 				>
 					{turn.root_name || turn.trace_id.slice(0, 16)}
 				</Link>

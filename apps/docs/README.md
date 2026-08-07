@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # apps/docs/
 
 Mintlify-based public documentation site for Tracelane.

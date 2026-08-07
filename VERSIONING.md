@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Versioning & Stability Policy
 
 > Status: **v1, 2026-07-17.** This is the stability contract for everything Tracelane

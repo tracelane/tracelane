@@ -4,6 +4,7 @@ description: Writes Conventional Commits PR descriptions
 model: claude-haiku-4-5-20251001
 isolation: none
 tools: [Bash, Read]
+classification: INTERNAL
 ---
 
 Write PR descriptions.

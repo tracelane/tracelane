@@ -8,8 +8,8 @@ import { expect } from "../src/harness.js";
  * integration, re-creating dashboards, and manually exporting trace data
  * with no standard format. Teams spend 2–6 weeks on migrations.
  *
- * Pain: Helicone is in maintenance mode. Teams want out but the switching
- * cost is too high. "We're stuck because migration is a sprint-size project."
+ * Pain: teams evaluating a move off an existing observability vendor find the
+ * switching cost too high. "We're stuck because migration is a sprint-size project."
  *
  * Tracelane fix: `tlane migrate --from helicone --url <helicone-url>` reads
  * Helicone traces via their export API, transforms to OTLP, bulk-imports to

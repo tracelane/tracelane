@@ -77,6 +77,12 @@ export function deriveAuditVerdict(report: VerifyReport | null): AuditVerdict {
 		const reasons = [...new Set(report.errors.map((e) => e.kind))];
 		return { state: "signature_failed", reasons };
 	}
+	// P0 (2026-08-07): an anchor the verifier SKIPPED for want of a trusted key
+	// leaves `signatures_valid` vacuously true. Never green on a skip — the same
+	// vacuous-true is what let `tlane verify` PASS a forged anchor.
+	if (report.anchors_unverified > 0) {
+		return { state: "signature_failed", reasons: ["anchors_unverified"] };
+	}
 	// An empty view has nothing to verify — never GREEN (verifying zero rows is not
 	// a pass). A truncated response (0 loaded out of a non-empty ledger) is caught
 	// and reddened server-side; from the chain bytes alone this reads as "empty".

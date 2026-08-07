@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Contributing to Tracelane
 
 Thank you for your interest in contributing. Tracelane is Apache 2.0 licensed
@@ -18,13 +19,13 @@ architectural changes. If you disagree with a decision, open an issue first.
 
 | Tool | Version | Install |
 |---|---|---|
-| Rust | 1.87+ (pinned in `rust-toolchain.toml`) | [rustup.rs](https://rustup.rs) |
-| Node.js | 22+ (pinned in `.nvmrc`) | [nodejs.org](https://nodejs.org) |
+| Rust | 1.95 (pinned in `rust-toolchain.toml`; published-crate MSRV is 1.88) | [rustup.rs](https://rustup.rs) |
+| Node.js | 22+ (`package.json` `engines.node`) | [nodejs.org](https://nodejs.org) |
 | pnpm | 9+ | `npm install -g pnpm` |
 | Docker | 24+ | [docker.com](https://docker.com) |
 | Python | 3.12+ | [python.org](https://python.org) |
 
-Use the pinned versions in `rust-toolchain.toml` and `.nvmrc` exactly — CI enforces these.
+Use the pinned versions in `rust-toolchain.toml` and `package.json` (`engines`, `packageManager: pnpm@9.15.0`) exactly.
 
 ## First-time setup
 
@@ -42,8 +43,8 @@ cargo build --workspace
 docker compose -f infra/dev/docker-compose.yml up -d
 
 # Apply Postgres migrations
-psql "$DATABASE_URL" -f infra/dev/postgres/migrations/01_init.sql
-psql "$DATABASE_URL" -f infra/dev/postgres/migrations/02_audit_ledger.sql
+psql "$DATABASE_URL" -f infra/dev/postgres/migrations/01_tenants.sql
+psql "$DATABASE_URL" -f infra/dev/postgres/migrations/02_payment_events.sql
 psql "$DATABASE_URL" -f infra/dev/postgres/migrations/03_audit_keys.sql
 
 # Apply ClickHouse schema
@@ -64,7 +65,7 @@ Required env vars in `.env.local`:
 | `DATABASE_URL` | Postgres DSN (default: `postgresql://tracelane:tracelane@localhost:5432/tracelane`) |
 | `CLICKHOUSE_DSN` | ClickHouse DSN (default: `http://localhost:8123`) |
 | `NATS_URL` | NATS JetStream URL (default: `nats://localhost:4222`) |
-| `TRACELANE_AUDIT_MASTER_KEY` | AES-256 master key for BYOK envelope encryption (generate with `openssl rand -hex 32`) |
+| `TRACELANE_BYOK_MASTER_KEY` | AES-256-GCM master key for BYOK envelope encryption — 32 bytes, **base64** (generate with `openssl rand -base64 32`) |
 | `WORKOS_API_KEY` | WorkOS API key (sign up at workos.com) |
 | `WORKOS_CLIENT_ID` | WorkOS client ID |
 | `POLAR_ACCESS_TOKEN` | Polar.sh organization access token (sandbox token for local dev) |
@@ -77,7 +78,7 @@ Open four terminals or use a process manager:
 # Rust gateway (port 8080)
 cargo run -p gateway
 
-# Rust ingest workers (OTLP gRPC port 4317)
+# Rust ingest workers (OTLP HTTP, port 4318)
 cargo run -p ingest
 
 # Next.js dashboard (port 3000)
@@ -135,7 +136,7 @@ Run before any hot-path change (gateway, ingest, predictive layer):
 ```bash
 pnpm bench:gateway
 pnpm bench:ingest
-pnpm bench:predictive
+pnpm bench:gateway
 ```
 
 A >10% regression blocks merge. Hard budgets:
@@ -190,14 +191,10 @@ Open a GitHub issue using the feature request template. Before doing so:
 - `tenant_id` comes from the JWT claim, never the request body
 - No raw SQL strings in TypeScript — use `@clickhouse/client` parameter binding
 - No `console.log` in committed code — use the structured logger
-- No secrets in code — `gitleaks` + `trufflehog` run in pre-commit and CI
+- No secrets in code — `gitleaks` runs in CI and in the pre-push gate
 - `secrecy::SecretString` for any Rust field named `*_key`, `*_token`, `*_secret`
 - Pin every external dependency version
 - No new deps without `cargo audit` / `pnpm audit` / `pip-audit` clean
-
-### Banned dependencies
-
-Do not add: `litellm` (CVE-2026-42208), `arize-phoenix` (ELv2), `openssl` crate (use `rustls`), `eslint`/`prettier` (use Biome), `trivy` (CVE-2026-33634). Full list in `CLAUDE.md`.
 
 ### Security-sensitive changes
 

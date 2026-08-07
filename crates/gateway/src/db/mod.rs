@@ -19,8 +19,10 @@
 
 pub mod api_keys;
 pub mod audit_chain_state;
+pub mod observed_tools;
 pub mod provider_keys;
 pub mod tenants;
+pub mod tool_capabilities;
 pub mod webhook_events;
 
 use anyhow::{Context as _, Result};

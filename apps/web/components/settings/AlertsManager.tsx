@@ -186,7 +186,7 @@ function LoadingState() {
 }
 
 function SectionError({ message }: { message: string }) {
-	return <p className="text-sm text-danger">{message}</p>;
+	return <p className="text-sm text-danger-ink">{message}</p>;
 }
 
 /** Displays the alert rule's last-evaluated state. */
@@ -312,7 +312,7 @@ function AddDestinationDialog({
 					{error && (
 						<p
 							role="alert"
-							className="text-xs text-danger bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
 						>
 							{error.message}
 						</p>
@@ -399,17 +399,17 @@ function DestinationsSection() {
 			{isLoading && <LoadingState />}
 			{isError && <SectionError message="Failed to load destinations." />}
 			{deleteMutation.isError && (
-				<p role="alert" className="text-sm text-danger">
+				<p role="alert" className="text-sm text-danger-ink">
 					Could not delete destination: {deleteMutation.error.message}
 				</p>
 			)}
 			{testMutation.isError && (
-				<p role="alert" className="text-sm text-danger">
+				<p role="alert" className="text-sm text-danger-ink">
 					Test alert failed: {testMutation.error.message}
 				</p>
 			)}
 			{testSuccess && (
-				<output className="text-sm text-ok block">
+				<output className="text-sm text-ok-ink block">
 					Test alert sent successfully.
 				</output>
 			)}
@@ -496,7 +496,7 @@ function DestinationsSection() {
 														setPendingDeleteId(dest.id);
 														deleteMutation.reset();
 													}}
-													className="text-xs px-2 py-1 rounded border border-danger text-danger hover:bg-danger-soft transition-colors"
+													className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 												>
 													Delete
 												</button>
@@ -696,7 +696,7 @@ function AddRuleDialog({
 						{error && (
 							<p
 								role="alert"
-								className="text-xs text-danger bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+								className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
 							>
 								{error.message}
 							</p>
@@ -786,7 +786,7 @@ function RulesSection({
 			{isLoading && <LoadingState />}
 			{isError && <SectionError message="Failed to load alert rules." />}
 			{deleteMutation.isError && (
-				<p role="alert" className="text-sm text-danger">
+				<p role="alert" className="text-sm text-danger-ink">
 					Could not delete rule: {deleteMutation.error.message}
 				</p>
 			)}
@@ -875,7 +875,7 @@ function RulesSection({
 														setPendingDeleteId(rule.id);
 														deleteMutation.reset();
 													}}
-													className="text-xs px-2 py-1 rounded border border-danger text-danger hover:bg-danger-soft transition-colors"
+													className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 												>
 													Delete
 												</button>

@@ -313,7 +313,7 @@ export default async function AuditPage({
 			    24h-shows-0 bug). The view shows the first N events from genesis; the
 			    complete ledger is the export. */}
 			<div className="mb-6 max-w-2xl">
-				<h1 className="text-2xl font-semibold text-ink">Audit Ledger</h1>
+				<h1 className="t-h1">Audit Ledger</h1>
 				<p className="mt-1 text-[13px] text-ink-2">
 					A tamper-evident, independently verifiable record of every
 					gateway-proxied call and guardrail verdict.

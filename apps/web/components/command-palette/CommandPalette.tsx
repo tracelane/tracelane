@@ -68,7 +68,7 @@ function highlight(text: string, query: string): React.ReactNode {
 	return (
 		<>
 			{text.slice(0, idx)}
-			<mark className="bg-transparent text-info font-medium">
+			<mark className="bg-transparent text-info-ink font-medium">
 				{text.slice(idx, idx + query.length)}
 			</mark>
 			{text.slice(idx + query.length)}

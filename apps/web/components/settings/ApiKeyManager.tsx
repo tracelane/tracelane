@@ -101,7 +101,7 @@ function NewKeyModal({
 						</h3>
 						<p className="text-xs text-ink-2 mt-0.5">{name}</p>
 					</div>
-					<span className="text-xs text-warn bg-warn/10 border border-warn/20 rounded px-2 py-0.5">
+					<span className="text-xs text-warn-ink bg-warn/10 border border-warn/20 rounded px-2 py-0.5">
 						Copy now — shown once
 					</span>
 				</div>
@@ -181,7 +181,7 @@ function CreateKeyDialog({
 					{error && (
 						<p
 							role="alert"
-							className="text-xs text-danger bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
 						>
 							Couldn&apos;t create the key: {error.message}. Please retry — if
 							it persists, check that the workspace has API-key creation
@@ -266,10 +266,10 @@ export function ApiKeyManager() {
 				<p className="text-sm text-ink-2 animate-pulse">Loading…</p>
 			)}
 			{isError && (
-				<p className="text-sm text-danger">Failed to load API keys.</p>
+				<p className="text-sm text-danger-ink">Failed to load API keys.</p>
 			)}
 			{revokeMutation.isError && (
-				<p role="alert" className="text-sm text-danger">
+				<p role="alert" className="text-sm text-danger-ink">
 					Couldn&apos;t revoke the key: {revokeMutation.error.message}
 				</p>
 			)}
@@ -333,7 +333,7 @@ export function ApiKeyManager() {
 													revokeMutation.mutate(key.id);
 												}
 											}}
-											className="text-xs px-2 py-1 rounded border border-danger text-danger hover:bg-danger-soft transition-colors"
+											className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 										>
 											Revoke
 										</button>

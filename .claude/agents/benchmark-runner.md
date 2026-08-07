@@ -4,6 +4,7 @@ description: Runs perf benchmarks against budgets. Blocks merge on >10% regressi
 model: claude-sonnet-4-6
 isolation: worktree
 tools: [Bash, Read]
+classification: INTERNAL
 ---
 
 Run benchmarks before merging hot-path changes.

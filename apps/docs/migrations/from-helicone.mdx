@@ -1,6 +1,7 @@
 ---
 title: Migrating from Helicone
 description: Run tlane migrate helicone to translate HELICONE_* env vars and custom properties into a working Tracelane setup — dry-run, apply, and config rewrites.
+classification: PUBLIC
 ---
 
 Helicone is mostly a proxy with config-via-env + per-request headers. The
@@ -9,7 +10,7 @@ canonical Tracelane migration path is one CLI command:
 ```bash
 tlane migrate helicone                           # dry-run scan
 tlane migrate helicone --apply                   # write .env.tracelane
-tlane migrate helicone --apply --with-config --src src/
+tlane migrate helicone --apply --dir src/
 ```
 
 The CLI:

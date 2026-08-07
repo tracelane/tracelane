@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Security Policy
 
 ## Supported versions
@@ -94,8 +95,11 @@ disclosure, coordinated with reporter.
   caller cannot reach ClickHouse or Rekor anchor batches.
 - **Supply chain:** Trusted Publishing OIDC only (no long-lived
   tokens). Sigstore Cosign keyless signatures on all releases.
-  CycloneDX SBOM attached. SLSA Build Level 3 provenance on all
-  artifacts. `.pth` file scanner in CI.
+  CycloneDX SBOM attached. Build provenance is attested via GitHub
+  `attest-build-provenance`, alongside the Cosign bundle. **We do not
+  claim a verified SLSA Level 3 attestation** — the repository runs
+  `slsa-github-generator` but its `final` job currently fails even on
+  successful releases. `.pth` file scanner in CI.
 - **No admin endpoints:** Tracelane has no `/config/update`-style
   endpoints. No `eval` or import-by-string of untrusted
   configuration.
@@ -105,38 +109,62 @@ disclosure, coordinated with reporter.
 
 ### Known gaps vs the published guarantees
 
-These are work-in-progress as of 2026-05-23 and are explicitly NOT
-yet guaranteed:
+Re-verified against the code on 2026-08-06. Three items previously listed
+here had already been closed and are removed below; what remains is what is
+genuinely still open.
 
-- **Customer-side audit verifier**: `packages/verifier-rust/src/lib.rs`
-  currently only checks that Rekor returns HTTP 200; it does not yet
-  validate the Ed25519 signature or the Rekor inclusion proof. The
-  server-side primitives are correct (see "Tamper-evident audit
-  ledger" above), but the end-to-end "tamper-evident with
-  customer-runnable cryptographic verification" claim requires the
-  verifier rewrite (tracked as R1 H1/H2 — pending).
-- **API-key storage**: keys are SHA-256-hashed without salt or KDF.
-  Argon2id migration is planned. A DB dump exposes hashes that are
-  trivially confirmable against candidate strings.
-- **JWKS fetch**: uses bare `reqwest::get` with no TLS pinning or
-  host allowlist on `WORKOS_JWKS_URL`. Planned: rustls client with
-  TLS 1.3 and host suffix allowlist.
 - **eIDAS qualified timestamps**: audit-ledger anchors use the
   gateway host's `Utc::now()`. A move to a qualified TSA (SwissSign,
   Sectigo, GlobalSign QTSP) is in scope for the Audit-SKU GA.
 
 Each will be removed from this list as the corresponding PR lands.
 
-### LiteLLM-specific mitigations
+**Closed since the 2026-05-23 revision of this list** (each verified against the
+code on 2026-08-06, not against a changelog):
 
-Given the March 2026 LiteLLM incidents (RCE via `/config/update`, JWT bypass,
-SQLi+SSTI+command injection chain), Tracelane explicitly:
+- **Customer-side audit verifier** — now verifies both halves.
+  `packages/verifier-rust/src/lib.rs` validates the Ed25519 signature against
+  the recomputed Merkle root using the trusted tenant public key (`:71`,
+  `:135-139`, `:220-228`), and validates the Rekor inclusion proof per
+  RFC 6962 §2.1.1 plus the C2SP signed-note checkpoint (`:570-575`,
+  `:618-649`, `:676-724`, `:1176-1217`). An inclusion-proof root that
+  disagrees with the verified checkpoint root is rejected.
+- **API-key storage** — keys are stored as a peppered HMAC-SHA256 lookup index
+  plus an Argon2id PHC string with a per-row salt
+  (`crates/gateway/src/db/api_keys.rs:204-209`, `:417-496`). There is no
+  bare-SHA-256 fallback: a row whose Argon2id PHC is absent or fails is
+  rejected (`:480-486`). Note the auth-result cache (`:158-169`, 900s TTL):
+  Argon2id runs on the cold path, and a warm-cache hit re-authenticates on the
+  peppered digest alone. At rest, a DB dump yields peppered + Argon2id-hashed
+  material, not confirmable digests.
+- **JWKS fetch** — `WORKOS_JWKS_URL` passes a host allowlist (`workos.com`
+  exact plus `.workos.com` suffix) and the SSRF guard before any request is
+  sent (`crates/gateway/src/auth/jwks.rs:202-203`, `:212-242`, `:267`), and the
+  client is built by `ssrf_guard::safe_client_builder()` with rustls
+  (`crates/gateway/src/ssrf_guard.rs:194-214`). **This is a host allowlist and
+  a hardened TLS client — it is not certificate pinning**; there is no pinned
+  root or custom certificate verifier.
 
-- Exposes no admin configuration endpoints
-- Uses Cedar (Apache 2.0) for policy enforcement, not string-eval
-- Requires 2 maintainer approvals on release tags
-- Scans every release for new `.pth` files (ML model backdoor vector)
-- Signs all release tags with Sigstore
+### Deliberate attack-surface reductions
+
+Each item below is a capability Tracelane deliberately does **not** ship, or a
+gate that fails closed. Some restate a guarantee above; they are collected here
+because the property is the *absence*, which is easy to miss in a feature list.
+
+- **No admin configuration endpoint.** There is no `/config/update`-style route —
+  runtime configuration cannot be mutated over HTTP by any caller.
+- **No `eval`, no string-templated policy on the request path.** Per-tenant
+  authorization is resolved in Postgres `workspace_entitlements`
+  (deny-overrides-grant); nothing on the request path evaluates caller input as
+  code or interpolates it into a policy string.
+- **No unsigned tag can publish.** CI runs `git verify-tag` against a pinned
+  allowed-signers file before any publish job runs, and fails closed
+  (`.github/workflows/release.yml:29-78`).
+- **No `.pth` file in the tree.** CI fails if one appears
+  (`.github/workflows/ci.yml:738-745`) — a Python import-time execution vector
+  that can ride along in a model archive.
+- **No unsigned artifact.** Binaries and the SBOM are signed with Sigstore
+  Cosign, keyless via OIDC (`.github/workflows/release.yml:193,206,216`).
 
 ## Cryptography
 
@@ -148,8 +176,10 @@ SQLi+SSTI+command injection chain), Tracelane explicitly:
   Wire format prepends a version byte (`0x02` = v2) and binds the
   ciphertext to a caller-supplied AAD that includes the `tenant_id`
   and the asset kind (`provider-key:<tenant>:<provider>` or
-  `audit-key:<tenant>`). v1 blobs (pre-Phase-5, empty AAD) decrypt
-  with a `warn` log so operators can plan the re-encryption migration.
+  `audit-key:<tenant>`). Legacy v1 blobs (no version byte, empty AAD)
+  are **rejected**, not decrypted — an empty AAD is what allowed the
+  cross-tenant ciphertext swap this format exists to prevent
+  (`crates/gateway/src/byok.rs:39`, `:171-182`).
 - **Asymmetric (audit-ledger signing):** Ed25519 via `ring`.
   Per-tenant keypairs (Enterprise tier, gated by
   `entitlements::F_AUDIT_KEYPAIR`) generated and stored
@@ -166,9 +196,17 @@ SQLi+SSTI+command injection chain), Tracelane explicitly:
 - Free-tier rate limits (60 RPM) reduce abuse surface but do not eliminate it
 - SLM judge inference latency (<50ms p99) means there is a brief window between
   request arrival and predictive decision — this is inherent to inline ML
-- Trajectory Guard F1 0.88–0.94 means ~6–12% of anomalies may not be detected;
-  rule-based Tier 1 guards (hash watcher, taint tracker) have 100% coverage for
-  their defined threat models
+- The ML tier is **not running**. `predictive/trajectory_guard.rs` and
+  `predictive/slm_judge.rs` are registered but return a constant score with the
+  `ort` inference call commented out, so they cannot currently produce a verdict.
+  The rule-based detectors in `crates/gateway/src/predictive/` are registered, but
+  most gate on payload fields (`mcp_server_name`, `tool_name`, `a2a_handoff`,
+  `protocol`) that a `/v1/chat/completions` request does not carry, so **they do not
+  fire on LLM traffic today** — the same disclosure as `README.md`. What does run
+  inline on chat traffic is the guardrail rail set (`guardrail/rails/`: cost,
+  secrets/PII, tool safety, lethal-trifecta, format, system-prompt leak, topic,
+  injection). No F1 or detection-rate figure is published for the ML tier because
+  none has been measured on a shipped model.
 
 ## Acknowledgments
 
@@ -203,13 +241,17 @@ cosign verify \
 ```
 
 SBOM (CycloneDX JSON) is attached to every GitHub release as `sbom.cyclonedx.json`.
-SLSA Build Level 3 provenance is attached via GitHub Attestations.
+Build provenance is attached via GitHub `attest-build-provenance`. A verified
+SLSA Level 3 attestation is **not** claimed — see the note above.
 
-### Why we use Grype instead of Trivy
+### How our scanners and CI actions are pinned
 
-CVE-2026-33634 compromised LiteLLM v1.82.7/1.82.8 via a poisoned Trivy GitHub Action
-(`aquasecurity/trivy-action`). The compromised action was distributed through GitHub's
-action marketplace. We use Grype (Anchore) with a pinned release binary instead, and
-all our CI actions are SHA-pinned to a specific commit rather than a floating tag.
-This choice is summarised in the
-[architectural decisions](https://docs.tracelane.dev/decisions) index.
+Our vulnerability scanner is not installed from a GitHub Action or a piped
+installer script. CI downloads a **version-pinned Grype (Anchore) release
+tarball, verifies its SHA-256 against a digest pinned in the workflow, and only
+then extracts it** (`.github/workflows/security-scan.yml:84-113`) — a moved
+release asset fails the checksum instead of executing. Every `uses:` in
+`.github/workflows/` is **SHA-pinned to a specific commit** rather than a
+floating tag, so a retargeted tag cannot change what runs — verifiable with
+`grep -rhoE 'uses: [^ ]+' .github/workflows/ | grep -v '@[0-9a-f]\{40\}'`,
+which returns nothing.

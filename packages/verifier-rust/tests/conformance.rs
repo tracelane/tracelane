@@ -195,3 +195,25 @@ fn chain_only_mode_asserts_no_anchor() {
     assert_eq!(report.rekor_anchors_resolved, 0);
     assert_eq!(report.anchors_included, 0);
 }
+
+/// P0 REGRESSION (2026-08-07). Without a trusted key the trusted-key gate is
+/// skipped and `signatures_valid` stays vacuously true — the audit CLI printed
+/// "PASS — every check passed." over this FORGED anchor and exited 0. The
+/// verifier must surface the skipped count so callers fail closed.
+#[test]
+fn forged_anchor_without_trusted_key_reports_unverified() {
+    let path = vector("forged-anchor.ndjson");
+    if !path.exists() {
+        eprintln!("skipping: vector not found at {}", path.display());
+        return;
+    }
+    // No tenant_pubkey — exactly what every doc showed a regulator running.
+    let report = verify_ledger(&path, &VerifyOptions::default()).expect("verify");
+    assert!(
+        report.anchors_unverified > 0,
+        "a skipped anchor must be counted, got anchors_unverified={}",
+        report.anchors_unverified
+    );
+    assert_eq!(report.rekor_anchors_resolved, 0);
+    assert_eq!(report.anchors_included, 0);
+}

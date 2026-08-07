@@ -1,3 +1,4 @@
+<!-- tracelane:classification: INTERNAL -->
 # Flaky Eval Tracker
 
 > Tracked by `incident-responder` subagent. Updated whenever an eval fails intermittently on main.

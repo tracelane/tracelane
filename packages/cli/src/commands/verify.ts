@@ -42,6 +42,7 @@ type VerifyLedger = (
 	rekor_anchors_seen: number;
 	rekor_anchors_resolved: number;
 	anchors_included: number;
+	anchors_unverified: number;
 	strip_detected: boolean;
 	errors: Array<{ seq: number | null; kind: string; detail: string }>;
 }>;
@@ -108,11 +109,21 @@ export function registerVerifyCommand(program: Command): void {
 					tenantPubkey,
 				});
 
+				// FAIL CLOSED (P0, 2026-08-07). Anchor records present but skipped
+				// for want of a trusted key mean signature + anchor verification
+				// NEVER RAN. Reporting PASS there printed `signatures_valid: true`
+				// over a FORGED anchor — proven against
+				// `evals/audit-ledger/forged-anchor.ndjson`. `signatures_valid` is
+				// vacuously true in chain-only mode; the verifier's own contract
+				// says never gate on it alone.
+				const unchecked = report.anchors_unverified > 0;
+
 				if (opts.json) {
 					process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 				} else {
-					const status =
-						report.hash_chain_valid && report.signatures_valid
+					const status = unchecked
+						? "INCOMPLETE"
+						: report.hash_chain_valid && report.signatures_valid
 							? "PASS"
 							: "FAIL";
 					process.stdout.write(`tlane verify: ${status}\n`);
@@ -126,7 +137,7 @@ export function registerVerifyCommand(program: Command): void {
 						`  hash_chain_valid:      ${report.hash_chain_valid}\n`,
 					);
 					process.stdout.write(
-						`  signatures_valid:      ${report.signatures_valid}\n`,
+						`  signatures_valid:      ${unchecked ? "NOT CHECKED — no --tenant-pubkey" : report.signatures_valid}\n`,
 					);
 					process.stdout.write(
 						`  rekor_anchors_seen:    ${report.rekor_anchors_seen}\n`,
@@ -161,8 +172,23 @@ export function registerVerifyCommand(program: Command): void {
 					}
 				}
 
+				if (unchecked && !opts.json) {
+					process.stderr.write(
+						`\ntlane verify: INCOMPLETE — ${report.anchors_unverified} anchor record(s) were NOT verified.
+The hash chain checked out, but signature and Rekor-anchor verification did not run,
+so a forged anchor would not have been detected. Re-run with the trusted key:
+
+  tlane verify <ledger> --tenant-pubkey <base64>
+
+Get it out-of-band from Settings \u2192 Audit signing key, or GET /v1/audit/pubkey.
+`,
+					);
+				}
+
 				process.exit(
-					report.hash_chain_valid && report.signatures_valid ? 0 : 1,
+					!unchecked && report.hash_chain_valid && report.signatures_valid
+						? 0
+						: 1,
 				);
 			},
 		);

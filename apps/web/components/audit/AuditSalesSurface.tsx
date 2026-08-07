@@ -8,7 +8,7 @@ import Link from "next/link";
 export function AuditSalesSurface() {
 	return (
 		<Card provenance className="p-6">
-			<div className="text-[11px] font-semibold uppercase tracking-wide text-seal-ink">
+			<div className="t-card-title text-seal-ink">
 				Audit SKU · $999/mo add-on
 			</div>
 			<h2 className="mt-1 text-lg font-semibold text-ink">

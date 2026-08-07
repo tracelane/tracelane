@@ -1,6 +1,7 @@
 ---
 title: Onboarding — sign up and get an API key
 description: Sign up on app.tracelane.dev with WorkOS Connect and generate a tenant API key — plus the operator checklist for a self-hosted deployment.
+classification: PUBLIC
 ---
 
 Two roles use this page: customers signing up at app.tracelane.dev, and
@@ -28,7 +29,7 @@ Eight steps to running Tracelane on your own infra.
 <Steps>
 
 <Step title="Reserve infra">
-  - Postgres 16 (Neon, RDS, or self-hosted) — tenant + user metadata
+  - Postgres 17 (Neon, RDS, or self-hosted) — tenant + user metadata
   - ClickHouse 24+ — span/audit hot tier
   - R2 (or S3) — span/audit cold tier
   - L4 GPU pool — optional, only for the roadmap SLM-judge inference tier; not required at V1
@@ -38,7 +39,7 @@ Eight steps to running Tracelane on your own infra.
 <Step title="Set secrets">
   - `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET` — billing (Polar.sh)
   - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_WEBHOOK_SECRET` — auth
-  - `TRACELANE_CMK_KEY` — provider-key envelope encryption (32 bytes hex, AES-256-GCM via `ring`)
+  - `TRACELANE_BYOK_MASTER_KEY` — provider-key envelope encryption (32 bytes, base64-encoded; AES-256-GCM via `ring`)
   - `JWT_SIGNING_KEY` — internal JWT
   - `CLICKHOUSE_URL`, `POSTGRES_URL`, `R2_*` — datastore endpoints
 </Step>
@@ -82,7 +83,7 @@ Eight steps to running Tracelane on your own infra.
   - Configure the Polar-hosted customer portal — branding, allowed actions
   - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
 
-  See [decisions/ADR-020-pricing-v2-honest-caps.md](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-020-pricing-v2-honest-caps.md)
+  See [ADR-020](/decisions/index)
   for the rationale behind seat caps, capped overage, and tier-specific retention.
 </Step>
 
@@ -107,7 +108,7 @@ Eight steps to running Tracelane on your own infra.
 
 <Step title="Production checklist">
   - All agent-tool safety guards set to `warn` initially; flip to `block` after one day of traces.
-  - Audit log hash-chain integrity confirmed (`tlane verify <ledger>` returns 0). The SHA-256 hash chain and Ed25519 per-tenant signing are live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
+  - Audit log integrity confirmed (`tlane verify <ledger> --tenant-pubkey <base64>` returns 0). Without the trusted key it exits `INCOMPLETE` by design — the hash chain is checked but signatures and anchors are not. The SHA-256 hash chain and Ed25519 per-tenant signing are live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
   - SBOM published — every tagged release carries a Cosign-signed
     `sbom.cyclonedx.json`, and `infra/sbom/` has CycloneDX outputs from CI.
   - Sigstore signing verified on **release artifacts** (`cosign verify-blob`

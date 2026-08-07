@@ -4,6 +4,7 @@ description: Runs the eval suite and reports regressions. Never modifies eval fi
 model: claude-sonnet-4-6
 isolation: worktree
 tools: [Bash, Read]
+classification: INTERNAL
 ---
 
 You run `pnpm eval:run --suite=all` and report results.

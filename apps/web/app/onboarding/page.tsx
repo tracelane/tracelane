@@ -58,7 +58,7 @@ function StepProgress({ current }: { current: number }) {
 					)}
 				</div>
 			))}
-			<span className="text-[11px] font-semibold uppercase tracking-wide text-ink-3 ml-3">
+			<span className="t-card-title text-ink-3 ml-3">
 				Step {current} of {TOTAL_STEPS}
 			</span>
 		</div>
@@ -100,9 +100,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 	return (
 		<div className="space-y-6">
 			<div>
-				<h2 className="text-2xl font-semibold text-ink">
-					Welcome to Tracelane
-				</h2>
+				<h2 className="t-h1">Welcome to Tracelane</h2>
 				<p className="text-sm text-ink-3 mt-2">
 					Name your workspace and we&apos;ll get your first agent trace flowing
 					in under two minutes.
@@ -159,7 +157,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 				/>
 			</div>
 
-			{error && <p className="text-sm text-danger">{error}</p>}
+			{error && <p className="text-sm text-danger-ink">{error}</p>}
 
 			<button
 				type="button"
@@ -239,7 +237,7 @@ function StepApiKey({
 		return (
 			<div className="space-y-6">
 				<div>
-					<h2 className="text-2xl font-semibold text-ink">Your API key</h2>
+					<h2 className="t-h1">Your API key</h2>
 					<p className="text-sm text-ink-3 mt-2">
 						Copy this now — it&apos;s shown once. We only store a SHA-256 hash.
 					</p>
@@ -292,7 +290,7 @@ function StepApiKey({
 	return (
 		<div className="space-y-6">
 			<div>
-				<h2 className="text-2xl font-semibold text-ink">Create an API key</h2>
+				<h2 className="t-h1">Create an API key</h2>
 				<p className="text-sm text-ink-3 mt-2">
 					This key authenticates your agents through the Tracelane gateway. Use
 					one key per environment.
@@ -301,7 +299,7 @@ function StepApiKey({
 
 			{priorKeyLost && (
 				<div className="rounded-lg border border-line bg-warn-soft p-4">
-					<p className="text-sm font-medium text-warn">
+					<p className="text-sm font-medium text-warn-ink">
 						Your earlier key can&apos;t be shown again
 					</p>
 					<p className="text-sm text-ink-2 mt-1">
@@ -336,7 +334,7 @@ function StepApiKey({
 				/>
 			</div>
 
-			{error && <p className="text-sm text-danger">{error}</p>}
+			{error && <p className="text-sm text-danger-ink">{error}</p>}
 
 			<button
 				type="button"
@@ -418,9 +416,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 	return (
 		<div className="space-y-6">
 			<div>
-				<h2 className="text-2xl font-semibold text-ink">
-					Send your first trace
-				</h2>
+				<h2 className="t-h1">Send your first trace</h2>
 				<p className="text-sm text-ink-3 mt-2">
 					Point your existing LLM client at the Tracelane gateway. It&apos;s
 					OpenAI- and Anthropic-compatible — no SDK swap required.
@@ -458,18 +454,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 
 			{lang === "python" && (
 				<div className="space-y-2">
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-						Install
-					</p>
+					<p className="t-card-title">Install</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							pip install tracelane anthropic
 						</code>
 						<CopyButton text="pip install tracelane anthropic" />
 					</div>
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2 mt-3">
-						Use
-					</p>
+					<p className="t-card-title mt-3">Use</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{pythonSnippet}
@@ -481,18 +473,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 
 			{lang === "typescript" && (
 				<div className="space-y-2">
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-						Install
-					</p>
+					<p className="t-card-title">Install</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install @tracelanedev/sdk openai
 						</code>
 						<CopyButton text="npm install @tracelanedev/sdk openai" />
 					</div>
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2 mt-3">
-						Use
-					</p>
+					<p className="t-card-title mt-3">Use</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{tsSnippet}
@@ -504,9 +492,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 
 			{lang === "curl" && (
 				<div className="space-y-2">
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-						Run
-					</p>
+					<p className="t-card-title">Run</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{curlSnippet}
@@ -523,18 +509,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 
 			{lang === "cli" && (
 				<div className="space-y-2">
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-						Install
-					</p>
+					<p className="t-card-title">Install</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install -g @tracelanedev/cli
 						</code>
 						<CopyButton text="npm install -g @tracelanedev/cli" />
 					</div>
-					<p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2 mt-3">
-						Use
-					</p>
+					<p className="t-card-title mt-3">Use</p>
 					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{cliSnippet}

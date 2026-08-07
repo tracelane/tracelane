@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # @tracelanedev/sdk
 
 [![npm](https://img.shields.io/npm/v/@tracelanedev/sdk)](https://www.npmjs.com/package/@tracelanedev/sdk)

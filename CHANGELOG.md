@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Changelog
 
 All notable changes to Tracelane are documented in this file.
@@ -113,7 +114,7 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
 
 - **Rust gateway** — OpenAI-, Anthropic-, and Google-shaped request proxying across
   30+ providers (7 native adapters plus any OpenAI-compatible endpoint), with
-  provider failover, retry with jittered backoff, and per-`(provider, region)`
+  provider failover, a single bounded retry, and per-`(provider, region)`
   circuit breakers. Low, bounded overhead on the hot path.
 - **BYOK key custody** — provider keys are envelope-encrypted at rest (`aws-lc-rs`
   AEAD), with AAD bound to `(tenant_id, provider_id)`. Keys never appear in logs,

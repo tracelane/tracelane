@@ -64,7 +64,7 @@ export default async function AuditKeyPage() {
 				<Card provenance className="space-y-3 p-5">
 					<div>
 						<div className="flex items-center justify-between gap-2">
-							<div className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+							<div className="t-card-title">
 								Ed25519 signing key (base64) — your trust root
 							</div>
 							<CopyButton value={ed} label="Copy key" />

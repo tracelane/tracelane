@@ -129,7 +129,7 @@ function SloTable({
 								</td>
 								<td className="px-4 py-3 text-right">
 									<span
-										className={`font-mono tabular-nums text-xs ${errorPct > 5 ? "text-danger font-semibold" : errorPct > 1 ? "text-warn" : "text-ok"}`}
+										className={`font-mono tabular-nums text-xs ${errorPct > 5 ? "text-danger-ink font-semibold" : errorPct > 1 ? "text-warn-ink" : "text-ok-ink"}`}
 									>
 										{errorPct.toFixed(2)}%
 									</span>
@@ -369,7 +369,7 @@ export default async function SloPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
 				<div>
-					<h1 className="text-2xl font-semibold text-ink">SLOs</h1>
+					<h1 className="t-h1">SLOs</h1>
 					<p className="mt-1 text-sm text-ink-2">
 						Error budget, latency percentiles, and error rates by provider/model
 						— last {rangeLabel(range)}

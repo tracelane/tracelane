@@ -166,7 +166,7 @@ export function TraceDetailView({ spans }: { spans: Span[] }) {
 								className={cn(
 									"flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1",
 									errorsOnly
-										? "border-danger/40 bg-danger-soft text-danger"
+										? "border-danger/40 bg-danger-soft text-danger-ink"
 										: "border-line text-ink-2 hover:bg-surface-2 hover:text-ink",
 								)}
 							>

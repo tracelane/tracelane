@@ -41,9 +41,7 @@ export default function RouteError({
 				<div className="flex justify-center">
 					<Logo withWordmark />
 				</div>
-				<h1 className="text-2xl font-semibold text-ink">
-					Something went wrong
-				</h1>
+				<h1 className="t-h1">Something went wrong</h1>
 				<p className="text-sm text-ink-2">
 					An unexpected error occurred. You can retry, or head back to your
 					dashboard.

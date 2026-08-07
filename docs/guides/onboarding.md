@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Onboarding — first tenant + first API key
 
 This is the operator + customer flow for getting from "I'm signing up"
@@ -53,7 +54,7 @@ changes apply within seconds via Polar webhook → Postgres
 
 ### Prerequisites
 
-- Rust 1.87+, Node 20+, pnpm 11+
+- Rust 1.95 (pinned by `rust-toolchain.toml`; the published-crate MSRV is 1.88), Node 22+, pnpm 9.15
 - Postgres 17 (Neon-compatible)
 - ClickHouse 24.12+
 - NATS 2.10+ with JetStream
@@ -189,7 +190,7 @@ Run the V1 eval suite locally:
 pnpm eval:run --suite=all
 ```
 
-50 pain-point assertions + 8 fault-tolerance scenarios. CI fails on
+69 pain-point assertions + 10 fault-tolerance scenarios. CI fails on
 any regression. Marketing claims on the public site auto-disable when
 the corresponding eval flips red on `main`.
 
@@ -208,5 +209,5 @@ Before flipping a tenant to a paid plan:
 - [ ] R2 bucket + IAM configured for cold-tier Parquet
 - [ ] OpenSSF Scorecard ≥ 9.0 on the public repo
 - [ ] OSV-Scanner clean across Rust + TS + Python lockfiles
-- [ ] All 50 pain-point evals green on the production gateway
+- [ ] All 69 pain-point evals green on the production gateway
 - [ ] Dashboard `/trust` page reviewed by procurement / legal counsel

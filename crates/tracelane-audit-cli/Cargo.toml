@@ -25,7 +25,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # row-hash / Merkle / Rekor verification logic.
 tracelane-audit-verifier = { path = "../../packages/verifier-rust" }
 
-# HTTP fetch from /api/audit/range. `ureq` matches the verifier's
+# HTTP fetch from /v1/audit/export. `ureq` matches the verifier's
 # choice — minimal deps, native-certs, no async runtime.
 ureq = { version = "2.10", default-features = false, features = ["tls", "native-certs"] }
 

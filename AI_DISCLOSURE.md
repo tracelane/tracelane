@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # AI Disclosure
 
 Tracelane is built with significant AI assistance. We are transparent about this.

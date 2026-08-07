@@ -37,8 +37,18 @@ import "./globals.css";
 // stay statically prerendered. Light is the default.
 const THEME_INIT = `(function(){try{var m=document.cookie.match(/(?:^|;\\s*)theme=(light|dark)/);document.documentElement.dataset.theme=(m&&m[1]==='dark')?'dark':'light';}catch(e){}})();`;
 
-// Type (app design system): Plus Jakarta Sans UI + JetBrains Mono data/code (no
-// serif in the app). Exposed as CSS vars that globals.css wires into --font-sans/-mono.
+// Type (app design system): Plus Jakarta Sans UI + JetBrains Mono data/code.
+// Exposed as CSS vars that globals.css wires into --font-sans / --font-mono.
+//
+// FONT FACES ARE UNCHANGED BY visual-pass-01 (founder: "keep existing font").
+// An Inter swap was tried and reverted — it also cost +21,160 B of font on the
+// critical path and was the whole of the /traces LCP regression, so keeping
+// Plus Jakarta closes that gate and restores the app/marketing brand lockup.
+// Only sizes, weights, spacing and colour move in this pass.
+//
+// `weight` is deliberately OMITTED on both: that makes next/font fetch the
+// VARIABLE axis rather than static instances. Plus Jakarta's axis is 200–800,
+// which is what lets the type scale ask for weights between the named stops.
 const plusJakarta = Plus_Jakarta_Sans({
 	subsets: ["latin"],
 	variable: "--font-plus-jakarta",

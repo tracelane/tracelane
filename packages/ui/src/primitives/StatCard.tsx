@@ -48,9 +48,9 @@ export interface StatCardProps {
 
 const TONE: Record<StatTone, string> = {
 	default: "text-ink",
-	ok: "text-ok",
-	warn: "text-warn",
-	danger: "text-danger",
+	ok: "text-ok-ink",
+	warn: "text-warn-ink",
+	danger: "text-danger-ink",
 };
 
 export function StatCard({
@@ -131,9 +131,7 @@ export function StatCard({
 					)}
 				</p>
 			</div>
-			<p className={cn("text-2xl font-semibold tabular-nums", valueCls)}>
-				{value}
-			</p>
+			<p className={cn("t-metric", valueCls)}>{value}</p>
 			{sub && <p className={cn("mt-0.5 text-[11px]", subCls)}>{sub}</p>}
 		</div>
 	);

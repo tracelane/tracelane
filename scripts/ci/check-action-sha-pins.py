@@ -4,7 +4,7 @@
 Why this exists
 ---------------
 `CLAUDE.md` requires "All GitHub Actions SHA-pinned, never tag-pinned", and
-`CLAUDE_CODE_STARTUP_AUDIT.md` §3.3 lists a grep for it. Until now that grep was
+The repo's startup audit lists a grep for it. Until now that grep was
 run **by hand** — the rule was documented, audited manually, and enforced by
 nobody. A tag is mutable: `uses: foo/bar@v3` resolves to whatever the tag points
 at today, so an upstream compromise or a retagged release executes in our CI with

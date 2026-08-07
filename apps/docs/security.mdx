@@ -1,6 +1,7 @@
 ---
 title: Tracelane security and data residency
 description: Tracelane security posture — ClickHouse and Postgres regional residency, R2 cold storage, envelope-encrypted keys, tamper-evident audit, SLSA supply chain.
+classification: PUBLIC
 ---
 
 ## Data residency
@@ -8,7 +9,7 @@ description: Tracelane security posture — ClickHouse and Postgres regional res
 | Data type | Where it lives | Retention |
 |---|---|---|
 | Spans (hot) | ClickHouse (your region) | Per plan: 7 days (Free) → 365 days (Enterprise) — see [pricing](/pricing) |
-| Spans (cold) | Cloudflare R2 (your bucket) | Until you delete the bucket object (no TTL) |
+| Spans (cold) | Cloudflare R2 — **implemented, not yet active** | n/a today; spans live in ClickHouse |
 | Tenant metadata, API keys | Neon Postgres (your region) | Until account deletion |
 | Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
 | Provider API keys | Postgres (envelope-encrypted) | Until revoked |
@@ -17,12 +18,12 @@ description: Tracelane security posture — ClickHouse and Postgres regional res
 <Note>
 **Current behavior:** hot spans carry a **365-day** storage backstop today, and
 per-plan trimming (7–365 days by tier) is rolling out — so until it ships, data may
-be retained **up to 365 days** regardless of plan. Longer-than-your-plan retention is
-never a shortcut around erasure: the delete below removes data immediately on request.
+be retained **up to 365 days** regardless of plan.
 </Note>
 
-For GDPR/CCPA right-to-erasure: `DELETE FROM tracelane.spans WHERE tenant_id = ?`
-plus a Postgres tenant deletion cascades all associated rows.
+There is no self-serve erasure endpoint. Per-subject erasure requests are handled
+manually via support. Deleting a tenant in Postgres cascades that tenant's control-plane
+rows (API keys, CMK keys, billing records).
 
 ## Provider key handling
 
@@ -30,7 +31,7 @@ Provider API keys (Anthropic, OpenAI, etc.) are **envelope-encrypted at rest**
 with AES-256-GCM (`ring` AEAD). The workflow:
 
 1. Each provider key is sealed with AES-256-GCM under the deployment envelope
-   master key (`TRACELANE_CMK_KEY`).
+   master key (`TRACELANE_BYOK_MASTER_KEY`).
 2. The ciphertext is bound with Additional Authenticated Data (AAD) =
    `provider-key:<tenant_id>:<provider_id>`, so a ciphertext cannot be replayed
    under another tenant or provider.
@@ -101,7 +102,7 @@ The gateway's outbound HTTP client blocks all private + link-local destinations:
 RFC1918 (`10/8`, `172.16/12`, `192.168/16`), `100.64/10` (CGNAT), `169.254/16`
 (metadata services), IPv6 loopback and ULA (`::1`, `fc00::/7`).
 
-`file://` and `gopher://` schemes are rejected. Redirect chains are capped at 3.
+Only `http`/`https` are permitted. Redirects are **disabled entirely** on the SSRF-hardened client — a redirect to a private address can never be followed.
 
 ## Vulnerability scanning
 
@@ -113,7 +114,6 @@ Every commit runs three independent scanners:
 | Grype (`anchore/scan-action`) | Container image layers |
 | Syft (`anchore/sbom-action`) | CycloneDX SBOM — attached to every tagged release, generated weekly for the repo, and attached to container images |
 
-Trivy is **not used** (CVE-2026-33634).
 
 ## Supply chain
 
@@ -131,7 +131,7 @@ Trivy is **not used** (CVE-2026-33634).
     gateway-x86_64-unknown-linux-gnu
   ```
 
-- **SLSA Build Level 3** provenance — **live on tagged release binaries** as of
+- **Build provenance** attested via GitHub `attest-build-provenance` — live on tagged release binaries as of
   `v0.2.3` and on the container image. Release-binary provenance is published as
   a GitHub attestation (`https://slsa.dev/provenance/v1`), naming the builder as
   `.github/workflows/release.yml@refs/tags/<tag>` and binding the binary's

@@ -1,27 +1,32 @@
 ---
 title: Tracelane pricing and plans
 description: Predictable AI agent reliability at honest prices — capped overage, no per-seat trap, no retention upcharge, Apache 2.0 core, Polar Merchant of Record.
+classification: PUBLIC
 ---
 
-50 named competitor pains, fixed. Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger for EU AI Act. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
+50 named competitor pains, fixed. Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger you can verify offline. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
 
 ## Tiers
 
 | Tier | Price | What's included |
 |---|---|---|
 | **OSS self-host** | $0 forever | 30+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
-| **Free hosted** | $0 | 10K traces + 10K gateway calls/mo, 60 RPM, 7-day retention, no commercial use, rule-based PR1+PR2. |
-| **Qualified-free** | $0 | Full Builder tier for verified OSS projects, .edu emails, startups with under $1M ARR. |
-| **Builder** | $59/mo | 150K traces + 150K gateway/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), 30-day retention, predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
-| **Team** | $249/mo | 1M traces + 1M gateway/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 90-day retention, predictive PR1–PR6, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 99% uptime target, predictive pre-flight guardrails with tamper-evident promotion record. |
-| **Business** | $899/mo | 5M traces + 5M gateway/mo, 60K RPM, 180-day retention, inline heuristic guardrails (ML ensemble + async judge on the roadmap), 99.9% uptime target, cohort baselines when your cohort reaches 30 customers (on the roadmap). |
-| **Enterprise** | From $2,999/mo | 25M+ traces custom, 365-day retention, PR1–PR6 at launch, PR7–PR12 on the roadmap, dedicated tenancy option, 99.95% uptime target, EU AI Act Article 12, DPDP, GDPR DPA, ISO 27001 inherited from Hetzner, SOC 2 Type I planned, ISO 42001 planned, HIPAA via opt-in GCP +$2,000/mo. |
-| **Audit SKU** | +$999/mo | EU AI Act Article 12 compliance. Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), eIDAS-grade timestamps via QTSP daily batch, regulatory export pack. See [Audit Ledger](/audit-ledger) for protocol details. |
+| **Free hosted** | $0 | 10K traces/mo, 60 RPM, 7-day retention, 1 seat, no commercial use, rule-based PR1+PR2. |
+| **Builder** | $59/mo | 150K traces/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), 30-day retention, predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
+| **Team** | $249/mo | 1M traces/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 90-day retention, 10 seats included (25 max), predictive PR1+PR2+PR4+PR5 (rule-based) — the same set Builder runs; PR6 is the ML prompt-guard sidecar and is not deployed, so it does not run — inline heuristic guardrails incl. the data-governance and quality rails (ML ensemble + async judge on the roadmap), 99% uptime target, predictive pre-flight guardrails with tamper-evident promotion record. |
+| **Business** | $899/mo | 5M traces/mo, 60K RPM, 180-day retention, 25 seats included (50 max), inline heuristic guardrails (ML ensemble + async judge on the roadmap), 99.9% uptime target, cohort baselines when your cohort reaches 30 customers (on the roadmap). |
+| **Enterprise** | From $2,999/mo | 25M+ traces custom, 365-day retention, uncapped seats, PR1+PR2+PR4+PR5 (rule-based) at launch; PR6 (ML prompt-guard sidecar) and PR7–PR12 on the roadmap, dedicated tenancy option, 99.95% uptime target. |
+| **Audit SKU** | +$999/mo | Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), plus the complete ledger export in the offline-verifier wire format — verify it yourself with `tlane verify --tenant-pubkey`, no Tracelane involvement. See [Audit Ledger](/audit-ledger) for protocol details. |
+
+<Note>
+**One meter.** Quotas are counted once per gateway request against a single monthly
+trace counter — there is no second gateway-call budget to track or run out of.
+</Note>
 
 <Note>
 Uptime targets are objectives, not contractual SLAs with service credits — a
-formal SLA with credits is available on Enterprise contracts. SOC 2 Type I is
-planned (not yet under audit). See [SLO](/slo) for the live error-budget dashboard.
+formal SLA with credits is available on Enterprise contracts. See [SLO](/slo)
+for the live error-budget dashboard.
 </Note>
 
 ## How we compare
@@ -34,7 +39,7 @@ planned (not yet under audit). See [SLO](/slo) for the live error-budget dashboa
 | Gateway | Rust gateway, BYOK 0% | none (obs only) | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
 | Inline predictive guardrails | yes, inline | no | no (post-failure clustering) | no | no |
 | Auto-rollback on cost/latency/error | yes, EWMA-based | manual prompt promotion | manual prompt promotion | none | none |
-| Tamper-evident audit ledger | $999 SKU, hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap) | no | no | SOC 2 / ISO 27001 / HIPAA on Pro | no |
+| Tamper-evident audit ledger | $999 SKU, hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap) | no | no | not documented | no |
 | Self-host license | Apache 2.0 (full stack) | none | Cloud + Enterprise Self-Hosted SKU | MIT (4-DB stack) | hybrid, seats charged |
 | OTel GenAI semconv | canonical wire format | proprietary | proprietary | partial | proprietary |
 | Intervention timing | pre-flight (before model call) | post-failure | post-failure (cluster + draft PR) | post-failure | eval-time |
@@ -50,7 +55,7 @@ Soft cap at 100% (you get an alert). Overages bill at $1.20 per 10K traces up to
 </Accordion>
 
 <Accordion title="How many people can use one workspace?">
-At launch a workspace is single-user — one login per workspace. Team collaboration (multiple members, roles, and seat management) is the first post-launch feature on the roadmap. Provider keys are BYOK and workspace-scoped, so a team can share one workspace login in the interim.
+Seats ship at launch. Free and Builder are single-seat. Team includes 10 seats (25 maximum), Business includes 25 (50 maximum), and Enterprise is uncapped. Invite by email from **Settings → Team** — invitations are sent through WorkOS, and each invitee is given a `member` or `viewer` role (owner is a separate explicit grant). The cap is enforced when you invite: accepted memberships and pending invitations both consume a seat, and an invite past the cap is refused with a typed `seat_limit_reached` error. Provider keys are BYOK and workspace-scoped, so every seat shares the workspace's keys.
 </Accordion>
 
 <Accordion title="What inline guardrails run on every request?">
@@ -60,7 +65,7 @@ self-host alike:
 
 | Free on every deployment | What it catches |
 | --- | --- |
-| MCP rug-pull detection *(needs pinning — see below)* | a tool whose definition changes after you approved it |
+| MCP rug-pull detection | a tool whose definition changes after you approved it |
 | Lethal-trifecta taint tracking | untrusted input reaching a tool that can exfiltrate |
 | Prompt-injection patterns | injection in prompts, tool descriptions and results |
 | Tool-schema validation | malformed or unexpected tool calls |
@@ -70,12 +75,14 @@ Team and above add the data-governance and quality rails: secrets/PII detection
 and redaction, output-format policy, system-prompt-leak detection, and
 topic/competitor policy.
 
-**One honest caveat on rug-pull detection:** it compares a tool definition
-against the one you pinned, and there is **no customer-facing way to pin one
-yet** — the capability registry is read-only from the gateway's side today. The
-rail is free and runs on every request, but until the pinning write path ships
-it has nothing to compare against for a self-serve tenant. Tracked; not
-something you should plan around this quarter.
+**How rug-pull detection works in practice:** it compares each request's tool
+definition against the one you approved. Tracelane records every tool definition
+it sees on your traffic, so approving is one click in **Guardrails → Tool
+pinning** — there is nothing to configure and no tool JSON to hand-author. After
+that, any change to the tool's name, schema or description is flagged as
+definition drift on the next request. Tracelane stores the definition *hash*,
+never the tool text. Approving pins a definition; it never grants a tool any
+capability, which is a separate owner-only setting.
 
 Each rail can flag or halt the request at the gateway, inline, per the
 configured policy — detection is observe-first by default, because a
@@ -98,19 +105,21 @@ PR7–PR10 (trajectory embedding, arg drift, A2A handoff, inline 1B distilled ju
 </Accordion>
 
 <Accordion title="What is the Audit SKU and do I need it?">
-Tamper-evident agent ledger for regulated AI deployments under EU AI Act Article 12 record-keeping obligations for high-risk AI systems (the Annex III high-risk timeline is provisional — expected around December 2027; confirm against the current text of the Act). Every span's Merkle root is recorded in a tamper-evident hash chain with Ed25519 per-tenant signing today; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis, with universal per-run anchoring and daily anchoring to an eIDAS Qualified Trust Service Provider (GlobalSign / ADACOM / Evidency) on the roadmap. If you deploy high-risk AI in the EU, you need this. See [Audit Ledger](/audit-ledger).
+A tamper-evident record of what your agents actually did. Every gateway-proxied request appends a hash-chained audit entry. Entries are batched (100 by default), each batch gets an RFC 6962 Merkle root, and that root is signed with your workspace's own Ed25519 key — the Merkle root is per batch, not per span. Anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis, with universal per-run anchoring on the roadmap.
+
+**Scope, stated plainly:** only calls proxied through the Tracelane gateway are chained. Spans sent straight from an SDK or an OTLP exporter are stored and queryable, but they are not part of the chain.
+
+The full ledger exports in the offline-verifier wire format, so you or a third party can verify the chain and the signatures independently with `tlane verify --tenant-pubkey` — no Tracelane involvement, no trust in us required. See [Audit Ledger](/audit-ledger).
 </Accordion>
 
 <Accordion title="Is there a free trial for paid tiers?">
-Free hosted (10K traces/mo) is permanently free for non-commercial use. Qualified-free (full Builder tier) for verified OSS projects, .edu emails, and startups with under $1M ARR. No paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+Free hosted (10K traces/mo) is permanently free for non-commercial use. There is no paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+
+Builder-level access for verified OSS projects, `.edu` addresses, and startups under $1M ARR is a **manual grant, not a self-serve plan**: there is no eligibility check in the product and no plan to select at signup. Email support@tracelane.dev and we set it by hand.
 </Accordion>
 
 <Accordion title="Can I self-host?">
 Yes. Apache 2.0 full stack on GitHub (`github.com/tracelane/tracelane`). Self-host the full stack with a single-node Docker Compose (ClickHouse-backed) — no managed cloud required. Enterprise gets a commercial-support license. See [Self-hosting](/self-hosting).
-</Accordion>
-
-<Accordion title="Why is HIPAA an add-on?">
-Hetzner does not sign Business Associate Agreements. Our HIPAA-eligible deployment runs on GCP us-central1 (BAA signed) at $2,000/mo on top of Enterprise base.
 </Accordion>
 
 </AccordionGroup>

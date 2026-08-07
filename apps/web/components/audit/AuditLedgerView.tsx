@@ -321,7 +321,7 @@ function NegativeScenarioPanel() {
 				</p>
 				<ul className="mt-3 space-y-3">
 					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger">✗</span>
+						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
 							<span className="text-[13px] font-medium text-ink">
 								Row hash mismatch.
@@ -329,14 +329,14 @@ function NegativeScenarioPanel() {
 							<span className="text-[13px] text-ink-2">
 								Recomputing a row&apos;s SHA-256 hash over its payload will not
 								match the stored hash. The verifier highlights that row in{" "}
-								<span className="font-medium text-danger">loud red</span> with
-								the exact <code className="font-mono text-ink-2">seq</code>{" "}
+								<span className="font-medium text-danger-ink">loud red</span>{" "}
+								with the exact <code className="font-mono text-ink-2">seq</code>{" "}
 								number.
 							</span>
 						</div>
 					</li>
 					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger">✗</span>
+						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
 							<span className="text-[13px] font-medium text-ink">
 								Chain break.
@@ -352,15 +352,15 @@ function NegativeScenarioPanel() {
 						</div>
 					</li>
 					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger">✗</span>
+						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
 							<span className="text-[13px] font-medium text-ink">
 								Verdict: Integrity check failed.
 							</span>{" "}
 							<span className="text-[13px] text-ink-2">
 								The &ldquo;Verify integrity&rdquo; result shows{" "}
-								<span className="font-medium text-danger">red</span>, not green
-								— with the first broken seq number and the reason (hash
+								<span className="font-medium text-danger-ink">red</span>, not
+								green — with the first broken seq number and the reason (hash
 								mismatch, chain break, or missing anchor proof).
 							</span>
 						</div>
@@ -697,15 +697,15 @@ function TrustPanel({
 						<div className="flex items-start gap-3">
 							<span
 								aria-hidden
-								className="mt-0.5 text-2xl text-danger shrink-0 font-bold"
+								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
 							>
 								✗
 							</span>
 							<div>
-								<div className="text-xl font-bold text-danger">
+								<div className="text-xl font-bold text-danger-ink">
 									Integrity check failed
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger/80">
+								<p className="mt-0.5 text-[13px] text-danger-ink/80">
 									The hash chain is broken
 									{verdict.firstSeq != null
 										? ` at seq ${verdict.firstSeq}`
@@ -722,15 +722,15 @@ function TrustPanel({
 						<div className="flex items-start gap-3">
 							<span
 								aria-hidden
-								className="mt-0.5 text-2xl text-danger shrink-0 font-bold"
+								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
 							>
 								✗
 							</span>
 							<div>
-								<div className="text-xl font-bold text-danger">
+								<div className="text-xl font-bold text-danger-ink">
 									Cannot verify this window
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger/80">
+								<p className="mt-0.5 text-[13px] text-danger-ink/80">
 									This view starts after your chain&apos;s genesis (older rows
 									are past your retention window) and has no public Rekor anchor
 									inside it to establish trust. Configure your tenant audit
@@ -745,15 +745,15 @@ function TrustPanel({
 						<div className="flex items-start gap-3">
 							<span
 								aria-hidden
-								className="mt-0.5 text-2xl text-danger shrink-0 font-bold"
+								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
 							>
 								✗
 							</span>
 							<div>
-								<div className="text-xl font-bold text-danger">
+								<div className="text-xl font-bold text-danger-ink">
 									Anchor proof missing
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger/80">
+								<p className="mt-0.5 text-[13px] text-danger-ink/80">
 									A batch claims to be publicly anchored but its proof is absent
 									— a possible strip or downgrade.
 								</p>
@@ -766,15 +766,15 @@ function TrustPanel({
 						<div className="flex items-start gap-3">
 							<span
 								aria-hidden
-								className="mt-0.5 text-2xl text-danger shrink-0 font-bold"
+								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
 							>
 								✗
 							</span>
 							<div>
-								<div className="text-xl font-bold text-danger">
+								<div className="text-xl font-bold text-danger-ink">
 									Anchor verification failed
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger/80">
+								<p className="mt-0.5 text-[13px] text-danger-ink/80">
 									The hash chain is intact, but a public-anchor check did not
 									pass: {verdict.reasons.map(humanizeVerdictKind).join("; ")}.
 								</p>
@@ -828,7 +828,7 @@ function TrustPanel({
 							incident and{" "}
 							<a
 								href="/support"
-								className="font-medium text-danger underline-offset-2 hover:underline"
+								className="font-medium text-danger-ink underline-offset-2 hover:underline"
 							>
 								contact Tracelane support
 							</a>{" "}
@@ -853,7 +853,7 @@ function TrustPanel({
 									verified
 										? "text-seal-ink"
 										: alarm
-											? "text-danger"
+											? "text-danger-ink"
 											: "text-ink-3",
 								)}
 							>
@@ -880,7 +880,7 @@ function TrustPanel({
 						</span>
 					)}
 					{alarm && stripped && (
-						<span className="text-[12px] font-medium text-danger">
+						<span className="text-[12px] font-medium text-danger-ink">
 							Anchor proof missing — possible strip/downgrade
 						</span>
 					)}
@@ -1045,9 +1045,7 @@ function TrustPanel({
 						<div className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Claim 1 of 2 · what we recomputed
 						</div>
-						<div className="mt-0.5 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-							Hash chain
-						</div>
+						<div className="mt-0.5 t-card-title">Hash chain</div>
 						{report.hash_chain_valid ? (
 							<>
 								<div className="mt-1 text-sm font-medium text-seal-ink tabular-nums">
@@ -1059,13 +1057,13 @@ function TrustPanel({
 							</>
 						) : (
 							<>
-								<div className="mt-1 text-sm font-medium text-danger">
+								<div className="mt-1 text-sm font-medium text-danger-ink">
 									Chain broken — recomputed hashes do not match
 								</div>
 								{report.errors.slice(0, 4).map((e) => (
 									<div
 										key={`${e.seq}-${e.kind}`}
-										className="mt-1 font-mono text-[11px] text-danger"
+										className="mt-1 font-mono text-[11px] text-danger-ink"
 									>
 										at seq {e.seq ?? "?"}: {e.kind}
 									</div>
@@ -1081,7 +1079,7 @@ function TrustPanel({
 								<div className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Claim 2 of 2 · what the public log proves
 								</div>
-								<div className="mt-0.5 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+								<div className="mt-0.5 t-card-title">
 									Signature &amp; public anchor
 								</div>
 							</>
@@ -1093,10 +1091,10 @@ function TrustPanel({
 							return (
 								<div className="rounded-lg border border-danger/40 bg-danger-soft/40 p-3">
 									{label}
-									<div className="mt-1 text-sm font-medium text-danger">
+									<div className="mt-1 text-sm font-medium text-danger-ink">
 										Verification FAILED
 									</div>
-									<div className="mt-1 text-[11px] text-danger">
+									<div className="mt-1 text-[11px] text-danger-ink">
 										{report.strip_detected
 											? "An anchor claims to be publicly anchored but its proof is missing (stripped). "
 											: ""}
@@ -1135,10 +1133,10 @@ function TrustPanel({
 							return (
 								<div className="rounded-lg border border-danger/40 bg-danger-soft/40 p-3">
 									{label}
-									<div className="mt-1 text-sm font-medium text-danger">
+									<div className="mt-1 text-sm font-medium text-danger-ink">
 										Anchor in log, but rows changed
 									</div>
-									<div className="mt-1 text-[11px] text-danger">
+									<div className="mt-1 text-[11px] text-danger-ink">
 										The anchored root is still in the public log, but the
 										ledger&apos;s rows no longer match it — see the broken chain
 										(Claim 1).
@@ -1257,7 +1255,7 @@ function ChainList({
 						<button
 							type="button"
 							onClick={jumpToBroken}
-							className="rounded-md border border-danger/40 bg-danger-soft/50 px-2 py-1 text-[11px] font-medium text-danger hover:bg-danger-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded-md border border-danger/40 bg-danger-soft/50 px-2 py-1 text-[11px] font-medium text-danger-ink hover:bg-danger-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 						>
 							Jump to first break (#{firstBrokenSeq})
 						</button>
@@ -1384,7 +1382,7 @@ function ChainList({
 										{r.event_type}
 									</span>
 									{broken ? (
-										<span className="min-w-0 flex-1 truncate font-medium text-danger">
+										<span className="min-w-0 flex-1 truncate font-medium text-danger-ink">
 											⚠ hash mismatch — click to inspect
 										</span>
 									) : (
@@ -1477,7 +1475,7 @@ function ChainList({
 										</div>
 									</div>
 									{broken && (
-										<div className="text-[11px] font-medium text-danger">
+										<div className="text-[11px] font-medium text-danger-ink">
 											row hash mismatch — recomputing this row&apos;s hash over
 											the data above does not match the stored hash.
 										</div>
@@ -1842,7 +1840,7 @@ export function AuditLedgerView({
 					data-testid="export-upsell"
 				>
 					<div>
-						<div className="text-[11px] font-semibold uppercase tracking-wide text-ink-inverse opacity-60">
+						<div className="t-card-title text-ink-inverse opacity-60">
 							Audit SKU · $999/mo add-on
 						</div>
 						<h2 className="mt-1 text-sm font-semibold text-ink-inverse">

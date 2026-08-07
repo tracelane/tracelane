@@ -59,9 +59,7 @@ export function Gauge({ value, display, label, className }: GaugeProps) {
 					/>
 				)}
 			</svg>
-			<div className="-mt-8 font-mono text-2xl font-semibold tabular-nums text-ink">
-				{text}
-			</div>
+			<div className="-mt-8 font-mono t-metric text-ink">{text}</div>
 			{label && <div className="mt-0.5 text-[11px] text-ink-3">{label}</div>}
 		</div>
 	);

@@ -1,6 +1,7 @@
 ---
 title: Tamper-evident audit ledger and Rekor anchoring
 description: Tamper-evident SHA-256 hash chain over every gateway call and guardrail verdict, with Ed25519 batch signing and Sigstore Rekor v2 anchoring.
+classification: PUBLIC
 ---
 
 Every request through the Tracelane gateway is appended to a per-tenant,
@@ -67,9 +68,11 @@ Request arrives at gateway
 
 The result: the hash chain is self-verifying. Given any NDJSON export,
 `tlane verify` recomputes the chain and returns exit 0 (no gaps, no mutations)
-or exit 1 with a specific fault description. For Audit-add-on batches the same
-verifier additionally validates the Ed25519 signatures and, for anchored
-batches, the Rekor inclusion proofs.
+or exit 1 with a specific fault description. Supplying `--tenant-pubkey`
+additionally validates the Ed25519 signatures and, for anchored batches, the
+Rekor inclusion proofs — that flag, not the plan, is what switches those layers
+on. Without it the chain is still checked, but a ledger carrying anchor records
+exits 1 as `INCOMPLETE` rather than passing on a partial result.
 
 ## Export
 
@@ -81,20 +84,9 @@ Audit-add-on capability. For anchored batches the export bundle includes the
 Rekor inclusion proof + signed checkpoint.
 </Note>
 
-```bash
-# Export all audit events since a date as NDJSON
-tlane export --since 2026-01-01 --format ndjson > audit.ndjson
-
-# Export as a ZIP package (manifest + batch headers; Rekor receipts for
-# anchored batches)
-tlane export --since 2026-01-01 --pack eu-ai-act-art12 > audit.zip
-
-# Available packs
-# eu-ai-act-art12     → EU AI Act Article 12 (agentic systems)
-# dpdp-phase-2        → India DPDP Phase 2
-```
-
-Or via API:
+The ledger export is an API call. It returns the NDJSON that `tlane verify`
+reads; for anchored batches the bundle carries the Rekor inclusion proof and the
+signed checkpoint.
 
 ```bash
 curl "https://gateway.tracelane.dev/v1/audit/export?since=2026-01-01" \
@@ -102,36 +94,60 @@ curl "https://gateway.tracelane.dev/v1/audit/export?since=2026-01-01" \
   -o audit.ndjson
 ```
 
+<Note>
+`tlane export --pack <name>` is a **different, unrelated command**. It writes a
+documentation pack — static markdown templates describing how Tracelane logs,
+which models it routes to, and how it handles data. It reads no ledger and makes
+no network calls, so it contains **none of your data** and is not an export of
+your audit chain. Use the API call above for the ledger itself.
+</Note>
+
 ## Verify
 
 ```bash
-# Verify NDJSON export hash chain (exits 0 on pass, 1 on fail)
-tlane verify audit.ndjson
+# Verify the NDJSON export. --tenant-pubkey is the trust root: without it
+# only the hash chain is checked and the CLI exits non-zero (INCOMPLETE).
+tlane verify audit.ndjson --tenant-pubkey <base64>
 
-# Verbose output
-tlane verify --verbose audit.ndjson
+# Machine-readable report (JSON to stdout)
+tlane verify audit.ndjson --tenant-pubkey <base64> --json
 ```
+
+**Without `--tenant-pubkey` the anchor layer does not run at all**, so a forged anchor would not be caught. The verifier therefore exits **non-zero with `INCOMPLETE`** when a ledger carries anchor records and no trusted key was supplied. Obtain the key out-of-band (dashboard Settings → Audit signing key, or `GET /v1/audit/pubkey`) — never from the export you are auditing.
 
 Output on pass:
 
 ```
-✓  Checked 42 batches, 4 200 events
-✓  All SHA-256 hashes match
-✓  No sequence gaps (event 1 … 4200 contiguous)
-✓  Ed25519 batch signatures — verified (per-tenant key)
-✓  Rekor inclusion proofs — verified for anchored batches (best-effort; unanchored batches verify via chain + Ed25519)
-Audit log is tamper-evident and intact.
+tlane verify: PASS
+  ledger:                audit.ndjson
+  rows_seen:             4200
+  hash_chain_valid:      true
+  signatures_valid:      true
+  rekor_anchors_seen:    42
+  rekor_anchors_resolved:42
+  anchors_included:      42 (Sigstore Rekor v2 · log2025-1.rekor.sigstore.dev)
 ```
 
-Output on failure:
+Anchoring is best-effort: `rekor_anchors_seen` counts the batches that claim an
+anchor, and unanchored batches still verify via the chain plus the Ed25519
+signature. Pass `--json` for the same report as a machine-readable object.
+
+Output on failure — the first ten divergences print with their `seq`:
 
 ```
-✗  Batch 17: SHA-256 mismatch on event 1 698
-     Expected: a3f1…
-     Got:      b9c2…
-     Possible cause: event modified or injected after anchoring.
-Exit code: 1
+tlane verify: FAIL
+  ledger:                audit.ndjson
+  rows_seen:             4200
+  hash_chain_valid:      false
+  signatures_valid:      true
+  rekor_anchors_seen:    42
+  rekor_anchors_resolved:42
+  anchors_included:      42 (Sigstore Rekor v2 · log2025-1.rekor.sigstore.dev)
+  errors (1):
+    - seq=1698  row_hash_mismatch: recomputed hash differs from the stored row hash
 ```
+
+Exit code 1.
 
 ## Verifier availability
 
@@ -140,8 +156,8 @@ without trusting Tracelane's toolchain:
 
 | Package | Install |
 |---|---|
-| Rust (reference) | `cargo install tlane-verifier` |
-| Python | `pip install tracelane-verifier` |
+| Rust (reference) | build from source (`cargo build -p tracelane-audit`) |
+| Python | `pip install tracelane-audit-verifier` |
 | TypeScript | `npm install @tracelanedev/audit-verifier` |
 
 All three recompute the SHA-256 hash chain and produce identical output for the
@@ -180,8 +196,11 @@ Each NDJSON line is one audit event:
 ## Batch header schema
 
 Each Audit-add-on batch carries a header. `ed25519_signature` is populated on
-every signed batch; `rekor_entry_id` is populated once the batch anchors (empty
-until then, not absent):
+every signed batch. `rekor_entry_id` is **absent from the JSON object entirely**
+until the batch anchors — the field is `skip_serializing_if = "Option::is_none"`
+(`crates/gateway/src/audit_export.rs:98`), asserted by the test
+`export_row_skips_rekor_when_none`. It is never emitted as an empty string or
+`null`. A verifier must treat a **missing key** as "not anchored".
 
 ```json
 {
@@ -205,11 +224,14 @@ CMK when BYOK is enabled. Rotate it from **Settings → BYOK Keys** — the old 
 remains valid for verifying historical exports; only new batches use the new key.
 
 ```bash
-# Export your current audit public key
-tlane export --public-key > audit-pubkey.pem
+# Fetch your current audit public key
+curl -s -H "Authorization: Bearer tlane_..." \
+  https://gateway.tracelane.dev/v1/audit/pubkey > audit-pubkey.txt
 
 # Verify a specific export with an explicit public key
-tlane verify --public-key audit-pubkey.pem audit.ndjson
+tlane verify audit.ndjson --tenant-pubkey "$(curl -s \
+  -H "Authorization: Bearer tlane_..." \
+  https://gateway.tracelane.dev/v1/audit/pubkey)"
 ```
 
 ## Related

@@ -226,6 +226,15 @@ impl PolarClient {
         });
         // Trailing slash REQUIRED (see create_checkout — 307 + no-redirect SSRF client).
         let url = format!("{}/customer-sessions/", self.base_url);
+        // `base_url` is operator-supplied (`POLAR_BASE_URL`). The module contract in
+        // `ssrf_guard` requires validate_url BEFORE any request to an operator- or
+        // customer-supplied URL; `safe_client_builder` disabling redirects is the second
+        // line, not a substitute. This call site was the one outlier among the three that
+        // reach the wire — `create_checkout` and `post_raw` both validate — so a
+        // `POLAR_BASE_URL` of `http://169.254.169.254` would have been POSTed to directly.
+        crate::ssrf_guard::validate_url(&url).await.map_err(|e| {
+            BillingError::Config(format!("Polar base URL rejected by SSRF guard: {e}"))
+        })?;
         let response = self
             .client
             .post(&url)
@@ -300,6 +309,32 @@ pub fn access_token_from_env() -> Result<SecretString, BillingError> {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+
+    /// The SSRF guard must run BEFORE the customer-portal POST, not just before
+    /// checkout. This call site was the one outlier of the three that reach the wire —
+    /// `create_checkout` and `post_raw` validated, `create_customer_portal_session` did
+    /// not — so an operator-set `POLAR_BASE_URL` pointing at link-local would have been
+    /// POSTed to directly. Found by an adversarial review of a docs change, 2026-08-06.
+    ///
+    /// This test FAILS (the call proceeds to a connection error rather than a Config
+    /// rejection) if the `validate_url` call is removed.
+    #[tokio::test]
+    async fn portal_session_rejects_link_local_base_url() {
+        let _guard = TestEnvGuard::new("http://169.254.169.254");
+        let client = PolarClient::new("polar_at_test");
+        let err = client
+            .create_customer_portal_session(
+                &PolarCustomerId("cus_test".into()),
+                "https://app.tracelane.dev/billing",
+            )
+            .await
+            .expect_err("link-local POLAR_BASE_URL must be refused by the SSRF guard");
+        assert!(
+            matches!(err, BillingError::Config(ref m) if m.contains("SSRF")),
+            "expected a Config error naming the SSRF guard, got: {err:?}"
+        );
+    }
+
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

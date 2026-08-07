@@ -1,6 +1,7 @@
+<!-- tracelane:classification: PUBLIC -->
 # `tlane` — Tracelane CLI
 
-[![npm](https://img.shields.io/npm/v/tlane?style=flat-square)](https://www.npmjs.com/package/tlane)
+[![npm](https://img.shields.io/npm/v/tlane?style=flat-square)](https://www.npmjs.com/package/@tracelanedev/cli)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](../../LICENSE)
 
 Developer toolbox for Tracelane, the flight recorder for AI agents. A single binary covering trace inspection, audit verification, prompt promotion, agent replay, one-line migrations, and CI eval gates.
@@ -8,11 +9,11 @@ Developer toolbox for Tracelane, the flight recorder for AI agents. A single bin
 ## Installation
 
 ```bash
-npm install -g tlane
+npm install -g @tracelanedev/cli
 # or
-pnpm add -g tlane
+pnpm add -g @tracelanedev/cli
 # or without installing (latest)
-npx tlane --version
+npx @tracelanedev/cli --version
 ```
 
 ## Quick start
@@ -22,8 +23,9 @@ npx tlane --version
 export TRACELANE_TOKEN=tlane_YOUR_API_KEY
 export TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev
 
-# 2. Verify your first audit ledger
-tlane verify ./audit.ndjson
+# 2. Verify your first audit ledger. --tenant-pubkey is the trust root —
+#    without it only the hash chain runs and the CLI exits non-zero.
+tlane verify ./audit.ndjson --tenant-pubkey <base64>
 
 # 3. Show active prompt versions
 tlane prompt show my-agent-prompt
@@ -41,12 +43,14 @@ tlane prompt promote my-agent-prompt \
 Verify a tamper-evident audit ledger against the Ed25519/SHA-256 hash chain and Sigstore Rekor anchors.
 
 ```bash
-tlane verify ./audit.ndjson
-tlane verify ./audit.ndjson --offline     # skip Rekor network calls
-tlane verify ./audit.ndjson --json        # machine-readable JSON report
+tlane verify ./audit.ndjson --tenant-pubkey <base64>          # the real invocation
+tlane verify ./audit.ndjson --tenant-pubkey <base64> --json   # machine-readable report
 ```
 
-**Exit codes:** `0` = PASS, `1` = verification failure, `2` = I/O error.
+**`--tenant-pubkey` is what makes the run mean something.** Without it the verifier checks the hash chain only: signature and Rekor-anchor verification never run, so a forged anchor would not be caught. The CLI therefore exits **non-zero with `INCOMPLETE`** whenever a ledger contains anchor records and no trusted key was supplied. Get the key out-of-band from Settings → Audit signing key, or `GET /v1/audit/pubkey` — not from the export itself.
+
+**Exit codes:** `0` = PASS, `1` = verification failure **or INCOMPLETE**, `2` = I/O error
+or missing file.
 
 ```
 tlane verify: PASS
@@ -56,6 +60,15 @@ tlane verify: PASS
   signatures_valid:      true
   rekor_anchors_seen:    24
   rekor_anchors_resolved:24
+  anchors_included:      24 (Sigstore Rekor v2 · log2025-1.rekor.sigstore.dev)
+```
+
+Run it without the key and you get this instead — by design:
+
+```
+tlane verify: INCOMPLETE
+  hash_chain_valid:      true
+  signatures_valid:      NOT CHECKED — no --tenant-pubkey
 ```
 
 ### `tlane prompt`
@@ -90,27 +103,36 @@ tlane prompt list my-prompt [--limit 100]
 
 ### `tlane export`
 
-Export audit evidence packs for regulatory compliance.
+Generate a documentation pack — static markdown templates describing how Tracelane logs, which models it routes to, and how it handles data, plus a `manifest.json`, emitted as a ZIP.
+
+**It reads no ledger and makes no network calls, so it contains none of your data.** For your actual ledger, export it from `/v1/audit/export` and run `tlane verify`.
 
 ```bash
-tlane export --pack eu-ai-act-art12     # EU AI Act Article 12 evidence pack
-tlane export --pack dpdp-phase-2        # India DPDP Phase 2 evidence pack
-tlane export --since 2025-01-01 --format ndjson
+tlane export --pack eu-ai-act-art12     # chain design, model registry, data-processing, guardrails
+tlane export --pack dpdp-phase-2        # storage region, processor/controller split, rights procedure
+tlane export --pack eu-ai-act-art12 --output-dir ./docs-pack
 ```
 
 ### `tlane migrate`
 
-One-line migration from Helicone or LiteLLM.
+One-command migration from Helicone or LiteLLM.
 
 ```bash
-# Helicone → Tracelane (PP-G4)
-tlane migrate --from helicone --url https://oai.helicone.ai
+# Helicone → Tracelane (PP-G4). Scans the project root, prints a diff,
+# writes nothing without --apply.
+tlane migrate helicone
+tlane migrate helicone --apply
+tlane migrate helicone --dir ./services/api --apply
 
-# LiteLLM config → Tracelane gateway config
-tlane import-litellm ./litellm_config.yaml
+# LiteLLM config → Tracelane gateway config. --config is a flag; a path
+# passed positionally is ignored in favour of the default litellm_config.yaml.
+tlane import-litellm --config ./litellm_config.yaml
+tlane import-litellm --config ./litellm_config.yaml --output tracelane.yaml --dry-run
 ```
 
-Outputs a Tracelane-compatible `tracelane.yaml` config. Preserves all provider routing, model mappings, and rate-limit rules.
+`migrate helicone` rewrites the env and source files it found, in place.
+`import-litellm` emits a Tracelane-compatible `tracelane.yaml`, preserving
+provider routing, model aliases, and rate-limit metadata.
 
 ### `tlane replay`
 
@@ -125,24 +147,40 @@ tlane replay <trace-id> --endpoint https://gateway.tracelane.dev
 
 ### `tlane eval`
 
-Run the eval suite or list eval status.
+Run the eval suite or list eval status. Both need a checkout of the Tracelane
+repository — the eval suites do not ship in the npm package.
 
 ```bash
 tlane eval run                             # run all evals
-tlane eval run --suite gateway             # run gateway-only suite
-tlane eval run --suite predictive --gate   # fail CI on regression
+tlane eval run --suite gc                  # gateway-correctness suite only
+tlane eval run --suite pp                  # pain-points suite only
+tlane eval run --suite ft --dry-run        # print the command without running it
 tlane eval list                            # list all pain-point evals + status
 ```
 
-Use `--gate` in CI to fail the job on any regression — this is the B1 merge gate.
+Suite ids: `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
+`is` (ingest-schema), `pp` (pain-points), `pir` (pii-redaction),
+`pi` (prompt-injection). An unrecognised id exits 2 instead of silently running
+everything.
+
+`eval run` exits with the underlying test runner's status, so CI gates on
+non-zero — that is the B1 merge gate. There is no `--gate` flag.
 
 ### `tlane init`
 
-Scaffold a new project with Tracelane SDK + `TRACELANE_API_KEY` env setup.
+Write a `tracelane.config.json` (endpoint, `serviceName`, `sampleRate`) and print
+the SDK install + wire-up steps. It writes that one file; it does not install a
+package or edit your source.
+
+`--endpoint` is the OTLP endpoint of an ingest receiver **you** run (default
+`http://localhost:4318`). Tracelane Cloud has no public OTLP ingress — hosted
+traces are captured at the gateway, so on Cloud leave `--endpoint` unset and
+point your OpenAI-compatible client at `https://gateway.tracelane.dev/v1`.
 
 ```bash
 tlane init
-tlane init --endpoint https://gateway.tracelane.dev
+tlane init --endpoint http://otel-collector.internal:4318
+tlane init --service-name checkout-agent --sample-rate 0.25 --force
 ```
 
 ### `tlane trace`
@@ -167,9 +205,9 @@ tlane trace <trace-id> --format timeline
 | ID | Description |
 |---|---|
 | PP-G1 | Developer onboarding — `tlane init` scaffolds in < 60 s |
-| PP-G4 | One-line Helicone migration — `tlane migrate --from helicone` |
-| PP-O8 | Agent replay across model versions — `tlane replay` |
-| PP-O11 | CI eval gate — `tlane eval run --gate` in GitHub Actions |
+| PP-G4 | One-command Helicone migration — `tlane migrate helicone --apply` |
+| PP-O8 | Agent replay of a recorded trace — `tlane replay` |
+| PP-O11 | CI eval gate — `tlane eval run --suite all` in GitHub Actions |
 | PP-PR6 | Audit ledger verification — `tlane verify` (exit code 0/1/2) |
 
 ## Stack

@@ -119,6 +119,24 @@ impl Claims {
     /// encryption keys, member management (IDENTITY_TEAM_SPEC §1)? Explicit
     /// `member`/`viewer` are denied; `owner`, legacy `admin`, API-key / service
     /// auth, and pre-role-config JWTs (`role == None`) are grandfathered.
+    /// May this caller perform an owner-scoped action that can WEAKEN a
+    /// security control?
+    ///
+    /// Stricter than [`Self::can_admin`], and deliberately so. `can_admin`
+    /// grandfathers `role == None` to full access so that enabling roles could
+    /// not lock out existing admins — but **API-key auth always has
+    /// `role == None`** (`auth/api_key.rs`), and [`Self::can_mint_keys`]
+    /// deliberately lets a *member* mint keys. Those two facts compose:
+    /// member → mint an API key → call an owner-only surface. That defeated the
+    ///
+    /// Use this for actions whose misuse is silent and damaging — moving
+    /// guardrail capabilities, revoking or replacing provider credentials. Use
+    /// `can_admin` for owner-scoped actions that are merely sensitive to read.
+    #[must_use]
+    pub fn is_verified_owner(&self) -> bool {
+        matches!(self.auth_method, AuthMethod::JwtBearer) && self.can_admin()
+    }
+
     pub fn can_admin(&self) -> bool {
         !matches!(self.role, Some(Role::Member) | Some(Role::Viewer))
     }
@@ -797,6 +815,42 @@ mod tests {
         assert_eq!(Role::from_slug("admin"), None);
         assert_eq!(Role::from_slug("Owner"), None); // case-sensitive slug
         assert_eq!(Role::from_slug(""), None);
+    }
+
+    /// `role == None`, and API-key auth ALWAYS has `role == None` — while
+    /// `can_mint_keys()` deliberately lets a MEMBER mint keys. Those compose:
+    /// member → mint a key → reach an owner-only surface.
+    /// `is_verified_owner()` is the stricter gate that closes it for actions
+    /// which can WEAKEN a control (guardrail caps; BYOK upload/revoke).
+    #[test]
+    fn is_verified_owner_excludes_api_keys_that_can_admin_allows() {
+        let mut api_key = claims_with_role(None);
+        api_key.auth_method = AuthMethod::ApiKey;
+
+        // The gap itself: can_admin says yes, is_verified_owner says no.
+        assert!(
+            api_key.can_admin(),
+            "precondition — the role==None grandfather still holds"
+        );
+        assert!(
+            !api_key.is_verified_owner(),
+            "an API key must not pass the stricter owner gate: a member can mint \
+             one for themselves"
+        );
+
+        // mTLS is ingest-only and must not reach an owner surface either.
+        let mut mtls = claims_with_role(None);
+        mtls.auth_method = AuthMethod::Mtls;
+        assert!(!mtls.is_verified_owner());
+
+        // Only a JWT that also clears can_admin passes.
+        assert!(claims_with_role(Some(Role::Owner)).is_verified_owner());
+        assert!(
+            claims_with_role(None).is_verified_owner(),
+            "a pre-role-config JWT stays grandfathered, matching can_admin"
+        );
+        assert!(!claims_with_role(Some(Role::Member)).is_verified_owner());
+        assert!(!claims_with_role(Some(Role::Viewer)).is_verified_owner());
     }
 
     #[test]

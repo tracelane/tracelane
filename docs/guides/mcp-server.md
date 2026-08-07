@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # Tracelane MCP Server
 
 `tracelane-mcp` exposes Tracelane's trace store and guardrail engine as
@@ -38,7 +39,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "args": ["@tracelanedev/mcp"],
       "env": {
         "TRACELANE_API_KEY": "tlk-your-key-here",
-        "TRACELANE_BASE_URL": "https://api.tracelane.dev"
+        "TRACELANE_GATEWAY_URL": "https://api.tracelane.dev"
       }
     }
   }
@@ -119,11 +120,11 @@ is validated against a JWT claim — never accepted from request body.
 
 ## Self-hosted setup
 
-If running Tracelane self-hosted, set `TRACELANE_BASE_URL` to your gateway URL:
+If running Tracelane self-hosted, set `TRACELANE_GATEWAY_URL` to your gateway URL:
 
 ```bash
 TRACELANE_API_KEY=tlk-your-key \
-TRACELANE_BASE_URL=http://localhost:8080 \
+TRACELANE_GATEWAY_URL=http://localhost:8080 \
 npx @tracelanedev/mcp
 ```
 

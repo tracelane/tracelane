@@ -185,7 +185,7 @@ export default async function PromptDetailPage({ params }: Props) {
 					>
 						<div className={S.envLabel}>{env}</div>
 						{"error" in data ? (
-							<div className="mt-2 text-sm text-warn">
+							<div className="mt-2 text-sm text-warn-ink">
 								{data.error.includes("404")
 									? "No active version"
 									: `Error — ${data.error}`}

@@ -19,6 +19,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
 import { RailRoster } from "./RailRoster";
+import { ToolPins } from "./ToolPins";
 import { WorkedExample } from "./WorkedExample";
 
 /** Honest explanation of the request/response split (some rails run on both). */
@@ -161,6 +162,20 @@ async function GuardrailData({ range }: { range?: string }) {
 			</div>
 
 			{/* The "show me" moment — a real worked example of a pre-flight block. */}
+			<section className="mt-10">
+				<h2 className="text-base font-semibold text-ink">Tool pinning</h2>
+				<p className="mt-1 max-w-3xl text-[13px] text-ink-2">
+					Approve the tool definitions your agents actually send. Once a
+					definition is approved, the guardrail engine flags any later change to
+					that tool&apos;s name, schema or description as definition drift — the
+					MCP rug-pull case. Tracelane records the definition hash, never the
+					tool text.
+				</p>
+				<div className="mt-4">
+					<ToolPins />
+				</div>
+			</section>
+
 			<WorkedExample />
 		</div>
 	);
@@ -176,7 +191,7 @@ export default async function GuardrailsPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
 				<div>
-					<h1 className="text-2xl font-semibold text-ink">Guardrails</h1>
+					<h1 className="t-h1">Guardrails</h1>
 					<p className="mt-1 max-w-2xl text-sm text-ink-2">
 						Pre-flight verdicts across your traffic — blocked, redacted or
 						allowed, plus inline overhead. Last {rangeLabel(range)}.

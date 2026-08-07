@@ -137,7 +137,7 @@ export function VerifyByTrace() {
 			</p>
 			{elapsed >= SLOW_AFTER_S && (
 				<div className="mt-2 rounded-md border border-warn/30 bg-warn-soft/40 px-3 py-2 text-[12px] text-ink-2">
-					<p className="font-medium text-warn">
+					<p className="font-medium text-warn-ink">
 						Nothing yet after {SLOW_AFTER_S}s? Check:
 					</p>
 					<ul className="mt-1 space-y-0.5">

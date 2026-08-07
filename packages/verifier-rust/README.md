@@ -1,3 +1,4 @@
+<!-- tracelane:classification: PUBLIC -->
 # `packages/verifier-rust`
 
 Reference verifier for Tracelane **tamper-evident audit ledgers** (Rust).

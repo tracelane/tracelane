@@ -118,4 +118,34 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 		expect(r.rekor_anchors_resolved).toBe(0);
 		expect(r.anchors_included).toBe(0);
 	});
+
+	// P0 REGRESSION (2026-08-07). Without a trusted key the trusted-key gate is
+	// skipped, so `signatures_valid` stays vacuously true — the CLI printed
+	// "PASS" over this FORGED anchor and exited 0. The verifier must report how
+	// many anchors it skipped so every caller can fail closed.
+	it("forged anchor WITHOUT a trusted key reports anchors_unverified, never a silent green", async () => {
+		const path = vector("forged-anchor.ndjson");
+		if (!existsSync(path)) {
+			console.warn(`skipping: vector not found at ${path}`);
+			return;
+		}
+		const report = await verifyLedger(path); // no tenantPubkey — the doc'd usage
+		expect(report.anchors_unverified).toBeGreaterThan(0);
+		expect(report.rekor_anchors_resolved).toBe(0);
+		expect(report.anchors_included).toBe(0);
+	});
+
+	it("supplying the trusted key clears anchors_unverified on a good ledger", async () => {
+		const path = vector("anchored.v1.ndjson");
+		if (!existsSync(path)) {
+			console.warn(`skipping: vector not found at ${path}`);
+			return;
+		}
+		const report = await verifyLedger(path, {
+			tenantPubkey: b64("+n4+cpxk9SZH8BK/WUifFHDGLGRn2ceyKMHd1R7S7Pw="),
+		});
+		expect(report.anchors_unverified).toBe(0);
+		expect(report.signatures_valid).toBe(true);
+		expect(report.anchors_included).toBeGreaterThan(0);
+	});
 });

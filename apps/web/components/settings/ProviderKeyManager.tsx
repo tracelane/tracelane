@@ -186,7 +186,7 @@ function AddKeyDialog({
 							— we show only the last 4 characters afterward.
 						</p>
 					</div>
-					{error && <p className="text-xs text-danger">{error}</p>}
+					{error && <p className="text-xs text-danger-ink">{error}</p>}
 					<div className="flex justify-end gap-2 pt-1">
 						<button
 							type="button"
@@ -298,7 +298,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 				<p className="text-sm text-ink-2 animate-pulse">Loading…</p>
 			)}
 			{isError && (
-				<p className="text-sm text-danger">Failed to load provider keys.</p>
+				<p className="text-sm text-danger-ink">Failed to load provider keys.</p>
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
@@ -337,7 +337,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 										<button
 											type="button"
 											onClick={() => revokeMutation.mutate(key.provider_id)}
-											className="text-xs px-2 py-1 rounded border border-danger text-danger hover:bg-danger-soft transition-colors"
+											className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 										>
 											Revoke
 										</button>

@@ -2,12 +2,13 @@
 title: SPIFFE/SPIRE ingest mTLS — operator runbook
 description: Bring up SPIRE in a customer cluster, register Tracelane ingest workload entries, and rotate trust bundles without dropping spans.
 sidebarTitle: SPIFFE ingest (operator)
+classification: PUBLIC
 ---
 
 # SPIFFE/SPIRE ingest mTLS — operator runbook
 
 > **Audience:** SREs running self-hosted Tracelane or operating the Audit SKU
-> in a customer cluster. **Authoritative design:** [ADR-028](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-028-spiffe-ingest-mtls.md).
+> in a customer cluster. **Authoritative design:** [ADR-028](/decisions/index).
 
 The Tracelane ingest worker authenticates every connection with a SPIFFE
 X.509-SVID issued by [SPIRE](https://spiffe.io). This page covers the
@@ -227,7 +228,7 @@ increase(tracelane_ingest_auth_total{result="wrong_trust_domain"}[15m]) > 0
 
 ## 7. Further reading
 
-- [ADR-028](https://github.com/tracelane/tracelane/blob/main/decisions/ADR-028-spiffe-ingest-mtls.md) — full design decision.
+- [ADR-028](/decisions/index) — full design decision.
 - [SPIFFE X.509-SVID spec §4](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md) — wire format.
 - [SPIRE Workload API spec](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md) — gRPC contract.
 - [Migration guide](/migration/spiffe-bootstrap) — moving an existing customer cluster onto Tracelane ingest mTLS.

@@ -4,6 +4,7 @@ description: Writes CHANGELOG.md entries on release using Keep a Changelog forma
 model: claude-haiku-4-5-20251001
 isolation: none
 tools: [Bash, Read, Write]
+classification: INTERNAL
 ---
 
 Write CHANGELOG.md entries on release. Keep a Changelog v1.1.0 format.

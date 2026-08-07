@@ -30,7 +30,7 @@ import {
  * `TRACELANE_PREDICTIVE_TEST_HOOKS=1` is set on the gateway. If the
  * endpoint isn't reachable, the test skips with a descriptive message.
  *
- * guardrails docs](../../docs/predictive-guardrails.md).
+ * guardrails docs](../../docs/archive/predictive-guardrails.md).
  */
 
 let live: LiveGatewayContext;

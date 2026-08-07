@@ -40,7 +40,7 @@ export function BillingPortalButton() {
 			>
 				{loading ? "Opening…" : "Manage billing"}
 			</button>
-			{error && <p className="text-xs text-danger">{error}</p>}
+			{error && <p className="text-xs text-danger-ink">{error}</p>}
 		</div>
 	);
 }

@@ -176,7 +176,7 @@ export default function PromptsListPage() {
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-6 flex flex-col items-start gap-4 sm:flex-row sm:justify-between">
 				<div>
-					<h1 className="text-2xl font-semibold text-ink">Prompts</h1>
+					<h1 className="t-h1">Prompts</h1>
 					<p className="mt-1 max-w-xl text-sm text-ink-2">
 						Version a prompt, then promote it across environments — every
 						promotion is written to the audit ledger.

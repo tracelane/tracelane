@@ -192,7 +192,7 @@ function InviteModal({
 							Owners are promoted after they join, from their member row.
 						</p>
 						{mutation.error && (
-							<p className="text-xs text-danger mb-3">
+							<p className="text-xs text-danger-ink mb-3">
 								{(mutation.error as Error).message}
 							</p>
 						)}
@@ -290,7 +290,7 @@ export function TeamManager({
 	return (
 		<div className="space-y-4">
 			{notice && (
-				<output className="block rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ok">
+				<output className="block rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ok-ink">
 					✓ {notice}
 				</output>
 			)}
@@ -302,7 +302,7 @@ export function TeamManager({
 				</p>
 				{canManage &&
 					(atLimit ? (
-						<span className="text-xs text-warn">
+						<span className="text-xs text-warn-ink">
 							Seat limit reached — upgrade to add more
 						</span>
 					) : (
@@ -318,7 +318,7 @@ export function TeamManager({
 
 			{isLoading && <Skeleton className="h-10 w-full" />}
 			{error && (
-				<p className="text-xs text-danger">
+				<p className="text-xs text-danger-ink">
 					Failed to load team members.{" "}
 					{error instanceof Error && error.message.includes("503")
 						? "WorkOS API not configured."
@@ -388,9 +388,11 @@ export function TeamManager({
 																Saving…
 															</span>
 														) : role.isSuccess ? (
-															<span className="text-xs text-ok">Saved ✓</span>
+															<span className="text-xs text-ok-ink">
+																Saved ✓
+															</span>
 														) : role.isError ? (
-															<span className="text-xs text-danger">
+															<span className="text-xs text-danger-ink">
 																Failed
 															</span>
 														) : null)}
@@ -416,7 +418,7 @@ export function TeamManager({
 															remove.mutate(m.id);
 														}
 													}}
-													className="text-xs text-ink-2 transition-colors hover:text-danger disabled:opacity-40"
+													className="text-xs text-ink-2 transition-colors hover:text-danger-ink disabled:opacity-40"
 												>
 													Remove
 												</button>
@@ -438,7 +440,7 @@ export function TeamManager({
 			)}
 
 			{(remove.error || role.error) && (
-				<p className="text-xs text-danger">
+				<p className="text-xs text-danger-ink">
 					{((remove.error ?? role.error) as Error).message}
 				</p>
 			)}
@@ -478,7 +480,7 @@ export function TeamManager({
 														type="button"
 														disabled={revoke.isPending}
 														onClick={() => revoke.mutate(p.id)}
-														className="text-xs text-ink-2 transition-colors hover:text-danger disabled:opacity-40"
+														className="text-xs text-ink-2 transition-colors hover:text-danger-ink disabled:opacity-40"
 													>
 														Revoke
 													</button>

@@ -17,6 +17,25 @@
 	},
 	"observability": {
 		"enabled": true
+	},
+	// Smart Placement — run the Worker NEAR THE GATEWAY, not near the user.
+	//
+	// Measured 2026-08-05 on the /dashboard 6s report: the gateway answers
+	// /health in 0.9ms on-node and 8.8ms through Caddy on-node, but 588ms mean /
+	// 2,745ms max over the WAN. The backend is not slow — the wide-area hop is,
+	// and it has a heavy tail.
+	//
+	// /dashboard issues EIGHT gateway subrequests in a Promise.all, so it waits
+	// for the slowest of eight draws from that tail. That is why only the
+	// dashboard is slow: /traces and /slo make 2-5 calls and mostly escape it.
+	//
+	// Default placement puts the Worker at the edge beside the user, making all
+	// eight round trips cross the ocean. Smart Placement moves the Worker beside
+	// the origin, so those eight become short hops and only the HTML response
+	// crosses the WAN once. This is the documented remedy for exactly this
+	// shape (multiple subrequests to one centralized backend).
+	"placement": {
+		"mode": "smart"
 	}
 	// Runtime config (incl. the PUBLIC NEXT_PUBLIC_* gateway/redirect URLs) is set
 	// via `wrangler secret put` — plaintext `vars` here are NOT bridged onto

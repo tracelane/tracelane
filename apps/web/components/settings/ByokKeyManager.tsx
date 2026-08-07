@@ -81,8 +81,8 @@ const STATUS_LABEL: Record<KeyStatus, string> = {
 
 const STATUS_BADGE: Record<KeyStatus, string> = {
 	active: "bg-surface-2 text-ink-2",
-	rotating: "bg-warn-soft text-warn",
-	revoked: "bg-danger-soft text-danger",
+	rotating: "bg-warn-soft text-warn-ink",
+	revoked: "bg-danger-soft text-danger-ink",
 };
 
 function KeyRow({

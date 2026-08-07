@@ -113,6 +113,17 @@ fi
 if [[ -f scripts/ci/check-byok-provider-coverage.py ]] && command -v python3 >/dev/null 2>&1; then
     run "byok-provider-coverage guard" python3 scripts/ci/check-byok-provider-coverage.py
 fi
+# Concurrent gateway fan-out budget. /dashboard fired EIGHT gateway subrequests
+# in one Promise.all, which resolves at the SLOWEST member — so it sampled the
+# wide-area tail eight times and took 6s+ per load while the gateway itself
+# answered in 0.9ms on-node. No existing gate could see it: the bench suite
+# measures GATEWAY latency (green throughout) and nothing measures latency from
+# where a customer stands. Selftest first — a guard nobody has watched fail is
+# assumed decorative. (runbooks/RCA-dashboard-fanout-tail-latency.md)
+if [[ -f scripts/ci/check-page-fanout.py ]] && command -v python3 >/dev/null 2>&1; then
+    run "page-fanout selftest"     python3 scripts/ci/check-page-fanout.py --selftest
+    run "page-fanout guard"        python3 scripts/ci/check-page-fanout.py
+fi
 # Mirrored from ci.yml: these guards were CI-ONLY and therefore enforced
 # NOWHERE while the CI workflow was disabled (dark 2026-06-20→). Local gate now
 # carries the load-bearing ones so a disabled CI can't silently un-guard them.
@@ -125,6 +136,29 @@ if command -v python3 >/dev/null 2>&1; then
     run "no-internal-refs-in-ui guard" python3 scripts/ci/no-internal-refs-in-ui.py
     run "gateway-fallback guard"       python3 scripts/ci/check-no-localhost-gateway-fallback.py
     run "npm-scope guard"              python3 scripts/ci/check-npm-scope.py
+    # Doc classification: every .md/.mdx in the export set carries a tag, and no
+    # CONFIDENTIAL/RESTRICTED doc sits inside it. MUST be here, not only in ci.yml:
+    # private-repo CI skips the root jobs on a direct push, so this hook is the only
+    # place the gate actually runs. Selftest first — it plants an untagged file, a
+    # CONFIDENTIAL one and a bogus level, and proves each blocks.
+    run "doc-classification selftest"  python3 scripts/ci/check-doc-classification.py --selftest
+    run "doc-classification guard"     python3 scripts/ci/check-doc-classification.py
+    # The map is generated; a stale map is a lying map. Same reasoning as the guard above:
+    # this must live in verify-all (the pre-push hook) because private-repo CI skips the
+    # root jobs on a direct push.
+    # Selftest FIRST — it proves the generator is deterministic (a flapping --check
+    # teaches everyone to ignore it) and that planted drift is actually detected.
+    run "claim-anchor selftest"        python3 scripts/ci/check-claim-anchors.py --selftest
+    run "claim anchors hold"           python3 scripts/ci/check-claim-anchors.py
+    run "doc-consistency selftest"     python3 scripts/ci/check-doc-consistency.py --selftest
+    run "doc cross-doc consistency"    python3 scripts/ci/check-doc-consistency.py
+    run "doc-index selftest"           python3 scripts/ci/build-doc-index.py --selftest
+    run "doc-index freshness"          python3 scripts/ci/build-doc-index.py --check
+    # Promotion gate selftest only — the gate itself is NOT run here. Its verdict depends
+    # on adversarial-pass currency, which is deliberately allowed to be stale between
+    # promotions; failing every push on that would be noise. The selftest proves the two
+    # hard blockers still fire.
+    run "promotion-gate selftest"      python3 scripts/ci/check-promotion-readiness.py --selftest
     # Offline banned-link guard (no network here — the merge gate must stay
     # offline/fast). The full liveness+identity pass runs pre-deploy in web.sh.
     run "external-link guard"          python3 scripts/ci/check-external-links.py --static

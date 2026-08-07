@@ -67,15 +67,20 @@
 	--color-selected: var(--selected);
 	--color-selected-on: var(--selected-on);
 
-	/* semantic status (pair with icon/shape — never color alone) */
+	/* semantic status (pair with icon/shape — never color alone).
+	   `--color-*` = the FILL; `--color-*-ink` = the AA-cleared TEXT tone. */
 	--color-ok: var(--ok);
+	--color-ok-ink: var(--ok-ink);
 	--color-ok-soft: var(--ok-soft);
 	--color-danger: var(--danger);
+	--color-danger-ink: var(--danger-ink);
 	--color-danger-on: var(--danger-on);
 	--color-danger-soft: var(--danger-soft);
 	--color-warn: var(--warn);
+	--color-warn-ink: var(--warn-ink);
 	--color-warn-soft: var(--warn-soft);
 	--color-info: var(--info);
+	--color-info-ink: var(--info-ink);
 	--color-info-soft: var(--info-soft);
 
 	/* shadcn-compat aliases so existing apps/web components keep working */
@@ -93,6 +98,18 @@
 	   next/font vars; these named fallbacks apply before the faces load. */
 	--font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
 	--font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+	/* visual-pass-01 body size. The spec's body band is 12–12.5px; `text-sm` is
+	   the app's body utility at ~224 call sites, so RETUNING THE TOKEN is how the
+	   band is hit — one theme value instead of 224 className edits, and one line
+	   to revert. Tailwind's stock --text-sm is 0.875rem/14px.
+	   NOTE (blast radius): this also shrinks buttons, inputs and table cells that
+	   use `text-sm`. That is the intended density of the tightened scale, but it
+	   is the single highest-reach value in this pass — check it first if the
+	   preview reads too small. `text-xs` (12px) already sits inside the band and
+	   is left alone. */
+	--text-sm: 0.78125rem; /* 12.5px */
+	--text-sm--line-height: 1.15rem; /* 18.4px */
 }
 
 /* LIGHT — DEFAULT (Tinted Slate + Lava, ADR-053). The tinted #f4f6fa slate is
@@ -100,26 +117,45 @@
    Lava/Verify deepened where used as thin text/lines so they clear ≥4.5:1. */
 :root {
 	color-scheme: light;
-	--bg: #e8e8ea; /* neutral grey page margin — the framed canvas floats on it (no blue) */
-	--canvas: #f4f4f5; /* rounded app-frame inner surface — the neutral grey canvas (founder) */
-	--surface: #ffffff; /* cards stay pure white — white-on-grey is the card/canvas separation */
-	--surface-2: #ececee; /* neutral grey tray (nav menu, icon buttons, hovers) — was blue-tinted */
-	--surface-3: #e4e4e7; /* neutral grey, one step deeper */
-	--surface-inverse: #17171a; /* neutral near-black: dark cards (error-budget/burn) + active nav pill */
-	--ink-inverse: #f5f5f6; /* text/icons ON --surface-inverse */
-	--line: #e9e9eb; /* neutral grey hairline (founder --border) */
-	--line-2: #e0e0e2; /* neutral grey, one step stronger (founder --border-2) */
-	--ink: #1c2530;
+	/* visual-pass-01 — the canvas returns to a BLUE-TINTED slate, now as a static
+	   vertical gradient rather than a flat fill. `--canvas` keeps a flat colour
+	   (the gradient's 55% stop) so every `bg-canvas` consumer still resolves; the
+	   gradient itself is `--canvas-gradient`, painted by `.app-canvas`. Static
+	   only — the ADR-053 animated-gradient ban stands. */
+	--bg: #e5ebf4; /* cool page margin — the framed canvas floats on it */
+	--canvas: #f0f5fc; /* flat fallback = the gradient's mid stop */
+	--canvas-gradient: linear-gradient(
+		180deg,
+		#f8fbff 0%,
+		#f0f5fc 55%,
+		#eaf1fa 100%
+	);
+	--surface: #ffffff; /* cards stay pure white — white-on-tint is the card/canvas separation */
+	--surface-2: #eef3fa; /* soft-blue well: icon chips, tray, hovers (visual-pass-01) */
+	--surface-3: #e3ebf6; /* soft blue, one step deeper */
+	--surface-inverse: #121821; /* cool near-black: dark cards (error-budget/burn) + active nav pill */
+	--ink-inverse: #e8ecf1; /* text/icons ON --surface-inverse */
+	--line: #e3e9f2; /* card hairline (visual-pass-01 --card-line) */
+	--line-2: #d5dfec; /* one step stronger */
+	--ink: #1e2632; /* founder: #10161d read too heavy — leaner, still 12.9:1 on white */
 	--logo-ink: #0c0d0f; /* brand lockup mono — the logo-lock near-black (matches tracelane.dev) */
-	--ink-2: #3d4854;
-	--ink-3: #7c8794;
+	--ink-2: #39434f;
+	/* --ink-3 was #7c8794 = 3.94:1 on white — BELOW the AA-4.5 floor it is used
+	   at (labels, captions, table headers). Deepened to clear AA on white AND on
+	   the --surface-2 well it also sits on. */
+	--ink-3: #626d7c;
 	/* Lava dual-tone (founder-decided): soft fill vs deep text. The named --lava-*
 	   are the source of truth; the --accent* roles point at them so every existing
 	   bg-accent / text-accent-ink consumer inherits with zero component churn. */
 	--lava-fill: #ff8566; /* soft coral-lava — all FILLS */
-	--lava-deep: #c8300f; /* deep lava — all TEXT/NUMBERS + thin lines. AA floor:
-	                         5.4:1 on white, ~4.5:1 on the lava-soft pill (the
-	                         softer #e0472f was 4.1:1/3.4:1 — below AA-4.5). */
+	--lava-deep: #c7300f; /* deep lava — all TEXT/NUMBERS + thin lines. AA floor:
+	                         5.45:1 on white, 4.51:1 on the lava-soft pill (the
+	                         softer #e0472f was 4.1:1/3.4:1 — below AA-4.5).
+	                         visual-pass-01: #c8300f measured 4.48:1 on the pill —
+	                         under AA by 0.02. Moved ONE step on the red channel
+	                         (200->199) to clear it. This is the only byte of lava
+	                         this pass touches; revert to #c8300f if the founder
+	                         would rather carry the miss than the change. */
 	--lava-soft: #ffe4dd; /* soft-pill background */
 	--accent: var(--lava-fill); /* Lava — solid fill */
 	--accent-2: #ff8571; /* Lava-2 — gradient light stop */
@@ -131,12 +167,14 @@
 	--accent-field: #ff8571; /* decoration only: hairlines, node pins */
 	--accent-glow: rgba(255, 106, 82, 0.45); /* CTA drop-glow */
 	--accent-glow-2: rgba(255, 106, 82, 0.55); /* CTA drop-glow, hover */
-	--seal: #1f9d64; /* Verify green — provenance signature */
-	--seal-ink: #157f4f; /* deepened Verify for provenance TEXT on light (AA) */
+	--seal: #1f9d64; /* Verify green — provenance signature. UNCHANGED (visual-pass-01). */
+	--seal-ink: #157c4d; /* deepened Verify for provenance TEXT on light (AA).
+	                        #157f4f was 4.36:1 on --seal-soft — under the AA-4.5
+	                        floor it exists to clear. 2% deeper, same colour. */
 	--seal-on: #ffffff;
 	--seal-soft: #e2f3ea;
 	--seal-line: #bfe3d2;
-	--ok: #1f9d64; /* ok = Verify green (ADR-053) */
+	--ok: #1f9d64; /* ok = Verify green (ADR-053) — the FILL. UNCHANGED. */
 	--ok-soft: #e2f3ea;
 	--danger: #cf222e;
 	--danger-on: #ffffff; /* label placed ON a solid danger fill (matches --accent-on) */
@@ -145,6 +183,21 @@
 	--warn-soft: #fdf6e8;
 	--info: #7c5cff; /* tool-span violet — AFT-1 id hue */
 	--info-soft: #efecff;
+	/*
+	 * Semantic TEXT variants (visual-pass-01) — the dual-tone split the palette
+	 * already makes for lava (--lava-fill / --lava-deep) and Verify
+	 * (--seal / --seal-ink), now completed for the four status colours.
+	 *
+	 * Why: `text-ok` was painting the Verify FILL green as text — 3.46:1 on
+	 * white, well under AA. Deepening `--ok` itself was not an option (it is the
+	 * Verify signature, pinned unchanged, and it is also a fill: `bg-ok` dots).
+	 * So the fills stay byte-identical and TEXT moves to these.
+	 * Rule for new code: `bg-*` uses the base token, `text-*` uses `-ink`.
+	 */
+	--ok-ink: #187c4f; /* 5.20:1 on white, 4.52:1 on --ok-soft */
+	--info-ink: #6f52e4; /* 5.23:1 on white, 4.51:1 on --info-soft */
+	--danger-ink: #cf222e; /* light: identical to --danger (already 5.36:1) */
+	--warn-ink: #b15209; /* 5.15:1 on white, 4.52:1 on the canvas end stop */
 	--selected: #17171a; /* selected/active pill fill — neutral black on light */
 	--selected-on: #ffffff; /* label on the selected pill */
 }
@@ -154,20 +207,21 @@
 [data-theme="dark"],
 .dark {
 	color-scheme: dark;
-	--bg: #0b0f14; /* tinted slate near-black */
-	--canvas: #0f141b; /* app-frame inner surface (dark) */
-	--surface: #141b26; /* cards — lifted for clearer elevation over the canvas */
-	--surface-2: #1d2836; /* tray / hover / chip — lifted so affordances read */
-	--surface-3: #26313f;
+	--bg: #090c11; /* page margin — sits UNDER the canvas, so one step darker */
+	--canvas: #0e131b; /* flat fallback = the gradient's end stop */
+	--canvas-gradient: linear-gradient(180deg, #0d1117 0%, #0e131b 100%);
+	--surface: #151c27; /* cards — lifted for clearer elevation over the canvas */
+	--surface-2: #1e2734; /* tray / hover / chip well — lifted so affordances read */
+	--surface-3: #28323f;
 	--surface-inverse: #05080c; /* dark cards + active nav pill (dark theme) */
-	--ink-inverse: #e7edf3;
-	--line: #2a3646; /* crisper card + table hairline on the dark cards */
-	--line-2: #394857; /* the STRONGER border — must be LIGHTER than --line in dark
+	--ink-inverse: #e8ecf1;
+	--line: #29323f; /* crisper card + table hairline on the dark cards */
+	--line-2: #3a4553; /* the STRONGER border — must be LIGHTER than --line in dark
 	                      (was #1a222d, darker than --line — an inverted hierarchy) */
-	--ink: #e7edf3;
+	--ink: #dfe6ee; /* leaner in dark too: dimmer, not brighter — brighter = heavier here */
 	--logo-ink: #f5f5f6; /* brand lockup mono — inverts to off-white on dark (logo lock) */
-	--ink-2: #9aa7b4;
-	--ink-3: #828f9d; /* tertiary/label text — lifted to clear AA on the dark cards */
+	--ink-2: #9ca8b6;
+	--ink-3: #8793a1; /* tertiary/label text — lifted to clear AA on the dark cards */
 	--accent: #ff5a3d; /* brightened Lava fill for dark */
 	--accent-2: #ff7a52;
 	--accent-strong: #e8330e;
@@ -185,13 +239,22 @@
 	--seal-line: #14432f;
 	--ok: #1fb87a;
 	--ok-soft: #0a2419;
-	--danger: #f0555a;
+	--danger: #f0555a; /* the FILL — unchanged: `bg-danger` carries a white label
+	                      (destructive buttons), and lightening it for text AA
+	                      would drop white-on-danger from 3.58:1 to 2.84:1. */
 	--danger-on: #ffffff; /* white label on the danger fill (matches --accent-on) */
 	--danger-soft: #2a1012;
 	--warn: #e0a020;
 	--warn-soft: #2a1f08;
 	--info: #9d7bff;
 	--info-soft: #1a142e;
+	/* Semantic TEXT variants (see the light block for the rationale). In dark,
+	   ok / warn / seal already clear AA, so their -ink equals the base; danger
+	   and info are lifted for text only, leaving both fills untouched. */
+	--ok-ink: #1fb87a; /* = --ok; 6.68:1 on --surface */
+	--info-ink: #a384ff; /* 5.94:1 on --surface (base was 4.41:1 on --surface-2) */
+	--danger-ink: #f26f73; /* 5.93:1 on --surface; the FILL stays #f0555a */
+	--warn-ink: #e0a020; /* = --warn; 7.51:1 on --surface */
 	/* New tokens only — the existing dark palette above is deliberately unchanged.
 	   Lava source vars mirror the dark --accent* so bg-lava-* utilities resolve in
 	   dark too; --accent* stay literal above (not rewired) so nothing dark shifts. */
@@ -222,10 +285,13 @@
 		--dur-fast: 140ms;
 		--dur-base: 180ms;
 		--radius-card: 0.875rem;
-		--shadow-rest: 0 1px 2px -1px rgba(20, 28, 36, 0.07), 0 4px 12px -6px
-			rgba(20, 28, 36, 0.06);
-		--shadow-lift: 0 2px 6px -2px rgba(20, 28, 36, 0.09), 0 14px 32px -14px
-			rgba(20, 28, 36, 0.16);
+		/* visual-pass-01: shadows are BLUE-TINTED (rgba(24,50,96,…)) rather than
+		   neutral slate, so a lifted card reads as the same light source as the
+		   blue canvas under it. A neutral shadow on a blue tint reads muddy. */
+		--shadow-rest: 0 1px 2px -1px rgba(24, 50, 96, 0.05), 0 4px 12px -6px
+			rgba(24, 50, 96, 0.06);
+		--shadow-lift: 0 2px 6px -2px rgba(24, 50, 96, 0.08), 0 14px 32px -14px
+			rgba(24, 50, 96, 0.14);
 		/* Specular top hairline — the "wet"/liquid edge. On light surfaces a white
 		   inset does nothing, so light mode uses a faint cool-white that reads as a
 		   polished edge against the tinted-slate palette. */
@@ -261,35 +327,16 @@
 			rgba(255, 255, 255, 0.28);
 		transition: box-shadow var(--dur-fast) var(--ease-out), transform
 			var(--dur-fast) var(--ease-out);
-		/* Anchors the sheen sweep below and clips it to the button's radius. */
 		position: relative;
 		overflow: hidden;
 		isolation: isolate;
 	}
 	/*
-	 * Sheen sweep — a soft specular band that crosses the CTA once on hover.
-	 * Animates `transform` ONLY (compositor-only, no repaint, no layout), so it
-	 * costs nothing on the hot path. `pointer-events: none` keeps it inert, and
-	 * it is skipped entirely under reduced-motion.
+	 * visual-pass-01 REMOVED the 620ms sheen sweep that crossed this button on
+	 * hover (founder: cut unnecessary animation). It was decoration — it
+	 * signalled nothing about state and nothing about what the button does. The
+	 * hover lift + shadow below remain, because those ARE the affordance.
 	 */
-	.cta-lava::after {
-		content: "";
-		position: absolute;
-		inset: 0;
-		z-index: -1;
-		background-image: linear-gradient(
-			105deg,
-			transparent 35%,
-			rgba(255, 255, 255, 0.32) 50%,
-			transparent 65%
-		);
-		transform: translateX(-100%);
-		pointer-events: none;
-	}
-	.cta-lava:hover::after {
-		transform: translateX(100%);
-		transition: transform 620ms var(--ease-out);
-	}
 	.cta-lava:hover {
 		transform: translateY(-1px);
 		box-shadow: 0 8px 22px -6px var(--accent-glow-2), inset 0 1px 0 0
@@ -299,8 +346,8 @@
 		transform: translateY(0);
 	}
 	@media (prefers-reduced-motion: reduce) {
-		.cta-lava::after {
-			display: none;
+		.cta-lava:hover {
+			transform: none;
 		}
 	}
 
@@ -378,6 +425,99 @@
 		box-shadow: var(--shadow-rest);
 	}
 
+	/*
+	 * ── visual-pass-01 ───────────────────────────────────────────────────────
+	 * The app canvas. `--canvas` alone is a flat colour; this paints the static
+	 * vertical gradient over it, with the flat colour as the fallback beneath so
+	 * a failed gradient degrades to the right tone rather than to nothing.
+	 * STATIC — no animation, no background-position transition. The ADR-053 ban
+	 * is on ANIMATED gradients (`ADR-053:40`), not on gradients.
+	 */
+	.app-canvas {
+		background-color: var(--canvas);
+		background-image: var(--canvas-gradient);
+	}
+
+	/*
+	 * Error-budget scan-line — a 2px lava gradient painted as the card's top
+	 * edge. Same mechanism as `.card-provenance-top` (a clipped background
+	 * strip, not a border or a pseudo-element) so it follows the rounded corners
+	 * and can never clip card content. Static: the gradient does not move.
+	 *
+	 * Rationing note: Lava marks BRAND/CTA and data, Verify marks provenance.
+	 * The error budget is a burn signal, not a provenance claim — so lava is the
+	 * correct seal here and the Verify green would be a category error.
+	 */
+	.card-lava-top {
+		background-image: linear-gradient(
+			90deg,
+			var(--accent-2) 0%,
+			var(--accent) 45%,
+			var(--accent-strong) 100%
+		);
+		background-size: 100% 2px;
+		background-position: top;
+		background-repeat: no-repeat;
+	}
+
+	/*
+	 * Horizontal data-bar fill. One class so every proportion bar in the app
+	 * (traffic-by-model, provider mix, tool usage, transcript spine) reads as
+	 * one material instead of four greys. The track stays `--surface-2`.
+	 */
+	.bar-lava {
+		background-image: linear-gradient(
+			90deg,
+			var(--accent-2) 0%,
+			var(--accent) 100%
+		);
+	}
+
+	/*
+	 * ── Type scale (visual-pass-01) ──────────────────────────────────────────
+	 * Four roles, four classes. Defined here rather than as per-site Tailwind
+	 * arbitrary values so the scale is ONE place to tune and the class names say
+	 * what the text IS, not how big it is.
+	 *
+	 * `font-weight: 650` is why layout.tsx loads Inter as a VARIABLE font — no
+	 * static instance carries 650. On the fallback face it rounds to 700.
+	 */
+	.t-h1 {
+		font-size: 22px;
+		font-weight: 700;
+		letter-spacing: -0.03em;
+		line-height: 1.18;
+		color: var(--ink);
+	}
+	.t-card-title {
+		font-size: 11px;
+		/* Founder: 650 on full ink read too dark and too thick. 600 on --ink-2 is
+		   the lean version — the title still leads the card, it just stops
+		   competing with the metric underneath it. */
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+	}
+	.t-metric {
+		font-size: 22px;
+		font-weight: 650;
+		letter-spacing: -0.03em;
+		line-height: 1.1;
+		font-variant-numeric: tabular-nums;
+	}
+	/* Section eyebrow — TYPE ONLY. The trailing hairline rule stays a real
+	   sibling element in the markup (SectionLabel already renders one) rather
+	   than a `::after` here: that keeps this pass's diff to className strings and
+	   leaves the hairline independently styleable. */
+	.t-eyebrow {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+	}
+
 	/* (The former .brand-logo/.brand-logo-icon PNG background rules were removed —
 	   the <Logo> component now renders the mark + wordmark as inline SVG + text
 	   (Source Serif 4), monochrome via --logo-ink, matching the marketing site's
@@ -394,7 +534,13 @@
 		font-family: var(--font-sans);
 		font-variant-numeric: tabular-nums; /* mandatory for all data */
 		-webkit-font-smoothing: antialiased;
-		letter-spacing: -0.006em;
+		/* visual-pass-01 type base. `tnum` only: the cv05/cv11 character variants
+		   were Inter-specific and are no-ops now that the face is unchanged —
+		   carrying dead feature flags is exactly the clutter this pass removes. */
+		font-feature-settings: "tnum";
+		letter-spacing: -0.005em;
+		font-size: 12.5px; /* body baseline — see --text-sm in @theme */
+		line-height: 1.5;
 	}
 	/* Verify-green focus ring (ADR-053) — one uniform focus affordance across
 	   links, buttons, and disclosure controls. */
