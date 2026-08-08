@@ -16,5 +16,5 @@ Reads an NDJSON ledger (one `AuditRow` per line) and produces a deterministic
 - **v2 (legacy re-derive):** length-prefixed, domain-separated framing; kept read-only for pre-v2.1 exports.
 
 This is the canonical implementation; `verifier-typescript` and
-`verifier-python` are byte-for-byte equivalents. Conformance vectors live in
+`verifier-python` are verdict-for-verdict equivalents. Conformance vectors live in
 `../../evals/audit-ledger/`. ~11 public items.

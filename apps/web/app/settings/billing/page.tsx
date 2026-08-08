@@ -52,7 +52,6 @@ const PLAN_FEATURES: Record<string, string[]> = {
 	enterprise: [
 		"Everything in Business",
 		"SAML SSO",
-		"Custom data residency",
 		"Dedicated support SLA",
 		"Audit add-on ($999/mo)",
 	],

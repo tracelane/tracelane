@@ -4,8 +4,7 @@
 Reference Python verifier for Tracelane tamper-evident audit ledgers.
 
 Mirrors the Rust verifier (`packages/verifier-rust`) and the TypeScript
-verifier (`packages/verifier-typescript`). All three produce identical
-`VerifyReport` JSON for the same input — conformance vectors live in
+verifier (`packages/verifier-typescript`). All three agree verdict-for-verdict on the same input — conformance vectors live in
 `evals/audit-ledger/`.
 
 ## Install

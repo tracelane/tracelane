@@ -153,8 +153,8 @@ const TAXONOMY: Record<string, AftTaxonomyEntry> = {
 		description:
 			"The sequence of spans in a trace is statistically anomalous versus a learned distribution of normal traces — a catch-all for novel failure modes.",
 		detection:
-			"A learned sequence model flags a reconstruction error above threshold.",
-		detectorStatus: "live",
+			"A learned sequence model would flag a reconstruction error above threshold. No model is trained and none ships: infer_reconstruction_error returns 0.0 unconditionally (crates/gateway/src/predictive/trajectory_guard.rs:72-85), so this detector can never fire.",
+		detectorStatus: "roadmap",
 	},
 };
 

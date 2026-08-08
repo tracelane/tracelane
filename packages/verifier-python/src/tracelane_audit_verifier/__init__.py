@@ -333,7 +333,8 @@ class VerifyError:
 
 @dataclass
 class VerifyReport:
-    """Verifier output. Byte-identical JSON to the Rust + TS verifiers."""
+    """Verifier output. Agrees verdict-for-verdict with the Rust + TS verifiers
+    on the shared conformance vectors; the JSON is not byte-compared."""
 
     ledger_path: str
     rows_seen: int = 0

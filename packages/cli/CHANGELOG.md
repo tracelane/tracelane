@@ -10,8 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 - Version-only release. No source changes since 0.2.2 — re-cut because the 0.2.2
   tag published this package to npm but produced no signed release artifacts
   (the release job could not resolve one of its pinned actions). 0.2.3 is the
-  same code from a release that carries a GitHub Release, Cosign signatures, an
-  SBOM and SLSA provenance.
+  same code from a release that carries a GitHub Release, Cosign signatures and an
+  SBOM. A verified SLSA Level 3 attestation is not claimed - the
+  slsa-github-generator final job fails even on successful releases.
 
 ## [0.2.2] - 2026-08-01
 

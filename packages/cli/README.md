@@ -73,7 +73,7 @@ tlane verify: INCOMPLETE
 
 ### `tlane prompt`
 
-B1 predictive pre-flight guardrails with a tamper-evident promotion record. Requires `TRACELANE_TOKEN` and `TRACELANE_GATEWAY_URL`.
+Prompt promotion and rollback with a tamper-evident promotion record. Requires `TRACELANE_TOKEN` and `TRACELANE_GATEWAY_URL`.
 
 ```bash
 # Show active version per environment
