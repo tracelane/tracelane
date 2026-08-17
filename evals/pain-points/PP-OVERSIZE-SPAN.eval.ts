@@ -15,7 +15,7 @@ import { expect } from "../src/harness.js";
  * same way with `reason=batch_too_large` in <1 µs without ever
  * allocating the protobuf struct.
  *
- * Rust implementation: `crates/ingest/src/limits.rs` + the post-decode
+ * Rust implementation: `crates/shared/src/otlp/limits.rs` + the post-decode
  * walk in `crates/ingest/src/otlp_receiver.rs::traces_handler`.
  * Bench: `crates/ingest/benches/limits.rs::bench_pre_decode_reject_10mb`
  * asserts <1 µs p50.
@@ -26,9 +26,15 @@ import { expect } from "../src/harness.js";
  *   3. otlp_receiver wires pre-decode + post-decode + reject header + warning band
  *   4. criterion bench file exists with the <1 µs budget
  *
+ *
+ * NOTE (GWY-41): `limits.rs` and `otlp_decode.rs` MOVED from `crates/ingest/src`
+ * to `crates/shared/src/otlp/` when the gateway gained an authenticated
+ * `POST /v1/traces` (B-227). Two OTLP entry points, one decoder — `ingest`
+ * re-exports both under their old module paths, so only these file paths moved.
  */
 
 const INGEST_SRC = path.resolve(__dirname, "../../crates/ingest/src");
+const SHARED_OTLP = path.resolve(__dirname, "../../crates/shared/src/otlp");
 const ADR = path.resolve(
 	__dirname,
 	"../../decisions/ADR-029-ingest-payload-limits.md",
@@ -46,7 +52,7 @@ describe("PP-OVERSIZE-SPAN: ingest rejects oversize spans (ADR-029)", () => {
 	});
 
 	it("2. limits.rs ships IngestLimits with documented defaults", () => {
-		const src = fs.readFileSync(path.join(INGEST_SRC, "limits.rs"), "utf8");
+		const src = fs.readFileSync(path.join(SHARED_OTLP, "limits.rs"), "utf8");
 		expect(src).toContain(
 			"pub const DEFAULT_MAX_SPAN_BYTES: usize = 1024 * 1024",
 		);
@@ -88,7 +94,7 @@ describe("PP-OVERSIZE-SPAN: ingest rejects oversize spans (ADR-029)", () => {
 	});
 
 	it("5. Default caps match ADR-029 table (1 MiB / 8 MiB batch / 32 KiB attr / 128 attrs)", () => {
-		const src = fs.readFileSync(path.join(INGEST_SRC, "limits.rs"), "utf8");
+		const src = fs.readFileSync(path.join(SHARED_OTLP, "limits.rs"), "utf8");
 		// Pre-decode multiplier 8 → 8 MiB batch for 1 MiB span default.
 		expect(src).toContain("PRE_DECODE_BATCH_MULTIPLIER: usize = 8");
 		// Warning band is half the span cap.

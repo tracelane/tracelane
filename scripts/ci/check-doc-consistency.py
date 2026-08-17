@@ -357,5 +357,23 @@ def main() -> int:
     return report(docs)
 
 
+KNOWN_FLAGS = {"--selftest", "--all"}
+
+
+def reject_unknown_flags(argv: list[str]) -> None:
+    """Exit 2 on any flag-shaped token we do not implement — a silently ignored
+    `--selftesst` runs the ordinary gate and exits 0, so the operator believes a
+    falsification ran when none did. Only `-`-prefixed tokens are judged."""
+    unknown = [a for a in argv if a.startswith("-") and a not in KNOWN_FLAGS]
+    if unknown:
+        print(
+            f"check-doc-consistency.py: unknown option(s): {' '.join(unknown)}\n"
+            f"usage: check-doc-consistency.py [--all | --selftest]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 if __name__ == "__main__":
+    reject_unknown_flags(sys.argv[1:])
     raise SystemExit(main())

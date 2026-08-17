@@ -4,6 +4,40 @@
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **`tlane init` now scaffolds the `.env`, installs the SDK, and wires the
+  frameworks it detects** — previously it wrote `tracelane.config.json` and
+  printed install hints, and nothing else.
+  - `.env` gets `TRACELANE_API_KEY` and `TRACELANE_GATEWAY_URL`. The merge is
+    append-only: a value you already set is never rewritten, `--force`
+    included. If a `.gitignore` exists and does not already cover `.env`, the
+    entry is added, because the file now holds a key.
+  - Frameworks are detected from `package.json` (Node) and
+    `pyproject.toml` / `requirements.txt` / `Pipfile` (Python), then written
+    into a bootstrap — `tracelane.ts`, `tracelane.mjs` or `tracelane_init.py`.
+    A polyglot repo gets both. On Python the bootstrap emits
+    `init(..., auto_instrument=True)`, which wraps installed `openai`,
+    `anthropic`, `litellm` and `claude_code` with no further edit. Every other
+    adapter — including all of the TypeScript ones — wraps an object only you
+    can construct, so the bootstrap imports the right `instrument*` function and
+    puts the exact call beside it. The TypeScript SDK has no zero-config
+    patching; `autoInstrument()` throws by design and lands in v1.1.
+  - The SDK is installed with the package manager your lockfile names (`pnpm`,
+    `yarn`, `bun`, `npm`, `uv`, `poetry`, `pipenv`, or `python3 -m pip`). A
+    failed install exits non-zero and prints the command to re-run; the
+    scaffolded files are left in place.
+  - New flags: `--no-env`, `--no-instrument`, `--no-install`. `--force` now also
+    governs the bootstrap, which is otherwise never overwritten.
+
+### Fixed
+- `tlane init` does not write `TRACELANE_ENDPOINT` into `.env`. `tlane replay`
+  reads that variable as a **gateway** base URL, so scaffolding the OTLP
+  receiver URL under that name would have pointed replay at the wrong port. The
+  OTLP endpoint stays in `tracelane.config.json` and is inlined into the
+  generated bootstrap.
+
 ## [0.2.3] - 2026-08-01
 
 ### Changed

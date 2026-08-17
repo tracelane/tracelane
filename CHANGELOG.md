@@ -65,6 +65,47 @@ technically. Making it bind self-hosters would need a license boundary this
 project does not have and, per `LICENSE-PLEDGE.md`, will not add. Everything
 here is Apache 2.0; there is no separate enterprise tree.
 
+### Added
+
+- **Signature time ruler on every time-bearing surface.** A single shared axis now
+  renders the trace list, the span waterfall, the traffic and latency charts, the SLO
+  view and the session list, so a timestamp means the same thing everywhere instead of
+  each surface drawing its own ticks. Absolute axes are UTC and labelled; the waterfall
+  reads elapsed-from-zero and always terminates on the exact total duration.
+- **Workspace ledger range.** `GET /v1/audit/ledger-range` returns the tenant's lifetime
+  audit-ledger sequence bounds and exact row count — a free-tier read, available on every
+  plan. An empty ledger returns absent bounds rather than `0–0`, because sequence 0 is a
+  real genesis entry and reporting it as a range would tell an empty workspace it holds
+  one record.
+
+### Changed
+
+- **Long time windows are aggregated server-side.** `GET /v1/slo` accepts an optional
+  `bucket` (width in hours) and groups to that width in the database. A 30-day request
+  returns tens of rows instead of hundreds, and the bucketed percentiles are true merged
+  quantiles rather than an average of hourly percentiles — so the reported tail is the
+  actual tail. Omitting the parameter returns the previous hourly response unchanged.
+- **One visual scale across the dashboard.** Corner radii, spacing rhythm, type sizes and
+  metric grouping now follow a single documented scale — cards and tiles at one radius,
+  controls and inputs at their own, large containers at another. Elevation is carried by
+  a hairline border and a near-invisible container tint rather than per-card shadows,
+  which removes a layer of paint from every dense grid.
+- **Grouped metric headings.** The first block of numbers on the SLO, gateway and
+  guardrail views is now labelled like every later block on those pages, so related
+  metrics read as related instead of as an undifferentiated wall.
+
+### Fixed
+
+- **Time axes no longer collapse on long ranges.** A month-wide axis previously drew one
+  label per day, which overprinted into an unreadable band in a chart column. Tick
+  intervals now extend to multi-day and multi-week steps, and the label count is capped
+  independently of the interval.
+- **Prompt detail pages redirect signed-out visitors instead of erroring.** Requesting a
+  prompt without a session returned a server error; it now redirects to sign-in. The
+  response does not distinguish a missing prompt from one belonging to another workspace,
+  so prompt names are not discoverable.
+
+
 ## [0.2.3] - 2026-08-01
 
 **First release to ship signed artifacts.** 0.2.1 and 0.2.2 both published
@@ -130,7 +171,9 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
   topic). A multi-model ML ensemble and async judge are **(roadmap)**.
 - **Predictive signatures** — live failure-signature detection surfaced on the
   Signatures page; additional predictors ship progressively behind entitlement flags.
-- **MCP server** — read-only, tenant-scoped, OAuth 2.1 (Stdio + Streamable HTTP).
+- **MCP server** — read-only, tenant-scoped, bearer-token auth (Stdio + Streamable
+  HTTP). Runs from a clone; the npm package is **not published yet**. OAuth 2.1 PKCE
+  is **(roadmap)**.
 - **SDKs + CLI** — Python and TypeScript instrumentation SDKs (40+ framework
   adapters, never capture keys or content), and the `tlane` CLI (`init`, `verify`,
   `import`, `migrate`, `replay`, `eval`).

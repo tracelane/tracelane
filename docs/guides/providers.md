@@ -1,14 +1,17 @@
 <!-- tracelane:classification: PUBLIC -->
 # Providers
 
-Tracelane gateway speaks to **30+ LLM providers** through a single API surface
-(OpenAI-compatible `/v1/chat/completions` and Anthropic-compatible
-`/v1/messages`). You point at `https://gateway.tracelane.dev`, set the model
-string, and we route + failover for you.
+Tracelane gateway speaks to **30+ LLM providers** through a single API surface:
+the OpenAI-compatible `/v1/chat/completions`. There is no Anthropic-native
+`/v1/messages` on the gateway — Anthropic models are reached through the same
+OpenAI-shaped call and translated upstream. You point at
+`https://gateway.tracelane.dev`, set the model string, and we route for you
+(cross-provider failover is opt-in per request via the `X-Tracelane-Failover`
+header, not a default).
 
 ## Supported providers
 
-### Dedicated adapters (6)
+### Dedicated adapters (7)
 
 These have purpose-built request/response translators because their API
 shape differs enough from OpenAI's that a generic adapter would lose
@@ -24,7 +27,7 @@ multi-modal parts).
 | Azure OpenAI | `azure/*` | `AZURE_OPENAI_API_KEY` (+ `AZURE_OPENAI_ENDPOINT`) | OpenAI shape, deployment-routed |
 | Cohere | `command-*`, `cohere/*` | `COHERE_API_KEY` | Native `/v2/chat` |
 
-### OpenAI-compatible adapters (29)
+### OpenAI-compatible adapters (28)
 
 These all speak the OpenAI Chat Completions wire format. We auto-route by
 model prefix; per-tenant overrides go in `tracelane.yaml`.
@@ -192,7 +195,7 @@ catch wire-format drift before it reaches a customer.
 
 ## Related
 
-- [API reference](./api-reference.md) — `/v1/messages`, `/v1/chat/completions` surfaces
+- [API reference](./api-reference.md) — the `/v1/chat/completions` surface
 - [Architecture](./architecture.md) — gateway data flow
 - [`crates/gateway/src/providers/`](./../crates/gateway/src/providers/) — adapters source
 - [`decisions/ADR-006-byok-envelope-encryption.md`](./../decisions/) — key handling

@@ -1,0 +1,22 @@
+---
+/**
+ * /pricing — a REAL route, as of 2026-08-16.
+ *
+ * It did not exist. `https://tracelane.dev/pricing` returned 404 while every "pricing"
+ * affordance on the site pointed at the homepage anchor `#pricing`, and ADR-074 §10
+ * lists Pricing as must-have scope for the consolidated site. A 404 on the one URL a
+ * buyer types by hand, and on the one a competitor links to, is not a small gap.
+ *
+ * The ladder itself is `PricingTable.astro` — the SAME component the homepage anchor
+ * renders, so the two cannot drift. Nothing here restates a price.
+ */
+import Base from "../layouts/Base.astro";
+import PricingTable from "../components/PricingTable.astro";
+---
+
+<Base
+  title="Pricing · Tracelane"
+  description="Open core. Self-host free forever. Hosted tiers start at $0. Metered in traces, not spans."
+>
+  <PricingTable as="h1" />
+</Base>

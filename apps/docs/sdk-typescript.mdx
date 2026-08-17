@@ -33,8 +33,11 @@ await client.chat.completions.create({
 // → Trace visible at https://app.tracelane.dev/traces within ~1 second
 ```
 
-Use the SDK below when you want to **export OTLP spans to an endpoint you run** —
-a self-hosted Tracelane ingest, or your own OTLP collector (Jaeger, Tempo, …).
+That captures the model call. Use the SDK below when you want the **shape of your
+agent** — the planner step, each tool call, the summariser — as a nested trace
+rather than one span per model call. It exports OTLP to any endpoint you can
+reach: **Tracelane Cloud's gateway**, a self-hosted Tracelane ingest, or your own
+collector (Jaeger, Tempo, …).
 
 ## Initialize
 
@@ -45,19 +48,27 @@ on the OpenTelemetry Node SDK and runs anywhere that runtime does (Node.js, Bun)
 import { init } from "@tracelanedev/sdk";
 
 // endpoint + apiKey are REQUIRED (no env-var auto-read).
-// `endpoint` is an OTLP HTTP receiver YOU can reach — your collector, or a
-// self-hosted Tracelane ingest. (Tracelane Cloud's ingest is not a public
-// OTLP endpoint — use the gateway path above for Cloud.)
 init({
-  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
-  apiKey: process.env.TRACELANE_API_KEY!,
+  endpoint: "https://gateway.tracelane.dev", // Tracelane Cloud
+  apiKey: process.env.TRACELANE_API_KEY!,    // needs the `ingest` scope
   serviceName: "my-agent",
 });
 ```
 
+For a self-hosted ingest or your own collector, set `endpoint` to that instead —
+`http://localhost:4318`, `http://otel-collector.internal:4318`, and so on.
+
+<Note>
+**Your key needs the `ingest` scope.** Keys minted before scopes existed carry
+the full API surface and work as-is. A key you scoped to `chat` and `read` does
+not — the gateway answers `403 insufficient_scope` and names `ingest` in the
+body. Tick **Ingest** in **Settings → API Keys** when you mint the key; it is on
+by default for new keys.
+</Note>
+
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `endpoint` | yes | — | OTLP HTTP endpoint you can reach. Spans POST to `${endpoint}/v1/traces`. |
+| `endpoint` | yes | — | OTLP HTTP endpoint. `https://gateway.tracelane.dev` for Cloud, or a receiver you run. Spans POST to `${endpoint}/v1/traces`. |
 | `apiKey` | yes | — | Your `tlane_*` key. Sent as the `x-tracelane-api-key` header. |
 | `serviceName` | no | `"unknown-service"` | Service name on spans |
 | `sampleRate` | no | `1.0` | Fraction of traces to capture (0–1; the tail sampler decides) |

@@ -7,9 +7,10 @@
 //!   1. Extract a fixed-dimension feature vector from each tool-call argument
 //!      blob. Default extractor (`BagOfBytesExtractor`) hashes byte-trigrams
 //!      into a 64-dim vector — deterministic, no model file, ~10µs per call.
-//!      Real `MiniLmExtractor` (gated behind the `predictive` feature) swaps in
-//!      sentence-transformers all-MiniLM-L6-v2 via `ort` for the production
-//!      embedding once the model file is available.
+//!      This is the ONLY extractor that exists. A sentence-transformer
+//!      (all-MiniLM-L6-v2 via `ort`) was designed for but is not implemented:
+//!      there is no `MiniLmExtractor` type and no cargo feature gating one —
+//!      `[features]` carries only `default` (GWY-36 wasm-plugin deleted 2026-08-09).
 //!   2. Maintain a per-`(tenant, tool_name)` rolling Mahalanobis state — running
 //!      mean + diagonal covariance estimate over the last 1000 events
 //!      (`MAX_WINDOW`), with EMA-style recency weighting (half-life 250).

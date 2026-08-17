@@ -12,6 +12,7 @@
 //! V1 meters:
 //!   tokens_processed   — sum of input + output tokens across all chats
 //!   audit_anchors      — count of Rekor anchor batches submitted
+//!   overage_v1         — requests served above the included monthly quota
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +26,17 @@ use super::polar_client::{BillingResult, PolarClient, PolarCustomerId};
 pub enum Meter {
     TokensProcessed,
     AuditAnchors,
+    /// SET-13. One unit per request served ABOVE the included monthly quota.
+    ///
+    /// `pricing.mdx` sells "overage $1.20/10K (5× hard cap then 429)" on Builder
+    /// and Team. Before this variant existed the gateway produced the
+    /// `AllowWithOverage` decision and metered NOTHING for it, so every request
+    /// between 100% of quota and the 5× cap was served free — the published
+    /// sentence billed for a meter that did not exist.
+    ///
+    /// Counts TRACES, not tokens: the price is per 10K traces, and Polar does the
+    /// division.
+    TracesOverage,
 }
 
 impl Meter {
@@ -33,6 +45,9 @@ impl Meter {
         match self {
             Meter::TokensProcessed => "tokens_processed",
             Meter::AuditAnchors => "audit_anchors",
+            // Matches the `overage_v1` lookup key the quota decision's own doc
+            // comment has named since the arm was written (`rate_limiter.rs`).
+            Meter::TracesOverage => "overage_v1",
         }
     }
 }
@@ -104,6 +119,12 @@ impl Recorder {
             {
                 Ok(()) => posted += 1,
                 Err(err) => {
+                    // (see the `Ok(posted)` below), and the caller only checks `Err` —
+                    // so a 100% billing-meter outage propagates upward as success. No
+                    // meter event has ever reached production, and nothing said so.
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::MeterFlushFailed,
+                    );
                     tracing::warn!(error = %err, "meter flush failed; will retry");
                     failures.push((key, value));
                 }
@@ -144,6 +165,36 @@ mod tests {
         PolarCustomerId("cust_polar_test".into())
     }
 
+    ///
+    /// `flush` returns `Ok(posted)` even when every event failed, and the caller only
+    /// inspects `Err` — so a total billing-meter outage propagates upward as success.
+    /// That is exactly how "no meter event has ever reached production" stayed invisible.
+    /// This drives a real flush against a fake token (the HTTP post fails) and asserts
+    /// the degradation counter advanced.
+    ///
+    /// Delta, not absolute — the registry is process-global.
+    #[tokio::test]
+    async fn failed_flush_advances_the_degradation_counter() {
+        use tracelane_shared::degradation::{Degradation, count};
+
+        let client = Arc::new(PolarClient::new("polar_pat_fake"));
+        let recorder = Recorder::new(client);
+        recorder.record(Meter::TokensProcessed, &cus(), 100).await;
+
+        let before = count(Degradation::MeterFlushFailed);
+        let posted = recorder.flush().await;
+        let after = count(Degradation::MeterFlushFailed);
+
+        // The point of the test is the counter, not the return value — and the return
+        // value being Ok(0) while a counter had to move IS the defect being closed.
+        assert!(
+            after > before,
+            "a failed meter flush must advance the degradation counter (before={before}, \
+             after={after}, flush returned {posted:?}) — otherwise under-billing every \
+             customer is indistinguishable from billing them correctly"
+        );
+    }
+
     #[tokio::test]
     async fn record_accumulates_per_meter() {
         let client = Arc::new(PolarClient::new("polar_pat_fake"));
@@ -179,5 +230,31 @@ mod tests {
         // these strings.
         assert_eq!(Meter::TokensProcessed.event_name(), "tokens_processed");
         assert_eq!(Meter::AuditAnchors.event_name(), "audit_anchors");
+    }
+
+    #[cfg(test)]
+    mod set13_tests {
+        use super::*;
+
+        /// The event name is the contract with Polar: the meter on their side matches
+        /// events BY NAME, so a rename here silently stops billing overage while the
+        /// gateway keeps reporting success. Pin it.
+        #[test]
+        fn overage_meter_event_name_is_stable() {
+            assert_eq!(Meter::TracesOverage.event_name(), "overage_v1");
+        }
+
+        /// Each meter must map to a DISTINCT Polar event name — two meters sharing a
+        /// name would silently sum into one bill line.
+        #[test]
+        fn meter_event_names_are_distinct() {
+            let names = [
+                Meter::TokensProcessed.event_name(),
+                Meter::AuditAnchors.event_name(),
+                Meter::TracesOverage.event_name(),
+            ];
+            let unique: std::collections::HashSet<_> = names.iter().collect();
+            assert_eq!(unique.len(), names.len(), "duplicate meter event name");
+        }
     }
 }

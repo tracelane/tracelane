@@ -2,8 +2,8 @@
  * /settings/workspace — org identity and tenant metadata.
  *
  * Shows WorkOS organization name + ID, plan, tenant row ID, and the
- * `WorkspaceManager` mutation surface: in-app org rename (PATCH) + WorkOS Admin
- * Portal launchers for SSO / domains / directory sync. Org details are fetched
+ * `WorkspaceManager` mutation surface: in-app org rename (PATCH), the quota-alert
+ * webhook (SET-04) + WorkOS Admin Portal launchers for SSO / domains / dsync. Org details are fetched
  * from the WorkOS Management API directly; every mutation derives the org id
  * from the session server-side.
  */
@@ -60,6 +60,7 @@ export default async function WorkspacePage() {
 				id: tenants.id,
 				plan: tenants.plan,
 				createdAt: tenants.createdAt,
+				slackWebhookUrl: tenants.slackWebhookUrl,
 			})
 			.from(tenants)
 			.where(eq(tenants.workosOrgId, session.tenantId))
@@ -85,7 +86,10 @@ export default async function WorkspacePage() {
 			</p>
 
 			<div className="mb-6">
-				<WorkspaceManager initialName={org?.name ?? ""} />
+				<WorkspaceManager
+					initialName={org?.name ?? ""}
+					initialNotifyWebhook={tenant?.slackWebhookUrl ?? ""}
+				/>
 			</div>
 
 			<Card>

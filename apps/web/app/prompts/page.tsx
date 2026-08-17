@@ -42,7 +42,7 @@ async function PromoteGateBanner() {
 	const ent = await resolveEntitlements(row?.id, plan);
 	if (ent.prompt_promotion_write) return null;
 	return (
-		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-accent-line bg-accent-soft px-4 py-2.5 text-sm text-accent-ink">
+		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
 			<span>
 				<span className="font-semibold">
 					🔒 Promoting a version across environments requires Team ($249/mo)
@@ -51,7 +51,7 @@ async function PromoteGateBanner() {
 			</span>
 			<Link
 				href="/settings/billing"
-				className="ml-auto rounded-lg border border-accent-line bg-surface px-3 py-1 font-medium text-accent-ink transition-colors hover:bg-surface-2"
+				className="ml-auto rounded-lg border border-action-line bg-surface px-3 py-1 font-medium text-action-ink transition-colors hover:bg-surface-2"
 			>
 				Upgrade →
 			</Link>
@@ -63,10 +63,10 @@ export const metadata: Metadata = { title: "Prompts — Tracelane" };
 export const dynamic = "force-dynamic";
 
 /** Env → badge tone mapping. Kept limited; unknown envs fall back to neutral. */
-const ENV_TONE: Record<string, "ok" | "accent" | "seal" | "warn" | "neutral"> =
+const ENV_TONE: Record<string, "ok" | "action" | "seal" | "warn" | "neutral"> =
 	{
 		production: "ok",
-		staging: "accent",
+		staging: "action",
 		canary: "seal",
 		dev: "warn",
 	};
@@ -97,20 +97,22 @@ async function PromptListData() {
 			<table className="w-full text-sm">
 				<thead className="border-b border-line">
 					<tr>
-						<th className="px-4 py-3 text-left font-medium text-ink-2">Name</th>
-						<th className="px-4 py-3 text-right font-medium text-ink-2">
+						<th className="px-3 py-1.5 text-left font-medium text-ink-2">
+							Name
+						</th>
+						<th className="px-3 py-1.5 text-right font-medium text-ink-2">
 							Versions
 						</th>
-						<th className="px-4 py-3 text-left font-medium text-ink-2">
+						<th className="px-3 py-1.5 text-left font-medium text-ink-2">
 							Active
 						</th>
 						<th
-							className="px-4 py-3 text-right font-medium text-ink-2"
+							className="px-3 py-1.5 text-right font-medium text-ink-2"
 							title="Last authored version — a promotion without a new version doesn't change this."
 						>
 							Last authored
 						</th>
-						<th className="px-4 py-3 text-right font-medium text-ink-2">
+						<th className="px-3 py-1.5 text-right font-medium text-ink-2">
 							<span className="sr-only">Actions</span>
 						</th>
 					</tr>
@@ -121,18 +123,18 @@ async function PromptListData() {
 							key={prompt.prompt_id}
 							className="transition-colors hover:bg-surface-2/30"
 						>
-							<td className="px-4 py-3">
+							<td className="px-3 py-2">
 								<Link
 									href={`/prompts/${encodeURIComponent(prompt.name)}`}
-									className="font-mono font-medium text-ink hover:text-accent-ink hover:underline"
+									className="font-mono font-medium text-ink hover:text-action-ink hover:underline"
 								>
 									{prompt.name}
 								</Link>
 							</td>
-							<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+							<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 								{prompt.versions}
 							</td>
-							<td className="px-4 py-3">
+							<td className="px-3 py-2">
 								<div className="flex flex-wrap gap-1.5">
 									{prompt.active.length === 0 ? (
 										<span className="text-xs text-ink-3">none</span>
@@ -145,10 +147,10 @@ async function PromptListData() {
 									)}
 								</div>
 							</td>
-							<td className="px-4 py-3 text-right text-xs tabular-nums text-ink-2">
+							<td className="px-3 py-2 text-right text-xs tabular-nums text-ink-2">
 								{formatDate(prompt.updated_at_ms)}
 							</td>
-							<td className="px-4 py-3 text-right">
+							<td className="px-3 py-2 text-right">
 								<DeletePromptButton name={prompt.name} />
 							</td>
 						</tr>
@@ -174,7 +176,7 @@ function PromptListSkeleton() {
 export default function PromptsListPage() {
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex flex-col items-start gap-4 sm:flex-row sm:justify-between">
+			<div className="mb-4 flex flex-col items-start gap-4 sm:flex-row sm:justify-between">
 				<div>
 					<h1 className="t-h1">Prompts</h1>
 					<p className="mt-1 max-w-xl text-sm text-ink-2">

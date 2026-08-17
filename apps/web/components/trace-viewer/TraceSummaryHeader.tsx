@@ -11,10 +11,10 @@
  */
 
 import type { Span } from "@/components/trace-viewer/types";
-import { fmtDur } from "@/lib/fmt-dur";
+
 import { countToolCallSpans, detectToolLoop } from "@/lib/tool-loop";
 import { computeTraceSummary } from "@/lib/trace-summary";
-import { Badge, StatCard } from "@tracelanedev/ui";
+import { Badge, StatCard, fmtDur } from "@tracelanedev/ui";
 
 function fmtInt(n: number): string {
 	return n.toLocaleString();

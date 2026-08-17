@@ -37,10 +37,35 @@ fn require_url() -> String {
     )
 }
 
+/// Create a FRESH database and return a URL pointing at it.
+///
+/// `db::apply_migrations` says so in its own doc comment: *"Fresh-database
+/// helper for integration tests only. The Drizzle SQL is NOT `IF NOT
+/// EXISTS`-guarded, so re-running against a populated DB fails."* Every test in
+/// this binary calls `test_pool()`, so before this existed the SECOND test to
+/// run died on `type "cmk_algorithm" already exists` — the tests could only ever
+/// have passed one at a time, which is part of why nothing ran them.
+///
+/// One database per call, named from a UUID, so the binary is parallel-safe.
+/// Returns the NAME; the caller overrides `cfg.dbname`, so no URL rewriting is
+/// needed and no new dependency is pulled in for it.
+async fn create_fresh_database() -> Result<String> {
+    let admin_url = require_url();
+    let (client, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls).await?;
+    let handle = tokio::spawn(conn);
+    let db = format!("tlane_it_{}", Uuid::new_v4().simple());
+    let created = client.batch_execute(&format!("CREATE DATABASE {db}")).await;
+    drop(client);
+    let _ = handle.await;
+    created.map_err(|e| anyhow::anyhow!("CREATE DATABASE {db} failed (needs createdb): {e}"))?;
+    Ok(db)
+}
+
 async fn test_pool() -> Result<deadpool_postgres::Pool> {
     // Re-implement build_pool inline — db::build_pool reads POSTGRES_URL,
     // which we deliberately don't set in CI test runs.
     let url = require_url();
+    let fresh_db = create_fresh_database().await?;
     let pg_cfg: tokio_postgres::Config = url.parse()?;
     let mut cfg = deadpool_postgres::Config::new();
     // tokio_postgres::config::Host has different variants per OS — use a
@@ -66,7 +91,9 @@ async fn test_pool() -> Result<deadpool_postgres::Pool> {
     cfg.password = pg_cfg
         .get_password()
         .map(|p| String::from_utf8_lossy(p).to_string());
-    cfg.dbname = pg_cfg.get_dbname().map(str::to_owned);
+    // Point at the FRESH database, not the one in the URL — see
+    // `create_fresh_database` for why re-migrating a populated DB cannot work.
+    cfg.dbname = Some(fresh_db);
     let pool = cfg.create_pool(
         Some(deadpool_postgres::Runtime::Tokio1),
         tokio_postgres::NoTls,
@@ -98,24 +125,68 @@ async fn create_tenant_and_lookup_by_api_key() -> Result<()> {
         "ci-test",
         key_prefix,
         None,
+        // A13: `create` is the raw writer — it stores exactly what it is given.
+        // Default MintOptions leaves scope/expiry/budget as SQL NULL, which is
+        // the LEGACY row shape, and that is deliberately what this test wants:
+        // the assertion below is that an unscoped row still authenticates with
+        // full surface. The full-set default lives at the HTTP edge
+        // (`MintOptions::with_default_scope`), not here.
+        &db::api_keys::MintOptions::default(),
     )
     .await?;
 
     // Hot-path lookup must round-trip
     let resolved = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
-    let (resolved, _key_id) = resolved.expect("api key should resolve");
+    // A13: the lookup now also returns the resolved capability, read in the same
+    // round-trip that authenticates the key.
+    let (resolved, _key_id, key_scope) = resolved.expect("api key should resolve");
     assert_eq!(resolved.as_uuid().to_string(), tenant_id.to_string());
+    // A key minted without an explicit scope is `scope IS NULL` — the legacy,
+    // full-surface case. This is the compatibility guarantee: if it ever
+    // regresses to a restricted scope, every key minted before A13 stops working.
+    assert_eq!(
+        key_scope,
+        tracelane_shared::api_scope::KeyScope::LegacyFullSurface,
+        "an unscoped key must resolve to the legacy full-surface capability"
+    );
 
     // Unknown key body must NOT resolve
     let unknown = db::api_keys::lookup_tenant_by_key_body(&pool, "nope_does_not_exist").await?;
     assert!(unknown.is_none(), "unknown key body must return None");
 
-    // Revoked keys must NOT resolve
+    // ── Revocation, and the bound it actually carries ───────────────────────
+    //
+    // This block used to assert `after_revoke.is_none()` immediately. That
+    // asserts a guarantee the product DELIBERATELY DOES NOT MAKE, and it is why
+    // this test failed the first time it was ever executed (2026-08-14).
+    //
+    // `revoke()` writes `revoked_at` and does NOT touch the positives-only auth
+    // measured unreliable against an autosuspending Neon compute (110
+    // drop/reconnect cycles in 21 h): **the cache TTL IS the revocation bound,
+    // and it is 60 s** (`DEFAULT_AUTH_CACHE_TTL_SECS`). Confirmed against
+    // production the same day — a deleted key returned 200 at t+45 s and 401
+    // from t+60 s.
+    //
+    // So the honest assertion is in two halves: the row is revoked, and the
+    // cache is what may still answer until it expires.
     db::api_keys::revoke(&pool, created.id).await?;
-    let after_revoke = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    let still_cached = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
     assert!(
-        after_revoke.is_none(),
-        "revoked api key must no longer resolve"
+        still_cached.is_some(),
+        "documented bound: a revoked key may still resolve from the positives-only \
+         auth cache for up to DEFAULT_AUTH_CACHE_TTL_SECS. If this now fails, \
+         revocation became immediate — a GOOD change, but update this pin and \
+         the B-178 note rather than deleting the assertion."
+    );
+
+    // Drop the cached entry and the revocation must be visible at once, which
+    // proves the row itself is genuinely revoked and only the cache was holding
+    // it — the discriminating half.
+    db::api_keys::invalidate(db::api_keys::peppered_lookup(&key_body)?).await;
+    let after_invalidate = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    assert!(
+        after_invalidate.is_none(),
+        "once the cache entry is gone, a revoked api key must not resolve"
     );
 
     Ok(())
@@ -144,9 +215,10 @@ async fn polar_id_round_trip_finds_tenant() -> Result<()> {
         Some(sub_id.as_str())
     );
 
-    db::tenants::set_plan_tier(&pool, &tenant_wrapped, "team").await?;
-    let after_upgrade = db::tenants::get(&pool, &tenant_wrapped).await?;
-    assert_eq!(after_upgrade.unwrap().plan_tier, "team");
+    // The `set_plan_tier` upgrade assertion was DELETED with the function it
+    // exercised (founder ruling 2026-08-14): a gateway-side plan writer with no
+    // production caller is an entry point into the one invariant B-241 shows we
+    // cannot hold. Plan state moves through the Polar webhook only.
 
     Ok(())
 }

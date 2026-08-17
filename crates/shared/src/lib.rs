@@ -8,8 +8,19 @@
 //! - `redact` — credential / API-key scrubbing for the tracing subscriber.
 //!   Used by both gateway and ingest so log output from either binary is
 //!   protected by the same byte-scan pattern set (A10).
+//! - `otlp` — the OTLP protobuf decoder and the ADR-029 payload caps. Here
+//!   rather than in `ingest` because `GWY-41` gave OTLP a SECOND entry point
+//!   (the gateway's authenticated `POST /v1/traces`) and two entry points must
+//!   not mean two decoders. `ingest` re-exports both under their old paths.
+//! - `aft` — the AFT failure-signature id shape (ADR-056 H1), needed by the
+//!   decoder above and by ingest's federation writer.
 
+pub mod aft;
+pub mod api_scope;
+pub mod degradation;
+pub mod listen_dsn;
 pub mod model;
+pub mod otlp;
 pub mod redact;
 pub mod self_host;
 pub mod span;

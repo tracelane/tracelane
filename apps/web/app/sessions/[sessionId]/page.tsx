@@ -49,8 +49,8 @@ function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 	const isError = turn.error_count > 0;
 	return (
 		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-2/40">
-			<td className="px-4 py-3 tabular-nums text-sm text-ink-2">{index}</td>
-			<td className="px-4 py-3">
+			<td className="px-3 py-2 tabular-nums text-sm text-ink-2">{index}</td>
+			<td className="px-3 py-2">
 				<Link
 					href={`/traces/${encodeURIComponent(turn.trace_id)}`}
 					className="font-mono text-xs text-info-ink hover:underline"
@@ -61,16 +61,16 @@ function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 					{turn.trace_id.slice(0, 8)}
 				</span>
 			</td>
-			<td className="px-4 py-3 text-xs text-ink-2">
+			<td className="px-3 py-2 text-xs text-ink-2">
 				{formatDateTimeUtc(parseDate(turn.start_time).toISOString())}
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-xs text-ink-2">
+			<td className="px-3 py-2 tabular-nums text-right text-xs text-ink-2">
 				{formatDuration(turn.duration_us)}
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-xs text-ink-2">
+			<td className="px-3 py-2 tabular-nums text-right text-xs text-ink-2">
 				{turn.span_count}
 			</td>
-			<td className="px-4 py-3">
+			<td className="px-3 py-2">
 				{isError ? (
 					<Badge tone="danger">
 						{turn.error_count} error{turn.error_count > 1 ? "s" : ""}
@@ -79,7 +79,7 @@ function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 					<Badge tone="ok">ok</Badge>
 				)}
 			</td>
-			<td className="px-4 py-3 font-mono text-xs text-ink-2">
+			<td className="px-3 py-2 font-mono text-xs text-ink-2">
 				{turn.model || "—"}
 			</td>
 		</tr>
@@ -131,25 +131,25 @@ async function SessionDetail({ sessionId }: { sessionId: string }) {
 				<table className="w-full text-sm">
 					<thead>
 						<tr className="border-b border-line bg-surface-2/60">
-							<th className="px-4 py-3 text-left text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								#
 							</th>
-							<th className="px-4 py-3 text-left text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								Operation
 							</th>
-							<th className="px-4 py-3 text-left text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								Started
 							</th>
-							<th className="px-4 py-3 text-right text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-right text-xs font-medium text-ink-2">
 								Duration
 							</th>
-							<th className="px-4 py-3 text-right text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-right text-xs font-medium text-ink-2">
 								Spans
 							</th>
-							<th className="px-4 py-3 text-left text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								Status
 							</th>
-							<th className="px-4 py-3 text-left text-xs font-medium text-ink-2">
+							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								Model
 							</th>
 						</tr>
@@ -169,7 +169,7 @@ export default async function SessionDetailPage({ params }: Props) {
 	const { sessionId } = await params;
 
 	return (
-		<main className="mx-auto max-w-7xl p-6">
+		<div className="mx-auto max-w-7xl p-6">
 			<div className="mb-6 flex items-center gap-3">
 				<Link
 					href="/sessions"
@@ -192,6 +192,6 @@ export default async function SessionDetailPage({ params }: Props) {
 			>
 				<SessionDetail sessionId={sessionId} />
 			</Suspense>
-		</main>
+		</div>
 	);
 }

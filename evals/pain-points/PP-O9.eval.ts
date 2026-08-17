@@ -25,6 +25,15 @@ import { expect } from "../src/harness.js";
  * - Verify tracelane.* namespace is additive, not replacing OTel fields
  *
  */
+/** Read a repo file relative to the repo root — the product, not a model of it. */
+function repoRead(rel: string): string {
+	// biome-ignore lint/style/useNodejsImportProtocol: harness is CJS
+	const fs = require("node:fs");
+	// biome-ignore lint/style/useNodejsImportProtocol: harness is CJS
+	const path = require("node:path");
+	return fs.readFileSync(path.resolve(__dirname, "../../", rel), "utf8");
+}
+
 describe("PP-O9: OTel + OpenInference compatible", () => {
 	it("TracelaneSpan has all required OTel core fields", () => {
 		// Verified by span.rs struct definition
@@ -35,13 +44,31 @@ describe("PP-O9: OTel + OpenInference compatible", () => {
 			"name",
 			"start_time",
 			"end_time",
-			"status_code",
+			"status", // the shipped field is `status`, not `status_code`
 		];
 		// These map 1:1 to OTel ResourceSpans → ScopeSpans → Span fields
-		expect(requiredOtelFields).toHaveLength(7);
+		// REWRITTEN 2026-08-12. This asserted a LOCAL array had 7 entries — a fact
+		// about the array literal three lines above, not about the span type. The
+		// checkable form: every field is declared on the shipped TracelaneSpan.
+		const span = repoRead("crates/shared/src/span.rs");
+		for (const f of requiredOtelFields) {
+			expect(span, `TracelaneSpan must declare ${f}`).toContain(f);
+		}
 	});
 
-	it("SpanAttributes includes OpenInference llm.* namespace", () => {
+	// ── FINDING 2026-08-12 ────────────────────────────────────────────────────
+	// This asserted that every entry of a LOCAL array starts with "llm." — true
+	// of the literal by construction, and green forever. Rewriting it against
+	// `crates/shared/src/span.rs` showed why it had to be a model: **the span type
+	// carries NO `llm_*` fields.** `llm.` appears exactly ONCE in that file, in a
+	// doc comment claiming OpenInference conventions are captured. The named
+	// fields that exist are `gen_ai_*`.
+	//
+	// I have NOT established whether `llm.*` keys flow through a generic attribute
+	// map elsewhere, so this is skipped with the finding rather than asserted
+	// either way — writing a passing test here would re-create exactly the
+	// problem. Un-skip when someone verifies where (or whether) `llm.*` is carried.
+	it.skip("SpanAttributes includes OpenInference llm.* namespace [UNVERIFIED — span.rs declares no llm_* field]", () => {
 		// Verified by span.rs SpanAttributes struct
 		const openInferenceAttrs = [
 			"llm.model_name",
@@ -50,7 +77,12 @@ describe("PP-O9: OTel + OpenInference compatible", () => {
 			"llm.input_messages",
 			"llm.output_messages",
 		];
-		expect(openInferenceAttrs.every((a) => a.startsWith("llm."))).toBe(true);
+		// Was: every string in a local array starts with "llm." — true of the
+		// literal by construction. Now: the attributes exist in the span type.
+		const span = repoRead("crates/shared/src/span.rs");
+		for (const a of openInferenceAttrs) {
+			expect(span, `span.rs must carry ${a}`).toContain(a.replace(/\./g, "_"));
+		}
 	});
 
 	it("SpanAttributes includes gen_ai.* OTLP semantic conventions", () => {
@@ -60,7 +92,10 @@ describe("PP-O9: OTel + OpenInference compatible", () => {
 			"gen_ai.request.model",
 			"gen_ai.response.model",
 		];
-		expect(genAiAttrs.every((a) => a.startsWith("gen_ai."))).toBe(true);
+		const span = repoRead("crates/shared/src/span.rs");
+		for (const a of genAiAttrs) {
+			expect(span, `span.rs must carry ${a}`).toContain(a.replace(/\./g, "_"));
+		}
 	});
 
 	it("tracelane.* attributes are additive — no OTel field names replaced", () => {

@@ -23,6 +23,7 @@ import {
 	MetricIcon,
 	Skeleton,
 	StatCard,
+	StatGrid,
 } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -56,14 +57,14 @@ async function GatewayData({ range }: { range?: string }) {
 	// Reachable, but no provider requests in the window (teach the first request).
 	if (stats.provider_count === 0) {
 		return (
-			<div className="space-y-5">
+			<div className="space-y-3">
 				<EmptyState
 					title={`No gateway requests in the last ${rangeLabel(range)}`}
 					description="Point your agents at the gateway — per-provider request volume, latency, error rate, and cache-hit rate will surface here. Send one request to see it appear:"
 					action={
 						<Link
 							href="/settings/providers"
-							className="text-[13px] font-medium text-accent-ink hover:underline"
+							className="text-[13px] font-medium text-action-ink hover:underline"
 						>
 							Manage providers →
 						</Link>
@@ -75,12 +76,12 @@ async function GatewayData({ range }: { range?: string }) {
 	}
 
 	return (
-		<div className="space-y-5">
+		<div className="space-y-3">
 			{/* Summary — REAL captured metrics only. */}
-			<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 items-stretch">
+			<StatGrid title="Traffic &amp; routing" cols={4}>
 				<Link
 					href={`/traces?range=${rangeShort(range)}`}
-					className="block h-full rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-seal"
+					className="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-seal"
 				>
 					<StatCard
 						icon="llm-calls"
@@ -89,14 +90,13 @@ async function GatewayData({ range }: { range?: string }) {
 						value={stats.total_requests.toLocaleString()}
 						sub={`across ${stats.provider_count} provider${stats.provider_count === 1 ? "" : "s"} · view traces`}
 						interactive
-						className="h-full flex flex-col"
 					/>
 				</Link>
 
 				{stats.total_errors > 0 ? (
 					<Link
 						href={`/traces?status=error&range=${rangeShort(range)}`}
-						className="block h-full rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-seal"
+						className="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-seal"
 					>
 						<StatCard
 							icon="failure-signatures"
@@ -113,7 +113,6 @@ async function GatewayData({ range }: { range?: string }) {
 						label="Error rate"
 						value={pct(stats.error_rate_pct)}
 						sub="no errors in window"
-						className="h-full flex flex-col"
 					/>
 				)}
 
@@ -147,47 +146,46 @@ async function GatewayData({ range }: { range?: string }) {
 					label="Providers active"
 					value={String(stats.provider_count)}
 					sub={`in the last ${rangeShort(range)}`}
-					className="h-full flex flex-col"
 				/>
-			</div>
+			</StatGrid>
 
 			{/* Per-provider health. */}
-			<div className="overflow-x-auto rounded-xl border border-line bg-surface">
+			<div className="overflow-x-auto rounded-lg border border-line bg-surface">
 				<table className="w-full text-sm">
 					<thead className="border-b border-line">
 						<tr>
-							<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Provider
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								LLM calls
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Error rate
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								p50
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								p95
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								p99
 							</th>
 							<th
-								className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-accent-ink"
+								className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-action-ink"
 								title="Gateway overhead p95 — the time Tracelane adds per request, EXCLUDING the upstream provider round-trip. Compare with the end-to-end p95 to the left: our slice is tiny."
 							>
 								Gateway ovh
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Cache hit
 							</th>
-							<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Failover
 							</th>
 							<th
-								className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3"
+								className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3"
 								title="Upstream breaker state — process-wide shared-infra health, not tenant-specific."
 							>
 								Circuit
@@ -200,11 +198,11 @@ async function GatewayData({ range }: { range?: string }) {
 								key={p.provider}
 								className="transition-colors hover:bg-surface-2/30"
 							>
-								<td className="px-4 py-3 font-medium text-ink">{p.provider}</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink">
+								<td className="px-3 py-2 font-medium text-ink">{p.provider}</td>
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink">
 									{p.requests.toLocaleString()}
 								</td>
-								<td className="px-4 py-3 text-right">
+								<td className="px-3 py-2 text-right">
 									{p.errors > 0 ? (
 										<Badge tone="danger">{pct(p.error_rate_pct)}</Badge>
 									) : (
@@ -213,32 +211,32 @@ async function GatewayData({ range }: { range?: string }) {
 										</span>
 									)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 									{ms(p.p50_ms)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 									{ms(p.p95_ms)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 									{ms(p.p99_ms)}
 								</td>
 								<td
-									className="px-4 py-3 text-right font-mono tabular-nums text-accent-ink"
+									className="px-3 py-2 text-right font-mono tabular-nums text-action-ink"
 									title="Gateway overhead p95 — Tracelane's own slice, excluding upstream generation"
 								>
 									{p.overhead_p95_ms > 0 ? ms(p.overhead_p95_ms) : "—"}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 									{pct(p.cache_hit_rate_pct)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 									{p.failovers > 0 ? (
 										<Badge tone="warn">{p.failovers.toLocaleString()}</Badge>
 									) : (
 										<span className="text-ink-3">—</span>
 									)}
 								</td>
-								<td className="px-4 py-3 text-right">
+								<td className="px-3 py-2 text-right">
 									{circuitUnhealthy(p.circuit_state) ? (
 										<Badge tone={circuitTone(p.circuit_state)}>
 											{circuitLabel(p.circuit_state)}
@@ -266,11 +264,11 @@ async function GatewayData({ range }: { range?: string }) {
 						last started (they carry no trace, so they reset on redeploy).
 					</p>
 				</div>
-				<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 items-stretch">
+				<StatGrid cols={4}>
 					{stats.total_failovers > 0 ? (
 						<Link
 							href={`/traces?failover=true&range=${rangeShort(range)}`}
-							className="block h-full rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-seal"
+							className="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-seal"
 						>
 							<StatCard
 								icon="request-flow"
@@ -291,7 +289,7 @@ async function GatewayData({ range }: { range?: string }) {
 									No failovers needed — add a second provider in{" "}
 									<Link
 										href="/settings/providers"
-										className="font-medium text-accent-ink hover:underline"
+										className="font-medium text-action-ink hover:underline"
 									>
 										LLM Providers
 									</Link>{" "}
@@ -307,14 +305,12 @@ async function GatewayData({ range }: { range?: string }) {
 						label="Rate-limited (since start)"
 						value={stats.rate_limited_since_start.toLocaleString()}
 						sub="429s since gateway start"
-						className="h-full flex flex-col"
 					/>
 					<StatCard
 						icon="spend"
 						label="Quota-exceeded (since start)"
 						value={stats.quota_exceeded_since_start.toLocaleString()}
 						sub="hard-cap 429s since gateway start"
-						className="h-full flex flex-col"
 					/>
 					<StatCard
 						icon="error-budget"
@@ -329,9 +325,8 @@ async function GatewayData({ range }: { range?: string }) {
 								? "all upstreams passing"
 								: "upstream(s) tripped — failing fast"
 						}
-						className="h-full flex flex-col"
 					/>
-				</div>
+				</StatGrid>
 			</section>
 
 			{/* The "try it" moment — run a request through the gateway, watch it land. */}
@@ -348,7 +343,7 @@ export default async function GatewayPage({
 	const { range } = await searchParams;
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+			<div className="mb-4 flex flex-wrap items-start justify-between gap-3">
 				<div className="max-w-2xl">
 					<h1 className="t-h1">Gateway</h1>
 					<p className="mt-1 text-sm text-ink-2">
@@ -356,7 +351,7 @@ export default async function GatewayPage({
 						state. Latency SLOs live on the{" "}
 						<Link
 							href="/slo"
-							className="font-medium text-accent-ink hover:underline"
+							className="font-medium text-action-ink hover:underline"
 						>
 							SLOs page
 						</Link>{" "}
@@ -368,11 +363,11 @@ export default async function GatewayPage({
 			<Suspense
 				fallback={
 					<div className="space-y-4">
-						<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+						<StatGrid cols={4}>
 							{[0, 1, 2, 3].map((i) => (
 								<Skeleton key={i} className="h-24" />
 							))}
-						</div>
+						</StatGrid>
 						<Skeleton className="h-64" />
 					</div>
 				}

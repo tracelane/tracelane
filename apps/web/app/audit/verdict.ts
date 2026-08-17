@@ -42,10 +42,24 @@ export type AuditVerdict =
 	| { state: "empty" }
 	/** RED: a row hash / prev-hash link no longer matches — the chain is broken. */
 	| { state: "chain_broken"; rows: number; firstSeq: number | null }
-	/** RED (ADR-070): a WINDOWED view with no public Rekor anchor to root it —
-	 *  the loaded rows may chain among themselves but nothing publicly trusted
-	 *  holds them, so integrity cannot be established. Never green. */
+	/** INDETERMINATE (ADR-070, reclassified by R53): a WINDOWED view with no public
+	 *  Rekor anchor to root it. The loaded rows may chain among themselves but nothing
+	 *  publicly trusted holds them, so integrity cannot be ESTABLISHED — which is not
+	 *  the same as integrity being BROKEN. Still never green; no longer an alarm.
+	 *
+	 *  ADR-070 made this RED on purpose and that decision is RECLASSIFIED, NOT REVERSED:
+	 *  its property was "never GREEN on an unrooted window", and indeterminate is not
+	 *  green. What changes is that we stop telling a customer their intact ledger
+	 *  FAILED verification when all we did was look at too narrow a slice of it. */
 	| { state: "unrooted_window" }
+	/** INDETERMINATE (R53): anchors are present but the verifier had no trusted key to
+	 *  check them with, so it SKIPPED them. Split out of `signature_failed`, where the
+	 *  2026-08-07 P0 had folded it — that P0's property was "never GREEN on a skip"
+	 *  (a vacuous `signatures_valid: true` once let `tlane verify` PASS a forged
+	 *  anchor), and indeterminate preserves it exactly. A skip is an absence of
+	 *  evidence; reporting it as a signature FAILURE is an accusation we cannot
+	 *  support. */
+	| { state: "anchors_unverifiable"; anchors: number }
 	/** RED: an anchor committed to "anchored" but its public proof is absent. */
 	| { state: "stripped" }
 	/** RED: a real anchor/signature failure (fingerprint mismatch, untrusted key). */
@@ -81,7 +95,14 @@ export function deriveAuditVerdict(report: VerifyReport | null): AuditVerdict {
 	// leaves `signatures_valid` vacuously true. Never green on a skip — the same
 	// vacuous-true is what let `tlane verify` PASS a forged anchor.
 	if (report.anchors_unverified > 0) {
-		return { state: "signature_failed", reasons: ["anchors_unverified"] };
+		// R53: NOT a signature failure. The verifier could not CHECK these anchors
+		// (no trusted key), which is "cannot determine", not "determined bad".
+		// CLAUDE.md §14 in reverse: "I cannot see" must never be reported as
+		// "something IS wrong". Still never green — see `isIndeterminate`.
+		return {
+			state: "anchors_unverifiable",
+			anchors: report.anchors_unverified,
+		};
 	}
 	// An empty view has nothing to verify — never GREEN (verifying zero rows is not
 	// a pass). A truncated response (0 loaded out of a non-empty ledger) is caught
@@ -113,14 +134,36 @@ export function deriveAuditVerdict(report: VerifyReport | null): AuditVerdict {
 	return { state: "chain_only", rows: report.rows_seen };
 }
 
-/** True for the RED states — the caller paints the alarm card + banner. */
+/** True for the RED states — the caller paints the alarm card + banner.
+ *
+ * R53: these are exactly the states carrying POSITIVE EVIDENCE that something is
+ * wrong — a recomputed hash that does not match, a proof that is missing, a signature
+ * that does not verify. `strip_detected` and a broken chain are RED unconditionally
+ * and no window can excuse them.
+ *
+ * What is NOT here any more is the absence of evidence. See `isIndeterminate`. */
 export function isAlarm(v: AuditVerdict): boolean {
 	return (
 		v.state === "chain_broken" ||
-		v.state === "unrooted_window" ||
 		v.state === "stripped" ||
 		v.state === "signature_failed"
 	);
+}
+
+/** True for the states where verification could not be COMPLETED — never green, and
+ * never an alarm either.
+ *
+ * WHY THIS BUCKET EXISTS (R53). Measured on production 2026-08-15: at
+ * `/v1/audit/self-verify?limit=10` the coverage filter dropped all 161 of a4037bef's
+ * anchors, `trust_established` went false, and the product told the operator their
+ * fully intact ledger FAILED verification. Our own product accusing a customer's
+ * ledger is worse than any false green we have found, because a customer acting on it
+ * escalates — to us, or to their auditor.
+ *
+ * The rule this restores is CLAUDE.md §14 read in reverse: "I cannot see" is never
+ * "nothing is wrong" — and it is never "something IS wrong" either. */
+export function isIndeterminate(v: AuditVerdict): boolean {
+	return v.state === "unrooted_window" || v.state === "anchors_unverifiable";
 }
 
 /** Machine failure `kind` → plain English an operator can read to an auditor.

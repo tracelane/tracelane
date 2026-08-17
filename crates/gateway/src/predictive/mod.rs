@@ -119,8 +119,25 @@ impl PredictiveLayer {
         // so injection coverage is preserved either way. The error log
         // surfaces explicitly so operators can fix the sidecar config.
         match PromptGuardPredictor::new(0.5) {
-            Ok(p) => predictors.push(Box::new(p)),
+            Ok(Some(p)) => predictors.push(Box::new(p)),
+            // NOT DEPLOYED — a configuration state, not a fault, so no degradation
+            // counter and no error. Stated once at startup because "the ML rail is
+            // absent" is a fact an operator should be able to read, and silence
+            Ok(None) => {
+                tracing::info!(
+                    "PR6 PromptGuard: PROMPT_GUARD_URL unset — the optional ML injection \
+                     augmentation is NOT deployed, so the predictor is omitted entirely (zero \
+                     per-request cost). Injection coverage is unaffected: the deterministic R8 \
+                     rail is free, ungated and enforcing. Set PROMPT_GUARD_URL to enable PR6.",
+                );
+            }
             Err(e) => {
+                // absent for the whole process lifetime — the most durable degradation
+                // in the system and the least visible, because a single startup line
+                // scrolls away and nothing afterwards mentions it again.
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::PredictorError,
+                );
                 tracing::error!(
                     error = %e,
                     "tracelane.predictive.degraded=true — PromptGuardPredictor init FAILED, PR6 (Llama Prompt Guard 2) is OFFLINE. \
@@ -216,6 +233,10 @@ impl PredictiveLayer {
     /// alert span and return `Allow` so the request proceeds. The
     /// `tracelane.predictive.degraded=true` marker is what the SLO dashboard
     fn degraded_fail_open(predictor_name: &'static str) -> Decision {
+        // and indistinguishable from "detection is working" for as long as it lasts.
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::PredictorError,
+        );
         tracing::error!(
             predictor = predictor_name,
             "tracelane.predictive.degraded=true — predictor PANICKED; failing OPEN (FT-05). \
@@ -305,6 +326,155 @@ mod tests {
             layer.evaluate_async(&ctx).await,
             Decision::Allow,
             "panicking predictor must fail open on the async hot path too",
+        );
+    }
+
+    ///
+    /// This is the assertion the whole class was missing. FT-05 fail-open is correct
+    /// while the system was blind. A degradation with no counter cannot be distinguished
+    /// from healthy operation by any signal we own.
+    ///
+    /// Delta, not absolute: the registry is process-global and other tests in this
+    /// binary touch the same kind.
+    #[test]
+    fn ft05_fail_open_advances_the_degradation_counter() {
+        use tracelane_shared::degradation::{Degradation, count};
+
+        let before = count(Degradation::PredictorError);
+
+        let layer = panicking_layer();
+        let tid = TenantId::from_jwt_claim(Uuid::from_u128(0xF705));
+        let req = serde_json::json!({"messages": []});
+        let ctx = PredictiveContext {
+            tenant_id: &tid,
+            request_json: &req,
+        };
+        assert_eq!(layer.evaluate(&ctx), Decision::Allow);
+
+        assert_eq!(
+            count(Degradation::PredictorError),
+            before + 1,
+            "a predictor that panicked and failed OPEN must advance the degradation \
+             counter — otherwise detection being offline looks exactly like detection \
+             finding nothing"
+        );
+    }
+
+    // ── GWY-C8 / A4: the predictive layer's own latency ──────────────────────
+    //
+    // `bench/predictive/` has said "(empty — not yet benchmarked)" since May, and
+    // its documented command — `cargo bench --bench bench_channel_a` — has NEVER
+    // been runnable, for two independent reasons found 2026-08-11:
+    //   1. `bench/predictive/bench_channel_a.rs` is registered in no Cargo.toml.
+    //   2. `crates/gateway/src/lib.rs` exposes only `circuit_breaker` and
+    //      `rate_limiter`. `predictive` lives in the BIN target, so no bench
+    //      target can `use` it at all.
+    // Nobody had run it, so nobody had discovered it did not exist.
+    //
+    // Rather than move `predictive` (and its `ssrf_guard` / `guardrail` /
+    // `kill_switch` cone) into the lib purely to satisfy a benchmark — a real
+    // refactor of the hot path for a measurement — the measurement lives HERE,
+    // where the code already is.
+    //
+    // WHAT THIS IS: a regression gate with a real measured figure, on whatever
+    // machine runs the test suite.
+    // WHAT THIS IS NOT: the ADR-014 production-equivalent benchmark. That still
+    // requires a Hetzner CCX13 run, which cannot happen on tl-node-1 today (no
+    // cargo on the node, and a full Rust compile saturates it). The public copy
+    // therefore stays hedged — `apps/docs/predictive-guardrails.mdx` still says
+    // "an engineering target, not yet measured on production-equivalent
+    // hardware", and that remains TRUE after this test.
+    //
+    // The budget is deliberately generous (100x headroom over the observed
+    // figure, not 10%). A tight timing assertion on a shared CI runner is a
+    // flake, and a flaky gate gets muted — which loses the signal entirely. This
+    // catches "someone put a network call / a regex catastrophe on the detection
+    // path", which is the failure that actually matters.
+    #[tokio::test]
+    async fn predictive_layer_latency_stays_within_its_blast_radius_budget() {
+        use std::time::Instant;
+
+        // A REALISTIC request: tools declared plus a multi-turn conversation, so
+        // `tool_definition_drift` and the schema validator do their real work.
+        // An empty body would measure the early-return and prove nothing.
+        let req = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant with tool access."},
+                {"role": "user", "content": "Look up the weather in Paris and book me a table."},
+                {"role": "assistant", "content": "I will check the weather first."},
+                {"role": "user", "content": "Thanks, and please confirm the reservation."}
+            ],
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city",
+                    "parameters": {"type": "object", "properties": {
+                        "city": {"type": "string"}, "units": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "book_table",
+                    "description": "Reserve a restaurant table",
+                    "parameters": {"type": "object", "properties": {
+                        "restaurant": {"type": "string"}, "time": {"type": "string"},
+                        "party_size": {"type": "integer"}}}}}
+            ]
+        });
+        let tid = TenantId::from_jwt_claim(Uuid::from_u128(0xC8));
+        let ctx = PredictiveContext {
+            tenant_id: &tid,
+            request_json: &req,
+        };
+        let layer = PredictiveLayer::new();
+
+        // Warm caches / first-touch allocations out of the sample.
+        for _ in 0..200 {
+            let _ = layer.evaluate_async(&ctx).await;
+        }
+
+        const N: usize = 2_000;
+        // `evaluate_async` is what `chat_completions_handler` actually calls
+        // (server.rs). Measuring the sync `evaluate` instead would report a
+        // number for a path the hot path does not take — close, but a different
+        // claim than the one the docs make.
+        let mut samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t0 = Instant::now();
+            let _ = layer.evaluate_async(&ctx).await;
+            samples.push(t0.elapsed().as_nanos() as u64);
+        }
+        samples.sort_unstable();
+        let at = |q: f64| samples[((N as f64 * q) as usize).min(N - 1)];
+        let (p50, p95, p99) = (at(0.50), at(0.95), at(0.99));
+
+        // The sync entry too, since `evaluate` still has callers and a
+        // divergence between the two is worth seeing rather than assuming.
+        let mut sync_samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t0 = Instant::now();
+            let _ = layer.evaluate(&ctx);
+            sync_samples.push(t0.elapsed().as_nanos() as u64);
+        }
+        sync_samples.sort_unstable();
+        let sync_p99 = sync_samples[((N as f64 * 0.99) as usize).min(N - 1)];
+
+        // Printed so `--nocapture` output can be pasted into
+        // bench/predictive/RESULTS.md rather than the file staying empty.
+        println!(
+            "predictive-layer latency over {N} iters ({} predictors): \
+             ASYNC (hot path) p50={p50}ns p95={p95}ns p99={p99}ns | \
+             sync evaluate() p99={sync_p99}ns",
+            layer.predictors.len()
+        );
+
+        // 50ms. The observed figure is microseconds, so this is ~3 orders of
+        // magnitude of headroom — it fails only on a change of KIND (blocking
+        // I/O, a pathological regex), never on machine noise.
+        const BUDGET_NS: u64 = 50_000_000;
+        assert!(
+            p99 < BUDGET_NS,
+            "predictive layer p99 {p99}ns exceeded the {BUDGET_NS}ns blast-radius \
+             budget — at this magnitude that means something on the detection path \
+             started doing I/O or backtracking, not that the machine is slow"
         );
     }
 }

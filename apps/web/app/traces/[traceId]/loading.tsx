@@ -9,7 +9,7 @@ const SPANS = ["a", "b", "c", "d", "e", "f"];
 
 export default function Loading() {
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<div className="mb-6 flex items-center gap-3">
 				<Skeleton className="h-4 w-16" />
 				<Skeleton className="h-6 w-64" />
@@ -23,6 +23,6 @@ export default function Loading() {
 					/>
 				))}
 			</div>
-		</main>
+		</div>
 	);
 }

@@ -13,9 +13,9 @@
 //! - Span has `tracelane.untrusted_input = true` (set by SDK on web-sourced spans)
 //! - Model tier is frontier: claude-opus-*, gpt-5*, gemini-3-pro
 //!
-//! V1 ships the per-request taint scoring below as a live signature; the
-//! cross-span DashMap taint accumulator (per-trace, with TTL) is a scaffold gated
-//! behind an entitlement flag.
+//! Scoring is **per request**. There is no cross-span or per-trace taint
+//! accumulation: `TaintTracker` is a unit struct with no state, and no
+//! entitlement flag gates it — every tenant gets the same per-request signal.
 
 use super::{Decision, PredictiveContext, Predictor};
 

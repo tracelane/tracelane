@@ -31,12 +31,14 @@ export interface Entitlements {
 	// Gateway + tracing
 	gateway_35_providers: boolean;
 	traces_90_day: boolean;
-	// Prompt promotion
+	// Prompt promotion. `prompt_promotion_read` is TRUE on every plan, free
+	// included: reading a prompt's version history is gated nowhere. The gateway
+	// `history_handler` (`crates/gateway/src/prompt_routes.rs`) carries no
+	// entitlement check, there is no `plan_entitlements` column for it (so it is
+	// absent from `rowToOverrides`), and no code outside this map reads it.
+	// Only the WRITE — promoting a version across environments — is gated (Team+).
 	prompt_promotion_read: boolean;
 	prompt_promotion_write: boolean;
-	eval_gates: boolean;
-	auto_rollback: boolean;
-	canary_splits: boolean;
 	// Security
 	byok_cmk: boolean;
 	// Paid Article-12 evidence-pack export (f_audit_addon, $999 add-on).
@@ -86,11 +88,8 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_full_capture: false,
 		gateway_35_providers: true,
 		traces_90_day: false,
-		prompt_promotion_read: false,
+		prompt_promotion_read: true,
 		prompt_promotion_write: false,
-		eval_gates: false,
-		auto_rollback: false,
-		canary_splits: false,
 		byok_cmk: false,
 		audit_ledger: false,
 		// ADR-066: free self-verify is ON for every plan by default.
@@ -121,9 +120,6 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		traces_90_day: true,
 		prompt_promotion_read: true,
 		prompt_promotion_write: false,
-		eval_gates: false,
-		auto_rollback: false,
-		canary_splits: false,
 		byok_cmk: false,
 		audit_ledger: false,
 		// ADR-066: free self-verify is ON for every plan by default.
@@ -154,9 +150,6 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		traces_90_day: true,
 		prompt_promotion_read: true,
 		prompt_promotion_write: true,
-		eval_gates: true,
-		auto_rollback: true,
-		canary_splits: false,
 		byok_cmk: false,
 		audit_ledger: false,
 		// ADR-066: free self-verify is ON for every plan by default.
@@ -187,9 +180,6 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		traces_90_day: true,
 		prompt_promotion_read: true,
 		prompt_promotion_write: true,
-		eval_gates: true,
-		auto_rollback: true,
-		canary_splits: true,
 		byok_cmk: true,
 		// Audit is the $999/mo ADD-ON at every tier (ADR-020/025) — never
 		// plan-bundled. Matches plan_entitlements.f_audit_addon = FALSE.
@@ -222,9 +212,6 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		traces_90_day: true,
 		prompt_promotion_read: true,
 		prompt_promotion_write: true,
-		eval_gates: true,
-		auto_rollback: true,
-		canary_splits: true,
 		byok_cmk: true,
 		// Add-on-only, same as Business (ADR-020/025).
 		audit_ledger: false,

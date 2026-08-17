@@ -13,14 +13,13 @@
  * bar is always the true duration).
  */
 
-import { fmtDur } from "@/lib/fmt-dur";
 import { inferSpanKind } from "@/lib/span-kind";
 import { spanStartUs } from "@/lib/trace-summary";
 import type { VisibleRow } from "@/lib/trace-tree";
-import { type SpanKind, cn } from "@tracelanedev/ui";
+import { type SpanKind, TimeRuler, cn, fmtDur } from "@tracelanedev/ui";
 
 /** Bar fill by kind — matches the transcript-spine node pins (one palette).
- * ADR-053 discipline: Lava (--accent) is CTA-only and Verify-green (--ok/--seal)
+ * ADR-053 discipline: Lava (--action) is CTA-only and Verify-green (--ok/--seal)
  * is provenance-only, so span kinds use the one free data hue (violet --info, the
  * AI-call family: tool bold, llm faint) + neutral ink for structure. The kind text
  * label always accompanies the color — never colour alone. Errors override to red. */
@@ -32,9 +31,6 @@ export const KIND_BAR: Record<SpanKind, string> = {
 	chain: "bg-ink-3",
 	unknown: "bg-ink-3",
 };
-
-/** Axis tick positions (fraction 0..1). Four segments reads clean at any width. */
-const TICKS = [0, 0.25, 0.5, 0.75, 1] as const;
 
 export function WaterfallView({
 	rows,
@@ -51,26 +47,38 @@ export function WaterfallView({
 	onSelectSpan: (id: string) => void;
 	onToggleCollapse: (id: string) => void;
 }) {
-	const span = (t: number) => (totalUs > 0 ? totalUs * t : 0);
-
 	return (
 		<div className="text-sm">
-			{/* Time axis header — aligned to the same 2fr/3fr grid as the rows. */}
-			<div className="sticky top-0 z-10 grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 border-b border-line bg-bg pb-1.5 pr-2">
-				<span className="pl-1 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+			{/*
+			 * Time axis header — ADR-074 §7's ONE ruler, in the same 2fr/3fr grid as the
+			 * rows so the ticks and the bars share a coordinate system.
+			 *
+			 * TimeRuler must be the DIRECT second grid child, with no wrapper carrying
+			 * padding: the bars below resolve their `left`/`width` percentages against
+			 * their own second-cell box, and any padding here would shift every tick
+			 * relative to the bar it describes.
+			 *
+			 * `startMs={0}` + `mode="relative"` is the only correct call for a waterfall.
+			 * The axis is ELAPSED time from the trace start — `totalUs` is already an
+			 * elapsed span, not an epoch — and `mode` is required rather than left to the
+			 * under-60s auto-switch, because a trace of a minute or more would otherwise
+			 * fall through to wall-clock formatting and render the UTC epoch.
+			 *
+			 * The header's own `border-b` is gone: the ruler draws the rule now, and
+			 * carrying both put two horizontal lines under the same axis.
+			 */}
+			<div className="sticky top-0 z-10 grid grid-cols-[minmax(0,2fr)_3fr] items-start gap-2 bg-bg pb-1.5 pr-2">
+				{/*
+				 * `h-6 border-t` mirrors the ruler's own box and its hairline, so the rule
+				 * reads as ONE line across the whole header instead of stopping where the
+				 * timeline column starts. The header's old full-width `border-b` is gone —
+				 * the ruler already draws a rule, and carrying both put two horizontal
+				 * lines under the same axis.
+				 */}
+				<span className="block h-6 border-line border-t pt-1.5 pl-1 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 					Span
 				</span>
-				<div className="relative h-4">
-					{TICKS.map((t) => (
-						<span
-							key={t}
-							className="absolute top-0 -translate-x-1/2 whitespace-nowrap text-[10px] tabular-nums text-ink-3 first:translate-x-0 last:-translate-x-full"
-							style={{ left: `${t * 100}%` }}
-						>
-							{fmtDur(span(t))}
-						</span>
-					))}
-				</div>
+				<TimeRuler startMs={0} endMs={totalUs / 1000} mode="relative" />
 			</div>
 
 			<div className="mt-1 space-y-px">
@@ -90,6 +98,16 @@ export function WaterfallView({
 					return (
 						<div
 							key={s.span_id}
+							// The ONLY stable hook on a waterfall span row. This view is the
+							// DEFAULT (TraceDetailView: useState<ViewMode>("waterfall")), but the
+							// e2e span locator was built from TranscriptSpine — `[role="treeitem"],
+							// ol li` — and the waterfall emits none of those. So every e2e
+							// assertion "about the spans" was querying the view the user is NOT
+							// looking at, and Playwright is continue-on-error, so it stayed
+							// invisible. Selected by `traceDetail().spanNodes` in
+							// e2e/fixtures/selectors.ts; a rendered-shape test pins it so the
+							// attribute cannot be dropped silently.
+							data-span-row={s.span_id}
 							className={cn(
 								"group grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-md pr-2 transition-colors",
 								selected ? "bg-surface-2" : "hover:bg-surface-2/40",

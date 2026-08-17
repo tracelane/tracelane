@@ -39,6 +39,7 @@
 //! - **H6**: persist unanchored batches for Rekor outage recovery.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 // future malformed payload that panics inside an audit-append can't
 // permanently DoS the tenant's chain (`std::sync::Mutex` would refuse
 // every subsequent lock). The audit chain invariants are protected by
@@ -347,6 +348,16 @@ struct TenantChainState {
     prev_hash: audit_format::Hash,
     pending_hashes: Vec<audit_format::Hash>,
     batch_start_seq: u64,
+    /// R21/R34 — the highest `batch_end_seq` this tenant has ever anchored, or `None`
+    /// if it has never anchored. Feeds [`anchor_batch_start`] so the threshold and the
+    /// age sweeper cannot produce overlapping batches.
+    ///
+    /// Seeded at [`AuditChain::warm_from_postgres`] from `audit_anchor_records`, NOT
+    /// from process memory: a tenant may go quiet for days and the gateway redeploys
+    /// often, so an in-memory-only value would reset to `None` on every restart and
+    /// let the threshold path recompute `seq + 1 - n` — reintroducing exactly the
+    /// overlap this field exists to prevent.
+    last_anchored_end: Option<u64>,
 }
 
 impl TenantChainState {
@@ -356,6 +367,7 @@ impl TenantChainState {
             prev_hash: audit_format::genesis_prev_hash(tenant_id),
             pending_hashes: Vec::new(),
             batch_start_seq: 0,
+            last_anchored_end: None,
         }
     }
 }
@@ -438,6 +450,216 @@ impl AuditChain {
 
     /// already set. Prod uses [`set_billing`](Self::set_billing); tests inject a
     /// counter/channel to assert the anchor→meter wiring without Postgres/Rekor.
+    /// R21 — read this tenant's anchor watermark. `None` = never anchored, or the
+    /// tenant is unknown to this process (which is also "never" as far as the
+    /// threshold path is concerned, and falls back to today's arithmetic).
+    fn last_anchored_end(&self, tenant_id: &TenantId) -> Option<u64> {
+        self.states
+            .get(tenant_id)
+            .and_then(|s| s.lock().last_anchored_end)
+    }
+
+    /// R21 — advance the watermark. Called at the moment an anchor is DISPATCHED, not
+    /// when it completes: `anchor_batch_from_ch` is spawned, and two triggers racing on
+    /// the same tenant must not both compute the same `batch_start`.
+    fn set_last_anchored_end(&self, tenant_id: &TenantId, end_seq: u64) {
+        // UPSERT, not set-if-present. On the PG path `states` holds only this watermark
+        // (seq and prev_hash come from Postgres) and is populated solely by
+        // `warm_from_postgres` at boot — so a tenant whose first event landed after the
+        // last restart is absent, and the old `if let Some(..)` made this a silent no-op
+        // for precisely the tenants the age sweep exists to serve. `or_insert_with` is
+        // safe here because the entry is a watermark cache on this path, and on the
+        // in-memory path the tenant is already present from its own append.
+        let s = self
+            .states
+            .entry(tenant_id.clone())
+            .or_insert_with(|| Mutex::new(TenantChainState::genesis(tenant_id)));
+        let mut g = s.lock();
+        // Monotonic: a late-arriving lower value must never rewind the watermark.
+        if g.last_anchored_end.is_none_or(|prev| end_seq > prev) {
+            g.last_anchored_end = Some(end_seq);
+        }
+    }
+
+    /// R21/R32 — **anchor any tenant whose oldest un-anchored row is older than
+    /// `max_age`, regardless of batch size.**
+    ///
+    /// Without this, `should_anchor` is a pure per-tenant COUNT threshold
+    /// (`(seq + 1) % anchor_every == 0`) with no time component, so a tenant that never
+    /// reaches `anchor_every` never signs and never anchors — **ever**. Measured
+    /// 2026-08-14: 92 rows across 5 tenants, 100% unsigned and unanchored, permanently.
+    /// Their hash chain is intact and verifies from genesis; what is missing is the
+    /// Ed25519 signature and the Rekor anchor — the third-party-verifiable half, which
+    /// is the differentiated claim.
+    ///
+    /// `max_age` is a PARAMETER, not a constant read inside, so a test can drive it with
+    /// `Duration::ZERO` and with a large value and assert both directions
+    /// (`TRAPS.md` §31 — prove both halves or the carve-out is indistinguishable from
+    /// not scanning at all).
+    ///
+    /// Returns the number of batches dispatched.
+    ///
+    /// # Errors
+    /// None — infallible by construction. This is a **fault-tolerance** path: a sweep
+    /// that cannot read ClickHouse logs and skips that tenant; it must never take down
+    /// the append path it runs beside.
+    pub async fn flush_aged_batches(&self, max_age: Duration) -> usize {
+        let Some(ref ch) = self.clickhouse_client else {
+            return 0;
+        };
+        // PG-PATH ONLY, and this is a correctness gate rather than a configuration nicety.
+        // The sweep's whole model is the PG-serialized append's: the durable watermark
+        // lives in `audit_anchor_records` and the leaf set is read back from ClickHouse.
+        // The in-memory append path (`append_in_memory`, used when there is no pool) keeps
+        // its OWN batch state in `pending_hashes` / `batch_start_seq` and is a THIRD
+        // batch-start arithmetic that R34 did not unify. Running both against one tenant
+        // produces exactly the overlap R34 exists to prevent — a duplicate anchor record
+        // and a duplicate billable `audit_anchors` event over the same rows.
+        let Some(ref pool) = self.pg_pool else {
+            return 0;
+        };
+        let max_age_secs = max_age.as_secs();
+
+        // Enumerate from the DURABLE store, never from `self.states`.
+        //
+        // `self.states` is populated at exactly ONE non-test site — `warm_from_postgres`,
+        // at boot. The prod append path (`append_pg_serialized`) never inserts, so on the
+        // PG path that map is a boot-time SNAPSHOT: sweeping it would silently exclude
+        // every tenant onboarded since the last restart, i.e. exactly the new low-volume
+        // customer this feature is for. It is a `GROUP BY` over one column every 15
+        // minutes, which is nothing next to being wrong about who is covered.
+        let tenants = match read_tenants_with_audit_rows(ch).await {
+            Ok(t) => t,
+            Err(err) => {
+                Self::note_sweep_skip(&err, None);
+                return 0;
+            }
+        };
+
+        let mut anchored = 0usize;
+        for tenant_id in tenants {
+            // DURABLE watermark, re-read every sweep — NOT `self.last_anchored_end`.
+            // `warm_from_postgres` degrades a failed watermark read to `None`, so the
+            // in-memory value can be `None` for a fully-anchored tenant; trusting it
+            // would make the first sweep re-anchor an already-anchored range, rewriting
+            // signatures and double-metering. Re-reading also means a failed anchor is
+            // simply retried next sweep instead of being remembered as done.
+            let watermark = match read_last_anchored_end(ch, &tenant_id).await {
+                Ok(w) => w,
+                Err(err) => {
+                    Self::note_sweep_skip(&err, Some(&tenant_id));
+                    continue;
+                }
+            };
+            let probe = read_oldest_unanchored_age_secs(ch, &tenant_id, watermark).await;
+            let Ok(Some((age_secs, head))) = probe else {
+                if let Err(ref err) = probe {
+                    Self::note_sweep_skip(err, Some(&tenant_id));
+                }
+                continue; // nothing un-anchored, or unreadable
+            };
+            if age_secs < max_age_secs {
+                continue;
+            }
+
+            // "Everything not yet anchored, up to here" — deliberately NOT
+            // `anchor_batch_start`. That rule takes `max(watermark + 1, end + 1 - n)`,
+            // whose second term is a floor the THRESHOLD path needs and the sweep must
+            // never apply: with a backlog larger than `anchor_every` it starts the batch
+            // partway in, and the watermark then advances past the rows it skipped —
+            // burying them, permanently, in the one mechanism that would have caught them.
+            let batch_start = watermark.map_or(0, |w| w.saturating_add(1));
+            if batch_start > head {
+                continue; // already covered; nothing to anchor
+            }
+            // Bound the batch, and CHUNK FORWARD rather than skip: a backlog bigger than
+            // this anchors its oldest rows now and the rest on subsequent sweeps.
+            let batch_end = head.min(batch_start.saturating_add(MAX_SWEEP_BATCH - 1));
+
+            // Cross-process claim. The threshold path is serialized by the per-tenant
+            // `SELECT … FOR UPDATE` on the chain head; the sweep touches no such row, so
+            // without this two gateways sweep the same tenant and both anchor it. That is
+            // not hypothetical: `infra/prod/blue-green-deploy.sh:84-85` deliberately
+            // LEAVES BLUE RUNNING after the cutover, so two processes co-run by design.
+            // A `try` lock, never a blocking one — losing the race means the other process
+            // is already doing it, which is the outcome we wanted anyway. The transaction
+            // exists ONLY to scope the lock; nothing is written through it.
+            let Ok(mut claim_client) = pool.get().await else {
+                continue;
+            };
+            let Ok(claim_tx) = claim_client.transaction().await else {
+                continue;
+            };
+            let claimed = claim_tx
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock($1)",
+                    &[&tenant_advisory_key(&tenant_id)],
+                )
+                .await
+                .map(|r| r.get::<_, bool>(0))
+                .unwrap_or(false);
+            if !claimed {
+                continue; // another process is flushing this tenant right now
+            }
+
+            tracing::info!(
+                tenant_id = %tenant_id, batch_start, batch_end, head, age_secs, max_age_secs,
+                "audit age-sweep: flushing an un-anchored batch past max_age"
+            );
+            // AWAITED, not spawned. Sequential dispatch bounds the fan-out to one
+            // in-flight anchor per process (the Postgres pool this shares is 16
+            // connections and the FAIL-CLOSED audit append needs them), serializes this
+            // process against itself, and — the reason that matters — lets a REFUSED
+            // batch be observed, so the watermark cache below is advanced only for a
+            // batch that was really anchored.
+            let ok = anchor_batch_from_ch(
+                self.rekor_client.clone(),
+                ch.clone(),
+                tenant_id.clone(),
+                batch_start,
+                batch_end,
+                self.anchor_hook.get().cloned(),
+            )
+            .await;
+            // Release the claim. A rollback, because the transaction wrote nothing and
+            // exists only to bound the advisory lock's lifetime.
+            let _ = claim_tx.rollback().await;
+
+            if ok {
+                // Keep the THRESHOLD path's in-memory cache in step, so a tenant this
+                // sweep just anchored does not later recompute `seq + 1 - n` and overlap
+                // it. Upserts, because a tenant that first appended after boot is not in
+                // `states` at all and the old set-if-present was a silent no-op for
+                // exactly the tenants the sweep serves.
+                self.set_last_anchored_end(&tenant_id, batch_end);
+                anchored += 1;
+            }
+        }
+        anchored
+    }
+
+    /// One place for "the sweep could not see, so it skipped" — counted, not just logged.
+    ///
+    /// A skipped tenant is silent by construction: its rows simply stay unsigned, and no
+    /// other trigger will ever anchor them because a low-volume tenant never reaches the
+    /// count threshold. A `warn!` per tenant per 15-minute sweep is the ingest LISTEN-loop
+    /// shape (`.claude/rules/logging.md`) — 300,000 identical lines that told nobody
+    /// anything — so the detail line is emitted only on the FIRST occurrence and the
+    /// counter carries the rest, letting `open_for_secs` answer how long it has been open.
+    fn note_sweep_skip(err: &anyhow::Error, tenant_id: Option<&TenantId>) {
+        let first = tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+        ) == 1;
+        if first {
+            tracing::warn!(
+                error = %err,
+                tenant_id = tenant_id.map(ToString::to_string).unwrap_or_else(|| "(all)".into()),
+                "audit age-sweep: could not read un-anchored state — skipping. Further \
+                 occurrences are counted, not logged (kind=audit_age_sweep_skipped)"
+            );
+        }
+    }
+
     pub fn set_anchor_hook(&self, hook: AnchorHook) {
         let _ = self.anchor_hook.set(hook);
     }
@@ -474,11 +696,16 @@ impl AuditChain {
     /// failure returns `Err` so the caller refuses the request (the audit product
     /// does not serve unrecorded requests). When the async path is unavailable
     /// (no JetStream context, or `kill.audit.async`), falls back to the
-    /// SYNCHRONOUS [`append`](Self::append) with its existing fail-open-loud
-    /// behavior, so dev / self-host / an operator lever never 503s.
+    /// SYNCHRONOUS [`append`](Self::append) — **also fail-closed since A2**.
+    ///
+    /// `kill.audit.async` may DEFER the record (force the sync path fleet-wide). It
+    /// cannot SUPPRESS it: on either path, a request whose event was not recorded is
+    /// refused. Dev / OSS self-host still never 503 here, because with no Postgres
+    /// pool `append` takes the in-memory path, which does not return `Err`.
     ///
     /// # Errors
-    /// Fail-closed: an async publish or ack failure. Never errs on the sync path.
+    /// **Fail-CLOSED on both paths** (security path, CLAUDE.md §10): an async
+    /// publish/ack failure, or a sync append failure.
     #[instrument(skip(self, event), fields(
         tenant_id = %event.tenant_id,
         event_type = %event.event_type,
@@ -490,15 +717,36 @@ impl AuditChain {
             .map(|k| k.flag("kill.audit.async", false))
             .unwrap_or(false);
         let Some(js) = self.jetstream.get().filter(|_| !async_killed) else {
-            // Sync fallback (no JetStream / kill.audit.async): fail-open-loud,
-            // identical to the pre-ADR-069 behavior.
-            if let Err(err) = self.append(event).await {
-                tracing::warn!(
+            // A2 — the sync fallback is FAIL-CLOSED, like the async path.
+            //
+            // It used to `warn!` and return `Ok(())`, so a failed append served the
+            // request with NO audit record. That contradicted CLAUDE.md §2 and
+            // docs/product/AUDIT.md §3 (both assert fail-closed) and it is why
+            // LEGAL-REGISTER.md:58 had to strike "no asynchronous deferral that could
+            // be selectively suppressed exists" — `kill.audit.async` was exactly such
+            // a deferral, and on a failing append it became a DROP.
+            //
+            // The lever may still DEFER (force the synchronous path fleet-wide). It can
+            // no longer SUPPRESS: whichever path runs, an unrecorded request is refused.
+            //
+            // This does not brick dev / OSS self-host, which was the reason the
+            // fallback was fail-open in the first place. Verified rather than assumed:
+            // with no Postgres pool `append` takes `append_in_memory`, whose ClickHouse
+            // write is spawned and warn-only, so it does not return `Err` — those
+            // deployments keep serving exactly as before. What now 503s is the case
+            // that should: a control plane IS configured and the ledger write failed.
+            //
+            // Honest limit: in the no-Postgres case the "record" is a process-local
+            // hash chain plus a fire-and-forget ClickHouse write. Fail-closed there is
+            // thin, and nothing in this fix makes that tier durable — it is the dev /
+            // self-host tier and must not be described as a tamper-evident ledger.
+            return self.append(event).await.inspect_err(|err| {
+                tracing::error!(
                     error = %err,
-                    "sync audit append failed — request proceeds (fail-open)"
+                    "sync audit append failed — REFUSING the request (fail-closed); \
+                     the audit product does not serve unrecorded requests"
                 );
-            }
-            return Ok(());
+            });
         };
 
         // Same PII-free canonicalization as the sync path (ADR-068): redact →
@@ -610,12 +858,28 @@ impl AuditChain {
                     ),
                 }
             }
+            // R21: seed the anchor watermark from the DURABLE record, never from memory.
+            // A failure here yields `None`, which is the safe direction: the threshold
+            // path then falls back to `seq + 1 - n`, i.e. exactly today's behaviour.
+            let anchored_end = match self.clickhouse_client {
+                Some(ref ch) => read_last_anchored_end(ch, &r.tenant_id).await.unwrap_or_else(
+                    |err| {
+                        tracing::warn!(
+                            error = %err, tenant_id = %r.tenant_id,
+                            "audit warm: could not read last anchored batch — anchor watermark unset"
+                        );
+                        None
+                    },
+                ),
+                None => None,
+            };
             self.states.entry(r.tenant_id.clone()).or_insert_with(|| {
                 Mutex::new(TenantChainState {
                     seq: head_seq + 1,
                     prev_hash: head_hash,
                     pending_hashes: Vec::with_capacity(self.anchor_every),
                     batch_start_seq: head_seq + 1,
+                    last_anchored_end: anchored_end,
                 })
             });
         }
@@ -828,7 +1092,11 @@ impl AuditChain {
         let n = self.anchor_every as u64;
         if n > 0 && (seq + 1).is_multiple_of(n) {
             if let Some(ch) = self.clickhouse_client.clone() {
-                let batch_start = seq + 1 - n;
+                // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n` directly —
+                // that is correct only if no batch was ever closed early by age.
+                let prev_end = self.last_anchored_end(&tenant_id);
+                let batch_start = anchor_batch_start(prev_end, seq, n);
+                self.set_last_anchored_end(&tenant_id, seq);
                 let rekor = self.rekor_client.clone();
                 let tid = tenant_id.clone();
                 let anchor_hook = self.anchor_hook.get().cloned();
@@ -1233,6 +1501,18 @@ async fn anchor_task(
             let tid = tenant_id.clone();
             tokio::spawn(async move {
                 if let Err(err) = write_anchor_record(&ch, row).await {
+                    // R17. The founder's ruling named the two backfills; this is the
+                    // THIRD spawned fail-open in the same function with the same shape
+                    // and the same consequence, and instrumenting two of three would
+                    // be TRAPS §29 (a finding recorded at one call site is not
+                    // recorded). Losing this row loses the ADR-062 offline bundle —
+                    // the inclusion proof and checkpoint captured at anchor time are
+                    // the ONLY offline-verification source, because Rekor v2 has no
+                    // online lookup. So the batch anchored and cannot be proven to
+                    // have anchored, which is the same customer-visible outcome.
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+                    );
                     tracing::warn!(
                         tenant_id = %tid,
                         start_seq,
@@ -1253,6 +1533,14 @@ async fn anchor_task(
             tokio::spawn(async move {
                 if let Err(err) = backfill_signature(&ch, &tid, &sig, &pk, start_seq, end_seq).await
                 {
+                    // R17. This runs detached, so its Err reaches nobody: the append
+                    // already reported success and `/health` is green. Left uncounted,
+                    // the batch stays UNSIGNED forever with nothing to retry it — the
+                    // ledger keeps its hash chain and quietly loses the property we
+                    // actually sell. Count it so `open_for_secs` can answer TRAPS §16.
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+                    );
                     tracing::warn!(
                         tenant_id = %tid,
                         start_seq,
@@ -1271,6 +1559,14 @@ async fn anchor_task(
             tokio::spawn(async move {
                 if let Err(err) = backfill_rekor_entry_id(&ch, &tid, &id, start_seq, end_seq).await
                 {
+                    // R17, same class as the signature backfill above: a REAL Rekor
+                    // entry exists in the public log, and the rows that entry attests
+                    // to will never name it. The anchor is not lost — it is
+                    // unreachable from the product, which is indistinguishable from
+                    // never having anchored for anyone reading the ledger.
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+                    );
                     tracing::warn!(
                         rekor_entry_id = %id,
                         tenant_id = %tid,
@@ -1305,6 +1601,80 @@ async fn anchor_task(
 /// (GATE 1) and the verifier reconstruct, so the anchored root stays valid
 /// (GATE 2). A missing / non-contiguous / short batch is logged and skipped
 /// (never anchor a malformed batch); best-effort, like a Rekor outage.
+/// R32 — a batch older than this anchors regardless of size. **Founder-ruled 24 h**, and
+/// the value is not arbitrary: it is the largest that still makes the customer-facing
+/// statement true, and the smallest that costs the busiest tenant nothing. At the
+/// measured 381 events/day, `a4037bef`'s 100-event threshold fires every ~6.3 h, so a
+/// 24 h timer never wins and its metered-anchor count is unchanged (+0/day). A 1 h value
+/// would flush it hourly — ~24 anchors/day against 3.8 today, a 6× cost for no benefit.
+/// A 7 d value would leave a new customer un-attested for a week, which is the same
+/// problem this fixes, slower.
+pub const ANCHOR_MAX_BATCH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the age sweep runs. Well below [`ANCHOR_MAX_BATCH_AGE`] so the effective
+/// flush latency is the age, not the interval.
+pub const ANCHOR_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// R21 — spawn the background age sweep.
+///
+/// A background task rather than a check inside `publish` **because an append-triggered
+/// check cannot fix the tenants this exists for.** A tenant that appends 35 events and
+/// goes quiet never appends again, so a condition evaluated on append never runs. That
+/// is precisely the 92-row population: 35, 35, 12, 7 and 3 lifetime events, none of
+/// which will ever reach the 100-event threshold.
+pub fn spawn_anchor_age_sweeper(chain: Arc<AuditChain>) {
+    tokio::spawn(async move {
+        // Settle first: a fresh node should not sweep before `warm_from_postgres` has
+        // seeded the anchor watermarks, or the first sweep would compute batch starts
+        // from `None` and could re-anchor an already-anchored range.
+        tokio::time::sleep(ANCHOR_SWEEP_INTERVAL).await;
+        loop {
+            let n = chain.flush_aged_batches(ANCHOR_MAX_BATCH_AGE).await;
+            if n > 0 {
+                tracing::info!(
+                    batches = n,
+                    "audit age-sweep: dispatched aged anchor batches"
+                );
+            }
+            tokio::time::sleep(ANCHOR_SWEEP_INTERVAL).await;
+        }
+    });
+}
+
+/// R32/R34 — **the batch a given anchor covers. ONE rule, BOTH triggers.**
+///
+/// Before R21 the seq-aligned path computed `seq + 1 - n` directly. That is correct
+/// only while every batch closes on the threshold, which stopped being true the moment
+/// a time-based flush could close a batch early: an age-flushed `[0..36]` followed by
+/// the threshold firing at seq 99 would have re-anchored `[0..99]`, **covering rows
+/// 0–36 twice** — a second `audit_anchor_records` row over the same rows and a second
+/// `audit_anchors` meter event for them.
+///
+/// Taking `max(last_anchored_end + 1, …)` makes a batch start where the previous one
+/// ended, whichever trigger closed it. The founder's reasoning for collapsing them
+/// rather than keeping two arithmetics (R34): **two triggers with different batch-start
+/// arithmetic are two rules that must agree forever.** With one rule the threshold path
+/// inherits this function's proof, and nobody can reintroduce the overlap by editing one
+/// site and not the other.
+///
+/// Pure and total, so both directions are unit-falsifiable with no I/O:
+/// * an age-flush followed by a threshold fire must produce **non-overlapping** ranges;
+/// * a pure threshold sequence with no age-flush must produce **exactly** the batches it
+///   produces today.
+fn anchor_batch_start(last_anchored_end: Option<u64>, end_seq: u64, anchor_every: u64) -> u64 {
+    // `saturating_sub`: a batch closed by AGE can end before `anchor_every` rows exist
+    // at all (e.g. end_seq=4, n=100), where `end_seq + 1 - n` would underflow.
+    let by_threshold = (end_seq + 1).saturating_sub(anchor_every);
+    match last_anchored_end {
+        Some(prev_end) => by_threshold.max(prev_end + 1),
+        None => by_threshold,
+    }
+}
+
+/// Returns `true` if the batch was well-formed and handed to [`anchor_task`], `false` if
+/// it was refused. **R21 depends on this distinction:** the age sweep must not advance
+/// its watermark cache for a batch that was never anchored, or those rows are buried —
+/// the sweep is the only thing that would ever have come back for them.
 async fn anchor_batch_from_ch(
     rekor_client: RekorClient,
     clickhouse_client: ClickhouseClient,
@@ -1312,7 +1682,7 @@ async fn anchor_batch_from_ch(
     start_seq: u64,
     end_seq: u64,
     anchor_hook: Option<AnchorHook>,
-) {
+) -> bool {
     let hashes =
         match read_batch_row_hashes(&clickhouse_client, &tenant_id, start_seq, end_seq).await {
             Ok(h) => h,
@@ -1321,7 +1691,7 @@ async fn anchor_batch_from_ch(
                     error = %err, tenant_id = %tenant_id, start_seq, end_seq,
                     "audit anchor: reading batch leaf set from ClickHouse failed — skipping anchor"
                 );
-                return;
+                return false;
             }
         };
     let expected = (end_seq - start_seq + 1) as usize;
@@ -1333,7 +1703,7 @@ async fn anchor_batch_from_ch(
             got = hashes.len(), expected, tenant_id = %tenant_id, start_seq, end_seq,
             "audit anchor: batch leaf set is incomplete after dedup — skipping anchor"
         );
-        return;
+        return false;
     }
     anchor_task(
         rekor_client,
@@ -1345,6 +1715,140 @@ async fn anchor_batch_from_ch(
         anchor_hook,
     )
     .await;
+    true
+}
+
+/// R21 — the largest batch one age flush will anchor. A backlog bigger than this is
+/// anchored in CONSECUTIVE chunks over successive sweeps — **chunked forward, never
+/// skipped**, because the sweep is the last mechanism that would come back for a row it
+/// passed over. Sized to bound the leaf set held in memory and the `ALTER … UPDATE`
+/// signature backfill's row count, not to match `anchor_every`.
+const MAX_SWEEP_BATCH: u64 = 10_000;
+
+/// R21 — every tenant with at least one `audit_log` row, read from the DURABLE store.
+///
+/// The sweep cannot enumerate from `AuditChain::states`: on the PG path that map is only
+/// ever written by `warm_from_postgres` at boot, so it is a snapshot that omits every
+/// tenant onboarded since the last restart.
+async fn read_tenants_with_audit_rows(client: &ClickhouseClient) -> anyhow::Result<Vec<TenantId>> {
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct TenantRow {
+        tenant_id: String,
+    }
+    // `GROUP BY` over one low-cardinality column on a columnar store, once per sweep
+    // interval. audit.rs is allow-listed in no-raw-ch-query.sh; this is the one query
+    // here that is deliberately NOT tenant-scoped, because producing the tenant list is
+    // its entire purpose.
+    let rows = client
+        .query("SELECT tenant_id FROM audit_log GROUP BY tenant_id")
+        .fetch_all::<TenantRow>()
+        .await
+        .context("enumerate tenants with audit_log rows")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.tenant_id.parse::<uuid::Uuid>().ok())
+        .map(TenantId::from_jwt_claim)
+        .collect())
+}
+
+/// R21 — a per-tenant Postgres advisory lock held for the duration of one age flush,
+/// released on drop.
+///
+/// **Why a lock at all.** The threshold trigger is serialized across processes by the
+/// per-tenant `SELECT … FOR UPDATE` on the chain head. The age sweep reads ClickHouse and
+/// touches no such row, so two gateway processes sweeping the same tenant would both
+/// compute the same batch and both anchor it — a duplicate `audit_anchor_records` row and
+/// a duplicate BILLABLE `audit_anchors` meter event over identical rows. Two processes is
+/// the designed state, not an accident: `infra/prod/blue-green-deploy.sh:84-85` keeps the
+/// BLUE pool running after the cutover for instant rollback.
+///
+/// **Why advisory and not `FOR UPDATE`.** The flush includes a Rekor round-trip. Holding
+/// the chain-head row lock across it would block that tenant's appends — and the append
+/// path is fail-CLOSED, so a slow Rekor would turn into customer-visible 503s. An advisory
+/// lock is off to the side: it serializes sweepers against each other and nothing else.
+///
+/// **Why the TRANSACTION-scoped variant.** `pg_try_advisory_lock` is session-scoped, and
+/// these connections are POOLED — returning one to the pool does not release its locks, so
+/// a missed unlock (an early return, a panic mid-anchor) would leave that tenant claimed
+/// for the life of the connection and silently exclude it from every future sweep. The
+/// `_xact_` variant is released by COMMIT *or* ROLLBACK *or* the transaction being dropped,
+/// so every exit path releases it without anything having to remember to.
+fn tenant_advisory_key(tenant_id: &TenantId) -> i64 {
+    const NAMESPACE: i64 = 0x746C_616E_6541_4E43; // "tlaneANC"
+    let b = tenant_id.as_uuid().as_bytes();
+    let mut k = [0u8; 8];
+    k.copy_from_slice(&b[..8]);
+    i64::from_le_bytes(k) ^ NAMESPACE
+}
+
+/// R21 — the highest `batch_end_seq` this tenant has ever anchored. `None` = never.
+///
+/// Read from `audit_anchor_records` rather than tracked in memory: the tenants this
+/// feature exists for may not append for days, and the gateway redeploys far more often
+/// than that.
+async fn read_last_anchored_end(
+    client: &ClickhouseClient,
+    tenant_id: &TenantId,
+) -> anyhow::Result<Option<u64>> {
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct MaxRow {
+        n: u64,
+        present: u8,
+    }
+    // `max()` over an empty set returns 0, which is indistinguishable from "anchored
+    // batch [x..0]" — so carry an explicit presence flag rather than treating 0 as a
+    // sentinel. Same class as TRAPS §25: a value that happens to be zero.
+    let row = client
+        .query(
+            "SELECT toUInt64(max(batch_end_seq)) AS n, toUInt8(count() > 0) AS present \
+             FROM audit_anchor_records WHERE tenant_id = ?",
+        )
+        .bind(tenant_id.to_string())
+        .fetch_one::<MaxRow>()
+        .await?;
+    Ok((row.present == 1).then_some(row.n))
+}
+
+/// R21 — the oldest un-anchored row's age for this tenant, or `None` if nothing is
+/// un-anchored. Drives the age flush.
+async fn read_oldest_unanchored_age_secs(
+    client: &ClickhouseClient,
+    tenant_id: &TenantId,
+    after_seq: Option<u64>,
+) -> anyhow::Result<Option<(u64, u64)>> {
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct AgeRow {
+        age_secs: u64,
+        head: u64,
+        present: u8,
+    }
+    // INCLUSIVE lower bound, always a real `UInt64` — **never a sentinel.**
+    //
+    // `after_seq` is the last ANCHORED seq, so the first un-anchored one is `+ 1`;
+    // a tenant that has never anchored starts at genesis, seq 0.
+    //
+    // This was `seq > ?` bound to the STRING "-1" when `after_seq` was `None`, to dodge
+    // the fact that `-1 as u64` wraps. ClickHouse rejects it outright —
+    // `Code 53 TYPE_MISMATCH: Cannot convert string '-1' to type UInt64` — and
+    // `flush_aged_batches` turns that `Err` into a `warn!` + `continue`, so **every
+    // tenant that had never anchored was silently skipped**: precisely the 92-row,
+    // 5-tenant population R21 exists to fix. Dodging the wrap with a string moved the
+    // bug from an arithmetic one to a type one and made it invisible.
+    //
+    // Caught only by running this function against a live ClickHouse. Every other R21
+    // test is pure arithmetic or a hand-built fixture, and all of them stayed green.
+    let from_seq = after_seq.map_or(0, |s| s.saturating_add(1));
+    let row = client
+        .query(
+            "SELECT toUInt64(greatest(0, dateDiff('second', min(event_time), now()))) AS age_secs, \
+                    toUInt64(max(seq)) AS head, toUInt8(count() > 0) AS present \
+             FROM audit_log FINAL WHERE tenant_id = ? AND seq >= ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(from_seq)
+        .fetch_one::<AgeRow>()
+        .await?;
+    Ok((row.present == 1).then_some((row.age_secs, row.head)))
 }
 
 /// Read the contiguous canonical `row_hash` leaf set for `[start … end]` from
@@ -1741,6 +2245,618 @@ mod tests {
         B64.encode(doc.as_ref())
     }
 
+    /// R17 FALSIFICATION — force REAL backfill failures and require the counter to move.
+    ///
+    /// The `health_body` unit test proves the FIELD is wired to the counter. It cannot
+    /// prove the counter is wired to the failure, and those are the two halves that have
+    /// to meet. This drives `anchor_task` — the actual production path — against an
+    /// unreachable ClickHouse, so all three attestation writes genuinely fail.
+    ///
+    /// Asserting an EXACT count is a DECISION, not a measurement (TRAPS §27): the two
+    /// writes this path reaches must both be counted. Dropping either turns this red —
+    /// before R17 it would have read `before + 0` while the ledger silently stopped
+    /// being third-party verifiable.
+    ///
+    /// # What this does NOT prove, stated rather than implied
+    ///
+    /// **Two of the three instrumented arms, not three.** The `rekor_entry_id` backfill
+    /// is gated on `is_real_rekor_entry(&entry_id)`, which requires an outcome that
+    /// actually anchored to a live transparency log. With `TRACELANE_REKOR_URL` unset —
+    /// the only offline-safe fixture — the batch is signed but unanchored, so that arm
+    /// is never entered. My first version of this test asserted 3 and went red for
+    /// exactly that reason: TRAPS §22, a probe that cannot reach the code under test.
+    /// The assertion was lowered to what the fixture genuinely exercises rather than the
+    /// fixture being stretched to justify the number.
+    ///
+    /// So `note()` in the `backfill_rekor_entry_id` Err arm is **compile-checked and
+    /// unproven**. Proving it needs a stub Rekor endpoint, which is a bigger fixture
+    /// than this defect warrants. Recorded as a known gap rather than papered over.
+    #[tokio::test]
+    async fn failed_audit_backfill_increments_the_degradation_counter() {
+        use tracelane_shared::degradation::{Degradation, count};
+
+        let before = count(Degradation::AuditBackfillFailed);
+
+        // Signed but never anchored: TRACELANE_REKOR_URL is unset in tests, so
+        // `anchor_batch` signs locally and makes no network call. `is_signed()` is what
+        // gates all three ClickHouse writes.
+        let key_b64 = fresh_signing_key_b64();
+        let rekor = RekorClient::new(Some(&key_b64), None).unwrap();
+
+        // Port 1 refuses immediately — the failure is a fast connect error, not a hang,
+        // so this test cannot become the slow one everybody disables.
+        let ch = ClickhouseClient::default().with_url("http://127.0.0.1:1");
+
+        anchor_task(
+            rekor,
+            Some(ch),
+            TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            vec![[9u8; 32]],
+            1,
+            1,
+            None,
+        )
+        .await;
+
+        // The writes are detached, so poll rather than sleeping a fixed amount.
+        let mut after = count(Degradation::AuditBackfillFailed);
+        for _ in 0..100 {
+            if after >= before + 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            after = count(Degradation::AuditBackfillFailed);
+        }
+
+        assert_eq!(
+            after - before,
+            2,
+            "the two attestation writes this path reaches — the audit_anchor_records \
+             row (the ADR-062 offline bundle) and the Ed25519 signature backfill — must \
+             BOTH be counted when they fail. Exactly 2, not >=2: a third would mean the \
+             rekor_entry_id arm became reachable, and this test's stated coverage claim \
+             would be stale."
+        );
+
+        // And the counter must actually reach the operator surface: the /health field
+        // goes red on exactly this value. Counter and field, joined.
+        let body = crate::server::health_body(true, 0, after);
+        assert_eq!(
+            body["audit_attestation_healthy"], false,
+            "/health must report attestation as unhealthy once a backfill has failed"
+        );
+        assert_eq!(
+            body["capture_healthy"], true,
+            "and it must NOT drag capture down with it — the operator has to be able to \
+             tell which half broke"
+        );
+    }
+
+    /// R34 direction 1 — **an age-flush followed by a threshold fire must produce
+    /// NON-OVERLAPPING ranges.** This is the defect the unified rule exists to prevent:
+    /// under the old `seq + 1 - n` arithmetic the threshold would have re-anchored from
+    /// 0, covering the age-flushed rows a second time — a duplicate
+    /// `audit_anchor_records` row and a duplicate `audit_anchors` meter event over the
+    /// SAME rows.
+    #[test]
+    fn age_flush_then_threshold_produces_non_overlapping_batches() {
+        const N: u64 = 100;
+
+        // The age sweeper closes [0..36] early (37 rows, well under the threshold).
+        let first_start = anchor_batch_start(None, 36, N);
+        assert_eq!(first_start, 0, "a first-ever batch starts at genesis");
+
+        // Later the tenant reaches seq 99 and the threshold fires.
+        let second_start = anchor_batch_start(Some(36), 99, N);
+        assert_eq!(
+            second_start, 37,
+            "the threshold batch must RESUME where the age flush ended, not restart at \
+             `seq + 1 - n` (which would be 0 and would re-cover rows 0..36)"
+        );
+        assert!(
+            second_start > 36,
+            "non-overlap is the property: batch 2 must start after batch 1 ended"
+        );
+
+        // And the old arithmetic really would have overlapped — pin the contrast so
+        // this test cannot be satisfied by the bug returning.
+        let old_arithmetic = (99 + 1) - N;
+        assert_eq!(old_arithmetic, 0);
+        assert_ne!(
+            second_start, old_arithmetic,
+            "if these ever agree, the unified rule has been reverted"
+        );
+    }
+
+    /// R34 direction 2 — **a pure threshold sequence with NO age-flush must produce
+    /// EXACTLY the batches it produces today.** Without this, direction 1 could be
+    /// satisfied by a rule that changes normal batching, which would silently
+    /// re-partition every existing tenant's future anchors.
+    #[test]
+    fn pure_threshold_sequence_is_byte_for_byte_todays_batching() {
+        const N: u64 = 100;
+        let mut watermark: Option<u64> = None;
+        let mut got = Vec::new();
+        // Ten consecutive threshold fires, exactly as the seq-aligned path drives them.
+        for batch in 0..10u64 {
+            let end = (batch + 1) * N - 1; // 99, 199, 299, …
+            let start = anchor_batch_start(watermark, end, N);
+            got.push((start, end));
+            watermark = Some(end);
+        }
+        let want: Vec<(u64, u64)> = (0..10u64).map(|b| (b * N, (b + 1) * N - 1)).collect();
+        assert_eq!(
+            got, want,
+            "with no age flush the unified rule must reproduce today's aligned width-100 \
+             batches exactly — prod has 158 of these, contiguous and gapless"
+        );
+    }
+
+    /// The underflow the `saturating_sub` guards: an age flush can close a batch before
+    /// `anchor_every` rows exist at all. `end_seq + 1 - n` would panic in debug.
+    #[test]
+    fn age_flush_below_the_threshold_does_not_underflow() {
+        assert_eq!(anchor_batch_start(None, 4, 100), 0);
+        assert_eq!(anchor_batch_start(Some(1), 4, 100), 2);
+    }
+
+    /// R21 — **a backlog larger than `anchor_every` must anchor from GENESIS, not from
+    /// `head + 1 - anchor_every`.**
+    ///
+    /// The sweep originally reused `anchor_batch_start`, whose `max(…, end + 1 - n)` term
+    /// is a floor the THRESHOLD path needs and the sweep must never apply. With 250
+    /// un-anchored rows it yields `batch_start = 150`, so rows **0–149 are never covered**
+    /// — and because the watermark then advances to 249, the sweep that exists to catch
+    /// un-anchored rows becomes the thing that permanently buries them. Nothing else would
+    /// ever come back for them: the count threshold only looks forward.
+    ///
+    /// Silent by construction — the ledger keeps its hash chain, `/health` stays green,
+    /// and 150 rows simply never become third-party verifiable. So it gets its own test
+    /// with an explicit assertion on the emitted RANGE, not on "an anchor happened".
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn r21_backlog_larger_than_anchor_every_anchors_from_genesis() {
+        let Some(url) = ch_test_url() else {
+            eprintln!("skip r21_backlog_larger: CLICKHOUSE_TEST_URL unset");
+            return;
+        };
+        if std::env::var("POSTGRES_TEST_URL").is_err() {
+            eprintln!("skip r21_backlog_larger: POSTGRES_TEST_URL unset");
+            return;
+        }
+        ClickhouseClient::default()
+            .with_url(&url)
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+
+        // 250: comfortably more than `anchor_every` (100), so the threshold floor and the
+        // correct answer differ by a wide, unmistakable margin.
+        const BACKLOG: u64 = 250;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        seed_aged_rows(&ch, &tenant, BACKLOG, 2 * 24 * 60 * 60).await;
+
+        let key = fresh_signing_key_b64();
+        let chain =
+            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pg_test_pool())).unwrap();
+        let anchored = chain
+            .flush_aged_batches(Duration::from_secs(24 * 60 * 60))
+            .await;
+        assert_eq!(anchored, 1, "the aged backlog must flush");
+
+        #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+        struct AnchorRow {
+            batch_start_seq: u64,
+            batch_end_seq: u64,
+        }
+        let mut rows: Vec<AnchorRow> = Vec::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            rows = ch
+                .query(
+                    "SELECT batch_start_seq, batch_end_seq FROM audit_anchor_records \
+                     WHERE tenant_id = ?",
+                )
+                .bind(tenant.to_string())
+                .fetch_all::<AnchorRow>()
+                .await
+                .unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 1, "exactly one anchor record for one flush");
+        assert_eq!(
+            (rows[0].batch_start_seq, rows[0].batch_end_seq),
+            (0, BACKLOG - 1),
+            "the flush must cover the WHOLE un-anchored backlog [0..249]. A start of 150 \
+             means the threshold floor leaked into the sweep and rows 0-149 were buried"
+        );
+
+        // And the rows themselves — the end-state, not the record. If only the last 100
+        // were covered, seq 0 is still unsigned and this is the assertion that says so.
+        #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+        struct SigCount {
+            signed: u64,
+        }
+        let mut signed = 0u64;
+        for _ in 0..40 {
+            signed = ch
+                .query("SELECT countIf(signature != '') AS signed FROM audit_log FINAL WHERE tenant_id = ?")
+                .bind(tenant.to_string())
+                .fetch_one::<SigCount>()
+                .await
+                .unwrap()
+                .signed;
+            if signed == BACKLOG {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            signed, BACKLOG,
+            "all 250 rows must be signed; 100 means rows 0-149 were silently skipped"
+        );
+    }
+
+    /// Drop + recreate `audit_anchor_records` for a fresh test. Destructive to the
+    /// shared table, like [`ch_reset_replacing_audit_log`] — deliberate.
+    async fn ch_reset_anchor_records(ch: &ClickhouseClient) {
+        ch.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS tracelane.audit_anchor_records",
+            "CREATE TABLE tracelane.audit_anchor_records \
+             (tenant_id String, batch_start_seq UInt64, batch_end_seq UInt64, \
+              merkle_root String, anchor_state String, \
+              ed25519_sig String DEFAULT '', ed25519_pubkey String DEFAULT '', \
+              ecdsa_pubkey_spki String DEFAULT '', rekor_log_url String DEFAULT '', \
+              rekor_log_index String DEFAULT '', canonicalized_body String DEFAULT '', \
+              inclusion_proof String DEFAULT '', checkpoint_envelope String DEFAULT '', \
+              anchored_at DateTime64(6,'UTC')) \
+             ENGINE = MergeTree PARTITION BY toYYYYMM(anchored_at) \
+             ORDER BY (tenant_id, batch_start_seq) SETTINGS index_granularity = 8192",
+        ] {
+            ch.query(stmt).execute().await.unwrap();
+        }
+    }
+
+    /// Seed `n` correctly-chained `audit_log` rows for `tenant`, all stamped
+    /// `age_secs` in the past, through the PRODUCTION row writer.
+    async fn seed_aged_rows(ch: &ClickhouseClient, tenant: &TenantId, n: u64, age_secs: i64) {
+        let base_us = Utc::now().timestamp_micros() - age_secs * 1_000_000;
+        let mut prev = audit_format::genesis_prev_hash(tenant);
+        for seq in 0..n {
+            let payload = audit_format::canonical_payload(&json!({ "i": seq }));
+            let rh = audit_format::row_hash_v2(&prev, tenant, seq, "request", "u", &payload);
+            write_audit_row(
+                ch,
+                AuditLogRow {
+                    tenant_id: tenant.to_string(),
+                    seq,
+                    event_time: base_us + seq as i64,
+                    event_type: "request".to_string(),
+                    actor: "u".to_string(),
+                    payload,
+                    prev_hash: audit_format::hex_encode(&prev),
+                    row_hash: audit_format::hex_encode(&rh),
+                    rekor_entry_id: None,
+                    signature: String::new(),
+                    signing_pubkey: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+            prev = rh;
+        }
+    }
+
+    /// R21 — **`flush_aged_batches` itself, against a live ClickHouse, in BOTH
+    /// directions within a SINGLE call.**
+    ///
+    /// The three tests above prove `anchor_batch_start`'s arithmetic, which is pure and
+    /// has no I/O. **They cannot prove the sweep DISCRIMINATES.** A `flush_aged_batches`
+    /// that flushed unconditionally, and one that never flushed at all, would both leave
+    /// every one of them green — `TRAPS.md` §31: prove both halves, or the carve-out is
+    /// indistinguishable from not scanning at all.
+    ///
+    /// So two tenants are seeded with an **identical** 37-row shape differing in exactly
+    /// **one** variable — `event_time` — and ONE call to `flush_aged_batches(24 h)` must
+    /// flush exactly the aged one. Asserting one call rather than two runs is deliberate:
+    /// the discrimination is what is under test, not the two outcomes separately.
+    ///
+    /// It then asserts the **observable end-state, not the return count** — an
+    /// `audit_anchor_records` row at `[0..36]` plus a signature on all 37 rows, written
+    /// by the production writer (`anchor_batch_from_ch` → `anchor_task`). That makes this
+    /// the end-to-end companion to the R35 fixture: **R35 proves the three reference
+    /// verifiers ACCEPT a width-37 batch; this proves the product actually PRODUCES
+    /// one**, through the real writer, with a real Ed25519 signing key.
+    ///
+    /// Run — **serially**, like the other CH-backed tests here: this and
+    /// [`r21_backlog_larger_than_anchor_every_anchors_from_genesis`] both DROP and
+    /// recreate the shared `audit_log` / `audit_anchor_records` tables, so in parallel
+    /// they clobber each other and fail for a reason that has nothing to do with R21.
+    /// ```text
+    /// CLICKHOUSE_TEST_URL=http://localhost:8123 \
+    /// POSTGRES_TEST_URL=postgres://…            \
+    ///   cargo test -p gateway --bins r21_ -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn r21_flush_aged_batches_discriminates_on_age_and_writes_a_partial_batch() {
+        let Some(url) = ch_test_url() else {
+            eprintln!("skip r21_flush_aged_batches: CLICKHOUSE_TEST_URL unset");
+            return;
+        };
+        // Postgres is REQUIRED, not incidental: the sweep is PG-path-only by design, and
+        // it takes a per-tenant advisory lock so two co-running gateways cannot both
+        // anchor the same batch.
+        if std::env::var("POSTGRES_TEST_URL").is_err() {
+            eprintln!("skip r21_flush_aged_batches: POSTGRES_TEST_URL unset");
+            return;
+        }
+        // The shared helpers use a client already SCOPED to `tracelane`, which cannot
+        // create the database it is scoped to (Code 81 on a fresh server). Bootstrap it
+        // with an unscoped client first so this test runs against a throwaway container,
+        // not only against a dev stack that happens to have the database already.
+        ClickhouseClient::default()
+            .with_url(&url)
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+
+        // 37: not 100, not a power of two, and ODD — the same width R35 pins, so the
+        // batch this produces exercises RFC6962's lone-odd-leaf promotion.
+        const WIDTH: u64 = 37;
+        const DAY: i64 = 24 * 60 * 60;
+
+        let aged = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let fresh = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        seed_aged_rows(&ch, &aged, WIDTH, 2 * DAY).await; // 48 h old — must flush
+        seed_aged_rows(&ch, &fresh, WIDTH, 0).await; // just now  — must NOT flush
+
+        // A signing key, because every write in `anchor_task` is gated on
+        // `outcome.is_signed()`; with no key the batch produces no record and the
+        // end-state assertions below would pass vacuously against a no-op.
+        let key = fresh_signing_key_b64();
+        let chain =
+            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pg_test_pool())).unwrap();
+
+        // NEITHER tenant is seeded into `chain.states`, and that is the point.
+        // `states` is written at exactly one non-test site — `warm_from_postgres`, at
+        // boot — so a sweep that enumerated it would cover only tenants that existed at
+        // the last restart and would silently skip every tenant onboarded since. Leaving
+        // the map empty here means a green can only come from the durable enumeration.
+        assert!(
+            chain.states.is_empty(),
+            "precondition: the sweep must find these tenants without any in-memory state"
+        );
+
+        let anchored = chain
+            .flush_aged_batches(Duration::from_secs(DAY as u64))
+            .await;
+
+        assert_eq!(
+            anchored, 1,
+            "exactly ONE of two identically-shaped tenants must flush — the aged one. \
+             0 means the sweep never fires (the 92 stay unsigned); 2 means it ignores \
+             age entirely and would re-anchor every tenant every 15 minutes"
+        );
+        assert_eq!(
+            chain.last_anchored_end(&aged),
+            Some(WIDTH - 1),
+            "the watermark cache must be UPSERTED for a tenant that was never in `states` \
+             — otherwise the threshold path later recomputes `seq + 1 - n` and overlaps \
+             the batch this sweep just anchored"
+        );
+        assert_eq!(
+            chain.last_anchored_end(&fresh),
+            None,
+            "the fresh tenant must be untouched — not merely un-flushed, but with no \
+             watermark written that would suppress its next legitimate flush"
+        );
+
+        // ---- the observable end-state, polled: the writes are spawned ----
+        #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+        struct AnchorRow {
+            batch_start_seq: u64,
+            batch_end_seq: u64,
+            anchor_state: String,
+            ed25519_sig: String,
+        }
+        let mut found: Option<AnchorRow> = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let rows = ch
+                .query(
+                    "SELECT batch_start_seq, batch_end_seq, anchor_state, ed25519_sig \
+                     FROM audit_anchor_records WHERE tenant_id = ?",
+                )
+                .bind(aged.to_string())
+                .fetch_all::<AnchorRow>()
+                .await
+                .unwrap();
+            if let Some(r) = rows.into_iter().next() {
+                found = Some(r);
+                break;
+            }
+        }
+        let rec = found.expect(
+            "the aged tenant must gain an audit_anchor_records row — this is the prod \
+             end-state R21 exists to produce, and 'the sweep returned 1' is not it",
+        );
+        assert_eq!(
+            (rec.batch_start_seq, rec.batch_end_seq),
+            (0, WIDTH - 1),
+            "the anchored batch must be the PARTIAL range [0..36], width 37 — not a \
+             width-100 range the tenant never reached"
+        );
+        assert!(
+            !rec.ed25519_sig.is_empty(),
+            "an anchor record with no Ed25519 signature is the half we actually sell"
+        );
+        assert_eq!(
+            rec.anchor_state, "unanchored",
+            "no Rekor URL is configured in this test, so the batch is signed but not \
+             publicly anchored — and the record must SAY so rather than overclaim"
+        );
+
+        // The signature backfill is a separate spawned write; poll it separately so a
+        // failure names which half broke.
+        #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+        struct SigCount {
+            signed: u64,
+            total: u64,
+        }
+        let mut counts = SigCount {
+            signed: 0,
+            total: 0,
+        };
+        for _ in 0..40 {
+            counts = ch
+                .query(
+                    "SELECT countIf(signature != '') AS signed, count() AS total \
+                     FROM audit_log FINAL WHERE tenant_id = ?",
+                )
+                .bind(aged.to_string())
+                .fetch_one::<SigCount>()
+                .await
+                .unwrap();
+            if counts.signed == WIDTH {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            (counts.signed, counts.total),
+            (WIDTH, WIDTH),
+            "all 37 rows must gain a signature — a partial backfill is the R17 failure \
+             mode (chain intact, /health green, rows permanently unsigned)"
+        );
+
+        let fresh_sigs = ch
+            .query(
+                "SELECT countIf(signature != '') AS signed, count() AS total \
+                    FROM audit_log FINAL WHERE tenant_id = ?",
+            )
+            .bind(fresh.to_string())
+            .fetch_one::<SigCount>()
+            .await
+            .unwrap();
+        assert_eq!(
+            (fresh_sigs.signed, fresh_sigs.total),
+            (0, WIDTH),
+            "the fresh tenant's rows must be untouched — if these are signed too, the \
+             age condition did nothing and the test above passed for the wrong reason"
+        );
+    }
+
+    /// R35 — **emit a PARTIAL-WIDTH anchored batch fixture for the three reference
+    /// verifiers.** Founder ruling: R21 does not merge until a batch whose width is not
+    /// `anchor_every` is anchored and proven GREEN by Rust, Python AND TypeScript.
+    ///
+    /// The time-based flush (R32) closes batches early by construction, so every
+    /// age-flushed batch has an arbitrary width. Today every one of prod's 158 anchor
+    /// records is exactly width 100, so **no partial batch exists anywhere to test
+    /// against** — which is precisely why this fixture has to be manufactured.
+    ///
+    /// **It is built with the PRODUCTION functions** — `audit_format::row_hash_v2`,
+    /// `merkle_root_v2`, `genesis_prev_hash`, `anchor_commitment`, `local_attest_msg` —
+    /// not a reimplementation. A fixture written to match the verifier would only prove
+    /// my reconstruction agrees with the verifier, never that the product does
+    /// (`TRAPS.md` §22).
+    ///
+    /// Ignored by default: it writes a file for an out-of-process check rather than
+    /// asserting anything itself. Run:
+    /// `cargo test -p gateway -- --ignored r35_emit_partial_width_anchor_fixture --nocapture`
+    #[test]
+    #[ignore = "fixture generator — writes NDJSON for the three verifiers to consume"]
+    fn r35_emit_partial_width_anchor_fixture() {
+        use ring::rand;
+
+        // 37, deliberately: not 100, not a power of two, and ODD — so the RFC6962 root
+        // exercises the lone-odd-leaf promotion path a width-100 batch never reaches.
+        const WIDTH: u64 = 37;
+        let tenant =
+            TenantId::from_jwt_claim("00000000-0000-4000-8000-0000000000aa".parse().unwrap());
+
+        let rng = rand::SystemRandom::new();
+        let doc = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+        let pubkey_b64 = B64.encode(kp.public_key().as_ref());
+
+        let mut prev = audit_format::genesis_prev_hash(&tenant);
+        let mut leaves: Vec<audit_format::Hash> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+
+        for seq in 0..WIDTH {
+            let payload = format!("{{\"n\":{seq}}}");
+            let rh = audit_format::row_hash_v2(
+                &prev,
+                &tenant,
+                seq,
+                "chat.completions.request",
+                "apikey:r35",
+                &payload,
+            );
+            lines.push(
+                json!({
+                    "format": "v2.1",
+                    "tenant_id": tenant.to_string(),
+                    "seq": seq,
+                    // Fixed epoch + seq keeps the fixture byte-stable across runs.
+                    "event_time": format!("2026-01-01T00:00:{:02}.000000Z", seq),
+                    "event_type": "chat.completions.request",
+                    "actor": "apikey:r35",
+                    "payload": payload,
+                    "prev_hash": audit_format::hex_encode(&prev),
+                    "row_hash": audit_format::hex_encode(&rh),
+                })
+                .to_string(),
+            );
+            leaves.push(rh);
+            prev = rh;
+        }
+
+        // Signed but NOT Rekor-anchored: commitment is the single 0x00 byte, which is
+        // the state an age-flushed batch is in until (and if) Rekor accepts it.
+        let root = audit_format::merkle_root_v2(&leaves);
+        let commitment = anchor_commitment(None);
+        let sig = kp.sign(&local_attest_msg(&root, &commitment));
+
+        lines.push(
+            json!({
+                "type": "anchor",
+                "tenant_id": tenant.to_string(),
+                "batch_start_seq": 0,
+                "batch_end_seq": WIDTH - 1,
+                "merkle_root": audit_format::hex_encode(&root),
+                "anchor_state": "unanchored",
+                "ed25519": { "signature": B64.encode(sig.as_ref()), "pubkey": pubkey_b64 },
+            })
+            .to_string(),
+        );
+
+        let out = std::env::var("R35_OUT")
+            .unwrap_or_else(|_| "/tmp/r35-partial-batch.ndjson".to_string());
+        std::fs::write(&out, lines.join("\n") + "\n").unwrap();
+        // Printed, not asserted: the verifiers are the assertion, out of process.
+        println!("R35_FIXTURE={out}");
+        println!("R35_PUBKEY_B64={pubkey_b64}");
+        println!("R35_WIDTH={WIDTH}");
+    }
+
     #[test]
     fn rekor_client_with_global_signs_root() {
         let key_b64 = fresh_signing_key_b64();
@@ -2031,6 +3147,89 @@ mod tests {
     // GATE 1 / GATE 2 recreate the shared `audit_log` table:
     //   POSTGRES_TEST_URL=postgres://… CLICKHOUSE_TEST_URL=http://localhost:8123 \
     //     cargo test -p gateway --bin gateway audit::tests:: -- --ignored --nocapture
+
+    // ── A2: the sync audit fallback is FAIL-CLOSED ──────────────────────────
+    // It used to warn and return Ok(()), serving the request with no audit
+    // record. These drive a REAL append failure (a pool aimed at a closed port,
+    // so `pool.get()` cannot connect) rather than mocking the outcome — the
+    // defect was in what publish() does with a genuine Err, so a test that
+    // fabricates the Err would be testing the fabrication.
+
+    /// A pool that is structurally valid and can never connect: port 1 is
+    /// reserved and nothing listens there. No env var, no live database, so this
+    /// runs on every `cargo test` — unlike the `--ignored` Postgres gates above,
+    /// which is exactly why the fail-open path went unnoticed for so long.
+    fn unreachable_pg_pool() -> deadpool_postgres::Pool {
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = Some("127.0.0.1".to_owned());
+        cfg.port = Some(1);
+        cfg.user = Some("nobody".to_owned());
+        cfg.dbname = Some("nodb".to_owned());
+        cfg.create_pool(
+            Some(deadpool_postgres::Runtime::Tokio1),
+            tokio_postgres::NoTls,
+        )
+        .expect("pool config is valid; it simply cannot connect")
+    }
+
+    fn a2_event(t: &TenantId) -> AuditEvent {
+        AuditEvent {
+            tenant_id: t.clone(),
+            event_type: "request",
+            actor: "u".into(),
+            payload: json!({"q": "ping"}),
+        }
+    }
+
+    /// THE DEFECT. No JetStream configured, so publish() takes the sync fallback;
+    /// the append fails; the request must be REFUSED, not served unrecorded.
+    #[tokio::test]
+    async fn sync_fallback_fails_closed_when_the_append_fails() {
+        let t = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::with_pg_pool(100, None, None, Some(unreachable_pg_pool())).unwrap();
+        let verdict = chain.publish(a2_event(&t)).await;
+        assert!(
+            verdict.is_err(),
+            "a failed sync append must return Err so the caller 503s — returning Ok \
+             here is the A2 defect: the request is served with NO audit record"
+        );
+    }
+
+    /// The operator lever may DEFER the record. It must not be able to SUPPRESS it.
+    /// This is the specific shape LEGAL-REGISTER.md:58 had to strike a claim over.
+    #[tokio::test]
+    async fn kill_audit_async_cannot_suppress_the_record() {
+        let t = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::with_pg_pool(100, None, None, Some(unreachable_pg_pool())).unwrap();
+        // Pull the lever: force the synchronous path fleet-wide.
+        let ks = std::sync::Arc::new(crate::kill_switch::KillSwitch::with_flags(
+            [("kill.audit.async".to_owned(), true)]
+                .into_iter()
+                .collect(),
+        ));
+        let _ = chain.kill_switch.set(ks);
+
+        assert!(
+            chain.publish(a2_event(&t)).await.is_err(),
+            "kill.audit.async may force the sync path; it must not turn a failed \
+             append into a served, unrecorded request"
+        );
+    }
+
+    /// The reason the fallback was fail-open in the first place, preserved: a
+    /// deployment with NO control plane (dev / OSS self-host) takes the in-memory
+    /// path, which does not error, so it keeps serving. If this ever starts
+    /// failing, the fix above has bricked self-host and must be revisited.
+    #[tokio::test]
+    async fn no_control_plane_still_serves_and_does_not_503() {
+        let t = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::new(100, None, None).unwrap();
+        assert!(
+            chain.publish(a2_event(&t)).await.is_ok(),
+            "no Postgres pool => in-memory append => must NOT 503; fail-closed here \
+             would brick every OSS self-host deployment"
+        );
+    }
 
     /// Build a deadpool from `POSTGRES_TEST_URL`.
     fn pg_test_pool() -> deadpool_postgres::Pool {

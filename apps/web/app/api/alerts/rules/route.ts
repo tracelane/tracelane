@@ -12,10 +12,19 @@
 import { GatewayError, gatewayGet, gatewayPost } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
+// MUST match crates/gateway/src/alerts/mod.rs METRICS, the Postgres CHECK in
+// migrations 0012+0017, and the AlertsManager dropdown. Enforced by
+// scripts/ci/check-alert-metrics-single-source.py.
+//
+// `overhead_p99` was missing here while the CHECK, the Rust const and the checker all
+// accepted it — so migration 0017, whose whole purpose was making a latency-tax
+// regression alertable, was unreachable: this proxy 422'd the metric before the request
+// ever left the dashboard. A hand-maintained list in 9 places drifts silently.
 const VALID_METRICS = new Set([
 	"error_rate",
 	"burn_rate",
 	"latency_p95",
+	"overhead_p99",
 	"cost_usd",
 	"quota_pct",
 ]);

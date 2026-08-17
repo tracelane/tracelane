@@ -18,10 +18,12 @@ Scope: every `.github/workflows/*.yml`. Exempt:
   - local actions (`uses: ./path`) — no registry, nothing to pin
   - docker refs (`uses: docker://…@sha256:…`) — pinned by digest instead
 
-Exit codes: 0 clean, 1 violation(s) found.
+Exit codes: 0 clean, 1 violation(s) found, 2 unrecognised command-line flag.
 
 Selftest: `--selftest` plants a tag-pinned `uses:` and asserts it is reported, so
-the guard is never trusted on the basis of having passed.
+the guard is never trusted on the basis of having passed. An unknown flag is
+REJECTED (exit 2) rather than ignored — `--selftesst` used to run the ordinary
+guard and exit 0, so an operator believed a selftest had run when none had.
 """
 
 from __future__ import annotations
@@ -136,7 +138,25 @@ def selftest() -> int:
     return 0
 
 
+# Every flag this script understands. An argv token starting with `-` that is not
+# here is a typo or a wrong assumption, and must not run the guard silently.
+KNOWN_FLAGS = {"--selftest"}
+
+
+def reject_unknown_flags(argv: list[str]) -> None:
+    """Exit 2 on any option-looking token that is not a real flag."""
+    unknown = [a for a in argv if a.startswith("-") and a not in KNOWN_FLAGS]
+    if unknown:
+        print(
+            f"{Path(__file__).name}: unrecognised option {unknown[0]!r}\n"
+            f"usage: {Path(__file__).name} [--selftest]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def main() -> int:
+    reject_unknown_flags(sys.argv[1:])
     if "--selftest" in sys.argv:
         return selftest()
     files = workflows()

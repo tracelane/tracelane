@@ -12,8 +12,8 @@
 //! fires `Decision::Warn { aft_id: "AFT-A2A-LIFECYCLE-001" }`.
 //!
 //! V1 ships the required-field check below as a live signature; full JSON Schema
-//! validation (via the `jsonschema` crate) is a scaffold gated behind an
-//! entitlement flag.
+//! full JSON-Schema validation (via the `jsonschema` crate) is not implemented.
+//! No entitlement gates this predictor — it runs for every tenant.
 
 use super::{Decision, PredictiveContext, Predictor};
 

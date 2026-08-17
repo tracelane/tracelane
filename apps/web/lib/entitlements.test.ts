@@ -45,10 +45,10 @@ describe("mergeOverrides (deny-overrides-grant primitive)", () => {
 		const base = { ...PLAN_ENTITLEMENTS.business };
 		const merged = mergeOverrides(base, {
 			byok_cmk: null,
-			eval_gates: undefined,
+			prompt_promotion_write: undefined,
 		});
 		expect(merged.byok_cmk).toBe(true);
-		expect(merged.eval_gates).toBe(true);
+		expect(merged.prompt_promotion_write).toBe(true);
 	});
 
 	it("coerces drizzle numeric strings to numbers for numeric fields", () => {

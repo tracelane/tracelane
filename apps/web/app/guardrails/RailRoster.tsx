@@ -83,7 +83,7 @@ function SortTh({
 }) {
 	const active = sort?.key === col;
 	return (
-		<th className="px-3 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+		<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 			<button
 				type="button"
 				onClick={() => onSort(col)}
@@ -133,15 +133,15 @@ export function RailRoster({
 	}, [byId, sort]);
 
 	return (
-		<div className="overflow-x-auto rounded-xl border border-line bg-surface">
+		<div className="overflow-x-auto rounded-lg border border-line bg-surface">
 			<table className="w-full text-sm">
 				<thead className="border-b border-line">
 					<tr>
-						<th className="w-8 py-3 pl-4" aria-label="Expand" />
-						<th className="px-3 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="w-8 py-1.5 pl-3" aria-label="Expand" />
+						<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Rail
 						</th>
-						<th className="px-3 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Action
 						</th>
 						<SortTh
@@ -190,7 +190,7 @@ function RailRow({
 				className="cursor-pointer align-top transition-colors hover:bg-surface-2/30"
 				onClick={() => setOpen((v) => !v)}
 			>
-				<td className="py-3 pl-4 pr-1">
+				<td className="py-2 pl-3 pr-3">
 					<button
 						type="button"
 						aria-expanded={open}
@@ -207,7 +207,7 @@ function RailRow({
 						</span>
 					</button>
 				</td>
-				<td className="px-3 py-3">
+				<td className="px-3 py-2">
 					<div className="flex items-center gap-2">
 						<span
 							className={`font-medium ${locked ? "text-ink-2" : "text-ink"}`}
@@ -216,7 +216,7 @@ function RailRow({
 						</span>
 						{locked && (
 							<span
-								className="inline-flex items-center gap-1 rounded bg-accent-soft px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent-ink"
+								className="inline-flex items-center gap-1 rounded bg-action-soft px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-action-ink"
 								title={
 									tier
 										? `Available on the ${tier} plan — upgrade to enable this rail.`
@@ -230,16 +230,16 @@ function RailRow({
 					</div>
 					<span className="font-mono text-[11px] text-ink-3">{m.id}</span>
 				</td>
-				<td className="px-3 py-3">
+				<td className="px-3 py-2">
 					<Badge tone={ACTION_TONE[m.action]}>{ACTION_LABEL[m.action]}</Badge>
 					<span className="ml-1 text-[10px] uppercase tracking-wide text-ink-3">
 						{m.side === "both" ? "req+resp" : m.side}
 					</span>
 				</td>
-				<td className="px-3 py-3 text-right font-mono tabular-nums text-ink">
+				<td className="px-3 py-2 text-right font-mono tabular-nums text-ink">
 					{live ? live.evaluations.toLocaleString() : "—"}
 				</td>
-				<td className="px-3 py-3 text-right">
+				<td className="px-3 py-2 text-right">
 					{live && live.blocks > 0 ? (
 						<Link
 							href={blockHref(range)}
@@ -255,7 +255,7 @@ function RailRow({
 						<span className="text-ink-3">—</span>
 					)}
 				</td>
-				<td className="px-3 py-3 text-right font-mono tabular-nums text-ink-2">
+				<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
 					{live ? `${live.p95_ms.toLocaleString()} ms` : "—"}
 				</td>
 			</tr>
@@ -263,7 +263,7 @@ function RailRow({
 			{open && (
 				<tr id={detailId} className="bg-surface-2/20">
 					<td />
-					<td colSpan={5} className="px-3 pb-4 pt-1">
+					<td colSpan={5} className="px-3 py-2">
 						<div className="max-w-3xl space-y-2 text-sm">
 							<p className="text-ink-2">{m.blurb}</p>
 							{locked && (

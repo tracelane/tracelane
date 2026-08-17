@@ -38,6 +38,24 @@ LABEL org.opencontainers.image.title="Tracelane Gateway" \
       org.opencontainers.image.description="The flight recorder for AI agents — Rust gateway" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/tracelane/tracelane"
+
+# ── DEPLOY PROVENANCE ────────────────────────────────────────────────────────────
+# Set ONLY by scripts/deploy/gateway.sh. Any other build — an ad-hoc
+# `docker compose build`, a manual `docker build` — leaves these EMPTY, and that
+# empty value is the signal.
+#
+# Earned 2026-08-10: a hand-rolled `tar -cf - crates/gateway crates/shared` push
+# rebuilt the gateway without the deploy script, so prod ran for hours on an image
+# with none of its own verification behind it — no source-marker, no /health proof,
+# no audit-live-proof, no rollback tag. The existing DEPLOYED_SHA.txt marker did not
+# catch it, because it is a file NEXT TO the source rather than a property of the
+# running image: it kept claiming a two-day-old sha for a freshly built container.
+# The only thing that surfaced it was a security scanner failing for an unrelated
+# reason. Ask the ARTIFACT, not the directory it was built from.
+ARG TRACELANE_DEPLOY_SHA=""
+ARG TRACELANE_DEPLOY_VIA=""
+LABEL org.tracelane.deploy.sha="$TRACELANE_DEPLOY_SHA" \
+      org.tracelane.deploy.via="$TRACELANE_DEPLOY_VIA"
 COPY --from=builder /gateway /usr/local/bin/gateway
 EXPOSE 8080
 ENV TRACELANE_PORT=8080 \

@@ -1,0 +1,125 @@
+---
+/**
+ * PricingTable — the price ladder, rendered by BOTH the homepage `#pricing` anchor and
+ * the `/pricing` route.
+ *
+ * ONE SOURCE, TWO SURFACES. `/pricing` did not exist before 2026-08-16 — it 404'd live
+ * while ADR-074 §10 listed it as must-have scope, and every "pricing" link on the site
+ * was a homepage anchor. The obvious fix (write a pricing page) would have created a
+ * SECOND copy of the ladder, and a price that appears in two places drifts: this repo
+ * already keeps `apps/docs/pricing.mdx`, `docs/product/SETTINGS.md` and the billing rules
+ * in a documented parallel-update set for exactly that reason.
+ *
+ * So the markup below is the homepage section, moved VERBATIM — not rewritten, not
+ * "improved". No number, claim, SLA, quota or disclaimer changed in the extraction. Any
+ * price change now edits one file and both surfaces move together.
+ *
+ * Copy locks apply here as everywhere: "tamper-evident", never "tamper-proof"; the
+ * regulatory language stays exactly as reviewed.
+ */
+interface Props {
+  /** Heading level. The homepage renders this as a SECTION (h2); /pricing is a PAGE
+   *  and must lead with an h1 — a page with no h1 is an accessibility and SEO defect,
+   *  and this one shipped exactly that way, because the markup was lifted verbatim
+   *  from a section and nothing re-examined the heading level on the way. */
+  as?: "h1" | "h2";
+}
+const { as: Heading = "h2" } = Astro.props;
+---
+
+  {/* ===== Pricing ===== */}
+  <section id="pricing" class="panel">
+    <div class="reveal max-w-2xl">
+      <Heading class="text-3xl sm:text-4xl text-fg">Pricing.</Heading>
+      <p class="mt-4 text-lg text-fg-muted">Open core. Self-host free forever. Hosted tiers start at $0.</p>
+    </div>
+
+    <div class="mt-14 grid gap-5 sm:grid-cols-2 md:grid-cols-3 reveal-group cards-hover">
+      <article class="glass p-6">
+        <h3 class="font-medium text-fg">OSS self-host</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$0</p>
+        <p class="mt-1 text-sm text-fg-subtle">Apache 2.0 · forever</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>Full Rust gateway · 30+ providers — 7 native adapters plus any OpenAI-compatible endpoint</li>
+          <li>ClickHouse + R2 storage</li>
+          <li>Tamper-evident audit ledger</li>
+          <li>Community Discord support</li>
+        </ul>
+      </article>
+
+      <article class="glass p-6">
+        <h3 class="font-medium text-fg">Free hosted</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$0</p>
+        <p class="mt-1 text-sm text-fg-subtle">10K traces / mo</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>Single workspace, 1 seat</li>
+          <li>7 days of queryable history · 60 RPM</li>
+          <li>Pre-flight policy checks</li>
+          <li>No credit card · no commercial use</li>
+        </ul>
+      </article>
+
+      <article class="glass p-6">
+        <h3 class="font-medium text-fg">Builder</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$59<span class="text-base text-fg-muted">/mo</span></p>
+        <p class="mt-1 text-sm text-fg-subtle">150K traces / mo · 1 seat</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>30 days of queryable history · 600 RPM</li>
+          <li>Guardrail verdict history (read-only)</li>
+          <li>Audit ledger + offline verify</li>
+          <li>Email support · 24h</li>
+        </ul>
+      </article>
+
+      <article class="rec-card glass p-6 relative">
+        <p class="absolute -top-3 left-6 px-2 text-xs font-mono text-pop lowercase" style="background:var(--color-bg-elevated)">recommended</p>
+        <h3 class="font-medium text-fg">Team</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$249<span class="text-base text-fg-muted">/mo</span></p>
+        <p class="mt-1 text-sm text-fg-subtle">1M traces / mo · 10 seats</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>90 days of queryable history</li>
+          <li>Pre-flight guardrail rails + tamper-evident promotion record</li>
+          <li>WorkOS SSO · 99% SLA</li>
+          <li>Slack support · 8h</li>
+        </ul>
+      </article>
+
+      <article class="glass p-6">
+        <h3 class="font-medium text-fg">Business</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$899<span class="text-base text-fg-muted">/mo</span></p>
+        <p class="mt-1 text-sm text-fg-subtle">5M traces / mo · 25 seats</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>180 days of queryable history</li>
+          <li>Inline heuristic guardrails (ML ensemble on the roadmap) · 99.9% SLA</li>
+          <li>WorkOS SSO</li>
+          <li>Dedicated Slack · 4h</li>
+        </ul>
+      </article>
+
+      <article class="glass p-6">
+        <h3 class="font-medium text-fg">Enterprise</h3>
+        <p class="mt-2 font-mono text-3xl text-fg">$2,999+<span class="text-base text-fg-muted">/mo</span></p>
+        <p class="mt-1 text-sm text-fg-subtle">25M+ traces · custom</p>
+        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+          <li>365 days of queryable history · custom seats</li>
+          <li>Region pinning (EU; US / IN on the roadmap)</li>
+          <li>BYOK + CMK self-service</li>
+          <li>1h SLA · dedicated CSM</li>
+        </ul>
+      </article>
+    </div>
+
+    <div class="mt-10 glass p-6">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <h3 class="font-medium text-fg">Tamper-evident agent ledger</h3>
+          <p class="mt-2 text-sm text-fg-muted leading-relaxed">
+            $999/mo add-on. SHA-256 hash chain + Ed25519-signed Merkle root, an Article 12 documentation pack, and an audit ledger kept for its full lifetime (no expiry clock). Tracelane enforces no per-tenant storage region today, signs no BAA, and makes no regulatory-conformance claim — the assessment remains yours. EU AI Act Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">details</a>).
+          </p>
+        </div>
+        <p class="font-mono text-2xl text-fg shrink-0">+$999<span class="text-base text-fg-muted">/mo</span></p>
+      </div>
+    </div>
+
+    <p class="mt-10 text-center text-sm text-fg-subtle">Metered in traces, not spans — one gateway call is one trace, and overage is $1.20 per 10K traces above your monthly quota. Need more seats than your plan includes? <a href="mailto:support@tracelane.dev?subject=Additional%20seats" class="underline decoration-fg-subtle hover:decoration-fg transition-colors">Talk to us</a>.</p>
+  </section>

@@ -12,7 +12,7 @@ Tracelane is five components in one monorepo:
 
 <CardGroup cols={2}>
   <Card title="Rust gateway" icon="bolt">
-    Axum + tokio. BYOK provider routing across 30+ LLM providers (6 native
+    Axum + tokio. BYOK provider routing across 30+ LLM providers (7 native
     adapters + any OpenAI-compatible endpoint). OTLP emit. Predictive layer
     inline (observe-first by default). Zero-allocation hot path. <code>crates/gateway/</code>
   </Card>
@@ -25,7 +25,7 @@ Tracelane is five components in one monorepo:
     <code>apps/web/</code>
   </Card>
   <Card title="TypeScript MCP server" icon="plug">
-    Read-only, tenant-scoped, OAuth 2.1, run from source today; <code>npx @tracelanedev/mcp</code> once published to npm.
+    Read-only, tenant-scoped, bearer-token auth. Run from source today; <code>npx @tracelanedev/mcp</code> once published to npm.
     <code>apps/mcp/</code>
   </Card>
   <Card title="Python eval orchestrator" icon="flask">

@@ -19,7 +19,7 @@ export function SegmentError({
 	reset: () => void;
 }) {
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<ErrorState
 				title="This view hit an error"
 				description="We couldn't load this data. It's usually transient — retry, and if it persists the gateway or trace store may be unavailable."
@@ -29,6 +29,6 @@ export function SegmentError({
 					</Button>
 				}
 			/>
-		</main>
+		</div>
 	);
 }

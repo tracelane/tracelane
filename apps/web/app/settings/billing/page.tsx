@@ -7,6 +7,8 @@
  */
 
 import { BillingPortalButton } from "@/components/settings/BillingPortalButton";
+import { PlansLink } from "@/components/settings/PlansLink";
+import { buildCard } from "@/components/settings/plan-catalog";
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
@@ -21,41 +23,19 @@ export const metadata: Metadata = { title: "Billing — Settings" };
 // "list price" suffix: the actual charge comes from Polar (the real billing
 // source); this label is informational and must not imply a confirmed charge.
 const PLAN_LABEL: Record<string, string> = {
+	free: "Free hosted — $0",
 	builder: "Builder — $59/mo list price",
 	team: "Team — $249/mo list price",
 	business: "Business — $899/mo list price",
 	enterprise: "Enterprise",
 };
 
-// Seat bullets are NOT hardcoded here — they're derived from resolveEntitlements()
-// so a per-workspace seat override is reflected in the UI (seat line injected
-// dynamically in BillingPage). Other feature bullets are static plan copy.
-const PLAN_FEATURES: Record<string, string[]> = {
-	builder: [
-		"30+-provider gateway",
-		"Full-fidelity traces (90-day hot)",
-		"Predictive guardrails (warn mode)",
-		"Prompt promotion (read-only)",
-	],
-	team: [
-		"Everything in Builder",
-		"Prompt promotion + eval gates",
-		"Auto-rollback workflow",
-		"Priority support",
-	],
-	business: [
-		"Everything in Team",
-		"Tamper-evident audit ledger",
-		"BYOK envelope encryption",
-		"SLO dashboards",
-	],
-	enterprise: [
-		"Everything in Business",
-		"SAML SSO",
-		"Dedicated support SLA",
-		"Audit add-on ($999/mo)",
-	],
-};
+// The per-plan bullet list was static prose and had drifted: it sold Builder as
+// "Full-fidelity traces (90-day hot)" while the entitlement map gives Builder
+// `retention_days: 30` and `f_full_capture: false`. It is now derived from the
+// SAME catalog the /plans ladder uses (`components/settings/plan-catalog.ts`),
+// off the RESOLVED entitlements — so the limits shown are this workspace's real
+// limits, overrides included, and a plan change cannot leave the copy behind.
 
 /**
  * Self-serve upgrade targets per current plan (Enterprise is sales-led — no
@@ -108,14 +88,14 @@ export default async function BillingPage() {
 	// dead legacy tenants.auditEnabled column (the invisible entitlement-gated UI bug class).
 	const ent = await resolveEntitlements(billing.id, plan as Plan);
 	const auditAddonActive = ent.audit_ledger;
-	const seatCap = ent.seat_cap_max;
-	const seatBullet =
-		seatCap === 0
-			? "Unlimited team members"
-			: seatCap === 1
-				? "1 team member"
-				: `Up to ${seatCap} team members`;
-	const features = [...(PLAN_FEATURES[plan] ?? []), seatBullet];
+	const card = buildCard(plan as Plan, ent);
+	const features = [
+		card.traces,
+		card.seats,
+		card.retention,
+		card.overage,
+		...card.features,
+	];
 	const hasBillingAccount = !!billing.polarCustomerId;
 	const upgradeTargets = UPGRADE_TARGETS[plan] ?? [];
 
@@ -123,8 +103,18 @@ export default async function BillingPage() {
 		<div className="space-y-6">
 			<div>
 				<h2 className="text-sm font-semibold text-ink">Current plan</h2>
+				{/* B-178: this said "take effect immediately via Polar webhook".
+				    Two different answers were being collapsed into one. The webhook
+				    writes the plan straight away and THIS page reads Postgres
+				    directly, so the dashboard is immediate — but the gateway serves
+				    entitlements from a cache whose TTL is the real bound on
+				    enforcement (15 minutes, and that is the bound now that the
+				    control-plane LISTEN is off by default). Saying "immediately"
+				    was true of the record and false of the thing customers care
+				    about, which is when their new limits actually apply. */}
 				<p className="text-xs text-ink-2 mt-0.5">
-					Plan changes take effect immediately via Polar webhook.
+					Plan changes are recorded here immediately. New limits apply to API
+					traffic within 15 minutes.
 				</p>
 			</div>
 
@@ -171,10 +161,11 @@ export default async function BillingPage() {
 			<div className="rounded-lg border border-line p-5 space-y-3">
 				<h3 className="text-sm font-medium text-ink">Upgrade your plan</h3>
 				<p className="text-xs text-ink-2">
-					Builder → Team unlocks Prompt Promotion, Eval Gates, and
-					Auto-Rollback. Team → Business adds the tamper-evident audit ledger
-					and BYOK. Business → Enterprise adds 25M+ traces, unlimited seats,
-					365-day retention, SSO, and a dedicated support SLA.
+					Builder → Team unlocks prompt authoring and promotion. Team → Business
+					adds BYOK and a higher trace allowance. Business → Enterprise adds
+					25M+ traces, unlimited seats, SSO, and a dedicated support SLA. The
+					tamper-evident audit ledger is a separate $999/mo add-on — it is not
+					bundled into any plan.
 				</p>
 				{upgradeTargets.length > 0 && (
 					<div className="flex flex-wrap gap-2 pt-1">
@@ -188,7 +179,7 @@ export default async function BillingPage() {
 							>
 								<button
 									type="submit"
-									className="px-3 py-1.5 rounded text-xs bg-accent text-accent-on hover:bg-accent/90 transition-colors"
+									className="px-3 py-1.5 rounded text-xs bg-action text-action-on hover:bg-action/90 transition-colors"
 								>
 									Upgrade to {TIER_NAME[tier] ?? tier}
 								</button>
@@ -216,17 +207,11 @@ export default async function BillingPage() {
 						Contact us — Enterprise
 					</a>
 				)}
-				{/* Marketing pricing is a homepage section (id="pricing"), not a
-				    standalone /pricing route — the latter 500s (CF Worker 1101).
-				    Link the working anchor. */}
-				<a
-					href="https://tracelane.dev/#pricing"
-					target="_blank"
-					rel="noopener noreferrer"
-					className="inline-block mt-1 text-xs text-ink-2 underline underline-offset-2 hover:text-ink transition-colors"
-				>
-					View all plans →
-				</a>
+				{/* SET-15: the plan comparison is IN the product now (/plans), derived
+				    from the entitlement map. It used to be an external link to the
+				    marketing homepage's #pricing section, which took the customer out
+				    of the dashboard to read figures no code check binds. */}
+				<PlansLink className="mt-1 inline-block text-xs text-ink-2 underline underline-offset-2 transition-colors hover:text-ink" />
 			</div>
 		</div>
 	);

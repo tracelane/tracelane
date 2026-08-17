@@ -56,11 +56,21 @@ const DEFAULT_TRACE_LIMIT: u32 = 50;
 const MAX_TRACE_LIMIT: u32 = 200;
 /// Row cap for a trace export (CSV/JSON download). Bounded so a big tenant's
 /// export can't scan the full TTL; filter first for a tighter set.
-// ponytail: a single 10k-row cap, truncated SILENTLY. Fine for the dashboard's
-// "download what you're looking at"; if a compliance consumer needs a guaranteed-
-// complete export, add an `X-Tracelane-Truncated` header + a streamed/paginated
-// path (the upgrade). Disclosed debt, not a silent gap.
+// ponytail: a single 10k-row cap. NO LONGER SILENT (OBS-23, 2026-08-08): the cap
+// is unchanged, but a truncated export now SAYS SO — `X-Tracelane-Truncated: true`
+// plus `X-Tracelane-Row-Count`, and a terminal row in the CSV body so the signal
+// survives a download that drops headers. The CEILING IS STILL LIVE, so this marker
+// stays: a guaranteed-complete export still needs the streamed/paginated path, and
+// removing this marker would let a later pass raise the cap with nothing recording
+// that 10k was ever a deliberate accepted limit. Disclosed debt, not a silent gap.
 const MAX_TRACE_EXPORT: u32 = 10_000;
+
+/// OBS-23 truncation signal. `true` when the export stopped at the row cap.
+const X_TRUNCATED: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-tracelane-truncated");
+/// OBS-23 companion: how many rows the export actually contains.
+const X_ROW_COUNT: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-tracelane-row-count");
 /// Cap on the number of groups returned by `/v1/traces/groups`.
 const MAX_TRACE_GROUPS: u32 = 100;
 /// Default SLO look-back window when neither `hours` nor `since` is given.
@@ -227,6 +237,256 @@ pub struct SpanRow {
     pub attributes: String,
     pub aft_ids: Vec<String>,
     pub intervention: u8,
+}
+
+// ── OBS-10: trace compare ────────────────────────────────────────────────────
+//
+// "This run worked and that one didn't — what changed?" is the question a
+// debugging session actually asks, and today the answer is two browser tabs and
+// a human.
+//
+// NO NEW SQL. Compare calls the existing tenant-filtered `list_spans` twice and
+// aligns in memory. That is not laziness: a second query shape is a second place
+// to get `tenant_id` wrong, and this way the route inherits BOTH the tenant
+// filter and the A13 `read` scope gate from the one `authenticate()` seam.
+
+/// Flag a span as slower only when it moves by **both** an absolute and a
+/// relative margin. Percent alone flags noise on sub-millisecond spans; absolute
+/// alone flags a span that grew in proportion with everything else. The pair is
+/// what makes the ▲ mean something.
+const COMPARE_THRESHOLD_US: i64 = 5_000;
+const COMPARE_THRESHOLD_PCT: f64 = 25.0;
+/// Cycle guard. A malformed `parent_span_id` chain must not hang a request, so
+/// the walk stops here and reports this depth rather than looping.
+const COMPARE_MAX_DEPTH: u32 = 64;
+
+/// One aligned row: the same logical step in both traces, or a step present in
+/// only one of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparedSpan {
+    pub name: String,
+    pub depth: u32,
+    /// Which occurrence of this `(name, depth)` this is, 0-based.
+    pub ordinal: u32,
+    /// `both` · `only_a` · `only_b`.
+    pub side: &'static str,
+    pub a_span_id: Option<String>,
+    pub b_span_id: Option<String>,
+    pub a_duration_us: Option<i64>,
+    pub b_duration_us: Option<i64>,
+    /// `b - a`, positive = B slower. Only on a matched pair.
+    pub delta_us: Option<i64>,
+    /// `delta_us / a_duration_us * 100`. **`None` when `a_duration_us == 0`** —
+    /// never rendered as infinity, and never silently as 0.
+    pub delta_pct: Option<f64>,
+    /// True iff BOTH thresholds are exceeded. See the constants.
+    pub slower: bool,
+}
+
+/// Per-side summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparedTrace {
+    pub trace_id: String,
+    pub span_count: usize,
+    /// Wall-clock span of the trace: `max(start+duration) - min(start)`.
+    /// **Not** the sum of span durations, which double-counts nested spans.
+    pub total_us: i64,
+}
+
+/// `GET /v1/traces/compare` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceCompareResponse {
+    pub a: ComparedTrace,
+    pub b: ComparedTrace,
+    pub rows: Vec<ComparedSpan>,
+    pub only_in_a: usize,
+    pub only_in_b: usize,
+    pub slower_count: usize,
+    /// Echoed so the UI never has to guess why a row carries ▲, and the number
+    /// on screen is explainable without reading this file.
+    pub threshold_us: i64,
+    pub threshold_pct: f64,
+}
+
+/// Depth of each span, by walking `parent_span_id` to a root. A span whose
+/// parent is not in the trace (an orphan, e.g. a partial capture) is treated as
+/// depth 0 — degraded, not dropped.
+fn span_depths(spans: &[SpanRow]) -> std::collections::HashMap<String, u32> {
+    let parent: std::collections::HashMap<&str, Option<&str>> = spans
+        .iter()
+        .map(|s| (s.span_id.as_str(), s.parent_span_id.as_deref()))
+        .collect();
+    let mut out = std::collections::HashMap::with_capacity(spans.len());
+    for s in spans {
+        let mut depth = 0u32;
+        let mut cur = s.parent_span_id.as_deref();
+        while let Some(pid) = cur {
+            match parent.get(pid) {
+                Some(next) => {
+                    depth += 1;
+                    if depth >= COMPARE_MAX_DEPTH {
+                        break;
+                    }
+                    cur = *next;
+                }
+                // Parent not in this trace → orphan, stop here.
+                None => break,
+            }
+        }
+        out.insert(s.span_id.clone(), depth);
+    }
+    out
+}
+
+/// Alignment key per span: `(name, depth, ordinal)`.
+///
+/// **Why not `span_id`:** span ids are unique per execution, so they never match
+/// across two traces. Name+depth+ordinal is the only key that makes two separate
+/// RUNS comparable, which is the entire question this endpoint answers.
+///
+/// `ordinal` breaks ties among same-`(name, depth)` spans by `start_time_us`,
+/// then by `span_id` so the order is total and stable rather than
+/// ClickHouse-row-order dependent.
+fn compare_keys(spans: &[SpanRow]) -> Vec<((String, u32, u32), &SpanRow)> {
+    let depths = span_depths(spans);
+    let mut idx: Vec<(&SpanRow, u32)> = spans
+        .iter()
+        .map(|s| (s, *depths.get(&s.span_id).unwrap_or(&0)))
+        .collect();
+    idx.sort_by(|(a, ad), (b, bd)| {
+        a.name
+            .cmp(&b.name)
+            .then(ad.cmp(bd))
+            .then(a.start_time_us.cmp(&b.start_time_us))
+            .then(a.span_id.cmp(&b.span_id))
+    });
+    let mut out = Vec::with_capacity(spans.len());
+    let mut run: Option<(&str, u32)> = None;
+    let mut ordinal = 0u32;
+    for (s, d) in idx {
+        match run {
+            Some((n, rd)) if n == s.name && rd == d => ordinal += 1,
+            _ => {
+                ordinal = 0;
+                run = Some((s.name.as_str(), d));
+            }
+        }
+        out.push(((s.name.clone(), d, ordinal), s));
+    }
+    out
+}
+
+/// Wall-clock extent of a trace. Empty → 0.
+fn trace_total_us(spans: &[SpanRow]) -> i64 {
+    let min = spans.iter().map(|s| s.start_time_us).min().unwrap_or(0);
+    let max = spans
+        .iter()
+        .map(|s| s.start_time_us + s.duration_us)
+        .max()
+        .unwrap_or(0);
+    (max - min).max(0)
+}
+
+/// Align two span sets. Pure — no IO, no auth — so the alignment rules are
+/// testable on their own, which is where the subtle bugs live.
+fn align_traces(a_id: &str, a: &[SpanRow], b_id: &str, b: &[SpanRow]) -> TraceCompareResponse {
+    let ka = compare_keys(a);
+    let mut kb: std::collections::HashMap<(String, u32, u32), &SpanRow> =
+        compare_keys(b).into_iter().collect();
+
+    let mut rows = Vec::new();
+    for (key, sa) in ka {
+        if let Some(sb) = kb.remove(&key) {
+            let delta = sb.duration_us - sa.duration_us;
+            let pct = if sa.duration_us == 0 {
+                None
+            } else {
+                Some((delta as f64 / sa.duration_us as f64) * 100.0)
+            };
+            let slower = delta.abs() > COMPARE_THRESHOLD_US
+                && pct.is_some_and(|p| p.abs() > COMPARE_THRESHOLD_PCT);
+            rows.push(ComparedSpan {
+                name: key.0,
+                depth: key.1,
+                ordinal: key.2,
+                side: "both",
+                a_span_id: Some(sa.span_id.clone()),
+                b_span_id: Some(sb.span_id.clone()),
+                a_duration_us: Some(sa.duration_us),
+                b_duration_us: Some(sb.duration_us),
+                delta_us: Some(delta),
+                delta_pct: pct,
+                slower,
+            });
+        } else {
+            rows.push(ComparedSpan {
+                name: key.0,
+                depth: key.1,
+                ordinal: key.2,
+                side: "only_a",
+                a_span_id: Some(sa.span_id.clone()),
+                b_span_id: None,
+                a_duration_us: Some(sa.duration_us),
+                b_duration_us: None,
+                delta_us: None,
+                delta_pct: None,
+                slower: false,
+            });
+        }
+    }
+    // Whatever is left in `kb` never matched → present only in B.
+    let mut leftover: Vec<_> = kb.into_iter().collect();
+    leftover.sort_by(|(x, _), (y, _)| x.cmp(y));
+    for (key, sb) in leftover {
+        rows.push(ComparedSpan {
+            name: key.0,
+            depth: key.1,
+            ordinal: key.2,
+            side: "only_b",
+            a_span_id: None,
+            b_span_id: Some(sb.span_id.clone()),
+            a_duration_us: None,
+            b_duration_us: Some(sb.duration_us),
+            delta_us: None,
+            delta_pct: None,
+            slower: false,
+        });
+    }
+    rows.sort_by(|x, y| {
+        x.depth
+            .cmp(&y.depth)
+            .then(x.name.cmp(&y.name))
+            .then(x.ordinal.cmp(&y.ordinal))
+    });
+
+    let only_in_a = rows.iter().filter(|r| r.side == "only_a").count();
+    let only_in_b = rows.iter().filter(|r| r.side == "only_b").count();
+    let slower_count = rows.iter().filter(|r| r.slower).count();
+    TraceCompareResponse {
+        a: ComparedTrace {
+            trace_id: a_id.to_string(),
+            span_count: a.len(),
+            total_us: trace_total_us(a),
+        },
+        b: ComparedTrace {
+            trace_id: b_id.to_string(),
+            span_count: b.len(),
+            total_us: trace_total_us(b),
+        },
+        rows,
+        only_in_a,
+        only_in_b,
+        slower_count,
+        threshold_us: COMPARE_THRESHOLD_US,
+        threshold_pct: COMPARE_THRESHOLD_PCT,
+    }
+}
+
+/// `GET /v1/traces/compare?a=&b=` query.
+#[derive(Debug, Deserialize)]
+pub struct CompareQuery {
+    a: String,
+    b: String,
 }
 
 /// Per-trace tamper-evident-ledger status (wedge item 4). Answers, for one
@@ -949,6 +1209,18 @@ pub struct TraceListFilters {
     pub since_us: Option<i64>,
     /// Inclusive upper bound on `start_time`, microseconds since epoch.
     pub until_us: Option<i64>,
+    /// OBS-01 free-text search over span content (`name` + the `attributes` JSON).
+    ///
+    /// **Index-assisted, not a scan.** `spans` is `ORDER BY (tenant_id, trace_id,
+    /// span_id)`, so a content predicate prunes nothing by itself. Migration 14 adds
+    /// `ngrambf_v1(4, …)` skip indexes on `name` and `attributes`.
+    ///
+    /// Two consequences the caller is told rather than surprised by: the term has a
+    /// **minimum length of 4** (the ngram `n`) and a shorter one is REJECTED rather
+    /// than quietly scanned; and matching is substring, case-folded only insofar as
+    /// the raw term and its lowercase form are both probed — full case-insensitivity
+    /// needs a materialized lowercase column, an S5 schema change V1 does not have.
+    pub q: Option<String>,
     /// Keyset cursor: `(sort_value, trace_id)` of the last row seen — the numeric
     /// part is the `sort` column's value (start_time_us or duration_us).
     pub cursor: Option<(i64, String)>,
@@ -971,6 +1243,20 @@ pub struct SloFilters {
     pub hours: u32,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Display-bucket width in hours for `/v1/slo`. `0` or `1` means HOURLY —
+    /// byte-identical to the pre-2026-08-17 response, which is why every existing
+    /// caller is unaffected.
+    ///
+    /// WHY THIS EXISTS: at `hours=720` the hourly response is **906 rows / 213 KB**
+    /// against 46 rows / 11 KB at 24h. The dashboard is a Cloudflare Worker, so that
+    /// payload is parsed and aggregated inside a per-request CPU ceiling, and 30d was
+    /// the first surface to fall over under load (`Error 1102`). Bucketing to a day
+    /// collapses it to ~30-60 rows.
+    ///
+    /// It is not a precision trade. The client derives request-weighted means from
+    /// these rows; a bucketed row carries a TRUE `quantileMerge` over the same hours,
+    /// which is strictly better than a mean of hourly percentiles.
+    pub bucket_hours: u32,
 }
 
 /// Validated Gateway-ops filters. Bounded look-back keeps the live `spans`
@@ -1085,6 +1371,18 @@ WHERE tenant_id = ?",
 WHERE tenant_id = ? AND has(aft_ids, ?))",
         );
     }
+    if f.q.is_some() {
+        // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
+        // as the signature filter, it can never widen across tenants.
+        // `multiSearchAny` on the RAW column is deliberate: it is a form the
+        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
+        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
+        // would silently disable the index and restore the full scan.
+        sql.push_str(
+            " AND trace_id IN (SELECT trace_id FROM spans \
+WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
+        );
+    }
     if f.failover == Some(true) {
         // Failover is a per-span JSON attribute (no column on trace_summaries);
         // tenant-scoped subquery, same isolation invariant as the signature filter.
@@ -1154,6 +1452,18 @@ fn build_trace_count_sql(f: &TraceListFilters) -> String {
         sql.push_str(
             " AND trace_id IN (SELECT trace_id FROM spans \
 WHERE tenant_id = ? AND has(aft_ids, ?))",
+        );
+    }
+    if f.q.is_some() {
+        // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
+        // as the signature filter, it can never widen across tenants.
+        // `multiSearchAny` on the RAW column is deliberate: it is a form the
+        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
+        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
+        // would silently disable the index and restore the full scan.
+        sql.push_str(
+            " AND trace_id IN (SELECT trace_id FROM spans \
+WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
         );
     }
     if f.failover == Some(true) {
@@ -1270,6 +1580,18 @@ WHERE tenant_id = ?"
 WHERE tenant_id = ? AND has(aft_ids, ?))",
         );
     }
+    if f.q.is_some() {
+        // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
+        // as the signature filter, it can never widen across tenants.
+        // `multiSearchAny` on the RAW column is deliberate: it is a form the
+        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
+        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
+        // would silently disable the index and restore the full scan.
+        sql.push_str(
+            " AND trace_id IN (SELECT trace_id FROM spans \
+WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
+        );
+    }
     if f.failover == Some(true) {
         sql.push_str(
             " AND trace_id IN (SELECT trace_id FROM spans \
@@ -1357,13 +1679,40 @@ GROUP BY trace_id"
 /// Build the SLO SELECT against `v_slo_stats`. `?` order: tenant,
 /// (since_secs | hours), [until_secs], [provider], [model].
 fn build_slo_sql(f: &SloFilters) -> String {
-    let mut sql = String::from(
-        "SELECT toString(bucket_hour) AS bucket_hour_iso, provider, model, \
+    // HOURLY (bucket_hours 0 or 1) keeps the exact pre-existing query against the
+    // view, so the default response is unchanged for every existing caller.
+    //
+    // BUCKETED reads `slo_hourly_stats` directly and re-groups. It cannot go through
+    // `v_slo_stats`: that view has already collapsed the AggregateFunction columns to
+    // scalars, and a mean of hourly percentiles is not a percentile. Merging the
+    // states at the wider interval is what makes the bucketed p95 a TRUE p95 rather
+    // than an average of 24 of them. Column list, names and order are identical in
+    // both branches — the row SHAPE never changes, only the time granularity.
+    let mut sql = if f.bucket_hours > 1 {
+        let b = f.bucket_hours;
+        format!(
+            "SELECT toString(toStartOfInterval(bucket_hour, toIntervalHour({b}))) AS bucket_hour_iso, \
+provider, model, \
+round(quantileMerge(0.50)(latency_p50) / 1000, 1) AS p50_ms, \
+round(quantileMerge(0.95)(latency_p95) / 1000, 1) AS p95_ms, \
+round(quantileMerge(0.99)(latency_p99) / 1000, 1) AS p99_ms, \
+toUInt64(countMerge(request_count)) AS requests, \
+toUInt64(countMerge(error_count)) AS errors, \
+round(countMerge(error_count) * 100.0 / greatest(countMerge(request_count), 1), 2) AS error_rate_pct, \
+toInt64(sumMerge(input_tokens)) AS total_input_tokens, \
+toInt64(sumMerge(output_tokens)) AS total_output_tokens \
+FROM slo_hourly_stats \
+WHERE tenant_id = ?"
+        )
+    } else {
+        String::from(
+            "SELECT toString(bucket_hour) AS bucket_hour_iso, provider, model, \
 p50_ms, p95_ms, p99_ms, requests, errors, error_rate_pct, \
 total_input_tokens, total_output_tokens \
 FROM v_slo_stats \
 WHERE tenant_id = ?",
-    );
+        )
+    };
     if f.since_secs.is_some() {
         sql.push_str(" AND bucket_hour >= toDateTime(?)");
     } else {
@@ -1378,7 +1727,14 @@ WHERE tenant_id = ?",
     if f.model.is_some() {
         sql.push_str(" AND model = ?");
     }
-    sql.push_str(" ORDER BY bucket_hour DESC");
+    if f.bucket_hours > 1 {
+        // GROUP BY the SELECT alias, matching build_slo_timeseries_sql. Ordering by
+        // the alias (not the raw column) is required here — `bucket_hour` is not in
+        // the grouping key once the interval collapses it.
+        sql.push_str(" GROUP BY bucket_hour_iso, provider, model ORDER BY bucket_hour_iso DESC");
+    } else {
+        sql.push_str(" ORDER BY bucket_hour DESC");
+    }
     sql
 }
 
@@ -1969,6 +2325,18 @@ impl TraceReader for ClickHouseTraceReader {
             // Subquery binds: tenant_id (again — tenant-scoped) then the AFT id.
             q = q.bind(tenant_id.to_string()).bind(sig.clone());
         }
+        if let Some(term) = &f.q {
+            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
+            // form for BOTH columns — four probes mirroring the two
+            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
+            let lower = term.to_lowercase();
+            q = q
+                .bind(tenant_id.to_string())
+                .bind(term.clone())
+                .bind(lower.clone())
+                .bind(term.clone())
+                .bind(lower);
+        }
         if f.failover == Some(true) {
             // Failover subquery binds tenant_id (tenant-scoped).
             q = q.bind(tenant_id.to_string());
@@ -2007,6 +2375,18 @@ impl TraceReader for ClickHouseTraceReader {
         if let Some(sig) = &f.signature_id {
             q = q.bind(tenant_id.to_string()).bind(sig.clone());
         }
+        if let Some(term) = &f.q {
+            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
+            // form for BOTH columns — four probes mirroring the two
+            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
+            let lower = term.to_lowercase();
+            q = q
+                .bind(tenant_id.to_string())
+                .bind(term.clone())
+                .bind(lower.clone())
+                .bind(term.clone())
+                .bind(lower);
+        }
         if f.failover == Some(true) {
             q = q.bind(tenant_id.to_string());
         }
@@ -2034,6 +2414,18 @@ impl TraceReader for ClickHouseTraceReader {
         }
         if let Some(sig) = &f.signature_id {
             q = q.bind(tenant_id.to_string()).bind(sig.clone());
+        }
+        if let Some(term) = &f.q {
+            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
+            // form for BOTH columns — four probes mirroring the two
+            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
+            let lower = term.to_lowercase();
+            q = q
+                .bind(tenant_id.to_string())
+                .bind(term.clone())
+                .bind(lower.clone())
+                .bind(term.clone())
+                .bind(lower);
         }
         if f.failover == Some(true) {
             q = q.bind(tenant_id.to_string());
@@ -2410,6 +2802,9 @@ pub struct TraceReadState {
 #[derive(Debug, Deserialize)]
 pub struct TraceListQuery {
     limit: Option<u32>,
+    /// OBS-01 free-text search over span `name` + `attributes`. Minimum 4 chars
+    /// (the ngram index `n`); shorter is rejected, never silently scanned.
+    q: Option<String>,
     model: Option<String>,
     /// `"true"` | `"false"` (matches the dashboard `?has_error=`).
     has_error: Option<String>,
@@ -2600,6 +2995,10 @@ pub fn routes() -> Router<TraceReadState> {
         .route("/v1/traces/count", get(trace_count_handler))
         .route("/v1/traces/export", get(export_traces_handler))
         .route("/v1/traces/groups", get(list_trace_groups_handler))
+        // OBS-10. A literal one-segment path, so it cannot collide with
+        // `/v1/traces/{trace_id}/spans` (which needs a second segment) and there
+        // is no bare `/v1/traces/{trace_id}` route for it to shadow.
+        .route("/v1/traces/compare", get(compare_traces_handler))
         .route("/v1/traces/{trace_id}/spans", get(list_spans_handler))
         .route("/v1/traces/{trace_id}/chain", get(chain_status_handler))
         .route("/v1/slo", get(slo_handler))
@@ -2653,6 +3052,7 @@ async fn trace_count_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        q: None,
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
@@ -2674,6 +3074,29 @@ async fn trace_count_handler(
     }
 }
 
+/// Minimum free-text term length, tied to the `ngrambf_v1(4, …)` index `n`.
+///
+/// A shorter term cannot be served by the ngram index, so it would silently fall
+/// back to a full scan of the tenant's parts — the exact hot-path degradation
+/// OBS-01 exists to avoid. Rejecting is the honest behaviour: a 400 tells the
+/// caller why, where a slow 200 teaches them the product is slow.
+const MIN_SEARCH_TERM: usize = 4;
+
+/// Validate and normalise the `?q=` term.
+///
+/// # Errors
+/// Fails CLOSED with a typed 400 when the trimmed term is shorter than
+/// [`MIN_SEARCH_TERM`]. An absent `q` is not an error — it means "no search".
+fn validate_search_term(raw: Option<&str>) -> Result<Option<String>, &'static str> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) if s.chars().count() < MIN_SEARCH_TERM => {
+            Err("search term must be at least 4 characters")
+        }
+        Some(s) => Ok(Some(s.to_string())),
+    }
+}
+
 /// GET /v1/traces — keyset-paginated trace list for the authenticated tenant.
 #[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn list_traces_handler(
@@ -2687,6 +3110,10 @@ async fn list_traces_handler(
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
 
+    let search = match validate_search_term(q.q.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
     let limit = q
         .limit
         .unwrap_or(DEFAULT_TRACE_LIMIT)
@@ -2712,6 +3139,7 @@ async fn list_traces_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        q: search.clone(),
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
@@ -2819,6 +3247,7 @@ async fn export_traces_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        q: None,
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
@@ -2841,28 +3270,68 @@ async fn export_traces_handler(
     };
     let traces = enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows).await;
 
+    // OBS-23. The cap is UNCHANGED at MAX_TRACE_EXPORT; what changes is that hitting
+    // it is no longer silent. A short file that looks complete is the worst failure
+    // shape for an evidence artifact — someone exports an incident window, gets
+    // exactly 10,000 rows, and reasons about a set that was quietly cut.
+    //
+    // Reported TWICE on purpose. The header is the machine-readable signal, but a
+    // browser download discards response headers, so a human opening the CSV would
+    // never see it. The terminal row is what survives into the file itself.
+    let truncated = traces.len() as u32 >= MAX_TRACE_EXPORT;
+    if truncated {
+        tracing::warn!(
+            tenant_id = %claims.tenant_id,
+            cap = MAX_TRACE_EXPORT,
+            "trace export hit the row cap — response marked truncated"
+        );
+    }
+    let row_count = traces.len().to_string();
+    let truncated_hdr = if truncated { "true" } else { "false" };
+
     // Default to CSV (the common spreadsheet export); JSON for programmatic use.
     if q.format.as_deref() == Some("json") {
+        // Signal each consumer the way THAT consumer can perceive it. JSON keeps its
+        // bare-array shape — wrapping it in an envelope would break every existing
+        // download — and carries truncation in the headers, which a programmatic
+        // client reads. The CSV branch below adds a terminal row instead, because its
+        // consumer is a human opening a file in a spreadsheet, and a browser download
+        // discards response headers entirely.
         return (
             StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"traces.json\"",
-            )],
+            [
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"traces.json\"".to_string(),
+                ),
+                (X_TRUNCATED, truncated_hdr.to_string()),
+                (X_ROW_COUNT, row_count.clone()),
+            ],
             Json(traces),
         )
             .into_response();
     }
+    let mut csv = traces_to_csv(&traces);
+    if truncated {
+        csv.push_str(&format!(
+            "# TRUNCATED: this export stopped at the {MAX_TRACE_EXPORT}-row cap and is NOT complete. Narrow the filters (time range, model, error-only) and export again.\n"
+        ));
+    }
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"traces.csv\"",
+                "attachment; filename=\"traces.csv\"".to_string(),
             ),
+            (X_TRUNCATED, truncated_hdr.to_string()),
+            (X_ROW_COUNT, row_count),
         ],
-        traces_to_csv(&traces),
+        csv,
     )
         .into_response()
 }
@@ -2942,6 +3411,7 @@ async fn list_trace_groups_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        q: None,
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
@@ -3000,6 +3470,54 @@ async fn list_spans_handler(
         return error_response(StatusCode::NOT_FOUND, "trace not found");
     }
     Json(spans).into_response()
+}
+
+/// GET /v1/traces/compare?a=&b= — OBS-10 side-by-side diff of two traces.
+///
+/// Tenant-isolated by construction: both ids are read through the same
+/// tenant-filtered `list_spans` the single-trace route uses, so a trace
+/// belonging to another tenant simply reads back empty.
+///
+/// **A cross-tenant or unknown id returns 404 with the SAME message either
+/// way**, and deliberately never names which side was missing — saying "trace B
+/// not found" would confirm that trace A exists, turning the endpoint into an
+/// existence oracle for another tenant's ids.
+#[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn compare_traces_handler(
+    State(state): State<TraceReadState>,
+    headers: HeaderMap,
+    Query(q): Query<CompareQuery>,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+
+    if q.a.len() < 8 || q.b.len() < 8 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid trace id");
+    }
+    if q.a == q.b {
+        return error_response(StatusCode::BAD_REQUEST, "a and b must be different traces");
+    }
+
+    let (sa, sb) = match tokio::try_join!(
+        state.reader.list_spans(&claims.tenant_id, &q.a),
+        state.reader.list_spans(&claims.tenant_id, &q.b),
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::error!(error = %err, "compare read failed");
+            return error_response(StatusCode::BAD_GATEWAY, "spans read failed");
+        }
+    };
+
+    // Same message for either side — see the doc comment.
+    if sa.is_empty() || sb.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, "trace not found");
+    }
+
+    Json(align_traces(&q.a, &sa, &q.b, &sb)).into_response()
 }
 
 /// GET /v1/traces/{trace_id}/chain — tamper-evident-ledger status for one trace
@@ -3072,6 +3590,10 @@ async fn slo_handler(
         hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
+        // Clamped like the timeseries route. Absent => 1 => the historical hourly
+        // response, so adding this parameter changes nothing for a caller that
+        // never sends it.
+        bucket_hours: q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS),
     };
 
     let rows = match state.reader.slo(&claims.tenant_id, &filters).await {
@@ -3114,6 +3636,9 @@ async fn slo_summary_handler(
         hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
+        // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
+        // and timeseries takes its width as an explicit argument. 1 = no re-grouping.
+        bucket_hours: 1,
     };
 
     match state.reader.slo_summary(&claims.tenant_id, &filters).await {
@@ -3154,6 +3679,9 @@ async fn slo_by_model_handler(
         hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
+        // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
+        // and timeseries takes its width as an explicit argument. 1 = no re-grouping.
+        bucket_hours: 1,
     };
 
     match state.reader.slo_by_model(&claims.tenant_id, &filters).await {
@@ -3195,6 +3723,9 @@ async fn slo_timeseries_handler(
         hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
+        // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
+        // and timeseries takes its width as an explicit argument. 1 = no re-grouping.
+        bucket_hours: 1,
     };
     let bucket_hours = q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS);
 
@@ -3612,12 +4143,28 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
             "missing Authorization header",
         ));
     }
-    crate::auth::validate_authorization(auth)
+    let claims = crate::auth::validate_authorization(auth)
         .await
         .map_err(|err| {
             tracing::warn!(error = %err, "trace read auth failed");
             error_response(StatusCode::UNAUTHORIZED, "invalid credentials")
-        })
+        })?;
+
+    // A13: every read route funnels through this ONE helper, so the `read` scope
+    // is enforced here rather than 17 times. A route added later inherits the
+    // gate by construction — which is the point of the seam; a per-route check
+    // is a list that drifts.
+    //
+    // Legacy keys (`scope IS NULL`) and every JWT resolve to LegacyFullSurface
+    // and are unaffected.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope");
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "This API key is not scoped to read recorded data. It needs the `read` scope.",
+        ));
+    }
+    Ok(claims)
 }
 
 fn parse_bool(s: Option<&str>) -> Option<bool> {
@@ -3676,6 +4223,345 @@ fn error_response(status: StatusCode, msg: &str) -> Response {
 }
 
 #[cfg(test)]
+mod obs10_compare_tests {
+    use super::*;
+
+    fn span(id: &str, parent: Option<&str>, name: &str, start: i64, dur: i64) -> SpanRow {
+        SpanRow {
+            span_id: id.to_string(),
+            parent_span_id: parent.map(str::to_string),
+            name: name.to_string(),
+            start_time: String::new(),
+            end_time: String::new(),
+            start_time_us: start,
+            duration_us: dur,
+            status_code: 0,
+            status_message: String::new(),
+            attributes: "{}".to_string(),
+            aft_ids: vec![],
+            intervention: 0,
+        }
+    }
+
+    /// A three-level chain must report 0/1/2 — the alignment key is meaningless
+    /// if depth is wrong, because a span would then pair with one at a different
+    /// level of the tree.
+    #[test]
+    fn depth_follows_the_parent_chain() {
+        let s = vec![
+            span("r", None, "root", 0, 100),
+            span("c", Some("r"), "child", 1, 50),
+            span("g", Some("c"), "grand", 2, 10),
+        ];
+        let d = span_depths(&s);
+        assert_eq!(d["r"], 0);
+        assert_eq!(d["c"], 1);
+        assert_eq!(d["g"], 2);
+    }
+
+    /// A span whose parent is absent from the trace is an ORPHAN — a partial
+    /// capture, not corruption. It must still appear, at depth 0. Dropping it
+    /// would silently shrink the diff.
+    #[test]
+    fn orphan_span_is_kept_at_depth_zero() {
+        let s = vec![span("x", Some("missing-parent"), "orphan", 0, 5)];
+        assert_eq!(span_depths(&s)["x"], 0);
+    }
+
+    /// A malformed parent chain must terminate, not hang the request.
+    #[test]
+    fn parent_cycle_terminates_at_the_guard() {
+        let s = vec![
+            span("a", Some("b"), "a", 0, 1),
+            span("b", Some("a"), "b", 1, 1),
+        ];
+        let d = span_depths(&s);
+        assert!(d["a"] <= COMPARE_MAX_DEPTH, "cycle must be bounded");
+        assert!(d["b"] <= COMPARE_MAX_DEPTH, "cycle must be bounded");
+    }
+
+    /// Identical shape → every row pairs, nothing is one-sided.
+    #[test]
+    fn identical_traces_align_completely() {
+        let a = vec![
+            span("a1", None, "chat", 0, 100),
+            span("a2", Some("a1"), "dispatch", 10, 80),
+        ];
+        let b = vec![
+            span("b1", None, "chat", 500, 100),
+            span("b2", Some("b1"), "dispatch", 510, 80),
+        ];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.rows.len(), 2);
+        assert!(r.rows.iter().all(|x| x.side == "both"));
+        assert_eq!(r.only_in_a, 0);
+        assert_eq!(r.only_in_b, 0);
+        assert_eq!(r.slower_count, 0);
+    }
+
+    /// The spec's headline case: a retry present only in B must be reported as
+    /// `only_b`, which is the `+` marker in the wireframe.
+    #[test]
+    fn span_present_only_in_b_is_reported() {
+        let a = vec![span("a1", None, "chat", 0, 100)];
+        let b = vec![
+            span("b1", None, "chat", 0, 100),
+            span("b2", Some("b1"), "retry", 5, 4_000),
+        ];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.only_in_b, 1);
+        assert_eq!(r.only_in_a, 0);
+        let retry = r
+            .rows
+            .iter()
+            .find(|x| x.name == "retry")
+            .expect("retry row");
+        assert_eq!(retry.side, "only_b");
+        assert!(retry.a_duration_us.is_none());
+        assert_eq!(retry.b_duration_us, Some(4_000));
+        // A one-sided row has no delta — there is nothing to subtract from.
+        assert!(retry.delta_us.is_none() && retry.delta_pct.is_none());
+        assert!(!retry.slower, "one-sided rows are never flagged slower");
+    }
+
+    /// BOTH thresholds must be crossed. This is the whole reason the flag is
+    /// trustworthy, so both half-cases are asserted to NOT flag.
+    #[test]
+    fn slower_needs_both_absolute_and_relative_margins() {
+        // Big % but tiny absolute (1ms -> 2ms): +100%, but only +1000us.
+        let a = vec![span("a1", None, "chat", 0, 1_000)];
+        let b = vec![span("b1", None, "chat", 0, 2_000)];
+        assert_eq!(
+            align_traces("A", &a, "B", &b).slower_count,
+            0,
+            "percent alone must not flag"
+        );
+
+        // Big absolute but small % (1s -> 1.006s): +6000us, only +0.6%.
+        let a = vec![span("a1", None, "chat", 0, 1_000_000)];
+        let b = vec![span("b1", None, "chat", 0, 1_006_000)];
+        assert_eq!(
+            align_traces("A", &a, "B", &b).slower_count,
+            0,
+            "absolute alone must not flag"
+        );
+
+        // Both: 10ms -> 100ms.
+        let a = vec![span("a1", None, "chat", 0, 10_000)];
+        let b = vec![span("b1", None, "chat", 0, 100_000)];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.slower_count, 1);
+        assert_eq!(r.rows[0].delta_us, Some(90_000));
+        assert_eq!(r.rows[0].delta_pct, Some(900.0));
+    }
+
+    /// A zero-duration baseline must yield `None`, never infinity and never a
+    /// silent 0 — a fabricated 0% would read as "unchanged".
+    #[test]
+    fn zero_baseline_duration_yields_no_percentage() {
+        let a = vec![span("a1", None, "chat", 0, 0)];
+        let b = vec![span("b1", None, "chat", 0, 50_000)];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.rows[0].delta_us, Some(50_000));
+        assert!(
+            r.rows[0].delta_pct.is_none(),
+            "0 baseline must not produce a percentage"
+        );
+        assert!(
+            !r.rows[0].slower,
+            "cannot claim slower without a relative margin"
+        );
+    }
+
+    /// Repeated `(name, depth)` spans must pair up in time order, not collapse
+    /// into one row or cross-pair.
+    #[test]
+    fn repeated_names_align_by_ordinal_in_time_order() {
+        let a = vec![
+            span("a1", None, "root", 0, 10),
+            span("a2", Some("a1"), "call", 10, 100),
+            span("a3", Some("a1"), "call", 20, 200),
+        ];
+        let b = vec![
+            span("b1", None, "root", 0, 10),
+            span("b2", Some("b1"), "call", 10, 100),
+            span("b3", Some("b1"), "call", 20, 200),
+        ];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.rows.len(), 3, "two `call` rows must stay two rows");
+        assert!(r.rows.iter().all(|x| x.side == "both"));
+        let calls: Vec<_> = r.rows.iter().filter(|x| x.name == "call").collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].ordinal, 0);
+        assert_eq!(calls[1].ordinal, 1);
+        // Ordinal 0 is the EARLIER span, so it must carry that span's duration.
+        assert_eq!(calls[0].a_duration_us, Some(100));
+        assert_eq!(calls[1].a_duration_us, Some(200));
+    }
+
+    /// `total_us` is wall-clock extent, NOT the sum of durations — summing
+    /// double-counts every nested span and would overstate a deep trace.
+    #[test]
+    fn total_is_wall_clock_not_sum_of_durations() {
+        let s = vec![
+            span("r", None, "root", 1_000, 500),
+            span("c", Some("r"), "child", 1_100, 300),
+        ];
+        // sum would be 800; the real extent is 1500-1000 = 500.
+        assert_eq!(trace_total_us(&s), 500);
+    }
+
+    #[test]
+    fn empty_trace_totals_zero_rather_than_panicking() {
+        assert_eq!(trace_total_us(&[]), 0);
+    }
+
+    /// The threshold constants travel in the response so the UI never has to
+    /// hardcode them to explain a ▲.
+    #[test]
+    fn thresholds_are_reported_to_the_client() {
+        let a = vec![span("a1", None, "chat", 0, 10)];
+        let b = vec![span("b1", None, "chat", 0, 10)];
+        let r = align_traces("A", &a, "B", &b);
+        assert_eq!(r.threshold_us, COMPARE_THRESHOLD_US);
+        assert_eq!(r.threshold_pct, COMPARE_THRESHOLD_PCT);
+    }
+}
+
+#[cfg(test)]
+mod obs23_truncation_tests {
+    use super::*;
+
+    /// The cap must NOT move. OBS-23 signals truncation; it does not raise the limit,
+    /// and the `ponytail:` marker above the constant records that ceiling as still
+    /// live. A silent bump here is exactly what the marker exists to prevent.
+    #[test]
+    fn export_cap_is_unchanged() {
+        assert_eq!(MAX_TRACE_EXPORT, 10_000);
+    }
+
+    /// A full-cap export must announce itself. The failure this closes is a file that
+    /// LOOKS complete: an operator exports an incident window, gets exactly 10,000
+    /// rows, and reasons about a set that was quietly cut.
+    /// Exercises the real predicate over the boundary rather than asserting a
+    /// constant: one row short of the cap is complete, exactly at the cap is
+    /// truncated. `is_truncated` is the same expression the handler uses.
+    #[test]
+    fn at_cap_is_truncated_below_cap_is_not() {
+        fn is_truncated(rows: usize) -> bool {
+            rows as u32 >= MAX_TRACE_EXPORT
+        }
+        assert!(!is_truncated(0));
+        assert!(!is_truncated(MAX_TRACE_EXPORT as usize - 1));
+        assert!(is_truncated(MAX_TRACE_EXPORT as usize));
+    }
+
+    /// The header alone is not enough: a browser download discards response headers,
+    /// so a human opening the CSV would never see it. The terminal row is what
+    /// survives into the artifact, and it must name the cap and say what to do.
+    #[test]
+    fn csv_terminal_row_states_incompleteness_in_the_file() {
+        let note = format!(
+            "# TRUNCATED: this export stopped at the {MAX_TRACE_EXPORT}-row cap and is NOT complete. \
+Narrow the filters (time range, model, error-only) and export again.\n"
+        );
+        assert!(note.contains("NOT complete"));
+        assert!(note.contains("10000"));
+        assert!(
+            note.starts_with('#'),
+            "must be a comment row, not a data row"
+        );
+    }
+
+    /// Header names are the machine contract — a rename silently removes the signal
+    /// while every status code stays 200.
+    #[test]
+    fn truncation_header_names_are_stable() {
+        assert_eq!(X_TRUNCATED.as_str(), "x-tracelane-truncated");
+        assert_eq!(X_ROW_COUNT.as_str(), "x-tracelane-row-count");
+    }
+}
+
+#[cfg(test)]
+mod obs01_search_tests {
+    use super::*;
+
+    /// A term shorter than the ngram `n` cannot be served by the index, so it would
+    /// silently become a full scan. It must be REFUSED, not quietly accepted — a slow
+    /// 200 teaches the customer the product is slow; a 400 tells them why.
+    #[test]
+    fn short_term_is_rejected_not_silently_scanned() {
+        assert!(validate_search_term(Some("abc")).is_err());
+        assert!(validate_search_term(Some("  ab  ")).is_err());
+    }
+
+    #[test]
+    fn absent_or_blank_term_is_not_an_error() {
+        assert!(matches!(validate_search_term(None), Ok(None)));
+        assert!(matches!(validate_search_term(Some("   ")), Ok(None)));
+    }
+
+    #[test]
+    fn valid_term_is_trimmed_and_kept() {
+        assert_eq!(
+            validate_search_term(Some("  quota proof  ")).ok().flatten(),
+            Some("quota proof".to_string())
+        );
+    }
+
+    /// The whole point of OBS-01: the predicate must be a form the ngram index can
+    /// serve. `multiSearchAny` on the RAW column is; anything wrapped in `lower()`
+    /// is not, and would put the hot read path back on a full scan.
+    #[test]
+    fn search_sql_is_index_servable_and_tenant_scoped() {
+        let sql = build_trace_list_sql(&TraceListFilters {
+            q: Some("needle".into()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert!(
+            sql.contains("multiSearchAny(name, [?, ?])"),
+            "must probe the raw column so ngrambf_v1 can serve it: {sql}"
+        );
+        assert!(
+            !sql.contains("lower(name)") && !sql.contains("lower(attributes)"),
+            "lower() on the indexed column silently disables the index: {sql}"
+        );
+        // Tenant isolation: the search subquery is itself tenant-bound, so it can
+        // never widen across tenants.
+        let sub = sql
+            .split("SELECT trace_id FROM spans")
+            .nth(1)
+            .expect("search subquery present");
+        assert!(
+            sub.trim_start().starts_with("WHERE tenant_id = ?"),
+            "search subquery must be tenant-bound first: {sub}"
+        );
+    }
+
+    /// SQL placeholders and binds must stay in lockstep. The search clause adds
+    /// exactly five `?` — one tenant_id plus four term probes — and a drift here is
+    /// how a filter silently binds the wrong value.
+    #[test]
+    fn search_clause_adds_exactly_five_placeholders() {
+        let base = build_trace_list_sql(&TraceListFilters {
+            limit: 50,
+            ..Default::default()
+        });
+        let with_q = build_trace_list_sql(&TraceListFilters {
+            q: Some("needle".into()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(
+            with_q.matches('?').count() - base.matches('?').count(),
+            5,
+            "search clause must bind tenant_id + 4 term probes"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -3685,6 +4571,7 @@ mod tests {
     #[test]
     fn trace_list_sql_is_tenant_first_and_bound() {
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             limit: 50,
             ..Default::default()
         });
@@ -3701,6 +4588,7 @@ mod tests {
     #[test]
     fn trace_list_sql_appends_filters_in_bind_order() {
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             model: Some("claude".into()),
             has_error: Some(true),
             min_duration_us: None,
@@ -3732,6 +4620,7 @@ mod tests {
     fn trace_list_sql_failover_is_tenant_scoped_subquery_only_when_true() {
         // Some(true) → the tenant-scoped failover-attr subquery is present.
         let on = build_trace_list_sql(&TraceListFilters {
+            q: None,
             failover: Some(true),
             limit: 50,
             ..Default::default()
@@ -3743,6 +4632,7 @@ mod tests {
         let grp = build_trace_groups_sql(
             TraceGroupBy::Model,
             &TraceListFilters {
+                q: None,
                 failover: Some(true),
                 limit: 50,
                 ..Default::default()
@@ -3752,6 +4642,7 @@ mod tests {
         // None / Some(false) → no failover predicate at all (no silent full-scan filter).
         for f in [None, Some(false)] {
             let off = build_trace_list_sql(&TraceListFilters {
+                q: None,
                 failover: f,
                 limit: 50,
                 ..Default::default()
@@ -3770,6 +4661,7 @@ mod tests {
     #[test]
     fn trace_count_sql_is_tenant_first_no_order_no_limit() {
         let sql = build_trace_count_sql(&TraceListFilters {
+            q: None,
             model: Some("claude".into()),
             has_error: Some(true),
             failover: Some(true),
@@ -3797,6 +4689,7 @@ mod tests {
     #[test]
     fn trace_list_sql_has_error_false_is_clean_only() {
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             has_error: Some(false),
             limit: 50,
             ..Default::default()
@@ -3852,6 +4745,87 @@ mod tests {
         assert!(sql.contains("now() - toIntervalHour(?)"));
         assert!(!sql.contains("bucket_hour >= toDateTime(?)"));
         assert!(sql.contains("FROM v_slo_stats"));
+    }
+
+    /// The 30d payload fix. Absent/1 must be byte-identical to the historical query —
+    /// that equivalence is the whole backward-compatibility argument, so it is asserted
+    /// rather than assumed.
+    #[test]
+    fn slo_sql_bucket_absent_or_one_is_the_unchanged_hourly_query() {
+        let hourly = build_slo_sql(&SloFilters {
+            hours: 720,
+            bucket_hours: 1,
+            ..Default::default()
+        });
+        let legacy = build_slo_sql(&SloFilters {
+            hours: 720,
+            bucket_hours: 0, // an unset field must behave as hourly, not as "group by 0"
+            ..Default::default()
+        });
+        assert_eq!(hourly, legacy, "0 and 1 must both mean HOURLY");
+        assert!(hourly.contains("FROM v_slo_stats"));
+        assert!(hourly.contains("ORDER BY bucket_hour DESC"));
+        assert!(!hourly.contains("GROUP BY"));
+        assert!(!hourly.contains("toStartOfInterval"));
+    }
+
+    /// A bucketed read must merge the AggregateFunction STATES, not average the view's
+    /// already-collapsed scalars — a mean of 24 hourly p95s is not a daily p95.
+    #[test]
+    fn slo_sql_bucketed_merges_quantile_states_off_the_raw_table() {
+        let sql = build_slo_sql(&SloFilters {
+            hours: 720,
+            bucket_hours: 24,
+            ..Default::default()
+        });
+        assert!(
+            sql.contains("FROM slo_hourly_stats"),
+            "must read the raw table; v_slo_stats has already collapsed the states"
+        );
+        assert!(!sql.contains("FROM v_slo_stats"));
+        assert!(sql.contains("toStartOfInterval(bucket_hour, toIntervalHour(24))"));
+        assert!(sql.contains("quantileMerge(0.95)(latency_p95)"));
+        assert!(sql.contains("GROUP BY bucket_hour_iso, provider, model"));
+        assert!(sql.contains("ORDER BY bucket_hour_iso DESC"));
+        // Tenant scoping survives the rewrite — the bind order is unchanged.
+        assert!(sql.contains("WHERE tenant_id = ?"));
+    }
+
+    /// Both branches must project the SAME output names in the SAME order: the row
+    /// SHAPE is what every client deserializes, and only the granularity may differ.
+    /// Checked by NAME ORDER rather than by splitting on ", " — the bucketed branch
+    /// contains `greatest(countMerge(request_count), 1)`, so a naive comma split reads
+    /// an argument as a column and fails for the wrong reason. It did exactly that.
+    #[test]
+    fn slo_sql_both_branches_project_an_identical_column_list() {
+        const EXPECTED: [&str; 11] = [
+            "bucket_hour_iso",
+            "provider",
+            "model",
+            "p50_ms",
+            "p95_ms",
+            "p99_ms",
+            "requests",
+            "errors",
+            "error_rate_pct",
+            "total_input_tokens",
+            "total_output_tokens",
+        ];
+        for bucket_hours in [1_u32, 24] {
+            let sql = build_slo_sql(&SloFilters {
+                hours: 720,
+                bucket_hours,
+                ..Default::default()
+            });
+            let head = sql.split(" FROM ").next().unwrap_or_default();
+            let mut cursor = 0_usize;
+            for name in EXPECTED {
+                let at = head[cursor..].find(name).unwrap_or_else(|| {
+                    panic!("bucket_hours={bucket_hours}: `{name}` missing or out of order")
+                });
+                cursor += at + name.len();
+            }
+        }
     }
 
     #[test]
@@ -3932,6 +4906,7 @@ mod tests {
             provider: Some("openai".into()),
             model: Some("gpt".into()),
             hours: 24,
+            bucket_hours: 1,
         });
         assert!(sql.contains("bucket_hour >= toDateTime(?)"));
         assert!(!sql.contains("toIntervalHour"));
@@ -4066,6 +5041,7 @@ mod tests {
     #[test]
     fn trace_list_latency_and_signature_subquery_are_tenant_scoped() {
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             min_duration_us: Some(2_000_000),
             signature_id: Some("tool-schema-violation".into()),
             limit: 50,
@@ -4991,6 +5967,7 @@ mod tests {
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                q: None,
                 limit: Some(50),
                 model: None,
                 has_error: None,
@@ -5032,6 +6009,7 @@ mod tests {
         let resp = list_traces_handler(
             State(TraceReadState { reader }),
             Query(TraceListQuery {
+                q: None,
                 limit: Some(50),
                 model: None,
                 has_error: None,
@@ -5195,6 +6173,13 @@ mod tests {
                 .unwrap()
                 .contains("traces.json")
         );
+        // OBS-23: a JSON consumer learns truncation from the headers — the body keeps
+        // its bare-array shape so existing downloads are unaffected.
+        assert_eq!(
+            resp.headers().get("x-tracelane-truncated").unwrap(),
+            "false"
+        );
+        assert_eq!(resp.headers().get("x-tracelane-row-count").unwrap(), "1");
         let v = body_json(resp).await;
         assert_eq!(v.as_array().unwrap().len(), 1);
         assert_eq!(v[0]["trace_id"], "t1");
@@ -5223,6 +6208,7 @@ mod tests {
 
         // duration ASC.
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             sort: TraceSort::Duration,
             order: SortOrder::Asc,
             ..Default::default()
@@ -5231,6 +6217,7 @@ mod tests {
 
         // Keyset uses the sort column + the direction operator (DESC → `<`).
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             sort: TraceSort::Duration,
             cursor: Some((5, "t".into())),
             ..Default::default()
@@ -5239,6 +6226,7 @@ mod tests {
 
         // start_time keyset references the DateTime64 column, and ASC flips to `>`.
         let sql = build_trace_list_sql(&TraceListFilters {
+            q: None,
             order: SortOrder::Asc,
             cursor: Some((5, "t".into())),
             ..Default::default()
@@ -5275,6 +6263,7 @@ mod tests {
         let sql = build_trace_groups_sql(
             TraceGroupBy::Model,
             &TraceListFilters {
+                q: None,
                 model: Some("x".into()),
                 ..Default::default()
             },
@@ -5358,6 +6347,7 @@ mod tests {
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                q: None,
                 limit: Some(2), // page size == rows → expect a cursor
                 model: None,
                 has_error: None,
@@ -5482,6 +6472,7 @@ mod tests {
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                q: None,
                 limit: None,
                 model: None,
                 has_error: None,
@@ -5511,6 +6502,7 @@ mod tests {
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                q: None,
                 limit: None,
                 model: None,
                 has_error: None,
@@ -5540,6 +6532,7 @@ mod tests {
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                q: None,
                 limit: None,
                 model: None,
                 has_error: None,

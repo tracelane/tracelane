@@ -60,7 +60,7 @@ export function TryItCurl() {
 				key from{" "}
 				<a
 					href="/settings/api-keys"
-					className="font-medium text-accent-ink hover:underline"
+					className="font-medium text-action-ink hover:underline"
 				>
 					Settings → API keys
 				</a>

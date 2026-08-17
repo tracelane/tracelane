@@ -24,18 +24,36 @@ All commands respect:
 
 ### `tlane init`
 
-Writes a `tracelane.config.json` (endpoint, `serviceName`, `sampleRate`) to the
-working directory and prints the SDK install + wire-up steps. It does not
-install anything or edit your source. Refuses to clobber an existing config
-unless `--force` is given.
+Scaffolds Tracelane into the project in the working directory. **It writes files
+and installs the SDK** — four steps, each one skippable:
 
-`--endpoint` is the OTLP endpoint of an ingest receiver **you** run (default
-`http://localhost:4318`). Tracelane Cloud has no public OTLP ingress — hosted
-traces are captured at the gateway, so on Cloud you leave `--endpoint` unset and
-point your OpenAI-compatible client at `https://gateway.tracelane.dev/v1`.
+| Step | What lands | Skip with |
+|---|---|---|
+| Config | `tracelane.config.json` — `endpoint`, `serviceName`, `sampleRate` | — |
+| Env | `TRACELANE_API_KEY` and `TRACELANE_GATEWAY_URL` merged into `.env`, and `.env` added to an existing `.gitignore` | `--no-env` |
+| Instrumentation | `tracelane.ts` / `tracelane.mjs` / `tracelane_init.py`, wiring the SDK to the frameworks found in your manifests | `--no-instrument` |
+| Install | `@tracelanedev/sdk` or `tracelane`, installed with your own package manager | `--no-install` |
+
+**What it will not do.** `.env` is only ever appended to — an existing
+`TRACELANE_API_KEY` is never rewritten, `--force` included. An existing config or
+bootstrap is kept unless you pass `--force`. A failed install exits non-zero and
+prints the command to re-run; the scaffolded files stay.
+
+**How far the bootstrap gets on its own.** On Python it emits
+`init(..., auto_instrument=True)`, which really does wrap installed `openai`,
+`anthropic`, `litellm` and `claude_code` with no further edit. Everything else —
+including every TypeScript adapter — wraps an object only you can construct, so
+the bootstrap imports the right `instrument*` function and emits the exact
+one-line call next to it.
+
+`--endpoint` is the OTLP endpoint spans are exported to. On Tracelane Cloud that
+is `https://gateway.tracelane.dev`, with a `tlane_…` key carrying the `ingest`
+scope. Self-hosting, it is the ingest receiver you run. The default is
+`http://localhost:4318` — a local receiver — so **on Cloud, pass `--endpoint`
+explicitly**.
 
 ```bash
-tlane init
+tlane init --endpoint https://gateway.tracelane.dev            # Tracelane Cloud
 tlane init --endpoint http://otel-collector.internal:4318 --service-name checkout-agent
 tlane init --sample-rate 0.25 --force
 ```

@@ -72,7 +72,19 @@ describe("PP-CARDINALITY-EXPLOSION: per-tenant attr-key cardinality cap (ADR-030
 			"utf8",
 		);
 		expect(src).toContain("pub const HLL_PRECISION: u8 = 14");
+		// GWY-41: the cap CONSTANT moved to `crates/shared/src/otlp/limits.rs`
+		// (IngestLimits::default() needs it and IngestLimits moved), and
+		// cardinality.rs re-exports it. Assert BOTH halves — the re-export here,
+		// and the value at its definition — so the ADR-030 number is still pinned
+		// and cannot be quietly changed at either end.
 		expect(src).toContain(
+			"pub use tracelane_shared::otlp::limits::DEFAULT_MAX_ATTR_CARDINALITY",
+		);
+		const limits = fs.readFileSync(
+			path.resolve(__dirname, "../../crates/shared/src/otlp/limits.rs"),
+			"utf8",
+		);
+		expect(limits).toContain(
 			"pub const DEFAULT_MAX_ATTR_CARDINALITY: usize = 10_000",
 		);
 		expect(src).toContain("pub struct CardinalityTracker");

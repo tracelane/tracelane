@@ -40,14 +40,18 @@ export function AuditSalesSurface() {
 					off-platform
 				</li>
 				<li>
-					• Cryptographic signing &amp; public-transparency (Rekor) anchoring —
-					on the roadmap
+					• Ed25519 signing on every batch, plus public-transparency anchoring
+					to Sigstore Rekor v2 — live today. Anchoring is{" "}
+					<strong>per batch, not per event</strong>, and is{" "}
+					<strong>best-effort</strong>: it never blocks the write path, so a
+					batch that is signed but not yet anchored is still valid. Coverage is
+					partial and growing.
 				</li>
 			</ul>
 			<div className="mt-5">
 				<Link
 					href="/settings/billing"
-					className="cta-lava inline-flex h-9 items-center rounded-lg px-4 text-[13px] font-medium"
+					className="bg-surface-inverse text-ink-inverse hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-[13px] font-medium"
 				>
 					Add the Audit SKU
 				</Link>

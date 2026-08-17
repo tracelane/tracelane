@@ -95,7 +95,11 @@ fn anchors_fully_covered(
 /// trust root (ADR-070 — genesis present OR a public Rekor anchor inside a
 /// retention-windowed view), AND a non-truncated response. `truncated` is true when
 /// the verifier saw 0 rows while the ledger holds some in this window (a stripped or
-/// broken response) — verifying nothing is never a GREEN pass. Any failure → RED.
+/// broken response) — verifying nothing is never a GREEN pass.
+///
+/// R53 — THREE values: `green`, `red`, `indeterminate`. Positive evidence of a problem
+/// is RED; a window that cannot be rooted is INDETERMINATE (never green, never an
+/// accusation). See `self_verify_verdict`.
 fn self_verify_verdict(
     hash_chain_valid: bool,
     signatures_valid: bool,
@@ -103,11 +107,32 @@ fn self_verify_verdict(
     trust_established: bool,
     truncated: bool,
 ) -> &'static str {
-    if hash_chain_valid && signatures_valid && !strip_detected && trust_established && !truncated {
-        "green"
-    } else {
-        "red"
+    // R53 — THREE verdicts, because two were a lie in one direction.
+    //
+    // RED is reserved for POSITIVE EVIDENCE that something is wrong: a recomputed hash
+    // that does not match, a signature that does not verify, a proof that is missing, or
+    // a response that was cut. Those are unconditional — no window excuses them.
+    if !hash_chain_valid || !signatures_valid || strip_detected || truncated {
+        return "red";
     }
+    // Everything checkable PASSED and the only thing missing is a trust root for this
+    // window — because `anchors_fully_covered` removed every anchor whose covered seqs
+    // fall outside it. Measured on prod 2026-08-15: at `?limit=10` all 161 of
+    // a4037bef's anchors were dropped and this returned RED for a fully intact ledger.
+    //
+    // That is CLAUDE.md §14 read in reverse. The rule says "I cannot see" is never
+    // "nothing is wrong"; its converse binds just as hard — "I cannot see" is never
+    // "something IS wrong" either. Telling a customer their tamper-evident ledger failed
+    // verification, when all we did was look at too narrow a slice of it, is worse than
+    // any false green: a customer acting on it escalates, to us or to their auditor.
+    //
+    // NOT A ROLLBACK OF ADR-070. That ADR's property was "an unrooted window is never
+    // GREEN", and `indeterminate` is not green. This RECLASSIFIES the same state; it
+    // does not re-admit it to the pass bucket.
+    if !trust_established {
+        return "indeterminate";
+    }
+    "green"
 }
 
 /// Default chain-row cap when the caller does not pass `?limit=`.
@@ -171,6 +196,10 @@ pub struct SelfVerifyResponse {
     /// (0 rows verified out of a non-empty ledger). A genesis-rooted unanchored
     /// chain is still GREEN (ADR-062 "unanchored-still-verifies"); a windowed view
     /// with no public anchor, or a truncated one, is RED. See `self_verify_verdict`.
+    /// `green` | `red` | `indeterminate` (R53). A consumer that treats anything other
+    /// than `green` as an alarm keeps working, but SHOULD distinguish the third value:
+    /// `indeterminate` means verification could not be completed over this window, not
+    /// that the ledger is bad.
     pub verdict: &'static str,
     pub hash_chain_valid: bool,
     pub signatures_valid: bool,
@@ -222,6 +251,20 @@ async fn handler(
             return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
         }
     };
+
+    // A13 scope gate — B-230. An entitlement gate is NOT a scope gate. Until
+    // 2026-08-13 the audit ledger was reachable by any authenticated key, so an
+    // `ingest`-scoped SDK key (default-on since GWY-41, and the credential most
+    // likely to sit in a container image) could read it. `read` is the scope
+    // `crates/shared/src/api_scope.rs:47-49` defines for precisely the
+    // hand-a-key-to-an-auditor case this surface exists to serve.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope — refusing audit read");
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "this API key is not scoped to read recorded data — it needs the `read` scope",
+        );
+    }
     let tenant = claims.tenant_id;
 
     // 2. Entitlement — resolve the full set (we need `retention_days`) and require
@@ -784,10 +827,32 @@ mod tests {
             "red",
             "strip detected"
         );
+        // R53 — THE RECLASSIFICATION, asserted rather than described. This case used
+        // to be "red" and is now "indeterminate". Everything checkable passed; the only
+        // absent thing is a trust root for this window.
         assert_eq!(
             self_verify_verdict(true, true, false, false, false),
+            "indeterminate",
+            "unrooted window: cannot verify is NOT verification failed"
+        );
+        // ADR-070's property SURVIVES — it said an unrooted window is never GREEN, and
+        // it still is not. Reclassified, not reversed; assert the half that binds.
+        assert_ne!(
+            self_verify_verdict(true, true, false, false, false),
+            "green",
+            "an unrooted window must never be green (ADR-070)"
+        );
+        // And a REAL problem inside an unrooted window is still RED — positive evidence
+        // outranks the window every time, so `indeterminate` can never mask a defect.
+        assert_eq!(
+            self_verify_verdict(false, true, false, false, false),
             "red",
-            "unrooted window"
+            "broken chain in an unrooted window is RED, not indeterminate"
+        );
+        assert_eq!(
+            self_verify_verdict(true, true, true, false, false),
+            "red",
+            "strip in an unrooted window is RED, not indeterminate"
         );
         assert_eq!(
             self_verify_verdict(true, true, false, true, true),

@@ -32,7 +32,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.0",
-		"@electric-sql/pglite": "^0.5.3",
+		"@electric-sql/pglite": "^0.5.4",
 		"@opennextjs/cloudflare": "1.19.11",
 		"@playwright/test": "^1.49.1",
 		"@tailwindcss/postcss": "^4.0.0",

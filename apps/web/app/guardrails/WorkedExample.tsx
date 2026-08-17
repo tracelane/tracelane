@@ -40,7 +40,7 @@ export function WorkedExample() {
 						<span className="font-medium text-ink">block</span> verdict that
 						shows up in the table above.
 					</p>
-					<div className="overflow-x-auto rounded-md bg-surface-2/60 p-3">
+					<div className="overflow-x-auto rounded-lg bg-surface-2/60 p-3">
 						<pre className="font-mono text-[12px] leading-relaxed text-ink-2">
 							{`# a request that trips the prompt-injection rail
 POST /v1/chat/completions

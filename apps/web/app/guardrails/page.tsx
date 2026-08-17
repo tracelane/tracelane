@@ -14,7 +14,13 @@ import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { fetchGuardrailStats } from "@/lib/guardrails";
 import { rangeLabel, rangeToHours } from "@/lib/range";
-import { Badge, EmptyState, Skeleton, StatCard } from "@tracelanedev/ui";
+import {
+	Badge,
+	EmptyState,
+	Skeleton,
+	StatCard,
+	StatGrid,
+} from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -63,7 +69,7 @@ async function GuardrailData({ range }: { range?: string }) {
 	const zero = stats.total_evaluations === 0;
 
 	return (
-		<div className="space-y-5">
+		<div className="space-y-3">
 			{zero && (
 				<div className="rounded-lg border border-line bg-surface-2/40 px-4 py-3 text-sm text-ink-2">
 					No guardrail verdicts in the last {label} yet — every request through
@@ -72,29 +78,27 @@ async function GuardrailData({ range }: { range?: string }) {
 					traffic flows.{" "}
 					<Link
 						href="/traces"
-						className="font-medium text-accent-ink hover:underline"
+						className="font-medium text-action-ink hover:underline"
 					>
 						View traces →
 					</Link>
 				</div>
 			)}
 			{/* Headline — block rate + the fail-open honesty signal + overhead. */}
-			<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 items-stretch">
+			<StatGrid title="Evaluation &amp; enforcement" cols={4}>
 				<StatCard
 					icon="traffic"
 					label={`Evaluations (${label})`}
 					value={stats.total_evaluations.toLocaleString()}
 					sub={`${stats.request_side.toLocaleString()} request · ${stats.response_side.toLocaleString()} response · response-side rolling out`}
 					hint={SIDE_HINT}
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="failure-signatures"
 					label="Block rate"
 					value={pct(stats.block_rate_pct)}
 					sub={`${stats.blocks.toLocaleString()} blocked pre-flight`}
-					variant="accent"
-					className="h-full flex flex-col"
+					variant="action"
 				/>
 				<StatCard
 					icon="error-budget"
@@ -106,16 +110,14 @@ async function GuardrailData({ range }: { range?: string }) {
 							: "no rail failed open"
 					}
 					tone={failOpenTone}
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="latency"
 					label="Inline overhead (p95)"
 					value={ms(stats.p95_ms)}
 					sub={`p50 ${ms(stats.p50_ms)} · p99 ${ms(stats.p99_ms)}`}
-					className="h-full flex flex-col"
 				/>
-			</div>
+			</StatGrid>
 
 			{/* Decision mix — the full breakdown, captured per verdict. Each badge is
 			    a click-through to the verdict-detail list, filtered + range-preserved. */}
@@ -140,7 +142,7 @@ async function GuardrailData({ range }: { range?: string }) {
 				</Link>
 				<Link
 					href={verdictHref("", range)}
-					className="text-[13px] font-medium text-accent-ink hover:underline"
+					className="text-[13px] font-medium text-action-ink hover:underline"
 				>
 					All verdicts →
 				</Link>
@@ -162,8 +164,11 @@ async function GuardrailData({ range }: { range?: string }) {
 			</div>
 
 			{/* The "show me" moment — a real worked example of a pre-flight block. */}
-			<section className="mt-10">
-				<h2 className="text-base font-semibold text-ink">Tool pinning</h2>
+			{/* text-sm to match "Guardrail rails" above it: these are sibling sections on
+			    one page and were rendering at 13px and 16px. mt-6, not mt-10 — 40px of
+			    separation on a page whose rhythm is now 12px read as a missing section. */}
+			<section className="mt-6">
+				<h2 className="text-sm font-semibold text-ink">Tool pinning</h2>
 				<p className="mt-1 max-w-3xl text-[13px] text-ink-2">
 					Approve the tool definitions your agents actually send. Once a
 					definition is approved, the guardrail engine flags any later change to
@@ -189,7 +194,7 @@ export default async function GuardrailsPage({
 	const { range } = await searchParams;
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+			<div className="mb-4 flex flex-wrap items-start justify-between gap-3">
 				<div>
 					<h1 className="t-h1">Guardrails</h1>
 					<p className="mt-1 max-w-2xl text-sm text-ink-2">
@@ -202,11 +207,11 @@ export default async function GuardrailsPage({
 			<Suspense
 				fallback={
 					<div className="space-y-4">
-						<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+						<StatGrid cols={4}>
 							{[0, 1, 2, 3].map((i) => (
 								<Skeleton key={i} className="h-24" />
 							))}
-						</div>
+						</StatGrid>
 						<Skeleton className="h-48" />
 					</div>
 				}

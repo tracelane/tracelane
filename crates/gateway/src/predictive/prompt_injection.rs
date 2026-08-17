@@ -15,7 +15,8 @@
 //! as instructions. The detection here is for logging and escalation.
 //!
 //! V1 ships the pattern-matching detector below as a live signature; the optional
-//! BERT classifier is a scaffold gated behind an entitlement flag.
+//! a BERT classifier is not implemented. No entitlement gates this predictor —
+//! it runs for every tenant.
 
 use super::{Decision, PredictiveContext, Predictor};
 

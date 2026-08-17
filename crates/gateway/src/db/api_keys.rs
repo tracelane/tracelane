@@ -150,24 +150,77 @@ fn pepper() -> Result<&'static SecretBox<[u8; 32]>> {
 //
 // POSITIVES ONLY — a not-found/revoked key is never cached, so a fresh key works
 // on its first request and a revoked key can only linger if it was cached BEFORE
-// revocation, a window closed immediately by the `key_revoked` NOTIFY
-// (entitlement_cache::listen_once) and, as a missed-NOTIFY backstop, the 15m TTL.
+// revocation.
+//
+// else. The previous comment here said the window was "closed immediately by the
+// `key_revoked` NOTIFY", with the TTL as a mere backstop. That was false in
+// production and the failure was systematic, not occasional: `pg_notify` reaches
+// only listeners attached at that instant, the Neon compute autosuspends after 5
+// min idle, and the revoking UPDATE is itself what wakes it — so on an idle system
+// the NOTIFY fires on a fresh postmaster while the gateway's listener is still
+// holding a socket it has not yet noticed is dead. Measured: 110 drop/reconnect
+// cycles in 21.07 h. The NOTIFY path is now off by default
+// (`entitlement_cache::control_plane_listen_enabled`).
+//
+// So the TTL is the revocation bound, it is stated as such, and it is 60s rather
+// than the 900s that silently applied while we believed otherwise. Cost of the
+// shorter TTL is one PG SELECT + one Argon2id verify per ACTIVE key per minute —
+// paid only when a request actually arrives, because this cache is in-memory and
+// positives-only. It therefore does not poll, and does not defeat Neon autosuspend
+// (which was the whole point of dropping LISTEN).
+
+/// What the auth cache stores: identity PLUS resolved capability (A13).
+type CachedAuth = (Uuid, Uuid, tracelane_shared::api_scope::KeyScope);
 
 static AUTH_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AUTH_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-fn auth_cache() -> &'static Cache<[u8; 32], (Uuid, Uuid)> {
-    static C: OnceLock<Cache<[u8; 32], (Uuid, Uuid)>> = OnceLock::new();
+const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 60;
+/// Hard ceiling. A revocation window is a security property, so an env typo must
+/// not be able to widen it past the value we previously (wrongly) shipped.
+const MAX_AUTH_CACHE_TTL_SECS: u64 = 900;
+
+/// Resolve the auth-cache TTL, clamped to `1..=900` seconds.
+///
+/// Fails CLOSED on garbage: an unparseable or out-of-range value falls back to the
+/// 60s default rather than to the maximum, because this bounds how long a REVOKED
+/// key keeps working.
+///
+/// Split from the env read so the policy is unit-testable without touching
+/// process-global env — `docs/reference/TRAPS.md` §20: a test that mutates a
+/// process-global races every other test that reads it, and the fix is not to
+/// share it rather than to guard it.
+fn parse_auth_cache_ttl(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (1..=MAX_AUTH_CACHE_TTL_SECS).contains(s))
+        .unwrap_or(DEFAULT_AUTH_CACHE_TTL_SECS)
+}
+
+fn auth_cache_ttl_secs() -> u64 {
+    parse_auth_cache_ttl(
+        std::env::var("TRACELANE_AUTH_CACHE_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn auth_cache() -> &'static Cache<[u8; 32], CachedAuth> {
+    static C: OnceLock<Cache<[u8; 32], CachedAuth>> = OnceLock::new();
     C.get_or_init(|| {
         Cache::builder()
             .max_capacity(50_000)
-            .time_to_live(Duration::from_secs(900)) // 15m defensive backstop
+            // not a backstop behind a NOTIFY that does not arrive. Override with
+            // TRACELANE_AUTH_CACHE_TTL_SECS when traffic makes the Argon2id cost
+            // matter; clamped so a typo cannot produce an unbounded window.
+            .time_to_live(Duration::from_secs(auth_cache_ttl_secs()))
             .build()
     })
 }
 
 /// Evict one cached auth result by its peppered-HMAC lookup digest. Called by the
-/// `key_revoked` LISTEN handler so revocation is immediate, not TTL-bound.
+/// `key_revoked` LISTEN handler when that listener is enabled — an OPTIMISATION
+/// that shortens the window, never the bound. The bound is the TTL above (60s).
+/// false in production for a structural reason, not an occasional one.
 pub async fn invalidate(digest: [u8; 32]) {
     auth_cache().invalidate(&digest).await;
 }
@@ -324,11 +377,21 @@ pub async fn mint(
     tenant_id: &TenantId,
     name: &str,
     minted_by: Option<&str>,
+    opts: MintOptions,
 ) -> Result<MintedKey> {
     let body = generate_key_body()?;
     let material = KeyMaterial::from_body(&body)?;
     let key_prefix: String = body.chars().take(KEY_PREFIX_LEN).collect();
-    let api_key = create(pool, tenant_id, &material, name, &key_prefix, minted_by).await?;
+    let api_key = create(
+        pool,
+        tenant_id,
+        &material,
+        name,
+        &key_prefix,
+        minted_by,
+        &opts,
+    )
+    .await?;
     Ok(MintedKey {
         api_key,
         key_prefix,
@@ -349,11 +412,91 @@ pub struct ApiKey {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// A13. `None` = the legacy full-surface key; see `api_scope::KeyScope`.
+    pub scope: Option<Vec<String>>,
+    /// A13. `None` = never expires.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// A13 mint options. Every field is optional at the wire, but the mint path
+/// turns an omitted `scope` into an EXPLICIT full set rather than SQL NULL —
+/// see [`mint`] for why that distinction is the whole point.
+#[derive(Debug, Clone, Default)]
+pub struct MintOptions {
+    pub scope: Option<Vec<String>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// USD/month. Carried as `f64` and bound as TEXT with a `::numeric` cast —
+    /// tokio-postgres has no native NUMERIC mapping without pulling in
+    /// `rust_decimal`, and the same bind-as-text-then-cast shape is already the
+    /// house workaround for PG enums. Postgres does the parse, and
+    /// `api_keys_budget_nonneg_chk` does the range check, so a bad value is a
+    /// constraint violation rather than a silently truncated number.
+    ///
+    /// v1 RECORDS and REPORTS the budget; it does not enforce a cut-off. That is
+    /// a separate ruling per the spec: refusing a paying customer's traffic on a
+    /// budget mis-read is worse than the overspend.
+    pub budget_usd_monthly: Option<f64>,
+}
+
+impl MintOptions {
+    /// A13 — the ONE place the NULL-vs-explicit distinction is decided.
+    ///
+    /// Migration 0024's hand-off note is explicit that NULL-means-unrestricted is
+    /// a BACKWARDS-COMPATIBILITY choice for the existing rows and "NOT a safe
+    /// default for new ones". So a key minted without a stated scope is written
+    /// with the FULL SET SPELLED OUT, never SQL NULL: identical authority to
+    /// today, but recorded as a decision rather than inherited as an absence.
+    /// `LegacyFullSurface` then means exactly one thing — "minted before A13" —
+    /// instead of accumulating new members forever.
+    ///
+    /// Applied at the HTTP edge rather than inside [`mint`] so the response body
+    /// reports what was actually stored. When it lived in `mint`, a caller that
+    /// omitted `scope` got `"scope": null` back while the row held the full set —
+    /// the API describing something other than the database.
+    ///
+    /// DEVIATION FROM THE NOTE, stated: it says the mint route must REQUIRE a
+    /// scope. Requiring one would 400 every existing caller of `POST /v1/keys`
+    /// the moment this deploys, the dashboard proxy included. The wire field
+    /// stays optional and the DEFAULT is what changed; the property the note
+    /// protects — no new key is silently unscoped — holds either way.
+    #[must_use]
+    pub fn with_default_scope(mut self) -> Self {
+        self.scope = Some(self.scope.unwrap_or_else(|| {
+            // `default_mint_set()`, NOT `all()`. Admin is opt-in and explicit,
+            // always — an omitted scope must never grant workspace management.
+            // Pinned by `omitted_scope_never_includes_admin`.
+            tracelane_shared::api_scope::Scope::default_mint_set()
+                .iter()
+                .map(|s| s.as_slug().to_string())
+                .collect()
+        }));
+        self
+    }
 }
 
 // ---------------------------------------------------------------------
 // CRUD
 // ---------------------------------------------------------------------
+
+/// Bind shape for `budget_usd_monthly`. **The `::text::` half is load-bearing.**
+///
+/// `budget_text` is an `Option<String>`. Written as a bare `$9::numeric`,
+/// Postgres infers the parameter type as `numeric` and tokio-postgres refuses to
+/// serialize a Rust `String` into it — `error serializing parameter 8` — **on
+/// every call, including when the value is `None`**, because the type check
+/// precedes any NULL handling. That shipped in `5ab66bd0` (A13, 2026-08-12) and
+/// took `POST /v1/keys` down completely: every mint returned 500, the dashboard
+/// showed 502, and **no customer could create an API key for two days.**
+///
+/// The fix is to bind as `text` and let the DB coerce. This is the *identical*
+/// rule `db/tenants.rs`'s `PLAN_ENUM_CAST` already wrote down — *"NEVER write a
+/// bare `$N::plan` for a string parameter"* — and the comment that introduced
+/// this bug cited that very workaround while dropping the `::text::` half that
+/// does the work. A lesson with no consumer on the second site.
+///
+/// Pinned by `tests::budget_numeric_cast_routes_through_text` and falsified for
+/// real against Postgres by `budget_param_serialization_contract`.
+const BUDGET_NUMERIC_CAST: &str = "::text::numeric";
 
 /// Insert a new API key. The caller has already generated the body and
 /// derived the `KeyMaterial`; `key_prefix` is the non-secret display prefix
@@ -373,13 +516,19 @@ pub async fn create(
     name: &str,
     key_prefix: &str,
     minted_by: Option<&str>,
+    opts: &MintOptions,
 ) -> Result<ApiKey> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let budget_text: Option<String> = opts.budget_usd_monthly.map(|b| format!("{b:.4}"));
+    let sql = format!(
+        "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by, \
+                               scope, expires_at, budget_usd_monthly)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST})
+         RETURNING id, tenant_id, name, created_at, last_used_at, revoked_at, scope, expires_at"
+    );
     let row = client
         .query_one(
-            "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, tenant_id, name, created_at, last_used_at, revoked_at",
+            &sql,
             &[
                 tenant_id.as_uuid(),
                 &name,
@@ -387,6 +536,9 @@ pub async fn create(
                 &material.argon2id_phc,
                 &key_prefix,
                 &minted_by,
+                &opts.scope,
+                &opts.expires_at,
+                &budget_text,
             ],
         )
         .await
@@ -398,6 +550,8 @@ pub async fn create(
         created_at: row.get(3),
         last_used_at: row.get(4),
         revoked_at: row.get(5),
+        scope: row.get(6),
+        expires_at: row.get(7),
     })
 }
 
@@ -413,12 +567,12 @@ pub async fn create(
 pub async fn lookup_tenant_by_key_body(
     pool: &Pool,
     key_body: &str,
-) -> Result<Option<(TenantId, Uuid)>> {
+) -> Result<Option<(TenantId, Uuid, tracelane_shared::api_scope::KeyScope)>> {
     let lookup = peppered_lookup(key_body)?;
 
     // fix B: warm-cache hit — the peppered-HMAC digest matched a previously
     // authenticated key. Skip the PG SELECT + the ~50ms Argon2id verify.
-    if let Some((tenant, key_id)) = auth_cache().get(&lookup).await {
+    if let Some((tenant, key_id, key_scope)) = auth_cache().get(&lookup).await {
         let hits = AUTH_CACHE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let miss = AUTH_CACHE_MISS_TOTAL.load(Ordering::Relaxed);
         // Loud, bounded hit-rate signal (once per 1000 lookups).
@@ -430,17 +584,29 @@ pub async fn lookup_tenant_by_key_body(
                 "api-key auth cache hit-rate"
             );
         }
-        return Ok(Some((TenantId::from_jwt_claim(tenant), key_id)));
+        return Ok(Some((TenantId::from_jwt_claim(tenant), key_id, key_scope)));
     }
     AUTH_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
 
+    // A13: `scope` and `expires_at` are read HERE, in the same round-trip that
+    // already authenticates the key — not re-derived per route. `expires_at` is
+    // filtered in SQL alongside `revoked_at` so an expired key is indistinguishable
+    // from a revoked one to everything downstream: same NULL row, same 401, no
+    // second code path to keep in step.
+    //
+    // Enforced in the gateway rather than by the DB (no constraint can express
+    // "reject at read time"), which means a clock skew between Neon and the
+    // gateway is the failure mode — `now()` is Postgres's, so both sides of the
+    // comparison come from the same clock. That is deliberate.
     let row = client
         .query_opt(
-            "SELECT tenant_id, id, argon2id_phc
+            "SELECT tenant_id, id, argon2id_phc, scope, expires_at
              FROM api_keys
-             WHERE lookup_hash = $1 AND revoked_at IS NULL",
+             WHERE lookup_hash = $1
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > now())",
             &[&lookup.as_slice()],
         )
         .await
@@ -451,6 +617,8 @@ pub async fn lookup_tenant_by_key_body(
     let tenant_uuid: Uuid = row.get(0);
     let id: Uuid = row.get(1);
     let phc: Option<String> = row.get(2);
+    let scope_raw: Option<Vec<String>> = row.get(3);
+    let key_scope = tracelane_shared::api_scope::KeyScope::from_column(scope_raw.as_deref());
 
     // KDF verify — defense in depth. The peppered HMAC already authenticated,
     // but the strong scheme REQUIRES the Argon2id PHC: a row with a NULL or
@@ -481,13 +649,19 @@ pub async fn lookup_tenant_by_key_body(
     }
 
     // Populate the warm cache for subsequent requests with this key (fix B).
-    auth_cache().insert(lookup, (tenant_uuid, id)).await;
+    // A13: the SCOPE is cached with the identity. Caching only (tenant, key_id)
+    // would force the caller to re-derive a capability it cannot see on a warm
+    // hit — and the only available default is full-surface, which would be a
+    // privilege escalation on every cached request.
+    auth_cache()
+        .insert(lookup, (tenant_uuid, id, key_scope.clone()))
+        .await;
     // ponytail: last_used_at is refreshed only on the (cold) miss path — a
     // warm-cached key updates it at most every 15m (TTL refill). Fine for a
     // display field; a spawned touch per warm hit would put a PG write back on
     // every request, defeating the cache.
     touch_last_used(&client, id).await;
-    Ok(Some((TenantId::from_jwt_claim(tenant_uuid), id)))
+    Ok(Some((TenantId::from_jwt_claim(tenant_uuid), id, key_scope)))
 }
 
 async fn touch_last_used(client: &deadpool_postgres::Client, id: Uuid) {
@@ -516,6 +690,36 @@ pub async fn revoke(pool: &Pool, id: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// set wrong must land on the tighter value, never the looser one.
+    #[test]
+    fn auth_cache_ttl_defaults_to_sixty_seconds() {
+        assert_eq!(parse_auth_cache_ttl(None), 60);
+        assert_eq!(DEFAULT_AUTH_CACHE_TTL_SECS, 60);
+    }
+
+    #[test]
+    fn auth_cache_ttl_honours_a_valid_override() {
+        assert_eq!(parse_auth_cache_ttl(Some("120")), 120);
+        assert_eq!(parse_auth_cache_ttl(Some(" 30 ")), 30);
+        assert_eq!(parse_auth_cache_ttl(Some("900")), 900);
+    }
+
+    /// Fails CLOSED, and this is the discriminating half: every bad input must
+    /// resolve to the 60s DEFAULT, not to `MAX`. An implementation that clamped
+    /// (`min(v, MAX)`) would pass "too large" by returning 900 — a 15-minute
+    /// in. These assertions fail against that implementation.
+    #[test]
+    fn auth_cache_ttl_rejects_garbage_toward_the_tighter_bound() {
+        for bad in ["0", "901", "86400", "-1", "abc", "", "60s", "1e3"] {
+            assert_eq!(
+                parse_auth_cache_ttl(Some(bad)),
+                DEFAULT_AUTH_CACHE_TTL_SECS,
+                "{bad:?} must fall back to the 60s default, never to MAX"
+            );
+        }
+        assert!(parse_auth_cache_ttl(Some("901")) < MAX_AUTH_CACHE_TTL_SECS);
+    }
 
     fn init_test_pepper() {
         // 32 zero bytes for tests. Real prod pepper comes from KMS.
@@ -676,5 +880,70 @@ mod tests {
             &a.chars().take(KEY_PREFIX_LEN).collect::<String>(),
             &a[..KEY_PREFIX_LEN]
         );
+    }
+
+    /// The `budget_usd_monthly` bind MUST route through `text`. A bare
+    /// `$9::numeric` makes Postgres infer the param as `numeric`, which
+    /// tokio-postgres cannot serialize a `String` into — every mint 500s.
+    /// Exact twin of `db::tenants::tests::plan_enum_cast_routes_through_text`;
+    /// that rule existed and this site did not consume it.
+    #[test]
+    fn budget_numeric_cast_routes_through_text() {
+        assert_eq!(BUDGET_NUMERIC_CAST, "::text::numeric");
+        assert!(
+            BUDGET_NUMERIC_CAST.contains("::text::"),
+            "numeric binds carrying a String must serialize as text, not the bare numeric type"
+        );
+        let values = format!("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST})");
+        assert!(values.contains("$9::text::numeric"), "must be text-routed");
+        assert!(
+            !values
+                .replace("$9::text::numeric", "")
+                .contains("::numeric"),
+            "no bare `$N::numeric` may remain"
+        );
+    }
+
+    /// Live contract against a real Postgres, the regression the unit suite
+    /// cannot express. A bare `$1::numeric` MUST fail `Option<String>` ->
+    /// numeric serialization (the shipped bug, and it fails for `None` too),
+    /// and the text-routed form MUST round-trip. Read-only; no table writes.
+    ///   POSTGRES_TEST_URL=postgres://... cargo test -p gateway --bins \
+    ///     db::api_keys::tests::budget_param_serialization_contract -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a real Postgres; set POSTGRES_TEST_URL"]
+    async fn budget_param_serialization_contract() {
+        let url = std::env::var("POSTGRES_TEST_URL").expect("POSTGRES_TEST_URL");
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let none: Option<String> = None;
+        let some: Option<String> = Some("12.3400".to_string());
+        // The shipped bug — and note it fails even for NULL, because the type
+        // check precedes any NULL handling. That is why no input avoided it.
+        assert!(
+            client
+                .query_one("SELECT $1::numeric", &[&none])
+                .await
+                .is_err(),
+            "bare $1::numeric must fail Option<String> serialization, even for None"
+        );
+        assert!(
+            client
+                .query_one("SELECT $1::numeric", &[&some])
+                .await
+                .is_err(),
+            "bare $1::numeric must fail Option<String> serialization for Some too"
+        );
+        // The fix.
+        for v in [&none, &some] {
+            client
+                .query_one("SELECT $1::text::numeric", &[v])
+                .await
+                .expect("text-routed numeric must serialize and round-trip");
+        }
     }
 }

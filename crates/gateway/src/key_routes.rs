@@ -49,6 +49,7 @@ pub trait KeyMinter: Send + Sync {
         tenant: &TenantId,
         name: &str,
         minted_by: Option<&str>,
+        opts: crate::db::api_keys::MintOptions,
     ) -> Result<MintedKey>;
 }
 
@@ -64,8 +65,9 @@ impl KeyMinter for PgKeyMinter {
         tenant: &TenantId,
         name: &str,
         minted_by: Option<&str>,
+        opts: crate::db::api_keys::MintOptions,
     ) -> Result<MintedKey> {
-        crate::db::api_keys::mint(&self.pool, tenant, name, minted_by).await
+        crate::db::api_keys::mint(&self.pool, tenant, name, minted_by, opts).await
     }
 }
 
@@ -79,6 +81,20 @@ pub struct KeyRoutesState {
 #[derive(Debug, Deserialize)]
 struct CreateKeyBody {
     name: String,
+    /// A13. Omitted ⇒ the full set, spelled out (see `db::api_keys::mint`).
+    /// An UNRECOGNISED slug is a 400 here rather than a silent drop: at mint
+    /// time the caller is a human choosing capabilities, and quietly ignoring
+    /// what they asked for would hand back a key that does less than the UI just
+    /// told them it does. (At AUTH time the same slug denies silently — there
+    /// the caller is a machine presenting a credential, and the safe answer is
+    /// simply "not granted".)
+    #[serde(default)]
+    scope: Option<Vec<String>>,
+    /// RFC3339. Must be in the future.
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    budget_usd_monthly: Option<f64>,
 }
 
 /// `POST /v1/keys` response. camelCase to match the dashboard's `CreateResult`
@@ -93,6 +109,10 @@ struct CreateKeyResponse {
     last_used_at: Option<String>,
     created_at: String,
     raw_key: String,
+    /// A13. `null` only for a pre-A13 key; every newly minted key is explicit.
+    scope: Option<Vec<String>>,
+    /// A13. RFC3339 UTC, `null` = never expires.
+    expires_at: Option<String>,
 }
 
 /// Mount the mint route. Merged in `server.rs` when Postgres is configured.
@@ -155,18 +175,106 @@ async fn create_key_handler(
         ));
     }
 
+    // ── A13: validate scope / expiry / budget BEFORE minting ───────────────
+    // Rejected here rather than at the DB so the caller gets a 400 naming the
+    // problem instead of a 500 from a constraint violation.
+    let scope = match body.scope {
+        None => None,
+        Some(raw) => {
+            if raw.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "scope must not be empty — omit it for a full-surface key".into(),
+                ));
+            }
+            let mut out = Vec::with_capacity(raw.len());
+            for slug in &raw {
+                let Some(parsed) = tracelane_shared::api_scope::Scope::from_slug(slug) else {
+                    let known: Vec<&str> = tracelane_shared::api_scope::Scope::all()
+                        .iter()
+                        .map(|s| s.as_slug())
+                        .collect();
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown scope {slug:?} — known scopes: {}",
+                            known.join(", ")
+                        ),
+                    ));
+                };
+                // Normalise + de-duplicate so the stored array is canonical.
+                let slug = parsed.as_slug().to_string();
+                if !out.contains(&slug) {
+                    out.push(slug);
+                }
+            }
+            Some(out)
+        }
+    };
+
+    let expires_at = match body.expires_at.as_deref() {
+        None => None,
+        Some(raw) => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("expires_at must be RFC3339: {e}"),
+                    )
+                })?
+                .with_timezone(&chrono::Utc);
+            // An already-expired key would authenticate nothing — almost
+            // certainly a mistake, and silently minting a dead credential is
+            // worse than refusing.
+            if parsed <= chrono::Utc::now() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "expires_at must be in the future".into(),
+                ));
+            }
+            Some(parsed)
+        }
+    };
+
+    if let Some(b) = body.budget_usd_monthly
+        && (!b.is_finite() || b < 0.0)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "budget_usd_monthly must be a finite, non-negative number".into(),
+        ));
+    }
+
+    let opts = crate::db::api_keys::MintOptions {
+        scope,
+        expires_at,
+        budget_usd_monthly: body.budget_usd_monthly,
+    }
+    // An omitted scope becomes the explicit full set here, at the edge, so the
+    // 201 body reports what the row actually holds.
+    .with_default_scope();
+
     // Record the minting user (WorkOS `sub`) so §3 member-removal can revoke
     // exactly this user's keys. API-key / dev auth has an `apikey:`/`dev-stub`
     // sub — harmless to store; it just won't match a WorkOS user_id on removal.
     let minted_by = claims.sub.clone();
     let minted = state
         .minter
-        .mint(&tenant, name, Some(&minted_by))
+        .mint(&tenant, name, Some(&minted_by), opts)
         .await
         .map_err(|err| {
             // The error chain can reference internal state (pool, pepper); log it,
             // return a terse message. Never surface the raw key or key material.
-            tracing::error!(error = %err, "API key mint failed");
+            //
+            // `{err:#}` — the ALTERNATE form — not `%err`. anyhow's plain Display
+            // prints ONLY the outermost `.context()` string, so this line logged
+            // `INSERT INTO api_keys failed` and discarded the cause. On 2026-08-14
+            // that cause was `error serializing parameter 8` and recovering it
+            // took four independent probes (schema replay, prepared-statement type
+            // inspection, a scratch-table trigger falsification, and a standalone
+            // tokio-postgres binding probe) against one line of output. `{:#}`
+            // walks the chain and would have printed it first time.
+            tracing::error!(error = %format!("{err:#}"), "API key mint failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to create API key".into(),
@@ -182,6 +290,8 @@ async fn create_key_handler(
             last_used_at: None,
             created_at: minted.api_key.created_at.to_rfc3339(),
             raw_key: minted.raw_key,
+            scope: minted.api_key.scope,
+            expires_at: minted.api_key.expires_at.map(|t| t.to_rfc3339()),
         }),
     ))
 }
@@ -200,6 +310,9 @@ mod tests {
     /// handler passes `Claims.tenant_id` (never a body/header value).
     struct MockKeyMinter {
         seen: Arc<Mutex<Vec<String>>>,
+        /// A13: what the handler actually passed down, so a test can assert the
+        /// VALIDATED+NORMALISED scope rather than just that minting happened.
+        last_opts: Arc<Mutex<Option<crate::db::api_keys::MintOptions>>>,
     }
     #[async_trait::async_trait]
     impl KeyMinter for MockKeyMinter {
@@ -208,8 +321,12 @@ mod tests {
             tenant: &TenantId,
             name: &str,
             _minted_by: Option<&str>,
+            opts: crate::db::api_keys::MintOptions,
         ) -> Result<MintedKey> {
             self.seen.lock().unwrap().push(tenant.to_string());
+            let scope = opts.scope.clone();
+            let expires_at = opts.expires_at;
+            *self.last_opts.lock().unwrap() = Some(opts);
             Ok(MintedKey {
                 api_key: ApiKey {
                     id: Uuid::nil(),
@@ -218,6 +335,8 @@ mod tests {
                     created_at: DateTime::<Utc>::from_timestamp(1_778_000_000, 0).unwrap(),
                     last_used_at: None,
                     revoked_at: None,
+                    scope,
+                    expires_at,
                 },
                 key_prefix: "AbC012".into(),
                 raw_key: "tlane_MOCKKEYBODYdonotuseinprod".into(),
@@ -225,10 +344,212 @@ mod tests {
         }
     }
 
+    // ── A13: scope / expiry validation at the mint edge ────────────────────
+
+    fn body_with(
+        scope: Option<Vec<String>>,
+        expires_at: Option<String>,
+        budget: Option<f64>,
+    ) -> CreateKeyBody {
+        CreateKeyBody {
+            name: "k".into(),
+            scope,
+            expires_at,
+            budget_usd_monthly: budget,
+        }
+    }
+
+    /// An omitted scope must be stored as the EXPLICIT full set, not SQL NULL.
+    /// NULL is reserved for keys minted before A13; if new keys kept landing as
+    /// NULL, `LegacyFullSurface` would keep growing and the distinction that
+    /// makes scope enforceable would erode.
+    #[tokio::test]
+    async fn omitted_scope_is_recorded_explicitly_not_as_null() {
+        let (state, _seen) = mock_state();
+        let (status, Json(body)) = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(None, None, None)),
+        )
+        .await
+        .expect("mint should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        let mut got = body.scope.expect("scope must not be null on a new key");
+        got.sort();
+        // HAND-MAINTAINED ON PURPOSE — do NOT derive this from `Scope::all()` or
+        // from `Scope::default_mint_set()`. Deriving it from the same source the
+        // handler reads would make the assertion circular: it would pass for any
+        // vocabulary, including a wrong one. This literal is the independent pin,
+        // and adding a scope is meant to land here as a red test so a human
+        // decides whether "omitted" should really include the new capability.
+        //
+        // GWY-41 added `ingest`, and it should: a key minted with no scope is the
+        // one a customer pastes into an app that both calls models and reports its
+        // traces.
+        //
+        // **`admin` was here and was REMOVED (founder ruling, 2026-08-14).** The
+        // literal above read `["admin", "chat", "ingest", "read"]` and this test
+        // was GREEN the whole time — it pinned the defect rather than catching it,
+        // because the pin was written to match the code instead of to state the
+        // intent. That is the lesson worth more than the fix: an independent pin
+        // is only independent if it encodes a DECISION.
+        assert_eq!(got, vec!["chat", "ingest", "read"]);
+    }
+
+    /// The security half of the rule above, asserted as its own property so it
+    /// cannot be weakened by a future edit to the vocabulary list.
+    ///
+    /// **An omitted scope must NEVER grant `admin`.** `admin` is
+    /// *"manage the workspace — mint/revoke keys, provider keys, settings"*, so a
+    /// silent grant is the exact escalation `is_verified_owner()` was added to
+    /// enforced at the gateway rather than in the dashboard dialog on purpose:
+    /// the dialog is not the only caller, and it was in fact the caller that
+    /// shipped WITHOUT a scope field at all.
+    #[tokio::test]
+    async fn omitted_scope_never_includes_admin() {
+        let (state, _seen) = mock_state();
+        let (_status, Json(body)) = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(None, None, None)),
+        )
+        .await
+        .expect("mint should succeed");
+        let got = body.scope.expect("scope must not be null on a new key");
+        assert!(
+            !got.iter().any(|s| s == "admin"),
+            "omitting `scope` must never grant admin — got {got:?}"
+        );
+    }
+
+    /// And the other direction, so the test above cannot be satisfied by
+    /// removing `admin` from the vocabulary entirely: `admin` must still be
+    /// grantable when it is asked for BY NAME. Opt-in, not unavailable.
+    #[tokio::test]
+    async fn admin_scope_is_still_grantable_when_requested_explicitly() {
+        let (state, _seen) = mock_state();
+        let (status, Json(body)) = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(Some(vec!["admin".into()]), None, None)),
+        )
+        .await
+        .expect("an explicit admin scope must still mint");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body.scope.expect("scope must not be null"),
+            vec!["admin".to_string()]
+        );
+    }
+
+    /// An unknown slug is a 400 naming the problem — never a silent drop that
+    /// hands back a key doing less than the caller asked for.
+    #[tokio::test]
+    async fn unknown_scope_is_rejected_with_the_known_set() {
+        let (state, _seen) = mock_state();
+        let err = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(Some(vec!["superuser".into()]), None, None)),
+        )
+        .await
+        .expect_err("an unknown scope must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("superuser"),
+            "message must name the bad slug"
+        );
+        assert!(err.1.contains("chat"), "message must list the known scopes");
+    }
+
+    #[tokio::test]
+    async fn scope_is_normalised_and_deduplicated() {
+        let (state, _seen) = mock_state();
+        let (_s, Json(body)) = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(
+                Some(vec!["READ".into(), " read ".into(), "chat".into()]),
+                None,
+                None,
+            )),
+        )
+        .await
+        .expect("mint should succeed");
+        assert_eq!(
+            body.scope,
+            Some(vec!["read".to_string(), "chat".to_string()])
+        );
+    }
+
+    /// `{}` is refused rather than stored: the DB CHECK would reject it anyway,
+    /// and a 400 explaining the alternative beats a 500 from a constraint.
+    #[tokio::test]
+    async fn empty_scope_array_is_refused_with_guidance() {
+        let (state, _seen) = mock_state();
+        let err = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(Some(vec![]), None, None)),
+        )
+        .await
+        .expect_err("an empty scope must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("omit it"), "must say how to get a full key");
+    }
+
+    /// Minting an already-dead credential is almost certainly a mistake, and
+    /// silently doing it is worse than refusing.
+    #[tokio::test]
+    async fn past_expiry_is_refused() {
+        let (state, _seen) = mock_state();
+        let err = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(None, Some("2020-01-01T00:00:00Z".into()), None)),
+        )
+        .await
+        .expect_err("a past expiry must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("future"));
+    }
+
+    #[tokio::test]
+    async fn malformed_expiry_is_a_400_not_a_500() {
+        let (state, _seen) = mock_state();
+        let err = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(None, Some("next tuesday".into()), None)),
+        )
+        .await
+        .expect_err("a malformed expiry must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("RFC3339"));
+    }
+
+    #[tokio::test]
+    async fn negative_and_nonfinite_budgets_are_refused() {
+        for bad in [-1.0_f64, f64::NAN, f64::INFINITY] {
+            let (state, _seen) = mock_state();
+            let err = create_key_handler(
+                State(state),
+                bearer_headers(),
+                Json(body_with(None, None, Some(bad))),
+            )
+            .await
+            .expect_err("a bad budget must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "budget {bad} must 400");
+        }
+    }
+
     fn mock_state() -> (KeyRoutesState, Arc<Mutex<Vec<String>>>) {
         let seen = Arc::new(Mutex::new(vec![]));
         let state = KeyRoutesState {
-            minter: Arc::new(MockKeyMinter { seen: seen.clone() }),
+            minter: Arc::new(MockKeyMinter {
+                seen: seen.clone(),
+                last_opts: Arc::new(Mutex::new(None)),
+            }),
         };
         (state, seen)
     }
@@ -281,6 +602,9 @@ mod tests {
             bearer_headers(),
             Json(CreateKeyBody {
                 name: "  prod-agent  ".into(),
+                scope: None,
+                expires_at: None,
+                budget_usd_monthly: None,
             }),
         )
         .await
@@ -301,7 +625,12 @@ mod tests {
         let (status, _msg) = create_key_handler(
             State(state),
             HeaderMap::new(), // no Authorization
-            Json(CreateKeyBody { name: "x".into() }),
+            Json(CreateKeyBody {
+                name: "x".into(),
+                scope: None,
+                expires_at: None,
+                budget_usd_monthly: None,
+            }),
         )
         .await
         .expect_err("must reject unauthenticated");
@@ -320,7 +649,12 @@ mod tests {
         let (status, _msg) = create_key_handler(
             State(state),
             bearer_headers(),
-            Json(CreateKeyBody { name: "   ".into() }),
+            Json(CreateKeyBody {
+                name: "   ".into(),
+                scope: None,
+                expires_at: None,
+                budget_usd_monthly: None,
+            }),
         )
         .await
         .expect_err("blank name must be rejected");

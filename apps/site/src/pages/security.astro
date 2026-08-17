@@ -1,0 +1,70 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base
+  title="Security · Tracelane"
+  description="Security posture, release integrity, vulnerability scanning, and compliance roadmap for Tracelane."
+>
+  <section class="container-prose py-24">
+    <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider lowercase">security</p>
+    <h1 class="text-3xl sm:text-4xl font-semibold tracking-tight text-fg">Security posture.</h1>
+    <p class="mt-6 text-lg text-fg-muted leading-relaxed">
+      Tracelane is designed for procurement reviews at regulated buyers. This page documents what's verifiable today and what's on the roadmap.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Release integrity</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— Sigstore Cosign keyless signing on every release artifact.</li>
+      <li>— Build provenance attested with GitHub attest-build-provenance. Every GitHub Action pinned by commit SHA. A verified SLSA Level 3 attestation is not claimed.</li>
+      <li>— Trusted Publishing OIDC for PyPI and npm. No long-lived registry tokens in CI.</li>
+      <li>— CycloneDX SBOM published with every release, verifiable from GitHub release artifacts.</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Vulnerability management</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— OSV-Scanner + Grype + Syft on every commit.</li>
+      <li>— gitleaks on every commit to block secret leaks.</li>
+      <li>— GitHub Security Advisories enabled for coordinated disclosure.</li>
+      <li>— cargo-deny enforces the dependency and license allow-list on every build.</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Transport + isolation</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— TLS 1.3 minimum.</li>
+      <li>— mTLS via SPIFFE/SPIRE for ingest workers.</li>
+      <li>— SSRF defense — RFC1918, 100.64/10, 169.254/16, ::1, fc00::/7 all denied. file:// and gopher:// schemes blocked. Redirects are disabled entirely on the hardened client, so a validated host cannot hand off to an unvalidated one.</li>
+      <li>— rustls + aws-lc-rs + ring crypto stack. No openssl.</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Tenant isolation</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— BYOK only. Provider keys envelope-encrypted at rest. Never written to logs or spans.</li>
+      <li>— secrecy::SecretString + Zeroize-on-drop for all in-memory credentials.</li>
+      <li>— Every ClickHouse query enforces WHERE tenant_id = ? from JWT claim, never request body.</li>
+      <li>— Row-level policies via X-Tenant-Id header propagated through getClientHeader().</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Containers + supply chain</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— Chainguard Wolfi base images only. Distroless. No shell, no package manager in runtime image.</li>
+      <li>— GitHub Actions pinned by SHA, never by tag.</li>
+      <li>— Custom tracing redaction layer scrubs secrets before they hit any log sink.</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Compliance roadmap</h2>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— SOC 2 — Tracelane holds no SOC 2 report today and none is in progress.</li>
+      <li>— HIPAA — Tracelane does not sign BAAs today. Hetzner, our infrastructure provider, does not sign them either.</li>
+      <li>— EU AI Act Article 12 — an Article 12 documentation pack ships with the Tamper-Evident Agent Ledger add-on. It generates evidence templates locally; it is not a conformance assessment and Tracelane makes no representation that deploying it satisfies any obligation. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">details</a>).</li>
+      <li>— India DPDP Phase II — Tracelane enforces no per-tenant storage region today; region pinning is on the roadmap. Enforcement Nov 13, 2026.</li>
+    </ul>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Responsible disclosure</h2>
+    <p class="mt-4 text-fg-muted">
+      Report security issues to <code class="font-mono text-fg">security@tracelane.dev</code>. We respond within 24 hours. Bug bounty program within 30 days of the V1 release.
+    </p>
+
+    <p class="mt-16 text-sm text-fg-subtle">Last updated: May 20, 2026.</p>
+  </section>
+</Base>

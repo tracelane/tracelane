@@ -23,7 +23,7 @@ Tracelane. Five components, one monorepo.
         │  • Audit publish (v2 SHA-256 chain, PII pre-redacted)        │
         │  • Provider dispatch (35 routable, prefix-routed, fail-closed)│
         │  • 1 same-provider retry; cross-provider failover is opt-in  │
-        │  • OTLP emit → NATS JetStream (NATS_URL unset ⇒ no spans)    │
+        │  • OTLP emit → NATS JetStream (NATS_URL required at boot)    │
         └────────────┬─────────────────────────┬──────────────────────┘
                      │ HTTPS to provider         │ NATS publish
                      ▼                           ▼

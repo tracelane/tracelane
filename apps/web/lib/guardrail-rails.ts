@@ -7,10 +7,12 @@
  * over-claim: R2/R6 redact, R5 only warns, R8 is a heuristic). Honesty lock: if a
  * rail's code changes what it does, this copy changes with it.
  *
- * `gated` reflects `GuardrailFeature` (rail.rs): free rails run for everyone;
- * gated rails require a workspace entitlement. We do NOT promise a specific tier —
- * no plan seed grants these yet (they're enabled per-workspace), so the honest
- * label is "Advanced", not "available on Team".
+ * `gated` mirrors `Rail::feature()` in `crates/gateway/src/guardrail/rails/*.rs`
+ * EXACTLY: `None` ⇒ free (the rail never consults the entitlement gate at all),
+ * `Some(GuardrailFeature::…)` ⇒ gated on a workspace entitlement. It is not a
+ * marketing judgement and must never be edited to match a price sheet — the
+ * binary decides, and `components/guardrails/rail-tier-drift.test.ts` fails the
+ * build if this file drifts from it.
  */
 
 export type RailAction = "block" | "redact" | "warn";
@@ -64,7 +66,8 @@ export const RAIL_ROSTER: RailMeta[] = [
 		name: "Tool-definition pinning",
 		action: "block",
 		side: "request",
-		gated: true,
+		// FREE on every plan, OSS included — `r3_tool_safety.rs:246` returns
+		gated: false,
 		blurb:
 			"Blocks a request when a tool's definition changed from the last-approved version — a silent MCP rug-pull.",
 	},
@@ -73,7 +76,9 @@ export const RAIL_ROSTER: RailMeta[] = [
 		name: "Lethal-trifecta prevention",
 		action: "block",
 		side: "request",
-		gated: true,
+		// FREE on every plan, OSS included — `r4_trifecta.rs:237` returns `None`
+		// agent-safety rail a free tier never sees is worthless as proof.
+		gated: false,
 		blurb:
 			"Blocks (or warns, in approve mode) requests where untrusted input, private-data access, and an exfil-capable tool converge — the lethal trifecta. Request-side only in V1.",
 	},
@@ -116,20 +121,26 @@ export const RAIL_ROSTER: RailMeta[] = [
 ];
 
 /**
- * The tier that unlocks each gated rail (ADR-064, amended 2026-07-14). Free rails
- * have no entry. Kept in lockstep with the `plan_entitlements` grants in
- * apps/web/db/seed.mjs — the label is a real purchase path only because the seed
- * grants that tier the rail. Amendment: all six gated rails now unlock at Team+
- * (R2/R4 moved down from Business) to make the full guardrail suite an
- * adoption-tier feature, not a Business-only one.
+ * The lowest plan that unlocks each GATED rail. A free rail has no entry — an
+ * entry here is a **purchase prompt**, so putting a free rail in this map bills a
+ * customer, in the UI, for something they already have.
+ *
+ * Derived from, and kept in lockstep with, the `plan_entitlements` grants in
+ * `apps/web/db/seed.mjs`: `f_guardrail_r{2,5,6,7}` are `false` on `free_v1` and
+ * `builder_v1`, `true` from `team_v1` up — so "Team" is a real purchase path.
+ *
+ * Only the four data-governance / quality rails appear. R3_pinning and
+ * made both UNGATED (`Rail::feature()` → `None`), so a Free tenant already runs
+ * them and the old "Team 🔒" badge on those two rows was a false upsell. Their
+ * `f_guardrail_r3_pinning` / `f_guardrail_r4` columns are still `true` on every
+ * plan in the seed purely so the control plane cannot contradict the binary —
+ * that is NOT a tier gate, and it must not be rendered as one.
  */
 export const RAIL_TIER: Record<string, "Team" | "Business"> = {
-	R3_pinning: "Team",
+	R2_secrets_pii: "Team",
 	R5_format: "Team",
 	R6_sysprompt_leak: "Team",
 	R7_topic_competitor: "Team",
-	R2_secrets_pii: "Team",
-	R4_trifecta: "Team",
 };
 
 const BY_ID: Record<string, RailMeta> = Object.fromEntries(

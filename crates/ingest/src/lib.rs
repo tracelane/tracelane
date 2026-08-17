@@ -24,7 +24,10 @@
 )]
 
 pub mod cardinality;
-pub mod limits;
+// MOVED to `tracelane_shared::otlp` for GWY-41 (see main.rs). Re-exported under the
+// old path so `benches/limits.rs` — `use ingest::limits::…` — compiles unchanged.
+pub use tracelane_shared::otlp::decode as otlp_decode;
+pub use tracelane_shared::otlp::limits;
 // Dual-compiled with `main.rs`'s `mod tail_sampler;` (same pattern as the two
 // above) so the PP-O2 sampler hot path is reachable from `benches/sampler.rs`.
 pub mod tail_sampler;

@@ -327,31 +327,37 @@ export type NavSection = {
  * dead. Items tagged `badge: "V1.1"` route to an honest ComingSoon empty state.
  */
 export const sections: NavSection[] = [
+	// ADR-074 §6 grouping. The SAME NINE hrefs as the previous Observe/Improve/
+	// Operate split — regrouped, never reduced, which is why the R12 after-proof
+	// on navigation is a re-grouping check and not a loss audit.
 	{
 		label: "Observe",
 		items: [
 			{ href: "/dashboard", label: "Dashboard", Icon: DashboardIcon },
 			{ href: "/traces", label: "Traces", Icon: ActivityIcon },
 			{ href: "/sessions", label: "Sessions", Icon: SessionsIcon },
-			{ href: "/slo", label: "SLO", Icon: BarChartIcon },
 		],
 	},
 	{
-		label: "Improve",
+		// PROVE is its own group DELIBERATELY (ADR-074 §6): the tamper-evident
+		// ledger is the moat, and burying it under Settings or "Operate" made the
+		// one thing competitors cannot copy the hardest thing to find.
+		label: "Prove",
 		items: [
+			{ href: "/audit", label: "Audit", Icon: ShieldIcon },
 			{ href: "/signatures", label: "Failure Signatures", Icon: SignatureIcon },
-			{ href: "/prompts", label: "Prompts", Icon: GitBranchIcon },
-			// Datasets / Experiments / Playground are V1.1 — not shown in the nav
-			// until built (their `app/*/page.tsx` ComingSoon stubs remain for
-			// direct-URL access + trivial re-enable). Re-add here when shipped.
 		],
 	},
 	{
 		label: "Operate",
 		items: [
-			{ href: "/guardrails", label: "Guardrails", Icon: ShieldCheckIcon },
-			{ href: "/audit", label: "Audit", Icon: ShieldIcon },
 			{ href: "/gateway", label: "Gateway", Icon: GatewayIcon },
+			{ href: "/guardrails", label: "Guardrails", Icon: ShieldCheckIcon },
+			{ href: "/slo", label: "SLO", Icon: BarChartIcon },
+			{ href: "/prompts", label: "Prompts", Icon: GitBranchIcon },
+			// Datasets / Experiments / Playground are V1.1 — not shown in the nav
+			// until built (their `app/*/page.tsx` ComingSoon stubs remain for
+			// direct-URL access + trivial re-enable). Re-add here when shipped.
 		],
 	},
 	{

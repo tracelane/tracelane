@@ -57,7 +57,13 @@ const COST_SQL: &str = "SELECT sum(if(isFinite(JSONExtractFloat(attributes, 'gen
     FROM tracelane.spans \
     WHERE tenant_id = ? AND start_time >= now() - toIntervalMinute(?)";
 // quota_pct: traces month-to-date (the rule's window is ignored — quota is monthly).
-const QUOTA_USED_SQL: &str = "SELECT toFloat64(count()) FROM tracelane.trace_summaries \
+// `uniqExact(trace_id)`, NOT `count()` — same defect and same reason as
+// `server::TRACES_THIS_MONTH_SQL` (B-243). A split trace emits >1 partial row in
+// `trace_summaries` that never collapses, so `count()` made the `quota_pct` alert
+// fire EARLY on real agent traffic. Kept numerically identical to the enforcer's
+// figure on purpose: an alert that disagrees with the quota it warns about is
+// worse than no alert.
+const QUOTA_USED_SQL: &str = "SELECT toFloat64(uniqExact(trace_id)) FROM tracelane.trace_summaries \
     WHERE tenant_id = ? AND start_time >= toStartOfMonth(now())";
 
 /// The error-budget fraction (`1 - availability SLO target`) for a plan lookup
@@ -74,11 +80,37 @@ fn plan_key_to_error_budget(key: Option<&str>) -> f64 {
 
 /// Evaluates alert rules and fires notifications. Spawned once at startup;
 /// requires both the control plane (Postgres, for rules) and ClickHouse (metrics).
+/// How long a fetched rule set is reused before Postgres is asked again.
+///
+/// alert_destinations` query on EVERY tick. At the 60-second default that is
+/// 1,440 round trips a day to a Frankfurt compute to ask a question that, with
+/// zero alert rules configured, has no rows behind it — and every one of them
+/// keeps the compute awake.
+///
+/// Raising the tick interval was the workaround; this is the fix, and it is
+/// deliberately a rule-set cache rather than a zero-rules special case, because
+/// a special case stops paying the moment the first rule is created. Here the
+/// Postgres query drops from once per tick to once per TTL **whether or not
+/// rules exist**, and evaluation continues at full tick rate against the cached
+/// set — so alert latency is unchanged.
+///
+/// The cost of the TTL is bounded and stated: a newly created or deleted rule
+/// takes effect within this window rather than on the next tick.
+const RULES_CACHE_TTL: Duration = Duration::from_secs(900);
+
+/// One enabled rule joined to the destination it fires to.
+type RuleWithDest = (AlertRule, super::AlertDestination);
+
+/// `(fetched_at, rules)` — `None` until the first fetch.
+type CachedRules = Option<(std::time::Instant, Vec<RuleWithDest>)>;
+
 pub struct AlertChecker {
     pool: DbPool,
     ch: clickhouse::Client,
     entitlements: Arc<EntitlementCache>,
     interval: Duration,
+    /// `(fetched_at, rules)`. `None` = never fetched.
+    rules_cache: tokio::sync::RwLock<CachedRules>,
 }
 
 impl AlertChecker {
@@ -93,6 +125,7 @@ impl AlertChecker {
             ch,
             entitlements,
             interval,
+            rules_cache: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -113,9 +146,30 @@ impl AlertChecker {
         });
     }
 
+    /// The enabled rule set, from cache when fresh.
+    ///
+    /// # Errors
+    /// Propagates a Postgres failure only when the cache is cold or stale — a
+    /// fresh cache serves without touching the control plane at all.
+    async fn cached_rules(&self) -> anyhow::Result<Vec<RuleWithDest>> {
+        if let Some((fetched_at, rules)) = self.rules_cache.read().await.as_ref()
+            && fetched_at.elapsed() < RULES_CACHE_TTL
+        {
+            return Ok(rules.clone());
+        }
+        let rules = super::list_enabled_rules_with_dest(&self.pool).await?;
+        *self.rules_cache.write().await = Some((std::time::Instant::now(), rules.clone()));
+        Ok(rules)
+    }
+
     /// One evaluation pass over all enabled rules.
     pub async fn run_once(&self) -> anyhow::Result<()> {
-        let rules = super::list_enabled_rules_with_dest(&self.pool).await?;
+        let rules = self.cached_rules().await?;
+        // Zero rules is the steady state today (alerting ships dark), and it must
+        // cost nothing: no ClickHouse queries, no entitlement lookups, no work.
+        if rules.is_empty() {
+            return Ok(());
+        }
         for (rule, dest) in rules {
             // Re-gate on the entitlement so a revoked tenant stops firing.
             if !self
@@ -126,6 +180,15 @@ impl AlertChecker {
                 continue;
             }
             let Some(value) = self.evaluate(&rule).await else {
+                // "I cannot see" as "nothing to do": the rule is skipped, the customer's
+                // alert silently stops evaluating, and the dashboard still shows it
+                // enabled. Fail-safe is the right CHOICE — firing on an unreadable metric
+                // would be worse — but it was completely uninstrumented, which is the
+                // exact defect this registry exists to close. The thing that tells you
+                // something is broken must not itself break quietly.
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::AlertEvalSkipped,
+                );
                 continue; // metric unavailable this tick → fail-safe skip
             };
             let breach = is_breach(value, &rule.comparator, rule.threshold);
@@ -141,6 +204,26 @@ impl AlertChecker {
                         "alert breach — firing notification"
                     );
                     fire_alert_async(dest.url.clone(), breach_message(&rule, value));
+                    // DSH-01: also land it in the tenant's in-app inbox. This is
+                    // on the ok->breach EDGE, so it is one row per breach, not one
+                    // per tick — the same discipline the webhook fire already
+                    // follows (.claude/rules/logging.md: transitions, not
+                    // occurrences).
+                    //
+                    // Deliberately AFTER the webhook: the outbound alert is the
+                    // load-bearing delivery and must not wait on a Postgres write.
+                    // `notify` fails OPEN and logs, so a full inbox table can
+                    // never suppress an alert.
+                    crate::notification_routes::notify(
+                        &self.pool,
+                        rule.tenant_id,
+                        "alert",
+                        &format!("Alert fired: {}", rule.metric),
+                        &breach_message(&rule, value),
+                        "warning",
+                        "/slo",
+                    )
+                    .await;
                     let _ = super::update_rule_state(&self.pool, rule.id, "breach", true).await;
                 }
                 (false, "breach") => {
@@ -278,11 +361,47 @@ impl AlertChecker {
 
 #[cfg(test)]
 mod tests {
-    use super::plan_key_to_error_budget;
+    use super::{RULES_CACHE_TTL, plan_key_to_error_budget};
+    use std::time::Duration;
 
     /// not a hardcoded 99.9%. The discriminating case: a Team tenant's target is
     /// 99% (budget 0.01), so the same error fraction yields a burn 10× lower than
     /// the old hardcoded 0.001 divisor — the exact overstatement this fixes.
+    /// money (Postgres is not consulted on every tick) without needing a live
+    /// Neon: the cache decision is a pure function of `fetched_at` vs the TTL.
+    #[test]
+    fn a_fresh_cache_entry_is_reused_and_a_stale_one_is_not() {
+        let fresh = std::time::Instant::now();
+        assert!(
+            fresh.elapsed() < RULES_CACHE_TTL,
+            "a just-fetched rule set must be served from cache — that is the whole saving"
+        );
+        // The boundary is what matters: at TTL the query must happen again, or a
+        // new rule would never take effect.
+        let stale = std::time::Instant::now()
+            .checked_sub(RULES_CACHE_TTL + Duration::from_secs(1))
+            .expect("representable");
+        assert!(
+            stale.elapsed() >= RULES_CACHE_TTL,
+            "past the TTL the rule set must be re-read, or a created rule never fires"
+        );
+    }
+
+    /// The TTL bounds how long a new rule waits, so it must stay small enough to
+    /// be an operational nuisance rather than a broken feature. Named so a future
+    /// "just make it an hour" has to argue with this line.
+    #[test]
+    fn rules_cache_ttl_stays_within_a_defensible_window() {
+        assert!(
+            RULES_CACHE_TTL <= Duration::from_secs(900),
+            "a newly created alert rule must start evaluating within 15 minutes"
+        );
+        assert!(
+            RULES_CACHE_TTL >= Duration::from_secs(300),
+            "below 5 minutes the per-tick Postgres saving stops being worth the code"
+        );
+    }
+
     #[test]
     fn plan_error_budget_matches_adr020_slas_and_fixes_team_10x() {
         assert_eq!(plan_key_to_error_budget(Some("team_v1")), 0.01); // 99%

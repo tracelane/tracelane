@@ -19,12 +19,14 @@ import {
 	LatencyTimeline,
 	Skeleton,
 	StatCard,
+	StatGrid,
 	type StatTone,
+	TimeRuler,
 } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { computeSloBudget } from "./budget";
-import { latencyPointsFromTimeseries } from "./latency";
+import { chartWindow, latencyPointsFromTimeseries } from "./latency";
 
 export const metadata: Metadata = { title: "SLOs — Tracelane" };
 
@@ -71,41 +73,41 @@ function SloTable({
 	}
 
 	return (
-		<div className="overflow-x-auto rounded-xl border border-line bg-surface">
+		<div className="overflow-x-auto rounded-lg border border-line bg-surface">
 			<table className="w-full text-sm">
 				<thead className="border-b border-line">
 					<tr>
-						<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Provider / Model
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Requests
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Error rate
 						</th>
 						<th
-							className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3"
+							className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3"
 							title="True window percentiles — merged from the stored per-hour quantile states (not an average of hourly percentiles)."
 						>
 							p50
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							p95
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							p99
 						</th>
 						<th
-							className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-accent-ink"
+							className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-action-ink"
 							title="Gateway overhead p95 — the time Tracelane adds, EXCLUDING upstream generation. Compare with the p95 to the left: our slice is tiny."
 						>
 							Gateway ovh
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Input tokens
 						</th>
-						<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Output tokens
 						</th>
 					</tr>
@@ -116,7 +118,7 @@ function SloTable({
 						const errorPct = s.error_rate_pct;
 						return (
 							<tr key={key} className="transition-colors hover:bg-surface-2/30">
-								<td className="px-4 py-3">
+								<td className="px-3 py-2">
 									<div className="font-medium text-xs text-ink">
 										{s.provider || "—"}
 									</div>
@@ -124,27 +126,27 @@ function SloTable({
 										{s.model || "—"}
 									</div>
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink">
 									{s.requests.toLocaleString()}
 								</td>
-								<td className="px-4 py-3 text-right">
+								<td className="px-3 py-2 text-right">
 									<span
 										className={`font-mono tabular-nums text-xs ${errorPct > 5 ? "text-danger-ink font-semibold" : errorPct > 1 ? "text-warn-ink" : "text-ok-ink"}`}
 									>
 										{errorPct.toFixed(2)}%
 									</span>
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink-2">
 									{formatDuration(s.p50_ms)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink-2">
 									{formatDuration(s.p95_ms)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink-2">
 									{formatDuration(s.p99_ms)}
 								</td>
 								<td
-									className="px-4 py-3 text-right font-mono tabular-nums text-xs text-accent-ink"
+									className="px-3 py-2 text-right font-mono tabular-nums text-xs text-action-ink"
 									title="Gateway overhead p95 — Tracelane's own slice, excluding upstream generation"
 								>
 									{(() => {
@@ -152,10 +154,10 @@ function SloTable({
 										return ovh && ovh > 0 ? formatDuration(ovh) : "—";
 									})()}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink-2">
 									{formatTokens(s.total_input_tokens)}
 								</td>
-								<td className="px-4 py-3 text-right font-mono tabular-nums text-xs text-ink-2">
+								<td className="px-3 py-2 text-right font-mono tabular-nums text-xs text-ink-2">
 									{formatTokens(s.total_output_tokens)}
 								</td>
 							</tr>
@@ -226,11 +228,14 @@ async function SloData({ range }: { range?: string }) {
 		totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
 	// Chart points are the gateway's TRUE per-bucket quantiles — just format the
 	// UTC label + rename fields (no client re-aggregation).
-	const latencyPoints = latencyPointsFromTimeseries(timePoints, bucketMs);
+	// R59: the REQUESTED window, so "— last {range}" above is true. See
+	// app/slo/latency.ts ChartWindow for why a data-derived domain was the defect.
+	const win = chartWindow(Date.now(), hours, bucketMs);
+	const latencyPoints = latencyPointsFromTimeseries(timePoints, bucketMs, win);
 	const budget = computeSloBudget(totalRequests, totalErrors);
 
 	return (
-		<div className="space-y-5">
+		<div className="space-y-3">
 			{/* Plain-language "what's measured" — elevates SLO target / availability
 			    / error budget to the same clarity the burn-rate line already has. */}
 			<details className="rounded-lg border border-line bg-surface-2/30 px-4 py-3 text-sm">
@@ -279,26 +284,23 @@ async function SloData({ range }: { range?: string }) {
 						window; above, it's exhausted early.
 					</p>
 				</div>
-				<div className="grid grid-cols-4 gap-4 items-stretch">
+				<StatGrid cols={4}>
 					<StatCard
 						icon="error-budget"
 						label="SLO target (default)"
 						value={`${budget.targetPct.toFixed(1)}%`}
-						className="h-full flex flex-col"
 					/>
 					<StatCard
 						icon="time"
 						label={`Availability (${label})`}
 						value={`${budget.availabilityPct.toFixed(3)}%`}
 						tone={toneOf(budget.tone)}
-						className="h-full flex flex-col"
 					/>
 					<StatCard
 						icon="error-budget"
 						label="Error budget remaining"
 						value={formatBudgetRemaining(budget.budgetRemainingPct)}
-						variant="accent"
-						className="h-full flex flex-col"
+						variant="action"
 					/>
 					<StatCard
 						icon="latency"
@@ -306,17 +308,15 @@ async function SloData({ range }: { range?: string }) {
 						value={formatBurnRate(budget.burnRate)}
 						variant="inverse"
 						sub="1.0× = on pace"
-						className="h-full flex flex-col"
 					/>
-				</div>
+				</StatGrid>
 			</section>
-			<div className="grid grid-cols-4 gap-4 items-stretch">
+			<StatGrid title="Volume &amp; errors" cols={4}>
 				<StatCard
 					icon="llm-calls"
 					label={`LLM calls (${label})`}
 					value={totalRequests.toLocaleString()}
 					hint="Model requests — one agent run can make several. Not the trace/conversation count (see Traces)."
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="failure-signatures"
@@ -325,26 +325,32 @@ async function SloData({ range }: { range?: string }) {
 					tone={
 						overallErrorPct > 5 ? "danger" : overallErrorPct > 1 ? "warn" : "ok"
 					}
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="tokens"
 					label="Input tokens"
 					value={formatTokens(totalInputTokens)}
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="tokens"
 					label="Output tokens"
 					value={formatTokens(totalOutputTokens)}
-					className="h-full flex flex-col"
 				/>
-			</div>
-			<Card className="p-4">
+			</StatGrid>
+			<Card className="p-3">
 				<h2 className="mb-3 text-sm font-semibold text-ink">
-					Latency over time — last {label}
+					Latency over time — last {label} · UTC
 				</h2>
-				<LatencyTimeline points={latencyPoints} />
+				<>
+					<LatencyTimeline points={latencyPoints} />
+					{/* ADR-074 §7 — the one time axis. */}
+					<TimeRuler
+						startMs={win.startMs}
+						endMs={win.endMs + bucketMs}
+						ticks={4}
+						mode="absolute"
+					/>
+				</>
 			</Card>
 			<SloTable modelRows={modelRows} overheadByModel={overheadByModel} />
 		</div>
@@ -367,7 +373,7 @@ export default async function SloPage({
 	const { range } = await searchParams;
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+			<div className="mb-4 flex flex-wrap items-start justify-between gap-3">
 				<div>
 					<h1 className="t-h1">SLOs</h1>
 					<p className="mt-1 text-sm text-ink-2">
@@ -380,11 +386,11 @@ export default async function SloPage({
 			<Suspense
 				fallback={
 					<div className="space-y-4">
-						<div className="grid grid-cols-4 gap-4">
+						<StatGrid cols={4}>
 							{[0, 1, 2, 3].map((i) => (
 								<Skeleton key={i} className="h-24" />
 							))}
-						</div>
+						</StatGrid>
 						<Skeleton className="h-64" />
 					</div>
 				}

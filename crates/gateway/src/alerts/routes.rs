@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{METRICS, is_breach};
+use super::{DeliveryError, METRICS, is_breach};
 use crate::db::DbPool;
 use crate::entitlement_cache::{EntitlementCache, FeatureKey};
 
@@ -316,6 +316,69 @@ struct TestBody {
     destination_id: Uuid,
 }
 
+/// The payload a manual test-fire sends.
+const TEST_ALERT_TEXT: &str = "✅ Tracelane test alert — your destination is wired correctly. \
+     (No rule breached; this was a manual test.)";
+
+/// Turn a delivery outcome into the tenant-visible response.
+///
+/// SET-N1: `202 {"status":"sent"}` is emitted **only** when the destination
+/// itself answered 2xx. It used to be emitted unconditionally — the POST was
+/// spawned and abandoned — so a revoked Slack webhook (`404 no_service`)
+/// reported "Test alert sent successfully" forever and the user had no way to
+/// learn their alerting was dead. `http_status` is the observed status, so the
+/// success case is auditable and not just a label.
+///
+/// Failures map to `502` (the destination is an upstream we could not deliver
+/// to) except an SSRF rejection, which is a `400` about the URL the tenant
+/// stored. Neither collides with the `404` that means "destination not found"
+/// or the `403` that means "alerts not entitled" — the dashboard proxy
+/// distinguishes on exactly those two.
+fn delivery_response(outcome: Result<u16, DeliveryError>) -> Response {
+    match outcome {
+        Ok(http_status) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "sent", "http_status": http_status })),
+        )
+            .into_response(),
+        Err(DeliveryError::Status { http_status, body }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "failed",
+                "error": "the destination rejected the test alert",
+                "http_status": http_status,
+                "detail": body,
+            })),
+        )
+            .into_response(),
+        Err(DeliveryError::Unreachable(detail)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "failed",
+                "error": "the destination was unreachable",
+                "detail": detail,
+            })),
+        )
+            .into_response(),
+        Err(DeliveryError::Rejected(detail)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "failed",
+                "error": "url rejected (SSRF guard)",
+                "detail": detail,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Deliver synchronously and report what actually happened. Bounded by the
+/// notifier's own validate + request timeouts (3s + 5s), which sit inside the
+/// dashboard proxy's 10s budget.
+async fn deliver_and_respond(url: &str, text: &str) -> Response {
+    delivery_response(super::deliver_alert(url, text).await)
+}
+
 async fn test_fire_handler(
     State(state): State<AlertRoutesState>,
     headers: HeaderMap,
@@ -326,15 +389,7 @@ async fn test_fire_handler(
         Err(r) => return r,
     };
     match super::get_destination(&state.pool, tenant, body.destination_id).await {
-        Ok(Some(dest)) => {
-            super::fire_alert_async(
-                dest.url,
-                "✅ Tracelane test alert — your destination is wired correctly. \
-                 (No rule breached; this was a manual test.)"
-                    .to_string(),
-            );
-            (StatusCode::ACCEPTED, Json(json!({ "status": "sent" }))).into_response()
-        }
+        Ok(Some(dest)) => deliver_and_respond(&dest.url, TEST_ALERT_TEXT).await,
         Ok(None) => err(StatusCode::NOT_FOUND, "destination not found"),
         Err(e) => {
             tracing::error!(error = %e, "test-fire destination lookup failed");
@@ -343,9 +398,18 @@ async fn test_fire_handler(
     }
 }
 
-#[cfg(test)]
+// `debug_assertions` is load-bearing, not decoration. These tests use
+// `LoopbackBypassGuard` → `ssrf_guard::set_loopback_bypass_for_tests`, which is itself
+// `#[cfg(debug_assertions)]` because a release binary must NEVER be able to switch the
+// SSRF loopback guard off (.claude/rules/security.md). `cargo bench` compiles test
+// targets in the BENCH profile, where `debug_assertions` is off — so a plain
+// `#[cfg(test)]` here compiles a call to a function that does not exist and takes the
+// whole Benchmarks job down with E0425. Same gate `providers/openai.rs:624` already uses.
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn create_rule_validation_matches_the_five_metrics_and_comparators() {
@@ -354,5 +418,117 @@ mod tests {
         // is_breach is the evaluator's comparator (routes validate the same set).
         assert!(is_breach(2.0, "gt", 1.0));
         assert!(is_breach(0.5, "lt", 1.0));
+    }
+
+    // ── SET-N1: what the user sees after pressing "Send test" ────────────────
+
+    struct LoopbackBypassGuard;
+    impl LoopbackBypassGuard {
+        fn new() -> Self {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+            Self
+        }
+    }
+    impl Drop for LoopbackBypassGuard {
+        fn drop(&mut self) {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+        }
+    }
+
+    async fn parts(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("response body is JSON"),
+        )
+    }
+
+    async fn mock_webhook(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// MUST ACCEPT: a live destination yields `202 {"status":"sent"}` — the
+    /// published contract — and now carries the status that proves it.
+    #[tokio::test]
+    async fn live_destination_reports_sent_with_the_observed_status() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = mock_webhook(200, "ok").await;
+
+        let (status, body) = parts(deliver_and_respond(&server.uri(), TEST_ALERT_TEXT).await).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "sent");
+        assert_eq!(body["http_status"], 200);
+    }
+
+    /// MUST REJECT — the end state this build exists for. A revoked Slack
+    /// webhook answers `404 no_service`; the user must be told, not shown
+    /// "Test alert sent successfully". `502` (not `404`) because the dashboard
+    /// proxy reads a gateway `404` as "destination not found".
+    #[tokio::test]
+    async fn revoked_destination_reports_failure_not_sent() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = mock_webhook(404, "no_service").await;
+
+        let (status, body) = parts(deliver_and_respond(&server.uri(), TEST_ALERT_TEXT).await).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_ne!(body["status"], "sent", "a dead webhook must never say sent");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["http_status"], 404);
+        assert_eq!(body["detail"], "no_service");
+    }
+
+    /// MUST REJECT: nothing listening → an unreachable failure, still not "sent".
+    #[tokio::test]
+    async fn unreachable_destination_reports_failure_not_sent() {
+        let _bypass = LoopbackBypassGuard::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{port}/hook");
+        let (status, body) = parts(deliver_and_respond(&url, TEST_ALERT_TEXT).await).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["status"], "failed");
+        assert!(body["http_status"].is_null(), "no status was observed");
+    }
+
+    /// MUST REJECT: an SSRF-blocked destination is a 400 about the stored URL,
+    /// never a 202. No loopback bypass — IMDS is blocked unconditionally.
+    #[tokio::test]
+    async fn ssrf_blocked_destination_reports_a_url_error_not_sent() {
+        let url = "http://169.254.169.254/latest/meta-data";
+        let (status, body) = parts(deliver_and_respond(url, TEST_ALERT_TEXT).await).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"], "url rejected (SSRF guard)");
+    }
+
+    /// The mapping is exhaustive and no failure variant can produce "sent".
+    #[tokio::test]
+    async fn no_delivery_error_variant_maps_to_sent() {
+        for e in [
+            DeliveryError::Rejected("blocked".into()),
+            DeliveryError::Unreachable("refused".into()),
+            DeliveryError::Status {
+                http_status: 500,
+                body: "boom".into(),
+            },
+        ] {
+            let (status, body) = parts(delivery_response(Err(e))).await;
+            assert!(status.is_client_error() || status.is_server_error());
+            assert_eq!(body["status"], "failed");
+        }
     }
 }

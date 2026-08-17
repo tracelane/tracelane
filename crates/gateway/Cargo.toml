@@ -112,12 +112,4 @@ default = []
 # compiled — product access is gated at runtime via workspace_entitlements,
 # not a cfg(feature) flag (CLAUDE.md bans cfg(feature) for product gating).
 # The former `prompt-promotion` feature was removed 2026-05-29 (audit P2-5).
-# Wasm plugin sandbox for untrusted third-party provider extensions.
-# Off by default — explicit opt-in because wasmtime adds ~15MB to the binary.
-wasm-plugin = ["dep:wasmtime"]
 
-[dependencies.wasmtime]
-version = "20.0"
-optional = true
-default-features = false
-features = ["cranelift", "component-model", "async"]

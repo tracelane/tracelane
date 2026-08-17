@@ -25,23 +25,30 @@ auto-read).
 from tracelane import init
 
 init(
-    endpoint="http://localhost:4318",   # OTLP HTTP receiver YOU can reach
-    api_key="tlane_...",                # from Settings → API Keys
-    service_name="my-agent",            # shows in trace viewer
+    endpoint="https://gateway.tracelane.dev",  # Tracelane Cloud
+    api_key="tlane_...",                       # needs the `ingest` scope
+    service_name="my-agent",                   # shows in trace viewer
 )
 ```
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `endpoint` | yes | — | OTLP HTTP endpoint you can reach. Spans POST to `${endpoint}/v1/traces`. |
+| `endpoint` | yes | — | OTLP HTTP endpoint. `https://gateway.tracelane.dev` for Cloud, or a receiver you run. Spans POST to `${endpoint}/v1/traces`. |
 | `api_key` | yes | — | Your `tlane_*` key. Sent as the `x-tracelane-api-key` header. |
 | `service_name` | no | `"unknown-service"` | Service name on spans |
 | `sample_rate` | no | `1.0` | Fraction of traces to capture (0.0–1.0; tail sampler decides) |
 | `auto_instrument` | no | `False` | If `True`, run `auto_instrument()` after init (see below) |
 
-`endpoint` is an OTLP receiver you run — a local collector or a self-hosted
-Tracelane ingest. Tracelane Cloud's ingest is **not** a public OTLP endpoint;
-for Cloud, point your client at the gateway instead (see [Quickstart](/quickstart)).
+`endpoint` is any OTLP HTTP receiver you can reach — **Tracelane Cloud's gateway**
+(`https://gateway.tracelane.dev`), a self-hosted Tracelane ingest, or a local
+collector such as `http://localhost:4318`.
+
+<Note>
+**Your key needs the `ingest` scope.** Keys minted before scopes existed carry the
+full API surface and work as-is. A key you scoped to `chat` and `read` does not —
+the gateway answers `403 insufficient_scope` and names `ingest` in the body. Tick
+**Ingest** in **Settings → API Keys**; it is on by default for new keys.
+</Note>
 
 ## Instrument what you want traced
 

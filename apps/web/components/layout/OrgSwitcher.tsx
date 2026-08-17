@@ -38,7 +38,7 @@ export async function OrgSwitcher() {
 	// account lives under Settings, so a non-clickable initial is noise).
 	return (
 		<div className="hidden items-center gap-2 rounded-full bg-surface-2 px-3 py-1.5 text-[12.5px] font-medium sm:flex">
-			<span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
+			<span className="h-1.5 w-1.5 rounded-full bg-action" aria-hidden />
 			<span className="max-w-[180px] truncate text-ink" title={name}>
 				{name}
 			</span>

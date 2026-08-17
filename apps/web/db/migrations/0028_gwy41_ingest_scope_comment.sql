@@ -1,0 +1,40 @@
+-- 0028 — GWY-41 / B-227: the `ingest` scope joins the closed vocabulary.
+--
+-- UN-JOURNALED, like every migration from 0009 on: `drizzle-kit migrate` applies
+-- only 0000–0008, so this is applied to Neon BY HAND.
+--
+-- **NOT a serialization point (S2 does not apply).** Nothing reads a column
+-- comment — no gateway code path, no query, no entitlement. This may be applied
+-- before, after or long after the gateway that adds the scope, and no ordering
+-- can break anything. It is recorded as a migration only because the comment
+-- lives in the database and there is no other way to change it.
+--
+-- WHY IT IS NOT MERELY COSMETIC.
+-- `0024` documented the vocabulary as `{chat,read,admin}` in the column comment
+-- itself. A13's whole design is that the vocabulary is CLOSED and that an
+-- unrecognised slug grants nothing — so the comment is the one place a future
+-- reader (or a psql session during an incident) learns what the legal values
+-- ARE. Leaving it three-valued after a fourth exists is the same
+-- this copy lives where nobody greps.
+--
+-- `scripts/ci/check-api-scope-single-source.py` now derives the vocabulary from
+-- `Scope::all()` in `crates/shared/src/api_scope.rs` and FAILS on disagreement
+-- between the enum, `from_slug`, the mint dialog's checkbox list and this
+-- comment. It caught this exact drift on its first run. Its `--selftest` plants
+-- each of the four disagreements and proves each one blocks.
+--
+-- NO SCHEMA CHANGE. `api_keys.scope` is `text[]` and the only CHECK on it is
+-- `api_keys_scope_not_empty_chk` (`cardinality(scope) > 0`, added in 0024) — the
+-- legal VALUES were never enumerated in the database, deliberately, because
+-- `Scope::from_slug` is the one authority and a duplicated CHECK would be a
+-- fifth list. So adding a scope needs no DDL at all.
+--
+-- APPLIED TO NEON 2026-08-13, read back from prod. The body uses a plain
+-- hyphen rather than an em-dash purely so the statement survives shell quoting
+-- on the way to psql; the file is kept byte-identical to what was executed so
+-- a future reader diffing the two finds nothing.
+--
+-- REVERSIBLE: re-run 0024's COMMENT statement.
+
+COMMENT ON COLUMN api_keys.scope IS
+    'Permission scopes from the closed vocabulary {chat,read,ingest,admin}. NULL = full API surface (legacy keys). Never empty; an unknown scope denies. Authority is Scope::from_slug in crates/shared/src/api_scope.rs - this comment is documentation, not a constraint.';

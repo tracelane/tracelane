@@ -53,7 +53,7 @@ export function Gauge({ value, display, label, className }: GaugeProps) {
 					<path
 						d={`M ${CX - R} ${CY} A ${R} ${R} 0 0 1 ${ex} ${ey}`}
 						fill="none"
-						stroke="var(--accent)"
+						stroke="var(--action)"
 						strokeWidth={12}
 						strokeLinecap="round"
 					/>

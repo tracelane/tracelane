@@ -33,13 +33,25 @@ const vector = (name: string): string =>
 	readFileSync(resolve(here, "../../../../evals/audit-ledger", name), "utf8");
 
 const h = createElement;
-const render = (ndjson: string, initialReport?: VerifyReport): string =>
-	renderToStaticMarkup(h(AuditLedgerView, { ndjson, initialReport }));
+const render = (
+	ndjson: string,
+	initialReport?: VerifyReport,
+	tenantPubkeyB64?: string,
+): string =>
+	renderToStaticMarkup(
+		h(AuditLedgerView, { ndjson, initialReport, tenantPubkeyB64 }),
+	);
 
 let goodNdjson: string;
 let tamperedNdjson: string;
 let goodReport: VerifyReport;
 let tamperedReport: VerifyReport;
+// R43/R48 fixtures: a real anchored vector, and the same bytes with the anchor
+// demoted to `unanchored` (a batch that is signed but reached no public log).
+let anchoredNd: string;
+let signedOnlyNd: string;
+let anchoredReport: VerifyReport;
+let signedOnlyReport: VerifyReport;
 
 beforeAll(async () => {
 	goodNdjson = vector("good.ndjson");
@@ -47,6 +59,20 @@ beforeAll(async () => {
 	// the REAL verifier — same call AuditLedgerView makes on "Verify integrity"
 	goodReport = await verifyLedgerText(goodNdjson, { offline: true });
 	tamperedReport = await verifyLedgerText(tamperedNdjson, { offline: true });
+	anchoredNd = vector("anchored.v1.ndjson");
+	signedOnlyNd = anchoredNd
+		.split("\n")
+		.map((line) =>
+			line.includes('"type":"anchor"') || line.includes('"type": "anchor"')
+				? line.replace(
+						/"anchor_state"\s*:\s*"anchored"/,
+						'"anchor_state":"unanchored"',
+					)
+				: line,
+		)
+		.join("\n");
+	anchoredReport = await verifyLedgerText(anchoredNd, { offline: true });
+	signedOnlyReport = await verifyLedgerText(signedOnlyNd, { offline: true });
 });
 
 describe("audit verifier — real recompute over canonical vectors (not a server boolean)", () => {
@@ -98,5 +124,77 @@ describe("AuditLedgerView — verdict UI is a function of the real report", () =
 		expect(html).not.toContain("Publicly anchored");
 		expect(html).not.toContain("independently verified");
 		expect(html).not.toContain("Signature verified");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// R43/R48 — THE STATE→COPY MAPPING, ASSERTED ON THE RENDERED MARKUP.
+//
+// WHY THESE EXIST, and it is the whole point. The first R43 attempt extracted the
+// decision into a pure function and unit-tested THAT. An adversarial pass then
+// reinstated BOTH original bugs directly in this component — the operator-signed
+// branch made to render "No signed batches yet", and the status line reverted to
+// `hasAnchorRecords` — and **all 523 tests still passed.** A pure-function test proves
+// the function; it never proves the component calls it correctly. Importing the
+// function is the WEAK form of TRAPS §22; the strong form is that a mutation to the
+// RENDER PATH turns a test red. These assert the markup, so they do.
+// ---------------------------------------------------------------------------
+
+describe("AuditLedgerView — trust states render DISTINCTLY (mutation-catching)", () => {
+	it("signed batches + NO fetchable trust root → operator-signed, NEVER 'no batches'", () => {
+		// The exact production shape: real anchor records, `tenantPubkeyB64` empty
+		// (app/audit/page.tsx does `keyRow?.pubkey ?? ""`). Pre-R43 this rendered
+		// "No signed batches yet" over signed data for five live tenants.
+		const html = render(signedOnlyNd, signedOnlyReport, "");
+		expect(html).toContain("operator-signed");
+		expect(html).not.toContain("No signed batches yet");
+		expect(html).not.toContain(
+			"Signing begins with your first gateway-proxied",
+		);
+	});
+
+	it("no anchor records at all → the no-batches copy, and ONLY that copy", () => {
+		const html = render(goodNdjson, goodReport, "");
+		expect(html).toContain("No signed batches yet");
+		expect(html).not.toContain("operator-signed");
+		expect(html).not.toContain("Tenant-signed");
+	});
+
+	it("a record that is NOT anchored must never claim public anchoring", () => {
+		// R48: an anchor RECORD exists for every SIGNED batch. Keying the header on
+		// record-presence claimed Sigstore inclusion for batches in no log at all.
+		const html = render(signedOnlyNd, signedOnlyReport, "");
+		expect(html).not.toContain("Publicly anchored");
+		expect(html).toContain("Signed, not publicly anchored");
+	});
+
+	it("a genuinely anchored record DOES claim public anchoring", () => {
+		const html = render(anchoredNd, anchoredReport, "");
+		expect(html).toContain("Publicly anchored (Sigstore Rekor v2)");
+	});
+
+	it("the three unanchored states share NO headline between them", () => {
+		const noBatches = render(goodNdjson, goodReport, "");
+		const operator = render(signedOnlyNd, signedOnlyReport, "");
+		const tenant = render(signedOnlyNd, signedOnlyReport, "AAAAtestpubkey=");
+		expect(noBatches).toContain("No signed batches yet");
+		expect(operator).toContain("Tamper-evident, operator-signed");
+		expect(tenant).toContain("Tenant-signed (Ed25519)");
+		// none may borrow another's headline — the defect was exactly this
+		expect(operator).not.toContain("No signed batches yet");
+		expect(tenant).not.toContain("Tamper-evident, operator-signed");
+		expect(noBatches).not.toContain("Tenant-signed (Ed25519)");
+	});
+});
+
+describe("AuditLedgerView — a CLAIMED anchor the verifier could not confirm", () => {
+	it("says so, borrowing neither the verified nor the not-anchored copy", () => {
+		// 1bb14687's exact pre-backfill shape: a real Rekor anchor in the ledger, and
+		// no fetchable pubkey, so `anchors_included` stays 0 and nothing is confirmed.
+		const html = render(anchoredNd, anchoredReport, "");
+		expect(html).toContain("Anchored in the public log — not verified here");
+		expect(html).not.toContain("independently verified");
+		expect(html).not.toContain("not yet publicly anchored");
+		expect(html).not.toContain("No signed batches yet");
 	});
 });

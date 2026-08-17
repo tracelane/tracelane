@@ -23,14 +23,26 @@ import { expect } from "../src/harness.js";
  *
  */
 describe("PP-O4: DuckDB embedded — no 4-service self-host", () => {
-	it("TRACELANE_STORAGE=duckdb env var is a documented option", () => {
+	// ── FINDING 2026-08-12, recorded rather than tested around ───────────────
+	// THIS EVAL COVERED A FEATURE THAT DOES NOT EXIST. It asserted a local array
+	// containing "duckdb" and an object claiming `externalServices: 0`, and was
+	// green for its whole life. `grep -rn duckdb crates/` returns ZERO hits —
+	// there is no DuckDB backend, no `TRACELANE_STORAGE` switch, and no
+	// single-binary mode. ClickHouse is the only span store.
+	//
+	// The founder's rule applies: if an eval turns out to cover a feature that
+	// does not exist, that is the finding — say so, do not write a test for it.
+	// So both cases are SKIPPED with the reason in the title, and the suite
+	// summary now reports them as SKIPPED instead of counting them as coverage.
+	// Un-skip them the day a DuckDB backend exists, not before.
+	it.skip("TRACELANE_STORAGE=duckdb env var is a documented option [NOT BUILT — zero duckdb hits in crates/]", () => {
 		// Architectural assertion: DuckDB backend exists
 		// Full check: grep crates/ingest/src for StorageBackend::DuckDb
 		const storageBackends = ["clickhouse", "duckdb"];
 		expect(storageBackends).toContain("duckdb");
 	});
 
-	it("single-binary mode requires no external services", () => {
+	it.skip("single-binary mode requires no external services [NOT BUILT — no single-binary mode exists]", () => {
 		// Tracelane Lite: gateway + ingest + DuckDB in one process
 		// No NATS, no ClickHouse, no Redis required
 		const liteRequirements = {

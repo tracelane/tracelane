@@ -42,7 +42,7 @@ export default async function ByokPage() {
 					Customer-managed keys (CMK) for regulated environments are part of the
 					Business plan and above.
 				</p>
-				<div className="max-w-2xl rounded-xl border border-accent-line bg-accent-soft px-4 py-3 text-sm text-accent-ink">
+				<div className="max-w-2xl rounded-lg border border-action-line bg-action-soft px-4 py-3 text-sm text-action-ink">
 					<span className="font-semibold">
 						Customer-managed encryption is available on Business ($899/mo) and
 						Enterprise.
@@ -67,7 +67,7 @@ export default async function ByokPage() {
 				for regulated environments. Stored as a fingerprint only.
 			</p>
 			{/* Honest state — this registry is not yet enforced. */}
-			<div className="mb-4 max-w-2xl rounded-md border border-line bg-surface-2/40 p-3 text-xs text-ink-2">
+			<div className="mb-4 max-w-2xl rounded-lg border border-line bg-surface-2/40 p-3 text-xs text-ink-2">
 				<div className="mb-1 font-medium text-ink">
 					Registered now · enforcement in a later release
 				</div>
@@ -86,7 +86,7 @@ export default async function ByokPage() {
 				OpenAI, …)?{" "}
 				<Link
 					href="/settings/providers"
-					className="font-medium text-accent-ink hover:underline"
+					className="font-medium text-action-ink hover:underline"
 				>
 					LLM Provider Keys →
 				</Link>

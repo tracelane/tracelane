@@ -19,7 +19,7 @@ const lockedCls =
 
 export function AuditHelpBar({ exportEntitled }: { exportEntitled: boolean }) {
 	return (
-		<div className="mb-5 flex flex-col gap-3 rounded-xl border border-line bg-surface-2/40 p-4 sm:flex-row sm:items-center sm:justify-between">
+		<div className="mb-5 flex flex-col gap-3 rounded-lg border border-line bg-surface-2/40 p-4 sm:flex-row sm:items-center sm:justify-between">
 			<div className="flex items-start gap-3">
 				<span
 					aria-hidden

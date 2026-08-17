@@ -3,6 +3,7 @@
 //! Exposes:
 //!   GET  /health                    — unauthenticated liveness probe
 //!   POST /v1/chat/completions       — OpenAI-compatible chat endpoint
+//!   POST /v1/embeddings             — OpenAI-compatible embeddings endpoint
 //!
 //! AppState bundles all shared components:
 //!   providers    — ProviderRegistry (35 routable: 7 native adapters + 28 OpenAI-compatible + failover chain)
@@ -43,6 +44,15 @@ use tracelane_shared::{
     TenantId, TracelaneSpan,
     span::{SpanAttributes, SpanStatus, SpanStatusCode},
 };
+
+/// `tracelane.yaml` reader (GWY-39) — `crates/gateway/src/config.rs`.
+///
+/// Declared here with `#[path]`, resolved relative to `src/`, rather than as a
+/// `mod config;` in `main.rs`. The module is only ever reached through
+/// `crate::server::config::…`; folding the declaration into `main.rs`'s module
+/// list is a mechanical follow-up with no behaviour change.
+#[path = "config.rs"]
+pub mod config;
 
 /// Gateway configuration loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -156,6 +166,13 @@ pub struct AppState {
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    // GWY-39: read `tracelane.yaml` BEFORE anything routes. Model aliases are
+    // consulted inside `ProviderRegistry::provider_id_for_model`, so installing
+    // them after the first request would mean two different routing tables in
+    // one process lifetime. Absent file ⇒ no aliases, no behaviour change;
+    // present-but-invalid ⇒ this `?` refuses to boot (see `config::install_from_env`).
+    self::config::install_from_env().context("tracelane.yaml")?;
+
     let providers = Arc::new(ProviderRegistry::new().context("build provider registry")?);
 
     // ADR-067: single-tenant self-host mode. `from_env` fail-closes if
@@ -303,6 +320,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         },
         None => None,
     };
+    // R47. Publish the verification key for any pre-H1 row BEFORE the chain is built,
+    // so `/v1/audit/pubkey` stops answering 200-with-an-empty-string on this boot rather
+    // than on the tenant's next anchor — which for a quiet, already-anchored tenant may
+    // never come. Idempotent and a no-op once the fleet is clean.
+    if let Some(ref store) = tenant_audit_keys {
+        let n = store.backfill_missing_public_keys().await;
+        if n > 0 {
+            tracing::info!(
+                rows = n,
+                "audit keys: published verification keys for pre-H1 rows (R47)"
+            );
+        }
+    }
+
     let rekor_key_b64 = config
         .rekor_signing_key
         .as_ref()
@@ -322,30 +353,92 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     // NATS JetStream client — fire-and-forget span publish to ingest workers.
-    // Soft dependency: if NATS_URL is unset or connection fails, we log and
-    // continue. Spans still reach structured logs; ingest loss is acceptable
-    // in dev. Production must set NATS_URL.
-    let nats = if let Some(ref url) = config.nats_url {
-        match async_nats::connect(url.as_str()).await {
-            Ok(client) => {
-                tracing::info!(%url, "NATS connected — span publish enabled");
-                Some(Arc::new(client))
-            }
-            Err(err) => {
-                tracing::error!(
-                    error = %err, %url,
-                    "NATS connection FAILED — span publish disabled; ALL spans will be \
-                     dropped until NATS is reachable. Check NATS_URL / network."
-                );
-                None
-            }
+    //
+    // A1: an UNSET `NATS_URL` is now a BOOT REFUSAL, not a warning.
+    //
+    // It used to log and continue, and that is the single worst failure this product
+    // can have: the gateway answers 200 to every request while recording nothing, and
+    // looks perfectly healthy doing it. A flight recorder that returns 200 while not
+    // recording is the #81 shape at the gateway edge, and every "full-fidelity capture"
+    // claim we publish is conditional on it. A warning does not carry that — nobody
+    // reads a startup line from three weeks ago.
+    //
+    // The escape hatch is explicit and must be TYPED by a human:
+    // `TRACELANE_ALLOW_NO_CAPTURE=1`. Dev and any deliberately capture-less deployment
+    // set it once; a production config that merely FORGOT `NATS_URL` cannot set it by
+    // accident. That asymmetry is the whole design — the mistake we are guarding
+    // against is omission, so the remedy has to be commission.
+    //
+    // NOTE the deliberate asymmetry with a CONNECT FAILURE just below, which still only
+    // logs. Unset is a misconfiguration that will never work; a failed connect is an
+    // operational blip that may clear on its own, and refusing to boot during a NATS
+    // restart would convert a recoverable outage into a hard one. That gap is real and
+    // tracked (the client is not re-established for the process lifetime) — it is a
+    // separate defect from this one and is NOT closed here.
+    let allow_no_capture = std::env::var("TRACELANE_ALLOW_NO_CAPTURE").as_deref() == Ok("1");
+    let nats = match capture_boot_decision(config.nats_url.is_some(), allow_no_capture) {
+        // `Connect` is returned only when `nats_url` is `Some`, so the `None` arm is
+        // unreachable by construction. It resolves to "no capture" rather than
+        // unwrapping: a panic on a path that cannot happen is strictly worse than a
+        // defensive fallthrough, and `.claude/rules/rust.md` bans `expect` here anyway.
+        CaptureBoot::Connect => match config.nats_url.as_deref() {
+            // the BACKGROUND and retried, instead of `connect()` returning `Err` once
+            // and capture being dead for the life of the process.
+            //
+            // The old shape lost a whole class of outage to ordering alone: if the
+            // gateway happened to start while NATS was restarting, or before DNS was
+            // warm, `nats` was `None` forever. The gateway then served 200s and dropped
+            // EVERY span until a human noticed and restarted it. async_nats already
+            // auto-reconnects once connected — the gap was only ever the FIRST connect,
+            // which is exactly the moment a dependency is most likely to be unready.
+            //
+            // Deliberately NOT a boot refusal (that is A1, for an UNSET url): refusing
+            // to start during a NATS restart converts a recoverable dependency outage
+            // into a hard gateway outage.
+            Some(url) => match async_nats::ConnectOptions::new()
+                .retry_on_initial_connect()
+                .connect(url)
+                .await
+            {
+                Ok(client) => {
+                    tracing::info!(
+                        %url,
+                        "NATS span publish wired (connect retries in the background if \
+                         the server is not yet reachable)"
+                    );
+                    CAPTURE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Some(Arc::new(client))
+                }
+                // With retry enabled this is now genuinely exceptional — a malformed
+                // URL or an auth rejection, not "the server is down". Still fail-open
+                // rather than fatal, and still loud.
+                Err(err) => {
+                    tracing::error!(
+                        error = %err, %url,
+                        "NATS client could not be constructed even with initial-connect \
+                         retry — span publish DISABLED; ALL spans will be dropped. This \
+                         is a bad NATS_URL or an auth rejection, not an unreachable \
+                         server. Check the value."
+                    );
+                    None
+                }
+            },
+            None => None,
+        },
+        CaptureBoot::RunWithoutCapture => {
+            tracing::warn!(
+                "NATS_URL not set and TRACELANE_ALLOW_NO_CAPTURE=1 — span publish DISABLED, \
+                 ALL spans will be dropped. This deployment has explicitly opted out of \
+                 capture; /health reports capture_healthy=false."
+            );
+            None
         }
-    } else {
-        tracing::warn!(
-            "NATS_URL not set — span publish DISABLED; ALL spans will be dropped \
-             (observability blind). Set NATS_URL in production; expected only in dev."
-        );
-        None
+        CaptureBoot::Refuse => anyhow::bail!(
+            "REFUSING TO BOOT: NATS_URL is not set, so span publish would be disabled and \
+             EVERY span dropped while the gateway returned 200 — a recorder that records \
+             nothing and looks healthy. Set NATS_URL, or set TRACELANE_ALLOW_NO_CAPTURE=1 \
+             to run deliberately without capture (dev / a gateway-only deployment)."
+        ),
     };
 
     let rate_limiter = Arc::new(RateLimiter::new());
@@ -407,6 +500,30 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         audit_chain.set_billing(Arc::clone(recorder));
     }
 
+    // R21/R32: the time-based anchor flush. Spawned HERE — last of the audit-chain
+    // wiring — because the sweep reads the anchor watermark seeded by
+    // `warm_from_postgres` above and dispatches through the billing hook set
+    // directly above it. Ordering is belt-and-braces rather than load-bearing: the
+    // sweeper sleeps one full `ANCHOR_SWEEP_INTERVAL` before its first pass and
+    // reads the hook at flush time, not at spawn time.
+    //
+    // WHY A BACKGROUND TASK AND NOT A CHECK IN `publish()`: an append-triggered
+    // condition cannot fix the tenants this exists for. `should_anchor` is a pure
+    // per-tenant COUNT threshold, so a tenant that appended 35 events and went quiet
+    // never signs and never anchors, ever — which is exactly the measured population
+    // (2026-08-14: 92 rows across 5 tenants, 100% unsigned and unanchored, at 35, 35,
+    // 12, 7 and 3 lifetime events).
+    //
+    // Spawned UNCONDITIONALLY: `flush_aged_batches` returns 0 immediately when the
+    // chain has no ClickHouse client, so a dev/OSS process without one gets an idle
+    // sleeper rather than a second boot condition to keep in sync with this one.
+    crate::audit::spawn_anchor_age_sweeper(Arc::clone(&audit_chain));
+    tracing::info!(
+        max_batch_age_secs = crate::audit::ANCHOR_MAX_BATCH_AGE.as_secs(),
+        sweep_interval_secs = crate::audit::ANCHOR_SWEEP_INTERVAL.as_secs(),
+        "audit anchor age-sweeper started"
+    );
+
     // (entitlements cache is constructed earlier — before the audit key store —
     // so the per-tenant audit keypair mint can be gated on f_audit_addon.)
 
@@ -446,6 +563,38 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
              unlimited-rate tier are for a NON-hosted bench node only; see \
              bench/gateway/BENCH_TODO.md for the sanctioned ephemeral-container run."
         );
+    }
+    // ── B-239: bench mode must not be able to reach a PRODUCTION data plane ──
+    //
+    // The refusal above closes the CONTROL plane (Postgres). It says nothing
+    // about where the bench process PUBLISHES, and that gap was exercised: a
+    // bench-mode gateway wrote 10,154 spans AND 20,307 rows of the
+    // tamper-evident audit ledger into production ClickHouse on 2026-08-04,
+    // through the real NATS -> ingest pipeline. The bench triple-gate protected
+    // the tenant GRANT and had nothing to say about the endpoints.
+    //
+    // WHY THIS SHAPE, and it is the whole point of the mechanism: the check does
+    // NOT enumerate known variables (`NATS_URL`, `CLICKHOUSE_URL`, ...). A list
+    // is a thing someone must remember to extend, and the next endpoint added to
+    // the data plane would be uncovered by construction — which is exactly how
+    // this hole existed. Instead it scans the ENTIRE environment by NAME SHAPE
+    // (`*_URL` / `*_ENDPOINT`) and refuses any value that does not resolve to
+    // loopback. A `FOO_URL` introduced next year is covered without anyone
+    // editing this function. Default-deny over a discovered set, not
+    // allow-by-omission over a maintained one.
+    if config.bench_mock_upstream {
+        let offenders = bench_nonlocal_endpoints(std::env::vars());
+        if !offenders.is_empty() {
+            anyhow::bail!(
+                "TRACELANE_BENCH_MOCK_UPSTREAM=1 with NON-LOOPBACK endpoint(s) configured: {} \
+                 — refusing to start. A bench-mode gateway publishes real spans and real \
+                 audit-ledger rows; pointed at a production endpoint it contaminates both, \
+                 and its tenant id can never exist in Postgres (the bench grant REQUIRES no \
+                 control plane), so the rows are unreachable by tenant-purge. Point every \
+                 *_URL / *_ENDPOINT at loopback, or unset it.",
+                offenders.join(", ")
+            );
+        }
     }
     if config.bench_mock_upstream {
         tracing::warn!(
@@ -532,6 +681,29 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/v1/auth/whoami", get(whoami_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        // GWY-26. Mounted UNCONDITIONALLY, beside chat/completions — an
+        // embeddings call that silently bypasses the gateway is the fidelity
+        // hole this closes, so it must not be env-gated into a 404.
+        .route("/v1/embeddings", post(embeddings_handler))
+        // GWY-41 / B-227 — the OTLP WRITE path, mounted DELIBERATELY here.
+        //
+        // `/v1/traces` is also a READ route: `trace_reads::routes()` binds GET on
+        // the same path, behind a `CLICKHOUSE_URL` gate and a different state type.
+        // This is the POST, it needs `AppState.nats`, and it must exist whether or
+        // not ClickHouse is configured — so it mounts here rather than there. Axum
+        // combines the two method routers because GET and POST are disjoint;
+        // `both_methods_on_v1_traces_coexist` asserts that instead of assuming it.
+        //
+        // UNCONDITIONAL, like `/v1/embeddings` and for the same reason: before this
+        // route existed, `POST /v1/traces` returned 405 and a Cloud customer could
+        // not produce a multi-span trace by any means. A 404 from an env-gated
+        // mount would read as "wrong URL" and send them hunting a hostname that
+        // does not exist. When capture is unwired the handler answers 503
+        // `capture_disabled`, which is the honest answer.
+        .route(
+            "/v1/traces",
+            post(crate::trace_ingest::ingest_traces_handler),
+        )
         .with_state(state.clone());
 
     // Polar webhooks are handled by the SINGLE receiver in the web tier
@@ -564,6 +736,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!("POLAR_ACCESS_TOKEN not set — billing portal + checkout not mounted");
     }
+
+    // SET-07: the usage read the dashboard has always called and the gateway never
+    // mounted. Deliberately OUTSIDE the Polar block — it reads ClickHouse and the
+    // entitlement cache, not Polar, so gating it on POLAR_ACCESS_TOKEN would make a
+    // self-host deployment silently show no usage. Polar is the payment processor;
+    // consumption is ours.
+    app = app.merge(crate::billing::usage::routes(state.clone()));
+    tracing::info!("billing usage mounted at /v1/billing/usage");
 
     // WorkOS webhook — same secret-or-skip pattern as the Polar webhook above.
     // Provisions tenants from organization.created and users from
@@ -618,7 +798,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // caller's own chain within their retention window. Shares the SAME
         // tenant-isolated reader + entitlement cache (via a cloned ExportState) so
         // there is one read path and one tenant seam — never a second one.
+        let ledger_range_app = crate::audit_ledger_range::routes().with_state(export_state.clone());
         let self_verify_app = crate::audit_self_verify::routes().with_state(export_state);
+        app = app.merge(ledger_range_app);
         app = app.merge(self_verify_app);
         tracing::info!("Audit self-verify mounted at /v1/audit/self-verify");
 
@@ -673,6 +855,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         };
         app = app.merge(crate::key_routes::routes().with_state(key_state));
         tracing::info!("API-key mint mounted at POST /v1/keys");
+
+        // OBS-18 annotations. Postgres-backed (mutable, low-volume, read one
+        // trace at a time), so it mounts here beside the other PG routes rather
+        // than in `trace_reads`, which is the ClickHouse surface. Gated on the
+        // same `global_pool()` — with no control plane the routes are simply
+        // absent, which is a clean 404 rather than a broken surface.
+        let ann_state = crate::annotation_routes::AnnotationRoutesState {
+            store: std::sync::Arc::new(crate::annotation_routes::PgAnnotationStore {
+                pool: pool.clone(),
+            }),
+        };
+        app = app.merge(crate::annotation_routes::routes().with_state(ann_state));
+        tracing::info!("annotations mounted at /v1/traces/{{trace_id}}/annotations");
+
+        // DSH-01 in-app inbox. Same Postgres gate.
+        let notif_state = crate::notification_routes::NotificationRoutesState {
+            store: std::sync::Arc::new(crate::notification_routes::PgNotificationStore {
+                pool: pool.clone(),
+            }),
+        };
+        app = app.merge(crate::notification_routes::routes().with_state(notif_state));
+        tracing::info!("notifications mounted at /v1/notifications");
     }
 
     // built once (build_prompt_router) and lives in AppState so the chat
@@ -732,9 +936,113 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     axum::serve(listener, app).await.context("axum serve error")
 }
 
+/// Is span publish WIRED? True once a NATS client exists.
+///
+/// is built with `retry_on_initial_connect()`, so it exists and reconnects in the
+/// background even while the server is unreachable. Treating this as "we are currently
+/// publishing" would be the overclaim; the live signal is `spans_dropped`, which only
+/// moves when a span is actually lost. A span buffered during a NATS restart is not
+/// lost, and is deliberately not counted as such.
+///
+/// A1. Deliberately a process-global rather than `AppState`: `/health` is mounted
+/// before state exists on some paths, and the one thing this must never do is be
+/// unavailable exactly when capture is broken.
+pub(crate) static CAPTURE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What boot should do about span capture (A1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureBoot {
+    /// `NATS_URL` is set — try to connect.
+    Connect,
+    /// No `NATS_URL`, but the operator explicitly opted out of capture.
+    RunWithoutCapture,
+    /// No `NATS_URL` and no explicit opt-out — refuse to start.
+    Refuse,
+}
+
+/// The A1 boot rule, extracted so it can be FALSIFIED.
+///
+/// Left inline it would be reachable only by booting a real gateway against a real
+/// NATS, which is precisely how a rule like this ends up never being tested in the
+/// state that matters (the refusal). The decision is pure; the I/O is not.
+pub(crate) const fn capture_boot_decision(
+    nats_url_set: bool,
+    allow_no_capture: bool,
+) -> CaptureBoot {
+    match (nats_url_set, allow_no_capture) {
+        // A set NATS_URL wins outright: the opt-out is about running WITHOUT capture,
+        // not about suppressing capture that was configured.
+        (true, _) => CaptureBoot::Connect,
+        (false, true) => CaptureBoot::RunWithoutCapture,
+        (false, false) => CaptureBoot::Refuse,
+    }
+}
+
+/// The `/health` body (A1), extracted so the contract is testable without a server.
+pub(crate) fn health_body(
+    capture_enabled: bool,
+    spans_dropped: u64,
+    audit_backfill_failures: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "service": "tracelane-gateway",
+        "capture_enabled": capture_enabled,
+        "spans_dropped": spans_dropped,
+        "capture_healthy": capture_enabled && spans_dropped == 0,
+        // R17. Deliberately NOT folded into `capture_healthy`: capture and
+        // attestation fail independently and a reader must be able to tell which
+        // is broken. Every span can be captured while the ledger silently stops
+        // being third-party verifiable — that is precisely the state this exists
+        // to make visible.
+        "audit_backfill_failures": audit_backfill_failures,
+        "audit_attestation_healthy": audit_backfill_failures == 0,
+    })
+}
+
 #[instrument]
+
+/// A1 — capture completeness, exposed where an operator can actually see it.
+///
+/// The hole this closes: the gateway returned `{"status":"ok"}` while dropping every
+/// span, and nothing on any read route said so. "The gateway is up" was being read as
+/// "we are recording", and those are different facts.
+///
+/// **`status` stays `ok` and this route stays 200 even when capture is dead.** That is
+/// on purpose: `/health` is the liveness probe the load balancer reads, so failing it
+/// would pull a serving node out of rotation and turn a recording outage into a serving
+/// outage. The signal belongs in the BODY, where an operator and a watchdog can alert on
+/// it, not in the status code.
+///
+/// - `capture_enabled` — span publish is wired (NATS connected at boot).
+/// - `spans_dropped` — cumulative spans dropped because publish was unavailable.
+/// - `capture_healthy` — `capture_enabled && spans_dropped == 0`. It is deliberately
+///   STICKY: once anything has been lost, this stays false until the process restarts,
+///   because "we lost data" does not stop being true when the cause clears.
 async fn health_handler() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok", "service": "tracelane-gateway" }))
+    use tracelane_shared::degradation::{Degradation, count};
+    let capture_enabled = CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    // Both drop causes, summed: "publish was never wired" and "publish was wired and
+    // failed" are different faults but identical consequences — a span that is gone.
+    let spans_dropped =
+        count(Degradation::SpansDroppedNoNats) + count(Degradation::SpanPublishFailed);
+    // R17: the ledger's attestation half, reported beside capture and never merged
+    // into it.
+    //
+    // R21 adds the second cause, summed for the same reason `spans_dropped` sums its
+    // two: "the post-anchor backfill failed" and "the age sweep could not read the
+    // tenant, so it never anchored at all" are different faults with one consequence —
+    // rows that stay unsigned and unanchored with nothing to retry them. The wire field
+    // name is a contract (R17: the watchdog greps it), so it stays; the two counters
+    // remain separable by `kind` at /v1/gateway/stats when an operator needs the cause.
+    let audit_backfill_failures =
+        count(Degradation::AuditBackfillFailed) + count(Degradation::AuditAgeSweepSkipped);
+    Json(health_body(
+        capture_enabled,
+        spans_dropped,
+        audit_backfill_failures,
+    ))
 }
 
 /// A2: validate the bearer credential and return the tenant. Lets sub-
@@ -980,6 +1288,31 @@ async fn chat_completions_handler(
         }
     };
 
+    // A13: scope gate, immediately after auth and BEFORE anything expensive.
+    // A key scoped `read` (the shape you hand an external auditor) must not be
+    // able to spend the tenant's provider budget. Placed here rather than at
+    // dispatch so a refused request costs one comparison, not an entitlement
+    // resolve, a quota check and a detection pass — the same reasoning that put
+    // auth first. Legacy keys (`scope IS NULL`) allow everything, so this is a
+    // no-op for every key minted before A13.
+    if !claims.allows_scope(crate::auth::scope::Scope::Chat) {
+        tracing::warn!(
+            sub = %claims.sub,
+            "api key lacks the `chat` scope — refusing completion"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "This API key is not scoped for completions. It needs the `chat` scope; mint a new key with it in Settings → API Keys.",
+                    "type": "insufficient_scope",
+                    "required_scope": "chat",
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
@@ -1078,6 +1411,22 @@ async fn chat_completions_handler(
             .seed_if_needed(tenant_id, year_month, baseline);
     }
     let quota = state.quota_tracker.check(tenant_id, quota_cfg);
+    // SET-08 soft cap. NON-BLOCKING by construction: notify, then fall through
+    // and serve the request normally. Fire-once lives in Postgres, not in this
+    // counter — see `maybe_notify_soft_cap`.
+    if let Some((quota, used)) = quota.at_or_over_included_quota() {
+        maybe_notify_soft_cap(tenant_id, year_month, quota, used);
+    }
+    // SET-13. Every request served ABOVE the included quota is billable overage.
+    // `pricing.mdx` sells "$1.20/10K (5× hard cap then 429)" on Builder and Team;
+    // until this arm existed the gateway produced `AllowWithOverage` and metered
+    // NOTHING against it, so the whole band between 100% and the 5× cap was
+    // served free while the price list said otherwise. `QuotaReached` is
+    // deliberately excluded — that request is the LAST one inside the allowance,
+    // not the first one outside it.
+    if let (QuotaDecision::AllowWithOverage { .. }, Some(rec)) = (quota, state.billing.as_ref()) {
+        spawn_overage_record(Arc::clone(rec), tenant_id.clone());
+    }
     if let QuotaDecision::HardCapExceeded { limit, used } = quota {
         // Count the quota rejection for the Gateway-ops live counter (see the
         // rate-limit branch above — same rationale: no span on a 429).
@@ -1090,8 +1439,12 @@ async fn chat_completions_handler(
             "quota hard cap exceeded — returning 429"
         );
         let reset_at = next_month_boundary_iso();
-        if let Some(webhook) = resolve_tenant_slack_webhook(tenant_id).await {
-            notify_quota_exceeded_async(webhook, tenant_id.clone(), limit, used);
+        if let Some(webhook) = resolve_tenant_quota_webhook(tenant_id).await {
+            notify_quota_event_async(
+                webhook,
+                tenant_id.clone(),
+                QuotaEvent::HardCap { limit, used },
+            );
         }
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1176,9 +1529,10 @@ async fn chat_completions_handler(
     };
     // ADR-069: durable CAPTURE before dispatch (acked JetStream publish); the
     // head-advance runs off the request path. Fail-CLOSED — a publish failure 503s
-    // (the audit product does not serve unrecorded requests). publish() falls back
-    // to the synchronous fail-open append when async is unwired / kill.audit.async,
-    // so dev / self-host / the operator lever never 503.
+    // (the audit product does not serve unrecorded requests). Since A2 the
+    // SYNCHRONOUS fallback (async unwired / kill.audit.async) is fail-closed too, so
+    // this 503 is now reachable on either path. Dev / self-host still never hit it:
+    // with no Postgres pool the append is in-memory and cannot fail.
     if let Err(err) = state.audit_chain.publish(audit_event).await {
         tracing::error!(error = %err, "audit publish failed — refusing request (fail-closed)");
         return (
@@ -1233,7 +1587,23 @@ async fn chat_completions_handler(
     } else {
         match crate::providers::ProviderRegistry::provider_id_for_model(&model) {
             Some(p) => p,
-            None => return unroutable_model_response(&model),
+            None => {
+                // R13, and I did not find this one by reading — the guard did, on its
+                // the ledger row is already published by here, so an unroutable model
+                // produced a ledger entry and no trace. It is also the single most
+                // likely error a new customer hits (a typo'd or unsupported model name),
+                // which makes it the worst one to be invisible.
+                emit_post_ledger_error_span(
+                    &state,
+                    tenant_id,
+                    trace_id,
+                    &model,
+                    request_start,
+                    "unroutable_model",
+                    None,
+                );
+                return unroutable_model_response(&model);
+            }
         }
     };
     // A4: BYOK lookup first — per-tenant ciphertext in `provider_keys` decrypted
@@ -1269,15 +1639,15 @@ async fn chat_completions_handler(
                 tracing::warn!(provider = provider_id, code, "provider key unresolvable");
                 // Emit the ERROR span so this is visible in /traces and countable —
                 // the most common first-run failure is invisible in the product.
-                if let Some(ref nats_client) = state.nats {
-                    let span = build_error_span(tenant_id, trace_id, &model, request_start, code);
-                    let nats = Arc::clone(nats_client);
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-                            tracing::warn!(error = %e, "error-span NATS publish failed");
-                        }
-                    });
-                }
+                emit_post_ledger_error_span(
+                    &state,
+                    tenant_id,
+                    trace_id,
+                    &model,
+                    request_start,
+                    code,
+                    None,
+                );
                 return provider_error_response(
                     status,
                     code,
@@ -1293,6 +1663,17 @@ async fn chat_completions_handler(
         match serde_json::from_value::<tracelane_shared::ChatRequest>(body.clone()) {
             Ok(r) => r,
             Err(err) => {
+                // R13: the ledger already recorded this request. A 400 here without a
+                // span is a row the audit export names and /traces cannot show.
+                emit_post_ledger_error_span(
+                    &state,
+                    tenant_id,
+                    trace_id,
+                    &model,
+                    request_start,
+                    "malformed_request",
+                    None,
+                );
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "error": format!("malformed request: {err}") })),
@@ -1300,6 +1681,22 @@ async fn chat_completions_handler(
                     .into_response();
             }
         };
+
+    // GWY-39: a `tracelane.yaml` alias names the provider (resolved above, via
+    // the canonical map) AND the upstream model. Only the OUTGOING request is
+    // rewritten. `model` deliberately keeps the caller's alias so the span, the
+    // ledger and the echoed response all say what the caller actually asked
+    // for — and so `dispatch_to_provider`'s defence-in-depth re-resolve lands on
+    // the same provider this handler already chose.
+    if let Some(a) = self::config::alias(&model) {
+        tracing::debug!(
+            alias = %model,
+            upstream_model = %a.upstream_model,
+            provider = %a.provider_id,
+            "tracelane.yaml model alias applied"
+        );
+        chat_request.model.clone_from(&a.upstream_model);
+    }
 
     // --- Step 4b: Inline guardrails (the guardrail spec) ---
     // Request-side rail dispatch over the parsed request (R4 lethal-trifecta +
@@ -1335,6 +1732,19 @@ async fn chat_completions_handler(
                 correlation_id = %correlation_id,
                 "guardrail verdict audit publish failed — refusing request (fail-closed)"
             );
+            // R13. The CHAT ledger row landed (that publish is upstream of here and
+            // fail-closed in its own right); it is the GUARDRAIL VERDICT that could not
+            // be captured. So the ledger attests to a request that was then refused,
+            // and without this the refusal is invisible in the product.
+            emit_post_ledger_error_span(
+                &state,
+                tenant_id,
+                trace_id,
+                &model,
+                request_start,
+                "audit_unavailable",
+                None,
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": "audit_unavailable" })),
@@ -1362,24 +1772,23 @@ async fn chat_completions_handler(
             // — otherwise the blocked hit is invisible on /signatures (the very
             // #3 gap, recreated for the injection case). Schema/drift no longer
             // reach this branch (they observe); injection is the live mapping.
-            if let Some(aft_id) = crate::guardrail::rails::r3_tool_safety::reason_to_aft(reason) {
-                if let Some(ref nats_client) = state.nats {
-                    let span = build_blocked_aft_span(
-                        tenant_id,
-                        trace_id,
-                        &model,
-                        request_start,
-                        "guardrail_block",
-                        aft_id,
-                    );
-                    let nats = Arc::clone(nats_client);
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-                            tracing::warn!(error = %e, "blocked-aft span NATS publish failed");
-                        }
-                    });
-                }
-            }
+            // R13. The AFT id is now an ATTRIBUTE of the span, not a CONDITION on
+            // emitting one. It used to gate the whole block: `if let Some(aft_id) =
+            // reason_to_aft(reason)`, with the 403 returning unconditionally below —
+            // and injection is the only live mapping (see the comment above), so
+            // **every other blocking rail produced a ledger row, a guardrail_verdicts
+            // row, a 403, and nothing in /traces.** The customer was told their request
+            // was blocked and could not see the block. Found by the verifier on the
+            // B-245 pass, inside a path I had already credited as covered.
+            emit_post_ledger_error_span(
+                &state,
+                tenant_id,
+                trace_id,
+                &model,
+                request_start,
+                "guardrail_block",
+                crate::guardrail::rails::r3_tool_safety::reason_to_aft(reason),
+            );
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
@@ -1427,6 +1836,23 @@ async fn chat_completions_handler(
             provider = upstream,
             killed = upstream_killed,
             "upstream unavailable (circuit open or killed) — short-circuiting with 503"
+        );
+        // R13. A breaker-open 503 is the single most useful error span there is: it is
+        // the shape a customer most wants to see on their own timeline, and it fires in
+        // bursts. The ledger recorded every one of these requests; before this, none of
+        // them appeared in /traces.
+        emit_post_ledger_error_span(
+            &state,
+            tenant_id,
+            trace_id,
+            &model,
+            request_start,
+            if upstream_killed {
+                "upstream_killed"
+            } else {
+                "upstream_circuit_open"
+            },
+            None,
         );
         let mut resp = (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1601,15 +2027,15 @@ async fn chat_completions_handler(
             } else {
                 "provider_unavailable"
             };
-            if let Some(ref nats_client) = state.nats {
-                let span = build_error_span(tenant_id, trace_id, &model, request_start, err_reason);
-                let nats = Arc::clone(nats_client);
-                tokio::spawn(async move {
-                    if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-                        tracing::warn!(error = %e, "error-span NATS publish failed");
-                    }
-                });
-            }
+            emit_post_ledger_error_span(
+                &state,
+                tenant_id,
+                trace_id,
+                &model,
+                request_start,
+                err_reason,
+                None,
+            );
 
             // rejected — surface that distinctly instead of an opaque 502 (a
             // mangled/expired key otherwise read as "provider unavailable", with
@@ -1804,6 +2230,628 @@ async fn chat_completions_handler(
     }
 }
 
+/// How a provider dispatch failed, in the vocabulary the span's `status.message`
+/// and the client's `error` code both use.
+///
+/// One definition so the countable reason and the returned status can never
+/// error span behind it, a structural 0% error rate on `/slo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchFailure {
+    /// Upstream 401/403 — the tenant's BYOK key was rejected. ROTATE it.
+    KeyRejected,
+    /// Upstream 429 — the caller is over the provider's limit. Not an outage.
+    RateLimited,
+    /// Upstream 404 — the provider does not serve this model for this account.
+    ModelNotFound,
+    /// Any other upstream 4xx. The upstream rejected the REQUEST; we cannot say
+    RequestRejected(u16),
+    /// Timeout, connection failure, or 5xx after retry. A genuine outage.
+    Unavailable,
+}
+
+impl DispatchFailure {
+    /// The `status.message` written onto the error span, and the `error` code
+    /// returned to the caller. Same token for both, by construction.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::KeyRejected => "provider_key_rejected",
+            Self::RateLimited => "provider_rate_limited",
+            Self::ModelNotFound => "model_not_found",
+            Self::RequestRejected(_) => "provider_request_rejected",
+            Self::Unavailable => "provider_unavailable",
+        }
+    }
+}
+
+/// Classify a dispatch error from its typed upstream status.
+///
+/// Mirrors the inline cascade in [`chat_completions_handler`] (`:1671-1767`)
+/// exactly; that cascade predates this helper and should be collapsed onto it,
+/// which is a pure refactor and deliberately not bundled into this change.
+fn classify_dispatch_error(err: &anyhow::Error) -> DispatchFailure {
+    let Some(http) = err.downcast_ref::<crate::providers::ProviderHttpError>() else {
+        return DispatchFailure::Unavailable;
+    };
+    if http.is_auth_rejection() {
+        DispatchFailure::KeyRejected
+    } else if http.is_rate_limited() {
+        DispatchFailure::RateLimited
+    } else if http.is_model_not_found() {
+        DispatchFailure::ModelNotFound
+    } else if http.is_unclassified_client_error() {
+        DispatchFailure::RequestRejected(http.status)
+    } else {
+        DispatchFailure::Unavailable
+    }
+}
+
+/// Client-facing response for a classified dispatch failure.
+///
+/// Allowlist-constructed and scrubbed by [`provider_error_response`] — the
+/// upstream body never crosses this boundary.
+fn dispatch_failure_response(
+    failure: DispatchFailure,
+    upstream: &'static str,
+) -> axum::response::Response {
+    match failure {
+        DispatchFailure::KeyRejected => provider_error_response(
+            StatusCode::UNAUTHORIZED,
+            failure.reason(),
+            Some(
+                "the configured provider key was rejected by the upstream provider — verify the key for this provider",
+            ),
+            Some(upstream),
+            None,
+        ),
+        DispatchFailure::RateLimited => provider_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            failure.reason(),
+            Some(
+                "the upstream provider rate-limited or quota-exhausted this request — retry later, or check the provider account's plan and billing",
+            ),
+            Some(upstream),
+            Some("60"),
+        ),
+        DispatchFailure::ModelNotFound => provider_error_response(
+            StatusCode::NOT_FOUND,
+            failure.reason(),
+            Some(
+                "the upstream provider does not recognise this model for this account — check the model name and that your provider account has access to it",
+            ),
+            Some(upstream),
+            None,
+        ),
+        DispatchFailure::RequestRejected(status) => {
+            let message = format!(
+                "the upstream provider rejected this request with HTTP {status}. \
+                 This is not a Tracelane outage — it is usually either a provider \
+                 key that is invalid or expired for this account, or a request the \
+                 provider could not accept (model, parameters, or payload). \
+                 Verify the key for this provider, then the request itself."
+            );
+            provider_error_response(
+                // Mirror the upstream status. 401/403/404/429 are claimed above
+                // and cannot reach here; anything unrepresentable degrades to
+                // 400 — still client-class, never a 5xx that blames us.
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                failure.reason(),
+                Some(&message),
+                Some(upstream),
+                None,
+            )
+        }
+        DispatchFailure::Unavailable => provider_error_response(
+            StatusCode::BAD_GATEWAY,
+            "provider unavailable",
+            None,
+            None,
+            None,
+        ),
+    }
+}
+
+/// Publish a span to NATS off the response path. No-op when `NATS_URL` is unset
+/// — which drops the span while the request still succeeds (`server.rs:331-357`).
+fn spawn_span_publish(state: &AppState, span: TracelaneSpan) {
+    let Some(nats_client) = state.nats.as_ref() else {
+        // call note_span_dropped_no_nats() on the same condition; this one — the
+        // embeddings path — returned with no counter and no log, so an embeddings-only
+        // tenant could lose 100% of its spans while every signal we had stayed clean.
+        crate::otlp_emit::note_span_dropped_no_nats();
+        return;
+    };
+    let nats = Arc::clone(nats_client);
+    tokio::spawn(async move {
+        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
+            crate::otlp_emit::note_span_publish_failed();
+            tracing::warn!(error = %e, "span NATS publish failed");
+        }
+    });
+}
+
+/// Embeddings span. Same shape as the chat span (one definition of the
+/// attribute set) with the OTel GenAI `embeddings` operation name, so an
+/// embeddings call is a first-class row in `/traces` rather than a chat call
+/// that happens to have zero output tokens.
+#[allow(clippy::too_many_arguments)]
+fn build_embeddings_span(
+    tenant_id: &TenantId,
+    trace_id: Uuid,
+    model: &str,
+    agent_id: Option<&str>,
+    human_authorizer: Option<&str>,
+    business_reference: Option<&str>,
+    conversation_id: Option<&str>,
+    start_time: chrono::DateTime<chrono::Utc>,
+    input_tokens: u32,
+    timing: Option<GatewayTiming>,
+    error_reason: Option<&str>,
+) -> TracelaneSpan {
+    let mut span = build_gateway_span(
+        tenant_id,
+        trace_id,
+        model,
+        agent_id,
+        human_authorizer,
+        business_reference,
+        start_time,
+        input_tokens,
+        // Embeddings produce no completion tokens. Reporting anything else
+        // would inflate every token rollup that sums output tokens.
+        0,
+        None,
+        SpanUsageMeta::default(),
+        conversation_id,
+        None,
+        timing,
+        error_reason,
+    );
+    span.name = "gen_ai.embeddings".to_string();
+    span.attributes.gen_ai_operation_name = Some("embeddings".to_string());
+    span
+}
+
+/// Embeddings handler — `POST /v1/embeddings` (GWY-26).
+///
+/// The OpenAI Embeddings shape, so an existing client works by swapping its
+/// base URL. It exists because a RAG agent's retrieval step was invisible to
+/// the flight recorder: `/v1/chat/completions` was the gateway's only inference
+/// route, so every embeddings call went straight to the provider — no span, no
+/// ledger entry, no quota, no BYOK.
+///
+/// ## Pipeline — the ORDER is the security property
+///
+/// ```text
+/// auth → rate limit → validate → monthly quota → audit publish (fail-CLOSED)
+/// → route (fail-CLOSED) → BYOK key → breaker → dispatch → span + meter
+/// ```
+///
+/// Nothing that resolves a credential or touches an upstream sits above the
+/// auth step, so an unauthenticated request cannot reach any of it. Asserted by
+/// `embeddings_without_authorization_is_rejected`, not by this comment
+/// (`crates/gateway/CLAUDE.md`: "adding a route without replicating that
+/// sequence ships an unauthenticated endpoint").
+///
+/// ## What it deliberately does NOT run, and why
+///
+/// - **Predictive layer / inline guardrails.** Both are defined over a
+///   `ChatRequest` — messages, tool definitions, tool results. An embeddings
+///   payload has none of those. Synthesising a fake `ChatRequest` to make the
+///   rails fire would write a verdict about a request that was never made into
+///   a tamper-evident ledger, which is worse than no verdict. R2 (secrets/PII)
+///   genuinely applies to embedding input and needs a rail that accepts raw
+///   text; that is a rail change, not a handler change.
+/// - **Untrusted-data wrapping.** Sentinel-wrapping exists so a downstream LLM
+///   cannot be steered by tool output. Nothing downstream of an embedding
+///   vector interprets instructions.
+/// - **Streaming / cross-provider failover / prompt promotion.** The embeddings
+///   API is not streamed, and there is no cross-provider embedding equivalence
+///   to fail over to — vectors from two providers are not interchangeable.
+///
+/// ## Fail directions
+///
+/// Fail-CLOSED: auth, audit publish (`503 audit_unavailable`), model routing
+/// (`400 unroutable_model`), provider-key resolution, input validation.
+/// Fail-OPEN: span publish and billing metering are off the response path — a
+/// NATS or Polar problem never fails a request that the provider served.
+#[instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
+async fn embeddings_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let request_start = chrono::Utc::now();
+
+    let trace_id = headers
+        .get("x-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let human_authorizer = headers
+        .get("x-human-authorizer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let conversation_id = headers
+        .get("x-conversation-id")
+        .or_else(|| headers.get("x-session-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let business_reference = headers
+        .get("x-business-reference")
+        .and_then(|v| v.to_str().ok())
+        .and_then(tracelane_shared::span::bounded_business_reference);
+
+    // --- Step 1: Auth. Nothing above this line resolves a credential. ---
+    let Some(authorization) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing Authorization header" })),
+        )
+            .into_response();
+    };
+    let claims = match crate::auth::validate_authorization(authorization).await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(error = %err, "authentication failed");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "invalid or expired credentials" })),
+            )
+                .into_response();
+        }
+    };
+    // A13 scope gate — B-230. `/v1/embeddings` SPENDS THE TENANT'S PROVIDER BUDGET
+    // exactly as `/v1/chat/completions` does, and until 2026-08-13 it had no scope
+    // check at all: the only `Scope::Chat` gate in the crate was on the chat route,
+    // so a `read`-scoped key — the shape `api_scope.rs:47-49` says to hand an
+    // external auditor — could run up a bill here. Same scope as chat on purpose:
+    // these are one capability (dispatch to a paid upstream) on two paths, and a
+    // separate `embeddings` scope would be a second thing to grant and forget.
+    // Placed immediately after auth, before any entitlement resolve, matching the
+    // chat path's ordering and its reasoning.
+    if !claims.allows_scope(crate::auth::scope::Scope::Chat) {
+        tracing::warn!(
+            sub = %claims.sub,
+            "api key lacks the `chat` scope — refusing embeddings"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "This API key is not scoped for embeddings. It needs the `chat` scope; mint a new key with it in Settings → API Keys.",
+                    "type": "insufficient_scope",
+                    "required_scope": "chat",
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let tenant_id = &claims.tenant_id;
+    tracing::Span::current().record("tenant_id", tenant_id.to_string());
+
+    // --- Step 2: Rate limit (one warm entitlement resolve, same as chat) ---
+    // No-cache resolves to Free, never to a paid tier (`.claude/rules/tenancy.md`).
+    let entitlements = match &state.entitlements {
+        Some(cache) => Some(cache.resolved(*tenant_id.as_uuid()).await),
+        None => None,
+    };
+    let tier = entitlements
+        .as_ref()
+        .map_or(RateLimitTier::Free, |e| e.rate_limit_tier());
+    if let RateLimitDecision::Throttle { retry_after_secs } =
+        state.rate_limiter.check(tenant_id, tier)
+    {
+        crate::rejection_metrics::registry().record_rate_limited(tenant_id);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate limit exceeded",
+                "retry_after_secs": retry_after_secs
+            })),
+        )
+            .into_response();
+    }
+
+    // --- Step 3: Parse + validate ---
+    // Deliberately ABOVE the monthly quota check and BELOW the rate limiter: a
+    // malformed request is still work worth throttling, but it must not consume
+    // a trace from the tenant's paid monthly allowance. (Chat validates later
+    // for historical reasons; that asymmetry is chat's, not this handler's.)
+    let request = match serde_json::from_value::<crate::providers::EmbeddingsRequest>(body.clone())
+    {
+        Ok(r) => r,
+        Err(err) => {
+            return provider_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some(&format!("malformed embeddings request: {err}")),
+                None,
+                None,
+            );
+        }
+    };
+    if let Err(err) = request.validate() {
+        return provider_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some(&format!("{err}")),
+            None,
+            None,
+        );
+    }
+    // The caller's model string — kept verbatim through routing, the span and
+    // the ledger even when a `tracelane.yaml` alias rewrites what goes upstream.
+    let model = request.model.clone();
+
+    // --- Step 4: Monthly quota hard-cap (same tracker as chat: one allowance) ---
+    let quota_cfg = entitlements.as_ref().map_or_else(
+        || QuotaConfig::from_plan_tier_str("free"),
+        |e| e.quota_config(),
+    );
+    let year_month = current_year_month();
+    if state.quota_tracker.needs_seed(tenant_id, year_month) {
+        let baseline = quota_baseline_from_clickhouse(&state, tenant_id).await;
+        state
+            .quota_tracker
+            .seed_if_needed(tenant_id, year_month, baseline);
+    }
+    let quota = state.quota_tracker.check(tenant_id, quota_cfg);
+    if let Some((limit, used)) = quota.at_or_over_included_quota() {
+        maybe_notify_soft_cap(tenant_id, year_month, limit, used);
+    }
+    if let (QuotaDecision::AllowWithOverage { .. }, Some(rec)) = (quota, state.billing.as_ref()) {
+        spawn_overage_record(Arc::clone(rec), tenant_id.clone());
+    }
+    if let QuotaDecision::HardCapExceeded { limit, used } = quota {
+        crate::rejection_metrics::registry().record_quota_exceeded(tenant_id);
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            quota_exceeded = true,
+            limit,
+            used,
+            "quota hard cap exceeded — returning 429"
+        );
+        let reset_at = next_month_boundary_iso();
+        if let Some(webhook) = resolve_tenant_quota_webhook(tenant_id).await {
+            notify_quota_event_async(
+                webhook,
+                tenant_id.clone(),
+                QuotaEvent::HardCap { limit, used },
+            );
+        }
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "quota_exceeded",
+                "limit": limit,
+                "used": used,
+                "reset_at": reset_at,
+                "upgrade_url": "https://app.tracelane.dev/settings/billing",
+            })),
+        )
+            .into_response();
+    }
+
+    // --- Step 5: Audit log. Fail-CLOSED (ADR-069) ---
+    // The payload records WHAT was embedded structurally (model, how many
+    // inputs) and never the input text itself: embedding input is raw customer
+    // documents, and the ledger is exported to third parties for verification.
+    let mut audit_payload = serde_json::json!({
+        "model": model,
+        "input_count": request.input_count(),
+        "trace_id": trace_id,
+    });
+    if let Some(ref br) = business_reference {
+        audit_payload["business_reference"] = serde_json::Value::String(br.clone());
+    }
+    if let Err(err) = state
+        .audit_chain
+        .publish(AuditEvent {
+            tenant_id: tenant_id.clone(),
+            event_type: "embeddings.request",
+            actor: claims.sub.clone(),
+            payload: audit_payload,
+        })
+        .await
+    {
+        tracing::error!(error = %err, "audit publish failed — refusing request (fail-closed)");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "audit_unavailable" })),
+        )
+            .into_response();
+    }
+
+    let Some(provider_id) = crate::providers::ProviderRegistry::provider_id_for_model(&model)
+    else {
+        return unroutable_model_response(&model);
+    };
+    // Only providers speaking the OpenAI embeddings wire format can serve this.
+    // Refuse by name rather than forward a shape the provider cannot parse and
+    // relay its 400 as if it were ours.
+    let Some(adapter) = state.providers.openai_compatible(provider_id) else {
+        tracing::warn!(
+            provider = provider_id,
+            "embeddings requested for a provider with no OpenAI-compatible embeddings endpoint"
+        );
+        return provider_error_response(
+            StatusCode::BAD_REQUEST,
+            "embeddings_unsupported_provider",
+            Some(
+                "this provider does not expose an OpenAI-compatible /v1/embeddings endpoint — \
+                 use an OpenAI or OpenAI-compatible embedding model, or map one in tracelane.yaml",
+            ),
+            Some(provider_id),
+            None,
+        );
+    };
+
+    // --- Step 7: BYOK key. Fail-CLOSED, and the two failures need OPPOSITE
+    // user actions (add a key vs rotate one) — never collapsed into one. ---
+    let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
+    let provider_key = match resolve_provider_key(tenant_id, provider_id, key_env).await {
+        ProviderKey::Found(k) => k,
+        outcome => {
+            let (status, code, message) = match outcome {
+                ProviderKey::NotConfigured => (
+                    StatusCode::BAD_REQUEST,
+                    "provider_not_configured",
+                    "no API key is configured for this provider — add one in Settings → LLM Providers, then retry",
+                ),
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "provider_key_unusable",
+                    "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
+                ),
+            };
+            tracing::warn!(provider = provider_id, code, "provider key unresolvable");
+            spawn_span_publish(
+                &state,
+                build_embeddings_span(
+                    tenant_id,
+                    trace_id,
+                    &model,
+                    agent_id.as_deref(),
+                    human_authorizer.as_deref(),
+                    business_reference.as_deref(),
+                    conversation_id.as_deref(),
+                    request_start,
+                    0,
+                    None,
+                    Some(code),
+                ),
+            );
+            return provider_error_response(status, code, Some(message), Some(provider_id), None);
+        }
+    };
+
+    // --- Step 8: Breaker + kill switch (ADR-036/038) ---
+    let upstream = provider_name_from_model(&model);
+    let region = "default";
+    if state.kill_switch.upstream_killed(upstream) || !state.circuit_breaker.allow(upstream, region)
+    {
+        tracing::warn!(
+            provider = upstream,
+            "upstream unavailable (circuit open or killed) — short-circuiting with 503"
+        );
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "upstream_circuit_open",
+                "provider": upstream,
+                "retry_after_seconds": 10
+            })),
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("10"),
+        );
+        resp.headers_mut().insert(
+            axum::http::HeaderName::from_static("tracelane-upstream-circuit"),
+            axum::http::HeaderValue::from_static("open"),
+        );
+        return resp;
+    }
+
+    // --- Step 9: Dispatch ---
+    // GWY-39: the alias's upstream model is what the provider is asked for; the
+    // caller's alias stays on `model` for the span, the ledger and the echoed
+    // response.
+    let mut upstream_request = request;
+    if let Some(a) = self::config::alias(&model) {
+        upstream_request.model.clone_from(&a.upstream_model);
+    }
+    let dispatch_ts = chrono::Utc::now();
+    let result = adapter
+        .embeddings(&upstream_request, &provider_key, tenant_id)
+        .await;
+    let provider_complete_ts = chrono::Utc::now();
+    state
+        .circuit_breaker
+        .record(upstream, region, result.is_ok());
+
+    let mut response = match result {
+        Ok(r) => r,
+        Err(err) => {
+            let failure = classify_dispatch_error(&err);
+            let status_code = err
+                .downcast_ref::<crate::providers::ProviderHttpError>()
+                .map(|e| e.status);
+            crate::otlp_emit::emit_operation_exception(
+                tenant_id,
+                upstream,
+                region,
+                "dispatch_failed",
+                status_code,
+            );
+            // error-rate metric is structurally pinned at 0% for this route.
+            spawn_span_publish(
+                &state,
+                build_embeddings_span(
+                    tenant_id,
+                    trace_id,
+                    &model,
+                    agent_id.as_deref(),
+                    human_authorizer.as_deref(),
+                    business_reference.as_deref(),
+                    conversation_id.as_deref(),
+                    request_start,
+                    0,
+                    None,
+                    Some(failure.reason()),
+                ),
+            );
+            tracing::warn!(
+                provider = upstream,
+                reason = failure.reason(),
+                status = ?status_code,
+                "embeddings dispatch failed"
+            );
+            return dispatch_failure_response(failure, upstream);
+        }
+    };
+
+    // --- Step 10: Record, meter, respond ---
+    let billable = response.billable_tokens();
+    spawn_span_publish(
+        &state,
+        build_embeddings_span(
+            tenant_id,
+            trace_id,
+            &model,
+            agent_id.as_deref(),
+            human_authorizer.as_deref(),
+            business_reference.as_deref(),
+            conversation_id.as_deref(),
+            request_start,
+            billable,
+            Some(GatewayTiming {
+                dispatch_ts,
+                provider_complete_ts,
+                // Embeddings are a single non-streamed round-trip: there is no
+                // first chunk distinct from the response.
+                ttft_us: None,
+            }),
+            None,
+        ),
+    );
+    if let Some(rec) = state.billing.as_ref() {
+        spawn_billing_record(Arc::clone(rec), tenant_id.clone(), u64::from(billable));
+    }
+
+    // Echo the model the CALLER asked for. A `tracelane.yaml` alias is the
+    // caller's own vocabulary; handing back the upstream name would break a
+    // client that round-trips `response.model` into its next request.
+    response.model = model;
+    (StatusCode::OK, Json(response)).into_response()
+}
+
 /// Count of billing meter-records spawned, bumped synchronously at the call site.
 ///
 /// Billing is fire-and-forget into a `tokio::spawn`, and a SUCCESSFUL meter logs
@@ -1842,6 +2890,41 @@ fn billing_records_spawned() -> u64 {
 /// `buffer_provider_stream` drains the response. The hot-path latency
 /// cost is one Postgres index-scan + one in-memory HashMap update —
 /// the actual Polar POST happens later in the background flusher.
+/// Meter ONE billable overage trace (SET-13).
+///
+/// Off the request path: the tenant→Polar-customer lookup and the buffer write
+/// both happen in a spawned task, so a slow control plane cannot add latency to
+/// a request the tenant is already paying extra for.
+///
+/// Counts 1 per request rather than a token total — the published price is per
+/// 10,000 TRACES, and Polar performs the division. Delivery to Polar is the
+/// `Recorder`'s 60s flusher, which restores the count to its buffer on failure
+/// and dedupes retries on `external_id`, so a network blip cannot double-bill.
+fn spawn_overage_record(billing: Arc<crate::billing::Recorder>, tenant_id: TenantId) {
+    tokio::spawn(async move {
+        let Some(pool) = crate::db::global_pool() else {
+            return;
+        };
+        let tenant = match crate::db::tenants::get(pool, &tenant_id).await {
+            Ok(Some(t)) => t,
+            _ => return,
+        };
+        let Some(customer_id) = tenant.polar_customer_id else {
+            // No Polar customer (self-serve tenant that never checked out). The
+            // quota decision still stands; there is simply nobody to bill.
+            return;
+        };
+        billing
+            .record(
+                crate::billing::Meter::TracesOverage,
+                &crate::billing::PolarCustomerId(customer_id),
+                1,
+            )
+            .await;
+        tracing::debug!(tenant_id = %tenant_id, "metered 1 overage trace (overage_v1)");
+    });
+}
+
 fn spawn_billing_record(
     billing: Arc<crate::billing::Recorder>,
     tenant_id: tracelane_shared::TenantId,
@@ -2143,6 +3226,55 @@ fn provider_error_response(
     resp
 }
 
+/// R13 — emit the error-status span for a request that ALREADY HAS A LEDGER ROW.
+///
+/// # Why this exists as one function
+///
+/// Past `state.audit_chain.publish(...)` on the chat path, the tamper-evident ledger
+/// asserts the request happened. **A return from there without a span is a request the
+/// ledger attests to and the product cannot show** — a customer reconciling their audit
+/// export against `/traces` finds a gap, and nothing anywhere reports one. Measured
+/// 2026-08-14 (B-245 §5.2): **~500 such rows fleet-wide**, on every tenant with traffic,
+/// at 5–8% of requests, present from the first day of the current ledger.
+///
+/// Three call sites already did this correctly and three did not, and the three that did
+/// were **the same ten lines copy-pasted** — which is exactly how the other three came to
+/// be missed. One definition means a new post-ledger exit is one line away from correct,
+/// and it is what makes `scripts/ci/check-post-ledger-span-emit.py` able to check the
+/// property mechanically: the guard looks for a call to THIS function, so it matches a
+/// construction rather than a word (`TRAPS.md` §19).
+///
+/// # Errors
+/// None — infallible by construction. This is a **fault-tolerance** path: failing to
+/// record a span must never change the response the customer already earned. The publish
+/// is detached and its failure is counted by `note_span_publish_failed()`.
+fn emit_post_ledger_error_span(
+    state: &AppState,
+    tenant_id: &TenantId,
+    trace_id: Uuid,
+    model: &str,
+    request_start: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+    aft_id: Option<&str>,
+) {
+    // No NATS ⇒ capture is not wired at all; the boot refusal (A1) already covers that
+    // case loudly, and `spans_dropped` is the live signal. Nothing to do here.
+    let Some(ref nats_client) = state.nats else {
+        return;
+    };
+    let span = match aft_id {
+        Some(aft) => build_blocked_aft_span(tenant_id, trace_id, model, request_start, reason, aft),
+        None => build_error_span(tenant_id, trace_id, model, request_start, reason),
+    };
+    let nats = Arc::clone(nats_client);
+    tokio::spawn(async move {
+        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
+            crate::otlp_emit::note_span_publish_failed();
+            tracing::warn!(error = %e, "post-ledger error-span NATS publish failed");
+        }
+    });
+}
+
 /// instead of a structural 0%. Reuses `build_gateway_span` so the shape stays one
 /// definition.
 fn build_error_span(
@@ -2337,6 +3469,45 @@ fn current_year_month() -> u32 {
 /// makes this an indexed range scan. Any failure → 0 (fail-open baseline: never
 /// block a paying tenant because ClickHouse blinked; worst case is one
 /// process-lifetime of under-count, corrected on the next month's seed).
+/// **The one definition of "traces this month".** SET-07.
+///
+/// Both the number a customer is SHOWN on the billing page and the number that
+/// 429s them read this constant, so the two cannot disagree. That property is the
+/// whole point: a usage figure that is merely *similar* to the enforced one is
+/// worse than none, because it is the figure a customer will quote back when they
+/// are cut off and the dashboard said they had headroom.
+///
+/// `trace_summaries`, not `spans` — one row per TRACE is what the quota bills, and
+/// counting spans would over-report by the fan-out factor of every trace. Its
+/// `(tenant_id, start_time, …)` sort key makes this an indexed range scan.
+///
+/// `toStartOfMonth(now())` is ClickHouse-server time (UTC), and the reset boundary
+/// is therefore the same instant for the display and the enforcement — matching
+/// them in the client would reintroduce the drift this constant removes.
+/// `uniqExact(trace_id)`, **NOT `count()`** — and this one bills.
+///
+/// `trace_summaries` is a write-time MV: if ingest splits a trace across batches
+/// it emits **one partial row per batch** for the same `trace_id`, each carrying
+/// that batch's own `min(start_time)`. `start_time` is in the ReplacingMergeTree
+/// ORDER BY, so the rows have distinct keys and never collapse — not even under
+/// `FINAL` (B-243, verified against a real trace on prod).
+///
+/// With `count()` that made **a multi-flush trace bill as two or more traces**
+/// against the monthly quota, and the same constant feeds the usage figure the
+/// customer is shown (`billing/usage.rs:86`) — so display and enforcement
+/// over-counted together, in OUR favour. A real agent triggers it and no
+/// synthetic test does: simulated sub-second calls fit one exporter flush, real
+/// LLM latency does not.
+///
+/// `trace_reads.rs:1427-1434` had already documented this exact mechanism and
+/// fixed the footer query with `uniqExact` — and four other call sites, this one
+/// included, kept `count()`. That is the CLASS-2 shape: a finding recorded at ONE
+/// call site is not recorded (`docs/reference/TRAPS.md` §29).
+///
+/// Pinned by `billing::usage::tests::usage_reads_the_same_predicate_the_quota_enforcer_reads`.
+pub const TRACES_THIS_MONTH_SQL: &str = "SELECT toUInt64(uniqExact(trace_id)) AS n FROM tracelane.trace_summaries \
+        WHERE tenant_id = ? AND start_time >= toStartOfMonth(now())";
+
 async fn quota_baseline_from_clickhouse(state: &AppState, tenant_id: &TenantId) -> u64 {
     let Some(url) = state.quota_ch_url.clone() else {
         return 0;
@@ -2345,10 +3516,8 @@ async fn quota_baseline_from_clickhouse(state: &AppState, tenant_id: &TenantId) 
     struct CountRow {
         n: u64,
     }
-    const SQL: &str = "SELECT count() AS n FROM tracelane.trace_summaries \
-        WHERE tenant_id = ? AND start_time >= toStartOfMonth(now())";
     match crate::clickhouse_query::ch_client(url)
-        .query(SQL)
+        .query(TRACES_THIS_MONTH_SQL)
         .bind(tenant_id.to_string())
         .fetch_one::<CountRow>()
         .await
@@ -2365,11 +3534,15 @@ async fn quota_baseline_from_clickhouse(state: &AppState, tenant_id: &TenantId) 
     }
 }
 
-/// Look up the Slack webhook URL for hard-cap quota alerts, if configured
-/// on `tenants.slack_webhook_url`. Returns None when the column is null,
-/// the tenant is missing, or no Postgres pool is available — the 429
-/// response is independent of webhook delivery.
-async fn resolve_tenant_slack_webhook(tenant_id: &TenantId) -> Option<String> {
+/// Look up the tenant's quota-alert webhook, if configured on
+/// `tenants.slack_webhook_url`. Returns None when the column is null, the
+/// tenant is missing, or no Postgres pool is available — the response is
+/// independent of webhook delivery.
+///
+/// The column name says "slack" for historical reasons only; any HTTPS
+/// receiver works. SET-04 added the writer (`/api/settings/notify-webhook`);
+/// before that this always returned None for every tenant.
+async fn resolve_tenant_quota_webhook(tenant_id: &TenantId) -> Option<String> {
     let pool = crate::db::global_pool()?;
     match crate::db::tenants::get(pool, tenant_id).await {
         Ok(Some(t)) => t.slack_webhook_url,
@@ -2423,46 +3596,213 @@ async fn validate_slack_webhook(webhook_url: &str) -> anyhow::Result<()> {
     crate::ssrf_guard::validate_url(webhook_url).await
 }
 
-/// Fire-and-forget Slack POST when a tenant hits the hard quota cap.
+/// Process-local cache of the SETTLED soft-cap outcome per tenant: the period
+/// for which this process knows the notification is finished — either we sent it
+/// or we lost the `ON CONFLICT` race to someone who did.
 ///
-/// Spawns onto the existing tokio runtime; the request handler does NOT
-/// await the POST. Webhook latency or failure is invisible to the caller.
-/// The POST body is the minimum needed for the receiver to render an
-/// actionable alert; intentionally never includes API-key material or
-/// trace contents (CLAUDE.md security non-negotiable #5).
+/// Caching the *outcome*, not merely the *attempt*, is what lets a LOST claim
+/// short-circuit with no Postgres round-trip for the rest of the period. It also
+/// fixes a silent-loss path the attempt-only version had: a transient Neon error
+/// marked the tenant attempted, so the alert was never retried and never sent —
+/// no error surfaced to anyone. An errored claim is NOT an outcome, so the task
+/// removes the entry and the next request retries.
+///
+/// Never the correctness boundary: exactly-once across restarts and replicas
+/// comes from the primary key on `quota_notifications`.
+static SOFT_CAP_SETTLED: std::sync::OnceLock<dashmap::DashMap<String, u32>> =
+    std::sync::OnceLock::new();
+
+/// Notify the tenant that they are at or over 100% of their included quota,
+/// exactly once per tenant per billing period — globally, not per process.
+///
+/// Off the request path entirely: the Postgres claim and the POST both happen
+/// inside a spawned task, so the request this fires on is served at full speed
+/// whether or not either succeeds.
+///
+/// **Why the claim is persisted.** The in-memory counter reseeds from ClickHouse
+/// a restart moves the counter and takes the answer with it. The previous
+/// implementation asked exactly that question (`used == quota`) and was wrong in
+/// both directions on any mid-month deploy: a reseed above quota lost the alert
+/// silently, a reseed below quota sent it twice.
+fn maybe_notify_soft_cap(tenant_id: &TenantId, year_month: u32, quota: u64, used: u64) {
+    let settled = SOFT_CAP_SETTLED.get_or_init(dashmap::DashMap::new);
+    let key = tenant_id.to_string();
+    // Claim the right to spawn ATOMICALLY. A `get` then `insert` leaves a window
+    // in which K concurrent requests at the crossing all observe "not settled"
+    // and all spawn, so K tasks race the same INSERT and K-1 lose. Holding the
+    // entry lock closes that: exactly one caller per (tenant, period) proceeds.
+    match settled.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(mut o) => {
+            if *o.get() == year_month {
+                // Already sent, or already lost to another replica. Either way
+                // there is nothing left to do and no reason to touch Postgres.
+                return;
+            }
+            o.insert(year_month);
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(year_month);
+        }
+    }
+
+    let Some(pool) = crate::db::global_pool().cloned() else {
+        // No control plane: nothing to claim against. Drop the marker so a later
+        // request can retry if a pool appears.
+        settled.remove_if(&key, |_, v| *v == year_month);
+        return;
+    };
+    let tenant = tenant_id.clone();
+    let period = format!("{year_month:06}");
+    let settled_key = key;
+    tokio::spawn(async move {
+        match crate::db::quota_notifications::claim(
+            &pool,
+            &tenant,
+            &period,
+            crate::db::quota_notifications::KIND_SOFT_CAP,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    tenant_id = %tenant,
+                    period = %period,
+                    "soft-cap notification already claimed for this period — not re-sending"
+                );
+                return;
+            }
+            Err(e) => {
+                // An ERROR is not an outcome. Forget it so the next request
+                // retries — otherwise one Neon blip at the crossing loses the
+                // alert for the whole period with nothing to show for it, which
+                // is the same silent-loss shape this whole fix exists to remove.
+                // Not notifying on THIS request is still correct: a missed alert
+                // beats a duplicate that trains the tenant to mute the channel
+                // their hard-cap 429 also arrives on.
+                SOFT_CAP_SETTLED
+                    .get_or_init(dashmap::DashMap::new)
+                    .remove_if(&settled_key, |_, v| *v == year_month);
+                tracing::warn!(
+                    error = %e,
+                    tenant_id = %tenant,
+                    "soft-cap claim failed — will retry on a later request"
+                );
+                return;
+            }
+        }
+        tracing::info!(
+            tenant_id = %tenant,
+            quota_soft_cap = true,
+            quota,
+            used,
+            "included quota reached (100%) — notifying, request still served"
+        );
+        // DSH-01 (closing B-211's quota producer). This is deliberately INSIDE
+        // the successful-claim branch, which is the only place that fires
+        // exactly once per (tenant, period) across restarts and replicas —
+        // B-211 said the quota producer must hang off THIS transition or it
+        // double-fires on a mid-month restart, which is the defect migration
+        // 0023's header documents.
+        //
+        // Before the webhook, and independent of it: the in-app row is the
+        // channel that cannot bounce, be filtered, or depend on the tenant
+        // having configured anything. A tenant with no webhook still gets told.
+        crate::notification_routes::notify(
+            &pool,
+            *tenant.as_uuid(),
+            "quota",
+            "Included quota reached (100%)",
+            &QuotaEvent::SoftCap { limit: quota, used }.message(&tenant),
+            "warning",
+            "/settings/billing",
+        )
+        .await;
+
+        if let Some(webhook) = resolve_tenant_quota_webhook(&tenant).await {
+            notify_quota_event_async(
+                webhook,
+                tenant.clone(),
+                QuotaEvent::SoftCap { limit: quota, used },
+            );
+        }
+    });
+}
+
+/// A quota milestone worth telling the tenant about.
+///
+/// The two variants differ in what the gateway DID, which is the only thing
+/// the tenant cannot infer for themselves: `SoftCap` was served, `HardCap` was
+/// refused. Keeping them in one enum is what makes the notify seam
+/// channel-agnostic — a future email or in-app channel is added inside
+/// [`notify_quota_event_async`] and reads this enum, without any quota logic
+/// moving out of `chat_completions_handler`.
+#[derive(Debug, Clone, Copy)]
+enum QuotaEvent {
+    /// Exactly 100% of the included quota. The request was SERVED (SET-08).
+    SoftCap { limit: u64, used: u64 },
+    /// Past the hard cap. The request was REFUSED with a 429.
+    HardCap { limit: u64, used: u64 },
+}
+
+impl QuotaEvent {
+    /// Human-readable alert text. Never includes API-key material or trace
+    /// contents (CLAUDE.md security non-negotiable #5) — tenant id and counts
+    /// only.
+    fn message(&self, tenant_id: &TenantId) -> String {
+        match *self {
+            QuotaEvent::SoftCap { limit, used } => format!(
+                "Tracelane quota reached — tenant {tenant_id} used {used} / included {limit} \
+                 (100%). Requests are STILL BEING SERVED; overage applies until the hard cap. \
+                 Visit https://app.tracelane.dev/settings/billing to review."
+            ),
+            QuotaEvent::HardCap { limit, used } => format!(
+                "Tracelane quota exceeded — tenant {tenant_id} used {used} / hard cap {limit}. \
+                 Gateway is now returning 429. Visit \
+                 https://app.tracelane.dev/settings/billing to upgrade."
+            ),
+        }
+    }
+}
+
+/// Fire-and-forget notification for a [`QuotaEvent`].
+///
+/// Spawns onto the existing tokio runtime; the request handler does NOT await
+/// delivery. Latency or failure is invisible to the caller — which is what
+/// makes the SET-08 soft cap genuinely non-blocking: the request is served
+/// whether or not this ever lands.
 ///
 /// The tenant-controlled URL passes [`validate_slack_webhook`] before any
 /// request fires (SSRF), and the request uses
 /// [`crate::ssrf_guard::safe_client_builder`] (rustls + no-redirect, so a
 /// redirect to an internal host cannot be followed). A rejected URL is
-/// log-and-dropped — the 429 the caller already received is independent of
-/// webhook delivery.
-fn notify_quota_exceeded_async(webhook_url: String, tenant_id: TenantId, limit: u64, used: u64) {
+/// log-and-dropped — the response the caller already received is independent
+/// of webhook delivery.
+///
+/// **Channel-agnostic on purpose.** Nothing here requires a `hooks.slack.com`
+/// host; the `{"text": …}` shape is what Slack and Discord both accept and any
+/// receiver can parse. Adding email means adding a branch in this function, not
+/// touching the quota arms in the hot path.
+fn notify_quota_event_async(webhook_url: String, tenant_id: TenantId, event: QuotaEvent) {
     tokio::spawn(async move {
         if let Err(e) = validate_slack_webhook(&webhook_url).await {
             tracing::warn!(
                 error = %e,
                 tenant_id = %tenant_id,
-                "slack webhook URL rejected by SSRF guard; dropping notification (429 already returned)"
+                ?event,
+                "quota webhook URL rejected by SSRF guard; dropping notification (response already returned)"
             );
             return;
         }
 
-        let body = serde_json::json!({
-            "text": format!(
-                "Tracelane quota exceeded — tenant {} used {} / hard cap {}. \
-                 Gateway is now returning 429. Visit \
-                 https://app.tracelane.dev/settings/billing to upgrade.",
-                tenant_id, used, limit
-            )
-        });
+        let body = serde_json::json!({ "text": event.message(&tenant_id) });
         let client = match crate::ssrf_guard::safe_client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "slack webhook client build failed");
+                tracing::warn!(error = %e, "quota webhook client build failed");
                 return;
             }
         };
@@ -2470,7 +3810,8 @@ fn notify_quota_exceeded_async(webhook_url: String, tenant_id: TenantId, limit: 
             tracing::warn!(
                 error = %e,
                 tenant_id = %tenant_id,
-                "slack webhook POST failed; 429 already returned to caller"
+                ?event,
+                "quota webhook POST failed; response already returned to caller"
             );
         }
     });
@@ -3012,6 +4353,7 @@ fn provider_stream_to_sse(
             let nats_clone = Arc::clone(nats_client);
             tokio::spawn(async move {
                 if let Err(e) = crate::otlp_emit::publish_span(&nats_clone, &span).await {
+                    crate::otlp_emit::note_span_publish_failed();
                     tracing::warn!(error = %e, "span NATS publish failed (streaming)");
                 }
             });
@@ -3205,6 +4547,7 @@ async fn buffer_provider_stream(
         let nats = Arc::clone(nats_client);
         tokio::spawn(async move {
             if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
+                crate::otlp_emit::note_span_publish_failed();
                 tracing::warn!(error = %e, "span NATS publish failed");
             }
         });
@@ -3295,6 +4638,300 @@ mod tests {
     use super::*;
     use crate::prompt_router::Env;
     use serde_json::json;
+
+    // ── A1: capture completeness ────────────────────────────────────────────
+    // The gateway used to answer 200 while dropping every span, and nothing said
+    // so. These assert the two halves of the fix: it REFUSES to start in the
+    // config that causes it, and it TELLS you when it is happening anyway.
+
+    /// The state that matters. Everything else here is the happy path; this is the
+    /// one the old code got wrong, and a test suite that only covers the others
+    /// would have passed against the defect.
+    #[test]
+    fn unset_nats_url_without_an_explicit_opt_out_refuses_to_boot() {
+        assert_eq!(
+            capture_boot_decision(false, false),
+            CaptureBoot::Refuse,
+            "a forgotten NATS_URL must stop the process, not produce a warning \
+             nobody reads three weeks later"
+        );
+    }
+
+    /// The escape hatch must work, or dev and capture-less deployments are bricked
+    /// and someone deletes the check. A guard people must route around is not a guard.
+    #[test]
+    fn an_explicit_opt_out_runs_without_capture() {
+        assert_eq!(
+            capture_boot_decision(false, true),
+            CaptureBoot::RunWithoutCapture
+        );
+    }
+
+    /// A configured NATS_URL wins regardless of the opt-out: the flag means "run
+    /// without capture", not "suppress capture that was configured".
+    #[test]
+    fn a_configured_nats_url_always_connects() {
+        assert_eq!(capture_boot_decision(true, false), CaptureBoot::Connect);
+        assert_eq!(capture_boot_decision(true, true), CaptureBoot::Connect);
+    }
+
+    /// `nats = None` for the life of the process — 200s and total span loss until a
+    /// human restarted it. async_nats already auto-reconnects once connected; the gap
+    /// was only ever the FIRST connect, which is exactly when a dependency is most
+    /// likely to be unready (NATS restarting, DNS not yet warm).
+    ///
+    /// Both directions, against a port nothing listens on:
+    ///   - plain `connect()`   -> Err  (the old behaviour, permanent capture loss)
+    ///   - `retry_on_initial_connect()` -> Ok (a client that heals itself)
+    /// Asserting only the second would not show that anything changed.
+    #[tokio::test]
+    async fn nats_initial_connect_failure_is_retried_not_fatal() {
+        // Port 1 is reserved; nothing listens there, so this is a real connect
+        // failure rather than a simulated one.
+        const DEAD: &str = "nats://127.0.0.1:1";
+
+        assert!(
+            async_nats::connect(DEAD).await.is_err(),
+            "sanity: a plain connect to a dead port must fail — if this ever passes, \
+             the test below proves nothing because both paths would succeed"
+        );
+
+        let retried = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect(DEAD)
+            .await;
+        assert!(
+            retried.is_ok(),
+            "with retry_on_initial_connect the client must be constructed and keep \
+             retrying in the background; returning Err here restores the defect — capture \
+             dead for the whole process because NATS happened to be down at boot"
+        );
+
+        // Both assertions above exercise async_nats directly, so they would still pass
+        // if someone reverted the BOOT PATH to a plain `connect()`. Pin the call site.
+        //
+        // COMMENTS ARE STRIPPED FIRST, and that is not incidental. The first version of
+        // this check searched the raw source, and the raw source is full of prose about
+        // the very thing being checked — this comment, the boot-path comment, the
+        // assertion message below. Reverting the boot path left every one of those in
+        // place, so the check passed against the defect. That is the second time today
+        // a guard keyed on a WORD instead of a CONSTRUCTION (see
+        // scripts/ci/check-federation-hash-deferral.py), and both were caught only by
+        // falsifying rather than by reading.
+        // ...and the search is scoped to PRODUCTION code — everything before the test
+        // module. Stripping comments was not enough: this test's own body calls
+        // `retry_on_initial_connect()` a few lines up, so with the whole file in scope
+        // the boot path could be deleted entirely and the needle would still be found
+        // in the test that exists to catch that. Third self-match today (see
+        // billing/usage.rs and tlane-watchdog.sh) — a source-scanning assertion must
+        // never be able to see itself.
+        let whole = include_str!("server.rs");
+        let prod = whole
+            .split_once("\n#[cfg(test)]")
+            .map_or(whole, |(before, _)| before);
+        let code: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Needle split so it cannot match this line either.
+        assert!(
+            code.contains(concat!(".retry_on_initial", "_connect()")),
+            "the gateway's NATS boot path must CALL retry_on_initial_connect — without \
+             it a gateway that starts while NATS is down never records again"
+        );
+    }
+
+    /// dead port; it does not prove the client HEALS. This does: build against a dead
+    /// port, then start a real NATS on that port and confirm the SAME client publishes.
+    ///
+    /// `#[ignore]` because it needs docker and ~20s. Run it deliberately:
+    ///   cargo test -p gateway --bin gateway -- b198_client_heals --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs docker; run deliberately"]
+    async fn b198_client_heals_once_nats_appears() {
+        use std::process::Command;
+        const PORT: &str = "4299";
+        let url = format!("nats://127.0.0.1:{PORT}");
+        let name = "b198-nats-heal";
+
+        let _ = Command::new("docker").args(["rm", "-f", name]).output();
+
+        // 1. Build the client while NOTHING is listening. Under the old code path this
+        //    is where capture died permanently.
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect(&url)
+            .await
+            .expect("client must be constructed against a dead port");
+
+        // 2. Bring NATS up on that port.
+        let up = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "-p",
+                &format!("127.0.0.1:{PORT}:4222"),
+                "nats:2.10-alpine",
+            ])
+            .output()
+            .expect("docker run");
+        assert!(
+            up.status.success(),
+            "could not start NATS: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+
+        // 3. Poll publish until the background retry connects.
+        let mut healed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // publish() alone can succeed into the client's buffer while still
+            // disconnected — flush() is what proves the bytes reached a server, so
+            // both must succeed or this would report "healed" on a queued message.
+            if client.publish("b198.heal", "x".into()).await.is_ok() && client.flush().await.is_ok()
+            {
+                healed = true;
+                break;
+            }
+        }
+        let _ = Command::new("docker").args(["rm", "-f", name]).output();
+
+        assert!(
+            healed,
+            "the client never recovered after NATS came up — the retry is not working; a \
+             gateway that boots during a NATS restart would drop every span forever"
+        );
+    }
+
+    /// `/health` must distinguish "up" from "recording". Those were the same field.
+    #[test]
+    fn health_reports_capture_separately_from_liveness() {
+        let healthy = health_body(true, 0, 0);
+        assert_eq!(healthy["status"], "ok");
+        assert_eq!(healthy["capture_healthy"], true);
+        assert_eq!(healthy["capture_enabled"], true);
+        assert_eq!(healthy["spans_dropped"], 0);
+
+        // Capture never wired: still "ok" (liveness), but NOT healthy for capture.
+        let blind = health_body(false, 0, 0);
+        assert_eq!(
+            blind["status"], "ok",
+            "/health is the load-balancer liveness probe — failing it would turn a \
+             recording outage into a serving outage"
+        );
+        assert_eq!(
+            blind["capture_healthy"], false,
+            "a gateway that records nothing must not report capture as healthy"
+        );
+
+        // Wired, but data was lost: healthy=false, and it is STICKY.
+        let lost = health_body(true, 7, 0);
+        assert_eq!(lost["capture_enabled"], true);
+        assert_eq!(lost["spans_dropped"], 7);
+        assert_eq!(
+            lost["capture_healthy"], false,
+            "'we lost 7 spans' does not stop being true when the cause clears"
+        );
+    }
+
+    /// R13 — a guardrail block whose reason has NO AFT mapping must still be visible.
+    ///
+    /// This is a DECISION, not a measurement (`TRAPS.md` §27). The old code read
+    /// `if let Some(aft_id) = reason_to_aft(reason) { …emit… }` with the 403 returning
+    /// unconditionally below it, so the span was gated on the AFT lookup. Injection is
+    /// the only live mapping, which meant **every other blocking rail produced a ledger
+    /// row, a `guardrail_verdicts` row, a 403 — and nothing in `/traces`.** The customer
+    /// was told their request was blocked and could not see the block.
+    ///
+    /// Both halves are asserted on purpose. The first alone would pass if someone made
+    /// `reason_to_aft` return `Some` for everything; the second alone would pass if the
+    /// mapping were deleted entirely.
+    #[test]
+    fn guardrail_block_without_an_aft_mapping_still_produces_a_span() {
+        use crate::guardrail::rails::r3_tool_safety::reason_to_aft;
+
+        // (a) The gate that used to suppress the span really does return None for a
+        //     blocking reason — i.e. the defect was reachable, not theoretical.
+        assert!(
+            reason_to_aft(crate::guardrail::outcome::reason_codes::BUDGET_CAP).is_none(),
+            "BUDGET_CAP has no AFT mapping — under the old nesting this block emitted NO \
+             span at all, which is the defect this test pins"
+        );
+
+        // (b) …and the span we now build for it is a real, renderable error span rather
+        //     than an empty shell. `aft_id: None` selects build_error_span.
+        let span = build_error_span(
+            &TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            Uuid::new_v4(),
+            "claude-haiku-4-5",
+            chrono::Utc::now(),
+            "guardrail_block",
+        );
+        assert_eq!(
+            span.status.code,
+            tracelane_shared::SpanStatusCode::Error,
+            "a blocked request must land as an ERROR span, not a success or Unset one — \
+             otherwise it renders as a normal call in /traces"
+        );
+        assert!(
+            span.attributes.tracelane_aft_id.is_none(),
+            "no AFT mapping means no signature id — the span must not invent one"
+        );
+
+        // (c) And the mapped case still carries its signature, so (a) cannot be
+        //     satisfied by deleting the AFT feature.
+        let poisoned = build_blocked_aft_span(
+            &TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            Uuid::new_v4(),
+            "claude-haiku-4-5",
+            chrono::Utc::now(),
+            "guardrail_block",
+            "AFT-TOOL-POISON-001",
+        );
+        assert_eq!(
+            poisoned.attributes.tracelane_aft_id.as_deref(),
+            Some("AFT-TOOL-POISON-001"),
+            "a mapped block must still reach /signatures"
+        );
+    }
+
+    /// R17 — capture and ATTESTATION are independent, and the whole point is that a
+    /// reader can tell which one is broken. The two assertions below are opposing on
+    /// purpose: neither alone separates "the field exists" from "the field is wired
+    /// to the right counter".
+    #[test]
+    fn health_reports_audit_attestation_separately_from_capture() {
+        // Perfect capture, BROKEN attestation. This is the state that was invisible:
+        // every span recorded, and the ledger silently not third-party verifiable.
+        let unattested = health_body(true, 0, 3);
+        assert_eq!(
+            unattested["capture_healthy"], true,
+            "capture is fine here — folding attestation into capture_healthy would \
+             misreport WHICH half failed"
+        );
+        assert_eq!(
+            unattested["audit_attestation_healthy"], false,
+            "3 failed backfills means rows are unsigned/unanchored; the ledger is NOT \
+             third-party verifiable and /health must say so"
+        );
+        assert_eq!(unattested["audit_backfill_failures"], 3);
+
+        // And the inverse, so the first case cannot pass by the field being hardcoded:
+        // capture broken, attestation fine.
+        let uncaptured = health_body(true, 5, 0);
+        assert_eq!(uncaptured["capture_healthy"], false);
+        assert_eq!(
+            uncaptured["audit_attestation_healthy"], true,
+            "dropped spans do not make the ledger unverifiable — these are different \
+             failures and must not move together"
+        );
+
+        // Liveness is unaffected by either: /health is the load-balancer probe.
+        assert_eq!(health_body(true, 0, 9)["status"], "ok");
+    }
 
     /// Regression: the span provider-attribution mapping had drifted
     /// from the dispatch/key-lookup mapping and stamped most of the providers
@@ -4093,6 +5730,154 @@ mod tests {
         );
     }
 
+    /// GWY-41 / B-227. `/v1/traces` is now bound TWICE, in two different
+    /// routers, behind two different gates: `GET` in `trace_reads::routes()`
+    /// (ClickHouse read, `CLICKHOUSE_URL`-gated) and `POST` here (OTLP write,
+    /// unconditional). `Router::merge` PANICS when two routers define the same
+    /// method on the same path, and a panic there is a boot panic — the gateway
+    /// would not start at all.
+    ///
+    /// Two halves, because neither alone is discriminating:
+    ///   (a) the runtime half proves axum actually combines disjoint methods on
+    ///       one path and dispatches BOTH — if that were false the gateway could
+    ///       not boot;
+    ///   (b) the source half pins the two real literals, so adding `get()` to the
+    ///       write route or `post()` to the read router fails here rather than at
+    ///       boot in production.
+    #[tokio::test]
+    async fn both_methods_on_v1_traces_coexist() {
+        // (a) runtime — merge, then dispatch each method.
+        async fn read() -> &'static str {
+            "read"
+        }
+        async fn write() -> &'static str {
+            "write"
+        }
+        let reads = Router::new().route("/v1/traces", get(read));
+        let writes = Router::new().route("/v1/traces", post(write));
+        let app = reads.merge(writes);
+
+        let server = axum_test::TestServer::new(app);
+        assert_eq!(server.get("/v1/traces").await.text(), "read");
+        assert_eq!(server.post("/v1/traces").await.text(), "write");
+
+        // (b) source — both real bindings still exist, with the methods that make
+        // (a) applicable. A future edit that gives either route the OTHER method
+        // turns the merge into a panic, and this is what catches it.
+        //
+        // WHITESPACE IS STRIPPED FROM BOTH SIDES. The first version matched a
+        // contiguous literal and went red the moment `cargo fmt` wrapped the
+        // mount across four lines — a guard that fails on FORMATTING trains
+        // people to edit the guard, which is worse than not having it. Stripping
+        // whitespace keeps it sensitive to the one thing it is about (the METHOD
+        // bound to the path) and blind to how rustfmt lays it out.
+        fn squeeze(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let reads_src = squeeze(include_str!("trace_reads.rs"));
+        let read_needle = format!(
+            "{}{}",
+            r#".route("/v1/traces","#, r#"get(list_traces_handler))"#
+        );
+        assert!(
+            reads_src.contains(&squeeze(&read_needle)),
+            "the read route moved or changed method — re-check the merge"
+        );
+        let server_src = squeeze(include_str!("server.rs"));
+        // The needle is ASSEMBLED AT RUNTIME and never appears contiguously in this
+        // file, so it cannot be satisfied by this assertion's own text. The first
+        // version of this check was written as one literal and PASSED while the real
+        // mount had been changed from `post` to `get` — `include_str!("server.rs")`
+        // found the assertion itself. A probe that cannot tell the two answers apart
+        // is not a probe.
+        let needle = format!(
+            "{}{}",
+            r#".route("/v1/traces","#, r#"post(crate::trace_ingest::ingest_traces_handler)"#
+        );
+        assert!(
+            server_src.contains(&squeeze(&needle)),
+            "the write route moved or changed method — re-check the merge"
+        );
+    }
+
+    /// B-230. Six routes authenticated a caller and then returned tenant data — or
+    /// spent the tenant's provider budget — with NO scope check, so the A13
+    /// vocabulary was unenforced on the surfaces it was written for. GWY-41 made it
+    /// sharper by shipping an `ingest` scope that is default-on, i.e. a real
+    /// credential in a customer's container image.
+    ///
+    /// This asserts the gate EXISTS and sits AFTER authentication in each file. It
+    /// is structural, and says so: the crate has no handler test harness (no
+    /// `tower::ServiceExt`/`oneshot` anywhere), so an HTTP-level assertion is its
+    /// own change. The behavioural proof is the prod 2x2 — same request, two
+    /// differently-scoped keys, one 403 and one not-403.
+    ///
+    /// Needles are ASSEMBLED AT RUNTIME so this test cannot be satisfied by its own
+    /// source text; the first version of the sibling route guard passed while the
+    /// thing it checked had been changed, for exactly that reason.
+    #[test]
+    fn every_b230_route_gates_on_scope_after_authenticating() {
+        let auth_call = format!("{}{}", "validate_", "authorization");
+        let read_gate = format!("{}{}", "allows_scope(crate::auth::scope::", "Scope::Read)");
+        let chat_gate = format!("{}{}", "allows_scope(crate::auth::scope::", "Scope::Chat)");
+
+        for (label, src, gate) in [
+            ("embeddings", include_str!("server.rs"), &chat_gate),
+            (
+                "tool-analytics",
+                include_str!("tool_analytics.rs"),
+                &read_gate,
+            ),
+            (
+                "billing-usage",
+                include_str!("billing/usage.rs"),
+                &read_gate,
+            ),
+            (
+                "audit-export/summary",
+                include_str!("audit_export.rs"),
+                &read_gate,
+            ),
+            (
+                "audit-self-verify",
+                include_str!("audit_self_verify.rs"),
+                &read_gate,
+            ),
+        ] {
+            let g = src
+                .find(gate.as_str())
+                // The ref stays in the COMMENT above, never in the message: this guard has no
+                // test carve-out on purpose, because an exemption keyed on "looks like a
+                // test" is a hole in a guard that exists to stop internal refs reaching a
+                // customer.
+                .unwrap_or_else(|| panic!("{label}: scope gate REMOVED — regression"));
+            let a = src
+                .find(auth_call.as_str())
+                .unwrap_or_else(|| panic!("{label}: no authentication call found at all"));
+            assert!(
+                g > a,
+                "{label}: the scope gate moved ABOVE authentication — it would read \
+                 claims that do not exist yet"
+            );
+        }
+
+        // The fifth prompt WRITE surface. `/observe` feeds the auto-rollback engine,
+        // which moves the production routing pointer, and it used to authenticate
+        // with no role check while its four siblings used the single-site helper.
+        let prompts = include_str!("prompt_routes.rs");
+        let observe = prompts
+            .find("async fn observe")
+            .or_else(|| prompts.find("fn observe_handler"))
+            .expect("observe handler");
+        let tail = &prompts[observe..];
+        let actor = format!("{}{}", "actor_from_", "auth(&headers)");
+        assert!(
+            tail.contains(actor.as_str()),
+            "/prompts/{{name}}/observe no longer authorizes the WRITE — a viewer could \
+             move production prompt routing"
+        );
+    }
+
     #[test]
     fn prompt_observation_parses_full_body() {
         let body = json!({
@@ -4189,6 +5974,528 @@ mod tests {
                 .await
                 .is_ok(),
             "a public webhook host must be allowed"
+        );
+    }
+}
+
+/// `/v1/embeddings` (GWY-26) + `tracelane.yaml` model aliases (GWY-39).
+///
+/// Gated on `debug_assertions` as well as `test` for the same reason
+/// `providers::smoke_tests` is: the loopback SSRF bypass these tests need is
+#[cfg(all(test, debug_assertions))]
+mod embeddings_route_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Thread-local loopback opt-in — wiremock binds 127.0.0.1 and the SSRF
+    /// guard blocks it. Never a process-env mutation (that races the suite).
+    struct LoopbackBypassGuard;
+
+    impl LoopbackBypassGuard {
+        fn new() -> Self {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+            Self
+        }
+    }
+
+    impl Drop for LoopbackBypassGuard {
+        fn drop(&mut self) {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+        }
+    }
+
+    /// An `AppState` with no Postgres, no ClickHouse, no NATS and no Polar —
+    /// i.e. the OSS self-host shape. Entitlements are `None`, which resolves to
+    /// the FREE tier, never a paid one (`.claude/rules/tenancy.md`).
+    fn test_state(providers: ProviderRegistry) -> AppState {
+        let audit_chain = Arc::new(
+            AuditChain::new(100, None, None).expect("audit chain builds without a signing key"),
+        );
+        AppState {
+            providers: Arc::new(providers),
+            audit_chain: Arc::clone(&audit_chain),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            quota_tracker: Arc::new(QuotaTracker::new()),
+            quota_ch_url: None,
+            predictive: Arc::new(PredictiveLayer::new()),
+            predictive_enforce: false,
+            guardrail: Arc::new(crate::guardrail::GuardrailEngine::new(
+                audit_chain,
+                None,
+                None,
+                Arc::new(crate::guardrail::capability::CapabilityRegistry::new()),
+            )),
+            billing: None,
+            nats: None,
+            entitlements: None,
+            circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreaker::new(
+                crate::circuit_breaker::BreakerConfig::default(),
+            )),
+            kill_switch: Arc::new(crate::kill_switch::KillSwitch::disabled()),
+            prompt_router: build_prompt_router(None),
+            bench_mock_upstream: false,
+        }
+    }
+
+    fn authed() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        );
+        h
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("response body is JSON")
+    }
+
+    /// A registry whose Ollama adapter points at `uri`. Ollama is the one
+    /// provider whose credential env var is empty by design, so this exercises
+    /// the real BYOK resolution path without a Postgres pool or an env var.
+    fn registry_pointing_ollama_at(uri: String) -> ProviderRegistry {
+        let mut reg = ProviderRegistry::new().expect("provider registry");
+        reg.ollama = crate::providers::OpenAiProvider::compatible(uri, "ollama")
+            .expect("ollama adapter for the mock");
+        reg
+    }
+
+    const VECTORS: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
+
+    async fn embeddings_mock() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "object": "embedding", "index": 0, "embedding": VECTORS }],
+                "model": "nomic-embed-text",
+                "usage": { "prompt_tokens": 11, "total_tokens": 11 }
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    // ── Negative first: every way in that must be REFUSED. ──
+
+    #[tokio::test]
+    async fn embeddings_without_authorization_is_rejected() {
+        // The failure this guards is the one crates/gateway/CLAUDE.md names:
+        // "adding a route without replicating that sequence ships an
+        // unauthenticated endpoint". There is no Tower auth layer to inherit.
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        let resp = embeddings_handler(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({ "model": "text-embedding-3-small", "input": "hi" })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated embeddings request must never reach routing or a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_rejects_an_unroutable_model_rather_than_defaulting() {
+        // BYOK key to a model the caller never named.
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({ "model": "no-such-model-family", "input": "hi" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "unroutable_model");
+    }
+
+    #[tokio::test]
+    async fn embeddings_rejects_a_provider_with_no_openai_shaped_endpoint() {
+        // Anthropic has no OpenAI-compatible /v1/embeddings. Forwarding the
+        // request on a guess would return an upstream 400 that reads as ours.
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({ "model": "claude-sonnet-4-6", "input": "hi" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "embeddings_unsupported_provider");
+        assert_eq!(body["provider"], "anthropic");
+    }
+
+    #[tokio::test]
+    async fn embeddings_rejects_a_body_with_no_input() {
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        for bad in [
+            json!({ "model": "text-embedding-3-small" }),
+            json!({ "model": "text-embedding-3-small", "input": [] }),
+            json!({ "input": "orphan input, no model" }),
+        ] {
+            let resp = embeddings_handler(State(state.clone()), authed(), Json(bad.clone())).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{bad} must be refused before a credential is resolved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embeddings_maps_an_upstream_401_to_a_key_rejection_not_an_outage() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key sk-leaked-value"))
+            .mount(&server)
+            .await;
+
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({ "model": "ollama/nomic-embed-text", "input": "hi" })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an upstream 401 is the tenant's key being rejected, not a 502 outage"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "provider_key_rejected");
+        assert!(
+            !body.to_string().contains("sk-leaked-value"),
+            "the upstream body must never cross this boundary: {body}"
+        );
+    }
+
+    // ── The end state: a caller gets usable vectors back. ──
+
+    #[tokio::test]
+    async fn embeddings_returns_vectors_a_caller_can_use() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = embeddings_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({ "model": "ollama/nomic-embed-text", "input": "embed me" })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // Not "it returned 200": the actual vector the caller came for.
+        let embedding = body["data"][0]["embedding"]
+            .as_array()
+            .expect("data[0].embedding must be an array of floats");
+        let got: Vec<f64> = embedding
+            .iter()
+            .map(|v| v.as_f64().expect("float"))
+            .collect();
+        assert_eq!(got.len(), 4);
+        for (i, want) in VECTORS.iter().enumerate() {
+            assert!(
+                (got[i] - f64::from(*want)).abs() < 1e-6,
+                "embedding[{i}] = {} , want {want}",
+                got[i]
+            );
+        }
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["usage"]["prompt_tokens"], 11);
+        // The model the caller sent is echoed back, so a client that
+        // round-trips `response.model` keeps working.
+        assert_eq!(body["model"], "ollama/nomic-embed-text");
+    }
+
+    #[test]
+    fn openai_bare_embedding_models_route_to_openai() {
+        // Without this arm `text-embedding-3-small` — the most-used embedding
+        // model there is — fail-closed as `unroutable_model`, because it
+        // carries no gpt/o1/o3 prefix.
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model("text-embedding-3-small"),
+            Some("openai")
+        );
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model("text-embedding-ada-002"),
+            Some("openai")
+        );
+        // Still fail-closed on a name nothing serves.
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model("text-embedding"),
+            None,
+            "the arm must not swallow a bare prefix with no model after it"
+        );
+    }
+
+    #[test]
+    fn the_embeddings_route_is_mounted_unconditionally() {
+        // Ten of the gateway's route groups are env-conditional. This one must
+        // not be: an embeddings call that 404s is the same silent bypass GWY-26
+        // exists to close. Scan only the non-test prefix so this literal does
+        // not match itself (same technique as the bench-gate guard above).
+        let full = include_str!("server.rs");
+        let non_test = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
+        assert!(
+            non_test.contains(concat!(
+                r#".route("/v1/embeddings", "#,
+                "post(embeddings_handler))"
+            )),
+            "the /v1/embeddings route must be mounted in the unconditional router"
+        );
+    }
+
+    // ── GWY-39: `tracelane.yaml` makes an unroutable model routable. ──
+
+    /// The whole GWY-39 claim in one test, because the config slot is
+    /// process-global and write-once: a model the built-in prefix table cannot
+    /// route becomes routable, reaches the aliased provider, and is sent
+    /// upstream under the aliased upstream model name.
+    #[tokio::test]
+    async fn tracelane_yaml_alias_routes_a_model_the_prefix_table_cannot() {
+        const ALIAS: &str = "tl-test-alias-embedder";
+
+        // 1. FALSIFY FIRST: without the file this model is unroutable.
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model(ALIAS),
+            None,
+            "precondition: the alias must be unroutable before the config is installed"
+        );
+
+        // 2. Install exactly the block apps/docs/providers.mdx describes.
+        let cfg = crate::server::config::parse(&format!(
+            "models:\n  {ALIAS}:\n    provider: ollama\n    model: nomic-embed-text\n"
+        ))
+        .expect("documented tracelane.yaml block must parse");
+        assert!(
+            crate::server::config::install_for_test(cfg),
+            "this must be the only test that installs a config"
+        );
+
+        // 3. The canonical map now resolves it — and so does every delegate,
+        //    because the alias lives INSIDE `provider_id_for_model`.
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model(ALIAS),
+            Some("ollama")
+        );
+        assert_eq!(provider_name_from_model(ALIAS), "ollama");
+        assert_eq!(
+            ProviderRegistry::api_key_env_var(ALIAS),
+            Some(""),
+            "the alias must resolve Ollama's (empty) credential, not another provider's"
+        );
+        // Exact match only — an alias must never widen into a prefix rule.
+        assert_eq!(
+            ProviderRegistry::provider_id_for_model(&format!("{ALIAS}-v2")),
+            None
+        );
+
+        // 4. End to end: the request routes, and the UPSTREAM sees the aliased
+        //    model name while the CALLER gets their own name back.
+        let _bypass = LoopbackBypassGuard::new();
+        let server = embeddings_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({ "model": ALIAS, "input": "embed me" })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the alias must make a previously-400 model serve a real response"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["model"], ALIAS, "the caller's own name is echoed back");
+        assert!(body["data"][0]["embedding"].is_array());
+
+        // The discriminating field: what the provider was actually asked for.
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock recorded requests");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("upstream body is JSON");
+        assert_eq!(
+            sent["model"], "nomic-embed-text",
+            "the upstream must be asked for the aliased model, not the alias"
+        );
+    }
+}
+
+/// Endpoint env vars that do NOT resolve to loopback (B-239).
+///
+/// Pure over an iterator of `(name, value)` so the refusal is unit-testable
+/// without touching the process environment — the same discipline as
+/// `capture_boot_decision`. Selection is by NAME SHAPE (`*_URL` / `*_ENDPOINT`),
+/// deliberately, so a variable added later is covered without editing this list.
+pub fn bench_nonlocal_endpoints<I: Iterator<Item = (String, String)>>(vars: I) -> Vec<String> {
+    let mut out: Vec<String> = vars
+        .filter(|(k, _)| {
+            let u = k.to_ascii_uppercase();
+            u.ends_with("_URL") || u.ends_with("_ENDPOINT")
+        })
+        .filter(|(_, v)| !v.trim().is_empty())
+        .filter(|(_, v)| !host_is_loopback(v))
+        .map(|(k, v)| format!("{k}={}", redact_endpoint(&v)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Host component of a URL-ish value, lowercased. Deliberately tolerant: a value
+/// that cannot be parsed is treated as NOT loopback, because failing closed is
+/// the safe direction for a boot refusal.
+fn endpoint_host(value: &str) -> String {
+    let v = value.trim();
+    let after_scheme = v.split_once("://").map_or(v, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // IPv6 literal keeps its brackets' contents; otherwise strip a trailing :port.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(h, _)| h)
+    } else {
+        host_port.rsplit_once(':').map_or(host_port, |(h, p)| {
+            if p.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                host_port
+            }
+        })
+    };
+    host.to_ascii_lowercase()
+}
+
+fn host_is_loopback(value: &str) -> bool {
+    let h = endpoint_host(value);
+    h == "localhost"
+        || h == "127.0.0.1"
+        || h == "::1"
+        || h == "0.0.0.0"
+        || h.ends_with(".localhost")
+        || h.starts_with("127.")
+}
+
+/// Never echo credentials from a connection string into a boot error.
+fn redact_endpoint(value: &str) -> String {
+    let h = endpoint_host(value);
+    if h.is_empty() {
+        "<unparseable>".to_string()
+    } else {
+        h
+    }
+}
+
+#[cfg(test)]
+mod bench_isolation_tests {
+    use super::*;
+
+    fn v(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn loopback_endpoints_are_allowed() {
+        let got = bench_nonlocal_endpoints(
+            v(&[
+                ("NATS_URL", "nats://127.0.0.1:4222"),
+                ("CLICKHOUSE_URL", "http://localhost:8123"),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://[::1]:4318"),
+            ])
+            .into_iter(),
+        );
+        assert!(
+            got.is_empty(),
+            "loopback must not trip the refusal, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn production_endpoints_are_refused() {
+        let got = bench_nonlocal_endpoints(
+            v(&[
+                ("NATS_URL", "nats://nats.prod.internal:4222"),
+                ("CLICKHOUSE_URL", "http://10.0.0.5:8123"),
+            ])
+            .into_iter(),
+        );
+        assert_eq!(
+            got.len(),
+            2,
+            "both prod endpoints must be named, got {got:?}"
+        );
+    }
+
+    /// THE PROPERTY THAT MAKES THIS STRUCTURAL: a variable nobody thought of.
+    /// If this ever needs a code change to pass, the mechanism has regressed to
+    /// a maintained list and B-239 can recur.
+    #[test]
+    fn an_endpoint_variable_that_did_not_exist_when_this_was_written_is_still_caught() {
+        let got = bench_nonlocal_endpoints(
+            v(&[("SOME_FUTURE_SERVICE_URL", "https://prod.example.com")]).into_iter(),
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "a *_URL added later must be covered by default"
+        );
+    }
+
+    #[test]
+    fn credentials_are_never_echoed_into_the_boot_error() {
+        let got = bench_nonlocal_endpoints(
+            v(&[("POSTGRES_URL", "postgres://user:hunter2@db.prod:5432/x")]).into_iter(),
+        );
+        assert_eq!(got.len(), 1);
+        assert!(
+            !got[0].contains("hunter2"),
+            "must not leak a password: {got:?}"
+        );
+        assert!(
+            got[0].contains("db.prod"),
+            "must still name the host: {got:?}"
+        );
+    }
+
+    #[test]
+    fn unparseable_values_fail_closed() {
+        let got = bench_nonlocal_endpoints(v(&[("WEIRD_URL", "not a url at all")]).into_iter());
+        assert_eq!(
+            got.len(),
+            1,
+            "an unparseable endpoint must refuse, not pass"
+        );
+    }
+
+    #[test]
+    fn non_endpoint_variables_are_ignored() {
+        let got = bench_nonlocal_endpoints(
+            v(&[("RUST_LOG", "info"), ("SSL_CERT_FILE", "/etc/ssl/cert.pem")]).into_iter(),
+        );
+        assert!(
+            got.is_empty(),
+            "only *_URL / *_ENDPOINT are in scope, got {got:?}"
         );
     }
 }

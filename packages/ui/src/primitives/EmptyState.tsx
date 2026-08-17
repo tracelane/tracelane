@@ -13,6 +13,23 @@ export interface EmptyStateProps {
 	 * frame; full-page first-run states keep the roomy default.
 	 */
 	compact?: boolean;
+	/**
+	 * `inline` — one muted line, left-aligned, NO border, NO centring.
+	 *
+	 * THE RULE, written here so nobody re-adds the border "for consistency":
+	 * AN EMPTY STATE INSIDE A BORDERED, TITLED CARD IS ALREADY FRAMED, AND A SECOND
+	 * DASHED FRAME IS NOISE. A full-page first-run state keeps the box, because there
+	 * the box IS the frame — it is the only thing giving the message an edge.
+	 *
+	 * Measured before this existed: 42 call sites, and a zero-traffic dashboard drew
+	 * eight dashed boxes nested inside eight bordered cards that each already carried
+	 * an icon and a title. Four other surfaces had quietly hand-rolled this exact
+	 * muted line rather than use the primitive, which is the tell that the variant was
+	 * missing rather than unwanted.
+	 *
+	 * `compact` only halves the padding; it keeps the box. This removes it.
+	 */
+	inline?: boolean;
 	className?: string;
 }
 
@@ -26,8 +43,23 @@ export function EmptyState({
 	description,
 	action,
 	compact,
+	inline,
 	className,
 }: EmptyStateProps) {
+	if (inline) {
+		// One line. No border, no background, no centring, no icon — the enclosing card
+		// supplies all four. The description follows on the same line as a middot clause
+		// rather than stacking, so an empty tile costs one row instead of a block.
+		return (
+			<p className={cn("text-sm text-ink-3", className)}>
+				{title}
+				{description ? (
+					<span className="text-ink-3"> · {description}</span>
+				) : null}
+				{action ? <span className="ml-2">{action}</span> : null}
+			</p>
+		);
+	}
 	return (
 		<div
 			className={cn(

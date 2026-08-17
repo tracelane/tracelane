@@ -8,9 +8,9 @@ import Link from "next/link";
 
 export default function TraceNotFound() {
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<div className="mx-auto max-w-md py-16 text-center">
-				<p className="font-mono text-5xl font-semibold leading-none text-accent-ink">
+				<p className="font-mono text-5xl font-semibold leading-none text-action-ink">
 					404
 				</p>
 				<h1 className="mt-3 text-lg font-semibold text-ink">Trace not found</h1>
@@ -27,6 +27,6 @@ export default function TraceNotFound() {
 					</Link>
 				</div>
 			</div>
-		</main>
+		</div>
 	);
 }

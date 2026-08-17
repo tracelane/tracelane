@@ -33,9 +33,12 @@ Company standard: *what we promise is delivered as premium — exceeding expecta
 never lazily meeting it.* Honesty locks govern the promise side; this governs delivery.
 
 So when the work merely satisfies the sentence in the spec, that is a finding you
-must report. The canonical shape is the gap in the customer's favour: the site says
-"sub-50ms target" and the gateway delivers 4.6ms. A surface that lands exactly on its
-stated bar has no margin, and the first regression breaks a public promise.
+must report. The canonical shape is the gap in the customer's favour: the shipped
+behaviour should beat the published bar with room to spare. A surface that lands
+exactly on its stated bar has no margin, and the first regression breaks a public
+promise. (State the measured figures from the run at hand — this file ships
+publicly, so a number written here becomes a public claim divorced from the
+conditions that produced it.)
 
 Report it as `MEETS_SPEC_ONLY` with: what the spec sentence promised, what was
 delivered, and where the premium interpretation would have gone further.

@@ -2,12 +2,16 @@
  * Tracelane TypeScript SDK.
  *
  * Auto-instruments AI agent frameworks by wrapping their HTTP clients.
- * Spans are emitted via OTLP to an ingest receiver you run.
+ * Spans are emitted via OTLP/HTTP to the endpoint you configure. This SDK uses
+ * the OTLP **JSON** exporter; Tracelane accepts JSON and protobuf alike.
  *
- * Tracelane Cloud has no public OTLP ingress — on Cloud, point your
- * OpenAI-compatible client at `https://gateway.tracelane.dev/v1` and the
- * gateway captures the trace; this SDK is for self-host and for framework
- * instrumentation you export to your own collector.
+ * On Tracelane Cloud that endpoint is the gateway itself —
+ * `https://gateway.tracelane.dev` — with a `tlane_…` key carrying the `ingest`
+ * scope. Self-hosting, it is the ingest receiver you run, or any OTLP collector.
+ *
+ * The gateway's chat path records ONE span per model call on its own, with no
+ * SDK. This SDK is what records the shape AROUND those calls — the planner step,
+ * each tool call, the retry — as a nested trace.
  *
  * @example
  * ```ts
@@ -15,7 +19,7 @@
  *
  * // Call once at application startup
  * init({
- *   endpoint: "http://localhost:4318", // an OTLP receiver you run
+ *   endpoint: "https://gateway.tracelane.dev", // or your own receiver
  *   apiKey: process.env.TRACELANE_API_KEY!,
  * });
  * ```
@@ -23,6 +27,18 @@
 
 export { init, shutdown } from "./tracer.js";
 export type { TracelaneConfig } from "./tracer.js";
+
+// Session (conversation) correlation — what /sessions groups traces by.
+export {
+	CONVERSATION_ID_ATTRIBUTE,
+	CONVERSATION_ID_HEADER,
+	getSession,
+	MAX_SESSION_ID_LENGTH,
+	SESSION_ID_HEADER,
+	sessionHeaders,
+	setSession,
+	withSession,
+} from "./session.js";
 
 // Individual instrument* exports for explicit single-library usage
 export { instrumentAnthropic } from "./instrumentations/anthropic.js";

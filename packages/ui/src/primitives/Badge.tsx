@@ -14,7 +14,7 @@ const badge = cva(
 				warn: "bg-warn-soft text-warn-ink",
 				info: "bg-info-soft text-info-ink",
 				seal: "bg-seal-soft text-seal-ink", // provenance chip
-				accent: "bg-accent-soft text-accent-ink", // active / function
+				action: "bg-action-soft text-action-ink", // active / function
 			},
 		},
 		defaultVariants: { tone: "neutral" },

@@ -218,17 +218,24 @@ pub async fn get_tenant_id_by_workos_org(pool: &Pool, workos_org_id: &str) -> Re
     Ok(row.map(|r| r.get(0)))
 }
 
-/// Update the plan tier. Used by the Polar webhook on subscription change.
-pub async fn set_plan_tier(pool: &Pool, tenant_id: &TenantId, plan: &str) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
-    let sql =
-        format!("UPDATE tenants SET plan = $2{PLAN_ENUM_CAST}, updated_at = now() WHERE id = $1");
-    client
-        .execute(&sql, &[tenant_id.as_uuid(), &plan])
-        .await
-        .context("UPDATE tenants set_plan_tier failed")?;
-    Ok(())
-}
+// `set_plan_tier` WAS HERE AND IS DELETED (founder ruling, 2026-08-14).
+//
+// It was a live `UPDATE tenants SET plan` in the gateway whose ONLY caller was an
+// integration test. Its doc comment said "Used by the Polar webhook on
+// subscription change" — false: the webhook is TypeScript
+// (`apps/web/app/api/webhooks/polar/route.ts`) and nothing in Rust ever called
+// this.
+//
+// Deleted rather than GUARDED, deliberately: guarding the callers of a function
+// that should not exist protects the entry point instead of removing it. B-241
+// shows we cannot currently hold the invariant that plan state moves only through
+// the Polar webhook — a convenient existing `set_plan_tier` is exactly how the
+// next session breaks it without meaning to. The DORMANT shape with a security
+// edge.
+//
+// If the gateway ever legitimately needs to set a plan, that is an ADR decision
+// made deliberately, not someone finding this function. Enforced from today by
+// `scripts/ci/check-plan-write-single-source.py`.
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +245,8 @@ mod tests {
     /// cannot serialize `&str` into a bare enum param (`$N::plan`), so a revert to
     /// bare `::plan` reintroduces the live "cannot convert &str <-> plan" bind
     /// failure that broke WorkOS `organization.created` provisioning. See
-    /// [`PLAN_ENUM_CAST`]. All three write statements interpolate the const, so a
+    /// [`PLAN_ENUM_CAST`]. BOTH remaining write statements interpolate the const
+    /// (it was three until `set_plan_tier` was deleted 2026-08-14), so a
     /// bare `$N::plan` can only reappear by editing the const (caught here).
     #[test]
     fn plan_enum_cast_routes_through_text() {

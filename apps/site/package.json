@@ -1,0 +1,31 @@
+{
+	"name": "@tracelanedev/site",
+	"type": "module",
+	"version": "0.1.0",
+	"private": true,
+	"description": "tracelane.dev \u2014 the marketing site, consolidated into the monorepo (ADR-074 \u00a710).",
+	"license": "MIT",
+	"scripts": {
+		"dev": "astro dev",
+		"build": "astro check && astro build",
+		"preview": "astro preview",
+		"astro": "astro",
+		"lint": "astro check",
+		"typecheck": "astro check",
+		"test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
+		"cf:deploy": "wrangler deploy"
+	},
+	"dependencies": {
+		"astro": "6.4.8"
+	},
+	"devDependencies": {
+		"@astrojs/check": "^0.9.0",
+		"@astrojs/sitemap": "^3.2.0",
+		"@cloudflare/workers-types": "^4.20260520.1",
+		"@tailwindcss/vite": "^4.0.0",
+		"@tracelanedev/ui": "workspace:*",
+		"tailwindcss": "^4.0.0",
+		"typescript": "^5.5.0",
+		"wrangler": "4.104.0"
+	}
+}

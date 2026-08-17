@@ -83,8 +83,18 @@ replays into an idempotent no-op: no gap, no duplicate sequence number.
 **Two honest notes on the failure modes.**
 
 1. A `kill.audit.async` kill-switch flag (`audit.rs:389-390`, read at
-   `audit.rs:497`) forces the synchronous append fleet-wide with no
-   redeploy. That fallback path is deliberately **fail-open**: if the
+   `audit.rs:497`) selects the synchronous append instead of the queued one.
+   **Corrected 2026-08-14 — this sentence previously read "forces the
+   synchronous append fleet-wide with no redeploy", and that overstated the
+   control in two ways.** The flag set is read **once, at process start**
+   (`kill_switch.rs:70`, into an immutable snapshot), so changing it takes
+   effect on a **service restart** — it is not a live runtime toggle. And in
+   the current production deployment no flag is set at all, so today this
+   fallback is reached only by the conditions below (JetStream unavailable),
+   never by an operator. We are correcting this rather than restating it
+   because a conformance statement that credits us with a control we cannot
+   exercise is exactly the kind of claim this document exists not to make.
+   That fallback path is deliberately **fail-open**: if the
    append fails it logs a warning and the request is served **with no
    audit record** (`audit.rs:500-508`). The same fallback applies to any
    deployment without JetStream wired — dev and self-host.

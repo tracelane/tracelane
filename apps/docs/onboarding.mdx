@@ -60,7 +60,7 @@ Eight steps to running Tracelane on your own infra.
 </Step>
 
 <Step title="Configure Polar">
-  Tracelane v2 pricing (ADR-020) requires nine `lookup_key`s. Create each as
+  Tracelane v2 pricing (ADR-020) requires six `lookup_key`s. Create each as
   a separate product in the [Polar.sh](https://polar.sh) dashboard, with the
   `lookup_key` set on each product's `product_metadata`:
 
@@ -72,9 +72,9 @@ Eight steps to running Tracelane on your own infra.
   | Enterprise plan | `enterprise_v1` | from $2,999/mo (custom) |
   | Audit add-on | `audit_addon_v1` | $999/mo |
   | Trace overage meter | `overage_v1` | $1.20 per 10K traces (metered) |
-  | Team extra seat | `team_extra_seat_v1` | $19/mo per seat (quantity) |
-  | Business extra seat | `business_extra_seat_v1` | $19/mo per seat (quantity) |
-  | HIPAA-on-GCP add-on | `hipaa_gcp_addon_v1` | $2,000/mo (Enterprise only) |
+
+  Seats are a per-tier **cap**, not a billable meter — an invite past the cap is
+  refused with `403 seat_limit_reached`. There is no extra-seat product to create.
 
   Then:
   - Create Polar meters with these event names: `tokens_processed`, `audit_anchors`, `traces_metered`
@@ -93,7 +93,6 @@ Eight steps to running Tracelane on your own infra.
   ./target/release/gateway   # serves :8080
   ./target/release/ingest    # serves OTLP HTTP :4318 + NATS consumer
   ```
-  Or use the supplied Helm chart at `infra/helm/`.
 </Step>
 
 <Step title="Deploy dashboard + MCP server">
@@ -102,8 +101,9 @@ Eight steps to running Tracelane on your own infra.
   pnpm build
   pnpm start
   ```
-  Both run as Next.js apps; the MCP server is also published as
-  run from source for local-only use (`npx @tracelanedev/mcp` once published).
+  The dashboard is a Next.js app. The MCP server is a separate Node process — run it
+  from source (`node apps/mcp/dist/index.js`) for local-only use; `npx @tracelanedev/mcp`
+  returns a 404 until a release tag publishes the package.
 </Step>
 
 <Step title="Production checklist">

@@ -9,11 +9,20 @@ export interface LogoProps {
 }
 
 /**
- * Tracelane brand lockup — the Chisel bracket-recorder mark + "tracelane"
- * wordmark, rendered IDENTICALLY to the marketing site
- * (`tracelane-site/src/components/Header.astro`): an inline SVG mark
- * (`viewBox 0 0 76 76`) at `height`px, `gap-2.5`, and the wordmark in the
- * display face — Source Serif 4, weight 600, size-lg, tracking-tight, lowercase.
+ * Tracelane brand lockup — the geometric **T monogram** + "tracelane" wordmark
+ * (ADR-074 §8), rendered IDENTICALLY to the marketing site header.
+ *
+ * THE MARK IS GENERATED GEOMETRY, NOT A DRAWING. The five paths below are the exact
+ * polygons in `scripts/brand/build-brand-assets.py` — 100x100 grid, stroke 12, counter
+ * gap 10, every diagonal at 45 degrees. Every favicon, app icon and lockup in `brand/`
+ * comes from those same numbers, so the header mark and the browser-tab icon cannot
+ * drift. If the mark changes, change it THERE and copy the paths here.
+ *
+ * The Chisel bracket-recorder it replaced (`viewBox 0 0 76 76`, two brackets, a tick
+ * and a bullseye) is dead — ADR-074 §8: "do not resurrect it from any spec". It
+ * survived in FIVE places after the brand assets were rebuilt, because generating the
+ * files is not the same as wiring them in; `scripts/ci/check-retired-logo.py` now
+ * blocks its return.
  *
  * ONE source of truth so the app header and the site header can't drift (the
  * previous app logo was a separate PNG raster, which is why it looked
@@ -39,42 +48,32 @@ export function Logo({
 			style={{ color: "var(--logo-ink)", gap: withWordmark ? gapPx : 0 }}
 		>
 			<svg
-				viewBox="0 0 76 76"
+				viewBox="0 0 100 100"
 				width={height}
 				height={height}
 				aria-hidden="true"
 				style={{ display: "block", flexShrink: 0 }}
 			>
+				<path d="M 2,2 L 96,2 L 84,14 L 2,14 Z" fill="currentColor" />
 				<path
-					d="M30 14 L14 14 L14 62 L30 62 L30 56 L20 56 L20 20 L30 20 Z"
+					d="M 2,14 L 14,14 L 14,28 L 44,28 L 44,40 L 12,40 L 2,30 Z"
+					fill="currentColor"
+				/>
+				<path d="M 32,40 L 44,40 L 44,86 L 32,98 Z" fill="currentColor" />
+				<path
+					d="M 96,16 L 96,28 L 84,40 L 54,40 L 54,28 L 84,28 Z"
 					fill="currentColor"
 				/>
 				<path
-					d="M46 14 L62 14 L62 62 L46 62 L46 56 L56 56 L56 20 L46 20 Z"
+					d="M 54,40 L 66,40 L 66,64 L 78,64 L 54,88 Z"
 					fill="currentColor"
-				/>
-				<rect x="20" y="36.4" width="36" height="3.2" fill="currentColor" />
-				<circle
-					cx="38"
-					cy="38"
-					r="9"
-					fill="var(--surface)"
-					stroke="currentColor"
-					strokeWidth="3"
-				/>
-				<circle
-					cx="38"
-					cy="38"
-					r="3.6"
-					fill="none"
-					stroke="currentColor"
-					strokeWidth="2.6"
 				/>
 			</svg>
 			{withWordmark && (
 				<span
 					style={{
-						fontFamily: 'var(--font-display, "Source Serif 4", Georgia, serif)',
+						fontFamily:
+							"var(--font-display, ui-sans-serif, system-ui, sans-serif)",
 						fontWeight: 600,
 						fontSize: wordmarkPx,
 						letterSpacing: "-0.025em",

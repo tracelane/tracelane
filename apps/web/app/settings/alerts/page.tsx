@@ -46,7 +46,7 @@ function AlertsUpsell() {
 			</p>
 			<a
 				href="/settings/billing"
-				className="inline-block text-xs font-medium text-accent-ink hover:underline"
+				className="inline-block text-xs font-medium text-action-ink hover:underline"
 			>
 				View plans →
 			</a>

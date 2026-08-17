@@ -249,6 +249,16 @@ pub fn span_subject(span: &TracelaneSpan) -> String {
 /// Side effects: increments a process-global counter and may emit one `warn!`.
 pub fn note_span_dropped_no_nats() -> u64 {
     let dropped = SPANS_DROPPED_NO_NATS.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // `/v1/gateway/stats` reads and what carries the "how long has this been open?"
+    // duration. This counter stays because its own regression test asserts it, but the
+    // registry is the one an operator can actually see. `note` does its own
+    // rate-limited TRACELANE_DEGRADED warn, so the local warn below is now redundant
+    // for alerting and kept only for the familiar log line.
+    tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::SpansDroppedNoNats,
+    );
+
     let now = unix_now_secs();
     let last = LAST_SPAN_DROP_WARN_UNIX.load(Ordering::Relaxed);
     // The first-ever drop (sentinel) always warns — independent of the wall clock
@@ -268,6 +278,21 @@ pub fn note_span_dropped_no_nats() -> u64 {
         );
     }
     dropped
+}
+
+/// Records that a span publish FAILED after NATS was connected — distinct from
+/// [`note_span_dropped_no_nats`], which is the "no client at all" case.
+///
+/// gateway that connects to NATS and then fails every write looked identical to a
+/// healthy one in every signal we had.
+///
+/// # Errors
+/// None — fault-tolerance path; instrumenting a failed publish must never fail the
+/// request that triggered it.
+pub fn note_span_publish_failed() -> u64 {
+    tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::SpanPublishFailed,
+    )
 }
 
 /// Wall-clock seconds since the Unix epoch, saturating to 0 on a pre-epoch clock.
@@ -376,5 +401,63 @@ mod span_publish_tests {
             after > before,
             "span-drop counter must advance on every drop (before={before}, after={after})"
         );
+    }
+
+    /// operator can actually see, and the only one carrying "how long has this been
+    /// open?". The local counter above is process-private and read by nothing but this
+    /// test, which is precisely the orphan-registry shape the shared module exists to
+    /// avoid repeating.
+    #[test]
+    fn dropped_span_reaches_the_shared_degradation_registry() {
+        use tracelane_shared::degradation::{Degradation, count, snapshot};
+
+        // Strict increase, not `before + 1`: the registry is process-global and cargo
+        // runs this binary's tests in parallel, so a sibling test may increment the same
+        // kind between these two reads. An exact-delta assertion here is a race.
+        let before = count(Degradation::SpansDroppedNoNats);
+        note_span_dropped_no_nats();
+        assert!(
+            count(Degradation::SpansDroppedNoNats) > before,
+            "a dropped span must advance the SHARED counter, not only the module-local one"
+        );
+
+        let stat = snapshot()
+            .into_iter()
+            .find(|s| s.kind == "spans_dropped_no_nats")
+            .expect("kind present in snapshot");
+        // The duration requirement is TRAPS §16: a count alone cannot tell a blip from
+        // three weeks. The citation lives HERE, in a comment, and not in the assertion
+        // string below — `no-internal-refs-in-ui` blocks internal refs in any string
+        // literal under crates/gateway/src, deliberately without a #[cfg(test)] carve-out,
+        // because an exemption keyed on "looks like a test" is a hole in a guard that
+        // exists to stop internal refs reaching a customer.
+        assert!(
+            stat.open_for_secs.is_some(),
+            "once fired, the registry must be able to answer how long spans have been \
+             dropping — a count alone cannot tell a blip from three weeks"
+        );
+    }
+
+    /// all, and used to be counted nowhere at any of its six call sites.
+    #[test]
+    fn publish_failure_is_counted_separately_from_no_client() {
+        use tracelane_shared::degradation::{Degradation, count};
+
+        let fails_before = count(Degradation::SpanPublishFailed);
+
+        note_span_publish_failed();
+
+        assert!(
+            count(Degradation::SpanPublishFailed) > fails_before,
+            "a failed publish must advance the publish-failure counter"
+        );
+
+        // Deliberately NOT asserting that SpansDroppedNoNats is unchanged here. The
+        // registry is process-global and cargo runs these tests in parallel, so two
+        // other tests in this binary are incrementing that same kind while this one
+        // runs — an "unchanged" assertion is a race, and a flaky guard teaches people
+        // to ignore guards. The cross-kind separation property is proven in the shared
+        // crate's own `note_advances_the_counter_for_that_kind_only`, where the kinds
+        // under test have no other writer in that binary.
     }
 }

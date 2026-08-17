@@ -12,8 +12,13 @@ import { expect } from "../src/harness.js";
  * Structural (this file): assert the migration, span model, decoder
  * normalization, and dual-emission switch are all present and wired.
  * Behavioral correctness is proven by Rust unit tests in
- * `crates/ingest/src/otlp_decode.rs` (legacy + v1.41 → identical SpanAttributes).
+ * `crates/shared/src/otlp/decode.rs` (legacy + v1.41 → identical SpanAttributes).
  * Full live-ClickHouse round-trip is the skipped integration case below.
+ *
+ * NOTE (GWY-41): `limits.rs` and `otlp_decode.rs` MOVED from `crates/ingest/src`
+ * to `crates/shared/src/otlp/` when the gateway gained an authenticated
+ * `POST /v1/traces` (B-227). Two OTLP entry points, one decoder — `ingest`
+ * re-exports both under their old module paths, so only these file paths moved.
  */
 function read(rel: string): string {
 	// biome-ignore lint/style/useNodejsImportProtocol: harness is CJS
@@ -41,7 +46,7 @@ describe("PP-SCHEMA-EVOLUTION: semconv v1.41 dual-emission + normalization", () 
 	});
 
 	it("ingest decoder normalizes legacy gen_ai.system → canonical provider", () => {
-		const src = read("../../crates/ingest/src/otlp_decode.rs");
+		const src = read("../../crates/shared/src/otlp/decode.rs");
 		// legacy key back-fills the canonical column
 		expect(src).toContain('"gen_ai.system"');
 		expect(src).toContain("gen_ai_provider_name.is_none()");

@@ -26,6 +26,24 @@ async function renameOrg(name: string): Promise<{ name: string }> {
 	return res.json() as Promise<{ name: string }>;
 }
 
+/**
+ * SET-04. Writes `tenants.slack_webhook_url` — the destination the gateway
+ * POSTs to when a tenant crosses its quota. Before this existed the column had
+ * a reader and no writer, so the alert could never fire for anyone.
+ */
+async function saveNotifyWebhook(url: string): Promise<{ url: string | null }> {
+	const res = await fetch("/api/settings/notify-webhook", {
+		method: url ? "PUT" : "DELETE",
+		headers: { "Content-Type": "application/json" },
+		...(url ? { body: JSON.stringify({ url }) } : {}),
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new Error(e.error ?? `HTTP ${res.status}`);
+	}
+	return res.json() as Promise<{ url: string | null }>;
+}
+
 async function openPortal(intent: string): Promise<void> {
 	const res = await fetch("/api/settings/workspace/portal", {
 		method: "POST",
@@ -53,9 +71,17 @@ const PORTAL_ACTIONS = [
 	{ intent: "audit_logs", label: "Audit log streaming" },
 ] as const;
 
-export function WorkspaceManager({ initialName }: { initialName: string }) {
+export function WorkspaceManager({
+	initialName,
+	initialNotifyWebhook,
+}: {
+	initialName: string;
+	initialNotifyWebhook: string;
+}) {
 	const [name, setName] = useState(initialName);
 	const [saved, setSaved] = useState(false);
+	const [hook, setHook] = useState(initialNotifyWebhook);
+	const [hookSaved, setHookSaved] = useState(false);
 
 	const rename = useMutation({
 		mutationFn: renameOrg,
@@ -64,10 +90,19 @@ export function WorkspaceManager({ initialName }: { initialName: string }) {
 			setTimeout(() => setSaved(false), 2500);
 		},
 	});
+	const saveHook = useMutation({
+		mutationFn: saveNotifyWebhook,
+		onSuccess: () => {
+			setHookSaved(true);
+			setTimeout(() => setHookSaved(false), 2500);
+		},
+	});
 	const portal = useMutation({ mutationFn: openPortal });
 
 	const trimmed = name.trim();
 	const dirty = trimmed.length > 0 && trimmed !== initialName;
+	const hookTrimmed = hook.trim();
+	const hookDirty = hookTrimmed !== initialNotifyWebhook;
 
 	return (
 		<div className="space-y-6">
@@ -86,14 +121,14 @@ export function WorkspaceManager({ initialName }: { initialName: string }) {
 						value={name}
 						maxLength={255}
 						onChange={(e) => setName(e.target.value)}
-						className="w-full max-w-sm rounded-lg border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-1 focus:ring-accent-ink"
+						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-1 focus:ring-action-ink"
 						placeholder="Acme, Inc."
 					/>
 					<button
 						type="button"
 						disabled={!dirty || rename.isPending}
 						onClick={() => rename.mutate(trimmed)}
-						className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-accent-on transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40"
+						className="rounded-lg bg-action px-3 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
 					>
 						{rename.isPending ? "Saving…" : "Save"}
 					</button>
@@ -102,6 +137,46 @@ export function WorkspaceManager({ initialName }: { initialName: string }) {
 				{rename.error && (
 					<p className="text-xs text-danger-ink">
 						{(rename.error as Error).message}
+					</p>
+				)}
+			</div>
+
+			{/* Quota alert webhook (SET-04) */}
+			<div className="space-y-2">
+				<label
+					htmlFor="notify-webhook"
+					className="block text-xs font-medium text-ink"
+				>
+					Quota alert webhook
+				</label>
+				<p className="text-xs text-ink-2">
+					HTTPS endpoint the gateway POSTs to when this workspace crosses its
+					monthly trace quota. Works with a Slack or Discord incoming webhook,
+					or any receiver you control. Leave empty to disable.
+				</p>
+				<div className="flex items-center gap-2">
+					<input
+						id="notify-webhook"
+						type="url"
+						value={hook}
+						maxLength={2048}
+						onChange={(e) => setHook(e.target.value)}
+						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-1 focus:ring-action-ink"
+						placeholder="https://hooks.slack.com/services/…"
+					/>
+					<button
+						type="button"
+						disabled={!hookDirty || saveHook.isPending}
+						onClick={() => saveHook.mutate(hookTrimmed)}
+						className="rounded-lg bg-action px-3 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
+					>
+						{saveHook.isPending ? "Saving…" : "Save"}
+					</button>
+					{hookSaved && <span className="text-xs text-ok-ink">Saved</span>}
+				</div>
+				{saveHook.error && (
+					<p className="text-xs text-danger-ink">
+						{(saveHook.error as Error).message}
 					</p>
 				)}
 			</div>

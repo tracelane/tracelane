@@ -113,11 +113,10 @@ Re-verified against the code on 2026-08-06. Three items previously listed
 here had already been closed and are removed below; what remains is what is
 genuinely still open.
 
-- **eIDAS qualified timestamps**: audit-ledger anchors use the
-  gateway host's `Utc::now()`. A move to a qualified TSA (SwissSign,
-  Sectigo, GlobalSign QTSP) is in scope for the Audit-SKU GA.
-
-Each will be removed from this list as the corresponding PR lands.
+- **No qualified timestamping**: audit-ledger anchor timestamps come from
+  the gateway host's `Utc::now()`. They are not countersigned by a
+  qualified trusted timestamping authority, and Tracelane makes no
+  eIDAS qualified-timestamp claim.
 
 **Closed since the 2026-05-23 revision of this list** (each verified against the
 code on 2026-08-06, not against a changelog):

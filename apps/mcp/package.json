@@ -1,7 +1,8 @@
 {
 	"name": "@tracelanedev/mcp",
-	"version": "0.1.0",
+	"version": "0.2.4",
 	"description": "Tracelane MCP server — read-only, tenant-scoped trace access",
+	"mcpName": "io.github.tracelane/tracelane-mcp",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/tracelane/tracelane.git",
@@ -15,7 +16,10 @@
 	"main": "./dist/index.js",
 	"scripts": {
 		"dev": "tsx watch src/index.ts",
-		"build": "tsup src/index.ts --format cjs --dts --no-splitting",
+		"gen:evals": "node scripts/gen-eval-manifest.mjs --write",
+		"prebuild": "node scripts/gen-eval-manifest.mjs --check && node scripts/check-registry-manifest.mjs --check",
+		"build": "tsup src/index.ts --format cjs --dts --no-splitting && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
+		"prepublishOnly": "pnpm run build",
 		"start": "node dist/index.js",
 		"lint": "biome check src/",
 		"typecheck": "tsc --noEmit",
@@ -34,7 +38,8 @@
 		"typescript": "^5.5.0",
 		"vitest": "^2.0.0"
 	},
-	"files": ["dist"],
+	"files": ["dist", "server.json"],
+	"engines": { "node": "^18.19.0 || >=20.6.0" },
 	"license": "Apache-2.0",
 	"publishConfig": {
 		"access": "public",
@@ -43,6 +48,7 @@
 	"keywords": [
 		"tracelane",
 		"mcp",
+		"model-context-protocol",
 		"opentelemetry",
 		"ai-observability",
 		"llm-tracing"

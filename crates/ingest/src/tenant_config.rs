@@ -265,6 +265,15 @@ pub fn pg_tenant_config_resolver(pool: DbPool, fault_quota: u64) -> ResolveFn {
             match resolve_one(&pool, tenant).await {
                 Ok(cfg) => cfg,
                 Err(e) => {
+                    // THREE WEEKS after a migration, promoting every tenant to Full
+                    // capture and leaving force_tail inert, and the per-resolve `warn!`
+                    // below was the only trace of it — a line nobody greps, in a log
+                    // nobody tails, that looks identical on resolve #1 and #3,000,000.
+                    // The counter carries first_seen, so "how long has this been open?"
+                    // now has an answer.
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::TenantConfigFault,
+                    );
                     tracing::warn!(
                         %tenant, error = %e, fault_quota,
                         "tenant config resolve FAULTED — keep-all (Full) so a control-plane blip \
@@ -320,9 +329,26 @@ async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig
 /// `POSTGRES_URL`) — LISTEN/NOTIFY does not survive a PgBouncer pooler. Listens
 /// on `entitlements_changed` (migration 12) AND `tenant_config_changed`
 /// (migration 14). Reconnects with backoff; the 30s TTL bounds staleness in the
-/// gap. A missing URL disables LISTEN (TTL-only) — correctness never depends on
-/// NOTIFY delivery.
+/// gap. **LISTEN is disabled only when BOTH vars are unset** (the fallback is an
+/// `or_else`) — correctness never depends on NOTIFY delivery.
+///
+/// connects to PgBouncer, where `LISTEN` succeeds and no notification can ever
+/// arrive. `listen_once` inspects the resolved HOST and reports `DEGRADED`
+/// rather than `active` in that case — see `tracelane_shared::listen_dsn`.
 pub fn spawn_listen_task(cache: Arc<TenantConfigCache>) {
+    // switch as the gateway (`entitlement_cache::control_plane_listen_enabled`).
+    // Ingest's listener died in the SAME MILLISECOND as the gateway's on all 110
+    // observed cycles, which is what identified the cause as the Neon compute
+    // suspending rather than either container's network. Correctness here never
+    // depended on NOTIFY — the 30s TTL is the floor and always was.
+    if !std::env::var("TRACELANE_CONTROL_PLANE_LISTEN").is_ok_and(|v| v == "1") {
+        tracing::info!(
+            "tenant-config LISTEN DISABLED (default; set TRACELANE_CONTROL_PLANE_LISTEN=1 to \
+             enable) — tenant-config invalidation is TTL-bound (30s), which is the floor it \
+             always relied on"
+        );
+        return;
+    }
     let Some(conn_str) = std::env::var("POSTGRES_DIRECT_URL")
         .ok()
         .or_else(|| std::env::var("POSTGRES_URL").ok())
@@ -342,6 +368,22 @@ pub fn spawn_listen_task(cache: Arc<TenantConfigCache>) {
     });
 }
 
+/// The first TCP host in `cfg` that is a pooler and therefore cannot deliver
+///
+/// Reads the host from the PARSED config, never a substring of the DSN — a
+/// password may contain `-pooler`. The predicate lives in
+/// `tracelane_shared::listen_dsn` so ingest and the gateway agree on what
+/// "pooled" means.
+fn pooled_listen_host(cfg: &tokio_postgres::Config) -> Option<String> {
+    use tokio_postgres::config::Host;
+    cfg.get_hosts().iter().find_map(|h| match h {
+        Host::Tcp(host) if tracelane_shared::listen_dsn::host_cannot_deliver_notify(host) => {
+            Some(host.clone())
+        }
+        _ => None,
+    })
+}
+
 async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Result<()> {
     use futures::StreamExt as _;
     use tokio_postgres::AsyncMessage;
@@ -352,6 +394,26 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
     let mut pg_cfg: tokio_postgres::Config =
         conn_str.parse().context("parse LISTEN connection string")?;
     pg_cfg.channel_binding(tokio_postgres::config::ChannelBinding::Prefer);
+    // A LISTEN connection carries NO traffic by design, so a socket that dies
+    // silently — a half-open TCP with no FIN, which is what a cloud proxy or a
+    // compute restart can leave behind — is invisible to it. `poll_message` just
+    // stays Pending, the driver task never ends, the channel never closes, and the
+    // reconnect loop below is never reached. It does not fail; it waits forever.
+    //
+    // EARNED 2026-08-11: after a Neon compute restart, ingest's LISTEN went silent
+    // and never reconnected — no error line, no reconnect line — while the gateway,
+    // which happened to receive a clean FIN, reconnected in 3 seconds. tokio-postgres
+    // defaults to a 2-HOUR keepalive idle, so the dead listener would have gone
+    // unnoticed for two hours, and nothing would have said so. Correctness survived
+    // on the TTL fallback; the silence is the defect.
+    //
+    // 30s idle + a bounded user timeout turns "waits forever" into "reconnects in
+    // under a minute, loudly".
+    pg_cfg.keepalives(true);
+    pg_cfg.keepalives_idle(std::time::Duration::from_secs(30));
+    pg_cfg.keepalives_interval(std::time::Duration::from_secs(10));
+    pg_cfg.keepalives_retries(3);
+    pg_cfg.tcp_user_timeout(std::time::Duration::from_secs(60));
     let (client, mut conn) = pg_cfg.connect(crate::db::pg_tls_connector()?).await?;
 
     // Drive the connection on a task BEFORE issuing LISTEN (polling only after
@@ -375,7 +437,19 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
     client
         .batch_execute("LISTEN entitlements_changed; LISTEN tenant_config_changed")
         .await?;
-    tracing::info!("tenant-config LISTEN active (entitlements_changed + tenant_config_changed)");
+    // `batch_execute` proves nothing about NOTIFY delivery. Ask the resolved
+    // host instead of reporting "active" unconditionally.
+    match pooled_listen_host(&pg_cfg) {
+        Some(host) => tracing::warn!(
+            host = %host,
+            "tenant-config LISTEN DEGRADED — connected to a POOLED endpoint that cannot \
+             deliver NOTIFY; tenant-config invalidation is TTL-only. Set POSTGRES_DIRECT_URL \
+             to the direct (non-pooler) endpoint."
+        ),
+        None => tracing::info!(
+            "tenant-config LISTEN active (entitlements_changed + tenant_config_changed)"
+        ),
+    }
 
     while let Some(msg) = rx.recv().await {
         if let AsyncMessage::Notification(note) = msg {
@@ -398,6 +472,68 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
+
+    /// deployment produces, and must NOT fire on a direct endpoint whose
+    /// PASSWORD merely contains `-pooler` (the case that makes a DSN substring
+    /// check wrong). Driven from DSN strings so the whole parse->host->predicate
+    /// path is covered, not just the predicate.
+    #[test]
+    fn pooled_endpoint_reported_degraded_direct_endpoint_not() {
+        let pooled: tokio_postgres::Config =
+            "postgres://u:pw@ep-x-pooler.eu-central-1.aws.neon.tech/db"
+                .parse()
+                .expect("parse");
+        assert_eq!(
+            super::pooled_listen_host(&pooled).as_deref(),
+            Some("ep-x-pooler.eu-central-1.aws.neon.tech")
+        );
+
+        let direct: tokio_postgres::Config = "postgres://u:pw@ep-x.eu-central-1.aws.neon.tech/db"
+            .parse()
+            .expect("parse");
+        assert!(super::pooled_listen_host(&direct).is_none());
+
+        let trap_dsn = "postgres://u:s3cret-pooler@ep-x.eu-central-1.aws.neon.tech/db";
+        assert!(
+            trap_dsn.contains("-pooler"),
+            "fixture must exercise the trap"
+        );
+        let trap: tokio_postgres::Config = trap_dsn.parse().expect("parse");
+        assert!(
+            super::pooled_listen_host(&trap).is_none(),
+            "a -pooler in the PASSWORD must not be read as a pooled host"
+        );
+    }
+
+    /// A LISTEN socket that dies silently must be DETECTED, not waited on.
+    ///
+    /// The 2026-08-11 incident: after a Neon compute restart ingest's listener went
+    /// silent and never reconnected — no error, no reconnect — because
+    /// tokio-postgres defaults to a 2-hour keepalive idle and `poll_message` simply
+    /// stayed Pending on a half-open socket. This asserts the config we now build
+    /// actually carries a short keepalive, which is the difference between "waits
+    /// two hours" and "reconnects in under a minute".
+    #[test]
+    fn listen_config_sets_a_short_keepalive_not_the_two_hour_default() {
+        let mut cfg: tokio_postgres::Config = "postgresql://u:p@h/db".parse().expect("parse");
+        cfg.channel_binding(tokio_postgres::config::ChannelBinding::Prefer);
+        cfg.keepalives(true);
+        cfg.keepalives_idle(std::time::Duration::from_secs(30));
+
+        assert_eq!(
+            cfg.get_keepalives_idle(),
+            std::time::Duration::from_secs(30),
+            "a LISTEN connection carries no traffic, so the keepalive IS the liveness check"
+        );
+        assert!(
+            cfg.get_keepalives(),
+            "keepalives must be on for a silent socket"
+        );
+        assert!(
+            cfg.get_keepalives_idle() <= std::time::Duration::from_secs(60),
+            "anything near tokio-postgres' 2-hour default reproduces the incident"
+        );
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -406,6 +542,57 @@ mod tests {
             policy: SamplingPolicy::Full,
             ..Default::default()
         }
+    }
+
+    ///
+    /// The production resolver returns `TenantConfig`, never `Result`, so a control-plane
+    /// fault is structurally invisible to every caller: the hot path receives a perfectly
+    /// valid `fault_keep_all` config and cannot tell it apart from a real one. That is how
+    /// this faulted continuously for THREE WEEKS, promoting every tenant to Full capture
+    /// against their entitlement and leaving `force_tail` inert, with nothing but a
+    /// per-resolve `warn!` nobody was reading.
+    ///
+    /// Drives the real fault: a pool pointed at a closed port, so `resolve_one` genuinely
+    /// errors and the `Err` arm runs. Asserts BOTH halves — the fallback config is still
+    /// returned (fail-open preserved) AND the counter moved (no longer silent).
+    ///
+    /// Delta, not absolute — the registry is process-global.
+    #[tokio::test]
+    async fn resolver_fault_advances_the_degradation_counter() {
+        use tracelane_shared::degradation::{Degradation, count};
+
+        // Port 1 on loopback: nothing listens, so pool.get() fails fast. deadpool is
+        // lazy, so building the pool itself does not connect.
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = Some("127.0.0.1".to_string());
+        cfg.port = Some(1);
+        cfg.user = Some("nobody".to_string());
+        cfg.dbname = Some("nodb".to_string());
+        let pool = cfg
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .expect("pool config is valid; connecting is what must fail");
+
+        let fault_quota = 4_242;
+        let resolver = pg_tenant_config_resolver(pool, fault_quota);
+
+        let before = count(Degradation::TenantConfigFault);
+        let cfg_out = resolver(uuid::Uuid::from_u128(0xB187)).await;
+        let after = count(Degradation::TenantConfigFault);
+
+        assert_eq!(
+            cfg_out.policy,
+            SamplingPolicy::Full,
+            "fail-open must be PRESERVED — a control-plane blip must not drop benign spans"
+        );
+        assert!(
+            after > before,
+            "a faulting resolver must advance the degradation counter (before={before}, \
+             after={after}) — otherwise three weeks of every-tenant-promoted looks exactly \
+             like a healthy control plane"
+        );
     }
 
     // ── resolve_policy precedence (pure) ──────────────────────────────────

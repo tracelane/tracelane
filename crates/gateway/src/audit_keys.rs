@@ -191,6 +191,112 @@ impl TenantAuditKeyStore {
         }
     }
 
+    /// R47 condition 2 — **prove the derived public half really verifies signatures made
+    /// by the stored private key, BEFORE publishing it.**
+    ///
+    /// Founder ruling, and the reasoning is the point: *"a wrong pubkey is worse than an
+    /// empty one — empty renders a visible degraded state, wrong renders a confident
+    /// false green that fails only when a customer verifies."* An empty
+    /// `public_key_b64` makes `/v1/audit/pubkey` return 200-with-nothing, which the
+    /// verifier rejects loudly (`untrusted_tenant_key`). A WRONG one would be published
+    /// as this workspace's trust root and would fail for an auditor, on their desk,
+    /// against a ledger that is actually intact.
+    ///
+    /// `ring` derives the public half from the private key by construction, so a mismatch
+    /// should be impossible — but "impossible by construction" is an assertion, and this
+    /// is a round-trip PROOF: sign a fixed message with the private key, verify it with
+    /// the derived public key. Costs one signature per pre-H1 row, once, at boot.
+    fn derived_pubkey_verified(keypair: &TenantAuditKeypair) -> Option<String> {
+        const PROBE: &[u8] = b"tracelane:r47:pubkey-derivation-selfcheck:v1";
+        let pubkey_bytes = keypair.public_key_bytes();
+        let sig = keypair.sign(PROBE);
+        signature::UnparsedPublicKey::new(&signature::ED25519, &pubkey_bytes)
+            .verify(PROBE, &sig)
+            .ok()
+            .map(|()| B64.encode(&pubkey_bytes))
+    }
+
+    /// R47 — publish the verification key for every pre-H1 row, at STARTUP.
+    ///
+    /// `get_or_create` heals a blank `public_key_b64` when the key is next USED, and that
+    /// is not enough on its own: the tenant this exists for (`1bb14687`) is quiet and
+    /// already fully anchored, so nothing would call `get_or_create` again and its
+    /// `/v1/audit/pubkey` would keep answering **200 with an empty string** indefinitely.
+    /// A defect that heals only on traffic does not heal for the tenants most likely to
+    /// have it. This runs on every boot, is idempotent, and is a no-op once the fleet is
+    /// clean — measured 2026-08-15: exactly 1 of 2 rows needs it.
+    ///
+    /// Returns the number of rows filled. **Infallible by design** — a fault-tolerance
+    /// path: it must never prevent the gateway from booting or signing.
+    pub async fn backfill_missing_public_keys(&self) -> usize {
+        let Ok(client) = self.pool.get().await else {
+            tracing::warn!("audit key backfill: no Postgres connection — skipping");
+            return 0;
+        };
+        let rows = match client
+            .query(
+                "SELECT tenant_id, encrypted_private_key FROM tenant_audit_keys \
+                 WHERE COALESCE(public_key_b64, '') = ''",
+                &[],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(error = %err, "audit key backfill: query failed — skipping");
+                return 0;
+            }
+        };
+        let mut filled = 0usize;
+        for row in rows {
+            let uuid: uuid::Uuid = row.get(0);
+            let encrypted: String = row.get(1);
+            let tenant = TenantId::from_jwt_claim(uuid);
+            // Derive, never re-key: the public half comes from the private key already
+            // stored. No signature is recomputed; no historical row changes.
+            let Ok(keypair) = self.decrypt_and_parse(tenant.clone(), &encrypted) else {
+                tracing::warn!(
+                    tenant_id = %tenant,
+                    "audit key backfill: could not decrypt the stored private key — left as-is"
+                );
+                continue;
+            };
+            // R47 condition 2 — do not publish a key that cannot verify its own signature.
+            let Some(derived) = Self::derived_pubkey_verified(&keypair) else {
+                tracing::error!(
+                    tenant_id = %tenant,
+                    "audit key backfill: the derived public key FAILED to verify a signature \
+                     made by the stored private key — REFUSING to publish it. The row is left \
+                     empty, which is a visible degraded state; a wrong key would be a \
+                     confident false green that only fails on the customer's desk."
+                );
+                continue;
+            };
+            match client
+                .execute(
+                    "UPDATE tenant_audit_keys SET public_key_b64 = $2 \
+                     WHERE tenant_id = $1 AND COALESCE(public_key_b64, '') = ''",
+                    &[&uuid, &derived],
+                )
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    filled += 1;
+                    tracing::info!(
+                        tenant_id = %tenant,
+                        "audit key: published the verification key for a pre-H1 row"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    error = %err, tenant_id = %tenant,
+                    "audit key backfill: UPDATE failed — /v1/audit/pubkey stays empty"
+                ),
+            }
+        }
+        filled
+    }
+
     /// Retrieve or generate the Ed25519 keypair for `tenant_id`.
     ///
     /// If no keypair exists yet, one is generated and persisted atomically.
@@ -207,7 +313,8 @@ impl TenantAuditKeyStore {
         // Try loading existing key first.
         let row = client
             .query_opt(
-                "SELECT encrypted_private_key FROM tenant_audit_keys WHERE tenant_id = $1",
+                "SELECT encrypted_private_key, COALESCE(public_key_b64, '') \
+                 FROM tenant_audit_keys WHERE tenant_id = $1",
                 &[&tenant_id.as_uuid()],
             )
             .await
@@ -215,7 +322,55 @@ impl TenantAuditKeyStore {
 
         if let Some(row) = row {
             let encrypted: String = row.get(0);
-            return self.decrypt_and_parse(tenant_id.clone(), &encrypted);
+            let stored_pub: String = row.get(1);
+            let keypair = self.decrypt_and_parse(tenant_id.clone(), &encrypted)?;
+
+            // R47 — SELF-HEAL a pre-H1 row whose public half was never stored.
+            //
+            // `public_key_b64` was `DEFAULT ''` and written by nothing until the H1 fix
+            // PRIVATE key and an EMPTY public one, so `GET /v1/audit/pubkey` answers
+            // **200 with an empty string** — success-shaped, carrying nothing. An auditor
+            // who follows the documented procedure and passes that to `--tenant-pubkey`
+            // gets `untrusted_tenant_key`: a FALSE RED on an intact ledger.
+            //
+            // The public half is derivable from the private key we just decrypted, so
+            // this re-derives rather than re-keys. **No signature is recomputed and no
+            // history is touched** — every existing row keeps the exact signature it
+            // already had, and this simply publishes the matching verification key.
+            //
+            // `WHERE public_key_b64 = ''` is load-bearing, not belt-and-braces: an UPDATE
+            // that could overwrite a POPULATED pubkey would break verification for every
+            // row signed under the old one. It can only ever fill a blank.
+            if stored_pub.is_empty()
+                && let Some(derived) = Self::derived_pubkey_verified(&keypair)
+            {
+                match client
+                    .execute(
+                        "UPDATE tenant_audit_keys SET public_key_b64 = $2 \
+                         WHERE tenant_id = $1 AND COALESCE(public_key_b64, '') = ''",
+                        &[&tenant_id.as_uuid(), &derived],
+                    )
+                    .await
+                {
+                    Ok(n) if n > 0 => tracing::info!(
+                        tenant_id = %tenant_id,
+                        "audit key: backfilled the missing public_key_b64 on a pre-H1 row \
+                         (derived from the stored private key; no signature recomputed)"
+                    ),
+                    Ok(_) => {} // someone else filled it first — converged, nothing to do
+                    Err(err) => {
+                        // Fail-OPEN: signing must not break because a convenience mirror
+                        // could not be written. The endpoint keeps returning empty until
+                        // the next attempt, which is exactly today's behaviour.
+                        tracing::warn!(
+                            error = %err, tenant_id = %tenant_id,
+                            "audit key: public_key_b64 backfill failed — /v1/audit/pubkey \
+                             will keep returning an empty key for this tenant"
+                        );
+                    }
+                }
+            }
+            return Ok(keypair);
         }
 
         // No key yet → about to MINT the per-tenant Ed25519 keypair, the Audit-SKU
@@ -275,11 +430,26 @@ impl TenantAuditKeyStore {
             .context("re-load tenant_audit_keys after insert")?;
         if let Some(row) = persisted {
             let encrypted: String = row.get(0);
+            tracing::info!("minted or converged on the persisted Ed25519 audit keypair");
             return self.decrypt_and_parse(tenant_id.clone(), &encrypted);
         }
 
-        tracing::info!("generated new Ed25519 audit keypair for tenant");
-        Ok(keypair)
+        // AUDIT-004 hardening (2026-08-09). This used to `Ok(keypair)` — returning the
+        // LOCAL, NEVER-PERSISTED keypair. That is the original AUDIT-004 defect in its
+        // last remaining form: a caller signing with a key absent from Postgres, so the
+        // verifier's H1 pin (pubkey read from `tenant_audit_keys`) false-negatives every
+        // row it signs, permanently, because the ledger is append-only.
+        //
+        // The re-load above cannot legitimately miss after the INSERT — either we won and
+        // the row is ours, or we lost and it is the winner's. Reaching here means the row
+        // vanished between the two statements, which is not a state we should paper over.
+        // FAIL CLOSED (CLAUDE.md rule 10 — this is a security path); the caller falls back
+        // to the global signing key, which IS verifiable. Matches `get_or_create_anchor`,
+        // which has always bailed here.
+        anyhow::bail!(
+            "tenant_audit_keys row vanished between INSERT and re-load — refusing to sign \
+             with a keypair that is not persisted (AUDIT-004)"
+        )
     }
 
     /// Retrieve or generate the tenant's ECDSA-P256 **anchor** keypair (ADR-062).
@@ -419,6 +589,147 @@ mod tests {
 
     fn test_tenant() -> TenantId {
         TenantId::from_jwt_claim(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+    }
+
+    /// **AUDIT-004 — the `get_or_create` keypair race, driven for real.**
+    ///
+    /// re-load), but NOTHING proved the convergence property — so a refactor could have
+    /// deleted the re-load and no gate would have noticed. A fix without falsification is
+    /// not a fix you can rely on.
+    ///
+    /// This is NOT a mocked race: two tasks call the real `get_or_create` concurrently on
+    /// a genuinely fresh tenant, against a live Postgres, on a multi-thread runtime. The
+    /// defect being excluded is that the LOSER returns its own locally-generated keypair —
+    /// which would then sign audit rows with a key absent from Postgres, permanently
+    /// false-negativing the verifier's H1 pin on an append-only ledger.
+    ///
+    /// Asserts BOTH halves, because either alone is satisfiable by a broken
+    /// implementation: exactly ONE row persists (the DB converged) AND both callers hold
+    /// the SAME public key (the callers converged). A version that persists one row while
+    /// handing the loser its local copy passes the first and fails the second — that is
+    /// precisely AUDIT-004.
+    ///
+    ///   POSTGRES_TEST_URL=postgres://… TRACELANE_BYOK_MASTER_KEY=… \
+    ///     cargo test -p gateway --bin gateway audit004 -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn audit004_concurrent_get_or_create_converges_on_one_persisted_key() {
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            eprintln!("skip audit004: POSTGRES_TEST_URL unset");
+            return;
+        };
+        let Ok(Some(byok)) = crate::byok::ByokMasterKey::from_env() else {
+            eprintln!("skip audit004: TRACELANE_BYOK_MASTER_KEY unset");
+            return;
+        };
+
+        let pg: tokio_postgres::Config = url.parse().expect("POSTGRES_TEST_URL parses");
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = pg.get_hosts().first().and_then(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
+            _ => None,
+        });
+        cfg.port = pg.get_ports().first().copied();
+        cfg.user = pg.get_user().map(str::to_string);
+        // Dropping the password yields deadpool's opaque "invalid configuration" at
+        // pool-create, not at connect — caught by actually RUNNING this test rather
+        // than shipping it #[ignore]d and unproven.
+        cfg.password = pg
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+        cfg.dbname = pg.get_dbname().map(str::to_string);
+        let pool = cfg
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .expect("test pool");
+        // Tolerate an ALREADY-migrated database. `apply_migrations` is not safely
+        // re-runnable — a second call against the same Postgres dies on
+        // `type "cmk_algorithm" already exists` — so an unconditional `.expect()` makes
+        // this test pass exactly once and fail on every re-run. What the test needs is
+        // the SCHEMA, not to be the one who created it: assert the table is there.
+        if let Err(e) = crate::db::apply_migrations(&pool).await {
+            eprintln!("apply_migrations: {e:#} (continuing — DB may already be migrated)");
+        }
+        {
+            let c = pool.get().await.expect("pg connection");
+            let n: i64 = c
+                .query_one(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_schema='public' AND table_name='tenant_audit_keys'",
+                    &[],
+                )
+                .await
+                .expect("schema probe")
+                .get(0);
+            assert_eq!(n, 1, "tenant_audit_keys must exist before the race runs");
+        }
+
+        // A FRESH tenant — the race only exists on the very first mint.
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        {
+            let c = pool.get().await.unwrap();
+            c.execute(
+                "INSERT INTO tenants (id, workos_org_id) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    tenant.as_uuid(),
+                    &format!("org-audit004-{}", Uuid::new_v4()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        // entitlements: None => the Audit-SKU gate is permissive, so both racers reach
+        // the mint. Two INDEPENDENT stores so nothing in-process serializes them; only
+        // Postgres does.
+        let byok = Arc::new(byok);
+        let a = TenantAuditKeyStore::new(pool.clone(), Arc::clone(&byok), None);
+        let b = TenantAuditKeyStore::new(pool.clone(), Arc::clone(&byok), None);
+
+        let (ta, tb) = (tenant.clone(), tenant.clone());
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { a.get_or_create(&ta).await.map(|k| k.public_key_bytes()) }),
+            tokio::spawn(async move { b.get_or_create(&tb).await.map(|k| k.public_key_bytes()) }),
+        );
+        let pk_a = ra.expect("task a").expect("get_or_create a");
+        let pk_b = rb.expect("task b").expect("get_or_create b");
+
+        let client = pool.get().await.unwrap();
+        let rows: i64 = client
+            .query_one(
+                "SELECT count(*) FROM tenant_audit_keys WHERE tenant_id = $1",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1, "exactly one keypair row must persist for a tenant");
+
+        assert_eq!(
+            pk_a, pk_b,
+            "AUDIT-004: concurrent first-callers must converge on the SAME persisted \
+             keypair. Differing keys mean the loser kept its local, never-persisted key \
+             and would sign audit rows the verifier can never pin."
+        );
+
+        // And the key both callers hold must be the one Postgres actually stores —
+        // convergence on a shared-but-unpersisted key would still break the H1 pin.
+        let stored: String = client
+            .query_one(
+                "SELECT public_key_b64 FROM tenant_audit_keys WHERE tenant_id = $1",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            stored,
+            B64.encode(&pk_a),
+            "the converged key must be the PERSISTED one (verifier H1 pin reads this row)"
+        );
     }
 
     #[test]

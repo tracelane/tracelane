@@ -126,8 +126,10 @@ function AddKeyDialog({
 	const hint = PROVIDERS.find((p) => p.id === providerId)?.hint;
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="surface-card bg-surface border border-line p-6 w-full max-w-md shadow-2xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+			{/* rounded-xl, not `surface-card`: this is a modal, and ADR-074 §5 sets
+			    "12–16px large containers", not the 8px card token that class carries. */}
+			<div className="rounded-xl bg-surface border border-line p-6 w-full max-w-md shadow-2xl space-y-4">
 				<h3 className="text-base font-semibold text-ink">Add provider key</h3>
 				<form
 					onSubmit={(e) => {
@@ -155,7 +157,7 @@ function AddKeyDialog({
 							id="provider-select"
 							value={providerId}
 							onChange={(e) => setProviderId(e.target.value)}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-accent-ink"
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-action-ink"
 						>
 							{PROVIDERS.map((p) => (
 								<option key={p.id} value={p.id}>
@@ -178,7 +180,7 @@ function AddKeyDialog({
 							value={plaintext}
 							onChange={(e) => setPlaintext(e.target.value)}
 							placeholder={hint ? `${hint}` : "paste your provider API key"}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-accent-ink"
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-action-ink"
 							required
 						/>
 						<p className="text-[11px] text-ink-2 mt-1">
@@ -198,7 +200,7 @@ function AddKeyDialog({
 						<button
 							type="submit"
 							disabled={!plaintext.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 disabled:opacity-40 transition-colors"
+							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 						>
 							{pending ? "Saving…" : "Save key"}
 						</button>
@@ -288,7 +290,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 						uploadMutation.reset();
 						setShowAdd(true);
 					}}
-					className="px-3 py-1.5 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 transition-colors"
+					className="px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ Add provider key
 				</button>
@@ -316,9 +318,9 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 					<table className="w-full text-left">
 						<thead className="bg-surface text-xs text-ink-2">
 							<tr>
-								<th className="py-2.5 px-4 font-medium">Provider</th>
-								<th className="py-2.5 pr-4 font-medium">Key</th>
-								<th className="py-2.5 pr-4 font-medium" />
+								<th className="py-1.5 px-3 font-medium">Provider</th>
+								<th className="py-1.5 pr-3 font-medium">Key</th>
+								<th className="py-1.5 pr-3 font-medium" />
 							</tr>
 						</thead>
 						<tbody>
@@ -327,13 +329,13 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 									key={key.provider_id}
 									className="border-t border-line last:border-0"
 								>
-									<td className="py-3 px-4 text-sm text-ink">
+									<td className="py-2 px-3 text-sm text-ink">
 										{PROVIDER_LABEL.get(key.provider_id) ?? key.provider_id}
 									</td>
-									<td className="py-3 pr-4 font-mono text-xs text-ink-2">
+									<td className="py-2 pr-3 font-mono text-xs text-ink-2">
 										••••••••{key.last4}
 									</td>
-									<td className="py-3 pr-4">
+									<td className="py-2 pr-3">
 										<button
 											type="button"
 											onClick={() => revokeMutation.mutate(key.provider_id)}

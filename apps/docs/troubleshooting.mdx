@@ -107,12 +107,12 @@ per-guard `tracelane.yaml` toggles are on the roadmap.
    matching `instrument_*` on each client after `init()`. `auto_instrument()`
    only covers anthropic, openai, litellm, and claude_code — everything else
    needs an explicit `instrument_*` call.
-3. **Wrong endpoint** — for the SDK, `endpoint` must be an OTLP receiver you run;
-   for the gateway-proxy path, your client's base URL must point to the gateway,
-   not the dashboard.
-4. **On Tracelane Cloud** — Cloud does not expose a public OTLP endpoint, so the
-   SDK's `init({ endpoint })` path won't reach it. Use the gateway-proxy path
-   (point your client's base URL at the gateway) for Cloud.
+3. **Wrong endpoint** — on Cloud, `endpoint` is `https://gateway.tracelane.dev`
+   (the SDK appends `/v1/traces`), **not** the dashboard URL. Self-hosting, it is
+   the OTLP receiver you run.
+4. **`403 insufficient_scope`** — the key is missing the `ingest` scope. The
+   response body names it. Mint a key with **Ingest** ticked in
+   **Settings → API Keys**; keys minted before scopes existed are unaffected.
 5. **Ingest lag** — spans can take up to 5 seconds to appear after the request.
    Wait 10 seconds and refresh.
 6. **Sampling rate** — if `sample_rate < 1.0`, only a fraction of requests are

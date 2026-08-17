@@ -289,6 +289,15 @@ mod tests {
         assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
+    // here. This file is pulled into `tests/failover_chaos.rs` and
+    // `tests/rate_limit_chaos.rs` via `#[path]`, and both of those SET
+    // TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS globally (wiremock binds to
+    // loopback) behind a OnceLock barrier whose invariant is "set before any test
+    // reads it". A test added here that READS the bypass does not go through that
+    // barrier, so it races the setter — which is exactly what happened: it flipped
+    // mid-test and took two previously-green chaos tests down with it. A binary of
+    // its own is the only place the process-global cannot be mutated underneath it.
+
     #[test]
     fn blocks_cgnat() {
         assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));

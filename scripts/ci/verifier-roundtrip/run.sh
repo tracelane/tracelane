@@ -43,13 +43,36 @@ lines[i]=JSON.stringify(o); fs.writeFileSync(outF, lines.join("\n")+"\n");
 # --- verifier artifacts (build if missing so `bash run.sh` works locally too) ---
 TS_DIST="$ROOT/packages/verifier-typescript/dist/index.js"
 [ -f "$TS_DIST" ] || (cd "$ROOT" && pnpm --filter @tracelanedev/audit-verifier build >/dev/null) || { echo "FATAL: TS verifier build failed"; exit 2; }
-RUST_BIN="$ROOT/target/release/tracelane-audit"
-[ -x "$RUST_BIN" ] || (cd "$ROOT" && cargo build --release -p tracelane-audit >/dev/null 2>&1) || { echo "FATAL: rust verifier build failed"; exit 2; }
+# HONOUR CARGO_TARGET_DIR. CI sets it to a persistent dir (B-202c/B-203), so the
+# binary does NOT land in $ROOT/target — and this line used to hardcode
+# $ROOT/target/release.
+CARGO_TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
+RUST_BIN="$CARGO_TARGET/release/tracelane-audit"
+if [ ! -x "$RUST_BIN" ]; then
+  (cd "$ROOT" && cargo build --release -p tracelane-audit >/dev/null 2>&1) \
+    || { echo "FATAL: rust verifier build failed"; exit 2; }
+fi
+# ASSERT THE POSTCONDITION, NOT THE BUILD'S EXIT CODE.
+#
+# This is what actually broke (2026-08-13). `cargo build` exited 0 while placing
+# the binary under $CARGO_TARGET_DIR, so the old `|| { FATAL }` never fired; the
+# missing $RUST_BIN was then exec'd with stderr swallowed, every rust check
+# produced empty output, and the harness rendered it as `<parse-error>` —
+# i.e. a MISSING verifier reported as a DISAGREEING one, on the job whose whole
+# purpose is detecting disagreement. The job had been `skipped` on every run
+# since CARGO_TARGET_DIR was introduced, so nothing went red for four commits.
+[ -x "$RUST_BIN" ] || {
+  echo "FATAL: rust verifier absent at $RUST_BIN after a SUCCESSFUL build"
+  echo "       CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-<unset>}  ROOT=$ROOT"
+  exit 2
+}
 PYTHON="${PYTHON:-python3}"
 "$PYTHON" -c 'import tracelane_audit_verifier' 2>/dev/null || { echo "FATAL: python verifier not importable via '$PYTHON' — pip install ./packages/verifier-python"; exit 2; }
 
 run_ts()   { node "$HERE/ts-verify.mjs" "$TS_DIST" "$1" "$PK"; }
 run_py()   { "$PYTHON" "$HERE/py-verify.py" "$1" "$PK"; }
+# `2>/dev/null` is tolerable ONLY because $RUST_BIN's existence is asserted above.
+# Without that assertion it converts "binary not found" into silent empty output.
 run_rust() { "$RUST_BIN" verify --file "$1" --tenant-pubkey "$PK" --format json 2>/dev/null | sed -n '/^{/,$p'; }
 
 # GREEN iff chain valid AND sig valid AND at least one anchor's inclusion proof verified.

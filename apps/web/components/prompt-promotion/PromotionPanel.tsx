@@ -193,7 +193,7 @@ export function PromotionPanel({
 						value={versionId}
 						onChange={(e) => setVersionId(e.target.value)}
 						placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-						className="w-full rounded-md border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-accent-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
 						required
 						disabled={isLoading}
 					/>
@@ -217,7 +217,7 @@ export function PromotionPanel({
 						value={evalRunId}
 						onChange={(e) => setEvalRunId(e.target.value)}
 						placeholder="Leave blank today — promote with an override reason below"
-						className="w-full rounded-md border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-accent-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
@@ -241,7 +241,7 @@ export function PromotionPanel({
 						value={overrideReason}
 						onChange={(e) => setOverrideReason(e.target.value)}
 						placeholder="e.g. urgent prod hotfix — approved by …"
-						className="w-full rounded-md border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
@@ -249,7 +249,7 @@ export function PromotionPanel({
 				<button
 					type="submit"
 					disabled={isLoading || !versionId.trim()}
-					className="w-full rounded-md bg-accent px-4 py-2 text-xs font-semibold text-accent-on transition-colors hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed"
+					className="w-full rounded-md bg-action px-4 py-2 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:opacity-40 disabled:cursor-not-allowed"
 				>
 					{isLoading
 						? "Promoting…"
@@ -260,7 +260,7 @@ export function PromotionPanel({
 			</form>
 
 			{status === "success" && result ? (
-				<div className="rounded-md border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
+				<div className="rounded-lg border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
 					<p className="font-semibold text-ok-ink">
 						{result.decision === "manual_override"
 							? "Manual override applied"
@@ -277,7 +277,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "blocked" && result ? (
-				<div className="rounded-md border border-warn bg-warn-soft/40 p-3 text-xs space-y-1">
+				<div className="rounded-lg border border-warn bg-warn-soft/40 p-3 text-xs space-y-1">
 					<p className="font-semibold text-warn-ink">
 						{result.decision === "blocked_by_eval"
 							? "Blocked by eval gate"
@@ -293,12 +293,12 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "upgrade_required" ? (
-				<div className="rounded-md border border-accent-line bg-accent-soft/40 p-3 text-xs space-y-1">
-					<p className="font-semibold text-accent-ink">Team plan required</p>
+				<div className="rounded-lg border border-action-line bg-action-soft/40 p-3 text-xs space-y-1">
+					<p className="font-semibold text-action-ink">Team plan required</p>
 					<p className="text-ink-2">{errorMsg}</p>
 					<a
 						href={upgradeUrl || "/#pricing"}
-						className="inline-block mt-1 text-accent-ink underline underline-offset-2 hover:opacity-80 transition-opacity"
+						className="inline-block mt-1 text-action-ink underline underline-offset-2 hover:opacity-80 transition-opacity"
 					>
 						Upgrade to Team →
 					</a>
@@ -306,7 +306,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "error" ? (
-				<div className="rounded-md border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
+				<div className="rounded-lg border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
 					{errorMsg || "Unexpected failure — check gateway logs."}
 				</div>
 			) : null}

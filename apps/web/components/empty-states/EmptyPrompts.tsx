@@ -85,7 +85,7 @@ export function EmptyPrompts() {
 							onClick={() => setTab(t)}
 							className={`px-4 py-2 text-xs font-medium transition-colors ${
 								tab === t
-									? "text-ink border-b-2 border-accent-ink -mb-px"
+									? "text-ink border-b-2 border-action-ink -mb-px"
 									: "text-ink-2 hover:text-ink"
 							}`}
 						>

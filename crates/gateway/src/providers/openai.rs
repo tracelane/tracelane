@@ -412,3 +412,394 @@ mod tests {
         assert!(oai.stream_options.include_usage);
     }
 }
+
+// ============================================================================
+// GWY-26 — the OpenAI Embeddings wire shape, owned by the adapter that speaks it.
+//
+// Why this lives here and not in its own module: `openai.rs` IS the definition
+// of the OpenAI wire format, and the 28 OpenAI-compatible hosts reuse this same
+// adapter. A separate `providers/embeddings.rs` would also be counted as a 36th
+// provider adapter by `scripts/ci/check-provider-count.py`, which globs
+// `providers/*.rs` — and that count has leaked into published marketing copy
+//
+// Why the endpoint exists at all: the flight recorder claims full-fidelity
+// capture of what an agent did, but the gateway mounted exactly three top-level
+// routes and none of them was `/v1/embeddings`, so every embeddings call in a
+// RAG agent went straight to the provider — the retrieval step that decides
+// what the model sees was invisible in the ledger and in /traces.
+//
+// Coverage is deliberately narrow and fails CLOSED: only providers exposing an
+// OpenAI-compatible `POST {base}/v1/embeddings` are dispatched
+// (`ProviderRegistry::openai_compatible`). Anthropic, Google/Vertex, Bedrock,
+// Cohere and Azure each use a different embeddings wire format; a request for
+// one of them is refused by name rather than forwarded on a guess, which would
+// surface as an opaque upstream 400 that reads like a Tracelane outage.
+// ============================================================================
+
+/// An OpenAI-shaped embeddings request.
+///
+/// `input` stays a `serde_json::Value` because the OpenAI contract accepts four
+/// forms (string, array of strings, array of tokens, array of token arrays) and
+/// re-encoding them into a Rust enum would only add a way to mangle a caller's
+/// payload. It is *validated* — see [`EmbeddingsRequest::validate`] — never
+/// silently reshaped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+impl EmbeddingsRequest {
+    /// Reject an `input` no provider can embed, before a credential is
+    /// resolved or a byte leaves the gateway.
+    ///
+    /// # Errors
+    ///
+    /// **Fails CLOSED.** An absent, empty, or wrong-typed `input` is a caller
+    /// error; forwarding it burns a provider round-trip and returns an upstream
+    /// 400 that reads as a Tracelane fault.
+    pub fn validate(&self) -> Result<()> {
+        if self.model.trim().is_empty() {
+            bail!("`model` is required");
+        }
+        match &self.input {
+            serde_json::Value::String(s) if !s.is_empty() => Ok(()),
+            serde_json::Value::String(_) => bail!("`input` must not be an empty string"),
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                let uniform_strings = items.iter().all(|i| i.is_string());
+                let uniform_tokens = items.iter().all(|i| {
+                    i.is_number()
+                        || i.as_array()
+                            .is_some_and(|a| a.iter().all(serde_json::Value::is_number))
+                });
+                if uniform_strings || uniform_tokens {
+                    Ok(())
+                } else {
+                    bail!("`input` array must be all strings, all tokens, or all token arrays")
+                }
+            }
+            serde_json::Value::Array(_) => bail!("`input` must not be an empty array"),
+            _ => bail!("`input` must be a string or an array"),
+        }
+    }
+
+    /// Number of separate texts embedded. Drives nothing but telemetry — the
+    /// billed unit is the provider-reported token count.
+    #[must_use]
+    pub fn input_count(&self) -> usize {
+        match &self.input {
+            serde_json::Value::Array(items) => items.len(),
+            _ => 1,
+        }
+    }
+}
+
+/// One embedding vector in the response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    #[serde(default = "embedding_object")]
+    pub object: String,
+    pub index: u32,
+    pub embedding: Vec<f32>,
+}
+
+fn embedding_object() -> String {
+    "embedding".to_string()
+}
+
+/// Provider-reported token usage. Embeddings have no output tokens.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct EmbeddingsUsage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+}
+
+/// An OpenAI-shaped embeddings response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsResponse {
+    #[serde(default = "list_object")]
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub usage: EmbeddingsUsage,
+}
+
+fn list_object() -> String {
+    "list".to_string()
+}
+
+impl EmbeddingsResponse {
+    /// Tokens to meter for this request. Prefers the provider's `total_tokens`
+    /// and falls back to `prompt_tokens`; never fabricates a count.
+    #[must_use]
+    pub fn billable_tokens(&self) -> u32 {
+        if self.usage.total_tokens > 0 {
+            self.usage.total_tokens
+        } else {
+            self.usage.prompt_tokens
+        }
+    }
+}
+
+impl OpenAiProvider {
+    /// `POST {base_url}/v1/embeddings`.
+    ///
+    /// # Errors
+    ///
+    /// **Fails CLOSED** — an error here is returned to the caller, never
+    /// swallowed:
+    /// - the SSRF guard rejects the configured base URL;
+    /// - the request cannot be sent;
+    /// - the upstream answers non-2xx, which becomes a typed
+    ///   [`crate::providers::ProviderHttpError`] carrying the STATUS ONLY. The upstream body is
+    ///   read to free the connection and then dropped — provider error bodies
+    ///   routinely echo the `Authorization` header, i.e. the tenant's own BYOK
+    /// - the 2xx body is not an embeddings payload.
+    #[instrument(skip(self, request, api_key), fields(
+        tenant_id = %tenant_id,
+        model = %request.model,
+        provider = self.provider_id,
+        inputs = request.input_count(),
+    ))]
+    pub async fn embeddings(
+        &self,
+        request: &EmbeddingsRequest,
+        api_key: &str,
+        tenant_id: &TenantId,
+    ) -> Result<EmbeddingsResponse> {
+        let url = format!("{}/v1/embeddings", self.base_url);
+
+        crate::ssrf_guard::validate_url(&url)
+            .await
+            .context("SSRF guard rejected the embeddings base URL")?;
+
+        let response = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(request)
+            .send()
+            .await
+            .context("failed to send embeddings request upstream")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // Body consumed to free the connection, never logged or propagated
+            // (credential-echo risk — see the `# Errors` note above).
+            let _body = response.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, provider = self.provider_id, "embeddings upstream error");
+            return Err(crate::providers::ProviderHttpError {
+                provider: self.provider_id,
+                status: status.as_u16(),
+                reason: None,
+            }
+            .into());
+        }
+
+        response
+            .json::<EmbeddingsResponse>()
+            .await
+            .context("upstream returned a body that is not an embeddings response")
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod embeddings_tests {
+    use super::*;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Wiremock binds 127.0.0.1 and the SSRF guard blocks loopback. Same
+    /// thread-local RAII opt-in `providers::smoke_tests` uses — never a
+    /// process-env mutation, which would race the parallel suite.
+    struct LoopbackBypassGuard;
+
+    impl LoopbackBypassGuard {
+        fn new() -> Self {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+            Self
+        }
+    }
+
+    impl Drop for LoopbackBypassGuard {
+        fn drop(&mut self) {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+        }
+    }
+
+    fn tenant() -> TenantId {
+        TenantId::from_jwt_claim(Uuid::from_u128(0xE11BE11B))
+    }
+
+    fn req(input: serde_json::Value) -> EmbeddingsRequest {
+        EmbeddingsRequest {
+            model: "text-embedding-3-small".into(),
+            input,
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        }
+    }
+
+    // ── Negative first: every input shape that must be REFUSED. ──
+
+    #[test]
+    fn rejects_inputs_no_provider_can_embed() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!([]),
+            serde_json::json!({ "text": "hi" }),
+            serde_json::json!(["ok", { "not": "a string" }]),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                req(bad.clone()).validate().is_err(),
+                "input {bad} must be refused before dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_every_documented_input_shape() {
+        for good in [
+            serde_json::json!("one string"),
+            serde_json::json!(["a", "b"]),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!([[1, 2], [3, 4]]),
+        ] {
+            req(good.clone())
+                .validate()
+                .unwrap_or_else(|e| panic!("input {good} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn rejects_a_missing_model() {
+        let mut r = req(serde_json::json!("hi"));
+        r.model = "  ".into();
+        assert!(r.validate().is_err(), "a blank model must be refused");
+    }
+
+    // ── The end state: real vectors come back over real HTTP. ──
+
+    #[tokio::test]
+    async fn returns_the_upstream_vectors_and_usage() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer sk-test-key"))
+            // The caller's model + input must actually reach the upstream.
+            .and(body_string_contains("text-embedding-3-small"))
+            .and(body_string_contains("hello world"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "object": "embedding", "index": 0, "embedding": [0.25, -0.5, 0.75] },
+                    { "object": "embedding", "index": 1, "embedding": [1.0, 0.0, -1.0] }
+                ],
+                "model": "text-embedding-3-small",
+                "usage": { "prompt_tokens": 7, "total_tokens": 7 }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::compatible(server.uri(), "openai")
+            .expect("build OpenAI-compatible provider");
+        let out = provider
+            .embeddings(
+                &req(serde_json::json!(["hello world", "second"])),
+                "sk-test-key",
+                &tenant(),
+            )
+            .await
+            .expect("embeddings round-trip");
+
+        // The observable end state: usable vectors, not a status code.
+        assert_eq!(out.data.len(), 2);
+        assert_eq!(out.data[0].embedding, vec![0.25, -0.5, 0.75]);
+        assert_eq!(out.data[1].embedding, vec![1.0, 0.0, -1.0]);
+        assert_eq!(out.data[1].index, 1);
+        assert_eq!(out.model, "text-embedding-3-small");
+        assert_eq!(out.billable_tokens(), 7);
+    }
+
+    #[tokio::test]
+    async fn upstream_401_is_typed_and_never_echoes_the_key() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+
+        // A real OpenAI 401 body echoes the offending key back at us.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": "Incorrect API key provided: sk-leaky-secret-value" }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::compatible(server.uri(), "openai")
+            .expect("build OpenAI-compatible provider");
+        let err = provider
+            .embeddings(
+                &req(serde_json::json!("hi")),
+                "sk-leaky-secret-value",
+                &tenant(),
+            )
+            .await
+            .expect_err("a 401 must surface as an error");
+
+        let typed = err
+            .downcast_ref::<crate::providers::ProviderHttpError>()
+            .expect("upstream 401 must be a typed ProviderHttpError");
+        assert!(
+            typed.is_auth_rejection(),
+            "401 must classify as an auth rejection"
+        );
+        // The whole error chain, rendered — this is what reaches logs.
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("sk-leaky-secret-value"),
+            "the upstream body (which echoes the key) must never reach the error: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_embeddings_2xx_body_is_an_error_not_an_empty_result() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "hello": "world" })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::compatible(server.uri(), "openai")
+            .expect("build OpenAI-compatible provider");
+        let err = provider
+            .embeddings(&req(serde_json::json!("hi")), "k", &tenant())
+            .await
+            .expect_err("a 200 that is not an embeddings payload must be an error");
+        assert!(
+            format!("{err:#}").contains("not an embeddings response"),
+            "{err:#}"
+        );
+    }
+}

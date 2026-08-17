@@ -33,13 +33,13 @@ working directory, then prints the SDK install + wire-up steps. It writes that
 one file and nothing else — it does not install a package, create `.env`, or
 edit your source. Without `--force` it refuses to overwrite an existing config.
 
-`--endpoint` is the OTLP endpoint of an ingest receiver **you** run (default
-`http://localhost:4318`). Tracelane Cloud has no public OTLP ingress — hosted
-traces are captured at the gateway, so on Cloud you leave `--endpoint` unset and
-point your OpenAI-compatible client at `https://gateway.tracelane.dev/v1`.
+`--endpoint` is the OTLP endpoint spans are exported to. On Tracelane Cloud that
+is `https://gateway.tracelane.dev`, with a `tlane_…` key carrying the `ingest`
+scope. Self-hosting, it is the ingest receiver you run. The default is
+`http://localhost:4318`, so **on Cloud, pass `--endpoint` explicitly**.
 
 ```bash
-tlane init
+tlane init --endpoint https://gateway.tracelane.dev         # Tracelane Cloud
 tlane init --endpoint http://otel-collector.internal:4318   # self-run receiver
 tlane init --service-name checkout-agent --sample-rate 0.25
 tlane init --force                                          # overwrite existing
@@ -200,7 +200,7 @@ Mapping is documented in [migrations/from-helicone.md](./migrations/from-helicon
 Translate a LiteLLM `model_list` to Tracelane gateway routing. Preserves the
 provider, model alias, and rate-limit metadata. Caller-side code that calls
 `litellm.completion(...)` keeps working through Tracelane's
-OpenAI-compatible `/v1/messages` and `/v1/chat/completions` endpoints — no
+OpenAI-compatible `/v1/chat/completions` endpoint — no
 SDK swap needed.
 
 The config path is a flag, not a positional argument. A path passed positionally

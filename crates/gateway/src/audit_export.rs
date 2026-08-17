@@ -200,6 +200,15 @@ pub trait AuditExportReader: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The tenant's LIFETIME ledger sequence range (R56, ADR-074 §7's chip).
+    /// Default: an empty ledger — a dev/mock reader has no chain, and `None`
+    /// bounds are how "no rows" is stated. Never `Some(0)`, which would claim a
+    /// genesis row that does not exist. `audit_log` is `ORDER BY (tenant_id, seq)`
+    /// with no TTL, so the ClickHouse impl reads this straight off the sort key.
+    async fn ledger_range(&self, _tenant_id: &TenantId) -> Result<(Option<u64>, Option<u64>, u64)> {
+        Ok((None, None, 0))
+    }
+
     /// Aggregate the window into totals + per-day + per-type counts. Default: an
     /// empty summary (dev/mock readers report no aggregate). The ClickHouse impl
     /// GROUP BYs so the counts are exact for any ledger size.
@@ -452,6 +461,35 @@ impl AuditExportReader for ClickHouseExportReader {
             });
         }
         Ok(out)
+    }
+
+    async fn ledger_range(&self, tenant_id: &TenantId) -> Result<(Option<u64>, Option<u64>, u64)> {
+        // FINAL so a crash-retry duplicate (ADR-065) is counted once. No time bound:
+        // audit_log has no TTL and is append-only, so this IS the lifetime range —
+        // which is what "▸ 15700-15799 for this workspace" claims.
+        #[derive(Deserialize, clickhouse::Row)]
+        struct RangeRow {
+            lo: u64,
+            hi: u64,
+            total: u64,
+        }
+        let r = self
+            .client
+            .query(
+                "SELECT min(seq) AS lo, max(seq) AS hi, count() AS total \
+                 FROM audit_log FINAL WHERE tenant_id = ?",
+            )
+            .bind(tenant_id.to_string())
+            .fetch_one::<RangeRow>()
+            .await
+            .context("audit_log ledger-range query failed")?;
+        // ClickHouse returns min/max = 0 over an EMPTY set, and seq 0 is a REAL
+        // genesis row — so the count is the only thing that distinguishes them.
+        // Reading 0/0 as a range would tell an empty workspace it has one row.
+        if r.total == 0 {
+            return Ok((None, None, 0));
+        }
+        Ok((Some(r.lo), Some(r.hi), r.total))
     }
 
     async fn summarize(
@@ -811,6 +849,20 @@ async fn summary_handler(
         }
     };
 
+    // A13 scope gate — B-230. An entitlement gate is NOT a scope gate. Until
+    // 2026-08-13 the audit ledger was reachable by any authenticated key, so an
+    // `ingest`-scoped SDK key (default-on since GWY-41, and the credential most
+    // likely to sit in a container image) could read it. `read` is the scope
+    // `crates/shared/src/api_scope.rs:47-49` defines for precisely the
+    // hand-a-key-to-an-auditor case this surface exists to serve.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope — refusing audit read");
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "this API key is not scoped to read recorded data — it needs the `read` scope",
+        );
+    }
+
     // 2. Audit-SKU entitlement gate — fail closed (identical to export).
     match state.entitlements {
         Some(ref cache) => {
@@ -871,6 +923,20 @@ async fn handler(
             return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
         }
     };
+
+    // A13 scope gate — B-230. An entitlement gate is NOT a scope gate. Until
+    // 2026-08-13 the audit ledger was reachable by any authenticated key, so an
+    // `ingest`-scoped SDK key (default-on since GWY-41, and the credential most
+    // likely to sit in a container image) could read it. `read` is the scope
+    // `crates/shared/src/api_scope.rs:47-49` defines for precisely the
+    // hand-a-key-to-an-auditor case this surface exists to serve.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope — refusing audit read");
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "this API key is not scoped to read recorded data — it needs the `read` scope",
+        );
+    }
 
     //    already resolved from the validated claim (the org_id→tenant seam is in
     //    `auth`), so the entitlement query only ever sees the internal tenant
@@ -1022,7 +1088,7 @@ fn parse_iso(s: &Option<String>) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn error_response(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, msg: &str) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")

@@ -1,17 +1,18 @@
 //! Browser passive observer — DOM state tracker and mutation scorer.
 //!
-//! The full Playwright + rrweb enrichment lives in the ingest worker
-//! (`crates/ingest/src/browser_enricher.rs`) and is a scaffold gated behind an
-//! entitlement flag. This gateway-side
-//! predictor reads the enriched `tracelane.browser.*` span attributes
-//! emitted upstream and makes fast inline decisions (<5ms).
+//! This predictor reads `tracelane.browser.*` span attributes and makes fast
+//! inline decisions. **Nothing in the tree emits those attributes**, so on live
+//! traffic it always falls through to `Allow`. The rrweb enrichment module
+//! (`crates/ingest/src/rrweb_enricher.rs`) is declared at `ingest/src/main.rs:42`
+//! and has no callers; there is no Playwright capture and no entitlement flag.
 //!
 //! Decision logic:
 //! - `captcha_detected == true` → Warn (AFT-A2UI-CAPTCHA-001)
 //! - `dom_mutation_score == 0.0` AND `step_index > 1` → Warn (AFT-A2UI-STUCKLOOP-001)
 //! - Otherwise → Allow
 //!
-//! The ingest worker flow (scaffold, gated behind an entitlement flag):
+//! The ingest worker flow this predictor was designed against — NOT implemented,
+//! no step below runs today:
 //! 1. Agent SDK emits browser spans with `tracelane.browser.*` attributes.
 //! 2. Ingest worker attaches `screenshot_url`, `dom_hash`, `dom_mutation_score`.
 //! 3. This predictor reads those attributes on the next gateway request.

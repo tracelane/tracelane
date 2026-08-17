@@ -21,10 +21,26 @@ import { expect } from "../src/harness.js";
  */
 const ROOT = path.resolve(__dirname, "../..");
 
+/** Read a repo file relative to the repo root — the product, not a model of it. */
+function repoRead(rel: string): string {
+	// biome-ignore lint/style/useNodejsImportProtocol: harness is CJS
+	const fs = require("node:fs");
+	// biome-ignore lint/style/useNodejsImportProtocol: harness is CJS
+	const path = require("node:path");
+	return fs.readFileSync(path.resolve(__dirname, "../../", rel), "utf8");
+}
+
 describe("PP-P12: BYOK at raw API prices — 0% markup", () => {
 	it("the gateway adds 0% markup on provider calls", () => {
-		const gatewayMarkupPct = 0;
-		expect(gatewayMarkupPct).toBe(0);
+		// REWRITTEN 2026-08-12 (was `const gatewayMarkupPct = 0` asserted 0 — a
+		// literal compared to itself). The checkable form of "0% markup" is that
+		// the price catalog holds PROVIDER list rates and applies no multiplier to
+		// them. A markup would have to appear here to reach a customer.
+		const pricing = repoRead("crates/gateway/src/pricing.rs");
+		expect(
+			/\bmarkup\b|\bmargin\b|\buplift\b|\* *1\.[0-9]+ *\/\/ *fee/i.test(pricing),
+			"pricing.rs must apply no markup multiplier to provider rates",
+		).toBe(false);
 	});
 
 	it("BYOK is structurally enforced in the gateway (envelope encryption)", () => {

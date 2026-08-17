@@ -15,7 +15,7 @@ import { cn } from "../lib/cn";
  * legible at 1/3-card width, with column captions beneath and a compact legend
  * mapping dot → name (with drill-through). Edges are a behind-layer SVG stretched
  * to the box; the dots are HTML (true circles, not scaled ellipses). Token-
- * colored: tools = --info (tool-span hue), models = --accent (lava), agent = ink.
+ * colored: tools = --info (tool-span hue), models = --action (lava), agent = ink.
  */
 
 export interface AgentGraphNode {
@@ -182,7 +182,7 @@ export function AgentGraph({
 						MODEL_X,
 						modelY[k] ?? 50,
 						dotPx(m.weight, modelMax),
-						"var(--accent)",
+						"var(--action)",
 						m.label,
 					),
 				)}
@@ -211,7 +211,7 @@ export function AgentGraph({
 			{/* legend — dot → name, with drill-through */}
 			<div className="space-y-1">
 				{legendRow("Tools", tools, "var(--info)")}
-				{legendRow("Models", models, "var(--accent)")}
+				{legendRow("Models", models, "var(--action)")}
 			</div>
 		</div>
 	);

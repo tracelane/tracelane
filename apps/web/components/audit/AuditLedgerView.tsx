@@ -5,6 +5,7 @@ import {
 	humanizeVerdictKind,
 	isAlarm,
 } from "@/app/audit/verdict";
+import { anchoredRecords, auditTrustState } from "@/lib/audit-trust-state";
 import {
 	type VerifyReport,
 	verifyLedgerText,
@@ -718,23 +719,54 @@ function TrustPanel({
 
 					{/* RED (ADR-070): a windowed view with no public anchor inside it —
 					    nothing publicly trusted roots the loaded rows. */}
+					{/* INDETERMINATE (R53) — NOT an alarm. Measured on prod 2026-08-15: at
+					    ?limit=10 the coverage filter dropped all 161 of a4037bef's anchors,
+					    trust_established went false, and this panel told the operator their
+					    fully intact ledger had FAILED verification. Neutral tokens and a ◇,
+					    never danger-ink and a ✗ — the styling WAS the accusation. */}
 					{verdict.state === "unrooted_window" && (
 						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
-							>
-								✗
+							<span aria-hidden className="mt-0.5 text-2xl text-ink-3 shrink-0">
+								◇
 							</span>
 							<div>
-								<div className="text-xl font-bold text-danger-ink">
-									Cannot verify this window
+								<div className="text-xl font-bold text-ink">
+									Not verifiable in this view
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger-ink/80">
-									This view starts after your chain&apos;s genesis (older rows
-									are past your retention window) and has no public Rekor anchor
-									inside it to establish trust. Configure your tenant audit
-									public key so an anchor in this view can root the chain.
+								<p className="mt-0.5 text-[13px] text-ink-2">
+									<strong>Nothing is wrong with your ledger</strong> — this view
+									simply has no public Rekor anchor inside it to verify against,
+									because it starts after your chain&apos;s genesis or loads too
+									few rows to contain a whole anchored batch. Widen the window,
+									or verify the complete export with{" "}
+									<code className="font-mono text-ink">tlane verify</code>,
+									which checks every anchor.
+								</p>
+							</div>
+						</div>
+					)}
+
+					{/* INDETERMINATE (R53) — anchors exist but there was no trusted key to
+					    check them with. Split out of `signature_failed`: the 2026-08-07 P0
+					    kept it out of GREEN, and it stays out of green; what it must not be
+					    is an accusation. */}
+					{verdict.state === "anchors_unverifiable" && (
+						<div className="flex items-start gap-3">
+							<span aria-hidden className="mt-0.5 text-2xl text-ink-3 shrink-0">
+								◇
+							</span>
+							<div>
+								<div className="text-xl font-bold text-ink">
+									Anchors not checked — no verification key
+								</div>
+								<p className="mt-0.5 text-[13px] text-ink-2">
+									<strong>This is not a verification failure.</strong>{" "}
+									<span className="tabular-nums">{verdict.anchors}</span> anchor
+									{verdict.anchors === 1 ? "" : "s"} in this view were skipped
+									because your workspace has no per-workspace signing key to
+									check them against, so their inclusion proofs were neither
+									confirmed nor rejected. A per-workspace key is issued with the
+									Audit add-on.
 								</p>
 							</div>
 						</div>
@@ -789,18 +821,22 @@ function TrustPanel({
 						variant="primary"
 						onClick={onVerify}
 						disabled={verifying || rowCount === 0}
-						className="cta-lava w-full sm:w-auto"
+						className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full sm:w-auto"
 					>
 						{verifying ? "Verifying…" : "Verify integrity"}
 					</Button>
 				</div>
 			</div>
 
-			{/* ── Anchor status line — conditionally shows "Publicly anchored"
-			     only when anchor records are present (hasAnchorRecords). When
-			     absent, shows "Not yet anchored" so we never claim public anchoring
-			     without evidence. The Playwright e2e test checks for the full text
-			     "Publicly anchored (Sigstore Rekor v2)" on the anchored fixture. */}
+			{/* ── Anchor status line — THREE states, keyed on `anchoredIndices`
+			     (R48's single "publicly anchored" predicate), never on
+			     `hasAnchorRecords`. An anchor RECORD is written for every SIGNED
+			     batch, anchored or not, so record-presence claims public anchoring
+			     for batches that reached no log — which is what this comment used
+			     to describe and what R43 removed. `hasAnchorRecords` now selects
+			     only between "signed, not anchored" and "nothing yet".
+			     The Playwright e2e test checks the full text "Publicly anchored
+			     (Sigstore Rekor v2)" on the anchored fixture. */}
 			{/* What-to-do-next — shown ONLY on a real failure (alarm). The banner says
 			    WHAT broke; a user also needs to know it is not their config and what the
 			    remediation path is. */}
@@ -844,7 +880,18 @@ function TrustPanel({
 			<div className="mt-4 space-y-2 border-t border-line pt-3">
 				{/* Status line — wraps cleanly on narrow (no ml-auto orphaning). */}
 				<div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-					{hasAnchorRecords ? (
+					{/* R43. THREE states here too, and the middle one did not exist.
+					    This read `hasAnchorRecords ? "Publicly anchored" : "Not yet
+					    anchored — begins with your first gateway-proxied batch"`, but an
+					    anchor RECORD is written for every SIGNED batch, anchored or not
+					    (anchor_task persists the ADR-062 bundle on `is_signed()`, and
+					    `anchor_state` may be "unanchored"). So after R21 gave the
+					    sub-threshold tenants a record, this header would have claimed
+					    "Publicly anchored (Sigstore Rekor v2)" for batches that reached
+					    no public log at all — a worse falsehood than the one R21 fixed.
+					    The truthful predicate is `anchoredIndices`, which already
+					    filters on `anchor_state === "anchored" && rekor.log_index`. */}
+					{anchoredIndices.length > 0 ? (
 						<span className="flex items-center gap-1.5">
 							<span
 								aria-hidden
@@ -863,6 +910,16 @@ function TrustPanel({
 								Publicly anchored (Sigstore Rekor v2)
 							</span>
 						</span>
+					) : hasAnchorRecords ? (
+						<span className="flex items-center gap-1.5">
+							<span aria-hidden className="text-sm text-ink-3">
+								◇
+							</span>
+							<span className="text-[12px] text-ink-3">
+								Signed, not publicly anchored — anchoring is best-effort and
+								does not block the write path
+							</span>
+						</span>
 					) : (
 						<span className="flex items-center gap-1.5">
 							<span aria-hidden className="text-sm text-ink-3">
@@ -873,7 +930,7 @@ function TrustPanel({
 							</span>
 						</span>
 					)}
-					{hasAnchorRecords && !alarm && (
+					{anchoredIndices.length > 0 && !alarm && (
 						<span className="text-[12px] text-ink-2 tabular-nums">
 							{anchoredIndices.length} batch
 							{anchoredIndices.length === 1 ? "" : "es"} anchored
@@ -1144,7 +1201,28 @@ function TrustPanel({
 								</div>
 							);
 						}
-						if (!tenantPubkeyB64 || anchorRecords.length === 0) {
+						// R43. THREE states, and none may borrow another's copy.
+						//
+						// This was ONE branch — `!tenantPubkeyB64 || anchorRecords.length === 0`
+						// — collapsing two unrelated facts: "you have no data yet" and "we
+						// cannot give you an out-of-band trust root". R21 gave five tenants a
+						// real `audit_anchor_records` row, so `anchorRecords.length` became 1,
+						// and the OR still short-circuited on the 404'd pubkey — the card kept
+						// saying "No signed batches yet" over 57 signed rows and a real anchor.
+						// A false sentence, shown to the customer, on the differentiated claim.
+						//
+						// Order matters: no-data is checked FIRST, so the trust-root state can
+						// never be mistaken for emptiness.
+						// The decision itself lives in `lib/audit-trust-state.ts` as a pure
+						// function with unit tests; this component RENDERS its result. Keeping
+						// the branching here too would leave those tests guarding a parallel
+						// implementation rather than the code that ships (`TRAPS.md` §22).
+						const trust = auditTrustState({
+							anchorRecordCount: anchorRecords.length,
+							anchoredCount: anchoredIndices.length,
+							tenantPubkeyB64,
+						});
+						if (trust === "no-batches") {
 							return (
 								<div className="rounded-lg border border-line bg-surface p-3">
 									{label}
@@ -1152,8 +1230,53 @@ function TrustPanel({
 										No signed batches yet
 									</div>
 									<div className="mt-1 text-[11px] text-ink-2">
-										Signing + anchoring begin with your first gateway-proxied
-										batch.
+										Signing begins with your first gateway-proxied batch.
+									</div>
+								</div>
+							);
+						}
+						// Signed, but we cannot hand this tenant a trust root they can check
+						// us with: `/v1/audit/pubkey` 404s (no per-tenant key) or returns an
+						// EMPTY pubkey (a legacy row minted before the key's public half was
+						// persisted). Either way the batches were signed with Tracelane's
+						// OPERATOR key. That is a real control — it still detects a later edit
+						// — but it is not third-party verifiable, and this card must not imply
+						// that it is. Naming the limitation in the term is the point.
+						if (trust === "publicly-anchored") {
+							// The ledger CLAIMS Rekor inclusion, but this panel is only reached when
+							// the verifier did NOT confirm it (`anchors_included === 0`) — and without
+							// a trust root it cannot. Say exactly that. Borrowing the verified copy
+							// would overclaim; borrowing the not-anchored copy would deny a real
+							// public anchor. Neither is true, so this state gets its own sentence.
+							return (
+								<div className="rounded-lg border border-line bg-surface p-3">
+									{label}
+									<div className="mt-1 text-sm font-medium text-ink">
+										Anchored in the public log — not verified here
+									</div>
+									<div className="mt-1 text-[11px] text-ink-2">
+										{tenantPubkeyB64
+											? "Run Verify integrity to check the inclusion proof against your key."
+											: "We cannot check the inclusion proof without a per-workspace verification key, so this batch is not independently verifiable yet."}
+									</div>
+								</div>
+							);
+						}
+						if (trust === "operator-signed") {
+							return (
+								<div className="rounded-lg border border-line bg-surface p-3">
+									{label}
+									<div className="mt-1 text-sm font-medium text-ink">
+										Tamper-evident, operator-signed
+									</div>
+									<div className="mt-1 text-[11px] text-ink-2">
+										These batches are signed with Tracelane&apos;s operator key,
+										not your own. That detects later tampering, but it cannot be
+										checked independently of us.{" "}
+										<span className="font-medium">
+											Independent verification requires the Audit add-on
+										</span>
+										, which issues your workspace its own signing key.
 									</div>
 								</div>
 							);
@@ -1162,12 +1285,12 @@ function TrustPanel({
 							<div className="rounded-lg border border-line bg-surface p-3">
 								{label}
 								<div className="mt-1 text-sm font-medium text-ink">
-									Signed locally (Ed25519)
+									Tenant-signed (Ed25519)
 								</div>
 								<div className="mt-1 text-[11px] text-ink-2">
-									Your key&apos;s attestation verified. These batches are not
-									yet publicly anchored (anchoring is best-effort,
-									gateway-path).
+									Signed with your workspace&apos;s own key and verified against
+									it. These batches are not yet publicly anchored (anchoring is
+									best-effort, gateway-path).
 								</div>
 							</div>
 						);
@@ -1688,11 +1811,14 @@ export function AuditLedgerView({
 		() => b64ToBytes(tenantPubkeyB64 ?? ""),
 		[tenantPubkeyB64],
 	);
+	// R48. ONE predicate for "publicly anchored", defined in lib/audit-trust-state.
+	// This file previously had three, and two of them disagreed (1 vs 0) on exactly
+	// the tenant class R43 is about. `report.anchors_included` is deliberately NOT
+	// folded in here: it counts what the verifier CONFIRMED, which is a stronger
+	// fact and keeps its own word ("independently verified").
 	const anchoredIndices = useMemo(
 		() =>
-			anchorRecords
-				.filter((a) => a.anchor_state === "anchored" && a.rekor?.log_index)
-				.map((a) => a.rekor?.log_index as string),
+			anchoredRecords(anchorRecords).map((a) => a.rekor?.log_index as string),
 		[anchorRecords],
 	);
 	const [report, setReport] = useState<VerifyReport | null>(
@@ -1826,7 +1952,11 @@ export function AuditLedgerView({
 						{exportScopeLabel}
 					</div>
 					<div className="mt-3 flex flex-wrap items-center gap-3">
-						<Button variant="primary" onClick={download} className="cta-lava">
+						<Button
+							variant="primary"
+							onClick={download}
+							className="bg-surface-inverse text-ink-inverse hover:opacity-90"
+						>
 							Download evidence (NDJSON)
 						</Button>
 						<code className="font-mono text-[11px] text-ink-2">
@@ -1836,7 +1966,7 @@ export function AuditLedgerView({
 				</Card>
 			) : (
 				<div
-					className="flex flex-col gap-4 rounded-xl bg-surface-inverse p-5 sm:flex-row sm:items-center sm:justify-between"
+					className="flex flex-col gap-4 rounded-lg bg-surface-inverse p-5 sm:flex-row sm:items-center sm:justify-between"
 					data-testid="export-upsell"
 				>
 					<div>
@@ -1857,7 +1987,7 @@ export function AuditLedgerView({
 					</div>
 					<Link
 						href="/settings/billing"
-						className="cta-lava inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-[13px] font-medium"
+						className="bg-surface-inverse text-ink-inverse hover:opacity-90 inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-[13px] font-medium"
 					>
 						Add the Audit SKU
 					</Link>

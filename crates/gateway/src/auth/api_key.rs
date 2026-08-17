@@ -40,7 +40,7 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
     // Path 1: real Postgres lookup. Hash + index-scan happens here.
     if let Some(pool) = crate::db::global_pool() {
         match crate::db::api_keys::lookup_tenant_by_key_body(pool, key_body).await {
-            Ok(Some((tenant_id, key_id))) => {
+            Ok(Some((tenant_id, key_id, key_scope))) => {
                 return Ok(Claims {
                     tenant_id,
                     // `sub` is the api_keys.id UUID — never a value derived from
@@ -50,8 +50,16 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     sub: format!("apikey:{key_id}"),
                     exp: u64::MAX,
                     auth_method: AuthMethod::ApiKey,
-                    // API keys carry no role → grandfathered full access.
+                    // API keys carry no role. That is NOT full access: since PL-9b
+                    // `has_no_role_system` covers only the self-host master key, so a
+                    // tenant key is denied `can_admin`. Per-capability predicates decide
+                    // what it may do (e.g. `can_write_prompts` admits it, A8).
                     role: None,
+                    // A13: the capability resolved at auth time. A key minted
+                    // before A13 has scope IS NULL -> LegacyFullSurface, so it
+                    // keeps working exactly as it did; a scoped key carries only
+                    // what it was granted.
+                    key_scope,
                 });
             }
             Ok(None) => bail!("API key not found or revoked"),
@@ -88,6 +96,7 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                 exp: u64::MAX,
                 auth_method: AuthMethod::ApiKey,
                 role: None,
+                key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
             });
         }
     }

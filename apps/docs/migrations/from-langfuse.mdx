@@ -1,45 +1,58 @@
 ---
 title: Migrating from Langfuse
-description: Point your existing Langfuse SDK at Tracelane's OTLP endpoint, or swap to the Tracelane SDK — an OTel-native pivot for LLM tracing.
+description: Point your existing Langfuse SDK at Tracelane's OTLP endpoint, or swap to the Tracelane SDK — an OTel-native pivot for LLM tracing that works on Cloud and self-host alike.
 classification: PUBLIC
 ---
 
 Langfuse exposes traces over its own SDK + an OTLP endpoint. Tracelane is
 OTel-native, so the pivot is:
 
-1. Keep your Langfuse SDK if you want, but configure its OTLP exporter
-   to point at an ingest receiver you run.
+1. Keep your Langfuse SDK if you want, but repoint its OTLP exporter.
 2. Or swap to `@tracelanedev/sdk` / `tracelane` (Python) and
    delete the Langfuse SDK.
 
 <Note>
-  Tracelane Cloud has **no public OTLP ingress**. On Cloud, traces are captured
-  at the gateway — point any OpenAI-compatible client at
-  `https://gateway.tracelane.dev/v1` and you are done (see the
-  [quickstart](/quickstart)). Paths A and B below describe pointing an OTLP
-  exporter at an ingest receiver **you** run, which is the self-host
-  configuration.
+  Both paths work on **Tracelane Cloud** and on self-host. On Cloud the OTLP
+  endpoint is the gateway, `https://gateway.tracelane.dev`, authenticated with a
+  `tlane_…` key carrying the **`ingest`** scope. Self-hosting, it is the ingest
+  receiver you run. If you only want the model call captured and not the agent's
+  structure, you need no exporter at all — point any OpenAI-compatible client at
+  `https://gateway.tracelane.dev/v1` (see the [quickstart](/quickstart)).
 </Note>
 
-## Path A — keep the Langfuse SDK (self-host)
+## Path A — keep the Langfuse SDK
 
-Point Langfuse's OTLP exporter at your own Tracelane ingest receiver. The
-receiver speaks OTLP **HTTP on :4318**:
+Repoint Langfuse's OTLP exporter. Tracelane accepts **both** OTLP/HTTP wire
+formats — protobuf and JSON, selected by `Content-Type` — and
+the exporter appends `/v1/traces` to whatever base you give it:
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # the ingest you run
+# Tracelane Cloud
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://gateway.tracelane.dev
 export OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer\ tlane_<your_key>
+
+# or a self-hosted ingest receiver you run
+# export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 ```
 
 Langfuse-emitted spans land in your ClickHouse hot tier and the dashboard
-renders them. Predictive guardrails won't fire (they need the gateway path),
-but observability + audit work.
+renders them. Predictive guardrails won't fire (they need the gateway's
+chat path), but observability + audit work.
 
-Bearer auth on the receiver is the single-tenant self-host mode. A
-multi-tenant ingest deployment enforces SPIFFE mTLS instead — see
-[SPIFFE ingest](/security/spiffe-ingest).
+<Warning>
+  **Spans sent this way are stored and queryable, but not hash-chained.** Only
+  calls proxied through the gateway's chat path enter the tamper-evident ledger —
+  see [the audit ledger](/audit-ledger). This is a property of the SDK path on
+  Cloud and self-host alike, not a Cloud limitation.
+</Warning>
 
-## Path B — full swap (self-host)
+**On a self-hosted, multi-tenant ingest, `Authorization` is not read at all** —
+that deployment enforces SPIFFE mTLS and authenticates the client certificate,
+not a bearer token (see [SPIFFE ingest](/security/spiffe-ingest)). The bearer
+above is for the Cloud gateway, and for single-tenant self-host it is ignored
+because there is exactly one tenant to attribute to.
+
+## Path B — full swap
 
 ```bash
 npm uninstall langfuse
@@ -51,8 +64,8 @@ import { init, instrumentOpenAI } from "@tracelanedev/sdk";
 import OpenAI from "openai";
 
 init({
-  endpoint: "http://localhost:4318", // an OTLP receiver you run
-  apiKey: process.env.TRACELANE_API_KEY!,
+  endpoint: "https://gateway.tracelane.dev", // or your own receiver
+  apiKey: process.env.TRACELANE_API_KEY!,    // needs the `ingest` scope
 });
 
 const client = new OpenAI();

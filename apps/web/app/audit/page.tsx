@@ -312,7 +312,7 @@ export default async function AuditPage({
 			    slice doesn't start at genesis and can't be verified (that was the
 			    24h-shows-0 bug). The view shows the first N events from genesis; the
 			    complete ledger is the export. */}
-			<div className="mb-6 max-w-2xl">
+			<div className="mb-4 max-w-2xl">
 				<h1 className="t-h1">Audit Ledger</h1>
 				<p className="mt-1 text-[13px] text-ink-2">
 					A tamper-evident, independently verifiable record of every

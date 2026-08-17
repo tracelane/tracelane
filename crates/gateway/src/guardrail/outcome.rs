@@ -313,6 +313,16 @@ pub mod reason_codes {
     /// Hard budget cap configured but session spend state is unknown (cache
     /// miss) → fail closed (§3 R1).
     pub const BUDGET_STATE_UNKNOWN: &str = "BUDGET_STATE_UNKNOWN";
+    /// The agent run took more tool-calling STEPS than the configured cap
+    /// (GWY-23 `step_cap_per_run`).
+    pub const STEP_CAP: &str = "STEP_CAP";
+    /// The SAME tool call (identical name + canonicalized arguments) repeated
+    /// more times in one run than the configured cap — the stuck-loop /
+    /// runaway signature (GWY-23 loop-hash detector).
+    pub const LOOP_HASH_REPEAT: &str = "LOOP_HASH_REPEAT";
+    /// More sub-agent delegations are open (spawned, not yet returned) than the
+    /// configured nesting cap (GWY-23 sub-agent depth cap).
+    pub const SUBAGENT_DEPTH_CAP: &str = "SUBAGENT_DEPTH_CAP";
 
     // ── R2 secrets + structured-PII ────────────────────────────────────────
     pub const SECRET_DETECTED: &str = "SECRET_DETECTED";
@@ -326,6 +336,10 @@ pub mod reason_codes {
     pub const TOOL_SCHEMA_INVALID: &str = "TOOL_SCHEMA_INVALID";
     pub const TOOL_ARG_POLICY: &str = "TOOL_ARG_POLICY";
     pub const TOOL_DEF_DRIFT: &str = "TOOL_DEF_DRIFT";
+    /// A call to a tool whose definition drifted from its approved pin, under
+    /// the opt-in SUSPEND posture — the tool stays suspended until the new
+    /// definition is re-approved (GWY-15 suspend/re-approve).
+    pub const TOOL_SUSPENDED: &str = "TOOL_SUSPENDED";
     pub const TOOL_DESC_INJECTION: &str = "TOOL_DESC_INJECTION";
 
     // ── R4 lethal trifecta ─────────────────────────────────────────────────

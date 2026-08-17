@@ -17,13 +17,22 @@ Enforced invariants:
   3. seeder ids ⊆ taxonomy keys         — the demo seeder may only emit ids the
                                           map knows (no reintroduced slug).
 
-Exit 0 iff all hold. Wired into scripts/verify-all.sh.
+Exit codes:
+    0 — all three invariants hold
+    1 — at least one is violated
+    2 — --selftest failed, or an unrecognised argument was passed
+
+Wired into scripts/verify-all.sh.
+Falsify it:  python3 scripts/ci/check-aft-vocabulary.py --selftest
 """
 
 from __future__ import annotations
 
+import argparse
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,7 +73,7 @@ def _is_stub(src: str) -> bool:
     return any(m in src for m in STUB_MARKERS)
 
 
-def detector_ids() -> tuple[set[str], set[str]]:
+def detector_ids(src_dirs: list[Path]) -> tuple[set[str], set[str]]:
     """(live_ids, stub_ids).
 
     live_ids  — canonical ids emitted by detectors that can actually produce a verdict.
@@ -72,7 +81,7 @@ def detector_ids() -> tuple[set[str], set[str]]:
     """
     live: set[str] = set()
     stub: set[str] = set()
-    for src_dir in (PREDICTIVE, GUARDRAIL_RAILS):
+    for src_dir in src_dirs:
         for rs in sorted(src_dir.glob("*.rs")):
             src = rs.read_text()
             found = set(AFT_LITERAL.findall(src))
@@ -84,9 +93,9 @@ def detector_ids() -> tuple[set[str], set[str]]:
     return live, stub - live
 
 
-def taxonomy_entries() -> dict[str, str]:
+def taxonomy_entries(path: Path) -> dict[str, str]:
     """{canonical id -> detectorStatus} parsed from aft-taxonomy.ts."""
-    text = TAXONOMY.read_text()
+    text = path.read_text()
     # each entry: "AFT-…": { … detectorStatus: "live"|"roadmap" … }
     pairs = re.findall(
         r'"(AFT-[A-Z0-9-]+)":\s*\{.*?detectorStatus:\s*"(live|roadmap)"',
@@ -96,33 +105,40 @@ def taxonomy_entries() -> dict[str, str]:
     return {aft: status for aft, status in pairs}
 
 
-def seeder_ids() -> set[str]:
+def seeder_ids(path: Path) -> set[str]:
     """EVERY quoted entry in the demo seeder's AFT_SIGNATURES list.
 
     Deliberately NOT limited to the AFT- prefix: the whole point of the inverse
     lint is to catch a reintroduced *slug* (e.g. "retry-storm"), which has no
     AFT- prefix and would otherwise be invisible.
     """
-    text = SEEDER.read_text()
+    text = path.read_text()
     m = re.search(r"AFT_SIGNATURES\s*=\s*\[(.*?)\]", text, re.DOTALL)
     if not m:
         return set()
     return set(re.findall(r'"([^"]+)"', m.group(1)))
 
 
-def main() -> int:
-    detectors, stubbed = detector_ids()
-    taxo = taxonomy_entries()
+def check(
+    src_dirs: list[Path],
+    taxonomy_path: Path,
+    seeder_path: Path,
+    quiet: bool = False,
+) -> list[str]:
+    """Return every vocabulary inconsistency. Empty list == all invariants hold."""
+    detectors, stubbed = detector_ids(src_dirs)
+    taxo = taxonomy_entries(taxonomy_path)
     taxo_ids = set(taxo)
     live = {a for a, s in taxo.items() if s == "live"}
-    seeder = seeder_ids()
+    seeder = seeder_ids(seeder_path)
 
-    print("== AFT-1 vocabulary guard ==")
-    print(
-        f"  detectors emit : {len(detectors)} ids ({len(stubbed)} stubbed -> must be roadmap)"
-    )
-    print(f"  taxonomy map   : {len(taxo_ids)} ids ({len(live)} live)")
-    print(f"  seeder emits   : {len(seeder)} ids")
+    if not quiet:
+        print("== AFT-1 vocabulary guard ==")
+        print(
+            f"  detectors emit : {len(detectors)} ids ({len(stubbed)} stubbed -> must be roadmap)"
+        )
+        print(f"  taxonomy map   : {len(taxo_ids)} ids ({len(live)} live)")
+        print(f"  seeder emits   : {len(seeder)} ids")
 
     errors: list[str] = []
 
@@ -163,6 +179,194 @@ def main() -> int:
     if not detectors:
         errors.append("parsed ZERO detector ids — parser/path drift, refusing to pass")
 
+    return errors
+
+
+# --------------------------------------------------------------------------
+# selftest
+#
+# The guard reads three surfaces (detector .rs files, the taxonomy .ts map, the
+# seeder .py), so the fixtures are a miniature of that tree built under a temp
+# dir — nothing under the repo is written or edited. Each case mutates ONE
+# surface and asserts the guard blocks; the first case asserts a consistent
+# vocabulary passes, without which "blocks on everything" would look correct.
+# --------------------------------------------------------------------------
+
+_REAL_DETECTOR = """
+pub fn detect(&self, req: &Request) -> Option<Finding> {
+    if req.tools.iter().any(|t| POISON.is_match(&t.description)) {
+        return Some(Finding::new("AFT-TOOL-POISON-001"));
+    }
+    None
+}
+"""
+
+_STUB_DETECTOR = """
+/// Stub: returns 0.0 until the model is trained. Emits "AFT-TRAJ-ANOMALY-001".
+pub fn score(&self, _t: &Trajectory) -> f32 {
+    0.0
+}
+"""
+
+
+def _taxonomy_src(entries: dict[str, str]) -> str:
+    body = "\n".join(
+        f'  "{aft}": {{ label: "x", detectorStatus: "{status}" }},'
+        for aft, status in entries.items()
+    )
+    return "export const AFT_TAXONOMY = {\n" + body + "\n};\n"
+
+
+def _seeder_src(ids: list[str]) -> str:
+    body = ", ".join(f'"{i}"' for i in ids)
+    return f"AFT_SIGNATURES = [{body}]\n"
+
+
+def _fixture(
+    td: Path,
+    name: str,
+    taxonomy: dict[str, str],
+    seeder: list[str],
+    detectors: bool = True,
+) -> tuple[list[Path], Path, Path]:
+    case = td / name
+    det = case / "detectors"
+    det.mkdir(parents=True)
+    if detectors:
+        (det / "tool_safety.rs").write_text(_REAL_DETECTOR)
+        (det / "trajectory_guard.rs").write_text(_STUB_DETECTOR)
+    tax = case / "aft-taxonomy.ts"
+    tax.write_text(_taxonomy_src(taxonomy))
+    seed = case / "demo_traces.py"
+    seed.write_text(_seeder_src(seeder))
+    return [det], tax, seed
+
+
+LIVE = "AFT-TOOL-POISON-001"
+STUBBED = "AFT-TRAJ-ANOMALY-001"
+
+
+def selftest() -> int:
+    before = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+
+    # (name, taxonomy map, seeder ids, has detector files, expected substring | None)
+    cases: list[tuple[str, dict[str, str], list[str], bool, str | None]] = [
+        (
+            "consistent_vocabulary",
+            {LIVE: "live", STUBBED: "roadmap"},
+            [LIVE, STUBBED],
+            True,
+            None,
+        ),
+        (
+            "detector_id_missing_from_map",
+            {STUBBED: "roadmap"},
+            [STUBBED],
+            True,
+            "NOT in aft-taxonomy.ts",
+        ),
+        (
+            "stub_labelled_live",
+            {LIVE: "live", STUBBED: "live"},
+            [LIVE],
+            True,
+            "labelled detectorStatus:'live' with NO real detector",
+        ),
+        (
+            "real_detector_labelled_roadmap",
+            {LIVE: "roadmap", STUBBED: "roadmap"},
+            [LIVE],
+            True,
+            "NOT labelled detectorStatus:'live'",
+        ),
+        (
+            "seeder_reintroduces_a_slug",
+            {LIVE: "live", STUBBED: "roadmap"},
+            [LIVE, "retry-storm"],
+            True,
+            "reintroduced slug / unknown id",
+        ),
+        (
+            "taxonomy_parse_drift",
+            {},
+            [],
+            True,
+            "parsed ZERO taxonomy entries",
+        ),
+        (
+            "detector_path_drift",
+            {LIVE: "live"},
+            [LIVE],
+            False,
+            "parsed ZERO detector ids",
+        ),
+    ]
+
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        td = Path(tmp)
+        for name, taxonomy, seeder, has_det, expect in cases:
+            dirs, tax, seed = _fixture(td, name, taxonomy, seeder, has_det)
+            errors = check(dirs, tax, seed, quiet=True)
+            if expect is None:
+                ok = not errors
+                detail = "clean vocabulary passes" if ok else f"unexpected: {errors}"
+            else:
+                ok = any(expect in e for e in errors)
+                detail = (
+                    f"blocked on {expect!r}"
+                    if ok
+                    else f"NOT blocked; got {errors or 'no errors'}"
+                )
+            print(f"  {'✓' if ok else '✗'} {name}: {detail}")
+            if not ok:
+                failures += 1
+
+    after = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    if before != after:
+        print("  ✗ tree_unchanged: the selftest left the working tree modified")
+        failures += 1
+    else:
+        print("  ✓ tree_unchanged: git status --porcelain identical before/after")
+
+    if failures:
+        print(f"\nselftest FAILED — {failures} case(s). The guard is not trustworthy.")
+        return 2
+    print(
+        f"\n{len(cases)} cases: the guard blocks an unmapped detector id, a stub claimed "
+        "live, an under-claimed detector, a reintroduced seeder slug and both parser "
+        "drifts — and passes a consistent vocabulary."
+    )
+    print("selftest PASSED.")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="AFT-1 vocabulary guard (detectors ⊆ map, live ⟺ detector, seeder ⊆ map)"
+    )
+    ap.add_argument(
+        "--selftest",
+        action="store_true",
+        help="plant vocabulary inconsistencies and prove the guard blocks them",
+    )
+    args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+
+    errors = check([PREDICTIVE, GUARDRAIL_RAILS], TAXONOMY, SEEDER)
     if errors:
         print("\nx AFT-1 vocabulary guard FAILED:")
         for e in errors:

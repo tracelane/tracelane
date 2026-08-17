@@ -1,11 +1,11 @@
 ---
-title: Tracelane concepts — spans, traces, sessions, projects
-description: Learn Tracelane's data model — spans, traces, sessions, organizations, projects, environments — and how quotas are metered against your plan.
+title: Tracelane concepts — spans, traces, sessions, organizations
+description: Learn Tracelane's data model — spans, traces, sessions, organizations, environments — and how quotas are metered against your plan.
 classification: PUBLIC
 ---
 
-Five words carry most of Tracelane's data model: **span**, **trace**, **session**,
-**organization**, and **project**. Get these right and the dashboard, the API, and
+Four words carry most of Tracelane's data model: **span**, **trace**, **session**,
+and **organization**. Get these right and the dashboard, the API, and
 your bill all read the same way.
 
 ## Span, trace, session
@@ -38,16 +38,72 @@ session  (conversation)
    └─ span  gen_ai.chat        model=claude-sonnet-4-6  tokens=880    cost=$0.004
 ```
 
-## Organization, project, environment
+## How a session gets its id
+
+A trace joins a session only if the call carries a conversation id. Tracelane
+never guesses one — two traces are the same conversation because **you** said so.
+
+There are exactly two ways to say it, and they end up in the same place:
+
+| Path | What you send | Where it lands |
+|---|---|---|
+| Gateway | the `x-conversation-id` request header (`x-session-id` is accepted as an alias) | the span's `gen_ai.conversation_id` |
+| OTLP | the `gen_ai.conversation.id` span attribute | the same column |
+
+Both SDKs set it for you. Wrap the turn, and every call inside the scope joins
+the session:
+
+<CodeGroup>
+
+```typescript TypeScript
+import { instrumentOpenAI, withSession } from "@tracelanedev/sdk";
+
+instrumentOpenAI(client);
+
+await withSession(conversationId, async () => {
+  await client.chat.completions.create({ model: "claude-sonnet-4-6", messages });
+  await client.chat.completions.create({ model: "claude-sonnet-4-6", messages: followUp });
+});
+```
+
+```python Python
+from tracelane import instrument_openai, use_session
+
+instrument_openai(client)
+
+with use_session(conversation_id):
+    client.chat.completions.create(model="claude-sonnet-4-6", messages=messages)
+    client.chat.completions.create(model="claude-sonnet-4-6", messages=follow_up)
+```
+
+</CodeGroup>
+
+Auto-attach covers the adapters that carry a per-call header argument —
+`instrumentOpenAI`, `instrumentAnthropic`, `instrumentLiteLLM`,
+`instrumentOpenRouter` in TypeScript; `instrument_openai`,
+`instrument_anthropic`, `instrument_openrouter` in Python. For any other client
+— including the no-SDK gateway path in the [Quickstart](/quickstart) — pass the
+header yourself with `sessionHeaders(id)` (TypeScript) or `session_headers(id)`
+(Python).
+
+<Note>
+**Ids are validated, not silently dropped.** A session id must be non-empty
+visible ASCII, at most 256 characters. Anything outside that throws at the call
+you wrote — the gateway would otherwise drop the header and the session would
+vanish with no error. An over-long id is rejected, never truncated, because a
+truncated id would split one conversation into two.
+</Note>
+
+A call made outside any session sends no session header and carries no
+conversation id — it is still a trace, just not part of a conversation.
+
+## Organization and environment
 
 - **Organization** — your workspace. An org maps 1:1 to a WorkOS Organization and
   to an internal **tenant** UUID. All isolation is per-tenant: every ClickHouse
   query runs `WHERE tenant_id = ?`, with the tenant taken from your validated JWT,
   never a request body. (The WorkOS `org_id` is resolved to the internal tenant
   UUID before any query — see [Tenant isolation](/security/tenant-isolation).)
-- **Project** — a logical app or agent **within** an org. Project scope adds a
-  `project_id` dimension on spans, and queries extend to
-  `WHERE tenant_id = ? AND project_id = ?`.
 - **Environment** — a promotion stage for prompt versions (`staging` →
   `production`). Environments apply to [prompt promotion](/prompt-promotion), not
   to trace storage.
@@ -55,8 +111,8 @@ session  (conversation)
 ## How usage is metered
 
 Billing is measured in **traces**, not spans and not raw gateway calls. Each plan
-includes a monthly **trace** quota *and* a separate **gateway-call** quota (for
-example, Builder includes 150K traces + 150K gateway calls). Above the included
+includes one monthly **trace** quota and nothing else to track — there is no
+separate gateway-call budget (Builder includes 150K traces). Above the included
 trace quota, overage meters at **$1.20 per 10K traces**, up to a **5× hard cap** —
 past which the gateway returns HTTP 429. See [Pricing](/pricing) for the exact
 per-tier numbers (they are the source of truth).
@@ -65,8 +121,7 @@ Tenants with no billing account — OSS self-host and unbilled workspaces — ar
 **never metered**.
 
 <Note>
-**What this page does not settle yet.** Per-project API keys and the `project_id`
-dimension are newly landed and rolling out. The exact accounting rules for
+**What this page does not settle yet.** The exact accounting rules for
 partial-trace and failed-request metering are defined by the pricing configuration
 in Polar, not by this page — always reconcile any usage number against
 [Pricing](/pricing) and your Polar dashboard.

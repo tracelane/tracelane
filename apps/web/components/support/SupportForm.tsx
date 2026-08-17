@@ -82,7 +82,7 @@ export function SupportForm() {
 				<button
 					type="button"
 					onClick={() => setStatus("idle")}
-					className="mt-4 rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-on transition-colors hover:bg-accent/90"
+					className="mt-4 rounded-md bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90"
 				>
 					Send another
 				</button>
@@ -99,6 +99,14 @@ export function SupportForm() {
 						key={t.key}
 						type="button"
 						onClick={() => setKind(t.key)}
+						// Which tab is selected was conveyed by COLOUR ALONE — a screen
+						// reader announced three identical buttons with no selected
+						// state (WCAG 1.4.1 / 4.1.2). `RangeControl.tsx:100` already
+						// does this; this control was missed. Found by the L16
+						// already-selected tab is correctly inert on re-click, and with
+						// no `aria-pressed` there was nothing to distinguish "correctly
+						// inert" from "wired to nothing".
+						aria-pressed={kind === t.key}
 						className={cn(
 							"flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal",
 							kind === t.key
@@ -122,7 +130,7 @@ export function SupportForm() {
 				id="support-area"
 				value={area}
 				onChange={(e) => setArea(e.target.value)}
-				className="mb-4 w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-accent-line"
+				className="mb-4 w-full rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-action-line"
 			>
 				{AREAS.map((a) => (
 					<option key={a.key} value={a.key}>
@@ -154,7 +162,7 @@ export function SupportForm() {
 				maxLength={MAX}
 				onChange={(e) => setMessage(e.target.value)}
 				placeholder="Tell us what's on your mind…"
-				className="h-48 w-full resize-y rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-3 focus:border-accent-line"
+				className="h-48 w-full resize-y rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-3 focus:border-action-line"
 			/>
 
 			{status === "error" && (
@@ -168,7 +176,7 @@ export function SupportForm() {
 					type="button"
 					onClick={send}
 					disabled={status === "sending" || !message.trim()}
-					className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-on transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40"
+					className="rounded-md bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
 				>
 					{status === "sending" ? "Sending…" : "Send"}
 				</button>

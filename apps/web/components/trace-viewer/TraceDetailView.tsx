@@ -48,9 +48,16 @@ const KIND_LABEL: Record<SpanKind, string> = {
 	unknown: "Other",
 };
 
-function toNode(row: VisibleRow): SpanNode {
+function toNode(row: VisibleRow, hitCounts?: Record<string, number>): SpanNode {
 	const s = row.span;
 	const matched = s.aft_ids[0];
+	// OBS-33: the badge reads "SEEN N×", which a user reads as "my workspace has hit
+	// this signature N times". `hits` carries that number, sourced from the gateway's
+	// per-tenant `your_hits` aggregate. It is NOT `s.aft_ids.length` — that is how many
+	// DIFFERENT signatures matched this one span, which is a different quantity and was
+	// almost always 1, so the badge read "SEEN 1×" for a signature the tenant had hit
+	// hundreds of times.
+	const hits = matched ? hitCounts?.[matched] : undefined;
 	return {
 		id: s.span_id,
 		name: s.name,
@@ -62,7 +69,10 @@ function toNode(row: VisibleRow): SpanNode {
 		// label = human name from AFT-1 spec; title = "id: label" tooltip on hover.
 		signature: matched
 			? {
-					count: s.aft_ids.length,
+					// Undefined until the per-tenant aggregate loads. The badge renders
+					// the label without a count rather than showing a wrong one — an
+					// invented number is worse than an absent one on a trust surface.
+					count: hits,
 					label: aftLabel(matched),
 					href: "/signatures",
 					title: `${matched}: ${aftLabel(matched)}`,
@@ -74,7 +84,18 @@ function toNode(row: VisibleRow): SpanNode {
 	};
 }
 
-export function TraceDetailView({ spans }: { spans: Span[] }) {
+export function TraceDetailView({
+	spans,
+	hitCounts,
+}: {
+	spans: Span[];
+	/**
+	 * OBS-33 — per-tenant `your_hits` per signature id, resolved SERVER-side by the
+	 * page and passed down. Undefined when the aggregate was unavailable; the badge
+	 * then renders without a count rather than substituting a wrong one.
+	 */
+	hitCounts?: Record<string, number>;
+}) {
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
 	const [query, setQuery] = useState("");
@@ -86,7 +107,10 @@ export function TraceDetailView({ spans }: { spans: Span[] }) {
 		() => computeVisibleRows(spans, { collapsed, query, errorsOnly }),
 		[spans, collapsed, query, errorsOnly],
 	);
-	const nodes = useMemo(() => rows.map(toNode), [rows]);
+	const nodes = useMemo(
+		() => rows.map((r) => toNode(r, hitCounts)),
+		[rows, hitCounts],
+	);
 	// Axis bounds from ALL spans (not just visible) so collapsing never rescales.
 	const bounds = useMemo(() => traceTimeBounds(spans), [spans]);
 	const selectedSpan = useMemo(
@@ -155,7 +179,7 @@ export function TraceDetailView({ spans }: { spans: Span[] }) {
 							onChange={(e) => setQuery(e.target.value)}
 							placeholder="Search spans…"
 							aria-label="Search spans"
-							className="w-full max-w-xs rounded-md border border-line bg-surface px-3 py-1.5 text-xs text-ink outline-none placeholder:text-ink-3 focus-visible:ring-2 focus-visible:ring-seal"
+							className="w-full max-w-xs rounded-sm border border-line bg-surface px-3 py-1.5 text-xs text-ink outline-none placeholder:text-ink-3 focus-visible:ring-2 focus-visible:ring-seal"
 						/>
 						{errorCount > 0 && (
 							<button

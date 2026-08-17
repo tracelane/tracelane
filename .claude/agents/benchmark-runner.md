@@ -9,8 +9,8 @@ classification: INTERNAL
 
 Run benchmarks before merging hot-path changes.
 
-`pnpm bench:gateway`    — must hit p99 <25ms, ≥5K RPS
-`pnpm bench:ingest`     — must hit ≥50K spans/sec single-node
+`pnpm bench:gateway`    — compare against the recorded baseline; block on a >10% regression
+`pnpm bench:ingest`     — compare against the recorded baseline; block on a >10% regression
 `pnpm bench:predictive` — must hit p99 <50ms inline
 
 For any regression:

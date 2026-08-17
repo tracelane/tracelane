@@ -1,0 +1,72 @@
+#
+# WHY THIS IS A SEPARATE WORKFLOW AND NOT A JOB INSIDE `CI`
+# ========================================================
+# This assertion has now failed twice from INSIDE the run it is observing, for two
+# opposite reasons, and the second failure is what produced this file:
+#
+#   1. As a job with `needs: [live-eval-gate, l16-e2e-gate, span-publish-integration,
+#      ingest-release-tenant-guard]` it could not speak when a need never reached a
+#      conclusion. `always()` does NOT cover that — it means "run even if a need
+#      FAILED", not "run even if a need never CONCLUDED". On run 31511826456 it sat
+#      `in_progress` while the run concluded `failure`: silent on the one run that
+#      mattered.
+#   2. With `needs:` removed so it could observe rather than depend, it started
+#      immediately and polled while the tier jobs were still QUEUED — reporting
+#      "never concluded" for jobs that simply had not run yet (run 31525023733).
+#      A false positive. The `needs:` edge had also been supplying the ORDERING that
+#      made the assertion meaningful; dropping it threw that away.
+#
+# Polling long enough to cover the tier's real duration would fix (2) but bill the
+# tier's whole wall-clock as idle runner minutes — tens of minutes per run, against a
+# 2,000-minute allowance.
+#
+# `workflow_run` resolves all three. It fires AFTER the CI run has concluded, so:
+#   * every job is already terminal — no polling, no ordering problem, ~1 billable
+#     minute;
+#   * it fires on `completed` regardless of conclusion, so it speaks on RED runs,
+#     which is the only time it carries information;
+#   * a hung or cancelled job is visible as a finished-run fact rather than as a
+#     dependency that never resolves.
+#
+# It reads the TRIGGERING run's job list, never its own.
+name: Behavioral tier actually ran (B-169)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read # read the triggering run's job list
+
+jobs:
+  assert-tier-ran:
+    name: Assert the behavioral tier executed
+    # Scoped to the events where `changes` fail-safes to run-all, so all four tier
+    # jobs are EXPECTED and `skipped` is unambiguously wrong. On push/PR the tier is
+    # path-gated and `skipped` is the CORRECT answer — asserting there would fire on
+    # every docs PR and get overridden, which is how a guard dies.
+    if: >-
+      github.event.workflow_run.event == 'schedule' ||
+      github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert the behavioral tier executed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # THE triggering run, not this one — and the variable is deliberately
+          # NOT called GITHUB_RUN_ID. GitHub SILENTLY IGNORES any `env:` that
+          # overrides a `GITHUB_*` name, so the first version of this file was
+          # dropped on the floor and the script inspected this workflow's own run,
+          # finding a job list of one and reporting all four targets `absent`
+          # (observer run 31530539758). It failed CLOSED, which is the design
+          # working — but a guard that observes itself is the self-match trap in
+          # workflow form, and a reserved prefix is how it got in.
+          TIER_RUN_ID: ${{ github.event.workflow_run.id }}
+          # Everything is already terminal, so no waiting is needed. A short
+          # timeout keeps a stuck API call from billing idle minutes.
+          TIER_ASSERT_TIMEOUT: "30"
+        run: python3 scripts/ci/assert-behavioral-tier-ran.py

@@ -78,6 +78,26 @@ export function ToolPins() {
 		}
 	}
 
+	// GWY-15b. The gateway has always exposed this; nothing called it, so approving
+	// was a one-way door. Unpin is per TOOL NAME, not per hash — the gateway stores
+	// one pin per tool — so this removes approval for the tool outright.
+	async function unpin(row: Observed) {
+		setBusy(`${row.tool_name}:${row.def_hash}`);
+		try {
+			const res = await fetch(
+				`/api/guardrails/tool-pins/${encodeURIComponent(row.tool_name)}`,
+				{ method: "DELETE" },
+			);
+			// 404 = already gone (a second click, or another owner got there first).
+			// Reloading shows the true state, so treat it as success rather than
+			// showing an error for an outcome the user already wanted.
+			if (res.ok || res.status === 404) await load();
+			else if (res.status === 403) setState({ kind: "forbidden" });
+		} finally {
+			setBusy(null);
+		}
+	}
+
 	if (state.kind === "loading") {
 		return <p className="text-sm text-ink-2">Loading observed tools…</p>;
 	}
@@ -118,12 +138,12 @@ export function ToolPins() {
 			<table className="w-full text-sm">
 				<thead>
 					<tr className="text-left text-ink-2">
-						<th className="py-2 pr-4 font-medium">Tool</th>
-						<th className="py-2 pr-4 font-medium">Definition</th>
-						<th className="py-2 pr-4 font-medium">First seen (UTC)</th>
-						<th className="py-2 pr-4 font-medium">Last seen (UTC)</th>
-						<th className="py-2 pr-4 font-medium">Status</th>
-						<th className="py-2 font-medium" />
+						<th className="py-1.5 pr-3 font-medium">Tool</th>
+						<th className="py-1.5 pr-3 font-medium">Definition</th>
+						<th className="py-1.5 pr-3 font-medium">First seen (UTC)</th>
+						<th className="py-1.5 pr-3 font-medium">Last seen (UTC)</th>
+						<th className="py-1.5 pr-3 font-medium">Status</th>
+						<th className="px-3 py-1.5 font-medium" />
 					</tr>
 				</thead>
 				<tbody>
@@ -133,17 +153,17 @@ export function ToolPins() {
 						const key = `${r.tool_name}:${r.def_hash}`;
 						return (
 							<tr key={key} className="border-t border-line">
-								<td className="py-2 pr-4 font-mono">{r.tool_name}</td>
-								<td className="py-2 pr-4 font-mono text-ink-2">
+								<td className="py-2 pr-3 font-mono">{r.tool_name}</td>
+								<td className="py-2 pr-3 font-mono text-ink-2">
 									{r.def_hash.slice(0, 12)}…
 								</td>
-								<td className="py-2 pr-4 text-ink-2">
+								<td className="py-2 pr-3 text-ink-2">
 									{absoluteDate(r.first_seen)}
 								</td>
-								<td className="py-2 pr-4 text-ink-2">
+								<td className="py-2 pr-3 text-ink-2">
 									{absoluteDate(r.last_seen)}
 								</td>
-								<td className="py-2 pr-4">
+								<td className="py-2 pr-3">
 									{r.approved ? (
 										<Badge tone="ok">Approved</Badge>
 									) : isDrift ? (
@@ -152,8 +172,17 @@ export function ToolPins() {
 										<Badge tone="neutral">Not approved</Badge>
 									)}
 								</td>
-								<td className="py-2">
-									{r.approved ? null : (
+								<td className="px-3 py-2">
+									{r.approved ? (
+										<button
+											type="button"
+											onClick={() => void unpin(r)}
+											disabled={busy === key}
+											className="rounded-md border border-line px-2.5 py-1 text-[13px] font-medium text-ink-2 hover:bg-surface-2 disabled:opacity-50"
+										>
+											{busy === key ? "Removing…" : "Remove approval"}
+										</button>
+									) : (
 										<button
 											type="button"
 											onClick={() => void approve(r)}
@@ -177,7 +206,10 @@ export function ToolPins() {
 				Approving pins this exact definition. If the tool's name, schema or
 				description changes afterwards, the guardrail engine flags it as
 				definition drift on the next request. Approving never grants a tool any
-				capability — that is a separate, owner-only setting.
+				capability — that is a separate, owner-only setting. Removing an
+				approval deletes the pin, so the tool goes back to unapproved and there
+				is no longer a definition to compare against — drift is no longer
+				reported for it until you approve one again.
 			</p>
 		</div>
 	);

@@ -1,0 +1,49 @@
+---
+const chisel = `<svg viewBox="0 0 100 100" width="26" height="26" aria-hidden="true" class="logo-mark">
+  <path d="M 2,2 L 96,2 L 84,14 L 2,14 Z" fill="currentColor"/>
+  <path d="M 2,14 L 14,14 L 14,28 L 44,28 L 44,40 L 12,40 L 2,30 Z" fill="currentColor"/>
+  <path d="M 32,40 L 44,40 L 44,86 L 32,98 Z" fill="currentColor"/>
+  <path d="M 96,16 L 96,28 L 84,40 L 54,40 L 54,28 L 84,28 Z" fill="currentColor"/>
+  <path d="M 54,40 L 66,40 L 66,64 L 78,64 L 54,88 Z" fill="currentColor"/>
+</svg>`;
+---
+
+<footer class="mt-24 border-t border-border" style="background: color-mix(in srgb, var(--color-accent) 14%, #ffffff)">
+  <div class="w-full px-5 sm:px-8 py-14">
+    <div class="grid gap-10 sm:grid-cols-2 lg:grid-cols-[1.5fr_1fr_1fr_1fr] text-sm">
+      <div class="max-w-xs">
+        <p class="flex items-center gap-2.5 text-fg lowercase font-semibold text-xl" style="font-family:var(--font-display)"><span set:html={chisel} />tracelane</p>
+        <p class="mt-4 text-fg-subtle leading-relaxed">The flight recorder for AI agents. Open source, Apache 2.0.</p>
+      </div>
+      <nav aria-label="Product">
+        <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider uppercase">Product</p>
+        <ul class="space-y-2.5 text-fg-muted">
+          <li><a href="/#what" class="hover:text-fg transition-colors">What</a></li>
+          <li><a href="/#audit" class="hover:text-fg transition-colors">Audit Ledger</a></li>
+          <li><a href="/pricing" class="hover:text-fg transition-colors">Pricing</a></li>
+          <li><a href="https://docs.tracelane.dev" class="hover:text-fg transition-colors" rel="noopener">Docs</a></li>
+        </ul>
+      </nav>
+      <nav aria-label="Resources">
+        <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider uppercase">Resources</p>
+        <ul class="space-y-2.5 text-fg-muted">
+          <li><a href="https://github.com/tracelane" class="hover:text-fg transition-colors" rel="me noopener">GitHub</a></li>
+          <li><a href="/security" class="hover:text-fg transition-colors">Security</a></li>
+          <li><a href="https://newsletter.aitechhive.com" class="hover:text-fg transition-colors" rel="noopener">Working Notes</a></li>
+                  </ul>
+      </nav>
+      <nav aria-label="Legal">
+        <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider uppercase">Legal</p>
+        <ul class="space-y-2.5 text-fg-muted">
+          <li><a href="/privacy" class="hover:text-fg transition-colors">Privacy</a></li>
+          <li><a href="/terms" class="hover:text-fg transition-colors">Terms</a></li>
+          <li class="text-fg-subtle pt-2"><a href="mailto:support@tracelane.dev" class="hover:text-fg transition-colors">support@tracelane.dev</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="mt-12 pt-6 border-t border-border text-xs text-fg-subtle font-mono flex flex-col sm:flex-row gap-2 justify-between">
+      <p>© 2026 Tracelane. Apache 2.0 core.</p>
+      <p>Open source · Self-host anywhere · Your keys, 0% markup</p>
+    </div>
+  </div>
+</footer>

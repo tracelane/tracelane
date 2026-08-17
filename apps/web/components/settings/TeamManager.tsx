@@ -14,6 +14,7 @@
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Skeleton } from "@tracelanedev/ui";
+import Link from "next/link";
 import { useState } from "react";
 
 type Role = "owner" | "member" | "viewer";
@@ -46,9 +47,50 @@ async function fetchPending(): Promise<PendingRow[]> {
 	return res.json() as Promise<PendingRow[]>;
 }
 
+/** Error codes this surface can render as a sentence rather than a token. */
+const ERROR_COPY: Record<string, string> = {
+	already_invited: "That address already has a pending invitation.",
+	already_member: "That person is already on the team.",
+	invalid_email: "That does not look like a valid email address.",
+	owner_required: "Only an owner can invite team members.",
+};
+
+/**
+ * Turn an API error body into something a human can act on.
+ *
+ * ADR-020 seat amendment, condition A (founder, 2026-08-12): *"the 403 at cap
+ * must read as an upgrade path, not a wall."* It did not. This function used to
+ * be `return err.error ?? HTTP ${res.status}`, so hitting the seat cap rendered
+ * the literal string **`seat_limit_reached`** in red — a machine token, with the
+ * `seat_cap_max`, `used` and `upgrade_url` the API already sends thrown away.
+ *
+ * The sentence below is deliberately explicit that seats are not purchasable
+ * individually. Saying only "upgrade to add seats" would imply a per-seat
+ * purchase path that the amendment says must never exist — the copy has to match
+ * the model, or it re-creates the expectation the model rejects.
+ */
 async function jsonError(res: Response): Promise<string> {
-	const err = (await res.json().catch(() => ({}))) as { error?: string };
-	return err.error ?? `HTTP ${res.status}`;
+	const err = (await res.json().catch(() => ({}))) as {
+		error?: string;
+		seat_cap_max?: number;
+		used?: number;
+	};
+	if (err.error === "seat_limit_reached") {
+		const cap = err.seat_cap_max;
+		const used = err.used;
+		const usage =
+			typeof cap === "number" && typeof used === "number"
+				? `all ${cap} seat${cap === 1 ? "" : "s"} on your plan (${used} used)`
+				: "every seat on your plan";
+		return `You are using ${usage}. Seats are not sold individually — move to the next tier to raise the cap.`;
+	}
+	const copy = err.error ? ERROR_COPY[err.error] : undefined;
+	return copy ?? err.error ?? `HTTP ${res.status}`;
+}
+
+/** Did this invite failure come from the seat cap? Drives the billing link. */
+function isSeatCapError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes("Seats are not sold");
 }
 
 async function sendInvite(input: { email: string; role: Role }): Promise<void> {
@@ -171,7 +213,7 @@ function InviteModal({
 							value={email}
 							onChange={(e) => setEmail(e.target.value)}
 							placeholder="colleague@company.com"
-							className="w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-4"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-4"
 						/>
 						<label
 							htmlFor="team-invite-role"
@@ -183,7 +225,7 @@ function InviteModal({
 							id="team-invite-role"
 							value={role}
 							onChange={(e) => setRole(e.target.value as Role)}
-							className="w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-1"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-1"
 						>
 							<option value="member">Member — full product access</option>
 							<option value="viewer">Viewer — read-only</option>
@@ -192,9 +234,22 @@ function InviteModal({
 							Owners are promoted after they join, from their member row.
 						</p>
 						{mutation.error && (
-							<p className="text-xs text-danger-ink mb-3">
-								{(mutation.error as Error).message}
-							</p>
+							<div className="mb-3">
+								<p className="text-xs text-danger-ink">
+									{(mutation.error as Error).message}
+								</p>
+								{/* ADR-020 condition A: the cap is a route to the next tier,
+								    so it ships with the route on it. Without this the message
+								    names a limit and offers nothing. */}
+								{isSeatCapError(mutation.error) && (
+									<Link
+										href="/settings/billing"
+										className="mt-1 inline-block text-xs font-medium text-action underline underline-offset-2"
+									>
+										Compare plans →
+									</Link>
+								)}
+							</div>
 						)}
 						<div className="flex gap-2">
 							<button
@@ -210,7 +265,7 @@ function InviteModal({
 								onClick={() =>
 									mutation.mutate({ email: email.trim().toLowerCase(), role })
 								}
-								className="flex-1 rounded-lg bg-accent py-2 text-sm font-medium text-accent-on hover:bg-accent/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+								className="flex-1 rounded-lg bg-action py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 							>
 								{mutation.isPending ? "Sending…" : "Send invite"}
 							</button>
@@ -309,7 +364,7 @@ export function TeamManager({
 						<button
 							type="button"
 							onClick={() => setShowInvite(true)}
-							className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-accent-on hover:bg-accent/90 transition-colors"
+							className="rounded-lg bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors"
 						>
 							+ Invite member
 						</button>
@@ -331,16 +386,16 @@ export function TeamManager({
 					<table className="w-full text-sm">
 						<thead className="bg-surface/60">
 							<tr>
-								<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Member
 								</th>
-								<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Role
 								</th>
-								<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Joined
 								</th>
-								<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									<span className="sr-only">Actions</span>
 								</th>
 							</tr>
@@ -353,11 +408,11 @@ export function TeamManager({
 										key={m.id}
 										className="hover:bg-surface-2/40 transition-colors"
 									>
-										<td className="px-4 py-3">
+										<td className="px-3 py-2">
 											<p className="text-xs font-medium text-ink">{m.name}</p>
 											<p className="text-xs text-ink-2 font-mono">{m.email}</p>
 										</td>
-										<td className="px-4 py-3">
+										<td className="px-3 py-2">
 											{canManage && !isSelf ? (
 												<div className="flex items-center gap-2">
 													<select
@@ -401,10 +456,10 @@ export function TeamManager({
 												<RoleBadge role={m.role} />
 											)}
 										</td>
-										<td className="px-4 py-3 text-xs text-ink-2">
+										<td className="px-3 py-2 text-xs text-ink-2">
 											{absoluteDate(m.joinedAt)}
 										</td>
-										<td className="px-4 py-3 text-right">
+										<td className="px-3 py-2 text-right">
 											{canManage && !isSelf && (
 												<button
 													type="button"
@@ -456,16 +511,16 @@ export function TeamManager({
 										key={p.id}
 										className="hover:bg-surface-2/40 transition-colors"
 									>
-										<td className="px-4 py-3">
+										<td className="px-3 py-2">
 											<p className="text-xs font-mono text-ink">{p.email}</p>
 										</td>
-										<td className="px-4 py-3">
+										<td className="px-3 py-2">
 											<RoleBadge role={p.role} />
 										</td>
-										<td className="px-4 py-3 text-xs text-ink-2">
+										<td className="px-3 py-2 text-xs text-ink-2">
 											invited {absoluteDate(p.invitedAt)}
 										</td>
-										<td className="px-4 py-3 text-right space-x-3">
+										<td className="px-3 py-2 text-right space-x-3">
 											{canManage && (
 												<>
 													<button

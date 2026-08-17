@@ -144,11 +144,11 @@ async fn handler(
     // the operator-controlled allowlist. Defends against a phishing flow
     // where a malicious actor calls the checkout endpoint with a hosted
     // page they control, then Polar's branded checkout redirects to it.
-    if let Err(why) = validate_checkout_url(&success_url) {
+    if let Err(why) = super::validate_redirect_url(&success_url) {
         tracing::warn!(reason = %why, url = %success_url, "rejecting success_url");
         return error(StatusCode::BAD_REQUEST, "success_url host not allowed");
     }
-    if let Err(why) = validate_checkout_url(&cancel_url) {
+    if let Err(why) = super::validate_redirect_url(&cancel_url) {
         tracing::warn!(reason = %why, url = %cancel_url, "rejecting cancel_url");
         return error(StatusCode::BAD_REQUEST, "cancel_url host not allowed");
     }
@@ -177,33 +177,8 @@ fn error(status: StatusCode, msg: &str) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
-/// Hosts permitted as `success_url` / `cancel_url` targets (A21).
-///
-/// Allowlist permits `tracelane.dev` and any subdomain. Debug builds may
-/// set `TRACELANE_BILLING_TEST_ANY_HOST=1` to bypass the check for local
-/// integration tests; release builds ignore the env var.
-fn validate_checkout_url(url: &str) -> Result<(), &'static str> {
-    #[cfg(debug_assertions)]
-    if std::env::var("TRACELANE_BILLING_TEST_ANY_HOST").as_deref() == Ok("1") {
-        return Ok(());
-    }
-
-    let parsed = reqwest::Url::parse(url).map_err(|_| "not a valid URL")?;
-    match parsed.scheme() {
-        "https" => {}
-        "http" if cfg!(debug_assertions) => {}
-        _ => return Err("scheme must be https"),
-    }
-    let host = parsed
-        .host_str()
-        .ok_or("URL missing host")?
-        .to_ascii_lowercase();
-    if host == "tracelane.dev" || host.ends_with(".tracelane.dev") {
-        Ok(())
-    } else {
-        Err("host not on the allowlist (*.tracelane.dev)")
-    }
-}
+// The allowlist moved to `super::validate_redirect_url` (SET-18) so the portal's
+// `return_url` is guarded by the SAME check, not a second copy that can drift.
 
 #[cfg(test)]
 mod tests {

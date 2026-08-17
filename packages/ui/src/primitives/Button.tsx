@@ -7,10 +7,11 @@ const button = cva(
 	{
 		variants: {
 			// `primary` is the rationed Lava CTA — highest-intent action only. The
-			// `.cta-lava` component class (tokens.css) carries the gradient, white
-			// label, and lava glow; `bg-accent` stays the solid-fill fallback.
+			// Solid ink (ADR-074 §1: the primary button is solid ink, never a fill
+			// label, and lava glow; `bg-action` stays the solid-fill fallback.
 			variant: {
-				primary: "cta-lava",
+				primary:
+					"bg-surface-inverse text-ink-inverse hover:opacity-90 active:opacity-95",
 				secondary: "border border-line bg-surface text-ink hover:bg-surface-2",
 				ghost: "text-ink-2 hover:bg-surface-2 hover:text-ink",
 				danger: "bg-danger text-danger-on hover:bg-danger/90",

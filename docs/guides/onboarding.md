@@ -45,8 +45,11 @@ Then send your first request — see [Quickstart](quickstart.md).
 In the dashboard: **Settings → Billing → Manage**. We open a
 Polar-hosted customer-portal session (`POST /v1/billing/portal`) where
 you upgrade the plan, add payment method, and view invoices. Plan
-changes apply within seconds via Polar webhook → Postgres
-`tenants.set_plan_tier`.
+changes are recorded within seconds via Polar webhook → Postgres
+`tenants.set_plan_tier`, and the dashboard reflects them straight away.
+**Your new limits apply to API traffic within 15 minutes** — the gateway
+serves entitlements from a cache rather than reading the control plane on
+every request, and that cache TTL is the bound.
 
 ---
 
@@ -102,7 +105,7 @@ config file by design — secrets live in your secrets store).
 | `TRACELANE_REKOR_SIGNING_KEY` | for audit anchoring | PKCS#8 DER base64 Ed25519 key |
 | `TRACELANE_REKOR_ANCHOR_EVERY` | optional | default 100 events per anchor batch |
 | `TRACELANE_DEV_AUTH` | optional | set to `0` to disable dev auth fallback in debug builds |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional | `http://localhost:4317` for span emit |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional | `http://localhost:4318` for span emit — OTLP **HTTP**. `:4317` is the gRPC port and Tracelane does not serve it |
 
 Routes mount conditionally:
 
@@ -190,7 +193,7 @@ Run the V1 eval suite locally:
 pnpm eval:run --suite=all
 ```
 
-69 pain-point assertions + 10 fault-tolerance scenarios. CI fails on
+68 pain-point assertions + 10 fault-tolerance scenarios. CI fails on
 any regression. Marketing claims on the public site auto-disable when
 the corresponding eval flips red on `main`.
 
@@ -209,5 +212,5 @@ Before flipping a tenant to a paid plan:
 - [ ] R2 bucket + IAM configured for cold-tier Parquet
 - [ ] OpenSSF Scorecard ≥ 9.0 on the public repo
 - [ ] OSV-Scanner clean across Rust + TS + Python lockfiles
-- [ ] All 69 pain-point evals green on the production gateway
+- [ ] All 68 pain-point evals green on the production gateway
 - [ ] Dashboard `/trust` page reviewed by procurement / legal counsel

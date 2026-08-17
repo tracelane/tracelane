@@ -43,32 +43,16 @@ function niceCeil(v: number): number {
 	return step * pow;
 }
 
-/** Contiguous runs of elements where `ok` holds — the segments between gaps. */
-function segments<T>(arr: T[], ok: (t: T) => boolean): T[][] {
-	const out: T[][] = [];
-	let cur: T[] = [];
-	for (const t of arr) {
-		if (ok(t)) {
-			cur.push(t);
-		} else if (cur.length) {
-			out.push(cur);
-			cur = [];
-		}
-	}
-	if (cur.length) out.push(cur);
-	return out;
-}
-
 /**
- * LatencyTimeline — hand-built inline-SVG latency-over-time chart (ADR-045 Neon
+ * LatencyTimeline — hand-built inline-SVG latency-over-time chart (design system
  * tokens, no charting-lib dependency; sibling to the three signature viz).
  *
- * Plots the p95 trace-line (the lime `--accent-ink` data-line role) over a faint
+ * Plots the p95 trace-line (the `--action-ink` data-line role) over a faint
  * p50–p99 band, one point per hourly bucket. **Real data only:** buckets with no
  * traffic arrive as null percentiles and render as GAPS — each contiguous run is
- * its own `<polyline>`, so the line never bridges a missing hour and no point is
- * interpolated or smoothed. Colors come only from tokens (lime line,
- * `--accent-soft` band, `--ink-3` labels) — no hardcoded hex.
+ * its own bar, so nothing bridges a missing hour and no bucket is
+ * interpolated or smoothed. Colors come only from tokens (accent line,
+ * `--action-soft` band, `--ink-3` labels) — no hardcoded hex.
  */
 export function LatencyTimeline({
 	points,
@@ -92,7 +76,12 @@ export function LatencyTimeline({
 		Math.max(...points.map((p) => p.p99 ?? p.p95 ?? p.p50 ?? 0)) * 1.05,
 	);
 	const n = points.length;
-	const xOf = (i: number) => PAD_L + (i / (n - 1)) * PLOT_W;
+	// Bars occupy SLOTS, not points on a line: each bucket owns a band of the axis, so
+	// x is the slot CENTRE and a missing bucket leaves a real hole rather than a
+	// stretched segment between its neighbours.
+	const slotW = PLOT_W / n;
+	const barW = Math.max(Math.min(slotW * 0.62, 14), 2);
+	const xOf = (i: number) => PAD_L + (i + 0.5) * slotW;
 	const yOf = (v: number) => PAD_T + PLOT_H * (1 - v / ceil);
 
 	// Resolve every bucket to plot coordinates once (null y = gap).
@@ -105,7 +94,6 @@ export function LatencyTimeline({
 	}));
 
 	const ticks = [0, ceil / 2, ceil];
-	const labelIdx = [0, Math.floor((n - 1) / 2), n - 1];
 
 	return (
 		<figure className={cn("m-0", className)}>
@@ -142,75 +130,64 @@ export function LatencyTimeline({
 					</g>
 				))}
 
-				{/* p50–p99 band (per contiguous run; breaks at gaps) */}
-				{segments(pts, (q) => q.y50 != null && q.y99 != null)
-					.filter((run) => run.length >= 2)
-					.map((run) => {
-						const top = run.map((q) => `${q.x},${q.y99}`);
-						const bottom = [...run].reverse().map((q) => `${q.x},${q.y50}`);
-						return (
-							<polygon
-								key={`band-${run[0]?.x}`}
-								points={[...top, ...bottom].join(" ")}
-								className="fill-accent-soft"
-							/>
-						);
-					})}
+				{/*
+				  RANGE BARS — p50→p99 per bucket, with a p95 tick. Replaces the former
+				  p50–p99 polygon band + p95 `<polyline>` + node dots (founder call:
+				  bars, not single-line charts).
 
-				{/* p95 trace-line (per contiguous run; gaps are real breaks) */}
-				{segments(pts, (q) => q.y95 != null)
-					.filter((run) => run.length >= 2)
-					.map((run) => (
-						<polyline
-							key={`p95-${run[0]?.x}`}
-							points={run.map((q) => `${q.x},${q.y95}`).join(" ")}
-							className="fill-none stroke-accent-ink"
-							strokeWidth={2}
-							strokeLinecap="round"
-							strokeLinejoin="round"
-							vectorEffect="non-scaling-stroke"
-						/>
-					))}
-
-				{/* node pins on each real p95 point */}
-				{pts.map((q) =>
-					q.y95 != null ? (
-						<circle
-							key={`dot-${q.x}`}
-							cx={q.x}
-							cy={q.y95}
-							r={2.5}
-							className="fill-accent-ink"
-						/>
-					) : null,
-				)}
-
-				{/* x labels (first / middle / last) */}
-				{labelIdx.map((i) => {
-					const q = pts[i];
-					if (!q) return null;
+				  This is strictly more honest than the line it replaces. Latency per
+				  bucket is a DISTRIBUTION, not a value: the old chart drew p95 as a
+				  continuous line and had to break it into per-run `<polyline>`s so it
+				  would not bridge a missing hour. With bars the gap is simply a bucket
+				  with no bar — the form carries the property instead of the workaround.
+				  The reader also gets the spread back, which the line threw away.
+				*/}
+				{pts.map((q) => {
+					if (q.y99 == null && q.y50 == null) return null;
+					const top = q.y99 ?? q.y95 ?? q.y50;
+					const bottom = q.y50 ?? q.y95 ?? q.y99;
+					if (top == null || bottom == null) return null;
+					const h = Math.max(bottom - top, 1.5);
 					return (
-						<text
-							key={`x-${i}`}
-							x={q.x}
-							y={H - 8}
-							textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}
-							className="fill-ink-3 font-mono text-[10px]"
-						>
-							{q.label}
-						</text>
+						<g key={`bar-${q.x}`}>
+							<rect
+								x={q.x - barW / 2}
+								y={top}
+								width={barW}
+								height={h}
+								rx={Math.min(2, barW / 2)}
+								className="fill-info opacity-35"
+							>
+								<title>{`${q.label} · p50–p99`}</title>
+							</rect>
+							{q.y95 != null && (
+								<rect
+									x={q.x - barW / 2}
+									y={q.y95 - 1}
+									width={barW}
+									height={2}
+									rx={1}
+									className="fill-info"
+								>
+									<title>{`${q.label} · p95`}</title>
+								</rect>
+							)}
+						</g>
 					);
 				})}
+
+				{/* x labels REMOVED 2026-08-16 — ADR-074 §7: the shared TimeRuler is the
+				    one time axis. Three bare labels here would be a second one. */}
 			</svg>
 
 			<figcaption className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-3">
 				<span className="inline-flex items-center gap-1.5">
-					<span className="inline-block h-0.5 w-3 bg-accent-ink" aria-hidden />
+					<span className="inline-block h-0.5 w-3 bg-action-ink" aria-hidden />
 					p95 latency
 				</span>
 				<span className="inline-flex items-center gap-1.5">
 					<span
-						className="inline-block h-2 w-3 rounded-sm bg-accent-soft"
+						className="inline-block h-2 w-3 rounded-sm bg-action-soft"
 						aria-hidden
 					/>
 					p50–p99 band

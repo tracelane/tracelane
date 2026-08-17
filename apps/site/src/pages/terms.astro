@@ -1,0 +1,119 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base
+  title="Terms · Tracelane"
+  description="Terms of service for tracelane.dev, the Tracelane software, and the paid hosted service."
+>
+  <section class="container-prose py-24">
+    <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider lowercase">terms of service</p>
+    <h1 class="text-3xl sm:text-4xl font-semibold tracking-tight text-fg">Terms.</h1>
+    <p class="mt-6 text-lg text-fg-muted leading-relaxed">
+      These are the terms for Tracelane: the tracelane.dev website, the open-source software, and the paid hosted service. By creating a workspace or subscribing to a paid plan, you agree to them.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">The service</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Tracelane is a reliability platform for AI agents. The hosted service provides a gateway that proxies your traffic to LLM providers using your own provider keys, full-fidelity trace capture and querying, inline guardrail checks, and — as a paid add-on — a tamper-evident audit ledger. You may also self-host the open-source core instead.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Software license</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      The Tracelane codebase is licensed under
+      <a href="https://www.apache.org/licenses/LICENSE-2.0" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">Apache 2.0</a>. The
+      <code class="font-mono text-fg">/spec</code>
+      directory is CC0. Paid features are gated by workspace entitlements at the application layer, not by a separate license.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Site content license</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      The content on tracelane.dev (text, structure, design) is licensed
+      <a href="https://creativecommons.org/licenses/by/4.0/" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">CC-BY-4.0</a>. You may reuse with attribution. Third-party brand names mentioned on this site (Anthropic, OpenAI, Cloudflare, Helicone, LiteLLM, etc.) remain the property of their owners.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Plans and billing</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Paid plans are billed monthly in advance:
+    </p>
+    <ul class="mt-4 space-y-2 text-fg-muted">
+      <li>— <span class="text-fg">Builder</span> — $59/mo, 150K traces/mo, 1 seat.</li>
+      <li>— <span class="text-fg">Team</span> — $249/mo, 1M traces/mo, 10 seats included.</li>
+      <li>— <span class="text-fg">Business</span> — $899/mo, 5M traces/mo, 25 seats included.</li>
+      <li>— <span class="text-fg">Enterprise</span> — from $2,999/mo, custom volume, custom seats.</li>
+      <li>— <span class="text-fg">Tamper-evident audit ledger</span> — $999/mo add-on, available on any plan.</li>
+    </ul>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      A trace is one gateway call. Usage above your included quota bills at $1.20 per 10,000 traces, and we stop rather than let a bill run away: at 5× your included quota the gateway returns HTTP 429. Free and qualified-free plans are not billed. Plan entitlements are enforced in the product; if the product and this page ever disagree, tell us and we will fix the page.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Payment processing</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      <a href="https://polar.sh" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">Polar Software Inc.</a>
+      is our Merchant of Record. Polar is the seller for your subscription, issues your invoice, and handles global tax collection (EU VAT, US sales tax, India GST, and ~50 other jurisdictions). Card details go to Polar and its payment processor — we never see or store them. Polar's own terms apply to the payment transaction alongside these terms.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Your data and your keys</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Your trace data is yours. We claim no ownership of it and do not use it to train models. You grant us only the licence needed to run the service for you — to store, process, and display your data back to you.
+    </p>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Provider keys are bring-your-own. They are envelope-encrypted at rest, bound to your workspace, and never written to logs, spans, or error messages. You remain responsible for your provider accounts, for the charges your traffic incurs with those providers, and for the content you send through the gateway. See the <a href="/privacy" class="underline decoration-fg-subtle hover:decoration-fg transition-colors">privacy policy</a> for what we process and where it lives.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Audit ledger retention</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      The tamper-evident audit ledger is append-only and retained for the life of the ledger. This is deliberate: a record whose entries can be selectively removed is not tamper-evident, and the ledger exists to be relied on by auditors and regulators. Erasure requests cover your traces and account data; ledger records are excluded for this reason. If you close your account, you may export the ledger first.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Acceptable use</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Do not use Tracelane to break the law, to attack or overload our infrastructure or a provider's, to resell the hosted service as your own, or to process data you have no right to process. Free hosted plans are for non-commercial use.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Termination</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      You may cancel at any time from your billing settings; cancellation takes effect at the end of the current billing period and we do not pro-rate partial months. You may export your data before or after cancelling. We may suspend or terminate an account for non-payment or for a breach of acceptable use, with notice where circumstances allow. On termination we retain your data for 30 days so you can recover it, then purge it on request or on schedule.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Uptime</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Uptime figures published on the pricing page are objectives, not contractual SLAs with service credits. A formal SLA with credits is available on Enterprise contracts.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">No warranty</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      The software and the site are provided "as is" under the Apache 2.0 license, without warranty of any kind. Nothing on this site constitutes a binding commitment to ship features, dates, or SLAs until contractual terms are signed.
+    </p>
+
+    {/* TODO — needs counsel, then restore this section with a real clause.
+         Deliberately NOT rendered: shipping a "Limitation of liability" heading above an
+         empty paragraph is worse than omitting it. Do not draft it here. Pull from a
+         reviewed Indian-law SaaS template: the cap (conventionally fees paid in the
+         preceding 12 months), exclusion of indirect/consequential loss, and the
+         carve-outs that cannot be capped. Note the interaction with Polar as Merchant of
+         Record — Polar is the seller of record, which affects who is liable for what. */}
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Governing law</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Tracelane operates as a sole proprietorship based in Bangalore, Karnataka, India. These terms are governed by the laws of India, and the courts at Bangalore have jurisdiction over any dispute arising from them.
+      {/* TODO — needs counsel: the precise governing-law / venue / dispute-resolution
+           clause (arbitration vs courts) should be drafted and reviewed, not paraphrased.
+           THIS CHANGES AT INCORPORATION — a Delaware C-Corp at the $50K ARR trigger moves
+           the contracting entity, governing law and venue, and must be revisited together
+           with the Polar Merchant-of-Record relationship. */}
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Changes to these terms</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      We may update these terms. If a change materially affects a paying customer, we will email you before it takes effect.
+    </p>
+
+    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Contact</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Questions about these terms — <code class="font-mono text-fg">support@tracelane.dev</code>.
+    </p>
+
+    <p class="mt-16 text-sm text-fg-subtle">Last updated: July 28, 2026.</p>
+  </section>
+</Base>

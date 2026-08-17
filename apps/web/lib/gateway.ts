@@ -155,6 +155,43 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 /**
+ * DELETE a gateway resource with the per-user WorkOS JWT as the Bearer.
+ *
+ * Returns nothing: the gateway answers a successful delete with **204 No
+ * Content**, so there is no body to parse and this deliberately does not try —
+ * `gatewayPost`'s `res.json()` would throw on an empty body and turn a
+ * successful revoke into a 500 the user reads as "it failed" while the row is
+ * already gone.
+ *
+ * A non-2xx becomes a {@link GatewayError} carrying the status, so callers can
+ * distinguish 403 (not an owner) from 404 (no such pin) rather than collapsing
+ * both into one message — the failure mode recorded for the role-403 path.
+ */
+export async function gatewayDelete(path: string): Promise<void> {
+	const { token } = await requireGatewayToken();
+	const base = gatewayBaseUrl();
+
+	let res: Response;
+	try {
+		res = await fetch(`${base}${path}`, {
+			method: "DELETE",
+			headers: { authorization: `Bearer ${token}` },
+			cache: "no-store",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+		});
+	} catch (err) {
+		throw new GatewayError(
+			503,
+			`gateway unreachable: ${err instanceof Error ? err.message : "fetch failed"}`,
+		);
+	}
+
+	if (!res.ok) {
+		throw new GatewayError(res.status, `gateway responded ${res.status}`);
+	}
+}
+
+/**
  * Like {@link gatewayGet} but returns `null` on a 404 instead of throwing.
  * Used for the trace-detail view: the gateway returns the SAME 404 for "trace
  * does not exist" and "trace belongs to another tenant", so a null result

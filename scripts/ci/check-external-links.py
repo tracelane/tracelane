@@ -25,7 +25,15 @@ Two layers, with a deliberate risk balance:
 
 Modes:
   --static   offline static guards only (used by verify-all --fast + CI merge gate)
+  --selftest offline: plants a banned link, proves the static guard reports it,
+             and proves a correct link is NOT reported
   (default)  static + live (used as a pre-deploy step in scripts/deploy/web.sh)
+
+Flags are parsed by argparse, so an unrecognised argument EXITS NON-ZERO. That
+is not cosmetic: this used to be `"--static" in sys.argv`, under which
+`--selftest` (and every typo of `--static`) silently fell through to the LIVE
+network path — the slow, third-party-dependent mode — while the caller believed
+it had asked for something else.
 
 The GROUND-TRUTH MANIFEST is the three tables below — the single source of truth
 for "which external target is correct". Update those, not scattered strings.
@@ -33,11 +41,14 @@ for "which external target is correct". Update those, not scattered strings.
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # ── Ground-truth manifest ────────────────────────────────────────────────────
 # Hosts that must NEVER be LINKED (https://<host>) from the web surface, + why.
@@ -83,7 +94,7 @@ API_HOSTS = {
 
 # Directories that render to the USER (exclude tests/mocks/e2e — those carry
 # intentional placeholder URLs like gateway.example / a stale vercel.app).
-WEB_SURFACE = ["apps/web/components", "apps/web/app", "apps/web/lib"]
+WEB_SURFACE = ["apps/web/components", "apps/web/app", "apps/web/lib", "apps/site/src"]
 TEST_MARKERS = (".test.", ".spec.", "__mocks__", "/e2e/", "/fixtures/")
 
 # A well-formed absolute URL with a dotted host; anything with a template
@@ -100,13 +111,17 @@ def git_files(dirs: list[str]) -> list[str]:
     return [f for f in out if not any(m in f for m in TEST_MARKERS)]
 
 
-def static_check() -> list[str]:
-    """Banned hosts LINKED (https://<host>) anywhere on the web surface -> errors."""
+def static_check(files: list[str] | None = None) -> list[str]:
+    """Banned hosts LINKED (https://<host>) anywhere on the web surface -> errors.
+
+    `files` overrides the scanned set (used only by --selftest, which plants
+    fixtures in a temp dir). None = the real web surface, as CI runs it.
+    """
     errors: list[str] = []
     patterns = {
         host: re.compile(r"https?://" + re.escape(host)) for host in BANNED_HOSTS
     }
-    for f in git_files(WEB_SURFACE):
+    for f in git_files(WEB_SURFACE) if files is None else files:
         try:
             with open(f, encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
@@ -186,8 +201,145 @@ def live_check() -> tuple[list[str], list[str]]:
     return errors, warns
 
 
+def selftest() -> int:
+    """Plant a banned link, prove the STATIC guard reports it, prove clean passes.
+
+    OFFLINE BY CONSTRUCTION, and that is asserted rather than asserted-about:
+    `urllib.request.urlopen` is replaced with a tripwire for the duration, and
+    the last case fails if anything tripped it. The live layer cannot be
+    selftested honestly — it resolves third-party endpoints and deliberately
+    WARNS (never fails) on their downtime, so an offline assertion about it
+    would be theatre. Only the hard-failing static layer is proven here.
+    """
+    failures: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if cond:
+            print(f"  ✓ {name}")
+        else:
+            print(f"  ✗ {name}{f' — {detail}' if detail else ''}")
+            failures.append(name)
+
+    before = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, check=False
+    ).stdout
+
+    tripped: list[str] = []
+    real_urlopen = urllib.request.urlopen
+
+    def _tripwire(*a, **kw):
+        tripped.append(str(a[:1]))
+        raise AssertionError("selftest must not touch the network")
+
+    urllib.request.urlopen = _tripwire  # type: ignore[assignment]
+    try:
+        # The manifest IS the guard. An empty one would make every case below
+        # pass while nothing is actually banned.
+        check("manifest_is_not_empty", bool(BANNED_HOSTS), "BANNED_HOSTS is empty")
+        host = next(iter(BANNED_HOSTS))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            linked = tmp / "AnchorLink.tsx"
+            linked.write_text(
+                "export function AnchorLink() {\n"
+                f'  return <a href="https://{host}/?logIndex={{i}}">view</a>;\n'
+                "}\n",
+                encoding="utf-8",
+            )
+            errs = static_check([str(linked)])
+            check(
+                "banned_host_LINKED_blocks",
+                any(host in e for e in errs),
+                f"planted https://{host} link went unreported: {errs}",
+            )
+            check(
+                "violation_reports_file_and_line",
+                any(f"{linked}:2" in e for e in errs),
+                f"expected '{linked}:2' in {errs}",
+            )
+
+            # http:// is the same defect wearing a different scheme.
+            plain = tmp / "Plain.tsx"
+            plain.write_text(f'const u = "http://{host}/entry";\n', encoding="utf-8")
+            check(
+                "banned_host_http_scheme_blocks",
+                bool(static_check([str(plain)])),
+                "http:// form was not caught",
+            )
+
+            # Documented negative: a PROSE mention (no scheme) is explicitly
+            # allowed. Without this the guard could ban the word and still look
+            # right — and the code comments that explain the v1/v2 trap would
+            # become unwritable.
+            prose = tmp / "Note.tsx"
+            prose.write_text(
+                f"// NOTE: {host} is the Rekor v1 UI — the WRONG log for our anchors.\n",
+                encoding="utf-8",
+            )
+            check(
+                "prose_mention_does_not_block",
+                not static_check([str(prose)]),
+                "a scheme-less prose mention was flagged",
+            )
+
+            # The correct target must pass, or the guard blocks the fix.
+            good = tmp / "Good.tsx"
+            good.write_text(
+                'const CHECKPOINT = "https://log2025-1.rekor.sigstore.dev/checkpoint";\n',
+                encoding="utf-8",
+            )
+            check(
+                "correct_rekor_v2_link_passes",
+                not static_check([str(good)]),
+                "the pinned Rekor v2 checkpoint URL was flagged",
+            )
+
+            # Mixed tree: one clean file does not launder the offender.
+            mixed = static_check([str(good), str(linked), str(prose)])
+            check(
+                "offender_beside_clean_files_blocks",
+                len(mixed) == 1 and host in mixed[0],
+                f"expected exactly one error naming {host}, got {mixed}",
+            )
+    finally:
+        urllib.request.urlopen = real_urlopen  # type: ignore[assignment]
+
+    check("no_network_touched", not tripped, f"urlopen called with {tripped}")
+
+    after = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, check=False
+    ).stdout
+    check("tree_restored", before == after, "selftest changed the working tree")
+
+    if failures:
+        print(f"selftest FAILED — {len(failures)} case(s): {', '.join(failures)}")
+        return 1
+    print("selftest PASSED.")
+    return 0
+
+
 def main() -> int:
-    static_only = "--static" in sys.argv
+    ap = argparse.ArgumentParser(
+        description="Guard user-facing external links against wrong/dead targets."
+    )
+    ap.add_argument(
+        "--static",
+        action="store_true",
+        help="offline banned-link guard only (no network)",
+    )
+    ap.add_argument(
+        "--selftest",
+        action="store_true",
+        help="offline: plant a banned link and prove this guard blocks it",
+    )
+    args = ap.parse_args()  # unknown flags -> usage on stderr, exit 2
+
+    if args.selftest:
+        return selftest()
+
+    static_only = args.static
     print("== external-link + identity guard ==")
 
     errors = static_check()

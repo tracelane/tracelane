@@ -113,7 +113,7 @@ export function registerEvalCommand(program: Command): void {
 		.description("Run the eval suite")
 		.option(
 			"--suite <name>",
-			"Eval suite to run: all|gateway|ingest|predictive",
+			"Eval suite to run: all|ft|gc|is|pp|pir|pi",
 			"all",
 		)
 		.option("--dry-run", "Print the command without executing")

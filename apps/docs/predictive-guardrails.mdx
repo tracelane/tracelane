@@ -31,12 +31,12 @@ an engineering target, not yet measured on production-equivalent hardware
 |---|---|---|---|
 | PR1 | MCP rug-pull detection | Live detection, observe-first | PP-MCP1..3 |
 | PR2 | Lethal-trifecta taint tracking | Roadmap / dormant on the chat path | PP-TFT1..4 |
-| PR3 | A2UI catalog conformance | Roadmap (A2UI payloads only) | PP-UI1..3 |
+| PR3 | A2UI component-type check | Never runs on the gateway chat path | PP-UI1..3 |
 | PR4 | Prompt-injection classifier (heuristic) | Partial / dormant on the chat path | PP-PI1..6 |
 | PR5 | Browser stuck-loop prediction | Roadmap (browser spans only) | PP-BR1..3 |
-| PR6 | A2A handoff validation | Roadmap (A2A envelopes only) | PP-A2A1..4 |
+| PR6 | A2A handoff required-field check | Never runs on the gateway chat path | PP-A2A1..4 |
 | PR7 | Output-policy regex + SLM judge | SLM judge is a stub; regex lives in the rails | PP-OUT1..5 |
-| PR8 | Argument drift (PR8-lite Mahalanobis) | Roadmap / dormant on the chat path | PP-G3, PP-PR8 |
+| PR8 | Argument drift | Never runs on the gateway chat path | PP-G3, PP-PR8 |
 
 ## PR1 — MCP rug-pull detection
 
@@ -54,11 +54,13 @@ requires a top-level `tool_name` + `tracelane_untrusted_input` + a frontier
 `model`; a chat-completions body supplies only `model`, so it never reaches
 threshold there. The enforced trifecta check is guardrail rail R4 (gated).
 
-## PR3 — A2UI catalog conformance
+## PR3 — A2UI component-type check
 
-*Roadmap.* Validates Agent-to-UI surfaces (cards, buttons, forms emitted via
-A2UI) against the published per-tenant catalog. Fires only on `protocol:"a2ui"`
-payloads — never on LLM chat traffic.
+*Never runs on the gateway chat path.* Checks the `type` of each Agent-to-UI
+component (cards, buttons, forms emitted via A2UI) against a fixed list of
+standard A2UI v0.9 types. There is no per-tenant catalog to resolve against and
+no rendered-output comparison. It evaluates only on `protocol:"a2ui"` payloads —
+never on LLM chat traffic.
 
 ## PR4 — Prompt-injection classifier
 
@@ -76,12 +78,14 @@ same page action. The detector uses a sliding window of
 (URL, DOM-action-fingerprint) tuples, but fires only on browser/operator spans
 (`tracelane.browser.step_index`) — not on LLM chat.
 
-## PR6 — A2A handoff validation
+## PR6 — A2A handoff required-field check
 
-*Roadmap.* When one agent hands a task to another, the validator checks the
-envelope schema, required fields, signed origin, and no circular handoff
-(A → B → A → B …). It fires only on `tracelane_message_type` A2A envelopes,
-never on a chat body.
+*Never runs on the gateway chat path.* When one agent hands a task to another,
+the validator checks that the handoff object carries four required fields —
+`handoff_id`, `from_agent`, `to_agent`, `context`. It does not verify a signed
+Agent Card or any other signed origin, does not check task-state legality, and
+does not detect handoff cycles. It evaluates only on `tracelane_message_type`
+A2A envelopes, never on a chat body.
 
 ## PR7 — Output-policy regex + SLM judge
 
@@ -93,12 +97,12 @@ from this predictor.
 
 ## PR8 — Argument drift
 
-*Roadmap / dormant on the chat path.* Rolling Mahalanobis distance over
-featurised tool-call argument embeddings, per `(tenant, tool)` pair (background
-EMA mean + covariance, 4σ threshold). The state machine is real but requires a
-top-level `tool_name` + `tool_args`; those are not present on a chat-completions
-body, so it is unreachable there. PR8-lite is the lightweight version; the full
-PR8 swaps EMA for a learned encoder.
+*Never runs on the gateway chat path.* The detector reads a top-level
+`tool_name` + `tool_args`; a `/v1/chat/completions` body carries neither, so it
+returns without evaluating. Tracelane does not detect MCP argument-distribution
+anomalies on live chat traffic. The reachable tool-argument check on that path
+is the tool-call schema validator, which validates each tool call against the
+`input_schema` declared in the request.
 
 ## Configuring per-tenant
 

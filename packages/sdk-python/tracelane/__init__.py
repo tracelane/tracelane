@@ -1,7 +1,8 @@
 """Tracelane Python SDK.
 
 Instruments AI agent frameworks via wrapt monkey-patching. Spans are emitted via
-OTLP HTTP to your Tracelane ingest endpoint. Instrumentation is explicit: call
+OTLP/HTTP (protobuf) to the endpoint you configure — https://gateway.tracelane.dev
+on Tracelane Cloud, or a receiver you run. Instrumentation is explicit: call
 ``init()`` once, then either ``auto_instrument()`` (best-effort for a small set
 of libraries) or the individual ``instrument_*`` functions.
 
@@ -11,7 +12,7 @@ Example (explicit — traces exactly what you wrap)::
     import anthropic
 
     init(
-        endpoint="http://localhost:4318",
+        endpoint="https://gateway.tracelane.dev",
         api_key=os.environ["TRACELANE_API_KEY"],
     )
     client = anthropic.Anthropic()
@@ -56,6 +57,18 @@ from tracelane.instrumentations.pydantic_ai import instrument_pydantic_ai
 from tracelane.instrumentations.qdrant import instrument_qdrant
 from tracelane.instrumentations.smolagents import instrument_smolagents
 from tracelane.instrumentations.vertexai import instrument_vertexai
+
+# Session (conversation) correlation — what /sessions groups traces by.
+from tracelane.session import (
+    CONVERSATION_ID_ATTRIBUTE,
+    CONVERSATION_ID_HEADER,
+    MAX_SESSION_ID_LENGTH,
+    SESSION_ID_HEADER,
+    get_session,
+    session_headers,
+    set_session,
+    use_session,
+)
 from tracelane.tracer import TracelaneConfig, init, shutdown
 
 
@@ -136,6 +149,14 @@ __all__ = [
     "shutdown",
     "TracelaneConfig",
     "auto_instrument",
+    "use_session",
+    "set_session",
+    "get_session",
+    "session_headers",
+    "CONVERSATION_ID_HEADER",
+    "SESSION_ID_HEADER",
+    "CONVERSATION_ID_ATTRIBUTE",
+    "MAX_SESSION_ID_LENGTH",
     "instrument_anthropic",
     "instrument_openai",
     "instrument_openai_async",

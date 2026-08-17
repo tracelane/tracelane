@@ -19,6 +19,7 @@
 
 ignore:
   # All Go stdlib CVEs come from the vendored esbuild dev-tool binary.
+  # REVIEW: 2026-11-07
   - package:
       type: go-module
   # rustls-webpki 0.102.x — transitive via async-nats 0.42 (NATS URL is
@@ -27,20 +28,17 @@ ignore:
   # osv-scanner.toml; real fix = the async-nats >=0.47 upgrade. By-name (not a
   # single GHSA) because Grype reports several webpki advisories under aliases
   # that don't match the RUSTSEC/OSV ids the other scanners list.
+  # REVIEW: 2026-11-07
   - package:
       name: rustls-webpki
-  # wasmtime 20.0.x — reachable ONLY via the off-by-default `wasm-plugin`
-  # feature (module is `#![cfg(feature = "wasm-plugin")]`, not compiled into any
-  # V1 ship binary). Grype scans Cargo.lock + re-flags these advisories because
-  # it does NOT read .cargo/audit.toml / osv-scanner.toml (which already accept
-  - package:
-      name: wasmtime
   # vite / vitest — dev/test tooling only (vitest), never shipped in any product
   # artifact. Grype catalogs them from pnpm-lock.yaml (not just node_modules),
   # so the exclude below is insufficient — the ignore is what suppresses them.
   # Mirrors osv-scanner.toml; tied to the vitest-major migration.
+  # REVIEW: 2026-11-07
   - package:
       name: vite
+  # REVIEW: 2026-11-07
   - package:
       name: vitest
   # brace-expansion 2.1.4 — the one residual of the 2026-07-30 bump pass (postcss,
@@ -54,9 +52,56 @@ ignore:
   # above) so any OTHER brace-expansion advisory still fires. The genuinely vulnerable
   # 2.1.2 cannot return: pnpm overrides floor the 2.x line at >=2.1.4 and the >=3 line
   # at >=5.0.8. Mirrors osv-scanner.toml + package.json auditConfig.ignoreGhsas.
+  # REVIEW: 2026-11-07
   - vulnerability: GHSA-mh99-v99m-4gvg
     package:
       name: brace-expansion
+  # ── ADDED 2026-08-09 (founder-ruled). These three were ALREADY accepted in
+  # osv-scanner.toml and were MISSING here, so Grype re-flagged advisories OSV had
+  # (BYOK routable-vs-storable) and the 6-way alert-metric list.
+
+  # opentelemetry_sdk 0.27.1 — SUPPRESSED, not fixed.
+  # Reason it does not apply: it is not a dependency we chose. `cargo tree --invert`
+  # shows it arrives ONLY via opentelemetry-proto (the OTLP protobuf decoder in
+  # crates/ingest). We consume prost-generated structs; no SDK entry point is ever
+  # called. Verified 2026-08-09 that `default-features = false` on opentelemetry-proto
+  # compiles clean but does NOT drop the crate — the sdk is required by the `trace`
+  # feature. The only real fix is opentelemetry-proto 0.27 -> ~0.32, a five-minor jump
+  # on the decoder in the ingest hot path, to patch code we never execute.
+  # UNBLOCKING CONDITION: bump when opentelemetry-proto is upgraded for another reason.
+  # REVIEW: 2026-11-07
+  - vulnerability: GHSA-w9wp-h8wv-79jx
+    package:
+      name: opentelemetry_sdk
+
+  # @hono/node-server 1.19.14 — SUPPRESSED, not fixed.
+  # Reason it does not apply: purely transitive (via the MCP SDK), patched only in the
+  # 2.x MAJOR. Forcing a major on a transitive dep we do not control, in an app whose
+  # tests would not catch a runtime break, is a worse risk than the moderate itself.
+  # UNBLOCKING CONDITION (founder, 2026-08-09): revisit when apps/mcp has real test
+  # coverage — until then a forced major is unverifiable.
+  # REVIEW: 2026-11-07
+  - vulnerability: GHSA-frvp-7c67-39w9
+    package:
+      name: "@hono/node-server"
+
+  # esbuild (0.18.20 / 0.19.12 / 0.21.5 / 0.27.7) — SUPPRESSED, not fixed.
+  # Reason it does not apply: BOTH advisories require the esbuild DEV SERVER
+  # (`esbuild --serve`), which this repo never runs. Every affected copy is build
+  # tooling only — drizzle-kit, @opennextjs/aws, bundle-require, esbuild-register,
+  # @esbuild-kit/core-utils — and esbuild is never shipped in a product artifact.
+  # An override to 0.25.0 would drag four build tools off their pinned majors to patch
+  # a code path we do not execute.
+  # UNBLOCKING CONDITION: drops out naturally as those tools upgrade their pins.
+  # REVIEW: 2026-11-07
+  - vulnerability: GHSA-67mh-4wv8-2f99
+    package:
+      name: esbuild
+  # REVIEW: 2026-11-07
+  - vulnerability: GHSA-g7r4-m6w7-qqqr
+    package:
+      name: esbuild
+
 
 exclude:
   - "./target/**"

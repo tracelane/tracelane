@@ -16,9 +16,8 @@ hardened production Docker Compose stack.
 | Node.js | 20+ | Dashboard + MCP server |
 | pnpm | 11+ | Node package manager |
 | Postgres | 17+ (Neon-compatible) | Tenant metadata, API keys, billing |
-| ClickHouse | 24.12+ | Span hot tier (90-day) |
+| ClickHouse | 24.12+ | Span hot tier (365-day TTL) |
 | NATS | 2.10+ with JetStream | Ingest queue |
-| Cloudflare R2 or S3 | — | Span cold tier (optional) |
 | L4 GPU (1×) | — | SLM judge (optional; degrades to regex-only) |
 
 ## Quick start — Docker Compose
@@ -49,18 +48,18 @@ The gateway listens on `:8080`, dashboard on `:3000`.
 
 ## Production — Docker Compose
 
-The production stack is the same compose model as dev, hardened. See
-`infra/prod/docker-compose.yml` (ClickHouse + NATS/JetStream + gateway +
-ingest + Caddy TLS). Postgres is external (Neon or RDS); the dashboard runs
-on Vercel/Cloudflare.
+The production stack is the same compose model as dev, hardened: ClickHouse +
+NATS/JetStream + gateway + ingest behind a TLS-terminating reverse proxy.
+Postgres is external (Neon or RDS); the dashboard runs on Vercel/Cloudflare.
+Start from `infra/self-host/` and `infra/docker/` — the compose files that ship
+with this repo. (Tracelane Cloud's own production compose is not published.)
 
 ```bash
 # On your host, from the repo root of your deployment checkout:
-docker compose -f infra/prod/docker-compose.yml up -d
+docker compose -f infra/self-host/docker-compose.yml up -d
 ```
 
-Images are built on-node from source (`infra/prod/blue-green-deploy.sh`
-performs blue-green cutover with auto-rollback). A published Helm chart and
+Images are built on-node from source. A published Helm chart and
 signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 
 ## Environment variables
@@ -69,7 +68,8 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | `postgres://user:pass@host:5432/tracelane` |
+| `POSTGRES_URL` | `postgres://user:pass@host:5432/tracelane` — read by the **gateway and ingest** (`PGHOST` + friends also work). Leave it unset and the gateway boots with no control plane: API-key validation falls back to the dev stub. |
+| `DATABASE_URL` | The same connection string, read by the **Next.js dashboard** (Drizzle/Neon) and `db/seed.mjs`. Set both — they are separate variables, not aliases. |
 | `CLICKHOUSE_URL` | `http://host:8123` |
 | `NATS_URL` | `nats://host:4222` |
 | `WORKOS_CLIENT_ID` | WorkOS Connect client ID |
@@ -80,7 +80,7 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 | `POLAR_ACCESS_TOKEN` | Polar.sh organization access token (billing) |
 | `POLAR_WEBHOOK_SECRET` | Polar webhook secret (`polar_whs_…`) |
 | `POLAR_EXPECTED_ORGANIZATION_ID` | Polar organization id the webhook secret was issued for |
-| `TRACELANE_BYOK_MASTER_KEY` | 32-byte hex master key for BYOK envelope encryption |
+| `TRACELANE_BYOK_MASTER_KEY` | 32-byte master key for BYOK envelope encryption, **base64-encoded** (AES-256-GCM). Not hex — the value is base64-decoded and must yield exactly 32 bytes, so a 64-character hex string decodes to 48 and the gateway refuses to start. |
 | `TRACELANE_REKOR_SIGNING_KEY` | PKCS#8 DER base64 Ed25519 key for audit anchoring |
 
 ### Optional
@@ -88,16 +88,18 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 | Variable | Default | Description |
 |---|---|---|
 | `TRACELANE_PORT` | `8080` | Gateway listen port |
-| `TRACELANE_REKOR_URL` | `https://rekor.sigstore.dev` | Rekor instance |
+| `TRACELANE_REKOR_URL` | — (unset) | Transparency-log endpoint for audit anchoring. Unset or empty ⇒ batches are signed and persisted locally only, with no outbound POST. There is no default log. |
 | `TRACELANE_REKOR_ANCHOR_EVERY` | `100` | Audit events per Rekor anchor batch |
 | `TRACELANE_BILLING_RETURN_URL` | `/settings/billing` | Polar portal return URL |
-| `TRACELANE_DEV_AUTH` | `1` | Set to `0` to disable dev auth fallback |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Export gateway's own spans to an OTLP collector |
 | `NEXT_PUBLIC_GATEWAY_URL` | `http://localhost:8080` | Gateway URL shown in dashboard |
-| `R2_BUCKET` | — | Cloudflare R2 bucket for cold-tier spans |
-| `R2_ACCOUNT_ID` | — | Cloudflare account ID |
-| `R2_ACCESS_KEY_ID` | — | R2 access key |
-| `R2_SECRET_ACCESS_KEY` | — | R2 secret key |
+
+<Note>
+There are no cold-tier storage variables to set. The R2 batcher in
+`crates/ingest/src/r2_batcher.rs` is compiled but nothing feeds its channel
+(`crates/ingest/src/main.rs:350` drops the sender), so no span is written to
+object storage on any deployment. Spans live in ClickHouse only.
+</Note>
 
 ## Apply migrations
 
@@ -206,11 +208,10 @@ Before accepting production traffic:
 - [ ] Polar products + meters + webhook configured and verified
 - [ ] ClickHouse pointing at production cluster (not dev compose)
 - [ ] Postgres pointing at production branch (Neon or RDS)
-- [ ] R2 bucket configured (optional — cold-tier span archival is on the roadmap)
 - [ ] TLS termination at reverse proxy (Caddy, Nginx, or Cloudflare Tunnel)
-- [ ] `TRACELANE_DEV_AUTH=0` (disables dev auth bypass)
+- [ ] Confirm `POSTGRES_URL` is set — a release build has **no** auth fallback and refuses every API key without it
 - [ ] OSV-Scanner + Grype clean on deployed commit
-- [ ] All 69 pain-point evals green: `pnpm eval:run --suite=all`
+- [ ] All 68 pain-point evals green: `pnpm eval:run --suite=all`
 
 ## Upgrading
 

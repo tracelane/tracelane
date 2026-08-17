@@ -54,7 +54,7 @@ DEFERRAL = re.compile(
     re.IGNORECASE,
 )
 
-SCAN_ROOTS = ("apps/web", "apps/docs")
+SCAN_ROOTS = ("apps/web", "apps/docs", "apps/site")
 SCAN_EXTS = {".mdx", ".md", ".svg", ".tsx", ".ts", ".jsx", ".js", ".astro"}
 SKIP_NAMES = {"changelog.mdx"}
 SKIP_DIRS = {"node_modules", ".next", "dist", "build", ".turbo", ".claude", "out"}
@@ -175,7 +175,18 @@ def selftest() -> int:
 
 
 if __name__ == "__main__":
-    if "--selftest" in sys.argv:
+    # REJECT unknown arguments. `if "--selftest" in sys.argv` alone silently treats every
+    # other flag as "run the full scan" and exits 0, so `--selftst` (or any typo in a CI
+    # invocation) reports a clean pass having checked nothing the caller asked for.
+    # `check-guard-selftests.py` probes exactly this — it calls every guard with a
+    # deliberate nonsense flag and requires a non-zero exit — and this guard failed that
+    # probe the moment it was wired into verify-all.sh on 2026-08-15, which is why it now
+    # parses argv instead of scanning it.
+    _args = sys.argv[1:]
+    if _args == ["--selftest"]:
         sys.exit(selftest())
+    if _args:
+        print(f"usage: {Path(sys.argv[0]).name} [--selftest]", file=sys.stderr)
+        sys.exit(2)
     # repo root = two levels up from scripts/ci/
     sys.exit(scan(Path(__file__).resolve().parents[2]))

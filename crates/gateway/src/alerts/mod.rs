@@ -308,30 +308,168 @@ pub async fn delete_destination(pool: &DbPool, tenant: Uuid, id: Uuid) -> Result
 
 // ── Notifier (reuses the SSRF-guarded Slack-format path) ─────────────────────
 
-/// Fire-and-forget POST of a Slack-format `{"text":…}` payload to a
-/// tenant-controlled webhook. The URL is validated by the SSRF guard BEFORE any
-/// packet leaves the box (a tenant webhook is an SSRF vector); the client is
-/// `safe_client_builder` (rustls + no-redirect). Slack, and Discord at
-/// `<webhook>/slack`, both accept this exact payload — one path, two providers.
+/// Wall-clock bound on the HTTP exchange with a tenant-controlled webhook.
+const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Wall-clock bound on SSRF validation (which does DNS) — `validate_url` has no
+/// internal timeout, so without this a slow resolver hangs the synchronous
+/// test-fire request until the browser gives up.
+const WEBHOOK_VALIDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Bytes of a webhook's error body we are willing to buffer. A tenant-controlled
+/// endpoint can answer with an unbounded stream; we only need the reason string
+/// (Slack answers `no_service` / `invalid_token`, Discord a short JSON object).
+const MAX_WEBHOOK_BODY_BYTES: usize = 512;
+/// Characters of that body we surface back to the tenant / the log.
+const MAX_DETAIL_CHARS: usize = 200;
+
+/// Why a webhook delivery did not land.
+///
+/// The variants are the distinctions a user needs to fix their own destination:
+/// `Status` means the webhook answered and said no (a revoked Slack URL answers
+/// `404 no_service`) — the case the old fire-and-forget path swallowed entirely,
+/// because `reqwest::send()` returns `Ok` for every HTTP status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryError {
+    /// The URL failed the SSRF guard — nothing left the box.
+    Rejected(String),
+    /// No HTTP response at all: DNS, TLS, connect, or timeout.
+    Unreachable(String),
+    /// The webhook answered, and the answer was not 2xx.
+    Status { http_status: u16, body: String },
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) => write!(f, "webhook URL rejected by the SSRF guard: {m}"),
+            Self::Unreachable(m) => write!(f, "webhook unreachable: {m}"),
+            // Status + body together is normally a banned shape (a provider error
+            // body can echo credentials — .claude/rules/security.md). It is safe
+            // here and only here: `body` has already been through
+            // `redact::scrub` + a 200-char cap in `sanitize_detail`, and the peer
+            // is the tenant's own webhook, not a credentialed provider.
+            Self::Status { http_status, body } if body.is_empty() => {
+                write!(f, "webhook answered HTTP {http_status}")
+            }
+            Self::Status { http_status, body } => {
+                write!(f, "webhook answered HTTP {http_status}: {body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
+/// Scrub, de-control and cap a webhook's response body before it is logged or
+/// returned. Credential redaction runs first so a webhook that echoes an
+/// `Authorization` header back at us cannot put it in our logs or our API body.
+fn sanitize_detail(raw: &[u8]) -> String {
+    let scrubbed = tracelane_shared::redact::scrub(raw);
+    String::from_utf8_lossy(&scrubbed)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Read at most [`MAX_WEBHOOK_BODY_BYTES`] of the response, then sanitize.
+/// Chunk-wise rather than `.text()` so a hostile endpoint cannot make us buffer
+/// its whole body.
+async fn read_bounded_body(resp: reqwest::Response) -> String {
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_WEBHOOK_BODY_BYTES);
+    while buf.len() < MAX_WEBHOOK_BODY_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_WEBHOOK_BODY_BYTES - buf.len();
+                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    sanitize_detail(&buf)
+}
+
+/// POST a Slack-format `{"text":…}` payload to a tenant-controlled webhook and
+/// **assert the outcome**, returning the observed HTTP status on success.
+///
+/// The URL is validated by the SSRF guard BEFORE any packet leaves the box (a
+/// tenant webhook is an SSRF vector); the client is `safe_client_builder`
+/// (rustls + no-redirect). Slack, and Discord at `<webhook>/slack`, both accept
+/// this exact payload — one path, two providers.
+///
+/// # Errors
+/// **Fail-CLOSED on the report**: this returns `Err` unless the webhook itself
+/// answered 2xx. A transport error, an SSRF rejection, and a non-2xx answer are
+/// three distinct [`DeliveryError`] variants — none of them is reported as a
+/// delivery. (Whether a *caller* then fails open is the caller's choice:
+/// [`fire_alert_async`] logs and continues, so a dead webhook never wedges the
+/// background checker; the test-fire route surfaces the failure to the user.)
+#[tracing::instrument(skip_all, fields(http_status = tracing::field::Empty))]
+pub async fn deliver_alert(webhook_url: &str, text: &str) -> Result<u16, DeliveryError> {
+    // The webhook URL is itself a credential (a Slack URL embeds its token), so
+    // it is never a tracing field and never part of an error string.
+    match tokio::time::timeout(
+        WEBHOOK_VALIDATE_TIMEOUT,
+        crate::ssrf_guard::validate_url(webhook_url),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(DeliveryError::Rejected(e.to_string())),
+        Err(_) => {
+            return Err(DeliveryError::Unreachable(
+                "URL validation (DNS) timed out".to_string(),
+            ));
+        }
+    }
+
+    let client = crate::ssrf_guard::safe_client_builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .map_err(|e| DeliveryError::Unreachable(format!("HTTP client build failed: {e}")))?;
+
+    let resp = client
+        .post(webhook_url)
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .map_err(|e| DeliveryError::Unreachable(e.to_string()))?;
+
+    let http_status = resp.status().as_u16();
+    tracing::Span::current().record("http_status", http_status);
+    if resp.status().is_success() {
+        return Ok(http_status);
+    }
+    Err(DeliveryError::Status {
+        http_status,
+        body: read_bounded_body(resp).await,
+    })
+}
+
+/// Fire-and-forget wrapper over [`deliver_alert`] for the background checker.
+///
+/// Still fire-and-forget — a breach notification must not block or fail a check
+/// tick — but the outcome is now **observed**: a webhook that answers non-2xx
+/// produces a `warn` carrying the observed status instead of nothing at all.
 pub fn fire_alert_async(webhook_url: String, text: String) {
     tokio::spawn(async move {
-        if let Err(e) = crate::ssrf_guard::validate_url(&webhook_url).await {
-            tracing::warn!(error = %e, "alert webhook URL rejected by SSRF guard; dropping");
-            return;
-        }
-        let body = serde_json::json!({ "text": text });
-        let client = match crate::ssrf_guard::safe_client_builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "alert webhook client build failed");
-                return;
+        match deliver_alert(&webhook_url, &text).await {
+            Ok(http_status) => {
+                tracing::debug!(http_status, "alert webhook delivered");
             }
-        };
-        if let Err(e) = client.post(&webhook_url).json(&body).send().await {
-            tracing::warn!(error = %e, "alert webhook POST failed");
+            Err(e) => {
+                let observed = match &e {
+                    DeliveryError::Status { http_status, .. } => Some(*http_status),
+                    _ => None,
+                };
+                tracing::warn!(
+                    error = %e,
+                    http_status = observed,
+                    "alert webhook delivery FAILED — the notification did not reach the destination"
+                );
+            }
         }
     });
 }
@@ -356,7 +494,11 @@ pub fn breach_message(rule: &AlertRule, value: f64) -> String {
     )
 }
 
-#[cfg(test)]
+// See the identical note in `alerts/routes.rs`: these tests drive
+// `ssrf_guard::set_loopback_bypass_for_tests`, which only exists under
+// `debug_assertions`. `cargo bench` builds test targets with it OFF, so a plain
+// `#[cfg(test)]` breaks the Benchmarks job at compile time (E0425).
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
 
@@ -397,5 +539,152 @@ mod tests {
         assert!(METRICS.contains(&"cost_usd"));
         assert!(METRICS.contains(&"quota_pct"));
         assert!(METRICS.contains(&"overhead_p99"));
+    }
+
+    // ── SET-N1: delivery is ASSERTED, not assumed ────────────────────────────
+    //
+    // The defect these cover: `client.post(..).send().await` returns `Ok` for
+    // EVERY HTTP status, so the old notifier treated a revoked Slack webhook
+    // (`404 no_service`) exactly like a successful post — silently, forever.
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Wiremock binds 127.0.0.1 and the SSRF guard blocks loopback. Same RAII
+    /// thread-local pattern as `providers::smoke_tests` — no process env, so
+    /// the parallel suite never races.
+    struct LoopbackBypassGuard;
+    impl LoopbackBypassGuard {
+        fn new() -> Self {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+            Self
+        }
+    }
+    impl Drop for LoopbackBypassGuard {
+        fn drop(&mut self) {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+        }
+    }
+
+    async fn mock_webhook(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// MUST ACCEPT: a webhook that answers 2xx is a delivery, and the observed
+    /// status is returned (Slack answers 200, Discord 204).
+    #[tokio::test]
+    async fn webhook_2xx_is_reported_as_delivered_with_the_observed_status() {
+        let _bypass = LoopbackBypassGuard::new();
+
+        let slack = mock_webhook(200, "ok").await;
+        assert_eq!(deliver_alert(&slack.uri(), "hello").await, Ok(200));
+
+        let discord = mock_webhook(204, "").await;
+        assert_eq!(deliver_alert(&discord.uri(), "hello").await, Ok(204));
+    }
+
+    /// MUST REJECT — the regression test for the anchor (`mod.rs:333`, no status
+    /// check). A revoked Slack webhook answers `404 no_service`. Before this
+    /// change the notifier returned without error and the API said "sent".
+    #[tokio::test]
+    async fn revoked_webhook_404_is_a_failure_carrying_the_reason() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = mock_webhook(404, "no_service").await;
+
+        let out = deliver_alert(&server.uri(), "hello").await;
+
+        assert_eq!(
+            out,
+            Err(DeliveryError::Status {
+                http_status: 404,
+                body: "no_service".to_string(),
+            }),
+            "a 404 from the destination must NOT be reported as a delivery"
+        );
+        // The reason reaches the user verbatim — that is what makes it fixable.
+        let msg = out.unwrap_err().to_string();
+        assert!(msg.contains("404"), "{msg}");
+        assert!(msg.contains("no_service"), "{msg}");
+    }
+
+    /// MUST REJECT: a 5xx from the destination is not a delivery either.
+    #[tokio::test]
+    async fn webhook_5xx_is_a_failure() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = mock_webhook(500, "internal error").await;
+
+        match deliver_alert(&server.uri(), "hello").await {
+            Err(DeliveryError::Status { http_status, .. }) => assert_eq!(http_status, 500),
+            other => panic!("expected a Status failure, got {other:?}"),
+        }
+    }
+
+    /// MUST REJECT: an unreachable destination (connection refused) is not a
+    /// delivery, and is distinguishable from "the webhook said no".
+    #[tokio::test]
+    async fn unreachable_webhook_is_not_a_delivery() {
+        let _bypass = LoopbackBypassGuard::new();
+        // Bind then drop to obtain a port nothing is listening on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let out = deliver_alert(&format!("http://127.0.0.1:{port}/hook"), "hello").await;
+
+        assert!(
+            matches!(out, Err(DeliveryError::Unreachable(_))),
+            "expected Unreachable, got {out:?}"
+        );
+    }
+
+    /// MUST REJECT: an SSRF-blocked URL never becomes a delivery. IMDS
+    /// (169.254.169.254) is an IP literal in a blocked range, so this holds
+    /// regardless of the loopback bypass — no bypass guard here on purpose.
+    #[tokio::test]
+    async fn ssrf_blocked_url_is_not_a_delivery() {
+        let out = deliver_alert("http://169.254.169.254/latest/meta-data", "hello").await;
+        assert!(
+            matches!(out, Err(DeliveryError::Rejected(_))),
+            "expected Rejected, got {out:?}"
+        );
+    }
+
+    /// The failure detail is bounded and credential-scrubbed before it reaches a
+    /// log line or the API body — a hostile destination cannot use our error
+    /// path as an echo channel or a memory amplifier.
+    #[tokio::test]
+    async fn webhook_error_body_is_scrubbed_and_capped() {
+        let _bypass = LoopbackBypassGuard::new();
+        let hostile = format!(
+            "Authorization: Bearer xoxb-unit-test-not-a-real-token\n{}",
+            "A".repeat(5000)
+        );
+        let server = mock_webhook(403, &hostile).await;
+
+        let Err(DeliveryError::Status { body, .. }) = deliver_alert(&server.uri(), "hi").await
+        else {
+            panic!("expected a Status failure");
+        };
+
+        assert!(
+            !body.contains("xoxb-unit-test-not-a-real-token"),
+            "credential survived redaction: {body}"
+        );
+        assert!(body.contains("[REDACTED]"), "{body}");
+        assert!(
+            body.chars().count() <= MAX_DETAIL_CHARS,
+            "detail not capped: {} chars",
+            body.chars().count()
+        );
+    }
+
+    #[test]
+    fn sanitize_detail_strips_control_characters() {
+        assert_eq!(sanitize_detail(b"no\x00_ser\nvice"), "no _ser vice");
     }
 }

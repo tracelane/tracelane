@@ -43,7 +43,9 @@ export default async function AccountPage() {
 		<div className="space-y-1">
 			<h2 className="text-sm font-semibold text-ink">Account</h2>
 			<p className="text-xs text-ink-2 mb-6">
-				Your profile and account controls. Email changes are not yet self-serve.
+				Your profile and account controls. Changing your email is self-serve —
+				the new address is verified before it is trusted, and you will need to
+				sign in again afterwards.
 			</p>
 			<ProfileManager
 				initialName={currentName}

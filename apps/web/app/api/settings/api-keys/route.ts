@@ -36,6 +36,10 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 			createdAt: apiKeys.createdAt,
 			lastUsedAt: apiKeys.lastUsedAt,
 			mintedBy: apiKeys.mintedBy,
+			// A13 — `scope: null` renders as "Full access (legacy)"; a non-null
+			// array renders the capabilities the key actually carries.
+			scope: apiKeys.scope,
+			expiresAt: apiKeys.expiresAt,
 		})
 		.from(apiKeys)
 		.where(and(eq(apiKeys.tenantId, tenantDbId), isNull(apiKeys.revokedAt)))
@@ -46,6 +50,11 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 
 interface CreateKeyBody {
 	name: string;
+	/** A13. Omitted ⇒ the gateway records the explicit full set. */
+	scope?: string[];
+	/** A13. RFC3339, must be in the future. */
+	expiresAt?: string;
+	budgetUsdMonthly?: number;
 }
 
 /** The gateway `/v1/keys` response — the raw key is present exactly once. */
@@ -56,6 +65,9 @@ interface CreateKeyResult {
 	createdAt: string;
 	lastUsedAt: string | null;
 	rawKey: string;
+	/** A13. `null` only for a key minted before A13. */
+	scope: string[] | null;
+	expiresAt: string | null;
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
@@ -80,14 +92,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	// per-user JWT and returns the raw key once.
 	let created: CreateKeyResult;
 	try {
-		created = await gatewayPost<CreateKeyResult>("/v1/keys", { name });
+		created = await gatewayPost<CreateKeyResult>("/v1/keys", {
+			name,
+			// The gateway validates these and 400s on an unknown scope / past
+			// expiry; this proxy deliberately does NOT re-validate. One validator,
+			// at the enforcement point — a second copy here would drift from it.
+			...(body.scope ? { scope: body.scope } : {}),
+			...(body.expiresAt ? { expires_at: body.expiresAt } : {}),
+			...(body.budgetUsdMonthly != null
+				? { budget_usd_monthly: body.budgetUsdMonthly }
+				: {}),
+		});
 	} catch (err) {
 		if (err instanceof GatewayError) {
-			// Surface auth failures as 401; anything else is an upstream fault.
-			const status = err.status === 401 ? 401 : 502;
+			// A CLIENT error is the caller's to fix and must keep its status AND
+			// its message — A13 validation returns 400 naming the bad scope or a
+			// past expiry, and collapsing that into a generic 502 would tell the
+			// user "failed to create API key" while the gateway had already
+			// explained exactly what was wrong. Same defect class as the role-403
+			// that once surfaced as an opaque failure.
+			//
+			// 5xx stays opaque: an upstream fault's message can carry internal
+			// state and is not actionable by the caller.
+			if (err.status >= 400 && err.status < 500) {
+				return NextResponse.json(
+					{ error: err.message || "invalid request" },
+					{ status: err.status },
+				);
+			}
 			return NextResponse.json(
 				{ error: "failed to create API key" },
-				{ status },
+				{ status: 502 },
 			);
 		}
 		// A `NEXT_REDIRECT` from requireGatewayToken (unauthenticated) must
@@ -107,6 +142,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		afterJson: {
 			name: created.name,
 			keyPrefix: created.keyPrefix,
+			scope: created.scope,
+			expiresAt: created.expiresAt,
 		},
 		ipAddr: ipFromRequest(request),
 		userAgent: request.headers.get("user-agent"),

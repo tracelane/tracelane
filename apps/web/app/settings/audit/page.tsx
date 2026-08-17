@@ -78,7 +78,7 @@ export default async function AuditKeyPage() {
 					</div>
 
 					{/* Non-cryptographer how-to — the trust channel in three steps. */}
-					<div className="rounded-md border border-line bg-surface-2/30 p-3 text-[13px] text-ink-2">
+					<div className="rounded-lg border border-line bg-surface-2/30 p-3 text-[13px] text-ink-2">
 						<div className="mb-1.5 font-medium text-ink">
 							Give this to your auditor
 						</div>
@@ -109,10 +109,24 @@ export default async function AuditKeyPage() {
 				</Card>
 			) : (
 				<Card className="p-5">
-					<div className="text-sm font-medium text-ink">No signing key yet</div>
+					<div className="text-sm font-medium text-ink">
+						No workspace signing key
+					</div>
+					{/* R49. This said "Generated automatically on your first gateway-proxied
+					    batch, then shown here." That is FALSE and had been since the mint
+					    gate landed (`crates/gateway/src/audit_keys.rs` — minting bails with
+					    "tenant not entitled to a per-tenant audit keypair (f_audit_addon)").
+					    Measured 2026-08-15: five production tenants have signed batches and
+					    will never be issued a key by that path, so the page promised them
+					    something no amount of traffic produces. Their batches ARE signed —
+					    with the operator key — which is why this no longer says "no key" as
+					    though nothing were happening. */}
 					<p className="mt-1 text-[13px] text-ink-2">
-						Generated automatically on your first gateway-proxied batch, then
-						shown here.
+						Your batches are signed with Tracelane&apos;s operator key, so the
+						ledger is tamper-evident — but a third party cannot verify it
+						without trusting us. A per-workspace signing key, which is what
+						makes independent verification possible, is issued with the Audit
+						add-on.
 					</p>
 				</Card>
 			)}
@@ -147,7 +161,7 @@ export default async function AuditKeyPage() {
 							Open the{" "}
 							<Link
 								href="/audit"
-								className="font-medium text-accent-ink hover:underline"
+								className="font-medium text-action-ink hover:underline"
 							>
 								Audit page
 							</Link>
@@ -176,7 +190,7 @@ export default async function AuditKeyPage() {
 						</span>
 					</li>
 					<li className="flex gap-3">
-						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent-soft font-mono text-[11px] font-semibold text-accent-ink">
+						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-action-soft font-mono text-[11px] font-semibold text-action-ink">
 							3
 						</span>
 						<span>
@@ -192,7 +206,7 @@ export default async function AuditKeyPage() {
 					</li>
 				</ol>
 
-				<div className="rounded-md border border-line bg-surface-2/40 p-3 text-[12.5px] leading-relaxed text-ink-2">
+				<div className="rounded-lg border border-line bg-surface-2/40 p-3 text-[12.5px] leading-relaxed text-ink-2">
 					<span className="font-medium text-ink">Worked example.</span> A
 					customer disputes a run from last month. Open the Audit page, narrow
 					to that window, and confirm the chain is green (signatures valid,
@@ -205,7 +219,7 @@ export default async function AuditKeyPage() {
 
 				<Link
 					href="/audit"
-					className="inline-flex text-[13px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="inline-flex text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 				>
 					Open the Audit page to verify now →
 				</Link>

@@ -21,6 +21,55 @@ export interface ApiKeyRow {
 	lastUsedAt: string | null;
 	/** WorkOS user id of the minter (null for pre-0011 keys → rendered "—"). */
 	mintedBy?: string | null;
+	/**
+	 * A13. `null` means the key was minted BEFORE scopes existed and carries the
+	 * full API surface — rendered as "Full access (legacy)" rather than as an
+	 * empty list, because "no scopes" and "all scopes" are opposite meanings and
+	 * showing a blank cell for the permissive one would be dangerously wrong.
+	 */
+	scope?: string[] | null;
+	/** A13. `null` = never expires. */
+	expiresAt?: string | null;
+}
+
+/** The closed scope vocabulary, mirrored from `tracelane_shared::api_scope`. */
+const SCOPES: { value: string; label: string; hint: string }[] = [
+	{
+		value: "chat",
+		label: "Chat",
+		hint: "Send completions through the gateway",
+	},
+	{
+		value: "read",
+		label: "Read",
+		hint: "Read traces, sessions and the audit ledger",
+	},
+	{
+		value: "ingest",
+		label: "Ingest",
+		hint: "Send traces from an SDK (OTLP)",
+	},
+	{
+		value: "admin",
+		label: "Admin",
+		hint: "Manage keys, providers and settings",
+	},
+];
+
+/** Human label for a key's capability. */
+function scopeLabel(scope: string[] | null | undefined): string {
+	if (scope == null) return "Full access (legacy)";
+	if (scope.length === 0) return "No access";
+	return scope
+		.map((v) => SCOPES.find((s) => s.value === v)?.label ?? v)
+		.join(" · ");
+}
+
+/** Is this key past its expiry? Display-only — the gateway is the real gate. */
+function isExpired(expiresAt: string | null | undefined): boolean {
+	if (!expiresAt) return false;
+	const t = new Date(expiresAt).getTime();
+	return Number.isFinite(t) && t <= Date.now();
 }
 
 /**
@@ -45,13 +94,29 @@ async function fetchKeys(): Promise<ApiKeyRow[]> {
 	return res.json() as Promise<ApiKeyRow[]>;
 }
 
-async function createKey(name: string): Promise<CreateResult> {
+export interface CreateKeyInput {
+	name: string;
+	scope: string[];
+	expiresAt: string | null;
+}
+
+async function createKey(input: CreateKeyInput): Promise<CreateResult> {
 	const res = await fetch("/api/settings/api-keys", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ name }),
+		body: JSON.stringify({
+			name: input.name,
+			scope: input.scope,
+			...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+		}),
 	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	if (!res.ok) {
+		// The gateway 400s with a message naming the bad scope or a past expiry,
+		// and the proxy now preserves it. Surfacing `HTTP 400` instead would throw
+		// away the only part the user can act on.
+		const body = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new Error(body.error ?? `HTTP ${res.status}`);
+	}
 	return res.json() as Promise<CreateResult>;
 }
 
@@ -92,8 +157,8 @@ function NewKeyModal({
 	onDone: () => void;
 }) {
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="bg-surface border border-line rounded-lg p-6 w-full max-w-lg shadow-2xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-lg shadow-2xl space-y-4">
 				<div className="flex items-start justify-between">
 					<div>
 						<h3 className="text-base font-semibold text-ink">
@@ -106,8 +171,8 @@ function NewKeyModal({
 					</span>
 				</div>
 
-				<div className="rounded-md bg-bg border border-line p-3 flex items-center justify-between gap-3">
-					<code className="text-xs font-mono text-accent-ink break-all">
+				<div className="rounded-lg bg-bg border border-line p-3 flex items-center justify-between gap-3">
+					<code className="text-xs font-mono text-action-ink break-all">
 						{rawKey}
 					</code>
 					<CopyButton text={rawKey} />
@@ -140,20 +205,47 @@ function CreateKeyDialog({
 	error,
 }: {
 	onClose: () => void;
-	onCreate: (name: string) => void;
+	onCreate: (input: CreateKeyInput) => void;
 	pending: boolean;
 	error: Error | null;
 }) {
 	const [name, setName] = useState("");
+	// A13. Default = chat + read + ingest, NOT all four. The mint default at the
+	// API is full-surface for backwards compatibility with existing callers, but a
+	// human choosing in this dialog should be offered least-privilege — `admin`
+	// lets a key mint further keys, which is the one capability worth an explicit
+	// tick.
+	//
+	// GWY-41 added `ingest` to the default deliberately: the key someone mints in
+	// their first five minutes is the key they paste into their app, and an app
+	// both calls models and reports its traces. Leaving it off would mean the SDK
+	// quickstart 403s for every new user, with the fix three screens away.
+	// Unticking it is still one click for anyone who wants a chat-only key.
+	const [scope, setScope] = useState<string[]>(["chat", "read", "ingest"]);
+	const [expiresAt, setExpiresAt] = useState("");
+	const toggle = (v: string) =>
+		setScope((cur) =>
+			cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v],
+		);
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="bg-surface border border-line rounded-lg p-6 w-full max-w-md shadow-2xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
 				<h3 className="text-base font-semibold text-ink">Create API key</h3>
 				<form
 					onSubmit={(e) => {
 						e.preventDefault();
-						if (name.trim() && !pending) onCreate(name.trim());
+						if (name.trim() && !pending && scope.length > 0) {
+							onCreate({
+								name: name.trim(),
+								scope,
+								// <input type="datetime-local"> yields local wall-clock with
+								// no zone. Send an explicit UTC instant rather than a naive
+								// string — the gateway parses RFC3339 strictly, and a naive
+								// value is the timestamp bug this repo has hit before.
+								expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+							});
+						}
 					}}
 					className="space-y-3"
 				>
@@ -171,10 +263,60 @@ function CreateKeyDialog({
 							onChange={(e) => setName(e.target.value)}
 							placeholder="e.g. prod-agent, ci-runner"
 							disabled={pending}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-accent-ink disabled:opacity-50"
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-action-ink disabled:opacity-50"
 							required
 						/>
 					</div>
+					<fieldset className="space-y-1.5">
+						<legend className="text-xs font-medium text-ink-2 mb-1">
+							Scope — what this key may do
+						</legend>
+						{SCOPES.map((sc) => (
+							<label
+								key={sc.value}
+								className="flex items-start gap-2 text-xs text-ink cursor-pointer"
+							>
+								<input
+									type="checkbox"
+									checked={scope.includes(sc.value)}
+									onChange={() => toggle(sc.value)}
+									disabled={pending}
+									className="mt-0.5"
+								/>
+								<span>
+									<span className="font-medium">{sc.label}</span>
+									<span className="text-ink-2"> — {sc.hint}</span>
+								</span>
+							</label>
+						))}
+						{scope.length === 0 && (
+							<p className="text-[11px] text-danger-ink">
+								Pick at least one — a key with no scope can do nothing.
+							</p>
+						)}
+					</fieldset>
+
+					<div>
+						<label
+							htmlFor="key-expires"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Expires <span className="text-ink-3">(optional)</span>
+						</label>
+						<input
+							id="key-expires"
+							type="datetime-local"
+							value={expiresAt}
+							onChange={(e) => setExpiresAt(e.target.value)}
+							disabled={pending}
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-action-ink disabled:opacity-50"
+						/>
+						<p className="text-[11px] text-ink-3 mt-1">
+							Leave blank for a key that never expires. Times are your local
+							zone; the key expires at that instant in UTC.
+						</p>
+					</div>
+
 					{/* Surface the create error inline — without this the request could
 					    fail (e.g. gateway/DB 500) and the dialog would appear to do
 					    nothing. */}
@@ -183,9 +325,18 @@ function CreateKeyDialog({
 							role="alert"
 							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
 						>
-							Couldn&apos;t create the key: {error.message}. Please retry — if
-							it persists, check that the workspace has API-key creation
-							enabled.
+							{/* Claims ONLY what the code knows. The previous copy read
+							    "…check that the workspace has API-key creation enabled",
+							    which named a setting that DOES NOT EXIST anywhere in the
+							    product — no entitlement flag, no column, no config key —
+							    and told the user to retry a failure that was 100%
+							    deterministic. It invented a plausible cause for an upstream
+							    fault and sent the customer to look for it. `error.message`
+							    is the gateway's own 4xx text when the request was the
+							    problem, or a generic string when the fault was ours
+							    (api-keys/route.ts:117-126); the UI cannot tell which, so it
+							    must not assert either. */}
+							Couldn&apos;t create the key: {error.message}
 						</p>
 					)}
 					<div className="flex justify-end gap-2 pt-1">
@@ -200,7 +351,7 @@ function CreateKeyDialog({
 						<button
 							type="submit"
 							disabled={!name.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 disabled:opacity-40 transition-colors"
+							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 						>
 							{pending ? "Creating…" : "Create"}
 						</button>
@@ -256,7 +407,7 @@ export function ApiKeyManager() {
 						createMutation.reset(); // clear any stale error before reopening
 						setShowCreate(true);
 					}}
-					className="px-3 py-1.5 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 transition-colors"
+					className="px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ New key
 				</button>
@@ -288,28 +439,71 @@ export function ApiKeyManager() {
 					<table className="w-full text-left">
 						<thead className="bg-surface text-xs text-ink-2">
 							<tr>
-								<th className="py-2.5 px-4 font-medium">Name</th>
-								<th className="py-2.5 pr-4 font-medium">Prefix</th>
-								<th className="py-2.5 pr-4 font-medium">Created</th>
-								<th className="py-2.5 pr-4 font-medium">Created by</th>
-								<th className="py-2.5 pr-4 font-medium">Last used</th>
-								<th className="py-2.5 pr-4 font-medium" />
+								<th className="py-1.5 px-3 font-medium">Name</th>
+								<th className="py-1.5 pr-3 font-medium">Prefix</th>
+								<th className="py-1.5 pr-3 font-medium">Scope</th>
+								<th className="py-1.5 pr-3 font-medium">Expires</th>
+								<th className="py-1.5 pr-3 font-medium">Created</th>
+								<th className="py-1.5 pr-3 font-medium">Created by</th>
+								<th
+									className="py-1.5 pr-3 font-medium"
+									title="Refreshed when a key misses the auth cache, so it can lag real usage by up to 15 minutes."
+								>
+									Last used{" "}
+									<span className="font-normal text-ink-3" aria-hidden="true">
+										†
+									</span>
+								</th>
+								<th className="py-1.5 pr-3 font-medium" />
 							</tr>
 						</thead>
 						<tbody>
 							{keys.map((key) => (
 								<tr key={key.id} className="border-t border-line last:border-0">
-									<td className="py-3 px-4 text-sm text-ink">{key.name}</td>
-									<td className="py-3 pr-4 font-mono text-xs text-ink-2">
+									<td className="py-2 px-3 text-sm text-ink">{key.name}</td>
+									<td className="py-2 pr-3 font-mono text-xs text-ink-2">
 										tlane_{key.keyPrefix}…
 									</td>
-									<td className="py-3 pr-4 text-xs text-ink-2">
+									<td className="py-2 pr-3 text-xs">
+										{/* `null` scope is a LEGACY key with the full surface —
+										    never render it as an empty list, which would read as
+										    "no access" and is the opposite of the truth. */}
+										<span
+											className={
+												key.scope == null ? "text-warn-ink" : "text-ink-2"
+											}
+											title={
+												key.scope == null
+													? "Minted before scopes existed — carries the full API surface. Re-mint with explicit scopes to narrow it."
+													: undefined
+											}
+										>
+											{scopeLabel(key.scope)}
+										</span>
+									</td>
+									<td className="py-2 pr-3 text-xs">
+										{key.expiresAt ? (
+											<span
+												className={
+													isExpired(key.expiresAt)
+														? "text-danger-ink"
+														: "text-ink-2"
+												}
+											>
+												{absoluteDate(key.expiresAt)}
+												{isExpired(key.expiresAt) ? " (expired)" : ""}
+											</span>
+										) : (
+											<span className="text-ink-3">Never</span>
+										)}
+									</td>
+									<td className="py-2 pr-3 text-xs text-ink-2">
 										{absoluteDate(key.createdAt)}
 									</td>
-									<td className="py-3 pr-4 font-mono text-xs text-ink-3">
+									<td className="py-2 pr-3 font-mono text-xs text-ink-3">
 										{key.mintedBy ? `${key.mintedBy.slice(0, 14)}…` : "—"}
 									</td>
-									<td className="py-3 pr-4 text-xs text-ink-2">
+									<td className="py-2 pr-3 text-xs text-ink-2">
 										{key.lastUsedAt ? (
 											absoluteDate(key.lastUsedAt)
 										) : (
@@ -321,13 +515,18 @@ export function ApiKeyManager() {
 											</span>
 										)}
 									</td>
-									<td className="py-3 pr-4">
+									<td className="py-2 pr-3">
 										<button
 											type="button"
 											onClick={() => {
 												if (
 													window.confirm(
-														`Revoke "${key.name}"? Any agent still using this key will immediately fail authentication. This cannot be undone.`,
+														// The gateway caches a positive auth result, so a
+														// revoked key keeps working until that entry expires —
+														// bounded at 60 seconds, and it was 15 minutes until
+														// 2026-08-12. Revocation is recorded instantly; it is
+														// ENFORCED within a minute, and the copy now says which.
+														`Revoke "${key.name}"? The key stops working within 60 seconds — any agent still using it will start failing authentication. This cannot be undone.`,
 													)
 												) {
 													revokeMutation.mutate(key.id);
@@ -342,6 +541,12 @@ export function ApiKeyManager() {
 							))}
 						</tbody>
 					</table>
+					<p className="px-4 pb-3 pt-2 text-[11px] text-ink-3">
+						† <strong>Last used</strong> is refreshed when a key misses the auth
+						cache, so it can lag real usage by up to 15 minutes. A key used
+						seconds ago may still read as older. Treat it as a staleness signal,
+						not an audit trail — the audit ledger is authoritative.
+					</p>
 				</div>
 			)}
 
@@ -351,7 +556,7 @@ export function ApiKeyManager() {
 						setShowCreate(false);
 						createMutation.reset();
 					}}
-					onCreate={(name) => createMutation.mutate(name)}
+					onCreate={(input) => createMutation.mutate(input)}
 					pending={createMutation.isPending}
 					error={createMutation.error}
 				/>

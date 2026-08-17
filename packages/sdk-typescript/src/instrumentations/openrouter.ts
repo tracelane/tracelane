@@ -20,6 +20,7 @@
  */
 
 import { SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { CONVERSATION_ID_ATTRIBUTE, applySessionToArgs } from "../session.js";
 import { markStreamingCall } from "../streaming.js";
 
 const tracer = trace.getTracer("@tracelanedev/sdk-openrouter", "0.1.0");
@@ -47,6 +48,11 @@ export function instrumentOpenRouter(client: OpenRouterClientLike): void {
 		const requestedModel =
 			typeof request?.model === "string" ? request.model : "unknown";
 
+		// Session correlation: adds `x-conversation-id` to the outgoing request
+		// (the gateway path) and the matching span attribute (the OTLP path).
+		// No-op when no session is active.
+		const sessionId = applySessionToArgs(args);
+
 		return tracer.startActiveSpan(
 			"openrouter.chat.completions.create",
 			{
@@ -55,6 +61,9 @@ export function instrumentOpenRouter(client: OpenRouterClientLike): void {
 					"gen_ai.provider.name": "openrouter",
 					"gen_ai.request.model": requestedModel,
 					"llm.model_name": requestedModel,
+					...(sessionId === undefined
+						? {}
+						: { [CONVERSATION_ID_ATTRIBUTE]: sessionId }),
 				},
 			},
 			async (span) => {

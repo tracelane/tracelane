@@ -1,0 +1,72 @@
+{
+	"$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+	"name": "io.github.tracelane/tracelane-mcp",
+	"description": "Read-only, tenant-scoped access to Tracelane agent traces and guardrail verdicts",
+	"version": "0.2.4",
+	"websiteUrl": "https://tracelane.dev/docs/mcp-server",
+	"repository": {
+		"url": "https://github.com/tracelane/tracelane",
+		"source": "github",
+		"subfolder": "apps/mcp"
+	},
+	"packages": [
+		{
+			"registryType": "npm",
+			"registryBaseUrl": "https://registry.npmjs.org",
+			"identifier": "@tracelanedev/mcp",
+			"version": "0.2.4",
+			"runtimeHint": "npx",
+			"transport": { "type": "stdio" },
+			"environmentVariables": [
+				{
+					"name": "TRACELANE_API_KEY",
+					"description": "Tracelane API key (tlane_…). Resolved to a tenant once at startup via the gateway's /v1/auth/whoami; the server refuses to start if the key is rejected.",
+					"isRequired": true,
+					"isSecret": true
+				},
+				{
+					"name": "TRACELANE_GATEWAY_URL",
+					"description": "Base URL of the Tracelane gateway used to validate TRACELANE_API_KEY. Must be https://…tracelane.dev outside development.",
+					"isRequired": true,
+					"format": "string",
+					"default": "https://gateway.tracelane.dev"
+				},
+				{
+					"name": "CLICKHOUSE_URL",
+					"description": "ClickHouse endpoint the server reads spans from. This server queries ClickHouse directly, so it targets a self-hosted or local Tracelane stack.",
+					"isRequired": true,
+					"format": "string",
+					"default": "http://localhost:8123"
+				},
+				{
+					"name": "CLICKHOUSE_USER",
+					"description": "ClickHouse username.",
+					"isRequired": false,
+					"format": "string",
+					"default": "default"
+				},
+				{
+					"name": "CLICKHOUSE_PASSWORD",
+					"description": "ClickHouse password.",
+					"isRequired": false,
+					"isSecret": true
+				},
+				{
+					"name": "CLICKHOUSE_DB",
+					"description": "ClickHouse database holding the spans table.",
+					"isRequired": false,
+					"format": "string",
+					"default": "tracelane"
+				},
+				{
+					"name": "TRACELANE_MCP_TRANSPORT",
+					"description": "Transport to serve. stdio (default) for desktop clients; http for the Streamable HTTP transport.",
+					"isRequired": false,
+					"format": "string",
+					"default": "stdio",
+					"choices": ["stdio", "http"]
+				}
+			]
+		}
+	]
+}

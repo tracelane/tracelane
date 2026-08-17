@@ -1,6 +1,7 @@
 /**
- * tlane import-helicone — read a Helicone setup (env vars + custom
- * properties) and emit a Tracelane gateway config + .env stanza.
+ * tlane import-helicone — rename a Helicone `.env` into its Tracelane
+ * equivalent. This moves CONFIGURATION only: it does not read, import or
+ * backfill any Helicone trace, request log or history.
  *
  * Helicone is mostly a proxy with config-via-env + per-request headers,
  * not a YAML config like LiteLLM. So this CLI:
@@ -8,14 +9,14 @@
  *   1. Reads `.env` (or `--env <path>`) looking for HELICONE_*
  *   2. Translates each known var to its Tracelane equivalent
  *   3. Emits a new `.env.tracelane` stanza with the renamed vars
- *   4. If `--with-config`, also emits `tracelane.yaml` with provider
- *      routing pulled from Helicone's `Helicone-Property-*` examples
- *      in your codebase (best-effort grep over `--src <dir>`)
+ *   4. Prints the Helicone → Tracelane request-header rename table
+ *   5. If `--with-config`, writes a fixed two-provider `tracelane.yaml`
+ *      starter scaffold to edit — it is not derived from your codebase
  *
  * Usage:
  *   tlane import-helicone                        # in repo root, scans .env
  *   tlane import-helicone --env config/.env
- *   tlane import-helicone --env .env --with-config --src src/
+ *   tlane import-helicone --env .env --with-config
  *   tlane import-helicone --dry-run              # print, don't write
  *
  * Maps the canonical migration table from
@@ -175,12 +176,12 @@ export function registerImportHeliconeCommand(program: Command): void {
 		)
 		.option(
 			"--with-config",
-			"Also emit a tracelane.yaml routing config (best-effort)",
+			"Also write a starter tracelane.yaml scaffold (fixed template — edit before use)",
 			false,
 		)
 		.option(
 			"--src <dir>",
-			"Source dir to grep for Helicone-Property-* usage (with --with-config)",
+			"Source dir to review manually for Helicone-Property-* usage — named in the reminder printed with --with-config; nothing is scanned",
 			"src/",
 		)
 		.option("--dry-run", "Print to stdout instead of writing files", false)

@@ -22,11 +22,13 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt as _, util::Subscr
 
 mod admin_audit;
 mod alerts;
+mod annotation_routes;
 mod audit;
 mod audit_consumer;
 mod audit_export;
 mod audit_format;
 mod audit_keys;
+mod audit_ledger_range;
 mod audit_pubkey;
 mod audit_retention;
 mod audit_self_verify;
@@ -41,6 +43,7 @@ mod entitlement_cache;
 mod guardrail;
 mod key_routes;
 mod kill_switch;
+mod notification_routes;
 mod otlp_emit;
 mod payment;
 mod predictive;
@@ -56,6 +59,7 @@ use tracelane_shared::redact;
 mod server;
 mod ssrf_guard;
 mod tool_analytics;
+mod trace_ingest;
 mod trace_reads;
 mod untrusted_data;
 

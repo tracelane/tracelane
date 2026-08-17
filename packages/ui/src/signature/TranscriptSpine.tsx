@@ -22,7 +22,8 @@ export interface SpanNode {
 	status: "ok" | "error";
 	/** matched failure signature → renders the inline seen-before glow. */
 	signature?: {
-		count: number;
+		/** Per-tenant hits. Optional: absent until resolved — see SeenBeforeSignal. */
+		count?: number;
 		label: string;
 		href?: string;
 		/** Native browser tooltip shown on hover — AFT-1 id + human label. */
@@ -36,7 +37,7 @@ export interface SpanNode {
 	collapsed?: boolean;
 }
 
-// span-kind colours (consistent everywhere). ADR-053 discipline: Lava (--accent)
+// span-kind colours (consistent everywhere). ADR-053 discipline: Lava (--action)
 // is CTA-only and Verify-green (--ok/--seal) is provenance-only, so span kinds use
 // the one free data hue (violet --info, the AI-call family: tool bold, llm faint) +
 // neutral ink for structure. The kind label always accompanies the colour — never
@@ -78,7 +79,7 @@ export interface TranscriptSpineProps {
  * color-coded span-kind node pins, error nodes ringed red, a latency bar per
  * step, and the inline seen-before glow where a signature matches.
  *
- * In-house component (Neon design system). Spans may be supplied flat
+ * In-house component (design system). Spans may be supplied flat
  * (chronological) or pre-shaped into a hierarchy by the caller: pass `depth` /
  * `hasChildren` / `collapsed` on each `SpanNode` to render an ARIA tree with
  * indentation and expand/collapse. The span-tree is reconstructed from
@@ -192,8 +193,8 @@ export function TranscriptSpine({
 											? "border-danger/40 bg-danger-soft/30"
 											: "border-line bg-surface",
 										interactive &&
-											"cursor-pointer hover:border-accent-line/60 focus-visible:ring-2 focus-visible:ring-accent-ink",
-										selected && "bg-accent-soft/40 ring-2 ring-accent-line",
+											"cursor-pointer hover:border-action-line/60 focus-visible:ring-2 focus-visible:ring-action-ink",
+										selected && "bg-action-soft/40 ring-2 ring-action-line",
 									)}
 								>
 									<div className="flex items-center justify-between gap-3">
@@ -285,7 +286,7 @@ function Disclosure({
 				e.stopPropagation();
 				onToggle();
 			}}
-			className="grid h-4 w-4 shrink-0 place-items-center rounded text-ink-3 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent-ink"
+			className="grid h-4 w-4 shrink-0 place-items-center rounded text-ink-3 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-action-ink"
 		>
 			<span aria-hidden className="text-[9px]">
 				{collapsed ? "▶" : "▼"}

@@ -206,6 +206,51 @@ set per ADR-028 §Observability:
 | `expired_svid` | SVID outside its validity window (clock skew or stale cert). |
 | `no_svid` | No PeerCertDer reached the auth layer (TLS handshake failed, or `peer_certificates()` was empty). |
 
+### Scraping the counter
+
+Ingest serves the Prometheus text format at **`/metrics`** on its own listener,
+separate from the OTLP port:
+
+```bash
+TRACELANE_METRICS_ADDR=127.0.0.1:9464   # default
+curl -s http://127.0.0.1:9464/metrics | grep tracelane_ingest_auth_total
+```
+
+```
+# HELP tracelane_ingest_auth_total SPIFFE authentication outcomes at the ingest OTLP receiver.
+# TYPE tracelane_ingest_auth_total counter
+tracelane_ingest_auth_total{result="ok"} 0
+tracelane_ingest_auth_total{result="wrong_trust_domain"} 0
+tracelane_ingest_auth_total{result="invalid_path"} 0
+tracelane_ingest_auth_total{result="expired_svid"} 0
+tracelane_ingest_auth_total{result="no_svid"} 0
+```
+
+All five series are always present, including at zero, so a `rate()` rule has
+something to evaluate on a healthy system rather than appearing only at the moment
+it fires.
+
+<Warning>
+**The default bind is loopback.** Running ingest in a container means `127.0.0.1` is
+unreachable from a Prometheus elsewhere — set `TRACELANE_METRICS_ADDR=0.0.0.0:9464`
+and restrict the port at your firewall or container network. The endpoint is
+**unauthenticated**; it carries only these auth-outcome counts, never tenant
+identifiers or span contents.
+
+The metrics listener cannot take ingest down. If its port is unavailable, ingest logs
+the failure and keeps ingesting spans without a scrape endpoint.
+</Warning>
+
+<Note>
+**These counters only move on the mTLS path.** They are incremented by the SPIFFE
+authentication middleware, which is attached only when ingest runs with SPIRE. On the
+single-tenant self-host path (`TRACELANE_SPIRE_SOCKET` unset, plaintext — ADR-067),
+there is no SPIFFE authentication to record, so every bucket stays at `0`
+permanently. Do not read those zeros as "no authentication failures" — on that
+deployment the alerts below have nothing to say, and tenant attribution is handled by
+the fixed-tenant mechanism instead.
+</Note>
+
 Recommended Prometheus alerts:
 
 ```promql

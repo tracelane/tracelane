@@ -27,9 +27,23 @@ from typing import Any
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 
+from tracelane.session import CONVERSATION_ID_ATTRIBUTE, apply_session_to_kwargs
+
 from ._streaming import mark_streaming_call
 
 _tracer = trace.get_tracer("tracelane.openrouter", "0.1.0")
+
+
+def _span_attributes(model: Any, session_id: str | None) -> dict[str, Any]:
+    """Request-side span attributes, including session correlation when active."""
+    attributes: dict[str, Any] = {
+        "gen_ai.provider.name": "openrouter",
+        "gen_ai.request.model": model,
+        "llm.model_name": model,
+    }
+    if session_id is not None:
+        attributes[CONVERSATION_ID_ATTRIBUTE] = session_id
+    return attributes
 
 
 def instrument_openrouter(client: Any) -> None:
@@ -49,14 +63,14 @@ def instrument_openrouter(client: Any) -> None:
 
         async def _async_create(*args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model", "unknown")
+            # Session correlation: adds `x-conversation-id` to the outgoing
+            # request (the gateway path) and the matching span attribute (the
+            # OTLP path). No-op when no session is active.
+            session_id = apply_session_to_kwargs(kwargs)
             with _tracer.start_as_current_span(
                 "openrouter.chat.completions.create",
                 kind=SpanKind.CLIENT,
-                attributes={
-                    "gen_ai.provider.name": "openrouter",
-                    "gen_ai.request.model": model,
-                    "llm.model_name": model,
-                },
+                attributes=_span_attributes(model, session_id),
             ) as span:
                 try:
                     result = await original_create(*args, **kwargs)
@@ -76,14 +90,14 @@ def instrument_openrouter(client: Any) -> None:
 
         def _sync_create(*args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model", "unknown")
+            # Session correlation: adds `x-conversation-id` to the outgoing
+            # request (the gateway path) and the matching span attribute (the
+            # OTLP path). No-op when no session is active.
+            session_id = apply_session_to_kwargs(kwargs)
             with _tracer.start_as_current_span(
                 "openrouter.chat.completions.create",
                 kind=SpanKind.CLIENT,
-                attributes={
-                    "gen_ai.provider.name": "openrouter",
-                    "gen_ai.request.model": model,
-                    "llm.model_name": model,
-                },
+                attributes=_span_attributes(model, session_id),
             ) as span:
                 try:
                     result = original_create(*args, **kwargs)

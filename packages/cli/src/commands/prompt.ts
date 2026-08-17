@@ -318,7 +318,7 @@ export function registerPromptCommand(program: Command): void {
 
 	commonOpts(prompt.command("diff <name>"))
 		.description(
-			"Diff two versions (local — pulls both via /v1/prompts and runs git diff)",
+			"Diff the active version of two environments (local — pulls both via /v1/prompts and runs git diff). It cannot diff two arbitrary version numbers.",
 		)
 		.requiredOption("--from-env <env>", "First env to fetch from")
 		.requiredOption("--to-env <env>", "Second env to fetch from")

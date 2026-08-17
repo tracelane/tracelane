@@ -16,7 +16,7 @@
  * the link to affected traces, and the tamper-evident ledger note.
  *
  * Colour discipline (ADR-053): names are INK; red is reserved for a real Block
- * severity. Links use --accent-ink; the AFT-1 id is the violet data hue.
+ * severity. Links use --action-ink; the AFT-1 id is the violet data hue.
  */
 "use client";
 
@@ -65,7 +65,7 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 				onClick={() => setOpen((v) => !v)}
 			>
 				{/* DISCLOSURE — real button, the keyboard-accessible toggle */}
-				<td className="py-2 pl-4 pr-1">
+				<td className="py-2 pl-3 pr-3">
 					<button
 						type="button"
 						aria-expanded={open}
@@ -84,13 +84,13 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 				</td>
 
 				{/* SIGNATURE — name in INK; mono canonical id beneath */}
-				<td className="py-2 pr-4">
+				<td className="py-2 pr-3">
 					<div className="font-medium text-ink">{name}</div>
 					<div className="font-mono text-xs text-ink-3">{sig.signature_id}</div>
 				</td>
 
 				{/* AFT-1 — the canonical id (violet data hue); tooltip carries name + detection */}
-				<td className="px-4 py-2">
+				<td className="px-3 py-2">
 					{t ? (
 						<Badge
 							tone="info"
@@ -111,7 +111,7 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 				</td>
 
 				{/* SEVERITY — AFT-1 intervention type (observe-first: recorded, not enforced) */}
-				<td className="px-4 py-2">
+				<td className="px-3 py-2">
 					<Badge
 						tone={sev.tone}
 						title="AFT-1 intervention type · observe-first — the decision is recorded, not enforced."
@@ -121,16 +121,16 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 				</td>
 
 				{/* OCCURRENCES — tabular body font */}
-				<td className="px-4 py-2 text-right tabular-nums text-ink">
+				<td className="px-3 py-2 text-right tabular-nums text-ink">
 					{sig.your_hits.toLocaleString()}
 				</td>
 
-				{/* TRACES — the functional link to the affected traces (--accent-ink) */}
-				<td className="px-4 py-2 text-right">
+				{/* TRACES — the functional link to the affected traces (--action-ink) */}
+				<td className="px-3 py-2 text-right">
 					<Link
 						href={tracesHref}
 						onClick={(e) => e.stopPropagation()}
-						className="font-medium tabular-nums text-accent-ink hover:underline"
+						className="font-medium tabular-nums text-action-ink hover:underline"
 					>
 						{sig.traces_affected.toLocaleString()}
 						<span aria-hidden> →</span>
@@ -140,12 +140,12 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 				{/* FIRST / LAST SEEN — both absolute UTC dates in the SAME format, so the
 				    pair is directly comparable and never a misleading relative value
 				    (the signatures first/last-seen-dates fix). Full timestamp on hover. */}
-				<td className="px-4 py-2 whitespace-nowrap tabular-nums text-ink-2">
+				<td className="px-3 py-2 whitespace-nowrap tabular-nums text-ink-2">
 					<time dateTime={sig.first_seen} title={sig.first_seen}>
 						{absoluteDate(sig.first_seen)}
 					</time>
 				</td>
-				<td className="px-4 py-2 whitespace-nowrap tabular-nums text-ink-2">
+				<td className="px-3 py-2 whitespace-nowrap tabular-nums text-ink-2">
 					<time dateTime={sig.last_seen} title={sig.last_seen}>
 						{absoluteDate(sig.last_seen)}
 					</time>
@@ -157,7 +157,7 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 			{open && (
 				<tr id={detailId} className="bg-surface-2/20">
 					<td />
-					<td colSpan={7} className="px-4 pb-4 pt-2">
+					<td colSpan={7} className="px-3 py-2">
 						<ul className="max-w-3xl space-y-1.5 text-sm">
 							{t?.description && (
 								<li className="flex gap-2">
@@ -185,7 +185,7 @@ export function SignatureRow({ sig }: { sig: SignatureHit }) {
 								<Link
 									href={tracesHref}
 									onClick={(e) => e.stopPropagation()}
-									className="font-medium text-accent-ink hover:underline"
+									className="font-medium text-action-ink hover:underline"
 								>
 									View {sig.traces_affected.toLocaleString()}{" "}
 									{sig.traces_affected === 1

@@ -86,6 +86,28 @@ HTTP responses for a deprecated `/v1` route will carry a `Deprecation` / `Sunset
 > A fuller standalone DEPRECATION policy (per-surface sunset timelines, header semantics) is a
 > post-launch follow-up; this section is the pre-publish minimum.
 
+## Release cadence — one tag, everything that moved
+
+**A release is a single signed tag covering every surface that has genuinely changed since
+the last one.** We do not cut a tag per package, per feature, or per fix.
+
+- One annotated, **SSH-signed** `v<x.y.z>` tag drives the entire publish run
+  (`.github/workflows/release.yml`): signature verification, Rust binaries, SLSA provenance,
+  npm, PyPI, and the MCP registry submission all descend from that one tag. The signature gate
+  **fails closed** — an unsigned or unrecognised tag publishes nothing.
+- **Surfaces that did not change are skipped, not republished.** npm and PyPI publishes are
+  idempotent, so an unbumped package is a no-op and the run stays green having published
+  nothing for it. Green therefore does not mean "everything on this list is now live" — check
+  the version, not the run status.
+- **Between releases, a finished package can sit built and unpublished.** That is the normal
+  state, not a defect: work lands on `main` continuously, and versions become installable only
+  when a tag carries them.
+
+The rule the last point exists to enforce: **a package is installable only once a tag has
+shipped it, so documentation for an unreleased package says exactly that** rather than
+printing an install command that returns 404. Whether a surface is published is a fact about
+the registry, never an inference from the repository.
+
 ## Changelog
 
 `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/) with

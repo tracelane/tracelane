@@ -5,7 +5,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../../LICENSE)
 
 Instrumentation for TypeScript AI agents, built on the OpenTelemetry Node SDK.
-Spans are emitted via OTLP to your Tracelane ingest endpoint.
+Spans are emitted via OTLP/HTTP (JSON) to the endpoint you configure —
+`https://gateway.tracelane.dev` on Tracelane Cloud, or a receiver you run.
 
 ## Install
 
@@ -36,8 +37,60 @@ await client.chat.completions.create({
 // → Trace visible at https://app.tracelane.dev/traces within ~1 second
 ```
 
-Use this SDK when you want to **export OTLP spans to an endpoint you run** — a
-self-hosted Tracelane ingest, or your own OTLP collector (Jaeger, Tempo, …).
+That captures the model call. Use this SDK when you want the **shape of your
+agent** — the planner step, each tool call, the summariser — as a nested trace
+rather than one span per model call. It exports OTLP to Tracelane Cloud's
+gateway, a self-hosted Tracelane ingest, or your own collector (Jaeger, Tempo, …).
+
+## Sessions — group turns into one conversation
+
+[`/sessions`](https://app.tracelane.dev/sessions) groups traces by conversation
+id. The id travels as the `x-conversation-id` request header (the gateway also
+accepts `x-session-id`), and it lands on the span as `gen_ai.conversation.id`.
+This SDK is what sets it — an un-sessioned call sends no session header and
+carries no conversation id.
+
+Wrap the turn and every call inside the scope joins the session:
+
+```typescript
+import { instrumentOpenAI, withSession } from "@tracelanedev/sdk";
+
+instrumentOpenAI(client);
+
+await withSession(conversationId, async () => {
+  await client.chat.completions.create({ model: "claude-sonnet-4-6", messages });
+  await client.chat.completions.create({ model: "claude-sonnet-4-6", messages: followUp });
+});
+// Both calls land in the same session.
+```
+
+`withSession` is backed by `AsyncLocalStorage`, so overlapping conversations in
+one server process never bleed into each other. For a single-conversation script
+or CLI, `setSession(id)` sets it process-wide instead, and `getSession()` reads
+back whichever is active.
+
+Auto-attach covers the four adapters that wrap a request-options argument:
+`instrumentOpenAI`, `instrumentAnthropic`, `instrumentLiteLLM` and
+`instrumentOpenRouter`. For every other client — including the no-SDK gateway
+path above — pass the header yourself:
+
+```typescript
+import { sessionHeaders } from "@tracelanedev/sdk";
+
+await client.chat.completions.create(
+  { model: "claude-sonnet-4-6", messages },
+  { headers: sessionHeaders(conversationId) },
+);
+```
+
+`sessionHeaders()` with no argument returns the active session, or `{}` when
+there is none, so it is always safe to spread. A header you set explicitly always
+wins over the ambient session.
+
+A session id must be non-empty visible ASCII, at most 256 characters. Anything
+else throws at the call you wrote, rather than being dropped in transit and
+leaving the session silently empty — and it is rejected, never truncated, because
+a truncated id would split one conversation into two.
 
 ## SDK quick start (OTLP export)
 
@@ -50,12 +103,9 @@ import { init, instrumentAnthropic } from "@tracelanedev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 
 // 1. Initialise once. endpoint + apiKey are REQUIRED (no env-var auto-read).
-//    `endpoint` is an OTLP receiver YOU can reach — your collector, or a
-//    self-hosted Tracelane ingest. (Tracelane Cloud's ingest is not a public
-//    OTLP endpoint — use the gateway path above for Cloud.)
 init({
-  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
-  apiKey: process.env.TRACELANE_API_KEY!,
+  endpoint: "https://gateway.tracelane.dev", // or a receiver you run
+  apiKey: process.env.TRACELANE_API_KEY!,    // needs the `ingest` scope
   serviceName: "my-agent",
 });
 
@@ -71,11 +121,17 @@ await client.messages.create({
 });
 ```
 
+> **Your key needs the `ingest` scope.** Keys minted before scopes existed carry
+> the full API surface and work as-is. A key scoped to `chat` and `read` does
+> not — the gateway answers `403 insufficient_scope` and names `ingest` in the
+> body. Tick **Ingest** in **Settings → API Keys**; it is on by default for new
+> keys.
+
 ### `init()` options
 
 | Field | Required | Description |
 |---|---|---|
-| `endpoint` | yes | OTLP HTTP endpoint you can reach, e.g. `http://localhost:4318` or a self-hosted ingest. Spans POST to `${endpoint}/v1/traces`. |
+| `endpoint` | yes | OTLP HTTP endpoint. `https://gateway.tracelane.dev` for Cloud, or a receiver you run (e.g. `http://localhost:4318`). Spans POST to `${endpoint}/v1/traces`. |
 | `apiKey` | yes | Your `tlane_…` key. Sent as the `x-tracelane-api-key` header. |
 | `serviceName` | no | Resource `service.name` (default `unknown-service`). |
 | `sampleRate` | no | 0.0–1.0 (default 1.0 — full trace; the tail sampler decides). |

@@ -46,6 +46,7 @@ const METRIC_META: Record<string, { label: string; unit: string }> = {
 	error_rate: { label: "Error rate", unit: "%" },
 	burn_rate: { label: "SLO burn rate", unit: "×" },
 	latency_p95: { label: "p95 latency", unit: "ms" },
+	overhead_p99: { label: "Gateway overhead p99", unit: "ms" },
 	cost_usd: { label: "Cost", unit: "USD" },
 	quota_pct: { label: "Quota used", unit: "%" },
 };
@@ -167,7 +168,7 @@ function SectionHeader({
 			<button
 				type="button"
 				onClick={onAdd}
-				className="shrink-0 px-3 py-1.5 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 transition-colors"
+				className="shrink-0 px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 			>
 				{addLabel}
 			</button>
@@ -230,8 +231,8 @@ function AddDestinationDialog({
 				: "https://example.com/webhook";
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="bg-surface border border-line rounded-lg p-6 w-full max-w-md shadow-2xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
 				<h3 className="text-base font-semibold text-ink">Add destination</h3>
 				<form
 					onSubmit={(e) => {
@@ -329,7 +330,7 @@ function AddDestinationDialog({
 						<button
 							type="submit"
 							disabled={!name.trim() || !url.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 disabled:opacity-40 transition-colors"
+							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 						>
 							{pending ? "Adding…" : "Add"}
 						</button>
@@ -426,16 +427,16 @@ function DestinationsSection() {
 					<table className="w-full text-left">
 						<thead className="bg-surface">
 							<tr>
-								<th className="py-2.5 px-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="py-1.5 px-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Name
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Type
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
 									URL
 								</th>
-								<th className="py-2.5 pr-4" />
+								<th className="py-1.5 pr-3" />
 							</tr>
 						</thead>
 						<tbody>
@@ -444,14 +445,14 @@ function DestinationsSection() {
 									key={dest.id}
 									className="border-t border-line last:border-0"
 								>
-									<td className="py-3 px-4 text-sm text-ink">{dest.name}</td>
-									<td className="py-3 pr-4 text-xs text-ink-2">
+									<td className="py-2 px-3 text-sm text-ink">{dest.name}</td>
+									<td className="py-2 pr-3 text-xs text-ink-2">
 										{KIND_LABELS[dest.kind] ?? dest.kind}
 									</td>
-									<td className="py-3 pr-4 text-xs text-ink-2 hidden sm:table-cell max-w-[14rem] truncate">
+									<td className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell max-w-[14rem] truncate">
 										{dest.url}
 									</td>
-									<td className="py-3 pr-4">
+									<td className="py-2 pr-3">
 										{pendingDeleteId === dest.id ? (
 											<div className="flex items-center gap-2">
 												<span className="text-xs text-ink-2">Delete?</span>
@@ -566,8 +567,8 @@ function AddRuleDialog({
 		Number(windowMinutes) <= 44640;
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div className="bg-surface border border-line rounded-lg p-6 w-full max-w-md shadow-2xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
 				<h3 className="text-base font-semibold text-ink">Add alert rule</h3>
 				{destinations.length === 0 ? (
 					<p className="text-sm text-ink-2">
@@ -607,6 +608,7 @@ function AddRuleDialog({
 								<option value="error_rate">Error rate (%)</option>
 								<option value="burn_rate">SLO burn rate (×)</option>
 								<option value="latency_p95">p95 latency (ms)</option>
+								<option value="overhead_p99">Gateway overhead p99 (ms)</option>
 								<option value="cost_usd">Cost (USD)</option>
 								<option value="quota_pct">Quota used (%)</option>
 							</select>
@@ -713,7 +715,7 @@ function AddRuleDialog({
 							<button
 								type="submit"
 								disabled={!canSubmit}
-								className="px-4 py-2 rounded text-sm bg-accent text-accent-on hover:bg-accent/90 disabled:opacity-40 transition-colors"
+								className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 							>
 								{pending ? "Adding…" : "Add rule"}
 							</button>
@@ -803,22 +805,22 @@ function RulesSection({
 					<table className="w-full text-left">
 						<thead className="bg-surface">
 							<tr>
-								<th className="py-2.5 px-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="py-1.5 px-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Metric
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									Condition
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
 									Window
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden md:table-cell">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden md:table-cell">
 									Destination
 								</th>
-								<th className="py-2.5 pr-4 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 									State
 								</th>
-								<th className="py-2.5 pr-4" />
+								<th className="py-1.5 pr-3" />
 							</tr>
 						</thead>
 						<tbody>
@@ -833,21 +835,21 @@ function RulesSection({
 										key={rule.id}
 										className="border-t border-line last:border-0"
 									>
-										<td className="py-3 px-4 text-sm text-ink">{meta.label}</td>
-										<td className="py-3 pr-4 text-xs text-ink-2 font-mono tabular-nums whitespace-nowrap">
+										<td className="py-2 px-3 text-sm text-ink">{meta.label}</td>
+										<td className="py-2 pr-3 text-xs text-ink-2 font-mono tabular-nums whitespace-nowrap">
 											{rule.comparator === "gt" ? ">" : "<"}{" "}
 											{String(rule.threshold)} {meta.unit}
 										</td>
-										<td className="py-3 pr-4 text-xs text-ink-2 hidden sm:table-cell font-mono tabular-nums">
+										<td className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell font-mono tabular-nums">
 											{formatWindow(rule.window_minutes)}
 										</td>
-										<td className="py-3 pr-4 text-xs text-ink-2 hidden md:table-cell truncate max-w-[10rem]">
+										<td className="py-2 pr-3 text-xs text-ink-2 hidden md:table-cell truncate max-w-[10rem]">
 											{dest ? dest.name : <span className="text-ink-3">—</span>}
 										</td>
-										<td className="py-3 pr-4">
+										<td className="py-2 pr-3">
 											<LastStateBadge state={rule.last_state} />
 										</td>
-										<td className="py-3 pr-4">
+										<td className="py-2 pr-3">
 											{pendingDeleteId === rule.id ? (
 												<div className="flex items-center gap-2">
 													<span className="text-xs text-ink-2">Delete?</span>

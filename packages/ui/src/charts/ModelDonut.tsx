@@ -44,7 +44,7 @@ const C = 2 * Math.PI * R;
 
 /** Lava-shade ramp — deep→soft by index, floor kept legible. */
 function shade(i: number): { color: string; op: number } {
-	return { color: "var(--accent)", op: Math.max(0.34, 0.85 - i * 0.16) };
+	return { color: "var(--action)", op: Math.max(0.34, 0.85 - i * 0.16) };
 }
 
 function compact(v: number): string {

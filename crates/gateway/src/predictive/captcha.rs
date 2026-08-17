@@ -12,8 +12,8 @@
 //! Target: detect within <5ms (PP-PR5). Pattern matching is O(1) per call.
 //!
 //! V1 ships the URL / page-signature pattern match below as a live signature; the
-//! ML classifier (page structure + iframe src patterns) is a scaffold gated behind
-//! an entitlement flag.
+//! an ML classifier (page structure + iframe src patterns) is not implemented.
+//! No entitlement gates this predictor — it runs for every tenant.
 
 use super::{Decision, PredictiveContext, Predictor};
 

@@ -21,13 +21,16 @@ A burn rate of 1.0 means you are exactly on track to use the full budget by
 the end of the window. A burn rate of 14.4 means you will exhaust the monthly
 budget in 2 hours if the current rate continues.
 
-## Configuration & alerting (roadmap)
+## Alerting
 
-Today the dashboard tracks the burn rate against a default availability target.
-Per-SLO configuration (custom SLIs, targets, windows) and **burn-rate alerting**
-are on the near-term roadmap. When alerting ships, breaches are delivered to a
-**webhook you control** (Slack-compatible) or your existing monitoring
-integration. Watch the changelog for availability.
+**Burn-rate alerting is live.** Create a rule in **Settings → Alerts**, set a
+threshold, and breaches are delivered to a **webhook you control** — Slack,
+Discord, or any HTTPS endpoint. Alongside burn rate you can alert on error rate,
+p95 latency, gateway overhead p99, spend, and quota used.
+
+Alerting is available on paid plans. **Per-SLO configuration** (custom SLIs,
+targets, windows) is not built — the dashboard tracks the burn rate against a
+default availability target, and the target is per plan, not per SLO.
 
 ## Dashboard
 

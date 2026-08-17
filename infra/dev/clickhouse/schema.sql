@@ -31,7 +31,23 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     intervention     UInt8 DEFAULT 0,      -- 0=none, 1=warn, 2=block
 
     -- Ingestion timestamp for deduplication windowing
-    ingested_at      DateTime64(3, 'UTC') DEFAULT now64()
+    ingested_at      DateTime64(3, 'UTC') DEFAULT now64(),
+
+    -- OBS-01 full-text search. ORDER BY is (tenant_id, trace_id, span_id), so a
+    -- content predicate hits NO index and degenerates to a full scan of the
+    -- tenant's parts. Measured on prod 2026-08-08 at 12,453 spans for the largest
+    -- tenant: substring search read 4.70 MiB / 14,436 rows in 24 ms, against
+    -- 634 KiB / 3 ms for an ORDER-BY-aligned count — 8x on both, and read_bytes
+    -- grows LINEARLY with tenant volume because nothing prunes granules. At the
+    -- 5M-traces/mo Business tier that is a multi-GB scan on an interactive read.
+    --
+    -- ngrambf_v1 (not tokenbf_v1) because the predicate is a SUBSTRING match:
+    -- `LIKE '%q%'`, matching what apps/mcp already does and what a user expects
+    -- from a search box. tokenbf_v1 only serves whole-token equality, so "auth"
+    -- would not find "authorize". n=4 sets the minimum useful query length; the
+    -- route enforces it so a 3-char query cannot silently fall back to a scan.
+    INDEX idx_name_ngram       name       TYPE ngrambf_v1(4, 4096, 3, 0) GRANULARITY 4,
+    INDEX idx_attributes_ngram attributes TYPE ngrambf_v1(4, 8192, 3, 0) GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(start_time)

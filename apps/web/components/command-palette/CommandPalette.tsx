@@ -166,7 +166,7 @@ export function CommandPalette() {
 		<dialog
 			aria-label="Command palette"
 			aria-modal="true"
-			className="fixed inset-0 z-50 m-0 flex h-full max-h-none w-full max-w-none items-start justify-center border-none bg-black/60 p-0 pt-[18vh] backdrop-blur-sm"
+			className="fixed inset-0 z-50 m-0 flex h-full max-h-none w-full max-w-none items-start justify-center border-none bg-black/60 p-0 pt-[18vh]"
 			onClick={() => setOpen(false)}
 			onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
 			open

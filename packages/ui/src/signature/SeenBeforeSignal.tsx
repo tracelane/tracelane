@@ -1,8 +1,16 @@
 import { cn } from "../lib/cn";
 
 export interface SeenBeforeSignalProps {
-	/** Per-tenant "your hits" count. NEVER render a network count the registry can't substantiate. */
-	count: number;
+	/**
+	 * Per-tenant "your hits" count. NEVER a network count the registry can't
+	 * substantiate.
+	 *
+	 * OPTIONAL by design (OBS-33): until the per-tenant aggregate has loaded there is
+	 * no honest number to show, so the badge renders the signature WITHOUT a count
+	 * rather than substituting one that happens to be in hand. An invented number on
+	 * a trust surface is worse than an absent one.
+	 */
+	count?: number;
 	/** e.g. "Tool-definition drift — matches a known signature". */
 	signatureLabel: string;
 	/** → View signature. */
@@ -20,7 +28,7 @@ export interface SeenBeforeSignalProps {
  * The "seen-before" ambient signal — when a span matches a known failure
  * signature it glows amber inline (the spellcheck-underline pattern), NOT a
  * separate tab. Felt where the failure is (the design-system spec §3.3). Amber is a
- * status cue, deliberately distinct from the lime accent and teal provenance.
+ * status cue, deliberately distinct from the action and the provenance seal.
  */
 export function SeenBeforeSignal({
 	count,
@@ -38,10 +46,12 @@ export function SeenBeforeSignal({
 			)}
 		>
 			<span aria-hidden>◆</span>
-			<span className="font-semibold tabular-nums">SEEN {count}×</span>
+			{typeof count === "number" && (
+				<span className="font-semibold tabular-nums">SEEN {count}×</span>
+			)}
 			<span className="text-ink-2">— {signatureLabel}</span>
 			{href && (
-				<a href={href} className="text-accent-ink no-underline hover:underline">
+				<a href={href} className="text-action-ink no-underline hover:underline">
 					View signature →
 				</a>
 			)}

@@ -16,9 +16,10 @@
  */
 
 import { aftLabel } from "@/lib/aft-labels";
-import { fmtDur } from "@/lib/fmt-dur";
+
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { extractGenAi } from "@/lib/trace-tree";
+import { fmtDur } from "@tracelanedev/ui";
 import { CopyButton } from "./CopyButton";
 import type { Span } from "./types";
 

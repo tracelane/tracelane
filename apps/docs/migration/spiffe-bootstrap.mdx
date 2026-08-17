@@ -25,7 +25,7 @@ mTLS-only deployment with zero span loss.
 | You're running Tracelane ingest `v0.1.0` or later | `ingest --version` |
 | You can install SPIRE in your cluster | Helm (k8s) or systemd (VM); see operator runbook |
 | You own a workspace UUID | Visible in the Tracelane dashboard → Settings → Workspace |
-| Your agents can be redeployed with a new auth config | Required to swap from bearer tokens / plaintext to mTLS |
+| Your agents can be redeployed with a new auth config | Required to swap from plaintext to mTLS |
 
 If any of those is "no", file an issue or reach out before continuing.
 
@@ -34,8 +34,17 @@ If any of those is "no", file an issue or reach out before continuing.
 ### Step 1 — Bring up SPIRE (zero disruption to existing ingest)
 
 Follow the [operator runbook §1](/security/spiffe-ingest#1-bring-up-spire-in-a-customer-cluster).
-At this point your existing plaintext-or-bearer ingest keeps running;
-SPIRE is installed but not yet wired into Tracelane.
+At this point your existing plaintext ingest keeps running; SPIRE is
+installed but not yet wired into Tracelane.
+
+<Note>
+  **The ingest receiver has never read an `Authorization` header.** A
+  self-hosted ingest is either plaintext single-tenant (ADR-067 — the tenant
+  comes from operator config, so there is exactly one and nothing to spoof) or
+  SPIFFE mTLS. A bearer token is what **Tracelane Cloud's gateway** accepts at
+  `POST /v1/traces`; it is not an ingest mode, and an earlier revision of the
+  migration docs implied otherwise.
+</Note>
 
 ### Step 2 — Register the workload entry
 
@@ -101,6 +110,11 @@ Native SPIFFE auto-wiring in the Tracelane Python and TypeScript SDKs
 (a `TRACELANE_USE_SPIFFE=1` switch) is on the roadmap. Until then,
 configure mTLS in your OTLP exporter directly — mount the SPIRE agent
 socket into the exporter process and point its client TLS at it.
+
+This applies to a **self-hosted, multi-tenant** ingest only. On Tracelane Cloud
+the SDKs need no mTLS: they export to `https://gateway.tracelane.dev` with a
+`tlane_…` key carrying the `ingest` scope, and the gateway forwards to ingest
+inside its own network.
 
 For non-SDK agents (raw OpenTelemetry Collector, fluentd, etc.) use the
 [`go-spiffe`](https://github.com/spiffe/go-spiffe) or

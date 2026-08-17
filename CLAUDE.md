@@ -46,7 +46,7 @@ Every edge carries its invariant. Dotted boxes are **not built**.
                     │     provider resolve + BYOK key       :1103        │
                     │  4b inline guardrails ─ FAIL-CLOSED   :1203        │
                     │     <UNTRUSTED_USER_DATA> wrap                     │
-                    │     kill-switch + circuit breaker     :1319-1345   │
+                    │     circuit breaker (+ start-time kill flags)      │
                     │     dispatch                          :1341        │
                     └───┬──────────────┬──────────────┬─────────────┬────┘
                         │              │              │             │
@@ -92,7 +92,7 @@ Every edge carries its invariant. Dotted boxes are **not built**.
 |---|---|---|
 | client → gateway | `tenant_id` comes ONLY from `Claims.tenant_id`, never a request body. `TenantId` has three named constructors — `from_jwt_claim`, `from_spiffe_svid`, `from_self_host_config` | `crates/shared/src/tenant.rs:25,:33,:45`; `server.rs:947` |
 | client → gateway | **The identity-provider org id is NOT the internal tenant UUID.** It is bridged by `auth::resolve_tenant_id` via a 30s cache; if a JWT carries both, they must agree or the token is rejected | `crates/gateway/src/auth/mod.rs:361-388`; `auth/org_tenant_cache.rs:40` |
-| gateway → NATS (spans) | `NATS_URL` is **OPTIONAL**. Unset ⇒ span publish DISABLED, **all spans dropped**, gateway still returns 200 | `server.rs:331-357` |
+| gateway → NATS (spans) | `NATS_URL` is **REQUIRED** — unset is a **boot refusal**; opt out explicitly with `TRACELANE_ALLOW_NO_CAPTURE=1`. A connect *failure* retries in the background rather than disabling capture for the process lifetime. `/health` reports `capture_enabled` / `spans_dropped` / `capture_healthy` | `server.rs:344-395` |
 | gateway → NATS (audit) | ACKED JetStream publish, **fail-CLOSED** → `503 {"error":"audit_unavailable"}`. `seq` is assigned only by the durable consumer | `audit.rs:493-554`; `server.rs:1111`, `:1239` |
 | NATS → ingest | Ack **after** the ClickHouse flush. OTLP-direct spans carry **no ack** — 200 is returned on channel `try_send` | `nats_consumer.rs:119-130`; `clickhouse_writer.rs:277-280`; `span_envelope.rs:20-23` |
 | ingest → ClickHouse | Ingest is the **sole** span writer. The gateway never writes spans | `clickhouse_writer.rs:374`; no such insert under `crates/gateway/src/` |

@@ -22,8 +22,9 @@ The single inference endpoint — the OpenAI Chat Completions shape. Routed to
 OpenAI for `gpt-*` / `o1*` / `o3*` and to any of the 28 OpenAI-compatible
 adapters by model-name prefix; Anthropic (`claude-*`), Google, Bedrock, and
 Cohere are reached by model name and translated to their native wire format.
-There is no separate `/v1/messages`, `/v1/embeddings`, or `/v1/rerank`
-endpoint — everything routes through chat/completions.
+`POST /v1/embeddings` is a separate endpoint, in the OpenAI Embeddings shape and
+routed by model name the same way. There is no `/v1/messages` or `/v1/rerank` —
+every chat/inference call routes through chat/completions.
 
 ## Prompt promotion (B1 / ADR-009)
 

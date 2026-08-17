@@ -20,17 +20,28 @@ Tracelane sits between your AI agents and your LLM providers. You get:
 - **Full-fidelity traces** — every LLM call, tool invocation, agent step, and retry captured as OTel spans using the GenAI semantic conventions. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
 - **Tamper-evident audit ledger** — every recorded event is hash-chained per tenant and batch-anchored to a public transparency log. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us. That is the part you can hand to an auditor.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
-- **Pain-point evals** — 69 assertions run in CI on every PR. Note the honest scope: they **report, they do not block** — no required status check gates a merge on them. The default job also runs with **mock providers**, so the behavioural half of each assertion is skipped there; a separate live-stack job exercises real behaviour.
+- **Pain-point evals** — 68 assertions run in CI on every PR. Note the honest scope: they **report, they do not block** — no required status check gates a merge on them. The default job also runs with **mock providers**, so the behavioural half of each assertion is skipped there; a separate live-stack job exercises real behaviour.
 - **Time-travel trace viewer** — step through any recorded agent trace span-by-span with `tlane replay` (read-only). Cross-model re-execution is on the roadmap.
 
+- **MCP tool-definition pinning and lethal-trifecta detection** — shipped, and **free on
+every tier including OSS self-host**. Both run as guardrail rails in-request at the
+gateway: pinning compares a live tool definition against the hash you approved and flags
+divergence; the trifecta rail flags the untrusted-input + private-data + exfiltration-path
+combination. Observe-first, like every other rail.
+
 **On the roadmap, not shipped** — named here because they appear elsewhere in our docs
-and we would rather you learn it from us than from the source: MCP rug-pull detection,
-lethal-trifecta taint tracking, browser stuck-loop prediction, A2UI catalog conformance,
-and the distilled SLM judge. The detectors exist in `crates/gateway/src/predictive/` but
-gate on payload fields (`mcp_server_name`, `tool_name`, `protocol`) that a
-`/v1/chat/completions` request does not carry, so **they do not fire on LLM traffic
-today**. See [`apps/docs/predictive-guardrails.mdx`](apps/docs/predictive-guardrails.mdx)
-for per-rail status.
+and we would rather you learn it from us than from the source. These live in
+`crates/gateway/src/predictive/`, a separate layer from the rails above, and **none of them
+fires on LLM traffic today** — for two different reasons:
+
+- **Browser stuck-loop prediction** and **A2UI catalog conformance** gate on payload fields
+  (`mcp_server_name`, `tool_name`, `protocol`) that a `/v1/chat/completions` request does
+  not carry, so they never reach their scoring path.
+- The **distilled SLM judge** runs on every request but is a **stub**: no trained model
+  ships, so it returns a constant score and can never flag anything.
+
+See [`apps/docs/predictive-guardrails.mdx`](apps/docs/predictive-guardrails.mdx) for
+per-rail status.
 
 ## Quick start
 
@@ -64,12 +75,14 @@ Postgres, Grafana on `:3001` — and deliberately starts no gateway. Use it with
 `cargo run -p gateway` when hacking on the gateway itself.)*
 
 Then instrument your agent with the SDK — explicit `init()` + per-client
-wrapping (nothing is patched on import):
+wrapping (nothing is patched on import). `endpoint` is
+`https://gateway.tracelane.dev` on Tracelane Cloud (the key needs the `ingest`
+scope) or the receiver you run when self-hosting:
 
 ```python
 from tracelane import init, instrument_anthropic
 
-init(endpoint="http://localhost:4318", api_key="tlane_...")
+init(endpoint="https://gateway.tracelane.dev", api_key="tlane_...")
 
 from anthropic import Anthropic
 
@@ -80,7 +93,10 @@ instrument_anthropic(client)  # now messages.create() emits spans
 ```typescript
 import { init, instrumentOpenAI } from "@tracelanedev/sdk";
 
-init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY! });
+init({
+  endpoint: "https://gateway.tracelane.dev",
+  apiKey: process.env.TRACELANE_API_KEY!,
+});
 
 import OpenAI from "openai";
 const client = new OpenAI();
@@ -128,7 +144,7 @@ ClickHouse              Cloudflare
 | `packages/sdk-typescript/` | TypeScript | Agent instrumentation SDK |
 | `packages/sdk-python/` | Python | Agent instrumentation SDK |
 | `packages/cli/` | TypeScript | `tlane` CLI |
-| `evals/` | TypeScript | 69 pain-point assertions (CI; behavioural half runs in the live-stack job) |
+| `evals/` | TypeScript | 68 pain-point assertions (CI; behavioural half runs in the live-stack job) |
 | `ml/` | Python | Trajectory Guard / SLM judge — training + export pipeline; no trained weights ship yet |
 | `spec/openagenttrace/` | Markdown | OpenAgentTrace v0.1 spec |
 | `spec/aft-1/` | Markdown | Agent Failure Taxonomy — 13 published failure modes |

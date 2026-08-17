@@ -31,9 +31,14 @@ mod config;
 mod db;
 mod disk_guard;
 mod federation;
-mod limits;
+// `limits` and `otlp_decode` MOVED to `tracelane_shared::otlp` for GWY-41 — the
+// gateway's authenticated `POST /v1/traces` is a second OTLP entry point, and two
+// entry points must not mean two decoders. Aliased back to their old paths so every
+// `crate::limits::` / `crate::otlp_decode::` call site below is unchanged.
+pub(crate) use tracelane_shared::otlp::limits;
+mod metrics_server;
 mod nats_consumer;
-mod otlp_decode;
+pub(crate) use tracelane_shared::otlp::decode as otlp_decode;
 mod otlp_receiver;
 mod per_trace_ceiling;
 mod quota;
@@ -324,6 +329,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::try_join!(
         otlp_task,
         refresher_fut,
+        // A10/PLT-N1. Fail-OPEN by construction: `metrics_server::run` never returns
+        // `Err` — it logs and parks — so a busy metrics port cannot abort the other
+        // five arms of this `try_join!` and stop span ingestion.
+        metrics_server::run(),
         disk.run_refresher(),
         nats_consumer::run(cfg.nats_url.clone(), nats_tx, single_tenant.clone()),
         clickhouse_writer::run(

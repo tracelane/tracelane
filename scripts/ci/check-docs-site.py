@@ -287,5 +287,23 @@ def main() -> int:
     return 0
 
 
+KNOWN_FLAGS = {"--selftest"}
+
+
+def reject_unknown_flags(argv: list[str]) -> None:
+    """Exit 2 on any flag-shaped token we do not implement — a silently ignored
+    `--selftesst` runs the ordinary guard and exits 0, so the operator believes a
+    falsification ran when none did. Only `-`-prefixed tokens are judged."""
+    unknown = [a for a in argv if a.startswith("-") and a not in KNOWN_FLAGS]
+    if unknown:
+        print(
+            f"check-docs-site.py: unknown option(s): {' '.join(unknown)}\n"
+            f"usage: check-docs-site.py [--selftest]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 if __name__ == "__main__":
+    reject_unknown_flags(sys.argv[1:])
     sys.exit(main())

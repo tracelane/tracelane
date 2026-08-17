@@ -1,7 +1,12 @@
-// Tracelane Neon design system (@tracelanedev/ui) — ADR-045 / the design-system spec.
+// Tracelane design system (@tracelanedev/ui). src/styles/tokens.css is the SINGLE
+// definition of colour, type and layout — this file describes none of it on purpose.
 // Import the token layer once in the consuming app:  import "@tracelanedev/ui/styles/tokens.css";
 
 export { cn } from "./lib/cn";
+// The ONE duration formatter. It lived in apps/web until 2026-08-16, which forced
+// TimeRuler (in this package) to either duplicate its rules or disagree with the bar
+// labels beside it — and two trace-viewer surfaces had already grown their own copies.
+export { fmtDur, fmtDurMs } from "./lib/fmt-dur";
 
 // primitives
 export { Button, type ButtonProps } from "./primitives/Button";
@@ -73,3 +78,17 @@ export {
 	type LatencyTimelineProps,
 	type LatencyPoint,
 } from "./signature/LatencyTimeline";
+
+// ── ADR-074 additions ────────────────────────────────────────────────────────
+export {
+	BarChart,
+	type BarChartProps,
+	type BarDatum,
+	type BarTone,
+} from "./charts/BarChart";
+export { StatGrid, type StatGridProps } from "./primitives/StatGrid";
+export {
+	LedgerSeqChip,
+	TimeRuler,
+	type TimeRulerProps,
+} from "./signature/TimeRuler";

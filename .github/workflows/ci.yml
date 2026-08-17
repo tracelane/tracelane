@@ -19,12 +19,24 @@ name: CI
 # dispatch to a self-hosted runner instead (private repo + a free box), set repo
 # variable CI_RUNNER (e.g. =tl-node-1) — no YAML edit for the light jobs.
 #
-# PER-JOB ROUTING (2026-07-13): `CI_RUNNER` routes only the LIGHT jobs (changes,
-# web, L16, verifier-roundtrip, python, eval, grep guards). The HEAVY cargo/stack
-# jobs (rust full-workspace, span-publish-integration, ingest-release-guard,
-# live-eval-gate, bench) are HARDCODED `ubuntu-latest` and never hit the runner —
-# a cold `cargo test --workspace --all-features` SATURATED the tl-node-1 prod box
-# (SSH lost; prod gateway stayed up).
+# PER-JOB ROUTING — CORRECTED 2026-08-10 by observation. The previous text here
+# claimed the heavy cargo/stack jobs were "HARDCODED `ubuntu-latest` and never hit
+# the runner". THAT WAS FALSE, and run 31369123020 proved it: with
+# `CI_RUNNER=tl-node-1`, Rust (fmt·clippy·test), Ingest release-profile guard and
+# Span publish → JetStream ALL ran on tl-node-1 and passed.
+#
+# `grep -n 'runs-on:'` is the authority: 10 of 14 jobs use the
+# `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` indirection. Only FOUR are hardcoded
+# `ubuntu-latest` — repo guards, live-eval-gate, bench, behavioral-tier-ran.
+#
+# The saturation hazard is real but is ALREADY MITIGATED, which is why the cold
+# build no longer takes the box down: the runner's systemd unit is cgroup-capped at
+# CPUQuotaPerSecUSec=2.4s (2.4 of 4 cores) and MemoryMax=8G. Measured during that
+# run: load ~1.3, prod untouched, SSH never lost.
+#
+# MEASURED COST of the routing, same run: 10 billable minutes (repo guards 1 +
+# live-eval-gate 9) against 23 minutes that ran free on tl-node-1 — 78% off the
+# ~45-minute baseline for a PR push.
 #
 # Tiers (apply whenever this workflow actually runs):
 #   • FAST tier (fmt·clippy·unit-test, web, python, grep guards, secret-scan):
@@ -55,6 +67,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `ready_for_review` is NOT in the default set (opened/synchronize/reopened),
+    # so without it a PR marked ready would never get its first real run — the
+    # draft guard below would have been a one-way door.
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: "0 3 * * 0" # weekly, Sun 03:00 UTC — full + behavioral, all paths (budget: not daily)
   workflow_dispatch: {} # manual full run (use to validate the runner end-to-end)
@@ -94,7 +110,20 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # MUST be false whenever `CI_RUNNER` routes jobs to the persistent box, and it
+  # now does (`CI_RUNNER=tl-node-1`, set 2026-08-10). This is the precondition the
+  # comment above spells out, honoured in the same change that set the variable.
+  #
+  # On a self-hosted runner a CANCELLED L16 sweep orphans its `next dev`
+  # (turbopack) + Playwright + chrome-headless children — SIGKILL skips cleanup,
+  # they run 30+ min, pin the box at load 25 and knock the runner offline. A
+  # GitHub-hosted runner discards the whole VM so an orphan cannot survive; a
+  # persistent machine has no such backstop.
+  #
+  # Cost of `false`: a rapid push series pays for every intermediate run. That is
+  # now bounded by the draft guard below — pushes to a DRAFT PR start no jobs at
+  # all, which is where a rapid push series actually happens.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -116,7 +145,18 @@ jobs:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
-    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
+    # DRAFT GUARD (2026-08-10). MEASURED: 76% of August CI minutes were pushes to
+    # three open feature-branch PRs at ~45 min per push. A draft PR is
+    # work-in-progress and does not need the merge gate on every push.
+    # `draft` is null on non-PR events, so `!= true` leaves push / schedule /
+    # workflow_dispatch untouched. Gating the ROOT jobs is sufficient: every
+    # other job `needs: changes`, and a skipped need skips the dependant.
+    # A run where everything skipped now reads CANNOT DETERMINE, not GREEN
+    # (scripts/ops/ci-status.sh) — a draft PR is honestly unverified. Mark it
+    # ready for review to get a verdict.
+    if: >-
+      (github.repository == 'tracelane/tracelane' || github.event_name != 'push')
+      && github.event.pull_request.draft != true
     name: Detect changed areas
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     outputs:
@@ -154,6 +194,24 @@ jobs:
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
+              # `.sql` stays cross-cutting EVERYWHERE, including under infra/prod —
+              # listed first so the ops-only skip below can never swallow it.
+              # infra/prod/partition-cutover.sql is the one instance today.
+              infra/prod/*.sql) run_all "cross-cutting: $f";;
+              # OPS-ONLY (2026-08-09, founder-ruled). Nothing under infra/prod/ is built,
+              # compiled or bundled by any job here — it is prod config, systemd units,
+              # Caddyfiles and deploy scripts. Before this, a ONE-FILE ClickHouse XML
+              # change ran Rust, Web, evals AND a cold release-mode benchmark: ~16
+              # billable minutes to benchmark code that did not change. Against a
+              # 2,000-minute allowance already carrying ~400 min/mo of re-enabled
+              # `guards`, that is not caution — it is noise, and noise is how a red run
+              # stops being read.
+              # NARROW BY DESIGN: infra/prod ONLY, never infra/*. infra/dev and
+              # infra/self-host stay cross-cutting because they DO feed test stacks.
+              # Enforced by scripts/ci/check-infra-prod-no-code.py, which fails if any
+              # .rs/.ts/.tsx/.py appears here — turning an invisible failure mode
+              # (code hiding under an excluded path) into a visible one.
+              infra/prod/*) continue;;
               spec/*|infra/*|.github/*|*.sql|Makefile|justfile|.cargo/*|rust-toolchain.toml) run_all "cross-cutting: $f";;
             esac
             case "$f" in
@@ -191,7 +249,7 @@ jobs:
     # if CI_RUNNER is unset (public repo → free hosted minutes).
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
         with:
@@ -205,6 +263,47 @@ jobs:
           # 10 GB repo limit → the service 400'd and nothing persisted → perpetual
           # cold builds. One shared cache stays under the cap and actually restores.
           shared-key: "rust-ci"
+      # ── (c) PERSISTENT CARGO TARGET DIR — B-202, founder-approved 2026-08-13 ──
+      #
+      # `actions/checkout` defaults to `clean: true` (`git clean -ffdx`), which
+      # deletes the gitignored `target/` on every job. The 166 MB Swatinem cache
+      # restores the registry and a pruned dep set but NOT build artifacts, so each
+      # run recompiles proc-macro2 / quote / syn / serde_core — roughly 3-4 min
+      # across each of the three jobs sharing the `rust-ci` key, ~12-16 min a run.
+      #
+      # The directory lives OUTSIDE `_work`, which is the entire trick: checkout
+      # cannot reach it, so it survives.
+      #
+      # SELF-HOSTED ONLY. On `ubuntu-latest` the runner is ephemeral, so a
+      # "persistent" directory is a lie and the path is not writable. The step is
+      # SKIPPED there rather than made to look like it worked.
+      #
+      # THE FLOOR GUARD IS THE POINT, NOT A NICETY. This box is ONE filesystem
+      # holding ClickHouse (`tracelane_clickhouse_data`), NATS and the
+      # tamper-evident audit ledger. A dev `target/` here measures 54 G, so an
+      # unguarded persistent target dir can consume essentially all free space on
+      # the disk carrying prod data. Below the floor the dir is DELETED and the run
+      # cold-builds — slow is the correct failure, full is not.
+      #
+      # SAFE ONLY AT CONCURRENCY=1, and that is load-bearing: these three jobs
+      # share one target dir, and cargo takes a lock on it. They serialize today
+      # because the runner runs one job at a time. **If a second runner is ever
+      # added (B-202 option (a), currently declined), this must become per-runner
+      # or it will serialize jobs that were meant to be parallel.**
+      - name: Persistent cargo target dir (self-hosted only)
+        if: vars.CI_RUNNER != ''
+        run: |
+          set -euo pipefail
+          TARGET_DIR=/opt/actions-runner/cargo-target
+          FLOOR_KB=$((40 * 1024 * 1024))   # 40 GiB floor on /
+          avail=$(df --output=avail / | tail -1 | tr -d ' ')
+          echo "disk avail=${avail} KB · floor=${FLOOR_KB} KB · target=${TARGET_DIR}"
+          if [ "$avail" -lt "$FLOOR_KB" ]; then
+            echo "::warning::below the 40 GiB floor — dropping ${TARGET_DIR}; this run cold-builds"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR"
+          echo "CARGO_TARGET_DIR=${TARGET_DIR}" >> "$GITHUB_ENV"
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
@@ -217,13 +316,59 @@ jobs:
   # TRACELANE_SPANS JetStream stream. Boots NATS with JetStream (-js) via
   # `docker run` (GitHub `services:` can't pass the -js command flag) and runs
   # the otherwise-#[ignore]d integration test. Triggered on Rust changes.
+  api-key-mint-postgres:
+    name: API-key mint (real Postgres)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    # HOSTED on purpose: this needs a `services:` container, and the self-hosted
+    # runner shares a box with production. Never point a throwaway Postgres at
+    # tl-node-1.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tracelane
+          POSTGRES_PASSWORD: tracelane_dev
+          POSTGRES_DB: tracelane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tracelane"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: "rust-ci"
+      # The ONLY test that exercises `db::api_keys::create()` against a real
+      # Postgres. It was `#[ignore]`d and referenced by NEITHER this workflow nor
+      # verify-all.sh — zero callers, so it had never run (TRAPS §1 CLASS-1). It
+      # would have gone red on its first execution: A13 bound `budget_usd_monthly`
+      # as `$9::numeric` while passing an `Option<String>`, which tokio-postgres
+      # refuses on EVERY call including None, so `POST /v1/keys` 500'd for two days
+      # and no customer could create an API key.
+      - name: api-key mint integration (real Postgres)
+        env:
+          POSTGRES_TEST_URL: postgres://tracelane:tracelane_dev@127.0.0.1:5432/tracelane
+        run: bash scripts/ci/run-postgres-integration.sh
+      # A guard ships with the proof that it BITES, in the same commit. This
+      # reintroduces the exact shipped defect and requires a RED.
+      - name: selftest — the suite must go RED on the reintroduced defect
+        env:
+          POSTGRES_TEST_URL: postgres://tracelane:tracelane_dev@127.0.0.1:5432/tracelane
+        run: bash scripts/ci/run-postgres-integration.sh --selftest
+
   web:
     name: Web (biome · typecheck · vitest)
     needs: changes
     if: needs.changes.outputs.web == 'true'
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
@@ -253,7 +398,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
@@ -273,6 +418,22 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
           shared-key: "rust-ci"
+      # Persistent cargo target dir — see the full rationale on the `rust` job.
+      # Self-hosted only; 40 GiB floor on `/`; safe only at concurrency=1.
+      - name: Persistent cargo target dir (self-hosted only)
+        if: vars.CI_RUNNER != ''
+        run: |
+          set -euo pipefail
+          TARGET_DIR=/opt/actions-runner/cargo-target
+          FLOOR_KB=$((40 * 1024 * 1024))
+          avail=$(df --output=avail / | tail -1 | tr -d ' ')
+          echo "disk avail=${avail} KB · floor=${FLOOR_KB} KB · target=${TARGET_DIR}"
+          if [ "$avail" -lt "$FLOOR_KB" ]; then
+            echo "::warning::below the 40 GiB floor — dropping ${TARGET_DIR}; this run cold-builds"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR"
+          echo "CARGO_TARGET_DIR=${TARGET_DIR}" >> "$GITHUB_ENV"
       - name: Install deps (JS workspace + Python verifier)
         run: |
           pnpm install --frozen-lockfile
@@ -290,7 +451,7 @@ jobs:
     if: needs.changes.outputs.python == 'true'
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Setup Python
         uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
         with:
@@ -330,12 +491,48 @@ jobs:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
-    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
+    # PRIVATE-MINUTE POLICY AMENDED 2026-08-09 — `guards` now runs on private push too.
+    #
+    # The policy above justified skipping with "the free public run". Between
+    # 2026-08-04 and 2026-08-09 THAT RUN DID NOT EXIST: the export dropper emitted a
+    # dropped jobs), GitHub rejected the file wholesale, and every public run produced
+    # ZERO jobs with conclusion=failure. Combined with 14/14 skipped here, there was no
+    # executing CI anywhere for five days — and the only surviving control,
+    # .githooks/pre-push, is bypassable with --no-verify and skipped entirely by a
+    # GitHub-UI merge.
+    #
+    # COST, measured not guessed: `guards` runs 11-18s (median 17s) => 1 billable
+    # minute, and there were 400 push-event runs in the last 30 days (all to main).
+    # ~400 min/month, 20% of the 2,000-minute Free allowance. `guards` is a LEAF job —
+    # nothing `needs:` it — so this re-enables exactly one job and cannot cascade.
+    # `changes` stays gated (every expensive job needs it) and so does `secret-scan`
+    # (its gitleaks scan already runs in verify-all.sh:218).
+    #
+    # To revert: restore
+    #   if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
+    # A5 keeps `guards` on private push. The DRAFT exclusion is additive and does
+    # not touch that: without it a draft run would be `guards` green + everything
+    # else skipped, which ci-status would read as GREEN — the false-verdict shape.
+    if: github.event.pull_request.draft != true
     name: Repo guards (20 structural checks)
-    runs-on: ubuntu-latest
+    # ROUTED TO THE SELF-HOSTED RUNNER 2026-08-17 (founder: "run locally as in the
+    # past, I won't add money for now"). This job was the ONLY hardcoded
+    # `ubuntu-latest` that runs on a private PUSH, and hosted minutes are exhausted,
+    # so it failed to PROVISION on seven consecutive pushes — 0 steps in 2 seconds,
+    # no log blob, while the last green run executed 52 steps. Nothing was wrong with
+    # the guards: all 20 pass locally. A job that never starts reports `failure`
+    # exactly like a job that fails, which is why the streak went unnoticed.
+    #
+    # Safe on the shared box: these are 20 python/shell structural checks, and the
+    # runner's systemd unit is already cgroup-capped (CPUQuotaPerSecUSec=2.4s of 4
+    # cores, MemoryMax=8G), the same mitigation that let rust/web/python route here.
+    #
+    # The other three hardcoded jobs STAY hosted, deliberately: `api-key-mint-postgres`
+    # needs a `services:` container and must never point a throwaway Postgres at the
+    # production node; `live-eval-gate` and `bench` run on schedule/dispatch only and
+    # were never part of this failure.
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-
       - name: SPIFFE auth stub regression guard (ADR-028)
         if: ${{ !cancelled() }}
         run: ./scripts/ci/no-auth-stub.sh
@@ -423,6 +620,106 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-action-sha-pins.py
 
+      - name: Workflow job-graph guard — selftest (prove a dangling need bites)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-workflow-job-graph.py --selftest
+
+      # A `needs:` naming a job that does not exist makes GitHub reject the WHOLE
+      # workflow: zero jobs start, so there is no failing step to read and the run is
+      # indistinguishable from an ordinary red one. That is how the public repo ran
+      # dead for five days (2026-08-04 → 08-09). build-public-export.sh runs this same
+      # guard on its OWN output, so the transform can no longer ship a broken graph.
+      - name: Workflow job-graph guard (no dangling `needs:`)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-workflow-job-graph.py
+
+      - name: Hot-path logging guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-hot-path-logging.py --selftest
+
+      # No info! on a per-request path — repetition belongs in a counter.
+      - name: Hot-path logging policy (no per-request INFO)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-hot-path-logging.py
+
+      - name: R2 endpoint jurisdiction guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-r2-endpoint-jurisdiction.py --selftest
+
+      # R2 endpoints are jurisdiction-scoped; the default host AccessDenies our EU bucket.
+      - name: R2 endpoint carries the .eu. jurisdiction segment
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-r2-endpoint-jurisdiction.py
+
+      - name: infra/prod no-code guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-infra-prod-no-code.py --selftest
+
+      # The condition on excluding infra/prod/** from path-filtering.
+      - name: infra/prod contains no built-language source
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-infra-prod-no-code.py
+
+      - name: Suppression review-date guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-suppression-reviews.py --selftest
+
+      # A vulnerability suppression with no review date is permanent by default.
+      - name: Suppression review dates (no undated or expired suppressions)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-suppression-reviews.py
+
+      - name: Alert-metric single-source guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-alert-metrics-single-source.py --selftest
+
+      # The alertable-metric list is written in 6 places. overhead_p99 was accepted by
+      # the Postgres CHECK and the gateway but 422'd by the web proxy, so migration 0017
+      # was unreachable from the dashboard and nothing failed.
+      - name: Alert-metric single-source guard (6 layers must agree)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-alert-metrics-single-source.py
+
+      - name: API-key scope single-source guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-api-scope-single-source.py --selftest
+
+      # GWY-41. The scope vocabulary is written in 3 places: the Rust enum that
+      # decides, the mint dialog's checkbox list, and the api_keys.scope column
+      # comment. A scope in Rust but not the UI is a capability nobody can grant;
+      # a checkbox for a slug Rust refuses mints a key with LESS access than the
+      # dialog just promised.
+      - name: API-key scope single-source guard (3 layers must agree)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-api-scope-single-source.py
+
+      - name: Release-only-test coverage guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-release-only-tests-covered.py --selftest
+
+      # GWY-41. A release-only test runs ONLY where a job invokes its package with
+      # --release. When the decoder moved crates, the release tenant-isolation
+      # guard moved with it and the job that ran it stayed green on 168 other tests.
+      - name: Release-only tests are covered by a --release job
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-release-only-tests-covered.py
+
+      - name: Guard meta-gate — selftest (prove the meta-gate itself blocks)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-guard-selftests.py --selftest
+
+      # THE META-GATE. Asserts every scripts/** guard verify-all.sh invokes can prove it
+      # blocks: it must reject an unknown flag AND pass its own --selftest. 20 scripts
+      # silently accepted `--selftest` and exited 0 having proven nothing; the unknown-flag
+      # probe is what makes a selftest pass mean anything at all.
+      - name: Guard selftest meta-gate (every guard can prove it blocks)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-guard-selftests.py
+
+      - name: Workflow job-graph guard (no dangling `needs:`)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-workflow-job-graph.py
+
       - name: Dockerfile digest-pin guard — selftest (prove it bites)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-dockerfile-digest-pins.py --selftest
@@ -445,11 +742,22 @@ jobs:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
-    if: github.repository == 'tracelane/tracelane' || github.event_name != 'push'
+    # DRAFT GUARD (2026-08-10). MEASURED: 76% of August CI minutes were pushes to
+    # three open feature-branch PRs at ~45 min per push. A draft PR is
+    # work-in-progress and does not need the merge gate on every push.
+    # `draft` is null on non-PR events, so `!= true` leaves push / schedule /
+    # workflow_dispatch untouched. Gating the ROOT jobs is sufficient: every
+    # other job `needs: changes`, and a skipped need skips the dependant.
+    # A run where everything skipped now reads CANNOT DETERMINE, not GREEN
+    # (scripts/ops/ci-status.sh) — a draft PR is honestly unverified. Mark it
+    # ready for review to get a verdict.
+    if: >-
+      (github.repository == 'tracelane/tracelane' || github.event_name != 'push')
+      && github.event.pull_request.draft != true
     name: Secret + supply-chain scan (fast)
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # gitleaks runs FIRST, on the pristine checkout (no node_modules/target
       # present yet), so it stays ~3s and false-positive-free.
       - name: Install gitleaks
@@ -502,10 +810,16 @@ jobs:
     # main-push event while `live_stack` keeps it on hot-path PRs.
     # NOTE: a DIRECT-to-main hot-path push (no PR) therefore skips bench until the
     # weekly cron — route hot-path changes through a PR to get the bench gate.
-    if: needs.changes.outputs.live_stack == 'true' && github.event_name != 'push'
+    # 2026-08-10: OFF pull_request too. A release-profile benchmark has no business
+    # on an intermediate push — 441 min in August, the single largest job.
+    # merge; a regression is caught by the WEEKLY cron instead. When a PR needs the
+    # gate, run it deliberately: gh workflow run CI --ref <branch>.
+    if: >-
+      needs.changes.outputs.live_stack == 'true'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest  # HEAVY (cargo/stack): OFF the prod node (per-job routing; ubuntu-latest is billing-gated - the founder's separate concern)
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
       - name: Cache Rust deps
@@ -554,101 +868,3 @@ jobs:
   #
   # Cost: one job on schedule + dispatch ≈ 5 billable min/month (GitHub rounds
   # every job up to a whole minute, so cost is job COUNT).
-  behavioral-tier-ran:
-    name: Behavioral tier actually ran (B-169)
-    needs:
-      [
-        changes,
-        live-eval-gate,
-        l16-e2e-gate,
-        span-publish-integration,
-        ingest-release-tenant-guard,
-      ]
-    # `always()` is load-bearing: without it a skipped need skips THIS job too,
-    # which is exactly the failure it exists to detect — decorative from birth in
-    # the one case it was built for.
-    #
-    # Scoped to schedule + workflow_dispatch because those are the events where
-    # the `changes` job fail-safes to run-all (`else run_all "event=$EVENT"`), so
-    # all four are EXPECTED and `skipped` is unambiguously wrong. On push/PR the
-    # tier is path-gated and `skipped` is the CORRECT answer — asserting there
-    # would fire on every docs PR and get overridden, which is how a guard dies.
-    if: >-
-      always() &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Assert all four behavioral jobs executed
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          OUT_RUST: ${{ needs.changes.outputs.rust }}
-          OUT_WEB: ${{ needs.changes.outputs.web }}
-          OUT_LIVE: ${{ needs.changes.outputs.live_stack }}
-          # Bracket form, not `needs.l16-e2e-gate.result`: `-` is subtraction in
-          # the expression grammar, so a hyphenated job id must be indexed.
-          R_LIVE_EVAL: ${{ needs['live-eval-gate'].result }}
-          R_L16: ${{ needs['l16-e2e-gate'].result }}
-          R_SPAN: ${{ needs['span-publish-integration'].result }}
-          R_INGEST: ${{ needs['ingest-release-tenant-guard'].result }}
-        run: |
-          set -uo pipefail
-          missing=0
-          rows=""
-
-          # A job that RAN and FAILED still EXECUTED. The run is already red from
-          # that job, and failing here too would blur which of the two problems
-          # this is. Only non-execution (skipped / cancelled) is this job's
-          # business — "did the net get cast", not "did it catch anything".
-          check() {
-            label="$1"; result="$2"; gate_name="$3"; gate_val="$4"
-            case "$result" in
-              success)
-                rows="${rows}| \`${label}\` | ✅ ran (success) | — |\n" ;;
-              failure)
-                rows="${rows}| \`${label}\` | ⚠️ ran (FAILED — see that job) | — |\n" ;;
-              *)
-                missing=$((missing + 1))
-                if [ "$CHANGES_RESULT" != "success" ]; then
-                  why="\`changes\` concluded **${CHANGES_RESULT}** — it gates this job through \`needs:\`, so it never got a chance"
-                elif [ "$gate_val" != "true" ]; then
-                  why="\`changes\` succeeded but emitted \`${gate_name}=${gate_val:-<empty>}\` — on \`${GITHUB_EVENT_NAME}\` it must fail-safe to \`true\`"
-                else
-                  why="\`${gate_name}=true\` and \`changes\` succeeded, yet the result is **${result}** — unexplained; read the run graph"
-                fi
-                rows="${rows}| \`${label}\` | ❌ **${result}** | ${why} |\n" ;;
-            esac
-          }
-
-          check live-eval-gate              "$R_LIVE_EVAL" live_stack "$OUT_LIVE"
-          check l16-e2e-gate                "$R_L16"       web        "$OUT_WEB"
-          check span-publish-integration    "$R_SPAN"      rust       "$OUT_RUST"
-          check ingest-release-tenant-guard "$R_INGEST"    rust       "$OUT_RUST"
-
-          # Printed on EVERY run, pass or fail. A control that is silent when
-          # healthy is indistinguishable from one that is broken, and the step
-          # summary is what makes it readable without opening logs — the reason
-          # the 2026-07-12 and 07-26 disappearances went unnoticed.
-          {
-            echo "### Behavioral tier — did it actually run?"
-            echo ""
-            echo "Event \`${GITHUB_EVENT_NAME}\` · \`changes\` concluded **${CHANGES_RESULT}**"
-            echo ""
-            echo "| job | executed? | why not |"
-            echo "|---|---|---|"
-            printf '%b' "$rows"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-          if [ "$missing" -gt 0 ]; then
-            {
-              echo ""
-              echo "**${missing} of 4 behavioral jobs DID NOT EXECUTE.**"
-              echo ""
-              echo "This run must not be read as a behavioral pass. On \`schedule\` this is the"
-              echo "only place these four run at all (private push-CI is off per B-153), so a"
-              echo "skip here is a week with no behavioral coverage — not a cheaper week."
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "::error::Behavioral tier incomplete — ${missing}/4 jobs did not execute (see the job summary for which and why)."
-            exit 1
-          fi
-          echo "✓ all 4 behavioral jobs executed"

@@ -12,31 +12,34 @@ live access to your production traces during debugging.
 or access another tenant's data.
 
 <Warning>
-**Not published to npm yet.** `@tracelanedev/mcp` is not on the registry today,
-so `npx @tracelanedev/mcp` returns a 404. Until it ships, run it from a clone —
-see the commands directly below. The `npx` forms further down are what to use
-once the package is published.
+**Not on npm, and not available on Tracelane Cloud.** `@tracelanedev/mcp` is not
+published to the registry — it is wired into the release workflow but no release tag has
+carried it yet — so `npx @tracelanedev/mcp` returns a 404. It becomes installable on the
+next bundled release. The server also reads
+spans straight out of ClickHouse instead of proxying the gateway, so it needs
+ClickHouse credentials: it runs against a self-hosted or local Tracelane stack, not
+against a hosted Cloud workspace.
 </Warning>
 
-Run from a clone until the npm package ships:
+## Run it
+
+Build it from a clone:
 
 ```bash
 git clone https://github.com/tracelane/tracelane && cd tracelane
 pnpm install && pnpm --filter @tracelanedev/mcp build
-node apps/mcp/dist/index.js
 ```
 
-## Install
+Then start it against your own stack. ClickHouse credentials are what it reads traces
+with; the gateway URL is used only to validate your `tlane_*` key:
 
 ```bash
-# Runs locally and reads your traces directly from Tracelane's ClickHouse —
-# it is not a hosted service and does not proxy the gateway.
-npx @tracelanedev/mcp
-
-# Self-hosted / local
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_USER=default \
+CLICKHOUSE_PASSWORD=... \
 TRACELANE_API_KEY=tlane_... \
 TRACELANE_GATEWAY_URL=http://localhost:8080 \
-npx @tracelanedev/mcp
+node apps/mcp/dist/index.js
 ```
 
 ## Configure Claude Desktop
@@ -48,11 +51,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 {
   "mcpServers": {
     "tracelane": {
-      "command": "npx",
-      "args": ["@tracelanedev/mcp"],
+      "command": "node",
+      "args": ["/path/to/tracelane/apps/mcp/dist/index.js"],
       "env": {
+        "CLICKHOUSE_URL": "http://localhost:8123",
+        "CLICKHOUSE_USER": "default",
+        "CLICKHOUSE_PASSWORD": "...",
         "TRACELANE_API_KEY": "tlane_...",
-        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+        "TRACELANE_GATEWAY_URL": "http://localhost:8080"
       }
     }
   }
@@ -69,11 +75,14 @@ Add to `.mcp.json` in your project root:
 {
   "mcpServers": {
     "tracelane": {
-      "command": "npx",
-      "args": ["@tracelanedev/mcp"],
+      "command": "node",
+      "args": ["/path/to/tracelane/apps/mcp/dist/index.js"],
       "env": {
+        "CLICKHOUSE_URL": "http://localhost:8123",
+        "CLICKHOUSE_USER": "default",
+        "CLICKHOUSE_PASSWORD": "...",
         "TRACELANE_API_KEY": "tlane_...",
-        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+        "TRACELANE_GATEWAY_URL": "http://localhost:8080"
       }
     }
   }
@@ -156,7 +165,7 @@ Resolution: review span 7–9 for unintended data exfiltration.
 mcp.tracelane.list_evals({ suite: "pain-points" })
 ```
 
-Returns the eval scoreboard — all 69 pain-point evals + 10 fault-tolerance evals
+Returns the eval scoreboard — all 68 pain-point evals + 10 fault-tolerance evals
 with current status (green / mock / stub / not-written).
 
 ### `get_eval_result`
@@ -191,7 +200,7 @@ Start in HTTP mode:
 ```bash
 TRACELANE_MCP_TRANSPORT=http \
 TRACELANE_MCP_PORT=3100 \
-npx @tracelanedev/mcp
+node apps/mcp/dist/index.js
 ```
 
 ## Auth

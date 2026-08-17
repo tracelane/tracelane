@@ -1,109 +1,99 @@
 /**
  * MCP tools for reading eval results.
  *
- * Reads from the local eval result cache produced by `pnpm eval:run`.
- * Falls back to the static INDEX.md listing if no cache is present.
+ * The eval CORPUS (ids + suite + repo-relative path) comes from
+ * `src/eval-manifest.json`, generated from `evals/` by
+ * `scripts/gen-eval-manifest.mjs` and bundled into `dist/`. That matters
+ * for distribution: `npx @tracelanedev/mcp` runs out of `node_modules`
+ * where no `evals/` directory exists at any depth, so the previous
+ * walk-up-from-`__dirname` lookup found nothing and the hand-maintained
+ * id array (49 entries against 79 real evals) was the only answer the
+ * published package could give.
+ *
+ * Eval SOURCE files are still read from a repo checkout when one is
+ * present — the manifest tells us the count and the ids; the checkout
+ * tells us the assertions. With no checkout the tools say so explicitly
+ * rather than reporting "not found".
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import manifest from "../eval-manifest.json";
 
-function findRepoRoot(): string {
+interface EvalEntry {
+	id: string;
+	/** Repo-relative path, e.g. `evals/pain-points/PP-G1.eval.ts`. */
+	path: string;
+	suite: string;
+}
+
+/** Flat id -> entry map. The ONLY set of ids these tools will act on. */
+const EVALS: ReadonlyMap<string, EvalEntry> = new Map(
+	Object.entries(manifest.suites).flatMap(([suite, entries]) =>
+		(entries as { id: string; path: string }[]).map(
+			(e) => [e.id, { ...e, suite }] as const,
+		),
+	),
+);
+
+const EVAL_IDS: readonly string[] = [...EVALS.keys()];
+
+/**
+ * Locate a repo checkout by walking up from the bundle looking for
+ * `evals/pain-points`. Returns `null` when there is none — the normal
+ * case for an `npx`-installed package.
+ */
+function findRepoRoot(): string | null {
 	let dir = __dirname;
 	for (let i = 0; i < 8; i++) {
 		if (existsSync(join(dir, "evals", "pain-points"))) return dir;
 		dir = join(dir, "..");
 	}
-	return __dirname;
-}
-
-function readIndexMd(): string | null {
-	const repoRoot = findRepoRoot();
-	const indexPath = join(repoRoot, "evals", "pain-points", "INDEX.md");
-	if (existsSync(indexPath)) {
-		return readFileSync(indexPath, "utf8");
-	}
 	return null;
 }
 
-const KNOWN_EVALS = [
-	"PP-G1",
-	"PP-G2",
-	"PP-G3",
-	"PP-G4",
-	"PP-G5",
-	"PP-O1",
-	"PP-O2",
-	"PP-O3",
-	"PP-O4",
-	"PP-O5",
-	"PP-O6",
-	"PP-O7",
-	"PP-O8",
-	"PP-O9",
-	"PP-O10",
-	"PP-O11",
-	"PP-P1",
-	"PP-P2",
-	"PP-P3",
-	"PP-P4",
-	"PP-P5",
-	"PP-P6",
-	"PP-P7",
-	"PP-P8",
-	"PP-P9",
-	"PP-P10",
-	"PP-P11",
-	"PP-P12",
-	"PP-P13",
-	"PP-PR1",
-	"PP-PR2",
-	"PP-PR3",
-	"PP-PR4",
-	"PP-PR5",
-	"PP-PR6",
-	"PP-PR7",
-	"PP-PR8",
-	"PP-PR9",
-	"PP-PR10",
-	"PP-PR11",
-	"PP-PR12",
-	"FT-01",
-	"FT-02",
-	"FT-03",
-	"FT-04",
-	"FT-05",
-	"FT-06",
-	"FT-07",
-	"FT-08",
-];
+function readIndexMd(repoRoot: string | null): string | null {
+	if (!repoRoot) return null;
+	const indexPath = join(repoRoot, "evals", "pain-points", "INDEX.md");
+	return existsSync(indexPath) ? readFileSync(indexPath, "utf8") : null;
+}
+
+function textResult(payload: unknown) {
+	return {
+		content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+	};
+}
 
 export function registerEvalTools(server: McpServer) {
 	server.tool(
 		"list_evals",
-		"List all pain-point evals and their current status",
+		"List all pain-point and fault-tolerance evals and their current status",
 		{},
 		async () => {
-			const indexContent = readIndexMd();
+			const repoRoot = findRepoRoot();
+			const indexContent = readIndexMd(repoRoot);
 
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: JSON.stringify({
-							eval_count: KNOWN_EVALS.length,
-							eval_ids: KNOWN_EVALS,
-							index_available: indexContent !== null,
-							index_excerpt: indexContent
-								? indexContent.slice(0, 2000)
-								: "Run `pnpm eval:index` to generate INDEX.md",
-							hint: "Use get_eval_result with an eval ID for details",
-						}),
-					},
-				],
-			};
+			return textResult({
+				eval_count: manifest.total,
+				eval_ids: EVAL_IDS,
+				suites: Object.fromEntries(
+					Object.entries(manifest.suites).map(([suite, entries]) => [
+						suite,
+						(entries as unknown[]).length,
+					]),
+				),
+				// Honest about which surface answered: the count is always the
+				// real corpus (bundled manifest); the excerpt needs a checkout.
+				source: "bundled eval manifest (generated from evals/)",
+				sources_available: repoRoot !== null,
+				index_available: indexContent !== null,
+				index_excerpt: indexContent
+					? indexContent.slice(0, 2000)
+					: "Eval sources are not part of the npm package — clone github.com/tracelane/tracelane to read assertions, or run `pnpm eval:index`.",
+				hint: "Use get_eval_result with an eval ID for details",
+			});
 		},
 	);
 
@@ -114,82 +104,54 @@ export function registerEvalTools(server: McpServer) {
 			eval_id: z.string().describe("Eval ID, e.g. PP-G3, PP-PR1, FT-01"),
 		},
 		async ({ eval_id }) => {
-			// eval-id shape (PP-*, FT-*, PR*). Without this, an
-			// MCP client could traverse out of the evals/ directory
-			// via `eval_id = "../../../etc/passwd"` (only files
-			// ending in `.eval.ts` were readable, but defense in
-			// depth costs nothing).
-			if (!/^(PP-[A-Z0-9]+|FT-\d+|PR\d+)$/.test(eval_id)) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								eval_id,
-								error:
-									"invalid eval_id shape — must match /^(PP-[A-Z0-9]+|FT-\\d+|PR\\d+)$/",
-							}),
-						},
-					],
-				};
+			// generated manifest and the PATH comes from the manifest entry —
+			// never from the caller's string. An `eval_id` of
+			// `../../../etc/passwd` cannot name a manifest entry, so traversal
+			// is structurally impossible rather than regex-filtered. The old
+			// regex also REJECTED 30+ real ids (`PP-AUDIT-TAMPER-DETECT`,
+			// `FT-10-concurrent-promotion-rollback`), so it failed both ways.
+			const entry = EVALS.get(eval_id);
+			if (!entry) {
+				return textResult({
+					eval_id,
+					error: `unknown eval id — not present in the ${manifest.total}-eval manifest`,
+					known_eval_ids: EVAL_IDS,
+				});
 			}
 
 			const repoRoot = findRepoRoot();
-
-			// Try to find the eval file
-			const evalFile = join(
-				repoRoot,
-				"evals",
-				"pain-points",
-				`${eval_id}.eval.ts`,
-			);
-			const ftFile = join(
-				repoRoot,
-				"evals",
-				"fault-tolerance",
-				`${eval_id}.eval.ts`,
-			);
-
-			const filePath = existsSync(evalFile)
-				? evalFile
-				: existsSync(ftFile)
-					? ftFile
-					: null;
-
-			if (!filePath) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								eval_id,
-								error: `Eval file not found. Known eval IDs: ${KNOWN_EVALS.join(", ")}`,
-							}),
-						},
-					],
-				};
+			if (!repoRoot) {
+				return textResult({
+					eval_id,
+					suite: entry.suite,
+					path: entry.path,
+					error:
+						"eval sources are not bundled in the npm package — clone github.com/tracelane/tracelane and run this server from the checkout to read assertions",
+				});
 			}
 
-			// Read the eval source to extract description
+			const filePath = join(repoRoot, entry.path);
+			if (!existsSync(filePath)) {
+				return textResult({
+					eval_id,
+					suite: entry.suite,
+					path: entry.path,
+					error: `eval file listed in the manifest is missing from the checkout at ${filePath} — the manifest is stale (run \`pnpm --filter @tracelanedev/mcp gen:evals\`)`,
+				});
+			}
+
 			const source = readFileSync(filePath, "utf8");
 			const descMatch = source.match(/describe\(['"]([^'"]+)['"]/);
 			const testMatches = [...source.matchAll(/it\(['"]([^'"]+)['"]/g)];
 
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: JSON.stringify({
-							eval_id,
-							file: filePath,
-							suite: descMatch?.[1] ?? "unknown",
-							tests: testMatches.map((m) => m[1]),
-							test_count: testMatches.length,
-							hint: "Run `pnpm eval:run --suite=all` for live pass/fail status",
-						}),
-					},
-				],
-			};
+			return textResult({
+				eval_id,
+				file: filePath,
+				suite: descMatch?.[1] ?? entry.suite,
+				tests: testMatches.map((m) => m[1]),
+				test_count: testMatches.length,
+				hint: "Run `pnpm eval:run --suite=all` for live pass/fail status",
+			});
 		},
 	);
 }

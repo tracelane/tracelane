@@ -18,6 +18,9 @@
 pub mod api_key;
 pub mod jwks;
 mod org_tenant_cache;
+/// API-key capability model. Defined in `tracelane_shared` (see that module's
+/// header for why) and re-exported so `crate::auth::scope::…` reads naturally.
+pub use tracelane_shared::api_scope as scope;
 pub mod workos_webhook;
 
 use std::sync::OnceLock;
@@ -76,19 +79,45 @@ pub struct Claims {
     /// Authentication method that produced these claims.
     pub auth_method: AuthMethod,
     /// Org membership role, read from the WorkOS session JWT `role` claim
-    /// (IDENTITY_TEAM_SPEC §1). `None` for API keys, service tokens, the dev
-    /// stub, and JWTs issued before roles were configured in WorkOS — all of
-    /// which are grandfathered to full access (see [`Claims::can_admin`]).
+    /// (IDENTITY_TEAM_SPEC §1). `None` means the slug was **absent or
+    /// unrecognised** — on a JWT that is a denial (PL-9); off a JWT (API keys,
+    /// service tokens, mTLS) there is no role system to read and authority is
+    /// unchanged. See [`Claims::can_admin`] / [`Claims::has_no_role_system`].
     pub role: Option<Role>,
+    /// A13 — what this credential is allowed to DO, resolved once at auth time.
+    ///
+    /// **Invariant: only an API key can be scoped.** Every other auth method
+    /// (WorkOS JWT, SPIFFE SVID, the self-host master key) is
+    /// [`KeyScope::LegacyFullSurface`] here, because those are governed by
+    /// [`Role`] and by the per-capability predicates below — there is no scope
+    /// system on them to read. Do not add one here without deciding what it
+    /// means for a JWT; two overlapping authority systems on one credential is
+    /// how a narrow grant silently becomes a wide one.
+    ///
+    /// Resolved in `db::api_keys::lookup_tenant_by_key_body` and carried through
+    /// the auth cache, so the hot path reads a resolved capability instead of
+    /// re-deriving one per route.
+    pub key_scope: scope::KeyScope,
+}
+
+impl Claims {
+    /// Does this credential carry `needed`?
+    ///
+    /// The ONE place a route asks the scope question. A route that compares
+    /// slugs itself will drift from the vocabulary; call this.
+    #[must_use]
+    pub fn allows_scope(&self, needed: scope::Scope) -> bool {
+        self.key_scope.allows(needed)
+    }
 }
 
 /// The three org roles (IDENTITY_TEAM_SPEC §1). Read from the WorkOS session
 /// JWT `role` claim; never stored in a Tracelane role table.
 ///
-/// Only these exact slugs restrict access. WorkOS's built-in `admin` slug and
-/// any unknown/absent slug map to `None` (grandfathered full access) so
-/// enabling this gate cannot demote existing admins or lock out API keys before
-/// the WorkOS environment roles are reconfigured to owner/member/viewer.
+/// Every slug that grants anything is named here. WorkOS's built-in `admin` is
+/// mapped to [`Role::Owner`] **explicitly**, so org full access is a decision
+/// rather than a fallthrough; any other slug, and an absent slug, are
+/// unrecognised and grant nothing on a JWT (PL-9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Owner,
@@ -97,37 +126,52 @@ pub enum Role {
 }
 
 impl Role {
+    /// `None` means **unrecognised**, never "trusted" — see
+    /// [`Claims::can_admin`] for what that resolves to.
     fn from_slug(slug: &str) -> Option<Self> {
         match slug {
-            "owner" => Some(Self::Owner),
+            // WorkOS ships `admin` as the built-in org role and it IS org full
+            // access. Named here so it is granted deliberately. Before PL-9 it
+            // reached full access through the `_` arm below, which made the
+            // WorkOS DEFAULT role indistinguishable from a typo.
+            "owner" | "admin" => Some(Self::Owner),
             "member" => Some(Self::Member),
             "viewer" => Some(Self::Viewer),
-            // `admin` (WorkOS default) + anything unknown → None (full access).
             _ => None,
         }
     }
 }
 
+/// Map the raw WorkOS `role` claim onto a [`Role`]. **One site**, so the JWT
+/// path and the PL-9 tests exercise the same code instead of a mirror of it.
+/// `None` out means absent-or-unrecognised — deliberately indistinguishable
+/// here, because [`Claims::can_admin`] denies both on a JWT.
+fn role_from_claim(raw: Option<&str>) -> Option<Role> {
+    raw.and_then(Role::from_slug)
+}
+
 impl Claims {
-    /// May this caller mint/revoke API keys? Everyone except an explicit
-    /// `viewer` (IDENTITY_TEAM_SPEC §1: members mint their own keys).
+    /// May this caller mint/revoke API keys? `owner` and `member` may
+    /// (IDENTITY_TEAM_SPEC §1: members mint their own keys); `viewer` may not,
+    /// and neither may a JWT whose role slug is unrecognised or absent — see
+    /// [`Self::has_no_role_system`].
     pub fn can_mint_keys(&self) -> bool {
-        self.role != Some(Role::Viewer)
+        match self.role {
+            Some(Role::Owner | Role::Member) => true,
+            Some(Role::Viewer) => false,
+            None => self.has_no_role_system(),
+        }
     }
 
-    /// May this caller perform owner-scoped actions — billing, BYOK provider /
-    /// encryption keys, member management (IDENTITY_TEAM_SPEC §1)? Explicit
-    /// `member`/`viewer` are denied; `owner`, legacy `admin`, API-key / service
-    /// auth, and pre-role-config JWTs (`role == None`) are grandfathered.
     /// May this caller perform an owner-scoped action that can WEAKEN a
     /// security control?
     ///
-    /// Stricter than [`Self::can_admin`], and deliberately so. `can_admin`
-    /// grandfathers `role == None` to full access so that enabling roles could
-    /// not lock out existing admins — but **API-key auth always has
-    /// `role == None`** (`auth/api_key.rs`), and [`Self::can_mint_keys`]
-    /// deliberately lets a *member* mint keys. Those two facts compose:
-    /// member → mint an API key → call an owner-only surface. That defeated the
+    /// Stricter than [`Self::can_admin`], and still required after PL-9. PL-9
+    /// closed the JWT half — an unrecognised or absent slug no longer admins —
+    /// but **API-key auth still has `role == None`** (`auth/api_key.rs`) and
+    /// [`Self::can_mint_keys`] deliberately lets a *member* mint keys. Those
+    /// compose: member → mint an API key → call an owner-only surface. That
+    /// holds that line until PL-9b splits the self-host principal out.
     ///
     /// Use this for actions whose misuse is silent and damaging — moving
     /// guardrail capabilities, revoking or replacing provider credentials. Use
@@ -137,8 +181,80 @@ impl Claims {
         matches!(self.auth_method, AuthMethod::JwtBearer) && self.can_admin()
     }
 
+    /// May this caller perform owner-scoped actions — billing, BYOK provider /
+    /// encryption keys, member management (IDENTITY_TEAM_SPEC §1)?
+    ///
+    /// `owner` (and the WorkOS built-in `admin`, which maps to it) may.
+    /// `member` and `viewer` are denied. A JWT carrying an unrecognised or
+    /// absent slug is **denied** — that is PL-9; see
+    /// [`Self::has_no_role_system`] for why non-JWT principals differ.
     pub fn can_admin(&self) -> bool {
-        !matches!(self.role, Some(Role::Member) | Some(Role::Viewer))
+        match self.role {
+            Some(Role::Owner) => true,
+            Some(Role::Member | Role::Viewer) => false,
+            None => self.has_no_role_system(),
+        }
+    }
+
+    /// May this caller CHANGE what prompt runs in production?
+    ///
+    /// A8/EVL-18 (2026-08-11). `create_version`, `promote` and `delete` were gated
+    /// on `require_promotion_write` — a **tenant entitlement** — which asks whether
+    /// the workspace paid for prompt promotion, never whether *this user* is allowed
+    /// to. In any Team-plan workspace a `member`, and a **`viewer`**, could flip the
+    /// production pointer and delete prompts. Viewer is the role we hand to people we
+    /// are deliberately not trusting with writes.
+    ///
+    /// **Why this is not just `can_admin`.** PL-9b demoted [`AuthMethod::ApiKey`] out
+    /// of admin, so `can_admin` would also revoke prompt promotion from every `tlane_`
+    /// key — and a CI-driven promotion pipeline is the obvious way to build this. That
+    /// would trade a role gap for a broken integration. So the bar is deliberately
+    /// *different from* `can_admin` rather than a copy of it: a human must be an owner
+    /// (or WorkOS `admin`), and a machine credential stays admitted.
+    ///
+    /// `None` + `JwtBearer` is **denied** — an absent or unrecognised role slug on a
+    /// human token is the PL-9 shape and fails closed.
+    pub fn can_write_prompts(&self) -> bool {
+        match self.role {
+            // `admin` maps to Owner in `Role::from_slug`; both are full org access.
+            Some(Role::Owner) => true,
+            Some(Role::Member | Role::Viewer) => false,
+            // Machine credentials: a tenant API key is the automation path, and the
+            // self-host master key is the operator's only credential.
+            None => matches!(
+                self.auth_method,
+                AuthMethod::ApiKey | AuthMethod::SelfHostMasterKey
+            ),
+        }
+    }
+
+    /// `role == None` means the WorkOS `role` claim was **absent or carried a
+    /// slug we do not recognise**. What that resolves to depends entirely on
+    /// how the caller authenticated, and conflating the two is PL-9.
+    ///
+    /// **On a JWT it is a denial.** WorkOS's default org role is `admin`, so
+    /// before this fix the default role, a renamed role and an outright typo
+    /// all landed on the same "grant everything" branch — privilege escalation
+    /// by default, and silent. A JWT is exactly the case where a role system
+    /// exists and we failed to read a role from it, so it fails CLOSED.
+    ///
+    /// **Off a JWT, exactly ONE principal is privileged without a slug: the
+    /// self-host master key** ([`AuthMethod::SelfHostMasterKey`],
+    /// `sub = "self-host"`). It is the operator of a single-tenant deployment
+    /// and its only credential — there is no role system to consult and nobody
+    /// else to ask.
+    ///
+    /// **Everything else is denied (PL-9b).** A tenant API key used to land here
+    /// too, and that was a live escalation: [`Self::can_mint_keys`] deliberately
+    /// lets a *member* mint a key, so member → mint → owner-only surface.
+    /// [`Self::is_verified_owner`]; six others stayed open until this. `Mtls` is
+    /// ingest's service identity and never needed admin either.
+    ///
+    /// The reason this took a second commit is that the operator and the tenant
+    /// machine credential **shared one `AuthMethod` variant**, so demoting one
+    /// demoted the other. They are different principals; now they say so.
+    fn has_no_role_system(&self) -> bool {
+        matches!(self.auth_method, AuthMethod::SelfHostMasterKey)
     }
 }
 
@@ -154,7 +270,20 @@ pub fn role_forbidden_json(required: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     JwtBearer,
+    /// A **tenant-issued** `tlane_` API key. A machine credential for the data
+    /// path — deliberately NOT an admin credential (PL-9b): a *member* may mint
+    /// one ([`Claims::can_mint_keys`]), so treating it as admin turns key
+    /// minting into privilege escalation.
     ApiKey,
+    /// The single-tenant **self-host master key** (ADR-067). Distinct from
+    /// [`AuthMethod::ApiKey`] precisely because it is the OPERATOR of a
+    /// self-hosted deployment, not a tenant machine credential — it is the only
+    /// credential such a deployment has, and it is set by whoever runs the
+    /// process. It keeps full authority; a tenant API key does not.
+    ///
+    /// These two shared one variant until PL-9b, which is why demoting API keys
+    /// looked like it would regress self-host. They are different principals.
+    SelfHostMasterKey,
     /// mTLS SPIFFE SVID (ingest workers only).
     Mtls,
 }
@@ -214,8 +343,10 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
         tenant_id: sh.tenant_id.clone(),
         sub: "self-host".to_string(),
         exp: u64::MAX,
-        auth_method: AuthMethod::ApiKey,
+        // PL-9b: its OWN principal, not `ApiKey`. This is the operator.
+        auth_method: AuthMethod::SelfHostMasterKey,
         role: None,
+        key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
     })
 }
 
@@ -342,7 +473,7 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
     // 3. Decode + validate (signature, exp, iss, aud), then resolve the
     //    tenant identity (direct UUID claim, or WorkOS org_id bridge).
     let claims = decode_and_validate(token, decoding_key, header.alg)?;
-    let role = claims.role.as_deref().and_then(Role::from_slug);
+    let role = role_from_claim(claims.role.as_deref());
     let tenant_id = resolve_tenant_id(&claims).await?;
     Ok(Claims {
         tenant_id,
@@ -350,6 +481,8 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
         exp: claims.exp,
         auth_method: AuthMethod::JwtBearer,
         role,
+        // A JWT is governed by Role, not by scopes — see the field's invariant.
+        key_scope: scope::KeyScope::LegacyFullSurface,
     })
 }
 
@@ -511,8 +644,13 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
         sub: "dev-stub".into(),
         exp: u64::MAX,
         auth_method,
-        // Dev tenant = full access (grandfathered, same as API keys).
-        role: None,
+        // Dev tenant = full access, stated EXPLICITLY (PL-9). It used to be
+        // `None`, i.e. full access by falling through the grandfather — the
+        // same shape as the bug. This path is debug-only and unreachable once
+        // `WORKOS_CLIENT_ID` is set (release builds `bail!` above), so the grant
+        // is safe; what matters is that it is now a decision, not a default.
+        role: Some(Role::Owner),
+        key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
     }
 }
 
@@ -563,7 +701,11 @@ mod tests {
         let claims =
             validate_self_host("unit-test-master-key-do-not-use", &sh).expect("exact match");
         assert_eq!(claims.tenant_id, self_host_tenant());
-        assert_eq!(claims.auth_method, AuthMethod::ApiKey);
+        // PL-9b: its OWN principal, not `ApiKey`. Sharing that variant with
+        // tenant keys is what made the operator and a member-mintable machine
+        // credential indistinguishable.
+        assert_eq!(claims.auth_method, AuthMethod::SelfHostMasterKey);
+        assert!(claims.can_admin(), "the operator keeps full authority");
         assert_eq!(claims.sub, "self-host");
     }
 
@@ -802,40 +944,190 @@ mod tests {
             exp: u64::MAX,
             auth_method: AuthMethod::JwtBearer,
             role,
+            key_scope: scope::KeyScope::LegacyFullSurface,
         }
     }
 
     #[test]
-    fn role_from_slug_maps_only_the_three_roles() {
+    fn role_from_slug_recognises_admin_and_nothing_else() {
         assert_eq!(Role::from_slug("owner"), Some(Role::Owner));
         assert_eq!(Role::from_slug("member"), Some(Role::Member));
         assert_eq!(Role::from_slug("viewer"), Some(Role::Viewer));
-        // WorkOS default `admin` + anything unknown → None (grandfathered).
-        // This is the guard against demoting existing admins when the gate ships.
-        assert_eq!(Role::from_slug("admin"), None);
+        // PL-9: WorkOS's built-in `admin` is org full access and is now granted
+        // DELIBERATELY. Before, it reached the same place via the unknown arm,
+        // which made the default role indistinguishable from a typo.
+        assert_eq!(Role::from_slug("admin"), Some(Role::Owner));
         assert_eq!(Role::from_slug("Owner"), None); // case-sensitive slug
         assert_eq!(Role::from_slug(""), None);
+        assert_eq!(Role::from_slug("administrator"), None);
     }
 
-    /// `role == None`, and API-key auth ALWAYS has `role == None` — while
-    /// `can_mint_keys()` deliberately lets a MEMBER mint keys. Those compose:
-    /// member → mint a key → reach an owner-only surface.
-    /// `is_verified_owner()` is the stricter gate that closes it for actions
-    /// which can WEAKEN a control (guardrail caps; BYOK upload/revoke).
+    /// PL-9, DRIVEN — the two shapes the founder named, pushed through the same
+    /// `role_from_claim` the JWT path calls at `validate_authorization`, then
+    /// through the gates the route handlers actually branch on
+    /// (`billing/checkout.rs:107`, `billing/portal.rs:80`,
+    /// `guardrail/tool_pins_api.rs:118`, `key_routes.rs:140`).
+    ///
+    /// Both MUST be denied. Before this fix both returned `true` from
+    /// `can_admin()`, and WorkOS's default org role is `admin`, so the default
+    /// role escalated to owner on every one of those surfaces.
+    #[test]
+    fn pl9_unknown_and_absent_role_slugs_are_denied_on_a_jwt() {
+        // The exact inputs: an unrecognised slug, and no slug at all.
+        for raw in [
+            Some("wat"),
+            Some("admin_typo"),
+            Some("Admin"),
+            Some(""),
+            None,
+        ] {
+            let claims = Claims {
+                tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).unwrap()),
+                sub: "u".into(),
+                exp: u64::MAX,
+                auth_method: AuthMethod::JwtBearer,
+                role: role_from_claim(raw),
+                key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+            };
+            assert_eq!(claims.role, None, "{raw:?} must not resolve to a role");
+            assert!(
+                !claims.can_admin(),
+                "{raw:?}: an unrecognised/absent slug must NOT admin — this is PL-9"
+            );
+            assert!(
+                !claims.can_mint_keys(),
+                "{raw:?}: an unrecognised/absent slug must NOT mint API keys"
+            );
+            assert!(
+                !claims.is_verified_owner(),
+                "{raw:?}: an unrecognised/absent slug must NOT clear the owner gate"
+            );
+        }
+
+        // And the counterpart that must KEEP working, or the fix is a lockout:
+        // WorkOS's built-in `admin` is the founder's own live role slug.
+        let admin = Claims {
+            tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).unwrap()),
+            sub: "u".into(),
+            exp: u64::MAX,
+            auth_method: AuthMethod::JwtBearer,
+            role: role_from_claim(Some("admin")),
+            key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+        };
+        assert_eq!(admin.role, Some(Role::Owner));
+        assert!(admin.can_admin() && admin.can_mint_keys() && admin.is_verified_owner());
+    }
+
+    /// PL-9b must not demote the SELF-HOST OPERATOR. It is a single-tenant
+    /// deployment's only credential; denying it locks the operator out of their
+    /// own instance. This is the assertion that made the API-key fix need its
+    /// own commit — the two principals shared one variant until now.
+    #[test]
+    fn pl9b_self_host_master_key_keeps_full_access() {
+        let mut op = claims_with_role(None);
+        op.auth_method = AuthMethod::SelfHostMasterKey;
+        assert!(op.can_admin(), "the self-host operator must still admin");
+        assert!(
+            op.can_mint_keys(),
+            "the self-host operator must still mint keys"
+        );
+    }
+
+    /// PL-9b, DRIVEN PER SURFACE. Every owner-scoped surface, named with the
+    /// gate it actually branches on, asserted to DENY a tenant API key.
+    ///
+    /// The escalation these close: `can_mint_keys` deliberately lets a MEMBER
+    /// mint an API key (IDENTITY_TEAM_SPEC §1), and that key used to clear
+    /// closed the last two rows here one at a time; the other six were open.
+    #[test]
+    fn pl9b_every_owner_surface_denies_a_tenant_api_key() {
+        let mut key = claims_with_role(None);
+        key.auth_method = AuthMethod::ApiKey;
+
+        // (surface, file:line of the gate, does the caller pass it?)
+        let surfaces: [(&str, &str, bool); 8] = [
+            ("billing portal", "billing/portal.rs:80", key.can_admin()),
+            (
+                "billing checkout",
+                "billing/checkout.rs:107",
+                key.can_admin(),
+            ),
+            (
+                "guardrail tool pins",
+                "guardrail/tool_pins_api.rs:118",
+                key.can_admin(),
+            ),
+            (
+                "BYOK provider read",
+                "byok_api/provider_keys_api.rs:235",
+                key.can_admin(),
+            ),
+            ("API key minting", "key_routes.rs:140", key.can_mint_keys()),
+            (
+                "alert rule writes",
+                "alerts/routes.rs:80",
+                key.can_mint_keys(),
+            ),
+            (
+                "guardrail caps move",
+                "guardrail/tool_pins_api.rs:182",
+                key.is_verified_owner(),
+            ),
+            (
+                "BYOK provider mutate",
+                "byok_api/provider_keys_api.rs:236",
+                key.is_verified_owner(),
+            ),
+        ];
+        for (surface, anchor, allowed) in surfaces {
+            assert!(
+                !allowed,
+                "PL-9b: a tenant API key must be DENIED at {surface} ({anchor}) — \
+                 a member can mint one, so allowing it is privilege escalation"
+            );
+        }
+
+        // And the denial a caller actually receives is the typed 403 body.
+        let body = role_forbidden_json("owner");
+        assert!(body.contains(r#""error":"role_forbidden""#), "body: {body}");
+    }
+
+    /// mTLS is ingest's service identity and never needed owner authority.
+    #[test]
+    fn pl9b_mtls_service_identity_is_not_an_admin() {
+        let mut m = claims_with_role(None);
+        m.auth_method = AuthMethod::Mtls;
+        assert!(!m.can_admin());
+        assert!(!m.can_mint_keys());
+    }
+
+    ///
+    /// Historically `can_admin()` grandfathered `role == None`, API-key auth
+    /// always has `role == None`, and `can_mint_keys()` deliberately lets a
+    /// MEMBER mint keys — so member → mint a key → owner-only surface.
+    /// `is_verified_owner()` was the narrower patch that closed the two most
+    /// dangerous surfaces. **PL-9b closed the gap itself**, so an API key now
+    /// fails BOTH gates. This test pins that the defence-in-depth ordering still
+    /// holds: the stricter gate must never be laxer than the looser one.
     #[test]
     fn is_verified_owner_excludes_api_keys_that_can_admin_allows() {
         let mut api_key = claims_with_role(None);
         api_key.auth_method = AuthMethod::ApiKey;
 
-        // The gap itself: can_admin says yes, is_verified_owner says no.
         assert!(
-            api_key.can_admin(),
-            "precondition — the role==None grandfather still holds"
+            !api_key.can_admin(),
+            "PL-9b: a tenant API key is no longer grandfathered to admin"
         );
         assert!(
             !api_key.is_verified_owner(),
             "an API key must not pass the stricter owner gate: a member can mint \
              one for themselves"
+        );
+        assert!(
+            // is_verified_owner ⟹ can_admin. The stricter gate must never admit
+            // a caller the looser one rejects, in either direction of change.
+            !api_key.is_verified_owner() || api_key.can_admin(),
+            "invariant: is_verified_owner must never be laxer than can_admin"
         );
 
         // mTLS is ingest-only and must not reach an owner surface either.
@@ -846,8 +1138,9 @@ mod tests {
         // Only a JWT that also clears can_admin passes.
         assert!(claims_with_role(Some(Role::Owner)).is_verified_owner());
         assert!(
-            claims_with_role(None).is_verified_owner(),
-            "a pre-role-config JWT stays grandfathered, matching can_admin"
+            !claims_with_role(None).is_verified_owner(),
+            "PL-9: a JWT with an unrecognised/absent role slug is denied, not \
+             grandfathered — matching can_admin"
         );
         assert!(!claims_with_role(Some(Role::Member)).is_verified_owner());
         assert!(!claims_with_role(Some(Role::Viewer)).is_verified_owner());
@@ -868,14 +1161,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_and_grandfathered_none_can_do_everything() {
-        for c in [
-            claims_with_role(Some(Role::Owner)),
-            claims_with_role(None), // API key / dev / pre-role-config JWT
-        ] {
-            assert!(c.can_mint_keys());
-            assert!(c.can_admin());
-        }
+    fn owner_can_do_everything() {
+        let c = claims_with_role(Some(Role::Owner));
+        assert!(c.can_mint_keys());
+        assert!(c.can_admin());
     }
 
     #[test]

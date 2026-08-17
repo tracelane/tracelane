@@ -1,0 +1,38 @@
+# form-action allows polar.sh DELIBERATELY. The app's own CSP
+# (apps/web/next.config.ts:72) already does. Without it a Pricing checkout button that
+# POSTs to Polar is blocked by the browser with NO visible error and NO server log — the
+# cause was a CSP directive nobody thought of as part of billing.
+/*
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://polar.sh https://*.polar.sh
+
+/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.js
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.css
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.png
+  Cache-Control: public, max-age=86400
+
+/*.jpg
+  Cache-Control: public, max-age=86400
+
+/*.svg
+  Cache-Control: public, max-age=86400
+
+/*.mp4
+  Cache-Control: public, max-age=86400
+
+/*.webm
+  Cache-Control: public, max-age=86400
+
+/api/*
+  Cache-Control: no-store

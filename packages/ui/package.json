@@ -3,7 +3,7 @@
 	"version": "0.0.0",
 	"private": true,
 	"type": "module",
-	"description": "Tracelane Neon design system (ADR-045) — tokens, primitives, the three signature visualizations. Built to the design-system spec.",
+	"description": "Tracelane design system — tokens, primitives, signature visualizations. tokens.css is the single source of truth.",
 	"exports": {
 		".": "./src/index.ts",
 		"./styles/tokens.css": "./src/styles/tokens.css"
@@ -11,8 +11,7 @@
 	"scripts": {
 		"lint": "biome check src/",
 		"contrast:check": "node scripts/contrast-check.mjs",
-		"typecheck": "tsc --noEmit",
-		"preview": "node scripts/build-preview.mjs"
+		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
 		"class-variance-authority": "^0.7.1",

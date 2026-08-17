@@ -1,13 +1,36 @@
 //! Tenant identity — opaque `TenantId` type.
 //!
-//! `TenantId` can only be constructed via one of three explicit trust
-//! boundaries: a validated JWT claim (gateway path), a verified SPIFFE
-//! X.509-SVID (ingest mTLS path), or the single operator-configured tenant of a
-//! self-host deployment (`from_self_host_config`, reachable only from the
-//! ADR-067 single-tenant mode, which hard-fails on any multi-tenant signal). All
-//! constructors are explicit so an audit grep for `TenantId::from_` enumerates
-//! every trust boundary.
-//! This invariant is the primary defence against cross-tenant data leaks.
+//! Three *named* trust boundaries construct a `TenantId`: a validated JWT claim
+//! (gateway path), a verified SPIFFE X.509-SVID (ingest mTLS path), or the
+//! single operator-configured tenant of a self-host deployment
+//! (`from_self_host_config`, reachable only from the ADR-067 single-tenant mode,
+//! which hard-fails on any multi-tenant signal).
+//!
+//! # There is a FOURTH, and it is not a `from_` function
+//!
+//! This module derives `Deserialize` with `#[serde(transparent)]`, so **serde
+//! builds a `TenantId` directly from bytes** — through no trust boundary, with
+//! nothing for `grep TenantId::from_` to find. This doc previously claimed that
+//! grep "enumerates every trust boundary". It does not, and a claim like that is
+//! worse than silence: it retires the question.
+//!
+//! What contains the fourth path today is the deployment, not this type:
+//!
+//! * the only bytes→`TenantId` site is `ingest::nats_consumer`, decoding a
+//!   payload the **gateway** wrote from a validated claim, over a NATS bus no
+//!   client can reach; and
+//! * the OTLP resource-attribute fallback is `#[cfg(debug_assertions)]`-gated,
+//!   so release builds reject a body-supplied tenant outright
+//!   (`ingest::otlp_decode::resolve_tenant`).
+//!
+//! Both are environmental. Add one `Json<T>` handler whose `T` carries a
+//! `TenantId` field and the request picks its own tenant, silently. That is why
+//! `scripts/ci/check-tenant-id-provenance.sh` fails any `Deserialize`-deriving
+//! struct with a `TenantId` field unless it is allowlisted with a note saying
+//! **who writes the bytes** — the machine-checked half of this comment.
+//!
+//! Keeping the constructors explicit is still the primary defence against
+//! cross-tenant leaks. It is just not the only door.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

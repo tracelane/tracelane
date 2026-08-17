@@ -2,7 +2,7 @@
 
 /*
  * Tailwind v4 must scan the design-system package so the utility classes its
- * components use (bg-surface, text-ink, text-accent-ink, border-seal, …) are
+ * components use (bg-surface, text-ink, text-action-ink, border-seal, …) are
  * generated into this app's stylesheet. Path is relative to this CSS file →
  * repo-root/packages/ui/src.
  */
@@ -13,9 +13,9 @@
  * design-system tokens. tokens.css references "Inter" / "JetBrains Mono" by
  * name as a fallback; here we point --font-sans / --font-mono at the actual
  * next/font CSS variables so the real self-hosted faces are used. The
- * Tinted-Slate-+-Lava palette, the @theme utilities, and the light-default
- * base all come from the imported tokens.css (ADR-053) — this app no longer
- * defines its own tokens.
+ * palette, the @theme utilities and the light-default base ALL come from the
+ * imported tokens.css — this app defines no tokens of its own, and tokens.css is
+ * the single source of truth for colour, type and layout.
  *
  * visual-pass-01 changes NO FONT FACE (founder: "keep existing font"). All three
  * roles are exactly as they were on main; only type SIZES, WEIGHTS and SPACING
@@ -28,8 +28,11 @@
 :root {
 	--font-sans: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
 	--font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", monospace;
-	/* Brand wordmark face (the <Logo> lockup). ONE font across app + marketing:
-	   Plus Jakarta Sans (founder call — kills the serif/sans confusion). */
+	/* Brand wordmark face (the <Logo> lockup). ONE font across app + marketing.
+	   ADR-074 §4 targets Inter; the swap was measured and REVERTED (see layout.tsx),
+	   so the lockup stays Plus Jakarta and brand/svg/*.svg lists Inter first with
+	   Plus Jakarta immediately after — the SVGs render identically on this machine
+	   and in the app until the font ruling changes. */
 	--font-display: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
 }
 

@@ -47,11 +47,21 @@ use dashmap::DashMap;
 use moka::future::Cache;
 use uuid::Uuid;
 
-/// Cache TTL — the missed-`NOTIFY` backstop, NOT the primary invalidation.
+/// Cache TTL — **the invalidation bound**, not a backstop behind `NOTIFY`.
 ///
-/// `LISTEN entitlements_changed` / `key_revoked` invalidates immediately on a
-/// real plan/entitlement/key change, so the TTL only bounds staleness in the
-/// rare case `LISTEN` drops. It was 30s, which forced a blocking Postgres
+/// the primary invalidation … LISTEN invalidates immediately … so the TTL only
+/// bounds staleness in the rare case LISTEN drops."* On prod the drop was not
+/// rare — **110 drops in 21.07 h, one per 11.5 min** — because the Neon compute
+/// autosuspends at 5 min idle and this listener's own retry is what wakes it
+/// (`pg_postmaster_start_time` 10:35:19.76 vs our `LISTEN active` 10:35:20.27).
+/// The listener is now OFF by default; see `control_plane_listen_enabled`.
+///
+/// The 15 minutes below is therefore the real staleness bound for entitlements.
+/// API-key REVOCATION is bounded separately and much more tightly — 60s, in
+/// `db::api_keys` — because a stale entitlement over-or-under-grants a feature
+/// while a stale auth entry keeps a revoked credential working.
+///
+/// It was 30s, which forced a blocking Postgres
 /// re-resolve on EVERY request from a low-QPS tenant (>30s between calls =
 /// expired entry = miss), so intermittent/launch-week traffic paid a
 /// ~60ms Neon-Frankfurt round-trip per request (~72ms p50 gateway overhead)
@@ -586,9 +596,60 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
 /// with backoff (the 15m TTL bounds staleness in the gap) and increments
 /// `tracelane_listen_reconnect_total`.
 ///
-/// Returns immediately; the task runs until the process exits. A `None` /
-/// unset direct URL disables `LISTEN` and the cache relies on the TTL alone.
+/// Returns immediately; the task runs until the process exits.
+///
+/// **`LISTEN` is disabled only when BOTH vars are unset** — the fallback below
+/// previously claimed "a `None`/unset direct URL disables `LISTEN`", which the
+/// two lines under it contradict; with `POSTGRES_DIRECT_URL` unset and
+/// `POSTGRES_URL` pointing at Neon's `-pooler`, the task connects to PgBouncer,
+/// `LISTEN` succeeds, and no notification can ever arrive. `listen_once` now
+/// inspects the resolved HOST and says `DEGRADED` in that case instead of
+/// `active` — see `tracelane_shared::listen_dsn`.
+/// 2026-08-12) — opt in with `TRACELANE_CONTROL_PLANE_LISTEN=1`.
+///
+/// **Why it is off.** Measured on prod over 21.07 h: the LISTEN connection was
+/// dropped and re-established **110 times** — one per 11.5 min — with the gateway
+/// and ingest sockets dying in the same millisecond, i.e. the Neon compute
+/// suspending, not a network blip. `pg_postmaster_start_time()` came back
+/// `10:35:19.76` against our own `LISTEN active` at `10:35:20.27`: **our retry is
+/// what wakes the compute.** So the listener did not hold the compute open; it
+/// resurrected it ~30-60s after every autosuspend, keeping it up ~91-95% of the
+/// time and the bill near the pinned-compute figure.
+///
+/// **And the guarantee it existed for was not being delivered.** `pg_notify`
+/// reaches only listeners attached at that instant — it is not durable. The
+/// producer is an AFTER-UPDATE trigger inside the revoking transaction
+/// (`0019_api_keys_revoke_notify.sql:21`). On an idle system the revoking `UPDATE`
+/// is itself what wakes a fresh postmaster, while this listener is still holding a
+/// dead socket it has not noticed yet — so the NOTIFY lands on zero listeners and
+/// is gone. The revocation traffic causes the wake, so the listener is
+/// structurally guaranteed to be late. That is not flakiness; it is a bias
+/// against precisely the case the mechanism exists for.
+///
+/// The honest bound was therefore the auth-cache TTL all along. That TTL is now
+/// **60s** (`db::api_keys`), which bounds revocation more tightly than the 15
+/// minutes this actually delivered — and, because the cache is positives-only and
+/// in-memory, expiry costs a PG query only when a request arrives, so it does NOT
+/// poll and does NOT defeat autosuspend.
+///
+/// Turn it back on when there is enough traffic that the compute never idles
+/// anyway; then NOTIFY delivery stops being a lottery and the argument changes.
+#[must_use]
+pub fn control_plane_listen_enabled() -> bool {
+    std::env::var("TRACELANE_CONTROL_PLANE_LISTEN").is_ok_and(|v| v == "1")
+}
+
 pub fn spawn_listen_task(cache: EntitlementCache) {
+    if !control_plane_listen_enabled() {
+        tracing::info!(
+            "control-plane LISTEN DISABLED (default; set TRACELANE_CONTROL_PLANE_LISTEN=1 to \
+             enable) — entitlement invalidation is TTL-bound (15m) and API-key revocation is \
+             TTL-bound (60s). Measured rationale: the listener did not hold the Neon compute \
+             open (110 drop/reconnect cycles in 21h) and could not reliably receive a \
+             key_revoked NOTIFY, because the revoking UPDATE is what wakes the compute."
+        );
+        return;
+    }
     let Some(conn_str) = std::env::var("POSTGRES_DIRECT_URL")
         .ok()
         .or_else(|| std::env::var("POSTGRES_URL").ok())
@@ -612,6 +673,23 @@ pub fn spawn_listen_task(cache: EntitlementCache) {
     });
 }
 
+/// The first TCP host in `cfg` that is a pooler and therefore cannot deliver
+///
+/// Reads the host from the PARSED config rather than substring-matching the DSN:
+/// a password may legitimately contain `-pooler`, and matching the raw string
+/// would degrade a correctly-configured direct endpoint. The predicate itself
+/// (with its label-vs-substring tests) lives in `tracelane_shared::listen_dsn`
+/// so the gateway and ingest cannot drift apart on what "pooled" means.
+fn pooled_listen_host(cfg: &tokio_postgres::Config) -> Option<String> {
+    use tokio_postgres::config::Host;
+    cfg.get_hosts().iter().find_map(|h| match h {
+        Host::Tcp(host) if tracelane_shared::listen_dsn::host_cannot_deliver_notify(host) => {
+            Some(host.clone())
+        }
+        _ => None,
+    })
+}
+
 /// One LISTEN session: connect, `LISTEN entitlements_changed`, and pump
 /// notifications into cache invalidations until the connection drops.
 async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result<()> {
@@ -629,6 +707,26 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     let mut pg_cfg: tokio_postgres::Config =
         conn_str.parse().context("parse POSTGRES_DIRECT_URL")?;
     pg_cfg.channel_binding(tokio_postgres::config::ChannelBinding::Prefer);
+    // A LISTEN connection carries NO traffic by design, so a socket that dies
+    // silently — a half-open TCP with no FIN, which is what a cloud proxy or a
+    // compute restart can leave behind — is invisible to it. `poll_message` just
+    // stays Pending, the driver task never ends, the channel never closes, and the
+    // reconnect loop below is never reached. It does not fail; it waits forever.
+    //
+    // EARNED 2026-08-11: after a Neon compute restart, ingest's LISTEN went silent
+    // and never reconnected — no error line, no reconnect line — while the gateway,
+    // which happened to receive a clean FIN, reconnected in 3 seconds. tokio-postgres
+    // defaults to a 2-HOUR keepalive idle, so the dead listener would have gone
+    // unnoticed for two hours, and nothing would have said so. Correctness survived
+    // on the TTL fallback; the silence is the defect.
+    //
+    // 30s idle + a bounded user timeout turns "waits forever" into "reconnects in
+    // under a minute, loudly".
+    pg_cfg.keepalives(true);
+    pg_cfg.keepalives_idle(std::time::Duration::from_secs(30));
+    pg_cfg.keepalives_interval(std::time::Duration::from_secs(10));
+    pg_cfg.keepalives_retries(3);
+    pg_cfg.tcp_user_timeout(std::time::Duration::from_secs(60));
     let (client, mut conn) = pg_cfg.connect(crate::db::pg_tls_connector()?).await?;
 
     // tokio_postgres requires the Connection to be polled continuously for the
@@ -658,7 +756,23 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     client
         .batch_execute("LISTEN entitlements_changed; LISTEN key_revoked")
         .await?;
-    tracing::info!("control-plane LISTEN active on entitlements_changed + key_revoked");
+    // is valid, the backend is just handed to another client before any NOTIFY
+    // can be routed back. So a successful `batch_execute` is NOT evidence that
+    // invalidation works, and reporting "active" here was the guard lying. Ask
+    // the resolved host instead; on a pooler this degrades to the 15m TTL, which
+    // means a revoked API key stays usable for up to 15 minutes.
+    match pooled_listen_host(&pg_cfg) {
+        Some(host) => tracing::warn!(
+            host = %host,
+            "control-plane LISTEN DEGRADED — connected to a POOLED endpoint that cannot \
+             deliver NOTIFY; entitlement + key_revoked invalidation is TTL-only (15m), so a \
+             revoked API key stays usable until it expires. Set POSTGRES_DIRECT_URL to the \
+             direct (non-pooler) endpoint."
+        ),
+        None => {
+            tracing::info!("control-plane LISTEN active on entitlements_changed + key_revoked");
+        }
+    }
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -706,6 +820,51 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// Neon deployment produces. Driven from a DSN string, not a hand-built
+    /// `Config`, so it covers the whole path the running process takes:
+    /// env var -> parse -> host -> predicate.
+    #[test]
+    fn pooled_endpoint_is_reported_degraded() {
+        let cfg: tokio_postgres::Config =
+            "postgres://u:pw@ep-cool-frost-123456-pooler.eu-central-1.aws.neon.tech/db"
+                .parse()
+                .expect("parse");
+        assert_eq!(
+            pooled_listen_host(&cfg).as_deref(),
+            Some("ep-cool-frost-123456-pooler.eu-central-1.aws.neon.tech"),
+            "the -pooler endpoint must be reported as unable to deliver NOTIFY"
+        );
+    }
+
+    /// The other direction: a direct endpoint must NOT be degraded, or every
+    /// healthy deployment logs a warning and the warning stops meaning anything.
+    #[test]
+    fn direct_endpoint_is_not_degraded() {
+        let cfg: tokio_postgres::Config =
+            "postgres://u:pw@ep-cool-frost-123456.eu-central-1.aws.neon.tech/db"
+                .parse()
+                .expect("parse");
+        assert!(pooled_listen_host(&cfg).is_none());
+    }
+
+    /// The discriminating case, and the reason this reads the PARSED host rather
+    /// than the DSN: a password may legitimately contain `-pooler`. A
+    /// `conn_str.contains("-pooler")` check would degrade this correctly-
+    /// configured DIRECT endpoint. This test fails against that implementation.
+    #[test]
+    fn a_password_containing_pooler_does_not_degrade_a_direct_endpoint() {
+        let dsn = "postgres://u:s3cret-pooler@ep-cool-frost-123456.eu-central-1.aws.neon.tech/db";
+        assert!(
+            dsn.contains("-pooler"),
+            "fixture must actually exercise the substring trap"
+        );
+        let cfg: tokio_postgres::Config = dsn.parse().expect("parse");
+        assert!(
+            pooled_listen_host(&cfg).is_none(),
+            "a -pooler in the PASSWORD must not be read as a pooled host"
+        );
+    }
 
     fn grant_all() -> ResolvedEntitlements {
         ResolvedEntitlements {

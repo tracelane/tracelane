@@ -46,13 +46,13 @@ function StepProgress({ current }: { current: number }) {
 				<div key={`step-${i}`} className="flex items-center gap-2">
 					<div
 						className={`h-2 w-2 rounded-full transition-colors ${
-							i + 1 <= current ? "bg-accent-ink" : "bg-surface-3"
+							i + 1 <= current ? "bg-action-ink" : "bg-surface-3"
 						}`}
 					/>
 					{i < TOTAL_STEPS - 1 && (
 						<div
 							className={`h-px w-8 transition-colors ${
-								i + 1 < current ? "bg-accent-ink" : "bg-surface-2"
+								i + 1 < current ? "bg-action-ink" : "bg-surface-2"
 							}`}
 						/>
 					)}
@@ -153,7 +153,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 					value={workspace}
 					onChange={(e) => setWorkspace(e.target.value)}
 					placeholder="Acme agents"
-					className="w-full rounded-lg border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 				/>
 			</div>
 
@@ -163,7 +163,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 				type="button"
 				onClick={start}
 				disabled={loading}
-				className="cta-lava w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating workspace…" : "Get started →"}
 			</button>
@@ -244,7 +244,7 @@ function StepApiKey({
 				</div>
 
 				<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center gap-3">
-					<code className="text-sm font-mono text-accent-ink break-all flex-1">
+					<code className="text-sm font-mono text-action-ink break-all flex-1">
 						{rawKey}
 					</code>
 					<CopyButton text={rawKey} />
@@ -256,7 +256,7 @@ function StepApiKey({
 					in{" "}
 					<Link
 						href="/settings/api-keys"
-						className="text-accent-ink hover:underline"
+						className="text-action-ink hover:underline"
 					>
 						Settings → API Keys
 					</Link>
@@ -268,7 +268,7 @@ function StepApiKey({
 						type="checkbox"
 						checked={confirmed}
 						onChange={(e) => setConfirmed(e.target.checked)}
-						className="rounded border-line accent-accent"
+						className="rounded border-line action-action"
 					/>
 					<span className="text-sm text-ink-2">
 						I&apos;ve copied and stored this key
@@ -279,7 +279,7 @@ function StepApiKey({
 					type="button"
 					onClick={onNext}
 					disabled={!confirmed}
-					className="cta-lava w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-40"
+					className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-40"
 				>
 					Continue →
 				</button>
@@ -308,7 +308,7 @@ function StepApiKey({
 						manage keys anytime in{" "}
 						<Link
 							href="/settings/api-keys"
-							className="text-accent-ink hover:underline"
+							className="text-action-ink hover:underline"
 						>
 							Settings → API Keys
 						</Link>
@@ -330,7 +330,7 @@ function StepApiKey({
 					value={keyName}
 					onChange={(e) => setKeyName(e.target.value)}
 					placeholder="my-agent"
-					className="w-full rounded-lg border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 				/>
 			</div>
 
@@ -340,7 +340,7 @@ function StepApiKey({
 				type="button"
 				onClick={create}
 				disabled={loading}
-				className="cta-lava w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating…" : "Create API key →"}
 			</button>
@@ -429,7 +429,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 					placeholder — paste the key you saved earlier, or{" "}
 					<Link
 						href="/settings/api-keys"
-						className="text-accent-ink hover:underline"
+						className="text-action-ink hover:underline"
 					>
 						create a new one
 					</Link>

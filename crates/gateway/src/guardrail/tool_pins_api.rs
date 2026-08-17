@@ -144,17 +144,14 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
 /// at all. Such a caller can still PIN a definition (which only ever ADDS drift
 /// detection) — that is what the observe-then-approve flow needs.
 #[must_use]
-pub fn caps_write_allowed(
-    auth_method: crate::auth::AuthMethod,
-    role: Option<crate::auth::Role>,
-) -> bool {
-    // Delegates to the ONE definition (`Claims::is_verified_owner`) so this
-    // rather than to guards.
-    matches!(auth_method, crate::auth::AuthMethod::JwtBearer)
-        && !matches!(
-            role,
-            Some(crate::auth::Role::Member) | Some(crate::auth::Role::Viewer)
-        )
+pub fn caps_write_allowed(claims: &crate::auth::Claims) -> bool {
+    // Delegates to the ONE definition so this predicate and BYOK's cannot drift
+    //
+    // It used to say that while INLINING a copy of the old `can_admin` body,
+    // which is the drift it claimed to prevent: PL-9 tightened `can_admin` and
+    // this copy kept granting. Now it actually delegates, so there is one
+    // definition and one place to change.
+    claims.is_verified_owner()
 }
 
 /// Compute the pin hash from a submitted definition. The ONLY way a `def_hash`
@@ -175,7 +172,7 @@ async fn pin(
         Err(e) => return e,
     };
     let tenant = claims.tenant_id.clone();
-    let may_write_caps = caps_write_allowed(claims.auth_method, claims.role);
+    let may_write_caps = caps_write_allowed(&claims);
     let name = req.tool_name.trim();
     if name.is_empty() || name.len() > MAX_TOOL_NAME_LEN {
         return error(StatusCode::BAD_REQUEST, "tool_name empty or too long");
@@ -469,11 +466,23 @@ mod tests {
     /// EVERY API key, so "member mints a key, then sets caps" defeated the gate.
     #[test]
     fn only_a_verified_owner_jwt_may_move_caps() {
-        use crate::auth::{AuthMethod, Role};
+        use crate::auth::{AuthMethod, Claims, Role};
+        use tracelane_shared::tenant::TenantId;
+
+        fn caller(auth_method: AuthMethod, role: Option<Role>) -> Claims {
+            Claims {
+                tenant_id: TenantId::from_jwt_claim(uuid::Uuid::nil()),
+                sub: "u".into(),
+                exp: u64::MAX,
+                auth_method,
+                role,
+                key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+            }
+        }
 
         // The escalation path that existed before this fix.
         assert!(
-            !caps_write_allowed(AuthMethod::ApiKey, None),
+            !caps_write_allowed(&caller(AuthMethod::ApiKey, None)),
             "an API key (role is always None) must NOT be able to move caps — \
              members are allowed to mint keys, so this composes into escalation"
         );
@@ -484,13 +493,20 @@ mod tests {
             (AuthMethod::JwtBearer, Some(Role::Member)),
             (AuthMethod::JwtBearer, Some(Role::Viewer)),
         ] {
-            assert!(!caps_write_allowed(m, r), "{m:?}/{r:?} must not move caps");
+            assert!(
+                !caps_write_allowed(&caller(m, r)),
+                "{m:?}/{r:?} must not move caps"
+            );
         }
-        // The only two that may.
-        assert!(caps_write_allowed(AuthMethod::JwtBearer, Some(Role::Owner)));
+        // The only shape that may.
+        assert!(caps_write_allowed(&caller(
+            AuthMethod::JwtBearer,
+            Some(Role::Owner)
+        )));
         assert!(
-            caps_write_allowed(AuthMethod::JwtBearer, None),
-            "a pre-role-config JWT stays grandfathered, matching can_admin()"
+            !caps_write_allowed(&caller(AuthMethod::JwtBearer, None)),
+            "PL-9: a JWT whose role slug is unrecognised or absent is denied, \
+             not grandfathered — matching can_admin()"
         );
     }
 

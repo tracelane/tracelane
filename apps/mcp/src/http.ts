@@ -23,6 +23,7 @@ import { resolveBearerViaGateway, runWithTenant } from "./auth.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
+import { MCP_SERVER_VERSION } from "./version.js";
 
 /** Default port when `TRACELANE_MCP_PORT` is unset. */
 const DEFAULT_PORT = 8081;
@@ -63,7 +64,7 @@ function extractBearer(req: IncomingMessage): string | null {
 function buildServer(): McpServer {
 	// Wrap so every tool invocation emits OTel MCP semconv v1.39 attributes.
 	const server = instrumentMcpServer(
-		new McpServer({ name: "tracelane", version: "0.1.0" }),
+		new McpServer({ name: "tracelane", version: MCP_SERVER_VERSION }),
 	);
 	registerTraceTools(server);
 	registerEvalTools(server);

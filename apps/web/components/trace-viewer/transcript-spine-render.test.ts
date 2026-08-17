@@ -241,7 +241,7 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 
 	it("color-codes every span kind from the design tokens (never hardcoded hex)", () => {
 		const html = render(TEN_SPANS);
-		// ADR-053 discipline: Lava (--accent) is CTA-only and Verify-green
+		// ADR-053 discipline: Lava (--action) is CTA-only and Verify-green
 		// (--ok/--seal) is provenance-only, so span kinds use the one free data
 		// hue (violet --info: tool bold, llm faint) + neutral ink for structure.
 		expect(html).toContain("bg-ink-2"); // agent → neutral (structure)
@@ -249,7 +249,7 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 		expect(html).toContain("bg-info"); // tool → violet (the trajectory)
 		expect(html).toContain("bg-ink-3"); // retrieval / unknown → muted
 		// Lava and Verify-green must NOT be used as a decorative span-kind fill.
-		expect(html).not.toContain("bg-accent-ink");
+		expect(html).not.toContain("bg-action-ink");
 		expect(html).not.toContain("bg-ok");
 		// no raw hex leaked into the markup (tokens-only rule, CLAUDE.md)
 		expect(html).not.toMatch(/#[0-9a-fA-F]{6}/);

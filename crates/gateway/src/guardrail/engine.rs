@@ -135,7 +135,11 @@ impl GuardrailEngine {
             Box::new(R1Cost::new()),
             Box::new(R2SecretsPii::new()),
             Box::new(R3Schema::new()),
-            Box::new(R3Pinning::new()),
+            // GWY-15: observe-first by default; a deployment opts into
+            // suspending rug-pulled tools via
+            // `TRACELANE_GUARDRAIL_SUSPEND_DRIFTED_TOOLS=1`. Read once here at
+            // startup, never on the hot path.
+            Box::new(R3Pinning::from_env()),
             Box::new(R4Trifecta::new()),
             Box::new(R5Format::new()),
             Box::new(R6SysPromptLeak::new()),
@@ -861,6 +865,178 @@ mod tests {
         );
         assert!(eval.outcome.records.iter().any(|r| r.rail == "R4_trifecta"
             && r.outcome.reason_code == Some(reason_codes::TRIFECTA_EXFIL_IN_TAINTED_SESSION)));
+    }
+
+    // ── GWY-23 multi-agent cost-runaway, through the PRODUCTION rail set ────
+    //
+    // These drive the real `GuardrailEngine::new` 9-rail set with R1's shipped
+    // DEFAULT config — no injected rail, no tuned threshold — so what they prove
+    // is what a customer's traffic hits. The registry is empty (permissive) so
+    // R3/R4 stay quiet and the blocking rail is unambiguous.
+
+    fn runaway_engine() -> GuardrailEngine {
+        let chain = Arc::new(AuditChain::new(100, None, None).expect("audit chain"));
+        GuardrailEngine::new(chain, None, None, Arc::new(CapabilityRegistry::new()))
+    }
+
+    /// One agent step: an assistant turn proposing a tool call.
+    fn agent_step(id: &str, name: &str, input: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }]),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    fn agent_request(messages: Vec<Message>) -> ChatRequest {
+        ChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            system: None,
+            messages,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            stream: None,
+            metadata: None,
+        }
+    }
+
+    /// Run one request through the production engine and return the evaluation.
+    async fn eval_agent_run(engine: &GuardrailEngine, req: &ChatRequest) -> RequestEvaluation {
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        engine
+            .evaluate_request(RequestInputs {
+                tenant_id: &tenant,
+                api_key_id: Some("apikey:gwy23"),
+                correlation_id: Ulid::new(),
+                request: req,
+                rag_context: Vec::new(),
+                session: SessionState::fresh(Some("sess-gwy23".to_string())),
+                actor: "apikey:gwy23",
+            })
+            .await
+    }
+
+    fn blocking_reason(eval: &RequestEvaluation) -> (&'static str, Option<&'static str>) {
+        let r = eval
+            .outcome
+            .records
+            .iter()
+            .find(|r| r.outcome.outcome == Outcome::Block)
+            .expect("a rail blocked");
+        (r.rail, r.outcome.reason_code)
+    }
+
+    /// GWY-23 step cap, live path: an agent loop that has taken 200 tool-calling
+    /// steps is stopped by R1 with `STEP_CAP` and the verdict lands in the
+    /// tamper-evident ledger. Every step uses DIFFERENT arguments, so the
+    /// loop-hash detector is not what fires — the step cap is.
+    #[tokio::test]
+    async fn step_cap_blocks_a_runaway_agent_run_on_the_production_rail_set() {
+        let engine = runaway_engine();
+        let req = agent_request(
+            (0..200)
+                .map(|i| agent_step(&format!("c{i}"), "search", json!({ "q": i })))
+                .collect(),
+        );
+        let eval = eval_agent_run(&engine, &req).await;
+
+        assert!(
+            eval.is_block(),
+            "a 200-step runaway must not reach a provider"
+        );
+        assert_eq!(eval.outcome.decision, Decision::Block);
+        assert_eq!(
+            blocking_reason(&eval),
+            ("R1_cost", Some(reason_codes::STEP_CAP))
+        );
+        assert!(
+            eval.ledger_recorded,
+            "the runaway verdict must be recorded, not just enforced"
+        );
+    }
+
+    /// GWY-23 loop-hash, live path: 25 byte-identical tool calls (the stuck-loop
+    /// signature) block with `LOOP_HASH_REPEAT` — well before the step cap would
+    /// have noticed, which is the whole point of a separate detector.
+    #[tokio::test]
+    async fn loop_hash_blocks_a_stuck_agent_on_the_production_rail_set() {
+        let engine = runaway_engine();
+        let req = agent_request(
+            (0..25)
+                .map(|i| agent_step(&format!("c{i}"), "get_status", json!({ "job": "j-1" })))
+                .collect(),
+        );
+        let eval = eval_agent_run(&engine, &req).await;
+
+        assert!(eval.is_block());
+        assert_eq!(
+            blocking_reason(&eval),
+            ("R1_cost", Some(reason_codes::LOOP_HASH_REPEAT))
+        );
+        let r1 = eval
+            .outcome
+            .records
+            .iter()
+            .find(|r| r.rail == "R1_cost")
+            .expect("R1 ran");
+        assert_eq!(r1.outcome.details["repeats"], 25);
+        assert_eq!(r1.outcome.details["tool"], "get_status");
+        assert!(eval.ledger_recorded);
+    }
+
+    /// GWY-23 sub-agent depth, live path: five delegations open at once (none
+    /// returned) block with `SUBAGENT_DEPTH_CAP` — the fork-bomb shape.
+    #[tokio::test]
+    async fn subagent_depth_blocks_a_fork_bomb_on_the_production_rail_set() {
+        let engine = runaway_engine();
+        let req = agent_request(
+            (0..5)
+                .map(|i| agent_step(&format!("d{i}"), "spawn_agent", json!({ "goal": i })))
+                .collect(),
+        );
+        let eval = eval_agent_run(&engine, &req).await;
+
+        assert!(eval.is_block());
+        assert_eq!(
+            blocking_reason(&eval),
+            ("R1_cost", Some(reason_codes::SUBAGENT_DEPTH_CAP))
+        );
+        assert!(eval.ledger_recorded);
+    }
+
+    /// MUST ACCEPT, live path: a healthy multi-agent run — 60 varied steps and
+    /// four sub-agents that each returned — passes the production rail set
+    /// untouched. Without this, "the runaway caps block" is indistinguishable
+    /// from "the rail blocks agent traffic".
+    #[tokio::test]
+    async fn healthy_multi_agent_run_passes_the_production_rail_set() {
+        let engine = runaway_engine();
+        let mut messages: Vec<Message> = (0..60)
+            .map(|i| agent_step(&format!("c{i}"), "search", json!({ "q": i })))
+            .collect();
+        for i in 0..4 {
+            let id = format!("d{i}");
+            messages.push(agent_step(&id, "spawn_agent", json!({ "goal": i })));
+            messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::Text("sub-agent finished".to_string()),
+                tool_call_id: Some(id),
+                tool_calls: None,
+            });
+        }
+        let eval = eval_agent_run(&engine, &agent_request(messages)).await;
+
+        assert!(
+            !eval.is_block(),
+            "a healthy agent run must not be blocked by the runaway caps"
+        );
+        assert_eq!(eval.outcome.decision, Decision::Allow);
     }
 
     /// Response-side dispatch end to end: a mock response rail blocks on a

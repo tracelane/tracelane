@@ -24,6 +24,17 @@ LABEL org.opencontainers.image.title="Tracelane Ingest" \
       org.opencontainers.image.description="OTLP receiver + NATS consumer + ClickHouse writer (SPIFFE mTLS)" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/tracelane/tracelane"
+# Deploy provenance — the SAME stamp the gateway carries, and for the same reason.
+# Added 2026-08-11: check-deploy-provenance.sh accepts any container as its argument,
+# but ingest carried no labels, so it answered CANNOT DETERMINE for exactly half the
+# data plane while reporting STAMPED for the gateway. A control that covers one of two
+# services reads as coverage. `scripts/deploy/gateway.sh` already builds both under
+# DEPLOY_INGEST=1 with these ARGs set, so this needed no change on the deploy side —
+# only the label was missing.
+ARG TRACELANE_DEPLOY_SHA=""
+ARG TRACELANE_DEPLOY_VIA=""
+LABEL org.tracelane.deploy.sha="$TRACELANE_DEPLOY_SHA" \
+      org.tracelane.deploy.via="$TRACELANE_DEPLOY_VIA"
 COPY --from=builder /build/target/release/ingest /usr/local/bin/ingest
 # OTLP HTTP receiver (mTLS-enforced in release builds when TRACELANE_SPIRE_SOCKET set)
 EXPOSE 4318

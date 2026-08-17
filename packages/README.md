@@ -10,7 +10,7 @@ verifiers. These are the surfaces customers install; they ship publicly (Apache
 | [`sdk-python`](sdk-python/) | Python instrumentation SDK (OTel-GenAI spans). |
 | [`sdk-typescript`](sdk-typescript/) | TypeScript SDK — provider + MCP instrumentation (`@tracelanedev/sdk`). |
 | [`cli`](cli/) | `tlane` CLI (migrate/import, audit verify). |
-| [`ui`](ui/) | `@tracelanedev/ui` — the "Tinted Slate + Lava" design system (tokens + components; ADR-053, which supersedes the ADR-045 Neon palette on tokens). Surfaces read tokens from here, never hardcode hex. |
+| [`ui`](ui/) | `@tracelanedev/ui` — the design system (tokens + components). `src/styles/tokens.css` is the single source of truth for colour, type and layout. Surfaces read tokens from here, never hardcode hex. |
 | [`verifier-rust`](verifier-rust/) | Reference audit-ledger verifier (Rust). |
 | [`verifier-typescript`](verifier-typescript/) | Reference audit-ledger verifier (TS). |
 | [`verifier-python`](verifier-python/) | Reference audit-ledger verifier (Python). |

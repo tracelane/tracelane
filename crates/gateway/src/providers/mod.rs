@@ -315,7 +315,6 @@ pub mod failover;
 pub mod google;
 pub mod openai;
 pub mod vertex;
-pub mod wasm_plugin;
 
 // `all(test, debug_assertions)`, NOT just `test`: smoke_tests calls the
 // loopback bypass (`ssrf_guard::set_loopback_bypass_for_tests`), which is
@@ -335,7 +334,15 @@ pub use azure::AzureOpenAiProvider;
 pub use bedrock::BedrockProvider;
 pub use cohere::CohereProvider;
 pub use google::GoogleProvider;
-pub use openai::OpenAiProvider;
+pub use openai::{
+    // GWY-26: the OpenAI embeddings wire shapes, owned by the adapter that
+    // speaks that format (see the block at the end of `openai.rs`).
+    EmbeddingData,
+    EmbeddingsRequest,
+    EmbeddingsResponse,
+    EmbeddingsUsage,
+    OpenAiProvider,
+};
 pub use vertex::VertexProvider;
 
 use tracelane_shared::{ChatRequest, ChatResponse, TenantId};
@@ -627,6 +634,22 @@ impl ProviderRegistry {
     /// `unroutable_model` error. Enforced by
     /// `scripts/ci/check-provider-mapping-single-source.py`.
     pub fn provider_id_for_model(model: &str) -> Option<&'static str> {
+        // GWY-39: operator-defined `tracelane.yaml` aliases are consulted FIRST
+        // and by EXACT NAME. Placing them here — inside the ONE canonical map —
+        // is what makes every delegate (`api_key_env_var`,
+        // `provider_name_from_model`, `dispatch_to_provider`) honour an alias
+        // without any of them growing a second lookup. An alias resolved in
+        //
+        // Exact-match, never a prefix: an alias cannot widen the built-in table,
+        // only name one model. `provider_id` was validated against the known
+        // provider set when the file was read, so this cannot introduce a
+        // provider_id `dispatch_to_provider` has no arm for.
+        //
+        // Cost when no `tracelane.yaml` exists (every deployment today): one
+        // relaxed atomic load, then `None`.
+        if let Some(a) = crate::server::config::alias(model) {
+            return Some(a.provider_id.as_str());
+        }
         let pid = match model {
             m if m.starts_with("claude") || m.starts_with("anthropic/") => "anthropic",
             m if m.starts_with("gpt")
@@ -636,6 +659,13 @@ impl ProviderRegistry {
             {
                 "openai"
             }
+            // GWY-26: OpenAI's embedding models carry none of the prefixes
+            // above (`text-embedding-3-small`, `text-embedding-ada-002`), so
+            // /v1/embeddings for the most-used embedding family in the world
+            // fail-closed as `unroutable_model`. Any other vendor's embedding
+            // model reaches its provider by the usual `<provider>/` prefix or
+            // by a `tracelane.yaml` alias — this arm is OpenAI's bare names only.
+            m if m.starts_with("text-embedding-") => "openai",
             m if m.starts_with("vertex/") => "vertex",
             m if m.starts_with("gemini") || m.starts_with("google/") => "google",
             m if m.starts_with("bedrock/") => "bedrock",
@@ -693,6 +723,58 @@ impl ProviderRegistry {
             _ => return None,
         };
         Some(pid)
+    }
+
+    /// The adapter for `provider_id`, when that provider speaks the
+    /// OpenAI-compatible wire format (`POST {base}/v1/embeddings`,
+    /// `POST {base}/v1/chat/completions`).
+    ///
+    /// `None` for the native adapters — Anthropic, Google, Vertex, Bedrock,
+    /// Azure and Cohere each have their own request shape and their own
+    /// embeddings endpoint (or none). GWY-26 dispatches embeddings through
+    /// this, so a `None` is a typed refusal naming the provider, never a
+    /// wrong-shape request forwarded on a guess.
+    ///
+    /// Keyed on `provider_id` — a fixed enumeration — and NOT on model
+    /// prefixes, for the same reason `dispatch_to_provider` is
+    /// (`scripts/ci/check-provider-mapping-single-source.py`). A new
+    /// OpenAI-compatible host that is missing here still chats normally; only
+    /// its embeddings refuse, loudly and by name.
+    #[must_use]
+    pub fn openai_compatible(&self, provider_id: &str) -> Option<&OpenAiProvider> {
+        let p = match provider_id {
+            "openai" => &self.openai,
+            "together" => &self.together,
+            "fireworks" => &self.fireworks,
+            "groq" => &self.groq,
+            "openrouter" => &self.openrouter,
+            "mistral" => &self.mistral,
+            "perplexity" => &self.perplexity,
+            "deepseek" => &self.deepseek,
+            "xai" => &self.xai,
+            "nvidia" => &self.nvidia_nim,
+            "cerebras" => &self.cerebras,
+            "sambanova" => &self.sambanova,
+            "lepton" => &self.lepton,
+            "lambda" => &self.lambda,
+            "novita" => &self.novita,
+            "ai21" => &self.ai21,
+            "hyperbolic" => &self.hyperbolic,
+            "deepinfra" => &self.deepinfra,
+            "cloudflare" => &self.cloudflare,
+            "ollama" => &self.ollama,
+            "baseten" => &self.baseten,
+            "huggingface" => &self.huggingface,
+            "anyscale" => &self.anyscale,
+            "modal" => &self.modal,
+            "predibase" => &self.predibase,
+            "moonshot" => &self.moonshot,
+            "upstage" => &self.upstage,
+            "yi" => &self.yi,
+            "aleph-alpha" => &self.aleph_alpha,
+            _ => return None,
+        };
+        Some(p)
     }
 
     /// Resolve the env-var name to read a provider API key from (legacy

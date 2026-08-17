@@ -259,7 +259,7 @@ mod tests {
     fn agent_safety_rails_are_ungated() {
         use crate::guardrail::rails::{r3_tool_safety::R3Pinning, r4_trifecta::R4Trifecta};
         assert!(
-            Rail::feature(&R3Pinning).is_none(),
+            Rail::feature(&R3Pinning::default()).is_none(),
             "R3 tool-definition pinning (MCP rug-pull) must stay FREE"
         );
         assert!(

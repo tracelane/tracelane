@@ -17,8 +17,10 @@ to change** — Step 3 points your existing OpenAI-compatible client at the
 gateway and the gateway captures the trace.
 
 The `@tracelanedev/sdk` (TypeScript) and `tracelane` (Python) packages are a
-separate, optional path: they export OTel spans to an OTLP receiver **you** run,
-which is the self-host configuration. See
+second, optional path — and the one that gives you a **nested** trace. The
+gateway records one span per model call; the SDK records the shape of the agent
+around them (the planner step, each tool call, the summariser) and exports it to
+`https://gateway.tracelane.dev` with the same `tlane_…` key. See
 [TypeScript SDK](/sdk-typescript) and [Python SDK](/sdk-python).
 
 ## Step 2 — Set two env vars
@@ -82,6 +84,37 @@ Or render it in the terminal, using a trace id from that list:
 ```bash
 tlane trace <traceId> --format timeline   # ASCII waterfall
 ```
+
+## Optional — group turns into a session
+
+A multi-turn conversation is several traces sharing one id. Send it as the
+`x-conversation-id` header and [`/sessions`](https://app.tracelane.dev/sessions)
+groups them; send nothing and each call is just a standalone trace.
+
+On the no-SDK path above, pass the header on the call:
+
+<CodeGroup>
+
+```typescript TypeScript
+await client.chat.completions.create(
+  { model: "claude-sonnet-4-6", messages: [{ role: "user", content: "Hello" }] },
+  { headers: { "x-conversation-id": conversationId } },
+);
+```
+
+```python Python
+client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Hello"}],
+    extra_headers={"x-conversation-id": conversation_id},
+)
+```
+
+</CodeGroup>
+
+If you use the SDK, `withSession(id, fn)` (TypeScript) and `use_session(id)`
+(Python) set that header for every call in the scope — see
+[Concepts](/concepts) for the full picture and the id rules.
 
 ## What you got for free
 

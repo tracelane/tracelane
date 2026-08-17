@@ -255,13 +255,36 @@ impl QuotaConfig {
 pub enum QuotaDecision {
     /// Within the included monthly quota.
     Allow,
-    /// Above the included quota, below the hard cap — billable overage.
+    /// `used == quota`: the last request INSIDE the included allowance. Served,
+    /// and NOT billable overage.
+    QuotaReached { quota: u64, used: u64 },
+    /// `quota < used <= hard cap` — billable overage. Served.
     /// Caller meters this to Polar via `overage_v1` lookup_key.
-    AllowWithOverage,
+    AllowWithOverage { quota: u64, used: u64 },
     /// Above `quota * hard_cap_tenths/10`. Caller must return 429 +
     /// the structured body `{error,limit,used,reset_at,upgrade_url}` and
     /// fire-and-forget the Slack webhook POST.
     HardCapExceeded { limit: u64, used: u64 },
+}
+
+impl QuotaDecision {
+    /// SET-08 notify predicate: at or over the included quota, and still served.
+    ///
+    /// A **position** test, deliberately not a transition test. The in-memory
+    /// land anywhere relative to the quota; an `== quota` transition test misses
+    /// the alert entirely when the reseed lands above, and re-fires when it lands
+    /// below. Both happen on any mid-month deploy.
+    ///
+    /// Fire-once is therefore NOT this function's job — it belongs to the
+    /// persisted marker in `db::quota_notifications`, which outlives the process
+    /// and is shared across replicas.
+    pub fn at_or_over_included_quota(&self) -> Option<(u64, u64)> {
+        match *self {
+            QuotaDecision::QuotaReached { quota, used }
+            | QuotaDecision::AllowWithOverage { quota, used } => Some((quota, used)),
+            QuotaDecision::Allow | QuotaDecision::HardCapExceeded { .. } => None,
+        }
+    }
 }
 
 /// Tracks monthly trace usage per tenant with sub-microsecond decision overhead.
@@ -313,10 +336,13 @@ impl QuotaTracker {
         let counter = self.usage.entry(key).or_insert_with(|| AtomicU64::new(0));
         let used = counter.fetch_add(1, Ordering::Relaxed) + 1;
         let limit = config.hard_cap_absolute();
+        let quota = config.trace_quota_monthly;
         if used > limit {
             QuotaDecision::HardCapExceeded { limit, used }
-        } else if used > config.trace_quota_monthly {
-            QuotaDecision::AllowWithOverage
+        } else if used == quota {
+            QuotaDecision::QuotaReached { quota, used }
+        } else if used > quota {
+            QuotaDecision::AllowWithOverage { quota, used }
         } else {
             QuotaDecision::Allow
         }
@@ -576,14 +602,166 @@ mod tests {
             trace_quota_monthly: 5,
             hard_cap_tenths: 50, // 5×5 = 25
         };
-        for _ in 0..5 {
+        // 1..=4 are plain Allow; the 5th lands EXACTLY on the quota and is the
+        // SET-08 soft-cap crossing, not Allow and not overage.
+        for _ in 0..4 {
             assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
         }
-        assert_eq!(q.check(&t, cfg), QuotaDecision::AllowWithOverage);
+        assert_eq!(
+            q.check(&t, cfg),
+            QuotaDecision::QuotaReached { quota: 5, used: 5 }
+        );
+        assert_eq!(
+            q.check(&t, cfg),
+            QuotaDecision::AllowWithOverage { quota: 5, used: 6 }
+        );
         // Many more overage calls still allowed until 25
-        for _ in 0..18 {
-            assert_eq!(q.check(&t, cfg), QuotaDecision::AllowWithOverage);
+        for used in 7..=24 {
+            assert_eq!(
+                q.check(&t, cfg),
+                QuotaDecision::AllowWithOverage { quota: 5, used }
+            );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SET-08 fire-once ACROSS RESTARTS.
+    //
+    // The first implementation fired on the transition `used == quota`. The
+    // counter below is process-local and reseeds from ClickHouse on boot
+    // directions. These tests pin the corrected behaviour: the predicate is the
+    // POSITION test `used >= quota`, and fire-once comes from a persisted
+    // marker whose real guarantee is the `quota_notifications` primary key.
+    // ------------------------------------------------------------------
+
+    /// Stands in for the persisted marker. `claim` returns true only the first
+    /// time for a given key — exactly the contract of
+    /// `INSERT … ON CONFLICT DO NOTHING` in `db::quota_notifications::claim`.
+    #[derive(Default)]
+    struct MarkerStub(std::collections::HashSet<(String, u32)>);
+
+    impl MarkerStub {
+        fn claim(&mut self, tenant: &TenantId, period: u32) -> bool {
+            self.0.insert((tenant.to_string(), period))
+        }
+    }
+
+    /// Run one process lifetime: fresh tracker, seeded from "ClickHouse" at
+    /// `seed`, then `requests` calls. Returns how many notifications fired.
+    fn notifications_in_lifetime(
+        cfg: QuotaConfig,
+        tenant: &TenantId,
+        period: u32,
+        seed: u64,
+        requests: u64,
+        marker: &mut MarkerStub,
+    ) -> usize {
+        let q = QuotaTracker::new();
+        q.seed_if_needed(tenant, period, seed);
+        let mut fired = 0;
+        for _ in 0..requests {
+            if q.check(tenant, cfg).at_or_over_included_quota().is_some()
+                && marker.claim(tenant, period)
+            {
+                fired += 1;
+            }
+        }
+        fired
+    }
+
+    fn soft_cap_cfg() -> QuotaConfig {
+        QuotaConfig {
+            trace_quota_monthly: 10,
+            hard_cap_tenths: 50, // hard cap 50 — well clear of these runs
+        }
+    }
+
+    /// Case 1 — a plain crossing fires exactly once.
+    #[test]
+    fn soft_cap_crossing_fires_once() {
+        let t = tid("11111111-0000-0000-0000-0000000000c1");
+        let mut m = MarkerStub::default();
+        let fired = notifications_in_lifetime(soft_cap_cfg(), &t, 202608, 0, 20, &mut m);
+        assert_eq!(fired, 1, "a single crossing must notify exactly once");
+    }
+
+    /// Case 2 — after the alert has been sent, a restart whose reseed lands
+    /// ABOVE the quota fires ZERO more. Under the old `== quota` predicate this
+    /// lifetime could never fire at all, which is how the alert got lost.
+    #[test]
+    fn soft_cap_restart_above_quota_fires_zero_more() {
+        let t = tid("11111111-0000-0000-0000-0000000000c2");
+        let cfg = soft_cap_cfg();
+        let mut m = MarkerStub::default();
+        assert_eq!(
+            notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m),
+            1,
+            "precondition: the first lifetime notifies"
+        );
+        let after_restart = notifications_in_lifetime(cfg, &t, 202608, 35, 10, &mut m);
+        assert_eq!(after_restart, 0, "a restart above quota must not re-notify");
+    }
+
+    /// Case 3 — a restart whose reseed lands BELOW the quota, then re-crosses,
+    /// fires ZERO more. This is the double-fire the transition predicate caused.
+    #[test]
+    fn soft_cap_restart_below_then_recross_fires_zero_more() {
+        let t = tid("11111111-0000-0000-0000-0000000000c3");
+        let cfg = soft_cap_cfg();
+        let mut m = MarkerStub::default();
+        assert_eq!(
+            notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m),
+            1,
+            "precondition: the first lifetime notifies"
+        );
+        let after_restart = notifications_in_lifetime(cfg, &t, 202608, 3, 20, &mut m);
+        assert_eq!(
+            after_restart, 0,
+            "a restart below quota that re-crosses must not re-notify"
+        );
+    }
+
+    /// A NEW billing period is a different marker key, so the alert is allowed
+    /// to fire again — otherwise a tenant is told once, ever.
+    #[test]
+    fn soft_cap_fires_again_in_the_next_period() {
+        let t = tid("11111111-0000-0000-0000-0000000000c4");
+        let cfg = soft_cap_cfg();
+        let mut m = MarkerStub::default();
+        assert_eq!(notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m), 1);
+        assert_eq!(
+            notifications_in_lifetime(cfg, &t, 202609, 0, 20, &mut m),
+            1,
+            "a new period must be able to notify again"
+        );
+    }
+
+    /// Pins WHY the predicate changed: with the counter reseeded above quota,
+    /// `used == quota` is never true again, so the old transition test yields
+    /// zero notifications where the position test yields one.
+    #[test]
+    fn position_predicate_catches_what_the_equality_predicate_missed() {
+        let t = tid("11111111-0000-0000-0000-0000000000c5");
+        let cfg = soft_cap_cfg();
+        let q = QuotaTracker::new();
+        q.seed_if_needed(&t, 202608, 35); // restart landed above quota=10
+
+        let mut equality_hits = 0;
+        let mut position_hits = 0;
+        for _ in 0..10 {
+            let d = q.check(&t, cfg);
+            if matches!(d, QuotaDecision::QuotaReached { .. }) {
+                equality_hits += 1;
+            }
+            if d.at_or_over_included_quota().is_some() {
+                position_hits += 1;
+            }
+        }
+        assert_eq!(equality_hits, 0, "the old predicate sees nothing here");
+        assert!(
+            position_hits > 0,
+            "the position predicate must still see it"
+        );
     }
 
     #[test]

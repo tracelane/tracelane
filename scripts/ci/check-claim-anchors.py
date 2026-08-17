@@ -51,6 +51,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LEDGER = ROOT / "docs" / "inventory" / "CLAIM_ANCHORS.json"
 
+# Every flag this script implements. A guard that silently IGNORES an unknown flag
+# runs the ordinary check and exits 0 — so `--selftesst` (typo) reports PASS while no
+# selftest ran, and the `--selftest` result proves nothing. Enforced by
+# scripts/ci/check-guard-selftests.py.
+KNOWN_FLAGS = {"--selftest", "--coverage"}
+USAGE = "usage: check-claim-anchors.py [--selftest | --coverage]"
+
+
+def reject_unknown_flags(argv: list[str]) -> None:
+    """Exit 2 on any option this script does not implement."""
+    unknown = [a for a in argv if a.startswith("-") and a not in KNOWN_FLAGS]
+    if unknown:
+        print(f"unknown option: {' '.join(unknown)}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+
+
 VERDICTS = {
     "TRUE-ANCHORED",
     "STRUCK-NO-ANCHOR",
@@ -264,6 +281,7 @@ def selftest() -> int:
 
 
 def main() -> int:
+    reject_unknown_flags(sys.argv[1:])
     if "--selftest" in sys.argv:
         return selftest()
     rows = load()

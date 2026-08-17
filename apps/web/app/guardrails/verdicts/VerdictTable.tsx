@@ -221,14 +221,14 @@ function RailDetail({ r }: { r: RailEntry }) {
 export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 	const [openKey, setOpenKey] = useState<string | null>(null);
 	const th =
-		"px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
+		"px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
 
 	return (
 		<div className="overflow-x-auto">
 			<table className="w-full text-sm">
 				<thead className="border-b border-line">
 					<tr>
-						<th className="w-8 py-3 pl-4" aria-label="Expand" />
+						<th className="w-8 py-1.5 pl-3" aria-label="Expand" />
 						<th className={th}>Time (UTC)</th>
 						<th className={th}>Side</th>
 						<th className={th}>Decision</th>
@@ -262,7 +262,7 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 									aria-expanded={isOpen}
 									className="cursor-pointer border-b border-line align-top transition-colors last:border-0 hover:bg-surface-2/40 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-seal"
 								>
-									<td className="py-3 pl-4 align-middle">
+									<td className="py-2 pl-3 align-middle">
 										<span
 											aria-hidden
 											className={`inline-block text-ink-3 transition-transform ${isOpen ? "rotate-90" : ""}`}
@@ -270,19 +270,19 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 											▸
 										</span>
 									</td>
-									<td className="px-4 py-3 text-xs text-ink-2">
+									<td className="px-3 py-2 text-xs text-ink-2">
 										{formatDateTimeUtc(parseDate(v.event_time).toISOString())}
 									</td>
-									<td className="px-4 py-3 text-[11px] uppercase tracking-wide text-ink-3">
+									<td className="px-3 py-2 text-[11px] uppercase tracking-wide text-ink-3">
 										{v.side}
 									</td>
-									<td className="px-4 py-3">
+									<td className="px-3 py-2">
 										<Badge tone={DECISION_TONE[v.decision] ?? "neutral"}>
 											{v.decision}
 										</Badge>
 									</td>
 									{/* The substance: which rail + WHY, in plain language. */}
-									<td className="px-4 py-3">
+									<td className="px-3 py-2">
 										{primary ? (
 											<>
 												<div className="text-[13px] text-ink">
@@ -309,14 +309,14 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 											</p>
 										)}
 									</td>
-									<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
+									<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink-2">
 										{fmtLatency(v.total_latency_micros)}
 									</td>
 								</tr>
 
 								{isOpen && (
 									<tr className="border-b border-line last:border-0">
-										<td colSpan={6} className="bg-surface-2/30 px-4 py-4">
+										<td colSpan={6} className="bg-surface-2/30 px-3 py-2">
 											<div className="space-y-3">
 												<div>
 													<p className="t-card-title text-ink-3">

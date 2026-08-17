@@ -1,14 +1,21 @@
 import { cn } from "../lib/cn";
 
 /**
- * Lollipop — discrete time-series (dot + stem) with real x/y axes + gridlines
+ * Lollipop — discrete time-series BARS with real x/y axes + gridlines. (Name kept:
+ * it is imported at a live call site and renaming it is churn, not a fix. The mark is
+ * a bar as of 2026-08-15; the dot-and-stem it is named after is gone.)
  * (app design system, docs/design/tracelane-app-full.html screen 1, "Traffic
- * over time"). Thin, clean, no wave/blob fill (ADR-051). The tallest bucket is
- * highlighted in lava.
+ * over time"). Thin, clean, no wave/blob fill (ADR-053:40 — corrected 2026-08-15
+ * from "ADR-051", which is the billing/EE split and carries no design authority;
+ * a guard now blocks that mis-citation: scripts/ci/check-adr051-design-miscite.py).
+ *
+ * The tallest bucket is emphasised by INK WEIGHT, not hue. It used to be painted in
+ * the lava action; ADR-074 §1 makes colour mean something happened, and "this is the
+ * biggest bar" is already visible from the bar being the biggest.
  *
  * Pure presentation: `value`s are the real per-bucket counts supplied by the
  * caller; nothing is smoothed or fabricated. An empty bucket (value 0) renders
- * an honest zero-height stem, never a gap-fill.
+ * an honest zero-height bar, never a gap-fill.
  */
 
 export interface LollipopPoint {
@@ -74,6 +81,8 @@ export function Lollipop({
 	);
 
 	const baseY = PAD_T + PLOT_H;
+	/** Width of one bucket's slot on the x axis — the bar is a fraction of it. */
+	const slot = PLOT_W / Math.max(1, n);
 	const xFor = (i: number) => PAD_L + ((i + 0.5) * PLOT_W) / Math.max(1, n);
 	const yFor = (v: number) => baseY - (v / yMax) * PLOT_H;
 
@@ -116,25 +125,35 @@ export function Lollipop({
 				);
 			})}
 
-			{/* lollipops */}
+			{/* BARS.
+			    Founder call 2026-08-15: bars, not a dot-and-stem lollipop. Each point is
+			    a BUCKET — requests in a window — so the mark should have the bucket's
+			    weight rather than a hairline stem topped by a dot that reads as a
+			    scatter point. The drill-through `hrefFor` wrapper is unchanged, so every
+			    bucket is still clickable; only the mark changed.
+
+			    Emphasis on the hot bucket is INK WEIGHT (opacity + ink), never hue —
+			    ADR-074 §1 spends colour on meaning, and "this is the bucket under your
+			    cursor" is not meaning. */}
 			{points.map((p, i) => {
 				const x = xFor(i);
 				const y = yFor(p.value);
 				const hot = i === hotIndex && p.value > 0;
-				const dotR = hot ? 5 : 4;
-				const color = hot ? "var(--accent)" : "var(--ink)";
+				const barW = Math.max(Math.min(slot * 0.6, 16), 2);
+				// A non-zero bucket always keeps a visible stub, so "small" never renders
+				// identically to "none" — the distinction the chart exists to show.
+				const h = p.value > 0 ? Math.max(baseY - y, 1.5) : 0;
 				const showLabel = hot || i % xStep === 0;
 				const stem = [
-					<line
-						key="stem"
-						x1={x}
-						x2={x}
-						y1={baseY}
-						y2={y}
-						stroke="var(--line-2)"
-						strokeWidth={1.5}
+					<rect
+						key="bar"
+						x={x - barW / 2}
+						y={baseY - h}
+						width={barW}
+						height={h}
+						rx={Math.min(2, barW / 2)}
+						className={cn("fill-info", hot ? "opacity-100" : "opacity-70")}
 					/>,
-					<circle key="dot" cx={x} cy={y} r={dotR} fill={color} />,
 					showLabel ? (
 						<text
 							key="val"
@@ -143,7 +162,7 @@ export function Lollipop({
 							textAnchor="middle"
 							className={cn(
 								"text-[9px] font-semibold tabular-nums",
-								hot ? "fill-[var(--accent)]" : "fill-[var(--ink-2)]",
+								hot ? "fill-[var(--ink)]" : "fill-[var(--ink-2)]",
 							)}
 						>
 							{compactCount(p.value)}
@@ -164,20 +183,10 @@ export function Lollipop({
 				);
 			})}
 
-			{/* x labels */}
-			{points.map((p, i) =>
-				i % xStep === 0 ? (
-					<text
-						key={`x-${p.label}-${i}`}
-						x={xFor(i)}
-						y={H - 6}
-						textAnchor="middle"
-						className="fill-[var(--ink-3)] text-[9px]"
-					>
-						{p.label}
-					</text>
-				) : null,
-			)}
+			{/* x labels REMOVED 2026-08-16 — ADR-074 §7. The shared `TimeRuler` is the
+			    app's one time axis, and a chart that keeps its own strided labels under
+			    a ruler is two axes for one dimension. The caller renders the ruler
+			    beneath this svg, inset to PAD_L/PAD_R so the ticks land on the slots. */}
 		</svg>
 	);
 }

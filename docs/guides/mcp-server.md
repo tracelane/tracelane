@@ -1,20 +1,34 @@
 <!-- tracelane:classification: PUBLIC -->
 # Tracelane MCP Server
 
-`tracelane-mcp` exposes Tracelane's trace store and guardrail engine as
-[Model Context Protocol](https://modelcontextprotocol.io) tools.
+`@tracelanedev/mcp` exposes Tracelane's trace store and its recorded guardrail
+decisions as [Model Context Protocol](https://modelcontextprotocol.io) tools.
 
-It is read-only, tenant-scoped, and intended for npm distribution (not yet published).
+It is read-only and tenant-scoped.
 
 ---
 
-> **Not published to npm yet.** `@tracelanedev/mcp` is not on the registry
-> today, so `npx @tracelanedev/mcp` returns a 404. Until it ships, run from a
-> clone: `pnpm install && pnpm --filter @tracelanedev/mcp build && node
-> apps/mcp/dist/index.js`. The `npx` commands below are the form to use once
-> the package is published.
+> **Not on npm — every `npx` line on this page returns a 404 today.**
+> `@tracelanedev/mcp` is not on the registry. The package is wired into the release
+> workflow and becomes installable when the next signed release tag carries it;
+> releases are bundled, so that is the next tag covering everything that has moved,
+> not a tag cut for this package alone. **Until then the only way to run it is from a
+> clone** — see [Run it today](#run-it-today). The `npx` forms below are what to use
+> *after* it is published; they are documented now so the configuration is ready, not
+> because they work.
 
-## Installation
+## Run it today (from a clone)
+
+```bash
+pnpm install
+pnpm --filter @tracelanedev/mcp build
+node apps/mcp/dist/index.js
+```
+
+Use `node /abs/path/to/apps/mcp/dist/index.js` as the `command` in any client config
+below, with no `args`, in place of the `npx` form.
+
+## Installation (once published — not yet available)
 
 ```bash
 npx @tracelanedev/mcp
@@ -125,11 +139,13 @@ If running Tracelane self-hosted, set `TRACELANE_GATEWAY_URL` to your gateway UR
 ```bash
 TRACELANE_API_KEY=tlk-your-key \
 TRACELANE_GATEWAY_URL=http://localhost:8080 \
-npx @tracelanedev/mcp
+node apps/mcp/dist/index.js        # `npx @tracelanedev/mcp` once published
 ```
 
 ---
 
 ## Source
 
-`apps/mcp/` — TypeScript, `@modelcontextprotocol/sdk`, OAuth 2.1, tenant-scoped.
+`apps/mcp/` — TypeScript, `@modelcontextprotocol/sdk`, tenant-scoped. Auth is a
+bearer token (`tlane_*` key or JWT) resolved through the gateway's
+`/v1/auth/whoami`; OAuth 2.1 PKCE is roadmap, not implemented.

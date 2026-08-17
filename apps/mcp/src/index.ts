@@ -1,10 +1,23 @@
+#!/usr/bin/env node
 /**
  * Tracelane MCP server entry point.
+ *
+ * The hashbang above is load-bearing for distribution, not decoration:
+ * `bin` targets are exec'd through npm's shim, so a `dist/index.js`
+ * without it fails with "Exec format error" the moment someone runs
+ * `npx @tracelanedev/mcp`. esbuild (via tsup) preserves a hashbang on
+ * the entry file into the bundle; `dist-bin.test.ts` spawns the built
+ * file WITHOUT an interpreter so its loss is caught, not shipped.
  *
  * Exposes read-only tools over the MCP protocol. Tenant isolation is
  * structural — every ClickHouse query includes `WHERE tenant_id = ?`
  * where `tenant_id` comes from the bearer token (HTTP) or the trusted
  * subprocess env block (Stdio), never from tool arguments.
+ *
+ * NOT ON NPM YET: `npx @tracelanedev/mcp` 404s today, so every `npx` form below
+ * is the POST-PUBLISH shape. Until a signed release tag carries this package,
+ * substitute `node <repo>/apps/mcp/dist/index.js`. Releases are bundled — one tag
+ * covering everything that moved — see VERSIONING.md "Release cadence".
  *
  * Transport selection (A2):
  *
@@ -31,6 +44,7 @@ import { runHttp } from "./http.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
+import { MCP_SERVER_VERSION } from "./version.js";
 
 async function runStdio(): Promise<void> {
 	// L3 sweep 2026-07-03: resolve TRACELANE_API_KEY -> tenant via the
@@ -40,7 +54,7 @@ async function runStdio(): Promise<void> {
 
 	// Wrap so every tool invocation emits OTel MCP semconv v1.39 attributes.
 	const server = instrumentMcpServer(
-		new McpServer({ name: "tracelane", version: "0.1.0" }),
+		new McpServer({ name: "tracelane", version: MCP_SERVER_VERSION }),
 	);
 	registerTraceTools(server);
 	registerEvalTools(server);

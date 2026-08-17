@@ -147,15 +147,10 @@ const TAXONOMY: Record<string, AftTaxonomyEntry> = {
 			"Near-identical tool calls (same tool + equivalent arguments) recur within a single trace beyond a threshold — a rule-based loop detector.",
 		detectorStatus: "roadmap",
 	},
-	"AFT-TRAJ-ANOMALY-001": {
-		id: "AFT-TRAJ-ANOMALY-001",
-		name: "Trajectory-level anomaly",
-		description:
-			"The sequence of spans in a trace is statistically anomalous versus a learned distribution of normal traces — a catch-all for novel failure modes.",
-		detection:
-			"A learned sequence model would flag a reconstruction error above threshold. No model is trained and none ships: infer_reconstruction_error returns 0.0 unconditionally (crates/gateway/src/predictive/trajectory_guard.rs:72-85), so this detector can never fire.",
-		detectorStatus: "roadmap",
-	},
+	// Learned trajectory-anomaly scoring (AFT-TRAJ-ANOMALY-001) is deliberately
+	// not carried here. Tracelane does not offer it: no model is trained, none
+	// ships, and trajectory_guard.rs scores every trace 0.0. Do not re-add the
+	// entry — an id in this map is a claim the product makes.
 };
 
 /**

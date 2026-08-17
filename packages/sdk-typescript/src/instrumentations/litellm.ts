@@ -19,6 +19,7 @@
  */
 
 import { SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { CONVERSATION_ID_ATTRIBUTE, applySessionToArgs } from "../session.js";
 import { markStreamingCall } from "../streaming.js";
 
 const tracer = trace.getTracer("@tracelanedev/sdk-litellm", "0.1.0");
@@ -46,6 +47,11 @@ export function instrumentLiteLLM(client: LiteLLMClientLike): void {
 		const model =
 			typeof request?.model === "string" ? request.model : "unknown";
 
+		// Session correlation: adds `x-conversation-id` to the outgoing request
+		// (the gateway path) and the matching span attribute (the OTLP path).
+		// No-op when no session is active.
+		const sessionId = applySessionToArgs(args);
+
 		return tracer.startActiveSpan(
 			"litellm.chat.completions.create",
 			{
@@ -54,6 +60,9 @@ export function instrumentLiteLLM(client: LiteLLMClientLike): void {
 					"gen_ai.provider.name": "litellm",
 					"gen_ai.request.model": model,
 					"llm.model_name": model,
+					...(sessionId === undefined
+						? {}
+						: { [CONVERSATION_ID_ATTRIBUTE]: sessionId }),
 				},
 			},
 			async (span) => {

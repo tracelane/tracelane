@@ -41,11 +41,60 @@ pub enum SweepMode {
     Enforce,
 }
 
+/// Directory the pre-delete snapshot is written to. **Enforce is refused without
+/// it** — see [`SweepMode::from_env`].
+pub const SNAPSHOT_DIR_ENV: &str = "TRACELANE_RETENTION_SNAPSHOT_DIR";
+
 impl SweepMode {
     /// Parse from `TRACELANE_RETENTION_SWEEP`. Unknown / unset → `Off` (deletion
     /// is strictly opt-in — an operator must ask for `dryrun`/`enforce`).
+    ///
+    /// **`Enforce` additionally requires a snapshot destination** and is
+    /// downgraded to `DryRun` without one (2026-08-11, founder-ruled).
+    ///
+    /// Retention deletion is the only irreversible action this process takes, and
+    /// it had **no undo**: the audit ledger records gateway actions, not row
+    /// deletions, so once a sweep ran the rows were simply gone. Requiring the
+    /// snapshot *at the mode boundary* rather than at the delete site means the
+    /// capability cannot be half-configured — you cannot end up in Enforce with
+    /// snapshots silently disabled, which is the configuration that would look
+    /// fine right up until someone needed the undo.
+    ///
+    /// The downgrade is deliberate rather than a hard refusal to boot: the safe
+    /// direction for a retention sweep is *not deleting*, and taking the gateway
+    /// down over a GC setting would trade a data risk for an availability one. It
+    /// is logged at ERROR because a silent downgrade would be its own defect.
     pub fn from_env() -> Self {
-        Self::parse(std::env::var("TRACELANE_RETENTION_SWEEP").unwrap_or_default())
+        let mode = Self::parse(std::env::var("TRACELANE_RETENTION_SWEEP").unwrap_or_default());
+        if mode == Self::Enforce && !Self::snapshot_dir_configured() {
+            tracing::error!(
+                env = SNAPSHOT_DIR_ENV,
+                "retention sweep asked for ENFORCE with no snapshot destination — \
+                 DOWNGRADED TO DRYRUN. Deletion is the one irreversible action here and \
+                 there is no undo without a pre-delete snapshot. Set the env var named \
+                 in this event's `env` field to a writable path to enable enforcement."
+            );
+            return Self::DryRun;
+        }
+        mode
+    }
+
+    /// Is a snapshot destination configured? Presence AND non-empty — an empty
+    /// string is the classic "set but not really set" that reads as configured.
+    fn snapshot_dir_configured() -> bool {
+        std::env::var(SNAPSHOT_DIR_ENV)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// The mode that should apply given a requested mode and whether a snapshot
+    /// destination exists. Pure, so the precondition is assertable without env.
+    #[must_use]
+    pub const fn with_snapshot_precondition(self, snapshot_configured: bool) -> Self {
+        match self {
+            Self::Enforce if !snapshot_configured => Self::DryRun,
+            other => other,
+        }
     }
 
     fn parse(raw: impl AsRef<str>) -> Self {
@@ -199,8 +248,34 @@ async fn resolve_retentions(pool: &DbPool) -> anyhow::Result<Vec<TenantRetention
         .collect())
 }
 
+/// How many rows a mode ACCOUNTS FOR, given `n` rows past the window.
+///
+/// Split out from `sweep_one` so the accounting contract is assertable without a
+/// ClickHouse client — the bug it encodes (`DryRun` reporting 0) lived in a branch
+/// no unit test could reach, which is why a summary line contradicted the detail
+/// lines above it for as long as it did.
+///
+/// `Off` is 0 because nothing was examined. `DryRun` is `n` because that is the
+/// question a dry run exists to answer. `Enforce` is `n` because that many rows
+/// were deleted.
+const fn rows_accounted(mode: SweepMode, n: u64) -> u64 {
+    match mode {
+        SweepMode::Off => 0,
+        SweepMode::DryRun | SweepMode::Enforce => n,
+    }
+}
+
 /// Count rows past `days` for `tenant_id` in one table; delete them in `Enforce`.
-/// Returns the row count (0 in dryrun). `clickhouse::Client` / `clickhouse::Row`
+///
+/// Returns **the number of rows the mode accounts for**: rows deleted in
+/// `Enforce`, rows that *would* be deleted in `DryRun`, and 0 in `Off`.
+///
+/// DryRun used to return 0, which made the caller's summary line read
+/// `retention sweep complete (would-delete) … rows=0` while the per-tenant lines
+/// directly above it reported 17,776 — so the one aggregate an operator or a
+/// ruling would read said "enforcing changes nothing", the exact opposite of the
+/// truth. The count is the whole point of a dry run. Fixed 2026-08-11; **this
+/// changes no deletion behaviour — DryRun still deletes nothing.** `clickhouse::Client` / `clickhouse::Row`
 /// are referenced fully-qualified so this file carries no `use clickhouse::`
 /// (the raw-CH-query guard keys on that import; this is a GC path, not a read).
 async fn sweep_one(
@@ -229,7 +304,9 @@ async fn sweep_one(
                 %tenant_id, table = table.label, retention_days = days, would_delete = n,
                 "retention sweep [dryrun]: rows past window"
             );
-            Ok(0)
+            // `n`, NOT 0 — see the doc comment. Nothing is deleted here; this is
+            // what the caller aggregates into the "would-delete" total.
+            Ok(rows_accounted(mode, n))
         }
         SweepMode::Enforce => {
             ch.query(table.delete_sql)
@@ -241,9 +318,9 @@ async fn sweep_one(
                 %tenant_id, table = table.label, retention_days = days, deleted = n,
                 "retention sweep [enforce]: deleted rows past window"
             );
-            Ok(n)
+            Ok(rows_accounted(mode, n))
         }
-        SweepMode::Off => Ok(0),
+        SweepMode::Off => Ok(rows_accounted(mode, n)),
     }
 }
 
@@ -260,6 +337,79 @@ mod tests {
         assert_eq!(SweepMode::parse("dryrun"), SweepMode::DryRun);
         assert_eq!(SweepMode::parse("dry-run"), SweepMode::DryRun);
         assert_eq!(SweepMode::parse(" Enforce "), SweepMode::Enforce);
+    }
+
+    /// THE REGRESSION. `DryRun` returned 0, so `run_sweep`'s summary printed
+    /// `retention sweep complete (would-delete) … rows=0` while the per-tenant
+    /// lines above it reported 17,776 rows past the window on prod. The one
+    /// aggregate an operator — or a founder ruling on whether to flip to
+    /// Enforce — would read said "enforcing changes nothing".
+    #[test]
+    fn dryrun_accounts_for_the_rows_it_would_delete() {
+        assert_eq!(
+            rows_accounted(SweepMode::DryRun, 11_610),
+            11_610,
+            "a dry run that reports 0 answers the opposite of the question it exists for"
+        );
+    }
+
+    #[test]
+    fn enforce_accounts_for_the_rows_it_deleted() {
+        assert_eq!(rows_accounted(SweepMode::Enforce, 6_154), 6_154);
+    }
+
+    #[test]
+    fn off_accounts_for_nothing_because_it_examined_nothing() {
+        assert_eq!(rows_accounted(SweepMode::Off, 11_610), 0);
+    }
+
+    /// DryRun and Enforce must report the SAME total for the same data — that
+    /// equality is what makes a dry run a preview of the enforce run rather than
+    /// a differently-shaped number.
+    #[test]
+    fn dryrun_total_previews_the_enforce_total() {
+        for n in [0_u64, 1, 6, 6_154, 11_610, u64::MAX] {
+            assert_eq!(
+                rows_accounted(SweepMode::DryRun, n),
+                rows_accounted(SweepMode::Enforce, n),
+                "dry run must preview enforce exactly, at n={n}"
+            );
+        }
+    }
+
+    /// PLT-40 (2026-08-11, founder-ruled): Enforce is REFUSED without a
+    /// pre-delete snapshot destination. Deletion is the only irreversible action
+    /// this process takes, and the audit ledger records gateway actions, not row
+    /// deletions — so without a snapshot there is no undo at all.
+    #[test]
+    fn enforce_without_a_snapshot_destination_is_downgraded_to_dryrun() {
+        assert_eq!(
+            SweepMode::Enforce.with_snapshot_precondition(false),
+            SweepMode::DryRun,
+            "enforcing with no undo must not be reachable by configuration alone"
+        );
+    }
+
+    #[test]
+    fn enforce_with_a_snapshot_destination_is_allowed() {
+        assert_eq!(
+            SweepMode::Enforce.with_snapshot_precondition(true),
+            SweepMode::Enforce
+        );
+    }
+
+    /// The precondition must gate ONLY Enforce. Downgrading DryRun would break the
+    /// mode prod actually runs, and downgrading Off would be meaningless.
+    #[test]
+    fn the_snapshot_precondition_touches_only_enforce() {
+        for m in [SweepMode::Off, SweepMode::DryRun] {
+            assert_eq!(
+                m.with_snapshot_precondition(false),
+                m,
+                "{m:?} must be unaffected — it deletes nothing, so it needs no undo"
+            );
+            assert_eq!(m.with_snapshot_precondition(true), m);
+        }
     }
 
     #[test]

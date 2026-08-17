@@ -10,7 +10,7 @@ const ROWS = ["a", "b", "c", "d", "e", "f", "g", "h"];
 
 export default function Loading() {
 	return (
-		<main className="mx-auto max-w-5xl p-6">
+		<div className="mx-auto max-w-5xl p-6">
 			<div className="mb-6">
 				<Skeleton className="h-8 w-48" />
 				<Skeleton className="mt-2 h-4 w-96 max-w-full" />
@@ -22,6 +22,6 @@ export default function Loading() {
 					<Skeleton key={id} className="h-10 w-full" />
 				))}
 			</div>
-		</main>
+		</div>
 	);
 }

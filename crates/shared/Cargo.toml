@@ -16,3 +16,21 @@ chrono = { workspace = true }
 # tracing subscribers; pulling the dep into shared keeps the byte-scan
 # layer's `MakeWriter` impl in one place.
 tracing-subscriber = { workspace = true }
+# `degradation::note` emits the rate-limited TRACELANE_DEGRADED warning that the
+# on-node watchdog greps. Already a transitive dep via tracing-subscriber; declared
+# because this crate now calls the macro directly.
+tracing = { workspace = true }
+# `otlp::decode` returns anyhow errors with context, matching the shape both
+# callers (ingest's receiver, the gateway's POST /v1/traces) already handle.
+anyhow = { workspace = true }
+# OTLP protobuf decoder + `prost::Message::encoded_len` for the ADR-029 span-size
+# cap. Moved here with the decoder for GWY-41 so there is ONE decoder, not two.
+# `gen-tonic-messages` gives the trace-service message types; we consume the
+# decoded structs only, never the gRPC service.
+# `with-serde` is what makes OTLP/JSON decodable (B-235). The generated types
+# carry `rename_all = "camelCase"` and deserialize `traceId`/`spanId`/
+# `parentSpanId` from HEX STRINGS — which is exactly the OTLP/JSON wire form
+# the OTel JS exporter emits. Without it the JSON body is unparseable and the
+# TypeScript SDK cannot deliver a span to Tracelane at all.
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "with-serde"] }
+prost = { workspace = true }

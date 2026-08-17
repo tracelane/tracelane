@@ -196,7 +196,9 @@ function translateConfig(litellm: LiteLLMConfig): TracelaneConfig {
 	];
 	if (callbacks.includes("otel") || callbacks.includes("opentelemetry")) {
 		tracelane.gateway.telemetry = {
-			otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}",
+			// :4318 is OTLP HTTP. :4317 is gRPC, which Tracelane does not serve —
+			// the previous default pointed at a port nothing listens on.
+			otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}",
 		};
 	}
 

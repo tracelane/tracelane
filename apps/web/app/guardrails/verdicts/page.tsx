@@ -166,7 +166,7 @@ export default async function GuardrailVerdictsPage({
 					defaultValue={sp.correlation_id ?? ""}
 					placeholder="Paste a correlation ID from a 403 response…"
 					aria-label="Correlation ID"
-					className="w-full max-w-md rounded-lg border border-line bg-surface px-3 py-1.5 font-mono text-[12.5px] text-ink placeholder:font-sans placeholder:text-ink-3 outline-none focus:border-accent-line"
+					className="w-full max-w-md rounded-sm border border-line bg-surface px-3 py-1.5 font-mono text-[12.5px] text-ink placeholder:font-sans placeholder:text-ink-3 outline-none focus:border-action-line"
 				/>
 				<button
 					type="submit"

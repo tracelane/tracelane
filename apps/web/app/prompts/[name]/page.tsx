@@ -16,6 +16,7 @@
 
 import { AuthorVersionForm } from "@/app/prompts/[name]/AuthorVersionForm";
 import { PromotionPanel } from "@/components/prompt-promotion/PromotionPanel";
+import { requireSession } from "@/lib/auth";
 import { ENVS, fetchHistory, fetchVersion } from "@/lib/prompts";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -42,22 +43,29 @@ function shortId(uuid: string | null | undefined): string {
 	return uuid.slice(0, 8);
 }
 
+/* This page kept its OWN spacing and radius scale — px-6 py-8, mb-8, mt-6, gap-4,
+   p-4, rounded-md, text-2xl — none of which are the app's. It was the only surface
+   still outside the design system after the 2026-08-16 pass, so a prompt detail read
+   as a different product from the page that links to it.
+   Now on the shared tokens: `surface-card` carries --radius-card (8px) instead of a
+   hardcoded rounded-md (6px), `t-h1`/`t-metric` come off the ADR-074 §2 ramp, and the
+   rhythm matches the rest of the app. Class strings only — no markup changed. */
 const S = {
-	page: "mx-auto max-w-4xl px-6 py-8",
-	header: "mb-8",
-	title: "text-2xl font-semibold tracking-tight font-mono",
-	subtitle: "mt-2 text-sm text-ink-2",
-	section: "mt-6",
-	sectionHeading: "mb-3 text-sm font-medium text-ink",
-	envGrid: "grid gap-4 md:grid-cols-3",
-	envCard: "rounded-md border border-line bg-surface p-4",
-	envCardError: "rounded-md border border-warn bg-warn-soft/20 p-4",
+	page: "mx-auto max-w-4xl px-4 py-4",
+	header: "mb-4",
+	title: "t-h1 font-mono",
+	subtitle: "mt-1 text-sm text-ink-2",
+	section: "mt-4",
+	sectionHeading: "mb-2 text-sm font-semibold text-ink",
+	envGrid: "grid gap-2 md:grid-cols-3",
+	envCard: "surface-card border border-line bg-surface p-3",
+	envCardError: "surface-card border border-warn bg-warn-soft/20 p-3",
 	envLabel: "text-xs uppercase tracking-wide text-ink-2",
-	versionLabel: "mt-2 text-lg font-semibold tabular-nums text-ink",
+	versionLabel: "mt-1.5 t-metric text-ink",
 	field: "mt-2 text-xs",
 	fieldLabel: "text-ink-2",
 	fieldValue: "ml-1 font-mono text-ink break-all",
-	contentBlock: "mt-6 rounded-md border border-line bg-surface p-4",
+	contentBlock: "mt-4 surface-card border border-line bg-surface p-3",
 	contentPre: "whitespace-pre-wrap font-mono text-xs text-ink leading-relaxed",
 	historyList: "space-y-3",
 	historyEmpty: "text-xs text-ink-2",
@@ -70,7 +78,7 @@ const S = {
 	historyTitle: "font-medium text-ink",
 	historyMeta: "mt-0.5 text-ink-2",
 	historyTime: "ml-auto whitespace-nowrap font-mono tabular-nums text-ink-2",
-	footerLinks: "mt-8 flex gap-4 text-sm",
+	footerLinks: "mt-6 flex gap-4 text-sm",
 	link: "underline decoration-ink-3 underline-offset-4 hover:decoration-ink transition-[text-decoration-color]",
 } as const;
 
@@ -113,6 +121,21 @@ function LifecycleStrip({ active }: { active: Set<string> }) {
 }
 
 export default async function PromptDetailPage({ params }: Props) {
+	// `/prompts` (the LIST) calls requireSession() first; this DETAIL page did not,
+	// so an unauthenticated hit fell straight through to the gateway fan-out below
+	// and escaped as an uncaught RSC error — a hard 500 on a public URL, measured on
+	// prod: /prompts/<missing> = 500 while /prompts = 200 and /traces/<missing> = 200.
+	//
+	// requireSession() is what converts that into a redirect: its own comment records
+	// why (WorkOS's ensureSignedIn auto-redirect throws a form OpenNext/CF does NOT
+	// turn into a 307, so it must redirect() explicitly).
+	//
+	// A 307 to sign-in, NOT the 404 the symptom suggests: this file's own contract is
+	// that "the gateway returns the SAME 404 for 'no version in this env' and 'not
+	// this tenant's', so existence never leaks across tenants". Answering a signed-out
+	// stranger with 404-vs-something-else would leak exactly what that guarantees.
+	await requireSession();
+
 	const { name } = await params;
 	const decodedName = decodeURIComponent(name);
 
@@ -157,7 +180,7 @@ export default async function PromptDetailPage({ params }: Props) {
 				: null;
 
 	return (
-		<main className={S.page}>
+		<div className={S.page}>
 			{/* ── Header ── */}
 			<header className={S.header}>
 				<h1 className={S.title}>{decodedName}</h1>
@@ -171,7 +194,7 @@ export default async function PromptDetailPage({ params }: Props) {
 			<LifecycleStrip active={activeEnvs} />
 
 			{nextStep && (
-				<div className="mb-6 rounded-md border border-line bg-surface-2/40 px-4 py-2.5 text-sm text-ink-2">
+				<div className="mb-6 rounded-lg border border-line bg-surface-2/40 px-4 py-2.5 text-sm text-ink-2">
 					<span className="font-medium text-ink">Next:</span> {nextStep}
 				</div>
 			)}
@@ -242,7 +265,7 @@ export default async function PromptDetailPage({ params }: Props) {
 
 			{/* ── Promotion / rollback history ── */}
 			<section className={S.section}>
-				<div className="rounded-md border border-line bg-surface p-4">
+				<div className="rounded-lg border border-line bg-surface p-4">
 					<div className="mb-3 flex flex-wrap items-baseline justify-between gap-1">
 						<span className={S.sectionHeading.replace("mb-3 ", "")}>
 							Recent activity · all prompts
@@ -344,6 +367,6 @@ export default async function PromptDetailPage({ params }: Props) {
 					Audit ledger →
 				</Link>
 			</nav>
-		</main>
+		</div>
 	);
 }

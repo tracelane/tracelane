@@ -125,7 +125,7 @@ export function VerifyByTrace() {
 			<div className="flex items-center gap-3">
 				<span
 					aria-hidden
-					className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent-ink"
+					className="inline-block h-2 w-2 animate-pulse rounded-full bg-action-ink"
 				/>
 				<p className="text-sm font-medium text-ink">
 					Waiting for your first trace…{" "}

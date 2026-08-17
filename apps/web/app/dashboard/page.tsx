@@ -20,6 +20,7 @@
 import { computeSloBudget } from "@/app/slo/budget";
 import {
 	buildTrafficPoints,
+	chartWindow,
 	latencyPointsFromTimeseries,
 } from "@/app/slo/latency";
 import type { SloRow, SloSummary, SloTimePoint } from "@/app/slo/types";
@@ -45,6 +46,8 @@ import {
 	MetricIcon,
 	type MetricIconName,
 	RequestFlow,
+	StatGrid,
+	TimeRuler,
 } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -107,9 +110,14 @@ function fmtCost(usd: number): string {
 	return `$${(usd / 1000).toFixed(1)}K`;
 }
 
-/** Focus ring shared by every click-through stat tile wrapper. */
+/** Focus ring shared by every click-through stat tile wrapper.
+ *
+ * `rounded-lg` (8px) is not a taste call — it MUST equal `--radius-card`, which
+ * ADR-074 §5 sets to 8px for cards and tiles. This wrapper was `rounded-xl`
+ * (12px) while the tile inside it is 8px, so every focus ring on the dashboard
+ * traced a rounder outline than the thing it was outlining. */
 const TILE_LINK_CLS =
-	"block rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
+	"block rounded-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
 
 /** Section divider label — reused for every bento group. The eyebrow type
  *  (10px/700/.12em) plus the trailing hairline rule, per visual-pass-01. */
@@ -144,7 +152,17 @@ async function DashboardData({ range }: { range: string | undefined }) {
 		guardrails,
 		timePoints,
 	] = await Promise.all([
-		gatewayGet<SloRow[]>(`/v1/slo?hours=${hours}`).then(
+		// `bucket` matches the display bucket this page already renders at, so the
+		// gateway groups server-side instead of shipping every HOUR to the edge.
+		// At range=30d that is 906 rows / 213KB -> ~30-60 rows: the Worker has a
+		// per-request CPU ceiling, and 30d was the first surface to exceed it under
+		// load (Error 1102). Every consumer below is unaffected — the sums are exact
+		// under re-aggregation, `wmean` re-weights identically, and byModel/byProvider
+		// keep their dimensions. The bucketed percentiles are a TRUE quantileMerge,
+		// which is strictly better than the mean-of-hourly-percentiles computed here.
+		gatewayGet<SloRow[]>(
+			`/v1/slo?hours=${hours}&bucket=${Math.max(1, Math.round(bucketMs / 3_600_000))}`,
+		).then(
 			(rows) => ({ rows, warming: false }),
 			(err) => {
 				if (err instanceof GatewayError)
@@ -226,8 +244,15 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	// it `~` so an approximation is never shown as a true window quantile.
 	const usingFallback = !sloSummary;
 	const budget = computeSloBudget(totalRequests, totalErrors);
-	const points = latencyPointsFromTimeseries(timePoints, bucketMs);
-	const traffic = buildTrafficPoints(rows, bucketMs);
+	// R59: both charts are drawn over the REQUESTED window, not over first-observed …
+	// last-observed. Without this the domain is a property of the data while the heading
+	// above describes the query — and steady traffic all day renders identically to a
+	// single 4am burst, which is the one thing these charts exist to tell apart.
+	// `Date.now()` is safe here: this is a server component, so there is no client
+	// re-render to disagree with.
+	const win = chartWindow(Date.now(), hours, bucketMs);
+	const points = latencyPointsFromTimeseries(timePoints, bucketMs, win);
+	const traffic = buildTrafficPoints(rows, bucketMs, win);
 	// A chart bar → that bucket's traces (gateway list honors since/until).
 	const barHref = (p: { t: number }) =>
 		`/traces?since=${encodeURIComponent(new Date(p.t).toISOString())}&until=${encodeURIComponent(
@@ -357,20 +382,23 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	const maxProvReq = topProviders[0]?.requests ?? 0;
 
 	return (
-		<div className="space-y-5">
+		<div className="space-y-3">
 			{dash && <WarmingBanner />}
 
 			{/* Header — greeting (left) + the KPI strip (top-right, per the mockup):
 			    error/block pills, availability + cache-hit bars, and the single
 			    page-level range control. Every value real; "—" when unreachable. */}
-			<div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+			{/* gap-3 / gap-y-2, not gap-5 / gap-y-4: this is the first thing above the
+			    fold, so every pixel here is one the reader scrolls past before seeing a
+			    single metric. Horizontal gap-x-6 is kept — it costs no vertical space. */}
+			<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
 				<div>
 					<h1 className="t-h1">Welcome back</h1>
 					<p className="mt-1.5 text-sm text-ink-3">
 						Your agent fleet, at a glance.
 					</p>
 				</div>
-				<div className="flex flex-wrap items-end gap-x-6 gap-y-4 lg:justify-end">
+				<div className="flex flex-wrap items-end gap-x-6 gap-y-2 lg:justify-end">
 					<div>
 						<div className="mb-1.5 text-[11.5px] text-ink-3">Error rate</div>
 						<Link
@@ -389,7 +417,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 						<Link
 							href="/guardrails"
-							className="inline-flex rounded-full bg-accent-soft px-3.5 py-1.5 text-[13.5px] font-medium tabular-nums text-accent-ink"
+							className="inline-flex rounded-full bg-action-soft px-3.5 py-1.5 text-[13.5px] font-medium tabular-nums text-action-ink"
 						>
 							{blockRatePct === null ? "—" : `${blockRatePct.toFixed(1)}%`}
 						</Link>
@@ -427,10 +455,13 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			{/* KPI cards — the three headline reals (requests / tokens / spend) as the
 			    mockup's monochrome icon tiles. Same reads as before; "—" when
 			    unreachable. Each tile clicks through to its detail view. */}
-			<div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+			{/* StatGrid, not a hand-rolled grid: it supplies `items-stretch` and the one
+			    shared gap, so this row lines up with the metric rows on SLO, Gateway and
+			    Guardrails instead of being a fourth slightly-different spacing. */}
+			<StatGrid title="Volume" cols={3}>
 				{kpis.map((k) => (
 					<Link key={k.label} href={k.href} className={TILE_LINK_CLS}>
-						<div className="stat-tile stat-tile--interactive flex h-full items-center gap-3.5 p-4">
+						<div className="stat-tile stat-tile--interactive flex h-full items-center gap-2.5 p-3">
 							<MetricIcon name={k.icon} />
 							<div className="min-w-0">
 								<div className="text-[11.5px] text-ink-3" title={k.hint}>
@@ -441,17 +472,17 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 					</Link>
 				))}
-			</div>
+			</StatGrid>
 
 			{/* Section 1 — Health at a glance: Where the time goes · Traffic over time
 			    (wide) · Error budget dark card. Three real signals in one equal-height
 			    row — the trip split, the request volume trend, and the SLO burn. */}
 			<SectionLabel>Health at a glance</SectionLabel>
-			<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
+			<div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
 				{/* Where the time goes — the honest trip split (real p95 per component;
 				    drill-through to the gateway detail). */}
 				<Link href="/gateway" className={`${TILE_LINK_CLS} lg:col-span-3`}>
-					<Card className="flex h-full flex-col p-4">
+					<Card className="flex h-full flex-col p-3">
 						<div className="mb-1 flex items-center justify-between gap-2">
 							<div className="flex items-center gap-2">
 								<MetricIcon name="time" size={28} />
@@ -493,7 +524,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							</div>
 						) : (
 							<EmptyState
-								compact
+								inline
 								title="No latency split yet"
 								description="Gateway vs provider latency appears here as requests flow."
 							/>
@@ -502,7 +533,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				</Link>
 
 				{/* Traffic over time — real per-hour request counts (wide). */}
-				<Card className="flex h-full flex-col p-4 sm:col-span-2 lg:col-span-6">
+				<Card className="flex h-full flex-col p-3 sm:col-span-2 lg:col-span-6">
 					<div className="mb-1 flex items-center gap-2">
 						<MetricIcon name="traffic" size={28} />
 						<h2 className="t-card-title">
@@ -516,10 +547,25 @@ async function DashboardData({ range }: { range: string | undefined }) {
 								hrefFor={trafficHref}
 								ariaLabel={`requests per bucket over the last ${rLabel}`}
 							/>
+							{/* ADR-074 §7 — the one time axis, replacing the strided labels this
+							    chart used to draw itself. `win.endMs` is the LAST BUCKET START, so the
+							    axis runs to that bucket's END. Inset to the svg's PAD_L/PAD_R (34/8 of
+							    a 640 viewBox) so ticks land on the slot centres the bars use. */}
+							<div
+								className="mt-1"
+								style={{ marginLeft: "5.31%", marginRight: "1.25%" }}
+							>
+								<TimeRuler
+									startMs={win.startMs}
+									endMs={win.endMs + bucketMs}
+									ticks={4}
+									mode="absolute"
+								/>
+							</div>
 						</div>
 					) : (
 						<EmptyState
-							compact
+							inline
 							title="No traffic yet"
 							description="Requests per bucket appear here as your agents call the gateway."
 						/>
@@ -528,7 +574,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 
 				{/* Error budget — the SLO burn snapshot as the mockup's dark card. Real
 				    arithmetic over the captured error rate; "—" when unreachable. */}
-				<div className="card-lava-top flex h-full flex-col rounded-xl bg-surface-inverse p-5 lg:col-span-3">
+				<div className="card-lava-top flex h-full flex-col rounded-lg bg-surface-inverse p-5 lg:col-span-3">
 					<div className="flex items-center justify-between gap-3">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="error-budget" size={28} onInverse />
@@ -540,7 +586,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							1.0× = on pace
 						</p>
 					</div>
-					<div className="mt-2 font-mono text-[34px] font-semibold leading-none text-accent tabular-nums">
+					<div className="mt-2 font-mono text-[34px] font-semibold leading-none text-ink-inverse tabular-nums">
 						{dash ? "—" : fmtBurn(budget.burnRate)}
 					</div>
 					<p className="mt-1.5 text-[11.5px] text-ink-inverse opacity-60">
@@ -573,10 +619,10 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			    gateway-overhead / provider / TTFT percentile split) · Request flow
 			    (Sankey) · Guardrail activity (block/fail-open real verdicts). */}
 			<SectionLabel>Latency, routing &amp; safety</SectionLabel>
-			<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
+			<div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
 				{/* Latency over time + the full gateway-overhead / provider / TTFT
 				    percentile split — all real. */}
-				<Card className="flex h-full flex-col p-4 sm:col-span-2 lg:col-span-4">
+				<Card className="flex h-full flex-col p-3 sm:col-span-2 lg:col-span-4">
 					<div className="mb-1 flex items-center gap-2">
 						<MetricIcon name="latency" size={28} />
 						<h2 className="t-card-title">
@@ -584,11 +630,21 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</h2>
 					</div>
 					{points.length > 0 ? (
-						<LatencyTimeline points={points} />
+						<>
+							<LatencyTimeline points={points} />
+							{/* ADR-074 §7 — one axis. preserveAspectRatio="none" means this svg
+								    stretches edge to edge, so the ruler needs no inset. */}
+							<TimeRuler
+								startMs={win.startMs}
+								endMs={win.endMs + bucketMs}
+								ticks={4}
+								mode="absolute"
+							/>
+						</>
 					) : (
 						<div className="flex flex-1 items-center">
 							<EmptyState
-								compact
+								inline
 								title="No latency data yet"
 								description="Hourly percentiles appear here as requests flow through the gateway."
 								className="w-full"
@@ -596,7 +652,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 					)}
 					{latency && latency.overhead_samples > 0 && (
-						<dl className="mt-3 grid grid-cols-[auto_1fr] items-baseline gap-x-4 gap-y-1.5 border-t border-line pt-3 text-[11px]">
+						<dl className="mt-2 grid grid-cols-[auto_1fr] items-baseline gap-x-4 gap-y-1.5 border-t border-line pt-3 text-[11px]">
 							<dt className="text-ink-3">Gateway</dt>
 							<dd className="text-right font-mono tabular-nums text-ink-2">
 								p50 {fmtMs(latency.overhead_p50_ms)} · p95{" "}
@@ -620,7 +676,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				</Card>
 
 				{/* Request flow — gateway → model → honest OK/Error outcome split. */}
-				<Card className="flex h-full flex-col p-4 sm:col-span-2 lg:col-span-4">
+				<Card className="flex h-full flex-col p-3 sm:col-span-2 lg:col-span-4">
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="request-flow" size={28} />
@@ -636,7 +692,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 					) : (
 						<EmptyState
-							compact
+							inline
 							title="No traffic yet"
 							description="The request path — gateway → model → OK/Error — appears here as your agents call the gateway."
 							className="w-full"
@@ -646,7 +702,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 
 				{/* Guardrail activity — real block/fail-open verdicts from the inline
 				    guardrail engine (fetchGuardrailStats, already in the Promise.all). */}
-				<Card className="flex h-full flex-col p-4 lg:col-span-4">
+				<Card className="flex h-full flex-col p-3 lg:col-span-4">
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="guardrail" size={28} />
@@ -657,7 +713,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					{guardrails === null || guardrails.total_evaluations === 0 ? (
 						<div className="flex flex-1 items-center">
 							<EmptyState
-								compact
+								inline
 								title="No guardrail activity yet"
 								description="Block/allow verdicts appear here as requests pass the inline guardrails."
 								className="w-full"
@@ -665,11 +721,11 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 					) : (
 						<div className="flex flex-1 flex-col justify-center">
-							<div className="font-mono t-metric text-accent-ink">
+							<div className="font-mono t-metric text-action-ink">
 								{guardrails.block_rate_pct.toFixed(1)}%
 							</div>
 							<p className="text-[11.5px] text-ink-3">block rate</p>
-							<div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-line pt-3">
+							<div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-line pt-3">
 								<div className="flex flex-col gap-0.5">
 									<span className="font-mono text-sm font-semibold tabular-nums text-ink">
 										{guardrails.total_evaluations.toLocaleString()}
@@ -704,7 +760,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			    Provider health (per-provider request mix + error rate) · Top failure
 			    signatures table. All three read already-fetched data — no new fetch. */}
 			<SectionLabel>Models, providers &amp; failures</SectionLabel>
-			<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
+			<div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12 lg:items-stretch">
 				{/* Traffic by model — top 5 provider/model series by request volume. */}
 				<Card className="flex h-full flex-col overflow-hidden lg:col-span-4">
 					<div className="flex items-center justify-between px-4 pt-3.5 pb-2">
@@ -714,7 +770,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 						<Link
 							href="/slo"
-							className="rounded text-[12px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded text-[12px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 						>
 							View all →
 						</Link>
@@ -723,13 +779,13 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						<table className="w-full text-sm">
 							<thead className="border-b border-line">
 								<tr>
-									<th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Model
 									</th>
-									<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Requests
 									</th>
-									<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Tokens
 									</th>
 								</tr>
@@ -740,11 +796,11 @@ async function DashboardData({ range }: { range: string | undefined }) {
 										key={`${m.provider}::${m.model}`}
 										className="transition-colors hover:bg-surface-2/40"
 									>
-										<td className="px-4 py-2">
+										<td className="px-3 py-2">
 											{m.model && m.model !== "—" ? (
 												<Link
 													href={`/traces?model=${encodeURIComponent(m.model)}&range=${rShort}`}
-													className="block truncate font-mono text-xs text-ink hover:text-accent-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+													className="block truncate font-mono text-xs text-ink hover:text-action-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 													title={`View ${m.model} traces`}
 												>
 													{m.model}
@@ -766,10 +822,10 @@ async function DashboardData({ range }: { range: string | undefined }) {
 												/>
 											</div>
 										</td>
-										<td className="px-4 py-2 text-right font-mono text-xs tabular-nums text-ink">
+										<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink">
 											{m.requests.toLocaleString()}
 										</td>
-										<td className="px-4 py-2 text-right font-mono text-xs tabular-nums text-ink-2">
+										<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink-2">
 											{fmtTokens(m.tokens)}
 										</td>
 									</tr>
@@ -779,14 +835,14 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					) : (
 						<div className="flex flex-1 items-center">
 							<EmptyState
-								compact
+								inline
 								title="No traffic yet"
 								description="Per-model request volume appears here once your agents call the gateway."
 								className="w-full"
 								action={
 									<Link
 										href="/settings/providers"
-										className="rounded text-[13px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+										className="rounded text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 									>
 										Connect a provider →
 									</Link>
@@ -799,7 +855,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				{/* Provider health — top 4 providers by request volume with error rate
 				    and a share bar. Derived inline from fetchGatewayStats (already
 				    fetched); no extra read, no fabricated numbers. */}
-				<Card className="flex h-full flex-col p-4 lg:col-span-4">
+				<Card className="flex h-full flex-col p-3 lg:col-span-4">
 					<div className="mb-2 flex items-center justify-between gap-2">
 						<div className="flex items-center gap-2">
 							<MetricIcon name="provider" size={28} />
@@ -810,7 +866,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					{topProviders.length === 0 ? (
 						<div className="flex flex-1 items-center">
 							<EmptyState
-								compact
+								inline
 								title="No provider traffic yet"
 								description="Per-provider request volume and error rate appear here."
 								className="w-full"
@@ -855,7 +911,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						</div>
 						<Link
 							href="/signatures"
-							className="rounded text-[12px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded text-[12px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 						>
 							View all →
 						</Link>
@@ -864,13 +920,13 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						<table className="w-full text-sm">
 							<thead className="border-b border-line">
 								<tr>
-									<th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Signature
 									</th>
-									<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Hits ({rShort})
 									</th>
-									<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Action
 									</th>
 								</tr>
@@ -881,19 +937,19 @@ async function DashboardData({ range }: { range: string | undefined }) {
 										key={s.signature_id}
 										className="transition-colors hover:bg-surface-2/40"
 									>
-										<td className="px-4 py-2">
+										<td className="px-3 py-2">
 											<Link
 												href={`/traces?signature_id=${encodeURIComponent(s.signature_id)}&range=${rShort}`}
-												className="rounded font-mono text-xs text-ink hover:text-accent-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+												className="rounded font-mono text-xs text-ink hover:text-action-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 												title={`View ${s.signature_id} traces`}
 											>
 												{s.signature_id}
 											</Link>
 										</td>
-										<td className="px-4 py-2 text-right font-mono text-xs tabular-nums text-ink">
+										<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink">
 											{s.your_hits.toLocaleString()}
 										</td>
-										<td className="px-4 py-2 text-right">
+										<td className="px-3 py-2 text-right">
 											<Badge tone={s.action === "blocking" ? "danger" : "warn"}>
 												{s.action === "blocking" ? "blocking" : "flag-only"}
 											</Badge>
@@ -905,14 +961,14 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					) : (
 						<div className="flex flex-1 items-center">
 							<EmptyState
-								compact
+								inline
 								title="No failure signatures matched yet"
 								description="A known agent-failure pattern (tool-schema violation, definition drift) seen in your traces surfaces here."
 								className="w-full"
 								action={
 									<Link
 										href="/signatures"
-										className="rounded text-[13px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+										className="rounded text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 									>
 										About failure signatures →
 									</Link>
@@ -933,7 +989,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					</div>
 					<Link
 						href="/traces"
-						className="rounded text-[13px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="rounded text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 					>
 						View traces →
 					</Link>
@@ -952,7 +1008,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						action={
 							<Link
 								href="/traces"
-								className="rounded text-[13px] font-medium text-accent-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+								className="rounded text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 							>
 								View traces →
 							</Link>
@@ -963,16 +1019,16 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						<table className="w-full text-sm">
 							<thead className="border-b border-line">
 								<tr>
-									<th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Tool
 									</th>
-									<th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Calls
 									</th>
-									<th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										Error rate
 									</th>
-									<th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 										p95
 									</th>
 								</tr>
@@ -988,7 +1044,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											key={t.tool}
 											className="transition-colors hover:bg-surface-2/40"
 										>
-											<td className="px-4 py-2.5">
+											<td className="px-3 py-2">
 												<span
 													className="block truncate font-mono text-xs text-ink"
 													title={t.tool}
@@ -1004,7 +1060,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 													/>
 												</div>
 											</td>
-											<td className="px-4 py-2.5 text-right font-mono text-xs tabular-nums text-ink">
+											<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink">
 												{t.calls.toLocaleString()}
 											</td>
 											<td
@@ -1014,7 +1070,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											>
 												{t.errors > 0 ? `${errPct}%` : "—"}
 											</td>
-											<td className="px-4 py-2.5 text-right font-mono text-xs tabular-nums text-ink-2">
+											<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink-2">
 												{fmtMs(t.p95_ms)}
 											</td>
 										</tr>

@@ -1,6 +1,6 @@
 ---
 title: Tracelane security and data residency
-description: Tracelane security posture — ClickHouse and Postgres regional residency, R2 cold storage, envelope-encrypted keys, tamper-evident audit, SLSA supply chain.
+description: Tracelane security posture — where span and control-plane data lives, R2 cold storage, envelope-encrypted keys, tamper-evident audit, SLSA supply chain.
 classification: PUBLIC
 ---
 
@@ -8,12 +8,35 @@ classification: PUBLIC
 
 | Data type | Where it lives | Retention |
 |---|---|---|
-| Spans (hot) | ClickHouse (your region) | Per plan: 7 days (Free) → 365 days (Enterprise) — see [pricing](/pricing) |
+| Spans (hot) | ClickHouse — **EU, Germany** (Hetzner, Falkenstein) | Up to 365 days. Retention is not customer-configurable. |
 | Spans (cold) | Cloudflare R2 — **implemented, not yet active** | n/a today; spans live in ClickHouse |
-| Tenant metadata, API keys | Neon Postgres (your region) | Until account deletion |
+| Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Until account deletion |
 | Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
 | Provider API keys | Postgres (envelope-encrypted) | Until revoked |
 | Prompt/completion text | ClickHouse spans | Same as spans (redact with `trace_content=false`) |
+
+### Sigstore Rekor — an external dependency, deliberately not a sub-processor
+
+Anchoring publishes each audit batch's **Merkle root** to the public Sigstore Rekor
+transparency log (`log2025-1.rekor.sigstore.dev`). It is a live external dependency and is
+named here so it is visible.
+
+**It is intentionally absent from our sub-processor tables.** Rekor receives a
+**hash — a Merkle root — and never a payload**: no prompt or completion text, no
+identifiers, no ledger row contents. The audit payload is metadata-only by construction
+(`{model, trace_id, warn_aft_id[, business_reference]}`) and is what the root is computed
+over, so a root discloses nothing about a data subject and cannot be reversed into one.
+On that basis there is **no processing of personal data to disclose**, which is why Rekor
+appears as a dependency rather than as a sub-processor.
+
+That reasoning is recorded so it is not re-litigated each time the list is reviewed. It
+would be revisited if the anchored content ever stopped being a bare hash.
+
+**Region selection is not offered.** Tracelane Cloud runs a single deployment: neither
+the span schema nor the control-plane schema carries a region dimension, so a tenant
+cannot be pinned to a region and no per-region isolation is claimed. If you need to
+control the jurisdiction your data sits in, [self-host](/self-hosting) — you choose
+where ClickHouse and Postgres run.
 
 <Note>
 **Current behavior:** hot spans carry a **365-day** storage backstop today, and

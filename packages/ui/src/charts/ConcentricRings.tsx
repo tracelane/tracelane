@@ -44,17 +44,17 @@ export function ConcentricRings({
 					const inner = i === n - 1;
 					// Outer→inner tint ramp toward the solid lava core.
 					const bg = inner
-						? "var(--accent)"
+						? "var(--action)"
 						: i === 0
-							? "var(--accent-soft)"
-							: "var(--accent-line)";
+							? "var(--action-soft)"
+							: "var(--action-line)";
 					// v0-VIZ-REVISIT (founder, 2026-07-20): the inner core value is white
-					// on the soft --accent fill (#ff8566) = ~2.4:1, below AA. Kept for v0
+					// on the soft --action fill (#ff8566) = ~2.4:1, below AA. Kept for v0
 					// (ring structure locked; founder revisiting the viz). Band values use
-					// --accent-ink (deep lava, AA) and read fine. On the viz rework, give
+					// --action-ink (deep lava, AA) and read fine. On the viz rework, give
 					// the core number a token that clears AA in BOTH themes.
-					const valueColor = inner ? "var(--accent-on)" : "var(--accent-ink)";
-					const labelColor = inner ? "var(--accent-on)" : "var(--ink-3)";
+					const valueColor = inner ? "var(--action-on)" : "var(--action-ink)";
+					const labelColor = inner ? "var(--action-on)" : "var(--ink-3)";
 					return (
 						<div
 							key={r.label}
@@ -102,7 +102,7 @@ export function ConcentricRings({
 								className="h-2 w-2 shrink-0 rounded-full border border-line"
 								style={{
 									background:
-										i === 0 ? "var(--accent-soft)" : "var(--accent-line)",
+										i === 0 ? "var(--action-soft)" : "var(--action-line)",
 								}}
 							/>
 							<span>{r.label}</span>

@@ -46,10 +46,10 @@ const BW = 15; // node bar width
 const GAP = 8; // vertical gap between stacked model bars
 const PLOT_H = H - PAD_T - PAD_B;
 
-/** Lava-shade ramp for the model routing ribbons/bars (rationed accent, no new palette). */
+/** Lava-shade ramp for the model routing ribbons/bars (rationed action, no new palette). */
 function modelShade(i: number): { fill: string; op: number } {
 	// deep→soft lava by index; capped so later models stay visible.
-	return { fill: "var(--accent)", op: Math.max(0.32, 0.62 - i * 0.1) };
+	return { fill: "var(--action)", op: Math.max(0.32, 0.62 - i * 0.1) };
 }
 
 /** Compact count for the gutter labels (1.2K / 3.4M). */
@@ -180,7 +180,7 @@ export function RequestFlow({
 					width={BW}
 					height={PLOT_H}
 					rx={3}
-					fill="var(--accent)"
+					fill="var(--action)"
 					fillOpacity={0.85}
 				/>
 				<text

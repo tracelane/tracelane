@@ -6,7 +6,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../../LICENSE)
 
 Instrumentation for Python AI agents, built on OpenTelemetry. Spans are emitted
-via OTLP to your Tracelane ingest endpoint. Instrumentation is explicit — you
+via OTLP/HTTP (protobuf) to the endpoint you configure — `https://gateway.tracelane.dev`
+on Tracelane Cloud, or a receiver you run. Instrumentation is explicit — you
 choose what to wrap.
 
 ## Install
@@ -23,26 +24,86 @@ all**: point your existing client's base URL at the gateway and use your
 
 ```python
 import os
-from anthropic import Anthropic
+from openai import OpenAI
 
-client = Anthropic(
-    base_url="https://gateway.tracelane.dev",
+# The gateway is OpenAI-compatible. It mounts /v1/chat/completions and reads the
+# key from the `authorization` header — an Anthropic-native client pointed here
+# would POST /v1/messages with `x-api-key` and get a 404.
+client = OpenAI(
+    base_url="https://gateway.tracelane.dev/v1",
     api_key=os.environ["TRACELANE_API_KEY"],  # tlane_… from app.tracelane.dev
 )
 
-client.messages.create(
+client.chat.completions.create(
     model="claude-sonnet-4-6",
     messages=[{"role": "user", "content": "Hello"}],
-    max_tokens=128,
 )
 # → Trace visible at https://app.tracelane.dev/traces within ~1 second
 ```
 
-Use this SDK when you want to **export OTLP spans to an endpoint you run** — a
-self-hosted Tracelane ingest, or your own OTLP collector. (Tracelane Cloud's
-ingest is not a public OTLP endpoint — use the gateway path above for Cloud.)
+That captures the model call. Use this SDK when you want the **shape of your
+agent** — the planner step, each tool call, the summariser — as a nested trace
+rather than one span per model call. It exports OTLP to Tracelane Cloud's
+gateway, a self-hosted Tracelane ingest, or your own collector.
+
+## Sessions — group turns into one conversation
+
+[`/sessions`](https://app.tracelane.dev/sessions) groups traces by conversation
+id. The id travels as the `x-conversation-id` request header (the gateway also
+accepts `x-session-id`), and it lands on the span as `gen_ai.conversation.id`.
+This SDK is what sets it — an un-sessioned call sends no session header and
+carries no conversation id.
+
+Wrap the turn and every call inside the block joins the session:
+
+```python
+from tracelane import instrument_openai, use_session
+
+instrument_openai(client)
+
+with use_session(conversation_id):
+    client.chat.completions.create(model="claude-sonnet-4-6", messages=messages)
+    client.chat.completions.create(model="claude-sonnet-4-6", messages=follow_up)
+# Both calls land in the same session.
+```
+
+`use_session` is backed by a `ContextVar`, so overlapping conversations never
+bleed into each other across asyncio tasks or threads, and the previous value is
+restored on exit — including when the block raises. For a single-conversation
+script, `set_session(id)` sets it without the automatic restore, and
+`get_session()` reads back whichever is active.
+
+Auto-attach covers the three adapters that forward `extra_headers`:
+`instrument_openai`, `instrument_anthropic` and `instrument_openrouter`. For
+every other client — including the no-SDK gateway path above — pass the header
+yourself:
+
+```python
+from tracelane import session_headers
+
+client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=messages,
+    extra_headers=session_headers(conversation_id),
+)
+```
+
+`session_headers()` with no argument returns the active session, or `{}` when
+there is none, so it is always safe to pass. A header you set explicitly always
+wins over the ambient session.
+
+A session id must be non-empty visible ASCII, at most 256 characters. Anything
+else raises at the call you wrote, rather than being dropped in transit and
+leaving the session silently empty — and it is rejected, never truncated, because
+a truncated id would split one conversation into two.
 
 ## SDK quick start (OTLP export)
+
+> **Your key needs the `ingest` scope.** Keys minted before scopes existed carry
+> the full API surface and work as-is. A key scoped to `chat` and `read` does
+> not — the gateway answers `403 insufficient_scope` and names `ingest` in the
+> body. Tick **Ingest** in **Settings → API Keys**; it is on by default for new
+> keys.
 
 Call `init()` once (endpoint + api_key are required — no env-var auto-read), then
 wrap each client. Two ways to wrap:
@@ -51,7 +112,11 @@ wrap each client. Two ways to wrap:
 from tracelane import init, instrument_anthropic
 import anthropic
 
-init(endpoint="http://localhost:4318", api_key="tlane_...", service_name="my-agent")
+init(
+    endpoint="https://gateway.tracelane.dev",  # or a receiver you run
+    api_key="tlane_...",  # needs the `ingest` scope
+    service_name="my-agent",
+)
 
 client = anthropic.Anthropic()
 instrument_anthropic(client)  # now client.messages.create() emits spans

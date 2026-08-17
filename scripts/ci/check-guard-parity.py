@@ -32,6 +32,23 @@ from pathlib import Path
 ROOT_GUARD = Path("scripts/pre-public-push.sh")
 EXPORT_GUARD = Path("scripts/export/pre-public-push.sh")
 
+# Every flag this script implements. A guard that silently IGNORES an unknown flag
+# runs the ordinary check and exits 0 — so `--selftesst` (typo) reports PASS while no
+# selftest ran, and the `--selftest` result proves nothing. Enforced by
+# scripts/ci/check-guard-selftests.py.
+KNOWN_FLAGS = {"--selftest"}
+USAGE = "usage: check-guard-parity.py [--selftest]"
+
+
+def reject_unknown_flags(argv: list[str]) -> None:
+    """Exit 2 on any option this script does not implement."""
+    unknown = [a for a in argv if a.startswith("-") and a not in KNOWN_FLAGS]
+    if unknown:
+        print(f"unknown option: {' '.join(unknown)}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+
+
 # Phrases banned from the public surface. Adding one here without adding it to
 # both guards fails this check — which is the point.
 #
@@ -107,10 +124,27 @@ def selftest() -> int:
 
 
 def main() -> int:
+    reject_unknown_flags(sys.argv[1:])
     if "--selftest" in sys.argv:
         return selftest()
 
-    failures = check(read(ROOT_GUARD), read(EXPORT_GUARD))
+    # The EXPORT guard's banned phrases moved OUT of the script and into
+    # docs/reference/NEVER_SAY_AGAIN.md (2026-08-10), so that adding a strike is a
+    # one-line data edit rather than a script change — the reason 60 strikes had only
+    # produced 9 checks. The guard's INTENT is unchanged ("the export gate covers
+    # these phrases"); only where they live changed, so the effective coverage is the
+    # script PLUS the list it reads. Checking the script alone would report a drift
+    # that does not exist — a right check pointed at the wrong file.
+    nsa_list = Path("docs/reference/NEVER_SAY_AGAIN.md")
+    export_effective = read(EXPORT_GUARD)
+    if nsa_list.exists():
+        export_effective += "\n" + nsa_list.read_text(encoding="utf-8")
+    else:
+        print(f"❌ guard parity: {nsa_list} is MISSING — the export guard's phrase")
+        print("   list is gone, so parity cannot be established. Fail closed.")
+        return 1
+
+    failures = check(read(ROOT_GUARD), export_effective)
     if failures:
         print("❌ pre-public-push guard parity BROKEN:")
         for f in failures:

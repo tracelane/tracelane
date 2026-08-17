@@ -62,10 +62,10 @@ export function TopLoadingBar() {
 	return (
 		<div
 			aria-hidden="true"
-			className="pointer-events-none fixed inset-x-0 top-0 z-[100] h-[3px] overflow-hidden bg-accent-soft"
+			className="pointer-events-none fixed inset-x-0 top-0 z-[100] h-[3px] overflow-hidden bg-action-soft"
 		>
 			<div
-				className="h-full w-1/3 rounded-full bg-accent shadow-[0_0_10px_var(--accent)]"
+				className="h-full w-1/3 rounded-full bg-action shadow-[0_0_10px_var(--action)]"
 				style={{ animation: "nav-indeterminate 1.1s ease-in-out infinite" }}
 			/>
 		</div>

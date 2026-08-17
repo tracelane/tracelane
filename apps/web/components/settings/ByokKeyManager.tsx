@@ -96,27 +96,27 @@ function KeyRow({
 }) {
 	return (
 		<tr className="border-b border-border last:border-0">
-			<td className="py-3 pr-4 text-sm font-medium">{entry.alias}</td>
-			<td className="py-3 pr-4 font-mono text-xs text-muted-foreground">
+			<td className="py-2 pr-3 text-sm font-medium">{entry.alias}</td>
+			<td className="py-2 pr-3 font-mono text-xs text-muted-foreground">
 				{entry.fingerprint.slice(0, 16)}…
 			</td>
-			<td className="py-3 pr-4 text-xs text-muted-foreground">
+			<td className="py-2 pr-3 text-xs text-muted-foreground">
 				{entry.algorithm}
 			</td>
-			<td className="py-3 pr-4 text-xs text-muted-foreground">
+			<td className="py-2 pr-3 text-xs text-muted-foreground">
 				{entry.purpose}
 			</td>
-			<td className="py-3 pr-4">
+			<td className="py-2 pr-3">
 				<span
 					className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${STATUS_BADGE[entry.status]}`}
 				>
 					{STATUS_LABEL[entry.status]}
 				</span>
 			</td>
-			<td className="py-3 pr-4 text-xs text-muted-foreground">
+			<td className="py-2 pr-3 text-xs text-muted-foreground">
 				{absoluteDate(entry.createdAt)}
 			</td>
-			<td className="py-3 flex gap-2">
+			<td className="px-3 py-2 flex gap-2">
 				{entry.status === "active" && (
 					<>
 						<button
@@ -158,8 +158,8 @@ function AddKeyModal({
 	};
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-			<div className="bg-card border rounded-lg p-6 w-full max-w-lg shadow-xl space-y-4">
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+			<div className="bg-card border rounded-xl p-6 w-full max-w-lg shadow-xl space-y-4">
 				<h3 className="text-base font-semibold">Register CMK Public Key</h3>
 				<form onSubmit={handleSubmit} className="space-y-3">
 					<div>
@@ -315,13 +315,13 @@ export function ByokKeyManager() {
 					<table className="w-full text-left">
 						<thead className="bg-muted/50 text-xs text-muted-foreground">
 							<tr>
-								<th className="py-2.5 pr-4 pl-4 font-medium">Alias</th>
-								<th className="py-2.5 pr-4 font-medium">Fingerprint</th>
-								<th className="py-2.5 pr-4 font-medium">Algorithm</th>
-								<th className="py-2.5 pr-4 font-medium">Purpose</th>
-								<th className="py-2.5 pr-4 font-medium">Status</th>
-								<th className="py-2.5 pr-4 font-medium">Created</th>
-								<th className="py-2.5 pr-4 font-medium">Actions</th>
+								<th className="py-1.5 pr-3 pl-3 font-medium">Alias</th>
+								<th className="py-1.5 pr-3 font-medium">Fingerprint</th>
+								<th className="py-1.5 pr-3 font-medium">Algorithm</th>
+								<th className="py-1.5 pr-3 font-medium">Purpose</th>
+								<th className="py-1.5 pr-3 font-medium">Status</th>
+								<th className="py-1.5 pr-3 font-medium">Created</th>
+								<th className="py-1.5 pr-3 font-medium">Actions</th>
 							</tr>
 						</thead>
 						<tbody className="pl-4">
@@ -348,8 +348,8 @@ export function ByokKeyManager() {
 
 			{/* Rotate key modal */}
 			{rotateId !== null && (
-				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-					<div className="bg-card border rounded-lg p-6 w-full max-w-lg shadow-xl space-y-4">
+				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+					<div className="bg-card border rounded-xl p-6 w-full max-w-lg shadow-xl space-y-4">
 						<h3 className="text-base font-semibold">Rotate CMK Key</h3>
 						<p className="text-xs text-muted-foreground">
 							Provide the new public key. The old key will remain active during

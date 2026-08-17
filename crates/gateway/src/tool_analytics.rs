@@ -68,6 +68,20 @@ async fn handler(
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, "auth failed").into_response(),
     };
+    // A13 scope gate — B-230. Entitlement/role gates are NOT scope gates: until
+    // 2026-08-13 this route returned tenant data to any authenticated key, so an
+    // `ingest`-scoped SDK key (the credential that now lives in a customer's
+    // container image, default-on since GWY-41) could read it. `read` is the scope
+    // `api_scope.rs:47-49` defines for exactly this.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope");
+        return (
+            StatusCode::FORBIDDEN,
+            "this API key is not scoped to read recorded data — it needs the `read` scope",
+        )
+            .into_response();
+    }
+
     let tenant = claims.tenant_id.to_string();
     let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);

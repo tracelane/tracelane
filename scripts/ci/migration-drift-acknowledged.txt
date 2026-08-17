@@ -1,0 +1,55 @@
+# Accepted absences for scripts/ci/audit-migration-drift.py
+#
+# Format:  kind|name|column|REASON
+# A line with an empty REASON is REFUSED, not honoured — an override without a record
+# fires again, so a deferral cannot quietly become permanent.
+#
+# WHY MOST OF THIS FILE EXISTS — established against the live Frankfurt catalog
+# 2026-08-09 (293 objects). There are TWO migration trees and they target TWO
+# databases:
+#
+#   apps/web/db/migrations/          Drizzle. Built prod Neon. CANONICAL (CLAUDE.md r5).
+#   infra/dev/postgres/migrations/   The dev docker-compose Postgres. NOT applied to
+#                                    prod — with ONE exception, migration 14, which was
+#
+# The two trees name the same logical objects differently: dev uses `idx_<table>_<col>`,
+# Drizzle uses `<table>_<col>_idx`. A rename is INVISIBLE to this tool by construction,
+# so each one is recorded here by hand with the live object it maps to. Every mapping
+# below was checked against the live catalog, not inferred from the name.
+
+# ── Drizzle-vs-Postgres default naming ───────────────────────────────────────────
+constraint|users_tenant_id_tenants_id_fk||RENAME live as `users_tenant_id_fkey` (Postgres default FK name) — verified in live catalog 2026-08-09
+
+# ── infra/dev tree: describes the DEV compose Postgres, never applied to prod ─────
+# Each maps to a live Drizzle-named equivalent, or to a table prod never had.
+table|admin_audit||RENAME live as `admin_audit_log` — confirmed by the only writer, crates/gateway/src/admin_audit.rs:129 `INSERT INTO admin_audit_log`
+index|idx_admin_audit_tenant_time||DEV-ONLY tree; prod has `idx_admin_audit_workspace` on the renamed table
+index|idx_api_keys_lookup||DEV-ONLY tree; superseded by the argon2id lookup index, live as `api_keys_lookup_hash_idx`
+index|idx_api_keys_lookup_hash||RENAME live as `api_keys_lookup_hash_idx` (Drizzle naming)
+index|idx_api_keys_lookup_hash_active||DEV-ONLY partial index; prod covers the same lookup with the non-partial `api_keys_lookup_hash_idx`
+index|idx_provider_keys_tenant||RENAME live as `provider_keys_tenant_idx`
+index|idx_workspace_entitlements_plan||RENAME live as `workspace_entitlements_plan_idx`
+index|tenant_audit_keys_tenant_idx||RENAME live as `tenant_audit_keys_one_per_tenant` (prod enforces one key per tenant as a UNIQUE index)
+index|idx_tenants_stripe_customer||DEV-ONLY tree, and Stripe-era: billing moved to Polar (ADR-020/052). The `tenants.stripe_customer_id` COLUMN still exists live; no index, and nothing queries by it.
+index|tenants_polar_customer_id_idx||DEV-ONLY tree. `tenants.polar_customer_id` exists live with NO index — a seq scan over 17 rows in the Polar webhook lookup. Harmless at this size; revisit past ~10k tenants.
+table|workspace_attr_cardinality||DEV-ONLY tree and UNWIRED — crates/ingest/src/cardinality.rs:258 states the writer is "Unwired in V1". No live reader anywhere in crates/ or apps/web.
+index|idx_workspace_attr_cardinality_updated||same as above — index on a table prod never created
+
+# ── REAL DRIFT, deliberately deferred by the founder ─────────────────────────────
+# hand-applied to prod: its COLUMNS landed, these three objects did not. Consequence
+# while absent: ingest's tenant-config LISTEN has nothing publishing on the channel,
+# apps/web/db/migrations/0024_a13_scoped_keys_and_b188_residue.sql fixes all three and
+# is drafted but UNAPPLIED (commit 7cd363fc).
+constraint|tenants_sampling_policy_chk||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
+function|notify_tenant_config_changed||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
+trigger|trg_tenants_config_notify||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
+
+# ── A13 scoped keys — migration drafted, deliberately UNAPPLIED ──────────────────
+# apps/web/db/migrations/0024 also carries A13. It lands before the gateway that reads
+# these columns deploys (S2 ordering, RECONCILED_BUILD_MAP.md:135).
+column|api_keys|scope|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+column|api_keys|expires_at|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+column|api_keys|budget_usd_monthly|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+constraint|api_keys_budget_nonneg_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+constraint|api_keys_scope_not_empty_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+index|api_keys_expires_at_idx||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied

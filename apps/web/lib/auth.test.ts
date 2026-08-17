@@ -66,6 +66,42 @@ describe("requireSession", () => {
 	});
 });
 
+describe("canAdmin (PL-9 — the UI gate must mirror the FIXED gateway gate)", () => {
+	// Negative first, per .claude/rules/testing.md. Every one of these returned
+	// TRUE before PL-9: the old body denied only a literal "member"/"viewer", so
+	// an unrecognised slug, a renamed role, null and undefined all passed —
+	// and WorkOS's default org role is `admin`, so the DEFAULT fell through to
+	// full access.
+	it("DENIES an unrecognised or absent role slug", async () => {
+		const { canAdmin } = await import("./auth");
+		for (const role of [
+			"wat",
+			"admin_typo",
+			"Admin", // slugs are case-sensitive, matching Role::from_slug
+			"Owner",
+			"",
+			null,
+			undefined,
+		]) {
+			expect(canAdmin(role), `role=${String(role)} must not admin`).toBe(false);
+		}
+	});
+
+	it("DENIES member and viewer", async () => {
+		const { canAdmin } = await import("./auth");
+		expect(canAdmin("member")).toBe(false);
+		expect(canAdmin("viewer")).toBe(false);
+	});
+
+	// The lockout guard: `admin` is WorkOS's built-in org role, so denying it
+	// would lock the real org owner out of billing and BYOK.
+	it("ALLOWS owner and the WorkOS built-in admin", async () => {
+		const { canAdmin } = await import("./auth");
+		expect(canAdmin("owner")).toBe(true);
+		expect(canAdmin("admin")).toBe(true);
+	});
+});
+
 describe("requireGatewayToken", () => {
 	it("BYPASS: returns the fake token + disposable tenant WITHOUT calling WorkOS", async () => {
 		vi.stubEnv("NODE_ENV", "test");

@@ -13,6 +13,7 @@ import {
 	deriveAuditVerdict,
 	humanizeVerdictKind,
 	isAlarm,
+	isIndeterminate,
 } from "./verdict";
 
 function report(over: Partial<VerifyReport>): VerifyReport {
@@ -131,7 +132,11 @@ describe("deriveAuditVerdict", () => {
 		expect(isAlarm(v)).toBe(false);
 	});
 
-	it("RED (ADR-070): windowed view with no anchor to root it → unrooted_window", () => {
+	// R53 RECLASSIFIED this from RED to INDETERMINATE. ADR-070's property was "an
+	// unrooted window is never GREEN" and that still holds — what changed is that it is
+	// no longer an ACCUSATION. Both halves asserted, so a future edit cannot quietly
+	// restore either the alarm or a pass.
+	it("INDETERMINATE (ADR-070 as amended by R53): unrooted window → not green, not an alarm", () => {
 		const v = deriveAuditVerdict(
 			report({
 				trust_established: false,
@@ -139,7 +144,9 @@ describe("deriveAuditVerdict", () => {
 			}),
 		);
 		expect(v).toEqual<AuditVerdict>({ state: "unrooted_window" });
-		expect(isAlarm(v)).toBe(true);
+		expect(isAlarm(v)).toBe(false);
+		expect(isIndeterminate(v)).toBe(true);
+		expect(v.state).not.toBe("verified");
 	});
 });
 
@@ -154,5 +161,87 @@ describe("humanizeVerdictKind", () => {
 	});
 	it("degrades an unknown kind to de-underscored text (never blank)", () => {
 		expect(humanizeVerdictKind("some_new_kind")).toBe("some new kind");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// R53 — the third bucket. Founder ruling: "I cannot see" must not be reported as
+// "something IS wrong" (CLAUDE.md §14, read in reverse). Nothing becomes GREEN.
+// ---------------------------------------------------------------------------
+describe("R53 — indeterminate is neither green nor an alarm", () => {
+	const base = {
+		rows_seen: 100,
+		hash_chain_valid: true,
+		signatures_valid: true,
+		strip_detected: false,
+		anchors_included: 0,
+		anchors_unverified: 0,
+		rekor_anchors_seen: 0,
+		rekor_anchors_resolved: 0,
+		verified_from_seq: 0,
+		trust_established: true,
+		errors: [],
+	} as unknown as VerifyReport;
+
+	it("an unrooted window is INDETERMINATE, not an alarm — and never green", () => {
+		const v = deriveAuditVerdict({ ...base, trust_established: false });
+		expect(v.state).toBe("unrooted_window");
+		expect(isAlarm(v)).toBe(false);
+		expect(isIndeterminate(v)).toBe(true);
+		expect(v.state).not.toBe("verified");
+		expect(v.state).not.toBe("chain_only");
+	});
+
+	it("skipped anchors are INDETERMINATE, not a signature failure", () => {
+		const v = deriveAuditVerdict({ ...base, anchors_unverified: 3 });
+		expect(v.state).toBe("anchors_unverifiable");
+		expect(isAlarm(v)).toBe(false);
+		expect(isIndeterminate(v)).toBe(true);
+	});
+
+	// THE FALSIFICATION, both directions. Positive evidence must still be RED, and it
+	// must outrank the window — otherwise `indeterminate` becomes a way to hide a defect.
+	it("a broken chain is STILL red, even inside an unrooted window", () => {
+		const v = deriveAuditVerdict({
+			...base,
+			hash_chain_valid: false,
+			trust_established: false,
+		});
+		expect(v.state).toBe("chain_broken");
+		expect(isAlarm(v)).toBe(true);
+		expect(isIndeterminate(v)).toBe(false);
+	});
+
+	it("a strip is STILL red, even inside an unrooted window", () => {
+		const v = deriveAuditVerdict({
+			...base,
+			strip_detected: true,
+			trust_established: false,
+		});
+		expect(v.state).toBe("stripped");
+		expect(isAlarm(v)).toBe(true);
+	});
+
+	it("a genuine signature failure is STILL red", () => {
+		const v = deriveAuditVerdict({
+			...base,
+			signatures_valid: false,
+			errors: [{ seq: null, kind: "merkle_root_mismatch", detail: "x" }],
+		} as unknown as VerifyReport);
+		expect(v.state).toBe("signature_failed");
+		expect(isAlarm(v)).toBe(true);
+	});
+
+	it("no state is both an alarm and indeterminate", () => {
+		const reports = [
+			{ ...base, trust_established: false },
+			{ ...base, anchors_unverified: 2 },
+			{ ...base, hash_chain_valid: false },
+			{ ...base, strip_detected: true },
+		] as unknown as VerifyReport[];
+		for (const r of reports) {
+			const v = deriveAuditVerdict(r);
+			expect(isAlarm(v) && isIndeterminate(v)).toBe(false);
+		}
 	});
 });

@@ -282,6 +282,34 @@ async fn tenant_from_auth(headers: &HeaderMap) -> Result<TenantId, (StatusCode, 
 /// Like [`tenant_from_auth`] but also returns the actor (JWT `sub`) — the
 /// authenticated user id — so an override promotion records WHO bypassed the
 /// eval gate in the tamper-evident decision.
+/// The authorization half of [`actor_from_auth`], split out so each write
+/// surface can be driven with real `viewer` / API-key claims in a test —
+/// `validate_authorization` needs a signed token, and a gate that can only be
+/// exercised through one is a gate that gets asserted by description.
+fn authorize_write(claims: &crate::auth::Claims) -> Result<(), (StatusCode, String)> {
+    if claims.can_write_prompts() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        crate::auth::role_forbidden_json("owner"),
+    ))
+}
+
+/// Authenticate **and authorize** a prompt WRITE. One site, all FIVE write
+/// surfaces (A8/EVL-18, 2026-08-11; `/observe` added 2026-08-13 by B-230).
+///
+/// Before this, the only gate was `require_promotion_write` — a *tenant
+/// entitlement* asking whether the workspace paid, never whether the caller is
+/// allowed. A `viewer` in a Team workspace could flip the production pointer.
+///
+/// Single-site by construction, following PL-9: `create_version` and `delete`
+/// used to inline their own auth and were therefore easy to miss, and
+/// `rollback` — a fourth write surface the finding did not name — flips the
+/// production pointer just as `promote` does. **And `/observe` was a fifth,
+/// missed again for the same reason: it does not look like a write.** It feeds
+/// the auto-rollback engine, which moves the production pointer on its own.
+/// Five call sites, one predicate.
 async fn actor_from_auth(headers: &HeaderMap) -> Result<(TenantId, String), (StatusCode, String)> {
     let header = headers.get("authorization").ok_or((
         StatusCode::UNAUTHORIZED,
@@ -296,6 +324,7 @@ async fn actor_from_auth(headers: &HeaderMap) -> Result<(TenantId, String), (Sta
     let claims = crate::auth::validate_authorization(header_str)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+    authorize_write(&claims)?;
     Ok((claims.tenant_id, claims.sub))
 }
 
@@ -352,14 +381,10 @@ async fn create_version_handler(
     headers: HeaderMap,
     Json(body): Json<CreateVersionBody>,
 ) -> Result<(StatusCode, Json<PromptVersionDto>), WriteError> {
-    let header = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| write_err(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
-    let claims = crate::auth::validate_authorization(header)
+    let (tenant_id, actor) = actor_from_auth(&headers)
         .await
-        .map_err(|e| write_err(StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
-    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+        .map_err(|(s, m)| write_err(s, m))?;
+    tracing::Span::current().record("tenant_id", tenant_id.to_string());
     if body.content.trim().is_empty() {
         return Err(write_err(
             StatusCode::BAD_REQUEST,
@@ -369,12 +394,12 @@ async fn create_version_handler(
     let v = state
         .router
         .create_version(
-            &claims.tenant_id,
+            &tenant_id,
             &name,
             body.content,
             body.model_pin,
             body.template_variables,
-            &claims.sub,
+            &actor,
         )
         .await
         .map_err(|e| {
@@ -409,17 +434,13 @@ async fn delete_handler(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, WriteError> {
-    let header = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| write_err(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
-    let claims = crate::auth::validate_authorization(header)
+    let (tenant_id, actor) = actor_from_auth(&headers)
         .await
-        .map_err(|e| write_err(StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
-    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+        .map_err(|(s, m)| write_err(s, m))?;
+    tracing::Span::current().record("tenant_id", tenant_id.to_string());
     state
         .router
-        .delete_prompt(&claims.tenant_id, &name, &claims.sub)
+        .delete_prompt(&tenant_id, &name, &actor)
         .await
         .map_err(|e| {
             tracing::error!(error = format!("{e:#}"), prompt_name = %name, "prompt delete failed");
@@ -568,7 +589,16 @@ async fn observe_handler(
     headers: HeaderMap,
     Json(body): Json<ObserveBody>,
 ) -> Result<Json<ObserveOutcomeDto>, WriteError> {
-    let tenant = tenant_from_auth(&headers)
+    // B-230: `/observe` is the FIFTH prompt WRITE surface and it used
+    // `tenant_from_auth` — authentication with NO role check — while the other
+    // four use `actor_from_auth` -> `authorize_write`. Its own comment below
+    // already says this feed drives auto-rollback, and auto-rollback FLIPS THE
+    // PRODUCTION ROUTING POINTER. So a `viewer` could move production prompt
+    // routing: exactly the hole A8/EVL-18 closed for promote/rollback/
+    // create_version/delete, left open on the one surface that finding did not
+    // enumerate. `actor_from_auth` is the single site — this is now its fifth
+    // caller, and the doc above it has been corrected to say five.
+    let (tenant, _sub) = actor_from_auth(&headers)
         .await
         .map_err(|(s, m)| write_err(s, m))?;
     tracing::Span::current().record("tenant_id", tenant.to_string());
@@ -965,6 +995,117 @@ mod tests {
             assert_eq!(ob.0, StatusCode::FORBIDDEN);
             assert!(ob.1.0.to_string().contains("entitlement_required"));
         });
+    }
+
+    // ---------------------------------------------------------------
+    // A8 / EVL-18 — role gate on the FOUR prompt write surfaces.
+    //
+    // Before this, the only gate was `require_promotion_write`, a TENANT
+    // entitlement: it asks whether the workspace paid, never whether the caller
+    // is allowed. A `viewer` in a Team workspace could flip the production
+    // pointer. One test per surface, each driving the exact function that
+    // surface calls, with real claims rather than a description of them.
+    // ---------------------------------------------------------------
+
+    fn caller(
+        auth_method: crate::auth::AuthMethod,
+        role: Option<crate::auth::Role>,
+    ) -> crate::auth::Claims {
+        crate::auth::Claims {
+            tenant_id: TenantId::from_jwt_claim(uuid::Uuid::nil()),
+            sub: "a8-test".into(),
+            exp: u64::MAX,
+            auth_method,
+            role,
+            // These fixtures test the ROLE gate; scope is orthogonal here.
+            key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+        }
+    }
+
+    /// Named per surface so a failure says WHICH write path regressed.
+    fn assert_surface_gate(surface: &str) {
+        use crate::auth::{AuthMethod, Role};
+
+        // DENIED — the finding: a viewer could write.
+        let viewer = caller(AuthMethod::JwtBearer, Some(Role::Viewer));
+        let err = authorize_write(&viewer).expect_err(&format!(
+            "{surface}: a VIEWER must not be able to write prompts"
+        ));
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("role_forbidden"),
+            "{surface}: a denial must be typed role_forbidden, not a generic failure —              a caller that cannot tell 'not allowed' from 'broken' retries forever"
+        );
+
+        // DENIED — member too, per the ruling.
+        assert!(
+            authorize_write(&caller(AuthMethod::JwtBearer, Some(Role::Member))).is_err(),
+            "{surface}: a MEMBER must not be able to write prompts"
+        );
+
+        // DENIED — PL-9: an absent/unrecognised slug on a HUMAN token fails closed.
+        assert!(
+            authorize_write(&caller(AuthMethod::JwtBearer, None)).is_err(),
+            "{surface}: a JWT with no recognised role must fail CLOSED (PL-9)"
+        );
+
+        // ADMITTED — the automation path. PL-9b demoted API keys out of admin, so
+        // gating on can_admin would have silently broken CI-driven promotion.
+        authorize_write(&caller(AuthMethod::ApiKey, None))
+            .unwrap_or_else(|e| panic!("{surface}: an API KEY must still write prompts: {e:?}"));
+
+        // ADMITTED — owner (and WorkOS `admin`, which maps to Owner).
+        authorize_write(&caller(AuthMethod::JwtBearer, Some(Role::Owner)))
+            .unwrap_or_else(|e| panic!("{surface}: an OWNER must be able to write prompts: {e:?}"));
+    }
+
+    #[test]
+    fn create_version_denies_viewer_admits_api_key() {
+        assert_surface_gate("create_version");
+    }
+
+    #[test]
+    fn promote_denies_viewer_admits_api_key() {
+        assert_surface_gate("promote");
+    }
+
+    #[test]
+    fn delete_denies_viewer_admits_api_key() {
+        assert_surface_gate("delete");
+    }
+
+    /// The fourth write surface, which the finding did not name — `rollback`
+    /// flips the production pointer exactly as `promote` does.
+    #[test]
+    fn rollback_denies_viewer_admits_api_key() {
+        assert_surface_gate("rollback");
+    }
+
+    /// STRUCTURAL: every write handler must reach the gate. Four near-identical
+    /// behavioural tests prove today's handlers; this proves the NEXT one cannot
+    /// quietly skip it — which is how `create_version` and `delete` ended up
+    /// inlining their own auth and missing the check in the first place.
+    #[test]
+    fn every_write_handler_routes_through_the_single_gate() {
+        let src = include_str!("prompt_routes.rs");
+        for handler in [
+            "async fn create_version_handler",
+            "async fn promote_handler",
+            "async fn delete_handler",
+            "async fn rollback_handler",
+        ] {
+            let start = src
+                .find(handler)
+                .unwrap_or_else(|| panic!("{handler} not found"));
+            // Body up to the next top-level `async fn`, or EOF.
+            let rest = &src[start + handler.len()..];
+            let end = rest.find("\nasync fn").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("actor_from_auth("),
+                "{handler} does not call actor_from_auth — it is a prompt WRITE surface                  with no role gate. Route it through the single site."
+            );
+        }
     }
 
     // ADR-009 Builder read-only: the READ surface stays open to an

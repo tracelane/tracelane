@@ -54,17 +54,17 @@ After:
 import tracelane
 
 tracelane.init(
-    endpoint="http://localhost:4318",   # an OTLP receiver you run
-    api_key="tlane_...",
+    endpoint="https://gateway.tracelane.dev",  # or an OTLP receiver you run
+    api_key="tlane_...",                       # needs the `ingest` scope
 )
 tracelane.auto_instrument()  # best-effort: anthropic, openai, litellm, claude_code
 ```
 
 `auto_instrument()` covers those four libraries when installed; for anything
 else, call its explicit `instrument_*` function after you construct the object
-(see the [Python SDK](/sdk-python)). For Tracelane Cloud — which does not expose
-a public OTLP endpoint — point your client at the gateway instead (see the
-[Quickstart](/quickstart)).
+(see the [Python SDK](/sdk-python)). On Tracelane Cloud the OTLP endpoint is the
+gateway itself and the key needs the `ingest` scope; self-hosting, it is the
+receiver you run.
 
 Remove `DD_API_KEY`, `DD_LLMOBS_ENABLED`, `DD_LLMOBS_ML_APP` from your environment.
 
@@ -112,7 +112,7 @@ Datadog dashboards use proprietary widgets. Tracelane provides:
 - **SLO dashboard** — error rate, latency, token spend per model/provider. The
   availability target is the product default (99.9 %); a per-tenant SLO target is
   not configurable yet
-- **Eval suite** — 69 pain-point + 10 fault-tolerance evals, run in CI (no in-app scoreboard yet)
+- **Eval suite** — 68 pain-point + 10 fault-tolerance evals, run in CI (no in-app scoreboard yet)
 - **Audit ledger** — in-app ledger view and NDJSON export (`/audit`)
 
 If you have custom Datadog monitors, the closest equivalent is an **alert rule**:

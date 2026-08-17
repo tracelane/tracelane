@@ -8,7 +8,7 @@ const CARDS = ["a", "b", "c", "d"];
 
 export default function Loading() {
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<Skeleton className="h-7 w-48" />
 			<div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
 				{CARDS.map((id) => (
@@ -16,6 +16,6 @@ export default function Loading() {
 				))}
 			</div>
 			<Skeleton className="mt-4 h-64 w-full rounded-xl" />
-		</main>
+		</div>
 	);
 }

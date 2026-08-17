@@ -38,11 +38,13 @@ use uuid::Uuid;
 /// relative error at 95% confidence (per hyperloglogplus crate docs).
 pub const HLL_PRECISION: u8 = 14;
 
-/// Per-tier max unique attribute keys per workspace per rolling 30-day
-/// window. V1 launch uses the Team default (10 000) for all workspaces
-/// because ingest does not yet resolve tiers; V1.1 wires
-/// `for_workspace(&Entitlements)` to the real ladder per ADR-030.
-pub const DEFAULT_MAX_ATTR_CARDINALITY: usize = 10_000;
+/// Per-tier max unique attribute keys per workspace per rolling 30-day window.
+///
+/// MOVED to `tracelane_shared::otlp::limits` for GWY-41 — `IngestLimits::default()`
+/// needs it and `IngestLimits` moved to `shared`. It is a *limit*, so the limits
+/// module is its right home; re-exported here so this module's call sites and the
+/// ADR-030 docs that name `cardinality::DEFAULT_MAX_ATTR_CARDINALITY` still resolve.
+pub use tracelane_shared::otlp::limits::DEFAULT_MAX_ATTR_CARDINALITY;
 
 /// Counter for `tracelane_attr_overflow_total{workspace_id_bucket}`.
 /// One AtomicU64 per of the 64 bucket ids (the same buckets ADR-029

@@ -1,0 +1,139 @@
+---
+import "../styles/global.css";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+
+export interface Props {
+  title?: string;
+  description?: string;
+  canonical?: string;
+  ogImage?: string;
+}
+
+const {
+  title = "tracelane — the flight recorder for AI agents",
+  description = "Open-source gateway for AI agents. Trace every run, replay the exact failure, and prove what happened with a tamper-evident ledger. Self-host or start free.",
+  canonical = Astro.url.pathname,
+  ogImage = "/og-default.png",
+} = Astro.props;
+
+const siteUrl = "https://tracelane.dev";
+const fullCanonical = new URL(canonical, siteUrl).toString();
+const fullOgImage = new URL(ogImage, siteUrl).toString();
+
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://tracelane.dev/#org",
+      name: "Tracelane",
+      url: "https://tracelane.dev",
+      logo: "https://tracelane.dev/og-default.png",
+      sameAs: [
+        "https://github.com/tracelane",
+        "https://x.com/xsanjeevlabs",
+        "https://www.linkedin.com/in/sanjeevlabs",
+        "https://newsletter.aitechhive.com",
+      ],
+    },
+    {
+      "@type": "SoftwareApplication",
+      name: "Tracelane",
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Linux, macOS, Windows",
+      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      softwareVersion: "1.0.0",
+      license: "https://www.apache.org/licenses/LICENSE-2.0",
+      url: "https://tracelane.dev",
+    },
+  ],
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="generator" content={Astro.generator} />
+
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={fullCanonical} />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={fullCanonical} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={fullOgImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content="Tracelane" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@xsanjeevlabs" />
+    <meta name="twitter:creator" content="@xsanjeevlabs" />
+    <meta name="twitter:url" content={fullCanonical} />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={fullOgImage} />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2" />
+
+    <link
+      rel="preload"
+      href="/fonts/inter-tight-var-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin="anonymous"
+    />
+    <link
+      rel="preload"
+      href="/fonts/inter-var-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin="anonymous"
+    />
+
+    <script type="application/ld+json" is:inline set:html={JSON.stringify(jsonLd)} />
+  </head>
+  <body>
+    <div class="scroll-progress" id="scroll-progress"></div>
+    <a href="#main" class="skip-link">skip to content</a>
+    <Header />
+    <main id="main">
+      <slot />
+    </main>
+    <Footer />
+
+    <script is:inline>
+      // top scroll-progress bar
+      (function () {
+        var bar = document.getElementById("scroll-progress");
+        if (!bar) return;
+        var ticking = false;
+        function update() {
+          var h = document.documentElement;
+          var max = h.scrollHeight - h.clientHeight;
+          var p = max > 0 ? h.scrollTop / max : 0;
+          bar.style.transform = "scaleX(" + p + ")";
+          ticking = false;
+        }
+        update();
+        window.addEventListener(
+          "scroll",
+          function () {
+            if (!ticking) {
+              ticking = true;
+              requestAnimationFrame(update);
+            }
+          },
+          { passive: true }
+        );
+        window.addEventListener("resize", update, { passive: true });
+      })();
+    </script>
+  </body>
+</html>

@@ -34,7 +34,7 @@ export default async function ProvidersPage() {
 				Looking for your own encryption keys (CMK)?{" "}
 				<a
 					href="/settings/byok"
-					className="font-medium text-accent-ink hover:underline"
+					className="font-medium text-action-ink hover:underline"
 				>
 					Encryption Keys →
 				</a>

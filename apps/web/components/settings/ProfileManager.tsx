@@ -1,14 +1,20 @@
 "use client";
 
 /**
- * ProfileManager — display-name edit + danger zone (IDENTITY_TEAM_SPEC §5).
+ * ProfileManager — display-name edit + email change + danger zone
+ * (IDENTITY_TEAM_SPEC §5).
  *
- * Name → PATCH /api/settings/account (WorkOS + mirror). Email is read-only.
+ * Name → PATCH /api/settings/account (WorkOS + mirror).
+ * Email → EmailChangeForm → POST /settings/account/email (SET-26). The address
+ * field below the name stays read-only on purpose: it is the *current* address,
+ * shown for reference, and changing it is a three-confirmation action with its
+ * own section rather than an inline edit.
  * Danger zone: delete account (type-email confirm) and, for owners, delete the
  * whole organization (type-org-name confirm, 30-day soft-delete). Both are
  * server-gated; the confirms are the launch compensating control for no re-auth.
  */
 
+import { EmailChangeForm } from "@/components/settings/EmailChangeForm";
 import { useMutation } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -88,7 +94,7 @@ export function ProfileManager({
 					value={name}
 					onChange={(e) => setName(e.target.value)}
 					placeholder="Your name"
-					className="w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 				/>
 				<label
 					htmlFor="profile-email"
@@ -100,14 +106,17 @@ export function ProfileManager({
 					id="profile-email"
 					value={email}
 					readOnly
-					className="w-full rounded-lg bg-surface border border-line px-3 py-2 text-sm text-ink-2 font-mono cursor-not-allowed"
+					className="w-full rounded-sm bg-surface border border-line px-3 py-2 text-sm text-ink-2 font-mono cursor-not-allowed"
 				/>
+				<p className="text-xs text-ink-3">
+					Change it below — the name field here saves on its own.
+				</p>
 				<div className="flex items-center gap-3 pt-1">
 					<button
 						type="button"
 						disabled={!name.trim() || name === initialName || save.isPending}
 						onClick={() => save.mutate(name.trim())}
-						className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-accent-on hover:bg-accent/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+						className="rounded-lg bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{save.isPending ? "Saving…" : "Save"}
 					</button>
@@ -119,6 +128,9 @@ export function ProfileManager({
 					)}
 				</div>
 			</section>
+
+			{/* Email change (SET-26) — its own section, three confirmations. */}
+			<EmailChangeForm email={email} />
 
 			{/* Danger zone */}
 			<section className="space-y-4 rounded-lg border border-danger/40 p-4">
@@ -135,7 +147,7 @@ export function ProfileManager({
 						value={confirmEmail}
 						onChange={(e) => setConfirmEmail(e.target.value)}
 						placeholder={email}
-						className="w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 					/>
 					<button
 						type="button"
@@ -159,15 +171,16 @@ export function ProfileManager({
 					<div className="space-y-2 border-t border-line pt-4">
 						<p className="text-xs text-ink-2">
 							Delete the entire organization (30-day soft-delete, then
-							permanent). Revokes all API keys and dashboard access immediately.
-							Type the organization name to confirm.
+							permanent). Dashboard access ends immediately; API keys are
+							revoked and stop working within 60 seconds. Type the organization
+							name to confirm.
 						</p>
 						<input
 							aria-label="confirm org name"
 							value={confirmOrg}
 							onChange={(e) => setConfirmOrg(e.target.value)}
 							placeholder="organization name"
-							className="w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 						/>
 						<button
 							type="button"

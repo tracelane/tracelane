@@ -67,12 +67,14 @@ const PLANS = [
 		"0.00",
 		false,
 		false,
+		false, // f_audit_addon (see enterprise_v1 for why it sits here)
 		false,
 		true,
 		true,
 		false,
 		false,
 		false,
+
 	],
 	[
 		"builder_v1",
@@ -85,12 +87,14 @@ const PLANS = [
 		"1.20",
 		false,
 		false,
+		false, // f_audit_addon (see enterprise_v1 for why it sits here)
 		false,
 		true,
 		true,
 		false,
 		false,
 		false,
+
 	],
 	[
 		"team_v1",
@@ -105,12 +109,14 @@ const PLANS = [
 		true, // f_prompt_promotion_write
 		// ADR-064 amended (founder 2026-07-14): ALL 9 rails at Team+ — gr2 + gr4
 		// moved down from Business so Team gets the full guardrail suite.
+		false, // f_audit_addon (see enterprise_v1 for why it sits here)
 		true, // gr2  (R2 secrets/PII)
 		true, // gr3_pinning
 		true, // gr4  (R4 lethal-trifecta)
 		true, // gr5
 		true, // gr6
 		true, // gr7
+
 	],
 	[
 		"business_v1",
@@ -123,12 +129,14 @@ const PLANS = [
 		"1.20",
 		true,
 		true,
+		false, // f_audit_addon (see enterprise_v1 for why it sits here)
 		true,
 		true,
 		true,
 		true,
 		true,
 		true,
+
 	],
 	[
 		"enterprise_v1",
@@ -141,12 +149,16 @@ const PLANS = [
 		"1.00",
 		true,
 		true,
+		true, // f_audit_addon — ENTERPRISE ONLY (founder ruling 2026-08-14). The six
+		// guardrail flags MUST remain the LAST SIX elements: the drift guard at
+		// components/guardrails/rail-tier-drift.test.ts:124 reads `p.slice(-6)`.
 		true,
 		true,
 		true,
 		true,
 		true,
 		true,
+
 	],
 ];
 
@@ -161,6 +173,7 @@ for (const [
 	ov,
 	fc,
 	ppw,
+	aa,
 	gr2,
 	gr3p,
 	gr4,
@@ -174,10 +187,11 @@ for (const [
 			trace_quota_monthly, gateway_quota_monthly,
 			overage_hard_cap_multiplier, overage_price_per_10k_usd, f_full_capture,
 			f_prompt_promotion_write,
+			f_audit_addon,
 			f_guardrail_r2, f_guardrail_r3_pinning, f_guardrail_r4,
 			f_guardrail_r5, f_guardrail_r6, f_guardrail_r7
 		) values (${key}, ${si}, ${sm}, ${rd}, ${tq}, ${gq}, ${cap}, ${ov}, ${fc}, ${ppw},
-			${gr2}, ${gr3p}, ${gr4}, ${gr5}, ${gr6}, ${gr7})
+			${aa}, ${gr2}, ${gr3p}, ${gr4}, ${gr5}, ${gr6}, ${gr7})
 		on conflict (plan_lookup_key) do update set
 			seat_cap_included = excluded.seat_cap_included,
 			seat_cap_max = excluded.seat_cap_max,
@@ -194,6 +208,7 @@ for (const [
 			f_guardrail_r5 = excluded.f_guardrail_r5,
 			f_guardrail_r6 = excluded.f_guardrail_r6,
 			f_guardrail_r7 = excluded.f_guardrail_r7,
+			f_audit_addon = excluded.f_audit_addon,
 			updated_at = now()`;
 }
 

@@ -29,8 +29,8 @@ const GROUPS = [
 ] as const;
 
 /**
- * Removable chip for an active text filter. Chip bg = accent-soft (per the
- * design-system "chip bg" token role); text = ink (never accent-ink — Lava is
+ * Removable chip for an active text filter. Chip bg = action-soft (per the
+ * design-system "chip bg" token role); text = ink (never action-ink — Lava is
  * CTA-only, not a selected-state color).
  */
 function FilterChip({
@@ -41,7 +41,7 @@ function FilterChip({
 	onRemove: () => void;
 }) {
 	return (
-		<span className="inline-flex items-center gap-1 rounded-md border border-accent-line bg-accent-soft px-2 py-0.5 text-[11px] font-semibold text-ink">
+		<span className="inline-flex items-center gap-1 rounded-md border border-action-line bg-action-soft px-2 py-0.5 text-[11px] font-semibold text-ink">
 			{label}
 			<button
 				type="button"
@@ -64,7 +64,7 @@ function FilterChip({
  * the same control row (was a separate server-rendered div in page.tsx) and
  * drives the /v1/traces/groups endpoint instead of the list.
  *
- * Active text filters render as removable chips (accent-soft bg + accent-line
+ * Active text filters render as removable chips (accent-soft bg + action-line
  * border) to match the §4 chip grammar; inputs appear when the filter is clear.
  * Segment controls (status, range, group) show their active option inline.
  */
@@ -121,7 +121,7 @@ export function FilterBar() {
 
 	/**
 	 * Segment control — a pill-group where one option is active. Active option
-	 * gets accent-soft bg with ink text (NOT accent-ink text — Lava is CTA only,
+	 * gets action-soft bg with ink text (NOT action-ink text — Lava is CTA only,
 	 * not a selected-state color).
 	 */
 	const segment = (

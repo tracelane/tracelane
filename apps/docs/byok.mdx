@@ -90,12 +90,12 @@ not stored-then-encrypted.
 
 ## Rotate & revoke
 
-Registering, listing, and removing CMK **fingerprints** is available today via
-the dashboard (**Settings → BYOK Keys**) and the API. Zero-downtime key
-rotation with background re-encryption of existing ciphertext, and automatic
-revocation once every ciphertext has been re-wrapped, are on the roadmap —
-there is no automated rewrap job in V1. Provider-key ciphertext is sealed under
-the deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
+Registering, listing, rotating, and removing CMK **fingerprints** is available
+today via the dashboard (**Settings → BYOK Keys**) and the API. Rotation is a
+registry operation only: it records the replacement fingerprint and marks the
+previous one `rotating`. No ciphertext is re-encrypted and no key is
+automatically revoked — provider-key ciphertext stays sealed under the
+deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
 
 ## Audit trail
 

@@ -6,13 +6,42 @@
 //! anonymized `federation_signals` row and batch-insert them.
 //!
 //! ## Privacy (this is the whole point — reviewed under `.claude/rules/security.md`)
-//! - `tenant_id_hash = SHA256(tenant_id)` is ONE-WAY. The raw `tenant_id` is
-//!   never written; reverse lookup is architecturally impossible.
+//! - `tenant_id_hash = SHA256(tenant_id)` is a **pseudonym, not an anonymiser**.
+//!   The raw `tenant_id` is never written.
 //! - Rows carry NO content: `aft_class` is a bounded AFT taxonomy id, and
 //!   `anonymized_hash` is a SHA256 of the already-PII-redacted span *name* shape,
 //!   never the payload.
 //! - There is NO cross-tenant read surface here (V1 = substrate only). The V2
 //!   surface may expose ONLY a k-anonymized aggregate (ADR-056).
+//!
+//! ### What the hash does and does not buy (corrected 2026-08-11, PLT-03/A7)
+//!
+//! This block previously said reverse lookup was "architecturally impossible".
+//! **That was an overclaim and is retracted.** The hash is *unkeyed*, so its
+//! strength is a property of the INPUT, not of the design:
+//!
+//! - **Preimage:** infeasible only because `tenant_id` is a v4 UUID (~122 bits).
+//!   Verified against live production 2026-08-11 — every distinct `tenant_id` in
+//!   `tracelane.spans` is a v4 UUID. Note the column is a ClickHouse `String`,
+//!   so nothing *structurally* enforces that; a future low-entropy tenant id
+//!   (a slug, a sequence) would make this table trivially reversible with no
+//!   code change here and no test failing.
+//! - **Confirmation:** anyone already holding a candidate `tenant_id` can
+//!   recompute the hash and confirm that tenant's presence and signal volume.
+//!   An unkeyed digest cannot prevent this; only a keyed one (HMAC under a
+//!   server-held secret) can. That is ADR-056 **M1**, deliberately deferred:
+//!   there is no reader of this table anywhere in the tree (V1 is write-only),
+//!   so keying today buys nothing and orphans every existing row.
+//! - **`anonymized_hash` is reversible by dictionary and that is fine.** Span
+//!   names are low-entropy (`gen_ai.chat`); a few hundred guesses recover them.
+//!   They are shape, not content or payload — but do not read the field name as
+//!   a claim of irreversibility.
+//!
+//! **Key it in the same change that ships the V2 read surface, not before** —
+//! and when you do, re-read `scripts/ops/tenant-purge.sh:193`, which EXCLUDES
+//! `federation_signals` from tenant erasure on the strength of this hash not
+//! being reversible to a live tenant. That exclusion and this paragraph are one
+//! decision; changing the hash without revisiting it changes the erasure story.
 //!
 //! ## Fail-open (span durability comes first)
 //! A federation-write error is logged and swallowed — it NEVER fails or delays
@@ -58,21 +87,14 @@ fn hour_bucket_secs(start_time_micros: i64) -> u32 {
     u32::try_from(hour).unwrap_or(u32::MAX)
 }
 
-/// Is `s` a well-formed AFT failure-signature id? The predictive layer only ever
-/// emits `&'static` `AFT-…` constants (e.g. `AFT-TOOL-DRIFT-001`,
-/// `AFT-MCP-RUGPULL-001`), so a valid id is: `AFT-` prefixed, 5..=64 chars, ASCII
-/// uppercase / digit / `-` only. This bounds the cross-tenant `aft_class` to the
-/// taxonomy SHAPE (ADR-056 H1) so attacker-supplied free text — PII, storage
-/// bombs, lowercase sentences — is rejected, WITHOUT a brittle enumerated
-/// allowlist that could silently drop a newly-added class (a green-while-broken
-/// trap). Also enforced at the ingest boundary (`otlp_decode.rs`) for defence in
-/// depth so a poisoned value never enters `SpanAttributes` at all.
-pub(crate) fn is_valid_aft_id(s: &str) -> bool {
-    (5..=64).contains(&s.len())
-        && s.starts_with("AFT-")
-        && s.bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-}
+/// The AFT id shape check MOVED to `tracelane_shared::aft` for GWY-41.
+///
+/// It is enforced at two boundaries — the OTLP decode path (so a poisoned value
+/// never enters `SpanAttributes`) and `row_from` below (so it never enters the
+/// cross-tenant table) — and the decoder moved to `shared`. Re-exported rather
+/// than copied: a duplicated validator is how one side quietly gets laxer than
+/// the other. Rationale and shape rule live at the definition (ADR-056 H1).
+pub(crate) use tracelane_shared::aft::is_valid_aft_id;
 
 /// Build a federation row from one span's fields (read by the caller from the
 /// `SpanRow` batch it already holds — no extra query). Returns `None` when the

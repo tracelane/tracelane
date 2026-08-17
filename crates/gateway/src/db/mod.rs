@@ -21,6 +21,7 @@ pub mod api_keys;
 pub mod audit_chain_state;
 pub mod observed_tools;
 pub mod provider_keys;
+pub mod quota_notifications;
 pub mod tenants;
 pub mod tool_capabilities;
 pub mod webhook_events;
@@ -216,6 +217,13 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         .await
         .map_err(|e: PoolError| anyhow::anyhow!("pool: {e}"))?;
     // Applied in order. Keep in sync with `apps/web/db/migrations/meta/_journal.json`.
+    // EVERY file in `apps/web/db/migrations/`, in lexical order — the definition of
+    // a fresh database. Pinned against the directory by
+    // `scripts/ci/check-migration-list-complete.py`, because this list DRIFTED:
+    // it read 0000-0006 then jumped to 0011, silently skipping 0007 (which adds
+    // `tenants.archived_at`) through 0010. Any integration test using this helper
+    // therefore died on `column "archived_at" does not exist` — one of three
+    // independent reasons the only test covering `api_keys::create` had never run.
     const MIGRATIONS: &[&str] = &[
         include_str!("../../../../apps/web/db/migrations/0000_initial_baseline.sql"),
         include_str!("../../../../apps/web/db/migrations/0001_reconcile_gateway_tables.sql"),
@@ -226,10 +234,32 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
             "../../../../apps/web/db/migrations/0005_adr009_seed_and_audit_addon_backfill.sql"
         ),
         include_str!("../../../../apps/web/db/migrations/0006_b084_users_name_guardrails.sql"),
-        // 0011 adds api_keys.minted_by (IDENTITY_TEAM_SPEC §3), which the
-        // `create`/`mint` INSERT now writes. Independent ALTER — safe to apply
-        // list; the ignored PG integration test needs the column to exist.
+        include_str!("../../../../apps/web/db/migrations/0007_b063_archived_at.sql"),
+        include_str!("../../../../apps/web/db/migrations/0008_api_keys_key_hash_partial.sql"),
+        include_str!("../../../../apps/web/db/migrations/0009_support_requests.sql"),
+        include_str!("../../../../apps/web/db/migrations/0010_a5_tenants_plan_default_free.sql"),
         include_str!("../../../../apps/web/db/migrations/0011_identity_api_keys_minted_by.sql"),
+        include_str!("../../../../apps/web/db/migrations/0012_alerts.sql"),
+        include_str!("../../../../apps/web/db/migrations/0013_alerts_builder_plus.sql"),
+        include_str!("../../../../apps/web/db/migrations/0014_rekor_v2_anchor_key.sql"),
+        include_str!("../../../../apps/web/db/migrations/0015_audit_selfverify.sql"),
+        include_str!("../../../../apps/web/db/migrations/0016_tool_capabilities.sql"),
+        include_str!("../../../../apps/web/db/migrations/0017_overhead_p99_alert_metric.sql"),
+        include_str!(
+            "../../../../apps/web/db/migrations/0018_audit_chain_state_retain_beyond_tenant.sql"
+        ),
+        include_str!("../../../../apps/web/db/migrations/0019_api_keys_revoke_notify.sql"),
+        include_str!("../../../../apps/web/db/migrations/0020_audit_appended_dedup.sql"),
+        include_str!("../../../../apps/web/db/migrations/0021_entitlements_notify_triggers.sql"),
+        include_str!("../../../../apps/web/db/migrations/0022_observed_tools.sql"),
+        include_str!("../../../../apps/web/db/migrations/0023_quota_notifications.sql"),
+        include_str!(
+            "../../../../apps/web/db/migrations/0024_a13_scoped_keys_and_b188_residue.sql"
+        ),
+        include_str!("../../../../apps/web/db/migrations/0025_obs18_trace_annotations.sql"),
+        include_str!("../../../../apps/web/db/migrations/0026_dsh01_notifications.sql"),
+        include_str!("../../../../apps/web/db/migrations/0027_gwy27_model_aliases.sql"),
+        include_str!("../../../../apps/web/db/migrations/0028_gwy41_ingest_scope_comment.sql"),
     ];
     for migration in MIGRATIONS {
         client

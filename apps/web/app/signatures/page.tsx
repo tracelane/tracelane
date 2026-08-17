@@ -15,7 +15,9 @@
  * so nothing implies we detect what we don't.
  *
  * Honesty locks:
- *   - NO cross-tenant / network column — that signal is V1.1.
+ *   - NO cross-tenant / network column, and no promise of one. The federation
+ *     substrate writes one-way-hashed rows only and has NO cross-tenant read
+ *     surface (crates/ingest/src/federation.rs:16) — never render one here.
  *   - NO "failures prevented" stat — detection is live; enforcement is opt-in and
  *     not yet real (AFT-1 observe-first, ADR-055). We never claim prevention.
  *   - Stats are "Signatures matched" + "Traces affected" (the gateway's DISTINCT
@@ -32,7 +34,14 @@
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { LIVE_SIGNATURE_IDS, aftFor } from "@/lib/aft-taxonomy";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
-import { Badge, Card, EmptyState, Skeleton, StatCard } from "@tracelanedev/ui";
+import {
+	Badge,
+	Card,
+	EmptyState,
+	Skeleton,
+	StatCard,
+	StatGrid,
+} from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -46,11 +55,11 @@ const WINDOW_DAYS = 30;
 /** Header row for the live-signatures table (8 cols). */
 function HeadRow() {
 	const th =
-		"px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
+		"px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
 	const thR = `${th} text-right`;
 	return (
 		<tr>
-			<th className="w-8 py-2 pl-4" aria-label="Expand" />
+			<th className="w-8 py-1.5 pl-3" aria-label="Expand" />
 			<th className={th}>Signature</th>
 			<th className={th}>AFT-1</th>
 			<th className={th}>Severity</th>
@@ -65,7 +74,7 @@ function HeadRow() {
 /** Header row for the roadmap table (5 cols — no first/last seen, no expand). */
 function RoadmapHeadRow() {
 	const th =
-		"px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
+		"px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
 	const thR = `${th} text-right`;
 	return (
 		<tr>
@@ -89,13 +98,13 @@ function RoadmapRow({ sig }: { sig: SignatureHit }) {
 	const tracesHref = `/traces?signature_id=${encodeURIComponent(sig.signature_id)}&range=30d`;
 	return (
 		<tr className="align-top">
-			<td className="px-4 py-3">
+			<td className="px-3 py-2">
 				<div className="font-medium text-ink-2">
 					{t?.name ?? sig.signature_id}
 				</div>
 				<div className="font-mono text-xs text-ink-3">{sig.signature_id}</div>
 			</td>
-			<td className="px-4 py-3">
+			<td className="px-3 py-2">
 				<Badge
 					tone="neutral"
 					className="font-mono"
@@ -108,16 +117,16 @@ function RoadmapRow({ sig }: { sig: SignatureHit }) {
 					{sig.signature_id}
 				</Badge>
 			</td>
-			<td className="max-w-xs px-4 py-3 text-sm text-ink-3">
+			<td className="max-w-xs px-3 py-2 text-sm text-ink-3">
 				{t?.detection ?? "—"}
 			</td>
-			<td className="px-4 py-3 text-right tabular-nums text-sm text-ink-3">
+			<td className="px-3 py-2 text-right tabular-nums text-sm text-ink-3">
 				{sig.your_hits.toLocaleString()}
 			</td>
-			<td className="px-4 py-3 text-right">
+			<td className="px-3 py-2 text-right">
 				<Link
 					href={tracesHref}
-					className="font-medium tabular-nums text-sm text-accent-ink hover:underline"
+					className="font-medium tabular-nums text-sm text-action-ink hover:underline"
 				>
 					{sig.traces_affected.toLocaleString()}
 					<span aria-hidden> →</span>
@@ -132,16 +141,16 @@ const SKELETON_ROW_KEYS = ["sk-a", "sk-b", "sk-c", "sk-d", "sk-e"] as const;
 
 function SignaturesSkeleton() {
 	return (
-		<div className="space-y-5">
-			<div className="grid grid-cols-2 gap-4 sm:max-w-md items-stretch">
+		<div className="space-y-3">
+			<StatGrid cols={2} className="sm:max-w-md">
 				{(["mc-a", "mc-b"] as const).map((k) => (
-					<Card key={k} className="p-4">
+					<Card key={k} className="p-3">
 						<Skeleton className="mb-2 h-3 w-24" />
 						<Skeleton className="h-7 w-16" />
 					</Card>
 				))}
-			</div>
-			<div className="overflow-x-auto rounded-xl border border-line bg-surface">
+			</StatGrid>
+			<div className="overflow-x-auto rounded-lg border border-line bg-surface">
 				<table className="w-full text-sm">
 					<thead className="border-b border-line">
 						<HeadRow />
@@ -149,29 +158,29 @@ function SignaturesSkeleton() {
 					<tbody className="divide-y divide-line">
 						{SKELETON_ROW_KEYS.map((k) => (
 							<tr key={k}>
-								<td className="py-2 pl-4">
+								<td className="py-2 pl-3">
 									<Skeleton className="h-4 w-4" />
 								</td>
-								<td className="py-2 pr-4">
+								<td className="py-2 pr-3">
 									<Skeleton className="mb-1 h-4 w-40" />
 									<Skeleton className="h-3 w-28" />
 								</td>
-								<td className="px-4 py-2">
+								<td className="px-3 py-2">
 									<Skeleton className="h-5 w-28" />
 								</td>
-								<td className="px-4 py-2">
+								<td className="px-3 py-2">
 									<Skeleton className="h-5 w-14" />
 								</td>
-								<td className="px-4 py-2 text-right">
+								<td className="px-3 py-2 text-right">
 									<Skeleton className="ml-auto h-4 w-8" />
 								</td>
-								<td className="px-4 py-2 text-right">
+								<td className="px-3 py-2 text-right">
 									<Skeleton className="ml-auto h-4 w-8" />
 								</td>
-								<td className="px-4 py-2">
+								<td className="px-3 py-2">
 									<Skeleton className="h-3 w-20" />
 								</td>
-								<td className="px-4 py-2">
+								<td className="px-3 py-2">
 									<Skeleton className="h-3 w-16" />
 								</td>
 							</tr>
@@ -229,26 +238,25 @@ async function SignaturesData() {
 	const matched = live.length;
 
 	return (
-		<div className="space-y-5">
+		<div className="space-y-3">
 			{/* 2 stat tiles — detection volume, never a prevention claim. Traces
 			    affected is the gateway's DISTINCT count (never a sum). NO "From
-			    network" tile (cross-tenant signal is V1.1). */}
-			<div className="grid grid-cols-2 gap-4 sm:max-w-md items-stretch">
+			    network" tile — there is no cross-tenant read surface to source it
+			    from, and none is promised. */}
+			<StatGrid cols={2} className="sm:max-w-md">
 				<StatCard
 					icon="failure-signatures"
 					label="Signatures matched · 30d"
 					value={matched.toLocaleString()}
 					hint="Live-detected AFT-1 failure patterns matched in the last 30 days. V1.1 roadmap entries are listed separately below."
-					className="h-full flex flex-col"
 				/>
 				<StatCard
 					icon="traffic"
 					label="Traces affected · 30d"
 					value={tracesAffected.toLocaleString()}
 					hint="Distinct traces with at least one live failure signature — never a sum of per-signature counts."
-					className="h-full flex flex-col"
 				/>
-			</div>
+			</StatGrid>
 
 			{/* LIVE TABLE — only signatures with a shipped reference detector. */}
 			{matched === 0 ? (
@@ -257,7 +265,7 @@ async function SignaturesData() {
 					description="When a request matches a known AFT-1 failure pattern (e.g. a tool-schema violation), it shows up here with your occurrence count, affected traces, and its AFT-1 id."
 				/>
 			) : (
-				<div className="overflow-x-auto rounded-xl border border-line bg-surface">
+				<div className="overflow-x-auto rounded-lg border border-line bg-surface">
 					<table className="w-full text-sm">
 						<thead className="border-b border-line">
 							<HeadRow />
@@ -287,7 +295,7 @@ async function SignaturesData() {
 							ships in V1.1 — not detected live yet.
 						</p>
 					</div>
-					<div className="overflow-x-auto rounded-xl border border-dashed border-line bg-surface">
+					<div className="overflow-x-auto rounded-lg border border-dashed border-line bg-surface">
 						<table className="w-full text-sm">
 							<thead className="border-b border-line">
 								<RoadmapHeadRow />
@@ -311,7 +319,7 @@ export const dynamic = "force-dynamic";
 export default function SignaturesPage() {
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6">
+			<div className="mb-4">
 				<h1 className="t-h1">Failure Signatures</h1>
 				<p className="mt-1 max-w-2xl text-sm text-ink-2">
 					Live-detected failures matched against the AFT-1 taxonomy — canonical

@@ -157,6 +157,12 @@ export const planEntitlements = pgTable("plan_entitlements", {
 		.notNull()
 		.default(false),
 	fCohortBaselines: boolean("f_cohort_baselines").notNull().default(false),
+	// NOT A SHIPPED ENTITLEMENT. There is no HIPAA BAA and no GCP deployment —
+	// nothing in this repo ever sets this flag TRUE: `seed.mjs` does not seed
+	// `hipaa_gcp_addon_v1`, and the Polar webhook explicitly refuses to auto-wire
+	// the grant (`app/api/webhooks/polar/route.ts` handleAddOnChange). The column
+	// exists in Neon, so it stays here for Drizzle parity; removing it is a
+	// hand-written migration, not an edit to this file.
 	fHipaaGcpAddon: boolean("f_hipaa_gcp_addon").notNull().default(false),
 	fAuditAddon: boolean("f_audit_addon").notNull().default(false),
 	// ADR-048 D2: full-capture gate. Business + Enterprise base = TRUE; others
@@ -384,9 +390,36 @@ export const apiKeys = pgTable(
 			.notNull(),
 		lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
 		revokedAt: timestamp("revoked_at", { withTimezone: true }),
+		// ── A13 / SET-20: scoped, time-bounded, budget-capped keys ──────────
+		// Applied to Neon by migration 0024 (un-journaled) BEFORE the gateway
+		// that reads them deploys — the ordering rule in apps/web/CLAUDE.md.
+		//
+		// ALL THREE ARE NULLABLE, and NULL preserves today's behaviour, so the
+		// existing keys keep working unchanged. That is a BACKWARDS-COMPATIBILITY
+		// choice for existing rows, NOT a safe default for new ones: the mint
+		// route requires an explicit scope. Do not read the column's permissive
+		// NULL as the policy.
+		//
+		//   scope              NULL = full API surface (legacy) · never `{}`
+		//   expiresAt          NULL = never expires (legacy)
+		//   budgetUsdMonthly   NULL = uncapped
+		//
+		// `{}` is rejected at the DB by `api_keys_scope_not_empty_chk` (falsified
+		// against prod 2026-08-12) because an empty array is ambiguous between
+		// "no permissions" and "all permissions"; NULL is the one unscoped form.
+		scope: text("scope").array(),
+		expiresAt: timestamp("expires_at", { withTimezone: true }),
+		budgetUsdMonthly: numeric("budget_usd_monthly", {
+			precision: 12,
+			scale: 4,
+		}),
 	},
 	(t) => [
 		index("api_keys_tenant_id_idx").on(t.tenantId),
+		// Only keys that actually expire are of interest to the expiry sweep.
+		index("api_keys_expires_at_idx")
+			.on(t.expiresAt)
+			.where(sql`${t.expiresAt} IS NOT NULL AND ${t.revokedAt} IS NULL`),
 		uniqueIndex("api_keys_lookup_hash_idx").on(t.lookupHash),
 		// NULL for keys minted by the current route. A plain unique index that
 		// treats NULLs as not-distinct rejects the 2nd NULL row → the "can't add a
@@ -675,3 +708,139 @@ export const observedTools = pgTable(
 );
 
 export type ObservedTool = typeof observedTools.$inferSelect;
+
+/**
+ * Persisted "we already told this tenant" marker for quota notifications
+ * (SET-08). Migration `0023_quota_notifications.sql`.
+ *
+ * The gateway's `QuotaTracker` is process-local and reseeds from ClickHouse on
+ * moves the counter and takes the answer with it. This table is that answer, and
+ * the primary key is the concurrency control: the claim is
+ * `INSERT … ON CONFLICT DO NOTHING`, so racing gateway replicas produce exactly
+ * one winner with no read-modify-write window.
+ *
+ * Written ONLY by the gateway. The dashboard does not read it today; it is here
+ * because `schema.ts` is canonical for control-plane Postgres (CLAUDE.md §1.5)
+ * and a table the gateway writes but Drizzle does not know about is exactly the
+ * drift that rule exists to prevent.
+ */
+export const quotaNotifications = pgTable(
+	"quota_notifications",
+	{
+		tenantId: uuid("tenant_id").notNull(),
+		/** Billing period as `YYYYMM` (UTC) — the gateway's `current_year_month()`. */
+		period: text("period").notNull(),
+		/** `soft_cap` | `hard_cap`. Text, not a PG enum — see the migration header. */
+		kind: text("kind").notNull(),
+		notifiedAt: timestamp("notified_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.period, t.kind] }),
+		index("quota_notifications_period_idx").on(t.period),
+	],
+);
+
+export type QuotaNotification = typeof quotaNotifications.$inferSelect;
+
+// ── OBS-18: trace annotations ────────────────────────────────────────────────
+
+/**
+ * A human's judgement about one trace: a label, and optionally a note.
+ *
+ * **The cheapest possible ground truth.** Every later eval and failure-signature
+ * feature needs a human verdict to learn from, and today nothing records one.
+ *
+ * **Why Postgres and not ClickHouse.** Annotations are low-volume, mutable
+ * (edited, removed) and read one-trace-at-a-time — the exact opposite of the
+ * append-only analytical rows ClickHouse holds. Putting them in ClickHouse would
+ * mean a ReplacingMergeTree tombstone dance for what is a single UPDATE here
+ * (see the soft-delete/re-create trap). The gateway already owns a Postgres pool.
+ *
+ * **One annotation per (tenant, trace, span, author)** — the primary key is the
+ * concurrency control, so a double-click is `ON CONFLICT DO UPDATE`, not two
+ * rows. `span_id` is `''` (not NULL) for a trace-level flag, because NULL is not
+ * comparable in a primary key and would silently permit duplicates.
+ */
+export const traceAnnotations = pgTable(
+	"trace_annotations",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		traceId: text("trace_id").notNull(),
+		/** `''` = the whole trace. Never NULL — see the table doc. */
+		spanId: text("span_id").notNull().default(""),
+		/** `good` | `bad` | `needs_review`. Text, validated in the gateway. */
+		label: text("label").notNull(),
+		note: text("note").notNull().default(""),
+		/** The `sub` claim of whoever flagged it. */
+		authorSub: text("author_sub").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({
+			columns: [t.tenantId, t.traceId, t.spanId, t.authorSub],
+		}),
+		// Drives the trace-list "Flagged" filter: which of THIS tenant's traces
+		// carry any annotation. Tenant-first so the index is usable by that
+		// predicate alone.
+		index("trace_annotations_tenant_trace_idx").on(t.tenantId, t.traceId),
+	],
+);
+
+export type TraceAnnotation = typeof traceAnnotations.$inferSelect;
+
+// ── DSH-01: in-app notifications ─────────────────────────────────────────────
+
+/**
+ * The tenant's inbox — what happened while nobody was looking.
+ *
+ * **Why it exists.** Alerting today can only leave the building (webhook), so a
+ * signal either interrupts someone or is lost. There is nowhere in the product
+ * that answers "what happened while I was away".
+ *
+ * **Read state is TENANT-WIDE, not per-user**, and the UI says so. Per-user read
+ * state needs a per-user join that buys little at this scale, and the spec's
+ * explicit instruction was "tenant-wide read state, and say so in the UI"
+ * rather than a silent half-implementation of per-user.
+ *
+ * **`link` is a RELATIVE in-app path** (`/slo`, `/billing`), never an absolute
+ * URL: a stored absolute URL is an open-redirect waiting to be rendered as an
+ * anchor, and this row is written by producers, not by a user.
+ */
+export const notifications = pgTable(
+	"notifications",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		/** `quota` | `alert` | `promotion`. Text, validated in the gateway. */
+		kind: text("kind").notNull(),
+		title: text("title").notNull(),
+		body: text("body").notNull().default(""),
+		/** `info` | `warning` | `critical`. */
+		severity: text("severity").notNull().default("info"),
+		/** Relative in-app path, e.g. `/slo`. Empty = not linkable. */
+		link: text("link").notNull().default(""),
+		/** NULL = unread. Tenant-wide, per the table doc. */
+		readAt: timestamp("read_at", { withTimezone: true }),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		// Drives both the unread badge and the panel: newest-first within a
+		// tenant, with unread cheaply countable.
+		index("notifications_tenant_created_idx").on(t.tenantId, t.createdAt),
+	],
+);
+
+export type Notification = typeof notifications.$inferSelect;

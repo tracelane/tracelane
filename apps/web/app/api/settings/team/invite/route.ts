@@ -146,6 +146,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	if (entitlements.seat_cap_max > 0) {
 		const used = members.length + pendingInvites.length;
 		if (used >= entitlements.seat_cap_max) {
+			// ADR-020 amendment, condition B (founder, 2026-08-12): once there are
+			// customers, measure whether ANY tenant hits the seat cap before its
+			// trace cap. If one does, the CAPS are wrong, not the model — the
+			// response is to raise 25/50, never to sell seat overage.
+			//
+			// This marker is what makes that a measurement rather than a note: the
+			// trigger is "the first time this fires in prod", and with zero users it
+			// cannot fire yet, so a date-based review would just expire unread. The
+			// string is stable and greppable on purpose.
+			// (The decision reference stays in this comment, not in the string:
+			// `no-internal-refs-in-ui.py` blocks ADR-###/§#/B-### inside any
+			// user-facing or API-visible text, and it is right to — the marker has
+			// to carry the MEANING, not our filing system.)
+			console.warn(
+				`[SEAT-CAP-MEASURE] seat cap reached plan=${entitlements.plan} cap=${entitlements.seat_cap_max} used=${used} — record whether this tenant hit its TRACE cap first; if not, the cap is set wrong`,
+			);
 			return NextResponse.json(
 				{
 					error: "seat_limit_reached",

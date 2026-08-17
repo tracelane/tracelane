@@ -51,13 +51,32 @@ impl KillSwitch {
     /// the 30s refresh task against `POSTHOG_HOST` (default `https://app.posthog.com`).
     /// Otherwise returns a [`KillSwitch::disabled`] that always serves defaults.
     pub fn from_env() -> Self {
-        let ks = Self::disabled();
+        // GWY-40. Until now the ONLY flag source was PostHog, so a deployment
+        // without a PostHog account — which is every deployment today, and prod
+        // — logged "all flags serve safe defaults" and every switch was
+        // permanently OFF. The switches were documented as an operational
+        // control and could not be operated: the STUB class, confirmed on the
+        // running container's own log before this was written.
+        //
+        // ONE env var carrying EXACT flag keys, not a var per flag. A per-flag
+        // name (`TRACELANE_KILLSWITCH_KILL_UPSTREAM_ANTHROPIC`) needs a mangling
+        // rule between `_` and `.` that is ambiguous in both directions — and a
+        // kill switch that fires on the wrong key, or silently fails to fire
+        // because the name round-tripped wrong, is worse than no switch. The
+        // keys here are the same strings `flag()` looks up, so there is nothing
+        // to translate and nothing to drift.
+        let ks = Self::from_flag_list(
+            std::env::var("TRACELANE_KILLSWITCH_FLAGS")
+                .unwrap_or_default()
+                .as_str(),
+        );
         match std::env::var("POSTHOG_PROJECT_API_KEY") {
             Ok(key) if !key.is_empty() => {
                 let host = std::env::var("POSTHOG_HOST")
                     .unwrap_or_else(|_| "https://app.posthog.com".to_string());
                 tracing::info!(%host, "kill-switch: PostHog flag refresh enabled (30s)");
-                ks.spawn_refresh(key, host);
+                // Detached by design: the gateway does not join this task.
+                let _refresh = ks.spawn_refresh(key, host);
             }
             _ => {
                 tracing::info!(
@@ -66,6 +85,38 @@ impl KillSwitch {
             }
         }
         ks
+    }
+
+    /// Build a snapshot from `TRACELANE_KILLSWITCH_FLAGS` — a comma-separated
+    /// list of flag keys to force ON.
+    ///
+    /// Every listed key is set to `true`; anything absent keeps its call-site
+    /// default. **Listing is the only thing this can do**: it cannot force a
+    /// flag OFF, because `false` is already every flag's fail-safe default and a
+    /// syntax for "off" would only create a way to spell the safe state wrongly.
+    ///
+    /// Unknown keys are kept, not rejected: `flag()` is a plain map lookup, so a
+    /// typo simply never matches a call site. Rejecting would mean this function
+    /// owning a list of every valid key — a second registry to drift.
+    pub fn from_flag_list(raw: &str) -> Self {
+        let flags: HashMap<String, bool> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(|k| (k.to_string(), true))
+            .collect();
+        if !flags.is_empty() {
+            // A state TRANSITION at startup, not a per-request line: this is
+            // exactly what INFO is for (.claude/rules/logging.md). Operators
+            // must be able to see which switches a process booted with — a kill
+            // switch nobody can confirm is armed is not a control.
+            let mut keys: Vec<&str> = flags.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            tracing::info!(flags = %keys.join(","), "kill-switch: flags forced ON via TRACELANE_KILLSWITCH_FLAGS");
+        }
+        Self {
+            flags: Arc::new(ArcSwap::from_pointee(flags)),
+        }
     }
 
     /// Seed a snapshot directly (tests / explicit configuration).
@@ -103,7 +154,15 @@ impl KillSwitch {
 
     /// Spawn the background refresh task. On any error it keeps the last good
     /// snapshot (or the empty default snapshot) — never clears to an unsafe state.
-    fn spawn_refresh(&self, api_key: String, host: String) {
+    ///
+    /// defect: deleting the `refresh_target` call below — the SSRF gate's only
+    /// invocation — compiled clean and turned NO test red, because a detached
+    /// `tokio::spawn` with no observable result cannot be asserted on. The gate's
+    /// LOGIC was falsification-proven; its INVOCATION was covered by review only, and
+    /// review is not a guard. With the handle returned, a test can observe the one
+    /// externally visible consequence of the gate firing: on a refused host the task
+    /// ENDS instead of entering the refresh loop.
+    fn spawn_refresh(&self, api_key: String, host: String) -> tokio::task::JoinHandle<()> {
         let flags = self.flags.clone();
         tokio::spawn(async move {
             // `POSTHOG_HOST` is operator-supplied, and `ssrf_guard`'s module
@@ -128,7 +187,7 @@ impl KillSwitch {
                 }
                 tokio::time::sleep(REFRESH_INTERVAL).await;
             }
-        });
+        })
     }
 }
 
@@ -204,6 +263,73 @@ async fn fetch_flags(
 
 #[cfg(test)]
 mod tests {
+    // ── GWY-40: the env flag source ──────────────────────────────────────────
+
+    /// The point of the whole change: a listed key must reach the CALL-SITE
+    /// predicates, not merely land in a map. Before GWY-40 these could not be
+    /// turned on at all without a PostHog account.
+    #[test]
+    fn a_listed_flag_reaches_the_call_site_predicates() {
+        let ks = KillSwitch::from_flag_list("kill.upstream.anthropic,kill.predictive.foo");
+        assert!(
+            ks.upstream_killed("anthropic"),
+            "the switch must actually fire"
+        );
+        assert!(ks.predictive_killed("foo"));
+        // And a neighbour must NOT be caught by it.
+        assert!(
+            !ks.upstream_killed("openai"),
+            "only the listed provider is killed"
+        );
+        assert!(!ks.predictive_killed("bar"));
+    }
+
+    /// Empty / absent env keeps every flag at its fail-safe default. This is the
+    /// state every deployment is in today, and it must stay harmless.
+    #[test]
+    fn empty_flag_list_leaves_every_switch_off() {
+        for raw in ["", "   ", ",", " , , "] {
+            let ks = KillSwitch::from_flag_list(raw);
+            assert!(!ks.upstream_killed("anthropic"), "{raw:?} must arm nothing");
+            assert!(!ks.predictive_killed("x"));
+            assert!(!ks.flag("kill.audit.async", false));
+        }
+    }
+
+    /// Whitespace around keys is tolerated — an operator editing a compose file
+    /// will write `a, b`, and a switch that silently fails on a space is the
+    /// same defect as no switch.
+    #[test]
+    fn whitespace_between_keys_is_tolerated() {
+        let ks = KillSwitch::from_flag_list("  kill.upstream.anthropic ,  kill.audit.async  ");
+        assert!(ks.upstream_killed("anthropic"));
+        assert!(ks.flag("kill.audit.async", false));
+    }
+
+    /// An unknown key is kept rather than rejected: `flag()` is a map lookup, so
+    /// a typo simply never matches a call site. Rejecting would mean this
+    /// function owning a list of every valid key — a second registry to drift.
+    #[test]
+    fn an_unknown_key_is_inert_not_an_error() {
+        let ks = KillSwitch::from_flag_list("kill.upstream.anthropic,kil.typo.here");
+        assert!(ks.upstream_killed("anthropic"), "the valid key still works");
+        assert!(!ks.upstream_killed("typo"));
+    }
+
+    /// The list can only force ON. There is deliberately no syntax for OFF,
+    /// because OFF is already every flag's default and a spelling for it would
+    /// only create a way to get the safe state wrong.
+    #[test]
+    fn the_list_cannot_force_a_flag_off() {
+        let ks = KillSwitch::from_flag_list("kill.upstream.anthropic");
+        // `default` still governs anything unlisted, in both directions.
+        assert!(
+            ks.flag("something.unlisted", true),
+            "unlisted keeps its default"
+        );
+        assert!(!ks.flag("other.unlisted", false));
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------
@@ -223,6 +349,46 @@ mod tests {
         assert_eq!(
             decide_url("https://eu.i.posthog.com/"),
             "https://eu.i.posthog.com/decide/?v=3"
+        );
+    }
+
+    /// below. Its INVOCATION was not: `spawn_refresh` fired a detached task with
+    /// no observable result, so deleting the `refresh_target` call — the only
+    /// thing standing between an operator-supplied `POSTHOG_HOST` and an
+    /// indefinite SSRF beacon — compiled clean and turned nothing red.
+    ///
+    /// The externally visible consequence of the gate firing is that the task
+    /// ENDS rather than entering the forever-loop. Now that the handle is
+    /// returned, that is assertable.
+    #[tokio::test]
+    async fn a_refused_host_ends_the_refresh_task_instead_of_looping() {
+        let ks = KillSwitch::disabled();
+        // Cloud metadata — refused by the SSRF gate before any request is made,
+        // so this test performs no network I/O.
+        let handle = ks.spawn_refresh("k".into(), "http://169.254.169.254".into());
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            ended.is_ok(),
+            "the refresh task must END when the host is refused. If it is still \
+             running, the SSRF gate is not being CALLED — which compiles clean \
+             and every logic test still passes"
+        );
+        assert!(
+            ended.is_ok_and(|r| r.is_ok()),
+            "the task must end cleanly, not panic"
+        );
+    }
+
+    /// The other direction, so the test above cannot pass by the task always
+    /// ending. A permitted host must produce a target — i.e. the gate admits as
+    /// well as refuses. IP literal, so no DNS and no network request.
+    #[tokio::test]
+    async fn a_permitted_host_yields_a_refresh_target() {
+        assert!(
+            refresh_target("https://1.1.1.1").await.is_some(),
+            "a public address must be ADMITTED — a gate that refuses everything \
+             would make the assertion above pass while PostHog never works"
         );
     }
 

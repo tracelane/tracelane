@@ -40,10 +40,18 @@ bytes = { version = "1.10" }
 # Tracing / observability
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.27" }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-semantic-conventions = { version = "0.27" }
+# REMOVED 2026-08-09: opentelemetry, opentelemetry-otlp, opentelemetry_sdk and
+# opentelemetry-semantic-conventions were declared here and consumed by NO member —
+# zero `workspace = true` references across every crate. The only OTel crate actually
+# used is `opentelemetry-proto`, pinned directly in crates/ingest/Cargo.toml as a pure
+# protobuf decoder.
+#
+# WHY cargo-machete DID NOT CATCH IT, since that is the obvious question: machete
+# inspects each crate's own `[dependencies]` for entries its source never uses.
+# `[workspace.dependencies]` is a CATALOGUE, not a dependency of anything — a member
+# opts in with `workspace = true`. An entry no member references is declared nowhere
+# machete inspects, so it is invisible to it by construction, not by oversight.
+# `cargo machete` reports "no unused dependencies" on this tree both before and after.
 
 # Error handling
 anyhow = { version = "1.0" }

@@ -1,10 +1,24 @@
 <!-- tracelane:classification: PUBLIC -->
 # `@tracelanedev/mcp` — Tracelane MCP Server
 
-[![npm](https://img.shields.io/npm/v/@tracelanedev/mcp?style=flat-square)](https://www.npmjs.com/package/@tracelanedev/mcp)
+[![npm](https://img.shields.io/badge/npm-not%20published%20yet-lightgrey?style=flat-square)](#quick-start)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](../../LICENSE)
 
 Read-only MCP server exposing Tracelane trace data to any MCP-compatible client — Claude Desktop, Claude Code, Cursor, or any agent using the Model Context Protocol.
+
+> **Not on npm yet — `npx @tracelanedev/mcp` still 404s, including in the config
+> blocks below.** The package is wired into the release workflow and becomes
+> installable when the next signed release tag carries it. Releases are bundled —
+> one tag covering everything that has moved, never a tag cut for a single package
+> ([VERSIONING.md, "Release cadence"](../../VERSIONING.md#release-cadence--one-tag-everything-that-moved))
+> — so treat every `npx` line here as the *post-publish* form and use the
+> [from-source](#self-hosting) path today. The same run submits `apps/mcp/server.json`
+> to the MCP registry; the name it will be listed under is
+> `io.github.tracelane/tracelane-mcp`.
+>
+> **It reads ClickHouse directly**, not through the gateway, so it needs ClickHouse
+> credentials and runs against a self-hosted or local Tracelane stack — not against a
+> hosted Cloud workspace.
 
 ## Quick start
 
@@ -20,7 +34,10 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
       "args": ["@tracelanedev/mcp"],
       "env": {
         "TRACELANE_API_KEY": "tlane_YOUR_KEY",
-        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev",
+        "CLICKHOUSE_URL": "http://localhost:8123",
+        "CLICKHOUSE_USER": "default",
+        "CLICKHOUSE_PASSWORD": "…"
       }
     }
   }
@@ -29,34 +46,23 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ### Claude Code
 
-```json
-// .mcp.json (project root)
-{
-  "mcpServers": {
-    "tracelane": {
-      "command": "npx",
-      "args": ["@tracelanedev/mcp"],
-      "env": {
-        "TRACELANE_API_KEY": "tlane_YOUR_KEY",
-        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
-      }
-    }
-  }
-}
-```
+The same block in `.mcp.json` at the project root.
 
-Or via Streamable HTTP (not yet available — stdio is the supported transport):
+### Until it is on npm
+
+Swap the two launch keys for a path into your clone — every `env` key is unchanged:
 
 ```json
-{
-  "mcpServers": {
-    "tracelane": {
-      "url": "https://mcp.tracelane.dev",
-      "transport": "http"
-    }
-  }
-}
+"command": "node",
+"args": ["/path/to/tracelane/apps/mcp/dist/index.js"]
 ```
+
+Build it first with `pnpm install && pnpm --filter @tracelanedev/mcp build`.
+
+The Streamable HTTP transport ships in this package (`TRACELANE_MCP_TRANSPORT=http`,
+see [Transports](#transports)) — run it yourself. There is **no hosted endpoint**:
+`https://mcp.tracelane.dev` does not resolve, so a `url`-style client entry has
+nothing to connect to.
 
 ## Tools
 
@@ -67,9 +73,9 @@ Or via Streamable HTTP (not yet available — stdio is the supported transport):
 | `get_span` | Get full details for a span including all LLM GenAI attributes. Params: `span_id` |
 | `search_traces` | Full-text search across trace root names and metadata. Params: `query`, `limit` |
 | `explain_guardrail_block` | Human-readable explanation of why a request was blocked or warned. Params: `span_id` |
-| `list_evals` | List all pain-point evals and their last-run status. Params: none |
-| `get_eval_result` | Get the latest result for a specific eval. Params: `eval_id` |
-| `replay_trace` | Re-run a trace against a different model or prompt version. Params: `trace_id`, `model?`, `prompt_version_id?` |
+| `list_evals` | List every pain-point + fault-tolerance eval id and count, read from the manifest bundled at build time from `evals/`. Params: none |
+| `get_eval_result` | Read a specific eval's assertions. Needs a repo checkout for the source; says so when there is none. Params: `eval_id` |
+| `replay_trace` | Return a recorded trace as-is (ordered spans with LLM/tool attributes) for offline step-through. **Read-only — it does not re-execute any model or tool.** Params: `trace_id`, `include_tool_calls?` |
 
 ## Example usage in Claude
 
@@ -79,7 +85,7 @@ Once connected, you can ask Claude:
 
 > "Compare the latency of traces using claude-haiku-4-5 vs claude-sonnet-4-6 in the last hour."
 
-> "Run the PP-G1 eval and tell me if it regressed."
+> "Show me the assertions PP-G1 makes."
 
 ## Auth
 
@@ -89,31 +95,33 @@ Once connected, you can ask Claude:
 
 ## Transports
 
-| Transport | When to use |
-|---|---|
-| **Stdio** | Local use — Claude Desktop, Claude Code, Cursor. Zero network exposure. |
-| **Streamable HTTP** | Not yet available. stdio is the supported transport today. |
+| Transport | How to select it | When to use |
+|---|---|---|
+| **Stdio** | default | Local use — Claude Desktop, Claude Code, Cursor. Zero network exposure. |
+| **Streamable HTTP** | `TRACELANE_MCP_TRANSPORT=http TRACELANE_MCP_PORT=8081` | Self-run remote deployments. Every request must carry `Authorization: Bearer <jwt-or-tlane-key>`; the tenant is resolved per request through the gateway. No hosted endpoint is operated for you. |
 
 ## Security invariants
 
-- **Read-only.** No write tools. The official `@modelcontextprotocol/sdk` enforces this at the transport layer.
+- **Read-only.** No write tools are registered — the tool surface is the eight listed above, all of which only read.
 - **Tenant isolation.** Every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound, never string-interpolated).
-- **`tenant_id` is never a tool parameter.** It comes from the API key lookup or JWT claim.
-- **No provider keys in tool responses.** The redaction layer strips `Authorization`, `x-api-key`, and bearer tokens before any span attribute surfaces through MCP.
-- **Prompt-injection defence.** User-supplied span content is returned wrapped in `<UNTRUSTED_USER_DATA>` sentinels.
+- **`tenant_id` is never a tool parameter.** Stdio resolves it once at startup from `TRACELANE_API_KEY` via the gateway and refuses to start if the key is rejected; HTTP resolves it per request from the bearer token and binds it through `AsyncLocalStorage`.
+- **No eval id reaches the filesystem.** `get_eval_result` looks the id up in the bundled manifest and uses the manifest's path, so a traversal string cannot name a file.
+- **`TRACELANE_GATEWAY_URL` is SSRF-checked** before any bearer is sent to it: https-only outside development, tracelane.dev hosts only, private/CGNAT/IMDS ranges refused.
+
+**Known gap — span content is returned verbatim.** There is no redaction pass over
+span attributes and no untrusted-content sentinel around user text. Do not point this
+server at a workspace whose spans may carry secrets you would not hand to the
+connected model.
 
 ## Self-hosting
 
 ```bash
-# From source
+# From source, against your own stack
 pnpm dev:mcp
-
-# Docker
-docker run -e TRACELANE_API_KEY=tlane_... \
-           -e CLICKHOUSE_URL=http://ch.internal:8123 \
-           -p 3001:3001 \
-           ghcr.io/tracelane/mcp:latest
 ```
+
+No container image is published for the MCP server — `ghcr.io/tracelane/mcp` does not
+exist. Run it from source or from the npm package once it ships.
 
 ## Stack
 

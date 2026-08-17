@@ -52,19 +52,19 @@ export function TraceGroupTable({
 			<table className="w-full text-sm">
 				<thead className="bg-surface-2">
 					<tr>
-						<th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							{label}
 						</th>
-						<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Traces
 						</th>
-						<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Error rate
 						</th>
-						<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							Avg
 						</th>
-						<th className="px-4 py-2 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 							p95
 						</th>
 					</tr>
@@ -79,7 +79,7 @@ export function TraceGroupTable({
 								key={g.group_key}
 								className="transition-colors hover:bg-surface-2"
 							>
-								<td className="px-4 py-2.5 font-mono text-xs">
+								<td className="px-3 py-2 font-mono text-xs">
 									{href ? (
 										<Link
 											href={href}
@@ -91,20 +91,20 @@ export function TraceGroupTable({
 										g.group_key || "—"
 									)}
 								</td>
-								<td className="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{g.trace_count.toLocaleString()}
 								</td>
-								<td className="px-4 py-2.5 text-right">
+								<td className="px-3 py-2 text-right">
 									<span
 										className={`font-mono text-xs tabular-nums ${errPct > 5 ? "text-danger-ink" : errPct > 1 ? "text-warn-ink" : "text-ok-ink"}`}
 									>
 										{errPct.toFixed(1)}%
 									</span>
 								</td>
-								<td className="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDuration(g.avg_duration_us)}
 								</td>
-								<td className="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDuration(g.p95_duration_us)}
 								</td>
 							</tr>

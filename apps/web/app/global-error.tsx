@@ -63,31 +63,27 @@ export default function GlobalError({
 							}}
 						>
 							<svg
-								viewBox="0 0 76 76"
+								viewBox="0 0 100 100"
 								width={24}
 								height={24}
 								fill="none"
 								role="img"
 								aria-label="Tracelane"
 							>
+								<path d="M 2,2 L 96,2 L 84,14 L 2,14 Z" fill="#fafafa" />
 								<path
-									d="M30 14 L14 14 L14 62 L30 62 L30 56 L20 56 L20 20 L30 20 Z"
+									d="M 2,14 L 14,14 L 14,28 L 44,28 L 44,40 L 12,40 L 2,30 Z"
+									fill="#fafafa"
+								/>
+								<path d="M 32,40 L 44,40 L 44,86 L 32,98 Z" fill="#fafafa" />
+								<path
+									d="M 96,16 L 96,28 L 84,40 L 54,40 L 54,28 L 84,28 Z"
 									fill="#fafafa"
 								/>
 								<path
-									d="M46 14 L62 14 L62 62 L46 62 L46 56 L56 56 L56 20 L46 20 Z"
+									d="M 54,40 L 66,40 L 66,64 L 78,64 L 54,88 Z"
 									fill="#fafafa"
 								/>
-								<rect x="20" y="36.4" width="36" height="3.2" fill="#fafafa" />
-								<circle
-									cx="38"
-									cy="38"
-									r="9"
-									stroke="#fafafa"
-									strokeWidth="3.5"
-									fill="#09090b"
-								/>
-								<circle cx="38" cy="38" r="3.2" fill="#fafafa" />
 							</svg>
 							<span
 								style={{

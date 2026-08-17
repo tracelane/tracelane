@@ -49,28 +49,28 @@ Full promotion workflow — create, gate, promote, auto-rollback — on **Team $
 
 ## Create and version prompts
 
-```bash
-# tlane CLI
-tlane prompt create my-agent-system \
-  --content "You are a helpful assistant..." \
-  --model-pin claude-sonnet-4-6
-
-# Push a new version to staging
-tlane prompt push my-agent-system \
-  --file prompts/system.txt \
-  --env staging
-```
-
-Or via the API:
+Versions are authored through the API (or the **Prompts** page in the dashboard).
+A new version is created and lands in `staging`:
 
 ```bash
-curl -X POST https://gateway.tracelane.dev/v1/prompts/my-agent-system \
+curl -X POST https://gateway.tracelane.dev/v1/prompts/my-agent-system/versions \
   -H "Authorization: Bearer tlane_..." \
+  -H "Content-Type: application/json" \
   -d '{
     "content": "You are a helpful assistant...",
-    "model_pin": "claude-sonnet-4-6",
-    "env": "staging"
+    "model_pin": "claude-sonnet-4-6"
   }'
+```
+
+The `201` response carries the `prompt_version_id` and the content `sha256_hex` —
+the id you pass to promote and rollback.
+
+The `tlane` CLI covers the read and promotion side of the workflow:
+
+```bash
+tlane prompt list my-agent-system      # promotion + rollback history
+tlane prompt show my-agent-system      # active version per environment
+tlane prompt diff my-agent-system --from-env staging --to-env production
 ```
 
 ## Eval gates

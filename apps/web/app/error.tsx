@@ -55,7 +55,7 @@ export default function RouteError({
 					<button
 						type="button"
 						onClick={reset}
-						className="cta-lava px-4 py-2 rounded-lg text-sm font-medium"
+						className="bg-surface-inverse text-ink-inverse hover:opacity-90 px-4 py-2 rounded-lg text-sm font-medium"
 					>
 						Try again
 					</button>

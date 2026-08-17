@@ -25,7 +25,7 @@ export default function OrganizationDeletedPage() {
 				</p>
 				<Link
 					href="/sign-out"
-					className="inline-block rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-on hover:bg-accent/90 transition-colors"
+					className="inline-block rounded-lg bg-action px-4 py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors"
 				>
 					Sign out
 				</Link>

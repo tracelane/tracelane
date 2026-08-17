@@ -24,6 +24,8 @@ import wrapt
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 
+from tracelane.session import CONVERSATION_ID_ATTRIBUTE, apply_session_to_kwargs
+
 from ._streaming import mark_streaming_call
 
 _tracer = trace.get_tracer("tracelane.anthropic", "0.1.0")
@@ -72,15 +74,23 @@ def instrument_anthropic(client: Any) -> None:
         model = kwargs.get("model", args[0] if args else "unknown")
         max_tokens = kwargs.get("max_tokens", 0)
 
+        # Session correlation: adds `x-conversation-id` to the outgoing request
+        # (the gateway path) and the matching span attribute (the OTLP path).
+        # No-op when no session is active.
+        session_id = apply_session_to_kwargs(kwargs)
+        attributes: dict[str, Any] = {
+            "gen_ai.provider.name": "anthropic",
+            "gen_ai.request.model": str(model),
+            "llm.model_name": str(model),
+            "gen_ai.request.max_tokens": int(max_tokens),
+        }
+        if session_id is not None:
+            attributes[CONVERSATION_ID_ATTRIBUTE] = session_id
+
         with _tracer.start_as_current_span(
             "anthropic.messages.create",
             kind=SpanKind.CLIENT,
-            attributes={
-                "gen_ai.provider.name": "anthropic",
-                "gen_ai.request.model": str(model),
-                "llm.model_name": str(model),
-                "gen_ai.request.max_tokens": int(max_tokens),
-            },
+            attributes=attributes,
         ) as span:
             try:
                 result = original_create(*args, **kwargs)

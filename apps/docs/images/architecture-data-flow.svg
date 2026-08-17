@@ -23,7 +23,7 @@
 
   <!-- ── GATEWAY ─────────────────────────────────────────────── -->
   <rect x="24" y="114" width="636" height="128" rx="8" fill="white" stroke="#93C5FD" stroke-width="2"/>
-  <text x="34" y="131" font-size="9" font-weight="700" letter-spacing="1" fill="#94A3B8" font-family="'Inter',system-ui,sans-serif">TRACELANE GATEWAY  ·  Rust · Axum · tokio  ·  ≥5 K RPS single instance</text>
+  <text x="34" y="131" font-size="9" font-weight="700" letter-spacing="1" fill="#94A3B8" font-family="'Inter',system-ui,sans-serif">TRACELANE GATEWAY  ·  Rust · Axum · tokio  ·  single instance</text>
 
   <!-- Predictive sub-box -->
   <rect x="34" y="138" width="298" height="92" rx="6" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>

@@ -66,7 +66,7 @@ export function SessionFilters() {
 						className={cn(
 							"rounded-md px-2.5 py-1 text-[12.5px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal",
 							status === o.v
-								? "bg-accent-soft text-ink"
+								? "bg-action-soft text-ink"
 								: "text-ink-2 hover:text-ink",
 						)}
 					>
@@ -79,7 +79,7 @@ export function SessionFilters() {
 				onChange={(e) => setModel(e.target.value)}
 				placeholder="model (exact)…"
 				aria-label="Filter sessions by model"
-				className="h-8 w-44 rounded-lg border border-line bg-surface px-2.5 text-[13px] text-ink outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+				className="h-8 w-44 rounded-sm border border-line bg-surface px-2.5 text-[13px] text-ink outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
 			/>
 		</div>
 	);

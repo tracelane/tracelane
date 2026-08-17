@@ -18,8 +18,13 @@ import {
 	TraceList,
 	type TraceSummary,
 } from "@/components/trace-viewer/TraceList";
-import { GatewayError, gatewayBaseUrl, gatewayGet } from "@/lib/gateway";
-import { EmptyState, Skeleton } from "@tracelanedev/ui";
+import {
+	GatewayError,
+	gatewayBaseUrl,
+	gatewayGet,
+	gatewayGetOrNull,
+} from "@/lib/gateway";
+import { EmptyState, LedgerSeqChip, Skeleton } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -27,6 +32,30 @@ import { Suspense } from "react";
 export const metadata: Metadata = { title: "Traces — Tracelane" };
 
 type SP = Record<string, string | undefined>;
+
+/**
+ * ADR-074 §7's ledger chip — ONE chip, at WORKSPACE scope, never per row.
+ *
+ * The scope is a correctness constraint, not a layout choice. The audit chain is
+ * per-tenant, so a per-TRACE "verified" claim is one the data does not support (§9;
+ * B-241/B-249 are what that costs). A RANGE says "this workspace's ledger runs
+ * 15700–15799", which is true, checkable, and the one thing no competitor's dashboard
+ * can show.
+ *
+ * Renders NOTHING when the range is absent — an empty ledger, an unentitled workspace,
+ * or an unreachable gateway. `/v1/audit/ledger-range` omits `from`/`to` for an empty
+ * ledger rather than sending 0–0, and 503s rather than reporting empty when it cannot
+ * read; both arrive here as "no chip", which is the honest render for all three.
+ */
+async function LedgerChip() {
+	const r = await gatewayGetOrNull<{
+		from?: number;
+		to?: number;
+		total: number;
+	}>("/v1/audit/ledger-range");
+	if (!r || r.from === undefined || r.to === undefined) return null;
+	return <LedgerSeqChip from={r.from} to={r.to} />;
+}
 
 /** Allowed page sizes (gateway clamps limit to 1..200). Default = 25. */
 const VALID_SIZES = [25, 50, 100, 200] as const;
@@ -355,7 +384,7 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 					action={
 						<Link
 							href="/traces?range=all"
-							className="text-[13px] font-medium text-accent-ink underline underline-offset-2 hover:text-ink"
+							className="text-[13px] font-medium text-action-ink underline underline-offset-2 hover:text-ink"
 						>
 							View all time →
 						</Link>
@@ -434,8 +463,13 @@ export default async function TracesPage({
 
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex items-center justify-between">
-				<h1 className="t-h1">Traces</h1>
+			<div className="mb-4 flex items-center justify-between">
+				<div className="flex items-baseline gap-3">
+					<h1 className="t-h1">Traces</h1>
+					<Suspense fallback={null}>
+						<LedgerChip />
+					</Suspense>
+				</div>
 				<div className="flex items-center gap-4">
 					<div className="flex items-center gap-2 text-xs">
 						<a
@@ -464,7 +498,7 @@ export default async function TracesPage({
 					<span>— traces where a cross-provider failover fired.</span>
 					<Link
 						href={pageHref(sp, { failover: undefined })}
-						className="ml-auto font-medium text-accent-ink hover:underline"
+						className="ml-auto font-medium text-action-ink hover:underline"
 					>
 						Clear ✕
 					</Link>
@@ -477,7 +511,7 @@ export default async function TracesPage({
 					<span>— traces within the period you drilled into.</span>
 					<Link
 						href={pageHref(sp, { since: undefined, until: undefined })}
-						className="ml-auto font-medium text-accent-ink hover:underline"
+						className="ml-auto font-medium text-action-ink hover:underline"
 					>
 						Clear ✕
 					</Link>

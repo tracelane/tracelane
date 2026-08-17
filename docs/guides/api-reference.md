@@ -41,7 +41,7 @@ chat path can return are:
 | `unroutable_model` | 400 | the `model` string matches no provider prefix. The map **fails closed** — there is no default provider. Body also echoes `model`. |
 | `audit_unavailable` | 503 | the tamper-evident append could not be published. Fail-closed by design: the audit product does not serve unrecorded requests. |
 | `quota_exceeded` | 429 | monthly trace quota × the plan's hard-cap multiplier exhausted. |
-| `upstream_circuit_open` | 503 | per-(provider, region) breaker open, or an operator kill-switch. Carries `Retry-After: 10`. |
+| `upstream_circuit_open` | 503 | per-(provider, region) breaker open. (An operator kill-switch can also open it; that lever is configured at service start, not at runtime, and is unset in production today.) Carries `Retry-After: 10`. |
 | `provider_key_rejected` | 401 | upstream rejected your BYOK key. |
 | `provider_rate_limited` | 429 | the **upstream** provider throttled you — not us. Carries `Retry-After: 60`. |
 | `model_not_found` | 404 | the upstream provider does not serve this model for your account. |

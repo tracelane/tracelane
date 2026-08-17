@@ -18,7 +18,7 @@ import { SessionFilters } from "@/components/sessions/SessionFilters";
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { rangeToHours } from "@/lib/range";
 import { type SessionSummary, fetchSessions } from "@/lib/sessions";
-import { Badge, Card, EmptyState, Skeleton } from "@tracelanedev/ui";
+import { Badge, Card, EmptyState, Skeleton, TimeRuler } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -79,6 +79,57 @@ function sortHref(sp: SP, col: SortCol): string {
 }
 
 /** A sortable column header — a link that flips the sort + shows the arrow. */
+/**
+ * ADR-074 §7 on /sessions — the same Timeline column the traces list carries, for the
+ * same reason: this table's x-axis is COLUMNS and its time axis is row order, so a
+ * header ruler would align to nothing. The rows get a real time dimension and the ruler
+ * lives in that column's own <th>.
+ *
+ * A session's START is derived: `last_activity - duration_us`. The gateway sends no
+ * first_activity, and deriving it is exact rather than approximate — duration_us IS the
+ * first-to-last span the "First → last" column already displays.
+ */
+function sessionWindow(
+	rows: SessionSummary[],
+): { startMs: number; endMs: number } | null {
+	let startMs = Number.POSITIVE_INFINITY;
+	let endMs = Number.NEGATIVE_INFINITY;
+	for (const s of rows) {
+		const end = parseDate(s.last_activity).getTime();
+		if (!Number.isFinite(end)) continue;
+		const start = end - Math.max(0, s.duration_us) / 1_000;
+		if (start < startMs) startMs = start;
+		if (end > endMs) endMs = end;
+	}
+	if (!Number.isFinite(startMs) || !(endMs > startMs)) return null;
+	return { startMs, endMs };
+}
+
+/** One session's bar — real start, real duration, inside the shared window. */
+function SessionBar({
+	s,
+	win,
+}: { s: SessionSummary; win: { startMs: number; endMs: number } }) {
+	const span = win.endMs - win.startMs;
+	const end = parseDate(s.last_activity).getTime();
+	if (!Number.isFinite(end) || span <= 0) return null;
+	const start = end - Math.max(0, s.duration_us) / 1_000;
+	const leftPct = ((start - win.startMs) / span) * 100;
+	const widthPct = Math.min(
+		Math.max(((end - start) / span) * 100, 0.6),
+		Math.max(0, 100 - leftPct),
+	);
+	return (
+		<span className="relative flex h-4 items-center" aria-hidden="true">
+			<span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line/60" />
+			<span
+				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm bg-ink-2/70"
+				style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+			/>
+		</span>
+	);
+}
+
 function SortHeader({
 	sp,
 	col,
@@ -91,7 +142,7 @@ function SortHeader({
 	const active = (sp.sort ?? "last_activity") === col;
 	const order = sp.order ?? "desc";
 	return (
-		<th className="px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+		<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 			<Link
 				href={sortHref(sp, col)}
 				className="inline-flex items-center gap-1 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
@@ -105,43 +156,51 @@ function SortHeader({
 	);
 }
 
-function SessionRow({ s }: { s: SessionSummary }) {
+function SessionRow({
+	s,
+	win,
+}: { s: SessionSummary; win: { startMs: number; endMs: number } | null }) {
 	const isError = s.status === "error";
 	return (
 		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-2/40">
-			<td className="px-4 py-3">
+			<td className="px-3 py-2">
 				<Link
 					href={`/sessions/${encodeURIComponent(s.session_id)}`}
-					className="font-mono text-xs text-accent-ink hover:underline"
+					className="font-mono text-xs text-action-ink hover:underline"
 				>
 					{s.session_id.length > 24
 						? `${s.session_id.slice(0, 12)}…${s.session_id.slice(-8)}`
 						: s.session_id}
 				</Link>
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-sm text-ink-2">
+			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{s.turns}
 			</td>
-			<td className="px-4 py-3 font-mono text-xs text-ink-2">
+			<td className="px-3 py-2 font-mono text-xs text-ink-2">
 				{s.model || "—"}
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-sm text-ink-2">
+			{win && (
+				<td className="px-3 py-2">
+					<SessionBar s={s} win={win} />
+				</td>
+			)}
+			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatTokens(s.total_tokens)}
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-sm text-ink-2">
+			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatDuration(s.duration_us)}
 			</td>
-			<td className="px-4 py-3 tabular-nums text-right text-sm text-ink-2">
+			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatCost(s.cost_usd)}
 			</td>
-			<td className="px-4 py-3">
+			<td className="px-3 py-2">
 				{isError ? (
 					<Badge tone="danger">error</Badge>
 				) : (
 					<Badge tone="ok">ok</Badge>
 				)}
 			</td>
-			<td className="px-4 py-3 text-right text-xs text-ink-2">
+			<td className="px-3 py-2 text-right text-xs text-ink-2">
 				{formatDateTimeUtc(parseDate(s.last_activity).toISOString())}
 			</td>
 		</tr>
@@ -188,6 +247,8 @@ async function SessionsData({ sp }: { sp: SP }) {
 	// The list is capped at the gateway's default (50) with no cursor; when exactly
 	// full, say so honestly rather than implying it's the complete set (audit #12).
 	const atCap = sessions.length >= 50;
+	// ADR-074 §7 — window from the ROWS, never a URL range (same rule as TraceList).
+	const win = sessionWindow(sessions);
 
 	return (
 		<div className="space-y-2">
@@ -195,20 +256,34 @@ async function SessionsData({ sp }: { sp: SP }) {
 				<table className="w-full text-sm">
 					<thead>
 						<tr className="border-b border-line">
-							<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Session
 							</th>
 							<SortHeader sp={sp} col="turns" label="Turns" />
 							<th
-								className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3"
+								className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3"
 								title="The latest model in the session. A session that switched models shows only the most recent — open the session to see every turn."
 							>
 								Model
 							</th>
+							{win && (
+								<th
+									className="w-[24%] min-w-[9rem] px-3 pt-1.5 pb-0.5 align-bottom"
+									title="Each bar is one session, positioned by its real first→last span. UTC."
+								>
+									<span className="sr-only">Timeline</span>
+									<TimeRuler
+										startMs={win.startMs}
+										endMs={win.endMs}
+										ticks={4}
+										mode="absolute"
+									/>
+								</th>
+							)}
 							<SortHeader sp={sp} col="tokens" label="Tokens" />
 							<SortHeader sp={sp} col="duration" label="First → last" />
 							<SortHeader sp={sp} col="cost" label="Cost" />
-							<th className="px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+							<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
 								Status
 							</th>
 							<SortHeader sp={sp} col="last_activity" label="Last activity" />
@@ -216,7 +291,7 @@ async function SessionsData({ sp }: { sp: SP }) {
 					</thead>
 					<tbody>
 						{sessions.map((s) => (
-							<SessionRow key={s.session_id} s={s} />
+							<SessionRow key={s.session_id} s={s} win={win} />
 						))}
 					</tbody>
 				</table>
@@ -244,7 +319,7 @@ export default async function SessionsPage({
 	const sp = await searchParams;
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div>
 					<h1 className="t-h1">Sessions</h1>
 					<p className="mt-1 text-sm text-ink-2">

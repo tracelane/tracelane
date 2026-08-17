@@ -168,19 +168,48 @@ non-zero — that is the B1 merge gate. There is no `--gate` flag.
 
 ### `tlane init`
 
-Write a `tracelane.config.json` (endpoint, `serviceName`, `sampleRate`) and print
-the SDK install + wire-up steps. It writes that one file; it does not install a
-package or edit your source.
+Scaffold Tracelane into the project in the working directory. Four steps, each
+one skippable:
 
-`--endpoint` is the OTLP endpoint of an ingest receiver **you** run (default
-`http://localhost:4318`). Tracelane Cloud has no public OTLP ingress — hosted
-traces are captured at the gateway, so on Cloud leave `--endpoint` unset and
-point your OpenAI-compatible client at `https://gateway.tracelane.dev/v1`.
+| Step | What lands | Skip with |
+|---|---|---|
+| Config | `tracelane.config.json` — `endpoint`, `serviceName`, `sampleRate` | — |
+| Env | `TRACELANE_API_KEY` and `TRACELANE_GATEWAY_URL` merged into `.env`, and `.env` added to an existing `.gitignore` | `--no-env` |
+| Instrumentation | `tracelane.ts` / `tracelane.mjs` / `tracelane_init.py` wiring the SDK to the frameworks found in your manifests | `--no-instrument` |
+| Install | `@tracelanedev/sdk` or `tracelane`, installed with your own package manager | `--no-install` |
+
+**Framework detection** reads `package.json` for Node and
+`pyproject.toml` / `requirements.txt` / `Pipfile` for Python, and matches them
+against the SDK's adapters. A polyglot repo gets both bootstraps.
+
+**How far the bootstrap gets on its own, honestly.** On Python it emits
+`init(..., auto_instrument=True)`, which really does wrap installed `openai`,
+`anthropic`, `litellm` and `claude_code` with no further edit. Everything else —
+including every TypeScript adapter — wraps an object only you can construct, so
+the bootstrap imports the right `instrument*` function and emits the exact
+one-line call next to it. The TypeScript SDK has no zero-config patching:
+`autoInstrument()` throws by design and lands in v1.1.
+
+**What it will not do.** `.env` is only ever appended to — an existing
+`TRACELANE_API_KEY` is never rewritten, `--force` included. An existing config or
+bootstrap is kept unless you pass `--force`. A failed install exits non-zero and
+prints the command to re-run; the scaffolded files stay.
+
+**Package manager** comes from the lockfile: `pnpm-lock.yaml` → `pnpm add`,
+`yarn.lock` → `yarn add`, `bun.lock*` → `bun add`, otherwise `npm install`; and
+`uv.lock` → `uv add`, `poetry.lock` or `[tool.poetry]` → `poetry add`, `Pipfile`
+→ `pipenv install`, otherwise `python3 -m pip install`.
+
+`--endpoint` is the OTLP endpoint spans are exported to. On Tracelane Cloud that
+is `https://gateway.tracelane.dev`, with a `tlane_…` key carrying the `ingest`
+scope. Self-hosting, it is the ingest receiver you run. The default is
+`http://localhost:4318`, so **on Cloud, pass `--endpoint` explicitly**.
 
 ```bash
-tlane init
+tlane init --endpoint https://gateway.tracelane.dev          # Tracelane Cloud
 tlane init --endpoint http://otel-collector.internal:4318
 tlane init --service-name checkout-agent --sample-rate 0.25 --force
+tlane init --no-install --no-env          # config + bootstrap only
 ```
 
 ### `tlane trace`
@@ -198,6 +227,7 @@ tlane trace <trace-id> --format timeline
 | Variable | Description |
 |---|---|
 | `TRACELANE_TOKEN` | API key (`tlane_...`) or Bearer JWT |
+| `TRACELANE_API_KEY` | API key used by `tlane trace`, by the bootstrap `tlane init` generates, and as a `TRACELANE_TOKEN` fallback for `tlane replay` |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL (default: `http://localhost:8080`) |
 
 ## Pain points addressed

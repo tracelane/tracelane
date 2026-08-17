@@ -64,7 +64,7 @@ Required env vars in `.env.local`:
 |---|---|
 | `DATABASE_URL` | Postgres DSN (default: `postgresql://tracelane:tracelane@localhost:5432/tracelane`) |
 | `CLICKHOUSE_DSN` | ClickHouse DSN (default: `http://localhost:8123`) |
-| `NATS_URL` | NATS JetStream URL (default: `nats://localhost:4222`) |
+| `NATS_URL` | NATS JetStream URL (default: `nats://localhost:4222`). **Required** — the gateway refuses to boot without it; set `TRACELANE_ALLOW_NO_CAPTURE=1` to run deliberately without span capture |
 | `TRACELANE_BYOK_MASTER_KEY` | AES-256-GCM master key for BYOK envelope encryption — 32 bytes, **base64** (generate with `openssl rand -base64 32`) |
 | `WORKOS_API_KEY` | WorkOS API key (sign up at workos.com) |
 | `WORKOS_CLIENT_ID` | WorkOS client ID |

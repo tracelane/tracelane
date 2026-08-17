@@ -32,13 +32,22 @@ export type Session = {
 
 /**
  * Owner-scoped UI gating (IDENTITY_TEAM_SPEC §1): billing, member management,
- * BYOK/encryption keys, workspace/org settings. Mirrors the gateway
- * `Claims::can_admin` grandfathering — only an explicit `member`/`viewer` is
- * denied; `owner`, legacy `admin`, and role-less sessions pass. UI gating is
- * never the only barrier; the gateway re-checks.
+ * BYOK/encryption keys, workspace/org settings.
+ *
+ * **Allowlist, not a denylist (PL-9).** This mirrors the gateway's
+ * `Claims::can_admin`, which is authoritative — and that means it must mirror
+ * the FIXED one. It previously denied only a literal `member`/`viewer`, so an
+ * unrecognised slug, a renamed role, `null` and `undefined` all passed. WorkOS's
+ * default org role is `admin`, so the default fell through to full access.
+ *
+ * These two must move together: the gateway now 403s an unrecognised or absent
+ * slug, so a permissive UI here would render buttons that fail on click — the
+ * dead-button class the L16 Playwright gate exists to catch.
  */
 export function canAdmin(role: string | null | undefined): boolean {
-	return role !== "member" && role !== "viewer";
+	// `admin` is WorkOS's built-in org role and maps to owner, exactly as
+	// `Role::from_slug` does in crates/gateway/src/auth/mod.rs.
+	return role === "owner" || role === "admin";
 }
 
 /**

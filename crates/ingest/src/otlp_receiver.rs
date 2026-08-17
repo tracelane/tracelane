@@ -299,9 +299,21 @@ async fn serve_one(
 
 /// Handle `POST /v1/traces`.
 ///
-/// Accepts OTLP protobuf (`application/x-protobuf`). JSON OTLP is out
-/// of scope for V1 — every SDK we ship and every collector we expect
-/// to peer with uses protobuf.
+/// Accepts **both** OTLP wire formats, selected by `Content-Type`:
+/// `application/x-protobuf` and `application/json` (B-235).
+///
+/// **The previous sentence here was false and it cost us the TypeScript SDK.**
+/// It read: *"JSON OTLP is out of scope for V1 — every SDK we ship and every
+/// collector we expect to peer with uses protobuf."* Our own
+/// `@tracelanedev/sdk` depends on `@opentelemetry/exporter-trace-otlp-http`,
+/// which is the **JSON** exporter (the protobuf one is `-proto`), so it sent
+/// `Content-Type: application/json` and every batch died as
+/// `failed to decode Protobuf message: unexpected end group tag`. The TS SDK had
+/// therefore never delivered a span to Tracelane — Cloud or self-host — and the
+/// comment asserting otherwise is why nobody looked.
+///
+/// An unrecognised or absent Content-Type is refused by name (415), never
+/// guessed as protobuf.
 ///
 /// Pipeline:
 /// 1. Decode the body via `otlp_decode::decode_otlp_protobuf`.
@@ -348,6 +360,27 @@ async fn traces_handler(
     if state.disk.is_shedding() {
         return disk_full_response(peer_tenant.as_ref());
     }
+
+    // B-235: resolve the WIRE FORMAT before reading the body. Both shipped SDKs
+    // are first-class and they disagree — Python exports protobuf, TypeScript
+    // exports JSON. An unrecognised or absent Content-Type is refused by name
+    // rather than guessed as protobuf, which is the guess that made every
+    // TypeScript batch look like a corrupt protobuf.
+    let wire = match crate::otlp_decode::wire_from_content_type(
+        req.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Some(w) => w,
+        None => {
+            return reject_response(
+                RejectReason::UnsupportedContentType,
+                0,
+                None,
+                peer_tenant.as_ref(),
+            );
+        }
+    };
 
     // ADR-029: resolve per-workspace limits. V1 returns defaults; V1.1
     // will swap to an entitlements-backed lookup once ingest carries a
@@ -401,13 +434,21 @@ async fn traces_handler(
     // ~10 µs spend is reclaimed here (queued internally as the V1.1
     // optimisation; collected now alongside the ADR-030
     // mutation requirement).
-    let mut pb_req = match ExportTraceServiceRequest::decode(body.as_ref()) {
+    let mut pb_req = match match wire {
+        crate::otlp_decode::Wire::Protobuf => {
+            ExportTraceServiceRequest::decode(body.as_ref()).map_err(|e| format!("protobuf: {e}"))
+        }
+        crate::otlp_decode::Wire::Json => {
+            serde_json::from_slice::<ExportTraceServiceRequest>(body.as_ref())
+                .map_err(|e| format!("json: {e}"))
+        }
+    } {
         Ok(r) => r,
         Err(err) => {
-            tracing::warn!(error = %err, "OTLP protobuf decode failed (pre-cap pass)");
+            tracing::warn!(error = %err, "OTLP decode failed (pre-cap pass)");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": err.to_string()})),
+                Json(serde_json::json!({"error": err})),
             )
                 .into_response();
         }
@@ -441,7 +482,24 @@ async fn traces_handler(
                             RejectReason::SpanTooLarge => cap.max_span_bytes as u64,
                             RejectReason::AttributeTooLarge => cap.max_attribute_value_bytes as u64,
                             RejectReason::TooManyAttributes => cap.max_attributes_per_span as u64,
-                            RejectReason::BatchTooLarge => cap.max_batch_bytes() as u64,
+                            // GWY-41 added a per-request span-COUNT cap, applied by the
+                            // gateway's `POST /v1/traces` where the payload is untrusted.
+                            // `check_span_post_decode` cannot return it — it inspects one
+                            // span and knows nothing about how many there are — so this
+                            // arm is unreachable today. Mapped to the batch cap rather
+                            // than `unreachable!`: a panic here would turn a future
+                            // refactor into an ingest crash on the ERROR path, which is
+                            // the worst place to discover one. Enumerated rather than
+                            // `_ =>` so the next variant added is a compile error here,
+                            // which is exactly how this one was caught.
+                            RejectReason::TooManySpans | RejectReason::BatchTooLarge => {
+                                cap.max_batch_bytes() as u64
+                            }
+                            // Unreachable from the per-span walk: the wire format is
+                            // resolved before the body is read. Enumerated rather than
+                            // `_ =>` so the next variant is a compile error here — which
+                            // is exactly how this arm and TooManySpans were both caught.
+                            RejectReason::UnsupportedContentType => 0,
                         };
                         return reject_response(
                             reason,
@@ -856,7 +914,8 @@ mod tests {
     /// DEBUG-ONLY: exercises the resource-attribute tenant fallback (dev path),
     /// which release hard-rejects. The release equivalent — that the fallback
     /// is refused, and a peer still wins — is covered by
-    /// `otlp_decode::tests::release_build_rejects_resource_attribute_tenant_fallback`
+    /// `tracelane_shared::otlp::decode::tests::release_build_rejects_resource_attribute_tenant_fallback`
+    /// (it moved there with the decoder in GWY-41)
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn e2e_protobuf_with_resource_tenant_dispatches_span() {
@@ -1017,6 +1076,27 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_rejects_empty_body() {
+        // The Content-Type is REQUIRED for this to test what it says. Before
+        // B-235 this request carried none and still asserted 400 — it was
+        // asserting "empty body" against a request with TWO problems, and the
+        // wire check (415) now legitimately answers first. A test that passes
+        // for the wrong reason is the shape this session kept finding.
+        let (app, _rx) = test_router();
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/x-protobuf")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// B-235: an ABSENT Content-Type is refused by name, never guessed as
+    /// protobuf. The guess is what made every OTLP/JSON batch from the
+    /// TypeScript SDK come back as a corrupt protobuf.
+    #[tokio::test]
+    async fn e2e_rejects_absent_content_type_with_415() {
         let (app, _rx) = test_router();
         let req = HttpRequest::builder()
             .method("POST")
@@ -1024,7 +1104,21 @@ mod tests {
             .body(AxumBody::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// And an unrecognised one, likewise.
+    #[tokio::test]
+    async fn e2e_rejects_unknown_content_type_with_415() {
+        let (app, _rx) = test_router();
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "text/plain")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]

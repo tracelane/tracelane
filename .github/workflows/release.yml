@@ -51,7 +51,7 @@ jobs:
       name: production-release
       url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -101,7 +101,7 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
@@ -158,7 +158,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
@@ -193,7 +193,7 @@ jobs:
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20  # v3.5.0
 
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@d94f46e13c6c62f59525ac9a1e147a99dc0b9bf5  # v0.17.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
           format: cyclonedx-json
           output-file: sbom.cyclonedx.json
@@ -278,7 +278,7 @@ jobs:
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
@@ -352,7 +352,7 @@ jobs:
       id-token: write  # Required for npm OIDC Trusted Publishing
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
@@ -378,7 +378,12 @@ jobs:
         # The published packages ship `files: ["dist"]`; build them explicitly
         # (root `pnpm build` only builds the dashboard). pnpm builds in
         # dependency order, so the verifier is built before the CLI that uses it.
-        run: pnpm --filter @tracelanedev/audit-verifier --filter @tracelanedev/sdk --filter @tracelanedev/cli build
+        #
+        # @tracelanedev/mcp (PLT-21): its `prebuild` runs two gates that must
+        # fail the RELEASE, not a later `mcp-publisher publish` — the eval
+        # manifest must match `evals/` on disk, and server.json / package.json /
+        # src/version.ts must agree on name + version. Both carry `--selftest`.
+        run: pnpm --filter @tracelanedev/audit-verifier --filter @tracelanedev/sdk --filter @tracelanedev/cli --filter @tracelanedev/mcp build
 
       - name: Publish @tracelanedev/* (npm CLI · OIDC Trusted Publishing · no long-lived token)
         # ADR-008: Trusted Publishing OIDC for crates.io, npm, PyPI, Docker Hub.
@@ -395,18 +400,33 @@ jobs:
         # + --provenance). Publish ORDER matters: the verifier must be on npm before
         # the CLI so the CLI's rewritten dependency resolves.
         #
-        # IDEMPOTENT: a coordinated tag fires this for ALL three packages, but some
+        # IDEMPOTENT: a coordinated tag fires this for ALL four packages, but some
         # may already be on npm (e.g. the SDK at 0.1.0, or a re-tagged run). Skip any
         # version already present so one unchanged package never strands the rest.
+        #
+        # @tracelanedev/mcp is LAST deliberately. It is the only entry that has
+        # never been published, and npm's Trusted Publishing config is created on
+        # an EXISTING package's settings page — same first-publish gap already
+        # documented above for crates.io. Ordering it last means the bootstrap
+        # gap cannot strand the three packages that do have publishers. It still
+        # FAILS the job (never a silent skip): a release that was supposed to
+        # ship the MCP server and did not must be red, and the pre-flight below
+        # says exactly which manual step unblocks it.
+        # (Wording is deliberate: `.github/` ships in the public export, and the
+        # banned-phrase guard blocks the internal term here. PL-6 regressed on
+        # 2026-08-09 for exactly this reason and would have blocked the v1.0.0 tag.)
         run: |
           set -euo pipefail
           echo "npm $(npm --version) (need >= 11.5.1 for tokenless OIDC Trusted Publishing)"
-          for pkg in @tracelanedev/audit-verifier @tracelanedev/sdk @tracelanedev/cli; do
+          for pkg in @tracelanedev/audit-verifier @tracelanedev/sdk @tracelanedev/cli @tracelanedev/mcp; do
             dir=$(pnpm --filter "$pkg" exec pwd | tail -1)
             ver=$(node -p "require('${dir}/package.json').version")
             if npm view "$pkg@$ver" version >/dev/null 2>&1; then
               echo "· $pkg@$ver already on npm — skipping (unchanged)"
               continue
+            fi
+            if ! npm view "$pkg" version >/dev/null 2>&1; then
+              echo "::warning title=First publish of ${pkg}::${pkg} has never been published. npm Trusted Publishing is configured on an existing package's settings page, so this PUT may 404/401 until a maintainer bootstraps the first version and registers the trusted publisher (owner=tracelane, repo=tracelane, workflow=release.yml, environment=BLANK)."
             fi
             packdir="${RUNNER_TEMP}/pack-$(echo "$pkg" | tr '/@' '__')"
             mkdir -p "$packdir"
@@ -416,6 +436,114 @@ jobs:
             echo "· publishing $tgz via npm CLI (OIDC Trusted Publishing + provenance)"
             npm publish "$tgz" --access public --provenance
           done
+
+      - name: Assert @tracelanedev/mcp is installable as `npx @tracelanedev/mcp`
+        # A 200 from `npm publish` is not the end state PLT-21 promises. The
+        # published one-liner is what customers run, so resolve it from the
+        # REGISTRY (not the workspace) and prove the bin exists with a node
+        # hashbang — the exact defect 0.1.0 shipped (mode 0644, no hashbang).
+        # `npm exec` would run the server and block on stdio, so this inspects
+        # the fetched package instead of starting it.
+        run: |
+          set -euo pipefail
+          ver=$(node -p "require('./apps/mcp/package.json').version")
+          work="${RUNNER_TEMP}/npx-proof"
+          mkdir -p "$work"
+          ( cd "$work" \
+            && npm pack "@tracelanedev/mcp@${ver}" --silent >/dev/null \
+            && tar -xzf ./*.tgz )
+          binrel=$(node -p "Object.values(require('${work}/package/package.json').bin)[0]")
+          bin="${work}/package/${binrel}"
+          test -f "$bin" || { echo "::error title=npx target missing::${binrel} is not in the published tarball"; exit 1; }
+          head -c 19 "$bin" | grep -qx '#!/usr/bin/env node' || {
+            echo "::error title=npx target has no hashbang::npm's bin symlink hands ${binrel} to the shell; \`npx @tracelanedev/mcp\` cannot start"; exit 1; }
+          name=$(node -p "require('${work}/package/package.json').mcpName || ''")
+          test -n "$name" || { echo "::error title=mcpName missing::the MCP registry cannot verify npm ownership without package.json mcpName"; exit 1; }
+          echo "::notice title=npx @tracelanedev/mcp verified::@tracelanedev/mcp@${ver} resolves from npm, bin=${binrel}, mcpName=${name}"
+
+  publish-mcp-registry:
+    name: Publish @tracelanedev/mcp to the MCP Registry (OIDC)
+    # MUST follow publish-npm: the registry's ownership check fetches
+    # registry.npmjs.org/@tracelanedev/mcp/<version> and requires the published
+    # package.json to carry `mcpName` equal to server.json's `name`
+    # (registry internal/validators/registries/npm.go:90,94). Submitting before
+    # the npm version exists is a guaranteed rejection.
+    needs: [verify-signed-tag, publish-npm]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # NO `environment:` — the registry's OIDC exchange grants `io.github.<owner>/*`
+    # off the `repository_owner` claim alone; it does not read an environment
+    # claim, and adding one would only narrow the token for no gain.
+    permissions:
+      id-token: write  # Required for the registry's GitHub OIDC token exchange
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install mcp-publisher (pinned + checksum-verified)
+        # PINNED, not `releases/latest`. The upstream example curls `latest`,
+        # which silently swaps the binary that holds an OIDC token capable of
+        # publishing under io.github.tracelane/*. Checksum from the release's
+        # own registry_1.8.1_checksums.txt.
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          set -euo pipefail
+          url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/mcp-publisher.tar.gz" "$url"
+          echo "${MCP_PUBLISHER_SHA256}  ${RUNNER_TEMP}/mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/mcp-publisher.tar.gz" -C "${RUNNER_TEMP}" mcp-publisher
+          chmod +x "${RUNNER_TEMP}/mcp-publisher"
+          "${RUNNER_TEMP}/mcp-publisher" --version
+
+      - name: Verify server.json agrees with the published package
+        # Same gate the package's own `prebuild` runs — re-run it here so this
+        # job fails on drift BEFORE it spends an OIDC token on a submission the
+        # registry would reject.
+        run: node apps/mcp/scripts/check-registry-manifest.mjs --check
+
+      - name: Login to the MCP Registry via GitHub OIDC (no long-lived token)
+        # Grants `io.github.<repository_owner>/*` — i.e. io.github.tracelane/*,
+        # which covers io.github.tracelane/tracelane-mcp. No secret involved.
+        run: '"${RUNNER_TEMP}/mcp-publisher" login github-oidc'
+
+      - name: Publish server.json
+        run: '"${RUNNER_TEMP}/mcp-publisher" publish apps/mcp/server.json'
+
+      - name: Confirm the server is live in the registry
+        # `publish` exiting 0 is not the end state PLT-21 promises. Read the
+        # server back OUT of the public registry and assert the version we just
+        # submitted is the one listed and its status is active — otherwise a
+        # no-op accept is indistinguishable from a real submission.
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./apps/mcp/server.json').name")
+          want=$(node -p "require('./apps/mcp/server.json').version")
+          curl -fsSL --get \
+            --data-urlencode "search=${name}" \
+            --data-urlencode "version=latest" \
+            https://registry.modelcontextprotocol.io/v0/servers > "${RUNNER_TEMP}/registry.json"
+          node -e '
+            const [file, name, want] = process.argv.slice(1);
+            const body = JSON.parse(require("node:fs").readFileSync(file, "utf8"));
+            const hit = (body.servers ?? [])
+              .map((e) => ({ s: e.server, meta: e._meta?.["io.modelcontextprotocol.registry/official"] }))
+              .find((e) => e.s?.name === name);
+            if (!hit) {
+              console.log(`::error title=MCP registry has no such server::${name} is absent from the registry after publish`);
+              process.exit(1);
+            }
+            if (hit.s.version !== want) {
+              console.log(`::error title=MCP registry did not take the submission::expected ${name}@${want}, registry reports ${hit.s.version}`);
+              process.exit(1);
+            }
+            if (hit.meta?.status && hit.meta.status !== "active") {
+              console.log(`::error title=MCP registry entry is not active::${name}@${want} has status ${hit.meta.status}`);
+              process.exit(1);
+            }
+            console.log(`::notice title=MCP registry updated::${name}@${hit.s.version} is live — clients can discover \`npx @tracelanedev/mcp\``);
+          ' "${RUNNER_TEMP}/registry.json" "$name" "$want"
 
   publish-pypi:
     name: Publish tracelane (SDK) to PyPI (Trusted Publishing / OIDC)
@@ -439,7 +567,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Setup Python
         uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
@@ -453,7 +581,7 @@ jobs:
         run: python -m build packages/sdk-python/
 
       - name: Publish to PyPI via OIDC (no long-lived token)
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
         with:
           packages-dir: packages/sdk-python/dist/
           # IDEMPOTENT: a re-tag re-runs this job, but the version may already be on
@@ -489,7 +617,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Setup Python
         uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
@@ -503,7 +631,7 @@ jobs:
         run: python -m build packages/verifier-python/
 
       - name: Publish to PyPI via OIDC (no long-lived token)
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
         with:
           packages-dir: packages/verifier-python/dist/
           # IDEMPOTENT: tracelane-audit-verifier 0.2.1 shipped on the first run; a

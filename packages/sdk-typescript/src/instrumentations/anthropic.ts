@@ -20,6 +20,7 @@
  */
 
 import { type Span, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { CONVERSATION_ID_ATTRIBUTE, applySessionToArgs } from "../session.js";
 import { markStreamingCall } from "../streaming.js";
 
 const tracer = trace.getTracer("@tracelanedev/sdk-anthropic", "0.1.0");
@@ -75,6 +76,11 @@ export function instrumentAnthropic(client: {
 		const model =
 			typeof request?.model === "string" ? request.model : "unknown";
 
+		// Session correlation: adds `x-conversation-id` to the outgoing request
+		// (the gateway path) and the matching span attribute (the OTLP path).
+		// No-op when no session is active.
+		const sessionId = applySessionToArgs(args);
+
 		return tracer.startActiveSpan(
 			"anthropic.messages.create",
 			{
@@ -83,6 +89,9 @@ export function instrumentAnthropic(client: {
 					"gen_ai.provider.name": "anthropic",
 					"gen_ai.request.model": model,
 					"llm.model_name": model,
+					...(sessionId === undefined
+						? {}
+						: { [CONVERSATION_ID_ATTRIBUTE]: sessionId }),
 				},
 			},
 			async (span) => {

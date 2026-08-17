@@ -16,8 +16,9 @@ import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { ChainStatusChip } from "@/components/trace-viewer/ChainStatusChip";
 import { CopyButton } from "@/components/trace-viewer/CopyButton";
 import { TraceDetailView } from "@/components/trace-viewer/TraceDetailView";
+import { TraceFlagPanel } from "@/components/trace-viewer/TraceFlagPanel";
 import type { Span } from "@/components/trace-viewer/types";
-import { GatewayError, gatewayGetOrNull } from "@/lib/gateway";
+import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
 import { EmptyState, Skeleton } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -76,7 +77,31 @@ async function SpanData({ traceId }: { traceId: string }) {
 		);
 	}
 
-	return <TraceDetailView spans={spans} />;
+	// OBS-33: resolve the tenant's per-signature hit counts server-side and hand them
+	// down. The badge reads "SEEN N×", which a user reads as "my workspace hit this N
+	// times" — that number is `your_hits` from the gateway aggregate, NOT how many
+	// signatures matched one span. Best-effort: a failure yields no counts and the
+	// badge renders without one, because a wrong number on a trust surface is worse
+	// than an absent one.
+	let hitCounts: Record<string, number> | undefined;
+	try {
+		const sinceIso = new Date(Date.now() - 30 * 86_400_000).toISOString();
+		const data = await gatewayGet<{
+			signatures: { signature_id: string; your_hits: number }[];
+		}>(`/v1/query/signatures?since=${encodeURIComponent(sinceIso)}`);
+		hitCounts = Object.fromEntries(
+			(data.signatures ?? []).map(
+				(s: { signature_id: string; your_hits: number }) => [
+					s.signature_id,
+					s.your_hits,
+				],
+			),
+		);
+	} catch {
+		hitCounts = undefined;
+	}
+
+	return <TraceDetailView spans={spans} hitCounts={hitCounts} />;
 }
 
 // Queries ClickHouse at request time — never prerender.
@@ -86,7 +111,7 @@ export default async function TraceDetailPage({ params }: Props) {
 	const { traceId } = await params;
 
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<div className="mb-6 flex items-center gap-3">
 				<Link
 					href="/traces"
@@ -107,6 +132,26 @@ export default async function TraceDetailPage({ params }: Props) {
 					</Suspense>
 					<CopyButton value={traceId} label="Copy ID" />
 					<CopyButton copyLocation label="Copy link" />
+					{/* THE CONTROL THAT DID NOT EXIST. /traces/compare renders a working
+					    span-level diff, and its own empty state has always said "Open a
+					    trace and choose Compare" — but no Compare control existed anywhere
+					    in the app, so the route had ZERO inbound links and was reachable
+					    only by hand-typing both query params. The R12 before-inventory
+					    named it the one genuinely stranded surface; this is the entry
+					    point, and the compare page now offers a picker for the second
+					    trace. */}
+					<Link
+						href={`/traces/compare?a=${encodeURIComponent(traceId)}`}
+						className="inline-flex h-7 items-center rounded-md border border-line px-2 text-ink-2 text-xs transition-colors hover:border-line-2 hover:text-ink"
+					>
+						Compare
+					</Link>
+					{/* OBS-18. Async (reads the existing verdict + the session role
+					    server-side), so it gets its own Suspense boundary — the
+					    header must not wait on it to paint. */}
+					<Suspense fallback={<Skeleton className="h-7 w-28 rounded-md" />}>
+						<TraceFlagPanel traceId={traceId} />
+					</Suspense>
 				</div>
 			</div>
 			<Suspense
@@ -120,6 +165,6 @@ export default async function TraceDetailPage({ params }: Props) {
 			>
 				<SpanData traceId={traceId} />
 			</Suspense>
-		</main>
+		</div>
 	);
 }
