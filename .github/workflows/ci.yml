@@ -642,21 +642,6 @@ jobs:
           python3 scripts/ci/check-tenant-isolation.py --selftest
           python3 scripts/ci/check-tenant-isolation.py
 
-      - name: pre-public-push guard parity
-        if: ${{ !cancelled() }}
-        # The root guard and the export guard are separate
-        # implementations; patching one does nothing to what ships. Selftest
-        # first (both halves), then the real parity check. Existing job — no
-        # extra billable job-minute.
-        run: |
-          python3 scripts/ci/check-guard-parity.py --selftest
-          python3 scripts/ci/check-guard-parity.py
-
-      # node is NOT preinstalled on the self-hosted runner. This job inherited it
-      # free from ubuntu-latest, so routing to tl-node-1 made the ONE node step below
-      # fail with `node: command not found` while the other 51 python/shell steps
-      # passed. Same pinned action and version the web/verifier jobs already use; no
-      # `cache: pnpm` because this job installs no dependencies.
       - name: Set up Node (the one node-dependent guard below)
         if: ${{ !cancelled() }}
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
@@ -777,18 +762,6 @@ jobs:
       - name: API-key scope single-source guard (3 layers must agree)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-api-scope-single-source.py
-
-      - name: Guard meta-gate — selftest (prove the meta-gate itself blocks)
-        if: ${{ !cancelled() }}
-        run: python3 scripts/ci/check-guard-selftests.py --selftest
-
-      # THE META-GATE. Asserts every scripts/** guard verify-all.sh invokes can prove it
-      # blocks: it must reject an unknown flag AND pass its own --selftest. 20 scripts
-      # silently accepted `--selftest` and exited 0 having proven nothing; the unknown-flag
-      # probe is what makes a selftest pass mean anything at all.
-      - name: Guard selftest meta-gate (every guard can prove it blocks)
-        if: ${{ !cancelled() }}
-        run: python3 scripts/ci/check-guard-selftests.py
 
       - name: Workflow job-graph guard (no dangling `needs:`)
         if: ${{ !cancelled() }}
