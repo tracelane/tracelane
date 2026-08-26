@@ -11,6 +11,7 @@
 //! Callers: `crates/gateway/src/audit.rs` — `RekorClient` looks up the keypair
 //! for the active tenant before submitting a Merkle root.
 //!
+//! Entitlement gate (ENFORCED): MINTING a new per-tenant keypair requires
 //! the Audit SKU entitlement (`f_audit_addon`) — checked in `get_or_create` via the
 //! `EntitlementCache`. An existing keypair is always honoured; a non-entitled tenant
 //! falls back to the global `TRACELANE_REKOR_SIGNING_KEY`. (CLAUDE.md: per-feature
@@ -328,6 +329,7 @@ impl TenantAuditKeyStore {
             // R47 — SELF-HEAL a pre-H1 row whose public half was never stored.
             //
             // `public_key_b64` was `DEFAULT ''` and written by nothing until the H1 fix
+            // landed 2026-07-09. A key minted before that date has a usable
             // PRIVATE key and an EMPTY public one, so `GET /v1/audit/pubkey` answers
             // **200 with an empty string** — success-shaped, carrying nothing. An auditor
             // who follows the documented procedure and passes that to `--tenant-pubkey`
@@ -392,7 +394,7 @@ impl TenantAuditKeyStore {
 
         // Generate and persist a new keypair.
         let keypair = TenantAuditKeypair::generate(tenant_id.clone())?;
-        // R2 C-1: bind the ciphertext to (audit-key, tenant_id) via AAD
+        // Bind the ciphertext to (audit-key, tenant_id) via AAD
         // so a row swap into a different tenant's audit_keys table row
         // (or across the provider_keys table) fails GCM authentication.
         let aad = crate::byok::audit_key_aad(tenant_id);
@@ -401,6 +403,7 @@ impl TenantAuditKeyStore {
             .encrypt_with_context(&keypair.private_key_der, &aad)
             .context("encrypt tenant audit keypair")?;
 
+        // H1 (security review): persist the PUBLIC key so the verifier can
         // pin `audit_log.signing_pubkey` against a source outside ClickHouse's
         // blast radius (a CH-write attacker could otherwise forge a fresh keypair
         // and rewrite both the row signature and its inline pubkey). The row-inline
@@ -416,6 +419,7 @@ impl TenantAuditKeyStore {
             .await
             .context("insert tenant_audit_keys")?;
 
+        // Concurrency (found via the on-node proof — one tenant produced two
         // per-tenant pubkeys): `ON CONFLICT DO NOTHING` means a racing request may
         // have persisted a DIFFERENT keypair first. Re-load the row so ALL
         // concurrent first-users converge on the ONE persisted key; otherwise an
@@ -460,6 +464,7 @@ impl TenantAuditKeyStore {
     /// the same Audit-SKU entitlement (`f_audit_addon`); an existing anchor key is
     /// always honoured.
     ///
+    /// Concurrency (pattern): two racing anchors may both try to mint — the
     /// conditional `UPDATE ... WHERE encrypted_anchor_key IS NULL` lets only the
     /// first land, then a re-load converges every caller on the ONE persisted key.
     #[instrument(skip(self), fields(tenant_id = %tenant_id))]
@@ -495,7 +500,7 @@ impl TenantAuditKeyStore {
         }
 
         let keypair = TenantAnchorKeypair::generate(tenant_id.clone())?;
-        // Distinct `anchor-key:` AAD (R2 C-1): an anchor-key ciphertext can never be
+        // Distinct `anchor-key:` AAD: an anchor-key ciphertext can never be
         // swapped into the Ed25519 signing-key slot and still authenticate.
         let aad = crate::byok::anchor_key_aad(tenant_id);
         let encrypted = self
@@ -561,7 +566,7 @@ impl TenantAuditKeyStore {
         tenant_id: TenantId,
         encrypted: &str,
     ) -> Result<TenantAuditKeypair> {
-        // R2 C-1: same AAD context as encrypt site.
+        // Same AAD context as encrypt site.
         let aad = crate::byok::audit_key_aad(&tenant_id);
         let private_key_der = self
             .byok
@@ -593,6 +598,7 @@ mod tests {
 
     /// **AUDIT-004 — the `get_or_create` keypair race, driven for real.**
     ///
+    /// Open since 2026-05-16 and closed in code by (`ON CONFLICT DO NOTHING` +
     /// re-load), but NOTHING proved the convergence property — so a refactor could have
     /// deleted the re-load and no gate would have noticed. A fix without falsification is
     /// not a fix you can rely on.

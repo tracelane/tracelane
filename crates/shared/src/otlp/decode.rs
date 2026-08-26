@@ -1149,6 +1149,7 @@ mod tests {
     /// this asserts the debug acceptance; the release rejection is asserted by
     /// `release_build_rejects_resource_attribute_tenant_fallback` under
     /// `cargo test --release`. Gating this to debug keeps the crate's test suite
+    /// green in BOTH profiles (F-1).
     #[cfg(debug_assertions)]
     #[test]
     fn decodes_span_with_resource_attribute_fallback() {
@@ -1168,6 +1169,7 @@ mod tests {
         assert_eq!(spans[0].tenant_id, tenant());
     }
 
+    ///  F-1 — the RELEASE tenant-isolation guarantee, exercised only under
     /// `cargo test --release`.
     ///
     /// In a release build (`debug_assertions` OFF) `resolve_tenant`'s

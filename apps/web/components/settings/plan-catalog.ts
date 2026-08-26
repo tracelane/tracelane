@@ -24,6 +24,7 @@
  *   Absence is not a claim, so a tier never advertises something the resolver
  *   would deny. (Never the inverse — "tail-sampled" as a negative bullet would
  *   be a claim about sampling behaviour this module cannot verify.)
+ * - "30+ providers", never "35+" — the `gateway_35_providers` flag NAME
  *   is a legacy identifier and must not reach copy.
  * - Guardrails are described as running inline at the gateway, observe-first.
  *   No "block" / "prevent" / "before it executes" framing (ADR-023 ban,
@@ -148,7 +149,7 @@ export function formatOverage(multiplier: number, pricePer10k: number): string {
  * gateway-side and absent from the TS `Entitlements` shape).
  */
 export function featureBullets(plan: Plan, ent: Entitlements): string[] {
-	const out: string[] = ["30+-provider gateway, BYOK at 0% markup"];
+	const out: string[] = ["150+-provider gateway, BYOK at 0% markup"];
 
 	if (ent.prompt_promotion_write) {
 		out.push("Prompt promotion — author and promote across environments");
@@ -245,6 +246,7 @@ export function hasCustomLimits(plan: Plan, resolved: Entitlements): boolean {
 /**
  * The Audit SKU is an ADD-ON at every tier (ADR-020/025) — never bundled into a
  * plan, which is why it is not a ladder column. Resolves from `f_audit_addon`,
+ * the same grant the gateway export gate reads.
  */
 export const AUDIT_ADDON = {
 	name: "Audit ledger",

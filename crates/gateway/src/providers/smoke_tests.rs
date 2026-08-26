@@ -117,6 +117,7 @@ const OPENAI_SSE_BODY: &str = concat!(
 
 #[tokio::test]
 async fn openai_401_surfaces_typed_auth_rejection() {
+    //  GW-SPAN-002: an upstream 401 must surface as a typed
     // ProviderHttpError(401) so the gateway answers `provider_key_rejected`
     // instead of an opaque 502 — and the credential-echoing body must NOT leak.
     let _bypass = allow_loopback_for_this_test();
@@ -145,6 +146,7 @@ async fn openai_401_surfaces_typed_auth_rejection() {
         .expect("dispatch error must downcast to ProviderHttpError");
     assert_eq!(http.status, 401);
     assert!(http.is_auth_rejection());
+    // Redaction (security.md /): the upstream body echoed a key
     // it must never appear in the error chain.
     assert!(
         !format!("{err:#}").contains("sk-leaked-secret"),
@@ -155,6 +157,7 @@ async fn openai_401_surfaces_typed_auth_rejection() {
 #[tokio::test]
 async fn openai_500_is_not_an_auth_rejection() {
     // A 5xx outage is an availability failure → 502, NOT provider_key_rejected.
+    // A VERBOSE 5xx body (echoing a BYOK key) + a `www-authenticate` header
     // must NOT leak into the error surfaced to the gateway — only status + a safe
     // reason token survive; the client then gets our normalized `provider
     // unavailable`, never the provider's payload.
@@ -187,6 +190,7 @@ sk-projFAKEleakDONOTUSE0123456789abcdef rejected upstream\",\"type\":\"server_er
         .expect("typed ProviderHttpError");
     assert_eq!(http.status, 500);
     assert!(!http.is_auth_rejection());
+    // Neither the verbose body's key nor the auth header survives.
     let chain = format!("{err:#}");
     assert!(
         !chain.contains("sk-projFAKEleak"),

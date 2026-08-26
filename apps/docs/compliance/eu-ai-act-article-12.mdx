@@ -52,7 +52,7 @@ does, mapped to the topic of each Article 12 paragraph.
 
 | Shipped capability — what you may cite as evidence |
 |---|
-| `crates/gateway/src/audit_retention.rs` defines a 180-day floor (`AUDIT_ADDON_MIN_RETENTION_DAYS`) and a `resolve_audit_retention(base_tier_days, has_audit_addon, contractual_override)` resolver that panics fail-loud on any override below it. **Be precise about what this is today:** the constant and the resolver exist and are unit-tested, but the resolver **has no production caller**, so it enforces nothing yet. **Cite the mechanism, and cite its limits.** Three facts carry the six-month requirement, and each is checkable against a running system: (1) **no scheduled job deletes audit data** — the retention sweep's table list is `spans` and `trace_summaries` only (`retention_sweep.rs`, `SWEEP_TABLES`), and it runs in `dryrun`; (2) **the ledger tables carry no TTL** — `audit_log`, `audit_anchor_records` and `audit_log_pre_rmt` each have no `TTL` clause, so nothing expires on its own; (3) **`scripts/ops/tenant-purge.sh` lists all three as RETAINED** under the ADR-068 legal-retention basis, and its post-run check fails the entire purge if a retained row moved. **What we do NOT claim, stated because the limit matters more than the reassurance:** we do not assert that nothing has ever been deleted, and we do not assert that the database can enumerate every deletion. ClickHouse `system.mutations` records `ALTER … DELETE` operations only — it is a live view rather than a durable log, and it does not cover `TRUNCATE`, `DROP PARTITION`, or a rename-based migration. Three such operations are on record against ledger tables, all against synthetic benchmark tenants or their anchor rows. Separately, a 2026-07-15 storage-engine migration moved the then-current `audit_log` aside by atomic `RENAME` and began a fresh chain: **those rows were retained, not deleted** — they remain queryable in `audit_log_pre_rmt`, which `tenant-purge.sh` retains precisely so the earlier chain stays re-derivable across the engine change. **That event leaves no row in `system.mutations`, which is exactly why this row describes a mechanism instead of asserting an invariant.** |
+| The Audit add-on carries a **180-day minimum retention** commitment for ledger data; other plans retain for their plan's period. Two properties carry the six-month requirement and both are checkable against a running system: (1) **no scheduled job deletes ledger data** — the retention sweep operates on span tables only and never on the ledger; (2) **the ledger tables carry no TTL**, so no row expires on its own. Contractual retention above the floor is supported; a value below it is refused. Today that floor is **operational and contractual rather than programmatically enforced** — retention is bounded by the absence of any automatic expiry, not by a runtime check. **What we do not claim, because the limit matters more than the reassurance:** we do not assert that no ledger row has ever been removed by an operator, nor that the database can enumerate every such operation — ClickHouse records `ALTER … DELETE` in a live view that does not cover `TRUNCATE`, `DROP PARTITION`, or rename-based migrations. This row therefore describes a retention **mechanism**, not an invariant we cannot falsify. Where a storage-engine migration has moved a prior chain aside, those rows are **retained and remain queryable**, so the earlier chain stays re-derivable across the change. |
 
 ### 12(3)(a) — log conformity with established procedures
 
@@ -76,7 +76,7 @@ does, mapped to the topic of each Article 12 paragraph.
 
 | Shipped capability — what you may cite as evidence |
 |---|
-| Per-row authorisation is enforced at the gateway by `WHERE tenant_id = ?` on every ClickHouse query (CI guard `tenant-isolation-check` blocks any new query that omits this filter). Cross-tenant chain integrity is the V1.5 AUDIT-001 fix; V1's per-tenant `seq` plus per-tenant Ed25519 keypair covers the integrity half. |
+| Per-row authorisation is enforced at the gateway: every ClickHouse query filters on the caller's tenant, and a CI guard blocks any new query that omits the filter. Ledger integrity in V1 is **per-tenant** — each workspace has its own sequence and its own Ed25519 keypair, so a workspace's chain is verifiable end to end independently of any other. Integrity guarantees that span across workspaces are on the roadmap. |
 
 ## Field mapping table (verifier output → Article 12 topic)
 
@@ -94,6 +94,7 @@ does, mapped to the topic of each Article 12 paragraph.
 | `hash_chain_valid` | (live) the log has not been mutated since write | 12(3)(a), 12(3)(d) |
 | `signatures_valid` | every Merkle root is Ed25519-signed by the workspace's per-tenant key (live) | 12(3)(a) |
 | `rekor_anchors_resolved` | anchored batches are independently verifiable against the public Sigstore Rekor v2 log, offline from the exported inclusion proof + checkpoint (live, best-effort) | 12(3)(a), 12(3)(c) |
+| `anchors_included` | how many batches were anchored at all — read with `rekor_anchors_resolved`, which counts only those whose proof resolved. Anchoring is per-batch and best-effort, so neither field implies universal coverage | 12(3)(a) |
 | `errors[].seq` + `errors[].kind` + `errors[].detail` | the *specific* row that failed verification, identifying any tampering attempt | 12(3)(a), 12(3)(d) |
 
 A field being green proves the cryptographic property named in the middle
@@ -158,11 +159,10 @@ leaving the chain-integrity check.
 - **`tracelane-audit export --format pdf`** — a rendered evidence packet. The
   V1 `--format text` and `--format json` outputs are human-readable; they can
   be rendered to PDF with any external tool. V1.1 ships a built-in renderer.
-- **Automated audit-data retention cleanup job.** The
-  `resolve_audit_retention` resolver is in place but has no production caller;
-  the cron + DELETE pipeline ships in V1.1. V1's invariant: no audit data is
-  deleted in V1, so the 180-day floor is trivially satisfied for any
-  workspace created post-launch.
+- **Automated audit-data retention cleanup.** Retention above the floor is
+  honoured today by the absence of any automatic expiry on ledger data; a
+  scheduled cleanup that enforces the ceiling is planned. See the 12(2)(c)
+  row above for exactly what is and is not claimed.
 
 ## Further reading
 

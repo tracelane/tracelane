@@ -1,3 +1,4 @@
+--  commit B — observed tools, the "approve" half of R3 rug-pull detection.
 --
 -- Commit A gave tenants a way to PIN a tool definition. Nobody hand-authors tool
 -- JSON, so a pin-only feature ships correct and unused. This table is what makes

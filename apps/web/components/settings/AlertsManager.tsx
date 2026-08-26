@@ -12,6 +12,8 @@
  * is entitled.
  */
 
+import { Modal } from "@/components/Modal";
+import { apiFetch } from "@/lib/api-fetch";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, EmptyState, Skeleton } from "@tracelanedev/ui";
 import { useState } from "react";
@@ -70,9 +72,9 @@ function formatWindow(minutes: number): string {
 async function fetchDestinations(): Promise<{
 	destinations: AlertDestination[];
 }> {
-	const res = await fetch("/api/alerts/destinations");
-	if (!res.ok) throw new Error(`HTTP ${String(res.status)}`);
-	return res.json() as Promise<{ destinations: AlertDestination[] }>;
+	return apiFetch<{ destinations: AlertDestination[] }>(
+		"/api/alerts/destinations",
+	);
 }
 
 async function createDestination(body: {
@@ -113,9 +115,7 @@ async function testDestination(destination_id: string): Promise<void> {
 }
 
 async function fetchRules(): Promise<{ rules: AlertRule[] }> {
-	const res = await fetch("/api/alerts/rules");
-	if (!res.ok) throw new Error(`HTTP ${String(res.status)}`);
-	return res.json() as Promise<{ rules: AlertRule[] }>;
+	return apiFetch<{ rules: AlertRule[] }>("/api/alerts/rules");
 }
 
 async function createRule(body: {
@@ -160,7 +160,7 @@ function SectionHeader({
 	addLabel: string;
 }) {
 	return (
-		<div className="flex items-start justify-between">
+		<div className="flex items-start justify-between gap-3">
 			<div>
 				<h2 className="text-sm font-semibold text-ink">{title}</h2>
 				<p className="text-xs text-ink-2 mt-0.5">{description}</p>
@@ -231,113 +231,107 @@ function AddDestinationDialog({
 				: "https://example.com/webhook";
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
-				<h3 className="text-base font-semibold text-ink">Add destination</h3>
-				<form
-					onSubmit={(e) => {
-						e.preventDefault();
-						if (!pending)
-							onCreate({ name: name.trim(), kind, url: url.trim() });
-					}}
-					className="space-y-3"
-				>
-					<div>
-						<label
-							htmlFor="dest-name"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							Name
-						</label>
-						<input
-							id="dest-name"
-							type="text"
-							value={name}
-							onChange={(e) => setName(e.target.value)}
-							placeholder="e.g. #alerts-prod"
-							disabled={pending}
-							required
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-						/>
-					</div>
-					<div>
-						<label
-							htmlFor="dest-kind"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							Type
-						</label>
-						<select
-							id="dest-kind"
-							value={kind}
-							onChange={(e) => setKind(e.target.value)}
-							disabled={pending}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-						>
-							<option value="slack">Slack</option>
-							<option value="discord">Discord</option>
-							<option value="webhook">Generic webhook</option>
-						</select>
-					</div>
-					{kind === "discord" && (
-						<p className="text-[11px] text-ink-2 bg-surface-2 border border-line rounded px-2.5 py-2">
-							Discord: use the webhook URL from your channel settings and append{" "}
-							<code className="font-mono">/slack</code> to the end — Tracelane
-							sends a Slack-compatible payload, which Discord&apos;s Slack
-							bridge accepts.
-						</p>
-					)}
-					<div>
-						<label
-							htmlFor="dest-url"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							URL
-						</label>
-						<input
-							id="dest-url"
-							type="url"
-							value={url}
-							onChange={(e) => setUrl(e.target.value)}
-							placeholder={urlPlaceholder}
-							disabled={pending}
-							required
-							pattern="https://.*"
-							title="URL must begin with https://"
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-						/>
-						<p className="text-[11px] text-ink-3 mt-1">
-							Must begin with https://
-						</p>
-					</div>
-					{error && (
-						<p
-							role="alert"
-							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
-						>
-							{error.message}
-						</p>
-					)}
-					<div className="flex justify-end gap-2 pt-1">
-						<button
-							type="button"
-							onClick={onClose}
-							disabled={pending}
-							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
-						>
-							Cancel
-						</button>
-						<button
-							type="submit"
-							disabled={!name.trim() || !url.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
-						>
-							{pending ? "Adding…" : "Add"}
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
+		<Modal title="Add destination" onClose={onClose}>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (!pending) onCreate({ name: name.trim(), kind, url: url.trim() });
+				}}
+				className="space-y-3"
+			>
+				<div>
+					<label
+						htmlFor="dest-name"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Name
+					</label>
+					<input
+						id="dest-name"
+						type="text"
+						value={name}
+						onChange={(e) => setName(e.target.value)}
+						placeholder="e.g. #alerts-prod"
+						disabled={pending}
+						required
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+					/>
+				</div>
+				<div>
+					<label
+						htmlFor="dest-kind"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Type
+					</label>
+					<select
+						id="dest-kind"
+						value={kind}
+						onChange={(e) => setKind(e.target.value)}
+						disabled={pending}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+					>
+						<option value="slack">Slack</option>
+						<option value="discord">Discord</option>
+						<option value="webhook">Generic webhook</option>
+					</select>
+				</div>
+				{kind === "discord" && (
+					<p className="text-2xs text-ink-2 bg-surface-2 border border-line rounded px-2.5 py-2">
+						Discord: use the webhook URL from your channel settings and append{" "}
+						<code className="font-mono">/slack</code> to the end — Tracelane
+						sends a Slack-compatible payload, which Discord&apos;s Slack bridge
+						accepts.
+					</p>
+				)}
+				<div>
+					<label
+						htmlFor="dest-url"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						URL
+					</label>
+					<input
+						id="dest-url"
+						type="url"
+						value={url}
+						onChange={(e) => setUrl(e.target.value)}
+						placeholder={urlPlaceholder}
+						disabled={pending}
+						required
+						pattern="https://.*"
+						title="URL must begin with https://"
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+					/>
+					<p className="text-2xs text-ink-3 mt-1">Must begin with https://</p>
+				</div>
+				{error && (
+					<p
+						role="alert"
+						className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+					>
+						{error.message}
+					</p>
+				)}
+				<div className="flex justify-end gap-2 pt-1">
+					<button
+						type="button"
+						onClick={onClose}
+						disabled={pending}
+						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
+					>
+						Cancel
+					</button>
+					<button
+						type="submit"
+						disabled={!name.trim() || !url.trim() || pending}
+						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
+					>
+						{pending ? "Adding…" : "Add"}
+					</button>
+				</div>
+			</form>
+		</Modal>
 	);
 }
 
@@ -418,22 +412,18 @@ function DestinationsSection() {
 			{!isLoading && !isError && destinations.length === 0 && (
 				<EmptyState
 					title="No destinations yet"
-					description="Add one to start receiving alert notifications."
+					description="Use “+ Add destination” above. A rule can only notify a destination that already exists here."
 				/>
 			)}
 
 			{destinations.length > 0 && (
-				<div className="rounded-lg border border-line overflow-hidden">
+				<div className="overflow-x-auto rounded-lg border border-line">
 					<table className="w-full text-left">
 						<thead className="bg-surface">
 							<tr>
-								<th className="py-1.5 px-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Name
-								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Type
-								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
+								<th className="py-1.5 px-3 t-metric-label">Name</th>
+								<th className="py-1.5 pr-3 t-metric-label">Type</th>
+								<th className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
 									URL
 								</th>
 								<th className="py-1.5 pr-3" />
@@ -567,174 +557,171 @@ function AddRuleDialog({
 		Number(windowMinutes) <= 44640;
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
-				<h3 className="text-base font-semibold text-ink">Add alert rule</h3>
-				{destinations.length === 0 ? (
-					<p className="text-sm text-ink-2">
-						No destinations configured. Add a destination first, then come back
-						to create a rule.
-					</p>
-				) : (
-					<form
-						onSubmit={(e) => {
-							e.preventDefault();
-							if (canSubmit) {
-								onCreate({
-									metric,
-									comparator,
-									threshold: Number(threshold),
-									window_minutes: Number(windowMinutes),
-									destination_id: destinationId,
-								});
-							}
-						}}
-						className="space-y-3"
-					>
-						<div>
+		<Modal title="Add alert rule" onClose={onClose}>
+			{destinations.length === 0 ? (
+				<p className="text-sm text-ink-2">
+					No destinations configured. Add a destination first, then come back to
+					create a rule.
+				</p>
+			) : (
+				<form
+					onSubmit={(e) => {
+						e.preventDefault();
+						if (canSubmit) {
+							onCreate({
+								metric,
+								comparator,
+								threshold: Number(threshold),
+								window_minutes: Number(windowMinutes),
+								destination_id: destinationId,
+							});
+						}
+					}}
+					className="space-y-3"
+				>
+					<div>
+						<label
+							htmlFor="rule-metric"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Metric
+						</label>
+						<select
+							id="rule-metric"
+							value={metric}
+							onChange={(e) => setMetric(e.target.value)}
+							disabled={pending}
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						>
+							<option value="error_rate">Error rate (%)</option>
+							<option value="burn_rate">SLO burn rate (×)</option>
+							<option value="latency_p95">p95 latency (ms)</option>
+							<option value="overhead_p99">Gateway overhead p99 (ms)</option>
+							<option value="cost_usd">Cost (USD)</option>
+							<option value="quota_pct">Quota used (%)</option>
+						</select>
+					</div>
+					<div className="flex gap-3">
+						<div className="w-28 shrink-0">
 							<label
-								htmlFor="rule-metric"
+								htmlFor="rule-comparator"
 								className="text-xs font-medium text-ink-2 block mb-1"
 							>
-								Metric
+								Condition
 							</label>
 							<select
-								id="rule-metric"
-								value={metric}
-								onChange={(e) => setMetric(e.target.value)}
+								id="rule-comparator"
+								value={comparator}
+								onChange={(e) => setComparator(e.target.value)}
 								disabled={pending}
-								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
+								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
 							>
-								<option value="error_rate">Error rate (%)</option>
-								<option value="burn_rate">SLO burn rate (×)</option>
-								<option value="latency_p95">p95 latency (ms)</option>
-								<option value="overhead_p99">Gateway overhead p99 (ms)</option>
-								<option value="cost_usd">Cost (USD)</option>
-								<option value="quota_pct">Quota used (%)</option>
+								<option value="gt">is above</option>
+								<option value="lt">is below</option>
 							</select>
 						</div>
-						<div className="flex gap-3">
-							<div className="w-28 shrink-0">
-								<label
-									htmlFor="rule-comparator"
-									className="text-xs font-medium text-ink-2 block mb-1"
-								>
-									Condition
-								</label>
-								<select
-									id="rule-comparator"
-									value={comparator}
-									onChange={(e) => setComparator(e.target.value)}
-									disabled={pending}
-									className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-								>
-									<option value="gt">is above</option>
-									<option value="lt">is below</option>
-								</select>
-							</div>
-							<div className="flex-1">
-								<label
-									htmlFor="rule-threshold"
-									className="text-xs font-medium text-ink-2 block mb-1"
-								>
-									Threshold ({metricMeta.unit})
-								</label>
-								<input
-									id="rule-threshold"
-									type="number"
-									value={threshold}
-									onChange={(e) => setThreshold(e.target.value)}
-									placeholder="e.g. 5"
-									disabled={pending}
-									required
-									step="any"
-									className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-								/>
-							</div>
-						</div>
-						<div>
+						<div className="flex-1">
 							<label
-								htmlFor="rule-window"
+								htmlFor="rule-threshold"
 								className="text-xs font-medium text-ink-2 block mb-1"
 							>
-								Evaluation window (minutes)
+								Threshold ({metricMeta.unit})
 							</label>
 							<input
-								id="rule-window"
+								id="rule-threshold"
 								type="number"
-								value={windowMinutes}
-								onChange={(e) => setWindowMinutes(e.target.value)}
-								min="1"
-								max="44640"
+								value={threshold}
+								onChange={(e) => setThreshold(e.target.value)}
+								placeholder="e.g. 5"
 								disabled={pending}
 								required
-								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
+								step="any"
+								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
 							/>
-							<p className="text-[11px] text-ink-3 mt-1">
-								1 – 44,640 minutes (up to 31 days)
-							</p>
 						</div>
-						<div>
-							<label
-								htmlFor="rule-destination"
-								className="text-xs font-medium text-ink-2 block mb-1"
-							>
-								Destination
-							</label>
-							<select
-								id="rule-destination"
-								value={destinationId}
-								onChange={(e) => setDestinationId(e.target.value)}
-								disabled={pending}
-								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-50"
-							>
-								{destinations.map((d) => (
-									<option key={d.id} value={d.id}>
-										{d.name} ({KIND_LABELS[d.kind] ?? d.kind})
-									</option>
-								))}
-							</select>
-						</div>
-						{error && (
-							<p
-								role="alert"
-								className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
-							>
-								{error.message}
-							</p>
-						)}
-						<div className="flex justify-end gap-2 pt-1">
-							<button
-								type="button"
-								onClick={onClose}
-								disabled={pending}
-								className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
-							>
-								Cancel
-							</button>
-							<button
-								type="submit"
-								disabled={!canSubmit}
-								className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
-							>
-								{pending ? "Adding…" : "Add rule"}
-							</button>
-						</div>
-					</form>
-				)}
-				{destinations.length === 0 && (
-					<div className="flex justify-end">
+					</div>
+					<div>
+						<label
+							htmlFor="rule-window"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Evaluation window (minutes)
+						</label>
+						<input
+							id="rule-window"
+							type="number"
+							value={windowMinutes}
+							onChange={(e) => setWindowMinutes(e.target.value)}
+							min="1"
+							max="44640"
+							disabled={pending}
+							required
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						/>
+						<p className="text-2xs text-ink-3 mt-1">
+							1 – 44,640 minutes (up to 31 days)
+						</p>
+					</div>
+					<div>
+						<label
+							htmlFor="rule-destination"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Destination
+						</label>
+						<select
+							id="rule-destination"
+							value={destinationId}
+							onChange={(e) => setDestinationId(e.target.value)}
+							disabled={pending}
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						>
+							{destinations.map((d) => (
+								<option key={d.id} value={d.id}>
+									{d.name} ({KIND_LABELS[d.kind] ?? d.kind})
+								</option>
+							))}
+						</select>
+					</div>
+					{error && (
+						<p
+							role="alert"
+							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+						>
+							{error.message}
+						</p>
+					)}
+					<div className="flex justify-end gap-2 pt-1">
 						<button
 							type="button"
 							onClick={onClose}
-							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
+							disabled={pending}
+							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
 						>
-							Close
+							Cancel
+						</button>
+						<button
+							type="submit"
+							disabled={!canSubmit}
+							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
+						>
+							{pending ? "Adding…" : "Add rule"}
 						</button>
 					</div>
-				)}
-			</div>
-		</div>
+				</form>
+			)}
+			{destinations.length === 0 && (
+				<div className="flex justify-end">
+					<button
+						type="button"
+						onClick={onClose}
+						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
+					>
+						Close
+					</button>
+				</div>
+			)}
+		</Modal>
 	);
 }
 
@@ -796,30 +783,24 @@ function RulesSection({
 			{!isLoading && !isError && rules.length === 0 && (
 				<EmptyState
 					title="No alert rules yet"
-					description="Add one to start monitoring your agents."
+					description="Use “+ Add rule” above to watch a metric and notify your destinations when it crosses a threshold."
 				/>
 			)}
 
 			{rules.length > 0 && (
-				<div className="rounded-lg border border-line overflow-hidden">
+				<div className="overflow-x-auto rounded-lg border border-line">
 					<table className="w-full text-left">
 						<thead className="bg-surface">
 							<tr>
-								<th className="py-1.5 px-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Metric
-								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Condition
-								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden sm:table-cell">
+								<th className="py-1.5 px-3 t-metric-label">Metric</th>
+								<th className="py-1.5 pr-3 t-metric-label">Condition</th>
+								<th className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
 									Window
 								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hidden md:table-cell">
+								<th className="py-1.5 pr-3 t-metric-label hidden md:table-cell">
 									Destination
 								</th>
-								<th className="py-1.5 pr-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									State
-								</th>
+								<th className="py-1.5 pr-3 t-metric-label">State</th>
 								<th className="py-1.5 pr-3" />
 							</tr>
 						</thead>

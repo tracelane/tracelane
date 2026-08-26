@@ -1,0 +1,39 @@
+# B-263 FALSIFICATION FIXTURE — proves `deny.toml`'s `proc-macro1` ban BLOCKS.
+#
+# WHY THIS EXISTS. That ban's only recorded proof was a run against the REAL
+# poisoned `Cargo.lock` kept from the incident. That lockfile is now gone from the
+# tree, from ~/tracelane-security-evidence/, from `git stash` and from every
+# branch, so the proof rested on a commit message. A guard whose falsification
+# cannot be re-run is a guard trusted on memory (CLAUDE.md §1).
+#
+# WHY A PATH DEPENDENCY AND NOT A LOCKFILE ENTRY. The first attempt hand-wrote a
+# `Cargo.lock` naming `proc-macro1` and cargo-deny passed it: cargo-deny evaluates
+# the graph `cargo metadata` RESOLVES, never the raw lockfile. A local path
+# dependency is resolvable offline, needs no crates.io (where the crate is now
+# removed), and puts a package literally named `proc-macro1 1.0.107` in the graph —
+# which is exactly and only what the ban matches.
+#
+# THERE IS NO PAYLOAD HERE. `proc-macro1/` is an empty lib: no `build.rs`, no
+# dependencies, no network, no source beyond a comment. Nothing here can execute.
+# `[workspace]` is empty and deliberate — it detaches this tree from the root
+# workspace so a normal `cargo build` never picks it up.
+[package]
+name = "b263-deny-ban-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+proc-macro1 = { path = "proc-macro1", version = "1.0.107" }
+
+[workspace]
+
+# cargo-machete is correct that this dependency is unused, and it is unused ON
+# PURPOSE: the fixture's entire job is to put `proc-macro1` in the resolved graph
+# so `deny.toml`'s ban has something to match. Using it would mean writing code
+# against a crate named after malware, which is worse.
+[package.metadata.cargo-machete]
+ignored = ["proc-macro1"]

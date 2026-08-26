@@ -48,7 +48,7 @@ const STATIC_ACTIONS: Action[] = [
 	{
 		id: "prompts",
 		label: "Prompt Studio",
-		description: "Promote, version, and evaluate prompts",
+		description: "Promote and version prompts",
 		href: "/prompts",
 		group: "navigation",
 	},
@@ -61,6 +61,28 @@ const STATIC_ACTIONS: Action[] = [
 	},
 ];
 
+/**
+ * The matched run inside a result label or description.
+ *
+ * WAS a colour-only highlight — a transparent `<mark>` tinted with `--info-ink`.
+ * `--info` used to be blue; the P0 palette retargets it at the chart neutral
+ * (#202124 light / #f2f2f2 dark), so the "highlight" became primary ink on
+ * primary-ink text and distinguished NOTHING. That is the failure mode a role
+ * token has when its value moves: nothing errors, the mark just stops meaning
+ * anything.
+ *
+ * The replacement is a `--surface-3` run at a heavier weight — TWO signals, and
+ * neither of them a hue, so it survives a monochrome system and a viewer who
+ * cannot resolve a 6% tonal step. `--surface-3` specifically, not `--surface-2`:
+ * the SELECTED row is painted `--surface-2`, so a `--surface-2` mark would be
+ * invisible on exactly the row the user is looking at. Verified in both themes —
+ * on the selected row #ebebe9-on-#f5f5f4 and #26272b-on-#1c1d20; on an unselected
+ * row #ebebe9-on-#ffffff and #26272b-on-#151619.
+ *
+ * The explicit background is also load-bearing: `<mark>` has a UA default of
+ * yellow-on-black that no reset in this app clears, which is what the previous
+ * transparent value was there for.
+ */
 function highlight(text: string, query: string): React.ReactNode {
 	if (!query) return text;
 	const idx = text.toLowerCase().indexOf(query.toLowerCase());
@@ -68,7 +90,7 @@ function highlight(text: string, query: string): React.ReactNode {
 	return (
 		<>
 			{text.slice(0, idx)}
-			<mark className="bg-transparent text-info-ink font-medium">
+			<mark className="bg-surface-3 font-semibold text-ink">
 				{text.slice(idx, idx + query.length)}
 			</mark>
 			{text.slice(idx + query.length)}
@@ -82,6 +104,7 @@ export function CommandPalette() {
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const inputRef = useRef<HTMLInputElement>(null);
 	const listRef = useRef<HTMLUListElement>(null);
+	const dialogRef = useRef<HTMLDialogElement>(null);
 	const router = useRouter();
 
 	const filtered = STATIC_ACTIONS.filter(
@@ -113,14 +136,51 @@ export function CommandPalette() {
 		return () => window.removeEventListener("keydown", handler);
 	}, []);
 
-	// Focus input when opened
+	// Promote to a REAL modal, and focus the input.
+	//
+	// This element rendered as `<dialog open>` until 2026-08-18, which is a
+	// NON-modal dialog: the page behind it stayed focusable, Tab walked straight
+	// out of the palette, and nothing made the rest of the document inert — while
+	// the element also carried `aria-modal="true"`, a claim about behaviour it did
+	// not have. `showModal()` is what actually buys the top layer, the focus trap
+	// and the inert background, so `aria-modal` is now gone as redundant.
+	//
+	// `showModal()` throws `InvalidStateError` on an already-open dialog (reachable
+	// under React 19 StrictMode's double-invoked effects), hence the `.open` check.
 	useEffect(() => {
-		if (open) {
-			requestAnimationFrame(() => inputRef.current?.focus());
-			setSelectedIndex(0);
-		} else {
+		if (!open) {
 			setQuery("");
+			return;
 		}
+		const el = dialogRef.current;
+		if (!el) return;
+		if (!el.open) el.showModal();
+		requestAnimationFrame(() => inputRef.current?.focus());
+		setSelectedIndex(0);
+
+		// Escape now arrives as the native `cancel` event. Preventing the default
+		// close keeps the browser from closing the dialog behind React's back and
+		// leaving `open` true with nothing rendered.
+		const onCancel = (e: Event) => {
+			e.preventDefault();
+			setOpen(false);
+		};
+		// The dialog fills the viewport and the panel is its child, so a click
+		// reported against the dialog itself landed outside the panel. Bound as a
+		// native listener rather than an `onClick` prop: `onClick` on a `<dialog>`
+		// trips `lint/a11y/useKeyWithClickEvents`, whose only accepted answer is a
+		// keyboard handler on the same element — and a decorative `onKeyDown` added
+		// to quiet a linter is exactly the kind of claim this repo keeps deleting.
+		const onClick = (e: MouseEvent) => {
+			if (e.target === el) setOpen(false);
+		};
+
+		el.addEventListener("cancel", onCancel);
+		el.addEventListener("click", onClick);
+		return () => {
+			el.removeEventListener("cancel", onCancel);
+			el.removeEventListener("click", onClick);
+		};
 	}, [open]);
 
 	// Scroll selected item into view
@@ -146,9 +206,6 @@ export function CommandPalette() {
 					e.preventDefault();
 					if (filtered[selectedIndex]) execute(filtered[selectedIndex]);
 					break;
-				case "Escape":
-					setOpen(false);
-					break;
 			}
 		},
 		[execute, filtered, selectedIndex],
@@ -162,20 +219,41 @@ export function CommandPalette() {
 	if (!open) return null;
 
 	return (
-		// eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
 		<dialog
+			ref={dialogRef}
 			aria-label="Command palette"
-			aria-modal="true"
 			className="fixed inset-0 z-50 m-0 flex h-full max-h-none w-full max-w-none items-start justify-center border-none bg-black/60 p-0 pt-[18vh]"
-			onClick={() => setOpen(false)}
-			onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
-			open
 		>
-			{/* Inner panel — stop propagation so clicks inside don't close */}
+			{/*
+			 * Inner panel. No stopPropagation: the dialog's own handler compares
+			 * `e.target` against the dialog element, so a click anywhere in here is
+			 * already outside the "clicked the scrim" case.
+			 *
+			 * P0 token pass. Three values were off the system and each is now the
+			 * token that names the role:
+			 *   · `--surface`, not `--bg`. The panel was painted the PAGE GROUND, so a
+			 *     floating overlay used the same material as the thing it floats over —
+			 *     flat in light, and in dark the panel (#0d0e10) was DARKER than the
+			 *     cards behind it. `--surface` is lighter than the ground in both
+			 *     themes, which is what "in front" means here.
+			 *   · `--radius-card`, not Tailwind's 16px `rounded-2xl`. The system has two
+			 *     radii; a panel takes the card one.
+			 *   · `--shadow-overlay`, not Tailwind's heaviest stock drop. The overlay
+			 *     elevation is defined once, in both themes, and a default-scale shadow
+			 *     is a fourth elevation nobody declared. The class it replaced is
+			 *     DESCRIBED rather than quoted: Tailwind extracts candidates from raw
+			 *     file bytes, comments included, so naming it here would keep emitting
+			 *     its rule into the built sheet with no element wearing it (the trap
+			 *     `NavProgress.tsx` records) — and it now has zero real call sites.
+			 *
+			 * It stays SOLID rather than taking the translucent chrome class. Glass is
+			 * sanctioned for overlays, but this one sits on a 60%-black scrim: the blur
+			 * would sample the scrim, so it pays a per-frame compositor pass to blur a
+			 * flat dim. Nothing to see through is not a case for see-through.
+			 */}
 			<div
 				role="presentation"
-				className="w-full max-w-xl overflow-hidden rounded-2xl border border-line bg-bg shadow-2xl"
-				onClick={(e) => e.stopPropagation()}
+				className="w-full max-w-xl overflow-hidden rounded-[var(--radius-card)] border border-line bg-surface shadow-[var(--shadow-overlay)]"
 				onKeyDown={handleKeyDown}
 			>
 				{/* Input row */}
@@ -197,7 +275,7 @@ export function CommandPalette() {
 					</svg>
 					<input
 						ref={inputRef}
-						className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-2 outline-none"
+						className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-3"
 						placeholder="Jump to a page…"
 						value={query}
 						onChange={handleQueryChange}
@@ -209,7 +287,10 @@ export function CommandPalette() {
 								: undefined
 						}
 					/>
-					<kbd className="shrink-0 rounded border border-line bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-ink-2">
+					{/* `--canvas-sunken`, matching the TopBar's ⌘K key: one <kbd> material
+					    for the app, and it is the only surface token that reads as
+					    RECESSED against a card in both themes. */}
+					<kbd className="shrink-0 rounded border border-line bg-canvas-sunken px-1.5 py-0.5 font-mono text-2xs font-medium text-ink-2">
 						ESC
 					</kbd>
 				</div>
@@ -230,10 +311,18 @@ export function CommandPalette() {
 							key={action.id}
 							id={`cmd-item-${action.id}`}
 							aria-selected={idx === selectedIndex}
-							className={`mx-2 flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${
-								idx === selectedIndex
-									? "bg-surface-2 text-ink"
-									: "text-ink hover:bg-surface"
+							/*
+							 * SELECTED is the only row state, and the hover class that used
+							 * to sit on the idle branch is DELETED rather than retoned.
+							 * `onMouseEnter` promotes the row to selected, so hovering and
+							 * selecting are the same event here: the hover fill could only
+							 * ever paint for the single frame before React re-rendered, and
+							 * on a keyboard-driven palette it never painted at all. It was
+							 * also `--surface`, which is now the panel's own colour — a
+							 * hover that changes nothing.
+							 */
+							className={`mx-2 flex cursor-pointer items-center gap-3 rounded-[var(--radius-control)] px-3 py-2.5 text-sm transition-colors ${
+								idx === selectedIndex ? "bg-surface-2 text-ink" : "text-ink"
 							}`}
 							onClick={() => execute(action)}
 							onKeyDown={(e) => {
@@ -274,15 +363,26 @@ export function CommandPalette() {
 				</ul>
 
 				{/* Footer hint */}
-				<div className="flex items-center gap-4 border-t border-line px-4 py-2 text-[10px] text-ink-3">
+				{/* Footer hint keys take the same `--canvas-sunken` material as the two
+				    above, so the palette does not carry three kinds of <kbd>. */}
+				<div className="flex items-center gap-4 border-t border-line px-4 py-2 text-2xs text-ink-3">
 					<span>
-						<kbd className="rounded border border-line px-1">↑↓</kbd> navigate
+						<kbd className="rounded border border-line bg-canvas-sunken px-1 font-mono">
+							↑↓
+						</kbd>{" "}
+						navigate
 					</span>
 					<span>
-						<kbd className="rounded border border-line px-1">↵</kbd> open
+						<kbd className="rounded border border-line bg-canvas-sunken px-1 font-mono">
+							↵
+						</kbd>{" "}
+						open
 					</span>
 					<span>
-						<kbd className="rounded border border-line px-1">esc</kbd> close
+						<kbd className="rounded border border-line bg-canvas-sunken px-1 font-mono">
+							esc
+						</kbd>{" "}
+						close
 					</span>
 				</div>
 			</div>

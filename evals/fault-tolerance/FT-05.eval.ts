@@ -17,6 +17,7 @@ import { expect } from "../src/harness.js";
  * `tracelane.predictive.degraded=true`, and return `Decision::Allow`.
  *
  * This is a deliberate architectural choice: false-negatives on predictive
+ * guardrails are better than a gateway outage. Documented in
  *
  * Chaos method: Inject a predictor that panics on every call. Assert that
  * the gateway returns 200 with predictive degraded flag, not 503.
@@ -51,6 +52,7 @@ describe("FT-05: Predictive ONNX crash — gateway fails open", () => {
 			path.join(GATEWAY_SRC, "predictive/mod.rs"),
 			"utf8",
 		);
+		// When ONNX crashes, emit tracelane.predictive.degraded span field
 		expect(content).toContain("degraded");
 		expect(content).toContain("tracing");
 	});

@@ -1,3 +1,4 @@
+//! The SSRF guard's loopback defence, tested at the ENTRY POINT.
 //!
 //! # Why this is its own binary
 //!

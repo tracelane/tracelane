@@ -8,6 +8,7 @@ import {
 /**
  * GC-TRACE-LOOP (live) — the canonical core-trace-loop merge gate (L2).
  *
+ * This is the single assertion that would have caught the silent
  * span-drop on day one. It exercises the WHOLE loop against a real ephemeral
  * stack (gateway → NATS → ingest → ClickHouse → gateway read), with ONLY the
  * upstream provider faked (a wiremock the gateway is pointed at via
@@ -16,8 +17,10 @@ import {
  *
  * It guards BOTH halves in one test:
  *   1. WRITE — a real `/v1/chat/completions` lands a span row in ClickHouse
+ *      (`tracelane.spans`). This is what silently died in.
  *   2. READ  — that trace is queryable THROUGH the gateway's tenant-resolved
  *      `/v1/traces` read path. This is the half that was independently broken
+ *      in (org_id→tenant seam).
  *
  * Auth/secrets: the CI stack runs a DEBUG gateway with `WORKOS_CLIENT_ID`
  * unset, so any non-`tlane_` Bearer token resolves the fixed dev-stub tenant
@@ -73,6 +76,7 @@ interface SpanRowData {
 
 /**
  * Fetch the most-recent persisted span ROWS for a tenant — the row-level proof
+ * (#81 /) that a gateway-emitted span actually landed in ClickHouse with
  * the CORRECT tenant_id, rather than relying on a count delta or a JetStream
  * sequence advance (which can advance while the row silently never persists).
  * Returns [] on any error or no rows.
@@ -106,6 +110,7 @@ async function clickhouseRowData(
  * row-level proof: the row carries the correct `tenant_id`, the span carrying
  * `MODEL` exists with intact structure (non-empty trace/span ids, valid
  * attributes JSON), and the span is NOT visible under a different tenant id
+ * (cross-tenant isolation). This is the deliverable for #81.
  */
 async function assertSpanRowForTenant(tenant: string): Promise<void> {
 	let rows: SpanRowData[] = [];
@@ -191,6 +196,7 @@ describe("GC-TRACE-LOOP (live): real chat request → ClickHouse → gateway /v1
 			// We only reach here when isLiveGatewayConfigured() is true (the outer
 			// skipIf handles mock-mode). So a gateway that is NOT reachable here is a
 			// REAL gate failure — never a silent skip. A green-but-skipped core loop is
+			// exactly the vacuous-pass anti-pattern this gate exists to kill.
 			expect(
 				live.skip,
 				`live gateway unreachable: ${live.skipReason ?? "unknown"}`,
@@ -215,6 +221,7 @@ describe("GC-TRACE-LOOP (live): real chat request → ClickHouse → gateway /v1
 			expect(chat.status).toBe(200);
 
 			// 2. WRITE half — the span must reach ClickHouse (ingest is async-batched,
+			//    so poll: up to ~20s at 500ms). This is the silent-drop guard.
 			let after = before;
 			for (let i = 0; i < 40; i++) {
 				after = await clickhouseSpanCount(DEV_TENANT);
@@ -223,11 +230,13 @@ describe("GC-TRACE-LOOP (live): real chat request → ClickHouse → gateway /v1
 			}
 			expect(after).toBeGreaterThan(before);
 
+			// 2b. ROW-LEVEL proof (#81 /) — the count delta says "a row appeared";
 			//     this asserts the ACTUAL row is queryable with the CORRECT tenant_id and
 			//     intact span structure, the proof a JetStream seq advance can never give.
 			await assertSpanRowForTenant(DEV_TENANT);
 
 			// 3. READ half — the trace must be queryable THROUGH the gateway's
+			//    tenant-resolved /v1/traces (the org_id→tenant read seam).
 			let traces: TraceRow[] = [];
 			for (let i = 0; i < 20; i++) {
 				traces = await gatewayTraces(live.url);
@@ -291,6 +300,7 @@ describe("GC-TRACE-LOOP (live): real chat request → ClickHouse → gateway /v1
 			}
 			expect(after).toBeGreaterThan(before);
 
+			// ROW-LEVEL proof for the streaming path (#81 /): the streaming span
 			// must land as a queryable ClickHouse row with the correct tenant_id — the
 			// streaming path is exactly where #81 dropped the span post-loop.
 			await assertSpanRowForTenant(DEV_TENANT);

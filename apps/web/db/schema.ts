@@ -86,6 +86,17 @@ export const tenants = pgTable(
 		forceTail: boolean("force_tail").default(false).notNull(),
 		// ADR-048 D5: billing contact for the quota-breach notice (nullable).
 		billingEmail: text("billing_email"),
+		// GWY-43: workspace-wide monthly USD spend ceiling across ALL keys.
+		// NULL = uncapped. Distinct from the plan's TRACE quota: this is a
+		// customer-set DOLLAR limit, and it composes with the per-key budget —
+		// a request must pass both. Applied by migration 0029 (un-journaled).
+		//
+		// "Per-team" in the Sprint-1 brief means this: there is no `teams` table
+		// and never was — a team IS the workspace (WorkOS org → tenants row).
+		budgetUsdMonthly: numeric("budget_usd_monthly", {
+			precision: 12,
+			scale: 4,
+		}),
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.defaultNow()
 			.notNull(),
@@ -98,6 +109,7 @@ export const tenants = pgTable(
 		// manual SQL, UI later (see PROGRESS Eng-queue).
 		archivedAt: timestamp("archived_at", { withTimezone: true }),
 		// Org display name (nullable). Retained in prod from an earlier push;
+		// re-added to schema.ts per so Drizzle matches reality. ADR-040
 		// dropped it from the gateway (WorkOS owns org names — the gateway never
 		// reads it), but `drizzle-kit push` never dropped the column, so it
 		// persists. Keeping it here is the honest, non-destructive reconcile.
@@ -105,6 +117,7 @@ export const tenants = pgTable(
 	},
 	(t) => [
 		uniqueIndex("tenants_workos_org_id_idx").on(t.workosOrgId),
+		//  LOW (defense in depth): the disposable E2E-bypass tenant id
 		// (lib/e2e-auth.ts E2E_TEST_TENANT_ID) must NEVER be a real tenant row.
 		// The app-layer mint already fails closed; this DB CHECK makes a real row
 		// with that id physically impossible (e.g. a stray seed / manual insert).
@@ -168,6 +181,7 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	// ADR-048 D2: full-capture gate. Business + Enterprise base = TRUE; others
 	// FALSE. Audit-SKU-active forces full regardless (resolved in entitlements).
 	fFullCapture: boolean("f_full_capture").notNull().default(false),
+	//  ADR-009: Prompt-Promotion WRITE workflow (promote/rollback
 	// observe). Team+ = TRUE (seeded); Builder is read-only, Free none.
 	fPromptPromotionWrite: boolean("f_prompt_promotion_write")
 		.notNull()
@@ -175,7 +189,41 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	// User-facing alerting (ADR-059; migration 0012). DARK on every plan until the
 	// founder flips it at DoD close; a per-tenant workspace override grants early.
 	fAlerts: boolean("f_alerts").notNull().default(false),
+	// ── Sprint 3, the eval loop (migration 0030) ───────────────────────────────
+	// Four flags, one migration, and the ORDER is the point: each column lands in
+	// Neon BEFORE the gateway that reads it deploys (CLAUDE.md §4.0). Get it
+	// backwards and nothing 500s — which is precisely the danger. The gateway
+	// resolves EVERY flag in ONE SELECT naming each column by name
+	// (`crates/gateway/src/entitlement_cache.rs:540-570`), so one absent column
+	// fails that whole statement for every tenant; the miss path then serves
+	// `deny_all()` because a freshly deployed process has no last-known grant
+	// (`entitlement_cache.rs:459-491`). Every gated feature — guardrail rails,
+	// prompt promotion, alerts, audit self-verify — goes OFF for every tenant,
+	// reported as a `warn!` and a counter, never as an error a caller can see.
+	// Plan default is FALSE for the same reason every other flag's is: an absent
+	// or unseeded control plane must resolve to the UNPRIVILEGED state
+	// (`.claude/rules/tenancy.md`). The tier split below is seeded, not defaulted.
+	//
+	// EVL-04 datasets + the golden schema. BUILDER+ = TRUE (spec §9 Q2) — the one
+	// flag of the four that is not Team+: datasets are table-stakes parity
+	// against LiteLLM/Langfuse/Braintrust, and gating them at Team loses the
+	// comparison before it starts.
+	fDatasets: boolean("f_datasets").notNull().default(false),
+	// EVL-02 experiments — a dataset × a prompt version, run and diffed
+	// side-by-side. Team+ = TRUE (seeded), alongside f_prompt_promotion_write,
+	// which the promote step at the end of an experiment already requires; a
+	// tenant able to run one but never act on it is the dormant shape.
+	fExperiments: boolean("f_experiments").notNull().default(false),
+	// EVL-28 online evals — sampled scoring of live production traffic. Team+ =
+	// TRUE (seeded). Spends the tenant's provider money per sampled request, so
+	// it is deliberately not a Builder default.
+	fOnlineEvals: boolean("f_online_evals").notNull().default(false),
+	// EVL-29 annotation / review queues over the OBS-18 trace_annotations store.
+	// Team+ = TRUE (seeded) — a review queue is a multi-seat workflow, and
+	// Builder is a one-seat plan (seat_cap_max = 1).
+	fAnnotationQueues: boolean("f_annotation_queues").notNull().default(false),
 	// Inline guardrail V1 rails (infra migration 12 → reconciled into Drizzle in
+	// they were prod-only, hand-applied). Gated rails default OFF for
 	// every plan (guardrail spec §2.7); R1/R3-schema/R8 are always-on and carry
 	// no flag. A workspace override or a future pricing-ADR seed flips one on.
 	fGuardrailR2: boolean("f_guardrail_r2").notNull().default(false),
@@ -234,10 +282,23 @@ export const workspaceEntitlements = pgTable(
 		fAuditAddon: boolean("f_audit_addon"),
 		// ADR-048 D2: per-tenant full-capture override (NULL = inherit plan).
 		fFullCapture: boolean("f_full_capture"),
+		//  ADR-009: per-tenant prompt-promotion-write override.
 		fPromptPromotionWrite: boolean("f_prompt_promotion_write"),
 		// ADR-059 alerting override (NULL = inherit plan).
 		fAlerts: boolean("f_alerts"),
+		// Sprint 3 eval-loop per-tenant overrides (migration 0030). NULLABLE and
+		// WITHOUT a default, deliberately and identically to every flag above:
+		// NULL = inherit the plan, and a FALSE here beats a plan-level TRUE
+		// (deny-overrides-grant, ADR-009 §7.4.9 — the gateway resolves
+		// `COALESCE(we.f_x, pe.f_x)`). Give one of these a NOT NULL DEFAULT and
+		// the override table stops meaning "inherit", silently: every tenant row
+		// would read FALSE and no plan grant would ever reach them.
+		fDatasets: boolean("f_datasets"),
+		fExperiments: boolean("f_experiments"),
+		fOnlineEvals: boolean("f_online_evals"),
+		fAnnotationQueues: boolean("f_annotation_queues"),
 		// Per-tenant guardrail-rail overrides (NULL = inherit plan). infra
+		// migration 12 → reconciled into Drizzle in (were prod-only).
 		fGuardrailR2: boolean("f_guardrail_r2"),
 		fGuardrailR3Pinning: boolean("f_guardrail_r3_pinning"),
 		fGuardrailR4: boolean("f_guardrail_r4"),
@@ -359,6 +420,7 @@ export const cmkKeys = pgTable(
 export type CmkKey = typeof cmkKeys.$inferSelect;
 
 // ── API keys ─────────────────────────────────────────────────────────────────
+// Gateway keys for authenticating agent traffic. Auth is the peppered-HMAC
 // + Argon2id scheme (ADR-042), matching crates/gateway/src/db/api_keys.rs:
 //   • lookup_hash  = HMAC-SHA256(TRACELANE_APIKEY_PEPPER, key_body) — indexed lookup
 //   • argon2id_phc = Argon2id(key_body) PHC string                  — KDF verify
@@ -379,6 +441,7 @@ export const apiKeys = pgTable(
 		lookupHash: bytea("lookup_hash"),
 		// Argon2id PHC string of key_body — verified after a lookup_hash hit.
 		argon2idPhc: text("argon2id_phc"),
+		// Legacy bare SHA-256(full key) hex — nullable + deprecated (rows).
 		keyHash: text("key_hash"),
 		keyPrefix: text("key_prefix").notNull(),
 		// WorkOS user id (`Claims.sub`) of the minting user, recorded by the
@@ -413,6 +476,17 @@ export const apiKeys = pgTable(
 			precision: 12,
 			scale: 4,
 		}),
+		// ── GWY-43: per-key rate limit ──────────────────────────────────────
+		// Applied to Neon by migration 0029 (un-journaled) BEFORE the gateway
+		// that reads it deploys — the gateway's hot-path auth SELECT reads this
+		// column, so a gateway ahead of the migration 500s on every API-key
+		// request rather than degrading.
+		//
+		//   rateLimitRpm  NULL = inherit the tenant's plan tier (pre-GWY-43)
+		//
+		// `api_keys_rate_limit_rpm_positive_chk` rejects 0: a key that can never
+		// be used is a foot-gun, and `revokedAt` already switches a key off.
+		rateLimitRpm: integer("rate_limit_rpm"),
 	},
 	(t) => [
 		index("api_keys_tenant_id_idx").on(t.tenantId),
@@ -421,6 +495,7 @@ export const apiKeys = pgTable(
 			.on(t.expiresAt)
 			.where(sql`${t.expiresAt} IS NOT NULL AND ${t.revokedAt} IS NULL`),
 		uniqueIndex("api_keys_lookup_hash_idx").on(t.lookupHash),
+		// PARTIAL unique index: `key_hash` is the LEGACY column, always
 		// NULL for keys minted by the current route. A plain unique index that
 		// treats NULLs as not-distinct rejects the 2nd NULL row → the "can't add a
 		// second key" 500. Excluding NULLs keeps uniqueness for legacy non-null
@@ -474,6 +549,7 @@ export const adminAuditLog = pgTable(
 		// admin_audit_log DENORMALISES the actor id so the row survives a
 		// hard-delete of the user/tenant it references (compliance trail). The
 		// `users` table does exist (gateway-provisioned via the WorkOS webhook;
+		// see `users` below, added in) — this column just doesn't point at it.
 		actorUserId: text("actor_user_id").notNull(),
 		// Internal tenant UUID; nullable for cross-workspace operator actions.
 		actorWorkspaceId: uuid("actor_workspace_id"),
@@ -586,6 +662,7 @@ export const tenantAuditKeys = pgTable(
 export type TenantAuditKey = typeof tenantAuditKeys.$inferSelect;
 
 // ── Payment events (x402 / AP2 / ACP) ─────────────────────────────────────────
+// Per-agent payment-protocol span ledger. The gateway records these
 // best-effort (crates/gateway/src/payment.rs). Mirrors migration 02.
 
 export const paymentEvents = pgTable(
@@ -620,8 +697,10 @@ export const paymentEvents = pgTable(
 
 export type PaymentEvent = typeof paymentEvents.$inferSelect;
 
+// ── users ────────────────────────────────────────────────────────────
 // Provisioned by the gateway WorkOS webhook (user.created / dsync.user.created;
 // crates/gateway/src/auth/workos_webhook.rs USER_UPSERT_SQL). Added to schema.ts
+// in (2026-07-04) to make Drizzle the single source of truth — it existed
 // only in the gateway's writes + the (now-retired) infra SQL. `user_id` is
 // supplied by the gateway (a hash of workos_user_id), so there is no default.
 // `email` UNIQUE is required by the gateway's `ON CONFLICT (email)` upsert.
@@ -672,6 +751,7 @@ export const supportRequests = pgTable(
 export type SupportRequest = typeof supportRequests.$inferSelect;
 
 /**
+ * B — tool definitions the gateway has actually OBSERVED, pending approval.
  *
  * Deliberately stores NO schema or description text: R3 records the hash, never
  * the tool text, and the observe path must not weaken that. Approving copies the
@@ -714,6 +794,7 @@ export type ObservedTool = typeof observedTools.$inferSelect;
  * (SET-08). Migration `0023_quota_notifications.sql`.
  *
  * The gateway's `QuotaTracker` is process-local and reseeds from ClickHouse on
+ * boot, so it cannot answer "have we notified this period?" — a restart
  * moves the counter and takes the answer with it. This table is that answer, and
  * the primary key is the concurrency control: the claim is
  * `INSERT … ON CONFLICT DO NOTHING`, so racing gateway replicas produce exactly

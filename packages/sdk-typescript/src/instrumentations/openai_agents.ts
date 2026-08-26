@@ -4,6 +4,7 @@
  * Wraps the OpenAI Agents SDK Runner.run() class method to emit OTel spans
  * for every agent execution. Captures agent name, output length, and
  * handoff metadata. The Agents SDK is the direct route to OpenAI Frontier
+ * customers post-Promptfoo.
  *
  * @example
  * ```ts

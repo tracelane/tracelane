@@ -1,6 +1,7 @@
 //! Tenant API key validation.
 //!
 //! API keys: `tlane_<base62>` — shown once at creation, never stored raw.
+//! Storage + lookup are the peppered-HMAC + Argon2id scheme (ADR-042)
 //! see `crate::db::api_keys`. This module is the auth entry point: it strips the
 //! `tlane_` prefix and resolves the key body via
 //! `db::api_keys::lookup_tenant_by_key_body` (peppered-HMAC lookup → Argon2id
@@ -40,7 +41,14 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
     // Path 1: real Postgres lookup. Hash + index-scan happens here.
     if let Some(pool) = crate::db::global_pool() {
         match crate::db::api_keys::lookup_tenant_by_key_body(pool, key_body).await {
-            Ok(Some((tenant_id, key_id, key_scope))) => {
+            Ok(Some(auth)) => {
+                let crate::db::api_keys::KeyAuth {
+                    tenant_id,
+                    key_id,
+                    scope: key_scope,
+                    budget_usd_monthly,
+                    rate_limit_rpm,
+                } = auth;
                 return Ok(Claims {
                     tenant_id,
                     // `sub` is the api_keys.id UUID — never a value derived from
@@ -60,6 +68,10 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     // keeps working exactly as it did; a scoped key carries only
                     // what it was granted.
                     key_scope,
+                    // GWY-43: carried on the claims so the hot path enforces a
+                    // budget and a per-key rate limit without a second lookup.
+                    budget_usd_monthly,
+                    rate_limit_rpm,
                 });
             }
             Ok(None) => bail!("API key not found or revoked"),
@@ -97,6 +109,9 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                 auth_method: AuthMethod::ApiKey,
                 role: None,
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+                // GWY-43: no budget and no per-key rate override on this credential.
+                budget_usd_monthly: None,
+                rate_limit_rpm: None,
             });
         }
     }

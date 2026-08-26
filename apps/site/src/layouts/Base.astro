@@ -56,7 +56,7 @@ const jsonLd = {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#ffffff" />
+    <meta name="theme-color" content="#f7f7f4" />
     <meta name="generator" content={Astro.generator} />
 
     <title>{title}</title>
@@ -82,16 +82,19 @@ const jsonLd = {
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2" />
 
+    {/* Inter Tight is no longer used — the rebuilt system runs ONE sans, like the
+        reference. Preloading a face the CSS never asks for is a wasted round trip
+        on the critical path, so the preload follows the stylesheet. */}
     <link
       rel="preload"
-      href="/fonts/inter-tight-var-latin.woff2"
+      href="/fonts/inter-var-latin.woff2"
       as="font"
       type="font/woff2"
       crossorigin="anonymous"
     />
     <link
       rel="preload"
-      href="/fonts/inter-var-latin.woff2"
+      href="/fonts/jetbrains-mono-var-latin.woff2"
       as="font"
       type="font/woff2"
       crossorigin="anonymous"
@@ -109,6 +112,73 @@ const jsonLd = {
     <Footer />
 
     <script is:inline>
+      /* Scroll reveal — single elements (.reveal) and staggered grids
+         (.reveal-group).
+
+         THIS LIVES IN THE LAYOUT, and that is the whole fix. It used to sit in
+         `index.astro`'s inline script, so it shipped to exactly one page. Every
+         `.reveal` element starts at `opacity: 0` and is only made visible by the
+         `.in` class this observer adds — which meant any OTHER page rendering a
+         revealing component painted nothing at all.
+
+         `/pricing` did exactly that from the day it was created (2026-08-16): it
+         renders the same `PricingTable.astro` as the homepage anchor, all six
+         tiers were present in the DOM, and all six sat at `opacity: 0`
+         permanently. The page looked blank below the header.
+
+         A reveal that never fires is not a missing animation, it is missing
+         CONTENT — so the observer belongs anywhere a `.reveal` can appear, and
+         the layout is the only place that is true of. */
+      (function () {
+        var els = document.querySelectorAll(".reveal, .reveal-group");
+        if (!els.length) return;
+        // No IntersectionObserver (or none matched): show everything rather than
+        // leave the page blank. Failing OPEN is the only safe direction here.
+        if (!("IntersectionObserver" in window)) {
+          els.forEach(function (el) { el.classList.add("in"); });
+          return;
+        }
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (e) {
+            if (e.isIntersecting) { reveal(e.target); }
+          });
+        }, { threshold: 0.14, rootMargin: "0px 0px -40px 0px" });
+        els.forEach(function (el) { io.observe(el); });
+
+        function reveal(el) { el.classList.add("in"); io.unobserve(el); }
+
+        /* SELF-HEALING SWEEP — the observer alone can strand content.
+           IntersectionObserver reports the state it sees ON A FRAME TICK. A fast
+           flick, a `scrollTo`, an anchor jump or a restored scroll position can
+           carry an element from below the fold to above it between two ticks, so
+           it is never OBSERVED intersecting — and because everything here starts
+           at `opacity: 0`, that element is then invisible for the life of the
+           page. Measured on this page 2026-08-24 with a scripted 500px-step
+           scroll: 29 of 47 elements stranded, including three whole sections.
+
+           A reveal that never fires is missing CONTENT, not a missing animation
+           (the /pricing blank-page incident, 2026-08-16). So the same predicate
+           is also evaluated on demand: anything whose top has passed the bottom
+           of the viewport is revealed regardless of what the observer saw. The
+           observer still drives the normal case, which is what keeps the
+           staggered entrance; this only catches what it dropped. */
+        var sweeping = false;
+        function sweep() {
+          sweeping = false;
+          var h = window.innerHeight;
+          els.forEach(function (el) {
+            if (el.classList.contains("in")) return;
+            if (el.getBoundingClientRect().top < h) reveal(el);
+          });
+        }
+        window.addEventListener("scroll", function () {
+          if (!sweeping) { sweeping = true; requestAnimationFrame(sweep); }
+        }, { passive: true });
+        window.addEventListener("resize", function () {
+          if (!sweeping) { sweeping = true; requestAnimationFrame(sweep); }
+        }, { passive: true });
+      })();
+
       // top scroll-progress bar
       (function () {
         var bar = document.getElementById("scroll-progress");
@@ -134,6 +204,7 @@ const jsonLd = {
         );
         window.addEventListener("resize", update, { passive: true });
       })();
+
     </script>
   </body>
 </html>

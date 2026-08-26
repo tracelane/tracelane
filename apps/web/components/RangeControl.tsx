@@ -10,17 +10,42 @@
  * flash (the page's Suspense boundary must NOT be keyed on `range`). The clicked
  * pill highlights OPTIMISTICALLY (instant feedback) and the control shows a quiet
  * pending state while the RSC re-fetches — the Instagram/Meta feel.
+ *
+ * PREFETCH POLICY — HOVER ONLY, and the reason is measured, not stylistic.
+ * This control used to `router.prefetch()` all three presets from a mount effect.
+ * Every preset is a FULL server render of the host page, so on a production build
+ * (`next start`, local fixture gateway, 2026-08-22) one browser load cost:
+ *
+ *     /dashboard  33 gateway subrequests   (the page needs  8)  — 4.1×
+ *     /slo        13 gateway subrequests   (the page needs  3)  — 4.3×
+ *     /gateway     9 gateway subrequests   (the page needs  2)  — 4.5×
+ *
+ * plus 77.6 kB of extra transfer on /dashboard alone. One of the three renders is
+ * the range ALREADY ON SCREEN — waste with no upside in any scenario — and another
+ * is `range=30d`, the exact 906-row window this repo already blew the Cloudflare
+ * Worker CPU ceiling on (Error 1102; see the `bucket=` note in
+ * `app/dashboard/page.tsx`). Speculatively running that on every dashboard view is
+ * the opposite of what that fix was for.
+ *
+ * What replaces it: `onOptionHover` below, which prefetches the ONE preset the
+ * pointer is actually on. KNOWN LIMIT, stated because it is a real trade: the
+ * primitive wires hover via `onMouseEnter` only, so a touch device gets no
+ * prefetch and its range switch is a cold RSC fetch — covered by the
+ * `useTransition` + optimistic pill + top progress bar above, which are what make
+ * the wait legible. If touch prefetch is wanted back, prefetch the two INACTIVE
+ * presets, never all three.
  */
 "use client";
 
 import { useNavProgress } from "@/components/NavProgress";
+import { SegmentedControl } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 
 const PRESETS = [
-	{ v: "24h", l: "24h" },
-	{ v: "7d", l: "7d" },
-	{ v: "30d", l: "30d" },
+	{ value: "24h", label: "24h" },
+	{ value: "7d", label: "7d" },
+	{ value: "30d", label: "30d" },
 ] as const;
 
 export const DEFAULT_RANGE = "24h";
@@ -66,18 +91,6 @@ export function RangeControl({
 		setPending(isPending);
 	}, [isPending, setPending]);
 
-	// Prefetch every range on mount so a click swaps in the (mostly) prefetched
-	// RSC payload — the Grafana/Vercel "feels instant" trick. Hover reinforces it.
-	// Inlined (not via hrefFor) so the deps are exactly pathname/sp/router.
-	useEffect(() => {
-		const qs = sp.toString();
-		for (const o of PRESETS) {
-			const p = new URLSearchParams(qs);
-			p.set("range", o.v);
-			router.prefetch(`${pathname}?${p.toString()}`);
-		}
-	}, [pathname, sp, router]);
-
 	const set = (v: string) => {
 		if (v === active) return;
 		setOptimistic(v); // instant pill feedback (outside the transition)
@@ -86,27 +99,26 @@ export function RangeControl({
 	};
 
 	return (
-		<div
-			aria-busy={isPending}
-			className={`inline-flex items-center rounded-md border border-line p-0.5 transition-opacity duration-150 ${isPending ? "opacity-60" : ""}`}
-		>
-			<span className="sr-only">Time range</span>
-			{PRESETS.map((o) => (
-				<button
-					key={o.v}
-					type="button"
-					onClick={() => set(o.v)}
-					onMouseEnter={() => router.prefetch(hrefFor(o.v))}
-					aria-pressed={active === o.v}
-					className={
-						active === o.v
-							? "rounded px-2.5 py-1 text-xs font-medium bg-selected text-selected-on"
-							: "rounded px-2.5 py-1 text-xs font-medium text-ink-2 hover:text-ink"
-					}
-				>
-					{o.l}
-				</button>
-			))}
-		</div>
+		/*
+		 * The well-with-a-lifted-segment treatment this control pioneered now lives
+		 * in `SegmentedControl` (`@tracelanedev/ui`), which is where the nine
+		 * hand-rolled copies of this pattern converged. The long note that used to
+		 * sit here — including how the lift reads as an INSET in dark theme — moved
+		 * with the markup it describes; it would be a comment about code that is no
+		 * longer in this file.
+		 *
+		 * What stays here is the only part that is this control's own: the
+		 * optimistic selection, the `useTransition` that keeps the current view on
+		 * screen, and the HOVER prefetch (the mount-time prefetch of every preset is
+		 * gone — the header block above carries the measurement that removed it).
+		 */
+		<SegmentedControl
+			label="Time range"
+			value={active}
+			options={PRESETS}
+			pending={isPending}
+			onChange={set}
+			onOptionHover={(v) => router.prefetch(hrefFor(v))}
+		/>
 	);
 }

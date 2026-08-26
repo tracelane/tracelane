@@ -1,3 +1,4 @@
+//! Gateway hot-path admission-overhead benchmark (ADR-033 /).
 //!
 //! Measures the per-request *gateway overhead* that the <25ms-p99 budget and
 //! the ADR-033 "no >10% regression" gate care about — the deterministic

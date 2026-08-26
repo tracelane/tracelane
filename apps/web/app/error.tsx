@@ -55,7 +55,15 @@ export default function RouteError({
 					<button
 						type="button"
 						onClick={reset}
-						className="bg-surface-inverse text-ink-inverse hover:opacity-90 px-4 py-2 rounded-lg text-sm font-medium"
+						// `bg-selected text-selected-on` — the theme-stable primary pair. This is a
+						// hand-rolled primary CTA (a <Link>/<button>, not the <Button> primitive), and it
+						// carried `bg-surface-inverse text-ink-inverse` until the 2026-08-22 contrast
+						// audit: in DARK `--surface-inverse` is #0d0e10 — the PAGE GROUND — so the fill
+						// sat at 1.00:1 against the canvas and 1.07:1 against a card, leaving a label
+						// with no visible button under it. Button.tsx made this exact swap for the
+						// primitive; these copies were missed. `--selected` flips per theme: 17.93:1 in
+						// light, 17.71:1 in dark, label included.
+						className="bg-selected text-selected-on hover:opacity-90 px-4 py-2 rounded-lg text-sm font-medium"
 					>
 						Try again
 					</button>

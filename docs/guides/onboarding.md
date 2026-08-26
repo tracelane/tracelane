@@ -16,8 +16,10 @@ Authenticate via WorkOS Connect (Google / Microsoft / GitHub / SAML
 for enterprises). On success, WorkOS posts `organization.created` and
 `user.created` events to our webhook, which:
 
-- Provisions a Tracelane `tenant` (free tier) — `tenant_id` derived
-  deterministically from `SHA256("workos_org:" || workos_org_id)[..16]`
+- Provisions a Tracelane `tenant` (free tier) with a randomly generated
+  `tenant_id` (UUID v4), stored against the WorkOS organization id under a
+  unique index. The organization id is **not** the tenant id, and the tenant
+  id is never derived from it — every resolution is a database lookup.
 - Inserts a `users` row tied to that `tenant_id`
 
 You're now logged in.
@@ -111,15 +113,13 @@ Routes mount conditionally:
 
 - `/v1/audit/export` — only with `CLICKHOUSE_URL`
 - `/v1/billing/portal` — only with `POLAR_ACCESS_TOKEN`
-- `/api/webhooks/polar` — only with `POLAR_WEBHOOK_SECRET`
+- `/api/webhooks/polar` — served by the DASHBOARD app (`apps/web`), not the gateway; only with `POLAR_WEBHOOK_SECRET`
 - `/v1/webhooks/workos` — only with `WORKOS_WEBHOOK_SECRET`
-- B1 prompt-promotion routes — only when built with feature
-  `prompt-promotion-preview`
 
 ### 4. Start the services
 
 ```bash
-cargo run -p gateway --release --features prompt-promotion-preview &
+cargo run -p gateway --release &
 cargo run -p ingest --release &
 pnpm --filter @tracelanedev/web build && pnpm --filter @tracelanedev/web start &
 ```
@@ -161,7 +161,9 @@ hood; we never call the Stripe API directly). In the Polar dashboard:
 
    (Five plans + four meters/add-ons = nine total Polar products.)
 3. Create a **Webhook** (Standard Webhooks spec) at
-   `$YOUR_GATEWAY/api/webhooks/polar` subscribed to the subscription
+   `$YOUR_DASHBOARD/api/webhooks/polar` — the dashboard origin, NOT the gateway; the
+   gateway has no Polar receiver and a webhook pointed there 404s, so no plan ever
+   flips — subscribed to the subscription
    and order events (`subscription.created`, `subscription.updated`,
    `subscription.canceled`, `order.created`) — copy the signing secret
    (`polar_whs_…`) to `POLAR_WEBHOOK_SECRET`, and set
@@ -193,8 +195,8 @@ Run the V1 eval suite locally:
 pnpm eval:run --suite=all
 ```
 
-68 pain-point assertions + 10 fault-tolerance scenarios. CI fails on
-any regression. Marketing claims on the public site auto-disable when
+20 conformance evals — 10 fault-tolerance chaos scenarios, 7 gateway-correctness,
+and one each for ingest-schema, PII-redaction and prompt-injection. CI fails on any regression. Marketing claims on the public site auto-disable when
 the corresponding eval flips red on `main`.
 
 ---
@@ -212,5 +214,5 @@ Before flipping a tenant to a paid plan:
 - [ ] R2 bucket + IAM configured for cold-tier Parquet
 - [ ] OpenSSF Scorecard ≥ 9.0 on the public repo
 - [ ] OSV-Scanner clean across Rust + TS + Python lockfiles
-- [ ] All 68 pain-point evals green on the production gateway
+- [ ] All 20 conformance evals green on the production gateway
 - [ ] Dashboard `/trust` page reviewed by procurement / legal counsel

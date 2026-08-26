@@ -7,10 +7,12 @@ import {
 
 /**
  * GC-DISPATCH-ERROR (live) — fault-tolerance gate for the dispatch-error surface
+ * (, GW-SPAN-002).
  *
  * When an upstream provider rejects the tenant's key (HTTP 401/403), the gateway
  * used to collapse it into an opaque **502 "provider unavailable"** — the user
  * got no signal the *key* was wrong (this cost two debugging cycles on the
+ *  L1 verify). It now classifies the upstream status and answers a typed
  * **401 `provider_key_rejected`**.
  *
  * The live stack points the Anthropic upstream at the mock provider, whose
@@ -20,6 +22,7 @@ import {
  *   handler → `provider_key_rejected`.
  *
  * Also a redaction guard: the mock's 401 body echoes a fake key; it must never
+ * reach the client (security.md /).
  *
  * Skips in mock mode (no live gateway); runs in the `live-eval-gate` CI job.
  */
@@ -60,6 +63,7 @@ describe("GC-DISPATCH-ERROR (live): upstream 401 → provider_key_rejected, not 
 				},
 			);
 
+			// Distinct, actionable status — not the old opaque 502.
 			expect(res.status).toBe(401);
 			const body = (await res.json()) as { error?: string; provider?: string };
 			expect(body.error).toBe("provider_key_rejected");

@@ -22,6 +22,28 @@
  * `defaultCollapsed`, so the first painted frame is already correct. Reading it in a
  * `useEffect` would render expanded and then snap — the flash §6 calls out. Radix would
  * not have helped here either; this is a server-render problem, not a component one.
+ *
+ * ── P0.13 REFINEMENT (2026-08-22) ────────────────────────────────────────────
+ * The brief calls the rail one of the strongest things in the product, so this pass
+ * is refinement only: the grouping, every destination, the collapse behaviour and the
+ * no-flash cookie are untouched. What changed, and why:
+ *
+ *   · THE PLANE IS SOLID `--sidebar`, NOT `.glass`. Glass is sanctioned for chrome,
+ *     but it buys nothing here and costs a compositor pass: the rail is a full-height
+ *     `sticky` COLUMN BESIDE the content, not a bar ON TOP of it, so nothing ever
+ *     scrolls underneath it — `backdrop-filter` re-samples a static canvas every
+ *     frame to reveal a static canvas. `--sidebar` is a real token now (#fcfcfb /
+ *     #101113: one step off the page ground in each theme), so a solid plane plus a
+ *     `--line` hairline separates the rail more crisply than an 82%-opaque wash did,
+ *     and it is cheaper. The TopBar keeps `.glass` — content genuinely passes under
+ *     that one.
+ *   · THE ACTIVE ROW IS A TONE STEP, NOT AN INK PILL. It was `--selected` /
+ *     `--selected-on`: solid black with a white label, which the brief names as the
+ *     thing to remove. The replacement pair and the measurement behind it are in
+ *     `nav-config.tsx` beside `RAIL_ITEM_ACTIVE` — including why the obvious token
+ *     pair inverts in dark.
+ *   · ICONS SIT ON A FIXED COLUMN (`RAIL_ICON`), so labels start at the same x
+ *     regardless of glyph width, and the touch target grew from `py-1.5` to `py-2`.
  */
 
 import { Logo, cn } from "@tracelanedev/ui";
@@ -29,7 +51,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { AccountMenu } from "./AccountMenu";
-import { sections } from "./nav-config";
+import {
+	RAIL_GROUP_LABEL,
+	RAIL_ICON,
+	RAIL_ITEM,
+	RAIL_ITEM_ACTIVE,
+	RAIL_ITEM_IDLE,
+	sections,
+} from "./nav-config";
 import { shortLabel } from "./nav-model";
 
 const COOKIE = "sidebar_state";
@@ -58,6 +87,26 @@ function ChevronIcon({ collapsed }: { collapsed: boolean }) {
 		>
 			<path d="M10 3.5 5.5 8l4.5 4.5" />
 		</svg>
+	);
+}
+
+/**
+ * The 2px leading-edge state marker on the active row. It is the cheapest signal
+ * that survives everything the tone step does not: a 7%-luminance background is
+ * legitimately hard to see on a dim laptop panel, and this reads at a glance
+ * without adding a colour. Tertiary ink rather than primary — the marker is meant
+ * to be noticed after the label, not before it.
+ *
+ * `inset-y-1` insets it from the row's own top and bottom so it reads as a marker
+ * on the row rather than as a divider between rows, and it is drawn for the
+ * collapsed rail too, where the tone step is the only other cue.
+ */
+function ActiveMarker() {
+	return (
+		<span
+			aria-hidden="true"
+			className="pointer-events-none absolute inset-y-1 left-0 w-0.5 rounded-full bg-ink-3"
+		/>
 	);
 }
 
@@ -96,17 +145,20 @@ export function Sidebar({
 	const nav = (
 		<nav
 			aria-label="Primary navigation"
-			className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto"
+			// `gap-5` between groups, up from `gap-4`: P0.13 asks for more air above
+			// each group heading, and the gap is what carries the grouping on the
+			// collapsed rail where the headings are not rendered at all.
+			className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto"
 		>
 			{PRIMARY_SECTIONS.map((section) => (
 				<div key={section.label} className="flex flex-col gap-0.5">
 					{/* Small-caps section labels are kept from the previous app —
 					    ADR-074 §4 says that instinct was right. Hidden on the rail,
-					    where the group is read from the gap instead. */}
+					    where the group is read from the gap instead. The type is
+					    `RAIL_GROUP_LABEL`; the reasoning for 11px/tertiary ink over
+					    the scale's page-level eyebrow is written there. */}
 					{!collapsed && (
-						<div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-ink-3">
-							{section.label}
-						</div>
+						<div className={RAIL_GROUP_LABEL}>{section.label}</div>
 					)}
 					{section.items.map(({ href, label: rawLabel, Icon }) => {
 						const active = isActive(href);
@@ -120,14 +172,13 @@ export function Sidebar({
 								title={collapsed ? label : undefined}
 								onClick={() => setMobileOpen(false)}
 								className={cn(
-									"flex items-center gap-2.5 rounded-md px-2 py-1.5 text-sm transition-colors",
+									RAIL_ITEM,
 									collapsed && "justify-center px-0",
-									active
-										? "bg-selected text-selected-on"
-										: "text-ink-2 hover:bg-surface-2 hover:text-ink",
+									active ? RAIL_ITEM_ACTIVE : RAIL_ITEM_IDLE,
 								)}
 							>
-								<span className="shrink-0">
+								{active && <ActiveMarker />}
+								<span className={RAIL_ICON}>
 									<Icon />
 								</span>
 								{!collapsed && <span className="truncate">{label}</span>}
@@ -163,23 +214,46 @@ export function Sidebar({
 					// scroll away. The nav scrolls inside itself if nine items ever outgrow a
 					// short viewport, and `mt-auto` pins the footer to the bottom of the
 					// VIEWPORT rather than the bottom of the document.
-					"sticky top-0 z-50 flex h-screen shrink-0 flex-col gap-3 overflow-hidden border-line border-r bg-canvas-sunken px-2 py-3 transition-[width] duration-150",
+					//
+					// The plane is the solid `--sidebar` token plus a `--line` right edge,
+					// NOT the translucent chrome class it carried until 2026-08-22 — the
+					// header comment explains why glass had no payoff on a column nothing
+					// scrolls under.
+					//
+					// `transition-[width]` is the ONE transition in the app on a layout
+					// property — width animates through layout+paint every frame, and it
+					// reflows the whole page beside it, not just the rail. It is kept
+					// deliberately: collapsing the rail has to give the main column its
+					// pixels back, and the transform-based alternatives (translating the
+					// rail off-canvas) change what "collapsed" means on desktop. What it
+					// gets instead is `motion-reduce:transition-none` — the page content
+					// physically travels here, which is exactly the movement class
+					// `prefers-reduced-motion` exists to suppress. Collapsed/expanded is
+					// unchanged; only the 150ms of travel between them is dropped.
+					"sticky top-0 z-50 flex h-screen shrink-0 flex-col gap-3 overflow-hidden border-line border-r bg-sidebar px-2 py-3 transition-[width] duration-150 motion-reduce:transition-none",
 					width,
 					// Mobile: off-canvas drawer, always full width when open.
 					"max-lg:fixed max-lg:inset-y-0 max-lg:left-0 max-lg:h-full max-lg:w-60",
 					mobileOpen ? "max-lg:flex" : "max-lg:hidden",
 				)}
 			>
+				{/* `pb-3` on the LOGO block, not a bigger column `gap`: the column's
+				    gap-3 also separates nav from the footer, so widening it would
+				    push the account menu around too. This adds breathing room in
+				    exactly one place — between the wordmark and the first section
+				    label — which is what the sidebar had spare. It is a rem value,
+				    so it scales with the ADR-074 `:root` clamp like everything else
+				    rather than pinning a pixel gap at one viewport. */}
 				<div
 					className={cn(
-						"flex items-center gap-2 px-1",
+						"flex items-center gap-2 px-1 pb-3",
 						collapsed && "justify-center px-0",
 					)}
 				>
 					<Link
 						href="/dashboard"
 						aria-label="Tracelane — dashboard"
-						className="flex items-center rounded-md outline-none"
+						className="flex items-center rounded-[var(--radius-control)]"
 					>
 						<Logo withWordmark={!collapsed} height={22} />
 					</Link>
@@ -195,11 +269,14 @@ export function Sidebar({
 						aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
 						aria-expanded={!collapsed}
 						className={cn(
-							"flex items-center gap-2.5 rounded-md px-2 py-1.5 text-ink-3 text-sm transition-colors hover:bg-surface-2 hover:text-ink",
+							RAIL_ITEM,
+							RAIL_ITEM_IDLE,
 							collapsed && "justify-center px-0",
 						)}
 					>
-						<ChevronIcon collapsed={collapsed} />
+						<span className={RAIL_ICON}>
+							<ChevronIcon collapsed={collapsed} />
+						</span>
 						{!collapsed && <span>Collapse</span>}
 					</button>
 				</div>
@@ -210,13 +287,19 @@ export function Sidebar({
 				type="button"
 				aria-label="Open navigation"
 				onClick={() => setMobileOpen(true)}
-				/* shadow-lg, not shadow-rest: `--shadow-rest` is defined in :root and NOT
-				   inside @theme (which closes at tokens.css:150), so `shadow-rest` was
-				   never a Tailwind utility and emitted nothing — verified against the
-				   built CSS, where .shadow-rest is absent while .shadow-2xl is present.
-				   This button is `fixed` over scrolling content, which is the overlay
-				   case ADR-074 §5 allows a shadow for, so it should actually have one. */
-				className="fixed bottom-4 left-4 z-30 flex h-11 w-11 items-center justify-center rounded-full border border-line bg-surface text-ink shadow-lg lg:hidden"
+				/* `--shadow-overlay`, not the stock Tailwind drop this carried: the button
+				   is `fixed` over scrolling content, which is the one elevation the system
+				   paints a shadow for, and the token is the value that elevation is defined
+				   at in both themes. It replaces the default-scale class for the same
+				   reason that class replaced `shadow-rest` — a shadow that is not the
+				   system's shadow is a fourth elevation nobody declared. The old class name
+				   is DESCRIBED rather than quoted, because Tailwind extracts candidates from
+				   comments too and would keep emitting a rule nothing wears.
+
+				   It stays `rounded-full`: the chrome's other floating chips (the theme
+				   toggle, the workspace pill) are circles/pills, and a lone 8px-cornered
+				   square among them would read as a different component, not a tidier one. */
+				className="fixed bottom-4 left-4 z-30 flex h-11 w-11 items-center justify-center rounded-full border border-line bg-surface text-ink shadow-[var(--shadow-overlay)] lg:hidden"
 			>
 				<svg
 					viewBox="0 0 16 16"

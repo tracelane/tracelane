@@ -1,3 +1,4 @@
+// UNCONDITIONAL 2xx GATE for k6 benchmark runs (B-187b).
 //
 // Pure decision function, deliberately in its own module with NO k6 imports, so
 // it can be exercised by plain `node` against REAL captured k6 payloads

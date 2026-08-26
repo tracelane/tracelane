@@ -1,3 +1,4 @@
+-- Migration 12: drop orphaned SLO/cost views (#7 + #8).
 --
 -- Both objects below have NO runtime reader (verified 2026-07-18): nothing in
 -- crates/gateway or apps/web queries them; only a migration-text eval asserts
@@ -9,6 +10,7 @@
 --    of 1e8 (10x under) and labels USD as "cents". Delete it.
 --
 -- #8 the v_slo_28d chain — orphaned; its overhead_p99 field also mislabels total
+--    end-to-end duration as "gateway overhead" vs a 25ms budget (
 --    collateral). Drop the view + its materialized view (stops the per-span
 --    write it did for a table nobody reads) + the target table.
 --

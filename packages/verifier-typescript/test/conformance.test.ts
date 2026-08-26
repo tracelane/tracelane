@@ -50,6 +50,7 @@ describe("audit-verifier conformance", () => {
 		expect(report.rekor_anchors_seen).toBe(0);
 	});
 
+	// ADR-050: the v2.1 vector carries JS-unsafe numbers (1.0, >2^53,
 	// 1e2, 0.50) as the verbatim canonical STRING. All three verifiers hash it
 	// byte-for-byte, so it passes identically — the parity bug cannot exist.
 	it("v2.1 boundary-number vector passes (verbatim string)", async () => {
@@ -60,6 +61,7 @@ describe("audit-verifier conformance", () => {
 		expect(report.rows_seen).toBe(2);
 	});
 
+	// The SAME data as a legacy v2 OBJECT payload reproduces in JS: the
 	// re-derive path (JSON.parse/stringify) is lossy for these numbers, so the
 	// recomputed hash diverges from the writer's. This is precisely why Path 2
 	// (verbatim string) was chosen; the vector above passes where this cannot.

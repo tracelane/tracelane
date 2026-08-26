@@ -2,6 +2,7 @@
 //!
 //! Buffers spans from the ingest pipeline into 1 MB NDJSON chunks before
 //! uploading to Cloudflare R2 via the S3-compatible API. This reduces R2
+//! Class A PUT operations by ~80× compared to one-PUT-per-span.
 //!
 //! Object key layout: `{tenant_id}/{yyyy}/{mm}/{dd}/{uuid}.ndjson`
 //!
@@ -11,6 +12,7 @@
 //! for 7 days, allowing manual or automated replay via `tlane replay-r2-dlq`.
 //! If NATS is also unavailable, the batch is dropped with a `spans_dropped`
 //! counter increment — the gateway's redundant ClickHouse write path ensures
+//! hot-path data is not lost.
 //!
 //! Phase 2 (Week 8): Parquet compression (zstd) for 10× additional storage
 //! saving. The NDJSON format is chosen here because it requires no extra deps
@@ -662,6 +664,7 @@ mod tests {
     /// FT-04 chaos: R2 is unreachable. Every PUT must fail gracefully — the
     /// retry loop exhausts, the batch degrades to the DLQ (or drop-and-log
     /// when NATS is also down), and `flush_tenant` returns WITHOUT panicking
+    /// or hanging. The hot path (ClickHouse) is never blocked by R2.
     ///
     /// The outage is injected by pointing `TRACELANE_R2_ENDPOINT` at an
     /// unresolvable `.invalid` host (guaranteed NXDOMAIN, RFC 6761) so every
@@ -744,6 +747,7 @@ mod tests {
 
     // DEBUG-ONLY: `assert_tenant_prefix` guards on `debug_assert!`, which is a
     // no-op in release (so `#[should_panic]` would fail under `cargo test
+    // release` — the release-profile job). The release behavior (returns
     // false, no panic) is covered by the structural eval, not the unit level.
     #[cfg(debug_assertions)]
     #[test]

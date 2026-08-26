@@ -1,7 +1,8 @@
 /**
- * tlane eval — pain-point eval suite commands.
+ * tlane eval — conformance eval suite commands.
  *
- *   tlane eval list   — parse evals/pain-points/INDEX.md and render each
+ *   tlane eval list   — render each eval and its status. Prefers a suite INDEX.md
+ *                        when the checkout has one, else lists the eval files.
  *                       eval's id, status, and title.
  *   tlane eval run    — run the eval suite via `pnpm eval:run --suite=<x>`
  *                       (use --dry-run to print the command without executing).
@@ -20,7 +21,7 @@ export interface EvalEntry {
 }
 
 /**
- * Parse the pain-point INDEX.md markdown tables into eval entries.
+ * Parse a suite INDEX.md markdown table into eval entries.
  *
  * Rows look like `| **PP-G1** | **Title** | **🟢 status** | ref |`. Header and
  * separator rows are skipped because their first cell is not a `PP-…` id.
@@ -57,11 +58,20 @@ export function findEvalIndex(startDir: string): string | null {
 	return null;
 }
 
-/** Walk up from `startDir` to find the `evals/pain-points` directory, if present. */
+/**
+ * Walk up from `startDir` to find the `evals/` root, if present.
+ *
+ * This used to look for `evals/pain-points` specifically. That suite is not part
+ * of the public repository, so in a published checkout the lookup failed and the
+ * command exited 1 telling you to run it from a clone of the public repo — the
+ * very clone you were already in. Looking for `evals/` finds the suites that do
+ * ship (fault-tolerance, gateway-correctness, ingest-schema, pii-redaction,
+ * prompt-injection) and lists those instead.
+ */
 export function findEvalDir(startDir: string): string | null {
 	let dir = startDir;
 	for (let i = 0; i < 8; i++) {
-		const candidate = join(dir, "evals", "pain-points");
+		const candidate = join(dir, "evals");
 		if (existsSync(candidate)) return candidate;
 		const parent = resolve(dir, "..");
 		if (parent === dir) break;
@@ -75,7 +85,7 @@ export function registerEvalCommand(program: Command): void {
 
 	evalCmd
 		.command("list")
-		.description("List pain-point evals and their status")
+		.description("List conformance evals and their status")
 		.action(() => {
 			const indexPath = findEvalIndex(process.cwd());
 			if (indexPath) {
@@ -95,15 +105,23 @@ export function registerEvalCommand(program: Command): void {
 			if (!dir) {
 				console.error(
 					"eval suite not found — the evals ship with the Tracelane repository, " +
-						"not the npm package. Run from a clone of https://github.com/tracelane/tracelane",
+						"not the npm package. Run this from a checkout that has an `evals/` " +
+						"directory.",
 				);
 				process.exit(1);
 				return;
 			}
-			const ids = readdirSync(dir)
-				.filter((f) => f.endsWith(".eval.ts"))
-				.map((f) => f.replace(/\.eval\.ts$/, ""))
-				.sort();
+			// `evals/` holds one directory per suite, so collect across all of them
+			// and label each entry with its suite.
+			const ids: string[] = [];
+			for (const suite of readdirSync(dir, { withFileTypes: true })) {
+				if (!suite.isDirectory()) continue;
+				for (const f of readdirSync(join(dir, suite.name))) {
+					if (!f.endsWith(".eval.ts")) continue;
+					ids.push(`${suite.name}/${f.replace(/\.eval\.ts$/, "")}`);
+				}
+			}
+			ids.sort();
 			for (const id of ids) console.log(id);
 			console.log(`\n${ids.length} evals`);
 		});
@@ -111,11 +129,7 @@ export function registerEvalCommand(program: Command): void {
 	evalCmd
 		.command("run")
 		.description("Run the eval suite")
-		.option(
-			"--suite <name>",
-			"Eval suite to run: all|ft|gc|is|pp|pir|pi",
-			"all",
-		)
+		.option("--suite <name>", "Eval suite to run: all|ft|gc|is|pir|pi", "all")
 		.option("--dry-run", "Print the command without executing")
 		.action((opts) => {
 			const args = ["eval:run", `--suite=${opts.suite}`];

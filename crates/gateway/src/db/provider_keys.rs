@@ -148,6 +148,7 @@ pub fn last4_of(plaintext: &str) -> String {
 
 /// A short, non-secret, human-matchable fingerprint for a stored credential.
 ///
+/// `last4_of` assumes a credential is an opaque string — true for every
 /// provider until the Vertex adapter introduced the first **structured** one, a
 /// ~2.4KB service-account JSON. Its last four characters are `m"\n}` — the tail of
 /// `"googleapis.com"`, a quote, an internal newline, and the closing brace. That
@@ -189,13 +190,32 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const KEY_CACHE_TTL: Duration = Duration::from_secs(300);
+/// **900s, raised from 300s (B-256).**
+///
+/// The comment this replaces claimed 300s was "long enough that the hot path
+/// almost never hits Postgres". Measurement disproved it: production requests
+/// arrive roughly every 400 SECONDS, so a 300-second entry was already expired
+/// when the next request needed it, and the fetch-plus-decrypt cost **16.0-19.8ms
+/// on every request** across three prod samples on 2026-08-18. The claim was not
+/// merely optimistic, it was inverted — the hot path hit Postgres almost every
+/// time. Where a comment and the measurement disagree, the comment is the defect.
+const KEY_CACHE_TTL: Duration = Duration::from_secs(900);
 
 /// Process-wide BYOK key cache. Keyed by `(tenant_uuid, provider_id)`.
 /// Values hold `SecretString` so plaintext stays wrapped + zeroized on
-/// drop. TTL is 5 minutes — short enough that a customer revocation
-/// (via DELETE on `provider_keys`) takes effect within the hour; long
-/// enough that the hot path almost never hits Postgres.
+/// drop.
+///
+/// **Raising the TTL does not widen the revocation window, because eviction is
+/// explicit:** both provider-key write paths call [`invalidate`]
+/// (`byok_api/provider_keys_api.rs`, on upsert and on delete), so a customer
+/// rotating or removing a key takes effect on the NEXT request whatever this
+/// value is. The TTL is the backstop for a change that did not come through
+/// those routes.
+///
+/// **Its honest limit,** the same one the capability registry carries: that
+/// invalidation is process-local. One gateway instance makes it complete; two
+/// would make this TTL the cross-instance bound, and the fix then is a broadcast
+/// invalidation rather than a different number here.
 struct CachedKey {
     secret: Arc<SecretString>,
     fetched_at: Instant,
@@ -221,8 +241,40 @@ fn cache() -> &'static Arc<ArcSwap<KeyCacheMap>> {
 /// `byok` module (the `tests/postgres_tenant_integration.rs` harness
 /// pulls `db/mod.rs` in via `#[path]` and would otherwise need `byok`
 /// too).
+/// Maximum cached provider keys. Entries hold a `SecretString`, so this also
+/// bounds how much decrypted key material is resident at once — a reason to cap
+/// it that has nothing to do with memory.
+const MAX_CACHED_KEYS: usize = 50_000;
+
 pub fn cache_decrypted(tenant_id: &TenantId, provider_id: &str, secret: Arc<SecretString>) {
-    cache().load().insert(
+    let map = cache().load();
+    // BOUND THE MAP. Before this it grew without limit: entries left only via an
+    // explicit `invalidate`, so every (tenant, provider) pair ever seen stayed
+    // resident for the process lifetime, decrypted, even after going permanently
+    // cold. Raising KEY_CACHE_TTL to 900s would have tripled how long each stale
+    // entry lingered, so bounding this is a PRECONDITION of that raise, not a
+    // separate improvement.
+    //
+    // Prune only when full, expired entries first. This runs on the cache-MISS
+    // path — a hit returns before reaching here — so even the pruning case is
+    // off the warm hot path.
+    if map.len() >= MAX_CACHED_KEYS {
+        map.retain(|_, entry| entry.is_fresh());
+        if map.len() >= MAX_CACHED_KEYS {
+            // Still full of LIVE entries. Skip caching rather than evict someone
+            // else's key: this request then pays a fetch, which is a latency
+            // cost it can attribute to itself. Evicting at random hands the same
+            // cost to an unrelated tenant AND makes it unattributable.
+            tracing::warn!(
+                cached = map.len(),
+                cap = MAX_CACHED_KEYS,
+                "BYOK key cache is full of live entries — not caching this key; provider-key \
+                 fetches will hit the control plane until entries expire"
+            );
+            return;
+        }
+    }
+    map.insert(
         (*tenant_id.as_uuid(), provider_id.to_string()),
         CachedKey {
             secret,
@@ -269,6 +321,8 @@ mod tests {
         assert_eq!(last4_of("ab"), "……");
     }
 
+    // ──: fingerprints for structured credentials ───────────────────────
+
     /// An obviously-fake service account shaped like the real thing. `key_id` is
     /// the `private_key_id` — a PUBLIC identifier (gcloud prints it), not key
     /// material.
@@ -280,6 +334,7 @@ mod tests {
         )
     }
 
+    /// THE REGRESSION: the raw tail of a service-account JSON is its
     /// closing syntax, not a fingerprint. Must be a clean 4 chars of the
     /// `private_key_id` — the value GCP's own console shows.
     #[test]

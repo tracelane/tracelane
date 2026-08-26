@@ -4,10 +4,15 @@
  * no source span renders "—", never a fabricated 0/$0. Cost is the sum of the
  * gateway's stored per-span `gen_ai_usage_cost` (real), blank when unpriced.
  *
- * Layout grammar (ADR-053):
+ * Layout grammar:
  *  - Duration + error-state are the lead metrics (larger value, prominent).
  *  - Secondary stats (spans, tokens, cost, model, provider) are smaller.
  *  - The "loop detected" badge uses a warn-tone Badge + SVG glyph (no raw emoji).
+ *
+ * The grammar above used to cite ADR-053 ("Tinted Slate + Lava"). That palette is
+ * retired and its successor superseded in turn; the LAYOUT rule survived the
+ * palette changes, so it is stated here on its own rather than under the name of
+ * a colour system this file no longer uses (CLAUDE.md §17).
  */
 
 import type { Span } from "@/components/trace-viewer/types";
@@ -75,9 +80,18 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 			{/* Premium metric tiles — one stat-card per KPI so each reads as first-class
 			    data, not a flat label strip. Grid: 2 cols on mobile, 3 on sm, then
 			    auto-fit at lg+ so all tiles always fill the available row width evenly.
-			    StatCard handles the gradient + hairline + shadow (ADR-053, no extra chrome
-			    here). Numeric values render at text-2xl; long string values (tokens,
-			    model, provider) use a smaller override to avoid overflow. */}
+			    StatCard owns the surface via `.stat-tile` — radius, hairline and the ~2%
+			    contact shadow, all from tokens.css, no extra chrome here.
+
+			    CORRECTED 2026-08-22: this said "StatCard handles the GRADIENT + hairline
+			    + shadow". `.stat-tile` carried `linear-gradient(160deg, #fcfdfe …)` and
+			    that gradient was DELETED — #fcfdfe has B > R, so every tile in the app
+			    was washing faint blue over its top-left corner. Separation is tone +
+			    hairline + shadow now.
+
+			    Numeric values take `.t-metric` (28px) from StatCard; the two long STRING
+			    values below override down the ramp so a model id or an "X.XK → Y.YK"
+			    pair does not crack a narrow tile. */}
 			<div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-[repeat(auto-fit,minmax(100px,1fr))]">
 				{/* Duration — lead metric; always present. */}
 				<StatCard label="Duration" value={fmtDur(s.totalDurationUs)} />
@@ -108,9 +122,11 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 				    wraps gracefully at "X.XK → Y.YK" without cracking a narrow tile. */}
 				<StatCard
 					label="Tokens"
-					value={
-						<span className="text-lg font-semibold tabular-nums">{tokens}</span>
-					}
+					// `.t-metric-sm` — the ramp's dense metric step (20px, tabular). It
+					// was `text-lg`, which is not a point on the app ramp at all
+					// (11/12/13/14/16/20/24/28/32) and so drifted from every other
+					// down-sized value in the strip.
+					value={<span className="t-metric-sm">{tokens}</span>}
 					hint="Input → output tokens summed across LLM spans in this trace."
 				/>
 

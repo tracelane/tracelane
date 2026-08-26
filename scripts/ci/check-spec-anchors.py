@@ -56,8 +56,21 @@ CLAIM_RE = re.compile(
 # Alternation is LONGEST-FIRST on purpose: Python's `|` takes the first branch that
 # matches, so `ts` before `tsx` truncates `TraceFlag.tsx` to `TraceFlag.ts` and the
 # guard then reports a missing file that exists. Caught on this guard's first real run.
+#
+# EXTENDED 2026-08-18 with the FRONT-END extensions — `astro css scss html jsx json js
+# cjs`. The list previously stopped at the backend's file types, which meant a spec about
+# a UI surface could not anchor to the files it was actually about: every anchor into
+# `apps/site/src/pages/index.astro` or `global.css` was invisible to this regex, the claim
+# read as UNANCHORED, and the only way to pass the gate was to cite an unrelated `.toml`.
+# A guard that makes the honest anchor impossible teaches authors to write a decorative
+# one, which is worse than no gate — it manufactures exactly the false confidence §16 says
+# the anchor exists to prevent. Found writing `SITE-02`.
+#
+# Ordering, per the LONGEST-FIRST rule above: `jsx` and `json` MUST precede `js`, or
+# `Chart.jsx` truncates to `Chart.js` and re-creates the `.tsx` bug this comment records.
 ANCHOR_RE = re.compile(
-    r"`?([A-Za-z0-9_./-]+\.(?:tsx|ts|rs|py|sql|toml|yaml|yml|mjs|md|sh))(?::(\d+)(?:-(\d+))?)?`?"
+    r"`?([A-Za-z0-9_./-]+\.(?:astro|scss|json|jsx|tsx|html|toml|yaml|yml|cjs|mjs|css"
+    r"|ts|rs|py|sql|js|yml|md|sh))(?::(\d+)(?:-(\d+))?)?`?"
 )
 SKIP = {"README.md", "TEMPLATE.md"}
 

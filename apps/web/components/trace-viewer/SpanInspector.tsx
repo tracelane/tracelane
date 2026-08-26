@@ -85,11 +85,7 @@ function AttributeRow({ k, v }: { k: string; v: unknown }) {
 }
 
 function SectionHeading({ children }: { children: string }) {
-	return (
-		<h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-			{children}
-		</h3>
-	);
+	return <h3 className="mb-2 t-metric-label">{children}</h3>;
 }
 
 /** One label/value line in the GenAI summary. Value falls back to an em dash.
@@ -181,36 +177,38 @@ export function SpanInspector({ span }: { span: Span | null }) {
 						<CopyButton value={span.attributes} label="Copy attributes" />
 					</div>
 				</div>
-				<table className="w-full">
-					<tbody>
-						<AttributeRow k="name" v={span.name} />
-						<AttributeRow k="span_id" v={span.span_id} />
-						<AttributeRow k="parent_span_id" v={span.parent_span_id ?? "—"} />
-						<AttributeRow
-							k="status"
-							v={STATUS_LABELS[span.status_code] ?? span.status_code}
-						/>
-						{span.status_message && (
-							<AttributeRow k="status_message" v={span.status_message} />
-						)}
-						{/* Duration formatted with shared adaptive formatter (µs/ms/s). */}
-						<AttributeRow k="duration" v={fmtDur(span.duration_us)} />
-						<AttributeRow
-							k="start_time"
-							v={formatDateTimeUtc(span.start_time)}
-						/>
-					</tbody>
-				</table>
+				<div className="overflow-x-auto">
+					<table className="w-full">
+						<tbody>
+							<AttributeRow k="name" v={span.name} />
+							<AttributeRow k="span_id" v={span.span_id} />
+							<AttributeRow k="parent_span_id" v={span.parent_span_id ?? "—"} />
+							<AttributeRow
+								k="status"
+								v={STATUS_LABELS[span.status_code] ?? span.status_code}
+							/>
+							{span.status_message && (
+								<AttributeRow k="status_message" v={span.status_message} />
+							)}
+							{/* Duration formatted with shared adaptive formatter (µs/ms/s). */}
+							<AttributeRow k="duration" v={fmtDur(span.duration_us)} />
+							<AttributeRow
+								k="start_time"
+								v={formatDateTimeUtc(span.start_time)}
+							/>
+						</tbody>
+					</table>
+				</div>
 			</div>
 
 			{businessRef && (
-				<div className="rounded-lg border border-line bg-surface-2/40 p-3">
+				<div className="rounded-lg border border-line bg-surface-2 p-3">
 					<div className="mb-1 flex items-center justify-between gap-2">
 						<SectionHeading>Business reference</SectionHeading>
 						<CopyButton value={businessRef} label="Copy" />
 					</div>
 					<p className="break-all font-mono text-sm text-ink">{businessRef}</p>
-					<p className="mt-1.5 text-[11px] leading-snug text-ink-3">
+					<p className="mt-1.5 text-2xs leading-snug text-ink-3">
 						Customer-supplied reference tying this activity to a business event
 						(loan, transaction, case). On a gateway-proxied call it is also part
 						of the tamper-evident ledger record.
@@ -219,7 +217,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 			)}
 
 			{hasSummary && (
-				<div className="rounded-lg border border-line bg-surface-2/40 p-3">
+				<div className="rounded-lg border border-line bg-surface-2 p-3">
 					<SectionHeading>GenAI</SectionHeading>
 					<div>
 						{/* Model/system/operation are names (prose) — regular font. */}
@@ -254,7 +252,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 							mono={summary.cost !== undefined}
 						/>
 					</div>
-					<p className="mt-2 text-[11px] leading-snug text-ink-3">
+					<p className="mt-2 text-2xs leading-snug text-ink-3">
 						Cost is the stored{" "}
 						<code className="font-mono">gen_ai_usage_cost</code> — the gateway
 						derives it from the model price catalog (or a provider-reported
@@ -266,7 +264,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 
 			{span.aft_ids.length > 0 && (
 				<div>
-					<h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-danger-ink">
+					<h3 className="mb-2 t-metric-label text-danger-ink">
 						Guardrail Interventions
 					</h3>
 					<div className="space-y-1">
@@ -301,52 +299,60 @@ export function SpanInspector({ span }: { span: Span | null }) {
 			{genAi.length > 0 && (
 				<div>
 					<SectionHeading>GenAI Attributes</SectionHeading>
-					<table className="w-full">
-						<tbody>
-							{genAi.map(([k, v]) => (
-								<AttributeRow key={k} k={k} v={v} />
-							))}
-						</tbody>
-					</table>
+					<div className="overflow-x-auto">
+						<table className="w-full">
+							<tbody>
+								{genAi.map(([k, v]) => (
+									<AttributeRow key={k} k={k} v={v} />
+								))}
+							</tbody>
+						</table>
+					</div>
 				</div>
 			)}
 
 			{llm.length > 0 && (
 				<div>
 					<SectionHeading>LLM Attributes</SectionHeading>
-					<table className="w-full">
-						<tbody>
-							{llm.map(([k, v]) => (
-								<AttributeRow key={k} k={k} v={v} />
-							))}
-						</tbody>
-					</table>
+					<div className="overflow-x-auto">
+						<table className="w-full">
+							<tbody>
+								{llm.map(([k, v]) => (
+									<AttributeRow key={k} k={k} v={v} />
+								))}
+							</tbody>
+						</table>
+					</div>
 				</div>
 			)}
 
 			{tracelane.length > 0 && (
 				<div>
 					<SectionHeading>Tracelane</SectionHeading>
-					<table className="w-full">
-						<tbody>
-							{tracelane.map(([k, v]) => (
-								<AttributeRow key={k} k={k} v={v} />
-							))}
-						</tbody>
-					</table>
+					<div className="overflow-x-auto">
+						<table className="w-full">
+							<tbody>
+								{tracelane.map(([k, v]) => (
+									<AttributeRow key={k} k={k} v={v} />
+								))}
+							</tbody>
+						</table>
+					</div>
 				</div>
 			)}
 
 			{other.length > 0 && (
 				<div>
 					<SectionHeading>Other</SectionHeading>
-					<table className="w-full">
-						<tbody>
-							{other.map(([k, v]) => (
-								<AttributeRow key={k} k={k} v={v} />
-							))}
-						</tbody>
-					</table>
+					<div className="overflow-x-auto">
+						<table className="w-full">
+							<tbody>
+								{other.map(([k, v]) => (
+									<AttributeRow key={k} k={k} v={v} />
+								))}
+							</tbody>
+						</table>
+					</div>
 				</div>
 			)}
 		</div>

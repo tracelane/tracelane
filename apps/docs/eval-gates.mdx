@@ -1,6 +1,6 @@
 ---
 title: Evals and prompt promotion
-description: Tracelane runs its own eval suite in CI. It does not run eval assertions against your prompt promotions — a promotion to production is an attributed, tamper-evident decision record.
+description: Eval gating is live. A prompt promotion requires a passing eval run; without one the non-override path returns 409, and every promotion is an attributed, tamper-evident decision record.
 classification: PUBLIC
 ---
 
@@ -11,11 +11,47 @@ the promotion ledger — see [Prompt Promotion](/prompt-promotion).
 Promotion writes are available on **Team $249/mo and above**.
 
 <Note>
-**Tracelane does not run eval assertions against a prompt promotion.** There is no
-eval-gate suite, no `tracelane.yaml` gate configuration, no assertion vocabulary and
-no eval-authoring API — nothing in Tracelane produces the eval-run records such a gate
-would read. A promotion to production is recorded as an attributed **manual override**
-carrying the actor and the reason, with `eval_run_id: null`.
+**Eval gating is live.** `POST /v1/prompts/{name}/evals` runs a set of cases against
+a candidate version, scores them with code-based assertions, and records the result;
+passing that run's id to `promote` opens the gate. A promotion with no passing run is
+still refused with `409` and recorded as an attributed **manual override** carrying
+the actor and the reason, with `eval_run_id: null`.
+
+**The scorers.** Nine, in two families. Seven are code rules that need nothing but
+the output — `contains`, `not_contains`, `regex`, `json_schema`, `length_bounds`,
+`max_latency_ms`, `max_cost_usd` — and one, `exact_match`, needs a reference answer.
+The ninth is `llm_judge`: a model grades the output against a rubric and returns a
+score, a verdict and a reason. **`json_schema` checks conformance, not
+parseability** — types, required keys and undeclared keys, so a response that parses
+into the wrong shape fails. A schema of `{}` accepts anything that parses.
+
+**The judge runs on your own key, through your own gateway, and it doubles the
+calls.** It is a second provider call per case, so a 200-case run with a judge is 400
+calls rather than 200 — the `202` tells you the number as `provider_calls` before the
+run spends anything. The judge appears in your traces like any other request, and
+`GET /v1/costs` reports `judge_cost_usd` separately from the rest of the eval spend.
+Rubrics are `answers_the_question`, `groundedness` and `instruction_following`, or
+your own prompt version. **`llm_judge` needs Team $249/mo and above**; every other
+scorer does not.
+
+**A judge that does not answer in its contract errors the case — it never fails it.**
+The response must be `{"score", "verdict", "reason"}` with `score` in `0.0–1.0`; a
+score outside that range, prose instead of JSON, or a missing field makes the case
+`errored`, and an errored case cannot open a promotion gate. A bad grader is not a
+bad prompt, and it is never guessed at.
+
+**Where cases come from.** Three sources. `"source": "dataset"` replays a frozen
+snapshot of a dataset — the only reproducible one, because the items are copied at
+creation and cannot move under a run. `"source": "inline"` carries the cases in the
+request. `"source": "traces"` replays real production traffic and needs content
+capture, which is **off by default for privacy**, so traces keep model, tokens, cost
+and latency but not the messages; ask for it without capture and you get a typed
+error saying so, never a silently empty run.
+
+**A case replayed from a trace has no reference answer**, because capture records the
+input and not the response. `exact_match` therefore errors on such a case rather than
+scoring it a miss — the reference is unknown, not wrong. The judge and the other six
+code rules score it fine.
 </Note>
 
 ## What a promotion records
@@ -33,26 +69,33 @@ so who promoted what, when and why is verifiable after the fact.
 
 ## Tracelane's own eval suite
 
-The project's own CI uses an eval framework: 68 pain-point assertions +
-10 fault-tolerance chaos evals, run on every push.
+The project's own CI runs 20 conformance evals — 10 fault-tolerance chaos scenarios,
+7 gateway-correctness, and one each for ingest-schema, PII-redaction and
+prompt-injection.
+
+<Note>
+**In this public mirror the suite is reference-only and is not wired to CI.**
+Six of the twenty assert against fixtures the mirror deliberately withholds, so
+`pnpm eval:run` will not pass from a public clone. The eval sources ship so the
+assertions behind our claims are readable; running them is a canonical-repo
+activity.
+</Note>
 
 <Note>
 **These report; they do not block.** The suite is not wired as a blocking
 required status check, so a red eval does not automatically refuse a change —
 it is surfaced and acted on. Assertions that need a live gateway are reported
-as **skipped** in CI, never as a fabricated pass; see the status vocabulary in
-`evals/pain-points/INDEX.md`.
+as **skipped** in CI, never as a fabricated pass.
 </Note>
 
-Run the full suite from a clone of the repo:
+In the canonical repository the suite runs as:
 
 ```bash
 pnpm eval:run --suite=all
 ```
 
 Valid suite names are `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pp` (pain-points), `pir` (PII-redaction) and `pi`
-(prompt-injection). An unknown suite name exits `2` rather than quietly running
+`is` (ingest-schema), `pir` (PII-redaction) and `pi` (prompt-injection). An unknown suite name exits `2` rather than quietly running
 everything.
 
 This suite is Tracelane's own regression harness. It is not a customer-facing eval

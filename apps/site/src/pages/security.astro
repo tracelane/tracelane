@@ -42,7 +42,7 @@ import Base from "../layouts/Base.astro";
       <li>— BYOK only. Provider keys envelope-encrypted at rest. Never written to logs or spans.</li>
       <li>— secrecy::SecretString + Zeroize-on-drop for all in-memory credentials.</li>
       <li>— Every ClickHouse query enforces WHERE tenant_id = ? from JWT claim, never request body.</li>
-      <li>— Row-level policies via X-Tenant-Id header propagated through getClientHeader().</li>
+      <li>— Enforced in the query layer and checked in CI: a query without the tenant filter fails the build.</li>
     </ul>
 
     <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Containers + supply chain</h2>

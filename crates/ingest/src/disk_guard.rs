@@ -5,6 +5,7 @@
 //! crash or panic the ingest process. Instead the node sheds **new** spans
 //! with a structured `507 Insufficient Storage` + `storage.disk_full=true`
 //! alert, while already-ingested data and the (ClickHouse-backed) read path
+//! are untouched. See and `evals/fault-tolerance/FT-08`.
 //!
 //! Hot-path discipline: the receiver checks a single `AtomicBool`
 //! (`is_shedding`) — no `statvfs` syscall per request. A background task
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Minimum free bytes below which the node sheds new spans. 100 MiB matches
+/// FT-08 / ("if available < 100MB, switch to reject-new + alert").
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// How often the background task re-checks free disk. Off the hot path.

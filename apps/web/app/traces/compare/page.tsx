@@ -72,7 +72,7 @@ export default async function CompareTracesPage({
 
 		return (
 			<main className="p-6">
-				<h1 className="mb-1 font-semibold text-xl">Compare traces</h1>
+				<h1 className="t-h1 mb-1">Compare traces</h1>
 				<p className="mb-4 text-ink-3 text-sm">
 					Comparing against <span className="font-mono text-ink">{a}</span> —
 					choose the second trace.
@@ -88,13 +88,13 @@ export default async function CompareTracesPage({
 							<li key={tr.trace_id}>
 								<Link
 									href={`/traces/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(tr.trace_id)}`}
-									className="flex items-center justify-between gap-4 px-3 py-2 transition-colors hover:bg-surface-2"
+									className="flex items-center justify-between gap-4 px-3 py-2 transition-colors hover:bg-surface-hover"
 								>
 									<span className="min-w-0 flex-1 truncate text-ink text-sm">
 										{tr.root_name || "(unnamed)"}
 									</span>
 									<span
-										className="shrink-0 font-mono text-[11px] text-ink-3"
+										className="shrink-0 font-mono text-2xs text-ink-3"
 										style={{ fontVariantNumeric: "tabular-nums" }}
 									>
 										{tr.trace_id.slice(0, 12)}…
@@ -118,7 +118,7 @@ export default async function CompareTracesPage({
 	if (!a || !b) {
 		return (
 			<main className="p-6">
-				<h1 className="mb-4 font-semibold text-xl">Compare traces</h1>
+				<h1 className="t-h1 mb-4">Compare traces</h1>
 				<EmptyState
 					title="Pick two traces to compare"
 					description="Open a trace and choose Compare, or pass ?a=<trace_id>&b=<trace_id>."
@@ -146,7 +146,7 @@ export default async function CompareTracesPage({
 		const notFound = status === 404;
 		return (
 			<main className="p-6">
-				<h1 className="text-xl font-semibold mb-4">Compare traces</h1>
+				<h1 className="t-h1 mb-4">Compare traces</h1>
 				<EmptyState
 					title={notFound ? "Trace not found" : "Couldn't load the comparison"}
 					description={
@@ -168,7 +168,7 @@ export default async function CompareTracesPage({
 
 	return (
 		<main className="p-6">
-			<h1 className="text-xl font-semibold mb-1">Compare traces</h1>
+			<h1 className="t-h1 mb-1">Compare traces</h1>
 			<p className="text-sm text-ink-3 mb-4">
 				{data.only_in_a + data.only_in_b} span
 				{data.only_in_a + data.only_in_b === 1 ? "" : "s"} present on one side
@@ -176,15 +176,16 @@ export default async function CompareTracesPage({
 				and {threshold_pct}%
 			</p>
 
-			<div className="grid grid-cols-2 gap-4 mb-4">
+			{/* P0.17: two 32-char trace ids side by side on a 360px phone gave each
+			    column ~160px, so every id broke across five mono lines. One column
+			    below `sm`. */}
+			<div className="mb-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
 				{([data.a, data.b] as const).map((t, i) => (
 					<div
 						key={t.trace_id}
-						className="rounded-lg border border-line bg-surface-2/40 p-3"
+						className="rounded-lg border border-line bg-surface-2 p-3"
 					>
-						<div className="text-xs uppercase text-ink-3">
-							Trace {i === 0 ? "A" : "B"}
-						</div>
+						<div className="t-metric-label">Trace {i === 0 ? "A" : "B"}</div>
 						<Link
 							className="font-mono text-sm underline break-all"
 							href={`/traces/${t.trace_id}`}

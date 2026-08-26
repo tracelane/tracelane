@@ -1,5 +1,6 @@
 //! B1 Prompt Router — promotion graph routing.
 //!
+//! Per ADR-009 and §7.4. Always compiled in V1; product
 //! access is gated at runtime via `workspace_entitlements`, not a
 //! `cfg(feature)` flag (CLAUDE.md bans cfg(feature) for product gating).
 //! ClickHouse persistence + eval gate + auto-rollback are wired in
@@ -20,6 +21,7 @@
 //!     its eval run is recorded `passed` in `eval_runs`. The default
 //!     `PermissiveGate` is used only in unit tests / dev with no DB.
 //!
+//! Performance budgets:
 //! - Routing pointer read (cached):        <1ms p99
 //! - Routing pointer read (cache miss):    <50ms p99 (ClickHouse)
 //! - Promotion gate latency (eval suite):  <30s p99 (driven by eval runner)
@@ -29,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use clickhouse::Client as ClickhouseClient;
 use uuid::Uuid;
@@ -85,6 +87,19 @@ pub struct PromotionDecision {
     pub eval_run_id: Option<Uuid>,
     pub decision: DecisionKind,
     pub notes: String,
+    /// WHO made this decision — the authenticated actor (`Claims.sub`, or
+    /// `apikey:<id>`), `"system:auto-rollback"` for an engine flip, `None` only
+    /// where no caller exists (unit tests).
+    ///
+    /// This exists because `promotion_decisions.decided_by_user_id` was written
+    /// as a hardcoded `None` on EVERY row while `prompt_routes.rs`'s own doc
+    /// comment claimed the actor was captured "so an override promotion records
+    /// WHO bypassed the eval gate in the tamper-evident decision". It was
+    /// captured — into the `notes` PROSE — and the structured, queryable column
+    /// stayed NULL. Prod bore that out: 5 promotion rows, every one
+    /// `decided_by_user_id = NULL`, one of them with the actor visible only
+    /// inside a sentence. A comment naming a control is not a control.
+    pub decided_by: Option<String>,
 }
 
 /// Fixed UUIDv5 namespace for deriving a stable `prompt_id` from
@@ -231,8 +246,8 @@ impl PromotionPersister for ClickHousePersister {
             // column's raw ticks, so this MUST be millis (was timestamp_micros() —
             // a 1000× overshoot into year ~48000; ADR-054 fix, never verified
             // on-node because promote never ran in prod).
-            decided_at: chrono::Utc::now().timestamp_millis(),
-            decided_by_user_id: None,
+            decided_at: crate::clickhouse_query::datetime64_millis_now(),
+            decided_by_user_id: decision.decided_by.clone(),
             notes: decision.notes.clone(),
         };
         let mut insert = self
@@ -301,11 +316,22 @@ pub trait VersionStore: Send + Sync {
     async fn next_version_number(&self, tenant_id: &TenantId, prompt_id: Uuid) -> Result<u32>;
     /// Every stored version (all tenants) — loaded into the registry at startup.
     async fn load_versions(&self) -> Result<Vec<(TenantId, PromptVersion)>>;
+    /// The auto-rollback "previous production" map, reconstructed from
+    /// `promotion_decisions` at startup: for each `(tenant, prompt_name)`, the
+    /// version that the CURRENT production version displaced.
+    ///
+    /// Defaults to empty so the in-memory and test stores need no change —
+    /// they have no durable history to reconstruct from.
+    async fn load_prev_production(&self) -> Result<Vec<(TenantId, String, Uuid)>> {
+        Ok(Vec::new())
+    }
+
     /// The active routing pointers (latest promotion per (tenant, name, env)),
     /// reconstructed from `promotion_decisions` at startup.
     async fn load_routing(&self) -> Result<Vec<RoutingEntry>>;
     /// The tenant's prompts + activity, for the dashboard list.
     async fn list(&self, tenant_id: &TenantId) -> Result<Vec<PromptSummary>>;
+    /// Soft-delete ("archive") a prompt: write an `archived=1` marker to
     /// `prompts` so `list`, `load_versions`, and `load_routing` exclude it
     /// thereafter. Idempotent — re-marking an already-archived prompt is inert.
     async fn archive(
@@ -403,7 +429,23 @@ struct PromptVersionInsertRow {
 /// A 64-byte value serialized as a ClickHouse `FixedString(64)` — exactly 64
 /// bytes with no length prefix (which a plain `String` would add, and which
 /// serde has no `[u8; 64]: Serialize` impl to produce).
-struct FixedHex64([u8; 64]);
+pub(crate) struct FixedHex64(pub(crate) [u8; 64]);
+
+impl FixedHex64 {
+    /// Build from a 64-char ASCII hex digest. Returns `None` on any other length,
+    /// because a short or long value here does not error at the wire — it
+    /// DESYNCHRONISES the RowBinary stream and the server reports a byte count
+    /// mismatch on some LATER row, which is how this cost an on-node debug once.
+    pub(crate) fn from_hex_str(hex: &str) -> Option<Self> {
+        let b = hex.as_bytes();
+        if b.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(b);
+        Some(Self(out))
+    }
+}
 
 impl serde::Serialize for FixedHex64 {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -417,6 +459,57 @@ impl serde::Serialize for FixedHex64 {
             t.serialize_element(b)?;
         }
         t.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FixedHex64 {
+    /// THE READ SIDE OF THE SAME WIRE CONTRACT, and its absence was a live prod
+    /// defect (**B-274**).
+    ///
+    /// B-273 fixed the WRITE side and stopped there. Every reader of a
+    /// `FixedString(64)` column kept declaring a plain `String`, which makes
+    /// clickhouse-rs consume a varint length prefix that a FixedString never
+    /// emits — so it reads a length out of the DIGEST'S OWN FIRST BYTES and then
+    /// runs off the end of the block. The client reports
+    /// *"not enough data, probably a row type mismatches a database schema"*,
+    /// which names the row and not the column, on a query that is perfectly
+    /// valid SQL.
+    ///
+    /// `deserialize_tuple(64, …)` is the mirror of the `serialize_tuple` above:
+    /// exactly 64 raw bytes, no prefix, in both directions. Putting both halves
+    /// on the newtype is the point — a SQL-side `toString()` cast would work too,
+    /// but it would have to be remembered at every one of the read sites, and
+    /// "remembered at every site" is precisely how the read half was missed.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'d> serde::de::Visitor<'d> for V {
+            type Value = FixedHex64;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("64 raw bytes (ClickHouse FixedString(64))")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'d>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<FixedHex64, A::Error> {
+                let mut out = [0u8; 64];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element::<u8>()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(FixedHex64(out))
+            }
+        }
+        d.deserialize_tuple(64, V)
+    }
+}
+
+impl FixedHex64 {
+    /// The 64 bytes as text. They are ASCII hex by construction —
+    /// [`FixedHex64::from_hex_str`] is the only way to build one — so this is
+    /// lossless for every value this type can hold.
+    pub(crate) fn to_hex_string(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
     }
 }
 
@@ -449,6 +542,17 @@ struct RoutingLoadRow {
 }
 
 #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+struct PrevProductionRow {
+    tenant_id: String,
+    prompt_name: String,
+    /// Non-nullable on the wire: the query maps a SQL NULL to the nil UUID so
+    /// argMax can range over every production promotion. Nil means "the newest
+    /// production promotion displaced nothing", i.e. no rollback target.
+    #[serde(with = "clickhouse::serde::uuid")]
+    prev_version_id: ::uuid::Uuid,
+}
+
+#[derive(Debug, serde::Deserialize, clickhouse::Row)]
 struct SummaryRow {
     prompt_name: String,
     #[serde(with = "clickhouse::serde::uuid")]
@@ -465,6 +569,7 @@ struct ActiveRow {
     version_number: u32,
 }
 
+/// INSERT row for `prompts` — the soft-delete archive marker. Field order
 /// MUST match the table's physical column order (migration 03). `prompts` is
 /// `ReplacingMergeTree(created_at)` keyed by `(tenant_id, prompt_id)`, so a marker
 /// with a fresh timestamp wins even though authoring never wrote a base row here.
@@ -595,6 +700,45 @@ impl VersionStore for ClickHouseVersionStore {
         Ok(out)
     }
 
+    async fn load_prev_production(&self) -> Result<Vec<(TenantId, String, Uuid)>> {
+        // `from_version_id` of the MOST RECENT production promotion is, by
+        // definition, the version the current production version displaced —
+        // which is exactly what `record_prev_production` stores at promote time.
+        //
+        // `ifNull(..., nil)` rather than a `from_version_id IS NOT NULL` filter:
+        // filtering first would make argMax pick an OLDER promotion's displaced
+        // version whenever the newest one had none (a first-ever promotion),
+        // which is the one case that must yield NO entry. Mapping NULL to the
+        // nil UUID keeps argMax over the full set and lets Rust drop it.
+        let rows = self
+            .client
+            .query(
+                "SELECT tenant_id, prompt_name, \
+                 argMax(ifNull(from_version_id, toUUID('00000000-0000-0000-0000-000000000000')), \
+                        decided_at) AS prev_version_id \
+                 FROM promotion_decisions \
+                 WHERE prompt_name != '' AND to_env = 'production' \
+                 AND decision IN ('promoted', 'manual_override') \
+                 AND prompt_id NOT IN (SELECT prompt_id FROM prompts FINAL WHERE archived = 1) \
+                 GROUP BY tenant_id, prompt_name",
+            )
+            .fetch_all::<PrevProductionRow>()
+            .await
+            .context("promotion_decisions prev_production reconstruction")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            if r.prev_version_id.is_nil() {
+                continue; // first-ever production promotion — nothing displaced
+            }
+            out.push((
+                tenant_from_stored(&r.tenant_id)?,
+                r.prompt_name,
+                r.prev_version_id,
+            ));
+        }
+        Ok(out)
+    }
+
     async fn load_routing(&self) -> Result<Vec<RoutingEntry>> {
         // Latest active promotion per (tenant, prompt_name, to_env). argMax picks
         // the most-recent decided_at; only landed decisions (promoted / override)
@@ -661,6 +805,7 @@ impl VersionStore for ClickHouseVersionStore {
             .await
             .context("prompt_versions active-per-env")?;
 
+        // Soft-deleted (archived) prompts are excluded from the list.
         let archived: std::collections::HashSet<Uuid> = self
             .client
             .query(
@@ -774,7 +919,18 @@ pub struct PromptRouter {
     /// `(tenant_id, prompt_name, env) -> active prompt_version_id`.
     routing: ArcSwap<HashMap<RoutingKey, Uuid>>,
     /// `prompt_version_id -> PromptVersion`.
-    versions: ArcSwap<HashMap<Uuid, PromptVersion>>,
+    /// Registered versions, keyed by **(tenant, version id)**.
+    ///
+    /// THE TENANT IS PART OF THE KEY, and it is the whole isolation property.
+    /// It used to be keyed by `Uuid` alone while `load_from_clickhouse`
+    /// discarded the tenant it had already read, so one process-global map held
+    /// every tenant's versions and `route()` resolved any id for anybody. A
+    /// promotion with a foreign `to_version_id` therefore served another
+    /// tenant's prompt CONTENT — reproduced by executing it, not by reading it.
+    /// `ADR-054:29` claims the registry is "tenant-scoped by construction (the
+    /// key carries tenant_id)"; the key did not, and per `CLAUDE.md` §17 the
+    /// code won and the ADR was the defect. Now it does.
+    versions: ArcSwap<HashMap<(TenantId, Uuid), PromptVersion>>,
     /// Eval-gate hook. Defaults to a permissive gate (every eval id reports
     /// Passed). Tests + production override via `with_eval_gate(...)`.
     eval_gate: Arc<dyn EvalGate>,
@@ -888,12 +1044,46 @@ impl PromptRouter {
     /// Add a prompt version to the in-memory registry. Production loads
     /// this from ClickHouse `prompt_versions` at startup; this method is
     /// the explicit hook for tests and dev tooling.
-    pub fn register_version(&self, v: PromptVersion) {
+    pub fn register_version(&self, tenant_id: &TenantId, v: PromptVersion) {
+        let key = (tenant_id.clone(), v.prompt_version_id);
         self.versions.rcu(|map| {
             let mut next = (**map).clone();
-            next.insert(v.prompt_version_id, v.clone());
+            next.insert(key.clone(), v.clone());
             next
         });
+    }
+
+    /// The version, if `tenant_id` owns it.
+    ///
+    /// The read half of [`Self::tenant_owns_version`], for callers that need the
+    /// version's own content and model pin rather than just a yes/no — the eval
+    /// engine runs the version's content as the system instruction, so it has to
+    /// resolve the object it was authorized against, not a second lookup that
+    /// could disagree.
+    #[must_use]
+    pub fn version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        version_id: Uuid,
+    ) -> Option<PromptVersion> {
+        self.versions
+            .load()
+            .get(&(tenant_id.clone(), version_id))
+            .cloned()
+    }
+
+    /// Does `version_id` belong to `tenant_id`?
+    ///
+    /// The object-level authorization check `promote` / `promote_with_override`
+    /// were missing. **Fails CLOSED** (`CLAUDE.md` §10): a cold or
+    /// failed-to-load registry answers `false`, so a promotion is refused
+    /// rather than allowed against a version whose ownership cannot be
+    /// established. Refusing to promote is recoverable; serving another
+    /// tenant's prompt is not.
+    fn tenant_owns_version(&self, tenant_id: &TenantId, version_id: Uuid) -> bool {
+        self.versions
+            .load()
+            .contains_key(&(tenant_id.clone(), version_id))
     }
 
     /// Author a new prompt version (ADR-054): compute the identity, persist it
@@ -942,7 +1132,7 @@ impl PromptRouter {
         self.version_store
             .unarchive(tenant_id, name, prompt_id, created_by)
             .await?;
-        self.register_version(version.clone());
+        self.register_version(tenant_id, version.clone());
         // Land in staging (routing + a promotion_decisions row → survives restart).
         // The initial landing has no eval run, so it uses the override path.
         self.promote_with_override(
@@ -952,11 +1142,13 @@ impl PromptRouter {
             Env::Staging,
             version.prompt_version_id,
             "initial version created",
+            Some(created_by),
         )
         .await?;
         Ok(version)
     }
 
+    /// Soft-delete ("archive") a prompt: durably mark it archived, then
     /// drop its in-memory routing pointers + version registry entries so the
     /// gateway stops serving it immediately. Survives a restart because `list`,
     /// `load_versions`, and `load_routing` all exclude archived prompt_ids.
@@ -1008,9 +1200,9 @@ impl PromptRouter {
     pub async fn load_from_clickhouse(&self) {
         match self.version_store.load_versions().await {
             Ok(versions) => {
-                let map: HashMap<Uuid, PromptVersion> = versions
+                let map: HashMap<(TenantId, Uuid), PromptVersion> = versions
                     .into_iter()
-                    .map(|(_, v)| (v.prompt_version_id, v))
+                    .map(|(t, v)| ((t, v.prompt_version_id), v))
                     .collect();
                 let n = map.len();
                 self.versions.store(Arc::new(map));
@@ -1020,6 +1212,36 @@ impl PromptRouter {
                 tracing::warn!(
                     error = format!("{err:#}"),
                     "prompt version load failed — registry starts empty"
+                );
+            }
+        }
+        // `prev_production` is the auto-rollback FLIP TARGET, and it used to be
+        // in-memory only: written by `record_prev_production` during a promote,
+        // cleared on delete, and never rebuilt. Every restart emptied it, so
+        // after any deploy the drift check fired, found no target, logged a
+        // warning and did nothing. Production promotions are rare (prod has had
+        // five, all in July), so in practice auto-rollback was dead in
+        // production from the first deploy after each one — a feature that
+        // reported healthy and could not act. Reconstructing it here is what
+        // makes it survive a restart, exactly as routing already did.
+        match self.version_store.load_prev_production().await {
+            Ok(entries) => {
+                let mut map: HashMap<(TenantId, String), Uuid> = HashMap::new();
+                for (tenant_id, prompt_name, prev) in entries {
+                    map.insert((tenant_id, prompt_name), prev);
+                }
+                let n = map.len();
+                self.prev_production.store(Arc::new(map));
+                tracing::info!(
+                    targets = n,
+                    "auto-rollback previous-production targets reconstructed from ClickHouse"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = format!("{err:#}"),
+                    "prev_production reconstruction failed — auto-rollback has no flip target \
+                     until the next production promotion"
                 );
             }
         }
@@ -1062,21 +1284,25 @@ impl PromptRouter {
         prompt_name: &str,
         env: Env,
     ) -> Result<PromptVersion> {
-        let key: RoutingKey = (tenant_id, prompt_name.to_string(), env);
+        let key: RoutingKey = (tenant_id.clone(), prompt_name.to_string(), env);
         let routing = self.routing.load();
         let version_id = routing
             .get(&key)
             .copied()
             .ok_or_else(|| anyhow!("no routing pointer for {prompt_name:?} in {env:?}"))?;
         let versions = self.versions.load();
-        versions.get(&version_id).cloned().ok_or_else(|| {
-            anyhow!("version {version_id} registered as active but missing from registry")
-        })
+        versions
+            .get(&(tenant_id, version_id))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("version {version_id} registered as active but missing from registry")
+            })
     }
 
     /// Atomically swap the routing pointer for `(tenant, prompt_name, to_env)`
     /// and append a `promotion_decisions` row.
     ///
+    /// Eval-gate enforcement (assertion 1):
     ///   - `eval_run_id = Some(id)` and gate reports `Passed` → promoted
     ///   - `eval_run_id = Some(id)` and gate reports `Failed`/`Errored`/`Running`
     ///     → `BlockedByEval`
@@ -1086,6 +1312,13 @@ impl PromptRouter {
     ///
     /// `promote_with_override()` exists as a separate entry point for the
     /// explicit human bypass case; it always records `ManualOverride`.
+    // 8 arguments: the 7 that describe the promotion, plus the ACTOR, which is
+    // an audit fact and not a convenience — see `PromotionDecision::decided_by`.
+    // Bundling them into a request struct would be tidier and is deliberately
+    // not done here: it would rewrite ~20 call sites in the middle of a security
+    // fix. Same `#[allow]` the adjacent hot-path fns already carry
+    // (`server.rs:1205`, `:3277`, `:4356`, `:4799`).
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant_id))]
     pub async fn promote(
         &self,
@@ -1095,7 +1328,18 @@ impl PromptRouter {
         to_env: Env,
         to_version_id: Uuid,
         eval_run_id: Option<Uuid>,
+        actor: Option<&str>,
     ) -> Result<PromotionDecision> {
+        // OBJECT-LEVEL AUTHORIZATION. `to_version_id` arrives from the request
+        // body; without this a tenant could point its own routing pointer at
+        // ANY version id it happened to know and then read that version's
+        // content back through `route()`. Reproduced by execution before this
+        // check existed: tenant A promoted tenant B's version id under a name
+        // of A's choosing and `GET /v1/prompts/<name>?env=production` returned
+        // B's prompt text. Fails CLOSED — see `tenant_owns_version`.
+        if !self.tenant_owns_version(&tenant_id, to_version_id) {
+            bail!("prompt version {to_version_id} is not a registered version for this tenant");
+        }
         // Eval-gate check.
         let decision_kind = match (eval_run_id, self.require_eval_gate) {
             (Some(id), _) => match self.eval_gate.status(&tenant_id, id).await {
@@ -1144,6 +1388,7 @@ impl PromptRouter {
             eval_run_id,
             decision: decision_kind,
             notes,
+            decided_by: actor.map(str::to_owned),
         };
 
         // Atomically swap the routing pointer iff the decision allows it.
@@ -1198,6 +1443,13 @@ impl PromptRouter {
 
     /// Explicit human-bypass promotion. Records `ManualOverride` in the
     /// audit trail. Always swaps the routing pointer.
+    // 8 arguments: the 7 that describe the promotion, plus the ACTOR, which is
+    // an audit fact and not a convenience — see `PromotionDecision::decided_by`.
+    // Bundling them into a request struct would be tidier and is deliberately
+    // not done here: it would rewrite ~20 call sites in the middle of a security
+    // fix. Same `#[allow]` the adjacent hot-path fns already carry
+    // (`server.rs:1205`, `:3277`, `:4356`, `:4799`).
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant_id))]
     pub async fn promote_with_override(
         &self,
@@ -1207,7 +1459,18 @@ impl PromptRouter {
         to_env: Env,
         to_version_id: Uuid,
         operator_note: &str,
+        actor: Option<&str>,
     ) -> Result<PromotionDecision> {
+        // OBJECT-LEVEL AUTHORIZATION. `to_version_id` arrives from the request
+        // body; without this a tenant could point its own routing pointer at
+        // ANY version id it happened to know and then read that version's
+        // content back through `route()`. Reproduced by execution before this
+        // check existed: tenant A promoted tenant B's version id under a name
+        // of A's choosing and `GET /v1/prompts/<name>?env=production` returned
+        // B's prompt text. Fails CLOSED — see `tenant_owns_version`.
+        if !self.tenant_owns_version(&tenant_id, to_version_id) {
+            bail!("prompt version {to_version_id} is not a registered version for this tenant");
+        }
         let key_to: RoutingKey = (tenant_id.clone(), prompt_name.to_string(), to_env);
         let from_version_id = self.routing.load().get(&key_to).copied();
 
@@ -1222,6 +1485,7 @@ impl PromptRouter {
             eval_run_id: None,
             decision: DecisionKind::ManualOverride,
             notes: format!("manual override: {operator_note}"),
+            decided_by: actor.map(str::to_owned),
         };
 
         self.routing.rcu(|map| {
@@ -1239,6 +1503,71 @@ impl PromptRouter {
 
         self.persist_promotion(&tenant_id, &decision).await?;
         Ok(decision)
+    }
+
+    /// Feed one observation into the EWMA engine, refusing versions this tenant
+    /// does not own.
+    ///
+    /// **The ownership check is what bounds this map.** The engine's state is
+    /// `HashMap<(TenantId, Uuid), MetricStates>` keyed on a version id that
+    /// arrives, on the chat path, straight out of the REQUEST BODY. Without a
+    /// check, any caller could mint unlimited distinct UUIDs and grow that map
+    /// without bound, and could poison the baseline for a version belonging to a
+    /// prompt they never touched. Constraining the key space to versions the
+    /// tenant actually registered fixes both: the map is now bounded by the
+    /// tenant's real version count.
+    async fn feed_engine(
+        &self,
+        tenant_id: &TenantId,
+        prompt_version_id: Uuid,
+        metrics: &PromptMetrics,
+    ) -> Result<()> {
+        if !self.tenant_owns_version(tenant_id, prompt_version_id) {
+            bail!("prompt version {prompt_version_id} is not a registered version for this tenant");
+        }
+        self.rollback_engine
+            .observe(tenant_id.clone(), prompt_version_id, metrics)
+            .await;
+        Ok(())
+    }
+
+    /// Observe metrics and COMPUTE a rollback decision, with no authority to act
+    /// on it. This is what the chat hot path calls.
+    ///
+    /// **Why the hot path gets a separate entry point rather than a flag.**
+    /// `chat_completions_handler` reads `tracelane_prompt_name`,
+    /// `tracelane_prompt_version_id` and `tracelane_prompt_env` out of the chat
+    /// REQUEST BODY and fed them straight into `observe_and_maybe_rollback`,
+    /// which flips the production routing pointer. That made the chat body a
+    /// sixth prompt-WRITE surface with none of the five gates the HTTP write
+    /// surfaces carry — no owner role, no Team+ entitlement, no scope. A Viewer
+    /// JWT or a `chat`-scoped key could drive the EWMA to near-zero variance
+    /// with ~30 identical completions (`COLD_START` is 30) and then flip
+    /// production with the 31st.
+    ///
+    /// Gating that call would have worked; REMOVING THE CAPABILITY is better,
+    /// because it cannot be un-gated by a later edit that does not know why the
+    /// gate was there. The pointer flip is now reachable only through
+    /// `observe_and_maybe_rollback`, whose sole caller is the `/observe` route —
+    /// which authenticates, checks the owner role, checks the Team+ entitlement
+    /// and now checks the `admin` scope.
+    pub async fn observe_only(
+        &self,
+        tenant_id: TenantId,
+        prompt_version_id: Uuid,
+        metrics: &PromptMetrics,
+    ) -> Result<RollbackOutcome> {
+        self.feed_engine(&tenant_id, prompt_version_id, metrics)
+            .await?;
+        let decision = self
+            .rollback_engine
+            .check_and_rollback(tenant_id, prompt_version_id, metrics)
+            .await?;
+        Ok(RollbackOutcome {
+            decision,
+            rolled_back_to: None,
+            auto_rollback_decision: None,
+        })
     }
 
     /// Observe a prompt-version's request metrics and, on objective (Auto)
@@ -1265,9 +1594,8 @@ impl PromptRouter {
         prompt_version_id: Uuid,
         metrics: &PromptMetrics,
     ) -> Result<RollbackOutcome> {
-        self.rollback_engine
-            .observe(tenant_id.clone(), prompt_version_id, metrics)
-            .await;
+        self.feed_engine(&tenant_id, prompt_version_id, metrics)
+            .await?;
         let decision = self
             .rollback_engine
             .check_and_rollback(tenant_id.clone(), prompt_version_id, metrics)
@@ -1296,6 +1624,11 @@ impl PromptRouter {
                                 decision.trigger_value,
                                 decision.ewma_baseline,
                             ),
+                            // Matches the actor string the audit chain already
+                            // uses for an engine flip (`prompt_routes.rs`
+                            // chain_eval_verdict), so the ClickHouse column and
+                            // the tamper-evident chain name the same actor.
+                            Some("system:auto-rollback"),
                         )
                         .await?;
                     rolled_back_to = Some(prev);
@@ -1332,6 +1665,7 @@ impl PromptRouter {
         env: Env,
         to_version_id: Uuid,
         reason: &str,
+        actor: Option<&str>,
     ) -> Result<PromotionDecision> {
         self.promote_with_override(
             tenant_id,
@@ -1340,6 +1674,7 @@ impl PromptRouter {
             env,
             to_version_id,
             &format!("rollback: {reason}"),
+            actor,
         )
         .await
     }
@@ -1484,6 +1819,8 @@ mod tests {
         unarchived: std::sync::Mutex<Vec<(String, Uuid)>>,
         /// When set, `archive` returns Err — exercises delete's fail-closed path.
         archive_fails: std::sync::atomic::AtomicBool,
+        /// Durable auto-rollback flip targets, as reconstructed at boot.
+        prev_production: Vec<(TenantId, String, Uuid)>,
     }
 
     #[async_trait::async_trait]
@@ -1507,6 +1844,9 @@ mod tests {
         }
         async fn load_versions(&self) -> Result<Vec<(TenantId, PromptVersion)>> {
             Ok(self.versions.clone())
+        }
+        async fn load_prev_production(&self) -> Result<Vec<(TenantId, String, Uuid)>> {
+            Ok(self.prev_production.clone())
         }
         async fn load_routing(&self) -> Result<Vec<RoutingEntry>> {
             Ok(self.routing.clone())
@@ -1561,7 +1901,14 @@ mod tests {
         assert_eq!(
             store.unarchived.lock().unwrap().as_slice(),
             &[("greet".to_string(), v.prompt_id)],
-            "create writes an archived=0 marker so a re-created prompt survives a restart"
+            "create writes an archived=0 marker so a re-created prompt survives a restart \
+             — AND so every `prompt_versions` row has a parent `prompts` row (R85). \
+             `demoprompt2` on prod is the one violation: created 2026-07-08 02:46:09, \
+             hours BEFORE `c8786383` added this call the same day, so it is routable and \
+             listed by GET /v1/prompts (which reads the registry) while having NO `prompts` \
+             row at all. Every prompt created after that fix is consistent. This assertion \
+             is what stops the invariant regressing; removing the `unarchive` call would \
+             strand every future version the same way."
         );
     }
 
@@ -1671,6 +2018,96 @@ mod tests {
         assert_eq!(resolved.content, "loaded");
     }
 
+    /// AUTO-ROLLBACK MUST SURVIVE A RESTART.
+    ///
+    /// `prev_production` — the flip TARGET — was in-memory only: written by
+    /// `record_prev_production` during a promote, cleared on delete, and never
+    /// rebuilt at boot. Every restart emptied it, so after a deploy the drift
+    /// check fired, found no target, logged a warning and did nothing. Prod has
+    /// had five production promotions ever, all in July, so in practice the
+    /// feature was dead there from the first deploy after each one — reporting
+    /// healthy and unable to act.
+    ///
+    /// This simulates a cold process: the store holds the durable history, the
+    /// router is fresh, and drift must still flip.
+    #[tokio::test]
+    async fn auto_rollback_flip_target_survives_a_restart() {
+        async fn drive_drift_after_boot(
+            prev_production: Vec<(TenantId, String, Uuid)>,
+        ) -> Option<Uuid> {
+            let t = tid(0x5E7);
+            let prompt_id = Uuid::from_u128(0x5E7);
+            let va = pv(prompt_id, 1);
+            let vb = pv(prompt_id, 2);
+            let store = MockVersionStore {
+                versions: vec![(t.clone(), va.clone()), (t.clone(), vb.clone())],
+                routing: vec![RoutingEntry {
+                    tenant_id: t.clone(),
+                    prompt_name: "p".into(),
+                    env: Env::Production,
+                    version_id: vb.prompt_version_id,
+                }],
+                prev_production,
+                ..Default::default()
+            };
+            // A FRESH router — nothing was promoted in this process.
+            let r = PromptRouter::new()
+                .without_eval_gate()
+                .with_version_store(Arc::new(store));
+            r.load_from_clickhouse().await;
+
+            for i in 0..100 {
+                r.observe_and_maybe_rollback(
+                    t.clone(),
+                    "p",
+                    Env::Production,
+                    vb.prompt_version_id,
+                    &PromptMetrics {
+                        cost_usd: 0.001 + ((i % 5) as f64) * 1e-6,
+                        latency_ms: 250.0,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            r.observe_and_maybe_rollback(
+                t,
+                "p",
+                Env::Production,
+                vb.prompt_version_id,
+                &PromptMetrics {
+                    cost_usd: 0.05,
+                    latency_ms: 250.0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .rolled_back_to
+        }
+
+        let t = tid(0x5E7);
+        let va = pv(Uuid::from_u128(0x5E7), 1);
+
+        // Reconstructed at boot → the flip finds its target.
+        assert_eq!(
+            drive_drift_after_boot(vec![(t, "p".into(), va.prompt_version_id)]).await,
+            Some(va.prompt_version_id),
+            "a reconstructed prev_production must let auto-rollback flip after a restart"
+        );
+
+        // DISCRIMINATION: the same drift, with nothing reconstructed, is the
+        // pre-fix behaviour — the decision fires and the flip cannot happen.
+        // Without this half the assertion above could pass for any reason.
+        assert_eq!(
+            drive_drift_after_boot(vec![]).await,
+            None,
+            "with no reconstructed target the flip cannot happen — this is exactly \
+             what every deploy used to produce"
+        );
+    }
+
     #[tokio::test]
     async fn delete_prompt_archives_and_drops_from_memory() {
         let store = Arc::new(MockVersionStore::default());
@@ -1740,19 +2177,27 @@ mod tests {
         );
     }
 
-    /// promote-to-prod always 409s today. `build_prompt_router` keeps
-    /// `require_eval_gate=true` (the default) and attaches `ClickHouseEvalGate`;
-    /// NOTHING in the repo writes `eval_runs`, so that gate always reads empty.
-    /// A `StaticEvalGate` with no rows is byte-for-byte equivalent (both return
-    /// `None`). Therefore:
-    ///   - promote WITH an eval_run_id  → gate None → `BlockedByEval` (HTTP 409)
-    ///   - promote WITHOUT an eval_run_id → `BlockedByPolicy` (HTTP 409)
-    /// and neither flips the production pointer. The ONLY path that reaches
-    /// production is the internal `promote_with_override` (ManualOverride), which
-    /// RED the day an `eval_runs` writer lands (part (a) would become `Promoted`)
-    /// — i.e. when the fix ships. Verify-on-node remains the definitive live proof.
+    /// Reproduce the PRODUCTION promote wiring and prove promote-to-prod 409s
+    /// when the gate cannot resolve a PASSING run:
+    ///   - promote WITH an unresolvable eval_run_id → `BlockedByEval` (HTTP 409)
+    ///   - promote WITHOUT an eval_run_id           → `BlockedByPolicy` (HTTP 409)
+    /// and neither flips the production pointer.
+    ///
+    /// **RENAMED 2026-08-19, and the old name was a prediction that turned out
+    /// wrong.** It was `…_always_409s_until_eval_runs_is_written`, and both it
+    /// and `specs/EVL-05` said it would go RED the day a writer landed. It did
+    /// not, and the reason is worth keeping: this test supplies a `StaticEvalGate`
+    /// with NO rows, so the gate returns `None` whether or not a writer exists
+    /// anywhere in the repo. What actually opens the gate is a run recorded
+    /// `passed` — the writer is necessary but not sufficient. `EVL-05` landed the
+    /// writer and this test still passes, correctly.
+    ///
+    /// So it is not a canary for the feature's absence; it is a permanent
+    /// assertion that **the gate fails CLOSED when it cannot resolve a passing
+    /// run**, which is the property worth keeping forever.
+    /// `promote_succeeds_with_passing_eval` is its positive twin.
     #[tokio::test]
-    async fn promote_in_production_config_always_409s_until_eval_runs_is_written() {
+    async fn promote_in_production_config_409s_without_a_passing_eval_run() {
         let store = Arc::new(MockVersionStore::default());
         let router = PromptRouter::new()
             .with_version_store(store.clone())
@@ -1774,6 +2219,7 @@ mod tests {
                 Env::Production,
                 v.prompt_version_id,
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .unwrap();
@@ -1787,6 +2233,7 @@ mod tests {
                 Env::Staging,
                 Env::Production,
                 v.prompt_version_id,
+                None,
                 None,
             )
             .await
@@ -1811,6 +2258,7 @@ mod tests {
                 Env::Production,
                 v.prompt_version_id,
                 "manual override",
+                None,
             )
             .await
             .unwrap();
@@ -1903,20 +2351,36 @@ mod tests {
         let prompt_id = Uuid::from_u128(0x10A);
         let va = pv(prompt_id, 1);
         let vb = pv(prompt_id, 2);
-        r.register_version(va.clone());
-        r.register_version(vb.clone());
+        r.register_version(&t, va.clone());
+        r.register_version(&t, vb.clone());
 
         let (r1, r2) = (Arc::clone(&r), Arc::clone(&r));
         let (t1, t2) = (t.clone(), t.clone());
         let (va_id, vb_id) = (va.prompt_version_id, vb.prompt_version_id);
         let (ra, rb) = tokio::join!(
             async move {
-                r1.promote(t1, "concurrent", Env::Staging, Env::Production, va_id, None)
-                    .await
+                r1.promote(
+                    t1,
+                    "concurrent",
+                    Env::Staging,
+                    Env::Production,
+                    va_id,
+                    None,
+                    None,
+                )
+                .await
             },
             async move {
-                r2.promote(t2, "concurrent", Env::Staging, Env::Production, vb_id, None)
-                    .await
+                r2.promote(
+                    t2,
+                    "concurrent",
+                    Env::Staging,
+                    Env::Production,
+                    vb_id,
+                    None,
+                    None,
+                )
+                .await
             },
         );
         // Both promotions completed without panicking or erroring.
@@ -1939,6 +2403,171 @@ mod tests {
     /// FT-10 (b): rollback is attribution-keyed. With vA→vB→vC promoted to
     /// production in sequence, an objective cost spike on vC must roll back to
     /// vB (the version vC displaced), NOT vA (the first-ever production).
+    /// THE HOT PATH MUST NOT BE ABLE TO MOVE PRODUCTION.
+    ///
+    /// `chat_completions_handler` reads `tracelane_prompt_version_id` out of the
+    /// chat REQUEST BODY and feeds the rollback engine. While that feed went
+    /// through `observe_and_maybe_rollback`, a Viewer JWT or a `chat`-scoped key
+    /// could warm the EWMA with ~30 identical completions and then flip the
+    /// production pointer with a spike on the 31st — a sixth prompt-WRITE
+    /// surface carrying none of the five gates the HTTP write routes carry.
+    ///
+    /// This drives the EXACT drift that `observe_and_maybe_rollback` acts on,
+    /// through `observe_only`, and asserts production does not move.
+    #[tokio::test]
+    async fn observe_only_computes_drift_but_cannot_flip_production() {
+        let r = PromptRouter::new().without_eval_gate();
+        let t = tid(0x0B5);
+        let prompt_id = Uuid::from_u128(0x0B5);
+        let va = pv(prompt_id, 1);
+        let vb = pv(prompt_id, 2);
+        r.register_version(&t, va.clone());
+        r.register_version(&t, vb.clone());
+        let name = "victim";
+
+        // vA → production, then vB displaces it, so `prev_production` holds vA
+        // and a flip has somewhere to go. Without this the test would pass for
+        // the wrong reason.
+        for v in [&va, &vb] {
+            r.promote(
+                t.clone(),
+                name,
+                Env::Staging,
+                Env::Production,
+                v.prompt_version_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Warm the EWMA past COLD_START (30), same recipe as the flip test.
+        for i in 0..100 {
+            let out = r
+                .observe_only(
+                    t.clone(),
+                    vb.prompt_version_id,
+                    &PromptMetrics {
+                        cost_usd: 0.001 + ((i % 5) as f64) * 1e-6,
+                        latency_ms: 250.0,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(out.rolled_back_to.is_none());
+        }
+
+        // The spike that DOES fire an Auto decision on the flipping path.
+        let out = r
+            .observe_only(
+                t.clone(),
+                vb.prompt_version_id,
+                &PromptMetrics {
+                    cost_usd: 0.05,
+                    latency_ms: 250.0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The DECISION is still computed — the hot path keeps its signal.
+        assert_eq!(
+            out.decision.mode,
+            Some(RollbackMode::Auto),
+            "observe_only must still compute the drift decision"
+        );
+        // ...but it carries no authority, and production did not move.
+        assert!(
+            out.rolled_back_to.is_none(),
+            "observe_only must never roll back"
+        );
+        assert!(
+            out.auto_rollback_decision.is_none(),
+            "observe_only must never produce a promotion decision"
+        );
+        assert_eq!(
+            r.route(t.clone(), name, Env::Production)
+                .await
+                .unwrap()
+                .prompt_version_id,
+            vb.prompt_version_id,
+            "the production pointer must still be vB — the chat path cannot flip it"
+        );
+
+        // DISCRIMINATION. Everything above would also pass if the drift simply
+        // were not flip-worthy — a probe that cannot tell the two answers apart
+        // proves nothing. Feed the SAME metrics through the flipping entry
+        // point and require that it DOES flip, so the assertions above are
+        // about authority rather than about the numbers.
+        let flipped = r
+            .observe_and_maybe_rollback(
+                t.clone(),
+                name,
+                Env::Production,
+                vb.prompt_version_id,
+                &PromptMetrics {
+                    cost_usd: 0.05,
+                    latency_ms: 250.0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            flipped.rolled_back_to,
+            Some(va.prompt_version_id),
+            "the same drift MUST flip through the gated path — otherwise the \
+             no-flip assertions above are vacuous"
+        );
+        assert_eq!(
+            r.route(t, name, Env::Production)
+                .await
+                .unwrap()
+                .prompt_version_id,
+            va.prompt_version_id,
+        );
+    }
+
+    /// The EWMA map is keyed on a version id that arrives from the request body.
+    /// Feeding an id the tenant does not own is refused, which is what bounds
+    /// the map and stops one prompt's metrics poisoning another's baseline.
+    #[tokio::test]
+    async fn observe_only_refuses_a_version_the_tenant_does_not_own() {
+        let r = PromptRouter::new().without_eval_gate();
+        let owner = tid(0x0B6);
+        let stranger = tid(0x0B7);
+        let v = pv(Uuid::from_u128(0x0B6), 1);
+        r.register_version(&owner, v.clone());
+
+        r.observe_only(
+            owner.clone(),
+            v.prompt_version_id,
+            &PromptMetrics::default(),
+        )
+        .await
+        .expect("the owning tenant may report metrics for its own version");
+
+        assert!(
+            r.observe_only(stranger, v.prompt_version_id, &PromptMetrics::default())
+                .await
+                .is_err(),
+            "another tenant must not be able to feed metrics for this version"
+        );
+        assert!(
+            r.observe_only(
+                owner,
+                Uuid::from_u128(0xDEADBEEF),
+                &PromptMetrics::default()
+            )
+            .await
+            .is_err(),
+            "an unregistered id must be refused — otherwise the body can grow the map without bound"
+        );
+    }
+
     #[tokio::test]
     async fn ft10_attribution_rollback_targets_specific_displaced_version() {
         let r = PromptRouter::new().without_eval_gate();
@@ -1948,7 +2577,7 @@ mod tests {
         let vb = pv(prompt_id, 2);
         let vc = pv(prompt_id, 3);
         for v in [&va, &vb, &vc] {
-            r.register_version((*v).clone());
+            r.register_version(&t, (*v).clone());
         }
         let name = "attribution";
         // vA→prod, vB displaces vA, vC displaces vB ⇒ prev_production = vB.
@@ -1959,6 +2588,7 @@ mod tests {
                 Env::Staging,
                 Env::Production,
                 v.prompt_version_id,
+                None,
                 None,
             )
             .await
@@ -2035,7 +2665,7 @@ mod tests {
         let r = PromptRouter::new();
         let prompt_id = Uuid::from_u128(0xAAAA);
         let v1 = pv(prompt_id, 1);
-        r.register_version(v1.clone());
+        r.register_version(&tid(2), v1.clone());
 
         let decision = r
             .promote(
@@ -2044,6 +2674,7 @@ mod tests {
                 Env::Staging,
                 Env::Production,
                 v1.prompt_version_id,
+                None,
                 None,
             )
             .await
@@ -2064,7 +2695,7 @@ mod tests {
         let r = PromptRouter::new().with_eval_gate(gate);
         let prompt_id = Uuid::from_u128(0xCAFE);
         let v1 = pv(prompt_id, 1);
-        r.register_version(v1.clone());
+        r.register_version(&tid(3), v1.clone());
 
         let decision = r
             .promote(
@@ -2074,6 +2705,7 @@ mod tests {
                 Env::Production,
                 v1.prompt_version_id,
                 Some(eval_run),
+                None,
             )
             .await
             .unwrap();
@@ -2097,7 +2729,7 @@ mod tests {
         let r = PromptRouter::new().with_eval_gate(gate);
         let prompt_id = Uuid::from_u128(0xF00D);
         let v1 = pv(prompt_id, 1);
-        r.register_version(v1.clone());
+        r.register_version(&tid(4), v1.clone());
 
         let decision = r
             .promote(
@@ -2107,6 +2739,7 @@ mod tests {
                 Env::Production,
                 v1.prompt_version_id,
                 Some(eval_run),
+                None,
             )
             .await
             .unwrap();
@@ -2118,7 +2751,7 @@ mod tests {
         let r = PromptRouter::new();
         let prompt_id = Uuid::from_u128(0x1234);
         let v1 = pv(prompt_id, 1);
-        r.register_version(v1.clone());
+        r.register_version(&tid(5), v1.clone());
 
         let decision = r
             .promote_with_override(
@@ -2128,6 +2761,7 @@ mod tests {
                 Env::Production,
                 v1.prompt_version_id,
                 "incident response — bypassing eval per runbook IR-042",
+                None,
             )
             .await
             .unwrap();
@@ -2139,14 +2773,130 @@ mod tests {
         assert_eq!(routed.prompt_version_id, v1.prompt_version_id);
     }
 
+    /// A capturing persister — the ONLY way to assert what actually reaches
+    /// `promotion_decisions`, because `ClickHousePersister` needs a server and
+    /// `NoOpPersister` drops the decision on the floor. Every existing promotion
+    /// test asserts the RETURNED decision, which is why a persister that wrote a
+    /// hardcoded `None` into `decided_by_user_id` survived unnoticed.
+    #[derive(Default)]
+    struct CapturingPersister {
+        seen: std::sync::Mutex<Vec<PromotionDecision>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PromotionPersister for CapturingPersister {
+        async fn persist(&self, _tenant_id: &TenantId, decision: &PromotionDecision) -> Result<()> {
+            self.seen.lock().unwrap().push(decision.clone());
+            Ok(())
+        }
+    }
+
+    /// The actor must reach the PERSISTED decision, not just the audit chain.
+    ///
+    /// Prod held 5 `promotion_decisions` rows, every one with
+    /// `decided_by_user_id = NULL`, while one of them carried the actor inside
+    /// the `notes` prose — and `prompt_routes.rs`'s doc comment claimed the
+    /// actor was captured "so an override promotion records WHO bypassed the
+    /// eval gate in the tamper-evident decision". It was captured into a
+    /// sentence. This asserts the structured column instead.
+    #[tokio::test]
+    async fn override_promotion_persists_the_actor_not_just_the_note() {
+        let cap = Arc::new(CapturingPersister::default());
+        let r = PromptRouter::new().with_persister(cap.clone());
+        let prompt_id = Uuid::from_u128(0x51D3);
+        let v1 = pv(prompt_id, 1);
+        r.register_version(&tid(21), v1.clone());
+
+        r.promote_with_override(
+            tid(21),
+            "incident-prompt",
+            Env::Staging,
+            Env::Production,
+            v1.prompt_version_id,
+            "user override by user_01ABC: incident IR-042",
+            Some("user_01ABC"),
+        )
+        .await
+        .unwrap();
+
+        let seen = cap.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the override must persist exactly one row");
+        assert_eq!(
+            seen[0].decided_by.as_deref(),
+            Some("user_01ABC"),
+            "decided_by must carry the actor — this is the column that was NULL \
+             on every production row"
+        );
+        assert_eq!(seen[0].decision, DecisionKind::ManualOverride);
+    }
+
+    /// The eval-gated path records its actor too — an allowed promotion is as
+    /// much an audit fact as a bypass.
+    #[tokio::test]
+    async fn eval_gated_promotion_persists_the_actor() {
+        let mut statuses = HashMap::new();
+        let eval_run = Uuid::from_u128(0x5EED);
+        statuses.insert(eval_run, EvalRunStatus::Passed);
+        let cap = Arc::new(CapturingPersister::default());
+        let r = PromptRouter::new()
+            .with_persister(cap.clone())
+            .with_eval_gate(Arc::new(StaticEvalGate { statuses }));
+        let prompt_id = Uuid::from_u128(0x51D4);
+        let v1 = pv(prompt_id, 1);
+        r.register_version(&tid(22), v1.clone());
+
+        r.promote(
+            tid(22),
+            "support-bot",
+            Env::Staging,
+            Env::Production,
+            v1.prompt_version_id,
+            Some(eval_run),
+            Some("user_01XYZ"),
+        )
+        .await
+        .unwrap();
+
+        let seen = cap.seen.lock().unwrap();
+        assert_eq!(seen[0].decided_by.as_deref(), Some("user_01XYZ"));
+        assert_eq!(seen[0].decision, DecisionKind::Promoted);
+    }
+
+    /// An engine-initiated flip is attributed to the engine, with the SAME
+    /// string the audit chain uses (`prompt_routes.rs` chain_eval_verdict), so
+    /// the ClickHouse column and the tamper-evident chain never disagree about
+    /// who moved the pointer.
+    #[tokio::test]
+    async fn auto_rollback_flip_is_attributed_to_the_engine() {
+        let cap = Arc::new(CapturingPersister::default());
+        let r = PromptRouter::new().with_persister(cap.clone());
+        let prompt_id = Uuid::from_u128(0x51D5);
+        let v1 = pv(prompt_id, 1);
+        r.register_version(&tid(23), v1.clone());
+
+        r.rollback(
+            tid(23),
+            "p",
+            Env::Production,
+            v1.prompt_version_id,
+            "auto-rollback: Cost drift 3.10\u{3c3}",
+            Some("system:auto-rollback"),
+        )
+        .await
+        .unwrap();
+
+        let seen = cap.seen.lock().unwrap();
+        assert_eq!(seen[0].decided_by.as_deref(), Some("system:auto-rollback"));
+    }
+
     #[tokio::test]
     async fn rollback_records_previous_version() {
         let r = PromptRouter::new().without_eval_gate();
         let prompt_id = Uuid::from_u128(0x9999);
         let v1 = pv(prompt_id, 1);
         let v2 = pv(prompt_id, 2);
-        r.register_version(v1.clone());
-        r.register_version(v2.clone());
+        r.register_version(&tid(6), v1.clone());
+        r.register_version(&tid(6), v2.clone());
 
         // Promote v1 -> production.
         r.promote(
@@ -2155,6 +2905,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v1.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2166,6 +2917,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v2.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2185,6 +2937,7 @@ mod tests {
                 Env::Production,
                 v1.prompt_version_id,
                 "v2 burned cost budget by 5x",
+                None,
             )
             .await
             .unwrap();
@@ -2207,8 +2960,12 @@ mod tests {
         let prompt_id = Uuid::from_u128(0x5555);
         let v_a = pv(prompt_id, 1);
         let v_b = pv(prompt_id, 2);
-        r.register_version(v_a.clone());
-        r.register_version(v_b.clone());
+        // Each version is registered under ITS OWN tenant. The registry is
+        // keyed by (tenant, version_id); registering both under one tenant is
+        // what the old global map did, and it is what let one tenant resolve
+        // the other's version.
+        r.register_version(&tid(100), v_a.clone());
+        r.register_version(&tid(101), v_b.clone());
 
         // Tenant A points at v_a; Tenant B points at v_b.
         r.promote(
@@ -2217,6 +2974,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v_a.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2227,6 +2985,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v_b.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2242,6 +3001,32 @@ mod tests {
             .unwrap();
         assert_eq!(a.version_number, 1);
         assert_eq!(b.version_number, 2);
+
+        // THE LEAK ITSELF. Before the registry was tenant-keyed and `promote`
+        // checked ownership, tenant A could name tenant B's version id under a
+        // prompt name of A's own choosing and then READ B's content back.
+        // Reproduced by execution at the time; refused now.
+        let leak = r
+            .promote(
+                tid(100),
+                "anything",
+                Env::Staging,
+                Env::Production,
+                v_b.prompt_version_id, // tenant 101's version
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            leak.is_err(),
+            "tenant A must not be able to promote tenant B's version id"
+        );
+        assert!(
+            r.route(tid(100), "anything", Env::Production)
+                .await
+                .is_err(),
+            "and no routing pointer may have been created by the refused promote"
+        );
     }
 
     #[tokio::test]
@@ -2250,8 +3035,8 @@ mod tests {
         let prompt_id = Uuid::from_u128(0x7777);
         let v1 = pv(prompt_id, 1);
         let v2 = pv(prompt_id, 2);
-        r.register_version(v1.clone());
-        r.register_version(v2.clone());
+        r.register_version(&tid(70), v1.clone());
+        r.register_version(&tid(70), v2.clone());
         let t = tid(70);
 
         // Promote v1 then v2 to production → prev_production = v1.
@@ -2262,6 +3047,7 @@ mod tests {
             Env::Production,
             v1.prompt_version_id,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2271,6 +3057,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v2.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2337,8 +3124,8 @@ mod tests {
         let prompt_id = Uuid::from_u128(0x8888);
         let v1 = pv(prompt_id, 1);
         let v2 = pv(prompt_id, 2);
-        r.register_version(v1.clone());
-        r.register_version(v2.clone());
+        r.register_version(&tid(71), v1.clone());
+        r.register_version(&tid(71), v2.clone());
         let t = tid(71);
 
         r.promote(
@@ -2347,6 +3134,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v1.prompt_version_id,
+            None,
             None,
         )
         .await
@@ -2357,6 +3145,7 @@ mod tests {
             Env::Staging,
             Env::Production,
             v2.prompt_version_id,
+            None,
             None,
         )
         .await

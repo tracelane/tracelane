@@ -2,6 +2,7 @@
  * GET  /api/settings/api-keys  — list active API keys for the authenticated tenant
  * POST /api/settings/api-keys  — create a new tlane_* key; raw key returned once
  *
+ * ## Minting moved to the gateway
  *
  * Key creation is proxied to the Rust gateway (`POST /v1/keys`) rather than
  * hashed here. The dashboard runs on the Cloudflare Workers runtime, where the
@@ -40,6 +41,17 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 			// array renders the capabilities the key actually carries.
 			scope: apiKeys.scope,
 			expiresAt: apiKeys.expiresAt,
+			// GWY-43 — the ceilings the gateway ENFORCES (402 on budget, 429 on
+			// rate). They were writable but never readable, so a key's limits were
+			// invisible everywhere outside psql. Selecting them is what lets the
+			// table show them.
+			//
+			// `budgetUsdMonthly` is a Postgres `numeric`: the driver hands it back
+			// as a STRING (e.g. "50.0000"), never a JS number — Drizzle types it
+			// `string | null` for that reason, and the client parses it.
+			// `rateLimitRpm` is `integer` and arrives as a number.
+			budgetUsdMonthly: apiKeys.budgetUsdMonthly,
+			rateLimitRpm: apiKeys.rateLimitRpm,
 		})
 		.from(apiKeys)
 		.where(and(eq(apiKeys.tenantId, tenantDbId), isNull(apiKeys.revokedAt)))
@@ -55,6 +67,8 @@ interface CreateKeyBody {
 	/** A13. RFC3339, must be in the future. */
 	expiresAt?: string;
 	budgetUsdMonthly?: number;
+	/** GWY-43. Requests/min for this key; omitted ⇒ the workspace plan limit. */
+	rateLimitRpm?: number;
 }
 
 /** The gateway `/v1/keys` response — the raw key is present exactly once. */
@@ -68,6 +82,9 @@ interface CreateKeyResult {
 	/** A13. `null` only for a key minted before A13. */
 	scope: string[] | null;
 	expiresAt: string | null;
+	/** GWY-43. Echoed back as the gateway validated them; `null` = uncapped. */
+	budgetUsdMonthly: number | null;
+	rateLimitRpm: number | null;
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
@@ -101,6 +118,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 			...(body.expiresAt ? { expires_at: body.expiresAt } : {}),
 			...(body.budgetUsdMonthly != null
 				? { budget_usd_monthly: body.budgetUsdMonthly }
+				: {}),
+			...(body.rateLimitRpm != null
+				? { rate_limit_rpm: body.rateLimitRpm }
 				: {}),
 		});
 	} catch (err) {
@@ -144,6 +164,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 			keyPrefix: created.keyPrefix,
 			scope: created.scope,
 			expiresAt: created.expiresAt,
+			// GWY-43 — the ceilings belong in the audit row for the same reason the
+			// scope does: they are the security-relevant shape of the credential
+			// that was just minted, and they are non-secret.
+			budgetUsdMonthly: created.budgetUsdMonthly,
+			rateLimitRpm: created.rateLimitRpm,
 		},
 		ipAddr: ipFromRequest(request),
 		userAgent: request.headers.get("user-agent"),

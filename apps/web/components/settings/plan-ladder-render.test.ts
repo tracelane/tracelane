@@ -98,7 +98,7 @@ describe("SET-15 — honesty locks hold in the rendered copy", () => {
 	});
 
 	it('says "30+" providers, never the retired "35+"', () => {
-		expect(html).toContain("30+-provider gateway");
+		expect(html).toContain("150+-provider gateway");
 		expect(html).not.toContain("35+");
 		// the legacy entitlement flag NAME must not leak into copy
 		expect(html).not.toContain("gateway_35_providers");

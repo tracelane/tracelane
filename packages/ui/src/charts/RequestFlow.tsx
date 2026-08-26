@@ -12,8 +12,16 @@ import { cn } from "../lib/cn";
  *
  * Labels live in the left/right gutters (Gateway, OK, Error); model identity is
  * carried by the HTML legend below (swatch → name → requests) so the ribbons
- * stay legible at card size. Ribbons are token-colored (a lava-shade ramp for
- * the model routing, ok/danger for the outcome), never hardcoded hex.
+ * stay legible at card size.
+ *
+ * COLOUR (P0.11, 2026-08-22). Two channels, and the split is the whole point:
+ *  · ROUTING — gateway → model — carries NO meaning of its own, so it is an OPACITY
+ *    ramp on `--chart-primary`, one colour told apart by value. It was a ramp on the
+ *    `--action` accent (a lava red before the palette swap), which spent a hue on
+ *    "which row of the legend is this".
+ *  · OUTCOME — model → OK / Error — IS the meaning, so it keeps `--ok` and `--danger`.
+ *    A red ribbon here says a request failed; that is a datum, not decoration.
+ * Never a hardcoded hex, in either channel.
  */
 
 export interface RequestFlowModel {
@@ -46,10 +54,12 @@ const BW = 15; // node bar width
 const GAP = 8; // vertical gap between stacked model bars
 const PLOT_H = H - PAD_T - PAD_B;
 
-/** Lava-shade ramp for the model routing ribbons/bars (rationed action, no new palette). */
+/** Rank ramp for the model routing ribbons/bars — `--chart-primary` stepped down in
+ *  opacity, no categorical palette. Models are not outcomes, so the only thing this
+ *  channel may encode is order. */
 function modelShade(i: number): { fill: string; op: number } {
-	// deep→soft lava by index; capped so later models stay visible.
-	return { fill: "var(--action)", op: Math.max(0.32, 0.62 - i * 0.1) };
+	// strong→soft by index; floored so later models stay visible.
+	return { fill: "var(--chart-primary)", op: Math.max(0.32, 0.62 - i * 0.1) };
 }
 
 /** Compact count for the gutter labels (1.2K / 3.4M). */
@@ -165,7 +175,18 @@ export function RequestFlow({
 					if (errShare > 0.01) errCursor += errShare;
 					return (
 						<g key={`r-${m.id ?? m.label}`}>
-							<path d={okPath} fill="var(--ok)" fillOpacity={0.3} />
+							{/*
+							 * THE OK RIBBON IS NEUTRAL, NOT GREEN — the same call the
+							 * dashboard's guardrail donut makes, for the same reason.
+							 * OK is ~99% of traffic on any healthy fleet, so painting it
+							 * `--ok` made the widest band on the card a saturated green
+							 * and the LOUDEST object on screen the news that nothing
+							 * happened. Under "colour is data" the datum here is the
+							 * EXCEPTION: the thin `--danger` ribbon splitting off below.
+							 * Neutral OK + red error is both more restrained and more
+							 * informative — the eye lands on the failure.
+							 */}
+							<path d={okPath} fill="var(--chart-primary)" fillOpacity={0.16} />
 							{errPath && (
 								<path d={errPath} fill="var(--danger)" fillOpacity={0.34} />
 							)}
@@ -173,20 +194,22 @@ export function RequestFlow({
 					);
 				})}
 
-				{/* gateway bar (full height) */}
+				{/* gateway bar (full height) — the source node, so it is the routing
+				    channel at full strength rather than a ramp step. */}
 				<rect
 					x={gwX}
 					y={PAD_T}
 					width={BW}
 					height={PLOT_H}
 					rx={3}
-					fill="var(--action)"
+					fill="var(--chart-primary)"
 					fillOpacity={0.85}
 				/>
 				<text
 					x={gwX + BW / 2}
 					y={PAD_T - 3}
 					textAnchor="middle"
+					/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 					className="fill-[var(--ink-2)] text-[9px] font-semibold"
 				>
 					Gateway
@@ -195,6 +218,7 @@ export function RequestFlow({
 					x={gwX + BW / 2}
 					y={H - 3}
 					textAnchor="middle"
+					/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 					className="fill-[var(--ink-3)] text-[9px] tabular-nums"
 				>
 					{compact(total)}
@@ -237,12 +261,13 @@ export function RequestFlow({
 							width={BW}
 							height={okH}
 							rx={3}
-							fill="var(--ok)"
-							fillOpacity={0.85}
+							fill="var(--chart-primary)"
+							fillOpacity={0.55}
 						/>
 						<text
 							x={outX + BW + 5}
 							y={okY0 + Math.min(okH, 12)}
+							/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 							className="fill-[var(--ink-2)] text-[9px] font-semibold"
 						>
 							OK
@@ -250,6 +275,7 @@ export function RequestFlow({
 						<text
 							x={outX + BW + 5}
 							y={okY0 + Math.min(okH, 12) + 11}
+							/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 							className="fill-[var(--ink-3)] text-[9px] tabular-nums"
 						>
 							{compact(totalOk)}
@@ -270,6 +296,7 @@ export function RequestFlow({
 						<text
 							x={outX + BW + 5}
 							y={errY0 + 8}
+							/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 							className="fill-[var(--danger)] text-[9px] font-semibold"
 						>
 							Error
@@ -284,7 +311,7 @@ export function RequestFlow({
 					const pct = total > 0 ? (m.requests / total) * 100 : 0;
 					const { fill, op } = modelShade(i);
 					const row = (
-						<span className="flex items-center gap-1.5 text-[10.5px] text-ink-3">
+						<span className="flex items-center gap-1.5 text-2xs text-ink-3">
 							<span
 								className="h-2 w-2 shrink-0 rounded-full"
 								style={{ background: fill, opacity: op + 0.25 }}
@@ -301,7 +328,7 @@ export function RequestFlow({
 							{m.href ? (
 								<a
 									href={m.href}
-									className="rounded hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+									className="rounded hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 								>
 									{row}
 								</a>

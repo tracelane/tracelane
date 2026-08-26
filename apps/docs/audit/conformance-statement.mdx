@@ -135,14 +135,16 @@ queryable but not chained.
 
 ### Article 12(2)(c) — retention floor
 
-Tracelane hardcodes `AUDIT_ADDON_MIN_RETENTION_DAYS = 180` in
-`crates/gateway/src/audit_retention.rs:17`. The `resolve_audit_retention`
-function asserts fail-loud if any caller attempts to set a contractual
-override shorter than 180 days for an Audit-add-on workspace
-(`audit_retention.rs:47`), and otherwise resolves to
-`max(base_tier_days, 180)`. This is enforced *in source*, not only in
-configuration — a configuration error cannot accidentally shorten
-retention below the floor.
+The Audit add-on carries a **180-day minimum retention** commitment for ledger
+data. Two properties carry it and both are checkable against a running system:
+no scheduled job deletes ledger data — the retention sweep operates on span
+tables only — and the ledger tables carry no TTL, so no row expires on its own.
+
+**Stated precisely, because the limit matters more than the reassurance:** that
+floor is operational and contractual rather than programmatically enforced.
+Retention holds because nothing expires ledger rows automatically, not because
+a runtime check refuses a shorter value. A shorter contractual term would be a
+process failure, not one the software currently refuses.
 
 Workspaces without the Audit add-on are subject to the base-tier
 retention (free 7d / builder 30d / team 90d / business 180d /
@@ -208,7 +210,7 @@ served (fail-closed).
 
 One honest limitation on the credential model: API keys are
 **workspace-scoped and revocable, but they are not per-endpoint-scoped
-and carry no expiry** — the `api_keys` table has neither a scope nor an
+and carry no expiry** unless you set them — the `api_keys` table has both a scope and an
 `expires_at` column (`apps/web/db/schema.ts`). Access for a review is
 therefore narrowed operationally: mint a key for the workspace under
 review, and revoke it when the review closes.
@@ -263,15 +265,14 @@ today**:
   spans; not written as ledger events.
 - **Automated audit-data retention cleanup job.** V1 does not delete
   audit data, so the 180-day floor is trivially satisfied; V1.1 ships
-  the cron + DELETE pipeline using `resolve_audit_retention`.
+  a scheduled cleanup that enforces the retention ceiling.
 - **PDF export.** `tracelane-audit export --format pdf` is queued for
   V1.1. V1 produces the equivalent human-readable content via
   `--format text` and `--format json`.
-- **Per-tenant chain-state isolation hardening (AUDIT-001).** V1's
-  per-tenant `seq` + per-tenant Ed25519 keypair already enforce
-  per-tenant cryptographic integrity; the
-  `DashMap<TenantId, ChainState>` refactor for additional defence in
-  depth against operator-side errors is queued for V1.5.
+- **Per-tenant chain-state isolation hardening.** V1's per-tenant `seq`
+  and per-tenant Ed25519 keypair already enforce per-tenant cryptographic
+  integrity. Further in-process isolation, as defence in depth against
+  operator-side error, is on the roadmap.
 - **Signed, published verifier binaries.** Configured but not yet run on
   a tag — see §12(3)(c).
 

@@ -7,19 +7,27 @@ classification: PUBLIC
 Helicone is mostly a proxy with config-via-env + per-request headers. The
 canonical Tracelane migration path is one CLI command:
 
+There are two commands and they do different things.
+
 ```bash
-tlane migrate helicone                           # dry-run scan
-tlane migrate helicone --apply                   # write .env.tracelane
-tlane migrate helicone --apply --dir src/
+# Rewrite your project IN PLACE — .env files and source.
+tlane migrate helicone                    # dry-run preview
+tlane migrate helicone --apply            # write changes
+tlane migrate helicone --apply --dir src/ # scan a different root
+
+# Or emit a separate stanza and leave your project untouched.
+tlane import-helicone                     # writes .env.tracelane
+tlane import-helicone --with-config       # also a starter tracelane.yaml
 ```
 
-The CLI:
+`tlane migrate helicone` reads `.env`, `.env.local`, `.env.production` and
+`.env.development`, translates each known `HELICONE_*` var, and **rewrites those
+files and matching source in place**. It does not emit `.env.tracelane`.
 
-1. Reads `.env` (or `--env <path>`) looking for `HELICONE_*` vars
-2. Translates each known var to its Tracelane equivalent
-3. Emits a new `.env.tracelane` stanza with the renamed vars
-4. With `--with-config --src <dir>`, also greps for `Helicone-Property-*` headers
-   in your source and synthesises a matching `tracelane.yaml`
+`tlane import-helicone` is the non-destructive path: it reads `--env <path>` and
+writes a `.env.tracelane` stanza. `--with-config` adds a **fixed two-provider
+starter scaffold** — it is a template, not derived from your code. `--src <dir>`
+only names a directory for you to review by hand; nothing is scanned.
 
 ## Env var mapping
 
@@ -27,9 +35,9 @@ The CLI:
 |---|---|---|
 | `HELICONE_API_KEY` | `TRACELANE_API_KEY` | Same role: tenant API key |
 | `HELICONE_BASE_URL` | `TRACELANE_GATEWAY_URL` | Override only for self-host |
-| `HELICONE_PROPERTY_*` | `tracelane.yaml` route metadata | Translated by `--with-config` |
+| `HELICONE_PROPERTY_*` | `X-Tracelane-Property-*` header | Per-request custom properties |
 | `HELICONE_USER_ID` | `TRACELANE_USER_ID` | Per-request user attribution |
-| `HELICONE_CACHE_ENABLED` | `TRACELANE_CACHE_ENABLED` | Same semantics |
+| `HELICONE_CACHE_ENABLED` | — | No equivalent: Tracelane has no built-in caching layer in V1 |
 
 ## What you keep
 
@@ -40,17 +48,20 @@ The CLI:
 ## What changes
 
 - The base URL: `https://gateway.tracelane.dev/v1` (or your self-host endpoint)
-- Caching backend: ClickHouse-tier, surfaced as `predictive.cache_hit` span attribute
-- Predictive guardrails inline — Helicone has no equivalent
+- Semantic response caching is operator-level, surfaced as the
+  `tracelane_semantic_cache_hit` span attribute
+- Predictive guardrails inline at the gateway. We found no equivalent inline
+  guardrail layer documented by Helicone as of 2026-08-26.
 
 ## License posture
 
-Helicone's `ai-gateway` is GPL-3.0 (viral copyleft). Tracelane is Apache
-2.0. We never copied code from `ai-gateway` — we reference patterns and
-build cleaner.
+Helicone's `ai-gateway` is licensed GPL-3.0; Tracelane is Apache 2.0 across
+the full stack. Tracelane is an independent implementation.
+
+*Licences verified as of 2026-08-26 from each repository's `LICENSE` file.*
 
 ## Related
 
 - [Quickstart](/quickstart)
-- [Providers](/providers) — the 30+ we route to (7 native + any OpenAI-compatible)
+- [Providers](/providers) — the 150+ we route to (6 native adapters + any OpenAI-compatible)
 - [CLI](/cli) — full `tlane` command list

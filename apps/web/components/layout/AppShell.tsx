@@ -58,11 +58,29 @@ export function AppShell({
 				<Sidebar defaultCollapsed={defaultCollapsed} />
 				<div className="flex min-w-0 flex-1 flex-col">
 					<TopBar orgSlot={orgSlot} />
-					{/* ADR-074 §5 G1 — container tint on the LARGE CONTENT CONTAINER, which is what
-					    §5 describes. `.app-canvas` (the 160deg <=4%-saturation static wash) was
-					    defined in tokens.css and applied NOWHERE; the tint had only ever reached
-					    cards. This is the one large container in the app. */}
-					<main className="app-canvas min-w-0 flex-1 px-5 py-5">
+					{/*
+					 * P0.15/P0.16 — the content ground, and the app's ONLY page gutter.
+					 *
+					 * `.app-canvas` is a REAL RULE now (tokens.css @layer components): it
+					 * paints `--canvas` plus `--canvas-gradient` on this one large
+					 * container. The previous comment here described a "160deg
+					 * <=4%-saturation static wash" that was "defined in tokens.css" — by
+					 * then neither half was true. The class had no definition ANYWHERE, so
+					 * this element painted nothing and `--canvas-gradient` had no consumer;
+					 * and the value it now carries is a flat 180deg ground, not a tinted
+					 * wash, because the ground stopped being white and no longer needs one.
+					 *
+					 * THE PADDING IS RESPONSIVE AND THERE IS STILL NO MAX-WIDTH. A flat
+					 * `px-5` gave a 1280px laptop and a 2560px monitor the same 20px gutter,
+					 * so the wider the screen the more the content looked stuck to the rail.
+					 * The ramp opens the gutter with the viewport while content stays
+					 * FULL-BLEED beside the rail — deliberately, per §11: re-introducing a
+					 * centred `max-w-*` wrapper is exactly the horizontal-space waste the
+					 * sidebar migration removed, and the waterfall is the surface that pays
+					 * for it. Vertical padding is `py-6` so the first card clears the sticky
+					 * bar rather than touching it.
+					 */}
+					<main className="app-canvas min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8 xl:px-10">
 						{children}
 					</main>
 				</div>

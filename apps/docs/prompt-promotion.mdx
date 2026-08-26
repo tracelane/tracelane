@@ -1,15 +1,16 @@
 ---
 title: Prompt promotion and staged rollouts
-description: Ship prompts like code — version, gate, and promote staging to production with auto-rollback and a tamper-evident record. Full workflow on Team $249+.
+description: Ship prompts like code — version, gate, and promote staging to production with drift-based rollback on the metrics you post, and a tamper-evident record. Full workflow on Team $249+.
 classification: PUBLIC
 ---
 
 Prompt Promotion is the B1 workflow that lets you move prompt versions from
-`staging` to `production` through automated eval checks, with auto-rollback
-if post-promotion metrics regress.
+`staging` to `production` through automated eval checks, with drift-based
+rollback when the post-promotion metrics **you post** regress. Rollback is not
+autonomous — see [Auto-rollback](#auto-rollback) for exactly what fires it.
 
 **Pricing:** Read-only (view active version + history) on **Builder $59**.
-Full promotion workflow — create, gate, promote, auto-rollback — on **Team $249+**.
+Full promotion workflow — create, gate, promote, drift-based rollback — on **Team $249+**.
 
 ## Core concepts
 
@@ -19,7 +20,7 @@ Full promotion workflow — create, gate, promote, auto-rollback — on **Team $
 | **Version** | An immutable snapshot of a prompt's content, SHA-256 hashed |
 | **Environment** | `staging`, `canary`, or `production` |
 | **Eval gate** | A set of eval assertions that must pass before promotion |
-| **Auto-rollback** | Automatic revert if a metric drifts past a σ threshold post-promotion |
+| **Auto-rollback** | Revert when a metric **you post** drifts past a σ threshold post-promotion. Gateway traffic updates the drift baseline but cannot trigger a revert |
 
 ## Workflow overview
 
@@ -41,10 +42,11 @@ Full promotion workflow — create, gate, promote, auto-rollback — on **Team $
   production        the prompt
         │
         ▼
-  Monitor metrics (error rate, latency, token spend, eval score)
+  POST your metrics to /v1/prompts/:name/observe
+  (cost, latency, guardrail-fire rate, eval score)
         │ drifts > threshold
         ▼
-  Auto-rollback fires → previous version restored
+  Rollback fires → previous version restored
 ```
 
 ## Create and version prompts
@@ -75,23 +77,28 @@ tlane prompt diff my-agent-system --from-env staging --to-env production
 
 ## Eval gates
 
-<Warning>
-**Roadmap (V1.1) — eval-gate blocking is not yet shipped.** What is **live today**
-is the versioned promotion itself: promote, rollback, and a **tamper-evident
-promotion record**. The eval **gate** does not yet run — there is no producer of
-`eval_runs` in production, so today every promotion is recorded as a tamper-evident
-**manual-override** decision with `eval_run_id: null`. The `tracelane.yaml` gate
-config, the streaming eval panel, and the `blocked_by_eval` response below are the
-**V1.1 shape**, shown here so the contract is stable — they are not exercised
-features yet. Nothing on this page auto-blocks a promotion today.
-</Warning>
+<Note>
+**Eval gating is live.** Run a suite with `POST /v1/prompts/{name}/evals`, then pass
+the returned `eval_run_id` to `promote`: a run recorded `passed` opens the gate, and
+anything else — `failed`, `errored`, still `running`, or an id the gate cannot
+resolve — refuses the promotion with `409` and leaves the production pointer where it
+was. **The gate fails closed**, so an unreadable run blocks rather than waves through.
 
-When eval gates ship (V1.1), a staging → production promotion will run your eval
-suite against the candidate version first, blocking promotion if any assertion
-fails. The planned configuration lives in `tracelane.yaml`:
+Still on the roadmap: the `tracelane.yaml` gate config and the streaming eval panel.
+Assertions are code rules plus an optional LLM judge — see
+[Evals and prompt promotion](/eval-gates). And a promotion is never gated
+*automatically* — you choose to supply a run id, or to record an attributed override
+instead.
+</Note>
+
+Eval gating is live. A staging → production promotion requires a passing eval
+run; without one the non-override path returns `409`. Start a run with
+`POST /v1/prompts/{name}/evals`. Declarative per-prompt thresholds in
+`tracelane.yaml` are still roadmap:
 
 ```yaml
-# V1.1 (roadmap) — no reader in the current gateway.
+# Roadmap: declarative thresholds have no reader in the current gateway.
+# The gate itself is live via POST /v1/prompts/{name}/evals.
 prompts:
   my-agent-system:
     eval_gate:
@@ -105,7 +112,7 @@ prompts:
 ```
 
 The eval suite referenced here is the same format as the CI merge-gate suite.
-See [`evals/pain-points/INDEX.md`](https://github.com/tracelane/tracelane/blob/main/evals/pain-points/INDEX.md).
+See [Eval gates](/eval-gates).
 
 ## Promote via dashboard
 
@@ -119,40 +126,69 @@ See [`evals/pain-points/INDEX.md`](https://github.com/tracelane/tracelane/blob/m
 
 ## Promote via API
 
+Promote against the **gateway**, not the dashboard origin. The dashboard route
+authenticates with a WorkOS session **cookie** and ignores an `Authorization`
+header; the gateway takes a Bearer credential.
+
+`to_version_id` is **required** and is a UUID — get it from the `201` body of
+`POST /v1/prompts/{name}/versions`, or from `GET /v1/prompts/{name}`.
+
 ```bash
-curl -X POST https://app.tracelane.dev/api/prompts/my-agent-system/promote \
-  -H "Authorization: Bearer $SESSION_JWT" \
+curl -X POST https://gateway.tracelane.dev/v1/prompts/my-agent-system/promote \
+  -H "Authorization: Bearer $TRACELANE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "from_env": "staging",
     "to_env": "production",
-    "eval_run_id": "run_abc123",   # optional: attach a prior eval run
-    "notes": "Better refusal rate on jailbreak suite"
+    "to_version_id": "3f1a6c2e-9b04-4d77-8a51-2e0c7f9b1d43",
+    "override_reason": "Better refusal rate on the jailbreak suite"
   }'
 ```
 
-Response on success:
+<Note>
+  `override_reason` is shown instead of `eval_run_id` because **nothing produces
+  eval runs yet** — supplying an `eval_run_id` returns `409` today. The override
+  path records an explicit, attributed bypass in the tamper-evident chain, which
+  is the honest way to promote until eval runs exist. The key needs the `admin`
+  scope; keys minted before scoping (`scope` unset) are unaffected.
+</Note>
+
+Response on success — every id is a UUID:
 
 ```json
 {
-  "promotion_id": "promo_xyz",
-  "decision": "promoted",
-  "from_version_id": "v_old",
-  "to_version_id": "v_new",
-  "eval_run_id": "run_abc123"
+  "promotion_id": "0f9c1a77-5b2d-4e18-9a30-6c5f8b2e4d91",
+  "from_version_id": "1c8b4e60-2a97-4f33-b5d2-70a1e9c6f382",
+  "to_version_id": "3f1a6c2e-9b04-4d77-8a51-2e0c7f9b1d43",
+  "from_env": "staging",
+  "to_env": "production",
+  "eval_run_id": null,
+  "decision": "manual_override",
+  "notes": "manual override: user override by user_01H…: Better refusal rate on the jailbreak suite"
 }
 ```
 
-Response on eval gate block _(V1.1 shape — the gate does not block promotions today)_:
+If you supply an `eval_run_id` instead of an `override_reason`, the gate
+resolves it and **blocks** — `409 Conflict`, and the routing pointer does not
+move. This is the shape you get today, and it is what makes an `eval_run_id`
+unusable until eval runs are produced: the gate cannot find the run, and a gate
+that cannot resolve its run fails **closed**.
 
 ```json
 {
-  "promotion_id": "promo_xyz",
+  "promotion_id": "0f9c1a77-5b2d-4e18-9a30-6c5f8b2e4d91",
+  "from_version_id": null,
+  "to_version_id": "3f1a6c2e-9b04-4d77-8a51-2e0c7f9b1d43",
+  "from_env": "staging",
+  "to_env": "production",
+  "eval_run_id": "8d2f5b91-3c47-4a06-9e18-b7d0f6a2c845",
   "decision": "blocked_by_eval",
-  "failed_assertions": ["PP-G1", "PP-PR4"],
-  "eval_run_id": "run_abc123"
+  "notes": "blocked: eval gate failed for run 8d2f5b91-3c47-4a06-9e18-b7d0f6a2c845"
 }
 ```
+
+Omitting `eval_run_id` **and** `override_reason` returns `409` with
+`"decision": "blocked_by_policy"`.
 
 ## Auto-rollback
 

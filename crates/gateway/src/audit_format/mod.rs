@@ -2,6 +2,7 @@
 //!
 //! ## Why v2
 //!
+//! The v1 format had three exploitable flaws (, C2, C3 from the
 //! Phase-0 security review):
 //!
 //! 1. **Hash input was ambiguous.** v1 concatenated fields with `|` as
@@ -32,7 +33,7 @@
 //!         || lp(actor)
 //!         || lp(payload_canonical_json) // RFC 8785 JCS — sorted keys, no whitespace
 //!         || lp(prev_hash)              // 32 bytes
-//! )
+//!
 //! ```
 //!
 //! where `lp(x) = u64_be(len(x)) || x`. Length-prefixing prevents
@@ -361,6 +362,7 @@ mod tests {
 
     #[test]
     fn row_hash_resists_field_boundary_attack() {
+        // The exploit case. Without length-prefixed framing,
         // these two distinct logical rows would hash to the same value
         // because the `|` separator can be re-partitioned.
         //
@@ -430,6 +432,7 @@ mod tests {
 
     #[test]
     fn merkle_root_resists_second_preimage_attack() {
+        // The exploit case. Without leaf/node domain separation,
         // a single-leaf tree and a 2-leaf tree of (raw_hash, raw_hash)
         // can produce the same root because both collapse to a SHA-256
         // of similar-looking inputs.

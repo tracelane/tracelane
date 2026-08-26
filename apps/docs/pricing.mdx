@@ -4,13 +4,13 @@ description: Predictable AI agent reliability at honest prices — capped overag
 classification: PUBLIC
 ---
 
-50 named competitor pains, fixed. Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger you can verify offline. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
+Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger you can verify offline. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
 
 ## Tiers
 
 | Tier | Price | What's included |
 |---|---|---|
-| **OSS self-host** | $0 forever | 30+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
+| **OSS self-host** | $0 forever | 150+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
 | **Free hosted** | $0 | 10K traces/mo, 60 RPM, 1 seat, no commercial use, rule-based PR1+PR2. |
 | **Builder** | $59/mo | 150K traces/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
 | **Team** | $249/mo | 1M traces/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 10 seats included (25 max), predictive PR1+PR2+PR4+PR5 (rule-based) — the same set Builder runs — inline heuristic guardrails incl. the data-governance and quality rails, predictive pre-flight guardrails with tamper-evident promotion record. |
@@ -43,7 +43,7 @@ target, and burn-rate alerts are available on paid plans.
 | Retention | up to 365d, no upcharge | 14d base, 9–10× upcharge to 400d | 14d base, 9–10× upcharge to 400d | 90d Core, 3yr Pro | 14d Starter, 30d Pro |
 | Gateway | Rust gateway, BYOK 0% | none (obs only) | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
 | Inline predictive guardrails | yes, inline | no | no (post-failure clustering) | no | no |
-| Auto-rollback on cost/latency/error | yes, EWMA-based | manual prompt promotion | manual prompt promotion | none | none |
+| Auto-rollback on posted metrics | EWMA drift on observations you post; not autonomous | manual prompt promotion | manual prompt promotion | none | none |
 | Tamper-evident audit ledger | $999 SKU, hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap) | no | no | not documented | no |
 | Self-host license | Apache 2.0 (full stack) | none | Cloud + Enterprise Self-Hosted SKU | MIT (4-DB stack) | hybrid, seats charged |
 | OTel GenAI semconv | canonical wire format | proprietary | proprietary | partial | proprietary |
@@ -101,7 +101,7 @@ traffic today.
 </Accordion>
 
 <Accordion title="How does Tracelane compare to LangSmith Engine (launched May 13, 2026)?">
-Engine clusters production failures after they happen, then drafts PRs and online evaluators in your LangSmith UI. Tracelane sits one step earlier in the agent lifecycle: inline heuristic guardrails at the gateway, tamper-evident promotion record on every deploy, and auto-rollback on objective metrics (cost, latency, error rate, guardrail-fire rate). Engine requires the LangSmith trace surface + LangChain-managed inference keys per LangSmith AI ToS. Tracelane is OTel GenAI semconv-native, BYOK zero markup, Apache 2.0 full stack, self-hostable. See [vs LangSmith Engine](/comparisons/vs-langsmith-engine).
+Engine clusters production failures after they happen, then drafts PRs and online evaluators in your LangSmith UI. Tracelane sits one step earlier in the agent lifecycle: inline heuristic guardrails at the gateway, tamper-evident promotion record on every deploy, and EWMA drift-based rollback on metrics you post to the observe endpoint (cost, latency, guardrail-fire rate — see [prompt promotion](/prompt-promotion) for what is autonomous and what is not). Engine requires the LangSmith trace surface + LangChain-managed inference keys per LangSmith AI ToS. Tracelane is OTel GenAI semconv-native, BYOK zero markup, Apache 2.0 full stack, self-hostable. See [vs LangSmith Engine](/comparisons/vs-langsmith-engine).
 </Accordion>
 
 <Accordion title="What is the Audit SKU and do I need it?">

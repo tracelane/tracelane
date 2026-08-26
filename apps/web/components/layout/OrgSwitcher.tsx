@@ -33,11 +33,21 @@ export async function OrgSwitcher() {
 	}
 
 	// Workspace identity pill (Option B — single-user-per-workspace). Just the
-	// workspace name + a status dot: no redundant "Production" tag (the name
+	// workspace name + a marker dot: no redundant "Production" tag (the name
 	// already conveys it) and no avatar (there is no per-user account menu — the
 	// account lives under Settings, so a non-clickable initial is noise).
+	//
+	// P0.14 token pass: `h-9` so the pill matches the notification and theme chips
+	// it sits between — three controls at three heights was the top bar's most
+	// visible alignment defect — plus a `--line` hairline so a `--surface-2` chip
+	// still has an edge against the translucent bar.
+	//
+	// THE DOT STAYS MONOCHROME (`--action`, the ink family) AND THAT IS A HONESTY
+	// CALL, not an oversight. It is static markup: it reports nothing. The brief
+	// reserves green for HEALTHY, so painting this dot green would be a permanent
+	// unearned health claim on every page of the app.
 	return (
-		<div className="hidden items-center gap-2 rounded-full bg-surface-2 px-3 py-1.5 text-[12.5px] font-medium sm:flex">
+		<div className="hidden h-9 shrink-0 items-center gap-2 rounded-full border border-line bg-surface-2 px-3 text-xs font-medium sm:flex">
 			<span className="h-1.5 w-1.5 rounded-full bg-action" aria-hidden />
 			<span className="max-w-[180px] truncate text-ink" title={name}>
 				{name}

@@ -41,7 +41,7 @@ export function TraceGroupTable({
 		return (
 			<EmptyState
 				title="No traces to group"
-				description="No traces match the current filters for this grouping."
+				description="Grouping summarises the traces the filters return, and right now they return none. Widen the time range or clear a filter."
 			/>
 		);
 	}
@@ -52,21 +52,13 @@ export function TraceGroupTable({
 			<table className="w-full text-sm">
 				<thead className="bg-surface-2">
 					<tr>
-						<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-							{label}
-						</th>
-						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-							Traces
-						</th>
-						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<th className="px-3 py-1.5 text-left t-metric-label">{label}</th>
+						<th className="px-3 py-1.5 text-right t-metric-label">Traces</th>
+						<th className="px-3 py-1.5 text-right t-metric-label">
 							Error rate
 						</th>
-						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-							Avg
-						</th>
-						<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-							p95
-						</th>
+						<th className="px-3 py-1.5 text-right t-metric-label">Avg</th>
+						<th className="px-3 py-1.5 text-right t-metric-label">p95</th>
 					</tr>
 				</thead>
 				<tbody className="divide-y">
@@ -77,13 +69,13 @@ export function TraceGroupTable({
 						return (
 							<tr
 								key={g.group_key}
-								className="transition-colors hover:bg-surface-2"
+								className="transition-colors hover:bg-surface-hover"
 							>
 								<td className="px-3 py-2 font-mono text-xs">
 									{href ? (
 										<Link
 											href={href}
-											className="text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+											className="text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 										>
 											{g.group_key || "—"}
 										</Link>

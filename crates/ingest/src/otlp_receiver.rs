@@ -267,6 +267,7 @@ async fn serve_one(
         Some(certs) if !certs.is_empty() => Bytes::copy_from_slice(certs[0].as_ref()),
         _ => {
             // warn, not info: with mandatory client auth this indicates an
+            // anomalous session (review F-5) — align with the
             // neighboring handshake-failure paths so it alerts.
             tracing::warn!(peer = %peer_addr, "post-handshake: no peer certificate available; dropping");
             record_auth_result(AuthResult::NoSvid);
@@ -771,6 +772,7 @@ mod tests {
     /// request `Extension<TenantId>` — the production mTLS path (what
     /// `require_spiffe_auth` injects post-handshake). Profile-agnostic: the
     /// peer path resolves in BOTH debug and release, unlike the
+    /// resource-attribute dev fallback which release hard-rejects.
     /// Use this for tests that need *a* tenant but aren't specifically
     /// exercising the debug fallback.
     fn req_with_peer(body: Vec<u8>) -> HttpRequest<AxumBody> {
@@ -903,6 +905,7 @@ mod tests {
     async fn ft08_healthy_disk_admits_batch() {
         let (app, mut rx) = test_router();
         // Peer path (mTLS) so this admits-happy-path test runs in debug AND
+        // release; disk behavior is profile-independent.
         let resp = app
             .oneshot(req_with_peer(sample_protobuf_body(None)))
             .await
@@ -916,6 +919,7 @@ mod tests {
     /// is refused, and a peer still wins — is covered by
     /// `tracelane_shared::otlp::decode::tests::release_build_rejects_resource_attribute_tenant_fallback`
     /// (it moved there with the decoder in GWY-41)
+    /// and `e2e_protobuf_with_peer_tenant_extension_wins`.
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn e2e_protobuf_with_resource_tenant_dispatches_span() {
@@ -969,6 +973,7 @@ mod tests {
     async fn quota_exceeded_hard_rejects_with_429_and_does_not_dispatch() {
         let (app, mut rx) = router_with_quota(1); // cap = 1 span / month
         // Peer path (mTLS) — same tenant across both batches so the quota
+        // counter accumulates; profile-independent.
 
         // First batch (1 span): under cap → 200, span reaches the writer channel.
         let r1 = app

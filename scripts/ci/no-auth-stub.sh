@@ -3,6 +3,7 @@
 #
 # CI guard: ensure `crates/ingest/src/auth.rs` never regresses to the
 # `Ok(())` stub that shipped in the pre-PR#6 ingest. Tracked as
+#  INGEST-001 (RESOLVED 2026-05-22) and ADR-028.
 #
 # A literal `Ok(())` returned from `verify_spiffe_svid` would re-introduce
 # the CRITICAL stub vulnerability. This script greps for the regression
@@ -130,6 +131,7 @@ pub fn verify_spiffe_svid(der: &[u8]) -> Result<SpiffeIdentity, SpiffeAuthError>
 RS
     _expect "dropping X509Certificate::from_der BLOCKS" 1 "X509Certificate::from_der"
 
+    # 5. Parses the cert but never extracts/validates the SPIFFE id (F-4).
     _plant <<'RS'
 use x509_parser::prelude::X509Certificate;
 
@@ -240,6 +242,7 @@ EOF
     exit 1
 fi
 
+#  review F-4: parsing the cert is not enough — the SPIFFE identity
 # must also be EXTRACTED AND VALIDATED (trust domain, tenant path, workload
 # kind). A refactor that keeps the DER parse but returns a fixed/nil
 # identity would pass the two checks above; require the SAN→SPIFFE-ID

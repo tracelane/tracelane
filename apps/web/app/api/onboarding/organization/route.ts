@@ -134,6 +134,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	// the admin-gated rename / member-removal / Admin-Portal surface on their OWN
 	// workspace. Invitees still get the default `member` (see the invite route).
 	// `admin` is the WorkOS built-in privileged slug and what `isPrivilegedRole`
+	// expects; the env must keep that slug (#5).
 	const memRes = await fetch(
 		`${WORKOS_API}/user_management/organization_memberships`,
 		{

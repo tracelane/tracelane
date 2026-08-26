@@ -37,15 +37,40 @@ export interface SpanNode {
 	collapsed?: boolean;
 }
 
-// span-kind colours (consistent everywhere). ADR-053 discipline: Lava (--action)
-// is CTA-only and Verify-green (--ok/--seal) is provenance-only, so span kinds use
-// the one free data hue (violet --info, the AI-call family: tool bold, llm faint) +
-// neutral ink for structure. The kind label always accompanies the colour — never
-// colour alone. Error nodes are ringed red.
-const KIND_DOT: Record<SpanKind, string> = {
-	agent: "bg-ink-2",
-	tool: "bg-info",
-	llm: "bg-info/50",
+/**
+ * THE span-kind value ramp — ONE map, exported, spent by every surface that marks a
+ * span by kind (the transcript spine's dots here, the waterfall's bars in
+ * `apps/web/components/trace-viewer/WaterfallView.tsx`).
+ *
+ * IT WAS TWO MAPS, AND THEY DRIFTED THE MOMENT THE PALETTE MOVED. Both encoded the
+ * same idea and neither knew about the other, so the 2026-08-22 swap fixed one and
+ * left the other holding a broken step: the spine had `llm: "bg-info/50"`, and once
+ * `--info` was retargeted from violet to `--chart-primary` that alpha composited to
+ * ~#8d8e90 — a hair off `--ink-3` #828280. Six kinds, five distinguishable marks,
+ * and no test could see it because both classes were present and correct in the DOM.
+ * A shared concept with two definitions is a drift generator; this is the fix, and
+ * the duplicate is deleted rather than re-synced.
+ *
+ * WHY VALUE AND NOT HUE. `--ok`/`--seal` are provenance-only and the action roles are
+ * CTA-only, so a span KIND — which is neither a state nor an action — must separate on
+ * the neutral ramp. Under P0.11 there is no free data hue left to group `tool` and
+ * `llm` into a family, and that is deliberate.
+ *
+ * THREE STEPS, NOT FOUR, AND `--ink-3` IS THE FLOOR ON PURPOSE. `--line-2` was the
+ * obvious fourth step and is where `unknown` would have landed — but `inferSpanKind`
+ * returns "unknown" whenever no strong attribute signal is present, so on real
+ * traces it is the MOST COMMON kind. A ramp that puts the most common kind at hairline
+ * value renders the typical trace as ghost marks. `--ink-3` is the system's declared UI
+ * floor (3.85:1 light / 3.74:1 dark) and is where the readable end of a ramp stops.
+ *
+ * Kinds sharing a step is not new and not a defect: every consumer renders a text
+ * label beside the mark, so colour is never the only carrier, and errors override to
+ * `--danger` — the one place a span mark is coloured at all.
+ */
+export const SPAN_KIND_MARK: Record<SpanKind, string> = {
+	tool: "bg-chart-primary",
+	llm: "bg-ink-2",
+	agent: "bg-ink-3",
 	retrieval: "bg-ink-3",
 	chain: "bg-ink-3",
 	unknown: "bg-ink-3",
@@ -106,7 +131,7 @@ export function TranscriptSpine({
 			{(hasError || verified !== undefined) && (
 				<div className="mb-3 flex items-center gap-2">
 					{hasError && (
-						<span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-1.5 py-0.5 text-[11px] font-semibold text-danger-ink">
+						<span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-1.5 py-0.5 text-2xs font-semibold text-danger-ink">
 							▲ error inside
 						</span>
 					)}
@@ -176,7 +201,7 @@ export function TranscriptSpine({
 									className={cn(
 										"absolute top-3 h-2 w-2 rounded-full ring-2 ring-bg",
 										"-left-[19px]",
-										KIND_DOT[s.kind],
+										SPAN_KIND_MARK[s.kind],
 										s.status === "error" && "ring-danger",
 									)}
 								/>
@@ -188,12 +213,12 @@ export function TranscriptSpine({
 									onKeyDown={onKeyDown}
 									style={depth > 0 ? { marginLeft: depth * 16 } : undefined}
 									className={cn(
-										"rounded-lg border px-3 py-2 outline-none transition-colors",
+										"rounded-lg border px-3 py-2 transition-colors",
 										s.status === "error"
 											? "border-danger/40 bg-danger-soft/30"
 											: "border-line bg-surface",
 										interactive &&
-											"cursor-pointer hover:border-action-line/60 focus-visible:ring-2 focus-visible:ring-action-ink",
+											"cursor-pointer hover:border-action-line/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring",
 										selected && "bg-action-soft/40 ring-2 ring-action-line",
 									)}
 								>
@@ -207,25 +232,25 @@ export function TranscriptSpine({
 													onToggle={() => onToggleCollapse?.(s.id)}
 												/>
 											)}
-											<span className="truncate text-[13px] font-medium text-ink">
+											<span className="truncate text-sm font-medium text-ink">
 												{s.name}
 											</span>
 										</span>
-										<span className="shrink-0 font-mono text-[11px] tabular-nums text-ink-2">
+										<span className="shrink-0 font-mono text-2xs tabular-nums text-ink-2">
 											{s.durationMs}&nbsp;ms
 										</span>
 									</div>
-									{/* latency bar — lava-gradient magnitude fill (visual-pass-01).
-										REVERSES the rule that stood here ("ADR-053: Lava is
-										CTA-only, never a decorative data-bar"): the founder's
-										visual pass widens ADR-053's permitted static-gradient
-										sites to include neutral magnitude bars. Semantically
-										COLOURED bars (the AFT-1 tool-span violet) keep their
-										hue — lava replaces neutral greys only, never an
-										information channel. Pending the ADR-053 amendment. */}
+									{/* Latency bar — `.bar-data` on a `--surface-2` track.
+										The class was `.bar-lava` and this comment described a
+										"lava-gradient magnitude fill"; BOTH the gradient and the
+										colour are gone as of 2026-08-22. `.bar-data` is a FLAT
+										`--chart-primary` fill — one material for every proportion
+										bar in the app — because P0 spends colour on meaning and a
+										gradient on a magnitude bar encodes nothing that the bar's
+										own length does not already say. */}
 									<div className="mt-1 h-1 rounded-full bg-surface-2">
 										<div
-											className="h-1 rounded-full bar-lava"
+											className="h-1 rounded-full bar-data"
 											style={{ width: `${(s.durationMs / maxMs) * 100}%` }}
 										/>
 									</div>
@@ -272,7 +297,7 @@ function Disclosure({
 		return (
 			<span
 				aria-hidden
-				className="grid h-4 w-4 shrink-0 place-items-center text-[9px] text-ink-3"
+				className="grid h-4 w-4 shrink-0 place-items-center text-2xs leading-none text-ink-3"
 			>
 				{collapsed ? "▶" : "▼"}
 			</span>
@@ -286,9 +311,9 @@ function Disclosure({
 				e.stopPropagation();
 				onToggle();
 			}}
-			className="grid h-4 w-4 shrink-0 place-items-center rounded text-ink-3 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-action-ink"
+			className="grid h-4 w-4 shrink-0 place-items-center rounded text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 		>
-			<span aria-hidden className="text-[9px]">
+			<span aria-hidden className="text-2xs">
 				{collapsed ? "▶" : "▼"}
 			</span>
 		</button>

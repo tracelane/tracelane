@@ -133,6 +133,7 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 	// A realistic agent run: 10 spans, 3 levels deep, every span-kind, one error,
 	// one matched failure signature. This proves the WHOLE the design-system spec
 	// §3.1/§3.2 visual language renders for a non-trivial trace — not just that a
+	// component mounts. We assert the REAL emitted DOM (the "200 is not
 	// proof" rule applied to the viewer: assert the rendered shape, not reachability).
 	const TEN_SPANS: SpanNode[] = [
 		{
@@ -239,16 +240,32 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 		expect(html).toContain('aria-level="3"');
 	});
 
-	it("color-codes every span kind from the design tokens (never hardcoded hex)", () => {
+	it("marks every span kind with a design token, never a hardcoded hex", () => {
 		const html = render(TEN_SPANS);
-		// ADR-053 discipline: Lava (--action) is CTA-only and Verify-green
-		// (--ok/--seal) is provenance-only, so span kinds use the one free data
-		// hue (violet --info: tool bold, llm faint) + neutral ink for structure.
-		expect(html).toContain("bg-ink-2"); // agent → neutral (structure)
-		expect(html).toContain("bg-info/50"); // llm → faint violet (AI-call family)
-		expect(html).toContain("bg-info"); // tool → violet (the trajectory)
-		expect(html).toContain("bg-ink-3"); // retrieval / unknown → muted
-		// Lava and Verify-green must NOT be used as a decorative span-kind fill.
+		/*
+		 * SPAN KIND IS SEPARATED BY VALUE, NOT HUE, AND THE MAP IS NOW SHARED.
+		 *
+		 * These assertions used to pin `bg-info` / `bg-info/50` and said so
+		 * deliberately: the spine kept its OWN copy of the kind map, and when the
+		 * 2026-08-22 palette retargeted `--info` from violet to `--chart-primary`,
+		 * the `/50` alpha composited to ~#8d8e90 — within a few points of `--ink-3`
+		 * #828280 — so `llm` and `unknown` rendered as the same grey. Six kinds,
+		 * five distinguishable marks, and this file was green throughout because
+		 * both classes were present and correct in the DOM.
+		 *
+		 * The fix was not a repaint, it was a DELETION: the duplicate map is gone and
+		 * both surfaces now spend `SPAN_KIND_MARK` from `@tracelanedev/ui`. So these
+		 * assertions no longer describe "what the spine renders today, pending a fix"
+		 * — they describe the one ramp, and they would fail if either consumer
+		 * drifted off it again.
+		 */
+		expect(html).toContain("bg-chart-primary"); // tool → the data mark (the trajectory)
+		expect(html).toContain("bg-ink-2"); // llm → secondary ink, one step down
+		expect(html).toContain("bg-ink-3"); // agent / retrieval / chain / unknown → the UI floor
+		// The retired violet must not come back through an alpha step.
+		expect(html).not.toContain("bg-info");
+		// The primary-action fill and the provenance green must NOT be spent as a
+		// decorative span-kind fill: one means "do this", the other means "verified".
 		expect(html).not.toContain("bg-action-ink");
 		expect(html).not.toContain("bg-ok");
 		// no raw hex leaked into the markup (tokens-only rule, CLAUDE.md)
@@ -298,6 +315,7 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 		}
 	});
 
+	// Provenance chip is DATA-DRIVEN, never a static claim: the chip
 	// reflects the `verified` prop. The per-tenant audit chain (audit_log) is NOT
 	// per-trace, so live TraceDetailView omits `verified` (no chip) rather than
 	// fabricate per-trace integrity — these tests prove the component renders each

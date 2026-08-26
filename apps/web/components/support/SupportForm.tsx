@@ -7,6 +7,7 @@
  * Posts to POST /api/support, which persists the message with the session actor.
  */
 
+import { SegmentedControl } from "@tracelanedev/ui";
 import { useState } from "react";
 
 const TABS = [
@@ -69,7 +70,7 @@ export function SupportForm() {
 
 	if (status === "sent") {
 		return (
-			<div className="rounded-lg border border-seal-line bg-seal-soft/40 p-6 text-center">
+			<div className="rounded-lg border border-seal-line bg-seal-soft p-6 text-center">
 				<p className="text-sm text-ink">
 					Thanks — we&apos;ve got your {kindLabel} and will follow up by email.
 				</p>
@@ -92,31 +93,28 @@ export function SupportForm() {
 
 	return (
 		<div>
-			{/* Tabs */}
-			<div className="mb-4 flex gap-1 rounded-lg border border-line p-1">
-				{TABS.map((t) => (
-					<button
-						key={t.key}
-						type="button"
-						onClick={() => setKind(t.key)}
-						// Which tab is selected was conveyed by COLOUR ALONE — a screen
-						// reader announced three identical buttons with no selected
-						// state (WCAG 1.4.1 / 4.1.2). `RangeControl.tsx:100` already
-						// does this; this control was missed. Found by the L16
-						// already-selected tab is correctly inert on re-click, and with
-						// no `aria-pressed` there was nothing to distinguish "correctly
-						// inert" from "wired to nothing".
-						aria-pressed={kind === t.key}
-						className={cn(
-							"flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal",
-							kind === t.key
-								? "bg-selected text-selected-on"
-								: "text-ink-2 hover:text-ink",
-						)}
-					>
-						{t.label}
-					</button>
-				))}
+			{/*
+			 * Kind selector. `aria-pressed` still rides on the selected option — it
+			 * is the primitive that sets it now, not this file. The reason it must
+			 * not be lost: which tab is selected was once conveyed by COLOUR ALONE,
+			 * so a screen reader announced three identical buttons with no selected
+			 * state (WCAG 1.4.1 / 4.1.2), and the L16 dead-button sweep could not
+			 * tell "correctly inert on re-click" from "wired to nothing".
+			 *
+			 * `size="md"` reproduces the old `px-3 py-1.5 text-sm` exactly. What it
+			 * does NOT reproduce is `flex-1`: the three tabs used to stretch across
+			 * the full form width, and the shared control is intrinsically sized.
+			 * That is the deliberate change — a full-bleed row of tabs is a fourth
+			 * shape for a control the rest of the app renders compactly.
+			 */}
+			<div className="mb-4">
+				<SegmentedControl
+					label="What kind of message is this?"
+					size="md"
+					value={kind}
+					options={TABS.map((t) => ({ value: t.key, label: t.label }))}
+					onChange={setKind}
+				/>
 			</div>
 
 			{/* Broad area — routes the request; stored with the message. */}
@@ -130,7 +128,7 @@ export function SupportForm() {
 				id="support-area"
 				value={area}
 				onChange={(e) => setArea(e.target.value)}
-				className="mb-4 w-full rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-action-line"
+				className="mb-4 w-full rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-action-line"
 			>
 				{AREAS.map((a) => (
 					<option key={a.key} value={a.key}>
@@ -162,7 +160,7 @@ export function SupportForm() {
 				maxLength={MAX}
 				onChange={(e) => setMessage(e.target.value)}
 				placeholder="Tell us what's on your mind…"
-				className="h-48 w-full resize-y rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-3 focus:border-action-line"
+				className="h-48 w-full resize-y rounded-sm border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:border-action-line"
 			/>
 
 			{status === "error" && (

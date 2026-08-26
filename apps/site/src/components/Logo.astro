@@ -1,0 +1,143 @@
+---
+/**
+ * The tracelane lockup — ONE definition for the whole site.
+ *
+ * WHY THIS IS A COMPONENT AND NOT FIVE COPIES OF AN SVG STRING. On 2026-08-15 the
+ * brand was replaced, 39 assets were generated and verified, and the retired mark was
+ * still rendering in FIVE places in production the next morning — the app header, the
+ * marketing header, the marketing footer, the favicon and the root error boundary —
+ * because the assets were swapped and the inline components were not. That is the whole
+ * reason `scripts/ci/check-retired-logo.py` exists. A mark pasted into N files is a mark
+ * that will be updated in N-1 of them.
+ *
+ * ── THE MARK ────────────────────────────────────────────────────────────────────
+ * Four crop corners capturing a centre, with a span entering from both edges. The
+ * founder's brief was "a span captured in a box, concentric circles in centre"; this is
+ * that, drawn fresh on the brand generator's own construction grid (100×100, stroke 12).
+ *
+ * It deliberately does NOT reuse the retired chisel bracket-recorder's geometry
+ * (ADR-074 §8, "dead; do not resurrect it from any spec"). Different canvas, different
+ * paths. `check-retired-logo.py` holds that line, and its two signatures are NOT quoted
+ * here on purpose: it scans raw text, so writing the pattern out to explain it trips the
+ * guard. Read the guard for the specifics.
+ *
+ * Monochrome, always. ADR-074 §8: **the logo is never coloured.** It inherits
+ * `currentColor` so it inverts on dark without a second asset.
+ *
+ * ── OPTICAL SIZING, and it is not decoration ────────────────────────────────────
+ * A ring-and-dot centre COLLAPSES at small sizes: at the first tuning the dot was 1.6px
+ * inside a 3.5px hole at 16px — sub-pixel mush, measured, not guessed. That is the same
+ * defect that made the original bracket-recorder unusable in a header.
+ *
+ * TWO fixes, and both were needed. First the FULL cut was RETUNED so the concentric
+ * reads at header size at 1x DPR — ring pushed out (r20, stroke 8), gap widened, dot
+ * fattened to r8 — verified by rendering the header at deviceScaleFactor 1, because a
+ * 2x screenshot hides exactly this class of defect. Second, below `SMALL_AT` the mark
+ * still drops to a simplified cut: thicker corners, one solid centre, no ring. There is
+ * a hard floor at favicon size — three concentric bands cannot each hold 1.5px inside
+ * 16px — and pretending otherwise ships mush.
+ *
+ * ── STATUS: SITE-ONLY PREVIEW ───────────────────────────────────────────────────
+ * `brand/` still generates the geometric T monogram, and `apps/web`, `apps/docs`, the
+ * README and the social images still ship it. This component is deliberately ahead of
+ * them so the mark can be judged in a real header at real size. Making it the brand
+ * means editing the polygons at the top of `scripts/brand/build-brand-assets.py` and
+ * re-running it — ADR-074 §8 calls that its own workstream, and it is queued, not done.
+ * Until it runs, THE SITE AND THE BRAND SET DISAGREE. That is a known, deliberate,
+ * temporary divergence and it is written here so nobody discovers it by accident.
+ *
+ * ── WORDMARK ────────────────────────────────────────────────────────────────────
+ * Lowercase — founder ruling 2026-08-24: "it feels like one word rather than trace and
+ * lane." Uppercase splits it into two readable halves; lowercase keeps it single.
+ * The ratios are READ OUT of `brand/svg/tracelane-lockup-horizontal-black.svg` rather
+ * than chosen: font-size 66 against an 80.6-unit mark (0.82×), weight 600, letter-spacing
+ * -2.2/66 = -0.033em, gap 31.4/100 of the mark box. The header previously shipped
+ * 16px/500, which is why it read weak.
+ */
+export interface Props {
+  /** Rendered mark size in px. Below 20 the simplified optical cut is used. */
+  size?: number;
+  /** Render the wordmark beside the mark. */
+  wordmark?: boolean;
+  class?: string;
+}
+
+const { size = 22, wordmark = true, class: className = "" } = Astro.props;
+
+/** Below this, the concentric centre is sub-pixel — see the optical-sizing note.
+ *  The retuned full cut holds down to ~20px at 1x; the favicon (16) sits under it. */
+const SMALL_AT = 20;
+const small = size < SMALL_AT;
+
+/** Four L-shaped crop corners. `arm` = leg length, `t` = stroke, on the 100×100 grid. */
+function corners(arm: number, t: number): string {
+  const i = 8 + t;
+  return [
+    `M 8,8 H ${8 + arm} V ${i} H ${i} V ${8 + arm} H 8 Z`,
+    `M 92,8 H ${92 - arm} V ${i} H ${92 - t} V ${8 + arm} H 92 Z`,
+    `M 8,92 H ${8 + arm} V ${92 - t} H ${i} V ${92 - arm} H 8 Z`,
+    `M 92,92 H ${92 - arm} V ${92 - t} H ${92 - t} V ${92 - arm} H 92 Z`,
+  ]
+    .map((d) => `<path d="${d}"/>`)
+    .join("");
+}
+
+/** The span — the detail that makes this ours rather than a stock viewfinder, because
+ *  four-corners-plus-a-circle is a dense prior-art idiom.
+ *
+ *  IT STOPS AT THE BRACKET LINE, and that is a decision, not a default. It used to run
+ *  to the canvas edge, which read as "the trace continues past the frame" but cost the
+ *  mark its SQUARE BOUNDING BOX — 0..100 wide against 8..92 tall. Every square surface
+ *  (favicon, app icon, PWA tile, avatar) then needs the mark hand-centred, and the two
+ *  axes optically disagree. Flush at 8..92 the span instead reads as connecting the
+ *  corners, which is tidier, and each bar ends exactly where the outer ring begins.
+ *  Founder call, 2026-08-24. */
+const span = `<rect x="8" y="44" width="17.5" height="12"/><rect x="74.5" y="44" width="17.5" height="12"/>`;
+/** Small cut: the centre is a solid disc, so the bars run to ITS edge, not the ring's. */
+const spanSmall = `<rect x="8" y="44" width="26" height="12"/><rect x="66" y="44" width="26" height="12"/>`;
+
+/* TWO CONCENTRIC RINGS, hollow centre — founder call, 2026-08-24: "concentric circles
+   in centre, not circle + dot." A ring plus a filled dot is one circle and a disc; two
+   rings is the thing the word actually describes. The outer ring's outer edge lands at
+   25.5, which is exactly where each span bar ends. */
+const geometry = small
+  ? corners(30, 14) + spanSmall + `<circle cx="50" cy="50" r="16"/>`
+  : corners(26, 12) +
+    span +
+    `<circle cx="50" cy="50" r="22" fill="none" stroke="currentColor" stroke-width="7"/>` +
+    `<circle cx="50" cy="50" r="8.5" fill="none" stroke="currentColor" stroke-width="6"/>`;
+
+/* Ratios from the official lockup — see the WORDMARK note. */
+const wordSize = (size * 0.82).toFixed(2);
+const gap = (size * 0.31).toFixed(2);
+---
+
+<span class:list={["tl-logo", className]} style={`--gap:${gap}px`}>
+  <svg
+    viewBox="0 0 100 100"
+    width={size}
+    height={size}
+    fill="currentColor"
+    aria-hidden="true"
+    set:html={geometry}
+  />
+  {wordmark && <span class="tl-word" style={`font-size:${wordSize}px`}>tracelane</span>}
+</span>
+
+<style>
+  .tl-logo {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--gap);
+    color: inherit;
+  }
+  .tl-logo svg {
+    display: block;
+    flex: none;
+  }
+  .tl-word {
+    font-weight: 600;
+    letter-spacing: -0.033em;
+    line-height: 1;
+  }
+</style>

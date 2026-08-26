@@ -116,8 +116,9 @@ Routes to the right upstream provider based on the `model` prefix:
 | `sonar*`, `perplexity/*` | Perplexity |
 | `deepseek*` | DeepSeek |
 | `grok*`, `xai/*` | xAI |
-| `vertex/*`, `together/*`, `fireworks/*`, `openrouter/*`, `ai21/*`, `@cf/*`, … | explicit-prefix aggregators + regional hosts |
-| ... | 35 routable providers total (7 native adapters + 28 OpenAI-compatible) — see [providers.md](providers.md) |
+| `vertex/*` | Google Vertex (service-account OAuth, not an API key) |
+| `together/*`, `fireworks/*`, `openrouter/*`, `ai21/*`, `@cf/*`, … | explicit-prefix aggregators + regional hosts |
+| ... | 150+ routable providers in total — 6 native adapters plus every row of the OpenAI-compatible catalog `crates/gateway/providers.tsv`; see [providers.md](providers.md) |
 
 **The map fails closed.** An unmatched model does not fall back to a default
 provider — it returns `400 unroutable_model`. That is deliberate: defaulting
@@ -154,10 +155,19 @@ leave no ledger row.
 
 ## Prompts
 
-Reads are open to any authenticated tenant. **Writes** (`promote`, `rollback`,
-`observe`, `versions`) are gated on the Team-tier `f_prompt_promotion_write`
-entitlement and fail **closed** — `403` without the entitlement, `503` if no
-entitlement source is reachable. Always mounted.
+Always mounted. Three gates apply, and they are **not** the same on every route —
+the previous wording said writes were uniformly entitlement-gated, which was not
+true of two of them:
+
+| Gate | Applies to |
+|---|---|
+| **Scope** — `read` for reads, `admin` for writes | every prompt route. A key minted with `scope` unset (`LegacyFullSurface`) is unaffected |
+| **Role** — owner, or a machine credential; `member`/`viewer` denied | all five write routes |
+| **Entitlement** — Team-tier `f_prompt_promotion_write`, fail **closed** (`403` without it, `503` if no entitlement source is reachable) | `promote`, `rollback`, `observe` **only** |
+
+`POST /v1/prompts/:name/versions` and `DELETE /v1/prompts/:name` carry **no
+entitlement gate by design** — authoring and archiving are free, promoting is the
+paid act. They still require the `admin` scope and the owner/machine role.
 
 ### `GET /v1/prompts/:name?env=production`
 
@@ -202,11 +212,15 @@ The tenant's prompts plus recent activity. Read-only, no entitlement gate.
 
 ### `POST /v1/prompts/:name/versions`
 
-Register a new version. **Write** — Team-tier gated.
+Register a new version. **Write** — available on every paid plan. Authoring is
+read-adjacent; it is *promotion to production* that is Team-tier gated
+(`crates/gateway/src/prompt_routes.rs:523-525`).
 
 ### `DELETE /v1/prompts/:name`
 
-Remove a prompt. **Write** — Team-tier gated.
+Soft-delete (archive) a prompt. **Write** — available on every paid plan, as the
+inverse of authoring; it is not the Team+ promotion gate
+(`crates/gateway/src/prompt_routes.rs:613-615`).
 
 ### `POST /v1/prompts/:name/promote`
 
@@ -243,9 +257,15 @@ tamper-evident `manual_override` decision. The Team-tier gate still applies.
 { "env": "production", "to_version_id": "<uuid>", "reason": "incident" }
 ```
 
-Atomically swaps the routing pointer back to the named version, appends a
-`rollback_events` row, and chains the decision into the audit ledger. Same
-response body as `promote`.
+Atomically swaps the routing pointer back to the named version and chains the
+decision into the audit ledger. Same response body as `promote`, with
+`decision: "manual_override"` — a manual rollback bypasses the eval gate by
+design, and is recorded as the bypass it is.
+
+It writes a **`promotion_decisions`** row, not a `rollback_events` row. That
+table is written only by the auto-rollback ENGINE when drift fires; a rollback
+you request yourself is a promotion decision in the other direction, and lives in
+the same ledger as every other pointer move.
 
 ### `POST /v1/prompts/:name/observe`
 
@@ -455,7 +475,7 @@ The HTTP API is the canonical contract. SDKs and CLIs wrap it:
   - `tlane verify` — offline audit-log verification
   - `tlane prompt {list,show,promote,rollback,diff}` — B1 prompt workflow
   - `tlane import-litellm` / `tlane import-helicone` — migration
-  - `tlane export` — extract spans/audit data
+  - `tlane export` — generate a compliance evidence pack (offline; not a span exporter)
   - `tlane replay` — re-render a captured trace step by step (read-only; it does
     not re-execute against a model)
 

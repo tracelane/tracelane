@@ -18,6 +18,7 @@ import { expect } from "../src/harness.js";
  * `crates/gateway/tests/failover_chaos.rs`. That test fires a 500 then
  * a 200 against the gateway's SSRF-guarded reqwest client and asserts
  * the retry path stays within the 200ms budget. Cross-provider
+ * failover with schema translation remains BLOCKERS (V1.5).
  */
 
 const GATEWAY_SRC = path.resolve(__dirname, "../../crates/gateway/src");

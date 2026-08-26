@@ -43,7 +43,7 @@ export function CopyButton({
 			aria-label={copied ? "Copied" : label}
 			className={
 				className ??
-				"shrink-0 rounded border border-line px-2 py-0.5 text-[11px] font-medium text-ink-2 transition-colors hover:border-ink-3 hover:text-ink"
+				"shrink-0 rounded border border-line px-2 py-0.5 text-2xs font-medium text-ink-2 transition-colors hover:border-ink-3 hover:text-ink"
 			}
 		>
 			{copied ? "Copied" : label}

@@ -29,6 +29,7 @@ export interface SeenBeforeSignalProps {
  * signature it glows amber inline (the spellcheck-underline pattern), NOT a
  * separate tab. Felt where the failure is (the design-system spec §3.3). Amber is a
  * status cue, deliberately distinct from the action and the provenance seal.
+ * [V1] wired to the 2 real prediction features; cross-customer network [V1.1].
  */
 export function SeenBeforeSignal({
 	count,
@@ -41,7 +42,7 @@ export function SeenBeforeSignal({
 		<span
 			title={title}
 			className={cn(
-				"inline-flex items-center gap-1.5 rounded-md bg-warn-soft px-1.5 py-0.5 text-[11px] text-warn-ink underline decoration-warn decoration-wavy underline-offset-2",
+				"inline-flex items-center gap-1.5 rounded-md bg-warn-soft px-1.5 py-0.5 text-2xs text-warn-ink underline decoration-warn decoration-wavy underline-offset-2",
 				className,
 			)}
 		>

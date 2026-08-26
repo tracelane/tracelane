@@ -1,6 +1,7 @@
 //! SLM Judge — distilled 1B encoder for flow adherence, tool-selection sanity,
 //! and hallucination grounding.
 //!
+//! Distilled from Llama-Guard 8B + NemoGuard 8B teachers. Target: <50ms p99,
 //! ≥1K req/sec on single L4 GPU (PP-PR10).
 //!
 //! Model file: `TRACELANE_SLM_JUDGE_MODEL` (default: models/slm_judge.onnx)

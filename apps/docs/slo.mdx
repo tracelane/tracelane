@@ -62,7 +62,8 @@ Returns hourly SLO rollups per (provider, model):
 ]
 ```
 
-Burn rate is derived client-side against a fixed **99.9%** availability target
+Burn rate is derived client-side against **your plan's** availability target
+(99% Team, 99.9% default, 99.95% Enterprise)
 (`apps/web/app/slo/budget.ts`); there is no per-SLO `objective` field.
 
 ## Related

@@ -11,6 +11,8 @@
  * Tenant-scoped: tenantId always comes from the session, never the UI.
  */
 
+import { Modal } from "@/components/Modal";
+import { apiFetch } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Skeleton } from "@tracelanedev/ui";
@@ -36,15 +38,11 @@ interface PendingRow {
 }
 
 async function fetchMembers(): Promise<MemberRow[]> {
-	const res = await fetch("/api/settings/team");
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	return res.json() as Promise<MemberRow[]>;
+	return apiFetch<MemberRow[]>("/api/settings/team");
 }
 
 async function fetchPending(): Promise<PendingRow[]> {
-	const res = await fetch("/api/settings/team/invitations");
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	return res.json() as Promise<PendingRow[]>;
+	return apiFetch<PendingRow[]>("/api/settings/team/invitations");
 }
 
 /** Error codes this surface can render as a sentence rather than a token. */
@@ -177,13 +175,13 @@ function InviteModal({
 	});
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl">
+		<Modal
+			title={sent ? "Invitation sent" : "Invite team member"}
+			onClose={onClose}
+		>
+			<div>
 				{sent ? (
 					<>
-						<h3 className="text-sm font-semibold text-ink mb-2">
-							Invitation sent
-						</h3>
 						<p className="text-xs text-ink-2 mb-4">
 							An invitation email has been dispatched to{" "}
 							<span className="font-mono text-ink">{email}</span>.
@@ -198,9 +196,6 @@ function InviteModal({
 					</>
 				) : (
 					<>
-						<h3 className="text-sm font-semibold text-ink mb-4">
-							Invite team member
-						</h3>
 						<label
 							htmlFor="team-invite-email"
 							className="block text-xs text-ink-2 mb-1"
@@ -213,7 +208,7 @@ function InviteModal({
 							value={email}
 							onChange={(e) => setEmail(e.target.value)}
 							placeholder="colleague@company.com"
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-4"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-4"
 						/>
 						<label
 							htmlFor="team-invite-role"
@@ -225,7 +220,7 @@ function InviteModal({
 							id="team-invite-role"
 							value={role}
 							onChange={(e) => setRole(e.target.value as Role)}
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal mb-1"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-1"
 						>
 							<option value="member">Member — full product access</option>
 							<option value="viewer">Viewer — read-only</option>
@@ -273,7 +268,7 @@ function InviteModal({
 					</>
 				)}
 			</div>
-		</div>
+		</Modal>
 	);
 }
 
@@ -349,7 +344,7 @@ export function TeamManager({
 					✓ {notice}
 				</output>
 			)}
-			<div className="flex items-center justify-between">
+			<div className="flex items-center justify-between gap-3">
 				<p className="text-xs text-ink-2">
 					{membersMax < 0
 						? `${seatsUsed} members · unlimited`
@@ -382,20 +377,14 @@ export function TeamManager({
 			)}
 
 			{members && members.length > 0 && (
-				<div className="rounded-lg border border-line overflow-hidden">
+				<div className="overflow-x-auto rounded-lg border border-line">
 					<table className="w-full text-sm">
-						<thead className="bg-surface/60">
+						<thead className="bg-surface">
 							<tr>
-								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Member
-								</th>
-								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Role
-								</th>
-								<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-									Joined
-								</th>
-								<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<th className="px-3 py-1.5 text-left t-metric-label">Member</th>
+								<th className="px-3 py-1.5 text-left t-metric-label">Role</th>
+								<th className="px-3 py-1.5 text-left t-metric-label">Joined</th>
+								<th className="px-3 py-1.5 text-right t-metric-label">
 									<span className="sr-only">Actions</span>
 								</th>
 							</tr>
@@ -406,7 +395,7 @@ export function TeamManager({
 								return (
 									<tr
 										key={m.id}
-										className="hover:bg-surface-2/40 transition-colors"
+										className="hover:bg-surface-hover transition-colors"
 									>
 										<td className="px-3 py-2">
 											<p className="text-xs font-medium text-ink">{m.name}</p>
@@ -429,7 +418,7 @@ export function TeamManager({
 																role: e.target.value as Role,
 															})
 														}
-														className="rounded bg-surface-2 border border-line px-1.5 py-0.5 text-xs text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal disabled:opacity-40"
+														className="rounded bg-surface-2 border border-line px-1.5 py-0.5 text-xs text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-40"
 													>
 														<option value="owner">owner</option>
 														<option value="member">member</option>
@@ -503,13 +492,13 @@ export function TeamManager({
 			{pending && pending.length > 0 && (
 				<div className="space-y-2">
 					<p className="text-xs font-medium text-ink-2">Pending invitations</p>
-					<div className="rounded-lg border border-line overflow-hidden">
+					<div className="overflow-x-auto rounded-lg border border-line">
 						<table className="w-full text-sm">
 							<tbody className="divide-y divide-line">
 								{pending.map((p) => (
 									<tr
 										key={p.id}
-										className="hover:bg-surface-2/40 transition-colors"
+										className="hover:bg-surface-hover transition-colors"
 									>
 										<td className="px-3 py-2">
 											<p className="text-xs font-mono text-ink">{p.email}</p>

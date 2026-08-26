@@ -4,7 +4,7 @@
 //! [`TenantQuery::execute`]. The wrapper attaches a `SETTINGS` block
 //! with tier-derived `max_memory_usage` + `max_execution_time` +
 //! `max_rows_to_read` so a misconfigured query cannot starve the
-//! shared CCX23 node for other tenants.
+//! shared node for other tenants.
 //!
 //! CI guard `scripts/ci/no-raw-ch-query.sh` enforces that no raw
 //! `clickhouse::Client::query` slips outside this wrapper (modulo
@@ -33,6 +33,32 @@ pub(crate) fn ch_client(url: impl Into<String>) -> clickhouse::Client {
         .with_user(std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))
         .with_password(std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default())
         .with_database(std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "tracelane".into()))
+}
+
+/// "Now", in the units a ClickHouse `DateTime64(3)` column actually stores.
+///
+/// **Use this for every `DateTime64(3)` write. Never call `timestamp_micros()`
+/// or `timestamp_nanos()` at an insert site.** `clickhouse-rs` maps a plain
+/// `i64` straight onto the column's RAW TICKS with no unit conversion, so the
+/// precision in the DDL is the only thing that decides what the number means —
+/// and getting it wrong is silent. It does not error, it does not truncate; it
+/// stores a timestamp roughly a thousand times too large and the row lands in
+/// the year ~48000, where nothing queries it and nothing complains.
+///
+/// **This has now happened twice on the same pair of tables**, which is why it
+/// is a shared function rather than a convention:
+///
+///   1. `promotion_decisions.decided_at` was `timestamp_micros()` — fixed under
+///      ADR-054, and the fix records in-source that it was "never verified
+///      on-node because promote never ran in prod".
+///   2. `rollback_events.fired_at` was `timestamp_micros()` — the exact same
+///      overshoot into the exact same sibling table, still unfixed while its
+///      twin's fix sat a few files away. Found 2026-08-19.
+///
+/// Two insert sites agreeing by convention is what allowed the second one. They
+/// now agree by construction.
+pub(crate) fn datetime64_millis_now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// Plan tier identifier — mirrors the Polar/ADR-020 plan keys without
@@ -151,6 +177,37 @@ impl TenantQuery {
             settings = self.caps.settings_fragment()
         )
     }
+}
+
+/// Split a ClickHouse migration file into executable statements, for tests.
+///
+/// **Comments are stripped BEFORE the split, and that ordering is the whole
+/// point.** `17_semantic_cache.sql:40` carries a trailing comment INSIDE the
+/// column list — *"What a hit saves; never re-charged."* — and that semicolon
+/// splits the `CREATE TABLE` in half. The server then reports
+/// *"Unmatched parentheses"* against a fragment that begins with `(`, which
+/// reads like a broken migration rather than a broken test.
+///
+/// `crates/gateway/tests/clickhouse_persister_integration.rs` splits first and
+/// filters `starts_with("--")` after, so it sends a comment block as SQL and
+/// dies with a syntax error at *position 1 ('the')*. It has had ZERO callers
+/// since it was written, so nothing ever ran it — `docs/reference/TRAPS.md` §1
+/// CLASS-1, the same shape `run-postgres-integration.sh` was created to close.
+#[cfg(test)]
+pub(crate) fn split_migration_statements(sql: &str) -> Vec<String> {
+    let stripped: String = sql
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    stripped
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(test)]

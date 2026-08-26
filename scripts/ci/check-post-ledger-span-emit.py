@@ -61,6 +61,19 @@ ALLOWLIST: list[tuple[str, str]] = [
             "the dispatch path itself, not as an error span"
         ),
     ),
+    (
+        "x-tracelane-cache",
+        (
+            "GWY-24 semantic-cache HIT. Also a success return, and it carries a FULL "
+            "gateway span published immediately above it via spawn_span_publish — "
+            "including the tier, the similarity and a pointer to the trace whose "
+            "answer was reused. An error span would be wrong here: nothing failed. "
+            "This is the one return where the span matters most, because a served "
+            "cache hit with no span is precisely the 'trace gap' that killed the "
+            "exact-match cache in specs/GWY-25 — so the allowlist entry is not a "
+            "waiver, it is a statement that the span is emitted by a different call."
+        ),
+    ),
 ]
 
 

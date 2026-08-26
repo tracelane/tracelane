@@ -8,6 +8,7 @@ import { expect } from "../src/harness.js";
  * registers exactly 8 predictors and that the evaluate() method returns
  * the most-severe Decision across all of them.
  *
+ * The 8 predictors:
  *   1. McpHashWatcher         — MCP rug-pull detection
  *   2. TaintTracker           — lethal-trifecta taint propagation
  *   3. StuckLoopDetector      — agent stuck-loop heuristic

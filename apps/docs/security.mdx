@@ -13,7 +13,7 @@ classification: PUBLIC
 | Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Until account deletion |
 | Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
 | Provider API keys | Postgres (envelope-encrypted) | Until revoked |
-| Prompt/completion text | ClickHouse spans | Same as spans (redact with `trace_content=false`) |
+| Prompt/completion text | ClickHouse spans | Same as spans (not captured unless an operator allowlists the workspace`) |
 
 ### Sigstore Rekor — an external dependency, deliberately not a sub-processor
 
@@ -77,7 +77,9 @@ Provider keys **never** appear in:
 ## Transport
 
 - **TLS 1.3 minimum** on all external traffic. TLS 1.2 rejected.
-- **mTLS** on the ingest path between the gateway and ingest workers.
+- **mTLS on the OTLP ingest receiver** — SDK and collector connections to ingest
+  are mutually authenticated against SPIFFE identities. The gateway publishes
+  spans to ingest over NATS on the internal network, which is not mTLS.
 - **HSTS** enforced on the dashboard domain.
 - No unencrypted HTTP accepted in production (redirect to HTTPS).
 
@@ -91,22 +93,43 @@ Tenant isolation is **structural**, not policy-enforced:
   WorkOS), never from the request body, URL parameter, or MCP tool argument.
 - Postgres tables use foreign-key cascades — deleting a tenant row deletes all
   associated API keys, CMK keys, and billing records atomically.
-- ClickHouse row-level policies (`getClientHeader('X-Tenant-Id')`) back the
-  prompt-promotion tables; the span hot tier is isolated by the mandatory
-  `WHERE tenant_id = ?` query wrapper (`TenantQuery`) plus the CI grep, not a
-  storage-engine policy on `spans`.
+- **Isolation is enforced in the query layer, not by a storage-engine policy.**
+  Every ClickHouse table — the span hot tier and the prompt-promotion tables
+  alike — is isolated by the mandatory `WHERE tenant_id = ?` bind (`TenantQuery`)
+  plus the CI grep above. No ClickHouse row-level policies are in force on any
+  table, and we would rather say so than credit a control you cannot verify.
 
 ## PII handling
 
 User-supplied span content (prompt/completion text) is wrapped in
 `<UNTRUSTED_USER_DATA>…</UNTRUSTED_USER_DATA>` before any internal LLM reads it.
 
-Redact at SDK level:
+### Prompt content
 
-```bash
-# Suppress all prompt/completion text from being sent
-TRACELANE_TRACE_CONTENT=false
-```
+**Prompt and completion text is not captured for your workspace.** The gateway
+records the *shape* of a run — model, provider, token counts, latency, cost,
+status, tool-call structure — and not the message bodies. The first-party SDKs do
+not send message bodies either.
+
+Capture is not merely absent, it is **off unless an operator turns it on for a
+named workspace.** A self-hosted deployment can enable it with a `trace_content:`
+block in `tracelane.yaml`, which takes an explicit list of workspace ids and a
+maximum field size; with no such block, capture is off for everyone. On Tracelane
+Cloud no customer workspace is on that list, and a CI guard fails the build if one
+is added.
+
+The one path by which prompt text can reach us is your **own** OpenTelemetry
+instrumentation: if you emit the `gen_ai.input.messages` /
+`gen_ai.output.messages` semantic-convention attributes to `POST /v1/traces`, we
+store what you send. That is under your control, in your instrumentation.
+
+<Note>
+Earlier revisions of this page documented a `TRACELANE_TRACE_CONTENT=false`
+setting. **No component reads that variable** — it was never implemented, so
+setting it has no effect in either direction. The operator-level `trace_content:`
+block described above is the real control. Corrected 2026-08-20; allowlist
+documented 2026-08-26.
+</Note>
 
 An inline output PII-redaction pass (`[REDACTED:<type>]`) is on the roadmap.
 PR7 today is the entitlement-gated predictive trajectory guard, not an
@@ -115,7 +138,7 @@ always-on span-output scrubber.
 ## Authentication
 
 - **Dashboard:** WorkOS AuthKit — SSO (Google, Microsoft, GitHub), SAML, email OTP.
-- **Gateway:** `tlane_*` API keys (SHA-256 hash stored, raw key shown once) or
+- **Gateway:** `tlane_*` API keys (peppered HMAC-SHA256 lookup hash + Argon2id verifier stored; raw key shown once) or
   WorkOS JWT (`organizationId` claim used as `tenant_id`).
 - **MCP server:** `tlane_*` API key via env var (V1); OAuth 2.1 PKCE (V2).
 
@@ -129,12 +152,16 @@ Only `http`/`https` are permitted. Redirects are **disabled entirely** on the SS
 
 ## Vulnerability scanning
 
-Every commit runs three independent scanners:
+Three independent scanners run on a schedule — OSV-Scanner and Grype daily,
+Syft weekly. They are not per-commit: the tradeoff is written into
+`security-scan.yml`'s own header, which trades per-push detection for a
+≤24h-delayed nightly scan.
+
 
 | Scanner | What it checks |
 |---|---|
 | OSV-Scanner | CVEs in Rust, Node, and Python lockfiles |
-| Grype (`anchore/scan-action`) | Container image layers |
+| Grype (digest-pinned binary, not the action wrapper) | Container image layers |
 | Syft (`anchore/sbom-action`) | CycloneDX SBOM — attached to every tagged release, generated weekly for the repo, and attached to container images |
 
 

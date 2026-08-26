@@ -218,14 +218,9 @@ export async function register() {
 }
 ```
 
-Enable the hook in `next.config.ts`:
-
-```typescript
-const config: NextConfig = {
-  experimental: { instrumentationHook: true },
-};
-export default config;
-```
+No `next.config.ts` change is needed. The instrumentation hook is stable in
+Next.js 15 — the `experimental.instrumentationHook` flag was removed, and
+setting it now raises an invalid-config warning.
 
 ## Testing
 

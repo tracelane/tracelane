@@ -16,7 +16,17 @@
 
 import { formatDateTimeUtc } from "@/lib/format-date";
 import type { GuardrailVerdict } from "@/lib/guardrails";
-import { Badge } from "@tracelanedev/ui";
+import {
+	Badge,
+	type BadgeProps,
+	TBody,
+	TD,
+	TDetail,
+	TH,
+	THead,
+	TR,
+	Table,
+} from "@tracelanedev/ui";
 import { Fragment, useState } from "react";
 
 /** One per-rail entry inside the `rails` JSON column (gateway `RailVerdict`). */
@@ -69,9 +79,18 @@ const REASON_LABEL: Record<string, string> = {
 	TOPIC_DENIED: "Denied topic",
 };
 
-const DECISION_TONE: Record<string, "danger" | "info" | "warn" | "ok"> = {
+/**
+ * Decision → badge tone. `redact` moved from `info` to `neutral` (P1,
+ * 2026-08-22) so this table, the rail roster and the decision-mix row on
+ * /guardrails all speak ONE badge grammar: danger = it stopped the request,
+ * warn = it flagged something to look at, ok = it passed, neutral = it recorded
+ * something. `--info-soft` and `--surface-2` are both grey and four values
+ * apart, so this changes the tone's PLACE IN THE GRAMMAR, not what a redaction
+ * means — the word "redact" is still the label and still carries the meaning.
+ */
+const DECISION_TONE: Record<string, NonNullable<BadgeProps["tone"]>> = {
 	block: "danger",
-	redact: "info",
+	redact: "neutral",
 	warn: "warn",
 	allow: "ok",
 };
@@ -109,7 +128,7 @@ function DetailPayload({ details }: { details: unknown }) {
 	if (details === null || details === undefined) return null;
 	if (typeof details !== "object") {
 		return (
-			<span className="font-mono text-[11px] text-ink">{String(details)}</span>
+			<span className="font-mono text-2xs text-ink">{String(details)}</span>
 		);
 	}
 	const entries = Object.entries(details as Record<string, unknown>);
@@ -118,8 +137,8 @@ function DetailPayload({ details }: { details: unknown }) {
 		<dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
 			{entries.map(([k, val]) => (
 				<Fragment key={k}>
-					<dt className="font-mono text-[11px] text-ink-3">{k}</dt>
-					<dd className="font-mono text-[11px] text-ink">
+					<dt className="font-mono text-2xs text-ink-3">{k}</dt>
+					<dd className="font-mono text-2xs text-ink">
 						{typeof val === "object" && val !== null
 							? JSON.stringify(val)
 							: String(val)}
@@ -144,7 +163,7 @@ function CopyButton({ value }: { value: string }) {
 					() => undefined,
 				);
 			}}
-			className="rounded border border-line px-1.5 py-0.5 text-[10px] text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink"
+			className="rounded border border-line px-1.5 py-0.5 text-2xs text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink"
 		>
 			{copied ? "Copied" : "Copy"}
 		</button>
@@ -158,7 +177,7 @@ function RailDetail({ r }: { r: RailEntry }) {
 	return (
 		<div className="rounded-lg border border-line bg-surface px-3 py-2.5">
 			<div className="flex flex-wrap items-center gap-2">
-				<span className="font-mono text-[12px] font-medium text-ink">
+				<span className="font-mono text-xs font-medium text-ink">
 					{r.rail ?? "—"}
 				</span>
 				<Badge
@@ -167,15 +186,13 @@ function RailDetail({ r }: { r: RailEntry }) {
 					{r.outcome ?? "—"}
 				</Badge>
 				{r.reason_code && (
-					<span className="font-mono text-[10.5px] text-ink-3">
-						{r.reason_code}
-					</span>
+					<span className="font-mono text-2xs text-ink-3">{r.reason_code}</span>
 				)}
 			</div>
 			{gloss && gloss !== r.reason_code && (
-				<p className="mt-1 text-[12px] text-ink-2">{gloss}</p>
+				<p className="mt-1 text-xs text-ink-2">{gloss}</p>
 			)}
-			<div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] text-ink-3">
+			<div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-2xs text-ink-3">
 				{r.score !== undefined && (
 					<span>
 						score{" "}
@@ -218,151 +235,171 @@ function RailDetail({ r }: { r: RailEntry }) {
 	);
 }
 
+/**
+ * ── ON THE SHARED TABLE SYSTEM (P1, 2026-08-22) ─────────────────────────────
+ * `Table/THead/TBody/TR/TH/TD/TDetail`, replacing the hand-rolled `<table>` and
+ * its private `th` class string. Three things this buys that the local version
+ * did not have: the header band is the SAME recessed rail the rail roster draws
+ * (they are two tables one click apart and had different `<thead>` treatments),
+ * the Overhead column gets right-align + tabular + mono as one indivisible
+ * decision rather than three utilities that can drift apart, and the open row
+ * keeps the hover tone via `expanded` so the row and its evidence panel read as
+ * one object.
+ *
+ * Behaviour is untouched: the row is still a `tabIndex={0}` element with
+ * `aria-expanded` and an Enter/Space handler, expansion is still local state,
+ * and every rendered value still comes straight from the stored verdict.
+ */
 export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 	const [openKey, setOpenKey] = useState<string | null>(null);
-	const th =
-		"px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3";
 
 	return (
-		<div className="overflow-x-auto">
-			<table className="w-full text-sm">
-				<thead className="border-b border-line">
-					<tr>
-						<th className="w-8 py-1.5 pl-3" aria-label="Expand" />
-						<th className={th}>Time (UTC)</th>
-						<th className={th}>Side</th>
-						<th className={th}>Decision</th>
-						<th className={th}>Why it fired</th>
-						<th className={`${th} text-right`}>Overhead</th>
-					</tr>
-				</thead>
-				<tbody>
-					{verdicts.map((v, i) => {
-						const key = `${v.correlation_id}-${v.side}-${i}`;
-						const isOpen = openKey === key;
-						const rails = parseRails(v.rails);
-						const fired = rails.filter(
-							(r) => r.outcome && r.outcome !== "allow",
-						);
-						const primary = fired[0];
-						const gloss = reasonText(primary?.reason_code);
-						const failedOpen = v.fail_open_rails.length > 0;
+		<Table>
+			{/* `border-t-0`: the shared `THead` is bordered top AND bottom so it holds
+			    its edge "whether or not the table starts at the top of its card"
+			    (its own words). This one DOES start at the top of a card, so its
+			    top border lands 1px inside the card's border in the same `--line`
+			    colour — two hairlines reading as one 2px rule along the top edge
+			    only, heavier than the three edges around it. Suppressed here, at
+			    the call site, rather than in the primitive: a table that starts
+			    mid-card still wants the border, and this is a question for one
+			    shared change rather than three concurrent ones. */}
+			<THead className="border-t-0">
+				<TR>
+					<TH className="w-10 px-2" aria-label="Expand" />
+					<TH>Time (UTC)</TH>
+					<TH>Side</TH>
+					<TH>Decision</TH>
+					<TH>Why it fired</TH>
+					<TH numeric>Overhead</TH>
+				</TR>
+			</THead>
+			<TBody>
+				{verdicts.map((v, i) => {
+					const key = `${v.correlation_id}-${v.side}-${i}`;
+					const isOpen = openKey === key;
+					const rails = parseRails(v.rails);
+					const fired = rails.filter((r) => r.outcome && r.outcome !== "allow");
+					const primary = fired[0];
+					const gloss = reasonText(primary?.reason_code);
+					const failedOpen = v.fail_open_rails.length > 0;
 
-						return (
-							<Fragment key={key}>
-								<tr
-									onClick={() => setOpenKey(isOpen ? null : key)}
-									onKeyDown={(e) => {
-										if (e.key === "Enter" || e.key === " ") {
-											e.preventDefault();
-											setOpenKey(isOpen ? null : key);
-										}
-									}}
-									tabIndex={0}
-									aria-expanded={isOpen}
-									className="cursor-pointer border-b border-line align-top transition-colors last:border-0 hover:bg-surface-2/40 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-seal"
-								>
-									<td className="py-2 pl-3 align-middle">
-										<span
-											aria-hidden
-											className={`inline-block text-ink-3 transition-transform ${isOpen ? "rotate-90" : ""}`}
-										>
-											▸
-										</span>
-									</td>
-									<td className="px-3 py-2 text-xs text-ink-2">
-										{formatDateTimeUtc(parseDate(v.event_time).toISOString())}
-									</td>
-									<td className="px-3 py-2 text-[11px] uppercase tracking-wide text-ink-3">
-										{v.side}
-									</td>
-									<td className="px-3 py-2">
-										<Badge tone={DECISION_TONE[v.decision] ?? "neutral"}>
-											{v.decision}
-										</Badge>
-									</td>
-									{/* The substance: which rail + WHY, in plain language. */}
-									<td className="px-3 py-2">
-										{primary ? (
-											<>
-												<div className="text-[13px] text-ink">
-													{gloss ?? primary.rail ?? "—"}
-												</div>
-												<div className="mt-0.5 font-mono text-[10.5px] text-ink-3">
-													{primary.rail}
-													{primary.reason_code
-														? ` · ${primary.reason_code}`
-														: ""}
-													{fired.length > 1
-														? ` · +${fired.length - 1} more rail${fired.length > 2 ? "s" : ""}`
-														: ""}
-												</div>
-											</>
-										) : (
-											<span className="text-xs text-ink-3">
-												No rail flagged this request
-											</span>
-										)}
-										{failedOpen && (
-											<p className="mt-1 text-[11px] text-warn-ink">
-												failed open: {v.fail_open_rails.join(", ")}
-											</p>
-										)}
-									</td>
-									<td className="px-3 py-2 text-right font-mono text-xs tabular-nums text-ink-2">
-										{fmtLatency(v.total_latency_micros)}
-									</td>
-								</tr>
-
-								{isOpen && (
-									<tr className="border-b border-line last:border-0">
-										<td colSpan={6} className="bg-surface-2/30 px-3 py-2">
-											<div className="space-y-3">
-												<div>
-													<p className="t-card-title text-ink-3">
-														Rails evaluated ({rails.length})
-													</p>
-													<div className="mt-1.5 grid gap-2 sm:grid-cols-2">
-														{rails.length > 0 ? (
-															rails.map((r, ri) => (
-																<RailDetail
-																	key={`${r.rail ?? "rail"}-${ri}`}
-																	r={r}
-																/>
-															))
-														) : (
-															<p className="text-[12px] text-ink-3">
-																No per-rail record stored for this verdict.
-															</p>
-														)}
-													</div>
-												</div>
-
-												<div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
-													<span className="text-[11px] text-ink-3">
-														Correlation ID (support reference)
-													</span>
-													<code className="font-mono text-[11px] text-ink">
-														{v.correlation_id}
-													</code>
-													<CopyButton value={v.correlation_id} />
-												</div>
-
-												<p className="text-[11px] text-ink-3">
-													A blocked request is stopped pre-flight, before any
-													span is written — so the prompt body is not retained
-													and there is no trace to open. The rail records above
-													are the complete stored evidence for this decision.
-												</p>
+					return (
+						<Fragment key={key}>
+							<TR
+								interactive
+								expanded={isOpen}
+								onClick={() => setOpenKey(isOpen ? null : key)}
+								onKeyDown={(e) => {
+									if (e.key === "Enter" || e.key === " ") {
+										e.preventDefault();
+										setOpenKey(isOpen ? null : key);
+									}
+								}}
+								tabIndex={0}
+								aria-expanded={isOpen}
+								className="align-top focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus-ring"
+							>
+								<TD className="w-10 px-2 align-middle">
+									<span
+										aria-hidden
+										className={`inline-block text-ink-3 transition-transform ${isOpen ? "rotate-90" : ""}`}
+									>
+										▸
+									</span>
+								</TD>
+								{/* A timestamp is a technical value, so it is MONO — and in a
+								    left column, so `mono` rather than `numeric`. Aligning the
+								    digits is what lets a reader scan for the minute a burst
+								    happened instead of reading every row. */}
+								<TD mono muted className="whitespace-nowrap text-xs">
+									{formatDateTimeUtc(parseDate(v.event_time).toISOString())}
+								</TD>
+								<TD className="text-2xs uppercase tracking-wide text-ink-3">
+									{v.side}
+								</TD>
+								<TD>
+									<Badge tone={DECISION_TONE[v.decision] ?? "neutral"}>
+										{v.decision}
+									</Badge>
+								</TD>
+								{/* The substance: which rail + WHY, in plain language. */}
+								<TD>
+									{primary ? (
+										<>
+											<div className="text-sm text-ink">
+												{gloss ?? primary.rail ?? "—"}
 											</div>
-										</td>
-									</tr>
-								)}
-							</Fragment>
-						);
-					})}
-				</tbody>
-			</table>
-		</div>
+											<div className="mt-0.5 font-mono text-2xs text-ink-3">
+												{primary.rail}
+												{primary.reason_code ? ` · ${primary.reason_code}` : ""}
+												{fired.length > 1
+													? ` · +${fired.length - 1} more rail${fired.length > 2 ? "s" : ""}`
+													: ""}
+											</div>
+										</>
+									) : (
+										<span className="text-xs text-ink-3">
+											No rail flagged this request
+										</span>
+									)}
+									{failedOpen && (
+										<p className="mt-1 text-2xs text-warn-ink">
+											failed open: {v.fail_open_rails.join(", ")}
+										</p>
+									)}
+								</TD>
+								<TD numeric muted className="text-xs">
+									{fmtLatency(v.total_latency_micros)}
+								</TD>
+							</TR>
+
+							{isOpen && (
+								<TDetail colSpan={6}>
+									<div className="space-y-3">
+										<div>
+											<p className="t-card-title text-ink-3">
+												Rails evaluated ({rails.length})
+											</p>
+											<div className="mt-1.5 grid gap-2 sm:grid-cols-2">
+												{rails.length > 0 ? (
+													rails.map((r, ri) => (
+														<RailDetail
+															key={`${r.rail ?? "rail"}-${ri}`}
+															r={r}
+														/>
+													))
+												) : (
+													<p className="text-xs text-ink-3">
+														No per-rail record stored for this verdict.
+													</p>
+												)}
+											</div>
+										</div>
+
+										<div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
+											<span className="text-2xs text-ink-3">
+												Correlation ID (support reference)
+											</span>
+											<code className="font-mono text-2xs text-ink">
+												{v.correlation_id}
+											</code>
+											<CopyButton value={v.correlation_id} />
+										</div>
+
+										<p className="text-2xs text-ink-3">
+											A blocked request is stopped pre-flight, before any span
+											is written — so the prompt body is not retained and there
+											is no trace to open. The rail records above are the
+											complete stored evidence for this decision.
+										</p>
+									</div>
+								</TDetail>
+							)}
+						</Fragment>
+					);
+				})}
+			</TBody>
+		</Table>
 	);
 }

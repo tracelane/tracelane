@@ -1,4 +1,5 @@
 /**
+ * nav-config regression test — no orphaned routes, no dead nav links.
  *
  * Guards both directions:
  *   - every previously-orphaned page (/sessions, /settings/{providers,team,

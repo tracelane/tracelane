@@ -3,6 +3,7 @@
  *
  * Wraps Letta (formerly MemGPT) client agent creation and message-sending
  * methods to emit OTel spans. Letta's tiered/archival memory model is a V2
+ * memory wedge enabler — instrumenting it now provides the observability
  * foundation for memory performance and coherence analysis.
  *
  * @example

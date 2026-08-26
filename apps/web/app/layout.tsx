@@ -1,20 +1,39 @@
 /**
  * Root layout — loaded once, wraps every route.
  *
- * Provides: TanStack Query client, Zustand store initialisation,
- * global navigation shell, and font loading.
+ * Provides: the TanStack Query client, the global navigation shell, and font
+ * loading.
  *
  * Layout structure:
  *   <html>
  *     <body>
- *       <Providers>         ← TanStack Query + Zustand
- *         <AppShell>        ← framed sky-blue shell + TopNav (client)
- *           {children}      ← route content, inside the floating canvas
- *         </AppShell>
- *         <CommandPalette />
- *       </Providers>
+ *       <AppShell>          ← sidebar rail + thin top bar, full-bleed content
+ *         {children}        ← route content, on the `--canvas` ground
+ *       </AppShell>
+ *       <CommandPalette />
  *     </body>
  *   </html>
+ *
+ * NO `<Providers>` HERE ANY MORE. It mounts TanStack Query's QueryClientProvider,
+ * and every `useQuery`/`useMutation` call site in this app is under
+ * `components/settings/` — so a global mount shipped the react-query runtime
+ * (chunk `8304`, 15,804 B raw / 5,279 B transferred, measured on a production
+ * build) to /dashboard, /traces, /slo, /gateway, /audit and every other route
+ * that never calls it. It now lives in `app/settings/layout.tsx`, the narrowest
+ * layout that covers all seven consumers.
+ * Consequence worth knowing: the query cache is scoped to the settings section,
+ * so leaving /settings and returning refetches instead of serving a ≤30s-stale
+ * entry. For tenant-scoped settings data that is the safer direction.
+ *
+ * TWO CLAIMS IN THIS BLOCK WERE FALSE AND ARE CORRECTED HERE (CLAUDE.md §17).
+ *   · "Zustand store initialisation" / "TanStack Query + Zustand" — providers.tsx
+ *     mounts a QueryClientProvider and nothing more, and `zustand` is not a
+ *     dependency of this app. apps/web/CLAUDE.md already says "no Zustand"; the
+ *     header here disagreed with both the code and that rule.
+ *   · "framed sky-blue shell … inside the floating canvas" — AppShell has neither
+ *     a frame nor a floating canvas (it dropped both with the sidebar move), and
+ *     under the P0 palette there is no blue anywhere in the system to be framed
+ *     in. The ground is `--canvas`, a warm neutral.
  *
  * AppShell reads the pathname and renders route content bare (no frame/nav)
  * on the full-screen routes — /onboarding and the auth pages — so unauthenticated
@@ -25,10 +44,9 @@ import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { AppShell } from "@/components/layout/AppShell";
 import { OrgSwitcher } from "@/components/layout/OrgSwitcher";
 import type { Metadata, Viewport } from "next";
-import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import { cookies } from "next/headers";
 import type { ReactNode } from "react";
-import { Providers } from "./providers";
 import "./globals.css";
 
 // No-flash theme seed (ADR-053). Runs synchronously before first paint and
@@ -38,40 +56,50 @@ import "./globals.css";
 // stay statically prerendered. Light is the default.
 const THEME_INIT = `(function(){try{var m=document.cookie.match(/(?:^|;\\s*)theme=(light|dark)/);document.documentElement.dataset.theme=(m&&m[1]==='dark')?'dark':'light';}catch(e){}})();`;
 
-// Type. INCUMBENT: Plus Jakarta Sans (UI) + JetBrains Mono (numerals, ids, hashes,
-// seq, model names, code). Exposed as CSS vars that globals.css wires into
-// --font-sans / --font-mono / --font-display.
+// ── TYPE (P0.3, founder brief 2026-08-22) ───────────────────────────────────
 //
-// ADR-074 §4 TARGETS INTER. IT WAS TRIED ON 2026-08-15 AND REVERTED, FOR THE SECOND
-// TIME, ON THE MEASUREMENT — under founder ruling R3, which set the gate and the
-// consequence: "if it regresses, revert to Plus Jakarta and tell me — the font is not
-// worth the route."
+// Geist (UI) + Geist Mono (numerals, ids, hashes, seq, model names, code).
+// Exposed as CSS vars that globals.css wires into --font-sans / --font-mono /
+// --font-display.
 //
-//   preloaded critical-path woff2   Plus Jakarta 67,752 B  →  Inter 88,912 B  (+21,160)
-//   total woff2 emitted             145,288 B             →  305,208 B
+// THE BRIEF MADE THIS CONDITIONAL — "if Geist is already available or can be added
+// cleanly without disrupting the application" — so it was MEASURED before it was
+// taken, on both axes the condition covers:
 //
-// +21,160 B is the SAME figure the first revert recorded, reproduced to the byte.
-// R3's premise was that a self-hosted, subset build "is a different measurement, not
-// that one re-run". It is not: `next/font/google` already self-hosts (it downloads at
-// BUILD time and serves from our origin — no runtime Google request), and it already
-// subsets to `latin`. Pinning `weight: 400/500/600` per ADR-074 §4 changed nothing —
-// 88,912 B either way, because next/font ships the variable face regardless. Inter's
-// latin subset is simply 48,432 B against Plus Jakarta's 27,272 B.
+// 1. DEPENDENCY COST: ZERO. Geist and Geist Mono are in `next/font/google`'s own
+//    catalog (`next/dist/compiled/@next/font/dist/google/font-data.json`, 1,862
+//    families, both present with a 100–900 variable axis and a `latin` subset).
+//    next/font DOWNLOADS AT BUILD TIME AND SERVES FROM OUR ORIGIN — there is no
+//    runtime Google request and no new package in package.json. The `geist` npm
+//    package was NOT needed and is not installed.
 //
-// Beating it needs a CUSTOM glyph subset (pyftsubset) committed as a local woff2 — a
-// real build step and a binary in the repo. Not taken without a ruling.
+// 2. PAYLOAD COST: IT IS A SAVING, WHICH INVERTS THE PRIOR RULING. Founder ruling
+//    R3 set the gate for a font swap after Inter was tried and reverted TWICE on
+//    the critical-path byte count ("if it regresses, revert to Plus Jakarta and
+//    tell me — the font is not worth the route"). Inter cost +21,160 B. Measured
+//    latin-subset woff2, fetched from fonts.gstatic.com on 2026-08-22:
 //
-// `weight` is deliberately OMITTED: that makes next/font fetch the VARIABLE axis rather
-// than static instances, which is what lets the type scale ask for weights between the
-// named stops. Plus Jakarta's axis is 200–800.
-const plusJakarta = Plus_Jakarta_Sans({
+//      sans   Plus Jakarta Sans 27,348 B  ->  Geist       29,400 B   (+2,052)
+//      mono   JetBrains Mono    40,404 B  ->  Geist Mono  23,128 B  (-17,276)
+//      ------------------------------------------------------------------------
+//      critical-path preload    67,752 B  ->  52,528 B   (-15,224 B, -22.5%)
+//
+//    The win is entirely in the MONO face, and that matters here specifically
+//    because this app sets `font-mono` on every numeral, id, hash and model name —
+//    JetBrains Mono was the single largest font on the route and it was the one
+//    doing the most work. R3's gate is satisfied in the customer's favour.
+//
+// `weight` is deliberately OMITTED: that makes next/font fetch the VARIABLE axis
+// rather than static instances, which is what lets the type scale ask for weights
+// between the named stops. Geist's axis is 100–900.
+const geistSans = Geist({
 	subsets: ["latin"],
-	variable: "--font-plus-jakarta",
+	variable: "--font-geist-sans",
 	display: "swap",
 });
-const jetbrainsMono = JetBrains_Mono({
+const geistMono = Geist_Mono({
 	subsets: ["latin"],
-	variable: "--font-jetbrains-mono",
+	variable: "--font-geist-mono",
 	display: "swap",
 });
 
@@ -126,7 +154,7 @@ export default async function RootLayout({
 	return (
 		<html
 			lang="en"
-			className={`${plusJakarta.variable} ${jetbrainsMono.variable}`}
+			className={`${geistSans.variable} ${geistMono.variable}`}
 			suppressHydrationWarning
 		>
 			<head>
@@ -135,12 +163,10 @@ export default async function RootLayout({
 				<script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
 			</head>
 			<body>
-				<Providers>
-					<AppShell orgSlot={<OrgSwitcher />} defaultCollapsed={collapsed}>
-						{children}
-					</AppShell>
-					<CommandPalette />
-				</Providers>
+				<AppShell orgSlot={<OrgSwitcher />} defaultCollapsed={collapsed}>
+					{children}
+				</AppShell>
+				<CommandPalette />
 			</body>
 		</html>
 	);

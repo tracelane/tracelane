@@ -8,7 +8,7 @@
 //!
 //! Run with `cargo bench -p ingest --bench limits`. The bench reports
 //! mean / median / p99 in ns; CI compares the median against the 1 µs
-//! ceiling asserted in `evals/pain-points/PP-OVERSIZE-SPAN.eval.ts`.
+//! ceiling asserted in the oversize-span conformance eval.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 

@@ -1,6 +1,7 @@
 # form-action allows polar.sh DELIBERATELY. The app's own CSP
 # (apps/web/next.config.ts:72) already does. Without it a Pricing checkout button that
 # POSTs to Polar is blocked by the browser with NO visible error and NO server log — the
+# exact failure this repo already paid for once, where checkout was dead and the
 # cause was a CSP directive nobody thought of as part of billing.
 /*
   Strict-Transport-Security: max-age=63072000; includeSubDomains; preload

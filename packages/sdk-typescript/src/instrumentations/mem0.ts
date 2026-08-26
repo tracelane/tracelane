@@ -2,6 +2,7 @@
  * Mem0 instrumentation for Tracelane.
  *
  * Wraps Mem0 MemoryClient add() and search() to emit OTel spans.
+ * Memory operations are a V2 memory-wedge enabler — instrumenting them now
  * establishes the observability baseline for memory hit rates, staleness
  * detection, and memory-augmented agent quality analysis.
  *

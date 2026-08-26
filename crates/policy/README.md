@@ -1,4 +1,4 @@
-<!-- tracelane:classification: INTERNAL -->
+<!-- tracelane:classification: PUBLIC -->
 # `crates/policy`
 
 PII redaction for the audit path, plus a **fail-closed policy-engine scaffold**.

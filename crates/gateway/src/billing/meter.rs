@@ -119,6 +119,7 @@ impl Recorder {
             {
                 Ok(()) => posted += 1,
                 Err(err) => {
+                    // C1. `flush` returns Ok(posted) even when EVERY event failed
                     // (see the `Ok(posted)` below), and the caller only checks `Err` —
                     // so a 100% billing-meter outage propagates upward as success. No
                     // meter event has ever reached production, and nothing said so.
@@ -165,6 +166,7 @@ mod tests {
         PolarCustomerId("cust_polar_test".into())
     }
 
+    /// C1: a meter flush that fails must MOVE A COUNTER.
     ///
     /// `flush` returns `Ok(posted)` even when every event failed, and the caller only
     /// inspects `Err` — so a total billing-meter outage propagates upward as success.

@@ -77,26 +77,91 @@ start_throwaway_postgres() {
 if [ "${1:-}" = "--selftest" ]; then
   # Prove the runner BITES: reintroduce the exact shipped defect and require a
   # RED. A guard that has never been observed failing is not a guard (§1).
-  TARGET=crates/gateway/src/db/api_keys.rs
-  BACKUP="$(mktemp)"; cp "$TARGET" "$BACKUP"
-  restore() { cp "$BACKUP" "$TARGET"; rm -f "$BACKUP"; cleanup; }
-  # SIGNALS, not just EXIT. This selftest rewrites a TRACKED gateway source in place —
-  # reintroducing the `$9::numeric` defect that returned 500 from POST /v1/keys for two
-  # days — and it is invoked by the meta-gate on every pre-push, wrapped in a 300s
-  # timeout. `subprocess.run(timeout=)` kills a slow probe, and a bare `trap … EXIT`
-  # does not survive that, nor an OOM (which has killed a session on this machine).
-  # The worktree would be left carrying the known-broken constant with the backup
-  # orphaned under a random /tmp name nobody knows to look for.
   #
-  # So: trap the catchable signals, and PRINT the backup path up front so a SIGKILL —
-  # the one case no trap can cover — still leaves a recoverable, discoverable state
-  # rather than a silent one. That residual is the honest ceiling here; running the
-  # whole selftest in a throwaway git worktree would close it, at the price of a cold
-  # cargo build every pre-push.
-  # ponytail: SIGKILL/OOM during the ~90s mutated window still leaves TARGET modified.
-  # Recovery is `cp` from the printed BACKUP path, and `git diff` shows it immediately.
-  trap restore EXIT INT TERM HUP
-  echo "SELFTEST: $TARGET is mutated for the next step; pristine copy at $BACKUP"
+  # ══ R121 (2026-08-24) — THE FALSIFICATION NO LONGER TOUCHES A TRACKED FILE. ══
+  #
+  # This used to `cp` the real `crates/gateway/src/db/api_keys.rs` to a temp path,
+  # REWRITE IT IN PLACE, run the suite, and restore on a trap. The mutation is the
+  # `$9::numeric` defect that returned 500 from `POST /v1/keys` for two days. The
+  # old comment here called the residual "the honest ceiling" and rejected the
+  # worktree fix on an ASSUMED cold-build cost.
+  #
+  # It bit on 2026-08-24. A `git commit` was killed at a 10-minute tool ceiling
+  # while this ran, and `git status` showed `crates/gateway/src/db/api_keys.rs`
+  # carrying `::numeric` — the live defect, sitting unstaged in the working tree.
+  # Only staging-by-name kept it out of the commit; `git add -A` would have shipped
+  # it. **A hazard whose mitigation is "remember not to use git add -A" is not
+  # mitigated** (founder ruling R121).
+  #
+  # THE ASSUMED COST WAS WRONG, and it was measured rather than argued:
+  #   · worktree, first build (cold, its OWN CARGO_TARGET_DIR) ... ~140 s, ONCE
+  #   · worktree, every subsequent build (warm) ................... 0 s
+  #   · the OLD in-place mutation's rebuild ....................... 78 s, EVERY RUN
+  #   · the OLD restore's rebuild ................................. 10 s, EVERY RUN
+  # So the worktree is a one-time 136 s and is then CHEAPER than what it replaces.
+  # The path is stable precisely so it stays warm; deleting it costs 136 s once.
+  #
+  # SEMANTIC CHANGE, stated rather than buried: the falsification now runs against
+  # **HEAD**, not the working tree. That is deliberate and it is an improvement —
+  # this step's job is to prove THE RUNNER BITES, and that proof should not depend
+  # on whatever the developer happens to have open. The real suite (below, no
+  # --selftest) still runs against the working tree and is what tests their code.
+  # ── STRIP THE HOOK ENVIRONMENT BEFORE ANY git CALL. ────────────────────────
+  # `.githooks/pre-commit` runs verify-all.sh -> the meta-gate -> this `--selftest`.
+  # Git exports GIT_DIR / GIT_INDEX_FILE to hooks, and GIT_INDEX_FILE is a RELATIVE
+  # path (`.git/index`). A nested `git worktree add` inherits it, resolves it against
+  # the NEW worktree, and dies:
+  #     fatal: .git/index: index file open failed: Not a directory
+  # leaving an EMPTY worktree. Run bare this selftest passed; run under the hook it
+  # did not — the same unit-vs-environment gap that let the CARGO_TARGET_DIR
+  # contamination through one revision earlier. It failed CLOSED (the `[ -f $TARGET ]`
+  # check refused rather than passing hollow), which is the only reason it was cheap.
+  git_clean() {
+      env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX \
+          -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+          -u GIT_COMMON_DIR -u GIT_NAMESPACE git "$@"
+  }
+  REPO_ROOT="$(git_clean rev-parse --show-toplevel)"
+  HEAD_SHA="$(git_clean -C "$REPO_ROOT" rev-parse HEAD)"
+  WT="${TRACELANE_FALSIFY_WORKTREE:-$HOME/.cache/tracelane/falsify-postgres-integration}"
+  # ── THE WORKTREE MUST NOT SHARE THE REPO'S CARGO_TARGET_DIR. ────────────────
+  # The first cut of R121 pointed the worktree at `$REPO_ROOT/target` to keep the
+  # build warm. That is WRONG and the gate caught it within one run: cargo derives
+  # the same unit hash for the same package regardless of source path, so the
+  # worktree's MUTATED gateway OVERWROTE the shared test binary
+  # (`target/debug/deps/postgres_tenant_integration-<hash>`) — and the real suite,
+  # whose own fingerprint still read "current", then RAN THE MUTATED BINARY and
+  # failed with the exact defect being falsified:
+  #     cannot convert between `Option<String>` and the Postgres type `numeric`
+  # A falsification that contaminates the thing it is falsifying proves nothing and
+  # breaks the real run. Its own target dir, persistent so it stays warm.
+  WT_TARGET="${TRACELANE_FALSIFY_TARGET:-$HOME/.cache/tracelane/falsify-target}"
+  case "$WT_TARGET" in
+    "$REPO_ROOT"/target|"$REPO_ROOT"/target/*)
+      echo "SELFTEST BROKEN: the falsify target dir must NOT be the repo's — that is the contamination this exists to prevent"
+      exit 1 ;;
+  esac
+  mkdir -p "$WT_TARGET"
+  mkdir -p "$(dirname "$WT")"
+  if [ -e "$WT/.git" ]; then
+    git_clean -C "$WT" reset --hard "$HEAD_SHA" >/dev/null 2>&1       && git_clean -C "$WT" clean -fdq >/dev/null 2>&1       || { git_clean -C "$REPO_ROOT" worktree remove --force "$WT" >/dev/null 2>&1
+           rm -rf "$WT"
+           git_clean -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+           git_clean -C "$REPO_ROOT" worktree add --detach "$WT" "$HEAD_SHA" >/dev/null; }
+  else
+    rm -rf "$WT"
+    # PRUNE BEFORE ADD — a worktree whose DIRECTORY is gone stays REGISTERED, and the
+    # add then dies with "missing but already registered worktree", leaving the next
+    # line to report the far more alarming "SELFTEST BROKEN: … absent in the worktree".
+    # That is a stale-registration problem wearing the costume of a broken guard, and it
+    # cost two full gate cycles on 2026-08-25 before anyone read git's own suggestion.
+    # `rm -rf "$WT"` above is exactly what CREATES that state, so the prune belongs here.
+    git_clean -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    git_clean -C "$REPO_ROOT" worktree add --detach "$WT" "$HEAD_SHA" >/dev/null
+  fi
+  TARGET="$WT/crates/gateway/src/db/api_keys.rs"
+  [ -f "$TARGET" ] || { echo "SELFTEST BROKEN: $TARGET absent in the worktree"; exit 1; }
+
   OLD='const BUDGET_NUMERIC_CAST: &str = "::text::numeric";'
   NEW='const BUDGET_NUMERIC_CAST: &str = "::numeric";'
   grep -qF "$OLD" "$TARGET" || { echo "SELFTEST BROKEN: cast const not found verbatim — the mutation would be a no-op"; exit 1; }
@@ -108,12 +173,22 @@ p,old,new=sys.argv[1],sys.argv[2],sys.argv[3]
 s=open(p).read(); assert old in s, "mutation target absent"
 open(p,"w").write(s.replace(old,new,1))
 PY
-  echo "SELFTEST: reverted the cast to the shipped defect (\$9::numeric). Expecting RED."
-  if bash "$0" >/dev/null 2>&1; then
-    echo "SELFTEST FAILED — the suite passed with the defect reintroduced. This runner proves nothing."
+  # THE PROPERTY THAT MAKES R121 REAL, asserted rather than assumed: the developer's
+  # own tree is untouched by everything above. If this ever stops holding, the fix
+  # has silently reverted to the thing it replaced.
+  if ! git_clean -C "$REPO_ROOT" diff --quiet -- crates/gateway/src/db/api_keys.rs; then
+    echo "SELFTEST BROKEN: the REAL tree's api_keys.rs is dirty — the falsification must never touch it"
     exit 1
   fi
-  echo "SELFTEST PASSED — the suite goes RED on the reintroduced defect."
+  echo "SELFTEST: falsifying in an isolated worktree ($WT). The real tree is NOT touched."
+  echo "SELFTEST: reverted the cast to the shipped defect (\$9::numeric). Expecting RED."
+  if ( cd "$WT" && CARGO_TARGET_DIR="$WT_TARGET" bash "$WT/scripts/ci/run-postgres-integration.sh" ) >/dev/null 2>&1; then
+    echo "SELFTEST FAILED — the suite passed with the defect reintroduced. This runner proves nothing."
+    git_clean -C "$WT" reset --hard "$HEAD_SHA" >/dev/null 2>&1
+    exit 1
+  fi
+  git_clean -C "$WT" reset --hard "$HEAD_SHA" >/dev/null 2>&1
+  echo "SELFTEST PASSED — the suite goes RED on the reintroduced defect, with the real tree untouched."
   exit 0
 fi
 

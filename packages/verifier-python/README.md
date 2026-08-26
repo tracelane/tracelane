@@ -10,6 +10,12 @@ verifier (`packages/verifier-typescript`). All three agree verdict-for-verdict o
 ## Install
 
 ```bash
+pip install tracelane-audit-verifier
+```
+
+To work on it from a checkout instead:
+
+```bash
 pip install -e packages/verifier-python
 ```
 

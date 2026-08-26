@@ -1,7 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="76" height="76">
-  <path d="M 2,2 L 96,2 L 84,14 L 2,14 Z" fill="currentColor"/>
-  <path d="M 2,14 L 14,14 L 14,28 L 44,28 L 44,40 L 12,40 L 2,30 Z" fill="currentColor"/>
-  <path d="M 32,40 L 44,40 L 44,86 L 32,98 Z" fill="currentColor"/>
-  <path d="M 96,16 L 96,28 L 84,40 L 54,40 L 54,28 L 84,28 Z" fill="currentColor"/>
-  <path d="M 54,40 L 66,40 L 66,64 L 78,64 L 54,88 Z" fill="currentColor"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100" role="img" aria-label="tracelane">
+  <!--
+    tracelane mark — the SMALL optical cut, deliberately.
+
+    A favicon renders at 16-32px in every surface that matters (tab strip, bookmark bar,
+    history). The full cut's ring-and-dot centre is sub-pixel there: at 16px the dot is
+    1.6px inside a 3.5px hole. So this file carries the simplified geometry — thicker
+    corners, one solid centre, no ring — matching `src/components/Logo.astro` below its
+    SMALL_AT threshold. Same silhouette, legible at 16px.
+
+    The span stops at the bracket line rather than the canvas edge, which keeps the
+    mark's bounding box SQUARE (8..92 on both axes). That matters most here: a favicon
+    is drawn into a square, and a mark wider than tall has to be hand-centred and still
+    looks off-axis.
+
+    This is a SITE-ONLY PREVIEW and is ahead of `brand/`, which still generates the
+    geometric T monogram for the app, docs, README and social images. See Logo.astro.
+
+    Not the retired chisel bracket-recorder (ADR-074 §8) — different canvas, different
+    paths. Its two signatures (a first-bracket path and a 76-unit square viewBox) are
+    deliberately NOT reproduced here, not even as an example: check-retired-logo.py
+    scans raw text and cannot tell a comment from markup, so quoting the pattern to
+    explain it is itself a hit. That is the guard behaving correctly.
+
+    Monochrome only (ADR-074 §8: the logo is never coloured).
+  -->
+  <g fill="#26251E">
+    <path d="M 8,8 H 38 V 22 H 22 V 38 H 8 Z"/>
+    <path d="M 92,8 H 62 V 22 H 78 V 38 H 92 Z"/>
+    <path d="M 8,92 H 38 V 78 H 22 V 62 H 8 Z"/>
+    <path d="M 92,92 H 62 V 78 H 78 V 62 H 92 Z"/>
+    <rect x="8" y="44" width="26" height="12"/>
+    <rect x="66" y="44" width="26" height="12"/>
+    <circle cx="50" cy="50" r="16"/>
+  </g>
 </svg>

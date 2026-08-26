@@ -1,3 +1,4 @@
+//! Hot-path microbench for the PP-O2 tail sampler.
 //!
 //! `TailSampler::evaluate` runs once per span the ClickHouse writer drains, so
 //! its cost multiplies by ingest throughput. Budget: it must stay far under the

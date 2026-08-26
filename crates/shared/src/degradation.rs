@@ -8,10 +8,12 @@
 //! "degraded for 30 seconds" from "degraded for three weeks", so the second case looks
 //! exactly like healthy operation. `docs/reference/TRAPS.md` §16.
 //!
+//! Earned by — ingest's tenant-config resolver faulted continuously for **three
 //! weeks** after a migration, silently promoting every tenant to `Full` capture,
 //! enforcing quota against a fallback cap, and leaving the `force_tail` kill-switch
 //! inert. `fault_keep_all` is correct for a blip. Nothing said it had stopped being one.
 //!
+//!  inventoried five such paths in this system. **One had a counter; four had no
 //! instrument at all**, and every one of them was found by a person looking directly at
 //! it rather than by a signal.
 //!
@@ -77,6 +79,7 @@ pub enum Degradation {
     SpanPublishFailed = 1,
     /// Ingest's tenant-config resolve faulted ⇒ `fault_keep_all` (Full capture, fallback
     /// quota). The resolver returns `TenantConfig`, not `Result`, so the fault is
+    /// structurally invisible to callers. **This is.**
     /// `crates/ingest/src/tenant_config.rs:261-279`.
     TenantConfigFault = 2,
     /// A Polar meter event failed to post. The flush still reports success upward, so
@@ -88,6 +91,7 @@ pub enum Degradation {
     /// continues and the request is allowed. `crates/gateway/src/predictive/mod.rs`.
     PredictorError = 4,
     /// The ALERT EVALUATOR could not compute a rule's metric and skipped the rule
+    /// (`alerts/checker.rs:129-131`, `continue`). **This is inside the alerting
     /// engine itself**: "I cannot see" is treated as "nothing to do", so a customer's
     /// alert silently stops evaluating while the UI still shows it as enabled. It had
     /// no instrument at all, which is the same defect the registry exists to close —
@@ -119,6 +123,16 @@ pub enum Degradation {
     /// instance loud instead of invisible, and the next instance is expected: R11
     /// re-grants the gateway's ClickHouse user, and an under-grant lands exactly here.
     AuditAgeSweepSkipped = 7,
+    /// The GWY-24 semantic cache could not consult itself — the embedding
+    /// provider was unreachable, or the ClickHouse scan failed. The request is
+    /// served normally by the provider, so nothing breaks and NOTHING SHOWS.
+    ///
+    /// That silence is exactly why it is counted. A cache is a fault-tolerance
+    /// path and fails OPEN by design, which means a permanently broken embedder
+    /// looks identical to a cache with no hits: the bill stays high, latency
+    /// stays normal, and no error is ever raised. `open_for_secs` is the only
+    /// thing that can answer "how long has this been degraded?"
+    SemanticCacheUnavailable = 8,
 }
 
 impl Degradation {
@@ -136,6 +150,7 @@ impl Degradation {
             Self::AlertEvalSkipped => "alert_eval_skipped",
             Self::AuditBackfillFailed => "audit_backfill_failed",
             Self::AuditAgeSweepSkipped => "audit_age_sweep_skipped",
+            Self::SemanticCacheUnavailable => "semantic_cache_unavailable",
         }
     }
 
@@ -179,6 +194,12 @@ impl Degradation {
                  Check the gateway's ClickHouse SELECT grant on audit_log and \
                  audit_anchor_records, and reachability."
             }
+            Self::SemanticCacheUnavailable => {
+                "the semantic cache is failing open — every request is going to the \
+                 provider and the bill is as if the cache were off. Nothing errors, so \
+                 this is invisible without this counter. Check the embedding provider \
+                 credential and ClickHouse."
+            }
         }
     }
 
@@ -193,13 +214,14 @@ impl Degradation {
             Self::AlertEvalSkipped,
             Self::AuditBackfillFailed,
             Self::AuditAgeSweepSkipped,
+            Degradation::SemanticCacheUnavailable,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 8;
+pub const COUNT: usize = 9;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -229,6 +251,7 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),
@@ -349,6 +372,7 @@ mod tests {
 
     // The counters are process-global, so tests must not assert absolute values —
     // another test (or a parallel one) may have incremented the same kind. Every
+    // assertion below is a DELTA, which is what the requirement actually needs:
     // "drive the degradation and assert the counter moved".
 
     #[test]

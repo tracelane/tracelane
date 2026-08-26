@@ -8,6 +8,7 @@
 //! empty → **permissive** registry (untagged tools hold no caps, not blocked).
 //! ≥ 1 row → **enforcing**.
 //!
+//! Store-outage posture: a resolver error must NEVER silently drop an
 //! *enforcing* tenant to permissive (that would disable R3 definition-pinning +
 //! R4 lethal-trifecta enforcement on a DB blip). On error we reuse the tenant's
 //! **last-known** registry (survives the moka TTL, mirrors `entitlement_cache`,
@@ -18,10 +19,12 @@
 //! tenant CLOSED would turn a Postgres blip into customer-facing 403s on agentic
 //! traffic for any R4-entitled (paid) tenant — under ENFORCING every untagged
 //! tool resolves to all-caps, so R4 blocks a converged trifecta. The load-bearing
+//!  fix is the last-known preservation (a warm enforcing tenant never drops
 //! to permissive); the cold edge stays available. (This was briefly cold→enforcing
 //! on 2026-07-28; reverted the same day after confirming R4 halts (403) and is
 //! plan-default-on for paid tiers — a DB blip must not become a launch-night
 //! outage. Empirical fail-closed validation for configured tenants is tracked as
+//! the chaos test.)
 
 use std::future::Future;
 use std::pin::Pin;
@@ -34,8 +37,39 @@ use uuid::Uuid;
 
 use crate::guardrail::capability::{CapabilityRegistry, CapabilitySet};
 
-const MAX_CAPACITY: u64 = 10_000;
-const TTL: Duration = Duration::from_secs(30);
+/// Tenants held in the registry cache.
+///
+/// Raised from 10,000, which was EXACTLY the three-month user target — a ceiling
+/// sitting on the number you plan to reach is a ceiling you will hit, and it
+/// would present as this same bug: entries evicted before reuse, every request
+/// paying a blocking resolve.
+const MAX_CAPACITY: u64 = 50_000;
+/// Cache lifetime for a tenant's capability registry.
+///
+/// **900s, raised from 30s (B-256).** At 30 seconds this cache could not hit:
+/// production requests arrive roughly every 400 seconds, so every request found
+/// an expired entry and paid a blocking Postgres resolve. Measured on prod
+/// 2026-08-18, that resolve was **14.1ms of a 202.3ms request** — the third
+/// largest stage, behind only the auth cache (which had the same defect at 60s)
+/// and the BYOK key cache (300s, same defect).
+///
+/// This module's own doc says it "mirrors `entitlement_cache`". It mirrored the
+/// BROKEN version: `entitlement_cache` was *itself* 30s once, for exactly this
+/// reason, and its comment records the fix — "a blocking Postgres re-resolve on
+/// EVERY request from a low-QPS tenant ... ~72ms p50 gateway overhead ... while
+/// the warm/sustained path measured ~1.6ms". It moved to 900s. This did not.
+///
+/// **A longer TTL is not a freshness trade here, because eviction is explicit.**
+/// Every tool-pin write path calls `GuardrailEngine::invalidate_registry`
+/// (`tool_pins_api.rs`, three call sites), so a customer's change takes effect on
+/// the NEXT request regardless of this value. The TTL is the backstop for changes
+/// that arrive without passing through those routes.
+///
+/// **Its honest limit:** that invalidation is process-local. With one gateway
+/// instance it is complete. Run two, and this TTL becomes the cross-instance
+/// staleness bound — at which point the invalidation needs to become a broadcast,
+/// not a longer or shorter number here.
+const TTL: Duration = Duration::from_secs(900);
 
 /// Boxed async resolver: tenant UUID → its [`CapabilityRegistry`]. Production
 /// injects the Postgres-backed [`pg_registry_resolver`]; tests inject a mock.
@@ -50,6 +84,7 @@ pub struct RegistryLoader {
     cache: Cache<Uuid, Arc<CapabilityRegistry>>,
     /// Last successfully-resolved registry per tenant. Survives the moka TTL so
     /// a store outage preserves each tenant's real posture instead of failing
+    /// open to permissive. Only written on a successful resolve.
     last_known: Arc<DashMap<Uuid, Arc<CapabilityRegistry>>>,
     resolve: RegistryResolveFn,
 }
@@ -69,6 +104,7 @@ impl RegistryLoader {
 
     /// Resolve a tenant's capability registry. Warm reads never hit Postgres.
     ///
+    /// **Store-outage posture.** On a resolver error we do NOT blindly
     /// return an empty permissive registry (that would silently disable R3/R4
     /// enforcement for a *configured* tenant on a DB blip). Instead we reuse the
     /// tenant's last-known registry if we have one (posture preserved). With no
@@ -209,6 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_outage_cold_falls_back_to_permissive() {
+        // A store outage with NO last-known registry falls back to
         // PERMISSIVE (available), NOT enforcing. Failing a cold/unconfigured
         // tenant closed would turn a DB blip into 403s on agentic traffic for any
         // R4-entitled tenant (under enforcing, untagged tools → all-caps → R4
@@ -231,6 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_outage_preserves_last_known_enforcing() {
+        // An ENFORCING tenant that was loaded once must KEEP its enforcing
         // posture through a later store outage — never drop to permissive.
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();

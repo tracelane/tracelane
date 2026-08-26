@@ -1,6 +1,7 @@
 -- Migration 0001 — reconcile gateway<->prod control-plane schema (ADR-042).
 --
 -- Adds the 4 Postgres tables the gateway reads/writes that were never in the
+-- Drizzle schema (so `drizzle-kit push` never created them), plus the
 -- peppered-HMAC columns on api_keys. **Idempotent** (IF NOT EXISTS / DROP NOT
 -- NULL) because prod was push-provisioned — there is no `drizzle` migrate
 -- tracking table, so this is applied directly via psql, not `drizzle-kit
@@ -63,6 +64,7 @@ CREATE INDEX IF NOT EXISTS "payment_events_tenant_idx" ON "payment_events" ("ten
 CREATE INDEX IF NOT EXISTS "payment_events_agent_idx" ON "payment_events" ("tenant_id","agent_id","created_at" DESC);
 --> statement-breakpoint
 
+-- ── api_keys: peppered-HMAC + Argon2id columns (ADR-042) ─────────────────
 ALTER TABLE "api_keys" ADD COLUMN IF NOT EXISTS "lookup_hash" bytea;
 --> statement-breakpoint
 ALTER TABLE "api_keys" ADD COLUMN IF NOT EXISTS "argon2id_phc" text;

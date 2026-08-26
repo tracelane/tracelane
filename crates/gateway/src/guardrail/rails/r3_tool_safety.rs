@@ -9,6 +9,7 @@
 //!     (run-doc: "VERIFY existing schema-validation still fires; ADD pinning") —
 //!     the predictive `ToolSchemaValidator` stays in place as the regression
 //!     guard; this rail is the guardrail-grade, fail-closed enforcement.
+//!   - [`R3Pinning`] (free / ungated) — definition pinning: a request
 //!     whose tool `def_hash` differs from the workspace's last-approved hash is
 //!     a rug-pull (`TOOL_DEF_DRIFT`). Records old/new **hash**, never the tool
 //!     text (§2.5).
@@ -246,6 +247,7 @@ pub fn drift_posture_from_env_value(value: Option<&str>) -> DriftPosture {
     }
 }
 
+/// R3 definition pinning — rug-pull detection. FREE / ungated.
 #[derive(Debug, Clone, Default)]
 pub struct R3Pinning {
     config: R3PinningConfig,
@@ -349,6 +351,7 @@ impl Rail for R3Pinning {
         FailMode::Closed
     }
     fn feature(&self) -> Option<GuardrailFeature> {
+        // FREE / ungated (, founder ruling 2026-08-04). Agent-safety and
         // basic-correctness rails are free in OSS and on every hosted tier;
         // product/quality/data-governance rails (R2 PII, R5 format, R6
         // sysprompt-leak, R7 topic) stay entitlement-gated. A flagship

@@ -152,7 +152,9 @@ describe("POST /api/webhooks/polar", () => {
 		expect(h.db?.db.insert).toHaveBeenCalledTimes(1); // only the dedup record
 	});
 
+	// This test used to assert the no-op: an add-on lookup_key was
 	// logged loudly and granted nothing, so a $999 Audit SKU purchase unlocked
+	// nothing. wired `handleAddOnChange` to actually grant f_audit_addon,
 	// which removed that log line and left this test red on a clean tree — a red
 	// test on the payment path. It now asserts the GRANT, which is the behaviour
 	// that must never regress.

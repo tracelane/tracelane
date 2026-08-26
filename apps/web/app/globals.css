@@ -9,31 +9,39 @@
 @source "../../../packages/ui/src";
 
 /*
- * Wire the self-hosted next/font families (loaded in layout.tsx) into the
- * design-system tokens. tokens.css references "Inter" / "JetBrains Mono" by
- * name as a fallback; here we point --font-sans / --font-mono at the actual
- * next/font CSS variables so the real self-hosted faces are used. The
- * palette, the @theme utilities and the light-default base ALL come from the
- * imported tokens.css — this app defines no tokens of its own, and tokens.css is
- * the single source of truth for colour, type and layout.
+ * Wire the next/font families (loaded in layout.tsx) into the design-system
+ * tokens. tokens.css names "Geist" / "Geist Mono" as a fallback for the moment
+ * before the faces load; here we point --font-sans / --font-mono at the actual
+ * next/font CSS variables so the real self-hosted faces are used. The palette,
+ * the @theme utilities and the light-default base ALL come from the imported
+ * tokens.css — this app defines no tokens of its own.
  *
- * visual-pass-01 changes NO FONT FACE (founder: "keep existing font"). All three
- * roles are exactly as they were on main; only type SIZES, WEIGHTS and SPACING
- * move, in tokens.css:
- *   --font-sans    Plus Jakarta Sans  every UI string.
- *   --font-mono    JetBrains Mono     every numeral / id / hash / model / seq.
- *   --font-display Plus Jakarta Sans  the <Logo> wordmark (brand lockup, shared
- *                  with the marketing site — must not drift).
+ *   --font-sans     Geist        every UI string.
+ *   --font-mono     Geist Mono   every numeral / id / hash / model / seq / code.
+ *   --font-display  Geist        the <Logo> wordmark (brand lockup).
+ *
+ * `next/font/google` self-hosts: the faces are downloaded at BUILD time and
+ * served from our own origin, so there is no runtime request to Google and no
+ * third-party connection on the critical path.
+ *
+ * ── ON --font-display AND THE BRAND LOCKUP ──────────────────────────────────
+ * The comment that stood here said "ONE font across app + marketing — must not
+ * drift", and it was FALSE when it was written. The marketing site sets
+ * `--font-display: "InterTight", "Inter", …` (apps/site/src/styles/global.css:62)
+ * and renders its wordmark with it (Header.astro:15, Footer.astro:15), while this
+ * app pointed --font-display at Plus Jakarta Sans. The two lockups had ALREADY
+ * drifted, and the comment asserting they had not is exactly the kind of
+ * confident-and-wrong line CLAUDE.md §17 treats as a defect.
+ *
+ * Geist is a geometric grotesque and is a CLOSER match to the site's Inter Tight
+ * than Plus Jakarta's humanist forms were, so this pass narrows the drift rather
+ * than widening it. Closing it entirely is a marketing-site change and is out of
+ * scope for a dashboard P0.
  */
 :root {
-	--font-sans: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
-	--font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", monospace;
-	/* Brand wordmark face (the <Logo> lockup). ONE font across app + marketing.
-	   ADR-074 §4 targets Inter; the swap was measured and REVERTED (see layout.tsx),
-	   so the lockup stays Plus Jakarta and brand/svg/*.svg lists Inter first with
-	   Plus Jakarta immediately after — the SVGs render identically on this machine
-	   and in the app until the font ruling changes. */
-	--font-display: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
+	--font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+	--font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+	--font-display: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 /* Top loading bar (components/NavProgress.tsx) — indeterminate sweep shown
@@ -48,5 +56,40 @@
 	}
 	100% {
 		transform: translateX(320%) scaleX(0.5);
+	}
+}
+
+/*
+ * The sweep, as a class rather than the inline `style` NavProgress used to carry
+ * (2026-08-17). Two reasons, and the first is a correctness one: an inline style
+ * wins over every stylesheet rule, so a `prefers-reduced-motion` override was
+ * IMPOSSIBLE while the animation lived in the JSX. This is the app's only
+ * transform-based infinite animation, which makes it the only one that needs the
+ * opt-out.
+ *
+ * `linear`, not `ease-in-out`: an indeterminate bar is constant motion, and
+ * ease-in-out decelerates into both ends of the travel — the bar hesitated twice
+ * a cycle while claiming work was in progress.
+ */
+.nav-sweep {
+	animation: nav-indeterminate 1.1s linear infinite;
+}
+
+/*
+ * Reduced motion keeps the SIGNAL and drops the TRAVEL — fewer and gentler, not
+ * zero (a bar that vanishes leaves the user with no loading indication at all,
+ * which is a worse outcome than the movement). The sweep becomes a static
+ * full-width dimmed bar: still unmistakably "working", nothing moving.
+ *
+ * Deliberately NOT a blanket `* { animation: none }`. The app's other repeating
+ * animation is `animate-pulse` on skeletons and status dots, which is
+ * opacity-only — no movement, nothing that triggers vestibular discomfort — and
+ * a global rule would strip the one loading affordance that is already safe.
+ */
+@media (prefers-reduced-motion: reduce) {
+	.nav-sweep {
+		animation: none;
+		width: 100%;
+		opacity: 0.55;
 	}
 }

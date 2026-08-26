@@ -8,7 +8,7 @@
 - [ ] Bug fix (non-breaking, fixes an issue)
 - [ ] New feature (non-breaking, adds functionality)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Performance improvement (hot-path change — benchmark-runner must be green)
+- [ ] Performance improvement (hot-path change — run the Benchmarks workflow; it is not a PR gate)
 - [ ] Security fix (security-reviewer subagent approval required)
 - [ ] Documentation only
 

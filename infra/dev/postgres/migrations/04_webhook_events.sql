@@ -12,6 +12,7 @@
 -- ON CONFLICT DO NOTHING and checks affected_rows == 1 — if 0, the
 -- event was processed before and the handler skips its side effects.
 --
+-- (— Tracelane security review, Phase 1.3.)
 
 CREATE TABLE IF NOT EXISTS webhook_events (
     source       TEXT        NOT NULL,

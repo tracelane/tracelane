@@ -2,7 +2,7 @@
   "name": "@tracelanedev/evals",
   "version": "0.1.0",
   "private": true,
-  "description": "Tracelane eval suite \u2014 69 pain-point assertions + gateway + ingest + PII + PI evals (89 .eval.ts total)",
+  "description": "Tracelane conformance evals \u2014 fault-tolerance, gateway-correctness, ingest-schema, PII-redaction and prompt-injection suites",
   "scripts": {
     "test": "echo 'evals are the canonical-repo merge gate (they assert internal ADRs/infra); reference-only in the public mirror' && exit 0",
     "eval:run": "tsx src/runner.ts",

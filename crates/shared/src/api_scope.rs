@@ -102,7 +102,19 @@ impl Scope {
         [Scope::Chat, Scope::Read, Scope::Ingest, Scope::Admin]
     }
 
-    /// What an **omitted** `scope` on a mint request resolves to.
+    /// The scope set that keys minted between 2026-08-14 and 2026-08-22 carry.
+    ///
+    /// **NO LONGER A DEFAULT.** Founder ruling R73 (2026-08-22) made `scope`
+    /// REQUIRED at mint — an omitted one is now a 400 naming the field
+    /// (`gateway/src/key_routes.rs`, the `None` arm) — so nothing resolves TO
+    /// this set any more. It is kept because it names a real population of
+    /// issued credentials, and `prompt_routes.rs`'s
+    /// `default_mint_set_key_cannot_write_prompts` asserts a property about
+    /// exactly that population. Deleting it would delete the only name for
+    /// the keys the old default produced.
+    ///
+    /// The history below is why `Admin` is not in it, and it still binds any
+    /// future proposal to reintroduce a default:
     ///
     /// **`Admin` is deliberately absent, and that is a security ruling, not a
     /// UI preference** (founder, 2026-08-14). Until then `with_default_scope`
@@ -112,6 +124,7 @@ impl Scope {
     /// *"Manage the workspace — mint/revoke keys, provider keys, settings."*
     ///
     /// That is precisely the escalation [`crate::api_scope`]'s owner gate exists
+    /// to stop (`is_verified_owner` — /PL-9b: *member → mint key → replace
     /// provider credential*), reachable **by key instead of by JWT** and with no
     /// disclosure to the person clicking Create.
     ///

@@ -1,6 +1,7 @@
 //! Tamper-evident audit log (v2) with Ed25519 hash chain and Sigstore
 //! Rekor anchoring.
 //!
+//! Closes, C2, C3, C4, C5, C6, H3, H4, H5 from the Phase-0
 //! audit-ledger security review.
 //!
 //! - **C1**: row hash uses length-prefixed, domain-separated framing
@@ -13,6 +14,7 @@
 //!   [`audit_keys::TenantAuditKeyStore`]. Each tenant's Merkle root is
 //!   signed by a tenant-scoped key; cross-tenant signing-key compromise
 //!   surface is bounded by `TenantAuditKeyStore` access (minting is
+//!   gated on the Audit SKU entitlement `f_audit_addon`).
 //!   Non-entitled tenants and dev fall back to the global
 //!   `TRACELANE_REKOR_SIGNING_KEY`.
 //! - **C5**: Ed25519 PKCS#8 bytes wrapped in `secrecy::SecretBox` so
@@ -40,6 +42,7 @@
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+//  B8: `parking_lot::Mutex` doesn't poison on panic, so a
 // future malformed payload that panics inside an audit-append can't
 // permanently DoS the tenant's chain (`std::sync::Mutex` would refuse
 // every subsequent lock). The audit chain invariants are protected by
@@ -373,6 +376,7 @@ impl TenantChainState {
 }
 
 /// Hook invoked once per **successful** Rekor anchor batch, with the anchoring
+/// tenant. Prod wires this to the Polar billing recorder via
 /// [`AuditChain::set_billing`] so each anchor batch meters one `audit_anchors`
 /// usage event (ADR-048); tests inject a channel. Sync — it only *dispatches*
 /// fire-and-forget work, never blocking or awaiting on the anchor path.
@@ -386,6 +390,7 @@ pub struct AuditChain {
     clickhouse_client: Option<ClickhouseClient>,
     /// Postgres pool for the persistent chain-state table.
     pg_pool: Option<deadpool_postgres::Pool>,
+    /// Per-successful-anchor hook (usage metering). Set once at startup
     /// via [`set_billing`](Self::set_billing); unset = anchoring is not metered.
     anchor_hook: OnceLock<AnchorHook>,
     /// ADR-069: JetStream context for the async audit publish path. Set once at
@@ -448,6 +453,7 @@ impl AuditChain {
         })
     }
 
+    /// Inject the per-successful-anchor hook. First set wins; a no-op if
     /// already set. Prod uses [`set_billing`](Self::set_billing); tests inject a
     /// counter/channel to assert the anchor→meter wiring without Postgres/Rekor.
     /// R21 — read this tenant's anchor watermark. `None` = never anchored, or the
@@ -665,6 +671,7 @@ impl AuditChain {
     }
 
     /// Wire the Polar billing recorder so each successful Rekor anchor batch
+    /// meters one `audit_anchors` usage event (/ ADR-048).
     ///
     /// Called once at startup, after the recorder is built (see `server.rs`).
     /// Off the anchor path: the hook only **spawns** the tenant → Polar-customer
@@ -828,6 +835,18 @@ impl AuditChain {
     /// duplicate, no gap). A CH row that does not chain from the persisted head
     /// is NOT adopted (never chain from an unverified row).
     #[instrument(skip(self))]
+    /// Is a Postgres control plane wired?
+    ///
+    /// **The ASYNC audit path (ADR-069) hard-requires one** — `append_from_wire`
+    /// bails without it — while the SYNC path does not: `append()` falls back to
+    /// `append_in_memory`, which hashes the chain and persists the `audit_log` row to
+    /// ClickHouse. So this is the question "which append path can actually succeed
+    /// here", and it must be asked ONCE AT BOOT rather than per message.
+    #[must_use]
+    pub(crate) fn has_pg_pool(&self) -> bool {
+        self.pg_pool.is_some()
+    }
+
     pub async fn warm_from_postgres(&self) -> Result<()> {
         let Some(ref pool) = self.pg_pool else {
             tracing::info!("no pg pool — skipping audit_chain_state warm");
@@ -943,6 +962,7 @@ impl AuditChain {
 
     /// Append one audit event, advancing the tenant's tamper-evident hash chain.
     ///
+    /// ** forward fix (ADR-065 F1):** when a Postgres pool is configured
     /// (always true in prod), seq assignment + chain-head advance are
     /// serialized **across processes** by a per-tenant `SELECT … FOR UPDATE`
     /// row lock ([`append_pg_serialized`](Self::append_pg_serialized)), and the
@@ -1112,6 +1132,7 @@ impl AuditChain {
     /// Legacy in-memory append (no Postgres pool → single-process dev / OSS
     /// self-host). Advances the per-tenant `DashMap` chain state under a
     /// `parking_lot::Mutex` and fires the CH write + anchor as fire-and-forget
+    /// tasks. The cross-process race cannot arise without a shared
     /// Postgres, so this path is unchanged. **Not used when `pg_pool` is set.**
     fn append_in_memory(&self, event: AuditEvent, payload_json: String) -> Result<()> {
         let (row_hash, seq, prev_hash_snapshot, should_anchor, pending_snapshot, batch_start) = {
@@ -1411,17 +1432,20 @@ async fn backfill_signature(
 /// entry. `(no-key)` sentinels — returned by `submit_for_tenant` when no signing
 /// key is configured — produced NO Rekor entry, so metering `audit_anchors` for
 /// them would over-charge a billed tenant whose signing key was mis-provisioned
+/// (security review HIGH). This matches the `(no-key)`-is-not-an-anchor
 /// convention the ClickHouse `rekor_entry_id` backfill already enforces.
 /// Extracted (not inlined) so the meter-vs-no-meter decision is unit-testable
 /// without a live Rekor round-trip.
 /// Whether a `rekor_entry_id` denotes a REAL external Rekor anchor, vs a
 /// sentinel: `(no-key)` (unsigned), `(no-rekor)` (signed but not externally
 /// anchored, ADR-057), or `(unknown-uuid)` (Rekor response had no parseable
+/// entry). Sentinels must never be metered (HIGH) or backfilled as a UUID.
 pub(crate) fn is_real_rekor_entry(entry_id: &str) -> bool {
     !matches!(entry_id, "(no-key)" | "(no-rekor)" | "(unknown-uuid)")
 }
 
 fn fire_anchor_hook(anchor_hook: &Option<AnchorHook>, entry_uuid: &str, tenant_id: &TenantId) {
+    // Only a REAL external Rekor anchor is metered (HIGH).
     if !is_real_rekor_entry(entry_uuid) {
         return;
     }
@@ -1431,6 +1455,7 @@ fn fire_anchor_hook(anchor_hook: &Option<AnchorHook>, entry_uuid: &str, tenant_i
 }
 
 /// Meter one successful Rekor anchor batch against the tenant's Polar customer
+/// (/ ADR-048). Fire-and-forget, OFF the anchor path: maps `tenant_id` →
 /// `polar_customer_id` via Postgres, then records `audit_anchors += 1`. Mirrors
 /// `server.rs::spawn_billing_record` (the `TokensProcessed` path). Only real
 /// anchors reach here — `(no-key)` batches are gated out by `fire_anchor_hook`.
@@ -1580,6 +1605,7 @@ async fn anchor_task(
         }
     }
 
+    // Meter only a REAL external Rekor anchor — AFTER the backfill spawns.
     // `(no-key)` / `(no-rekor)` batches produced no Rekor entry and are gated out
     // by `fire_anchor_hook`. The hook only dispatches fire-and-forget work.
     fire_anchor_hook(&anchor_hook, &entry_id, &tenant_id);
@@ -1933,10 +1959,12 @@ async fn read_rows_after(
 
 /// Submits hashedrekord entries to Sigstore Rekor v2.
 ///
+/// PKCS#8 bytes wrapped in `secrecy::SecretBox` so they
 /// zeroize on drop. `ring::Ed25519KeyPair` itself is not zeroizable
 /// upstream — the SecretBox is the canonical zero-on-process-exit
 /// source of truth.
 ///
+/// `tenant_keys` holds the optional per-tenant signing-key
 /// store. When set, `submit_for_tenant` prefers it over the global
 /// `signing` material; tenants without a keypair (or when the store
 /// returns an error) fall back to the global key.
@@ -2226,6 +2254,7 @@ mod tests {
         TenantId::from_jwt_claim(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
     }
 
+    // — sign-routing tests ------------------------------------
     //
     // These exercise `RekorClient::sign_with_global` plus the
     // `submit_for_tenant` selection logic *up to* the point of the HTTP
@@ -3041,6 +3070,7 @@ mod tests {
         println!("TRACELANE_REKOR_SIGNING_KEY={}", fresh_signing_key_b64());
     }
 
+    /// On-node deploy proof: given a REAL prod signed audit row's
     /// `row_hash` (hex) + `signature` (b64) + `signing_pubkey` (b64) via env,
     /// recompute the 1-row batch Merkle root exactly as the gateway did and verify
     /// the Ed25519 signature — the honest, green-on-real-data proof. With
@@ -3140,6 +3170,7 @@ mod tests {
         assert_eq!(s2.lock().seq, 1);
     }
 
+    // forward-fix integration harness (ADR-065 F1) ------------
     //
     // These `#[ignore]`d tests need a live Postgres (audit_chain_state) AND a
     // live ClickHouse (audit_log as ReplacingMergeTree). Run them from the dev
@@ -3475,7 +3506,9 @@ mod tests {
         );
     }
 
+    /// ** cross-process seq race (the whole point of ADR-065 F1).**
     ///
+    /// This is the audit-LOG seq-assignment race — DISTINCT from the
     /// `audit_keys.rs` `get_or_create` anchor-KEY race (a different table,
     /// `tenant_audit_keys`, whose failure is a duplicate *keypair*, closed by
     /// `ON CONFLICT (tenant_id) DO NOTHING` + reload). Here, two co-running
@@ -3574,6 +3607,7 @@ mod tests {
         assert_eq!(head.last_seq, total - 1, "PG head == last assigned seq");
     }
 
+    /// ** crash-mid-append + restart reconcile (ADR-065 HOLE C).**
     ///
     /// Simulate a crash AFTER the durable ClickHouse write but BEFORE the
     /// Postgres head advance/commit: a durable CH row exists at seq N that
@@ -3758,6 +3792,7 @@ mod tests {
         assert_eq!(state.lock().pending_hashes.len(), 0);
     }
 
+    ///  regression (security-review HIGH): the anchor billing hook meters a
     /// REAL Rekor entry but NEVER a `(no-key)` sentinel. `Meter::AuditAnchors`
     /// previously had NO call-site at all (the ADR-048 "Polar meters
     /// TokensProcessed + AuditAnchors" claim was false; the dashboard
@@ -3798,6 +3833,7 @@ mod tests {
         fire_anchor_hook(&None, "a1b2c3d4", &tenant());
     }
 
+    /// A chain with NO billing hook set still anchors without panicking
     /// unmetered anchoring (POLAR_ACCESS_TOKEN unset) must never break the ledger.
     #[tokio::test]
     async fn anchor_without_billing_hook_is_a_noop_not_a_panic() {
@@ -3847,6 +3883,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_append_uses_genesis_seed_not_zero() {
+        // V1 seeded prev_hash to "". v2 derives a per-tenant seed.
         let chain = AuditChain::new(100, None, None).unwrap();
         let ev = AuditEvent {
             tenant_id: tenant(),

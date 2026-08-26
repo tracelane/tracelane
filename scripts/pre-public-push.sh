@@ -199,20 +199,62 @@ scan_docs() { # <label> <regex> <path...>
 # indefinitely. The 2026-08-07 ledger pass found the gap still open across ~30
 # more exported files. Anything added to build-public-export.sh's ALLOW array
 # belongs here too — a public-capable file outside this list is unguarded.
+# R136 (B-279 L2a): THE SCAN SCOPE IS DERIVED FROM THE EXPORT ALLOWLIST, not
+# maintained beside it.
+#
+# This block used to be a hand-kept list of trees that had to be updated whenever
+# build-public-export.sh's ALLOW array changed. The comment above said exactly that —
+# "Anything added to build-public-export.sh's ALLOW array belongs here too" — which is
+# a rule a human has to remember, and it failed: `.claude/agents` was in ALLOW while
+# this list never named it, so NINE agent definitions shipped UNSCANNED and one carried
+# `5K RPS`, a phrase on the enforced never-say-again list. B-182 was the same defect one
+# tree earlier. The rule was never wrong; keeping the list by hand was.
+#
+# TWO TREES, one list, fail-CLOSED — the same shape as the never-say-again list below.
+# In the private repo the source is scripts/export/export-allow.txt. That directory is
+# DENIED from the export, so build-public-export.sh materializes a copy at
+# scripts/export-allow.txt and this resolves whichever exists. If NEITHER exists this
+# BLOCKS: a scan with no scope would pass everything and report success, which is the
+# precise failure this file exists to prevent.
+ALLOW_LIST="$ROOT/scripts/export/export-allow.txt"
+[ -f "$ALLOW_LIST" ] || ALLOW_LIST="$ROOT/scripts/export-allow.txt"
 DOCS=()
-# `.claude/agents` ADDED 2026-08-13. It has been in build-public-export.sh's ALLOW
-# array all along while this list never mentioned it, so nine agent definitions
-# shipped publicly UNSCANNED — and one of them carried `5K RPS`, a phrase on the
-# enforced never-say-again list. The comment directly above already stated the
-# rule this line broke; the list, not the rule, was the defect.
-for d in apps/web apps/docs docs/guides packages crates spec evals ml bench infra .github \
-         .claude/agents; do
-  [ -d "$ROOT/$d" ] && DOCS+=("$ROOT/$d")
-done
-for f in README.md SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md VERSIONING.md \
-         AI_DISCLOSURE.md LICENSE-PLEDGE.md CLAUDE.public.md; do
-  [ -f "$ROOT/$f" ] && DOCS+=("$ROOT/$f")
-done
+if [ ! -f "$ALLOW_LIST" ]; then
+  echo "BLOCKED [scan-scope]: the export allowlist is MISSING."
+  echo "  Looked for scripts/export/export-allow.txt (private repo) and"
+  echo "  scripts/export-allow.txt (export tree). Neither exists."
+  echo "  A marketing scan with no scope inspects nothing and reports success."
+  FAIL=1
+else
+  # NOT PROSE, and excluded with the reason at the site. These ship, but they carry no
+  # customer-readable claims — a lockfile or a git attributes file cannot make a
+  # marketing statement, and scanning them only adds runtime and false-positive
+  # surface. Everything else in the allowlist IS scanned, including every root
+  # markdown file, which is what B-182 was about.
+  _not_prose() {
+    case "$1" in
+      Cargo.lock|pnpm-lock.yaml|package.json|pnpm-workspace.yaml|rust-toolchain.toml) return 0 ;;
+      .gitattributes|.gitleaks.toml|deny.toml|osv-scanner.toml|.grype.yaml|.cargo/audit.toml) return 0 ;;
+      .env.example|LICENSE|NOTICE|CODEOWNERS|Dockerfile) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  _al_seen=0
+  while IFS= read -r _p; do
+    case "$_p" in ''|\#*) continue ;; esac
+    _al_seen=$((_al_seen+1))
+    _not_prose "$_p" && continue
+    if [ -d "$ROOT/$_p" ] || [ -f "$ROOT/$_p" ]; then DOCS+=("$ROOT/$_p"); fi
+  done < "$ALLOW_LIST"
+  if [ "$_al_seen" -lt 1 ]; then
+    echo "BLOCKED [scan-scope]: the export allowlist parsed to ZERO entries ($ALLOW_LIST)."
+    FAIL=1
+  fi
+  # CLAUDE.public.md ships AS CLAUDE.md and is therefore not an allowlist entry, but it
+  # is public-capable prose and must be scanned in the private tree.
+  [ -f "$ROOT/CLAUDE.public.md" ] && DOCS+=("$ROOT/CLAUDE.public.md")
+  echo "scan scope: ${#DOCS[@]} path(s) derived from $(basename "$ALLOW_LIST") ($_al_seen entries)"
+fi
 
 # NOTE (2026-08-13): this scan is NOT deny-aware, and that is a real gap —
 # see PROGRESS.md B-217. A first attempt at filtering here was REMOVED rather than

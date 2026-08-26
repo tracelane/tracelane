@@ -216,7 +216,7 @@ explicit, per-deployment opt-in.
 
 The open-source Tracelane gateway (Apache-2.0, in this repository) ships reference
 detectors for a subset of these entries under `crates/gateway/src/predictive/`, and
-its pain-point eval suite under `evals/pain-points/` exercises them. Coverage is a
+its conformance eval suites under `evals/` exercise them. Coverage is a
 subset of the taxonomy and is expanding — this document is the standard; the gateway
 is one implementation of it. The observe-first model above is the gateway default:
 detectors record and flag; enforcement is opt-in.

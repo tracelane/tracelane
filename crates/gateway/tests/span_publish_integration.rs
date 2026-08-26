@@ -1,3 +1,4 @@
+//!  regression: a published gateway span MUST land on the
 //! `TRACELANE_SPANS` JetStream stream.
 //!
 //! The write path silently died in prod when `NATS_URL` was absent from the

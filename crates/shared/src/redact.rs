@@ -15,7 +15,7 @@
 //!   - `tlane_<20+ base62>` (Tracelane's own API key) → `tlane_[REDACTED]`
 //!   - `AKIA<16 uppercase alnum>` (AWS access key ID) → `AKIA[REDACTED]`
 //!
-//! Added in Phase 1 security remediation (reviewer R2 C-3):
+//! Added in Phase 1 security remediation (reviewer):
 //!   - `AIza<35 alnum-or-underscore-or-hyphen>` (Google API key) → `AIza[REDACTED]`
 //!   - `sk_live_<24+ alnum>` / `sk_test_<24+>` / `rk_live_<24+>` /
 //!     `whsec_<24+>` (Stripe live / restricted / webhook secrets) → `[REDACTED]`
@@ -28,6 +28,7 @@
 //!   - AWS secret access key: 40-char base64 following
 //!     `aws_secret_access_key`, `secret_access_key`, or `X-Amz-Signature`
 //!
+//! Added 2026-07-17 — Google now issues a SECOND key format that the
 //! `AIza` rule above silently misses. Two complementary rules cover it:
 //!   - `?key=<value>` / `&key=<value>` (credential in a URL query string) →
 //!     `key=[REDACTED]`. The Google adapter passes the API key this way
@@ -151,6 +152,7 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
             }
         }
 
+        // ── 6d. `xai-<20+ chars>` (xAI / Grok BYOK secret key).: BYOK
         // formats beyond `sk-`/`AIza` must redact too, since an upstream
         // provider-error body can echo the tenant's own key.
         if try_match_prefix(input, i, b"xai-") {
@@ -168,6 +170,7 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
         // keys are `gsk_` + ~52 base62 chars. NOTE: Mistral keys are a prefixless
         // 32-char token and CANNOT be pattern-redacted without unacceptable false
         // positives — they are protected by SecretString + never-logged +
+        // provider-error body allowlisting, not by this layer.
         if try_match_prefix(input, i, b"gsk_") {
             let val_start = i + 4;
             let end = skip_token(input, val_start);
@@ -203,7 +206,7 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
         }
 
         // ── 8. `AIza<35 alnum>` (Google API key — 39 chars total).
-        // Reviewer R2 C-3: previously a Google key in a provider error
+        // Reviewer: previously a Google key in a provider error
         // body landed in logs verbatim.
         if try_match_prefix(input, i, b"AIza") {
             let val_start = i + 4;
@@ -313,6 +316,7 @@ pub fn scrub(input: &[u8]) -> Vec<u8> {
         // `…:streamGenerateContent?alt=sse&key=<API_KEY>` (`google.rs:74`), and a
         // transport error's `Display` can drag that whole URL into a log line.
         //
+        // This matches the PARAMETER, never the value shape, and that is
         // the point. Block 8 keys off the literal `AIza` prefix of the classic
         // 39-char Google key; Google now issues keys with a different prefix and
         // length, which block 8 silently misses — verified against a real key
@@ -646,7 +650,7 @@ mod tests {
         assert!(out.contains("[REDACTED]"), "got: {out}");
     }
 
-    // ---- Phase 1 redaction-breadth additions (reviewer R2 C-3) ----
+    // Phase 1 redaction-breadth additions (reviewer) --
 
     #[test]
     fn scrubs_google_ai_key() {
@@ -669,6 +673,9 @@ mod tests {
         );
     }
 
+    // modern Google key format + the `?key=` URL vector --
+
+    /// The regression that motivated: Google issues keys that the `AIza`
     /// matcher does not recognise (verified 2026-07-17 against a real key —
     /// longer than the classic 39 chars, different prefix, contains a dot).
     /// Block 8 cannot see it; block 12 must, because the adapter puts the key
@@ -930,6 +937,7 @@ mod tests {
 
     #[test]
     fn scrubs_xai_byok_key() {
+        // XAI/Grok BYOK key format — an upstream 401 body can echo it.
         // Clearly-fake value per rules/testing.md.
         let input = "Incorrect API key: xai-FAKEtestkeyDONOTUSE0123456789abcdef rejected";
         let out = scrub_str(input);

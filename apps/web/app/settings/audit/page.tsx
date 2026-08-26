@@ -69,16 +69,16 @@ export default async function AuditKeyPage() {
 							</div>
 							<CopyButton value={ed} label="Copy key" />
 						</div>
-						<code className="mt-1 block break-all font-mono text-[12px] text-ink">
+						<code className="mt-1 block break-all font-mono text-xs text-ink">
 							{ed}
 						</code>
-						<div className="mt-1 font-mono text-[11px] text-ink-2">
+						<div className="mt-1 font-mono text-2xs text-ink-2">
 							SHA-256 fingerprint: {fingerprint(ed)}
 						</div>
 					</div>
 
 					{/* Non-cryptographer how-to — the trust channel in three steps. */}
-					<div className="rounded-lg border border-line bg-surface-2/30 p-3 text-[13px] text-ink-2">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 text-sm text-ink-2">
 						<div className="mb-1.5 font-medium text-ink">
 							Give this to your auditor
 						</div>
@@ -97,7 +97,7 @@ export default async function AuditKeyPage() {
 								on the exported ledger — no Tracelane account needed.
 							</li>
 						</ol>
-						<p className="mt-2 text-[12px] text-ink-3">
+						<p className="mt-2 text-xs text-ink-3">
 							<strong className="text-ink-2">Why out-of-band matters:</strong> a
 							key fetched from us proves nothing — we could serve a forged one.
 							A valid signature only means &ldquo;signed by the key you
@@ -121,7 +121,7 @@ export default async function AuditKeyPage() {
 					    something no amount of traffic produces. Their batches ARE signed —
 					    with the operator key — which is why this no longer says "no key" as
 					    though nothing were happening. */}
-					<p className="mt-1 text-[13px] text-ink-2">
+					<p className="mt-1 text-sm text-ink-2">
 						Your batches are signed with Tracelane&apos;s operator key, so the
 						ledger is tamper-evident — but a third party cannot verify it
 						without trusting us. A per-workspace signing key, which is what
@@ -141,7 +141,7 @@ export default async function AuditKeyPage() {
 					<h3 className="text-sm font-semibold text-ink">
 						How to verify your audit chain
 					</h3>
-					<p className="mt-1 text-[13px] leading-relaxed text-ink-2">
+					<p className="mt-1 text-sm leading-relaxed text-ink-2">
 						Your workspace keeps one <strong>tamper-evident</strong> audit chain
 						— a hash-linked, signed ledger of your audit events,{" "}
 						<strong>per workspace</strong> (not per trace). Here is how to check
@@ -149,9 +149,9 @@ export default async function AuditKeyPage() {
 					</p>
 				</div>
 
-				<ol className="space-y-3 text-[13px] text-ink-2">
+				<ol className="space-y-3 text-sm text-ink-2">
 					<li className="flex gap-3">
-						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-seal-soft font-mono text-[11px] font-semibold text-seal-ink">
+						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-seal-soft font-mono text-2xs font-semibold text-seal-ink">
 							1
 						</span>
 						<span>
@@ -172,7 +172,7 @@ export default async function AuditKeyPage() {
 						</span>
 					</li>
 					<li className="flex gap-3">
-						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-seal-soft font-mono text-[11px] font-semibold text-seal-ink">
+						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-seal-soft font-mono text-2xs font-semibold text-seal-ink">
 							2
 						</span>
 						<span>
@@ -180,7 +180,7 @@ export default async function AuditKeyPage() {
 								Re-verify offline yourself — free.
 							</span>{" "}
 							The same bytes drive the open-source CLI. Run{" "}
-							<code className="rounded bg-surface-2 px-1 py-0.5 font-mono text-[12px] text-ink">
+							<code className="rounded bg-surface-2 px-1 py-0.5 font-mono text-xs text-ink">
 								tlane verify ./audit.ndjson --tenant-pubkey &lt;key above&gt;
 							</code>{" "}
 							(add <code className="font-mono text-ink">--offline</code> to skip
@@ -190,7 +190,7 @@ export default async function AuditKeyPage() {
 						</span>
 					</li>
 					<li className="flex gap-3">
-						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-action-soft font-mono text-[11px] font-semibold text-action-ink">
+						<span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-action-soft font-mono text-2xs font-semibold text-action-ink">
 							3
 						</span>
 						<span>
@@ -206,7 +206,7 @@ export default async function AuditKeyPage() {
 					</li>
 				</ol>
 
-				<div className="rounded-lg border border-line bg-surface-2/40 p-3 text-[12.5px] leading-relaxed text-ink-2">
+				<div className="rounded-lg border border-line bg-surface-2 p-3 text-xs leading-relaxed text-ink-2">
 					<span className="font-medium text-ink">Worked example.</span> A
 					customer disputes a run from last month. Open the Audit page, narrow
 					to that window, and confirm the chain is green (signatures valid,
@@ -219,7 +219,7 @@ export default async function AuditKeyPage() {
 
 				<Link
 					href="/audit"
-					className="inline-flex text-[13px] font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="inline-flex text-sm font-medium text-action-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				>
 					Open the Audit page to verify now →
 				</Link>

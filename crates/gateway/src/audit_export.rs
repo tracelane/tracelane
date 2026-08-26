@@ -10,12 +10,14 @@
 //! `tlane verify` over the downloaded NDJSON to prove their own audit
 //! chain is intact.
 //!
+//! ## Wire format `v2.1` — authoritative-once (ADR-050)
 //!
 //! `payload` is emitted as the **verbatim stored canonical JSON string**
 //! (the exact `row_hash` preimage the writer hashed at append time —
 //! `audit.rs` stores `canonical_payload(...)` in the `payload` column,
 //! `audit_format::row_hash_v2` hashes that same string). We do **not**
 //! re-parse it into a JSON object here: re-deriving the canonical form on
+//! the read path is exactly the numeric-canonicalization parity bug
 //! (JS `JSON.parse`/`stringify` is lossy — `1.0→1`, `>2^53` loses
 //! precision, `1e2→100`, `0.50→0.5`). Every verifier now SHA-256s the
 //! stored bytes directly; parity is true by construction.
@@ -29,6 +31,7 @@
 //! Tenant id NEVER from request body or query — only from a verified
 //! claim (CLAUDE.md invariant).
 //!
+//! ## Entitlement gate (/ ADR-009 / ADR-025)
 //!
 //! The tamper-evident export is a **paid** capability — the $999/mo Audit
 //! SKU (`FeatureKey::AuditAddon`). After the tenant is resolved from the
@@ -280,12 +283,14 @@ impl ClickHouseExportReader {
     }
 }
 
+// SERIALIZATION-INTEGRITY INVARIANT (class): this reader deserializes via
 // `clickhouse::Row` (RowBinary), so `seq` / the batch seqs come back as REAL u64
 // integers and serde emits them to the verifier NDJSON as JSON NUMBERS. A
 // ClickHouse `FORMAT JSONEachRow` read instead quotes UInt64 as STRINGS by
 // default, and the verifier's `seq + 1` then does string concatenation ("0"+1 →
 // "01") → a false `seq_out_of_order` RED (and, if a hash encoding ever changed,
 // potentially a false GREEN — the same "serialization lies about integrity"
+// class as). DO NOT switch this read to a JSON format; if you ever must,
 // pin `SETTINGS output_format_json_quote_64bit_integers = 0` explicitly.
 #[derive(Debug, Deserialize, clickhouse::Row)]
 struct AuditLogRow {
@@ -375,6 +380,7 @@ impl AuditExportReader for ClickHouseExportReader {
             // ADR-050 (v2.1): the `payload` column IS the verbatim canonical
             // JSON string the writer hashed (`row_hash` preimage). Emit it
             // AS-IS — do NOT re-parse into a Value and re-serialize. Re-deriving
+            // the canonical form on the read path is the parity bug.
             // Every v2 row ever written stored this canonical form, so stamping
             // `v2.1` on all rows is correct — no pre-ADR-050 row is misrepresented.
             out.push(ExportRow {
@@ -796,6 +802,7 @@ fn micros_to_iso8601(micros: i64) -> String {
 #[derive(Clone)]
 pub struct ExportState {
     pub reader: Arc<dyn AuditExportReader>,
+    /// Entitlement cache for the Audit-SKU gate (/ ADR-009). `None`
     /// only when Postgres is unset (no entitlement source), in which case
     /// the gate FAILS CLOSED — we won't serve the paid export we can't
     /// verify. In production the cache is always present alongside the
@@ -938,6 +945,7 @@ async fn handler(
         );
     }
 
+    // 2. Audit-SKU entitlement gate (/ ADR-009 / ADR-025). The tenant is
     //    already resolved from the validated claim (the org_id→tenant seam is in
     //    `auth`), so the entitlement query only ever sees the internal tenant
     //    UUID — never a raw org_id. This runs BEFORE any ClickHouse read, so an
@@ -1096,6 +1104,7 @@ pub(crate) fn error_response(status: StatusCode, msg: &str) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+/// Typed `403` for the Audit-SKU paywall. Mirrors the hard-cap `429`
 /// error schema (`server.rs::notify_quota_exceeded`): a machine-readable `error`
 /// code + human `message` + an `upgrade_url` pointer — never an opaque error.
 /// `serde_json` handles escaping (no `format!` string injection).
@@ -1352,9 +1361,12 @@ mod tests {
         assert_eq!(empty["total"], 0);
     }
 
+    // v2.1 authoritative-once round-trip (ADR-050 /) --------
+
     /// The gateway WRITER's canonicalization must produce byte-for-byte the
     /// exact preimage the three reference verifiers (and the shared
     /// `evals/audit-ledger/boundary-numbers.v2_1.ndjson` vector) expect. If
+    /// this drifts, the ledger would fail its own verification — the
     /// class. Pins the canonical bytes, genesis seed, and row_hash over the
     /// JS-unsafe number class (`1.0`, `>2^53`, `1e2`, `0.50`).
     #[test]
@@ -1398,6 +1410,7 @@ mod tests {
     /// End-state proof (offline #2b, real writer + real exporter code): the
     /// exported `payload` is the stored canonical string VERBATIM, it re-hashes
     /// to the stored `row_hash` (so the chain verifies), and a one-digit tamper
+    /// breaks it. Uses the JS-unsafe number class that broke.
     #[test]
     fn v2_1_exported_payload_is_the_verbatim_row_hash_preimage() {
         use crate::audit_format;
@@ -1568,6 +1581,7 @@ mod tests {
         );
     }
 
+    // Audit-SKU entitlement gate ------------------------------
     //
     // Drives the REAL handler (auth → entitlement gate → response) via the
     // `tlane_` dev-stub auth path (debug-only: active when there is no global
@@ -1672,6 +1686,7 @@ mod tests {
             (status, String::from_utf8_lossy(&bytes).into_owned())
         }
 
+        // The "curl the paywall" attack: an authenticated tlane_ key
         // WITHOUT the Audit SKU must get 403 + ZERO ledger bytes, not the export.
         #[test]
         fn tlane_key_without_audit_entitlement_gets_403_and_zero_ledger_bytes() {

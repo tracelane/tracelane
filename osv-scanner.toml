@@ -7,13 +7,25 @@
 # jsonwebtoken GHSA-h395-gr6q-cpjc — was FIXED by bumping to 10.4.0,
 # not ignored. npm moderates are below the pnpm-audit --audit-level=high gate
 # and tracked internally.
+#
+# ── ON `# REVIEW:` DATES — READ BEFORE TRUSTING ONE ─────────────────────────
+# Every remaining entry carries the SAME bulk-stamped `# REVIEW: 2026-11-07`.
+# An identical date on every row carries NO PER-ENTRY INFORMATION: it records
+# when someone stamped the file, not when anyone re-read THIS justification.
+# That is the same defect as a file-level "last verified" stamp standing in for
+# a row-level re-read. Two entries were found on 2026-08-24 whose REASON had
+# gone false while the entry still fired and therefore still looked healthy
+# (@hono/node-server — fixed on our own 1.x line all along, now bumped and the
+# ignore deleted; and vitest — right conclusion, wrong version arithmetic, text
+# corrected below). AN IGNORE WHOSE REASON HAS GONE FALSE IS WORSE THAN AN
+# UNUSED ONE: it is a decision nobody will re-open. No guard checks this; it is
+# a human re-read, and the date above will not tell you when one last happened.
+#
+# 19 dead ignores were deleted 2026-08-24 (osv-scanner 2.4.0 reported each as
+# unused): 4 whose package is gone, 10 bumped past the fix, 4 alias-redundant
+# with the GHSA half already listed, and @hono/node-server once bumped.
 
-# bincode: bincode 1.x unmaintained, transitive; 2.0 is a transitive-incompatible major bump. Mirrors .cargo/audit.toml.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0141"
-reason = "bincode 1.x unmaintained, transitive; 2.0 is a transitive-incompatible major bump. Mirrors .cargo/audit.toml."
-
+# new advisories surfaced 2026-07-06; all dev-tooling or transitive-below-concern -
 # vite: dev/test tooling (vitest), never shipped in any product artifact; tied to the vitest-major migration.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
@@ -28,84 +40,17 @@ reason = "vite dev/test tooling (vitest), not shipped in any product artifact; t
 [[IgnoredVulns]]
 id = "GHSA-g7r4-m6w7-qqqr"
 reason = "esbuild build-time bundler (vitest/tsup), never shipped; dev tooling only. Same class as GHSA-67mh."
-# @babel/core: dev/build-time transform tooling; below the pnpm-audit high gate.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-4x5r-pxfx-6jf8"
-reason = "@babel/core dev/build-time tooling; below the pnpm-audit high gate; tracked internally."
-# @opentelemetry/core: transitive OTel JS moderate; below the pnpm-audit high gate.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-8988-4f7v-96qf"
-reason = "@opentelemetry/core transitive moderate; below the pnpm-audit high gate; tracked internally."
 # opentelemetry_sdk (Rust 0.27.1): transitive OTel Rust SDK moderate; not a reachable RCE. Tracked with the OTel-Rust bump.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-w9wp-h8wv-79jx"
 reason = "opentelemetry_sdk 0.27.x transitive moderate (OTel Rust SDK); not a reachable RCE; tracked with the OTel-Rust upgrade."
-# cmov (Rust 0.5.3): transitive constant-time helper; moderate, no reachable exploit in our use. Tracked internally.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-3rjw-m598-pq24"
-reason = "cmov 0.5.x transitive constant-time helper; moderate, not reachable in our use; tracked internally."
 
 # esbuild: build-time bundler (vitest/tsup), never shipped; dev tooling only.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-67mh-4wv8-2f99"
 reason = "build-time bundler (vitest/tsup), never shipped; dev tooling only."
-
-# hono: moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-hm8q-7f3q-5f36"
-reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-p77w-8qqv-26rm"
-reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-qp7p-654g-cw7p"
-reason = "moderate; apps/mcp HTTP framework — below the pnpm-audit high gate. Bump hono 4.x in a future npm sweep."
-
-# ip-address: transitive moderate, below the pnpm-audit high gate; tracked internally.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-v2v4-37r5-5v8g"
-reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
-
-# openssl: build-dependency only of ort-sys's ONNX downloader (ureq->native-tls->openssl); absent from the product runtime tree (the no-openssl gate confirms).
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-phqj-4mhp-q6mq"
-reason = "build-dependency only of ort-sys's ONNX downloader (ureq->native-tls->openssl); absent from the product runtime tree (the no-openssl gate confirms)."
-
-# paste: unmaintained proc-macro, transitive, no fix; mirrors .cargo/audit.toml.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0436"
-reason = "unmaintained proc-macro, transitive, no fix; mirrors .cargo/audit.toml."
-
-# postcss: transitive moderate, below the pnpm-audit high gate; tracked internally.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-qx2v-qp2m-jg93"
-reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
-
-# protobufjs: transitive moderate, below the pnpm-audit high gate; tracked internally.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-jggg-4jg4-v7c6"
-reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
-
-# qs: transitive moderate, below the pnpm-audit high gate; tracked internally.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-q8mj-m7cp-5q26"
-reason = "transitive moderate, below the pnpm-audit high gate; tracked internally."
 
 # rustls-pemfile: informational/deprecated, transitive; mirrors .cargo/audit.toml.
 # REVIEW: 2026-11-07
@@ -134,26 +79,6 @@ reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, C
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
 
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0049"
-reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0098"
-reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0099"
-reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0104"
-reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
-
 # vite: dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migration. Tracked in .
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
@@ -164,38 +89,49 @@ reason = "dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migrat
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-5xrq-8626-4rwp"
-reason = "file-read only when `vitest --ui` is running — we never run the UI (only `vitest run`). Patch is vitest 4.1.0 (major). Tracked in ."
+reason = "vitest UI server arbitrary file read/exec. REASON CORRECTED 2026-08-24: the previous text said 'patch is vitest 4.1.0 (major)'. OSV's real ranges are [0, 3.2.6) and [4.0.0, 4.1.0); we resolve vitest 2.1.9 (declared ^2.0.0 in 6 packages), so we sit in the FIRST range and the first fixed version on our line is 3.2.6 - still a MAJOR bump (2.x -> 3.x), not the 4.x one claimed. Conclusion unchanged, arithmetic was wrong. Precondition not met either: the advisory requires the vitest UI server to be LISTENING; every invocation here is `vitest run` (no --ui), and it is dev/test tooling never shipped in a product artifact. FOUNDER RULING R126 (2026-08-24): NO BUMP — a 2->3 major across six packages for a dev-only test runner whose exploit precondition we never meet. This ignore is DELIBERATE and its reason is now the true one; if it goes false again, delete or correct it rather than leaving it, because an ignore whose stated reason is false is worse than an unused one."
 
-# major. Bump alongside the MCP SDK refresh (2026-07-23 local-scan triage).
+# ── astro 6.4.8, surfaced by the weekly on-node scan (R118 alert, 2026-08-24) ──
+#
+# THREE ADVISORIES, ALL SSR-ONLY, AND WE SHIP A PURELY STATIC SITE. Each one was
+# READ at osv.dev rather than taken from a note, and each says in its own text
+# that a static build is unaffected:
+#
+#   GHSA-4g3v-8h47-v7g6 (5.3) — reflected XSS via unescaped View Transition
+#     animation properties in server-generated CSS
+#     (`runtime/server/transition.ts`). Advisory scopes it to `output: "server"`
+#     and `prerender = false` routes.
+#   GHSA-f48w-9m4c-m7f5 (5.1) — unescaped attribute NAMES in `renderHTMLElement()`
+#     (`runtime/server/render/dom.ts`). Needs an SSR runtime that exposes a global
+#     `HTMLElement` (Deno/Bun/jsdom); in default Node SSR the branch is dead.
+#   GHSA-7pw4-f3q4-r2p2 (2.1) — reflected XSS through `transition:persist` /
+#     `transition:scope` values copied unescaped into server-rendered output by
+#     `generateHydrateScript()`.
+#
+# THE CONDITION THAT MAKES THESE UNREACHABLE, stated so it can be RE-CHECKED
+# rather than believed: `apps/site/astro.config.mjs` declares NO adapter and no
+# `output: "server"`, so Astro defaults to `output: "static"`; `apps/site/dist/`
+# contains no server entry. There is no SSR runtime to reach any of the three
+# code paths.
+#
+# ⚠️  DELETE THESE THREE THE DAY `apps/site` GAINS AN ADAPTER OR `output:
+# "server"`. That single change makes all three live, and this ignore would then
+# be an ignore whose reason has gone false — which this file's own header calls
+# worse than an unused one.
+#
+# The real fix is astro 6 -> 7 (a major). Not taken for a static marketing site
+# against three Medium/Low advisories that cannot execute.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
-id = "GHSA-frvp-7c67-39w9"
-reason = "moderate; apps/mcp @hono/node-server — patched only in the 2.x major; bump with the MCP SDK refresh. Below the pnpm-audit high gate."
+id = "GHSA-4g3v-8h47-v7g6"
+reason = "astro View-Transition CSS XSS. SSR-ONLY: the advisory scopes it to `output: \"server\"` / `prerender = false`. `apps/site` has NO adapter and no `output: \"server\"` (astro.config.mjs), so it builds static and `dist/` has no server entry — the code path cannot run. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.1.0 (major)."
 
-# brace-expansion: the ONLY residual after the 2026-07-30 bump pass. Three of the
-# four advisories that reddened the public scan were fixed by raising versions, not
-# ignored: postcss 8.4.31+8.5.12 -> 8.5.25 (GHSA-6g55-p6wh-862q, GHSA-r28c-9q8g-f849),
-# valibot 1.4.0 -> 1.4.2 (GHSA-5qjj-4xww-7phc), brace-expansion 5.0.7 -> 5.0.9.
-#
-# The 2.x copy CANNOT be raised past 2.x: brace-expansion 5.x replaced the callable
-# default export (`module.exports = expandTop`) with a named one (`exports.expand`),
-# and minimatch@8.0.7 consumes it as a default — forcing >=5 there throws
-# "TypeError: (0 , brace_expansion_1.default) is not a function" at build time
-# (falsification-tested 2026-07-30 against the real packages).
-#
-# 2.1.4 DOES carry the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH = 4_000_000;
-# a PoC that fatally OOMs 2.1.2 under --max-old-space-size=256 returns bounded on
-# 2.1.4). The GHSA range is a flat `<= 5.0.7`, i.e. NOT branch-aware, so it keeps
-# matching every 1.x/2.x/3.x maintenance release regardless of the fix.
-#
-# Safe to ignore by id because the OTHER copy cannot regress into it: the pnpm
-# override `brace-expansion@>=3: ">=5.0.8"` is a hard floor, so the >=3 line can
-# never resolve below the real fix while this ignore is in place. Chain is
-# build-only (apps/web devDep -> @opennextjs/cloudflare -> @opennextjs/aws ->
-# @node-minify/core@8.0.6 -> glob@9.3.5 -> minimatch@8.0.7); never in a shipped
-# artifact. Removable once @opennextjs/aws moves to @node-minify/core >=10, which
-# drops glob entirely.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
-id = "GHSA-mh99-v99m-4gvg"
-reason = "brace-expansion 2.1.4 (build-only, via @opennextjs/aws -> @node-minify/core@8 -> glob@9 -> minimatch@8) carries the backported CVE-2026-14257 fix; the GHSA range <=5.0.7 is not branch-aware so it still matches. Cannot raise to 5.x: minimatch@8 needs the callable default export 5.x dropped. The >=3 copy is floored at >=5.0.8 by pnpm override, so this ignore masks no unfixed instance."
+id = "GHSA-f48w-9m4c-m7f5"
+reason = "astro `renderHTMLElement()` unescaped attribute names. SSR-ONLY, and doubly unreachable: it needs an SSR runtime exposing a global `HTMLElement` (Deno/Bun/jsdom) — in default Node SSR the branch is dead — plus a component extending native HTMLElement with attacker-controlled spread keys. `apps/site` is a static build with no adapter, so there is no SSR runtime at all. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.0.6 (major)."
+
+# REVIEW: 2026-11-07
+[[IgnoredVulns]]
+id = "GHSA-7pw4-f3q4-r2p2"
+reason = "astro transition-directive reflected XSS via `generateHydrateScript()`. SSR-ONLY — the advisory states static sites do not execute the vulnerable function — and it additionally requires the developer to pass request-derived input straight into a transition directive, which apps/site does not do. `apps/site` is a static build with no adapter. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.0.4 (major)."

@@ -10,6 +10,7 @@
 # build/dev artifact trees from the scan. Cargo and npm dependency CVEs are
 # still covered by cargo-audit / cargo-deny / pnpm-audit / OSV-Scanner.
 #
+# ⚠️ SCHEMA NOTE (fixed 2026-07-06): each ignore rule below is a
 # PACKAGE-ONLY matcher — do NOT add `vulnerability: "*"`. Grype treats the
 # `vulnerability` field as a LITERAL vuln-id comparison, so `"*"` matches a vuln
 # *named* "*" (i.e. nothing), silently disabling the rule (grype loads the
@@ -58,6 +59,7 @@ ignore:
       name: brace-expansion
   # ── ADDED 2026-08-09 (founder-ruled). These three were ALREADY accepted in
   # osv-scanner.toml and were MISSING here, so Grype re-flagged advisories OSV had
+  # passed. Two suppression lists for one decision, drifted — same class as
   # (BYOK routable-vs-storable) and the 6-way alert-metric list.
 
   # opentelemetry_sdk 0.27.1 — SUPPRESSED, not fixed.

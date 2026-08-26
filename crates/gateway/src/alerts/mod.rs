@@ -538,6 +538,7 @@ mod tests {
         assert_eq!(METRICS.len(), 6);
         assert!(METRICS.contains(&"cost_usd"));
         assert!(METRICS.contains(&"quota_pct"));
+        //  prevention: gateway-overhead is a budgetable metric.
         assert!(METRICS.contains(&"overhead_p99"));
     }
 

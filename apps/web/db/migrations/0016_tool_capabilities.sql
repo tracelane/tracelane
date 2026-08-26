@@ -1,8 +1,11 @@
+-- Migration 0016 — per-workspace tool-capability registry.
 -- Prod-Neon twin of infra/dev/postgres/migrations/13_tool_capabilities.sql.
 --
 -- WHY THIS EXISTS AS A NEW MIGRATION
 -- The table was created only in the RETIRED `infra/dev/postgres/migrations/`
+-- set, which prod does not apply — D2 was re-scoped to "migrate the
 -- non-Drizzle SQL into Drizzle FIRST, THEN delete infra", and this file is that
+-- migration for `13_tool_capabilities.sql`. Consequence on prod: the
 -- table never existed anywhere, so `guardrail::registry_loader` errored on EVERY
 -- cache-miss and fell back to PERMISSIVE while logging `db error` — implying a
 -- store outage when the relation was simply absent.
@@ -20,6 +23,7 @@
 -- permissive-because-unconfigured instead of permissive-because-the-query-failed,
 -- and the loader stops erroring on the hot path. It also makes R3Pinning
 -- *possible* — the loader can pin a `def_hash` once a row exists, which is the
+-- outstanding proof fenced in.md.
 
 CREATE TABLE IF NOT EXISTS tool_capabilities (
     tenant_id   UUID        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,

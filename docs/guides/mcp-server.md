@@ -52,7 +52,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "command": "npx",
       "args": ["@tracelanedev/mcp"],
       "env": {
-        "TRACELANE_API_KEY": "tlk-your-key-here",
+        "TRACELANE_API_KEY": "tlane_your-key-here",
         "TRACELANE_GATEWAY_URL": "https://api.tracelane.dev"
       }
     }
@@ -137,7 +137,7 @@ is validated against a JWT claim — never accepted from request body.
 If running Tracelane self-hosted, set `TRACELANE_GATEWAY_URL` to your gateway URL:
 
 ```bash
-TRACELANE_API_KEY=tlk-your-key \
+TRACELANE_API_KEY=tlane_your-key \
 TRACELANE_GATEWAY_URL=http://localhost:8080 \
 node apps/mcp/dist/index.js        # `npx @tracelanedev/mcp` once published
 ```

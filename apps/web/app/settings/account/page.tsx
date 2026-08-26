@@ -15,6 +15,7 @@ export const dynamic = "force-dynamic";
 /**
  * Seed the display name from WorkOS — the system of record (spec principle #1)
  * — NOT the `users` mirror, which is a best-effort cache that isn't reliably
+ * populated. Falls back to empty on any error; never blank-crashes.
  */
 async function currentDisplayName(workosUserId: string): Promise<string> {
 	const key = process.env.WORKOS_API_KEY;

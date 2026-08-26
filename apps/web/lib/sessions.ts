@@ -8,6 +8,7 @@
  * that JWT's `org_id` → internal tenant UUID (ADR-042) and binds it into
  * `WHERE tenant_id = ?`, so a user only ever sees their own tenant's sessions.
  *
+ *  posture: the dashboard NEVER binds a tenant id itself; the JWT is the
  * only tenant signal. `GATEWAY_BEARER_TOKEN` is never read here.
  */
 

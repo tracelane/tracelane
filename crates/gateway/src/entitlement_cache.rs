@@ -1,3 +1,4 @@
+//! In-process entitlement-resolution cache (ADR-035, TRD §23.1).
 //!
 //! Resolving `entitlements::check(tenant, F_*)` against Neon on every request
 //! is ~5K round-trips/sec at the gateway target — a 5–15ms hop that blows the
@@ -8,6 +9,7 @@
 //!
 //! ## Resolution
 //!
+//! `deny-overrides-grant` is computed in Postgres at refresh time:
 //! a tenant's `workspace_entitlements` non-NULL columns overlay the
 //! `plan_entitlements` plan defaults; a `FALSE` override beats a `TRUE` default.
 //! The cache holds the resolved booleans only. We resolve **all** feature flags
@@ -49,6 +51,7 @@ use uuid::Uuid;
 
 /// Cache TTL — **the invalidation bound**, not a backstop behind `NOTIFY`.
 ///
+///  (2026-08-12) corrected this. It read: *"the missed-NOTIFY backstop, NOT
 /// the primary invalidation … LISTEN invalidates immediately … so the TTL only
 /// bounds staleness in the rare case LISTEN drops."* On prod the drop was not
 /// rare — **110 drops in 21.07 h, one per 11.5 min** — because the Neon compute
@@ -118,6 +121,7 @@ pub enum FeatureKey {
     AuditSelfVerify,
     /// B1 Prompt-Promotion WRITE workflow (promote / rollback / observe) —
     /// ADR-009 gates it to Team+ (Builder is read-only). Enforced by
+    /// `prompt_routes`.
     PromptPromotionWrite,
     // Inline guardrails V1 (the guardrail spec §2.7) — the GATED rails. The
     // free defaults (R1, R3 schema-val, R8 heuristic) are NOT here; they are
@@ -130,6 +134,23 @@ pub enum FeatureKey {
     GuardrailR7,
     /// ADR-059 user-facing alerting (a tenant's alert rules → their webhook).
     Alerts,
+    // ── Sprint 3, the eval loop (EVL-04/02/28/29). ──────────────────────────
+    //
+    // Four flags rather than one, because they gate four independently sellable
+    // surfaces and a single `f_evals` would force the cheapest of them onto the
+    // tier of the most expensive. `Datasets` is Builder+ (it is table-stakes
+    // parity and gating it at Team loses the comparison before it starts); the
+    // other three are Team+, mirroring `PromptPromotionWrite`, because each one
+    // spends the tenant's provider money.
+    //
+    // ORDER MATTERS AND IT IS NOT PARALLEL (CLAUDE.md §4.0): the column lands in
+    // Neon FIRST (`apps/web/db/migrations/0030_evl04_dataset_entitlements.sql`),
+    // and only then does a gateway that reads it deploy. Reversing that reads a
+    // column that does not exist yet and 500s the whole entitlement resolve.
+    Datasets,
+    Experiments,
+    OnlineEvals,
+    AnnotationQueues,
 }
 
 impl FeatureKey {
@@ -154,6 +175,10 @@ impl FeatureKey {
             Self::GuardrailR6 => "f_guardrail_r6",
             Self::GuardrailR7 => "f_guardrail_r7",
             Self::Alerts => "f_alerts",
+            Self::Datasets => "f_datasets",
+            Self::Experiments => "f_experiments",
+            Self::OnlineEvals => "f_online_evals",
+            Self::AnnotationQueues => "f_annotation_queues",
         }
     }
 }
@@ -174,6 +199,7 @@ pub struct ResolvedEntitlements {
     pub f_audit_addon: bool,
     /// Free-tier audit self-verify (ADR-066). Default-TRUE on every plan.
     pub f_audit_selfverify: bool,
+    /// B1 Prompt-Promotion write workflow (ADR-009 Team+;).
     pub f_prompt_promotion_write: bool,
     // Inline guardrails V1 (§2.7) — gated rails (RailGate maps these to grants).
     pub f_guardrail_r2: bool,
@@ -190,11 +216,31 @@ pub struct ResolvedEntitlements {
     pub f_full_capture: bool,
     /// ADR-059 user-facing alerting entitlement (dark by default on every plan).
     pub f_alerts: bool,
+    // Sprint 3 (EVL-04/02/28/29). Four flags, four surfaces — see FeatureKey.
+    pub f_datasets: bool,
+    pub f_experiments: bool,
+    pub f_online_evals: bool,
+    pub f_annotation_queues: bool,
+    /// Monthly included trace quota (deny-overrides-grant from
     /// `workspace_entitlements` ⊕ `plan_entitlements`). The gateway hard-cap 429
     /// threshold = `trace_quota_monthly` × `overage_hard_cap_multiplier`.
     pub trace_quota_monthly: i64,
+    /// Hard-cap multiplier as integer tenths (5.0× → 50, 1.0× → 10) so the
     /// hot-path decision stays integer-only and this struct keeps deriving `Eq`.
     pub overage_hard_cap_multiplier_tenths: i32,
+    /// GWY-43: the workspace-wide monthly USD spend ceiling (`tenants
+    /// .budget_usd_monthly`), in integer **micro-USD**. `0` = uncapped.
+    ///
+    /// Micro-USD rather than `Option<f64>` for one concrete reason: this struct
+    /// derives `Eq`, which the cache uses to decide whether a refresh actually
+    /// changed anything, and `f64` is not `Eq`. It also matches the unit
+    /// `crate::spend` counts in, so no conversion happens on the hot path.
+    ///
+    /// This rides the entitlement cache rather than getting its own PG read
+    /// because that cache is already the sanctioned per-tenant config path —
+    /// 15-minute TTL with `LISTEN/NOTIFY` invalidation, never per request
+    /// (`CLAUDE.md` §2, gw ↔ PG).
+    pub workspace_budget_micro_usd: u64,
 }
 
 impl ResolvedEntitlements {
@@ -225,13 +271,21 @@ impl ResolvedEntitlements {
             retention_days: 7,
             f_full_capture: false,
             f_alerts: false,
+            // fail-CLOSED: no control plane => free tier, never paid.
+            f_datasets: false,
+            f_experiments: false,
+            f_online_evals: false,
+            f_annotation_queues: false,
+            // Free-plan quota defaults (10K traces, 1.0× hard cap = 429
             // exactly at the included quota) — fail-restricted, mirrors
             // plan_entitlements.free_v1.
             trace_quota_monthly: 10_000,
             overage_hard_cap_multiplier_tenths: 10,
+            workspace_budget_micro_usd: 0,
         }
     }
 
+    /// The ONE sanctioned no-cache grant: the benchmark context (B-187d).
     ///
     /// Resolved at the ENTITLEMENT LAYER — the single site every per-tenant
     /// check reads from — instead of N bypasses at N enforcement points. Four
@@ -256,6 +310,7 @@ impl ResolvedEntitlements {
     /// TEST ONLY — a cache granting the four PAID rails (R2 PII, R5 format,
     /// R6 sysprompt-leak, R7 topic).
     ///
+    /// Before the no-cache inversion was fixed, a `None` entitlement
     /// cache granted every rail, so tests exercising a PAID rail could pass
     /// `None` and still get it. That is exactly the bug. Tests that assert paid
     /// behaviour must now GRANT it explicitly — which also means each such test
@@ -293,6 +348,7 @@ impl ResolvedEntitlements {
             f_audit_selfverify: true,
             f_prompt_promotion_write: false,
             // Rails ON: the benchmark must measure the guardrail work a real
+            // request pays for. This is also what the pre-B-187d no-cache
             // RailGate did implicitly — now it is explicit and bench-scoped.
             f_guardrail_r2: true,
             f_guardrail_r3_pinning: true,
@@ -303,6 +359,11 @@ impl ResolvedEntitlements {
             retention_days: 7,
             f_full_capture: false,
             f_alerts: false,
+            // fail-CLOSED: no control plane => free tier, never paid.
+            f_datasets: false,
+            f_experiments: false,
+            f_online_evals: false,
+            f_annotation_queues: false,
             // The point of the grant: no rate-limit tier and no monthly quota
             // can reject the run. `trace_quota_monthly: 0` is the documented
             // "unlimited" sentinel — `QuotaTracker::check` early-returns Allow
@@ -310,6 +371,7 @@ impl ResolvedEntitlements {
             // same way the tier short-circuits the limiter.
             trace_quota_monthly: 0,
             overage_hard_cap_multiplier_tenths: 10,
+            workspace_budget_micro_usd: 0,
         }
     }
 
@@ -357,11 +419,17 @@ impl ResolvedEntitlements {
             FeatureKey::GuardrailR6 => self.f_guardrail_r6,
             FeatureKey::GuardrailR7 => self.f_guardrail_r7,
             FeatureKey::Alerts => self.f_alerts,
+            FeatureKey::Datasets => self.f_datasets,
+            FeatureKey::Experiments => self.f_experiments,
+            FeatureKey::OnlineEvals => self.f_online_evals,
+            FeatureKey::AnnotationQueues => self.f_annotation_queues,
         }
     }
 
+    /// Derive the gateway monthly-quota config from the resolved
     /// entitlements. The 429 hard cap = `trace_quota_monthly` × multiplier, both
     /// sourced from `workspace_entitlements` ⊕ `plan_entitlements` (never the
+    /// hardcoded plan map — that drift was the gap; CLAUDE.md control-
     /// plane rule). A zero/negative quota (only the OSS self-host path) means
     /// "no quota enforced".
     pub fn quota_config(&self) -> crate::rate_limiter::QuotaConfig {
@@ -511,30 +579,37 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
             // fall back to free_v1 below.
             const SQL: &str = "\
                 SELECT pe.plan_lookup_key, \
-                  COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory), \
-                  COALESCE(we.f_pr8_argdrift, pe.f_pr8_argdrift), \
-                  COALESCE(we.f_pr9_a2a_handoff, pe.f_pr9_a2a_handoff), \
-                  COALESCE(we.f_pr10_inline_slm_judge, pe.f_pr10_inline_slm_judge), \
-                  COALESCE(we.f_pr11_slo_drift, pe.f_pr11_slo_drift), \
-                  COALESCE(we.f_pr12_langgraph_branch, pe.f_pr12_langgraph_branch), \
-                  COALESCE(we.f_cohort_baselines, pe.f_cohort_baselines), \
-                  COALESCE(we.f_hipaa_gcp_addon, pe.f_hipaa_gcp_addon), \
-                  COALESCE(we.f_audit_addon, pe.f_audit_addon), \
-                  COALESCE(we.retention_days, pe.retention_days), \
-                  COALESCE(we.f_guardrail_r2, pe.f_guardrail_r2), \
-                  COALESCE(we.f_guardrail_r3_pinning, pe.f_guardrail_r3_pinning), \
-                  COALESCE(we.f_guardrail_r4, pe.f_guardrail_r4), \
-                  COALESCE(we.f_guardrail_r5, pe.f_guardrail_r5), \
-                  COALESCE(we.f_guardrail_r6, pe.f_guardrail_r6), \
-                  COALESCE(we.f_guardrail_r7, pe.f_guardrail_r7), \
-                  COALESCE(we.f_full_capture, pe.f_full_capture), \
-                  COALESCE(we.f_prompt_promotion_write, pe.f_prompt_promotion_write), \
-                  COALESCE(we.f_alerts, pe.f_alerts), \
-                  COALESCE(we.f_audit_selfverify, pe.f_audit_selfverify), \
-                  COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly), \
+                  COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory) AS f_pr7_trajectory, \
+                  COALESCE(we.f_pr8_argdrift, pe.f_pr8_argdrift) AS f_pr8_argdrift, \
+                  COALESCE(we.f_pr9_a2a_handoff, pe.f_pr9_a2a_handoff) AS f_pr9_a2a_handoff, \
+                  COALESCE(we.f_pr10_inline_slm_judge, pe.f_pr10_inline_slm_judge) AS f_pr10_inline_slm_judge, \
+                  COALESCE(we.f_pr11_slo_drift, pe.f_pr11_slo_drift) AS f_pr11_slo_drift, \
+                  COALESCE(we.f_pr12_langgraph_branch, pe.f_pr12_langgraph_branch) AS f_pr12_langgraph_branch, \
+                  COALESCE(we.f_cohort_baselines, pe.f_cohort_baselines) AS f_cohort_baselines, \
+                  COALESCE(we.f_hipaa_gcp_addon, pe.f_hipaa_gcp_addon) AS f_hipaa_gcp_addon, \
+                  COALESCE(we.f_audit_addon, pe.f_audit_addon) AS f_audit_addon, \
+                  COALESCE(we.retention_days, pe.retention_days) AS retention_days, \
+                  COALESCE(we.f_guardrail_r2, pe.f_guardrail_r2) AS f_guardrail_r2, \
+                  COALESCE(we.f_guardrail_r3_pinning, pe.f_guardrail_r3_pinning) AS f_guardrail_r3_pinning, \
+                  COALESCE(we.f_guardrail_r4, pe.f_guardrail_r4) AS f_guardrail_r4, \
+                  COALESCE(we.f_guardrail_r5, pe.f_guardrail_r5) AS f_guardrail_r5, \
+                  COALESCE(we.f_guardrail_r6, pe.f_guardrail_r6) AS f_guardrail_r6, \
+                  COALESCE(we.f_guardrail_r7, pe.f_guardrail_r7) AS f_guardrail_r7, \
+                  COALESCE(we.f_full_capture, pe.f_full_capture) AS f_full_capture, \
+                  COALESCE(we.f_prompt_promotion_write, pe.f_prompt_promotion_write) AS f_prompt_promotion_write, \
+                  COALESCE(we.f_alerts, pe.f_alerts) AS f_alerts, \
+                  COALESCE(we.f_datasets, pe.f_datasets) AS f_datasets, \
+                  COALESCE(we.f_experiments, pe.f_experiments) AS f_experiments, \
+                  COALESCE(we.f_online_evals, pe.f_online_evals) AS f_online_evals, \
+                  COALESCE(we.f_annotation_queues, pe.f_annotation_queues) AS f_annotation_queues, \
+                  COALESCE(we.f_audit_selfverify, pe.f_audit_selfverify) AS f_audit_selfverify, \
+                  COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly) AS trace_quota_monthly, \
                   (COALESCE(we.overage_hard_cap_multiplier, pe.overage_hard_cap_multiplier) * 10)::int \
+                    AS overage_hard_cap_multiplier_tenths, \
+                  t.budget_usd_monthly::text AS workspace_budget_usd_text \
                 FROM workspace_entitlements we \
                 JOIN plan_entitlements pe ON pe.plan_lookup_key = we.plan_lookup_key \
+                LEFT JOIN tenants t ON t.id = we.tenant_id \
                 WHERE we.tenant_id = $1";
             if let Some(row) = client.query_opt(SQL, &[&tenant]).await? {
                 return Ok(row_to_resolved(&row));
@@ -548,8 +623,10 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                   f_guardrail_r2, f_guardrail_r3_pinning, f_guardrail_r4, \
                   f_guardrail_r5, f_guardrail_r6, f_guardrail_r7, \
                   f_full_capture, f_prompt_promotion_write, f_alerts, \
+                  f_datasets, f_experiments, f_online_evals, f_annotation_queues, \
                   f_audit_selfverify, \
-                  trace_quota_monthly, (overage_hard_cap_multiplier * 10)::int \
+                  trace_quota_monthly, \
+                  (overage_hard_cap_multiplier * 10)::int AS overage_hard_cap_multiplier_tenths \
                 FROM plan_entitlements WHERE plan_lookup_key = 'free_v1'";
             match client.query_opt(FALLBACK, &[]).await? {
                 Some(row) => Ok(row_to_resolved(&row)),
@@ -559,31 +636,88 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
     })
 }
 
+/// Map one entitlements row onto [`ResolvedEntitlements`], **by COLUMN NAME**.
+///
+/// ## Why this is not `row.get(0..23)` any more
+///
+/// It was, and it was the highest value-to-cost item in the 2026-07-29
+/// falsification audit (PL-20 #1). Twenty-four positional reads against two
+/// hand-written SELECTs, with **zero real coverage** — every gateway test
+/// injects a mock resolver, so nothing exercised this function at all. A single
+/// column inserted or reordered in either query shifts every field below it, and
+/// the failure is silent: booleans still deserialise as booleans.
+///
+/// The blast radius is what made it #1. One reorder misgrants across **billing,
+/// guardrails and audit simultaneously** — and `f_guardrail_r4` does not merely
+/// over-permit, it **BLOCKS with a 403**, so a mis-slotted grant is a live denial
+/// of a paying tenant's traffic rather than a quiet extra feature.
+///
+/// **The audit's recommended fix was a test. This is better than a test:** with
+/// every column aliased and every read by name, a reorder cannot land a value in
+/// the wrong field at all. The hazard is removed rather than detected. A test
+/// tells you afterwards; a name never lets it happen.
+///
+/// That required aliasing the primary query's columns, which is why they now all
+/// carry `AS <field>` — Postgres names a `COALESCE(...)` expression `coalesce`,
+/// so name lookup was impossible before and positional indexing was the only
+/// option available. The alias is the enabling change.
+///
+/// Cost: a name lookup is O(columns) rather than O(1). Irrelevant here — this
+/// runs on a cache MISS, not per request (`CLAUDE.md` §2: never a per-request
+/// Postgres round-trip).
+///
+/// # Panics
+/// `Row::get` panics on an unknown column, which is the correct direction: a
+/// query that stops returning a field is a deploy-time bug, and failing loudly
+/// beats resolving a tenant's entitlements from a half-read row. The one
+/// genuinely optional column uses `try_get` — see below.
 fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
     ResolvedEntitlements {
-        plan_lookup_key: row.get(0),
-        f_pr7_trajectory: row.get(1),
-        f_pr8_argdrift: row.get(2),
-        f_pr9_a2a_handoff: row.get(3),
-        f_pr10_inline_slm_judge: row.get(4),
-        f_pr11_slo_drift: row.get(5),
-        f_pr12_langgraph_branch: row.get(6),
-        f_cohort_baselines: row.get(7),
-        f_hipaa_gcp_addon: row.get(8),
-        f_audit_addon: row.get(9),
-        retention_days: row.get(10),
-        f_guardrail_r2: row.get(11),
-        f_guardrail_r3_pinning: row.get(12),
-        f_guardrail_r4: row.get(13),
-        f_guardrail_r5: row.get(14),
-        f_guardrail_r6: row.get(15),
-        f_guardrail_r7: row.get(16),
-        f_full_capture: row.get(17),
-        f_prompt_promotion_write: row.get(18),
-        f_alerts: row.get(19),
-        f_audit_selfverify: row.get(20),
-        trace_quota_monthly: row.get(21),
-        overage_hard_cap_multiplier_tenths: row.get(22),
+        plan_lookup_key: row.get("plan_lookup_key"),
+        f_pr7_trajectory: row.get("f_pr7_trajectory"),
+        f_pr8_argdrift: row.get("f_pr8_argdrift"),
+        f_pr9_a2a_handoff: row.get("f_pr9_a2a_handoff"),
+        f_pr10_inline_slm_judge: row.get("f_pr10_inline_slm_judge"),
+        f_pr11_slo_drift: row.get("f_pr11_slo_drift"),
+        f_pr12_langgraph_branch: row.get("f_pr12_langgraph_branch"),
+        f_cohort_baselines: row.get("f_cohort_baselines"),
+        f_hipaa_gcp_addon: row.get("f_hipaa_gcp_addon"),
+        f_audit_addon: row.get("f_audit_addon"),
+        retention_days: row.get("retention_days"),
+        f_guardrail_r2: row.get("f_guardrail_r2"),
+        f_guardrail_r3_pinning: row.get("f_guardrail_r3_pinning"),
+        f_guardrail_r4: row.get("f_guardrail_r4"),
+        f_guardrail_r5: row.get("f_guardrail_r5"),
+        f_guardrail_r6: row.get("f_guardrail_r6"),
+        f_guardrail_r7: row.get("f_guardrail_r7"),
+        f_full_capture: row.get("f_full_capture"),
+        f_prompt_promotion_write: row.get("f_prompt_promotion_write"),
+        f_alerts: row.get("f_alerts"),
+        // BY NAME, never by position — `fd51a598` fixed a 23-column positional
+        // read with zero coverage, where a reorder would silently misgrant.
+        f_datasets: row.get("f_datasets"),
+        f_experiments: row.get("f_experiments"),
+        f_online_evals: row.get("f_online_evals"),
+        f_annotation_queues: row.get("f_annotation_queues"),
+        f_audit_selfverify: row.get("f_audit_selfverify"),
+        trace_quota_monthly: row.get("trace_quota_monthly"),
+        overage_hard_cap_multiplier_tenths: row.get("overage_hard_cap_multiplier_tenths"),
+        // Present ONLY on the primary query. The FALLBACK (an unseeded tenant,
+        // plan defaults only) has no `tenants` join, so this column does not
+        // exist there — and an unseeded tenant has no workspace budget, which is
+        // the same answer. `try_get` by name absorbs both "absent column" and
+        // "NULL" without conflating them with a real zero.
+        //
+        // Parse failure is also uncapped: `tenants_budget_nonneg_chk` rejects a
+        // negative at write time, and a mis-read that silently refuses every
+        // request is worse than one that fails to bite.
+        workspace_budget_micro_usd: row
+            .try_get::<_, Option<String>>("workspace_budget_usd_text")
+            .ok()
+            .flatten()
+            .and_then(|t| t.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(0, |v| (v * 1_000_000.0).round() as u64),
     }
 }
 
@@ -599,12 +733,14 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
 /// Returns immediately; the task runs until the process exits.
 ///
 /// **`LISTEN` is disabled only when BOTH vars are unset** — the fallback below
+/// is an `or_else`, not a `None` short-circuit.: this doc comment
 /// previously claimed "a `None`/unset direct URL disables `LISTEN`", which the
 /// two lines under it contradict; with `POSTGRES_DIRECT_URL` unset and
 /// `POSTGRES_URL` pointing at Neon's `-pooler`, the task connects to PgBouncer,
 /// `LISTEN` succeeds, and no notification can ever arrive. `listen_once` now
 /// inspects the resolved HOST and says `DEGRADED` in that case instead of
 /// `active` — see `tracelane_shared::listen_dsn`.
+/// Is the control-plane `LISTEN` task enabled? **Default OFF** (re-ruling,
 /// 2026-08-12) — opt in with `TRACELANE_CONTROL_PLANE_LISTEN=1`.
 ///
 /// **Why it is off.** Measured on prod over 21.07 h: the LISTEN connection was
@@ -674,6 +810,7 @@ pub fn spawn_listen_task(cache: EntitlementCache) {
 }
 
 /// The first TCP host in `cfg` that is a pooler and therefore cannot deliver
+/// `NOTIFY`, or `None` when every host can.
 ///
 /// Reads the host from the PARSED config rather than substring-matching the DSN:
 /// a password may legitimately contain `-pooler`, and matching the raw string
@@ -752,10 +889,12 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     });
 
     // One dedicated direct LISTEN connection carries both control-plane channels:
+    // entitlement invalidation AND api-key revocation (fix B) — no second
     // direct connection needed.
     client
         .batch_execute("LISTEN entitlements_changed; LISTEN key_revoked")
         .await?;
+    // `LISTEN` SUCCEEDS on a PgBouncer transaction pooler — the statement
     // is valid, the backend is just handed to another client before any NOTIFY
     // can be routed back. So a successful `batch_execute` is NOT evidence that
     // invalidation works, and reporting "active" here was the guard lying. Ask
@@ -777,6 +916,7 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
     while let Some(msg) = rx.recv().await {
         match msg {
             AsyncMessage::Notification(note) => match note.channel() {
+                //  fix B: an api key was revoked — payload is hex(lookup_hash),
                 // the auth-cache key. Evict it so revocation stays immediate.
                 "key_revoked" => match hex::decode(note.payload()) {
                     Ok(v) if v.len() == 32 => {
@@ -821,6 +961,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// The DEGRADED branch must actually FIRE on the config the ordinary
     /// Neon deployment produces. Driven from a DSN string, not a hand-built
     /// `Config`, so it covers the whole path the running process takes:
     /// env var -> parse -> host -> predicate.
@@ -868,6 +1009,14 @@ mod tests {
 
     fn grant_all() -> ResolvedEntitlements {
         ResolvedEntitlements {
+            // Sprint 3 flags. `grant_all` means ALL — a fixture that quietly omits a
+            // new flag would make every test using it assert the FREE behaviour while
+            // reading as the entitled one, which is the inverted-default shape
+            // shipped (`.claude/rules/tenancy.md`).
+            f_datasets: true,
+            f_experiments: true,
+            f_online_evals: true,
+            f_annotation_queues: true,
             plan_lookup_key: "enterprise_v1".to_string(),
             f_pr7_trajectory: true,
             f_pr8_argdrift: true,
@@ -891,6 +1040,7 @@ mod tests {
             f_alerts: true,
             trace_quota_monthly: 25_000_000,
             overage_hard_cap_multiplier_tenths: 990,
+            workspace_budget_micro_usd: 0,
         }
     }
 
@@ -994,6 +1144,7 @@ mod tests {
         }
     }
 
+    /// The gateway quota is entitlement-driven — `quota_config` reads the
     /// resolved `trace_quota_monthly` × multiplier, NOT the hardcoded plan map.
     #[test]
     fn quota_config_derives_from_entitlements_not_hardcoded() {
@@ -1026,5 +1177,154 @@ mod tests {
         // …and 5.0× (tenths 50) gives the ADR-020 grace band.
         e.overage_hard_cap_multiplier_tenths = 50;
         assert_eq!(e.quota_config().hard_cap_absolute(), 750_000);
+    }
+
+    /// PL-20 #1 — the falsification proof for the entitlements resolver.
+    ///
+    /// `row_to_resolved` now reads by NAME, so a column reorder can no longer
+    /// misgrant. This closes the other half: that the names it reads actually
+    /// EXIST in both queries. Adding a field to `ResolvedEntitlements` and
+    /// wiring `row.get("f_new_thing")` without adding the column to the SQL
+    /// compiles fine and panics at runtime, on a cache miss, in production —
+    /// which is precisely the shape of failure this resolver keeps producing.
+    ///
+    /// It reads its own source rather than a fixture, so it cannot drift from
+    /// the thing it describes. No database required, so it runs in the ordinary
+    /// `cargo test` lane rather than the real-Postgres one — the audit's note
+    /// that only 2 of 24 CI guards are re-runnable is the reason that matters.
+    #[test]
+    fn every_column_the_resolver_reads_exists_in_both_queries() {
+        let src = include_str!("entitlement_cache.rs");
+
+        // Scan ONLY the mapper's body. Scanning the whole file also matched a
+        // `row.get("…")` written inside this test's own doc comment — the probe
+        // found itself, which is a self-match, not a finding.
+        let body_start = src
+            .find("fn row_to_resolved(")
+            .expect("row_to_resolved not found");
+        let body_end = src[body_start..]
+            .find("\n}\n")
+            .expect("end of row_to_resolved")
+            + body_start;
+        let body = &src[body_start..body_end];
+
+        // The names the mapper asks for.
+        let mut wanted: Vec<&str> = Vec::new();
+        for seg in body.split("row.get(\"").skip(1) {
+            if let Some(end) = seg.find('"') {
+                wanted.push(&seg[..end]);
+            }
+        }
+        for seg in body.split("try_get::<_, Option<String>>(\"").skip(1) {
+            if let Some(end) = seg.find('"') {
+                wanted.push(&seg[..end]);
+            }
+        }
+        assert!(
+            wanted.len() >= 23,
+            "expected the full entitlement column set, found {} — did the mapper change shape?",
+            wanted.len()
+        );
+
+        // Slice each SQL constant out of the source.
+        let cut = |marker: &str| -> String {
+            let at = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} not found"));
+            let from = src[at..].find("SELECT").expect("SELECT") + at;
+            let to = src[from..].find("\";").expect("end of SQL literal") + from;
+            src[from..to].to_string()
+        };
+        let primary = cut("const SQL: &str");
+        let fallback = cut("const FALLBACK: &str");
+
+        // What NAME would Postgres give each selected column? That is the only
+        // thing `row.get(name)` can address, and it is NOT "the name appears
+        // somewhere in the SQL text".
+        //
+        // THE FIRST VERSION OF THIS TEST USED `sql.contains(name)` AND WAS
+        // WORTHLESS. Dropping `AS f_guardrail_r4` leaves `f_guardrail_r4` in the
+        // text twice over, inside `COALESCE(we.f_guardrail_r4, pe.f_guardrail_r4)`
+        // — so the substring check passed while the column had become
+        // unaddressable and the resolver would panic in production. Both
+        // deliberate falsifications went green. That is the exact PL-20 shape
+        // this test exists to close, reproduced by the test itself, which is why
+        // it now parses output names instead of grepping.
+        fn output_names(sql: &str) -> Vec<String> {
+            let list = &sql
+                [sql.find("SELECT").map_or(0, |i| i + 6)..sql.find(" FROM ").unwrap_or(sql.len())];
+            let mut names = Vec::new();
+            let mut depth = 0usize;
+            let mut cur = String::new();
+            for ch in list.chars() {
+                match ch {
+                    '(' => {
+                        depth += 1;
+                        cur.push(ch);
+                    }
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        cur.push(ch);
+                    }
+                    ',' if depth == 0 => {
+                        names.push(std::mem::take(&mut cur));
+                    }
+                    _ => cur.push(ch),
+                }
+            }
+            names.push(cur);
+            names
+                .into_iter()
+                .filter_map(|col| {
+                    let col = col.replace('\\', " ");
+                    let col = col.trim().to_string();
+                    if col.is_empty() {
+                        return None;
+                    }
+                    // `… AS name` wins.
+                    if let Some(at) = col.rfind(" AS ") {
+                        return Some(col[at + 4..].trim().to_string());
+                    }
+                    // A bare or qualified column reference: `pe.foo` -> `foo`.
+                    // Anything with an expression in it (parens, a cast) is
+                    // UNNAMED in Postgres and therefore not addressable.
+                    if col.contains('(') || col.contains("::") {
+                        return None;
+                    }
+                    Some(col.rsplit('.').next().unwrap_or(&col).trim().to_string())
+                })
+                .collect()
+        }
+
+        let primary_names = output_names(&primary);
+        let fallback_names = output_names(&fallback);
+
+        for name in &wanted {
+            assert!(
+                primary_names.iter().any(|c| c == name),
+                "`{name}` is not an addressable OUTPUT COLUMN of the PRIMARY query \
+                 (it needs `AS {name}`, or to be a bare column reference) — \
+                 `row.get(\"{name}\")` will PANIC on a cache miss in production. \
+                 Addressable columns are: {primary_names:?}"
+            );
+        }
+
+        // The fallback deliberately lacks the workspace budget: it has no
+        // `tenants` join, and an unseeded tenant has no workspace budget. That is
+        // the ONE permitted absence, and `try_get` is what makes it safe — so
+        // this asserts the exception is exactly one column wide rather than
+        // letting a second silently join it.
+        let missing: Vec<&&str> = wanted
+            .iter()
+            .filter(|n| !fallback_names.iter().any(|c| c == **n))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![&"workspace_budget_usd_text"],
+            "the FALLBACK query may omit exactly ONE column (the workspace \
+             budget, read with try_get). Anything else listed here is a field \
+             that will panic for every unseeded tenant. Fallback columns: \
+             {fallback_names:?}"
+        );
     }
 }

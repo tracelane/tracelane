@@ -8,6 +8,7 @@
 //! gating, and per-rail metrics.
 //!
 //! It is **additive** to the older `crate::predictive` layer (see
+//! `.md` 2026-06-19 architecture decision): the spec's
 //! `RailOutcome` model — `block | redact | warn | allow | not_applicable |
 //! fail_open` with score / reason_code / latency — is richer than the
 //! predictive layer's `Decision`, so guardrails get a purpose-built substrate

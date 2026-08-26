@@ -1,4 +1,6 @@
+# ── PRIVATE-MINUTE POLICY (2026-08-01) ────────────────────────────────
 # Public Actions are unlimited and free; private are capped at 2,000 min/month
+# and exhausted mid-cycle twice (June, July). These workflow FILES
 # are shared — the public repo is built from this tree — so the trigger list
 # cannot be edited to cut private cost without also disabling the PUBLIC run,
 # which is now the only always-on gate. The split is therefore a job-level
@@ -50,6 +52,7 @@ jobs:
         # The installer's DEFAULT cosign version is what we get (no
         # `cosign-release` input, per sigstore's own guidance). Print it so the
         # run RECORDS which binary signed, rather than us inferring it from the
+        # action tag. v3.5.0 gives cosign 2.2.4; v4.1.2 gives 3.0.6.
         run: cosign version
 
       - name: Sign SBOM with Sigstore Cosign (keyless OIDC)

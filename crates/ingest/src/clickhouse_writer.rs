@@ -45,6 +45,7 @@ struct SpanRow {
     status_code: u8,
     status_message: String,
     attributes: String,
+    //  #5: the dedicated columns the /signatures page queries
     // (`has(aft_ids, ?)` + `intervention`). Populated from the predictive AFT hit the
     // gateway records in the span; empty when no detector matched.
     aft_ids: Vec<String>,
@@ -80,6 +81,7 @@ impl From<TracelaneSpan> for SpanRow {
                 );
                 String::new()
             }),
+            //  #5: map the predictive AFT hit into the signatures columns. A single
             // matched id today (the evaluator returns the most-severe Decision); the
             // column is an Array so a future multi-signature span needs no schema change.
             // intervention stays the recorded severity (0 today = observe-first "flag",
@@ -246,6 +248,7 @@ pub async fn run(
                         match flush(&client, &batch).await {
                             Ok(()) => {
                                 ack_all(pending_acks).await;
+                                // Federation substrate (ADR-056 ·),
                                 // fail-open — same as the steady-state path.
                                 crate::federation::write_signals(&client, &federation_rows(&batch))
                                     .await;
@@ -275,6 +278,7 @@ pub async fn run(
                 .await
                 .context("ClickHouse batch flush failed")?;
             ack_all(pending_acks).await;
+            // Federation substrate (ADR-056 ·): anonymized cross-customer
             // signal aggregates from the spans just durably written. Best-effort
             // + fail-open — never affects span durability or the acks above.
             crate::federation::write_signals(&client, &federation_rows(&batch)).await;
@@ -294,6 +298,7 @@ pub async fn run(
 /// Apply the tail-sampling gate to one span. Returns `Some(row)` to keep (push
 /// to the batch) or `None` to drop.
 ///
+/// Extracted from the recv loop so the sampling wiring (/ PP-O2) is
 /// unit-testable without a live ClickHouse: a test asserts a 0%-rate sampler
 /// drops a clean span here but keeps an error span — which fails if this gate
 /// is ever removed (the bug this fixes was that the sampler was never called).
@@ -318,6 +323,7 @@ fn sample_one(
 }
 
 /// Extract the anonymized federation signals from a durably-flushed span batch
+/// (ADR-056 ·). Reads the `SpanRow` fields the writer already holds — no
 /// extra query — and keeps only spans that carry a `tracelane_aft_id`.
 fn federation_rows(batch: &[SpanRow]) -> Vec<crate::federation::FederationRow> {
     batch
@@ -446,6 +452,7 @@ mod tests {
         }
     }
 
+    /// Regression for / PP-O2: the writer's per-span path runs the tail
     /// sampler. With a 0% baseline a clean span is dropped (never written) while
     /// error / intervention spans are kept — exercising the exact gate the recv
     /// loop calls, so removing the sampler wiring breaks this test.

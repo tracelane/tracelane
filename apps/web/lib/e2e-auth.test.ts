@@ -1,4 +1,5 @@
 /**
+ * Tests for the dev-only E2E auth bypass.
  *
  * Negative cases first per `.claude/rules/testing.md`. The headline gates:
  *   - Gate 1: a production build that carries the flag THROWS at module load

@@ -1,0 +1,35 @@
+{
+	"$schema": "https://unpkg.com/knip@6/schema.json",
+
+	// ── HOW THIS TOOL IS USED HERE, AND THE ONE THING IT MUST NOT BE USED FOR ──
+	//
+	// THE GATE RUNS FILES + DEPENDENCIES ONLY, and that narrowing is deliberate:
+	//   scripts/verify-all.sh:802
+	//   pnpm exec knip --include files,dependencies,devDependencies --no-config-hints
+	// Those are the two categories knip resolves reliably in this repo, and the gate
+	// is green on them.
+	//
+	// DO NOT ADD `exports` TO THE GATE, AND DO NOT ACT ON `--include exports` WITHOUT
+	// VERIFYING EACH HIT BY HAND. Measured 2026-08-22: of 19 reported unused exports,
+	// THREE ARE LIVE —
+	//   · AUTH_STATE_PATH      used by playwright.config.ts
+	//   · PUBLIC_ROUTES        used by e2e/dead-buttons.spec.ts
+	//   · DEFAULT_DEADLINE_MS  used by evals/fault-tolerance/FT-07.eval.ts
+	// Playwright's config and specs are not in the Next entry graph, and `evals/` is a
+	// different workspace entirely, so a run rooted at apps/web cannot see any of them.
+	// Deleting on knip's word would have removed working code from three places.
+	//
+	// AN `entry` ARRAY DOES NOT FIX IT — TESTED, NOT ASSUMED. Adding
+	// `playwright.config.ts` and `e2e/**/*.spec.ts` as entry points produced BYTE
+	// IDENTICAL exports output (same 19 hits, same three false positives), so the
+	// block was removed rather than left in place looking like it did something.
+	// Config that does nothing is worse than no config: it reads as a solved problem.
+	//
+	// The remaining 16 are genuinely unused, all PRE-EXISTING (git grep at HEAD gives
+	// identical counts), and seven are cited by name in ADR-020, and
+	// So removing them is a documentation change
+	// too, not a one-line delete.
+
+	"ignore": ["open-next.config.ts", "lib/e2e-db.stub.ts"],
+	"ignoreDependencies": ["tailwindcss"]
+}

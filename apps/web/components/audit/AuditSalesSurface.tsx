@@ -11,10 +11,10 @@ export function AuditSalesSurface() {
 			<div className="t-card-title text-seal-ink">
 				Audit SKU · $999/mo add-on
 			</div>
-			<h2 className="mt-1 text-lg font-semibold text-ink">
+			<h2 className="mt-1 text-md font-semibold text-ink">
 				A provable record of every gateway call and guardrail verdict
 			</h2>
-			<p className="mt-2 max-w-2xl text-[13px] text-ink-2">
+			<p className="mt-2 max-w-2xl text-sm text-ink-2">
 				Every gateway-proxied call and guardrail verdict is appended to a
 				SHA-256 hash chain. The chain is <strong>tamper-evident</strong>: any
 				change to a past event breaks the recomputed hash. You — or a regulator
@@ -25,7 +25,7 @@ export function AuditSalesSurface() {
 				without trusting Tracelane. Built for EU AI Act Article 12
 				record-keeping.
 			</p>
-			<ul className="mt-3 space-y-1.5 text-[13px] text-ink-2">
+			<ul className="mt-3 space-y-1.5 text-sm text-ink-2">
 				<li>
 					• Tamper-evident SHA-256 hash chain over every gateway call and
 					guardrail verdict (OTLP/SDK-captured spans are full-fidelity; chaining
@@ -51,7 +51,15 @@ export function AuditSalesSurface() {
 			<div className="mt-5">
 				<Link
 					href="/settings/billing"
-					className="bg-surface-inverse text-ink-inverse hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-[13px] font-medium"
+					// `bg-selected text-selected-on` — the theme-stable primary pair. This is a
+					// hand-rolled primary CTA (a <Link>/<button>, not the <Button> primitive), and it
+					// carried `bg-surface-inverse text-ink-inverse` until the 2026-08-22 contrast
+					// audit: in DARK `--surface-inverse` is #0d0e10 — the PAGE GROUND — so the fill
+					// sat at 1.00:1 against the canvas and 1.07:1 against a card, leaving a label
+					// with no visible button under it. Button.tsx made this exact swap for the
+					// primitive; these copies were missed. `--selected` flips per theme: 17.93:1 in
+					// light, 17.71:1 in dark, label included.
+					className="bg-selected text-selected-on hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-sm font-medium"
 				>
 					Add the Audit SKU
 				</Link>

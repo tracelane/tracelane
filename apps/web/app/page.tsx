@@ -1,5 +1,6 @@
 /**
  * Root redirect — sends new users to /onboarding, returning users to the
+ * overview-first /dashboard (§1: the landing surface is the overview,
  * not raw trace rows).
  *
  * New user = authenticated but has no active API keys yet.

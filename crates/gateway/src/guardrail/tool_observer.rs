@@ -1,4 +1,5 @@
 //! Observe the tool definitions that actually arrive, so they can be approved
+//! (/B).
 //!
 //! ## Why in-process, and why not per-request I/O
 //!

@@ -115,12 +115,16 @@ export function AuthorVersionForm({ promptName }: Props) {
 	const isLoading = status === "loading";
 
 	return (
-		<div className="rounded-lg border border-line bg-surface p-5 space-y-4">
+		// `.surface-card`: this is the page's authoring panel — a bordered surface
+		// with padding and content — so it takes `--radius-card`. `rounded-lg` is the
+		// CONTROL radius and belongs on the inputs and buttons inside it, not on the
+		// panel around them.
+		<div className="surface-card space-y-4 border border-line bg-surface p-5">
 			<h2 className="text-sm font-semibold text-ink">Author new version</h2>
 
 			{status === "success" && result ? (
 				<div className="space-y-3">
-					<div className="rounded-lg border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
+					<div className="rounded-lg border border-ok bg-ok-soft p-3 text-xs space-y-1">
 						<p className="font-semibold text-ok-ink">
 							Version {result.version_number} authored
 						</p>
@@ -172,7 +176,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 							placeholder={
 								"You are a helpful assistant.\n\nUser query: {{user_query}}"
 							}
-							className="w-full rounded-sm border border-line bg-bg px-3 py-2 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line resize-y"
+							className="w-full rounded-sm border border-line bg-bg px-3 py-2 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line resize-y"
 							required
 							disabled={isLoading}
 						/>
@@ -192,7 +196,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 							value={modelPin}
 							onChange={(e) => setModelPin(e.target.value)}
 							placeholder="gpt-4o-mini"
-							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
+							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 							disabled={isLoading}
 						/>
 					</div>
@@ -211,13 +215,13 @@ export function AuthorVersionForm({ promptName }: Props) {
 							value={templateVars}
 							onChange={(e) => setTemplateVars(e.target.value)}
 							placeholder="user_query, context"
-							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
+							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 							disabled={isLoading}
 						/>
 					</div>
 
 					{status === "error" ? (
-						<div className="rounded-lg border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
+						<div className="rounded-lg border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
 							{errorMsg || "Unexpected failure — check gateway logs."}
 						</div>
 					) : null}

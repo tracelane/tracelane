@@ -11,6 +11,8 @@
  * Pain-points: PP-G5 (BYOK provider keys), PP-P15 (enterprise CMK self-service).
  */
 
+import { Modal } from "@/components/Modal";
+import { apiFetch } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -35,9 +37,7 @@ interface AddKeyPayload {
 }
 
 async function fetchKeys(): Promise<CmkEntry[]> {
-	const res = await fetch("/api/settings/cmk-keys");
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	return res.json() as Promise<CmkEntry[]>;
+	return apiFetch<CmkEntry[]>("/api/settings/cmk-keys");
 }
 
 async function addKey(payload: AddKeyPayload): Promise<CmkEntry> {
@@ -95,25 +95,21 @@ function KeyRow({
 	onRotate: (id: string) => void;
 }) {
 	return (
-		<tr className="border-b border-border last:border-0">
+		<tr className="border-b border-line last:border-0">
 			<td className="py-2 pr-3 text-sm font-medium">{entry.alias}</td>
-			<td className="py-2 pr-3 font-mono text-xs text-muted-foreground">
+			<td className="py-2 pr-3 font-mono text-xs text-ink-2">
 				{entry.fingerprint.slice(0, 16)}…
 			</td>
-			<td className="py-2 pr-3 text-xs text-muted-foreground">
-				{entry.algorithm}
-			</td>
-			<td className="py-2 pr-3 text-xs text-muted-foreground">
-				{entry.purpose}
-			</td>
+			<td className="py-2 pr-3 text-xs text-ink-2">{entry.algorithm}</td>
+			<td className="py-2 pr-3 text-xs text-ink-2">{entry.purpose}</td>
 			<td className="py-2 pr-3">
 				<span
-					className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${STATUS_BADGE[entry.status]}`}
+					className={`inline-block px-2 py-0.5 rounded text-2xs font-medium ${STATUS_BADGE[entry.status]}`}
 				>
 					{STATUS_LABEL[entry.status]}
 				</span>
 			</td>
-			<td className="py-2 pr-3 text-xs text-muted-foreground">
+			<td className="py-2 pr-3 text-xs text-ink-2">
 				{absoluteDate(entry.createdAt)}
 			</td>
 			<td className="px-3 py-2 flex gap-2">
@@ -122,14 +118,29 @@ function KeyRow({
 						<button
 							type="button"
 							onClick={() => onRotate(entry.id)}
-							className="text-xs px-2 py-1 rounded border border-border hover:bg-muted transition-colors"
+							className="text-xs px-2 py-1 rounded border border-line hover:bg-surface-2 transition-colors"
 						>
 							Rotate
 						</button>
+						{/* DEAD CLASSES, FIXED 2026-08-22. This carried `border-destructive`
+						    and `hover:bg-destructive/10`. `--color-destructive` was one of the
+						    shadcn-compat aliases DELETED 2026-08-18, and tokens.css:115 records
+						    that deletion with the justification "exactly ONE component still
+						    used them — settings/ByokKeyManager.tsx — which now names the real
+						    tokens". It did not: these two survived, so the utilities generated
+						    NO CSS (`grep -c destructive` over the built stylesheet returns 0,
+						    against 19 hits for `bg-surface-2`). The border fell back to the
+						    inherited colour and the hover state did nothing at all — on the
+						    REVOKE control for a customer's provider key, the most destructive
+						    action on this page. A dead class is invisible to every colour grep
+						    precisely because it paints nothing.
+						    `border-danger/40` + `bg-danger-soft` are the tree's existing
+						    convention (9 and 25 uses); `text-danger-ink` is the text tone the
+						    contract requires on a card (5.49:1 vs `--danger`'s 4.45:1). */}
 						<button
 							type="button"
 							onClick={() => onRevoke(entry.id)}
-							className="text-xs px-2 py-1 rounded border border-destructive text-destructive hover:bg-destructive/10 transition-colors"
+							className="text-xs px-2 py-1 rounded border border-danger/40 text-danger-ink hover:bg-danger-soft transition-colors"
 						>
 							Revoke
 						</button>
@@ -158,86 +169,81 @@ function AddKeyModal({
 	};
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-			<div className="bg-card border rounded-xl p-6 w-full max-w-lg shadow-xl space-y-4">
-				<h3 className="text-base font-semibold">Register CMK Public Key</h3>
-				<form onSubmit={handleSubmit} className="space-y-3">
-					<div>
-						<label
-							htmlFor="cmk-alias"
-							className="text-xs font-medium text-muted-foreground block mb-1"
-						>
-							Key alias
-						</label>
-						<input
-							id="cmk-alias"
-							type="text"
-							value={alias}
-							onChange={(e) => setAlias(e.target.value)}
-							placeholder="e.g. prod-cmk-2026"
-							className="w-full rounded border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-							required
-						/>
-					</div>
-					<div>
-						<label
-							htmlFor="cmk-purpose"
-							className="text-xs font-medium text-muted-foreground block mb-1"
-						>
-							Purpose
-						</label>
-						<select
-							id="cmk-purpose"
-							value={purpose}
-							onChange={(e) =>
-								setPurpose(e.target.value as CmkEntry["purpose"])
-							}
-							className="w-full rounded border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-						>
-							<option value="all">All (provider keys + trace payload)</option>
-							<option value="provider-keys">Provider API keys only</option>
-							<option value="trace-payload">Trace payload only</option>
-						</select>
-					</div>
-					<div>
-						<label
-							htmlFor="cmk-pem"
-							className="text-xs font-medium text-muted-foreground block mb-1"
-						>
-							Public key (PEM — Ed25519 or RSA-4096)
-						</label>
-						<textarea
-							id="cmk-pem"
-							value={pem}
-							onChange={(e) => setPem(e.target.value)}
-							placeholder="-----BEGIN PUBLIC KEY-----&#10;...&#10;-----END PUBLIC KEY-----"
-							rows={6}
-							className="w-full rounded border border-input bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring resize-none"
-							required
-						/>
-					</div>
-					<p className="text-[11px] text-muted-foreground">
-						Only the public key is transmitted. Keys are stored as a
-						fingerprint; the raw PEM is not retained after processing.
-					</p>
-					<div className="flex justify-end gap-2 pt-2">
-						<button
-							type="button"
-							onClick={onClose}
-							className="px-4 py-2 rounded text-sm border border-border hover:bg-muted transition-colors"
-						>
-							Cancel
-						</button>
-						<button
-							type="submit"
-							className="px-4 py-2 rounded text-sm bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-						>
-							Register Key
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
+		<Modal title="Register CMK Public Key" onClose={onClose} width="lg">
+			<form onSubmit={handleSubmit} className="space-y-3">
+				<div>
+					<label
+						htmlFor="cmk-alias"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Key alias
+					</label>
+					<input
+						id="cmk-alias"
+						type="text"
+						value={alias}
+						onChange={(e) => setAlias(e.target.value)}
+						placeholder="e.g. prod-cmk-2026"
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+						required
+					/>
+				</div>
+				<div>
+					<label
+						htmlFor="cmk-purpose"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Purpose
+					</label>
+					<select
+						id="cmk-purpose"
+						value={purpose}
+						onChange={(e) => setPurpose(e.target.value as CmkEntry["purpose"])}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					>
+						<option value="all">All (provider keys + trace payload)</option>
+						<option value="provider-keys">Provider API keys only</option>
+						<option value="trace-payload">Trace payload only</option>
+					</select>
+				</div>
+				<div>
+					<label
+						htmlFor="cmk-pem"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Public key (PEM — Ed25519 or RSA-4096)
+					</label>
+					<textarea
+						id="cmk-pem"
+						value={pem}
+						onChange={(e) => setPem(e.target.value)}
+						placeholder="-----BEGIN PUBLIC KEY-----&#10;...&#10;-----END PUBLIC KEY-----"
+						rows={6}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-xs font-mono focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring resize-none"
+						required
+					/>
+				</div>
+				<p className="text-2xs text-ink-2">
+					Only the public key is transmitted. Keys are stored as a fingerprint;
+					the raw PEM is not retained after processing.
+				</p>
+				<div className="flex justify-end gap-2 pt-2">
+					<button
+						type="button"
+						onClick={onClose}
+						className="px-4 py-2 rounded text-sm border border-line hover:bg-surface-2 transition-colors"
+					>
+						Cancel
+					</button>
+					<button
+						type="submit"
+						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
+					>
+						Register Key
+					</button>
+				</div>
+			</form>
+		</Modal>
 	);
 }
 
@@ -282,38 +288,36 @@ export function ByokKeyManager() {
 
 	return (
 		<div className="space-y-4">
-			<div className="flex items-center justify-between">
+			<div className="flex items-center justify-between gap-3">
 				<div>
 					<h3 className="text-sm font-semibold text-ink">Registered keys</h3>
 				</div>
 				<button
 					type="button"
 					onClick={() => setShowAdd(true)}
-					className="px-4 py-2 rounded text-sm bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+					className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ Add Key
 				</button>
 			</div>
 
 			{isLoading && (
-				<p className="text-sm text-muted-foreground animate-pulse">
-					Loading keys…
-				</p>
+				<p className="text-sm text-ink-2 animate-pulse">Loading keys…</p>
 			)}
 			{isError && (
-				<p className="text-sm text-destructive">Failed to load CMK keys.</p>
+				<p className="text-sm text-danger-ink">Failed to load CMK keys.</p>
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
-				<div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+				<div className="rounded-lg border border-dashed border-line p-8 text-center text-sm text-ink-2">
 					No CMK keys registered. Add a key to enable BYOK encryption.
 				</div>
 			)}
 
 			{keys.length > 0 && (
-				<div className="rounded-lg border overflow-hidden">
+				<div className="overflow-x-auto rounded-lg border border-line">
 					<table className="w-full text-left">
-						<thead className="bg-muted/50 text-xs text-muted-foreground">
+						<thead className="bg-surface-2 text-xs text-ink-2">
 							<tr>
 								<th className="py-1.5 pr-3 pl-3 font-medium">Alias</th>
 								<th className="py-1.5 pr-3 font-medium">Fingerprint</th>
@@ -348,45 +352,49 @@ export function ByokKeyManager() {
 
 			{/* Rotate key modal */}
 			{rotateId !== null && (
-				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-					<div className="bg-card border rounded-xl p-6 w-full max-w-lg shadow-xl space-y-4">
-						<h3 className="text-base font-semibold">Rotate CMK Key</h3>
-						<p className="text-xs text-muted-foreground">
-							Provide the new public key. The old key will remain active during
-							re-encryption (status: rotating) and be revoked automatically once
-							complete.
-						</p>
-						<textarea
-							value={rotatePem}
-							onChange={(e) => setRotatePem(e.target.value)}
-							placeholder="-----BEGIN PUBLIC KEY-----&#10;...&#10;-----END PUBLIC KEY-----"
-							rows={6}
-							className="w-full rounded border border-input bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring resize-none"
-						/>
-						<div className="flex justify-end gap-2 pt-2">
-							<button
-								type="button"
-								onClick={() => {
-									setRotateId(null);
-									setRotatePem("");
-								}}
-								className="px-4 py-2 rounded text-sm border border-border hover:bg-muted transition-colors"
-							>
-								Cancel
-							</button>
-							<button
-								type="button"
-								onClick={() =>
-									rotateMutation.mutate({ id: rotateId, pem: rotatePem })
-								}
-								disabled={!rotatePem.trim()}
-								className="px-4 py-2 rounded text-sm bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
-							>
-								Rotate Key
-							</button>
-						</div>
+				<Modal
+					title="Rotate CMK Key"
+					onClose={() => {
+						setRotateId(null);
+						setRotatePem("");
+					}}
+					width="lg"
+				>
+					<p className="text-xs text-ink-2">
+						Provide the new public key. The old key will remain active during
+						re-encryption (status: rotating) and be revoked automatically once
+						complete.
+					</p>
+					<textarea
+						value={rotatePem}
+						onChange={(e) => setRotatePem(e.target.value)}
+						placeholder="-----BEGIN PUBLIC KEY-----&#10;...&#10;-----END PUBLIC KEY-----"
+						rows={6}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-xs font-mono focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring resize-none"
+					/>
+					<div className="flex justify-end gap-2 pt-2">
+						<button
+							type="button"
+							onClick={() => {
+								setRotateId(null);
+								setRotatePem("");
+							}}
+							className="px-4 py-2 rounded text-sm border border-line hover:bg-surface-2 transition-colors"
+						>
+							Cancel
+						</button>
+						<button
+							type="button"
+							onClick={() =>
+								rotateMutation.mutate({ id: rotateId, pem: rotatePem })
+							}
+							disabled={!rotatePem.trim()}
+							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-50 transition-colors"
+						>
+							Rotate Key
+						</button>
 					</div>
-				</div>
+				</Modal>
 			)}
 		</div>
 	);

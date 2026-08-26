@@ -3,6 +3,7 @@
  * multi-turn session.
  *
  * Fetches `/v1/sessions/:id/traces` via the per-user JWT (no static bearer —
+ *  posture), then renders the traces as a numbered turn list. Each turn
  * links to its full trace detail at `/traces/[traceId]`. A null gateway
  * result (404 or any GatewayError) calls `notFound()` — the gateway returns
  * the SAME 404 for "session missing" and "not this tenant's", so existence
@@ -48,7 +49,7 @@ function parseDate(s: string): Date {
 function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 	const isError = turn.error_count > 0;
 	return (
-		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-2/40">
+		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-hover">
 			<td className="px-3 py-2 tabular-nums text-sm text-ink-2">{index}</td>
 			<td className="px-3 py-2">
 				<Link
@@ -57,7 +58,7 @@ function TurnRow({ turn, index }: { turn: SessionTraceRow; index: number }) {
 				>
 					{turn.root_name || turn.trace_id.slice(0, 16)}
 				</Link>
-				<span className="ml-2 font-mono text-[11px] text-ink-3">
+				<span className="ml-2 font-mono text-2xs text-ink-3">
 					{turn.trace_id.slice(0, 8)}
 				</span>
 			</td>
@@ -99,7 +100,7 @@ async function SessionDetail({ sessionId }: { sessionId: string }) {
 	if (traces.length === 0) {
 		return (
 			<EmptyState
-				title="No traces in this session yet."
+				title="No traces in this session yet"
 				description="The session exists but has no recorded traces. They'll appear as the agent runs."
 			/>
 		);
@@ -130,7 +131,7 @@ async function SessionDetail({ sessionId }: { sessionId: string }) {
 			<Card className="overflow-x-auto">
 				<table className="w-full text-sm">
 					<thead>
-						<tr className="border-b border-line bg-surface-2/60">
+						<tr className="border-b border-line bg-surface-2">
 							<th className="px-3 py-1.5 text-left text-xs font-medium text-ink-2">
 								#
 							</th>
@@ -177,9 +178,7 @@ export default async function SessionDetailPage({ params }: Props) {
 				>
 					← Back to sessions
 				</Link>
-				<h1 className="min-w-0 flex-1 truncate font-mono text-xl font-semibold text-ink">
-					{sessionId}
-				</h1>
+				<h1 className="t-h1 min-w-0 flex-1 truncate font-mono">{sessionId}</h1>
 			</div>
 			<Suspense
 				fallback={

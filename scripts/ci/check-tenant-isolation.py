@@ -226,6 +226,7 @@ def rust_test_mod_spans(src: str) -> list[tuple[int, int]]:
 
 
 # ---------------------------------------------------------------------------
+# Executor reachability (, test regions only)
 # ---------------------------------------------------------------------------
 #
 # The filed fix shape — "only flag a literal actually PASSED to a query
@@ -398,6 +399,7 @@ def scan_source(src: str, is_rust: bool, all_test_region: bool = False) -> list[
         else:
             unit = src[span[0] : span[1]]
 
+        # Inside a test region a string containing `FROM tracelane.` is
         # usually an ASSERTION ABOUT a query (`assert!(SQL.contains(…))`,
         # `expect(q.query).toContain(…)`), not a query. It only counts if it can
         # be shown to reach an executor — which is what makes the live-ClickHouse
@@ -531,6 +533,7 @@ SELFTEST_CASES: list[tuple[str, str, bool, bool]] = [
         True,
         False,
     ),
+    # ──: the test-region surface. Previously these regions were BLANKED,
     # so every case below returned "clean" — including the executed ones.
     (
         "test_mod_executed_unscoped_query_BLOCKS",
@@ -618,6 +621,42 @@ SELFTEST_CASES: list[tuple[str, str, bool, bool]] = [
         False,
         True,
     ),
+    (
+        # PL-20 #2, PINNED 2026-08-20. The falsification-backlog audit recorded
+        # this guard as "weak BY CONSTRUCTION — `:100` searches the whole file, so
+        # nine scoped queries beside one unscoped in the same file passes clean",
+        # and ranked fixing it #2 of three.
+        #
+        # Re-measured on the day that review came due: the guard ALREADY catches
+        # it. B-226 rewrote the scan to judge each query against its own string
+        # literal rather than the file, so the audit's premise had gone stale.
+        #
+        # Nothing PINNED it, though. The property held by construction of the
+        # current implementation, and a refactor that widened the unit back toward
+        # file scope would restore the blind spot with every existing test still
+        # green — precisely the class PL-20 exists to close. The audit's own
+        # fixture is therefore a permanent case now, not a one-off check someone
+        # ran once and wrote a sentence about.
+        "nine scoped queries beside one unscoped, same file (PL-20 #2)",
+        "\n".join(
+            f'const OK{i}: &str = "SELECT a FROM tracelane.spans WHERE tenant_id = ?";'
+            for i in range(9)
+        )
+        + '\nconst BAD: &str = "SELECT a FROM tracelane.spans WHERE trace_id = ?";',
+        True,
+        True,
+    ),
+    (
+        # The other direction, because a guard that always fires is a wall rather
+        # than a gate: ten scoped queries in one file must stay clean.
+        "ten scoped queries, same file, no false positive (PL-20 #2)",
+        "\n".join(
+            f'const OK{i}: &str = "SELECT a FROM tracelane.spans WHERE tenant_id = ?";'
+            for i in range(10)
+        ),
+        True,
+        False,
+    ),
 ]
 
 # find_violations-level cases: (relative path, source, expect_violation).
@@ -633,6 +672,7 @@ SELFTEST_PATH_CASES: list[tuple[str, str, bool]] = [
     (
         "apps/x/leak.ts",
         # The BYTE-IDENTICAL body outside a test filename. Same verdict — the
+        # point of is that the filename stopped deciding the answer.
         "const rows = await db.query({ query: `SELECT prompt FROM tracelane.spans LIMIT 100` });",
         True,
     ),

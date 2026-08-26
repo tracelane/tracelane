@@ -1,3 +1,4 @@
+# Behavioral tier actually ran
 #
 # WHY THIS IS A SEPARATE WORKFLOW AND NOT A JOB INSIDE `CI`
 # ========================================================
@@ -50,7 +51,12 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'schedule' ||
       github.event.workflow_run.event == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    # B-269: was a hardcoded `ubuntu-latest`, which is billing-gated on this account.
+    # This workflow exists to announce "the behavioral tier did not run" — and it was
+    # being killed with 0 steps by the SAME block it should have been reporting, so the
+    # absence-detector shared a failure mode with the absence. Route it like every other
+    # job (repo var CI_RUNNER=tl-node-1) so it survives the outage it reports on.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

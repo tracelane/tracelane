@@ -1,5 +1,6 @@
 //! Is this Postgres host able to deliver `NOTIFY`?
 //!
+//! **.** Both control-plane `LISTEN` tasks — `gateway::entitlement_cache`
 //! and `ingest::tenant_config` — resolve their DSN as
 //! `POSTGRES_DIRECT_URL` **or else** `POSTGRES_URL`, so the "disabled" branch is
 //! reached only when *both* are unset. With the ordinary Neon config
@@ -11,6 +12,7 @@
 //!
 //! Nothing errors. Invalidation silently degrades to the 15-minute TTL, which
 //! means **a revoked API key keeps working for up to 15 minutes** while an INFO
+//! line asserts the opposite. Same shape as one layer down: listening on a
 //! socket that will never deliver, and saying so in the log.
 //!
 //! **Why a host predicate and not a "is `POSTGRES_DIRECT_URL` set?" check.** A

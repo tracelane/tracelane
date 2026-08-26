@@ -12,6 +12,7 @@
  * Those are not durably captured in the create/promote DTO — rendering them
  * would fabricate data. Show only: versions, active-per-env, history, controls.
  *
+ * tenant_id is resolved by the gateway from the WorkOS JWT (ADR-042 /).
  */
 
 import { AuthorVersionForm } from "@/app/prompts/[name]/AuthorVersionForm";
@@ -59,8 +60,8 @@ const S = {
 	sectionHeading: "mb-2 text-sm font-semibold text-ink",
 	envGrid: "grid gap-2 md:grid-cols-3",
 	envCard: "surface-card border border-line bg-surface p-3",
-	envCardError: "surface-card border border-warn bg-warn-soft/20 p-3",
-	envLabel: "text-xs uppercase tracking-wide text-ink-2",
+	envCardError: "surface-card border border-warn bg-warn-soft p-3",
+	envLabel: "t-metric-label",
 	versionLabel: "mt-1.5 t-metric text-ink",
 	field: "mt-2 text-xs",
 	fieldLabel: "text-ink-2",
@@ -121,6 +122,7 @@ function LifecycleStrip({ active }: { active: Set<string> }) {
 }
 
 export default async function PromptDetailPage({ params }: Props) {
+	// class, surviving in the one prompts page that never adopted the fix.
 	// `/prompts` (the LIST) calls requireSession() first; this DETAIL page did not,
 	// so an unauthenticated hit fell straight through to the gateway fan-out below
 	// and escaped as an uncaught RSC error — a hard 500 on a public URL, measured on
@@ -194,7 +196,7 @@ export default async function PromptDetailPage({ params }: Props) {
 			<LifecycleStrip active={activeEnvs} />
 
 			{nextStep && (
-				<div className="mb-6 rounded-lg border border-line bg-surface-2/40 px-4 py-2.5 text-sm text-ink-2">
+				<div className="mb-6 rounded-lg border border-line bg-surface-2 px-4 py-2.5 text-sm text-ink-2">
 					<span className="font-medium text-ink">Next:</span> {nextStep}
 				</div>
 			)}
@@ -265,7 +267,10 @@ export default async function PromptDetailPage({ params }: Props) {
 
 			{/* ── Promotion / rollback history ── */}
 			<section className={S.section}>
-				<div className="rounded-lg border border-line bg-surface p-4">
+				{/* `.surface-card` rather than `rounded-lg`, so this panel picks up
+				    `--radius-card` and matches `S.envCard` / `S.contentBlock` above,
+				    which already do. */}
+				<div className="surface-card border border-line bg-surface p-4">
 					<div className="mb-3 flex flex-wrap items-baseline justify-between gap-1">
 						<span className={S.sectionHeading.replace("mb-3 ", "")}>
 							Recent activity · all prompts

@@ -4,6 +4,7 @@
 //! pairs (normal vs. failure modes). Detects novel failure patterns that rule-based
 //! predictors miss. Loaded from `TRACELANE_TRAJ_GUARD_MODEL` (default: models/trajectory_guard.onnx).
 //!
+//! Latency target: <30ms p99 (AFT-TRAJ-ANOMALY-001).
 //!
 //! Two decision thresholds:
 //!   reconstruction_error > WARN_THRESHOLD  → Warn (AFT-TRAJ-ANOMALY-001)

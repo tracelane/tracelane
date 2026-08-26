@@ -1,4 +1,6 @@
+# ── PRIVATE-MINUTE POLICY (2026-08-01) ────────────────────────────────
 # Public Actions are unlimited and free; private are capped at 2,000 min/month
+# and exhausted mid-cycle twice (June, July). These workflow FILES
 # are shared — the public repo is built from this tree — so the trigger list
 # cannot be edited to cut private cost without also disabling the PUBLIC run,
 # which is now the only always-on gate. The split is therefore a job-level

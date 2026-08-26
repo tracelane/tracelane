@@ -4,6 +4,7 @@
 [advisories]
 # rustls-webpki 0.102.x CVEs — these are pulled in transitively by async-nats 0.38.
 # async-nats 0.38 requires webpki 0.102.x; upgrade to async-nats >=0.47 will fix this.
+# Tracked in. The CRL parsing bug is not reachable from our gateway
 # (we don't expose CRL parsing to untrusted external input — our NATS server URL
 # is operator-controlled via NATS_URL env var, not user-supplied).
 #
@@ -11,12 +12,15 @@
 # default (crates/gateway/Cargo.toml:107 — `wasm-plugin = ["dep:wasmtime"]`)
 # and is not enabled in any V1 ship binary. The wasm_plugin module is
 # `#![cfg(feature = "wasm-plugin")]` so it does not compile into the default
+# gateway. Upgrade to wasmtime 45.x (current) is tracked in as
+#  and must land before wasm-plugin is enabled for any customer build.
 ignore = [
     "RUSTSEC-2026-0104",  # rustls-webpki: reachable panic in CRL parsing
     "RUSTSEC-2026-0049",  # rustls-webpki: vulnerability
     "RUSTSEC-2026-0098",  # rustls-webpki: vulnerability
     "RUSTSEC-2026-0099",  # rustls-webpki: vulnerability
     "RUSTSEC-2025-0134",  # rustls-pemfile: informational/deprecated warning
+    # wasmtime 20.0.2 — gated behind off-by-default wasm-plugin feature
     "RUSTSEC-2026-0222",  # wasmtime — type indices mixed between engines (2026-08-01)
     "RUSTSEC-2024-0438",  # wasmtime
     "RUSTSEC-2024-0439",  # wasmtime

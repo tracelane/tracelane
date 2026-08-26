@@ -95,6 +95,7 @@ pub struct GuardrailEngine {
     /// When present, resolves the registry per tenant; falls back to permissive
     /// on a store outage. `None` → use the shared `registry`.
     registry_loader: Option<Arc<RegistryLoader>>,
+    /// B: records observed tool definitions for approval. `None` = not
     /// wired (no control plane), and observation is simply skipped.
     tool_observer: Option<Arc<crate::guardrail::tool_observer::ToolObserver>>,
     /// `None` in dev / OSS self-host (no Postgres) → every gated rail granted
@@ -185,6 +186,7 @@ impl GuardrailEngine {
         }
     }
 
+    /// Attach the tool observer (/B). Without it, tool definitions are
     /// never recorded and the approve list stays empty — the rail still works
     /// for anything already pinned.
     #[must_use]
@@ -196,6 +198,7 @@ impl GuardrailEngine {
         self
     }
 
+    /// Evict a tenant's cached capability registry.
     ///
     /// Called by the tool-pin write path so a new pin takes effect on the NEXT
     /// request instead of after the cache TTL. Without it a customer pins a
@@ -246,6 +249,7 @@ impl GuardrailEngine {
         } = inputs;
 
         // Entitlement gate resolved off the warm cache (no Postgres on the hot
+        // path); None cache → FREE tier. The five ungated rails run
         // regardless; R2/R5/R6/R7 need a control-plane grant.
         let gate = RailGate::resolve(self.entitlements.as_deref(), *tenant_id.as_uuid()).await;
 
@@ -261,6 +265,7 @@ impl GuardrailEngine {
             session,
         );
 
+        // B: record what we actually saw, so the tenant can approve it.
         // The hash is already computed (capability.rs:297), so this is a
         // DashMap update and no I/O. Best-effort by construction — observation
         // must never affect a response.
@@ -581,6 +586,7 @@ mod tests {
         assert!(eval.ledger_recorded);
     }
 
+    ///  (founder ruling 2026-08-04): R4 lethal-trifecta is FREE. A tenant
     /// with **every gated feature denied** still gets trifecta protection.
     ///
     /// This test previously asserted the OPPOSITE — that R4 is skipped without a

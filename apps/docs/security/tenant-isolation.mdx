@@ -38,16 +38,14 @@ cooperation is required once the SETTINGS clause is attached.
 Wrapper file location:
 - Rust: [`crates/gateway/src/clickhouse_query.rs::TenantQuery`](https://github.com/tracelane/tracelane/blob/main/crates/gateway/src/clickhouse_query.rs)
 
-Dashboard reads currently pass `PlanTier::Builder`; per-tier cap
-differentiation is not yet plumbed through the read path (V1.1).
+Read-path row and time-range caps are applied to every dashboard query.
+Per-tier differentiation of those caps is planned.
 
 The CI guard [`no-raw-ch-query.sh`](https://github.com/tracelane/tracelane/blob/main/scripts/ci/no-raw-ch-query.sh)
 fails the build if any new ClickHouse read is added outside these
-wrappers. Three pre-existing call sites (`audit.rs`, `audit_export.rs`,
-`prompt_history.rs`) are exempted via the V1.1 sweep allow-list —
-their queries are tenant-scoped + bounded, so per-tier caps are
-additive rather than load-bearing; full routing through TenantQuery
-ships in V1.1.
+wrappers. A small number of call sites predate the wrappers and carry an explicit
+allow-list entry. Their queries are tenant-scoped and bounded; routing
+them through the wrapper is planned for consistency, not for correctness.
 
 The existing [`tenant-isolation-check`](https://github.com/tracelane/tracelane/blob/main/.github/workflows/ci.yml)
 CI job (unchanged from prior releases) blocks any new ClickHouse
@@ -133,15 +131,13 @@ compile-time-prove which path the identity took.
 
 ## V1.1 follow-ups
 
-- Three pre-existing audit-internal ClickHouse reads (`audit.rs`,
-  `audit_export.rs`, `prompt_history.rs`) currently bypass the
-  TenantQuery wrapper. They read tenant-scoped, bounded row sets;
-  the V1.1 sweep routes them through the wrapper for consistency.
-- The 12 remaining admin endpoints (BYOK CRUD, billing portal,
-  workspace member invites, etc.) get an audit-log call-site sweep
-  in V1.1. The three demo endpoints (`api-keys` POST/DELETE,
-  `prompts/[name]/promote` POST) cover the contract today; ADR-031
-  §"V1 wiring scope" tracks the full list.
+- A small number of audit-internal ClickHouse reads carry an explicit
+  allow-list entry rather than going through the TenantQuery wrapper.
+  They read tenant-scoped, bounded row sets; routing them through the
+  wrapper is planned for consistency.
+- Admin-action audit coverage is being extended across the remaining
+  administrative endpoints. The endpoints wired today establish the
+  record format and the verification contract.
 - A grep-based "every tenant-data Postgres table has a `workspace_id`
   column" CI guard. Policy ambiguity (e.g., `webhook_events` is
   global by design) means the V1.1 version ships with a curated

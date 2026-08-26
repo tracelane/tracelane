@@ -114,6 +114,28 @@ TERMINAL = {
 }
 RAN = {"success", "failure", "timed_out"}
 
+# B-269. GitHub reports a job it never PROVISIONED as `conclusion: failure` — the same
+# value as a job that ran and failed its tests. That collapse is why this guard would
+# have reported GREEN while one of its own targets never executed: on 2026-08-17 three
+# `ubuntu-latest` jobs were killed for account billing with `steps: []`, a 3-second
+# lifetime and no log blob, and `failure` is in RAN by deliberate design ("the run is
+# already red from that job").
+#
+# The DISCRIMINATING FIELD is the step list: a job that never started has an explicitly
+# EMPTY `steps` array — not even "Set up job". A job that ran and failed has steps.
+#
+# Only an EXPLICIT empty list downgrades. A MISSING `steps` key means the payload does
+# not carry the field, which is CANNOT DETERMINE about provisioning, not evidence of it —
+# so it is left alone rather than turned into a false red on every run.
+NEVER_STARTED = "never started (0 steps — no runner was provisioned)"
+
+
+def never_started(job: dict) -> bool:
+    """True only when the API explicitly reports zero steps."""
+    steps = job.get("steps")
+    return isinstance(steps, list) and len(steps) == 0
+
+
 POLL_SECONDS = 15
 DEFAULT_TIMEOUT_SECONDS = 240
 
@@ -136,6 +158,10 @@ def verdict(jobs: list[dict], targets: tuple[str, ...]) -> list[tuple[str, str, 
         if status != "completed" or conclusion is None:
             # Non-terminal. THE case that produced this rewrite.
             out.append((name, f"{status or 'unknown'} (never concluded)", False))
+            continue
+        if conclusion in RAN and never_started(job):
+            # Would have counted as RAN. It did not run at all.
+            out.append((name, f"{conclusion} / {NEVER_STARTED}", False))
             continue
         out.append((name, conclusion, conclusion in RAN))
     return out
@@ -195,6 +221,20 @@ def selftest() -> int:
             fails += 1
 
     def done(n: str, c: str) -> dict:
+        """A job that RAN: it has steps. Every pre-existing case uses this."""
+        return {
+            "name": n,
+            "status": "completed",
+            "conclusion": c,
+            "steps": [{"name": "Set up job", "conclusion": "success"}],
+        }
+
+    def never_provisioned(n: str) -> dict:
+        """B-269: GitHub's shape for a job it refused to provision — `failure`, 0 steps."""
+        return {"name": n, "status": "completed", "conclusion": "failure", "steps": []}
+
+    def no_steps_field(n: str, c: str) -> dict:
+        """A payload with no `steps` key at all: CANNOT DETERMINE, must not downgrade."""
         return {"name": n, "status": "completed", "conclusion": c}
 
     case(
@@ -248,6 +288,38 @@ def selftest() -> int:
     else:
         print("  ✗ would poll forever on a terminal-but-skipped job")
         fails += 1
+
+    # ── B-269, BOTH DIRECTIONS. The whole defect is that these two are the SAME
+    # `conclusion: failure` to the API, so a guard keying on conclusion alone cannot
+    # tell them apart — and it counted both as RAN.
+    case(
+        "NEVER STARTED (failure + 0 steps) -> NOT ran  [B-269, the defect]",
+        [never_provisioned("A"), done("B", "success")],
+        [False, True],
+    )
+    case(
+        "ran AND failed (failure + steps) -> still RAN  [B-269, the false positive]",
+        [done("A", "failure"), done("B", "success")],
+        [True, True],
+    )
+    case(
+        "both never started -> neither ran",
+        [never_provisioned("A"), never_provisioned("B")],
+        [False, False],
+    )
+    case(
+        "no `steps` field -> unchanged, still RAN (CANNOT DETERMINE is not evidence)",
+        [no_steps_field("A", "failure"), no_steps_field("B", "success")],
+        [True, True],
+    )
+    case(
+        "success with 0 steps is also never-started",
+        [
+            {"name": "A", "status": "completed", "conclusion": "success", "steps": []},
+            done("B", "success"),
+        ],
+        [False, True],
+    )
 
     if fails:
         print(f"behavioral-tier-ran selftest FAILED — {fails} case(s).")

@@ -1,5 +1,6 @@
 /**
  * In-memory fixed-window rate limiter for auth-adjacent web routes
+ * (IDENTITY_TEAM_SPEC §2/§6). Reuses the token-bucket shape on the web
  * side (the gateway has its own for WorkOS webhooks).
  */
 

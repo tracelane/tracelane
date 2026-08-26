@@ -1,3 +1,4 @@
+-- Migration 15: B1 Prompt-Promotion WRITE entitlement (, ADR-009).
 -- Postgres 17 + Neon-compatible. Idempotent (ALTER … IF NOT EXISTS;
 -- UPDATE is value-stable on re-run).
 --
@@ -13,10 +14,12 @@
 -- FALSE (column default) for free_v1 / builder_v1.
 --
 -- ⚠ DEPLOY ORDER: apply this migration BEFORE deploying a gateway built with
+-- the resolver (its SQL reads f_prompt_promotion_write; a missing
 -- column fails every entitlement resolve → fail-open-to-last-known/deny-all).
 -- Applying the migration first is always safe (old binaries ignore the column).
 --
 -- The prod-Neon twin of this migration lives in the drizzle set
+-- (`apps/web/db/migrations/`), which also carries the audit-addon
 -- backfill (the legacy `tenants.audit_enabled` column is drizzle-only and
 -- does not exist in this dev-stack schema).
 

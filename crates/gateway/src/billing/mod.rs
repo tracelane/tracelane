@@ -38,6 +38,7 @@ pub use portal::PortalState;
 // NOTE: the Polar webhook RECEIVER lives in the web tier
 // (`apps/web/app/api/webhooks/polar`), the single correct handler. The former
 // gateway `webhook` module (a second, incomplete receiver keyed only on
+// `polar_customer_id`) was retired 2026-07-28 — one receiver, no drift.
 
 /// Hosts permitted as a billing redirect target — `success_url` / `cancel_url`
 /// on checkout (A21) and `return_url` on the customer portal (SET-18).

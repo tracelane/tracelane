@@ -13,16 +13,17 @@ what you can build against are summarised below.
 |---|---|---|
 | ADR-006 | BYOK envelope encryption | Accepted |
 | ADR-008 | Trusted Publishing (OIDC) | Accepted |
-| ADR-008 | Tamper-evident agent ledger v1 design | Accepted |
 | ADR-009 | B1 — Prompt Promotion (atomic + rollbackable) | Accepted |
 | ADR-011 | Path-to-live sequencing | Accepted |
 | ADR-012 | Cowork ↔ Claude Code split | Accepted |
+| ADR-018 | Tamper-evident agent ledger v1 design | Accepted |
 
 ## Key decisions in plain English
 
-**Apache 2.0 over GPL-3.0 / ELv2.** We compete with Helicone (GPL-3.0
-viral) and Phoenix (ELv2 SaaS-blocked) by being the OSS that doesn't
-make customers nervous. Reference patterns; never fork.
+**Apache 2.0.** Permissive licensing was a deliberate choice: no copyleft
+obligation for teams embedding the gateway, and no source-available clause
+restricting how you deploy it. We wanted a licence our own customers could
+adopt without a legal review.
 
 **Rust gateway, not Go.** Low p95 overhead with full tracing on is a
 hot-path budget (measured figures publish with the Reliability Benchmark v1.0).
@@ -42,11 +43,12 @@ SDKs — they swap exporters.
 
 **Agent-tool safety inline, not async.** The point is to catch a
 compromised or hallucinated tool call at the gateway, inline, rather than
-reconstruct it from an incident after the fact. The budget is real
-(`combined, inline`) and `benchmark-runner` enforces it.
+reconstruct it from an incident after the fact. The latency budget for that
+inline work is tracked in the canonical repository's benchmark suite.
 
 **Every claim carries an eval.** A claim that a guard exists is written
-down as an assertion in `evals/`, and the suite runs in CI on every push.
+down as an assertion in `evals/`, and the suite runs in the canonical
+repository's CI. The assertions ship here so they are readable.
 Behavioral assertions that need a live gateway report as **skipped**, never
 as a fabricated pass. The suite is not yet enforced as a blocking required
 check — it reports, and a red result is acted on rather than automatically

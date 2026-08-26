@@ -1,6 +1,7 @@
 "use client";
 
 /**
+ * Tool pinning — the approve surface for R3 rug-pull detection (/B).
  *
  * Shows the tool definitions the gateway has ACTUALLY SEEN on this tenant's
  * traffic, so approving is one click instead of hand-authoring tool JSON.
@@ -12,10 +13,39 @@
  * The drift signal is the point of the screen: when a tool name appears with a
  * hash different from its approved one, its definition changed after you
  * approved it — the rug-pull R3 exists to catch.
+ *
+ * ── PRESENTATION PASS (P1, 2026-08-22) ──────────────────────────────────────
+ * On the shared `Table` system and the shared `Button`; the fetch, the approve
+ * and unpin calls, the 403/404 handling and every string are untouched. Two
+ * things worth naming because they are judgement calls, not conversions:
+ *
+ *  · DRIFT STAYS A BADGE, NOT A ROW COLOUR. "Definition changed" is the loudest
+ *    fact this table can report, and the tempting move is to tint the whole row
+ *    danger. A tinted row colours five cells that are not the finding — the
+ *    hash, the timestamps, the button — and once one row is tinted the eye reads
+ *    the UNTINTED rows as a second category rather than as normal. The chip is
+ *    where the meaning is, and it already carries the words.
+ *  · LOADING IS SKELETON ROWS, NOT A SENTENCE. "Loading observed tools…" told
+ *    the reader nothing about the shape that was arriving; three row-height
+ *    placeholders hold the layout so the section does not jump when the fetch
+ *    lands. They are `aria-hidden` (the Skeleton primitive sets it) and carry no
+ *    numbers — an empty grey bar cannot be misread as a value.
  */
 
 import { absoluteDate } from "@/lib/format-date";
-import { Badge, EmptyState } from "@tracelanedev/ui";
+import {
+	Badge,
+	Button,
+	Card,
+	EmptyState,
+	Skeleton,
+	TBody,
+	TD,
+	TH,
+	THead,
+	TR,
+	Table,
+} from "@tracelanedev/ui";
 import { useCallback, useEffect, useState } from "react";
 
 type Observed = {
@@ -99,7 +129,13 @@ export function ToolPins() {
 	}
 
 	if (state.kind === "loading") {
-		return <p className="text-sm text-ink-2">Loading observed tools…</p>;
+		return (
+			<Card quiet className="space-y-2 p-4">
+				{[0, 1, 2].map((i) => (
+					<Skeleton key={i} className="h-9 w-full" />
+				))}
+			</Card>
+		);
 	}
 
 	if (state.kind === "forbidden") {
@@ -112,10 +148,15 @@ export function ToolPins() {
 	}
 
 	if (state.kind === "error") {
+		// The `inline` variant: one muted line, no frame. An error inside a titled
+		// section does not need a second box drawn around it, and a danger-tinted
+		// panel for a transient fetch failure would outweigh the drift chips that
+		// are the actual signal on this surface. Copy unchanged.
 		return (
-			<p className="text-sm text-ink-2">
-				Could not load observed tools ({state.detail}).
-			</p>
+			<EmptyState
+				inline
+				title={`Could not load observed tools (${state.detail}).`}
+			/>
 		);
 	}
 
@@ -134,75 +175,89 @@ export function ToolPins() {
 		if (r.approved) approvedByName.set(r.tool_name, r.def_hash);
 
 	return (
-		<div className="overflow-x-auto">
-			<table className="w-full text-sm">
-				<thead>
-					<tr className="text-left text-ink-2">
-						<th className="py-1.5 pr-3 font-medium">Tool</th>
-						<th className="py-1.5 pr-3 font-medium">Definition</th>
-						<th className="py-1.5 pr-3 font-medium">First seen (UTC)</th>
-						<th className="py-1.5 pr-3 font-medium">Last seen (UTC)</th>
-						<th className="py-1.5 pr-3 font-medium">Status</th>
-						<th className="px-3 py-1.5 font-medium" />
-					</tr>
-				</thead>
-				<tbody>
-					{state.rows.map((r) => {
-						const approvedHash = approvedByName.get(r.tool_name);
-						const isDrift = !r.approved && approvedHash !== undefined;
-						const key = `${r.tool_name}:${r.def_hash}`;
-						return (
-							<tr key={key} className="border-t border-line">
-								<td className="py-2 pr-3 font-mono">{r.tool_name}</td>
-								<td className="py-2 pr-3 font-mono text-ink-2">
-									{r.def_hash.slice(0, 12)}…
-								</td>
-								<td className="py-2 pr-3 text-ink-2">
-									{absoluteDate(r.first_seen)}
-								</td>
-								<td className="py-2 pr-3 text-ink-2">
-									{absoluteDate(r.last_seen)}
-								</td>
-								<td className="py-2 pr-3">
-									{r.approved ? (
-										<Badge tone="ok">Approved</Badge>
-									) : isDrift ? (
-										<Badge tone="danger">Definition changed</Badge>
-									) : (
-										<Badge tone="neutral">Not approved</Badge>
-									)}
-								</td>
-								<td className="px-3 py-2">
-									{r.approved ? (
-										<button
-											type="button"
-											onClick={() => void unpin(r)}
-											disabled={busy === key}
-											className="rounded-md border border-line px-2.5 py-1 text-[13px] font-medium text-ink-2 hover:bg-surface-2 disabled:opacity-50"
-										>
-											{busy === key ? "Removing…" : "Remove approval"}
-										</button>
-									) : (
-										<button
-											type="button"
-											onClick={() => void approve(r)}
-											disabled={busy === key}
-											className="rounded-md border border-line px-2.5 py-1 text-[13px] font-medium hover:bg-surface-2 disabled:opacity-50"
-										>
-											{busy === key
-												? "Approving…"
-												: isDrift
-													? "Approve new definition"
-													: "Approve"}
-										</button>
-									)}
-								</td>
-							</tr>
-						);
-					})}
-				</tbody>
-			</table>
-			<p className="mt-3 text-[13px] text-ink-2">
+		<div className="space-y-3">
+			<Card quiet className="overflow-hidden p-0">
+				<Table>
+					{/* `border-t-0`: the shared `THead` is bordered top AND bottom so it holds
+					    its edge "whether or not the table starts at the top of its card"
+					    (its own words). This one DOES start at the top of a card, so its
+					    top border lands 1px inside the card's border in the same `--line`
+					    colour — two hairlines reading as one 2px rule along the top edge
+					    only, heavier than the three edges around it. Suppressed here, at
+					    the call site, rather than in the primitive: a table that starts
+					    mid-card still wants the border, and this is a question for one
+					    shared change rather than three concurrent ones. */}
+					<THead className="border-t-0">
+						<TR>
+							<TH>Tool</TH>
+							<TH>Definition</TH>
+							<TH>First seen (UTC)</TH>
+							<TH>Last seen (UTC)</TH>
+							<TH>Status</TH>
+							<TH aria-label="Actions" />
+						</TR>
+					</THead>
+					<TBody>
+						{state.rows.map((r) => {
+							const approvedHash = approvedByName.get(r.tool_name);
+							const isDrift = !r.approved && approvedHash !== undefined;
+							const key = `${r.tool_name}:${r.def_hash}`;
+							return (
+								<TR key={key}>
+									{/* Both are technical identifiers in LEFT columns, so both
+									    take `mono` rather than `numeric` — they are not numbers
+									    and right-aligning a hash next to a tool name would put
+									    two ragged left edges in the middle of the table. */}
+									<TD mono>{r.tool_name}</TD>
+									<TD mono muted>
+										{r.def_hash.slice(0, 12)}…
+									</TD>
+									<TD muted>{absoluteDate(r.first_seen)}</TD>
+									<TD muted>{absoluteDate(r.last_seen)}</TD>
+									<TD>
+										{r.approved ? (
+											<Badge tone="ok">Approved</Badge>
+										) : isDrift ? (
+											<Badge tone="danger">Definition changed</Badge>
+										) : (
+											<Badge tone="neutral">Not approved</Badge>
+										)}
+									</TD>
+									<TD className="text-right">
+										{r.approved ? (
+											<Button
+												variant="secondary"
+												size="sm"
+												onClick={() => void unpin(r)}
+												disabled={busy === key}
+											>
+												{busy === key ? "Removing…" : "Remove approval"}
+											</Button>
+										) : (
+											<Button
+												variant="secondary"
+												size="sm"
+												onClick={() => void approve(r)}
+												disabled={busy === key}
+											>
+												{busy === key
+													? "Approving…"
+													: isDrift
+														? "Approve new definition"
+														: "Approve"}
+											</Button>
+										)}
+									</TD>
+								</TR>
+							);
+						})}
+					</TBody>
+				</Table>
+			</Card>
+			{/* The authorisation semantics, verbatim. `text-xs`/`ink-2`: it is a
+			    footnote to the table, not a second body paragraph competing with the
+			    section intro above it. */}
+			<p className="max-w-3xl text-xs text-ink-2">
 				Approving pins this exact definition. If the tool's name, schema or
 				description changes afterwards, the guardrail engine flags it as
 				definition drift on the next request. Approving never grants a tool any

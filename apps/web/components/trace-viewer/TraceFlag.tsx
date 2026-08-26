@@ -111,7 +111,7 @@ export function TraceFlag({
 		<div className="inline-flex flex-col items-start gap-1">
 			<div className="inline-flex items-center gap-2">
 				{current ? (
-					<span className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface-2/40 px-2 py-1 text-[13px]">
+					<span className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface-2 px-2 py-1 text-sm">
 						{/* Glyph AND text: state must never be conveyed by symbol or
 						    colour alone — a screen reader has to get the same answer. */}
 						<span aria-hidden="true">⚑</span>
@@ -121,7 +121,7 @@ export function TraceFlag({
 						</span>
 					</span>
 				) : (
-					<span className="text-[13px] text-ink-3">Not flagged</span>
+					<span className="text-sm text-ink-3">Not flagged</span>
 				)}
 
 				<button
@@ -131,7 +131,7 @@ export function TraceFlag({
 					title={
 						canWrite ? undefined : "Your role can view flags but not set them."
 					}
-					className="rounded-lg border border-line px-2 py-1 text-[13px] disabled:opacity-50"
+					className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
 				>
 					{busy ? "Saving…" : current ? "Edit" : "⚑ Flag"}
 				</button>
@@ -141,7 +141,7 @@ export function TraceFlag({
 						type="button"
 						disabled={busy}
 						onClick={remove}
-						className="rounded-lg border border-line px-2 py-1 text-[13px] disabled:opacity-50"
+						className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
 					>
 						Remove
 					</button>
@@ -151,13 +151,13 @@ export function TraceFlag({
 			{/* ERROR is stated, never swallowed: a failed save that looks like a
 			    success is how a verdict silently goes unrecorded. */}
 			{error && (
-				<p role="alert" className="text-[13px] text-ink-2">
+				<p role="alert" className="text-sm text-ink-2">
 					{error}
 				</p>
 			)}
 
 			{open && canWrite && (
-				<div className="mt-1 rounded-lg border border-line bg-surface-2/40 p-3">
+				<div className="mt-1 rounded-lg border border-line bg-surface-2 p-3">
 					<div className="flex gap-2">
 						{LABELS.map((l) => (
 							<button
@@ -166,17 +166,14 @@ export function TraceFlag({
 								disabled={busy}
 								aria-pressed={current?.label === l.value}
 								onClick={() => save(l.value)}
-								className="rounded-lg border border-line px-2 py-1 text-[13px] disabled:opacity-50"
+								className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
 							>
 								{current?.label === l.value ? "✓ " : ""}
 								{l.text}
 							</button>
 						))}
 					</div>
-					<label
-						className="mt-2 block text-[13px] text-ink-3"
-						htmlFor="flag-note"
-					>
+					<label className="mt-2 block text-sm text-ink-3" htmlFor="flag-note">
 						Note (optional)
 					</label>
 					<textarea
@@ -185,7 +182,7 @@ export function TraceFlag({
 						onChange={(e) => setNote(e.target.value)}
 						maxLength={2000}
 						rows={2}
-						className="mt-1 w-full rounded-sm border border-line bg-transparent p-2 text-[13px]"
+						className="mt-1 w-full rounded-sm border border-line bg-transparent p-2 text-sm"
 					/>
 				</div>
 			)}

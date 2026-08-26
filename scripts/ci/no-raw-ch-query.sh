@@ -104,12 +104,94 @@ scan_tree() {
             # eval_runs, internally bounded like prompt_history. V1.1 sweep
             # routes it through TenantQuery for consistency (ADR-031).
             crates/gateway/src/prompt_router.rs) continue ;;
+            # EVL-05 eval engine. Two shapes, both checked rather than waved:
+            #  · the ONE query that scans `spans` on caller-supplied filters IS
+            #    wrapped by `TenantQuery` — and at the TIGHTEST (Builder) caps
+            #    rather than the tenant's own tier, because a background
+            #    case-fetch must not out-consume interactive queries. Compliant,
+            #    not exempt, same as trace_reads.rs.
+            #  · the `eval_runs` reads are small tenant-scoped lookups bounded by
+            #    LIMIT, the same shape as prompt_router's gate read above.
+            crates/gateway/src/prompt_eval.rs) continue ;;
+            # GWY-24 semantic cache. The one SELECT is wrapped by `TenantQuery`
+            # at the TIGHTEST (Builder) caps — a cache lookup sits ON the hot
+            # path, so it must never out-consume the interactive queries of the
+            # same workspace. Compliant, not exempt, same as trace_reads.rs.
+            # The INSERT is a write, which this guard does not police.
+            crates/gateway/src/semantic_cache.rs) continue ;;
             # Gateway-proxied trace + SLO reads (Option 1, ). The .query
             # execution lives here, but every SELECT IS wrapped by
             # clickhouse_query::TenantQuery (ADR-031 caps applied) — so this is
             # compliant, not exempt. Allow-listed because the grep matches any
             # `.query` call site regardless of the cap wrapper.
             crates/gateway/src/trace_reads.rs) continue ;;
+            # EVL-04 datasets. COMPLIANT, NOT EXEMPT.
+            #
+            # CORRECTED 2026-08-23 — MY FIRST DIAGNOSIS OF THIS FILE WAS WRONG AND I
+            # "FIXED" WORKING CODE. This entry read: "10 of its 12 `.query` sites
+            # passed raw SQL". They did not. Each one assigns
+            # `let sql = Self::capped("...")` and then passes `&sql`, which is the
+            # capped string — the guard flagged the file only because it greps for
+            # `.query(` regardless of the wrapper, which is the whole reason the
+            # entries above exist. Reading the grep hit as the defect, instead of
+            # reading the code around it, I wrapped ten already-capped strings a
+            # second time. Harmless by luck (`sql_with_settings` appends a SETTINGS
+            # fragment and ClickHouse takes the last one), but it was a change made
+            # on a misread, and it is reverted.
+            #
+            # THE LESSON IS THE GUARD'S OWN §2: a failed check is a claim about your
+            # TEST until you have read the detector. This one says in its header that
+            # it matches call sites, not wrappers.
+            #
+            # All 12 sites go through `ClickHouseDatasetStore::capped`, which is
+            # `TenantQuery::new(sql, PlanTier::Builder).sql_with_settings()` — the
+            # TIGHTEST caps rather than the tenant's own tier, because a dataset
+            # browse or a snapshot freeze is a background surface and must not
+            # out-consume the interactive queries of the same workspace. Same
+            # reasoning as `prompt_eval.rs` above.
+            #
+            # VERIFY THE CLAIM RATHER THAN TRUSTING THIS COMMENT — the capping is
+            # at the `let sql =` site, not the `.query()` site:
+            #   grep -c '\.query(' crates/gateway/src/dataset_routes.rs       # 12
+            #   grep -c 'Self::capped(' crates/gateway/src/dataset_routes.rs   # >= 12
+            # If those two numbers ever differ, this entry is a lie and the file is
+            # silently uncapped — which is precisely what a per-file allowance in a
+            # structural guard converts "not checked here" into (TRAPS §39).
+            crates/gateway/src/dataset_routes.rs) continue ;;
+            # EVL-02 experiments. COMPLIANT, NOT EXEMPT — and the claim was
+            # COUNTED before it was written, because the entry above records what
+            # happens when it is not: a grep hit was read as the defect and ten
+            # already-capped strings were wrapped a second time.
+            #
+            # 8 `.query(` sites. SIX are `.query(&sql)` where `sql` is
+            # `TenantQuery::new(..., PlanTier::Builder).sql_with_settings()` — the
+            # TIGHTEST caps rather than the tenant's own tier, because reading an
+            # experiment is a background surface and must not out-consume the
+            # interactive queries of the same workspace (same reasoning as
+            # `dataset_routes.rs` and `prompt_eval.rs`). The remaining TWO are
+            # inside `#[cfg(test)] mod clickhouse_roundtrip`, which applies
+            # migrations 18 and 19 to a throwaway container; the guard's path
+            # exemption covers `*/tests/*` but not an in-file test module, so they
+            # are named here rather than left to look like reads.
+            #
+            # VERIFY THE CLAIM RATHER THAN TRUSTING THIS COMMENT:
+            #   grep -c '\.query(' crates/gateway/src/experiment_routes.rs          # 8
+            #   grep -c 'TenantQuery::new(' crates/gateway/src/experiment_routes.rs  # 6
+            #   grep -c 'sql_with_settings()' crates/gateway/src/experiment_routes.rs # 6
+            # If the first exceeds the second by more than the two test-module
+            # sites, this entry is a lie and the file is silently uncapped — which
+            # is exactly what a per-file allowance in a structural guard converts
+            # "not checked here" into (TRAPS §39).
+            crates/gateway/src/experiment_routes.rs) continue ;;
+            # GWY-43 spend. COMPLIANT, NOT EXEMPT — and it was NOT when this entry
+            # was first needed. `seed_workspace` (EVL-02's budget seed) shipped an
+            # UNCAPPED `.query`, this guard caught it on the commit that introduced
+            # it, and it was FIXED rather than allow-listed: the one read now goes
+            # through `TenantQuery` at `PlanTier::Builder`.
+            #
+            #   grep -c '\.query(' crates/gateway/src/spend.rs           # 1
+            #   grep -c 'TenantQuery::new(' crates/gateway/src/spend.rs   # 1
+            crates/gateway/src/spend.rs) continue ;;
             # ── SURFACED 2026-08-13 by widening the trigger; DECLARED, not silent ──
             # These six became visible only when the trigger stopped requiring a
             # direct `use clickhouse::` import. Each was checked rather than waved

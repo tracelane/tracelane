@@ -24,6 +24,7 @@ useDefault = true
 #
 # Prefix-anchored with a length FLOOR, not a pinned length — Google publishes
 # no format spec and treats the key as opaque, so a pinned length lets a
+# slightly-different key through. See (the internal google-key-redaction incident review).
 [[rules]]
 id = "tracelane-google-auth-key-aq"
 description = "Google Authentication Key (AQ. format, 2026) — no upstream rule exists"
@@ -68,5 +69,6 @@ regexes = [
   # rule fires on the variable-name shape, not on any secret. Verified 2026-07-17.
   # NOTE: these regexes match gitleaks' extracted SECRET, not the matched line —
   # so this is the identifier itself, not `keyId = tenantPubkeyB64`. Also covers
+  # which quotes the same line.
   '''^tenantPubkeyB64$''',
 ]

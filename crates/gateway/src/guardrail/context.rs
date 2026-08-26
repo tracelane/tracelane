@@ -325,6 +325,7 @@ impl<'r> GuardrailContext<'r> {
             registry_posture: registry.posture(),
             est_input_tokens: estimate_input_tokens(request),
             model: &request.model,
+            // Guardrail label only (not a key lookup) — "unknown" on an
             // unmatched model is safe; the key path fail-closes separately.
             provider: crate::providers::ProviderRegistry::provider_id_for_model(&request.model)
                 .unwrap_or("unknown"),
@@ -368,6 +369,7 @@ impl<'r> GuardrailContext<'r> {
             registry_posture: RegistryPosture::Permissive,
             est_input_tokens: 0,
             model: &inputs.model,
+            // Guardrail label only (see above).
             provider: crate::providers::ProviderRegistry::provider_id_for_model(&inputs.model)
                 .unwrap_or("unknown"),
             session: inputs.session.clone(),

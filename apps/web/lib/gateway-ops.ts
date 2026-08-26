@@ -7,6 +7,7 @@
  * that JWT's `org_id` → internal tenant UUID (ADR-042) and binds it into
  * `WHERE tenant_id = ?`, so a user only ever sees their own tenant's stats.
  *
+ *  posture: the dashboard NEVER binds a tenant id itself; the JWT is the
  * only tenant signal. `GATEWAY_BEARER_TOKEN` is never read here.
  *
  * Honesty: every metric is a real, captured signal, but two windows coexist and
@@ -88,6 +89,93 @@ export async function fetchGatewayStats(opts?: {
 		return await gatewayGet<GatewayStats>(
 			`/v1/gateway/stats${qs ? `?${qs}` : ""}`,
 		);
+	} catch (err) {
+		if (err instanceof GatewayError) return null;
+		throw err;
+	}
+}
+
+// ── Cost attribution (GWY-43, Sprint 1 item 5) ───────────────────────────────
+
+/** One row of the spend breakdown, as returned by `GET /v1/costs`. */
+export type CostBreakdownRow = {
+	/**
+	 * The dimension value: an `api_keys.id`, a model string, or a provider id.
+	 * EMPTY STRING when the span carries no value on this dimension — a
+	 * session-authenticated request has no API key. That is not the same as
+	 * "unattributed", and the UI labels it rather than hiding the row.
+	 */
+	dimension: string;
+	requests: number;
+	/** Requests in this bucket whose cost we actually know. */
+	priced_requests: number;
+	/** Requests we could NOT price. Never folded into `cost_usd` as zero. */
+	unpriced_requests: number;
+	cost_usd: number;
+	input_tokens: number;
+	output_tokens: number;
+	/**
+	 * Of the above, how much was an eval run or an experiment arm (R94).
+	 * `0` here is MEASURED — every span either carries `tracelane_eval_run_id`
+	 * or does not — so it is safe to render as a zero rather than as unknown.
+	 */
+	eval_requests: number;
+	eval_cost_usd: number;
+};
+
+/** The `GET /v1/costs` response (gateway shape). */
+export type CostBreakdown = {
+	window_hours: number;
+	by: "key" | "model" | "provider";
+	total_cost_usd: number;
+	total_requests: number;
+	priced_requests: number;
+	/**
+	 * How much of the window `total_cost_usd` does NOT account for.
+	 *
+	 * This is the number that makes the total honest. `pricing::cost_usd`
+	 * returns no value for a model whose price we do not know, and the gateway
+	 * omits the attribute rather than writing 0 — but every read path used to
+	 * wrap the extract in `if(… > 0, x, 0)`, so unknown arrived as a confident
+	 * $0.00. Rendering this beside the total is what separates a cheap window
+	 * from an unpriced one.
+	 */
+	unpriced_requests: number;
+	/** Present only for `by=key`: when per-key attribution began. */
+	attribution_begins_note: string | null;
+	/** `"all"` (default) | `"production"` | `"eval"` — echoed by the gateway. */
+	scope: "all" | "production" | "eval";
+	/**
+	 * **The R94 split.** An experiment is deliberately expensive, so its spend
+	 * landing inside the customer's production figure is the worst possible
+	 * number to leave conflated. The gateway reports both halves at every scope;
+	 * `total_cost_usd` keeps its meaning and is DECOMPOSED rather than redefined.
+	 */
+	eval_cost_usd: number;
+	eval_requests: number;
+	production_cost_usd: number;
+	production_requests: number;
+	/** When eval attribution began — before R81 there was no attribute to read. */
+	eval_attribution_note: string;
+	rows: CostBreakdownRow[];
+};
+
+/**
+ * Fetch the spend breakdown for the authenticated tenant.
+ *
+ * `null` on `GatewayError` (unreachable) so the page can show its warming state,
+ * exactly as `fetchGatewayStats` does — distinct from a real empty result.
+ */
+export async function fetchCostBreakdown(opts?: {
+	hours?: number;
+	by?: "key" | "model" | "provider";
+}): Promise<CostBreakdown | null> {
+	const q = new URLSearchParams();
+	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
+	if (opts?.by !== undefined) q.set("by", opts.by);
+	const qs = q.toString();
+	try {
+		return await gatewayGet<CostBreakdown>(`/v1/costs${qs ? `?${qs}` : ""}`);
 	} catch (err) {
 		if (err instanceof GatewayError) return null;
 		throw err;

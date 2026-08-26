@@ -33,6 +33,24 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     -- Ingestion timestamp for deduplication windowing
     ingested_at      DateTime64(3, 'UTC') DEFAULT now64(),
 
+    -- GWY-43 (migration 16): cost-attribution dimensions. MATERIALIZED off the
+    -- attributes JSON, so only spans written after that deploy carry them —
+    -- measured values, never backfilled.
+    --
+    -- `api_key_id` is the dimension per-key spend needs and the table did not
+    -- have: "spend by model" was answerable, "spend by KEY" was impossible
+    -- because the fact was never recorded. Empty for a session-authenticated
+    -- request (no API key), which is NOT the same as unattributed.
+    -- It is the `api_keys.id` UUID, never the key: no secret-derived value goes
+    -- on a span (ADR-042 / security review M-2).
+    --
+    -- `cost_usd_present` exists because every read path wrapped the JSON cost in
+    -- `if(isFinite AND > 0, x, 0)`, which renders an HONESTLY UNKNOWN cost as a
+    -- confident $0.00. This separates "no cost recorded" from "cost was zero".
+    api_key_id       String  MATERIALIZED JSONExtractString(attributes, 'tracelane_api_key_id'),
+    cost_usd         Float64 MATERIALIZED JSONExtractFloat(attributes, 'gen_ai_usage_cost'),
+    cost_usd_present UInt8   MATERIALIZED toUInt8(JSONHas(attributes, 'gen_ai_usage_cost')),
+
     -- OBS-01 full-text search. ORDER BY is (tenant_id, trace_id, span_id), so a
     -- content predicate hits NO index and degenerates to a full scan of the
     -- tenant's parts. Measured on prod 2026-08-08 at 12,453 spans for the largest
@@ -46,12 +64,14 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     -- from a search box. tokenbf_v1 only serves whole-token equality, so "auth"
     -- would not find "authorize". n=4 sets the minimum useful query length; the
     -- route enforces it so a 3-char query cannot silently fall back to a scan.
+    INDEX idx_api_key_id       api_key_id TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_name_ngram       name       TYPE ngrambf_v1(4, 4096, 3, 0) GRANULARITY 4,
     INDEX idx_attributes_ngram attributes TYPE ngrambf_v1(4, 8192, 3, 0) GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(start_time)
 ORDER BY (tenant_id, trace_id, span_id)
+-- 365d = the MAX plan retention (Enterprise) — a fail-safe BACKSTOP, not the
 -- per-plan window. Per-tenant retention (Free 7 / Builder 30 / Team 90 / Business 180
 -- / Enterprise 365) is enforced by the entitlement-driven sweep job
 -- (crates/gateway/src/retention_sweep.rs, reads plan_entitlements.retention_days).
@@ -66,19 +86,29 @@ CREATE TABLE IF NOT EXISTS tracelane.trace_summaries
 (
     tenant_id        String,
     trace_id         String,
-    root_name        String,
-    start_time       DateTime64(6, 'UTC'),
-    end_time         DateTime64(6, 'UTC'),
-    duration_us      Int64,
-    span_count       UInt32,
-    error_count      UInt32,
-    intervention     UInt8,
-    model            String DEFAULT ''
+    root_name        SimpleAggregateFunction(max, String),
+    start_time       SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    end_time         SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+    span_count       SimpleAggregateFunction(sum, UInt64),
+    error_count      SimpleAggregateFunction(sum, UInt64),
+    intervention     SimpleAggregateFunction(max, UInt8),
+    model            SimpleAggregateFunction(max, String),
+    -- Read-time from the MERGED bounds; a per-batch duration is not a component of the
+    -- trace's duration, so it must never be stored.
+    duration_us      Int64 ALIAS dateDiff('microsecond', start_time, end_time)
 )
-ENGINE = ReplacingMergeTree(end_time)
-PARTITION BY toYYYYMM(start_time)
-ORDER BY (tenant_id, start_time, trace_id)
--- is done by the entitlement-driven retention sweep job, not this flat TTL.
+-- B-243 (migration 15): was ReplacingMergeTree(end_time) ORDER BY (tenant_id, start_time,
+-- trace_id) PARTITION BY toYYYYMM(start_time). A materialized view aggregates PER INSERT
+-- BLOCK, so a trace whose spans arrive in two ingest flushes emitted TWO rows, each with its
+-- own min(start_time) — and because start_time was IN THE SORTING KEY the rows had different
+-- keys and FINAL could not collapse them. Replacing is also the wrong operation: it keeps one
+-- partial row rather than merging two, so the survivor would carry 5 spans or 3, never 8.
+-- AggregatingMergeTree + SimpleAggregateFunction merges them, and PARTITION BY tuple() is
+-- required because ClickHouse merges only WITHIN a partition — any per-batch-derived
+-- partition key reintroduces the defect in a rarer, harder-to-find form.
+ENGINE = AggregatingMergeTree
+PARTITION BY tuple()
+ORDER BY (tenant_id, trace_id)
 TTL toDate(start_time) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
 
@@ -94,31 +124,23 @@ AS
 SELECT
     s.tenant_id AS tenant_id,
     s.trace_id  AS trace_id,
-    argMinIf(s.name, s.start_time, s.parent_span_id IS NULL) AS root_name,
+    -- maxIf over the ROOT span's name: a batch carrying no root contributes '' and loses the
+    -- merge. `argMinIf` has no mergeable simple form, which is why this changed with B-243.
+    maxIf(s.name, s.parent_span_id IS NULL)                  AS root_name,
     min(s.start_time)                                        AS start_time,
     max(s.end_time)                                          AS end_time,
-    dateDiff('microsecond', min(s.start_time), max(s.end_time)) AS duration_us,
-    count()                                                  AS span_count,
-    countIf(s.status_code = 2)                               AS error_count,
+    toUInt64(count())                                        AS span_count,
+    toUInt64(countIf(s.status_code = 2))                     AS error_count,
     max(s.intervention)                                      AS intervention,
-    -- OTel-GenAI attrs are stored flattened with underscores
-    -- (`gen_ai_response_model`); coalesce to the dotted + OpenInference forms.
-    argMinIf(
+    -- OTel-GenAI attrs are stored flattened with underscores (ADR-043 / migration 06).
+    max(
         coalesce(
             nullIf(JSONExtractString(s.attributes, 'gen_ai_response_model'), ''),
             nullIf(JSONExtractString(s.attributes, 'gen_ai_request_model'), ''),
             nullIf(JSONExtractString(s.attributes, 'gen_ai.response.model'), ''),
             nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
             JSONExtractString(s.attributes, 'llm.model_name')
-        ),
-        s.start_time,
-        coalesce(
-            nullIf(JSONExtractString(s.attributes, 'gen_ai_response_model'), ''),
-            nullIf(JSONExtractString(s.attributes, 'gen_ai_request_model'), ''),
-            nullIf(JSONExtractString(s.attributes, 'gen_ai.response.model'), ''),
-            nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
-            JSONExtractString(s.attributes, 'llm.model_name')
-        ) != ''
+        )
     )                                                        AS model
 FROM tracelane.spans AS s
 GROUP BY s.tenant_id, s.trace_id;
@@ -145,6 +167,7 @@ SETTINGS index_granularity = 8192;
 -- Append-only; hash_chain forms a Merkle chain per tenant.
 -- Ed25519 Merkle commitments anchored to Rekor (Week 5).
 --
+-- ReplacingMergeTree(event_time) (forward fix, ADR-065 F1): the
 -- per-tenant Postgres-serialized append writes the CH row durably BEFORE it
 -- advances + commits the Postgres head, so a crash between the CH write and the
 -- commit can leave an orphan row at a seq a later retry re-mints. Keying replace

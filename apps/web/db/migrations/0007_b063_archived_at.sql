@@ -1,3 +1,4 @@
+-- `tenants.archived_at` was push-provisioned in prod (ADR-040) but never
 -- had a migration, and no earlier migration SQL creates it (0000 baseline omits
 -- it; 0001 only *comments* that it deliberately doesn't touch `tenants`). So a
 -- fresh `drizzle-kit migrate` (new env / CI-from-scratch) builds a `tenants`

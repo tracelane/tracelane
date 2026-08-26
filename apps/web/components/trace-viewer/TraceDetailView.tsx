@@ -24,6 +24,7 @@ import {
 } from "@/lib/trace-tree";
 import {
 	Button,
+	SegmentedControl,
 	type SpanKind,
 	type SpanNode,
 	TranscriptSpine,
@@ -37,6 +38,11 @@ import { WaterfallView } from "./WaterfallView";
 import type { Span } from "./types";
 
 type ViewMode = "waterfall" | "transcript";
+
+const VIEW_OPTIONS = [
+	{ value: "waterfall", label: "Waterfall" },
+	{ value: "transcript", label: "Transcript" },
+] as const satisfies ReadonlyArray<{ value: ViewMode; label: string }>;
 
 /** Human label for each span kind — shown in the toolbar legend. */
 const KIND_LABEL: Record<SpanKind, string> = {
@@ -65,6 +71,7 @@ function toNode(row: VisibleRow, hitCounts?: Record<string, number>): SpanNode {
 		durationMs: Math.round(s.duration_us / 1000),
 		status: s.status_code === 2 ? "error" : "ok",
 		// matched failure-signature (AFT) → the inline seen-before glow (per-tenant
+		// hits; cross-customer network is V1.1). "View signature →" deep-links to
 		// the §4 Failure Signatures page (now built — no longer a dead link).
 		// label = human name from AFT-1 spec; title = "id: label" tooltip on hover.
 		signature: matched
@@ -142,44 +149,40 @@ export function TraceDetailView({
 		<div className="space-y-4">
 			<TraceSummaryHeader spans={spans} />
 			<div className="flex flex-col gap-4 md:h-[calc(100vh-320px)] md:min-h-[400px] md:flex-row">
-				<div className="flex flex-1 flex-col overflow-hidden rounded-xl border border-line bg-surface/40">
+				{/* The span-view panel is a card, so it takes `--radius-card` from
+				    `.surface-card` rather than the 12px `rounded-xl` it used to hardcode —
+				    a bordered panel with padding and content is exactly what that class is
+				    for, and hardcoding a radius is how a card drifts off the system. The
+				    fill was `bg-surface`: a 40%-opaque white over an unknown parent is
+				    off-white on the canvas and a grey smear inside a dark card, i.e. not a
+				    colour anyone chose. It is the card surface now. */}
+				<div className="surface-card flex flex-1 flex-col overflow-hidden border border-line bg-surface">
 					<div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2">
-						{/* View toggle — Waterfall (readable default) | Transcript (spine). */}
-						<div
-							role="tablist"
-							aria-label="Span view"
-							className="flex items-center rounded-md border border-line p-0.5"
-						>
-							{(
-								[
-									["waterfall", "Waterfall"],
-									["transcript", "Transcript"],
-								] as const
-							).map(([mode, label]) => (
-								<button
-									key={mode}
-									type="button"
-									role="tab"
-									aria-selected={view === mode}
-									onClick={() => setView(mode)}
-									className={cn(
-										"rounded px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1",
-										view === mode
-											? "bg-surface-2 text-ink"
-											: "text-ink-2 hover:text-ink",
-									)}
-								>
-									{label}
-								</button>
-							))}
-						</div>
+						{/*
+						 * View toggle — Waterfall (readable default) | Transcript (spine).
+						 *
+						 * It was `role="tablist"` / `role="tab"` / `aria-selected` over two
+						 * plain buttons, which claimed the ARIA tab contract without
+						 * implementing either half: no roving tabindex (both buttons take
+						 * Tab) and no `aria-controls` onto a `role="tabpanel"` (the two
+						 * views render as siblings below, neither of them a tabpanel). The
+						 * primitive announces `role="group"` with the SAME accessible name
+						 * and `aria-pressed` on the chosen option — a weaker claim that
+						 * the markup actually keeps.
+						 */}
+						<SegmentedControl
+							label="Span view"
+							value={view}
+							options={VIEW_OPTIONS}
+							onChange={setView}
+						/>
 						<input
 							type="search"
 							value={query}
 							onChange={(e) => setQuery(e.target.value)}
 							placeholder="Search spans…"
 							aria-label="Search spans"
-							className="w-full max-w-xs rounded-sm border border-line bg-surface px-3 py-1.5 text-xs text-ink outline-none placeholder:text-ink-3 focus-visible:ring-2 focus-visible:ring-seal"
+							className="w-full max-w-xs rounded-sm border border-line bg-surface px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						/>
 						{errorCount > 0 && (
 							<button
@@ -188,7 +191,7 @@ export function TraceDetailView({
 								aria-pressed={errorsOnly}
 								title="Show only error spans and the path down to them"
 								className={cn(
-									"flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1",
+									"flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2",
 									errorsOnly
 										? "border-danger/40 bg-danger-soft text-danger-ink"
 										: "border-line text-ink-2 hover:bg-surface-2 hover:text-ink",
@@ -204,11 +207,13 @@ export function TraceDetailView({
 						)}
 
 						{/* Compact span-kind legend — only shown when ≥ 2 kinds are visible.
-						    Colors match the waterfall bars exactly (KIND_BAR). Each entry is a
-						    colored dot + uppercase label (never color alone). */}
+						    Marks match the waterfall bars exactly (the same KIND_BAR map, imported
+						    rather than restated). Each entry is a dot on the monochrome VALUE ramp
+						    plus its small-caps label, so the label carries the meaning and the dot
+						    only ranks it — the marks are no longer hues to be told apart. */}
 						{showLegend && (
 							<div
-								className="flex items-center gap-3 text-[10px] font-semibold uppercase tracking-wide text-ink-3"
+								className="flex items-center gap-3 t-metric-label"
 								aria-label="Span kind legend"
 							>
 								{usedKinds.map((kind) => (
@@ -289,8 +294,13 @@ export function TraceDetailView({
 						)}
 					</div>
 				</div>
-				<div className="flex w-full flex-col overflow-hidden rounded-xl border border-line bg-surface md:w-[480px] md:flex-shrink-0">
-					<div className="border-b border-line bg-surface-2/50 px-4 py-3">
+				{/* The inspector is the second card in the pair; same radius source as the
+				    panel beside it, so the two read as one instrument. Its header band is
+				    `--canvas-sunken`, the declared role for a strip that sits UNDER the
+				    card surface — it was `bg-surface-2`, a half-strength well over the
+				    card, which is a value that changes with whatever is behind it. */}
+				<div className="surface-card flex w-full flex-col overflow-hidden border border-line bg-surface md:w-[480px] md:flex-shrink-0">
+					<div className="border-b border-line bg-canvas-sunken px-4 py-3">
 						<h2 className="text-sm font-semibold text-ink">Span Inspector</h2>
 					</div>
 					<SpanInspector span={selectedSpan} />

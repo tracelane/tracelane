@@ -106,6 +106,7 @@ interface DeleteBody {
  * `tlane_` keys (so gateway traffic 401s immediately — the key lookup filters
  * `revoked_at IS NULL`). Dashboard access is blocked by the archived-org guard
  * in requireSession. Hard purge (WorkOS org delete, ClickHouse/R2/Neon rows,
+ * Polar subscription cancel) is the scheduled job [V1.1] — data is
  * "purged within 30 days"; soft-delete is reversible in-window (archived_at =
  * NULL) until then.
  */

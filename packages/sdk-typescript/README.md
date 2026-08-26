@@ -144,7 +144,7 @@ registered on `beforeExit`).
 Streamed calls (`stream: true`) pass through untouched and still produce a
 span with model + latency, marked `tracelane.streaming = true`. Token usage
 and finish reason are **not** captured for streamed responses yet — that
-lands in v1.1. A once-per-process runtime warning says exactly this.
+is not implemented. A once-per-process runtime warning says exactly this.
 
 ## Instrumented libraries
 
@@ -170,7 +170,7 @@ Full list (one export per library): `instrumentAnthropic`, `instrumentOpenAI`,
 `instrumentFirecrawl`.
 
 > **Zero-config `autoInstrument()` is not in v1** — calling it throws with a
-> pointer to this explicit API. Auto-detection lands in v1.1.
+> pointer to this explicit API. Auto-detection is not implemented.
 
 ## Next.js App Router
 

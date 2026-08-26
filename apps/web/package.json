@@ -14,9 +14,6 @@
 		"lint": "biome check app/ components/ lib/",
 		"typecheck": "tsc --noEmit",
 		"test": "vitest run",
-		"test:e2e": "playwright test",
-		"test:e2e:hero": "E2E_BYPASS_AUTH=1 E2E_LIGHT=1 playwright test audit-hero --project=chromium",
-		"test:e2e:gate": "E2E_BYPASS_AUTH=1 E2E_LIGHT=1 playwright test dead-buttons global-chrome --project=chromium",
 		"db:seed": "node db/seed.mjs"
 	},
 	"dependencies": {
@@ -34,7 +31,6 @@
 		"@biomejs/biome": "^1.9.0",
 		"@electric-sql/pglite": "^0.5.4",
 		"@opennextjs/cloudflare": "1.19.11",
-		"@playwright/test": "^1.49.1",
 		"@tailwindcss/postcss": "^4.0.0",
 		"@types/node": "^22.0.0",
 		"@types/react": "19.0.0",

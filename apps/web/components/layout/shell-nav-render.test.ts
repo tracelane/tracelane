@@ -52,7 +52,25 @@ beforeEach(() => {
 describe("R12 after-proof — the sidebar strands nothing", () => {
 	it("renders EVERY primary destination as a real link", () => {
 		const html = render();
-		expect(NAV_ITEMS.length).toBe(9); // ADR-074 §6: nine items, no scroll
+		// NO PINNED COUNT — founder ruling, 2026-08-24.
+		//
+		// This asserted `toBe(9)` citing "ADR-074 §6: nine items, no scroll", and
+		// it BLOCKED shipping the Experiments entry after EVL-02 landed. The nine
+		// was a CHECKLIST OF WHAT HAD TO EXIST AT THE END OF THE ADR-074
+		// RENOVATION — a snapshot of that moment — not a permanent ceiling. The
+		// product grows; a test that pins the count turns every new feature's nav
+		// entry into a test failure and invites the next person to "just bump the
+		// number", which asserts nothing at all.
+		//
+		// WHAT ACTUALLY MATTERS IS BELOW: every declared destination renders as a
+		// REAL link. That property holds at nine, at ten, and at whatever the
+		// product needs next.
+		//
+		// The `> 0` is not padding: `for (const … of [])` passes vacuously, so a
+		// nav that resolved to an empty list would satisfy every assertion in this
+		// block while rendering nothing. A loop that iterates nothing must never
+		// read as a pass.
+		expect(NAV_ITEMS.length).toBeGreaterThan(0);
 		for (const { href } of NAV_ITEMS) {
 			expect(html, `sidebar dropped ${href}`).toContain(`href="${href}"`);
 		}

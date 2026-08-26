@@ -151,7 +151,7 @@ auto_instrument()  # wraps installed anthropic / openai / litellm / claude_code
 Streamed calls (`stream=True`) pass through untouched and still produce a
 span with model + latency, marked `tracelane.streaming = True`. Token usage
 and finish reason are **not** captured for streamed responses yet — that
-lands in v1.1. A once-per-process `UserWarning` says exactly this.
+is not implemented. A once-per-process `UserWarning` says exactly this.
 
 ## Instrumented libraries
 

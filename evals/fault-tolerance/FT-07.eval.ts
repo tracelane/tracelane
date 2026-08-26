@@ -35,6 +35,7 @@ describe("FT-07: Dashboard slow ClickHouse query — timeout + partial result", 
 			path.join(WEB_APP, "app/slo/page.tsx"),
 			"utf8",
 		);
+		// Option 1: the dashboard reads ClickHouse only through the
 		// gateway proxy (tenant resolved gateway-side from the JWT). Real data,
 		// not static fixtures.
 		expect(content).toContain("gatewayGet");
@@ -96,6 +97,7 @@ describe("FT-07: Dashboard slow ClickHouse query — timeout + partial result", 
 		expect(content).toContain("streamQueryWithDeadline");
 		expect(content).toContain("text/event-stream");
 		// Tenant isolation: the read goes through the gateway proxy, which binds
+		// tenant_id from the validated JWT claims (Option 1). The
 		// deadline/partial/SSE degradation contract is unchanged.
 		expect(content).toContain("gatewayGet");
 	});

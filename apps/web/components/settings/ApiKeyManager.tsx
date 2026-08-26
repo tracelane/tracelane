@@ -9,6 +9,8 @@
  * Pain-points: PP-G1 (developer onboarding), PP-G5 (BYOK key management).
  */
 
+import { Modal } from "@/components/Modal";
+import { apiFetch } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -30,6 +32,17 @@ export interface ApiKeyRow {
 	scope?: string[] | null;
 	/** A13. `null` = never expires. */
 	expiresAt?: string | null;
+	/**
+	 * GWY-43. Monthly USD ceiling for this key; `null` = uncapped.
+	 *
+	 * The union is not laziness. The LIST reads the Postgres `numeric` column,
+	 * which the driver hands back as a STRING ("50.0000"); the create response
+	 * echoes the value the gateway validated, which is a JSON NUMBER. Both reach
+	 * this type, so both are declared — `formatBudget` normalises them.
+	 */
+	budgetUsdMonthly?: string | number | null;
+	/** GWY-43. Requests/min ceiling for this key; `null` = the plan limit only. */
+	rateLimitRpm?: number | null;
 }
 
 /** The closed scope vocabulary, mirrored from `tracelane_shared::api_scope`. */
@@ -65,6 +78,48 @@ function scopeLabel(scope: string[] | null | undefined): string {
 		.join(" · ");
 }
 
+/**
+ * The monthly USD ceiling, formatted. Accepts the `numeric`-as-string the list
+ * returns and the JSON number the create response echoes; anything that will not
+ * parse renders as no cap, which matches the gateway — `db::api_keys` filters a
+ * budget it cannot parse down to `None` rather than treating it as zero.
+ */
+function formatBudget(v: string | number | null | undefined): string | null {
+	if (v == null) return null;
+	const n = typeof v === "number" ? v : Number.parseFloat(v);
+	return Number.isFinite(n) && n > 0 ? `$${n.toFixed(2)}/mo` : null;
+}
+
+/**
+ * The key's own ceilings as one label, or `null` when it carries neither.
+ *
+ * Both are shown together because they answer one question — "what is this key
+ * allowed to do?" — and because a key with no ceilings must read as *no
+ * ceilings*, not as a blank cell. Same reasoning as the legacy-scope cell above.
+ */
+function limitsLabel(key: ApiKeyRow): string | null {
+	const parts: string[] = [];
+	const budget = formatBudget(key.budgetUsdMonthly);
+	if (budget) parts.push(budget);
+	if (key.rateLimitRpm != null && key.rateLimitRpm > 0) {
+		parts.push(`${key.rateLimitRpm} req/min`);
+	}
+	return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * A numeric form field that is legitimately allowed to be empty. Blank, or
+ * anything that does not parse to a finite number, is `null` = "not set" —
+ * never `NaN`, which `JSON.stringify` would quietly write as `null` in the
+ * request body and the server would read as a deliberate "no cap".
+ */
+function optionalNumber(raw: string): number | null {
+	const t = raw.trim();
+	if (t === "") return null;
+	const n = Number(t);
+	return Number.isFinite(n) ? n : null;
+}
+
 /** Is this key past its expiry? Display-only — the gateway is the real gate. */
 function isExpired(expiresAt: string | null | undefined): boolean {
 	if (!expiresAt) return false;
@@ -84,20 +139,54 @@ function idleHint(createdAt: string, lastUsedAt: string | null): string | null {
 	return ageMs > 7 * 86_400_000 ? "unused — consider revoking" : "unused (new)";
 }
 
+/**
+ * The per-key ceilings, in one column.
+ *
+ * They live together because they answer one question — what is this key
+ * allowed to spend and how fast — and because the column exists at all for a
+ * reason worth stating: both are ENFORCED by the gateway (402 and 429), and a
+ * limit the customer cannot see is one they cannot trust. Until GWY-43 the
+ * budget column was writable only by hand-written SQL and readable nowhere.
+ */
+function LimitsCell({ row }: { row: ApiKeyRow }) {
+	const label = limitsLabel(row);
+	return (
+		<td className="py-2 pr-3 text-xs">
+			{label ? (
+				<span
+					className="text-ink-2"
+					title="Set when the key was created. The budget is a hard stop (402 until the month rolls over); the rate limit returns 429 and narrows the workspace plan limit for this key."
+				>
+					{label}
+				</span>
+			) : (
+				<span
+					className="text-ink-3"
+					title="No per-key ceilings — this key is bounded only by your workspace's plan limits."
+				>
+					None
+				</span>
+			)}
+		</td>
+	);
+}
+
 interface CreateResult extends ApiKeyRow {
 	rawKey: string;
 }
 
 async function fetchKeys(): Promise<ApiKeyRow[]> {
-	const res = await fetch("/api/settings/api-keys");
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	return res.json() as Promise<ApiKeyRow[]>;
+	return apiFetch<ApiKeyRow[]>("/api/settings/api-keys");
 }
 
 export interface CreateKeyInput {
 	name: string;
 	scope: string[];
 	expiresAt: string | null;
+	/** GWY-43. `null` = no cap. */
+	budgetUsdMonthly: number | null;
+	/** GWY-43. `null` = inherit the workspace plan limit. */
+	rateLimitRpm: number | null;
 }
 
 async function createKey(input: CreateKeyInput): Promise<CreateResult> {
@@ -108,6 +197,15 @@ async function createKey(input: CreateKeyInput): Promise<CreateResult> {
 			name: input.name,
 			scope: input.scope,
 			...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+			// Sent only when set. Omitted means "no cap", and JSON.stringify turns a
+			// NaN into `null`, so an unparseable field must never reach the body —
+			// it would read as a deliberate "uncapped" rather than as a mistake.
+			...(input.budgetUsdMonthly != null
+				? { budgetUsdMonthly: input.budgetUsdMonthly }
+				: {}),
+			...(input.rateLimitRpm != null
+				? { rateLimitRpm: input.rateLimitRpm }
+				: {}),
 		}),
 	});
 	if (!res.ok) {
@@ -150,55 +248,90 @@ function CopyButton({ text }: { text: string }) {
 function NewKeyModal({
 	rawKey,
 	name,
+	scope,
 	onDone,
 }: {
 	rawKey: string;
 	name: string;
+	scope: string[] | null | undefined;
 	onDone: () => void;
 }) {
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-lg shadow-2xl space-y-4">
-				<div className="flex items-start justify-between">
-					<div>
-						<h3 className="text-base font-semibold text-ink">
-							API key created
-						</h3>
-						<p className="text-xs text-ink-2 mt-0.5">{name}</p>
-					</div>
-					<span className="text-xs text-warn-ink bg-warn/10 border border-warn/20 rounded px-2 py-0.5">
-						Copy now — shown once
-					</span>
-				</div>
-
-				<div className="rounded-lg bg-bg border border-line p-3 flex items-center justify-between gap-3">
-					<code className="text-xs font-mono text-action-ink break-all">
-						{rawKey}
-					</code>
-					<CopyButton text={rawKey} />
-				</div>
-
-				<p className="text-[11px] text-ink-2">
-					Store this key in your secrets manager — this is the only time it's
-					shown. We keep only a one-way verifier digest (HMAC + Argon2id), never
-					the key itself; if you lose it, revoke and create a new one.
-				</p>
-
-				<div className="flex justify-end pt-1">
-					<button
-						type="button"
-						onClick={onDone}
-						className="px-4 py-2 rounded text-sm bg-surface-2 text-ink hover:bg-surface-3 transition-colors"
-					>
-						I&apos;ve saved it
-					</button>
-				</div>
+		// `dismissable={false}`: this dialog shows the raw API key exactly once and
+		// the server cannot re-issue it — a stray Escape would destroy it.
+		<Modal
+			title="API key created"
+			titleAside={
+				// `--warn-soft` is the named soft fill; `bg-warn/10` was a 10% wash of the
+				// FILL token over whatever is behind the modal header, which is a
+				// different colour in each theme and in neither case a chosen one.
+				<span className="rounded border border-warn/20 bg-warn-soft px-2 py-0.5 text-xs text-warn-ink">
+					Copy now — shown once
+				</span>
+			}
+			description={name}
+			onClose={onDone}
+			width="lg"
+			dismissable={false}
+		>
+			<div className="rounded-lg bg-bg border border-line p-3 flex items-center justify-between gap-3">
+				<code className="text-xs font-mono text-action-ink break-all">
+					{rawKey}
+				</code>
+				<CopyButton text={rawKey} />
 			</div>
-		</div>
+
+			{/*
+			 * WHAT THIS KEY CAN DO, shown at the one moment it is both known and
+			 * still cheaply revocable. Its absence is how a key minted as
+			 * "read-only" went out able to spend provider budget: the dialog
+			 * pre-granted three scopes and nothing afterwards ever contradicted
+			 * the operator's belief about what they had made.
+			 *
+			 * Chat is called out by name because it is the scope with a bill
+			 * attached — the others cost visibility, this one costs money.
+			 */}
+			<div className="rounded-lg border border-line p-3">
+				<p className="text-2xs text-ink-2 mb-1.5">This key can:</p>
+				<p className="text-xs text-ink">{scopeLabel(scope)}</p>
+				{Array.isArray(scope) && scope.includes("chat") && (
+					<p className="text-2xs text-warn-ink mt-1.5">
+						Includes <strong>Chat</strong> — this key can send completions
+						through the gateway and spend your provider budget. Revoke it now if
+						that was not intended.
+					</p>
+				)}
+				{scope == null && (
+					<p className="text-2xs text-warn-ink mt-1.5">
+						Legacy full-surface key — no scope recorded, so every surface is
+						allowed.
+					</p>
+				)}
+			</div>
+
+			<p className="text-2xs text-ink-2">
+				Store this key in your secrets manager — this is the only time it's
+				shown. We keep only a one-way verifier digest (HMAC + Argon2id), never
+				the key itself; if you lose it, revoke and create a new one.
+			</p>
+
+			<div className="flex justify-end pt-1">
+				<button
+					type="button"
+					onClick={onDone}
+					className="px-4 py-2 rounded text-sm bg-surface-2 text-ink hover:bg-surface-3 transition-colors"
+				>
+					I&apos;ve saved it
+				</button>
+			</div>
+		</Modal>
 	);
 }
 
-function CreateKeyDialog({
+// Exported for `api-key-scope-default.test.tsx`, which asserts against the
+// RENDERED MARKUP that no scope arrives pre-granted. Testing the state array
+// would pass while the checkboxes said otherwise (TRAPS §34).
+export function CreateKeyDialog({
 	onClose,
 	onCreate,
 	pending,
@@ -221,144 +354,239 @@ function CreateKeyDialog({
 	// both calls models and reports its traces. Leaving it off would mean the SDK
 	// quickstart 403s for every new user, with the fix three screens away.
 	// Unticking it is still one click for anyone who wants a chat-only key.
-	const [scope, setScope] = useState<string[]>(["chat", "read", "ingest"]);
+	// NOTHING PRE-CHECKED, and this is a deliberate reversal.
+	//
+	// This defaulted to ["chat", "read", "ingest"], so minting a READ-ONLY key
+	// required noticing two boxes were already ticked and un-ticking them. The
+	// founder minted a key intending read-only, got one that completed a real
+	// Anthropic call, and only found out because a proof that needed a
+	// non-chat-capable key kept succeeding.
+	//
+	// A credential dialog whose default grants the MOST is a default that fails
+	// OPEN: the quiet path — open, name it, click Create — hands out chat (which
+	// spends provider budget) and ingest. Least privilege says the quiet path must
+	// grant nothing, and the form already refuses an empty scope with "Pick at
+	// least one", so this costs one deliberate click and buys an explicit choice.
+	const [scope, setScope] = useState<string[]>([]);
 	const [expiresAt, setExpiresAt] = useState("");
+	// GWY-43. Both limits are held as the raw input STRING and parsed once on
+	// submit: "" is a real, meaningful value here (no cap), and coercing the box
+	// to a number would make an empty field indistinguishable from a typed 0.
+	const [budget, setBudget] = useState("");
+	const [rateLimit, setRateLimit] = useState("");
 	const toggle = (v: string) =>
 		setScope((cur) =>
 			cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v],
 		);
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			<div className="bg-surface border border-line rounded-xl p-6 w-full max-w-md shadow-2xl space-y-4">
-				<h3 className="text-base font-semibold text-ink">Create API key</h3>
-				<form
-					onSubmit={(e) => {
-						e.preventDefault();
-						if (name.trim() && !pending && scope.length > 0) {
-							onCreate({
-								name: name.trim(),
-								scope,
-								// <input type="datetime-local"> yields local wall-clock with
-								// no zone. Send an explicit UTC instant rather than a naive
-								// string — the gateway parses RFC3339 strictly, and a naive
-								// value is the timestamp bug this repo has hit before.
-								expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
-							});
-						}
-					}}
-					className="space-y-3"
-				>
-					<div>
+		// `lg`, not the default `md`: GWY-43 added two more field groups, each with
+		// the copy that states what happens AT the limit. At `md` the form ran past
+		// a 768px viewport, and this Modal centres its panel — an overflowing panel
+		// clips at the TOP, hiding the key-name field rather than the buttons.
+		<Modal title="Create API key" onClose={onClose} width="lg">
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (name.trim() && !pending && scope.length > 0) {
+						onCreate({
+							name: name.trim(),
+							scope,
+							// <input type="datetime-local"> yields local wall-clock with
+							// no zone. Send an explicit UTC instant rather than a naive
+							// string — the gateway parses RFC3339 strictly, and a naive
+							// value is the timestamp bug this repo has hit before.
+							expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+							// `optionalNumber` returns null for blank AND for anything that
+							// will not parse, so a half-typed box cannot be sent as an
+							// unintended "no cap". The gateway validates the range.
+							budgetUsdMonthly: optionalNumber(budget),
+							rateLimitRpm: optionalNumber(rateLimit),
+						});
+					}
+				}}
+				className="space-y-3"
+			>
+				<div>
+					<label
+						htmlFor="key-name"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Key name
+					</label>
+					<input
+						id="key-name"
+						type="text"
+						value={name}
+						onChange={(e) => setName(e.target.value)}
+						placeholder="e.g. prod-agent, ci-runner"
+						disabled={pending}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						required
+					/>
+				</div>
+				<fieldset className="space-y-1.5">
+					<legend className="text-xs font-medium text-ink-2 mb-1">
+						Scope — what this key may do
+					</legend>
+					{SCOPES.map((sc) => (
 						<label
-							htmlFor="key-name"
-							className="text-xs font-medium text-ink-2 block mb-1"
+							key={sc.value}
+							className="flex items-start gap-2 text-xs text-ink cursor-pointer"
 						>
-							Key name
+							<input
+								type="checkbox"
+								checked={scope.includes(sc.value)}
+								onChange={() => toggle(sc.value)}
+								disabled={pending}
+								className="mt-0.5"
+							/>
+							<span>
+								<span className="font-medium">{sc.label}</span>
+								<span className="text-ink-2"> — {sc.hint}</span>
+							</span>
 						</label>
-						<input
-							id="key-name"
-							type="text"
-							value={name}
-							onChange={(e) => setName(e.target.value)}
-							placeholder="e.g. prod-agent, ci-runner"
-							disabled={pending}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-action-ink disabled:opacity-50"
-							required
-						/>
-					</div>
-					<fieldset className="space-y-1.5">
-						<legend className="text-xs font-medium text-ink-2 mb-1">
-							Scope — what this key may do
-						</legend>
-						{SCOPES.map((sc) => (
-							<label
-								key={sc.value}
-								className="flex items-start gap-2 text-xs text-ink cursor-pointer"
-							>
-								<input
-									type="checkbox"
-									checked={scope.includes(sc.value)}
-									onChange={() => toggle(sc.value)}
-									disabled={pending}
-									className="mt-0.5"
-								/>
-								<span>
-									<span className="font-medium">{sc.label}</span>
-									<span className="text-ink-2"> — {sc.hint}</span>
-								</span>
-							</label>
-						))}
-						{scope.length === 0 && (
-							<p className="text-[11px] text-danger-ink">
-								Pick at least one — a key with no scope can do nothing.
-							</p>
-						)}
-					</fieldset>
-
-					<div>
-						<label
-							htmlFor="key-expires"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							Expires <span className="text-ink-3">(optional)</span>
-						</label>
-						<input
-							id="key-expires"
-							type="datetime-local"
-							value={expiresAt}
-							onChange={(e) => setExpiresAt(e.target.value)}
-							disabled={pending}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-action-ink disabled:opacity-50"
-						/>
-						<p className="text-[11px] text-ink-3 mt-1">
-							Leave blank for a key that never expires. Times are your local
-							zone; the key expires at that instant in UTC.
-						</p>
-					</div>
-
-					{/* Surface the create error inline — without this the request could
-					    fail (e.g. gateway/DB 500) and the dialog would appear to do
-					    nothing. */}
-					{error && (
-						<p
-							role="alert"
-							className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
-						>
-							{/* Claims ONLY what the code knows. The previous copy read
-							    "…check that the workspace has API-key creation enabled",
-							    which named a setting that DOES NOT EXIST anywhere in the
-							    product — no entitlement flag, no column, no config key —
-							    and told the user to retry a failure that was 100%
-							    deterministic. It invented a plausible cause for an upstream
-							    fault and sent the customer to look for it. `error.message`
-							    is the gateway's own 4xx text when the request was the
-							    problem, or a generic string when the fault was ours
-							    (api-keys/route.ts:117-126); the UI cannot tell which, so it
-							    must not assert either. */}
-							Couldn&apos;t create the key: {error.message}
+					))}
+					{scope.length === 0 && (
+						<p className="text-2xs text-danger-ink">
+							Pick at least one — a key with no scope can do nothing.
 						</p>
 					)}
-					<div className="flex justify-end gap-2 pt-1">
-						<button
-							type="button"
-							onClick={onClose}
+				</fieldset>
+
+				<div>
+					<label
+						htmlFor="key-expires"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Expires <span className="text-ink-3">(optional)</span>
+					</label>
+					<input
+						id="key-expires"
+						type="datetime-local"
+						value={expiresAt}
+						onChange={(e) => setExpiresAt(e.target.value)}
+						disabled={pending}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+					/>
+					<p className="text-2xs text-ink-3 mt-1">
+						Leave blank for a key that never expires. Times are your local zone;
+						the key expires at that instant in UTC.
+					</p>
+				</div>
+
+				<div className="grid gap-3 sm:grid-cols-2">
+					<div>
+						<label
+							htmlFor="key-budget"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Monthly budget (USD){" "}
+							<span className="text-ink-3">(optional)</span>
+						</label>
+						<input
+							id="key-budget"
+							type="number"
+							inputMode="decimal"
+							min="0.01"
+							step="0.01"
+							value={budget}
+							onChange={(e) => setBudget(e.target.value)}
+							placeholder="no limit"
 							disabled={pending}
-							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
-						>
-							Cancel
-						</button>
-						<button
-							type="submit"
-							disabled={!name.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
-						>
-							{pending ? "Creating…" : "Create"}
-						</button>
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						/>
+						{/* Says what the code does and no more. The gateway checks this
+						    before it decrypts a provider credential and returns 402
+						    `key_budget_exceeded` with a `resets_at` — a stop, not a
+						    throttle, which is exactly why it is NOT a 429: a 429 tells
+						    every OpenAI-shaped client to retry into a wall
+						    (server.rs, Step 2c). */}
+						<p className="text-2xs text-ink-3 mt-1">
+							A hard stop, not a throttle. Once this key&apos;s recorded spend
+							for the month reaches the cap, <code>/v1/chat/completions</code>{" "}
+							returns <strong>402</strong> for this key until the month rolls
+							over — retrying does not help. Spend comes from each
+							request&apos;s recorded cost, so a model we have no published
+							price for adds nothing to the total. Leave blank for no limit.
+						</p>
 					</div>
-				</form>
-			</div>
-		</div>
+
+					<div>
+						<label
+							htmlFor="key-rpm"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							Rate limit (requests/min){" "}
+							<span className="text-ink-3">(optional)</span>
+						</label>
+						<input
+							id="key-rpm"
+							type="number"
+							inputMode="numeric"
+							min="1"
+							step="1"
+							value={rateLimit}
+							onChange={(e) => setRateLimit(e.target.value)}
+							placeholder="workspace default"
+							disabled={pending}
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+						/>
+						{/* The per-key bucket is checked AFTER the workspace bucket and
+						    both must pass (`RateLimiter::check_scoped`), so this narrows
+						    the workspace allowance for one credential — it never widens
+						    it. The 429 body carries `retry_after_secs`; there is no
+						    `Retry-After` HEADER on this response, so do not promise one. */}
+						<p className="text-2xs text-ink-3 mt-1">
+							Requests past this rate get <strong>429</strong> with the seconds
+							to wait, and the key keeps working. Your workspace plan limit
+							still applies on top — this only narrows it for this key. Leave
+							blank to use the plan limit alone.
+						</p>
+					</div>
+				</div>
+
+				{/* Surface the create error inline — without this the request could
+				    fail (e.g. gateway/DB 500) and the dialog would appear to do
+				    nothing. */}
+				{error && (
+					<p
+						role="alert"
+						className="text-xs text-danger-ink bg-danger-soft border border-danger/30 rounded px-2 py-1.5"
+					>
+						{/* Claims ONLY what the code knows. The previous copy read
+						    "…check that the workspace has API-key creation enabled",
+						    which named a setting that DOES NOT EXIST anywhere in the
+						    product — no entitlement flag, no column, no config key —
+						    and told the user to retry a failure that was 100%
+						    deterministic. It invented a plausible cause for an upstream
+						    fault and sent the customer to look for it. `error.message`
+						    is the gateway's own 4xx text when the request was the
+						    problem, or a generic string when the fault was ours
+						    (api-keys/route.ts:117-126); the UI cannot tell which, so it
+						    must not assert either. */}
+						Couldn&apos;t create the key: {error.message}
+					</p>
+				)}
+				<div className="flex justify-end gap-2 pt-1">
+					<button
+						type="button"
+						onClick={onClose}
+						disabled={pending}
+						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
+					>
+						Cancel
+					</button>
+					<button
+						type="submit"
+						disabled={!name.trim() || pending}
+						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
+					>
+						{pending ? "Creating…" : "Create"}
+					</button>
+				</div>
+			</form>
+		</Modal>
 	);
 }
 
@@ -393,7 +621,7 @@ export function ApiKeyManager() {
 
 	return (
 		<div className="space-y-4">
-			<div className="flex items-center justify-between">
+			<div className="flex items-center justify-between gap-3">
 				<div>
 					<h2 className="text-sm font-semibold text-ink">API keys</h2>
 					<p className="text-xs text-ink-2 mt-0.5">
@@ -435,7 +663,7 @@ export function ApiKeyManager() {
 			)}
 
 			{keys.length > 0 && (
-				<div className="rounded-lg border border-line overflow-hidden">
+				<div className="overflow-x-auto rounded-lg border border-line">
 					<table className="w-full text-left">
 						<thead className="bg-surface text-xs text-ink-2">
 							<tr>
@@ -443,6 +671,12 @@ export function ApiKeyManager() {
 								<th className="py-1.5 pr-3 font-medium">Prefix</th>
 								<th className="py-1.5 pr-3 font-medium">Scope</th>
 								<th className="py-1.5 pr-3 font-medium">Expires</th>
+								<th
+									className="py-1.5 pr-3 font-medium"
+									title="Per-key monthly spend cap and requests-per-minute cap, both enforced by the gateway."
+								>
+									Limits
+								</th>
 								<th className="py-1.5 pr-3 font-medium">Created</th>
 								<th className="py-1.5 pr-3 font-medium">Created by</th>
 								<th
@@ -497,6 +731,7 @@ export function ApiKeyManager() {
 											<span className="text-ink-3">Never</span>
 										)}
 									</td>
+									<LimitsCell row={key} />
 									<td className="py-2 pr-3 text-xs text-ink-2">
 										{absoluteDate(key.createdAt)}
 									</td>
@@ -521,6 +756,7 @@ export function ApiKeyManager() {
 											onClick={() => {
 												if (
 													window.confirm(
+														// This said "will immediately fail authentication".
 														// The gateway caches a positive auth result, so a
 														// revoked key keeps working until that entry expires —
 														// bounded at 60 seconds, and it was 15 minutes until
@@ -541,7 +777,7 @@ export function ApiKeyManager() {
 							))}
 						</tbody>
 					</table>
-					<p className="px-4 pb-3 pt-2 text-[11px] text-ink-3">
+					<p className="px-4 pb-3 pt-2 text-2xs text-ink-3">
 						† <strong>Last used</strong> is refreshed when a key misses the auth
 						cache, so it can lag real usage by up to 15 minutes. A key used
 						seconds ago may still read as older. Treat it as a staleness signal,
@@ -566,6 +802,7 @@ export function ApiKeyManager() {
 				<NewKeyModal
 					rawKey={newKey.rawKey}
 					name={newKey.name}
+					scope={newKey.scope}
 					onDone={() => setNewKey(null)}
 				/>
 			)}

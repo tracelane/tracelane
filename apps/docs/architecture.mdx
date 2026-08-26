@@ -12,7 +12,7 @@ Tracelane is five components in one monorepo:
 
 <CardGroup cols={2}>
   <Card title="Rust gateway" icon="bolt">
-    Axum + tokio. BYOK provider routing across 30+ LLM providers (7 native
+    Axum + tokio. BYOK provider routing across 150+ LLM providers (7 native
     adapters + any OpenAI-compatible endpoint). OTLP emit. Predictive layer
     inline (observe-first by default). Zero-allocation hot path. <code>crates/gateway/</code>
   </Card>
@@ -21,7 +21,7 @@ Tracelane is five components in one monorepo:
     single-node ingest. <code>crates/ingest/</code>
   </Card>
   <Card title="Next.js 15 dashboard" icon="display">
-    App Router, Tailwind 4, shadcn/ui, Motion, in-house transcript-spine trace viewer (SVG/DOM).
+    App Router, Tailwind 4, in-house component library and transcript-spine trace viewer (SVG/DOM).
     <code>apps/web/</code>
   </Card>
   <Card title="TypeScript MCP server" icon="plug">
@@ -29,8 +29,8 @@ Tracelane is five components in one monorepo:
     <code>apps/mcp/</code>
   </Card>
   <Card title="Python eval orchestrator" icon="flask">
-    Wraps DeepEval + Ragas + Inspect AI behind a unified API. Runs in CI on
-    every push.
+    Wraps DeepEval + Ragas + Inspect AI behind a unified API. Runs in the
+    canonical repository's CI.
     <code>evals/</code>
   </Card>
 </CardGroup>
@@ -63,7 +63,7 @@ Tracelane is five components in one monorepo:
                                     ▼
                        ┌──────────────────────────┐
                        │  ClickHouse (hot tier)   │
-                       │  R2 (cold tier)          │
+                       │  R2 (cold tier, built    │
                        │  Postgres (metadata)     │
                        └────────────┬─────────────┘
                                     ▲
@@ -140,7 +140,7 @@ Python / TypeScript verifiers.
 
 ## Performance budgets
 
-These are **internal CI targets**, not measured public benchmarks — `benchmark-runner`
+These are **internal CI targets**, not measured public benchmarks — the benchmark suite
 rejects PRs that push any p95 over budget. Published, independently measured figures will
 ship with the Reliability Benchmark v1.0; until then we quote no public
 performance numbers.
@@ -176,9 +176,9 @@ Throughput floors are likewise internal targets pending the Reliability Benchmar
 
 ## Subagents (Claude Code)
 
-The build is itself instrumented. We use ten subagents covering review,
-benchmarking, eval, security, incident response, marketing, and competitor
-tracking. See [`.claude/agents/`](https://github.com/tracelane/tracelane/tree/main/.claude/agents).
+The build is itself instrumented. We use fourteen subagents covering review,
+benchmarking, eval, security, incident response, marketing, competitor tracking,
+documentation upkeep, and memory curation. These live in the canonical repository and are not part of this mirror.
 
 ## Related
 

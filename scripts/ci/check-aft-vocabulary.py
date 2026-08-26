@@ -40,6 +40,7 @@ PREDICTIVE = ROOT / "crates/gateway/src/predictive"
 # Guardrail rails are real detectors too: R3 (tool safety) emits the canonical
 # tool AFT ids, including AFT-TOOL-POISON-001 (tool-description injection) which
 # has no predictive counterpart. Scraping this dir keeps the `live` taxonomy set
+# honest against what the guardrail actually emits (#5).
 GUARDRAIL_RAILS = ROOT / "crates/gateway/src/guardrail/rails"
 TAXONOMY = ROOT / "apps/web/lib/aft-taxonomy.ts"
 SEEDER = ROOT / "scripts/seed/demo_traces.py"

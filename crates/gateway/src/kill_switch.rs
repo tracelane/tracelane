@@ -1,3 +1,4 @@
+//! Operational kill-switch / feature-flag layer (ADR-038, TRD §23.6).
 //!
 //! Distinct from entitlements: entitlements answer "is this tenant *allowed*
 //! this feature?" (commercial); kill-switches answer "is this code path *safe
@@ -155,6 +156,7 @@ impl KillSwitch {
     /// Spawn the background refresh task. On any error it keeps the last good
     /// snapshot (or the empty default snapshot) — never clears to an unsafe state.
     ///
+    /// **Returns the `JoinHandle`**. It used to return ``, and that was the
     /// defect: deleting the `refresh_target` call below — the SSRF gate's only
     /// invocation — compiled clean and turned NO test red, because a detached
     /// `tokio::spawn` with no observable result cannot be asserted on. The gate's
@@ -352,6 +354,7 @@ mod tests {
         );
     }
 
+    /// . The gate's LOGIC is covered by the `refresh_target_rejects_*` tests
     /// below. Its INVOCATION was not: `spawn_refresh` fired a detached task with
     /// no observable result, so deleting the `refresh_target` call — the only
     /// thing standing between an operator-supplied `POSTHOG_HOST` and an

@@ -121,7 +121,7 @@ export function WorkspaceManager({
 						value={name}
 						maxLength={255}
 						onChange={(e) => setName(e.target.value)}
-						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-1 focus:ring-action-ink"
+						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						placeholder="Acme, Inc."
 					/>
 					<button
@@ -161,7 +161,7 @@ export function WorkspaceManager({
 						value={hook}
 						maxLength={2048}
 						onChange={(e) => setHook(e.target.value)}
-						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus:ring-1 focus:ring-action-ink"
+						className="w-full max-w-sm rounded-sm border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						placeholder="https://hooks.slack.com/services/…"
 					/>
 					<button

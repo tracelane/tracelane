@@ -7,16 +7,43 @@ import { cn } from "../lib/cn";
  * Billing). A single component so the icon language reads as one system, not a
  * per-page snowflake.
  *
- * Look (design-system §icons, visual-pass-01): a circular soft-BLUE well
- * (`--surface-2` = #eef3fa light) with a single-color line icon inside at
- * stroke 1.6 — thinned from 1.75 so the glyph reads lean rather than chunky at
- * 13–18px. The icon is `currentColor` = `--ink`, never grey; a greyed glyph
- * read as disabled next to the figure it labels.
- * It INVERTS to a light ink on the dark theme
- * automatically (both tokens flip in the `.dark` block) — never lava-colored;
- * Lava stays rationed for data / CTAs. On a dark CARD (the error-budget tile,
- * which is `--surface-inverse` regardless of theme) pass `onInverse` to flip the
- * chip to a subtle white wash + inverse ink so the icon still reads.
+ * ── LOOK (P0.12) ────────────────────────────────────────────────────────────
+ *
+ * A `--surface-2` WELL with a single-colour line icon inside at stroke 1.6 —
+ * thinned from 1.75 so the glyph reads lean rather than chunky at 13–18px. The
+ * icon is `currentColor` = `--ink`, never grey; a greyed glyph read as disabled
+ * next to the figure it labels. Both tokens flip with the theme, so the chip
+ * inverts automatically.
+ *
+ * THE COLOUR NOTE IN THIS BLOCK WAS WRONG AND IS CORRECTED (2026-08-22). It said
+ * "a circular soft-BLUE well (`--surface-2` = #eef3fa light)". `--surface-2` is
+ * #f5f5f4 — a warm neutral — and has been since the P0 palette landed; #eef3fa
+ * was the value under the retired tinted-slate system. The CODE was already
+ * right (`bg-surface-2` + `currentColor` is exactly what P0.12 asks for); only
+ * this comment still described a blue chip, which is precisely the doc-vs-code
+ * defect CLAUDE.md §17 makes a bug. The stale sentence about lava rationing went
+ * with it — lava is deleted from the system.
+ *
+ * SHAPE: a SQUIRCLE, not a circle, and the radius is PROPORTIONAL (30% of the
+ * chip). The decision, since both are defensible:
+ *   · The system's corner language is a generously rounded rectangle — 18px on
+ *     cards, 8px on controls. A perfect circle belongs to neither family and
+ *     reads as an avatar or a consumer-app badge sitting on an instrument panel.
+ *   · A squircle presents more area at the same nominal size, so the glyph can
+ *     stay at 50% and still read at 28px.
+ *   · The radius is computed rather than a `rounded-*` utility BECAUSE the chip
+ *     is sized in px: a fixed 8px radius is a near-circle at 18px and a hard
+ *     square at 36px, i.e. a different shape at each call site. 30% holds one
+ *     shape across the 18–36px range the app actually uses.
+ * It is spent as an inline style for the same reason width/height are — the
+ * component adds no new utility classes to the CSS bundle.
+ *
+ * On a dark CARD (the error-budget tile, which is `--surface-inverse` regardless
+ * of theme) pass `onInverse` to flip the chip to a subtle white wash + inverse
+ * ink so the icon still reads. `bg-white/10` is a translucent WASH rather than a
+ * token because the system has no "well on an inverse surface" role: `--surface-2`
+ * is a light grey in light theme and would paint a bright chip on a near-black
+ * card. Stated here rather than left to be rediscovered.
  *
  * Icons are hand-authored inline SVG (24×24, stroke-only) — no icon-library
  * dependency, no bundle cost beyond the single glyph rendered. Decorative: the
@@ -165,9 +192,10 @@ export interface MetricIconProps {
 }
 
 /**
- * Renders the soft chip + line icon for a metric. Pure presentational, no state.
- * Sizes are inline styles (not arbitrary Tailwind values) so the component adds
- * no new utility classes to the CSS bundle.
+ * Renders the chip + line icon for a metric. Pure presentational, no state.
+ * Size AND radius are inline styles (not arbitrary Tailwind values) so the
+ * component adds no new utility classes to the CSS bundle — and so the corner
+ * stays proportional to the chip at every call site (see the header).
  */
 export function MetricIcon({
 	name,
@@ -180,14 +208,21 @@ export function MetricIcon({
 		<span
 			aria-hidden="true"
 			className={cn(
-				"grid shrink-0 place-items-center rounded-full",
-				// visual-pass-01: the glyph is INK, never grey. The chip keeps its
-				// soft-blue well (--surface-2, now #eef3fa) so the icon reads as a
-				// deliberate mark on a tinted disc rather than a faded one.
+				"grid shrink-0 place-items-center",
+				// The glyph is INK, never grey — a greyed glyph reads as disabled next
+				// to the figure it labels. The chip is the system's inert WELL
+				// (--surface-2, a warm neutral #f5f5f4), so the icon reads as a
+				// deliberate mark on a container rather than a faded one.
 				onInverse ? "bg-white/10 text-ink-inverse" : "bg-surface-2 text-ink",
 				className,
 			)}
-			style={{ width: size, height: size } as CSSProperties}
+			style={
+				{
+					width: size,
+					height: size,
+					borderRadius: Math.round(size * 0.3),
+				} as CSSProperties
+			}
 		>
 			<svg
 				width={icon}

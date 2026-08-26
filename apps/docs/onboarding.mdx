@@ -19,8 +19,10 @@ operators self-hosting Tracelane.
 6. Drop it in your env as `TRACELANE_API_KEY`.
 7. Make a call. The trace shows up at [app.tracelane.dev/traces](https://app.tracelane.dev/traces) within a second.
 
-You're done. Predictive guardrails default to `warn`; flip them to `block`
-in the dashboard once you've reviewed your first day of traces.
+You're done. Predictive guardrails are observe-first: they flag and record
+findings on the trace rather than blocking the request. The dashboard surfaces
+what was observed and lets you pin or approve tools; it does not switch a rail
+into blocking.
 
 ## Operator self-host checklist
 
@@ -40,14 +42,20 @@ Eight steps to running Tracelane on your own infra.
   - `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET` — billing (Polar.sh)
   - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_WEBHOOK_SECRET` — auth
   - `TRACELANE_BYOK_MASTER_KEY` — provider-key envelope encryption (32 bytes, base64-encoded; AES-256-GCM via `ring`)
-  - `JWT_SIGNING_KEY` — internal JWT
-  - `CLICKHOUSE_URL`, `POSTGRES_URL`, `R2_*` — datastore endpoints
+  - `TRACELANE_APIKEY_PEPPER` — API-key hashing pepper (release builds refuse to boot without it)
+  - `CLICKHOUSE_URL`, `POSTGRES_URL` — datastore endpoints. (The R2 cold tier is
+    built but not fed in V1, so its `TRACELANE_R2_*` variables are not required.)
 </Step>
 
-<Step title="Migrations apply automatically">
-  Migrations apply automatically when the gateway boots (`db::apply_migrations`,
-  idempotent) — there is no separate migrate command. Just start the gateway
-  once against a reachable Postgres + ClickHouse.
+<Step title="Apply migrations">
+  Drizzle is canonical for the control-plane Postgres schema. Apply it before
+  starting the gateway:
+
+  ```bash
+  pnpm --filter @tracelanedev/web exec drizzle-kit migrate
+  ```
+
+  The gateway does **not** apply migrations at boot.
 </Step>
 
 <Step title="Configure WorkOS Connect">
@@ -56,7 +64,7 @@ Eight steps to running Tracelane on your own infra.
   - Configure SAML or OAuth providers
   - Set the redirect URI to your dashboard's WorkOS callback — the Next.js app handles the SSO callback, not the gateway
   - Add the webhook URL `https://gateway.<your-domain>/v1/webhooks/workos`
-  - Set the webhook events: `user.created`, `user.updated`, `organization.created`
+  - Set the webhook events: `organization.created`, `user.created`, `dsync.user.created`
 </Step>
 
 <Step title="Configure Polar">
@@ -77,8 +85,8 @@ Eight steps to running Tracelane on your own infra.
   refused with `403 seat_limit_reached`. There is no extra-seat product to create.
 
   Then:
-  - Create Polar meters with these event names: `tokens_processed`, `audit_anchors`, `traces_metered`
-  - Add the Tracelane webhook URL `https://gateway.<your-domain>/v1/webhooks/polar`
+  - Create Polar meters with these event names: `tokens_processed`, `audit_anchors`
+  - Add the Tracelane webhook URL `https://<your-dashboard-domain>/api/webhooks/polar`
   - Subscribe to events: `subscription.created`, `subscription.updated`, `subscription.active`, `subscription.canceled`, `order.created`, `order.paid`
   - Configure the Polar-hosted customer portal — branding, allowed actions
   - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
@@ -99,7 +107,7 @@ Eight steps to running Tracelane on your own infra.
   ```bash
   pnpm install
   pnpm build
-  pnpm start
+  pnpm --filter @tracelanedev/web start
   ```
   The dashboard is a Next.js app. The MCP server is a separate Node process — run it
   from source (`node apps/mcp/dist/index.js`) for local-only use; `npx @tracelanedev/mcp`
@@ -107,10 +115,10 @@ Eight steps to running Tracelane on your own infra.
 </Step>
 
 <Step title="Production checklist">
-  - All agent-tool safety guards set to `warn` initially; flip to `block` after one day of traces.
+  - Agent-tool safety guards reviewed. They run observe-first — they record findings on the trace and do not block the request.
   - Audit log integrity confirmed (`tlane verify <ledger> --tenant-pubkey <base64>` returns 0). Without the trusted key it exits `INCOMPLETE` by design — the hash chain is checked but signatures and anchors are not. The SHA-256 hash chain and Ed25519 per-tenant signing are live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
   - SBOM published — every tagged release carries a Cosign-signed
-    `sbom.cyclonedx.json`, and `infra/sbom/` has CycloneDX outputs from CI.
+    `sbom.cyclonedx.json`, uploaded as a workflow artifact by CI.
   - Sigstore signing verified on **release artifacts** (`cosign verify-blob`
     against the `.cosign.bundle` beside each binary, cosign >= 3.0.6) and on the
     container image (`cosign verify` on the published image digest).

@@ -20,6 +20,7 @@
 //!      delivery id acks 200 without re-dispatching, so retries cannot
 //!      loop side effects).
 //!
+//! ## Tenant identity
 //!
 //! The tenant for an event is resolved by an authoritative Postgres LOOKUP
 //! on `tenants.workos_org_id` — NEVER by deriving a UUID from the org id.
@@ -71,10 +72,12 @@ impl WorkOsWebhookConfig {
 #[derive(Clone)]
 pub struct WorkOsWebhookState {
     pub config: Arc<WorkOsWebhookConfig>,
+    /// Global provisioning-rate cap, shared (via `Arc`) across every
     /// cloned per-request state so the token bucket is process-wide.
     pub rate_limiter: Arc<WebhookRateLimiter>,
 }
 
+/// Default per-minute budget for control-plane–growing WorkOS events.
 ///
 /// A solo-founder product's real WorkOS signup/webhook rate is far below
 /// 1/sec sustained and its bursts are small; 60/min with a 60-event burst
@@ -82,6 +85,7 @@ pub struct WorkOsWebhookState {
 /// grow `tenants`/`users` rows. Ops override with `WORKOS_WEBHOOK_RATE_PER_MIN`.
 const DEFAULT_WEBHOOK_PROVISION_RATE_PER_MIN: u32 = 60;
 
+/// Global token-bucket cap on **provisioning** WorkOS webhook events.
 ///
 /// Signature verification proves an event was relayed by WorkOS, but not that
 /// the control plane may grow unboundedly: WorkOS AuthKit signups are cheap and
@@ -147,6 +151,7 @@ impl WebhookRateLimiter {
 }
 
 /// Whether an event type can grow the control plane (provisions a `tenants` or
+/// `users` row). ONLY these consume the provisioning budget — keep this
 /// set in lockstep with the provisioning arms of [`dispatch`] (a test pins the
 /// correspondence). Log-only events return `false` so a flood of them cannot
 /// starve real provisioning.
@@ -320,6 +325,7 @@ pub async fn handler(
     };
     tracing::info!(event_id = %event.id, event = %event.event, "WorkOS webhook received");
 
+    //  + H-1: dedupe with record-on-success semantics.
     // See `billing/webhook.rs` for the rationale; same pattern here.
     if let Some(pool) = crate::db::global_pool() {
         match crate::db::webhook_events::already_processed(
@@ -345,6 +351,7 @@ pub async fn handler(
         }
     }
 
+    // Cap authentic PROVISIONING events (tenant/user row creation) to a
     // bounded rate. Checked here — AFTER signature + dedup, BEFORE dispatch — so
     // only novel, WorkOS-signed events that would actually grow the control
     // plane draw from the budget. A throttled event is NOT recorded processed,
@@ -400,6 +407,7 @@ async fn dispatch(event: &WorkOsEvent) -> Result<()> {
     }
 }
 
+/// Deterministic org→UUID hash — **dev/no-pool fallback ONLY**.
 ///
 /// This is NOT a provisioning or resolution path: prod tenant ids are
 /// random and the authoritative mapping is `tenants.workos_org_id`. The
@@ -440,6 +448,7 @@ async fn handle_organization_created(event: &WorkOsEvent) -> Result<()> {
             return Ok(());
         }
     };
+    // Upsert keyed on workos_org_id. A dashboard-onboarded tenant
     // (random UUID) already carrying this org id is returned untouched —
     // the event is idempotent instead of failing the UNIQUE constraint.
     match crate::db::tenants::create_or_get_by_workos_org(pool, &org.id, "free")
@@ -455,6 +464,7 @@ async fn handle_organization_created(event: &WorkOsEvent) -> Result<()> {
         }
         None => {
             // Archived (kill-switched) tenant — refuse to resurrect; ack the
+            // event so WorkOS stops redelivering (review F-2).
             tracing::warn!(
                 workos_org = %org.id,
                 "organization.created for an ARCHIVED tenant — refused (kill-switch stays cut)"
@@ -467,9 +477,11 @@ async fn handle_organization_created(event: &WorkOsEvent) -> Result<()> {
 /// Resolve the tenant for a user event: authoritative LOOKUP on
 /// `tenants.workos_org_id` first; only if the org has no tenant yet (webhook
 /// enabled after orgs existed, or event ordering) is one provisioned. NEVER
+/// derives the UUID from the org id (: prod tenant ids are random, so a
 /// derived id matches no `tenants` row → orphaned users / broken tenancy).
 ///
 /// Returns `Ok(None)` when the org's tenant is ARCHIVED (provision refused —
+///  review F-2): the caller must ack without side effects so the
 /// kill-switch stays cut.
 ///
 /// Injectable lookup/provision so the resolution contract is unit-testable
@@ -493,10 +505,12 @@ where
     provision(org_id.to_string()).await
 }
 
+/// The users upsert. The `ON CONFLICT (email) DO UPDATE` arm is
 /// guarded on `users.tenant_id = EXCLUDED.tenant_id`: a SAME-tenant
 /// re-provision converges `workos_user_id`, while a CROSS-tenant email
 /// collision is a zero-row no-op. Without the guard, a WorkOS-signable event
 /// (an attacker inviting a victim's email into their own org) would silently
+/// REBIND the victim's user row to the attacker's tenant (security
 /// review F-1 — a cross-tenant user-rebind primitive). Const so the guard is
 /// pinned by a test and cannot be dropped silently.
 const USER_UPSERT_SQL: &str = "INSERT INTO users (user_id, tenant_id, email, workos_user_id, name)
@@ -524,6 +538,7 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
             return Ok(());
         }
     };
+    // Lookup, never derivation. Unknown org → provision on demand
     // (free plan, random UUID) so a user event arriving before its
     // organization.created still lands on a real tenant.
     let resolved = resolve_tenant_for_user(
@@ -549,6 +564,7 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
     )
     .await?;
     let Some(tenant_id) = resolved else {
+        // Archived tenant — ack without side effects (review F-2).
         tracing::warn!(
             workos_user = %user.id,
             "user.created for an ARCHIVED tenant — user NOT provisioned (kill-switch stays cut)"
@@ -743,6 +759,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "a verified log-only event acks 200");
     }
 
+    // provisioning ingress rate cap ------------------------------
+
     fn provisioning_state(secret: &str, per_min: u32) -> WorkOsWebhookState {
         WorkOsWebhookState {
             config: Arc::new(WorkOsWebhookConfig {
@@ -755,6 +773,7 @@ mod tests {
     /// Drive `handler()` with one authentic, signed event of `event_type` and
     /// return the HTTP status. No `set_global_pool` in tests, so dispatch is a
     /// no-op and dedup is skipped — a provisioning event's fate is decided by
+    /// the rate limiter alone, exactly the ingress guard under test.
     async fn post_signed(
         state: &WorkOsWebhookState,
         secret: &str,
@@ -798,6 +817,7 @@ mod tests {
     }
 
     /// The provisioning-event set MUST match `dispatch`'s provisioning arms —
+    /// drift would let a control-plane–growing event skip the cap.
     #[test]
     fn is_provisioning_event_matches_dispatch_arms() {
         assert!(is_provisioning_event("organization.created"));
@@ -808,6 +828,7 @@ mod tests {
         assert!(!is_provisioning_event("user.updated"));
     }
 
+    ///  regression: authentic, signed PROVISIONING events past the cap are
     /// throttled at the handler with 429, so the control plane cannot grow
     /// unboundedly from cheap signed events.
     #[tokio::test]
@@ -833,6 +854,7 @@ mod tests {
         );
     }
 
+    /// The cap is shared across event TYPES (one global budget), so a
     /// `user.created` is throttled once an `organization.created` drained it.
     #[tokio::test]
     async fn handler_provisioning_budget_is_shared_across_event_types() {
@@ -850,6 +872,7 @@ mod tests {
         );
     }
 
+    /// Log-only events must NOT draw from the provisioning budget — a
     /// flood of them cannot starve real tenant/user provisioning.
     #[tokio::test]
     async fn handler_log_only_events_bypass_the_provisioning_cap() {
@@ -872,6 +895,7 @@ mod tests {
         );
     }
 
+    /// An unsigned/badly-signed flood is rejected at 401 BEFORE the rate
     /// limiter, so it can neither grow rows nor consume the provisioning budget.
     #[tokio::test]
     async fn handler_bad_signature_does_not_consume_provisioning_budget() {
@@ -943,10 +967,13 @@ mod tests {
         assert!(err.contains("more than 8 v1 hashes"), "got: {err}");
     }
 
+    // tenant resolution is LOOKUP, never derivation -----------
+
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().unwrap()
     }
 
+    /// THE regression: user.created on an EXISTING org must resolve to
     /// the existing tenant UUID (random, dashboard-style — deliberately NOT
     /// equal to the old derivation), and must not provision anything.
     #[test]
@@ -1003,6 +1030,7 @@ mod tests {
         });
     }
 
+    ///  review F-2: an ARCHIVED tenant's org refuses provisioning
     /// the resolver returns Ok(None) ("ack, no side effects"), never an id.
     #[test]
     fn user_on_archived_org_is_refused_not_provisioned() {
@@ -1021,6 +1049,7 @@ mod tests {
         });
     }
 
+    ///  review F-1: pin the anti-rebind guard on the users upsert. The
     /// cross-tenant email-collision attack (attacker invites a victim's email
     /// into their own WorkOS org) is only refused while the DO UPDATE arm is
     /// tenant-guarded and does NOT rewrite tenant_id. SQL semantics run only

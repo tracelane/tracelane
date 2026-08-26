@@ -7,6 +7,7 @@
 -- WHY THIS TABLE EXISTS
 -- The first cut of the SET-08 soft cap fired on the transition `used == quota`,
 -- with `used` coming from the in-memory `QuotaTracker`. That counter is
+-- process-local and reseeds from ClickHouse on boot, so on ANY mid-month
 -- deploy the equality is unsound in both directions:
 --   * a restart landing the counter ABOVE quota never sees `== quota` again, so
 --     the tenant is never told they hit 100% — the alert is lost silently;

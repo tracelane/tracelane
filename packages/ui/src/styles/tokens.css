@@ -4,40 +4,33 @@
  * Tracelane design system tokens — THE single source of truth for colour, type and
  * layout. Nothing else may define them; a palette swap happens HERE and nowhere else.
  *
- * VALUES CURRENTLY HELD: ADR-074 "Instrument" — light default, monochrome chrome,
- * COLOUR IS DATA. A colour on screen means something happened (error, warning,
- * verified, in-flight); nothing decorative is coloured, and the primary button is
- * solid ink, never a fill colour.
+ * VALUES CURRENTLY HELD: **"Instrument II"** — the founder's P0 premium-UI brief of
+ * 2026-08-22. A warm-neutral graphite system: no brand accent, no blue, no violet,
+ * no teal, no lava. The ground is #fafaf9 and the card is #ffffff, so a card
+ * separates by TONE before it separates by border or shadow. COLOUR IS DATA — green
+ * healthy, orange degraded, red failed, and nothing decorative is coloured at all.
  *
- * The token VALUES swapped in one file because the names are roles, not colours:
- * ~2,162 semantic references across 100 files kept working untouched.
+ * The token VALUES swap in one file because the names are ROLES, not colours:
+ * ~2,100 semantic references across ~100 files keep working untouched. That is the
+ * whole reason this file is worth its length, and it is why the two hues this pass
+ * had to delete (--info was #1d5bd0 blue, --data-2 was #6438d9 violet) could be
+ * retargeted at the chart neutrals without renaming a single call site.
  *
- * `--accent-*` IS NOW `--action-*` (2026-08-17, founder-approved). The value swap left
- * 177 utilities across 50 files called `accent-*` while holding monochrome chrome — a
- * name that had become a lie, since §1's whole rule is that COLOUR IS DATA and nothing
- * decorative is coloured. `action` states the role (interactive surfaces) and makes no
- * claim about hue. Pure rename: every definition and every utility moved together, so
- * no rendered value changed.
+ * SUPERSEDES ADR-074 "Instrument" (the pure-white / monochrome-chrome value set) and,
+ * through it, the retired ADR-053 "Tinted Slate + Lava". Both are HISTORY: the ADR-074
+ * §3 palette table, its 8px card radius, its "exactly one shadow, on overlays only"
+ * elevation rule and its ban on chrome glass are all restated or replaced below, at
+ * the line that holds each value. Where this file and an ADR disagree, THIS FILE IS
+ * THE CODE and the ADR is the record of an earlier intention (CLAUDE.md §4.0, §17).
  *
- * `--lava-*` remains as a DEPRECATED alias resolving to the monochrome ink family —
- * kept so nothing broke in one pass, not a live concept. New code uses `--ink*`,
- * `--line*`, `--surface*` for chrome and `--ok/--danger/--warn/--info/--data-2` for
- * data.
+ * `--accent-*` IS `--action-*` (2026-08-17, founder-approved). The `--lava-*` aliases
+ * that survived alongside it are DELETED in this pass — zero consumers, under the name
+ * of a colour the system no longer contains. Name `--ink*`, `--line*`, `--surface*`
+ * for chrome, `--ok/--warn/--danger` for state, and `--chart-*` for data marks.
  *
  * WCAG: every pair in packages/ui/scripts/contrast-check.mjs passes in BOTH themes.
- *
- * (historical) ADR-053 (palette) over the
- * ADR-045 role architecture / design-system spec §1.
- *
- * Semantic tokens, named by ROLE (--surface / --ink / --line / --ok / --danger),
- * never by colour — which is exactly why the ADR-053 -> ADR-074 swap touched no
- * component. LIGHT is the default; the [data-theme="dark"] block is at parity.
- *
- * The ~25 lines that stood here described the retired "Tinted Slate + Lava" system in
- * detail — the dual-tone lava split, the rationed CTA gradient, the grey canvas. Every
- * word of it was false as of the ADR-074 value swap. Deleted rather than annotated: a
- * long, confident, wrong explanation is worse than none, and this file's job is to be
- * the ONE place the palette is stated (R2).
+ * Where a brief value did not clear its floor, the derivation and the measured ratio
+ * are written at the line — never silently substituted.
  *
  * `inline` makes the Tailwind v4 color utilities reference the live CSS vars.
  */
@@ -47,8 +40,17 @@
 	--color-surface: var(--surface);
 	--color-surface-2: var(--surface-2);
 	--color-surface-3: var(--surface-3);
+	/* The row/cell hover step ON a white card (P0.1 `--surface-hover`). It is
+	   LIGHTER than --surface-2 in light theme and DARKER in dark, which is why it
+	   is its own role rather than "surface-1.5": on a white card the hover moves
+	   AWAY from the card colour, and on a dark card it moves away in the other
+	   direction. --surface-2 stays the inert WELL (chips, tracks, trays). */
+	--color-surface-hover: var(--surface-hover);
 	--color-canvas: var(--canvas);
 	--color-canvas-sunken: var(--canvas-sunken);
+	/* The navigation rail. A named role, not `bg-surface`, because the brief gives
+	   it its own value in both themes and it is the one large chrome plane. */
+	--color-sidebar: var(--sidebar);
 	--color-surface-inverse: var(--surface-inverse);
 	--color-ink-inverse: var(--ink-inverse);
 	--color-line: var(--line);
@@ -57,10 +59,12 @@
 	--color-ink-2: var(--ink-2);
 	--color-ink-3: var(--ink-3);
 
-	/* interactive-surface roles (was `accent`, renamed 2026-08-17) + the deprecated lava source tokens */
-	--color-lava-fill: var(--lava-fill);
-	--color-lava-deep: var(--lava-deep);
-	--color-lava-soft: var(--lava-soft);
+	/* Interactive-surface roles (was `accent`, renamed 2026-08-17).
+	   `--color-lava-fill/-deep/-soft` were DELETED 2026-08-22 along with their source
+	   tokens: they generated `bg-lava-*` / `text-lava-*` utilities that ZERO files in
+	   the tree used, under a name for a colour the system no longer contains. A live
+	   utility for a dead concept is the thing tokens.css warns about two paragraphs
+	   above — it reads as the sanctioned way to do a thing. */
 	--color-action: var(--action);
 	--color-action-ink: var(--action-ink);
 	--color-action-on: var(--action-on);
@@ -75,6 +79,11 @@
 	   light, a light pill in dark — theme-flipped so it never reads black-on-black. */
 	--color-selected: var(--selected);
 	--color-selected-on: var(--selected-on);
+
+	/* THE focus affordance. One role token, so the ring is tuned in ONE place and
+	   `outline-focus-ring` / `ring-focus-ring` name what they are for. See the
+	   `--focus-ring` definition below for why it stopped being Verify-green. */
+	--color-focus-ring: var(--focus-ring);
 
 	/* semantic status (pair with icon/shape — never color alone).
 	   `--color-*` = the FILL; `--color-*-ink` = the AA-cleared TEXT tone. */
@@ -93,23 +102,39 @@
 	--color-info-soft: var(--info-soft);
 	--color-data-2: var(--data-2);
 
-	/* shadcn-compat aliases so existing apps/web components keep working */
-	--color-background: var(--bg);
-	--color-foreground: var(--ink);
-	--color-muted: var(--surface-2);
-	--color-muted-foreground: var(--ink-2);
-	--color-border: var(--line);
-	--color-primary: var(--action);
-	--color-primary-foreground: var(--action-on);
-	--color-destructive: var(--danger);
+	/* CHART ROLES (P0.11). Named separately from the status colours because a chart
+	   mark is not a state: `fill-chart-primary` says "this is the series", where
+	   `fill-ok` would say "this is healthy". Only the semantic-event marks on a
+	   chart use ok/warn/danger. */
+	--color-chart-primary: var(--chart-primary);
+	--color-chart-secondary: var(--chart-secondary);
+	--color-chart-grid: var(--chart-grid);
+	--color-chart-fill: var(--chart-fill);
 
-	/* type: the consuming app wires these. INCUMBENT is Plus Jakarta Sans + JetBrains
-   Mono (apps/web/app/layout.tsx:52). ADR-074 targets Inter, self-hosted+subset only
-   -- a Google-Fonts Inter swap was tried and REVERTED for a /traces LCP regression (no serif in the app —
-	   Source Serif 4 is marketing-only). globals.css points these at the actual
-	   next/font vars; these named fallbacks apply before the faces load. */
-	--font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-	--font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+	/* The shadcn-compat aliases (--color-background / -foreground / -muted /
+	   -muted-foreground / -border / -primary / -primary-foreground / -destructive)
+	   were DELETED 2026-08-18. They existed "so existing apps/web components keep
+	   working", and by then exactly ONE component still used them —
+	   `settings/ByokKeyManager.tsx` — which now names the real tokens. Each alias
+	   was a pure rename of a token defined above, so nothing rendered differently;
+	   what they cost was a second vocabulary for the same colours, in which
+	   `bg-card` and `ring-ring` LOOK like members and generate no CSS at all. That
+	   ambiguity is what let two BYOK modals ship with no background. There is no
+	   shadcn in this repo (`apps/web/CLAUDE.md` says so); there are now no
+	   shadcn-shaped token names either. */
+
+	/* TYPE: the consuming app wires these. Geist + Geist Mono (P0.3), loaded via
+	   `next/font/google` in apps/web/app/layout.tsx and pointed at the real
+	   next/font CSS variables in apps/web/app/globals.css. The names below are the
+	   fallback that applies for the frame before the faces load.
+	   THE PREDECESSOR AND WHY IT MOVED: Plus Jakarta Sans + JetBrains Mono. Inter
+	   was tried twice and reverted twice on a measured +21,160 B critical-path
+	   regression (founder ruling R3). Geist was measured against the same gate and
+	   went the OTHER way — -15,224 B, because Geist Mono is 17 KB smaller than
+	   JetBrains Mono and this app monospaces every numeral. The arithmetic is in
+	   layout.tsx, at the import that spends it. */
+	--font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+	--font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
 
 	/* visual-pass-01 body size. The spec's body band is 12–12.5px; `text-sm` is
 	   the app's body utility at ~224 call sites, so RETUNING THE TOKEN is how the
@@ -143,329 +168,461 @@
 	     16 -> --text-md    (new name, 0 prior uses)
 	     20 -> --text-ramp-20
 	     28 -> --text-ramp-28
-	   The three `--text-ramp-*` are plain custom properties, not `--text-*` utility
-	   slots, precisely so they cannot collide with a stock name. */
+	   CORRECTED 2026-08-17. This said the three `--text-ramp-*` are "plain custom
+	   properties, not `--text-*` utility slots". They ARE in Tailwind's `--text-*`
+	   namespace and DO generate utilities — `text-ramp-14` / `text-ramp-20` /
+	   `text-ramp-28` all compile, verified against the built stylesheet. What the odd
+	   name actually buys is the thing the paragraph above is really about: `ramp-14`
+	   is not a STOCK size key, so defining it cannot silently resize the 19 existing
+	   `text-xl` and 16 `text-base` uses the way pointing `--text-xl` at 28px would.
+	   The protection is real; the explanation of it was not.
+	   They emit font-size with NO line-height (there is no `--text-ramp-N--line-height`
+	   sibling), so they behave exactly like the `text-[Npx]` they replaced. */
 	--text-2xs: 0.6875rem; /* 11px — small-caps labels, card titles */
-	--text-2xs--line-height: 1rem; /* 16px */
+	/*
+	 * 15px, NOT 16px, and the change is invisible in a .tsx diff — which is exactly
+	 * why it is written down here.
+	 *
+	 * `text-[11px]` compiles to `font-size` ALONE, so 193 dense labels were inheriting
+	 * the body's 1.35 and sitting in a 14.85px line box. `.text-2xs` is a real ramp
+	 * utility and emits font-size AND `line-height: var(--tw-leading, <this>)`. At the
+	 * old 1rem every one of those labels would have GAINED 1.15px of leading the moment
+	 * the type ramp swept them onto the utility — invisible per row, ~14px over a
+	 * twelve-row table, which is a visibly looser table nobody asked for.
+	 *
+	 * 0.9375rem = 15px = 1.364 on an 11px body, which is the §2 app density (1.35)
+	 * rounded to a whole pixel rather than a fraction.
+	 *
+	 * BLAST RADIUS IS EXACTLY THE UTILITY, and that is why the retune is safe: only
+	 * `text-2xs` reads `--text-2xs--line-height`. `.t-card-title` and `.t-eyebrow`
+	 * spend `var(--text-2xs)` for font-size and set their own line-height, so neither
+	 * moves. Before the ramp sweep the utility had ZERO uses in the tree.
+	 */
+	--text-2xs--line-height: 0.9375rem; /* 15px = 1.364 — the §2 app density on 11px */
 	--text-sm: 0.8125rem; /* 13px — BODY BASE */
 	--text-sm--line-height: 1.1rem; /* 17.6px = 1.35 */
 	--text-md: 1rem; /* 16px — section lead */
 	--text-md--line-height: 1.3125rem; /* 21px */
 	--text-ramp-14: 0.875rem; /* 14px */
 	--text-ramp-20: 1.25rem; /* 20px */
+	--text-ramp-24: 1.5rem; /* 24px */
 	--text-ramp-28: 1.75rem; /* 28px */
+	--text-ramp-32: 2rem; /* 32px — ramp top, page titles only */
 }
 
-/* LIGHT — DEFAULT (ADR-074 "Instrument"). Pure-white canvas, monochrome chrome;
-   the dark block below is at parity, not an afterthought. Colour appears only where
-   a datum carries meaning. */
+/*
+ * ── MOTION TOKENS (2026-08-17) ───────────────────────────────────────────────
+ * A SEPARATE, non-`inline` @theme block, and the placement is the whole point.
+ *
+ * WHERE THESE USED TO LIVE, AND WHY THAT WAS A TRAP. `--ease-out` / `--dur-*`
+ * were defined at `@layer components > :root` (below). Tailwind v4 ALSO ships
+ * `--ease-out` in its own theme (`cubic-bezier(0, 0, 0.2, 1)`), emitted to
+ * `:root` in an earlier layer — so the components-layer definition silently
+ * SHADOWED it. The `ease-out` utility class and `var(--ease-out)` resolved to
+ * our curve while reading like Tailwind's. Nothing used the utility, so nothing
+ * broke; it was a live trap, not a live bug. Declaring them in `@theme` puts
+ * ours and Tailwind's in the same place, where an override is visible.
+ *
+ * THE CURVE CHANGED, and this is a behaviour change, not a rename.
+ * Was: `cubic-bezier(0.2, 0, 0, 1)`. Its first control point has y=0, so its
+ * initial velocity is 0/0.2 = ZERO — the shape is an ease-IN-OUT, filed under
+ * the name `ease-out`. Measured progress through the transition:
+ *
+ *            t=0.05   t=0.10   t=0.20   t=0.30    initial slope
+ *   was       2.9%    15.6%    50.0%    68.8%      0.00
+ *   now      21.0%    39.8%    68.2%    84.3%      4.35
+ *   tw stock  8.2%*   16.1%*   30.8%*   44.5%*      inf
+ *   ease-in   0.4%     1.7%     6.2%    13.0%      0.00
+ *              (* Tailwind's --ease-out, cubic-bezier(0,0,0.2,1))
+ *
+ * The old curve shared its zero initial velocity with `ease-in`: for the first
+ * ~9ms of a 180ms transition it had moved 2.9%, which is the exact moment the
+ * user is watching after a click or a hover. It caught up and overtook stock
+ * ease-out by t=0.2, so this was never "slow" overall — it was slow at the
+ * front, which is the only end that reads as responsiveness.
+ * `cubic-bezier(0.23, 1, 0.32, 1)` is a strong ease-out (emilkowalski/skills,
+ * `review-animations/STANDARDS.md`).
+ *
+ * WHY THE TAILWIND DEFAULTS ARE OVERRIDDEN HERE. Tailwind's stock
+ * `--default-transition-timing-function` is `cubic-bezier(0.4, 0, 0.2, 1)` —
+ * also zero initial velocity, and at t=0.05 it has moved 0.6% (ease-in moves
+ * 0.4%). Every bare `transition-colors` / `transition-transform` /
+ * `transition-opacity` in this repo inherits it: 156 + 14 + 5 = 175 sites,
+ * against TWO sites that spend `var(--ease-out)`. So the design system's motion
+ * vocabulary governed one component and 175 others did something else.
+ *
+ * Retuning the default is how the whole surface is reached in one value instead
+ * of 175 className edits — the same move `--text-sm` makes above, for the same
+ * reason, and one line to revert.
+ */
+@theme {
+	--ease-out: cubic-bezier(0.23, 1, 0.32, 1); /* strong ease-out — enter/exit, hover, press */
+	--ease-in-out: cubic-bezier(0.77, 0, 0.175, 1); /* on-screen MOVEMENT (a thing travelling) */
+	--dur-fast: 140ms; /* press feedback, hover, colour */
+	--dur-base: 180ms; /* surface + border changes */
+
+	/* Consumed by every bare `transition-*` utility (Tailwind emits
+	   `var(--tw-ease, var(--default-transition-timing-function))`). */
+	--default-transition-duration: var(--dur-fast);
+	--default-transition-timing-function: var(--ease-out);
+}
+
+/*
+ * ── LIGHT — DEFAULT ("Instrument II", founder P0 brief 2026-08-22) ───────────
+ *
+ * WHAT CHANGED AND WHY. The previous values were a PURE-WHITE system: --bg,
+ * --canvas and --surface were all #ffffff, and card separation was carried by a
+ * 1.7:1 hairline (--line #c0c0c6) plus a drop shadow. That is the third attempt
+ * at the same problem — a white card on a white ground has nothing to exist by —
+ * and each attempt fixed it with a different crutch: first a blue tint on the
+ * ground, then elevation, then a darker border.
+ *
+ * The founder's P0 brief solves it at the root: THE GROUND AND THE CARD ARE
+ * DIFFERENT VALUES. #fafaf9 canvas, #ffffff card. Separation is now tonal, which
+ * is what every premium light interface actually does, and it is why the border
+ * can go BACK to a quiet #e7e7e5 without the card dissolving. That reverses the
+ * 2026-08-21 "make the borders darker" instruction, and the reversal is the
+ * point: that instruction was a fix for the pure-white ground, and the ground is
+ * gone. --line-2 (#d8d8d5) is the emphasis step for hover and for the places
+ * that genuinely need an edge to read.
+ *
+ * WARM NEUTRAL, NOT GREY. Every surface value carries R=G>B by 1–2 points
+ * (#fafaf9, #f5f5f4, #e7e7e5). Saturation is ~0.4%, far under the ≤4% ceiling —
+ * you cannot see the warmth as a hue, you can see that the screen is not cold.
+ * The pale-BLUE cast the brief called out is gone: no surface, line or ink token
+ * in this block has B > R.
+ *
+ * COLOUR IS STILL DATA (the one rule that survives every palette swap). There is
+ * no brand accent. --action* is the ink family, so the primary button, links and
+ * data bars are graphite. Green means healthy, orange means degraded, red means
+ * failed, and nothing decorative is coloured — which is why --info and --data-2,
+ * which used to be a blue and a violet, are now the two CHART neutrals.
+ *
+ * WCAG: every pair in packages/ui/scripts/contrast-check.mjs passes in BOTH
+ * themes; the derivations that are NOT the brief's literal value are each
+ * annotated at the line, with the measured ratio.
+ */
 :root {
 	color-scheme: light;
-	/* visual-pass-01 — the canvas returns to a BLUE-TINTED slate, now as a static
-	   vertical gradient rather than a flat fill. `--canvas` keeps a flat colour
-	   (the gradient's 55% stop) so every `bg-canvas` consumer still resolves; the
-	   gradient itself is `--canvas-gradient`, painted by `.app-canvas`. Static
-	   only — the ADR-053 animated-gradient ban stands. */
-	--bg: #ffffff; /* cool page margin — the framed canvas floats on it */
-	--canvas: #ffffff; /* flat fallback = the gradient's mid stop */
-	--canvas-gradient: linear-gradient(
-		160deg,
-		#f3f6fa 0%,
-		#fafbfc 55%,
-		#ffffff 100%
-	); /* G1 container tint (ADR-074 §5): <=4% saturation, two-ish stops, STATIC */
-	--canvas-sunken: #f7f8fa; /* sub-nav strips, table headers (ADR-074 §3) */
-	--surface: #ffffff; /* cards stay pure white — white-on-tint is the card/canvas separation */
-	--surface-2: #f7f8fa; /* soft-blue well: icon chips, tray, hovers (visual-pass-01) */
-	--surface-3: #eef0f3; /* soft blue, one step deeper */
-	--surface-inverse: #0d0d0d; /* cool near-black: dark cards (error-budget/burn) + active nav pill */
-	--ink-inverse: #ffffff; /* text/icons ON --surface-inverse */
-	--line: #e5e7eb; /* card hairline (visual-pass-01 --card-line) */
-	--line-2: #d1d5db; /* one step stronger */
-	--ink: #0d0d0d; /* founder: #10161d read too heavy — leaner, still 12.9:1 on white */
-	--logo-ink: #0d0d0d; /* brand lockup mono — the logo-lock near-black (matches tracelane.dev) */
-	/* FOUNDER AMENDMENT 2026-08-16: darker than ADR-074 §3's #5d6470 / #8b919c.
-	   Seen on the real dashboard, the spec values read WASHED OUT — nav items,
-	   small-caps section labels and card titles all sat too light against a pure
-	   white canvas. §3's palette was reasoned about as swatches; this is what it
-	   looks like at 12.5px on screen, and the screen wins. Both stay clearly
-	   MUTED against --ink (#0d0d0d) — the hierarchy is intact, it is just legible. */
-	--ink-2: #414753;
-	/* --ink-3 was #7c8794 = 3.94:1 on white — BELOW the AA-4.5 floor it is used
-	   at (labels, captions, table headers). Deepened to clear AA on white AND on
-	   the --surface-2 well it also sits on. */
-	--ink-3: #697080;
-	/* Lava dual-tone (founder-decided): soft fill vs deep text. The named --lava-*
-	   are the source of truth; the --action* roles point at them so every existing
-	   bg-action / text-action-ink consumer inherits with zero component churn. */
-	--lava-fill: #0d0d0d; /* soft coral-lava — all FILLS */
-	--lava-deep: #0d0d0d; /* deep lava — all TEXT/NUMBERS + thin lines. AA floor:
-	                         5.45:1 on white, 4.51:1 on the lava-soft pill (the
-	                         softer #e0472f was 4.1:1/3.4:1 — below AA-4.5).
-	                         visual-pass-01: #c8300f measured 4.48:1 on the pill —
-	                         under AA by 0.02. Moved ONE step on the red channel
-	                         (200->199) to clear it. This is the only byte of lava
-	                         this pass touches; revert to #c8300f if the founder
-	                         would rather carry the miss than the change. */
-	--lava-soft: #f7f8fa; /* soft-pill background */
-	--action: var(--lava-fill); /* Lava — solid fill */
-	--action-ink: var(--lava-deep); /* Lava for action TEXT/line on light */
-	--action-on: #ffffff; /* label placed ON a Lava fill */
-	--action-soft: var(--lava-soft); /* selected-row tint / chip bg / outer ring band */
-	--action-line: #e5e7eb;
-	--seal: #067647; /* Verify green — provenance signature. UNCHANGED (visual-pass-01). */
-	--seal-ink: #067647; /* deepened Verify for provenance TEXT on light (AA).
-	                        #157f4f was 4.36:1 on --seal-soft — under the AA-4.5
-	                        floor it exists to clear. 2% deeper, same colour. */
-	--seal-on: #ffffff;
-	--seal-soft: #e7f4ed;
-	--seal-line: #bfe0cd;
-	--ok: #067647; /* ok = Verify green (ADR-053) — the FILL. UNCHANGED. */
-	--ok-soft: #e7f4ed;
-	--danger: #d92d20;
-	--danger-on: #ffffff; /* label placed ON a solid danger fill (matches --action-on) */
-	--danger-soft: #fdecea;
-	--warn: #b54708;
-	--warn-soft: #fdf3e6;
-	--info: #1d5bd0; /* tool-span violet — AFT-1 id hue */
-	--info-soft: #e8f0fd;
+
+	/* ── ground ──────────────────────────────────────────────────────────── */
+	--bg: #fafaf9; /* the page ground — warm neutral, NOT white */
+	--canvas: #fafaf9; /* = --bg; the content column paints the same ground */
+	/* Flat. Kept as a gradient token because `.app-canvas` and the dark theme
+	   both consume the name, and a one-stop gradient is how you say "there is
+	   deliberately no gradient here" without deleting the seam. */
+	--canvas-gradient: linear-gradient(180deg, #fafaf9 0%, #fafaf9 100%);
+	/* The rail. LIGHTER than the canvas (#fcfcfb vs #fafaf9), which is the
+	   opposite of the usual "sunken sidebar" instinct and is what the brief
+	   specifies: the navigation reads as a near-white sheet the content sits
+	   beside, not as a well the content climbs out of. */
+	--sidebar: #fcfcfb;
+	/* One step UNDER the canvas — sub-nav strips, table headers, <kbd>. The
+	   ordering (sunken < canvas < surface) is the contract, not the value. */
+	--canvas-sunken: #f1f1f0;
+
+	/* ── surfaces ────────────────────────────────────────────────────────── */
+	--surface: #ffffff; /* cards — the only pure white left in the system */
+	--surface-2: #f5f5f4; /* the well: icon chips, tray, inert fills, tracks */
+	--surface-hover: #f8f8f7; /* row/cell hover ON a white card — one step off white */
+	--surface-3: #ebebe9; /* the press step, one below the well */
+	/* The deliberate dark card in a light UI (P0.10 error budget) + tooltips.
+	   #151619 is the brief's dark-mode --surface, used here on purpose so the one
+	   inverted surface in light theme is the SAME material as an ordinary card in
+	   dark theme rather than a fourth near-black nobody else uses. */
+	--surface-inverse: #151619;
+	--ink-inverse: #f5f5f5; /* text/icons ON --surface-inverse — 16.60:1 */
+
+	/* ── elevation ───────────────────────────────────────────────────────── */
+	/* P0.5, to the byte: one tight contact shadow for the EDGE, one wide soft
+	   shadow for the LIFT. Both are weaker than the values they replace (4%/4% ->
+	   2%/2.5%) because the ground is no longer white — tone is now doing most of
+	   the separation, so the shadow only has to finish the job. */
+	/* TWO ELEVATIONS, NOT THREE. `--shadow-raised` sat between these with ZERO
+	   consumers — the same defect this file already records for the deleted
+	   `--shadow-rest` / `--shadow-lift` / `--sheen`, recurring because a middle
+	   step looks reasonable in a list. A defined-but-unused token reads as the
+	   sanctioned way to do a thing, so the next person reaches for an elevation
+	   the system does not actually have. The system has exactly two: a card sits,
+	   or an overlay floats. */
+	--shadow-card: 0 1px 2px rgb(0 0 0 / 0.02), 0 4px 12px rgb(0 0 0 / 0.025);
+	--shadow-overlay: 0 2px 6px rgb(0 0 0 / 0.06), 0 20px 44px rgb(0 0 0 / 0.12);
+
+	/* ── glass (CHROME ONLY — see the note at `.glass`) ──────────────────── */
+	--glass-bg: rgb(252 252 251 / 0.82);
+	--glass-line: rgb(0 0 0 / 0.05);
+	--glass-blur: 12px;
+
+	/* ── lines ───────────────────────────────────────────────────────────── */
+	--line: #e7e7e5; /* the hairline. 1.24:1 on white — quiet BY DESIGN now that
+	                    the card/ground tone split carries the edge. */
+	--line-2: #d8d8d5; /* the emphasis step: hover borders, dividers that must read */
+
+	/* ── ink ─────────────────────────────────────────────────────────────── */
+	--ink: #171717; /* 17.93:1 on card, 17.17:1 on canvas */
+	--logo-ink: #171717; /* brand lockup mono — tracks --ink */
+	--ink-2: #6b6b6b; /* 5.33:1 on card — clears AA for body/secondary text */
 	/*
-	 * Semantic TEXT variants (visual-pass-01) — the dual-tone split the palette
-	 * already makes for lava (--lava-fill / --lava-deep) and Verify
-	 * (--seal / --seal-ink), now completed for the four status colours.
+	 * #828280, NOT the brief's #9a9a9a, AND THE REASON IS THE BRIEF'S OWN P0.18.
 	 *
-	 * Why: `text-ok` was painting the Verify FILL green as text — 3.46:1 on
-	 * white, well under AA. Deepening `--ok` itself was not an option (it is the
-	 * Verify signature, pinned unchanged, and it is also a fill: `bg-ok` dots).
-	 * So the fills stay byte-identical and TEXT moves to these.
-	 * Rule for new code: `bg-*` uses the base token, `text-*` uses `-ink`.
+	 * P0.18 requires light and dark to hold the SAME semantic hierarchy. The
+	 * brief's dark tertiary (#71717a) measures 3.74:1 on its surface; its light
+	 * tertiary (#9a9a9a) measures 2.81:1 on white — so the two themes would have
+	 * been a third apart in legibility at the same semantic level, and the light
+	 * one would have sat under the 3:1 non-text floor the repo's own contrast
+	 * gate asserts for this token. #828280 measures 3.85:1 on the card and 3.69:1
+	 * on the canvas: parity with dark, above the floor, and still visibly a third
+	 * step below --ink-2 (5.33:1) so the ramp reads as three levels, not two.
+	 *
+	 * P0.3's "Do not make secondary text too faint. The dashboard must remain
+	 * readable" is the same instruction from the other side.
 	 */
-	--ok-ink: #067647; /* 5.20:1 on white, 4.52:1 on --ok-soft */
-	--info-ink: #1d5bd0; /* 5.23:1 on white, 4.51:1 on --info-soft */
-	--danger-ink: #d92d20; /* light: identical to --danger (already 5.36:1) */
-	--warn-ink: #b54708; /* 5.15:1 on white, 4.52:1 on the canvas end stop */
-	--selected: #0d0d0d;
-	--data-2: #6438d9; /* second data series (ADR-074 §3) */ /* selected/active pill fill — neutral black on light */
-	--selected-on: #ffffff; /* label on the selected pill */
+	--ink-3: #828280;
+
+	/* ── interactive surfaces (the `--action*` roles) ────────────────────── */
+	/* NO BRAND ACCENT IN P0. Every action role resolves into the ink family, so
+	   the primary button is solid graphite, links are graphite, data bars are
+	   graphite. New code names --ink / --line / --surface for chrome and
+	   --ok/--warn/--danger for state.
+	   THE `--lava-*` SOURCE TOKENS ARE DELETED (2026-08-22). They were three
+	   aliases holding the ink value under the name of a retired coral-red, and a
+	   tree-wide grep found ZERO consumers: no `var(--lava-*)`, no `bg-lava-*`, no
+	   `text-lava-*`. The comment that stood here claimed "~50 files still saying
+	   `bg-lava-*`", which was false when it was written and is the reason the
+	   aliases survived two palette swaps. */
+	--action: #171717;
+	--action-ink: #171717;
+	--action-on: #ffffff; /* label ON an action fill — 17.93:1 */
+	--action-soft: #f5f5f4;
+	--action-line: #e7e7e5;
+
+	/* ── semantic status — the ONLY colour in the system ─────────────────── */
+	/* The `--x` value is the FILL (dots, bars, arcs, chart marks, solid buttons);
+	   the `--x-ink` value is the TEXT tone. They differ where the brief's fill
+	   value does not clear 4.5:1 as small text — the same dual-tone split this
+	   palette has always made, now applied to all three states. */
+	--ok: #16803c; /* brief value. 5.02:1 on card, 4.80:1 on canvas */
+	--ok-ink: #137035; /* 6.18:1 on card, 5.48:1 on --ok-soft */
+	--ok-soft: #e9f4ec;
+	--warn: #c77a00; /* brief value. 3.38:1 — a UI/graphic mark, never small text */
+	--warn-ink: #9c6000; /* 5.14:1 on card, 4.59:1 on --warn-soft */
+	--warn-soft: #faf1e3;
+	--danger: #dc3b35; /* brief value. 4.45:1; white-on-it is 4.45:1 */
+	--danger-ink: #c62e28; /* 5.49:1 on card, 4.75:1 on --danger-soft */
+	--danger-on: #ffffff; /* label ON a solid danger fill */
+	--danger-soft: #fbebea;
+	/*
+	 * --info AND --data-2 ARE NOW CHART NEUTRALS, AND THAT IS THE BIGGEST
+	 * SEMANTIC CHANGE IN THIS PASS.
+	 *
+	 * They were #1d5bd0 (blue) and #6438d9 (violet) — the "one free data hue" the
+	 * trace viewer used for tool spans and the second bar series. The P0 brief
+	 * bans both outright ("No blue visual cast remains · No purple/violet
+	 * remains") because a decorative hue in a product whose whole rule is COLOUR
+	 * IS DATA says something happened when nothing did.
+	 *
+	 * They keep their NAMES so nothing had to be renamed across ~40 call sites,
+	 * and they take the brief's chart values: --info is chart-primary (graphite),
+	 * --data-2 is chart-secondary (mid grey). Where two series used to be told
+	 * apart by hue they are now told apart by VALUE, which is the monochrome
+	 * information design the rest of the system already uses.
+	 */
+	--info: #202124; /* = --chart-primary. 16.10:1 on card */
+	--info-ink: #202124;
+	--info-soft: #f1f1f0; /* = --chart-fill */
+	--data-2: #a7a7a7; /* = --chart-secondary — the second series, by value not hue */
+
+	/* ── charts (P0.11) ──────────────────────────────────────────────────── */
+	--chart-primary: #202124; /* the one data colour */
+	--chart-secondary: #a7a7a7; /* the second series / de-emphasised marks */
+	--chart-grid: #eeeeec; /* axis + gridlines — barely there on purpose */
+	--chart-fill: #f1f1f0; /* area fill under a line, and inert bar tracks */
+
+	/* ── provenance seal ─────────────────────────────────────────────────── */
+	/* The audit ledger's verified mark. It is the SAME green as --ok, deliberately:
+	   under the brief, green means one thing — healthy/verified — and a second
+	   green would be a second meaning nobody can name. */
+	/* No `--seal-on`. It was the label colour for a SOLID seal fill, and nothing in
+	   the app paints one — the seal is a 2px provenance strip and a soft chip, never
+	   a filled button. The contrast gate asserted `seal-on` on `seal`, i.e. it
+	   proved a combination that is never rendered, which is exactly the trap the
+	   `selected-on` note in contrast-check.mjs records. Both went together. */
+	--seal: #16803c;
+	--seal-ink: #137035;
+	--seal-soft: #e9f4ec;
+	--seal-line: #c2e0cd;
+
+	/* ── selected / active pill ──────────────────────────────────────────── */
+	--selected: #171717; /* solid ink in light … */
+	--selected-on: #ffffff; /* … white label — 17.93:1 */
+
+	/*
+	 * FOCUS IS CHROME, SO FOCUS IS MONOCHROME. It is not a datum, so under
+	 * "colour is data" it must not be coloured — and --ink has the most contrast
+	 * available (17.9:1 against a 3:1 requirement, WCAG 2.2 SC 1.4.11).
+	 *
+	 * THE KNOWN LIMIT — AND THE SENTENCE THAT USED TO END IT WAS FALSE.
+	 *
+	 * An ink ring drawn ON an ink surface is invisible, and --surface-inverse cards
+	 * are ink. This note claimed `outline-offset` saves it ("the ring is painted
+	 * OUTSIDE the border box, on the canvas behind") and then asserted: "A focusable
+	 * control placed INSIDE a --surface-inverse card would still need its own
+	 * override; there are none."
+	 *
+	 * BOTH HALVES WERE WRONG. A 2px offset puts the ring 2px outside the CONTROL,
+	 * which on a card is still ON THE CARD, not on the canvas — the offset only
+	 * reaches the canvas for a control at the card's very edge. And there WAS such a
+	 * control: `apps/web/components/audit/AuditLedgerView.tsx`'s Audit-SKU CTA is a
+	 * focusable <Link> inside a --surface-inverse panel, so its ring measured
+	 * #171717 on #151619 = 1.01:1 in the DEFAULT theme. It carries an explicit
+	 * `focus-visible:outline-ink-inverse` now.
+	 *
+	 * THE RULE, stated so the next one is caught at the call site: a focusable
+	 * control on a --surface-inverse surface MUST override the ring colour to
+	 * --ink-inverse. Overriding the COLOUR is correct; adding a second ring
+	 * mechanism or `outline-none` is not (the design-constraints guard blocks the
+	 * latter).
+	 */
+	--focus-ring: var(--ink);
 }
 
-/* DARK — at parity (ADR-074 §3). Same roles, same names, dark values. */
+/*
+ * ── DARK — DESIGNED INDEPENDENTLY, NOT INVERTED (P0.2) ───────────────────────
+ *
+ * The role names and the semantic hierarchy are identical to light (P0.18); the
+ * VALUES are their own system. Two places where that shows:
+ *
+ *  · SEPARATION RUNS THE OTHER WAY. In light the card is lighter than the
+ *    ground; here the card (#151619) is lighter than the ground (#0d0e10) too —
+ *    both themes lift the card, neither inverts the relationship. What flips is
+ *    the shadow: a black drop shadow on a near-black ground is invisible, so
+ *    dark separates on surface contrast + the hairline, and the shadow tokens
+ *    survive only so `.surface-card` resolves in one rule for both themes.
+ *
+ *  · --line-2 MUST BE LIGHTER THAN --line HERE. "Stronger border" means more
+ *    contrast against the surface, and on a dark surface more contrast is
+ *    lighter. This palette shipped that inverted once (--line-2 darker than
+ *    --line), and every hover border in the app got quieter instead of louder.
+ */
 [data-theme="dark"],
 .dark {
 	color-scheme: dark;
-	--bg: #0a0c10; /* page margin — sits UNDER the canvas, so one step darker */
-	--canvas: #0a0c10; /* flat fallback = the gradient's end stop */
-	--canvas-gradient: linear-gradient(
-		160deg,
-		#161a21 0%,
-		#13161c 55%,
-		#12151b 100%
-	);
-	--canvas-sunken: #0e1116;
-	--surface: #12151b; /* cards — lifted for clearer elevation over the canvas */
-	--surface-2: #1a1e25; /* tray / hover / chip well — lifted so affordances read */
-	--surface-3: #232830;
-	--surface-inverse: #0a0c10; /* dark cards + active nav pill (dark theme) */
-	--ink-inverse: #f0f3f7;
-	--line: #232830; /* crisper card + table hairline on the dark cards */
-	--line-2: #333a45; /* the STRONGER border — must be LIGHTER than --line in dark
-	                      (was #1a222d, darker than --line — an inverted hierarchy) */
-	--ink: #f0f3f7; /* leaner in dark too: dimmer, not brighter — brighter = heavier here */
-	--logo-ink: #ffffff; /* brand lockup mono — inverts to off-white on dark (logo lock) */
-	/* Same amendment, mirrored: on the dark canvas legibility means LIFTING. */
-	--ink-2: #b3bcc8;
-	--ink-3: #8b94a2; /* tertiary/label text — lifted to clear AA on the dark cards */
-	--action: #f0f3f7; /* brightened Lava fill for dark */
-	--action-ink: #f0f3f7; /* Lava as TEXT/line on dark */
-	--action-on: #0a0c10;
-	--action-soft: #1a1e25;
-	--action-line: #232830;
-	--seal: #22c55e; /* brightened Verify for dark */
-	--seal-ink: #22c55e;
-	--seal-on: #04140d;
-	--seal-soft: #0d2417;
-	--seal-line: #14432f;
-	--ok: #22c55e;
-	--ok-soft: #0d2417;
-	--danger: #ff5a5a; /* the FILL — unchanged: `bg-danger` carries a white label
-	                      (destructive buttons), and lightening it for text AA
-	                      would drop white-on-danger from 3.58:1 to 2.84:1. */
-	--danger-on: #ffffff; /* white label on the danger fill (matches --action-on) */
-	--danger-soft: #2a1214;
-	--warn: #f5a524;
-	--warn-soft: #2a1f08;
-	--info: #5b8def;
-	--info-soft: #111c2e;
-	/* Semantic TEXT variants (see the light block for the rationale). In dark,
-	   ok / warn / seal already clear AA, so their -ink equals the base; danger
-	   and info are lifted for text only, leaving both fills untouched. */
-	--ok-ink: #22c55e; /* = --ok; 6.68:1 on --surface */
-	--info-ink: #5b8def; /* 5.94:1 on --surface (base was 4.41:1 on --surface-2) */
-	--danger-ink: #ff5a5a; /* 5.93:1 on --surface; the FILL stays #f0555a */
-	--warn-ink: #f5a524; /* = --warn; 7.51:1 on --surface */
-	/* New tokens only — the existing dark palette above is deliberately unchanged.
-	   Lava source vars mirror the dark --action* so bg-lava-* utilities resolve in
-	   dark too; --action* stay literal above (not rewired) so nothing dark shifts. */
-	--lava-fill: #f0f3f7;
-	--lava-deep: #f0f3f7;
-	--lava-soft: #1a1e25;
-	--selected: #f0f3f7;
-	--data-2: #8b6bf0; /* second data series (ADR-074 §3) */ /* selected pill INVERTS in dark: light pill... */
-	--selected-on: #0a0c10; /* ...with dark text — high separation on the dark track */
+
+	/* ── ground ──────────────────────────────────────────────────────────── */
+	--bg: #0d0e10;
+	--canvas: #0d0e10;
+	--canvas-gradient: linear-gradient(180deg, #0d0e10 0%, #0d0e10 100%);
+	--sidebar: #101113; /* one step ABOVE the ground, mirroring light's #fcfcfb */
+	--canvas-sunken: #0a0a0c; /* under the ground — table headers, <kbd> */
+
+	/* ── surfaces ────────────────────────────────────────────────────────── */
+	--surface: #151619;
+	--surface-2: #1c1d20;
+	--surface-hover: #202125;
+	--surface-3: #26272b;
+	/* The inverse card in dark is the GROUND colour, so the P0.10 error-budget
+	   tile reads as recessed rather than lifted. It therefore has NO tonal edge
+	   of its own and MUST carry `border border-line` at the call site — which the
+	   dashboard does, for exactly this reason. */
+	--surface-inverse: #0d0e10;
+	--ink-inverse: #f5f5f5;
+
+	/* ── elevation: a hairline, not a drop ───────────────────────────────── */
+	--shadow-card: 0 1px 2px rgb(0 0 0 / 0.2);
+	--shadow-overlay: 0 2px 6px rgb(0 0 0 / 0.5), 0 20px 44px rgb(0 0 0 / 0.45);
+
+	/* ── glass (CHROME ONLY) ─────────────────────────────────────────────── */
+	--glass-bg: rgb(16 17 19 / 0.82);
+	--glass-line: rgb(255 255 255 / 0.07);
+	--glass-blur: 12px;
+
+	/* ── lines ───────────────────────────────────────────────────────────── */
+	--line: #292b2f;
+	--line-2: #383a3f;
+
+	/* ── ink ─────────────────────────────────────────────────────────────── */
+	--ink: #f5f5f5; /* 16.60:1 on card */
+	--logo-ink: #f5f5f5;
+	--ink-2: #a1a1aa; /* 7.06:1 on card */
+	--ink-3: #71717a; /* 3.74:1 on card — the brief's value, and the reference the
+	                     light theme's --ink-3 was tuned to match (see there) */
+
+	/* ── interactive surfaces ────────────────────────────────────────────── */
+	--action: #f5f5f5;
+	--action-ink: #f5f5f5;
+	--action-on: #0d0e10;
+	--action-soft: #1c1d20;
+	--action-line: #292b2f;
+
+	/* ── semantic status ─────────────────────────────────────────────────── */
+	/* All three brief values clear 4.5:1 as text on the card, so the -ink variants
+	   equal their fills here. That asymmetry with light is correct: a token pair
+	   exists to guarantee legibility, not to be different for its own sake. */
+	--ok: #34a853; /* 5.92:1 on card */
+	--ok-ink: #34a853;
+	--ok-soft: #10281a;
+	--warn: #f0a43c; /* 8.68:1 on card */
+	--warn-ink: #f0a43c;
+	--warn-soft: #2a1f0c;
+	--danger: #ff5a52; /* 5.89:1 on card */
+	--danger-ink: #ff5a52;
+	--danger-on: #ffffff; /* white label on the danger fill — 3.07:1, the large/UI
+	                         floor. Deepening the fill for a text-AA label would cost
+	                         the fill its legibility as a MARK, which is its main job. */
+	--danger-soft: #2b1414;
+	/* Chart neutrals — see the light block for why these are no longer a blue and
+	   a violet. */
+	--info: #f2f2f2; /* = --chart-primary */
+	--info-ink: #f2f2f2;
+	--info-soft: #242528; /* = --chart-fill */
+	--data-2: #777777; /* = --chart-secondary. 4.04:1 on card */
+
+	/* ── charts (P0.11) ──────────────────────────────────────────────────── */
+	--chart-primary: #f2f2f2;
+	--chart-secondary: #777777;
+	--chart-grid: #292b2f;
+	--chart-fill: #242528;
+
+	/* ── provenance seal — the same green as --ok, same reason ───────────── */
+	--seal: #34a853;
+	--seal-ink: #34a853;
+	--seal-soft: #10281a;
+	--seal-line: #1c4630;
+
+	/* ── selected / active pill — INVERTS, so it never reads dark-on-dark ── */
+	--selected: #f5f5f5;
+	--selected-on: #0d0e10; /* 17.71:1 */
+
+	--focus-ring: var(--ink);
 }
 
 @layer components {
-	/*
-	 * ── Motion + elevation primitives (cosmetic pass 2026-07-28) ─────────────
-	 * One easing curve and two shadow recipes, so every lifted surface in the app
-	 * agrees. Previously each component inlined its own cubic-bezier and its own
-	 * one-layer shadow, which is why tiles, cards and the CTA felt subtly
-	 * different when they moved.
-	 *
-	 * `--shadow-rest/-lift` are TWO-layer: a tight contact shadow (grounds the
-	 * edge) plus a wide ambient one (gives depth). A single-layer shadow reads
-	 * flat and slightly muddy; the pair is what makes a surface look lifted
-	 * rather than outlined. Still cheap — no blur filters, no backdrop-filter
-	 * (ADR-053 rejected literal glass on purpose: it costs frames and reads as
-	 * nothing on a flat page).
-	 */
 	:root {
-		--ease-out: cubic-bezier(0.2, 0, 0, 1);
-		--dur-fast: 140ms;
-		--dur-base: 180ms;
-		/* ADR-074 §5: "8px cards and tiles, 12-16px large containers". This was
-		   0.875rem (14px) on EVERYTHING — the large-container value on a 120px tile,
-		   which is what made a wall of them read soft and bubbly rather than precise. */
-		--radius-card: 0.5rem; /* 8px — cards and tiles */
-		--radius-container: 0.75rem; /* 12px — large containers */
-		/* visual-pass-01: shadows are BLUE-TINTED (rgba(24,50,96,…)) rather than
-		   neutral slate, so a lifted card reads as the same light source as the
-		   blue canvas under it. A neutral shadow on a blue tint reads muddy. */
-		--shadow-rest: 0 1px 2px -1px rgba(24, 50, 96, 0.05), 0 4px 12px -6px
-			rgba(24, 50, 96, 0.06);
-		--shadow-lift: 0 2px 6px -2px rgba(24, 50, 96, 0.08), 0 14px 32px -14px
-			rgba(24, 50, 96, 0.14);
-		/* Specular top hairline — the "wet"/liquid edge. On light surfaces a white
-		   inset does nothing, so light mode uses a faint cool-white that reads as a
-		   polished edge against the tinted-slate palette. */
-		--sheen: inset 0 1px 0 0 rgba(255, 255, 255, 0.9);
-	}
-	[data-theme="dark"],
-	.dark {
-		--shadow-rest: 0 1px 2px -1px rgba(0, 0, 0, 0.45), 0 4px 14px -6px
-			rgba(0, 0, 0, 0.4);
-		--shadow-lift: 0 2px 8px -2px rgba(0, 0, 0, 0.5), 0 16px 34px -14px
-			rgba(0, 0, 0, 0.55);
-		--sheen: inset 0 1px 0 0 rgba(255, 255, 255, 0.045);
-	}
-
-	/* `.cta-lava` was DELETED 2026-08-16. It was a 135deg gradient whose three stops
-	   (--action-2 / --action / --action-strong) all collapsed to the same near-black in
-	   the ADR-074 value swap, so it painted a flat fill through a gradient, a glow and a
-	   specular hairline — and §5 bans exactly that form. The primary button is solid ink.
-	   Its three source tokens (--action-2, --action-strong, --action-field) had no other
-	   consumer and went with it. */
-
-	/*
-	 * Provenance card top-action (ADR-053) — a 3px Verify-green gradient painted
-	 * as the card's top edge (one of the three permitted gradient sites). A
-	 * background strip (not a border/pseudo) so it clips cleanly to the rounded
-	 * corners with no overflow and never clips card content. Pair with
-	 * `border-t-0` so the gradient IS the top edge.
-	 */
-	.card-provenance-top {
-		background-image: linear-gradient(90deg, var(--seal), var(--seal-ink));
-		background-size: 100% 3px;
-		background-position: top;
-		background-repeat: no-repeat;
-	}
-
-	/*
-	 * The shared <StatCard> surface. FLAT: a hairline border plus the near-invisible
-	 * G1 tint, and nothing else — no shadow, no sheen, no hover-lift.
-	 *
-	 * This comment used to describe "quiet elevation … a soft 1px shadow … still
-	 * feels lifted", which is what the rule below actually did until 2026-08-16.
-	 * It is rewritten rather than amended because a comment that contradicts the
-	 * declaration underneath it is worse than none (CLAUDE.md §17).
-	 */
-	.stat-tile {
-		border-radius: var(--radius-card);
-		border: 1px solid var(--line);
 		/*
-		 * ADR-074 §5 G1 — the container tint. Specified in the ADR, applied nowhere
-		 * until 2026-08-16, which is a large part of why a wall of tiles read flat:
-		 * a pure-white card on a pure-white canvas has ONLY its 1px border to exist
-		 * by, so twelve of them become a wireframe.
+		 * RADIUS — two roles, and the split is the point (P0.5).
 		 *
-		 * G1's whole discipline is that it must be near-invisible on its own and only
-		 * legible as separation: <=4% saturation, two stops, static, 160deg, no extra
-		 * border. `#fcfdfe -> #ffffff` is ~1% — you cannot see the gradient, you can
-		 * see the card. That is the intended effect, not a weaker version of one.
+		 * ADR-074 §5 fixed everything at 8px "cards and tiles". The P0 brief asks
+		 * for 16–20px on cards, and a card and a button at the same radius is
+		 * exactly what makes a surface read as a wireframe of rounded rectangles
+		 * rather than as a sheet with controls on it. So the card gets the brief's
+		 * band and CONTROLS keep the small value they always had.
+		 *
+		 * THESE ARE REM, AND THE ROOT IS ADAPTIVE (see the `:root` clamp in @layer
+		 * base): 1.125rem is 18px at a 16px root and 16.4px at the ~14.6px root a
+		 * 1440px viewport resolves to — i.e. inside the brief's 16–20px band across
+		 * the range the app is actually used at. A px value would have been 18px on
+		 * every screen and would not have tracked the density clamp.
 		 */
-		background-color: var(--surface);
-		background-image: linear-gradient(160deg, #fcfdfe 0%, #ffffff 62%);
-		/* NO SHADOW. §5: "Exactly one shadow exists in the system, on overlays only",
-		   and per-row shadows are named in the Never list. Every tile carried
-		   --shadow-rest + --sheen, so a dashboard of twelve tiles painted twelve
-		   drop shadows and a specular hairline each — the single biggest reason the
-		   surface read as a 2019 card UI rather than an instrument. Separation is
-		   the hairline border plus the G1 tint; both are cheaper and flatter. */
+		--radius-card: 1.125rem; /* 16–20px — cards, tiles, panels */
+		--radius-control: 0.5rem; /* 8px — buttons, inputs, chips, pills */
 	}
-	.stat-tile--interactive {
-		cursor: pointer;
-		/* Transitions ONLY the two properties :hover actually changes. It used to
-		   also transition box-shadow and transform — both vestigial since the lift
-		   and the shadows were removed, and a transition on a property nothing sets
-		   is a promise the stylesheet does not keep. */
-		transition: border-color var(--dur-base) var(--ease-out), background-color
-			var(--dur-base) var(--ease-out);
-	}
-	.stat-tile--interactive:hover {
-		/* Border + surface only. The old rule lifted 1px and swapped two shadows;
-		   on a dense grid that reads as the page twitching, not as affordance. */
-		border-color: var(--line-2);
-		background-color: var(--surface-2);
-	}
-	.stat-tile--interactive:active {
-		background-color: var(--surface-3);
-	}
-	[data-theme="dark"] .stat-tile,
-	.dark .stat-tile {
-		background-image: linear-gradient(
-			180deg,
-			var(--surface-2) 0%,
-			var(--surface) 150%
-		);
-	}
-	/* No reduced-motion override for .stat-tile--interactive any more: the hover
-	   changed a transform, and that transform is gone. A colour transition is not
-	   motion, so there is nothing left here to opt out of. */
 
 	/*
-	 * Shared <Card> surface. Same radius and the same FLAT treatment as .stat-tile,
-	 * so a card and a metric tile sitting side by side read as the same material
-	 * instead of two different ones.
-	 */
-	.surface-card {
-		border-radius: var(--radius-card);
-		/* Flat, per §5 — see .stat-tile. The border carries the edge. */
-	}
-	/* The provenance variant paints a 3px Verify-green top edge; the border and that
-	   edge are the whole treatment.
-	   It carried `box-shadow: var(--shadow-rest)` until 2026-08-16 — correct when the
-	   base had shadow+sheen and this override existed only to drop the sheen, but the
-	   base went flat and this was left behind, making the provenance card the ONE
-	   card in the system still painting a drop shadow. Exactly the "per-row shadows"
-	   §5 names in its Never list, surviving in the variant nobody re-read. */
-
-	/*
-	 * ── visual-pass-01 ───────────────────────────────────────────────────────
-	 * The app canvas. `--canvas` alone is a flat colour; this paints the static
-	 * vertical gradient over it, with the flat colour as the fallback beneath so
-	 * a failed gradient degrades to the right tone rather than to nothing.
-	 * STATIC — no animation, no background-position transition. The ADR-053 ban
-	 * is on ANIMATED gradients (`ADR-053:40`), not on gradients.
+	 * THE CONTENT GROUND. `.app-canvas` was USED on <main> and on the onboarding
+	 * shell and DEFINED NOWHERE — a dead class for as long as both call sites have
+	 * existed, which is why `--canvas-gradient` had no consumer either. It is a
+	 * real rule now: the one large content container paints the canvas explicitly
+	 * instead of inheriting whatever <body> happens to be.
 	 */
 	.app-canvas {
 		background-color: var(--canvas);
@@ -473,19 +630,97 @@
 	}
 
 	/*
-	 * Error-budget scan-line — a 2px lava gradient painted as the card's top
-	 * edge. Same mechanism as `.card-provenance-top` (a clipped background
-	 * strip, not a border or a pseudo-element) so it follows the rounded corners
-	 * and can never clip card content. Static: the gradient does not move.
+	 * ── SURFACE HIERARCHY (P0.4) ─────────────────────────────────────────────
 	 *
-	 * Rationing note: Lava marks BRAND/CTA and data, Verify marks provenance.
-	 * The error budget is a burn signal, not a provenance claim — so lava is the
-	 * correct seal here and the Verify green would be a category error.
+	 * THE PROBLEM THIS SOLVES: every panel on the dashboard carried the same
+	 * border, the same radius and the same weight, so nine cards read as nine
+	 * equally important facts and the reader had to do the ranking. Two classes,
+	 * one difference:
+	 *
+	 *   .surface-card          PRIMARY — a white sheet LIFTED off the ground.
+	 *   .surface-card--quiet   SECONDARY — the same sheet, FLAT on the ground.
+	 *
+	 * The lift is ~2% of black across two layers. That is deliberately almost
+	 * nothing: on a #fafaf9 ground the card is already separated by TONE, so the
+	 * shadow only has to say "this one is in front", and anything heavier turns a
+	 * grid of tiles into a grid of grey smudges.
 	 */
-	.card-lava-top {
-		/* Was a 3-stop gradient whose stops all collapsed to the same ink in the
-		   ADR-074 swap. A flat ink strip, stated as one. */
-		background-color: var(--action);
+	.surface-card {
+		border-radius: var(--radius-card);
+		background-color: var(--surface);
+		box-shadow: var(--shadow-card);
+	}
+	/*
+	 * The de-emphasised sibling. No shadow — and NOT a different colour, a
+	 * different border or a different radius, because a hierarchy built from four
+	 * simultaneous differences reads as two unrelated components rather than as
+	 * two levels of one.
+	 */
+	.surface-card--quiet {
+		box-shadow: none;
+	}
+
+	/*
+	 * The shared <StatCard> surface. Same material as `.surface-card` so a metric
+	 * tile and a card sitting side by side read as one system.
+	 *
+	 * THE GRADIENT IS GONE, AND IT WAS A BUG AS WELL AS A STYLE. This rule carried
+	 * `linear-gradient(160deg, #fcfdfe 0%, #ffffff 62%)` as the ADR-074 §5 "G1
+	 * container tint". #fcfdfe has B > R — it is a COOL white — so every metric
+	 * tile in the app was painting a faint blue wash over its top-left corner.
+	 * That is a literal instance of the "pale-blue visual cast" P0.1 opens by
+	 * asking us to remove, and it was invisible in review because it lived in a
+	 * stylesheet rather than in a component's className.
+	 */
+	.stat-tile {
+		border-radius: var(--radius-card);
+		border: 1px solid var(--line);
+		background-color: var(--surface);
+		box-shadow: var(--shadow-card);
+	}
+	.stat-tile--interactive {
+		cursor: pointer;
+		/* Only the two properties :hover actually changes. A transition on a
+		   property nothing sets is a promise the stylesheet does not keep. */
+		transition: border-color var(--dur-base) var(--ease-out), background-color
+			var(--dur-base) var(--ease-out);
+	}
+	.stat-tile--interactive:hover {
+		border-color: var(--line-2);
+		background-color: var(--surface-hover);
+	}
+	.stat-tile--interactive:active {
+		background-color: var(--surface-2);
+	}
+	/* Dark theme separates on surface contrast, not on light, so the tile is flat
+	   and the hairline does the edge. No gradient here either — the old
+	   `linear-gradient(180deg, --surface-2, --surface 150%)` was the dark twin of
+	   the cool-white wash above.
+	   `:not(.surface-card--quiet)` IS LOAD-BEARING, and it is a specificity fix, not
+	   a style choice: `[data-theme="dark"] .surface-card` scores (0,2,0) against
+	   `.surface-card--quiet`'s (0,1,0), so without it the dark theme handed every
+	   SECONDARY card its shadow back and the whole P0.4 hierarchy silently existed
+	   in light only. Nothing in the light rules would have shown it. */
+	[data-theme="dark"] .stat-tile,
+	.dark .stat-tile,
+	[data-theme="dark"] .surface-card:not(.surface-card--quiet),
+	.dark .surface-card:not(.surface-card--quiet) {
+		box-shadow: var(--shadow-card);
+	}
+
+	/*
+	 * Provenance top-edge (the audit/ledger `<Card provenance>`): a 2px seal-green
+	 * strip painted as the card's top edge. A background strip rather than a
+	 * border or a pseudo-element so it clips cleanly to the rounded corners and can
+	 * never clip card content. Pair with `border-t-0` so the strip IS the top edge.
+	 *
+	 * FLAT, not the two-stop gradient it used to be: both stops resolve into the
+	 * same green family now, so the gradient was painting a flat fill through a
+	 * more expensive mechanism. This is one of the very few coloured marks left in
+	 * the system, and it is coloured because it means VERIFIED.
+	 */
+	.card-provenance-top {
+		background-color: var(--seal);
 		background-image: none;
 		background-size: 100% 2px;
 		background-position: top;
@@ -493,72 +728,177 @@
 	}
 
 	/*
-	 * Horizontal data-bar fill. One class so every proportion bar in the app
-	 * (traffic-by-model, provider mix, tool usage, transcript spine) reads as
-	 * one material instead of four greys. The track stays `--surface-2`.
+	 * Horizontal data-bar fill. ONE class so every proportion bar in the app
+	 * (traffic-by-model, provider mix, tool usage, transcript spine) is one
+	 * material instead of four greys. The track is `--surface-2`.
+	 *
+	 * RENAMED from `.bar-lava` (2026-08-22). "Lava" was a colour that no longer
+	 * exists, on a class that paints a DATA mark — `--chart-primary` names both
+	 * what it is and where its value comes from. Every call site moved in the same
+	 * change; the old name is deleted rather than aliased, because a deprecated
+	 * alias is how two vocabularies for one thing survive.
 	 */
-	.bar-lava {
-		/* Same collapse — both stops are the same ink now. Flat fill. */
-		background-color: var(--action);
+	.bar-data {
+		background-color: var(--chart-primary);
 	}
 
 	/*
-	 * ── Type scale (visual-pass-01) ──────────────────────────────────────────
-	 * Four roles, four classes. Defined here rather than as per-site Tailwind
-	 * arbitrary values so the scale is ONE place to tune and the class names say
-	 * what the text IS, not how big it is.
+	 * The tooltip surface. Deliberately the INVERSE surface, not a white card: a
+	 * white tooltip on a white card is another card, and a tooltip's whole job is
+	 * to read as a layer ABOVE the page.
+	 */
+	.tl-tooltip {
+		background-color: var(--surface-inverse);
+		color: var(--ink-inverse);
+		box-shadow: var(--shadow-overlay);
+		font-family: var(--font-sans);
+	}
+	@media (prefers-reduced-motion: no-preference) {
+		.tl-tooltip {
+			animation: tl-tooltip-in 120ms ease-out;
+		}
+	}
+	@keyframes tl-tooltip-in {
+		from {
+			opacity: 0;
+		}
+		to {
+			opacity: 1;
+		}
+	}
+
+	/*
+	 * Translucent chrome — sticky headers, the sidebar rail, overlays, the command
+	 * palette. SCOPED TO CHROME ON PURPOSE: `backdrop-filter` makes the compositor
+	 * re-sample everything behind it on every paint, so a blurred surface over a
+	 * scrolling 2,000-span table is a frame-rate problem. Chrome is small, mostly
+	 * static and already composited — it pays almost nothing.
 	 *
-	 * `font-weight: 650` is why layout.tsx loads Inter as a VARIABLE font — no
-	 * static instance carries 650. On the fallback face it rounds to 700.
+	 * `--glass-bg` is 82% opaque, so a browser without `backdrop-filter` renders a
+	 * near-solid bar. That is a fine fallback on an achromatic ground and is why
+	 * no `@supports` guard is needed.
+	 */
+	.glass {
+		background-color: var(--glass-bg);
+		border-color: var(--glass-line);
+		/* design-constraint-ok: chrome-only glass (sticky headers, the rail, overlays, the command palette) — never rows or cards, because a per-frame compositor re-sample only costs something over data-dense scrolling. */
+		-webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+		/* design-constraint-ok: chrome-only glass — see the line above. */
+		backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+	}
+
+	/*
+	 * ── TYPE SCALE (P0.3) ────────────────────────────────────────────────────
+	 * Six roles, six classes, named for what the text IS rather than how big it
+	 * is — so the scale is ONE place to tune and a call site cannot drift off it.
+	 *
+	 * The hierarchy the brief asks for, and the gap that made the old one fail:
+	 * `t-h1` and `t-metric` used to be 28px and 20px with `t-card-title` at 11px
+	 * UPPERCASE. Uppercase micro-titles on every card are the single strongest
+	 * "admin dashboard" tell there is, and they forced the card header to compete
+	 * with the section header above it, which was also uppercase. Now only
+	 * SECTION labels are uppercase (P0.8 keeps them); a card title is sentence
+	 * case at body size, and the metric is the biggest thing inside its card.
 	 */
 	.t-h1 {
-		font-size: var(--text-ramp-28); /* 28px — ramp top */
+		font-size: var(--text-ramp-32); /* 28–32px per P0.3 */
 		font-weight: 600;
-		letter-spacing: -0.02em; /* §4: -0.02em at 28+ */
-		line-height: 1.14;
+		letter-spacing: -0.022em; /* tighter at the top of the ramp */
+		line-height: 1.1;
 		color: var(--ink);
 	}
-	.t-card-title {
-		font-size: var(--text-2xs); /* 11px */
-		/* Founder: 650 on full ink read too dark and too thick. 600 on --ink-2 is
-		   the lean version — the title still leads the card, it just stops
-		   competing with the metric underneath it. */
+	/* Section eyebrow — TYPE ONLY. The trailing hairline rule stays a real sibling
+	   element in the markup (SectionLabel renders one) so it is independently
+	   styleable. 12px/0.10em, on --ink-2 rather than --ink-3: P0.8 calls these
+	   "secondary text", and at 12px with 0.10em tracking the tertiary tone was the
+	   faintest thing on the page. */
+	.t-eyebrow {
+		font-size: var(--text-xs); /* 12px */
 		font-weight: 600;
-		letter-spacing: 0.04em;
+		letter-spacing: 0.1em;
 		text-transform: uppercase;
 		color: var(--ink-2);
 	}
+	/* Card title — 13px, sentence case, PRIMARY ink. It leads its card; the
+	   uppercase treatment now belongs to section labels alone. */
+	.t-card-title {
+		font-size: var(--text-sm); /* 13px */
+		font-weight: 600;
+		letter-spacing: -0.005em;
+		line-height: 1.3;
+		color: var(--ink);
+	}
+	/* The micro label above a metric ("ERROR RATE"). The one place uppercase
+	   survives inside a card, because P0.6 asks for it and because a metric label
+	   is closer to an axis label than to a title. Extracted from StatCard's inline
+	   classes so the KPI strip and the tiles cannot drift apart. */
+	.t-metric-label {
+		font-size: var(--text-2xs); /* 11px */
+		font-weight: 600;
+		/* 0.06em, down from 0.08. At 11px in Geist the wider value opened "TE" and
+		   "SE" pairs far enough that "ERROR RATE" read as "ERROR RAT E" on the
+		   render. Tracking has to be set against the face that ships, not against
+		   the number in a spec. */
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+	}
+	/* THE NUMBER. 28px is the bottom of P0.6's 28–36px band; at the adaptive root
+	   that is ~25.5px at 1440 and 28px at 1920. `tabular-nums` is mandatory — a
+	   value that changes must not make its own row jitter. */
 	.t-metric {
-		/* 20px, NOT 22. It was the same size as `t-h1`, which is precisely why a
-		   page title read as a peer of every stat on it. One step below the title
-		   is what makes the title a title. */
-		font-size: var(--text-ramp-20); /* 20px */
-		font-weight: 650;
+		font-size: var(--text-ramp-28);
+		font-weight: 600;
+		letter-spacing: -0.022em;
+		line-height: 1.05;
+		font-variant-numeric: tabular-nums;
+	}
+	/* The dense variant, for a tile in a 5- or 6-up strip where the full metric
+	   size would wrap a five-figure number. Same weight and tracking, one ramp
+	   step down, so a dense row still reads as the same instrument. */
+	.t-metric-sm {
+		font-size: var(--text-ramp-20);
+		font-weight: 600;
 		letter-spacing: -0.02em;
 		line-height: 1.1;
 		font-variant-numeric: tabular-nums;
 	}
-	/* Section eyebrow — TYPE ONLY. The trailing hairline rule stays a real
-	   sibling element in the markup (SectionLabel already renders one) rather
-	   than a `::after` here: that keeps this pass's diff to className strings and
-	   leaves the hairline independently styleable. */
-	.t-eyebrow {
-		font-size: var(--text-2xs); /* 11px — ramp bottom; 10px was off-scale */
-		font-weight: 700;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-
-	/* (The former .brand-logo/.brand-logo-icon PNG background rules were removed —
-	   the <Logo> component now renders the mark + wordmark as inline SVG + text
-	   (Source Serif 4), monochrome via --logo-ink, matching the marketing site's
-	   lockup one-to-one. The public/brand/logo-*.png assets are now unused.) */
 }
 
 @layer base {
 	* {
 		border-color: var(--line);
+	}
+	/*
+	 * ── ADAPTIVE ROOT (founder, 2026-08-17: "the page looks zoomed up a lot at 100%
+	 *    scale. Make it adaptive and reduce the size of all metrics, tiles to fit") ──
+	 *
+	 * ONE knob scales the WHOLE interface, because everything downstream is already
+	 * expressed in rem and rem resolves against THIS element:
+	 *   · the §2 type ramp   --text-2xs 0.6875rem … --text-ramp-28 1.75rem
+	 *   · every Tailwind spacing utility  --spacing: 0.25rem  (p-3, gap-2, h-9, w-60 …)
+	 *   · every radius       --radius-md 0.375rem, --radius-lg 0.5rem …
+	 * So tiles, gaps, padding, control heights, the sidebar width and the type all
+	 * shrink together and keep their proportions. Scaling only the FONT would have
+	 * made the text smaller inside boxes that stayed the same size, which reads as
+	 * wrong rather than as denser.
+	 *
+	 * WHY IT LOOKED ZOOMED. The browser default root is 16px and every rem above was
+	 * authored against it, so the layout was pinned to a 16px grid at every viewport —
+	 * a 1280px laptop got the same physical tile as a 2560px monitor. Nothing was
+	 * adaptive; `body`'s hard `13px` was the only size that did not scale, which is
+	 * also why the type looked small inside boxes that looked large.
+	 *
+	 * THE CURVE: 13.5px at 1024 and below, 16px at 1920 and above, linear between.
+	 * At the common 1440 it lands at ~14.6px, so the interface renders ~9% tighter
+	 * than today without a single component changing. TO TUNE THE WHOLE APP'S DENSITY,
+	 * CHANGE THE FIRST NUMBER — that is the entire point of putting it here.
+	 *
+	 * The floor is a real floor: below ~13.5px root the 11px ramp bottom would fall
+	 * under 9.3px, and the ramp already sits at the edge of comfortable reading.
+	 */
+	:root {
+		font-size: clamp(13.5px, 0.2561vw + 10.88px, 16px);
 	}
 	body {
 		background-color: var(--bg);
@@ -566,33 +906,41 @@
 		font-family: var(--font-sans);
 		font-variant-numeric: tabular-nums; /* mandatory for all data */
 		-webkit-font-smoothing: antialiased;
-		/* visual-pass-01 type base. `tnum` only: the cv05/cv11 character variants
-		   were Inter-specific and are no-ops now that the face is unchanged —
-		   carrying dead feature flags is exactly the clutter this pass removes. */
+		/* `tnum` only. The cv05/cv11 character variants that used to sit here were
+		   Inter-specific and were no-ops on the shipped face — a dead feature flag
+		   reads as a considered choice, which is worse than no flag at all. */
 		font-feature-settings: "tnum";
 		letter-spacing: -0.005em;
-		font-size: 13px; /* ADR-074 §2 app base — see the ramp in @theme */
-		line-height: 1.35; /* §2 app density; marketing re-asserts 1.6 later */
+		/* `var(--text-sm)` (0.8125rem), NOT a hard 13px. It was the ONE size in the app
+		   that could not scale with the adaptive root above, so body copy stayed put
+		   while every box around it shrank — the opposite of the intended effect. Same
+		   rendered size at a 16px root; now it tracks. */
+		font-size: var(--text-sm); /* 13px app base — see the ramp in @theme */
+		line-height: 1.4; /* opened from 1.35: P0.15 asks for breathing room, and body
+		                     leading is the cheapest place in the system to buy it. */
 	}
 
 	/*
-	 * ADR-074 §4 LETTER-SPACING RAMP. Specified in the ADR and never implemented —
-	 * which is a large part of why the app read "basic": every heading sat at the
-	 * font's default tracking, so a 28px h1 and a 12.5px label had the same optical
-	 * texture and the hierarchy came only from size.
+	 * LETTER-SPACING RAMP. Tightening large type and opening small type is the
+	 * single cheapest thing that separates typeset from typed: -0.022em at 28+,
+	 * -0.015em at 20, -0.01em at 16, ~0 at body, +0.08–0.10em on small-caps labels.
+	 * Without it a 32px title and a 12px label carry the same optical texture and
+	 * the hierarchy comes only from size.
 	 *
-	 * Tightening large type and opening small type is the single cheapest thing that
-	 * separates typeset from typed. §4: -0.02em at 28+, -0.01em at 16-20, 0 below,
-	 * +0.06em on small-caps labels.
+	 * `.t-h1` is NOT in this selector list any more. It carries its own complete
+	 * declaration in @layer components (size, weight, tracking, leading, colour), so
+	 * naming it here too meant two rules setting the same three properties in two
+	 * layers — the kind of split that makes a type tweak land in one place and
+	 * silently not in the other. A bare `h1` still gets a sane default.
 	 */
-	h1,
-	.t-h1 {
-		letter-spacing: -0.02em;
+	h1 {
+		letter-spacing: -0.022em;
 		font-weight: 600;
-		line-height: 1.15;
+		line-height: 1.1;
 	}
-	h2,
-	.t-h2 {
+	/* `.t-h2` was in this selector and had ZERO call sites — an alias for a role
+	   nothing claims. The bare `h2` is live and keeps the rule. */
+	h2 {
 		letter-spacing: -0.015em;
 		font-weight: 600;
 		line-height: 1.2;
@@ -603,21 +951,45 @@
 	}
 	/* Numerals are DATA. Mono + tabular everywhere they appear, so a column of
 	   figures aligns and a changing value never makes the row jitter. */
-	.t-num,
+	/* `.t-num` was here with ZERO call sites; `td.num` and `.tabular` are live. */
 	td.num,
 	.tabular {
 		font-family: var(--font-mono);
 		font-variant-numeric: tabular-nums;
 		letter-spacing: -0.01em;
 	}
-	/* Verify-green focus ring (ADR-053) — one uniform focus affordance across
-	   links, buttons, and disclosure controls. */
+	/*
+	 * THE focus affordance — one mechanism, one colour, one offset.
+	 *
+	 * WAS: `2px solid var(--seal)` at `outline-offset: 3px`, and it was only half the
+	 * story. Button.tsx set `outline-none` and painted a `ring-2 … ring-offset-2`
+	 * instead — a SECOND mechanism at a DIFFERENT offset, so a focused button and a
+	 * focused link sat at different distances from their own edge. `outline` wins the
+	 * tie-break on merit, not just on count: a ring is a box-shadow and is therefore
+	 * CLIPPED by any `overflow-hidden` ancestor — table cells, the sidebar rail, the
+	 * scroll containers this app is full of — while an outline is painted in its own
+	 * layer and cannot be clipped. Offset unifies at 2px because ~64 call sites
+	 * already say `focus-visible:outline-offset-2`; moving the base to match them is
+	 * the smaller change and the one that ends the disagreement.
+	 *
+	 * The colour is `--focus-ring` (monochrome ink) — see its definition for why the
+	 * Verify green had to go.
+	 *
+	 * The selector list grew to cover inputs, selects, textareas and anything given an
+	 * explicit `tabindex`. They were focusable and reachable by keyboard the whole time
+	 * and got only the browser default, which several resets suppress — the failure
+	 * mode being a control you can Tab to with no visible sign that you have.
+	 */
 	a:focus-visible,
 	button:focus-visible,
 	summary:focus-visible,
-	[role="button"]:focus-visible {
-		outline: 2px solid var(--seal);
-		outline-offset: 3px;
+	input:focus-visible,
+	select:focus-visible,
+	textarea:focus-visible,
+	[role="button"]:focus-visible,
+	[tabindex]:focus-visible {
+		outline: 2px solid var(--focus-ring);
+		outline-offset: 2px;
 	}
 	/* `border-radius` here applies to the ELEMENT, not the outline — setting it
 	   globally squared off every rounded button and pill the moment it took focus

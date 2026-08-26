@@ -128,13 +128,22 @@ export function latencyPointsFromTimeseries(
 	return out;
 }
 
-/** One hourly traffic bucket: total requests + the errored subset. */
+/** One hourly traffic bucket: total requests + the errored subset + tokens. */
 export interface TrafficPoint {
 	/** Bucket start epoch (ms) — a stable unique key across a multi-day window. */
 	t: number;
 	label: string;
 	requests: number;
 	errors: number;
+	/**
+	 * input + output tokens in this bucket (DSH-08).
+	 *
+	 * ADDED HERE RATHER THAN AS A SECOND `buildTokenPoints`, deliberately: the
+	 * tokens spark and the traffic chart must sit on the SAME bucket grid, and two
+	 * folds over the same rows are two chances to disagree about what a bucket is.
+	 * One fold, one grid, three series.
+	 */
+	tokens: number;
 }
 
 /**
@@ -148,14 +157,18 @@ export function buildTrafficPoints(
 	bucketMs: number,
 	window: ChartWindow,
 ): TrafficPoint[] {
-	const byBucket = new Map<number, { requests: number; errors: number }>();
+	const byBucket = new Map<
+		number,
+		{ requests: number; errors: number; tokens: number }
+	>();
 	for (const r of rows) {
 		const epoch = parseBucketHour(r.bucket_hour);
 		if (epoch == null) continue;
 		const key = Math.floor(epoch / bucketMs) * bucketMs;
-		const cur = byBucket.get(key) ?? { requests: 0, errors: 0 };
+		const cur = byBucket.get(key) ?? { requests: 0, errors: 0, tokens: 0 };
 		cur.requests += r.requests;
 		cur.errors += r.errors;
+		cur.tokens += r.total_input_tokens + r.total_output_tokens;
 		byBucket.set(key, cur);
 	}
 	const keys = [...byBucket.keys()].sort((a, b) => a - b);
@@ -174,6 +187,7 @@ export function buildTrafficPoints(
 			label: bucketLabel(key, bucketMs),
 			requests: acc?.requests ?? 0,
 			errors: acc?.errors ?? 0,
+			tokens: acc?.tokens ?? 0,
 		});
 	}
 	return points;

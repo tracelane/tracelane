@@ -84,9 +84,11 @@ curl -X POST https://app.tracelane.dev/api/settings/cmk-keys \
 | `provider-keys` | Provider API keys (Anthropic, OpenAI, …) | Live |
 | `trace-payload` / `all` | Prompt + completion text in stored spans | Roadmap |
 
-To keep prompt/completion text out of storage today, set
-`TRACELANE_TRACE_CONTENT=false` in the SDK — content is dropped at capture,
-not stored-then-encrypted.
+Prompt and completion text is **not captured today** by the gateway or by the
+first-party SDKs, so there is nothing to keep out of storage and no flag to set.
+(An earlier revision pointed at `TRACELANE_TRACE_CONTENT`; no component reads that
+variable — corrected 2026-08-20.) Text reaches us only if your own OpenTelemetry
+instrumentation sends the `gen_ai.*.messages` attributes.
 
 ## Rotate & revoke
 
@@ -99,9 +101,9 @@ deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
 
 ## Audit trail
 
-Every CMK fingerprint operation (register, remove) is written to the
-tamper-evident audit ledger with the CMK fingerprint. Use `tlane verify` to
-confirm the log has not been altered.
+CMK register and remove operations are recorded against the tenant in the
+control plane. They are not currently written to the tamper-evident audit
+ledger, so `tlane verify` does not cover them.
 
 ## Self-host
 

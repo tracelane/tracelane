@@ -123,7 +123,10 @@ function SessionBar({
 		<span className="relative flex h-4 items-center" aria-hidden="true">
 			<span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line/60" />
 			<span
-				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm bg-ink-2/70"
+				// `--chart-secondary` (the de-emphasised data-mark role) rather than
+				// `bg-ink-2/70`: an alpha re-composites against the row behind it, so
+				// the same bar changed value the moment the row was hovered.
+				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm bg-chart-secondary"
 				style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
 			/>
 		</span>
@@ -142,10 +145,10 @@ function SortHeader({
 	const active = (sp.sort ?? "last_activity") === col;
 	const order = sp.order ?? "desc";
 	return (
-		<th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+		<th className="px-3 py-1.5 text-right t-metric-label">
 			<Link
 				href={sortHref(sp, col)}
-				className="inline-flex items-center gap-1 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+				className="inline-flex items-center gap-1 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			>
 				{label}
 				<span className="text-ink-3">
@@ -162,7 +165,7 @@ function SessionRow({
 }: { s: SessionSummary; win: { startMs: number; endMs: number } | null }) {
 	const isError = s.status === "error";
 	return (
-		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-2/40">
+		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-hover">
 			<td className="px-3 py-2">
 				<Link
 					href={`/sessions/${encodeURIComponent(s.session_id)}`}
@@ -230,7 +233,7 @@ async function SessionsData({ sp }: { sp: SP }) {
 				action={
 					<Link
 						href="/sessions"
-						className="text-[13px] font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+						className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 					>
 						Clear filters
 					</Link>
@@ -238,7 +241,7 @@ async function SessionsData({ sp }: { sp: SP }) {
 			/>
 		) : (
 			<EmptyState
-				title="No sessions in this window."
+				title="No sessions in this window"
 				description="Sessions thread an agent's related traces by conversation id. Widen the range, or once your agents emit `gen_ai.conversation.id`, multi-turn runs show up here."
 			/>
 		);
@@ -256,12 +259,10 @@ async function SessionsData({ sp }: { sp: SP }) {
 				<table className="w-full text-sm">
 					<thead>
 						<tr className="border-b border-line">
-							<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-								Session
-							</th>
+							<th className="px-3 py-1.5 text-left t-metric-label">Session</th>
 							<SortHeader sp={sp} col="turns" label="Turns" />
 							<th
-								className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3"
+								className="px-3 py-1.5 text-left t-metric-label"
 								title="The latest model in the session. A session that switched models shows only the most recent — open the session to see every turn."
 							>
 								Model
@@ -283,9 +284,7 @@ async function SessionsData({ sp }: { sp: SP }) {
 							<SortHeader sp={sp} col="tokens" label="Tokens" />
 							<SortHeader sp={sp} col="duration" label="First → last" />
 							<SortHeader sp={sp} col="cost" label="Cost" />
-							<th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-								Status
-							</th>
+							<th className="px-3 py-1.5 text-left t-metric-label">Status</th>
 							<SortHeader sp={sp} col="last_activity" label="Last activity" />
 						</tr>
 					</thead>
@@ -297,12 +296,12 @@ async function SessionsData({ sp }: { sp: SP }) {
 				</table>
 			</Card>
 			{atCap && (
-				<p className="px-1 text-[12px] text-ink-3">
+				<p className="px-1 text-xs text-ink-3">
 					Showing the first 50 sessions — narrow the date range or add filters
 					to see more.
 				</p>
 			)}
-			<p className="px-1 text-[11px] text-ink-3">
+			<p className="px-1 text-2xs text-ink-3">
 				Tokens and cost are summed per session across all turns — they may
 				double-count when usage is recorded on both a wrapper span and its inner
 				span. “—” means unpriced or no usage, not necessarily zero.

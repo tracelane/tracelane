@@ -90,6 +90,7 @@ GROUP BY tenant_id, bucket_hour, provider, model;
 
 -- ── SLO alert records ─────────────────────────────────────────────────────────
 -- Alert-event sink for the ADR-061 alert job (one row per breach). NOTE: the
+-- job is not built yet — this table is provisioned ahead of it; there
 -- is no writer today.
 -- Append-only; one row per breach event.
 CREATE TABLE IF NOT EXISTS tracelane.slo_alerts
@@ -144,6 +145,7 @@ WHERE JSONHas(attributes, 'gen_ai_usage_input_tokens')
    OR JSONHas(attributes, 'llm.usage.prompt_tokens');
 
 -- ── Cost estimation view ──────────────────────────────────────────────────────
+-- Model pricing from — approximate costs per 1M tokens (USD).
 -- Updated monthly; values are estimates for budget alerting only.
 CREATE VIEW IF NOT EXISTS tracelane.v_cost_by_hour AS
 SELECT

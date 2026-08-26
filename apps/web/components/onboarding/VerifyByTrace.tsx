@@ -83,7 +83,7 @@ export function VerifyByTrace() {
 
 	if (state === "found") {
 		return (
-			<div className="flex items-center gap-3 rounded-lg border border-seal-line bg-seal-soft/40 px-4 py-3">
+			<div className="flex items-center gap-3 rounded-lg border border-seal-line bg-seal-soft px-4 py-3">
 				<span aria-hidden className="text-seal-ink">
 					●
 				</span>
@@ -91,7 +91,7 @@ export function VerifyByTrace() {
 					<p className="text-sm font-medium text-ink">
 						Your first trace landed
 					</p>
-					<p className="text-[13px] text-ink-2">Opening it…</p>
+					<p className="text-sm text-ink-2">Opening it…</p>
 				</div>
 			</div>
 		);
@@ -101,19 +101,19 @@ export function VerifyByTrace() {
 		return (
 			<div
 				role="alert"
-				className="rounded-lg border border-danger/40 bg-danger-soft/40 px-4 py-3"
+				className="rounded-lg border border-danger/40 bg-danger-soft px-4 py-3"
 			>
 				<p className="text-sm font-medium text-ink">
 					{errKind === "auth"
 						? "Your session was rejected"
 						: "Can't reach the gateway"}
 				</p>
-				<p className="mt-0.5 text-[13px] text-ink-2">
+				<p className="mt-0.5 text-sm text-ink-2">
 					{errKind === "auth"
 						? "Sign in again, then return to this step."
 						: "The trace read path is unavailable right now — we'll keep trying. If your agent is already sending requests, the gateway or ingest may be down."}
 				</p>
-				<p className="mt-1 text-[11px] tabular-nums text-ink-3">
+				<p className="mt-1 text-2xs tabular-nums text-ink-3">
 					Still polling… ({elapsed}s)
 				</p>
 			</div>
@@ -121,7 +121,9 @@ export function VerifyByTrace() {
 	}
 
 	return (
-		<div className="rounded-lg border border-line bg-surface px-4 py-3">
+		// `.surface-card`, so the waiting panel and the step cards around it share
+		// one radius.
+		<div className="surface-card border border-line bg-surface px-4 py-3">
 			<div className="flex items-center gap-3">
 				<span
 					aria-hidden
@@ -132,11 +134,11 @@ export function VerifyByTrace() {
 					<span className="tabular-nums text-ink-2">({elapsed}s)</span>
 				</p>
 			</div>
-			<p className="mt-1 text-[13px] text-ink-2">
+			<p className="mt-1 text-sm text-ink-2">
 				Run the snippet above — the moment a span lands, this opens your trace.
 			</p>
 			{elapsed >= SLOW_AFTER_S && (
-				<div className="mt-2 rounded-md border border-warn/30 bg-warn-soft/40 px-3 py-2 text-[12px] text-ink-2">
+				<div className="mt-2 rounded-md border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-ink-2">
 					<p className="font-medium text-warn-ink">
 						Nothing yet after {SLOW_AFTER_S}s? Check:
 					</p>

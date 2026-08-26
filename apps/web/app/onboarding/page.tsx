@@ -21,7 +21,12 @@
  */
 
 import { VerifyByTrace } from "@/components/onboarding/VerifyByTrace";
-import { Logo, MetricIcon, type MetricIconName } from "@tracelanedev/ui";
+import {
+	Logo,
+	MetricIcon,
+	type MetricIconName,
+	SegmentedControl,
+} from "@tracelanedev/ui";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -58,7 +63,11 @@ function StepProgress({ current }: { current: number }) {
 					)}
 				</div>
 			))}
-			<span className="t-card-title text-ink-3 ml-3">
+			{/* A step counter is a caption, not a card title. It spent `.t-card-title`
+			    and then overrode the colour that class exists to set — which is the tell
+			    that the role was wrong rather than the value. Plain caption utilities
+			    keep the type-class vocabulary meaning what it says. */}
+			<span className="ml-3 text-xs text-ink-3">
 				Step {current} of {TOTAL_STEPS}
 			</span>
 		</div>
@@ -153,7 +162,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 					value={workspace}
 					onChange={(e) => setWorkspace(e.target.value)}
 					placeholder="Acme agents"
-					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 			</div>
 
@@ -163,7 +172,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 				type="button"
 				onClick={start}
 				disabled={loading}
-				className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating workspace…" : "Get started →"}
 			</button>
@@ -243,7 +252,7 @@ function StepApiKey({
 					</p>
 				</div>
 
-				<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center gap-3">
+				<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center gap-3">
 					<code className="text-sm font-mono text-action-ink break-all flex-1">
 						{rawKey}
 					</code>
@@ -279,7 +288,7 @@ function StepApiKey({
 					type="button"
 					onClick={onNext}
 					disabled={!confirmed}
-					className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-40"
+					className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-40"
 				>
 					Continue →
 				</button>
@@ -330,7 +339,7 @@ function StepApiKey({
 					value={keyName}
 					onChange={(e) => setKeyName(e.target.value)}
 					placeholder="my-agent"
-					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 			</div>
 
@@ -340,7 +349,7 @@ function StepApiKey({
 				type="button"
 				onClick={create}
 				disabled={loading}
-				className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating…" : "Create API key →"}
 			</button>
@@ -360,6 +369,15 @@ const LANG_LABELS = {
 	cli: "CLI",
 } as const;
 
+type Lang = keyof typeof LANG_LABELS;
+
+/** The quick-start language switcher's options, derived from the label map so a
+ *  new language cannot be labelled and then left out of the control. */
+const LANG_OPTIONS = (Object.keys(LANG_LABELS) as Lang[]).map((value) => ({
+	value,
+	label: LANG_LABELS[value],
+}));
+
 function StepQuickstart({
 	apiKey,
 	onDone,
@@ -367,9 +385,7 @@ function StepQuickstart({
 	apiKey: string;
 	onDone: () => void;
 }) {
-	const [lang, setLang] = useState<"python" | "typescript" | "curl" | "cli">(
-		"python",
-	);
+	const [lang, setLang] = useState<Lang>("python");
 
 	const displayKey = apiKey || "tlane_<your_key>";
 
@@ -437,32 +453,27 @@ tlane init --endpoint ${GATEWAY_URL}`;
 				</p>
 			)}
 
-			<div className="inline-flex rounded-lg border border-line bg-surface p-0.5">
-				{(["python", "typescript", "curl", "cli"] as const).map((l) => (
-					<button
-						key={l}
-						type="button"
-						onClick={() => setLang(l)}
-						className={`rounded-md px-3 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal ${
-							lang === l ? "bg-surface-3 text-ink" : "text-ink-2 hover:text-ink"
-						}`}
-					>
-						{LANG_LABELS[l]}
-					</button>
-				))}
-			</div>
+			{/* The shared <SegmentedControl> — the same control as the traces filter
+			    bar and the sessions filter, which is the point: this switcher had its
+			    own copy of the markup and its own answer to "which one is on". */}
+			<SegmentedControl
+				label="Code language"
+				value={lang}
+				options={LANG_OPTIONS}
+				onChange={setLang}
+			/>
 
 			{lang === "python" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							pip install tracelane anthropic
 						</code>
 						<CopyButton text="pip install tracelane anthropic" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{pythonSnippet}
 						</pre>
@@ -474,14 +485,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "typescript" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install @tracelanedev/sdk openai
 						</code>
 						<CopyButton text="npm install @tracelanedev/sdk openai" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{tsSnippet}
 						</pre>
@@ -493,7 +504,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "curl" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Run</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{curlSnippet}
 						</pre>
@@ -510,14 +521,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "cli" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install -g @tracelanedev/cli
 						</code>
 						<CopyButton text="npm install -g @tracelanedev/cli" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2/50 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{cliSnippet}
 						</pre>
@@ -531,7 +542,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			<button
 				type="button"
 				onClick={onDone}
-				className="text-[13px] text-ink-2 transition-colors hover:text-ink"
+				className="text-sm text-ink-2 transition-colors hover:text-ink"
 			>
 				Skip for now → dashboard
 			</button>
@@ -587,13 +598,34 @@ export default function OnboardingPage() {
 	const priorKeyLost = keyCreatedThisSession && !createdKey;
 
 	return (
-		<div className="min-h-screen bg-bg grid place-items-center p-4 sm:p-6">
+		// `.app-canvas` instead of `bg-bg`, and no hand-rolled shadow (2026-08-17).
+		//
+		// This card was the last surface in the app still painting a drop shadow, and it
+		// painted a HARDCODED one: `rgba(40,60,90,0.30)`. Two rules at once — ADR-074 §5
+		// permitted exactly one shadow in the system and only on overlays (AppShell.tsx
+		// records its own being removed for this), and apps/web/CLAUDE.md is "design
+		// tokens only — never hardcode hex".
+		//
+		// CORRECTED 2026-08-22. The paragraph that stood here said "`--bg` and `--surface`
+		// are BOTH #ffffff in light theme, so a flat white card on a flat white page has
+		// nothing but its 1px border to exist by". That was true of the pure-white value
+		// set and is FALSE under the P0 palette: the ground is #fafaf9 and the card is
+		// #ffffff, so a card now separates by TONE before it separates by border or
+		// shadow, and that is the whole point of the ground/card split (tokens.css, light
+		// block). `.app-canvas` is still correct and still needed — onboarding is a bare
+		// route, so nothing above it paints the ground — but the reason is "the canvas is
+		// the ground every other card sits on", not "otherwise this card is invisible".
+		//
+		// The card now carries `.surface-card` rather than `rounded-2xl`, so its radius
+		// and its (very light) elevation come from the same place as every other card
+		// instead of from a hardcoded Tailwind step that happened to be near the band.
+		<div className="app-canvas min-h-screen grid place-items-center p-4 sm:p-6">
 			<div className="w-full max-w-[520px]">
 				<div className="flex justify-center mb-6">
 					<Logo withWordmark />
 				</div>
 
-				<div className="rounded-2xl border border-line bg-surface p-6 sm:p-8 shadow-[0_20px_50px_-24px_rgba(40,60,90,0.30)]">
+				<div className="surface-card border border-line bg-surface p-6 sm:p-8">
 					<StepProgress current={step} />
 
 					{step === 1 && <StepWelcome onNext={next} />}

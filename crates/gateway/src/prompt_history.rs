@@ -144,11 +144,25 @@ impl HistoryReader for ClickHouseHistoryReader {
         prompt_name: &str,
         limit: u32,
     ) -> Result<Vec<HistoryEntry>> {
-        // For the V1 cut we filter by tenant_id only — prompt_name
-        // resolution to prompt_id happens via the in-memory version
-        // registry on the route handler side. The query still respects
-        // the CLAUDE.md tenant isolation invariant.
-        let _ = prompt_name;
+        // FIXED 2026-08-20 (B-261 P1). `/v1/prompts/{name}/history` used to
+        // discard the name and return the tenant's ENTIRE promotion and rollback
+        // history labelled as one prompt's. Tenant isolation was never affected
+        // — both queries bind `tenant_id` — so it was wrong DATA, not a leak.
+        //
+        // THE `ponytail:` MARKER THAT STOOD HERE IS REMOVED BECAUSE ITS CEILING
+        // WAS NOT REAL, which is the only sanctioned reason to remove one
+        // (CLAUDE.md rule 8). It claimed `rollback_events` "has no prompt
+        // dimension at all". It has one, reachable in a single hop: its
+        // `prompt_id` column stores the VERSION id, and `prompt_versions` maps
+        // `prompt_version_id -> prompt_name`. Verified against prod before
+        // touching it — `promotion_decisions.prompt_name` exists and is
+        // non-empty on 6 of 6 rows, and both join columns are present.
+        //
+        // The marker's REASONING was sound and is preserved as the shape of the
+        // fix: filtering one half and not the other yields a page that looks
+        // filtered and is not, which is worse than one honestly unfiltered. So
+        // both halves filter, or neither does — pinned by
+        // `both_history_queries_filter_on_prompt_name`.
         let limit = limit.clamp(1, 500);
 
         // ADR-031 V1.1 sweep: prompt-history reads are tenant-scoped
@@ -157,30 +171,18 @@ impl HistoryReader for ClickHouseHistoryReader {
         // `scripts/ci/no-raw-ch-query.sh`.
         let promotions_fut = self
             .client
-            .query(
-                "SELECT promotion_id, from_env, to_env, from_version_id, \
-                        to_version_id, decision, notes, decided_at \
-                 FROM promotion_decisions \
-                 WHERE tenant_id = ? \
-                 ORDER BY decided_at DESC \
-                 LIMIT ?",
-            )
+            .query(PROMOTIONS_SQL)
             .bind(tenant_id.to_string())
+            .bind(prompt_name)
             .bind(limit)
             .fetch_all::<PromotionRow>();
 
         let rollbacks_fut = self
             .client
-            .query(
-                "SELECT rollback_id, from_version_id, to_version_id, \
-                        trigger_metric, trigger_value, sigma_drift, \
-                        rollback_mode, fired_at \
-                 FROM rollback_events \
-                 WHERE tenant_id = ? \
-                 ORDER BY fired_at DESC \
-                 LIMIT ?",
-            )
+            .query(ROLLBACKS_SQL)
             .bind(tenant_id.to_string())
+            .bind(tenant_id.to_string())
+            .bind(prompt_name)
             .bind(limit)
             .fetch_all::<RollbackRow>();
 
@@ -225,12 +227,89 @@ impl HistoryReader for ClickHouseHistoryReader {
     }
 }
 
+/// Both history queries, as named constants **so a test can assert the invariant
+/// that broke this endpoint**: filter BOTH halves on the prompt name, or neither.
+///
+/// `/v1/prompts/{name}/history` shipped ignoring `{name}` entirely and returning
+/// the tenant's whole timeline labelled as one prompt's. The `ponytail:` marker
+/// that recorded it argued — correctly — that filtering one half and leaving the
+/// other unfiltered is WORSE than an honestly unfiltered page, because it looks
+/// filtered. That asymmetry is the regression worth pinning, and an inline string
+/// literal cannot be inspected by a test.
+const PROMOTIONS_SQL: &str = "SELECT promotion_id, from_env, to_env, from_version_id, \
+        to_version_id, decision, notes, decided_at \
+ FROM promotion_decisions \
+ WHERE tenant_id = ? AND prompt_name = ? \
+ ORDER BY decided_at DESC \
+ LIMIT ?";
+
+/// `rollback_events` carries no `prompt_name` of its own — its `prompt_id` is the
+/// VERSION id (a documented B1 proxy), so the name is one hop away through
+/// `prompt_versions`.
+///
+/// **The subquery is tenant-scoped TOO, not just the outer query.** An unscoped
+/// inner `SELECT` would let another tenant's version id match and pull their
+/// rollback rows into this tenant's page — that is how adding a filter turns into
+/// a leak, and it is the same object-ownership axis as TRAPS §39.
+const ROLLBACKS_SQL: &str = "SELECT rollback_id, from_version_id, to_version_id, \
+        trigger_metric, trigger_value, sigma_drift, \
+        rollback_mode, fired_at \
+ FROM rollback_events \
+ WHERE tenant_id = ? AND prompt_id IN ( \
+     SELECT prompt_version_id FROM prompt_versions \
+     WHERE tenant_id = ? AND prompt_name = ? \
+ ) \
+ ORDER BY fired_at DESC \
+ LIMIT ?";
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tid(n: u128) -> TenantId {
         TenantId::from_jwt_claim(uuid::Uuid::from_u128(n))
+    }
+
+    /// B-261 P1. `/v1/prompts/{name}/history` shipped ignoring `{name}` and
+    /// returning the tenant's WHOLE promotion+rollback timeline labelled as one
+    /// prompt's.
+    ///
+    /// **The invariant is symmetry, not presence.** The `ponytail:` marker that
+    /// recorded the defect argued — correctly — that filtering one half and
+    /// leaving the other unfiltered is WORSE than an honestly unfiltered page,
+    /// because it then LOOKS filtered. So this asserts BOTH queries carry the
+    /// name predicate; a future edit that drops it from either one fails here.
+    ///
+    /// Falsified before it was trusted: deleting `AND prompt_name = ?` from
+    /// `PROMOTIONS_SQL` fails on the promotions assertion, and removing the
+    /// subquery from `ROLLBACKS_SQL` fails on the rollbacks one.
+    #[test]
+    fn both_history_queries_filter_on_prompt_name() {
+        assert!(
+            PROMOTIONS_SQL.contains("prompt_name = ?"),
+            "promotion_decisions must filter on the prompt name — without it \
+             /history returns the tenant's entire timeline"
+        );
+        assert!(
+            ROLLBACKS_SQL.contains("prompt_name = ?"),
+            "rollback_events must ALSO filter on the prompt name (via the \
+             prompt_versions hop) — a half-filtered page is worse than an \
+             unfiltered one because it looks filtered"
+        );
+        // The rollback hop reaches another table, so its subquery must be
+        // tenant-scoped IN ITS OWN RIGHT. An unscoped inner SELECT would match
+        // another tenant's version id and pull their rows in — a filter turning
+        // into a leak (TRAPS §39, the object-ownership axis).
+        let inner = ROLLBACKS_SQL
+            .split("prompt_id IN (")
+            .nth(1)
+            .expect("rollback query must reach prompt_versions through a subquery");
+        assert!(
+            inner.contains("tenant_id = ?"),
+            "the prompt_versions subquery must bind tenant_id itself, not rely \
+             on the outer query's — otherwise adding this filter opens a \
+             cross-tenant read"
+        );
     }
 
     #[tokio::test]

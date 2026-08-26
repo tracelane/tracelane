@@ -1,4 +1,5 @@
 /**
+ * Server-side gateway proxy (Option 1).
  *
  * The dashboard runs off-node (Vercel) and cannot reach ClickHouse, which is
  * on-node only. ALL trace + SLO reads go through the Rust gateway's authed
@@ -68,14 +69,54 @@ export function gatewayBaseUrl(): string {
  */
 const GATEWAY_TIMEOUT_MS = 10_000;
 
-/** Typed gateway error carrying the upstream HTTP status. */
+/**
+ * Typed gateway error carrying the upstream HTTP status **and its body**.
+ *
+ * The gateway's refusals are typed and each one carries the fields a page needs
+ * to say something useful — `required_role` on a role 403, `budget_usd` /
+ * `spent_usd` / `resets_at` on a budget 402, `items` / `max_items` on a
+ * `dataset_too_large` 400. Keeping only the status discarded all of it at the
+ * boundary and forced every caller to invent a generic message, which is the
+ * "role 403 reads as a generic failure" shape one layer up.
+ *
+ * `body` is `null` when the upstream sent no body or sent one that is not a JSON
+ * object — never `{}`, because "it sent nothing" and "it sent an empty object"
+ * are different facts and a caller that reads a field off `{}` would get
+ * `undefined` either way with no idea which happened.
+ */
 export class GatewayError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
+		readonly body: Record<string, unknown> | null = null,
 	) {
 		super(message);
 		this.name = "GatewayError";
+	}
+}
+
+/**
+ * Read an error response's body, best-effort. Runs ONLY on the failure path, so
+ * it costs nothing in normal operation.
+ *
+ * Swallows its own failures deliberately: a body that will not read or will not
+ * parse must degrade to `null` and let the STATUS carry the answer, never turn a
+ * clean 404 into a thrown exception the caller did not expect.
+ */
+async function readErrorBody(
+	res: Response,
+): Promise<Record<string, unknown> | null> {
+	try {
+		const text = await res.text();
+		if (!text) return null;
+		const parsed: unknown = JSON.parse(text);
+		return parsed !== null &&
+			typeof parsed === "object" &&
+			!Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
 	}
 }
 
@@ -113,7 +154,11 @@ export async function gatewayGet<T>(path: string): Promise<T> {
 	}
 
 	if (!res.ok) {
-		throw new GatewayError(res.status, `gateway responded ${res.status}`);
+		throw new GatewayError(
+			res.status,
+			`gateway responded ${res.status}`,
+			await readErrorBody(res),
+		);
 	}
 	return (await res.json()) as T;
 }
@@ -149,7 +194,11 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 	}
 
 	if (!res.ok) {
-		throw new GatewayError(res.status, `gateway responded ${res.status}`);
+		throw new GatewayError(
+			res.status,
+			`gateway responded ${res.status}`,
+			await readErrorBody(res),
+		);
 	}
 	return (await res.json()) as T;
 }

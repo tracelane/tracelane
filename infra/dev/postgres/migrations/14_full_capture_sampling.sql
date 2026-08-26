@@ -17,6 +17,7 @@
 --   3. tenants.sampling_policy {tail|full}    — the tenant's preference WITHIN
 --                                               what f_full_capture entitles.
 --   4. tenants.force_tail                     — operational kill-switch (ADR-048
+--                                               D4.4 /), independent of
 --                                               entitlements; stops one runaway
 --                                               tenant without a deploy.
 --   5. NOTIFY trigger on tenants → the ingest tenant_config_cache.

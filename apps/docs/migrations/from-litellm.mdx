@@ -20,11 +20,11 @@ its `api_base` to Tracelane's OpenAI-compatible `/v1/chat/completions` endpoint 
 you keep the LiteLLM SDK, no swap needed.
 
 <Warning>
-**What the emitted file is, and is not.** `tracelane.yaml` is a translation aid
-you read, not a file the gateway loads: the gateway has **no config-file reader**
-— it is configured entirely from environment variables at process start. Use the
-output to see which providers, limits and failover values to carry across; then
-set them in the environment.
+**What the emitted file is.** `tracelane.yaml` is read by the gateway at start
+from `$TRACELANE_CONFIG` or `./tracelane.yaml`. It carries the operator-level
+blocks — failover chain, semantic cache, content-capture allowlist. Credentials
+and endpoints are still environment variables; the file does not hold secrets.
+See [Providers](/providers) for the schema it accepts.
 
 The importer's built-in parser reads JSON-formatted config directly, and for YAML
 it currently handles only a flat `key: value` subset — a nested `model_list:`
@@ -61,8 +61,8 @@ any other proxy's security history — check that against its own advisories.
 
 - **No endpoint that rewrites gateway config.** Model-to-provider routing is
   compiled into the binary and fails closed on an unknown model (`400
-  unroutable_model`, no default upstream) — there is no config file to reload and
-  no endpoint that loads one. The `/v1/*` write routes that do exist (BYOK keys,
+  unroutable_model`, no default upstream). `tracelane.yaml` is read once at
+  process start; no endpoint reloads it at runtime. The `/v1/*` write routes that do exist (BYOK keys,
   prompt versions, alert rules) are authenticated, tenant-scoped and ledgered;
   none of them is global configuration.
 - **No interpreter on the request path.** The gateway is a single Rust binary; it
@@ -79,3 +79,10 @@ a hit; it is not yet wired as a blocking required status check.
 - [Quickstart](/quickstart)
 - [Providers](/providers)
 - [Architecture](/architecture)
+
+---
+
+*Competitor details verified as of 2026-08-26 against public documentation and
+public repositories. Where a capability is marked absent, we found none documented
+at that date — not that the vendor lacks it. If anything here is inaccurate,
+please [open an issue](https://github.com/tracelane/tracelane/issues).*

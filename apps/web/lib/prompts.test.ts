@@ -1,4 +1,5 @@
 /**
+ * Tests for lib/prompts — prompt-detail gateway reads (regression).
  *
  * The deliverable: tenant A's prompt fetch never returns tenant B's versions or
  * history. We mock `requireGatewayToken` to mint a per-tenant JWT and a

@@ -17,6 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Command } from "commander";
+import { parse as parseYamlDocument } from "yaml";
 
 // ── LiteLLM config types (subset we care about) ──────────────────────────────
 
@@ -229,8 +230,11 @@ function toYaml(obj: unknown, indent = 0): string {
 		return entries
 			.map(([k, v]) => {
 				const valStr = toYaml(v, indent + 1);
-				const isBlock =
-					valStr.includes("\n") || (typeof v === "object" && v !== null);
+				// A value that renders to ONE line is inline, whatever its type.
+				// This used to be `typeof v === "object"`, which forced `[]` and `{}`
+				// onto their own line at column 0 — `providers:\n[]` is not valid YAML,
+				// so the tool emitted a file it could not itself re-read.
+				const isBlock = valStr.includes("\n");
 				return isBlock ? `${pad}${k}:\n${valStr}` : `${pad}${k}: ${valStr}`;
 			})
 			.join("\n");
@@ -284,61 +288,32 @@ function collectWarnings(litellm: LiteLLMConfig): string[] {
 	return warnings;
 }
 
-// ── YAML parser (simple subset, no deps) ─────────────────────────────────────
+// ── YAML parsing ─────────────────────────────────────────────────────────────
 
+/**
+ * Parse a LiteLLM config.
+ *
+ * **This used to be a hand-rolled line scanner and it read EVERY REAL CONFIG AS ZERO
+ * PROVIDERS.** It handled only flat `key: value` pairs, so `model_list` — a list of
+ * maps, which is the entire substance of a litellm_config.yaml — was never built, and
+ * `(litellm.model_list ?? [])` was always empty. The command then wrote a config
+ * containing `providers: []` and **exited 0 with a green checkmark**. A migration tool
+ * that silently reports "nothing to migrate" is worse than no migration tool: it tells
+ * someone evaluating us that we do not work, at the moment they were willing to try.
+ *
+ * The source comment said "a production-grade impl would use js-yaml", so the defect
+ * was known. `yaml` is a direct dependency now; the translation logic below was always
+ * correct and is unchanged — it was only ever starved of input.
+ *
+ * JSON is still tried first: it is a strict subset of YAML, the fast path, and it is
+ * what the JSON-config branch already relied on.
+ */
 function parseYaml(content: string): unknown {
 	try {
-		// Try JSON first (YAML is a superset of JSON)
 		return JSON.parse(content);
 	} catch {
-		// Simple YAML parse for the litellm_config.yaml structure
-		// Uses line-by-line parsing for the flat/nested structures we care about
-		const result: Record<string, unknown> = {};
-		const lines = content.split("\n");
-		let i = 0;
-
-		while (i < lines.length) {
-			// `i < lines.length` is the loop guard, so the index is in range —
-			// surface the invariant via an explicit guard rather than `!` to
-			// satisfy Biome's noNonNullAssertion rule.
-			const line = lines[i];
-			if (line === undefined) break;
-			const trimmed = line.trimStart();
-			if (!trimmed || trimmed.startsWith("#")) {
-				i++;
-				continue;
-			}
-
-			const colonIdx = trimmed.indexOf(":");
-			if (colonIdx === -1) {
-				i++;
-				continue;
-			}
-
-			const key = trimmed.slice(0, colonIdx).trim();
-			const afterColon = trimmed.slice(colonIdx + 1).trim();
-
-			if (afterColon && !afterColon.startsWith("#")) {
-				// Simple key: value
-				result[key] = parseYamlValue(afterColon);
-			}
-			// For nested structures, we rely on JSON.stringify and trust the
-			// litellm_config.yaml is well-formed enough for our needs.
-			// A production-grade impl would use js-yaml.
-			i++;
-		}
-
-		return result;
+		return parseYamlDocument(content);
 	}
-}
-
-function parseYamlValue(v: string): unknown {
-	if (v === "true") return true;
-	if (v === "false") return false;
-	if (v === "null" || v === "~") return null;
-	const num = Number(v);
-	if (!Number.isNaN(num) && v !== "") return num;
-	return v.replace(/^["']|["']$/g, "");
 }
 
 // ── Main command ──────────────────────────────────────────────────────────────
@@ -397,7 +372,7 @@ async function runImport(opts: {
 		"  1. Set TRACELANE_API_KEY (get one at https://tracelane.dev/dashboard)",
 	);
 	console.log(
-		"  2. Start the gateway: docker compose -f infra/dev/docker-compose.yml up -d",
+		"  2. Start the gateway: docker compose -f infra/self-host/docker-compose.yml up -d",
 	);
 	console.log(
 		"  3. Point your agents at TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev\n",

@@ -4,8 +4,6 @@ description: Compare Tracelane and Helicone for LLM observability, licensing, an
 classification: PUBLIC
 ---
 
-Helicone was reported to have been acquired by Mintlify in early 2026 (per press coverage; treat the specifics as unconfirmed).
-
 Tracelane is Apache 2.0 across the entire stack — gateway, ingest, SDKs and self-host.
 If licensing matters to your review, read each project's `LICENSE` file and take your own
 counsel's view: Tracelane's is [Apache-2.0](https://github.com/tracelane/tracelane/blob/main/LICENSE),
@@ -17,12 +15,11 @@ and Helicone's `ai-gateway` carries a
 | Claim | Tracelane | Helicone |
 |---|---|---|
 | License (full stack) | Apache 2.0 | `Helicone/helicone` Apache-2.0; `Helicone/ai-gateway` GPL-3.0 (per each repo's `LICENSE`) |
-| Maintenance posture | Active development | Reported Mintlify acquisition (early 2026) |
 | Gateway language | Rust | Rust |
-| Wire format | OTel GenAI semconv (canonical) | Helicone proprietary + OpenTelemetry partial |
+| Wire format | OTel GenAI semconv (canonical) | Helicone's own schema; OpenTelemetry support documented as partial |
 | Predictive guardrails | Inline heuristic guardrails | — |
 | Tamper-evident audit ledger | $999 add-on SKU (tamper-evident hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap) | — |
-| Auto-rollback on objective metrics | Yes, EWMA-based | — |
+| Auto-rollback on objective metrics | EWMA drift on metrics you post; not autonomous | — |
 | Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
 | Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |
 | BYOK | Envelope encryption, AAD bound to (tenant_id, provider_id) | Supported |
@@ -53,7 +50,7 @@ You do not have to take that on trust. Our `deny.toml` sets a license allowlist 
 </Accordion>
 
 <Accordion title="Is Tracelane feature-equivalent to Helicone?">
-Tracelane covers 30+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline, inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
+Tracelane covers 150+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline (**self-host writes and hashes the chain to ClickHouse; chain resumption ACROSS a gateway restart needs the Postgres control plane, so continuous multi-restart chains are Cloud today**), inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
 </Accordion>
 
 <Accordion title="What happens to my historical Helicone data?">
@@ -61,3 +58,11 @@ Your historical traces stay where they are — `tlane migrate helicone` is a con
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+*Verified as of 2026-08-26 against each vendor's public documentation and public
+repositories. A `—` means we found no such capability documented at that date —
+not that the vendor lacks it. Vendors change their products; if anything here is
+inaccurate or out of date, please [open an issue](https://github.com/tracelane/tracelane/issues)
+and we will correct it.*

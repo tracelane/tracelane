@@ -5,6 +5,7 @@
  * Goes through `gatewayGet` (`lib/gateway.ts`), which mints the per-user WorkOS
  * access token and forwards it as the Bearer; the gateway resolves the tenant
  * from that JWT (ADR-042) and binds `WHERE tenant_id = ?`. The dashboard never
+ * binds a tenant id itself.
  *
  * Every number is a REAL captured signal over `spans`:
  *   - overhead = `gateway_overhead_us` (the time Tracelane adds, EXCLUDING the

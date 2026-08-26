@@ -146,6 +146,7 @@ impl RailGate {
     /// reads never hit Postgres. A `None` cache (OSS self-host / dev with no
     /// Postgres) resolves to the FREE tier: the five ungated rails still run
     /// (they never consult this gate), and the four paid rails require a
+    /// control-plane grant. — this previously granted every gated rail.
     pub async fn resolve(
         cache: Option<&crate::entitlement_cache::EntitlementCache>,
         tenant: uuid::Uuid,
@@ -155,6 +156,7 @@ impl RailGate {
                 let resolved = c.resolved(tenant).await;
                 Self::from_resolved(&resolved)
             }
+            // NO-CACHE -> the FREE tier., fixed 2026-08-04.
             //
             // This previously returned `Self::all()`, granting every gated rail
             // when no control plane exists — so an OSS self-host received the
@@ -209,11 +211,13 @@ pub trait Rail: Send + Sync {
 mod tests {
     use super::*;
 
+    // ──: the no-cache arm must resolve to the FREE tier ──────────────
     //
     // MECHANISM assertions. The bug these replace was invisible precisely
     // because outcomes looked fine: every rail ran, nothing errored, nobody was
     // billed wrongly. So assert the GATE STATE, not that requests succeed.
 
+    /// The regression itself. Before this arm was `Self::all`.
     #[tokio::test]
     async fn no_cache_resolves_to_free_tier_never_all() {
         let gate = RailGate::resolve(None, uuid::Uuid::from_u128(1)).await;

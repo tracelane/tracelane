@@ -9,6 +9,7 @@
 //!
 //! If the HTTP call fails for any reason — network error, timeout, sidecar
 //! crash, ONNX runtime crash — `score()` / `is_injection()` fail open (0.0 /
+//! false) and the gateway continues serving (/ FT-05). A guardrail
 //! that fails open SILENTLY is the span-publish failure class, so the fail-open
 //! is made **loud**: each fail-open is counted and a rate-limited `warn!` (≤1 /
 //! [`FAIL_WARN_INTERVAL_SECS`]).
@@ -387,6 +388,7 @@ impl Predictor for PromptGuardPredictor {
             if texts.is_empty() {
                 return Decision::Allow;
             }
+            // Cap message-count to bound p99. With
             // the sidecar's 30ms per-call timeout, an unbounded loop
             // over `messages[*]` lets a 1000-turn conversation block
             // the hot path for 30s. 8 most-recent messages cover the

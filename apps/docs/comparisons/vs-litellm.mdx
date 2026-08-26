@@ -12,7 +12,7 @@ Tracelane is a Rust gateway with Trusted Publishing OIDC, Cosign keyless signing
 
 | Claim | Tracelane | LiteLLM |
 |---|---|---|
-| Language on request path | Rust (Apache 2.0) | Python (Apache 2.0 OSS, paid proxy) |
+| Language on request path | Rust (Apache 2.0) | Python (MIT core; `enterprise/` under a separate commercial licence) |
 | Supply-chain posture | Cosign keyless + attested build provenance + OSV-Scanner + Grype + Syft | PyPI install with transitive dependency surface |
 | Token model | Trusted Publishing OIDC (no long-lived registry tokens) | Registry token model per project policy |
 | Vuln scanning | OSV-Scanner + Grype + Syft | Not documented |
@@ -45,7 +45,7 @@ export OPENAI_BASE_URL=https://gateway.tracelane.dev/v1
 <AccordionGroup>
 
 <Accordion title="Does Tracelane have feature parity with LiteLLM?">
-For the request-path features (30+-provider routing, failover, retry, usage/token tracking, BYOK), yes. Tracelane adds predictive guardrails inline, tamper-evident audit ledger, and OTel GenAI semconv wire format that LiteLLM does not have.
+For the request-path features (multi-provider routing, failover, retry, usage/token tracking, BYOK), yes. Tracelane adds inline predictive guardrails, a tamper-evident audit ledger, and OTel GenAI semconv as its canonical wire format; we found none of the three documented for LiteLLM as of 2026-08-26.
 </Accordion>
 
 <Accordion title="Is `tlane import-litellm` a complete migration?">
@@ -57,3 +57,11 @@ OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scan
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+*Verified as of 2026-08-26 against each vendor's public documentation and public
+repositories. A `—` means we found no such capability documented at that date —
+not that the vendor lacks it. Vendors change their products; if anything here is
+inaccurate or out of date, please [open an issue](https://github.com/tracelane/tracelane/issues)
+and we will correct it.*

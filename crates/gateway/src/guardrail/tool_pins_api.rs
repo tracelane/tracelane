@@ -1,3 +1,4 @@
+//! `/v1/guardrails/tool-pins` — the write path for R3 rug-pull detection.
 //!
 //!   - `POST   /v1/guardrails/tool-pins`             — pin / re-pin a definition
 //!   - `GET    /v1/guardrails/tool-pins`             — list this tenant's pins
@@ -9,6 +10,7 @@
 //! and flags `TOOL_DEF_DRIFT` when they differ. The read path, the storage table
 //! and the comparison all shipped. **Nothing could create a pin**, so the rail
 //! was correct and permanently inert — it had nothing to compare against. That
+//! gap is, and it mattered more after 2026-08-04, when R3 pinning became
 //! a FREE rail and part of the advertised agent-safety story.
 //!
 //! ## Two properties that are structural, not conventional
@@ -132,6 +134,7 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
 
 /// May this caller WRITE `caps`?
 ///
+///  follow-up, found by the verifier. `Claims::can_admin` grandfathers
 /// `role == None` to full access — and **API-key auth always has `role == None`**
 /// (`auth/api_key.rs`). Since `can_mint_keys()` deliberately lets a *member*
 /// mint keys, "member → mint an API key → set caps" composes into exactly the
@@ -146,6 +149,7 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
 #[must_use]
 pub fn caps_write_allowed(claims: &crate::auth::Claims) -> bool {
     // Delegates to the ONE definition so this predicate and BYOK's cannot drift
+    // apart — lesson applied to code rather than to guards.
     //
     // It used to say that while INLINING a copy of the old `can_admin` body,
     // which is the drift it claimed to prevent: PL-9 tightened `can_admin` and
@@ -462,6 +466,7 @@ mod tests {
         );
     }
 
+    /// MECHANISM, follow-up (verifier finding). The full matrix — the
     /// bug was that `can_admin()` alone grandfathers `role == None`, which is
     /// EVERY API key, so "member mints a key, then sets caps" defeated the gate.
     #[test]
@@ -477,6 +482,8 @@ mod tests {
                 auth_method,
                 role,
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+                budget_usd_monthly: None,
+                rate_limit_rpm: None,
             }
         }
 

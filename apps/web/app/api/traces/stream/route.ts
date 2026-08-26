@@ -8,6 +8,7 @@
  *   - a `full` frame with fresh rows when the read completes (budget 3s),
  *   - or an `error` frame if the read fails.
  *
+ * Option 1: the read is a server-side short-poll of the gateway
  * `GET /v1/traces` — NOT a direct ClickHouse query from the edge. The gateway
  * resolves the tenant from the forwarded Bearer token; this route never binds a
  * tenant id into a query. The cache key is the WorkOS org id (a stable

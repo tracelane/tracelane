@@ -21,12 +21,12 @@ brings, so you can compare it against your current bill and plan yourself.
 | LLM call tracing | OTel GenAI semconv spans — portable to any OTel-compatible backend |
 | Agent-specific signals | Inline heuristic rails at the gateway; MCP/agent-tool detectors fire on tool traffic, not chat completions |
 | Inline guardrails | Rails run in-request and verdicts are written to the ledger. The predictive layer is **observe-first by default** — a `Block` is recorded and the request still proceeds unless enforcement is explicitly enabled |
-| Prompt versioning + eval gates | Prompt promotion + auto-rollback (B1); eval gates dark-launched V1.1 |
+| Prompt versioning + eval gates | Prompt promotion live; rollback is EWMA drift on metrics you post, not autonomous; eval gating live — a promotion without a passing run returns `409` unless you record an attributed override |
 | Time-travel replay | Read-only re-render; cross-model re-execution is on the roadmap |
-| BYOK gateway | 30+ providers, 0 % markup on your provider keys |
+| BYOK gateway | 150+ providers, 0 % markup on your provider keys |
 | Tamper-evident audit ledger | Hash chain + Merkle + Ed25519 per-tenant signing (live); resolved Sigstore Rekor v2 inclusion proof on anchored batches (best-effort); universal per-run anchoring on the roadmap |
 | Self-hostable | Apache 2.0, single-node Docker Compose (`infra/self-host/docker-compose.yml`). No Helm chart is published |
-| Pricing model | Per span — see [Pricing](/pricing) |
+| Pricing model | Per trace — see [Pricing](/pricing) |
 
 ## Step 1 — Install Tracelane
 
@@ -112,7 +112,7 @@ Datadog dashboards use proprietary widgets. Tracelane provides:
 - **SLO dashboard** — error rate, latency, token spend per model/provider. The
   availability target is the product default (99.9 %); a per-tenant SLO target is
   not configurable yet
-- **Eval suite** — 68 pain-point + 10 fault-tolerance evals, run in CI (no in-app scoreboard yet)
+- **Eval suite** — 20 conformance evals, run in CI (no in-app scoreboard yet)
 - **Audit ledger** — in-app ledger view and NDJSON export (`/audit`)
 
 If you have custom Datadog monitors, the closest equivalent is an **alert rule**:
@@ -142,3 +142,10 @@ tracelane.auto_instrument()
 - [Audit ledger](/audit-ledger)
 - [Migrating from LiteLLM](/migrations/from-litellm)
 - [Migrating from LangSmith](/migrations/from-langsmith)
+
+---
+
+*Competitor details verified as of 2026-08-26 against public documentation and
+public repositories. Where a capability is marked absent, we found none documented
+at that date — not that the vendor lacks it. If anything here is inaccurate,
+please [open an issue](https://github.com/tracelane/tracelane/issues).*

@@ -117,6 +117,7 @@ export async function runHttp(): Promise<void> {
 			if (req.method === "POST") {
 				const raw = await readBody(req);
 				if (raw.length > 0) {
+					// 400 (client error) on
 					// malformed JSON, not 500 (server error). The
 					// outer `try` would catch the throw and convert
 					// it to 500 — explicit 400 keeps probe-

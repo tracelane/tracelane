@@ -19,7 +19,17 @@ export function circuitLabel(state: string): string {
 	return "Closed";
 }
 
-/** True when the breaker is not passing traffic normally (worth a badge). */
+/**
+ * True when the breaker is not passing traffic normally.
+ *
+ * It said "worth a badge", and after the P1 design pass that is no longer what
+ * the page does: `/gateway` renders ONE status mark for every state (a toned dot
+ * plus the word) instead of a badge for two states and bare mono text for the
+ * third, so nothing calls this to decide a rendering any more. Kept — with its
+ * tests — because "is this breaker healthy" is a real question about the field
+ * and the next caller should not re-derive the string comparison; deleted the
+ * moment it is genuinely nobody's question.
+ */
 export function circuitUnhealthy(state: string): boolean {
 	return state === "open" || state === "half_open";
 }

@@ -1,3 +1,4 @@
+//! `observed_tools` — the approve half of R3 rug-pull detection (/B).
 //!
 //! Commit A gave tenants a way to pin a tool definition. Nobody hand-authors
 //! tool JSON, so pin-only would have shipped correct and unused. The gateway
@@ -118,6 +119,7 @@ pub async fn list(pool: &Pool, tenant_id: &TenantId) -> Result<Vec<ObservedTool>
 ///    existing owner-set `caps` is preserved and no caller can raise or lower it
 ///    through this path. That matters because lowering `caps` to 0 disables the
 ///    R4 taint detection protecting the tool just as effectively as raising it
+///    grants a false sanction (/A).
 ///
 /// Returns whether a pin was written.
 ///

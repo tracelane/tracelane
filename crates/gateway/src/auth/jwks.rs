@@ -187,6 +187,7 @@ pub async fn get_cached_with_refresh_on_miss(kid: &str) -> Result<Arc<JwksCache>
 
 /// Hosts permitted as a `WORKOS_JWKS_URL` override target.
 ///
+/// Closes R3 H4: previously the env var was followed
 /// blindly via bare `reqwest::get`. An operator who controls DNS
 /// (or who fat-fingers the env var into an attacker-controlled
 /// host) could substitute a JWKS that contains the attacker's
@@ -260,6 +261,7 @@ async fn fetch_from_workos() -> Result<JwksCache> {
     let base_url = std::env::var("WORKOS_JWKS_URL")
         .unwrap_or_else(|_| format!("https://api.workos.com/sso/jwks/{client_id}"));
 
+    // R3 H4: validate the URL through SSRF + host allowlist
     // BEFORE the HTTP call, so a misconfigured / DNS-poisoned host
     // cannot inject signing keys.
     validate_jwks_url(&base_url).await?;
@@ -279,7 +281,7 @@ async fn fetch_from_workos() -> Result<JwksCache> {
 
     let status = response.status();
     if !status.is_success() {
-        // R2 C-3 symmetric: do NOT propagate the response body.
+        //  symmetric: do NOT propagate the response body.
         // WorkOS error bodies have included internal request IDs
         // and (historically) the requesting client_id.
         let _body = response.text().await.unwrap_or_default();
@@ -336,6 +338,8 @@ mod tests {
         };
         assert!(cache.lookup("nope").is_none());
     }
+
+    // / R3 H4 JWKS hardening tests --
 
     /// Hold a process-wide lock + reset the JWKS test bypass for
     /// every allowlist test so concurrent tests don't see each

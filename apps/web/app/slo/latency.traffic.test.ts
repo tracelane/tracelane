@@ -75,6 +75,35 @@ describe("buildTrafficPoints", () => {
 		expect(pts[1]).toMatchObject({ requests: 0, errors: 0 });
 	});
 
+	it("sums input+output TOKENS onto the same bucket grid (DSH-08)", () => {
+		// The tokens spark and the traffic chart are drawn from ONE fold precisely so
+		// they cannot disagree about what a bucket is — so the tokens total has to be
+		// asserted on the same points the requests total is.
+		const pts = buildTrafficPoints(
+			[
+				row({
+					bucket_hour: "2026-07-10 10:00:00",
+					requests: 3,
+					total_input_tokens: 300,
+					total_output_tokens: 120,
+				}),
+				row({
+					bucket_hour: "2026-07-10 10:00:00",
+					model: "claude-sonnet",
+					requests: 2,
+					total_input_tokens: 80,
+					total_output_tokens: 20,
+				}),
+				row({ bucket_hour: "2026-07-10 11:00:00", requests: 1 }),
+			],
+			HOUR,
+			spanning("2026-07-10T10:00:00Z", "2026-07-10T11:00:00Z"),
+		);
+		expect(pts[0]).toMatchObject({ requests: 5, tokens: 520 });
+		// A bucket with traffic but no recorded tokens is an honest 0, not undefined.
+		expect(pts[1]).toMatchObject({ requests: 1, tokens: 0 });
+	});
+
 	it("returns [] when no bucket timestamp parses", () => {
 		expect(
 			buildTrafficPoints(

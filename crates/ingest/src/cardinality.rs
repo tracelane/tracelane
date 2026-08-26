@@ -323,10 +323,29 @@ mod tests {
         );
     }
 
+    /// **DETERMINISTIC WORKSPACE ID ON PURPOSE.** This used `Uuid::new_v4()`, so
+    /// although the 10,000 keys are fixed, the per-workspace hash seed changed
+    /// every run and the estimate wandered.
+    ///
+    /// HLL at p=14 has 2^14 registers and a standard error of
+    /// `1.04/sqrt(16384) ~= 0.81%`, so the +/-2% bound sits at only ~2.5 sigma —
+    /// roughly **1 run in 70 fails on a correct implementation**. It failed the
+    /// pre-commit gate on 2026-08-20 at `rel_err=0.0218` while the diff under
+    /// test touched a completely different crate.
+    ///
+    /// A probabilistic control that fails at random is not a control: it trains
+    /// you to re-run until green, which is how a real regression gets waved
+    /// through. Fixing the seed makes this either always pass or always fail —
+    /// i.e. an actual regression detector for the estimator's accuracy.
+    ///
+    /// With this seed the estimate is **10,020 — `rel_err = 0.0020`**, a 10x
+    /// margin inside the 2% bound, so it is not passing by a whisker. Measured
+    /// by temporarily forcing the threshold to 0 to make the assertion print the
+    /// real figure, which also proves the test can still FAIL (it exits 101).
     #[test]
     fn hll_estimate_is_within_1_percent_at_10k_keys() {
         let t = CardinalityTracker::new();
-        let ws = Uuid::new_v4();
+        let ws = Uuid::from_u128(0x5eed_0000_0000_0000_0000_0000_0000_0001);
         for i in 0..10_000 {
             let key = format!("ns.attr.{i}");
             // Use a generous cap so we don't trip overflow during the

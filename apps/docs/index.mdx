@@ -32,7 +32,7 @@ positioning, Apache 2.0, no SaaS-blocked license games.
   <Card title="Agent-tool safety" icon="shield-check" href="/predictive-guardrails">
     MCP tool-definition-drift + schema validation at the gateway. Each rail backed by a green eval.
   </Card>
-  <Card title="30+ providers" icon="plug" href="/providers">
+  <Card title="150+ providers" icon="plug" href="/providers">
     BYOK across Anthropic, OpenAI, Google, Bedrock, Azure, Cohere + any OpenAI-compatible endpoint.
   </Card>
 </CardGroup>
@@ -48,10 +48,12 @@ positioning, Apache 2.0, no SaaS-blocked license games.
     reconstructed from an incident write-up.
   </Card>
   <Card title="Every claim carries an eval" icon="circle-check">
-    68 pain-point assertions and 10 fault-tolerance chaos evals run in CI on
-    every push. Structural assertions run green; behavioral ones report as
-    **skipped** without a live gateway rather than as a pass. The suite reports
-    — it is not yet wired as a blocking required check.
+    20 conformance evals — 10 fault-tolerance chaos scenarios, 7 gateway-correctness,
+    and one each for ingest-schema, PII-redaction and prompt-injection. They run in
+    the canonical repository's CI; in this public mirror they ship as readable
+    reference, because six of them assert against fixtures the mirror deliberately
+    withholds. Structural assertions run green; behavioral ones report as
+    **skipped** without a live gateway rather than as a pass.
   </Card>
   <Card title="Tamper-evident ledger" icon="lock">
     SHA-256 hash chain and Ed25519 per-tenant signing, with byte-identical

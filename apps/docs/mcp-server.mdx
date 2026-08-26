@@ -95,15 +95,14 @@ Add to `.mcp.json` in your project root:
 
 ```typescript
 mcp.tracelane.list_traces({
-  since: "1h",            // "1h" | "24h" | "7d" | ISO-8601 timestamp
-  limit: 20,              // default 20, max 100
-  model: "claude-*",      // optional glob filter
-  intervention: "block",  // "none" | "warn" | "block"
+  limit: 20,                            // optional, 1-100, default 20
+  model_filter: "claude-sonnet-4-6",    // optional, exact model name
+  has_error: true,                      // optional, traces with >=1 error span
 })
 ```
 
-Returns: array of trace summaries (trace_id, root_name, duration_ms, span_count,
-intervention, model, timestamp).
+Returns: array of trace summaries (`trace_id`, `root_name`, `start_time`,
+`duration_us`, `span_count`, `error_count`, `intervention`, `model`).
 
 ### `get_trace`
 
@@ -120,8 +119,9 @@ annotations, token counts, and latency breakdown.
 mcp.tracelane.get_span({ span_id: "uuid" })
 ```
 
-Returns: single span with all attributes, input/output content (if
-`trace_content=true`), and predictive verdict detail.
+Returns: single span with all attributes and predictive verdict detail. Input and
+output content appears only if an operator has enabled content capture for the
+workspace (see [Security](/security)); it is off by default.
 
 ### `search_traces`
 
@@ -147,14 +147,15 @@ intervention taken, and how to resolve.
 Example output:
 
 ```
-PR2 — Lethal-trifecta taint block
+R4_trifecta — lethal-trifecta taint sequence
 
 Evidence:
   - Untrusted input entered at span 3 (user message)
   - Private data accessed at span 7 (read_file tool)
   - External write attempted at span 9 (send_email tool)
 
-Intervention: blocked — request was not forwarded to provider.
+Intervention: flagged — detection is observe-first by default, so the
+request was forwarded and the finding recorded on the trace.
 
 Resolution: review span 7–9 for unintended data exfiltration.
 ```
@@ -162,11 +163,10 @@ Resolution: review span 7–9 for unintended data exfiltration.
 ### `list_evals`
 
 ```typescript
-mcp.tracelane.list_evals({ suite: "pain-points" })
+mcp.tracelane.list_evals({ suite: "fault-tolerance" })
 ```
 
-Returns the eval scoreboard — all 68 pain-point evals + 10 fault-tolerance evals
-with current status (green / mock / stub / not-written).
+Returns the eval scoreboard — the 20 conformance evals with current status.
 
 ### `get_eval_result`
 

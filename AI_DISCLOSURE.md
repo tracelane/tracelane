@@ -10,7 +10,7 @@ architecture planning, code generation, documentation, and autonomous task
 execution under founder direction.
 
 **Model:** the main session runs Claude Opus 5. Delegated subagents run the
-models pinned in `.claude/agents/*.md` — claude-sonnet-4-6 (implementer tasks),
+models pinned per-agent in the canonical repository — claude-sonnet-4-6 (implementer tasks),
 claude-opus-4-7 (security review), claude-haiku-4-5-20251001 (PR descriptions
 and changelogs).
 
@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
   `security-reviewer` subagent using claude-opus-4-7 for deeper reasoning.
 - **Reproducibility:** All AI-generated decisions are documented as ADRs, summarised at
   <https://docs.tracelane.dev/decisions>
-  ADRs so future maintainers understand the reasoning.
+  so future maintainers understand the reasoning.
 - **License:** AI-generated code is original work contributed by the founder.
   No GPL, ELv2, or other restrictively-licensed code was used as input.
 

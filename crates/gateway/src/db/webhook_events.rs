@@ -11,6 +11,7 @@
 //! `false` if it was already recorded (caller skips side effects and
 //! returns 200).
 //!
+//! Reviewer — Tracelane security review, Phase 1.3.
 
 use anyhow::{Context as _, Result};
 use deadpool_postgres::Pool;

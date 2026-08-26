@@ -6,6 +6,7 @@
 //! identical Gemini request/response contract as AI Studio (`google.rs`) —
 //! same `contents`/`systemInstruction`/`tools`/`generationConfig` fields, same
 //! `usageMetadata` shape — so this module reuses `GeminiRequest::from_universal`
+//! and `build_gemini_stream` wholesale, inheriting the `thoughtsTokenCount`
 //! fold for free. Only three things differ: host, path, and auth.
 //!
 //! Auth is the whole reason this is a separate adapter. **Vertex rejects API
@@ -279,7 +280,7 @@ impl VertexProvider {
 
         let status = response.status();
         if !status.is_success() {
-            // Status only — never the body (R2 C-3: provider error bodies echo credentials).
+            // Status only — never the body (: provider error bodies echo credentials).
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(status = %status, "Vertex AI API error");
             return Err(ProviderHttpError {

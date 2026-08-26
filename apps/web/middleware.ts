@@ -5,6 +5,7 @@
  * All other paths require a valid WorkOS session.
  * tenant_id is the WorkOS organizationId from the session.
  *
+ * Dev-only E2E bypass: when `e2eAuthEnabled` is true (non-prod build
  * with the opt-in flag set — see lib/e2e-auth.ts for the predicate), let the
  * request reach the page instead of redirecting to /sign-in — `lib/auth.ts`
  * then resolves the disposable test session. `e2eAuthEnabled()` THROWS in a

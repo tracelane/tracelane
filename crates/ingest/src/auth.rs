@@ -521,6 +521,7 @@ mod tests {
         );
         let der = mint_svid(&[&uri], (2020, 1, 1), (2021, 1, 1));
         // Injectable clock (testing.md discipline) — provably time-independent,
+        // matching rejects_not_yet_valid_svid (review F-3).
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 0, 0, 0).unwrap();
 
         match verify_spiffe_svid_at(&der, now) {
@@ -944,6 +945,8 @@ mod tests {
         assert_eq!(std::str::from_utf8(&body).unwrap(), tenant_uuid.to_string());
     }
 
+    // F-2: peer identity wins over body-supplied tenant, e2e ------
+
     /// A handler that decodes an OTLP body using the tenant the middleware
     /// injected (`Extension<TenantId>` from the verified SVID) and echoes the
     /// resolved span's tenant — the downstream shape of the real ingest path.
@@ -1007,6 +1010,7 @@ mod tests {
         req.encode_to_vec()
     }
 
+    ///  F-2 — the FULL-STACK tenant-isolation guarantee through the real
     /// `require_spiffe_auth` seam.
     ///
     /// A valid tenant-A mTLS peer sends a body that stuffs `tracelane.tenant_id`
@@ -1062,6 +1066,7 @@ mod tests {
         );
     }
 
+    ///  F-2 companion: an UNAUTHENTICATED request (no peer cert) carrying a
     /// body-supplied tenant is rejected at the middleware (401) and never
     /// reaches the decoder — a body tenant cannot self-authorize.
     #[tokio::test]

@@ -13,11 +13,14 @@ export const metadata: Metadata = { title: "Organization deleted" };
 
 export default function OrganizationDeletedPage() {
 	return (
-		<div className="flex min-h-screen items-center justify-center bg-surface px-6">
+		// `bg-bg`, the page GROUND. It was `bg-surface`, which under the P0 palette is
+		// the CARD colour (#ffffff against a #fafaf9 ground) — so this was the one
+		// full-screen route rendering the card material edge to edge. When ground and
+		// card were both pure white that was invisible; the moment they split, it was
+		// the only page in the app on the wrong plane.
+		<div className="flex min-h-screen items-center justify-center bg-bg px-6">
 			<div className="max-w-md text-center space-y-4">
-				<h1 className="text-lg font-semibold text-ink">
-					This organization was deleted
-				</h1>
+				<h1 className="t-h1">This organization was deleted</h1>
 				<p className="text-sm text-ink-2">
 					Its workspace is scheduled for permanent deletion within 30 days. If
 					this was a mistake, contact support before then to restore it. Access

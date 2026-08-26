@@ -235,6 +235,11 @@ is_allowed() {
 		apps/web/e2e/*) return 0 ;;
 		.github/workflows/ci.yml) return 0 ;;
 		scripts/ci/no-e2e-auth-in-prod.sh) return 0 ;;
+		# The build-ARTIFACT gate. It asserts the bypass's boot-crash survives into
+		# the emitted bundle, so it must name the flag to find the chunks that read
+		# it — the same reason this script is on its own allowlist. Neither runs in
+		# the Worker; both are repo-side CI.
+		scripts/ci/check-e2e-bypass-not-folded.py) return 0 ;;
 		*.md) return 0 ;;
 		*) return 1 ;;
 	esac

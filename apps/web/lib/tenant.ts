@@ -11,6 +11,7 @@ import { tenants, users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 /**
+ * Best-effort upsert of the `users` mirror row. WorkOS is the system of
  * record (spec principle #1); this table is a convenience cache (the account
  * page's name seed, ledger-FK integrity). The gateway webhook CAN'T populate it
  * — WorkOS `user.created` carries no org, and membership events aren't

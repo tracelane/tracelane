@@ -1,17 +1,40 @@
-//! Provider failover logic (FT-01).
+//! Provider failover (FT-01 /).
 //!
-//! `FailoverChain` wraps an ordered list of provider names and tries them
-//! in sequence when the primary fails. A provider is considered failed if
-//! it returns a non-retryable HTTP error (500, 502, 503, 504) or a network
-//! timeout. The chain activates the secondary within the 200ms SLO defined
-//! in TRD FT-01.
+//! ## Two mechanisms share this name; only one is on the request path
 //!
-//! Span attribute `tracelane.failover.activated=true` is set whenever a
-//! secondary provider is used. `tracelane.failover.attempt_count=N` records
-//! the number of attempts made.
+//! - **On the request path.** [`cross_provider_candidates`] supplies the
+//!   ordered `(provider id, model)` hops the chat handler walks when a request
+//!   opted in with `X-Tracelane-Failover: cross-provider` *and* the primary
+//!   provider errored. That opt-in is OFF by default, so a request that does
+//!   not send the header never reaches a second provider.
+//! - **Not on the request path.** [`execute_with_failover`] is a generic
+//!   try-each-in-turn combinator. Its only callers are this module's tests and
+//!   `providers/smoke_tests.rs`; the chat handler does not call it. Recorded
+//!   here because a reader who assumes otherwise will change it and watch
+//!   production behave identically.
 //!
-//! Failover chain (from CLAUDE.md §model-routing):
-//!   Anthropic Sonnet → OpenAI gpt-5.x → Gemini 3 Pro
+//! The retry that runs on **every** request is same-provider, and it lives in
+//! `server.rs::dispatch_with_retry` — not in this module.
+//!
+//! ## Operator configuration (`tracelane.yaml`)
+//!
+//! ```yaml
+//! failover:
+//!   chain: anthropic, openai, google
+//!   retries: 1
+//!   backoff_ms: 100
+//! ```
+//!
+//! Parsed and validated by [`crate::server::config`]: every provider id is
+//! checked against the catalog and every hop's model must resolve back to its
+//! own provider, both at parse time. A hop the gateway could not dispatch is a
+//! failover that silently does not happen, so an unroutable entry refuses the
+//! boot instead of being dropped. A hop may name its own model
+//! (`chain: groq:llama-3.3-70b-versatile`), which is the only way to use one of
+//! the 160-odd providers that has no built-in entry below.
+//!
+//! With **no** `failover:` block the built-ins below apply, so a deployment
+//! that ships no config file is unchanged.
 
 use std::time::{Duration, Instant};
 
@@ -23,11 +46,113 @@ use tracelane_shared::TenantId;
 /// Error codes that trigger failover (not caller errors like 400, 401).
 pub const FAILOVER_CODES: &[u16] = &[500, 502, 503, 504];
 
-/// Default timeout before giving up on a single provider attempt.
-pub const PROVIDER_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
-
 /// Maximum time budget for the entire failover chain.
+///
+/// Read by `server.rs::dispatch_with_retry` to decide whether a retry still
+/// fits, and by [`crate::server::config`] to bound a configured `backoff_ms`.
 pub const FAILOVER_BUDGET_MS: u64 = 200;
+
+/// The built-in cross-provider chain: `(provider id, the model to ask that
+/// provider for)`.
+///
+/// Cross-provider failover works because the gateway carries a *universal*
+/// `ChatRequest` that each adapter translates into its provider's wire format
+/// — so failing over is re-dispatching the same canonical request to a
+/// different provider with a model that routes there. Every model here must
+/// therefore resolve back to its own provider through
+/// `ProviderRegistry::provider_id_for_model`, which
+/// `builtin_chain_models_route_back_to_their_own_provider` proves rather than
+/// asserts by prefix.
+///
+/// These are deliberately long-lived model names, **not** each family's current
+/// flagship: changing one changes what every deployment without a `failover:`
+/// block dispatches to. An operator who wants a newer model names it in
+/// `tracelane.yaml` instead of waiting for a gateway release.
+pub const DEFAULT_CHAIN: &[(&str, &str)] = &[
+    ("anthropic", "claude-3-5-sonnet-latest"),
+    ("openai", "gpt-4o"),
+    ("google", "gemini-1.5-pro"),
+];
+
+/// Same-provider retry attempts made when no `failover:` block is present.
+/// This is the count `server.rs::dispatch_with_retry` hardcodes today.
+pub const DEFAULT_RETRIES: u32 = 1;
+
+/// Pause before the same-provider retry when no `failover:` block is present,
+/// in milliseconds. The value `server.rs::dispatch_with_retry` hardcodes today.
+pub const DEFAULT_BACKOFF_MS: u64 = 100;
+
+/// Largest `retries:` a `failover:` block may ask for.
+///
+/// An operator cap, not a derived limit: every attempt is a real upstream round
+/// trip inside the same [`FAILOVER_BUDGET_MS`] budget, so a sixth attempt
+/// cannot fit even at zero backoff.
+pub const MAX_RETRIES: u32 = 5;
+
+/// How many extra same-provider attempts to make, and how long to wait between
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Attempts *after* the first. `0` disables the retry.
+    pub retries: u32,
+    /// Pause between attempts, in milliseconds.
+    pub backoff_ms: u64,
+}
+
+impl RetryPolicy {
+    /// The built-in policy: one retry, 100 ms apart.
+    pub const BUILTIN: Self = Self {
+        retries: DEFAULT_RETRIES,
+        backoff_ms: DEFAULT_BACKOFF_MS,
+    };
+
+    /// Total time this policy can spend sleeping between attempts.
+    ///
+    /// [`crate::server::config`] refuses a `failover:` block whose plan does
+    /// not fit inside [`FAILOVER_BUDGET_MS`] — a backoff longer than the budget
+    /// is a retry that can never fire, which reads as "retries configured" and
+    /// behaves as "no retries".
+    #[must_use]
+    pub const fn planned_backoff_ms(&self) -> u64 {
+        self.retries as u64 * self.backoff_ms
+    }
+}
+
+// The built-in policy must satisfy the very bounds `config` enforces on a
+// CONFIGURED one — otherwise the default would be a value an operator is
+// forbidden to write down, and `build_failover` could not skip the plan check
+// when neither `retries:` nor `backoff_ms:` is present. Asserted at COMPILE
+// time rather than in a test: every term is a `const`, so a unit test asserting
+// them would pass by construction and prove nothing a reader could not already
+// see. Change a default past a bound and the crate does not build.
+const _: () = assert!(RetryPolicy::BUILTIN.planned_backoff_ms() < FAILOVER_BUDGET_MS);
+const _: () = assert!(RetryPolicy::BUILTIN.retries <= MAX_RETRIES);
+const _: () = assert!(RetryPolicy::BUILTIN.backoff_ms < FAILOVER_BUDGET_MS);
+
+/// The retry policy in force: the `failover:` block's, or [`RetryPolicy::BUILTIN`].
+///
+/// **APPLIED. `server.rs::dispatch_with_retry` calls this** (`server.rs`, the
+/// `retry_policy()` call at the head of the loop), so an operator's `retries:`
+/// and `backoff_ms:` change the real number of attempts and the real pause
+/// between them.
+///
+/// This doc previously said the opposite — "the retry loop does not read this
+/// yet" — and pointed at a startup WARN that announced the gap. GWY-44 wired the
+/// loop; the doc and the WARN were not updated with it. **A stale doc that
+/// UNDERSTATES what the code does is still a defect**, and this one had teeth: it
+/// told an operator their configured retry policy was inert, so the reasonable
+/// response was to stop trusting the knob. Corrected 2026-08-18, found by
+/// checking whether the chain was really in force rather than assuming it.
+///
+/// `retries:` and `backoff_ms:` are ALSO validated at parse time — an
+/// out-of-budget value refuses the boot rather than being silently clamped.
+#[must_use]
+pub fn retry_policy() -> RetryPolicy {
+    crate::server::config::failover().map_or(RetryPolicy::BUILTIN, |f| RetryPolicy {
+        retries: f.retries(),
+        backoff_ms: f.backoff_ms(),
+    })
+}
 
 /// Records the outcome of a failover chain execution.
 #[derive(Debug, Clone)]
@@ -45,7 +170,13 @@ pub struct FailoverRecord {
 }
 
 impl FailoverRecord {
-    /// Build span attributes from this record for OTLP emission.
+    /// Render this record as `(key, value)` pairs.
+    ///
+    /// Nothing emits these today: the span fields a served request actually
+    /// carries are `tracelane_failover_activated` / `tracelane_failover_from`
+    /// (`crates/shared/src/span.rs`), set by the chat handler on the
+    /// cross-provider path. This method belongs to [`execute_with_failover`],
+    /// which is not on that path.
     pub fn span_attrs(&self) -> Vec<(&'static str, String)> {
         vec![
             (
@@ -74,41 +205,49 @@ pub fn is_failover_eligible(status_code: u16) -> bool {
     FAILOVER_CODES.contains(&status_code)
 }
 
-/// The ordered fallback chain of provider names.
+/// The built-in model for a provider in [`DEFAULT_CHAIN`], or `None`.
 ///
-/// Production: Anthropic Sonnet → OpenAI → Gemini (from CLAUDE.md).
-/// Overridable per-tenant in the Cedar policy engine (Week 8).
-pub fn default_failover_chain() -> Vec<&'static str> {
-    vec!["anthropic", "openai", "google"]
-}
-
-///
-/// Cross-provider failover works because the gateway carries a *universal*
-/// `ChatRequest` that each adapter translates into its provider's wire format
-/// — so failing over is just re-dispatching the same canonical request to a
-/// different provider with a model that routes there. The returned string must
-/// match that provider's prefix in `dispatch_to_provider` /
-/// `provider_name_from_model`. Kept deliberately small (one flagship model per
-/// family); tune as flagship models change.
+/// `None` is a real answer, and the common one: only three of the 169 routable
+/// providers have a built-in entry. A `failover:` chain that names any other
+/// provider must spell the model out (`chain: groq:llama-3.3-70b-versatile`),
+/// and [`crate::server::config`] refuses the block if it does not — rather than
+/// dropping the hop and leaving a chain that looks configured and does nothing.
 #[must_use]
 pub fn failover_model_for(provider: &str) -> Option<&'static str> {
-    match provider {
-        "anthropic" => Some("claude-3-5-sonnet-latest"),
-        "openai" => Some("gpt-4o"),
-        "google" => Some("gemini-1.5-pro"),
-        _ => None,
-    }
+    DEFAULT_CHAIN
+        .iter()
+        .find(|(p, _)| *p == provider)
+        .map(|(_, m)| *m)
 }
 
-/// from `primary_family`. Skips the primary and any provider without a known
-/// failover model. Empty when the primary is the only viable family.
+/// Ordered `(provider, model)` candidates to try when failing over AWAY
+/// from `primary_family`. Skips the primary; empty when it is the only hop.
+///
+/// Reads the `failover:` chain from `tracelane.yaml` when one was installed,
+/// otherwise [`DEFAULT_CHAIN`]. Both are already validated — every id is a
+/// provider some adapter serves, every model resolves back to its own provider
+/// — so this cannot silently drop a hop the operator *wrote*.
+///
+/// The chat handler still skips a hop at *dispatch* time, for two runtime
+/// reasons that are not this function's to know: an open circuit breaker or a
+/// kill switch (skipped with no log line at all), and no BYOK key stored for
+/// that provider (one `DEBUG`). Both are properties of the moment, not of the
+/// config, so neither is knowable at parse time.
 #[must_use]
 pub fn cross_provider_candidates(primary_family: &str) -> Vec<(&'static str, &'static str)> {
-    default_failover_chain()
-        .into_iter()
-        .filter(|p| *p != primary_family)
-        .filter_map(|p| failover_model_for(p).map(|m| (p, m)))
-        .collect()
+    match crate::server::config::failover() {
+        Some(cfg) => cfg
+            .chain()
+            .iter()
+            .filter(|hop| hop.provider_id != primary_family)
+            .map(|hop| (hop.provider_id.as_str(), hop.model.as_str()))
+            .collect(),
+        None => DEFAULT_CHAIN
+            .iter()
+            .filter(|(p, _)| *p != primary_family)
+            .copied()
+            .collect(),
+    }
 }
 
 /// Trait implemented by provider executor closures.
@@ -123,12 +262,23 @@ pub trait ProviderAttempt: Send + Sync {
 
 /// Execute a closure against each provider in `chain` until one succeeds.
 ///
+/// **Not on the request path.** The chat handler does its own cross-provider
+/// walk inline (it has to resolve a BYOK key and consult a circuit breaker per
+/// hop, neither of which this signature can express). The callers here are this
+/// module's tests and `providers/smoke_tests.rs`.
+///
 /// Returns `Ok((output, record))` when a provider succeeds.
 /// Returns `Err(last_error)` if all providers fail.
 ///
 /// # Arguments
 /// - `chain` — ordered provider names to try
 /// - `attempt_fn` — async closure `(provider_name: &str) -> Result<T, status_code>`
+///
+/// # Errors
+///
+/// Fails when every provider in the chain returned a failover-eligible status,
+/// and short-circuits with an error on the first NON-retryable status (a 401 is
+/// the same 401 from every provider, so trying the next one only costs money).
 #[instrument(skip(chain, attempt_fn), fields(tenant_id = %tenant_id))]
 pub async fn execute_with_failover<F, Fut, T>(
     tenant_id: &TenantId,
@@ -140,14 +290,15 @@ where
     Fut: std::future::Future<Output = std::result::Result<T, u16>> + Send,
     T: Send,
 {
-    let deadline = Instant::now() + Duration::from_millis(FAILOVER_BUDGET_MS);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(FAILOVER_BUDGET_MS);
     let mut last_code: u16 = 0;
 
     for (idx, &provider_name) in chain.iter().enumerate() {
         if Instant::now() >= deadline && idx > 0 {
             tracing::warn!(
                 provider = provider_name,
-                elapsed_ms = deadline.elapsed().as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
                 "failover budget exhausted — skipping remaining providers"
             );
             break;
@@ -155,16 +306,12 @@ where
 
         match attempt_fn(provider_name).await {
             Ok(output) => {
-                let elapsed_ms = Instant::now()
-                    .duration_since(deadline - Duration::from_millis(FAILOVER_BUDGET_MS))
-                    .as_millis() as u64;
-
                 let record = FailoverRecord {
                     winning_provider_index: idx,
                     winning_provider_name: provider_name.to_string(),
                     attempt_count: idx + 1,
                     failover_activated: idx > 0,
-                    total_elapsed_ms: elapsed_ms,
+                    total_elapsed_ms: started.elapsed().as_millis() as u64,
                 };
 
                 if record.failover_activated {
@@ -204,6 +351,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderRegistry;
     use tracelane_shared::TenantId;
     use uuid::Uuid;
 
@@ -325,27 +473,33 @@ mod tests {
         assert_eq!(activated.map(|(_, v)| v.as_str()), Some("true"));
     }
 
+    /// The property the chain actually depends on: re-dispatching a hop's model
+    /// must land on that hop's provider. Asserted through the SAME resolver the
+    /// chat handler calls, not through a prefix the test writes down itself —
+    /// a prefix assertion passes even when the routing table has moved.
     #[test]
-    fn failover_models_route_back_to_their_provider() {
-        // Each failover model must start with the prefix dispatch_to_provider
-        // uses to route, so re-dispatch lands on the intended adapter.
+    fn builtin_chain_models_route_back_to_their_own_provider() {
+        for (provider, model) in DEFAULT_CHAIN {
+            assert_eq!(
+                ProviderRegistry::provider_id_for_model(model),
+                Some(*provider),
+                "failover model `{model}` must still resolve to `{provider}`"
+            );
+        }
         assert_eq!(
             failover_model_for("anthropic"),
             Some("claude-3-5-sonnet-latest")
         );
-        assert!(
-            failover_model_for("anthropic")
-                .unwrap()
-                .starts_with("claude")
-        );
-        assert!(failover_model_for("openai").unwrap().starts_with("gpt"));
-        assert!(failover_model_for("google").unwrap().starts_with("gemini"));
+        // A provider with no built-in model is `None`, not a guess — that is
+        // what makes `config` refuse `chain: groq` instead of dropping the hop.
+        assert_eq!(failover_model_for("groq"), None);
         assert_eq!(failover_model_for("cohere"), None);
     }
 
     #[test]
-    fn cross_provider_candidates_skips_primary_and_keyless_families() {
-        // Failing over from Anthropic → the rest of the default chain.
+    fn cross_provider_candidates_skips_the_primary() {
+        // No `failover:` block is installed in this test binary, so these
+        // exercise the DEFAULT_CHAIN branch.
         assert_eq!(
             cross_provider_candidates("anthropic"),
             vec![("openai", "gpt-4o"), ("google", "gemini-1.5-pro")],
@@ -359,6 +513,14 @@ mod tests {
             ],
         );
         // A primary outside the chain still yields the full chain.
-        assert_eq!(cross_provider_candidates("cohere").len(), 3);
+        assert_eq!(
+            cross_provider_candidates("cohere").len(),
+            DEFAULT_CHAIN.len()
+        );
+    }
+
+    #[test]
+    fn retry_policy_is_the_builtin_when_no_failover_block_is_installed() {
+        assert_eq!(retry_policy(), RetryPolicy::BUILTIN);
     }
 }

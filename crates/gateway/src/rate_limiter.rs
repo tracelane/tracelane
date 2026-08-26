@@ -29,6 +29,7 @@ pub enum RateLimitTier {
     Team = 2,
     Business = 3,
     Enterprise = 4,
+    /// Benchmark-only (B-187b). NOT a commercial tier and NOT reachable for any
     /// tenant that exists in Postgres — the caller grants it only when the
     /// entitlement cache is absent, which is exactly "no control plane, so not
     /// hosted". Never returned by `from_plan_tier_str`, so no plan string can
@@ -66,6 +67,7 @@ impl RateLimitTier {
 }
 
 /// Single token bucket. `pub(crate)` so the WorkOS webhook ingress limiter
+/// (`auth::workos_webhook::WebhookRateLimiter`) reuses the exact same
 /// refill/consume math instead of hand-rolling a second copy.
 pub(crate) struct BucketState {
     tokens: f64,
@@ -113,6 +115,11 @@ impl BucketState {
 /// collision if multiple tiers are checked.
 ///
 /// Thread-safe: DashMap uses fine-grained shard locking.
+/// Bucket discriminant for the PER-KEY bucket. 255 cannot collide with a
+/// `RateLimitTier`, which is a small contiguous enum — asserted by
+/// `key_bucket_discriminant_cannot_collide_with_a_tier`.
+const KEY_BUCKET: u8 = 255;
+
 pub struct RateLimiter {
     buckets: Arc<DashMap<(String, u8), BucketState>>,
 }
@@ -130,6 +137,63 @@ impl RateLimiter {
     /// Returns `Throttle { retry_after_secs }` when the bucket is empty.
     #[instrument(skip(self), fields(tenant_id = %tenant_id))]
     pub fn check(&self, tenant_id: &TenantId, tier: RateLimitTier) -> RateLimitDecision {
+        // B-187c: `Bench` must short-circuit here alongside `Enterprise`.
+        //
+        // Granting the tier was not enough. Both report `u32::MAX` rpm, but only
+        // `Enterprise` was listed here — so `Bench` fell through to the token
+        // bucket, where `capacity = f64::from(u32::MAX)` with float refill does
+        // NOT behave as unlimited. Live consequence: the acceptance-bar request
+        // returned 200, k6 then aborted with "NO requests completed", and a
+        // single request after the burst returned 429. The tier was granted and
+        // then ignored one layer down — the third rejection-measurement trap in
+        // the same benchmark path (see docs/reference/TRAPS.md).
+        self.check_scoped(tenant_id, tier, None, None)
+    }
+
+    /// Check a request against a **per-key** RPM cap, falling back to the
+    /// tenant's plan tier when the key has none (GWY-43).
+    ///
+    /// Two separate buckets, and the request must pass BOTH:
+    ///
+    ///   - the **tenant** bucket, keyed `(tenant_id, tier)` — unchanged, and the
+    ///     one that protects the platform;
+    ///   - the **key** bucket, keyed `(tenant_id + key_id, 255)` — a customer's
+    ///     own ceiling on one credential, so a runaway script holding one key
+    ///     cannot consume the whole workspace's allowance.
+    ///
+    /// The key bucket is keyed on tenant AND key id, never on key id alone: the
+    /// id is a UUID and collisions are not the concern, but a cache keyed on a
+    /// value that arrives from the request is a shape this repo has been burned
+    /// by, and prefixing the tenant makes the isolation structural.
+    ///
+    /// `key_rpm` of `None` — no override configured — leaves behaviour exactly
+    /// as it was before GWY-43. The tenant check still runs first, so an
+    /// Enterprise/Bench short-circuit is unchanged for keys without an override.
+    #[instrument(skip(self), fields(tenant_id = %tenant_id))]
+    pub fn check_scoped(
+        &self,
+        tenant_id: &TenantId,
+        tier: RateLimitTier,
+        key_id: Option<&str>,
+        key_rpm: Option<u32>,
+    ) -> RateLimitDecision {
+        let tenant_decision = self.check_tier(tenant_id, tier);
+        if matches!(tenant_decision, RateLimitDecision::Throttle { .. }) {
+            return tenant_decision;
+        }
+        // A per-key cap is a customer's own ceiling and applies even on tiers
+        // that skip the platform bucket — an Enterprise workspace that sets a
+        // 10 rpm cap on a CI key means it.
+        match (key_id, key_rpm) {
+            (Some(id), Some(rpm)) if rpm > 0 => {
+                self.consume(format!("{tenant_id}/{id}"), KEY_BUCKET, f64::from(rpm))
+            }
+            _ => tenant_decision,
+        }
+    }
+
+    fn check_tier(&self, tenant_id: &TenantId, tier: RateLimitTier) -> RateLimitDecision {
+        // B-187c: `Bench` must short-circuit here alongside `Enterprise`.
         //
         // Granting the tier was not enough. Both report `u32::MAX` rpm, but only
         // `Enterprise` was listed here — so `Bench` fell through to the token
@@ -142,13 +206,18 @@ impl RateLimiter {
         if matches!(tier, RateLimitTier::Enterprise | RateLimitTier::Bench) {
             return RateLimitDecision::Allow;
         }
+        self.consume(
+            tenant_id.to_string(),
+            tier as u8,
+            f64::from(tier.requests_per_minute()),
+        )
+    }
 
-        let rpm = f64::from(tier.requests_per_minute());
+    fn consume(&self, bucket_id: String, tier_key: u8, rpm: f64) -> RateLimitDecision {
         let capacity = rpm;
         // Tokens refilled at rpm/60_000 per millisecond (= rpm per minute)
         let refill_per_ms = rpm / 60_000.0;
-        let tier_key = tier as u8;
-        let key = (tenant_id.to_string(), tier_key);
+        let key = (bucket_id, tier_key);
 
         let mut entry = self
             .buckets
@@ -215,6 +284,7 @@ impl QuotaConfig {
     /// Map the `tenants.plan_tier` string to a QuotaConfig.
     ///
     /// Values mirror the `plan_entitlements` seed rows (`apps/web/db/seed.mjs`;
+    /// schema in the Drizzle migrations per ADR-040/). This is the
     /// in-memory fallback for
     /// the gateway hot path; the dashboard reads the same values through
     /// `plan_entitlements` + `workspace_entitlements` (deny-overrides-grant).
@@ -271,6 +341,7 @@ impl QuotaDecision {
     /// SET-08 notify predicate: at or over the included quota, and still served.
     ///
     /// A **position** test, deliberately not a transition test. The in-memory
+    /// counter reseeds from ClickHouse on boot, so after a restart it can
     /// land anywhere relative to the quota; an `== quota` transition test misses
     /// the alert entirely when the reseed lands above, and re-fires when it lands
     /// below. Both happen on any mid-month deploy.
@@ -303,6 +374,7 @@ pub struct QuotaTracker {
     /// implementing `Hash + Eq` (it currently does, but keeping this
     /// loose mirrors the existing RateLimiter pattern).
     usage: Arc<DashMap<String, AtomicU64>>,
+    ///  durability: per-tenant `YYYYMM` the in-memory counter was last
     /// seeded from the durable ClickHouse trace count for. Empty = never seeded
     /// this process (fresh start / post-deploy). Drives both restart-durability
     /// (re-seed after a restart) and the month-boundary reset (`reset_for_period`
@@ -367,6 +439,7 @@ impl QuotaTracker {
         }
     }
 
+    ///  durability: does this tenant's counter need (re)seeding for
     /// `year_month` (`YYYYMM`)? True if never seeded this process (post-restart)
     /// or last seeded for a different month (month boundary). The hot path calls
     /// this FIRST so the durable ClickHouse baseline read happens once per tenant
@@ -380,7 +453,9 @@ impl QuotaTracker {
             .unwrap_or(true)
     }
 
+    ///  durability: seed the in-memory monthly counter from a durable
     /// `baseline` (the ClickHouse trace count for `year_month`) so a restart or
+    /// blue-green deploy no longer forgives accrued usage — the counter
     /// silently reset to 0 on every restart, making the hard cap bypassable by a
     /// redeploy.
     ///
@@ -429,6 +504,139 @@ impl Default for QuotaTracker {
 
 #[cfg(test)]
 mod tests {
+
+    // ── GWY-43: per-key rate limits ─────────────────────────────────────────
+
+    fn t() -> TenantId {
+        TenantId::from_jwt_claim(uuid::Uuid::from_u128(0xA11CE))
+    }
+
+    /// The control, OBSERVED THROTTLING. A per-key cap that has never been seen
+    /// to refuse is not a cap.
+    #[test]
+    fn a_per_key_cap_throttles_that_key() {
+        let rl = RateLimiter::new();
+        let tenant = t();
+        // Team tier is generous; the KEY cap is 3.
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if matches!(
+                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(3)),
+                RateLimitDecision::Allow
+            ) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, 3,
+            "a 3 rpm key cap must allow exactly 3 in a burst"
+        );
+    }
+
+    /// The isolation property: one key exhausting its cap must not throttle a
+    /// DIFFERENT key on the same tenant. Without this the feature is just a
+    /// second tenant limit wearing a key's name.
+    #[test]
+    fn one_keys_cap_does_not_throttle_another_key() {
+        let rl = RateLimiter::new();
+        let tenant = t();
+        for _ in 0..5 {
+            let _ = rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(2));
+        }
+        assert!(
+            matches!(
+                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(2)),
+                RateLimitDecision::Throttle { .. }
+            ),
+            "key-a must be exhausted"
+        );
+        assert!(
+            matches!(
+                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-b"), Some(2)),
+                RateLimitDecision::Allow
+            ),
+            "key-b has its own bucket and must still pass"
+        );
+    }
+
+    /// No override = exactly the pre-GWY-43 behaviour. This is the regression
+    /// guard for every key that exists today.
+    #[test]
+    fn no_override_behaves_exactly_like_the_tenant_check() {
+        let rl = RateLimiter::new();
+        let tenant = t();
+        for _ in 0..50 {
+            assert_eq!(
+                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), None),
+                rl_reference(&tenant),
+                "a key with no override must not be limited more than its tenant"
+            );
+        }
+        fn rl_reference(_t: &TenantId) -> RateLimitDecision {
+            RateLimitDecision::Allow
+        }
+    }
+
+    /// A per-key cap applies even where the platform bucket short-circuits. An
+    /// Enterprise workspace that puts a 2 rpm cap on a CI key means it.
+    #[test]
+    fn a_key_cap_binds_even_on_enterprise() {
+        let rl = RateLimiter::new();
+        let tenant = t();
+        let mut allowed = 0;
+        for _ in 0..6 {
+            if matches!(
+                rl.check_scoped(&tenant, RateLimitTier::Enterprise, Some("ci"), Some(2)),
+                RateLimitDecision::Allow
+            ) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, 2,
+            "the customer's own cap is not waived by their plan"
+        );
+    }
+
+    /// The tenant bucket is still checked FIRST, so a per-key cap cannot be used
+    /// to escape the platform's own limit.
+    #[test]
+    fn a_generous_key_cap_cannot_exceed_the_tenant_limit() {
+        let rl = RateLimiter::new();
+        let tenant = t();
+        let tier = RateLimitTier::Free;
+        let cap = tier.requests_per_minute();
+        let mut allowed = 0;
+        for _ in 0..(cap + 20) {
+            if matches!(
+                rl.check_scoped(&tenant, tier, Some("k"), Some(u32::MAX)),
+                RateLimitDecision::Allow
+            ) {
+                allowed += 1;
+            }
+        }
+        assert!(
+            allowed <= cap,
+            "allowed {allowed} > tenant cap {cap}: a key override must not widen the platform limit"
+        );
+    }
+
+    #[test]
+    fn key_bucket_discriminant_cannot_collide_with_a_tier() {
+        for tier in [
+            RateLimitTier::Free,
+            RateLimitTier::Builder,
+            RateLimitTier::Team,
+            RateLimitTier::Business,
+            RateLimitTier::Enterprise,
+            RateLimitTier::Bench,
+        ] {
+            assert_ne!(
+                tier as u8, KEY_BUCKET,
+                "{tier:?} collides with the key bucket"
+            );
+        }
+    }
     use super::*;
     use tracelane_shared::TenantId;
 
@@ -477,6 +685,7 @@ mod tests {
 
     #[test]
     fn bench_tier_is_never_throttled() {
+        // B-187c. Free throttles at 60/min; Bench must not throttle at all.
         // N is deliberately far past every other tier's ceiling (Business =
         // 60_000) so this cannot pass by sitting under some other limit.
         let rl = RateLimiter::new();
@@ -629,6 +838,7 @@ mod tests {
     //
     // The first implementation fired on the transition `used == quota`. The
     // counter below is process-local and reseeds from ClickHouse on boot
+    // so on any mid-month deploy that equality is wrong in BOTH
     // directions. These tests pin the corrected behaviour: the predicate is the
     // POSITION test `used >= quota`, and fire-once comes from a persisted
     // marker whose real guarantee is the `quota_notifications` primary key.
@@ -834,8 +1044,10 @@ mod tests {
         assert_eq!(q.check(&t2, cfg), QuotaDecision::Allow);
     }
 
+    ///  regression: the counter is durable across "restart" (re-seeds from a
     /// baseline instead of resetting to 0), race-safe (a redundant same-month seed
     /// does not clobber live increments), and month-aware (a new month re-seeds).
+    /// the counter zeroed on every restart, making the hard cap
     /// bypassable by a redeploy.
     #[test]
     fn seed_is_durable_race_safe_and_month_aware() {

@@ -30,15 +30,31 @@ export function SettingsNav() {
 	const pathname = usePathname();
 
 	return (
-		<nav className="flex sm:flex-col gap-1 shrink-0 sm:w-40">
+		/*
+		 * P0.17: below `sm` this is a HORIZONTAL strip of seven tabs, which is wider
+		 * than a phone. It scrolls in its own track rather than widening the page —
+		 * `whitespace-nowrap` keeps each label on one line so the strip scrolls
+		 * instead of the labels wrapping to two rows of ragged height.
+		 */
+		<nav className="flex gap-1 shrink-0 overflow-x-auto sm:overflow-x-visible sm:flex-col sm:w-40">
 			{TABS.map(({ href, label }) => (
 				<Link
 					key={href}
 					href={href}
 					className={
+						/*
+						 * ACTIVE is `--surface-3`, HOVER is `--surface-hover`, and the pair
+						 * has to be read in both themes. Active was `--surface-2` and hover
+						 * a 50% wash of the same token: in LIGHT that ordered correctly by
+						 * accident, but in DARK `--surface-hover` (#202125) is LIGHTER than
+						 * `--surface-2` (#1c1d20), so hovering an inactive tab made it read
+						 * louder than the tab you are actually on. `--surface-3` is the
+						 * declared press/active step and sits above the hover step in BOTH
+						 * themes, which is the only way this ordering survives a palette swap.
+						 */
 						pathname.startsWith(href)
-							? "rounded-md px-3 py-2 text-sm font-medium text-ink bg-surface-2"
-							: "rounded-md px-3 py-2 text-sm text-ink-2 hover:text-ink hover:bg-surface-2/50 transition-colors"
+							? "rounded-md px-3 py-2 text-sm font-medium text-ink bg-surface-3 whitespace-nowrap"
+							: "rounded-md px-3 py-2 text-sm text-ink-2 whitespace-nowrap hover:text-ink hover:bg-surface-hover transition-colors"
 					}
 				>
 					{label}

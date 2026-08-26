@@ -19,6 +19,7 @@ set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 ROOT=$(cd -- "$HERE/.." >/dev/null 2>&1 && pwd)
+# Apply the authoritative Drizzle migrations (id-PK shape), not the
 # retired infra SQL. psql handles the `--> statement-breakpoint` `--` comments.
 MIGRATIONS_DIR="$ROOT/apps/web/db/migrations"
 

@@ -56,6 +56,7 @@ dashmap = "6"
 # In-process entitlement-resolution cache (ADR-035). The only new crate this
 # reconciliation adds; eliminates the per-request Neon round-trip.
 moka = { version = "0.12", features = ["future"] }
+#  B8: poison-free Mutex for the per-tenant audit chain.
 # `std::sync::Mutex` poison would permanently DoS a tenant after any
 # panic inside the lock; `parking_lot::Mutex` has no poison semantics.
 parking_lot = "0.12"
@@ -74,6 +75,10 @@ tracelane-shared = { path = "../shared" }
 # Policy crate — hosts PII redaction (100% recall invariant).
 # Audit chain redacts every payload before hashing/storage.
 tracelane-policy = { path = "../policy" }
+# EVL-05 eval assertions. Already in this binary transitively via
+# `tracelane-policy`, so declaring it directly adds no code — it just stops the
+# use being an accident of another crate's dependency graph.
+regex = "1.11"
 
 # Reference audit-ledger verifier (Apache-2.0). The free-tier self-verify
 # endpoint (audit_self_verify.rs) reuses the SAME verifier the OSS CLI ships —

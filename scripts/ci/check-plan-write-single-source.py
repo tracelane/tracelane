@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ALLOWED = {"apps/web/app/api/webhooks/polar/route.ts"}
 
 # Rust: any SQL that sets the plan column on tenants. There is no Rust webhook —
+# the receiver was retired 2026-07-28 — so ANY Rust plan write is a
 # violation by construction, not by allowlist.
 RUST_SQL = re.compile(r"UPDATE\s+tenants\s+SET\s+plan\b", re.IGNORECASE)
 

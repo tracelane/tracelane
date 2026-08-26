@@ -14,6 +14,7 @@
  *      workspace_entitlements.plan_lookup_key (plan membership only).
  *      ADD-ON events (a separate Polar subscription — the $999 Audit SKU) grant
  *      the matching workspace_entitlements boolean and NEVER touch the base plan
+ * . Per-plan feature flags are NOT set here (those are plan defaults).
  *   6. Unknown plan key / unresolved tenant → log + 200 (no infinite retry).
  *
  * E2E is gated on the founder: register the webhook in the Polar dashboard and
@@ -119,11 +120,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
+	// organization_id cross-check (symmetric).
 	if (!orgCheckBypassed()) {
 		// `.trim()` is REQUIRED: `wrangler secret put` / `echo` can append a
 		// trailing newline to the stored value, and a clean `actual` (parsed from
 		// JSON) would then never equal `"<uuid>\n"` — a silent 401 storm. The
 		// secret path already trims (`decodeWebhookSecret`); this makes the org
+		// check symmetric.
 		const expected = process.env.POLAR_EXPECTED_ORGANIZATION_ID?.trim();
 		if (!expected) {
 			console.error("[polar-webhook] POLAR_EXPECTED_ORGANIZATION_ID unset");
@@ -134,6 +137,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		}
 		// An org id is a public identifier, not a credential — log actual vs
 		// expected on mismatch so a config error is diagnosable (an unlogged
+		// mismatch left blind through several redeliver cycles).
 		const actual = extractOrganizationId(event.data);
 		if (actual !== expected) {
 			console.warn(
@@ -218,6 +222,7 @@ async function handleSubscriptionChange(
 	// Add-on subscriptions (the $999 Audit SKU, seat/overage meters, HIPAA-GCP)
 	// are a SEPARATE Polar subscription from the base plan. Route them BEFORE the
 	// plan resolver — which would otherwise class every add-on as "unknown" and
+	// no-op — so a real Audit-SKU purchase actually flips f_audit_addon.
 	// They must never touch tenants.plan / polar_subscription_id.
 	if (isAddOnLookupKey(lookupKey)) {
 		await handleAddOnChange(eventType, data, lookupKey as string, status);

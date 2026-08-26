@@ -45,18 +45,29 @@ CREATE TABLE IF NOT EXISTS tracelane.trace_summaries
 (
     tenant_id        String,
     trace_id         String,
-    root_name        String,
-    start_time       DateTime64(6, 'UTC'),
-    end_time         DateTime64(6, 'UTC'),
-    duration_us      Int64,
-    span_count       UInt32,
-    error_count      UInt32,
-    intervention     UInt8,
-    model            String DEFAULT ''
+    root_name        SimpleAggregateFunction(max, String),
+    start_time       SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    end_time         SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+    span_count       SimpleAggregateFunction(sum, UInt64),
+    error_count      SimpleAggregateFunction(sum, UInt64),
+    intervention     SimpleAggregateFunction(max, UInt8),
+    model            SimpleAggregateFunction(max, String),
+    -- Read-time from the MERGED bounds; a per-batch duration is not a component of the
+    -- trace's duration, so it must never be stored.
+    duration_us      Int64 ALIAS dateDiff('microsecond', start_time, end_time)
 )
-ENGINE = ReplacingMergeTree(end_time)
-PARTITION BY toYYYYMM(start_time)
-ORDER BY (tenant_id, start_time, trace_id)
+-- B-243 (migration 15): was ReplacingMergeTree(end_time) ORDER BY (tenant_id, start_time,
+-- trace_id) PARTITION BY toYYYYMM(start_time). A materialized view aggregates PER INSERT
+-- BLOCK, so a trace whose spans arrive in two ingest flushes emitted TWO rows, each with its
+-- own min(start_time) — and because start_time was IN THE SORTING KEY the rows had different
+-- keys and FINAL could not collapse them. Replacing is also the wrong operation: it keeps one
+-- partial row rather than merging two, so the survivor would carry 5 spans or 3, never 8.
+-- AggregatingMergeTree + SimpleAggregateFunction merges them, and PARTITION BY tuple() is
+-- required because ClickHouse merges only WITHIN a partition — any per-batch-derived
+-- partition key reintroduces the defect in a rarer, harder-to-find form.
+ENGINE = AggregatingMergeTree
+PARTITION BY tuple()
+ORDER BY (tenant_id, trace_id)
 TTL toDate(start_time) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
 
@@ -64,37 +75,28 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS tracelane.mv_trace_summaries
 TO tracelane.trace_summaries
 AS
 SELECT
-    tenant_id,
-    trace_id,
-    argMinIf(name, start_time, parent_span_id IS NULL) AS root_name,
-    min(start_time)                                     AS start_time,
-    max(end_time)                                       AS end_time,
-    dateDiff('microsecond', min(start_time), max(end_time)) AS duration_us,
-    count()                                             AS span_count,
-    countIf(status_code = 2)                            AS error_count,
-    max(intervention)                                   AS intervention,
-    -- OTel-GenAI attrs are stored flattened with underscores
-    -- (`gen_ai_response_model`); coalesce to the dotted + OpenInference forms
-    -- (ADR-043 / Migration 06). Without this the Model column ships empty.
-    argMinIf(
+    s.tenant_id AS tenant_id,
+    s.trace_id  AS trace_id,
+    -- maxIf over the ROOT span's name: a batch carrying no root contributes '' and loses the
+    -- merge. `argMinIf` has no mergeable simple form, which is why this changed with B-243.
+    maxIf(s.name, s.parent_span_id IS NULL)                  AS root_name,
+    min(s.start_time)                                        AS start_time,
+    max(s.end_time)                                          AS end_time,
+    toUInt64(count())                                        AS span_count,
+    toUInt64(countIf(s.status_code = 2))                     AS error_count,
+    max(s.intervention)                                      AS intervention,
+    -- OTel-GenAI attrs are stored flattened with underscores (ADR-043 / migration 06).
+    max(
         coalesce(
-            nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai.request.model'), ''),
-            JSONExtractString(attributes, 'llm.model_name')
-        ),
-        start_time,
-        coalesce(
-            nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''),
-            nullIf(JSONExtractString(attributes, 'gen_ai.request.model'), ''),
-            JSONExtractString(attributes, 'llm.model_name')
-        ) != ''
-    )                                                   AS model
-FROM tracelane.spans
-GROUP BY tenant_id, trace_id;
+            nullIf(JSONExtractString(s.attributes, 'gen_ai_response_model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai_request_model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai.response.model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
+            JSONExtractString(s.attributes, 'llm.model_name')
+        )
+    )                                                        AS model
+FROM tracelane.spans AS s
+GROUP BY s.tenant_id, s.trace_id;
 
 -- ── Per-tenant usage counters ────────────────────────────────────────────────
 -- Used for billing and rate-limit reporting. SummingMergeTree accumulates deltas.

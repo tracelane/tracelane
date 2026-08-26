@@ -16,21 +16,29 @@
 import { inferSpanKind } from "@/lib/span-kind";
 import { spanStartUs } from "@/lib/trace-summary";
 import type { VisibleRow } from "@/lib/trace-tree";
-import { type SpanKind, TimeRuler, cn, fmtDur } from "@tracelanedev/ui";
+import {
+	SPAN_KIND_MARK,
+	type SpanKind,
+	TimeRuler,
+	cn,
+	fmtDur,
+} from "@tracelanedev/ui";
 
-/** Bar fill by kind — matches the transcript-spine node pins (one palette).
- * ADR-053 discipline: Lava (--action) is CTA-only and Verify-green (--ok/--seal)
- * is provenance-only, so span kinds use the one free data hue (violet --info, the
- * AI-call family: tool bold, llm faint) + neutral ink for structure. The kind text
- * label always accompanies the color — never colour alone. Errors override to red. */
-export const KIND_BAR: Record<SpanKind, string> = {
-	agent: "bg-ink-2",
-	tool: "bg-info",
-	llm: "bg-info/50",
-	retrieval: "bg-ink-3",
-	chain: "bg-ink-3",
-	unknown: "bg-ink-3",
-};
+/**
+ * The span-kind mark, re-exported from the design system.
+ *
+ * IT USED TO BE A SECOND COPY OF THE RAMP, DECLARED HERE, and that duplication is
+ * what this change removes. `packages/ui`'s transcript spine marks the same six kinds
+ * for the same reason; two maps encoding one idea drifted the moment the palette moved
+ * (the spine's `llm` step was still an alpha of the retired violet, which composited
+ * to within a few points of its own `unknown` step). The map, and the reasoning for
+ * every step in it, now live at `SPAN_KIND_MARK` in
+ * `packages/ui/src/signature/TranscriptSpine.tsx`.
+ *
+ * The name is kept as an alias because `TraceDetailView`'s legend imports `KIND_BAR`
+ * from this module, and renaming a working import is churn this pass does not need.
+ */
+export const KIND_BAR = SPAN_KIND_MARK;
 
 export function WaterfallView({
 	rows,
@@ -75,7 +83,7 @@ export function WaterfallView({
 				 * the ruler already draws a rule, and carrying both put two horizontal
 				 * lines under the same axis.
 				 */}
-				<span className="block h-6 border-line border-t pt-1.5 pl-1 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+				<span className="block h-6 border-line border-t pt-1.5 pl-1 t-metric-label">
 					Span
 				</span>
 				<TimeRuler startMs={0} endMs={totalUs / 1000} mode="relative" />
@@ -108,9 +116,15 @@ export function WaterfallView({
 							// e2e/fixtures/selectors.ts; a rendered-shape test pins it so the
 							// attribute cannot be dropped silently.
 							data-span-row={s.span_id}
+							// Row states, and the ordering is the point: HOVER is
+							// `--surface-hover` (the role that exists for a row on a card) and
+							// SELECTED is `--surface-3` (the declared press/active step, one
+							// louder than hover). Selected used to be `--surface-2`; in DARK
+							// that token (#1c1d20) is QUIETER than `--surface-hover` (#202125),
+							// so hovering any other row out-shouted the row you had selected.
 							className={cn(
 								"group grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-md pr-2 transition-colors",
-								selected ? "bg-surface-2" : "hover:bg-surface-2/40",
+								selected ? "bg-surface-3" : "hover:bg-surface-hover",
 							)}
 						>
 							{/* Tree cell: depth guide rails · indent · disclosure · kind dot · name. */}
@@ -143,7 +157,7 @@ export function WaterfallView({
 										onClick={() => onToggleCollapse(s.span_id)}
 										aria-label={row.collapsed ? "Expand" : "Collapse"}
 										aria-expanded={!row.collapsed}
-										className="grid h-4 w-4 shrink-0 place-items-center rounded text-[9px] text-ink-3 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1"
+										className="grid h-4 w-4 shrink-0 place-items-center rounded text-2xs leading-none text-ink-3 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 									>
 										{row.collapsed ? "▶" : "▼"}
 									</button>
@@ -161,7 +175,7 @@ export function WaterfallView({
 								<button
 									type="button"
 									onClick={() => onSelectSpan(s.span_id)}
-									className="truncate text-left text-[13px] text-ink hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1"
+									className="truncate text-left text-sm text-ink hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 									title={s.name}
 								>
 									{s.name}
@@ -172,7 +186,7 @@ export function WaterfallView({
 							<button
 								type="button"
 								onClick={() => onSelectSpan(s.span_id)}
-								className="relative flex h-6 items-center focus-visible:outline-2 focus-visible:outline-seal focus-visible:outline-offset-1 rounded-sm"
+								className="relative flex h-6 items-center focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2 rounded-sm"
 								title={`start +${fmtDur(offsetUs)} · ${fmtDur(s.duration_us)}${isError ? " · error" : ""}`}
 							>
 								{/* faint baseline so empty rows still read as a track */}
@@ -188,7 +202,7 @@ export function WaterfallView({
 								<span
 									// Opaque chip so the exact duration stays legible even when a
 									// long bar reaches the right edge underneath it.
-									className="absolute right-1 rounded bg-bg px-1 text-[11px] tabular-nums text-ink-2"
+									className="absolute right-1 rounded bg-bg px-1 text-2xs tabular-nums text-ink-2"
 								>
 									{fmtDur(s.duration_us)}
 								</span>

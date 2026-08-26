@@ -30,7 +30,19 @@
  *
  * EXCEPTION — `f_prompt_promotion_write` is ALSO a plan-level default: the
  * ADR-009 tier split is locked (Team+ = TRUE, Builder read-only, Free none),
+ * so it is seeded like the seat caps (; mirrors drizzle migration 0005 +
  * infra/dev migration 15).
+ *
+ * EXCEPTION — the four Sprint 3 eval-loop flags are plan-level defaults too, and
+ * the split is founder-accepted: `f_datasets` TRUE on Builder and above (EVL-04
+ * §9 Q2 — datasets are the table-stakes parity surface, and gating them at Team
+ * loses the comparison before it starts), `f_experiments` / `f_online_evals` /
+ * `f_annotation_queues` TRUE on Team and above, exactly like
+ * `f_prompt_promotion_write`. Mirrors drizzle migration
+ * `0030_evl04_dataset_entitlements.sql`, which seeds the same split so a Neon
+ * that never runs this file still resolves the right tiers. Free is FALSE on all
+ * four: an unseeded or absent control plane must land on the UNPRIVILEGED value
+ * (`.claude/rules/tenancy.md`), which is what the column DEFAULT already gives.
  */
 
 import { neon } from "@neondatabase/serverless";
@@ -46,9 +58,13 @@ const sql = neon(url);
 // gateway_quota, overage_hard_cap_multiplier, overage_price_per_10k_usd,
 // f_full_capture (Business+Enterprise=true),
 // f_prompt_promotion_write (Team+=true, ADR-009),
+// f_audit_addon (Enterprise only),
+// then the four Sprint 3 eval-loop flags (migration 0030): f_datasets
+//   (Builder+), f_experiments, f_online_evals, f_annotation_queues (Team+),
 // then the six gated guardrail rails (ADR-064): r2, r3_pinning, r4, r5, r6, r7.
 //   Free/Builder = none · Team+ = ALL 6 gated rails (r2/r3_pinning/r4/r5/r6/r7)
 //   (ADR-064 amended 2026-07-14: r2/r4 moved down from Business to Team).]
+//  (2026-08-04): f_guardrail_r3_pinning and f_guardrail_r4 are TRUE on
 // EVERY plan, free_v1 included. Those two rails are now UNGATED in the gateway
 // (`Rail::feature()` returns None), so they run regardless of this column — the
 // column is kept only so the control plane cannot contradict the binary. The
@@ -68,13 +84,18 @@ const PLANS = [
 		false,
 		false,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
+		// Sprint 3 eval loop (migration 0030). These four sit BETWEEN f_audit_addon
+		// and the guardrail six on purpose — the drift guard reads `p.slice(-6)`.
+		false, // f_datasets          (EVL-04, Builder+)
+		false, // f_experiments       (EVL-02, Team+)
+		false, // f_online_evals      (EVL-28, Team+)
+		false, // f_annotation_queues (EVL-29, Team+)
 		false,
 		true,
 		true,
 		false,
 		false,
 		false,
-
 	],
 	[
 		"builder_v1",
@@ -88,13 +109,18 @@ const PLANS = [
 		false,
 		false,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
+		// Sprint 3 eval loop (migration 0030). These four sit BETWEEN f_audit_addon
+		// and the guardrail six on purpose — the drift guard reads `p.slice(-6)`.
+		true, // f_datasets          (EVL-04, Builder+)
+		false, // f_experiments       (EVL-02, Team+)
+		false, // f_online_evals      (EVL-28, Team+)
+		false, // f_annotation_queues (EVL-29, Team+)
 		false,
 		true,
 		true,
 		false,
 		false,
 		false,
-
 	],
 	[
 		"team_v1",
@@ -110,13 +136,18 @@ const PLANS = [
 		// ADR-064 amended (founder 2026-07-14): ALL 9 rails at Team+ — gr2 + gr4
 		// moved down from Business so Team gets the full guardrail suite.
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
+		// Sprint 3 eval loop (migration 0030). These four sit BETWEEN f_audit_addon
+		// and the guardrail six on purpose — the drift guard reads `p.slice(-6)`.
+		true, // f_datasets          (EVL-04, Builder+)
+		true, // f_experiments       (EVL-02, Team+)
+		true, // f_online_evals      (EVL-28, Team+)
+		true, // f_annotation_queues (EVL-29, Team+)
 		true, // gr2  (R2 secrets/PII)
 		true, // gr3_pinning
 		true, // gr4  (R4 lethal-trifecta)
 		true, // gr5
 		true, // gr6
 		true, // gr7
-
 	],
 	[
 		"business_v1",
@@ -130,13 +161,18 @@ const PLANS = [
 		true,
 		true,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
+		// Sprint 3 eval loop (migration 0030). These four sit BETWEEN f_audit_addon
+		// and the guardrail six on purpose — the drift guard reads `p.slice(-6)`.
+		true, // f_datasets          (EVL-04, Builder+)
+		true, // f_experiments       (EVL-02, Team+)
+		true, // f_online_evals      (EVL-28, Team+)
+		true, // f_annotation_queues (EVL-29, Team+)
 		true,
 		true,
 		true,
 		true,
 		true,
 		true,
-
 	],
 	[
 		"enterprise_v1",
@@ -152,13 +188,18 @@ const PLANS = [
 		true, // f_audit_addon — ENTERPRISE ONLY (founder ruling 2026-08-14). The six
 		// guardrail flags MUST remain the LAST SIX elements: the drift guard at
 		// components/guardrails/rail-tier-drift.test.ts:124 reads `p.slice(-6)`.
+		// Sprint 3 eval loop (migration 0030) — the four sit ABOVE the guardrail
+		// six, which is what keeps the invariant just stated true.
+		true, // f_datasets          (EVL-04, Builder+)
+		true, // f_experiments       (EVL-02, Team+)
+		true, // f_online_evals      (EVL-28, Team+)
+		true, // f_annotation_queues (EVL-29, Team+)
 		true,
 		true,
 		true,
 		true,
 		true,
 		true,
-
 	],
 ];
 
@@ -174,6 +215,10 @@ for (const [
 	fc,
 	ppw,
 	aa,
+	ds,
+	exp,
+	oe,
+	aq,
 	gr2,
 	gr3p,
 	gr4,
@@ -188,10 +233,12 @@ for (const [
 			overage_hard_cap_multiplier, overage_price_per_10k_usd, f_full_capture,
 			f_prompt_promotion_write,
 			f_audit_addon,
+			f_datasets, f_experiments, f_online_evals, f_annotation_queues,
 			f_guardrail_r2, f_guardrail_r3_pinning, f_guardrail_r4,
 			f_guardrail_r5, f_guardrail_r6, f_guardrail_r7
 		) values (${key}, ${si}, ${sm}, ${rd}, ${tq}, ${gq}, ${cap}, ${ov}, ${fc}, ${ppw},
-			${aa}, ${gr2}, ${gr3p}, ${gr4}, ${gr5}, ${gr6}, ${gr7})
+			${aa}, ${ds}, ${exp}, ${oe}, ${aq},
+			${gr2}, ${gr3p}, ${gr4}, ${gr5}, ${gr6}, ${gr7})
 		on conflict (plan_lookup_key) do update set
 			seat_cap_included = excluded.seat_cap_included,
 			seat_cap_max = excluded.seat_cap_max,
@@ -202,6 +249,10 @@ for (const [
 			overage_price_per_10k_usd = excluded.overage_price_per_10k_usd,
 			f_full_capture = excluded.f_full_capture,
 			f_prompt_promotion_write = excluded.f_prompt_promotion_write,
+			f_datasets = excluded.f_datasets,
+			f_experiments = excluded.f_experiments,
+			f_online_evals = excluded.f_online_evals,
+			f_annotation_queues = excluded.f_annotation_queues,
 			f_guardrail_r2 = excluded.f_guardrail_r2,
 			f_guardrail_r3_pinning = excluded.f_guardrail_r3_pinning,
 			f_guardrail_r4 = excluded.f_guardrail_r4,

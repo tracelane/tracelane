@@ -138,7 +138,7 @@ mcp.traces.list({
 
 ## Performance
 
-`benchmark-runner` gates the **combined** predictive-layer latency budget
+The **combined** predictive-layer latency budget is tracked by the benchmark suite
 (`<30ms p50 / <50ms p95 / <100ms p99`, internal target). There are no per-guard
 measured numbers — the layer's latency is not yet measured on
 production-equivalent hardware (pending Reliability Benchmark v1.0).
@@ -147,5 +147,4 @@ production-equivalent hardware (pending Reliability Benchmark v1.0).
 
 - [Architecture](/architecture)
 - [Providers](/providers)
-- The full eval mapping is in
-  [`evals/pain-points/INDEX.md`](https://github.com/tracelane/tracelane/blob/main/evals/pain-points/INDEX.md)
+- [Security](/security)

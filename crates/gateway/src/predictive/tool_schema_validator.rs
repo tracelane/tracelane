@@ -1,3 +1,4 @@
+//! Hallucinated tool-call schema validator (PR13, ADR-024 §3, item 3).
 //!
 //! Pure, stateless validation of the tool calls a request carries against the
 //! tool schemas that same request *declared*. In an agentic loop the request
@@ -18,6 +19,7 @@
 //! over `serde_json::Value`, which covers the common hallucination shapes
 //! without pulling a full JSON-Schema engine onto the hot path. Nested-object
 //! schemas are intentionally not recursed — top-level checks are deterministic
+//! and bounded; full conformance is the post-call SLM judge's job.
 //!
 //! Decision: observe-first `Warn { aft_id: "AFT-TOOL-SCHEMA-001" }`. The
 //! gateway is a proxy — a schema violation is a strong signal but blocking a

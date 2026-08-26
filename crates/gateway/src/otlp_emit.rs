@@ -105,6 +105,7 @@ pub async fn emit_span(span: TracelaneSpan) -> anyhow::Result<()> {
                     attrs.gen_ai_usage_cache_creation_input_tokens.unwrap_or(0),
                 "gen_ai.usage.reasoning.output_tokens" =
                     attrs.gen_ai_usage_reasoning_output_tokens.unwrap_or(0),
+                // Upstream-reported cost; 0.0 = not reported on the wire.
                 "gen_ai.usage.cost" = attrs.gen_ai_usage_cost.unwrap_or(0.0),
                 "gen_ai.request.stream" = attrs.gen_ai_request_stream.unwrap_or(false),
                 "gen_ai.response.time_to_first_chunk" =
@@ -205,6 +206,7 @@ pub fn emit_evaluation_result(
 
 /// Cumulative count of spans dropped because NATS span-publish is disabled (no
 /// connected client). Monotonic for the process lifetime; surfaced in the
+/// rate-limited warning below and asserted by the regression test.
 static SPANS_DROPPED_NO_NATS: AtomicU64 = AtomicU64::new(0);
 
 /// Sentinel for [`LAST_SPAN_DROP_WARN_UNIX`] meaning "no span-drop warning has
@@ -227,6 +229,7 @@ const SPAN_DROP_WARN_INTERVAL_SECS: u64 = 30;
 ///
 /// Ingest workers consume `tracelane.spans.>`, so every span subject MUST stay
 /// under that prefix. Extracted as a pure fn so the wire contract is unit-testable
+/// without a live NATS (regression).
 ///
 /// # Example
 /// ```ignore
@@ -240,6 +243,7 @@ pub fn span_subject(span: &TracelaneSpan) -> String {
 /// Records that a span was dropped because span-publish is disabled (no NATS
 /// client), emitting a **rate-limited** `warn!`.
 ///
+/// On an observability product, silently dropping 100% of spans is the
 /// worst-case failure. When `AppState::nats` is `None` the per-request publish is
 /// skipped — this makes that skip *loud*: the first drop warns immediately, then
 /// at most once per [`SPAN_DROP_WARN_INTERVAL_SECS`], so a misconfigured prod
@@ -250,6 +254,7 @@ pub fn span_subject(span: &TracelaneSpan) -> String {
 pub fn note_span_dropped_no_nats() -> u64 {
     let dropped = SPANS_DROPPED_NO_NATS.fetch_add(1, Ordering::Relaxed) + 1;
 
+    // C1: also record in the shared degradation registry, which is what
     // `/v1/gateway/stats` reads and what carries the "how long has this been open?"
     // duration. This counter stays because its own regression test asserts it, but the
     // registry is the one an operator can actually see. `note` does its own
@@ -283,6 +288,7 @@ pub fn note_span_dropped_no_nats() -> u64 {
 /// Records that a span publish FAILED after NATS was connected — distinct from
 /// [`note_span_dropped_no_nats`], which is the "no client at all" case.
 ///
+/// This case was `warn!`-only at six call sites and counted nowhere, so a
 /// gateway that connects to NATS and then fails every write looked identical to a
 /// healthy one in every signal we had.
 ///
@@ -379,6 +385,7 @@ mod span_publish_tests {
     #[test]
     fn span_wire_payload_round_trips() {
         // The exact bytes publish_span puts on the wire must deserialize back to
+        // an equivalent span (ingest does this). wire-contract guard.
         let span = test_span(INCIDENT_TENANT);
         let bytes = serde_json::to_vec(&span).unwrap();
         let back: TracelaneSpan = serde_json::from_slice(&bytes).unwrap();
@@ -392,6 +399,7 @@ mod span_publish_tests {
 
     #[test]
     fn dropped_span_is_counted_not_silent() {
+        // Regression: when NATS is absent the per-request path calls
         // note_span_dropped_no_nats() instead of silently skipping. The counter
         // MUST advance so "publish disabled" can never again be a silent 100%
         // span loss — the rate-limited warn rides on this accounting.
@@ -403,6 +411,7 @@ mod span_publish_tests {
         );
     }
 
+    /// C1: the drop must also reach the shared degradation registry — the one an
     /// operator can actually see, and the only one carrying "how long has this been
     /// open?". The local counter above is process-private and read by nothing but this
     /// test, which is precisely the orphan-registry shape the shared module exists to
@@ -438,6 +447,7 @@ mod span_publish_tests {
         );
     }
 
+    /// C1: a publish FAILURE is a different degradation from having no client at
     /// all, and used to be counted nowhere at any of its six call sites.
     #[test]
     fn publish_failure_is_counted_separately_from_no_client() {

@@ -48,6 +48,7 @@
 //! record). Entries expire after 24h of inactivity, and both maps are bounded so
 //! a hostile client cannot grow them without limit.
 //!
+//! This is AFT-MCP-RUGPULL-001 per
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

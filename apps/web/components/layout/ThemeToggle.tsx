@@ -73,26 +73,38 @@ export function ThemeToggle({ compact = false }: { compact?: boolean } = {}) {
 
 	const nextLabel = theme === "dark" ? "light" : "dark";
 
-	// Compact icon-only affordance for the top-nav header (app design system).
+	// Compact icon-only affordance for the top bar — a monochrome glyph on a
+	// `--surface-2` container chip, which is the shape the P0 brief specifies for
+	// every icon in the app. `--surface-3` is the hover step, matching the
+	// well -> press-step pair the nav rail uses, so the whole chrome answers a
+	// pointer the same way. `rounded-full` is deliberate here and shared with the
+	// workspace pill beside it: these are chips, not controls with a field.
 	if (compact) {
 		return (
 			<button
 				type="button"
 				onClick={toggle}
 				aria-label={`Switch to ${nextLabel} theme`}
-				className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3 hover:text-ink"
+				className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3 hover:text-ink"
 			>
 				{theme === "dark" ? <SunIcon /> : <MoonIcon />}
 			</button>
 		);
 	}
 
+	// The full-width row variant. NOTE: it has no call site in `apps/web` today —
+	// `TopBar` is the only consumer and it always passes `compact`. Left in place
+	// (deleting an exported variant is not this pass's business) but brought onto
+	// the same tokens: the hover was `--surface-2` at 50% opacity, an opacity-faded
+	// token that resolves to a value the palette does not contain, and the radius
+	// was a third value. Now: the control radius, and the same well hover step the
+	// chip and the rail use.
 	return (
 		<button
 			type="button"
 			onClick={toggle}
 			aria-label={`Switch to ${nextLabel} theme`}
-			className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-ink-2 transition-colors hover:bg-surface-2/50 hover:text-ink"
+			className="flex w-full items-center gap-3 rounded-[var(--radius-control)] px-3 py-2 text-sm text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink"
 		>
 			{theme === "dark" ? <SunIcon /> : <MoonIcon />}
 			<span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>

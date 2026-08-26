@@ -1,3 +1,4 @@
+-- 0021: emit `entitlements_changed` NOTIFY on every entitlement write so
 -- the gateway's in-process entitlement cache (`crates/gateway/src/
 -- entitlement_cache.rs`) evicts IMMEDIATELY instead of waiting out the 15-min TTL.
 --
@@ -9,6 +10,7 @@
 -- connected but nothing ever fired the NOTIFY: a plan upgrade (webhook → tenants.
 -- plan + workspace_entitlements) took up to 15 min to unlock gated features at
 -- the gateway (prompt promotion, quotas, guardrails). Green-while-broken +
+-- dev-only-migration drift (class). Found 2026-07-28 verifying the
 -- free→team flip actually unlocks prompt promotion.
 --
 -- Payload:

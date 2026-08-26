@@ -69,10 +69,18 @@ function scan(repoRoot) {
 	}
 	/** @type {Record<string, {id: string, path: string}[]>} */
 	const suites = {};
+	// A suite named here but ABSENT on disk is not an error: the public export
+	// deliberately withholds `evals/pain-points`, and hard-failing on it made
+	// `pnpm --filter @tracelanedev/mcp build` exit 1 in the published tree. Worse,
+	// release.yml runs that same filtered build for audit-verifier + sdk + cli +
+	// mcp, so the first tag cut from the mirror would have published NOTHING.
+	// `evals/` itself missing IS still fatal (above) — that is corpus-blindness,
+	// which is what this script exists to catch. A withheld suite is a policy
+	// decision, and the manifest must simply describe what is present.
 	for (const [dir, key] of SUITES) {
 		const abs = join(evalsDir, dir);
 		if (!existsSync(abs)) {
-			throw new Error(`expected eval suite directory is missing: ${abs}`);
+			continue;
 		}
 		suites[key] = readdirSync(abs)
 			.filter((f) => f.endsWith(EVAL_SUFFIX))

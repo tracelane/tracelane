@@ -9,6 +9,8 @@
  *      column overrides the plan default. A FALSE here overrides a TRUE
  *      in plan_entitlements (deny-overrides-grant).
  *
+ * Audit access (, founder-ratified 2026-07-03): `audit_ledger` resolves
+ * from `f_audit_addon` — the SAME source the gateway export gate
  * checks. The legacy `tenants.auditEnabled` read arm is GONE; existing legacy
  * grants were migrated to `workspace_entitlements.f_audit_addon = TRUE` by
  * drizzle migration 0005. One source of truth: a tenant either has the
@@ -299,10 +301,12 @@ function rowToOverrides(
 		f_cohort_baselines: row.fCohortBaselines,
 		f_hipaa_gcp_addon: row.fHipaaGcpAddon,
 		f_full_capture: row.fFullCapture,
+		// Audit access resolves from f_audit_addon — the same column
 		// the gateway export gate checks (one source of truth).
 		audit_ledger: row.fAuditAddon,
 		// ADR-066: free self-verify grant (default TRUE; workspace FALSE overrides).
 		audit_self_verify: row.fAuditSelfverify,
+		// Prompt-promotion write workflow (ADR-009 Team+).
 		prompt_promotion_write: row.fPromptPromotionWrite,
 		// ADR-059: alerting feature flag. DARK by default; workspace override
 		// or a future plan-entitlements seed row turns it on.

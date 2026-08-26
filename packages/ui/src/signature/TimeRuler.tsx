@@ -19,11 +19,29 @@ import { fmtDurMs } from "../lib/fmt-dur";
  *    instrument is made to look cheap.
  *  · monospace, tabular timestamps — so digits sit in the same column as the eye tracks
  *    across, and a label never jitters as the value changes
- *  · `ink-3` for the rule, `ink-2` for labels — the axis must recede behind the data.
- *    An axis that competes with its own series is the tell of a chart nobody had to read.
+ *  · the axis must recede behind the data. An axis that competes with its own series is
+ *    the tell of a chart nobody had to read.
  *
  * Colour: none. The ruler is chrome (§1) — a coloured axis would spend the one signal
  * this design system reserves for meaning.
+ *
+ * WEIGHTS (P0.11, 2026-08-22), and one of them is a deliberate deviation:
+ *  · the RULE and the MINOR ticks are `--chart-grid`, the token tokens.css defines for
+ *    "axis + gridlines — barely there on purpose". They were `--line-2`, the EMPHASIS
+ *    hairline reserved for hover borders and dividers that must read, which is two steps
+ *    louder than an axis has any business being.
+ *  · LABELS are `--ink-3`, matching every other axis label in the charts package
+ *    (BarChart, Lollipop, LatencyTimeline all use it). They were `--ink-2`, so the
+ *    shared axis was the one axis in the app whose labels sat a step above the rest.
+ *    Measured: #828280 on the white card is 3.85:1 and #71717a on the dark card is
+ *    3.74:1 — above the 3:1 floor this token is tuned to, BELOW the 4.5:1 small-text
+ *    floor. That is stated here rather than hidden; reverting is one word.
+ *  · MAJOR ticks stay at `--line-2` and DO NOT move to chart-grid. A major tick is an
+ *    isolated 1×6px mark, not a continuous rule: #eeeeec against a #ffffff card measures
+ *    1.16:1 against #d8d8d5's 1.43:1, and at that size the difference is present-vs-gone.
+ *    Losing it would take the anchor for its own label with it. The
+ *    major/minor hierarchy is length + label + one value step, and the value step is
+ *    the part that survives on a low-quality display.
  *
  * ── FOUR DEFECTS FIXED 2026-08-16, BEFORE THIS WAS PLACED ON ANY SCREEN ───────────
  * This component shipped built, unit-tested and exported, and did not work. It reached
@@ -267,15 +285,15 @@ export function TimeRuler({
 			role="presentation"
 			data-time-ruler
 		>
-			{/* The rule itself — one hairline, full width. */}
-			<div className="absolute inset-x-0 top-0 h-px bg-line-2" />
+			{/* The rule itself — one hairline, full width, at the chart-grid weight. */}
+			<div className="absolute inset-x-0 top-0 h-px bg-chart-grid" />
 
 			{/* MINOR ticks — drawn, never labelled (§7). Siblings of the majors, so they
 			    share the ruler's coordinate system rather than a 1px wrapper's. */}
 			{minorPos.map((p) => (
 				<div
 					key={`m${p}`}
-					className="absolute top-0 h-1 w-px bg-line-2"
+					className="absolute top-0 h-1 w-px bg-chart-grid"
 					style={{ left: `${p}%` }}
 					aria-hidden="true"
 				/>
@@ -296,10 +314,13 @@ export function TimeRuler({
 						className="absolute top-0"
 						style={{ left: `${m.pos}%` }}
 					>
-						<div className="h-1.5 w-px bg-ink-3" />
+						{/* One value step above the minors — see the WEIGHTS note in the header
+					    for why this is NOT chart-grid. */}
+						<div className="h-1.5 w-px bg-line-2" />
 						<span
 							className={cn(
-								"absolute top-2 whitespace-nowrap font-mono text-[9.5px] text-ink-2",
+								/* design-constraint-ok: label positioned by the same pixel scale as the marks it labels — the ramp floor would overlap the neighbouring tick */
+								"absolute top-2 whitespace-nowrap font-mono text-[9.5px] text-ink-3",
 								anchor,
 							)}
 							style={{ fontVariantNumeric: "tabular-nums" }}
@@ -352,7 +373,7 @@ export function LedgerSeqChip({
 	return (
 		<span
 			className={cn(
-				"inline-flex items-center gap-1 font-mono text-[10px] text-ink-3 leading-none",
+				"inline-flex items-center gap-1 font-mono text-2xs text-ink-3 leading-none",
 				className,
 			)}
 			style={{ fontVariantNumeric: "tabular-nums" }}

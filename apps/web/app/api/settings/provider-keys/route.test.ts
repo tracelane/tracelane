@@ -195,7 +195,7 @@ describe("GET /api/settings/provider-keys", () => {
 		};
 		expect(body.error).toBe("role_forbidden");
 		expect(body.required_role).toBe("owner");
-		// Body is ours, never the upstream's (security.md R2 C-3).
+		// Body is ours, never the upstream's (security.md).
 		expect(JSON.stringify(body)).not.toContain("UPSTREAM_BODY");
 	});
 });

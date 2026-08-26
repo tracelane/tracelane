@@ -4,6 +4,8 @@
 -- founder granted standing authority for reversible, non-monetary changes).
 --
 -- ONE migration, ONE review, ONE apply (founder, 2026-08-08). It bundles A13's
+-- schema half with the three incompletely-applied migrations audit found,
+-- because hand-applying them separately is exactly what produced.
 --
 -- ORDERING RULE (CLAUDE.md §4.0, S2): this lands in Neon **BEFORE** the gateway
 -- that reads the new columns deploys. A13's code half (`key_routes.rs` scope
@@ -90,6 +92,7 @@ COMMENT ON COLUMN api_keys.budget_usd_monthly IS
     'Per-key monthly spend cap in USD. NULL = uncapped.';
 
 ------------------------------------------------------------------------------
+-- 2. — migration 14 residue, WITH THE DEFECT FIXED (see the header).
 --
 -- Columns `sampling_policy` and `force_tail` already landed in Frankfurt; the
 -- CHECK, the function and the trigger did not.
@@ -125,6 +128,7 @@ CREATE TRIGGER trg_tenants_config_notify
     FOR EACH ROW EXECUTE FUNCTION notify_tenant_config_changed();
 
 ------------------------------------------------------------------------------
+-- 3. — migration 05 residue. The column landed; its index did not.
 -- Reverse-map index for the Polar webhook's `get_by_polar_customer` lookup,
 -- which currently sequential-scans.
 ------------------------------------------------------------------------------
@@ -133,6 +137,7 @@ CREATE INDEX IF NOT EXISTS tenants_polar_customer_id_idx
     WHERE polar_customer_id IS NOT NULL AND archived_at IS NULL;
 
 ------------------------------------------------------------------------------
+-- 4. — migration 10 residue. RULED 2026-08-12: NOT RESTORED.
 --
 -- The draft asked for a decision and recommended deleting this section. Taking
 -- the recommendation. `workspace_attr_cardinality` never landed in Frankfurt and
@@ -175,6 +180,7 @@ COMMIT;
 --        THEN 'ok' ELSE 'MISSING' END;
 --
 -- Then prove the trigger actually FIRES rather than merely existing — the
+-- distinction turned on:
 --   UPDATE tenants SET sampling_policy = sampling_policy WHERE id = '<any-id>';
 -- with `RUST_LOG=info,ingest::tenant_config=debug` on ingest, expect
 --   "tenant-config cache entry invalidated via NOTIFY".

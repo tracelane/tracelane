@@ -29,9 +29,9 @@ All commands respect these env vars:
 ### `tlane init`
 
 Writes a `tracelane.config.json` (endpoint, `serviceName`, `sampleRate`) to the
-working directory, then prints the SDK install + wire-up steps. It writes that
-one file and nothing else — it does not install a package, create `.env`, or
-edit your source. Without `--force` it refuses to overwrite an existing config.
+working directory, then prints the SDK install + wire-up steps. By default it also writes `.env`, an
+instrumentation bootstrap, and installs the SDK; use `--no-env`,
+`--no-instrument` and `--no-install` to opt out. Without `--force` it refuses to overwrite an existing config.
 
 `--endpoint` is the OTLP endpoint spans are exported to. On Tracelane Cloud that
 is `https://gateway.tracelane.dev`, with a `tlane_…` key carrying the `ingest`
@@ -80,13 +80,13 @@ for humans.
 ```bash
 tlane eval run                                  # all suites
 tlane eval run --suite gc                       # gateway-correctness only
-tlane eval run --suite pp                       # pain-points only
+tlane eval run --suite gc                       # gateway-correctness only
 tlane eval run --suite ft --dry-run             # print the command, don't run it
 tlane eval list
 ```
 
 Suite ids: `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pp` (pain-points), `pir` (pii-redaction),
+`is` (ingest-schema), `pir` (pii-redaction),
 `pi` (prompt-injection). An unrecognised id exits 2 rather than falling through
 to a full run — a wrong suite name in a deploy gate must fail loudly. The merge
 gate is `--suite all`.
@@ -97,7 +97,7 @@ the npm package.
 
 ### `tlane prompt list | show | promote | rollback | diff`
 
-Front-end for the [B1 Prompt Promotion](../../decisions/ADR-009-b1-prompt-promotion.md)
+Front-end for the B1 Prompt Promotion decision (ADR-009)
 endpoints. Tenants pin a prompt version per environment, promote with a
 contract test, and roll back instantly.
 
@@ -193,7 +193,7 @@ tlane migrate helicone --endpoint https://gateway.acme.internal --apply
 The flags are `--apply`, `--dir <path>` (default: cwd) and `--endpoint <url>`
 (default `https://gateway.tracelane.dev`, used in the printed next-steps).
 
-Mapping is documented in [migrations/from-helicone.md](./migrations/from-helicone.md).
+Mapping is documented by `tlane import-helicone --help`.
 
 ### `tlane import-litellm --config <path>`
 
@@ -248,5 +248,5 @@ CI should gate on non-zero.
 - [Quickstart](./quickstart.md) — your first trace in 60 seconds
 - [API reference](./api-reference.md) — what the CLI calls
 - [Onboarding](./onboarding.md) — operator self-host checklist
-- [`decisions/ADR-009-b1-prompt-promotion.md`](../../decisions/ADR-009-b1-prompt-promotion.md)
-- [`decisions/ADR-011-path-to-live.md`](../../decisions/ADR-011-path-to-live.md)
+- ADR-009 — B1 Prompt Promotion (see the ADR index in the docs site)
+- ADR-011 — Path-to-live sequencing (see the ADR index in the docs site)

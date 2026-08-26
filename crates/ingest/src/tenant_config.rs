@@ -265,6 +265,7 @@ pub fn pg_tenant_config_resolver(pool: DbPool, fault_quota: u64) -> ResolveFn {
             match resolve_one(&pool, tenant).await {
                 Ok(cfg) => cfg,
                 Err(e) => {
+                    // C1. This is the site: it faulted continuously for
                     // THREE WEEKS after a migration, promoting every tenant to Full
                     // capture and leaving force_tail inert, and the per-resolve `warn!`
                     // below was the only trace of it — a line nobody greps, in a log
@@ -332,10 +333,12 @@ async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig
 /// gap. **LISTEN is disabled only when BOTH vars are unset** (the fallback is an
 /// `or_else`) — correctness never depends on NOTIFY delivery.
 ///
+/// `POSTGRES_DIRECT_URL` unset + `POSTGRES_URL` on Neon's `-pooler`
 /// connects to PgBouncer, where `LISTEN` succeeds and no notification can ever
 /// arrive. `listen_once` inspects the resolved HOST and reports `DEGRADED`
 /// rather than `active` in that case — see `tracelane_shared::listen_dsn`.
 pub fn spawn_listen_task(cache: Arc<TenantConfigCache>) {
+    //  re-ruling 2026-08-12 — OFF by default, same measurement and same
     // switch as the gateway (`entitlement_cache::control_plane_listen_enabled`).
     // Ingest's listener died in the SAME MILLISECOND as the gateway's on all 110
     // observed cycles, which is what identified the cause as the Neon compute
@@ -369,6 +372,7 @@ pub fn spawn_listen_task(cache: Arc<TenantConfigCache>) {
 }
 
 /// The first TCP host in `cfg` that is a pooler and therefore cannot deliver
+/// `NOTIFY`, or `None` when every host can.
 ///
 /// Reads the host from the PARSED config, never a substring of the DSN — a
 /// password may contain `-pooler`. The predicate lives in
@@ -437,6 +441,7 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
     client
         .batch_execute("LISTEN entitlements_changed; LISTEN tenant_config_changed")
         .await?;
+    // `LISTEN` SUCCEEDS on a transaction pooler, so a clean
     // `batch_execute` proves nothing about NOTIFY delivery. Ask the resolved
     // host instead of reporting "active" unconditionally.
     match pooled_listen_host(&pg_cfg) {
@@ -473,6 +478,7 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
 
+    /// The DEGRADED branch must FIRE on the config the ordinary Neon
     /// deployment produces, and must NOT fire on a direct endpoint whose
     /// PASSWORD merely contains `-pooler` (the case that makes a DSN substring
     /// check wrong). Driven from DSN strings so the whole parse->host->predicate
@@ -544,6 +550,7 @@ mod tests {
         }
     }
 
+    /// C1 — the site itself.
     ///
     /// The production resolver returns `TenantConfig`, never `Result`, so a control-plane
     /// fault is structurally invisible to every caller: the hot path receives a perfectly
@@ -753,8 +760,10 @@ mod tests {
         );
     }
 
+    ///  regression: RESOLVE_SQL must join/filter on the tenants PK `id`,
     /// never the old `tenant_id` column (prod `tenants` has no `tenant_id`). A
     /// revert would make the ingest resolver 500 against prod (same class as
+    /// . Also CI-guarded repo-wide by `scripts/ci/check-tenants-pk-column.sh`.
     #[test]
     fn resolve_sql_uses_tenants_id_pk_not_tenant_id() {
         assert!(

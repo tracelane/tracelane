@@ -38,9 +38,12 @@ mod byok;
 mod byok_api;
 mod circuit_breaker;
 mod clickhouse_query;
+mod dataset_routes;
 mod db;
 mod entitlement_cache;
+mod experiment_routes;
 mod guardrail;
+mod hotpath;
 mod key_routes;
 mod kill_switch;
 mod notification_routes;
@@ -57,6 +60,7 @@ mod retention_sweep;
 // call sites stable.
 use tracelane_shared::redact;
 mod server;
+mod spend;
 mod ssrf_guard;
 mod tool_analytics;
 mod trace_ingest;
@@ -70,9 +74,11 @@ mod untrusted_data;
 // prompt_router carry the EWMA + routing-pointer logic; prompt_routes
 // plugs the HTTP endpoints into the server router.
 mod auto_rollback;
+mod prompt_eval;
 mod prompt_history;
 mod prompt_router;
 mod prompt_routes;
+mod semantic_cache;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

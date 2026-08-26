@@ -1,4 +1,5 @@
 -- Migration 03: B1 Prompt Promotion + Eval Gates + Auto-Rollback
+-- Per ADR-009 and §7.4.2.
 --
 -- Five tables. tenant_id is String (UUID representation) to match the
 -- audit_log convention; the Enum8 columns from earlier drafts were
@@ -7,6 +8,7 @@
 -- wire-format handling.
 --
 -- All ORDER BY (tenant_id, …), all PARTITION BY toYYYYMM(...) — under
+-- 50 tenants this collapses to month-only partitions per existing
 -- multi-tenancy pattern.
 
 -- prompts: the named prompt entity

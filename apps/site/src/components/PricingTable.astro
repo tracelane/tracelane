@@ -36,11 +36,15 @@ const { as: Heading = "h2" } = Astro.props;
 
     <div class="mt-14 grid gap-5 sm:grid-cols-2 md:grid-cols-3 reveal-group cards-hover">
       <article class="glass p-6">
-        <h3 class="font-medium text-fg">OSS self-host</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$0</p>
-        <p class="mt-1 text-sm text-fg-subtle">Apache 2.0 · forever</p>
+        <div class="mesh-tile tile-graphite">
+          <h3 class="t-name">OSS self-host</h3>
+          <div>
+            <p class="t-price">$0</p>
+            <p class="t-meta">Apache 2.0 · forever</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>Full Rust gateway · 30+ providers — 7 native adapters plus any OpenAI-compatible endpoint</li>
+          <li>Full Rust gateway · 150+ providers — 6 native adapters plus any OpenAI-compatible endpoint</li>
           <li>ClickHouse + R2 storage</li>
           <li>Tamper-evident audit ledger</li>
           <li>Community Discord support</li>
@@ -48,9 +52,13 @@ const { as: Heading = "h2" } = Astro.props;
       </article>
 
       <article class="glass p-6">
-        <h3 class="font-medium text-fg">Free hosted</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$0</p>
-        <p class="mt-1 text-sm text-fg-subtle">10K traces / mo</p>
+        <div class="mesh-tile tile-teal">
+          <h3 class="t-name">Free hosted</h3>
+          <div>
+            <p class="t-price">$0</p>
+            <p class="t-meta">10K traces / mo</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>Single workspace, 1 seat</li>
           <li>7 days of queryable history · 60 RPM</li>
@@ -60,9 +68,13 @@ const { as: Heading = "h2" } = Astro.props;
       </article>
 
       <article class="glass p-6">
-        <h3 class="font-medium text-fg">Builder</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$59<span class="text-base text-fg-muted">/mo</span></p>
-        <p class="mt-1 text-sm text-fg-subtle">150K traces / mo · 1 seat</p>
+        <div class="mesh-tile tile-bronze">
+          <h3 class="t-name">Builder</h3>
+          <div>
+            <p class="t-price">$59<span class="t-per">/mo</span></p>
+            <p class="t-meta">150K traces / mo · 1 seat</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>30 days of queryable history · 600 RPM</li>
           <li>Guardrail verdict history (read-only)</li>
@@ -73,9 +85,13 @@ const { as: Heading = "h2" } = Astro.props;
 
       <article class="rec-card glass p-6 relative">
         <p class="absolute -top-3 left-6 px-2 text-xs font-mono text-pop lowercase" style="background:var(--color-bg-elevated)">recommended</p>
-        <h3 class="font-medium text-fg">Team</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$249<span class="text-base text-fg-muted">/mo</span></p>
-        <p class="mt-1 text-sm text-fg-subtle">1M traces / mo · 10 seats</p>
+        <div class="mesh-tile tile-forest">
+          <h3 class="t-name">Team</h3>
+          <div>
+            <p class="t-price">$249<span class="t-per">/mo</span></p>
+            <p class="t-meta">1M traces / mo · 10 seats</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>90 days of queryable history</li>
           <li>Pre-flight guardrail rails + tamper-evident promotion record</li>
@@ -85,9 +101,13 @@ const { as: Heading = "h2" } = Astro.props;
       </article>
 
       <article class="glass p-6">
-        <h3 class="font-medium text-fg">Business</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$899<span class="text-base text-fg-muted">/mo</span></p>
-        <p class="mt-1 text-sm text-fg-subtle">5M traces / mo · 25 seats</p>
+        <div class="mesh-tile tile-wine">
+          <h3 class="t-name">Business</h3>
+          <div>
+            <p class="t-price">$899<span class="t-per">/mo</span></p>
+            <p class="t-meta">5M traces / mo · 25 seats</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>180 days of queryable history</li>
           <li>Inline heuristic guardrails (ML ensemble on the roadmap) · 99.9% SLA</li>
@@ -97,9 +117,13 @@ const { as: Heading = "h2" } = Astro.props;
       </article>
 
       <article class="glass p-6">
-        <h3 class="font-medium text-fg">Enterprise</h3>
-        <p class="mt-2 font-mono text-3xl text-fg">$2,999+<span class="text-base text-fg-muted">/mo</span></p>
-        <p class="mt-1 text-sm text-fg-subtle">25M+ traces · custom</p>
+        <div class="mesh-tile tile-indigo">
+          <h3 class="t-name">Enterprise</h3>
+          <div>
+            <p class="t-price">$2,999+<span class="t-per">/mo</span></p>
+            <p class="t-meta">25M+ traces · custom</p>
+          </div>
+        </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>365 days of queryable history · custom seats</li>
           <li>Region pinning (EU; US / IN on the roadmap)</li>

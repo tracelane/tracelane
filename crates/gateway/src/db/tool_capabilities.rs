@@ -1,7 +1,9 @@
+//! `tool_capabilities` writes — the pin side of R3 rug-pull detection.
 //!
 //! The READ side already existed and is wired: `guardrail::registry_loader`'s
 //! `pg_registry_resolver` loads `(tool_name, caps, def_hash)` per tenant and
 //! calls `CapabilityRegistry::register_pinned`, and `R3Pinning` compares each
+//! request's `def_hash` against the pin. What was missing — the whole of
 //! is a way for a tenant to CREATE a pin. Without one the rail is correct and
 //! inert: nothing is pinned, so nothing can drift.
 //!
@@ -57,6 +59,7 @@ pub async fn upsert(
 
 /// Pin a definition **without touching `caps`** — the API-key path.
 ///
+///  follow-up: `caps` is what R4 lethal-trifecta reasons about, so ANY
 /// change to it is security-relevant *in both directions*. Raising bits can make
 /// an exfiltration path look sanctioned; **lowering them to 0 silently disables
 /// the taint detection that was protecting the tool.** A caller who is not a

@@ -1,3 +1,4 @@
+//! Entitlement-driven per-plan retention sweep.
 //!
 //! ClickHouse `tracelane.spans` / `tracelane.trace_summaries` carry a flat **365d
 //! TTL backstop** (the MAX plan retention). This background job trims each tenant

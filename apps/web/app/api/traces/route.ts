@@ -1,6 +1,7 @@
 /**
  * GET /api/traces — list recent traces for the authenticated tenant.
  *
+ * Thin server-side proxy to the gateway `GET /v1/traces` (Option 1).
  * The gateway owns the ClickHouse read and resolves the tenant from the
  * forwarded Bearer token's claims — the dashboard never touches ClickHouse and
  * never binds a tenant id into a query.

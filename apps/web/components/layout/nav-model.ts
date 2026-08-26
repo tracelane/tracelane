@@ -1,6 +1,7 @@
 /**
  * nav-model — what the shipped navigation ACTUALLY renders, as pure data.
  *
+ * WHY THIS FILE EXISTS. The nav used to compute its own item list inline
  * while `e2e/fixtures/selectors.ts` carried a HAND-COPIED list of what it believed
  * the nav rendered. The two drifted the moment the left sidebar was replaced by a
  * horizontal bar: the spec went on asserting six per-item Settings links and a label

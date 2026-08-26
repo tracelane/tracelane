@@ -10,14 +10,14 @@
  */
 "use client";
 
-import { cn } from "@tracelanedev/ui";
+import { SegmentedControl } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
 const STATUS = [
-	{ v: "", l: "All" },
-	{ v: "error", l: "Errored" },
-	{ v: "ok", l: "Clean" },
+	{ value: "", label: "All" },
+	{ value: "error", label: "Errored" },
+	{ value: "ok", label: "Clean" },
 ] as const;
 
 export function SessionFilters() {
@@ -57,29 +57,25 @@ export function SessionFilters() {
 
 	return (
 		<div className="inline-flex flex-wrap items-center gap-2">
-			<div className="inline-flex rounded-lg border border-line bg-surface p-0.5">
-				{STATUS.map((o) => (
-					<button
-						key={o.v || "all"}
-						type="button"
-						onClick={() => setParam("status", o.v)}
-						className={cn(
-							"rounded-md px-2.5 py-1 text-[12.5px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal",
-							status === o.v
-								? "bg-action-soft text-ink"
-								: "text-ink-2 hover:text-ink",
-						)}
-					>
-						{o.l}
-					</button>
-				))}
-			</div>
+			{/* The shared <SegmentedControl> — literally the same control as the traces
+			    FilterBar's status segment, which is the point: this file used to
+			    hand-roll its own copy and the two surfaces had drifted apart once
+			    already. */}
+			<SegmentedControl
+				label="Session status"
+				value={status}
+				options={STATUS}
+				onChange={(v) => setParam("status", v)}
+			/>
 			<input
 				value={model}
 				onChange={(e) => setModel(e.target.value)}
 				placeholder="model (exact)…"
 				aria-label="Filter sessions by model"
-				className="h-8 w-44 rounded-sm border border-line bg-surface px-2.5 text-[13px] text-ink outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+				// `rounded-lg` (`--radius-control`, 8px) — the same as the traces FilterBar's
+				// model input, which is literally the same control on the sibling surface.
+				// It was `rounded-sm` (4px), half the control radius.
+				className="h-8 w-44 rounded-lg border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			/>
 		</div>
 	);

@@ -1,4 +1,5 @@
 /**
+ * OTel MCP semantic conventions (v1.39, ADR-032 /).
  *
  * The MCP semconv (open-telemetry/semantic-conventions PRs #2043, #2083) landed
  * in semconv v1.39 — absent from the v1.34 baseline. These are the canonical

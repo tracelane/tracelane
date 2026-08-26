@@ -139,7 +139,19 @@ async fn create_tenant_and_lookup_by_api_key() -> Result<()> {
     let resolved = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
     // A13: the lookup now also returns the resolved capability, read in the same
     // round-trip that authenticates the key.
-    let (resolved, _key_id, key_scope) = resolved.expect("api key should resolve");
+    // GWY-43: the lookup returns a `KeyAuth` struct rather than a tuple — it now
+    // also carries the key's budget and rate-limit ceilings, read in the same
+    // round trip.
+    let auth = resolved.expect("api key should resolve");
+    let (resolved, key_scope) = (auth.tenant_id, auth.scope);
+    assert_eq!(
+        auth.budget_usd_monthly, None,
+        "a key minted with no budget must resolve as uncapped, not as zero"
+    );
+    assert_eq!(
+        auth.rate_limit_rpm, None,
+        "a key minted with no rpm override must inherit the tenant tier"
+    );
     assert_eq!(resolved.as_uuid().to_string(), tenant_id.to_string());
     // A key minted without an explicit scope is `scope IS NULL` — the legacy,
     // full-surface case. This is the compatibility guarantee: if it ever
@@ -161,6 +173,7 @@ async fn create_tenant_and_lookup_by_api_key() -> Result<()> {
     // this test failed the first time it was ever executed (2026-08-14).
     //
     // `revoke()` writes `revoked_at` and does NOT touch the positives-only auth
+    // cache. made that explicit after `pg_notify`-based invalidation was
     // measured unreliable against an autosuspending Neon compute (110
     // drop/reconnect cycles in 21 h): **the cache TTL IS the revocation bound,
     // and it is 60 s** (`DEFAULT_AUTH_CACHE_TTL_SECS`). Confirmed against
@@ -225,6 +238,7 @@ async fn polar_id_round_trip_finds_tenant() -> Result<()> {
 
 /// Smoke test runs without Postgres — proves the authoritative Drizzle
 /// migration SQL embeds correctly + the peppered_lookup derivation honours its
+/// 32-byte contract. (: the old `infra/dev/postgres/migrations/` set was
 /// retired; Drizzle `apps/web/db/migrations/` is the single source of truth.)
 #[test]
 fn migration_sql_embeds_and_hash_is_stable() {
@@ -237,6 +251,7 @@ fn migration_sql_embeds_and_hash_is_stable() {
     assert!(m06.contains("CREATE TABLE \"users\""));
     assert!(m06.contains("f_guardrail_r2"));
 
+    // peppered_lookup is the deterministic 32-byte lookup derivation.
     let _ = db::api_keys::init_pepper(&"22".repeat(32));
     let h1 = db::api_keys::peppered_lookup("abc123").unwrap();
     let h2 = db::api_keys::peppered_lookup("abc123").unwrap();

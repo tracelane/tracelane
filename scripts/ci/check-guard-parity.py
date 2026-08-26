@@ -110,6 +110,7 @@ def selftest() -> int:
     case("in-sync guards PASS", both, both, True)
 
     # HALF TWO: it must FAIL for each phrase missing from either side. This is
+    # the exact shape: patched one file, not the other.
     for phrase in MUST_BE_BANNED_IN_BOTH:
         thinned = " ".join(p for p in MUST_BE_BANNED_IN_BOTH if p != phrase)
         case(f"missing {phrase!r} from EXPORT guard blocks", both, thinned, False)

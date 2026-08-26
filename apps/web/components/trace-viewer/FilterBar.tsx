@@ -1,7 +1,7 @@
 "use client";
 
 import { nextFilterParams } from "@/app/traces/filter-params";
-import { Button, cn } from "@tracelanedev/ui";
+import { Button, SegmentedControl, cn } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
@@ -10,28 +10,34 @@ import { useCallback, useEffect, useState } from "react";
 // min_latency_ms, signature_id (the §2 read-path dims). provider / cost
 // thresholds are V1.1 (need a write-path MV change — not cleanly read-path).
 const STATUS = [
-	{ v: "", l: "All" },
-	{ v: "ok", l: "OK" },
-	{ v: "error", l: "Error" },
+	{ value: "", label: "All" },
+	{ value: "ok", label: "OK" },
+	{ value: "error", label: "Error" },
 ] as const;
 const RANGE = [
-	{ v: "1h", l: "1h" },
-	{ v: "24h", l: "24h" },
-	{ v: "7d", l: "7d" },
-	{ v: "30d", l: "30d" },
-	{ v: "all", l: "All time" },
+	{ value: "1h", label: "1h" },
+	{ value: "24h", label: "24h" },
+	{ value: "7d", label: "7d" },
+	{ value: "30d", label: "30d" },
+	{ value: "all", label: "All time" },
 ] as const;
 const GROUPS = [
-	{ v: "", l: "None" },
-	{ v: "model", l: "Model" },
-	{ v: "operation", l: "Operation" },
-	{ v: "status", l: "Status" },
+	{ value: "", label: "None" },
+	{ value: "model", label: "Model" },
+	{ value: "operation", label: "Operation" },
+	{ value: "status", label: "Status" },
 ] as const;
 
 /**
- * Removable chip for an active text filter. Chip bg = action-soft (per the
- * design-system "chip bg" token role); text = ink (never action-ink — Lava is
- * CTA-only, not a selected-state color).
+ * Removable chip for an active text filter. Chip fill = `--action-soft`, text =
+ * `--ink`.
+ *
+ * The old note here justified the ink text as "never action-ink — Lava is CTA-only".
+ * There is no Lava: `--lava-*` is deleted and `--action-ink` now IS `--ink`, so the
+ * two are the same value and the warning describes a distinction the palette no
+ * longer draws. What still holds, and is the reason worth keeping, is that a
+ * SELECTED filter is not an action — it is a state — so it gets the quiet well fill
+ * and body ink rather than any emphasis treatment.
  */
 function FilterChip({
 	label,
@@ -41,13 +47,13 @@ function FilterChip({
 	onRemove: () => void;
 }) {
 	return (
-		<span className="inline-flex items-center gap-1 rounded-md border border-action-line bg-action-soft px-2 py-0.5 text-[11px] font-semibold text-ink">
+		<span className="inline-flex items-center gap-1 rounded-md border border-action-line bg-action-soft px-2 py-0.5 text-2xs font-semibold text-ink">
 			{label}
 			<button
 				type="button"
 				aria-label={`Remove ${label} filter`}
 				onClick={onRemove}
-				className="ml-0.5 rounded text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+				className="ml-0.5 rounded text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			>
 				×
 			</button>
@@ -64,9 +70,12 @@ function FilterChip({
  * the same control row (was a separate server-rendered div in page.tsx) and
  * drives the /v1/traces/groups endpoint instead of the list.
  *
- * Active text filters render as removable chips (accent-soft bg + action-line
+ * Active text filters render as removable chips (`--action-soft` fill + `--action-line`
  * border) to match the §4 chip grammar; inputs appear when the filter is clear.
- * Segment controls (status, range, group) show their active option inline.
+ * Status, range and group are three instances of the shared <SegmentedControl>
+ * primitive — they used to be three renders of a local `segment()` helper that
+ * painted the active option as a solid ink pill, which is how one filter row
+ * ended up carrying five of them.
  */
 export function FilterBar() {
 	const router = useRouter();
@@ -119,35 +128,6 @@ export function FilterBar() {
 		return () => clearTimeout(id);
 	}, [signature, setParam, sp]);
 
-	/**
-	 * Segment control — a pill-group where one option is active. Active option
-	 * gets action-soft bg with ink text (NOT action-ink text — Lava is CTA only,
-	 * not a selected-state color).
-	 */
-	const segment = (
-		key: string,
-		current: string,
-		opts: ReadonlyArray<{ v: string; l: string }>,
-	) => (
-		<div className="inline-flex rounded-lg border border-line bg-surface p-0.5">
-			{opts.map((o) => (
-				<button
-					key={o.v || "all"}
-					type="button"
-					onClick={() => setParam(key, o.v)}
-					className={cn(
-						"rounded-md px-2.5 py-1 text-[12.5px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal",
-						current === o.v
-							? "bg-selected text-selected-on"
-							: "text-ink-2 hover:text-ink",
-					)}
-				>
-					{o.l}
-				</button>
-			))}
-		</div>
-	);
-
 	// The default 1h range isn't a "custom" filter — only a non-default range
 	// counts toward showing "Clear all".
 	const active = Boolean(
@@ -160,15 +140,25 @@ export function FilterBar() {
 	);
 
 	const inputCls =
-		"h-8 rounded-lg border border-line bg-surface px-2.5 text-[13px] text-ink outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
+		"h-8 rounded-lg border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
 
 	return (
 		<div className="mb-4 flex flex-wrap items-center gap-2">
 			{/* Status */}
-			{segment("status", status, STATUS)}
+			<SegmentedControl
+				label="Trace status"
+				value={status}
+				options={STATUS}
+				onChange={(v) => setParam("status", v)}
+			/>
 
 			{/* Time range */}
-			{segment("range", range, RANGE)}
+			<SegmentedControl
+				label="Time range"
+				value={range}
+				options={RANGE}
+				onChange={(v) => setParam("range", v)}
+			/>
 
 			{/* Model — chip when active, input when clear */}
 			{model ? (
@@ -245,14 +235,33 @@ export function FilterBar() {
 				</Button>
 			)}
 
-			{/* Visual separator before group control */}
-			<span className="mx-1 h-4 w-px bg-line" aria-hidden="true" />
+			{/*
+			 * The hairline separator that used to sit HERE is deleted. It marked the
+			 * boundary between the filters and the group control while both were on one
+			 * line — but the row wraps, and once the group control moved to line two the
+			 * separator was stranded as a floating tick at the right end of line one,
+			 * dividing nothing from nothing. A separator that survives the wrap of the
+			 * thing it separates is worse than none, and the wrap is now the boundary.
+			 */}
 
-			{/* Group by — folded into the same control row (was a separate div in page.tsx) */}
-			<span className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-				Group
+			{/*
+			 * Group-by. THE LABEL AND ITS CONTROL ARE ONE FLEX ITEM, and that is a
+			 * layout fix, not decoration: as two siblings in the wrapping row they
+			 * were separable, and at 1440px the row broke exactly between them —
+			 * "Group" stranded at the right end of line one, its segments at the left
+			 * end of line two, reading as a heading for the wrong thing. Wrapping the
+			 * pair in its own `inline-flex` makes them wrap TOGETHER or not at all.
+			 * Found by rendering the page; the JSX looked fine.
+			 */}
+			<span className="inline-flex items-center gap-2">
+				<span className="t-metric-label">Group</span>
+				<SegmentedControl
+					label="Group by"
+					value={group}
+					options={GROUPS}
+					onChange={(v) => setParam("group", v)}
+				/>
 			</span>
-			{segment("group", group, GROUPS)}
 		</div>
 	);
 }

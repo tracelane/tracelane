@@ -32,7 +32,6 @@ const SCAN_DIRS = [APP, join(__dirname, "..", "..", "components")];
 /** Routes with no inbound link, each with the reason it is allowed to have none. */
 const DELIBERATE: Record<string, string> = {
 	"/datasets": "V1.1 ComingSoon stub — nav-config.tsx keeps it out until built",
-	"/experiments": "V1.1 ComingSoon stub — same",
 	"/playground": "V1.1 ComingSoon stub — same",
 	"/legal/[doc]": "linked from marketing/external, not from app chrome",
 	"/": "root redirect — the entry point itself, nothing links to it internally",
@@ -94,11 +93,46 @@ function stripComments(src: string): string {
 }
 
 /** Any `"/path"` or `` `/path...` `` literal appearing in CODE. */
+/**
+ * A `${…}` interpolation inside a template literal IS one route segment.
+ *
+ * WITHOUT THIS THE EXTRACTOR CREDITS THE WRONG ROUTE, and that is not theoretical
+ * — it fired the day the first mid-path dynamic route landed.
+ * `router.push(`/experiments/${id}`)` navigates to `/experiments/[experimentId]`,
+ * but PATH_RE stops at the `$` and records `/experiments`. So the LIST page was
+ * reported as linked (it is not — it is deliberately out of the nav) while the
+ * DETAIL page it actually navigates to got no credit at all. One truncation,
+ * wrong in both directions at once.
+ *
+ * Collapsing the interpolation to a placeholder segment — and collapsing a route
+ * pattern's `[param]` to the same placeholder — makes the two comparable, so
+ * `/experiments/_D_/compare` matches `/experiments/[experimentId]/compare`
+ * exactly. It is a TIGHTENING: every edge it adds names a real route pattern, and
+ * every edge it removes was pointing at the wrong one.
+ *
+ * Non-greedy to the FIRST `}` — the real shapes are `${id}` and
+ * `${encodeURIComponent(id)}`, neither with a nested brace. A nested one would
+ * leave the tail unmatched, which fails toward "stranded" (loud) rather than
+ * toward "reachable" (silent).
+ */
+const DYN = "_D_";
+function collapseInterpolations(src: string): string {
+	return src.replace(/\$\{[\s\S]*?\}/g, DYN);
+}
+
+/** A route pattern in the same vocabulary: `/x/[id]/y` -> `/x/_D_/y`. */
+function collapseParams(route: string): string {
+	return route.replace(/\[[^\]]+\]/g, DYN);
+}
+
 const PATH_RE = /["`](\/[a-z0-9][a-z0-9/_-]*)/gi;
 
 const perFile = SCAN_DIRS.flatMap((d) => walk(d))
 	.filter((f) => /\.(tsx?|ts)$/.test(f) && !/\.test\.tsx?$/.test(f))
-	.map((f) => ({ file: f, text: stripComments(readFileSync(f, "utf8")) }));
+	.map((f) => ({
+		file: f,
+		text: collapseInterpolations(stripComments(readFileSync(f, "utf8"))),
+	}));
 
 /** target path -> the files that reference it */
 const inbound = new Map<string, Set<string>>();
@@ -112,10 +146,13 @@ for (const { file, text } of perFile) {
 
 function hasInbound(route: string): boolean {
 	if (route === "/") return true;
-	const stem = route.replace(/\/\[[^\]]+\]$/, "");
+	// Compared in the COLLAPSED vocabulary, so an interpolated href matches the
+	// route pattern it actually navigates to.
+	const pattern = collapseParams(route);
+	const stem = pattern.replace(new RegExp(`/${DYN}$`), "");
 	const ownDir = join(APP, ...route.split("/").filter(Boolean));
 	for (const [target, files] of inbound) {
-		if (target !== route && target !== stem && !target.startsWith(`${stem}/`))
+		if (target !== pattern && target !== stem && !target.startsWith(`${stem}/`))
 			continue;
 		for (const f of files) if (!f.startsWith(ownDir)) return true;
 	}

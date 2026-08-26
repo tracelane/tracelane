@@ -1,3 +1,4 @@
+//! Customer-facing trace + SLO read endpoints (Option 1).
 //!
 //! Three authed GET routes, mounted only when `CLICKHOUSE_URL` is set:
 //!   GET /v1/traces                  — keyset-paginated trace list
@@ -149,8 +150,10 @@ pub struct TraceSummary {
     /// `2026-06-10 12:34:56.123456`) — same shape the dashboard already renders.
     pub start_time: String,
     pub duration_us: i64,
-    pub span_count: u32,
-    pub error_count: u32,
+    /// `u64` to match `TraceSummaryRow` — see B-257 there. JSON numbers are
+    /// width-agnostic, so the dashboard is unaffected.
+    pub span_count: u64,
+    pub error_count: u64,
     pub intervention: u8,
     pub model: String,
     /// Summed real `gen_ai_usage_cost` (USD) over this trace's spans. The list
@@ -181,8 +184,17 @@ pub struct TraceSummaryRow {
     pub start_time: String,
     pub start_time_us: i64,
     pub duration_us: i64,
-    pub span_count: u32,
-    pub error_count: u32,
+    /// **`u64`, not `u32` — B-257.** B-243 converted `trace_summaries` to an
+    /// `AggregatingMergeTree` and widened these two to
+    /// `SimpleAggregateFunction(sum, UInt64)`. The `clickhouse` 0.13 client
+    /// VALIDATES column types against the struct, so a `u32` here does not
+    /// truncate — it fails the ENTIRE SELECT, and `/v1/traces` answered 502 for
+    /// every tenant for a day. The migration was verified with
+    /// `clickhouse-client`, which is untyped TSV and cannot see this; the Rust
+    /// client that actually reads the table was never run against it.
+    /// `trace_summaries_row_types_match_the_schema` is the control.
+    pub span_count: u64,
+    pub error_count: u64,
     pub intervention: u8,
     pub model: String,
 }
@@ -544,6 +556,7 @@ pub struct SloRow {
 }
 
 /// Window-WIDE SLO summary — the true merged quantiles for the headline tiles
+/// (#9), distinct from the per-bucket [`SloRow`]. One row per window.
 #[derive(Debug, Clone, Deserialize, Serialize, clickhouse::Row)]
 pub struct SloSummary {
     pub p50_ms: f64,
@@ -668,6 +681,7 @@ pub struct GatewayProviderRow {
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub cache_hits: u64,
+    /// Requests served BY this provider via a cross-provider failover.
     pub failovers: u64,
     /// Summed REAL per-span `gen_ai_usage_cost` (USD) the gateway stored for this
     /// provider in the window. Spans the model isn't priced for contribute 0 —
@@ -694,6 +708,7 @@ pub struct GatewayProviderHealth {
     pub p99_ms: f64,
     pub cache_hits: u64,
     pub cache_hit_rate_pct: f64,
+    /// Requests this provider served via cross-provider failover.
     pub failovers: u64,
     /// Summed real stored `gen_ai_usage_cost` (USD) for this provider (see
     /// `GatewayProviderRow::cost_usd` — real, lower-bound over priced traffic).
@@ -726,6 +741,7 @@ pub struct GatewayStatsResponse {
     pub error_rate_pct: f64,
     pub cache_hit_rate_pct: f64,
     pub provider_count: u32,
+    /// Total requests served via cross-provider failover in the window.
     pub total_failovers: u64,
     /// Tenant-wide real spend (USD) in the window — Σ of the stored per-span
     /// `gen_ai_usage_cost`. A lower bound over priced traffic (unpriced models
@@ -741,6 +757,300 @@ pub struct GatewayStatsResponse {
     /// (a provider can be down with zero recent traffic).
     pub open_breakers: u32,
     pub uninstrumented: Vec<&'static str>,
+}
+
+// ── Cost attribution (GWY-43, Sprint 1 item 5) ──────────────────────────────
+
+/// Which dimension to attribute spend to.
+///
+/// `Key` is the one that was structurally impossible before migration 16: spans
+/// carried no `api_key_id`, so "spend by key" could not be answered however well
+/// the dashboard were built. That is the `OBS-N1` shape — a read path with no
+/// writer — and it is why this enum exists at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostDimension {
+    Key,
+    Model,
+    Provider,
+}
+
+impl CostDimension {
+    fn parse(s: Option<&str>) -> Option<Self> {
+        match s.unwrap_or("key") {
+            "key" => Some(Self::Key),
+            "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
+            _ => None,
+        }
+    }
+
+    /// The ClickHouse expression to GROUP BY. Every one of these is a real
+    /// column or a JSON extract the table already indexes — none is
+    /// user-supplied, so this cannot be an injection surface.
+    fn column(self) -> &'static str {
+        match self {
+            Self::Key => "api_key_id",
+            Self::Model => "JSONExtractString(attributes, 'gen_ai_request_model')",
+            Self::Provider => "JSONExtractString(attributes, 'gen_ai_provider_name')",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Model => "model",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// Which traffic a cost answer covers.
+///
+/// **R94 — item 9 owns this half.** R81 closed the WRITE side only: eval spans
+/// have carried `tracelane_eval_run_id` since it shipped, but `/v1/costs` did not
+/// break that spend out and the dashboards did not exclude it. So an
+/// experiment's own cost silently inflated the customer's PRODUCTION spend
+/// figure — and an experiment is deliberately expensive, which makes that the
+/// worst possible number to leave conflated.
+///
+/// **`All` stays the DEFAULT deliberately.** Changing what an existing caller's
+/// unchanged request means is a silent change to every number already on a
+/// screen, which is the same class of harm one step removed. Instead the
+/// response ALWAYS carries the eval/production split, so the figure is never
+/// conflated-and-unknowable, and a caller that wants production-only asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostScope {
+    /// Everything in the window. The split is still reported.
+    All,
+    /// Spans with NO eval run id — real customer traffic.
+    Production,
+    /// Spans emitted by an eval run or an experiment arm.
+    Eval,
+}
+
+/// The discriminator, written ONCE.
+///
+/// `JSONExtractString` at read time and **never a `MATERIALIZED` column** — spec
+/// `EVL-02` §2.3b, founder ruling R106. A materialized column is computed on
+/// INSERT, so it would be EMPTY for every span already written, including the
+/// first eval spans this product ever emitted. A feature built to measure things
+/// would begin by being unable to see its own first measurements — and it would
+/// report that absence as zero rather than as unknown.
+///
+/// A missing key yields `''`, so `!= ''` is exactly "this span belongs to an eval
+/// run".
+const EVAL_SPAN_EXPR: &str = "JSONExtractString(attributes, 'tracelane_eval_run_id')";
+
+/// The `EVL-23` judge discriminator, written ONCE beside its sibling.
+///
+/// **A judge call is an eval span AND a judge span** — it carries both
+/// attributes — so `judge_*` is a SUBSET of `eval_*`, never a third bucket added
+/// to the total. Stated here because the alternative reading ("eval + judge =
+/// total eval spend") double-counts every judged run, and the two figures sit
+/// next to each other in the response where that mistake is easiest to make.
+///
+/// Same read-time `JSONExtractString`, same reason (`EVL-02` §2.3b, R106): a
+/// MATERIALIZED column is computed on INSERT and would be empty for every span
+/// already written, so the first judge spans this product ever emitted would be
+/// invisible to the surface built to price them.
+const JUDGE_SPAN_EXPR: &str = "JSONExtractString(attributes, 'tracelane_eval_role')";
+
+impl CostScope {
+    fn parse(s: Option<&str>) -> Option<Self> {
+        match s.unwrap_or("all") {
+            "all" => Some(Self::All),
+            "production" => Some(Self::Production),
+            "eval" => Some(Self::Eval),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Production => "production",
+            Self::Eval => "eval",
+        }
+    }
+
+    /// The extra WHERE predicate, or empty. Contains no user input — the scope
+    /// is parsed into an enum first, so this cannot be an injection surface.
+    fn predicate(self) -> String {
+        match self {
+            Self::All => String::new(),
+            Self::Production => format!("AND {EVAL_SPAN_EXPR} = '' "),
+            Self::Eval => format!("AND {EVAL_SPAN_EXPR} != '' "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CostFilters {
+    pub hours: u32,
+    pub dimension: CostDimension,
+    pub limit: u32,
+    pub scope: CostScope,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, clickhouse::Row)]
+pub struct CostRow {
+    pub dimension: String,
+    pub requests: u64,
+    /// Requests in this bucket whose cost we actually KNOW.
+    pub priced_requests: u64,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// The EVAL portion of this bucket (R94). Reported alongside the total
+    /// rather than subtracted from it, so a reader can see both without the
+    /// endpoint having to pick which one "the" number is.
+    pub eval_requests: u64,
+    pub eval_cost_usd: f64,
+    /// The JUDGE portion (`EVL-23`) — a SUBSET of the eval portion above, not an
+    /// addition to it.
+    pub judge_requests: u64,
+    pub judge_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CostBreakdownRow {
+    /// The dimension value: an `api_keys.id`, a model string, or a provider id.
+    /// Empty string for spend that carries no value on this dimension — a
+    /// session-authenticated request has no API key, and that is NOT the same as
+    /// unattributed. The UI must label it, not hide it.
+    pub dimension: String,
+    pub requests: u64,
+    pub priced_requests: u64,
+    /// Requests we could not price. Rendered as its own number, never folded
+    /// into `cost_usd` as if it were zero.
+    pub unpriced_requests: u64,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Of the above, how much was an eval run or an experiment arm. `0` here is
+    /// MEASURED — every span either carries the attribute or does not — so it is
+    /// safe to render as a zero rather than as unknown.
+    pub eval_requests: u64,
+    pub eval_cost_usd: f64,
+    /// Of the eval spend above, how much was the JUDGE grading rather than the
+    /// prompt running (`EVL-23`). **A subset of `eval_*`, never an addition** —
+    /// a judge span carries both attributes, so adding these to `eval_*` would
+    /// count every judge call twice.
+    pub judge_requests: u64,
+    pub judge_cost_usd: f64,
+}
+
+/// Spend, attributed.
+///
+/// **The honesty field here is `unpriced_requests`, and it is the point.**
+/// `pricing::cost_usd` returns `None` for a model whose price we do not know,
+/// and the gateway omits the attribute entirely rather than writing 0. But every
+/// read path in this file wrapped the JSON extract in
+/// `if(isFinite(x) AND x > 0, x, 0)` — which turns "we do not know" into a
+/// confident **$0.00**. Before GWY-42 the price table covered 13 models across
+/// three vendors, so most real traffic took that path and the spend tile
+/// under-reported silently. This response reports both halves so a reader can
+/// tell a cheap month from an unpriced one.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostBreakdownResponse {
+    pub window_hours: u32,
+    /// `"key"` | `"model"` | `"provider"`.
+    pub by: &'static str,
+    pub total_cost_usd: f64,
+    pub total_requests: u64,
+    /// Requests in the window we could price. `total_requests - priced_requests`
+    /// is how much of the window `total_cost_usd` does NOT account for.
+    pub priced_requests: u64,
+    pub unpriced_requests: u64,
+    /// **When did per-key attribution begin.** `api_key_id` is materialized by
+    /// ClickHouse migration 16 and is only populated for spans written after it
+    /// deployed, so a "by key" answer cannot see further back than that. Null
+    /// for dimensions that were always recorded (model, provider).
+    pub attribution_begins_note: Option<&'static str>,
+    /// `"all"` | `"production"` | `"eval"` — echoed, because every number above
+    /// and below is *within this scope* and a client that forgot which it asked
+    /// for would otherwise be reading a different question's answer.
+    pub scope: &'static str,
+    /// **The R94 split.** Always present, at every scope, so the total is never
+    /// conflated-and-unknowable. Under `scope=production` these are `0` and that
+    /// is the truth of the filtered set, not a suppressed number.
+    pub eval_cost_usd: f64,
+    pub eval_requests: u64,
+    /// `total − eval`, computed here rather than left to the client so the two
+    /// halves cannot be added up differently by two readers.
+    pub production_cost_usd: f64,
+    pub production_requests: u64,
+    /// **When eval attribution began**, in the same spirit as
+    /// `attribution_begins_note`: `tracelane_eval_run_id` is written by the
+    /// gateway from R81 onward, so eval spend before that deploy is invisible to
+    /// this split and is counted as production. Stated rather than left for
+    /// someone to discover from a suspiciously round zero.
+    pub eval_attribution_note: &'static str,
+    /// **The `EVL-23` judge split, and it is a SUBSET of the eval split above.**
+    /// A judge call carries `tracelane_eval_run_id` AND `tracelane_eval_role`, so
+    /// `judge_cost_usd <= eval_cost_usd` always, and
+    /// `eval_cost_usd - judge_cost_usd` is what the prompts themselves cost.
+    /// Broken out because a judged run spends twice what an unjudged one does and
+    /// "what did grading cost me" is the question a customer asks when the bill
+    /// doubles — folding it into eval spend leaves that answerable only by
+    /// guessing from model names, which fails the moment someone judges with the
+    /// model under test.
+    pub judge_cost_usd: f64,
+    pub judge_requests: u64,
+    pub rows: Vec<CostBreakdownRow>,
+}
+
+/// Build the cost-attribution SELECT. `?` order: tenant, hours, limit.
+///
+/// **EVERY `cost_usd` / `cost_usd_present` IS QUALIFIED `spans.`, AND THAT IS NOT
+/// STYLE — IT IS THE FIX FOR A PROD 502.**
+///
+/// This SELECT aliases its own aggregate `AS cost_usd`, and a SELECT-list alias
+/// SHADOWS the column it is named after for every other expression in the same
+/// SELECT. So the moment a SECOND `sumIf(cost_usd, …)` was added for the eval
+/// split, `cost_usd` inside it resolved to the ALIAS — an aggregate nested in an
+/// aggregate — and ClickHouse answered `Code 184 ILLEGAL_AGGREGATION`. Every
+/// `/v1/costs` request 502'd.
+///
+/// It shipped behind green tests because **every test here asserts the SQL
+/// STRING**, and a string cannot be illegal — only a server can say that. The
+/// round-trip test below now EXECUTES this against a real ClickHouse, which is
+/// the only thing that could have caught it.
+///
+/// Third instance of alias shadowing in one day, after `B-272` (a `WHERE` reading
+/// its own `toString(...)` alias) and the eval-item read (a `score IS NOT NULL`
+/// flag reading its own `ifNull(...)` alias). The rule that removes the class:
+/// **an alias never reuses a column's name, and every source column is
+/// qualified.**
+///
+/// Uses the REAL `cost_usd` / `cost_usd_present` columns (migration 16) rather
+/// than a per-row `JSONExtractFloat`, so the sum is indexed work rather than a
+/// scan-and-parse, and — more importantly — `cost_usd_present` lets the query
+/// COUNT what it could not price instead of silently adding zero for it.
+fn build_cost_breakdown_sql(f: &CostFilters) -> String {
+    format!(
+        "SELECT \
+{dim} AS dimension, \
+toUInt64(count()) AS requests, \
+toUInt64(countIf(spans.cost_usd_present = 1)) AS priced_requests, \
+round(sumIf(spans.cost_usd, spans.cost_usd_present = 1 AND isFinite(spans.cost_usd)), 6) \
+  AS cost_usd, \
+toUInt64(sum(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens'))) AS input_tokens, \
+toUInt64(sum(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens'))) AS output_tokens, \
+toUInt64(countIf({eval} != '')) AS eval_requests, \
+round(sumIf(spans.cost_usd, spans.cost_usd_present = 1 AND isFinite(spans.cost_usd) \
+  AND {eval} != ''), 6) AS eval_cost_usd, \
+toUInt64(countIf({judge} = 'judge')) AS judge_requests, \
+round(sumIf(spans.cost_usd, spans.cost_usd_present = 1 AND isFinite(spans.cost_usd) \
+  AND {judge} = 'judge'), 6) AS judge_cost_usd \
+FROM spans FINAL \
+WHERE tenant_id = ? AND start_time >= now() - toIntervalHour(?) {scope}\
+GROUP BY dimension ORDER BY cost_usd DESC, requests DESC LIMIT ?",
+        dim = f.dimension.column(),
+        eval = EVAL_SPAN_EXPR,
+        judge = JUDGE_SPAN_EXPR,
+        scope = f.scope.predicate(),
+    )
 }
 
 /// `num/denom` as a 2-dp percentage; `0.0` when `denom == 0` (never NaN).
@@ -831,6 +1141,7 @@ impl GatewayStatsResponse {
 // `guardrail::recorder` (decision, per-rail outcomes, fail-open rails, latency).
 // This is the ONLY customer-facing view of the pre-flight guardrail engine — the
 // core product signal. Every column below maps to a captured field; nothing here
+// is derived or fabricated (§ honesty lock /).
 
 /// Single-row tenant summary from `build_guardrail_summary_sql`. POSITIONAL —
 /// field order MUST match the SELECT.
@@ -1740,6 +2051,7 @@ WHERE tenant_id = ?",
 
 /// Build the window-WIDE SLO summary SELECT — the TRUE p50/p95/p99 over the
 /// whole window via `quantileMerge` over the stored `quantileState`, NOT a
+/// weighted mean of per-hour bucket percentiles (#9: the dashboard tile
 /// computed `Σ(pXX·requests)/Σrequests` client-side — a percentile-of-percentiles
 /// that diverges from the true quantile). One row. `?` order mirrors
 /// `build_slo_sql`: tenant, (since_secs | hours), [until_secs], [provider],
@@ -2244,6 +2556,12 @@ pub trait TraceReader: Send + Sync {
         tenant_id: &TenantId,
         filters: &GatewayStatsFilters,
     ) -> Result<Vec<GatewayProviderRow>>;
+    /// Spend attributed to one dimension (key / model / provider) over a window.
+    async fn cost_breakdown(
+        &self,
+        tenant_id: &TenantId,
+        filters: &CostFilters,
+    ) -> Result<Vec<CostRow>>;
     /// Window-wide latency split (overhead / provider / TTFT) + per-(provider,
     /// model) overhead for the SLO table. Two live `spans` aggregates. Returns
     /// `(totals, by_model)`.
@@ -2607,6 +2925,19 @@ impl TraceReader for ClickHouseTraceReader {
         q.fetch_all::<GatewayProviderRow>()
             .await
             .context("gateway stats SELECT failed")
+    }
+
+    async fn cost_breakdown(&self, tenant_id: &TenantId, f: &CostFilters) -> Result<Vec<CostRow>> {
+        let sql =
+            TenantQuery::new(build_cost_breakdown_sql(f), PlanTier::Builder).sql_with_settings();
+        self.client
+            .query(&sql)
+            .bind(tenant_id.to_string())
+            .bind(f.hours)
+            .bind(f.limit)
+            .fetch_all::<CostRow>()
+            .await
+            .context("cost breakdown SELECT failed")
     }
 
     async fn latency_breakdown(
@@ -3006,6 +3337,7 @@ pub fn routes() -> Router<TraceReadState> {
         .route("/v1/slo/models", get(slo_by_model_handler))
         .route("/v1/slo/timeseries", get(slo_timeseries_handler))
         .route("/v1/gateway/stats", get(gateway_stats_handler))
+        .route("/v1/costs", get(cost_breakdown_handler))
         .route(
             "/v1/query/latency-breakdown",
             get(latency_breakdown_handler),
@@ -3609,6 +3941,7 @@ async fn slo_handler(
 /// GET /v1/slo/summary — the window-WIDE TRUE p50/p95/p99 (quantileMerge over the
 /// stored per-hour quantile states) for the headline latency tiles. The dashboard
 /// previously computed a request-weighted mean of the per-hour bucket percentiles
+/// (#9), which is a percentile-of-percentiles and diverges from the true
 /// quantile. Tenant id comes only from `Claims.tenant_id`. Same query params as
 /// `/v1/slo` so it scopes to the same window/provider/model.
 async fn slo_summary_handler(
@@ -3740,6 +4073,120 @@ async fn slo_timeseries_handler(
             error_response(StatusCode::BAD_GATEWAY, "slo timeseries read failed")
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CostQuery {
+    hours: Option<u32>,
+    by: Option<String>,
+    /// `all` (default) | `production` | `eval`. See [`CostScope`].
+    scope: Option<String>,
+}
+
+/// `GET /v1/costs` — spend attributed by key, model or provider.
+///
+/// Sprint 1 item 5. Cost already existed on every span; what did not exist was
+/// the ability to GROUP it by the thing a platform team actually budgets
+/// against. `api_key_id` arrived with ClickHouse migration 16, so a "by key"
+/// answer necessarily starts there — the response says so rather than letting a
+/// short history read as low spend.
+#[tracing::instrument(skip_all, fields(tenant_id))]
+async fn cost_breakdown_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<CostQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+
+    let Some(dimension) = CostDimension::parse(q.by.as_deref()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid `by` — expected one of: key, model, provider",
+        );
+    };
+    let Some(scope) = CostScope::parse(q.scope.as_deref()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid `scope` — expected one of: all, production, eval",
+        );
+    };
+    let hours = q
+        .hours
+        .unwrap_or(DEFAULT_GATEWAY_HOURS)
+        .clamp(1, MAX_GATEWAY_HOURS);
+    let filters = CostFilters {
+        hours,
+        dimension,
+        limit: GATEWAY_PROVIDER_CAP,
+        scope,
+    };
+
+    let rows = match state
+        .reader
+        .cost_breakdown(&claims.tenant_id, &filters)
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(error = %err, "cost breakdown read failed");
+            return error_response(StatusCode::BAD_GATEWAY, "cost breakdown read failed");
+        }
+    };
+
+    let total_requests: u64 = rows.iter().map(|r| r.requests).sum();
+    let priced_requests: u64 = rows.iter().map(|r| r.priced_requests).sum();
+    let total_cost_usd: f64 = rows.iter().map(|r| r.cost_usd).sum();
+    let eval_requests: u64 = rows.iter().map(|r| r.eval_requests).sum();
+    let eval_cost_usd: f64 = rows.iter().map(|r| r.eval_cost_usd).sum();
+    let judge_requests: u64 = rows.iter().map(|r| r.judge_requests).sum();
+    let judge_cost_usd: f64 = rows.iter().map(|r| r.judge_cost_usd).sum();
+    let out = CostBreakdownResponse {
+        window_hours: hours,
+        by: dimension.as_str(),
+        total_cost_usd,
+        total_requests,
+        priced_requests,
+        unpriced_requests: total_requests.saturating_sub(priced_requests),
+        attribution_begins_note: (dimension == CostDimension::Key).then_some(
+            "per-key attribution begins at the migration-16 deploy; earlier spans \
+             carry no api_key_id and are reported under the empty key",
+        ),
+        scope: scope.as_str(),
+        eval_cost_usd,
+        eval_requests,
+        // Subtracted rather than queried a second time: one aggregate produced
+        // both halves, so they cannot disagree the way two round trips over a
+        // moving table could.
+        production_cost_usd: total_cost_usd - eval_cost_usd,
+        production_requests: total_requests.saturating_sub(eval_requests),
+        eval_attribution_note: "eval and experiment spend is identified by the \
+             tracelane_eval_run_id span attribute, which the gateway began writing with R81; \
+             eval traffic from before that deploy carries no attribute and is counted here \
+             as production",
+        judge_cost_usd,
+        judge_requests,
+        rows: rows
+            .into_iter()
+            .map(|r| CostBreakdownRow {
+                unpriced_requests: r.requests.saturating_sub(r.priced_requests),
+                dimension: r.dimension,
+                requests: r.requests,
+                priced_requests: r.priced_requests,
+                cost_usd: r.cost_usd,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+                eval_requests: r.eval_requests,
+                eval_cost_usd: r.eval_cost_usd,
+                judge_requests: r.judge_requests,
+                judge_cost_usd: r.judge_cost_usd,
+            })
+            .collect(),
+    };
+    Json(out).into_response()
 }
 
 /// GET /v1/gateway/stats — per-provider router health for the authenticated
@@ -5212,6 +5659,7 @@ mod tests {
         slo_by_model: Vec<SloModelRow>,
         slo_timeseries: Vec<SloTimePoint>,
         gateway: Vec<GatewayProviderRow>,
+        costs: Vec<CostRow>,
         latency_totals: LatencyTotalsRow,
         latency_by_model: Vec<LatencyModelRow>,
         guardrail_summary: GuardrailSummaryRow,
@@ -5234,6 +5682,7 @@ mod tests {
                 slo_by_model: Vec::new(),
                 slo_timeseries: Vec::new(),
                 gateway: Vec::new(),
+                costs: Vec::new(),
                 latency_totals: LatencyTotalsRow::default(),
                 latency_by_model: Vec::new(),
                 guardrail_summary: GuardrailSummaryRow::default(),
@@ -5331,6 +5780,16 @@ mod tests {
         ) -> Result<Vec<GatewayProviderRow>> {
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
             Ok(self.gateway.clone())
+        }
+        async fn cost_breakdown(
+            &self,
+            tenant_id: &TenantId,
+            _f: &CostFilters,
+        ) -> Result<Vec<CostRow>> {
+            // Records the tenant so the isolation assertion below can prove the
+            // handler binds `Claims.tenant_id` and never a query parameter.
+            self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
+            Ok(self.costs.clone())
         }
         async fn latency_breakdown(
             &self,
@@ -5491,7 +5950,280 @@ mod tests {
 
     const DEV_TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
-    #[cfg(debug_assertions)]
+    // ── GWY-43: cost attribution ────────────────────────────────────────────
+
+    fn cost_filters(dim: CostDimension) -> CostFilters {
+        CostFilters {
+            hours: 24,
+            dimension: dim,
+            limit: 100,
+            scope: CostScope::All,
+        }
+    }
+
+    fn cost_filters_scoped(dim: CostDimension, scope: CostScope) -> CostFilters {
+        CostFilters {
+            hours: 24,
+            dimension: dim,
+            limit: 100,
+            scope,
+        }
+    }
+
+    // ── R94: eval spend is separable from production spend ──────────────────
+
+    /// The DEFAULT must not silently change what an existing caller's request
+    /// means. `scope=all` adds no predicate — it only adds the split columns.
+    #[test]
+    fn the_default_cost_scope_filters_nothing() {
+        let sql = build_cost_breakdown_sql(&cost_filters(CostDimension::Model));
+        assert!(
+            !sql.contains("tracelane_eval_run_id') = ''")
+                && !sql.contains("tracelane_eval_run_id') != '' \nGROUP"),
+            "scope=all must not narrow the WHERE: {sql}"
+        );
+        assert_eq!(CostScope::parse(None), Some(CostScope::All));
+        assert_eq!(CostScope::parse(Some("nonsense")), None);
+    }
+
+    #[test]
+    fn each_cost_scope_produces_its_own_predicate() {
+        let prod = build_cost_breakdown_sql(&cost_filters_scoped(
+            CostDimension::Model,
+            CostScope::Production,
+        ));
+        assert!(
+            prod.contains("AND JSONExtractString(attributes, 'tracelane_eval_run_id') = ''"),
+            "production scope must EXCLUDE eval spans: {prod}"
+        );
+        let eval =
+            build_cost_breakdown_sql(&cost_filters_scoped(CostDimension::Model, CostScope::Eval));
+        assert!(
+            eval.contains("AND JSONExtractString(attributes, 'tracelane_eval_run_id') != ''"),
+            "eval scope must select ONLY eval spans: {eval}"
+        );
+        // Tenant still first — the scope predicate must never be bound ahead of
+        // it, and it is not bound at all (it carries no placeholder).
+        for sql in [&prod, &eval] {
+            let w = sql.find("WHERE tenant_id = ?").expect("tenant WHERE");
+            assert!(!sql[..w].contains('?'), "tenant must be first: {sql}");
+        }
+    }
+
+    /// The split columns must be present at EVERY scope, so the response can
+    /// always say how much of the figure was eval spend.
+    #[test]
+    fn the_eval_split_columns_are_always_selected() {
+        for scope in [CostScope::All, CostScope::Production, CostScope::Eval] {
+            let sql = build_cost_breakdown_sql(&cost_filters_scoped(CostDimension::Key, scope));
+            for col in [
+                "AS eval_requests",
+                "AS eval_cost_usd",
+                "AS judge_requests",
+                "AS judge_cost_usd",
+            ] {
+                assert!(sql.contains(col), "{scope:?} is missing {col}: {sql}");
+            }
+            // EVERY sum over `cost_usd` is guarded by `cost_usd_present` — an
+            // unpriced call must not be summed as $0.00 into ANY half.
+            //
+            // **Asserted as a RATIO, not as a count, and that is the point.** This
+            // was `== 2` and it went red the moment `EVL-23` added a third guarded
+            // sum for the judge split — a correct change failing a test that had
+            // pinned a snapshot of how many sums existed at the time. A pinned
+            // count is a photograph, not a rule: it blocks the next honest
+            // addition and says nothing about the property. The property is that
+            // guarded sums == all sums, which holds for two, three or ten.
+            let sums = sql.matches("sumIf(spans.cost_usd,").count();
+            let guarded = sql
+                .matches("spans.cost_usd_present = 1 AND isFinite(spans.cost_usd)")
+                .count();
+            assert!(
+                sums >= 2,
+                "{scope:?}: expected at least the total + eval sums: {sql}"
+            );
+            assert_eq!(
+                guarded, sums,
+                "EVERY sum over cost_usd must carry the honesty guard — {guarded} of {sums} do: {sql}"
+            );
+            // THE 502 ITSELF, at string level. `AS cost_usd` shadows the column
+            // for every other expression in the same SELECT, so an UNQUALIFIED
+            // `sumIf(cost_usd, …)` beside it nests an aggregate in an aggregate
+            // and ClickHouse refuses the whole query (`Code 184`). This is the
+            // cheap half; `clickhouse_roundtrip` below is the half that actually
+            // proved it, by asking a server.
+            assert!(
+                !sql.contains("sumIf(cost_usd,") && !sql.contains("countIf(cost_usd_present"),
+                "every cost column must be QUALIFIED `spans.` — an unqualified one \
+                 resolves to the `AS cost_usd` alias and 502s the endpoint: {sql}"
+            );
+        }
+    }
+
+    /// **A MATERIALIZED column would make the first eval spans invisible.** R106
+    /// settled this; the guard is here so the "obvious optimisation" is refused
+    /// by a test rather than by someone remembering the argument.
+    #[test]
+    fn eval_attribution_reads_the_json_at_query_time() {
+        let sql = build_cost_breakdown_sql(&cost_filters(CostDimension::Model));
+        assert!(
+            sql.contains("JSONExtractString(attributes, 'tracelane_eval_run_id')"),
+            "eval attribution must read the attribute at QUERY time: {sql}"
+        );
+        assert!(
+            !sql.contains("eval_run_id ="),
+            "a bare `eval_run_id` column would be a MATERIALIZED column, which is \
+             computed on INSERT and is EMPTY for every span already written — \
+             including the first eval spans ever emitted: {sql}"
+        );
+    }
+
+    /// CLAUDE.md's #1 non-negotiable, asserted structurally rather than trusted:
+    /// `tenant_id` is the FIRST bound placeholder, so no other predicate can be
+    /// bound ahead of it and widen the read.
+    /// B-257 — THE CONTROL FOR THE BUG THAT 502'd `/v1/traces` FOR A DAY.
+    ///
+    /// B-243 converted `trace_summaries` to an `AggregatingMergeTree` and, in
+    /// doing so, widened `span_count`/`error_count` from `UInt32` to
+    /// `SimpleAggregateFunction(sum, UInt64)`. The `clickhouse` 0.13 client
+    /// validates column types against the row struct, so the still-`u32` fields
+    /// did not truncate — they failed the whole SELECT. Every tenant's traces
+    /// page answered 502.
+    ///
+    /// **Why nothing caught it:** the migration was verified by running the
+    /// query in `clickhouse-client`, which speaks untyped TSV and is perfectly
+    /// happy. The Rust client — the one that actually reads this table in
+    /// production — was never pointed at the new schema. Proving a read with a
+    /// DIFFERENT client than the one that performs it proves nothing about the
+    /// one that does.
+    ///
+    /// This reads the checked-in schema and asserts each `trace_summaries`
+    /// column the list SELECT projects has the width the struct declares. It is
+    /// static (no ClickHouse needed) so it runs in every `cargo test`.
+    #[test]
+    fn trace_summaries_row_types_match_the_schema() {
+        let schema = include_str!("../../../infra/dev/clickhouse/schema.sql");
+        let start = schema
+            .find("CREATE TABLE IF NOT EXISTS tracelane.trace_summaries")
+            .expect("trace_summaries must exist in schema.sql");
+        let body = &schema[start..];
+        let end = body.find("\nENGINE").unwrap_or(body.len());
+        let body = &body[..end];
+
+        // (column, the Rust width the row struct declares for it)
+        let expected: &[(&str, &str)] = &[
+            ("span_count", "UInt64"),
+            ("error_count", "UInt64"),
+            ("intervention", "UInt8"),
+        ];
+        for (col, want_width) in expected {
+            let line = body
+                .lines()
+                .find(|l| l.trim_start().starts_with(col))
+                .unwrap_or_else(|| panic!("column `{col}` not found in trace_summaries"));
+            assert!(
+                line.contains(want_width),
+                "`{col}` is declared `{line}` in schema.sql but TraceSummaryRow reads it as \
+                 {want_width}. The clickhouse client VALIDATES types — a mismatch fails the \
+                 entire SELECT, it does not truncate. Widen the struct field AND this \
+                 expectation together."
+            );
+        }
+    }
+
+    #[test]
+    fn cost_sql_is_tenant_first_for_every_dimension() {
+        for dim in [
+            CostDimension::Key,
+            CostDimension::Model,
+            CostDimension::Provider,
+        ] {
+            let sql = build_cost_breakdown_sql(&cost_filters(dim));
+            assert!(sql.contains("WHERE tenant_id = ?"), "sql: {sql}");
+            let where_pos = sql.find("WHERE tenant_id = ?").unwrap();
+            assert!(
+                !sql[..where_pos].contains('?'),
+                "tenant must be the first bound placeholder for {dim:?}: {sql}"
+            );
+        }
+    }
+
+    /// The whole point of the endpoint: the "by key" grouping uses the REAL
+    /// `api_key_id` column (migration 16), not a JSON extract. If this ever
+    /// regresses to `JSONExtractString(attributes, …)` the query still works and
+    /// silently stops using the bloom-filter index.
+    #[test]
+    fn cost_by_key_groups_on_the_materialized_column() {
+        let sql = build_cost_breakdown_sql(&cost_filters(CostDimension::Key));
+        assert!(
+            sql.contains("api_key_id AS dimension"),
+            "by=key must group on the materialized column: {sql}"
+        );
+        assert!(
+            !sql.contains("JSONExtractString(attributes, 'tracelane_api_key_id')"),
+            "by=key must not fall back to a per-row JSON extract: {sql}"
+        );
+    }
+
+    /// THE HONESTY ASSERTION. The sum must be guarded by `cost_usd_present`, and
+    /// the query must COUNT what it could not price. Every other cost read in
+    /// this file wraps the extract in `if(… > 0, x, 0)`, which renders an
+    /// honestly-unknown cost as a confident $0.00.
+    ///
+    /// **The column names are QUALIFIED `spans.` and this test was updated to
+    /// match rather than the code reverted to satisfy it.** The qualification is
+    /// the fix for a prod 502 (`Code 184`, see `build_cost_breakdown_sql`), and a
+    /// test that pins a SPELLING instead of the PROPERTY would have blocked it —
+    /// the "a gate that fights an honest fix is presence-checking, not
+    /// behaviour-checking" shape. What is asserted is still exactly the property:
+    /// the guard is `cost_usd_present`, never `> 0`.
+    #[test]
+    fn cost_sql_separates_unpriced_from_zero() {
+        let sql = build_cost_breakdown_sql(&cost_filters(CostDimension::Model));
+        assert!(
+            sql.contains("countIf(spans.cost_usd_present = 1)) AS priced_requests"),
+            "must count what it could price: {sql}"
+        );
+        assert!(
+            sql.contains("sumIf(spans.cost_usd, spans.cost_usd_present = 1"),
+            "the sum must be guarded by cost_usd_present, not by `> 0`: {sql}"
+        );
+        assert!(
+            !sql.contains("JSONExtractFloat(attributes, 'gen_ai_usage_cost') > 0"),
+            "must not reintroduce the coercion that renders unknown as zero: {sql}"
+        );
+    }
+
+    #[test]
+    fn cost_dimension_parsing_is_closed() {
+        assert_eq!(CostDimension::parse(None), Some(CostDimension::Key));
+        assert_eq!(CostDimension::parse(Some("key")), Some(CostDimension::Key));
+        assert_eq!(
+            CostDimension::parse(Some("model")),
+            Some(CostDimension::Model)
+        );
+        assert_eq!(
+            CostDimension::parse(Some("provider")),
+            Some(CostDimension::Provider)
+        );
+        // Fail CLOSED on anything else — a silently-defaulted dimension would
+        // answer a question the caller did not ask.
+        for bad in ["tenant", "", "KEY", "api_key_id", "1; DROP TABLE spans"] {
+            assert_eq!(
+                CostDimension::parse(Some(bad)),
+                None,
+                "`{bad}` must be rejected, not defaulted"
+            );
+        }
+    }
+
+    /// The dimension column is chosen from a closed enum, never interpolated
+    /// from the query string — so `by=` cannot reach the SQL text.
+    #[test]
+    fn a_hostile_by_parameter_cannot_reach_the_sql() {
+        assert!(CostDimension::parse(Some("api_key_id) FROM spans WHERE 1=1 --")).is_none());
+    }
+
     #[test]
     fn gateway_stats_sql_is_tenant_first_and_windowed() {
         let sql = build_gateway_stats_sql(&GatewayStatsFilters {
@@ -5514,6 +6246,7 @@ mod tests {
             "sql: {sql}"
         );
         assert!(sql.contains("gen_ai_provider_name"), "sql: {sql}");
+        // failover activations are now a real, span-derived count.
         assert!(
             sql.contains("countIf(JSONExtractBool(attributes, 'tracelane_failover_activated'))"),
             "sql: {sql}"
@@ -6904,5 +7637,242 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(reader.seen_tenant.lock().unwrap().is_empty());
+    }
+}
+
+// ── REAL-CLICKHOUSE EXECUTION OF THE COST SQL ────────────────────────────────
+//
+// WHY THIS EXISTS, and it is not a nice-to-have: every other test in this file
+// asserts the SQL **STRING**. A string cannot be illegal — only a server can say
+// that — so a query that is syntactically fine and semantically rejected sails
+// through the whole suite, the whole gate and a successful deploy.
+//
+// That is exactly what happened. Adding the eval split introduced a second
+// `sumIf(cost_usd, …)` beside an aggregate already aliased `AS cost_usd`; the
+// alias shadowed the column, ClickHouse answered `Code 184 ILLEGAL_AGGREGATION`,
+// and **every `/v1/costs` request 502'd on prod**. Four string-level tests were
+// green the entire time.
+//
+// So this EXECUTES the builder's output — every dimension × every scope — against
+// a real server. It asserts nothing about the numbers; the only claim is *the
+// server accepts this query*, which is the one thing a string test can never make.
+//
+// `#[ignore]` + `CLICKHOUSE_TEST_URL`: run via
+// `scripts/ci/run-clickhouse-integration.sh`.
+#[cfg(test)]
+mod clickhouse_roundtrip {
+    use super::*;
+
+    fn ch() -> Option<clickhouse::Client> {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").ok()?;
+        Some(
+            clickhouse::Client::default()
+                .with_url(url)
+                .with_database("tracelane"),
+        )
+    }
+
+    /// The `spans` table as the cost query reads it. Applied from the checked-in
+    /// schema, not hand-written here: a test that declares its own columns proves
+    /// the code agrees with the TEST, which is the tautology this module exists
+    /// to break.
+    async fn ensure_spans(c: &clickhouse::Client) {
+        clickhouse::Client::default()
+            .with_url(std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL"))
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let schema = include_str!("../../../infra/dev/clickhouse/schema.sql");
+        for stmt in crate::clickhouse_query::split_migration_statements(schema) {
+            // The schema file defines the whole instance; only `spans` is needed
+            // here and the rest may reference objects a bare container lacks, so
+            // a statement that does not apply is skipped rather than fatal. The
+            // ONE statement that must succeed is asserted immediately after.
+            let _ = c.query(&stmt).execute().await;
+        }
+        let exists: u64 = c
+            .query("SELECT count() FROM system.tables WHERE database='tracelane' AND name='spans'")
+            .fetch_one()
+            .await
+            .expect("system.tables read");
+        assert_eq!(
+            exists, 1,
+            "`spans` was not created — the rest of this test would pass by querying nothing"
+        );
+    }
+
+    /// EVERY dimension × EVERY scope must be a query the server ACCEPTS.
+    ///
+    /// A failure here is `Code 184` / `Code 47` / `Code 386` — the classes that
+    /// are invisible to a string assertion and visible only to a server.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn the_cost_sql_is_accepted_by_a_real_clickhouse() {
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_spans(&c).await;
+        let tenant = uuid::Uuid::new_v4().to_string();
+
+        let mut checked = 0;
+        for dimension in [
+            CostDimension::Key,
+            CostDimension::Model,
+            CostDimension::Provider,
+        ] {
+            for scope in [CostScope::All, CostScope::Production, CostScope::Eval] {
+                let f = CostFilters {
+                    hours: 24,
+                    dimension,
+                    limit: 100,
+                    scope,
+                };
+                let sql = TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder)
+                    .sql_with_settings();
+                c.query(&sql)
+                    .bind(&tenant)
+                    .bind(24_u32)
+                    .bind(100_u32)
+                    .fetch_all::<CostRow>()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{dimension:?}/{scope:?} REJECTED by ClickHouse: {e}
+{sql}"
+                        )
+                    });
+                checked += 1;
+            }
+        }
+        // A loop that ran zero times would pass silently — the "filter that
+        // matches nothing must never read as a pass" rule, applied to a test.
+        assert_eq!(checked, 9, "expected 3 dimensions x 3 scopes");
+    }
+
+    /// **`EVL-23` — THE JUDGE SPLIT, PROVEN ON A REAL SERVER WITH REAL ROWS.**
+    ///
+    /// The test above proves the SQL is legal. This one proves it is *right*:
+    /// three spans go in — one production, one eval case, one eval judge — and
+    /// the three-way split must come back exact, with `judge ⊆ eval` rather than
+    /// `judge + eval`.
+    ///
+    /// **Why a round trip and not a string assertion.** `/v1/costs` 502'd on prod
+    /// on 2026-08-24 behind four green string tests, a clean 106-step gate and
+    /// five green deploy proofs, because a SELECT-list alias shadowed the column
+    /// it was named after and only a server can say `Code 184`. This row adds a
+    /// second `sumIf` over the same `spans.cost_usd`, which is *precisely* the
+    /// edit that caused it, so it does not ship on a string assertion.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn the_judge_split_is_a_subset_of_the_eval_split_on_real_rows() {
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_spans(&c).await;
+        let tenant = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+
+        // EVERYTHING the query reads is MATERIALIZED off `attributes` — `model`,
+        // `provider`, `cost_usd` and `cost_usd_present` are not insertable
+        // columns. Writing the JSON the gateway actually writes is the point: a
+        // test that inserted its own columns would prove the code agrees with the
+        // TEST. (This test's first run got that wrong and ClickHouse said so —
+        // `Code 16 NO_SUCH_COLUMN_IN_TABLE` — which is the round trip earning its
+        // keep before it ever checked an answer.)
+        //
+        // production $0.10 · eval case $0.02 · eval judge $0.01
+        for (role, cost) in [
+            (None, 0.10_f64),
+            (Some("case"), 0.02),
+            (Some("judge"), 0.01),
+        ] {
+            let mut attrs = serde_json::json!({
+                "gen_ai_request_model": "claude-haiku-4-5",
+                "gen_ai_provider_name": "anthropic",
+                "gen_ai_usage_cost": cost,
+            });
+            if let Some(role) = role {
+                attrs["tracelane_eval_run_id"] = serde_json::Value::String(run.clone());
+                attrs["tracelane_eval_role"] = serde_json::Value::String(role.to_string());
+            }
+            c.query(
+                "INSERT INTO tracelane.spans \
+                 (tenant_id, trace_id, span_id, name, start_time, end_time, status_code, \
+                  attributes) \
+                 VALUES (?, generateUUIDv4(), generateUUIDv4(), 'gen_ai.chat', now(), now(), \
+                 1, ?)",
+            )
+            .bind(&tenant)
+            .bind(attrs.to_string())
+            .execute()
+            .await
+            .expect("insert span");
+        }
+
+        let f = CostFilters {
+            hours: 24,
+            dimension: CostDimension::Model,
+            limit: 100,
+            scope: CostScope::All,
+        };
+        let sql =
+            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder).sql_with_settings();
+        let rows: Vec<CostRow> = c
+            .query(&sql)
+            .bind(&tenant)
+            .bind(24_u32)
+            .bind(100_u32)
+            .fetch_all()
+            .await
+            .unwrap_or_else(|e| panic!("REJECTED by ClickHouse: {e}\n{sql}"));
+
+        assert_eq!(rows.len(), 1, "one model, one row: {rows:?}");
+        let r = &rows[0];
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+
+        assert_eq!(r.requests, 3, "three spans went in");
+        assert!(near(r.cost_usd, 0.13), "total: {}", r.cost_usd);
+
+        // The eval half — case AND judge, because a judge call IS eval traffic.
+        assert_eq!(r.eval_requests, 2, "the judge call is eval traffic too");
+        assert!(near(r.eval_cost_usd, 0.03), "eval: {}", r.eval_cost_usd);
+
+        // The judge half — a SUBSET, not an addition.
+        assert_eq!(r.judge_requests, 1);
+        assert!(near(r.judge_cost_usd, 0.01), "judge: {}", r.judge_cost_usd);
+        assert!(
+            r.judge_cost_usd <= r.eval_cost_usd,
+            "judge spend can never exceed eval spend — it is a subset of it"
+        );
+
+        // The arithmetic the response documents, checked rather than asserted in
+        // prose: production = total − eval, and prompts-only = eval − judge.
+        assert!(near(r.cost_usd - r.eval_cost_usd, 0.10), "production");
+        assert!(
+            near(r.eval_cost_usd - r.judge_cost_usd, 0.02),
+            "the prompts themselves"
+        );
+
+        // scope=eval must see BOTH eval spans and no production one — the split
+        // is exact in both directions, which is what a filter reading its own
+        // alias would break.
+        let f = CostFilters {
+            scope: CostScope::Eval,
+            ..f
+        };
+        let sql =
+            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder).sql_with_settings();
+        let rows: Vec<CostRow> = c
+            .query(&sql)
+            .bind(&tenant)
+            .bind(24_u32)
+            .bind(100_u32)
+            .fetch_all()
+            .await
+            .expect("scope=eval");
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].judge_requests, 1);
+        assert!(near(rows[0].cost_usd, 0.03));
     }
 }

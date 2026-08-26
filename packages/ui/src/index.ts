@@ -25,6 +25,10 @@ export {
 } from "./primitives/MetricIcon";
 export { Badge, type BadgeProps } from "./primitives/Badge";
 export { Skeleton } from "./primitives/Skeleton";
+// Hover/focus detail. The repo had NO tooltip or popover before 2026-08-19 — the
+// only hover affordance anywhere was the native `title=` attribute, which is
+// slow, unstyleable, and invisible on touch.
+export { Tooltip, type TooltipProps } from "./primitives/Tooltip";
 export { EmptyState, type EmptyStateProps } from "./primitives/EmptyState";
 export { ErrorState, type ErrorStateProps } from "./primitives/ErrorState";
 
@@ -72,6 +76,10 @@ export {
 	type TranscriptSpineProps,
 	type SpanNode,
 	type SpanKind,
+	// The ONE span-kind value ramp. Exported because `apps/web`'s waterfall marks the
+	// same kinds and used to keep its own copy — the two drifted the moment the palette
+	// moved. See the map's own comment for why it is value, not hue.
+	SPAN_KIND_MARK,
 } from "./signature/TranscriptSpine";
 export {
 	LatencyTimeline,
@@ -87,6 +95,31 @@ export {
 	type BarTone,
 } from "./charts/BarChart";
 export { StatGrid, type StatGridProps } from "./primitives/StatGrid";
+// THE table system. One header height, one row height, one hover, one alignment rule.
+// It replaced 21 hand-rolled tables that between them had seven `<thead>` treatments
+// and three different row hovers — see the component for the measurement.
+export {
+	Table,
+	THead,
+	TBody,
+	TR,
+	TH,
+	TD,
+	TDetail,
+	type TRProps,
+	type THProps,
+	type TDProps,
+} from "./primitives/Table";
+// THE one-of-N control. It replaced nine hand-rolled copies, eight of which painted
+// the selected option as a solid ink pill — see the component for why that is wrong
+// for one-of-N specifically, and still right for the primary button.
+export {
+	SegmentedControl,
+	type SegmentedControlProps,
+	type SegmentedOption,
+} from "./primitives/SegmentedControl";
+// Extracted from StatCard (DSH-08) the moment a second surface wanted the shape.
+export { SparkBars, type SparkBarsProps } from "./charts/SparkBars";
 export {
 	LedgerSeqChip,
 	TimeRuler,

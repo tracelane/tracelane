@@ -9,6 +9,7 @@
  * UUID (ADR-042) and binds it into `WHERE tenant_id = ?`, so a user only ever
  * sees their own tenant's prompts.
  *
+ * This replaced the static `GATEWAY_BEARER_TOKEN` operator bearer.
  * The dashboard NEVER binds a tenant id itself; the JWT is the only tenant
  * signal.
  */

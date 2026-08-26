@@ -1,3 +1,4 @@
+-- Migration 07: API key Argon2id + peppered-HMAC lookup (/ R3 H1).
 -- Postgres 17 + Neon-compatible. Idempotent — every CREATE has IF NOT EXISTS.
 --
 -- The pre-migration schema stored the key body as bare SHA-256 (no salt, no

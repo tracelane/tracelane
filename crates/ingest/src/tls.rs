@@ -20,6 +20,7 @@
 //! they don't reach the verifier again. New handshakes pick up the
 //! updated bundle via `ArcSwap::load`. This matches the pattern used by
 //! Envoy / Linkerd / Istio. Maximum staleness equals the SVID TTL (1h
+//! per), with zero rotation downtime.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -289,6 +290,7 @@ impl BundleRefresher {
             let updates = update.context("stream recv")?;
             for u in updates {
                 // Case-insensitive to match parse_spiffe_id's trust-domain
+                // compare (review F-6): a SPIRE emitting varied case
                 // must not silently stop bundle rotation.
                 if u.trust_domain.eq_ignore_ascii_case(&self.trust_domain) {
                     let store = root_store_from_bundle(&u.bundle)
@@ -504,6 +506,7 @@ mod tests {
     /// We spawn a real mock SPIRE (so `connect()` succeeds), then drop the
     /// handle so the agent disappears. The retry policy is shrunk via
     /// `with_retry_policy` so the give-up path runs in milliseconds rather
+    /// than the ~3.5-minute production budget. (Linux/WSL2) is
     /// resolved, so this now runs in the normal suite.
     #[tokio::test]
     async fn ft09_refresher_exits_with_err_when_spire_agent_down() {

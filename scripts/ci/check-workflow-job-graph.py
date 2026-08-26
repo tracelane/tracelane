@@ -179,6 +179,7 @@ jobs:
         assert check([ok]) == 0, "selftest: a closed job graph must PASS"
         print("✓ selftest: closed graph passes (inline, flow and multi-line needs)")
 
+        # The shape: a job needing one that the export dropper removed.
         bad = td / "bad.yml"
         bad.write_text(
             good.replace(

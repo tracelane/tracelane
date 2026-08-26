@@ -51,6 +51,7 @@ function inline(text: string, keyBase: string): ReactNode[] {
 			out.push(
 				<code
 					key={key}
+					/* design-constraint-ok: relative to the surrounding prose by design — inline <code> must track the paragraph it sits in, so it is not a point on the ramp */
 					className="rounded bg-surface-2 px-1 py-0.5 font-mono text-[0.9em] text-ink"
 				>
 					{m[2]}

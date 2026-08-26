@@ -1,4 +1,4 @@
-<!-- tracelane:classification: INTERNAL -->
+<!-- tracelane:classification: PUBLIC -->
 # apps/web
 
 Tracelane's Next.js 15 dashboard — the customer-facing observability UI.

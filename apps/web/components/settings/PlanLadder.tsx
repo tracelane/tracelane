@@ -55,7 +55,7 @@ function PlanColumn({
 				</div>
 				<p className="text-base font-semibold text-ink">{card.price}</p>
 				{card.plan !== "free" && (
-					<p className="text-[11px] text-ink-3">list price</p>
+					<p className="text-2xs text-ink-3">list price</p>
 				)}
 				<p className="text-xs text-ink-2">{card.tagline}</p>
 			</div>
@@ -160,7 +160,7 @@ export function PlanLadder({
 				<div className="flex flex-wrap items-center gap-2">
 					<h3 className="text-sm font-semibold text-ink">{AUDIT_ADDON.name}</h3>
 					<Badge tone="seal">{AUDIT_ADDON.price}</Badge>
-					<span className="text-[11px] text-ink-3">
+					<span className="text-2xs text-ink-3">
 						add-on at every tier — never bundled into a plan
 					</span>
 				</div>

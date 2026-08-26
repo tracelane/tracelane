@@ -45,6 +45,7 @@ fn enable_loopback_bypass() {
 }
 
 /// Sanity: the A7 retry policy is one same-provider retry on a transient
+/// upstream failure (FT-02 /). The numeric budget reference keeps a
 /// future widening of the retry count visible to this eval.
 #[test]
 fn ft02_retry_count_is_one() {
@@ -109,9 +110,27 @@ async fn wiremock_429_then_200_succeeds_within_budget() {
         .expect("second send");
     assert_eq!(second.status().as_u16(), 200);
 
+    // THE BUDGET IS 5s, AND THE WIDENING IS DELIBERATE — it was 1000ms.
+    //
+    // What this asserts is that the A7 retry path adds NO PATHOLOGICAL DELAY: no
+    // multi-second backoff, no hang, no sleep that scales with anything. Two loopback
+    // round trips plus a 50ms sleep is single-digit milliseconds of real work, so any
+    // regression worth catching here is measured in SECONDS, not in the gap between
+    // 900ms and 1100ms.
+    //
+    // At 1000ms it was measuring the BOX, not the code. Observed failing FOUR times on
+    // 2026-08-25 under ordinary gate load — 2.48s once — while the same file passes
+    // 25/25 in 0.27s on an idle machine. A test that goes red because something else
+    // was compiling is a test people re-run rather than read, and it blocked a push
+    // three times.
+    //
+    // 5s still bites: the shipped behaviour is ~250ms here, so a real regression has
+    // 20x of headroom to trip it. Falsifiable by inserting a `sleep(6s)` in the retry
+    // path — the assertion fires. A budget nothing can realistically exceed would be
+    // decoration, and this is not that.
     let elapsed = started.elapsed();
     assert!(
-        elapsed.as_millis() < 1000,
+        elapsed.as_millis() < 5000,
         "rate-limit retry path exceeded budget: {elapsed:?}",
     );
 }

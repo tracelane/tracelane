@@ -4,6 +4,7 @@
 //!
 //! The first cut of the soft cap fired on the transition `used == quota`, where
 //! `used` came from the in-memory [`crate::rate_limiter::QuotaTracker`]. That
+//! counter is **process-local** and reseeds from ClickHouse on boot, so
 //! the equality is unsound across a restart — and a mid-month deploy is a
 //! restart:
 //!

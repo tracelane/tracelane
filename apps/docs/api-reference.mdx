@@ -18,10 +18,13 @@ All authenticated endpoints accept `Authorization: Bearer <jwt | tlane_*>`.
 
 ### `POST /v1/chat/completions`
 
-The single inference endpoint — the OpenAI Chat Completions shape. Routed to
-OpenAI for `gpt-*` / `o1*` / `o3*` and to any of the 28 OpenAI-compatible
-adapters by model-name prefix; Anthropic (`claude-*`), Google, Bedrock, and
-Cohere are reached by model name and translated to their native wire format.
+The single inference endpoint — the OpenAI Chat Completions shape. Routed by
+model-name prefix across 150+ providers: OpenAI for `gpt-*` / `o1*` / `o3*` and
+every other OpenAI-compatible host by its own prefix, plus 6 native adapters —
+Anthropic (`claude-*`), Google (`gemini-*`), Vertex (`vertex/*`), Bedrock
+(`bedrock/*`), Azure (`azure/*`), Cohere (`command*`) — whose requests are
+translated to their native wire format. Full prefix list:
+[Providers](/providers).
 `POST /v1/embeddings` is a separate endpoint, in the OpenAI Embeddings shape and
 routed by model name the same way. There is no `/v1/messages` or `/v1/rerank` —
 every chat/inference call routes through chat/completions.
@@ -74,8 +77,11 @@ API-key listing and revocation are dashboard surfaces, not gateway routes.
 | GET | `/v1/guardrails/stats` | Guardrail verdict counts and rates |
 | GET | `/v1/guardrails/verdicts` | Recent guardrail verdicts |
 
-These are read-only. There is no gateway policy-write endpoint; guardrail
-enforcement is configured in the dashboard. See
+The verdict and observation routes above are read-only. Tool pinning is not:
+when a Postgres control plane is configured the gateway also mounts
+`POST /v1/guardrails/tool-pins`, `POST /v1/guardrails/tool-pins/approve` and
+`DELETE /v1/guardrails/tool-pins/{tool_name}`, which write pin state. Rail
+modes themselves are not settable over the API. See
 [Predictive guardrails](/predictive-guardrails) for the rail catalog.
 
 ## Operational

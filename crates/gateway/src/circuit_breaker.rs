@@ -1,16 +1,17 @@
+//! Per-upstream circuit breakers (ADR-036, TRD §23.2).
 //!
-//! 35+ providers are 35+ independent failure domains. Without a breaker, one
-//! hung or erroring upstream (regional outage, 429 storm) ties up gateway
-//! worker slots and degrades *all* tenants — a common-mode failure across
-//! unrelated traffic. This breaker bulkheads each `(provider, region)` so one
-//! upstream's failure cannot exhaust the gateway.
+//! The gateway routes 150+ providers, and each one is an independent failure
+//! domain. Without a breaker, one hung or erroring upstream (regional outage,
+//! 429 storm) ties up gateway worker slots and degrades *all* tenants — a
+//! common-mode failure across unrelated traffic. This breaker bulkheads each
+//! `(provider, region)` so one upstream's failure cannot exhaust the gateway.
 //!
 //! ## Why in-dispatch, not a Tower layer
 //!
 //! ADR-036 describes "a Tower layer wrapping every provider adapter". The
 //! adapters are not `tower::Service`s — they are dispatched by a `match` in
-//! `server::dispatch_to_provider`. Rather than refactor all 35 adapters into
-//! Services purely to satisfy the wording, the breaker is an in-process state
+//! `server::dispatch_to_provider`. Rather than refactor every adapter into a
+//! Service purely to satisfy the wording, the breaker is an in-process state
 //! map checked/recorded around the existing dispatch. The semantics (Closed →
 //! Open → Half-Open) are identical; the integration is smaller and lower-risk.
 //!

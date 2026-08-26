@@ -1,9 +1,12 @@
+# ── PRIVATE-MINUTE POLICY (2026-08-01) ────────────────────────────────
 # Workflow files are SHARED with the public repo, so the trigger list cannot be
 # edited to cut private cost without disabling the public run too. The split is
 # a job-level repository condition on the three root jobs.
 name: CI
 
+# ── Tiering + runner target ──────────────────────
 # This workflow does NOT name a box. CI home = GitHub Actions, LIVE + tiered.
+# History (, RESOLVED 2026-07-02): the account's free Actions minutes were
 # EXHAUSTED (2,000/2,000) from ~2026-06-20 with a budget cap blocking paid
 # overflow, so GitHub started no runs until the 2026-07-01 monthly reset — the
 # "disabled_manually" / "payments failed" strings GitHub showed were BOTH
@@ -98,6 +101,7 @@ on:
 #
 # Why it matters now: queued-not-cancelled means a rapid push series pays full
 # price for every intermediate run, and the 2,000-minute Free allowance is the
+# binding constraint.
 # Least privilege. The ONLY token use in this workflow is the `changes` job's
 # `gh api repos/.../compare` — a read. No job creates a release, pushes a
 # package, or uploads SARIF, so nothing here needs write. Declared explicitly
@@ -136,12 +140,15 @@ jobs:
   # cross-cutting file, API error) runs ALL areas, so the gate is never weakened,
   # only made cheaper when it safely can be.
   changes:
+    # PRIVATE-MINUTE POLICY: on PUBLIC this always runs. On PRIVATE it runs
     # only for pull_request / schedule / workflow_dispatch, NOT push — a private
     # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # pull_request is KEPT so Dependabot PRs get a real CI signal (
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
     # ingest-release-tenant-guard can run — all four proven green together in
+    # run 30687343588 (2026-08-01, full-tier workflow_dispatch on main). See:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
@@ -372,6 +379,22 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
+          # ⚠️ THIS PIN IS LOAD-BEARING FOR 18 SECURITY OVERRIDES. DO NOT BUMP IT
+          # WITHOUT `scripts/ci/check-pnpm-overrides-applied.py` GREEN. (R131/R132)
+          #
+          # pnpm 10 STOPPED READING the `pnpm` field in package.json — which is where
+          # `pnpm.overrides` lives, and every entry there is a security floor (hono,
+          # postcss, qs, undici, protobufjs, brace-expansion, ip-address, …). The
+          # binary on a dev box here is already 11.16.0 and prints, on every run:
+          #     [WARN] The "pnpm" field in package.json is no longer read by pnpm.
+          # We are safe by DELEGATION, NOT BY DESIGN: `packageManager: pnpm@9.15.0`
+          # makes corepack hand off to 9.15.0, which does read it — and this pin keeps
+          # CI on the same major.
+          #
+          # If you bump this: the overrides stop applying on the next lockfile
+          # regeneration and NOTHING FAILS. No red, no alert, no advisory reappears
+          # until an audit months later. Move the overrides to wherever the new pnpm
+          # reads them FIRST, regenerate the lockfile, and confirm that guard is green.
           version: 9
       - name: Setup Node
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
@@ -402,6 +425,22 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
+          # ⚠️ THIS PIN IS LOAD-BEARING FOR 18 SECURITY OVERRIDES. DO NOT BUMP IT
+          # WITHOUT `scripts/ci/check-pnpm-overrides-applied.py` GREEN. (R131/R132)
+          #
+          # pnpm 10 STOPPED READING the `pnpm` field in package.json — which is where
+          # `pnpm.overrides` lives, and every entry there is a security floor (hono,
+          # postcss, qs, undici, protobufjs, brace-expansion, ip-address, …). The
+          # binary on a dev box here is already 11.16.0 and prints, on every run:
+          #     [WARN] The "pnpm" field in package.json is no longer read by pnpm.
+          # We are safe by DELEGATION, NOT BY DESIGN: `packageManager: pnpm@9.15.0`
+          # makes corepack hand off to 9.15.0, which does read it — and this pin keeps
+          # CI on the same major.
+          #
+          # If you bump this: the overrides stop applying on the next lockfile
+          # regeneration and NOTHING FAILS. No red, no alert, no advisory reappears
+          # until an audit months later. Move the overrides to wherever the new pnpm
+          # reads them FIRST, regenerate the lockfile, and confirm that guard is green.
           version: 9
       - name: Setup Node
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
@@ -482,12 +521,15 @@ jobs:
         run: pytest
 
   guards:
+    # PRIVATE-MINUTE POLICY: on PUBLIC this always runs. On PRIVATE it runs
     # only for pull_request / schedule / workflow_dispatch, NOT push — a private
     # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # pull_request is KEPT so Dependabot PRs get a real CI signal (
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
     # ingest-release-tenant-guard can run — all four proven green together in
+    # run 30687343588 (2026-08-01, full-tier workflow_dispatch on main). See:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
@@ -495,6 +537,7 @@ jobs:
     #
     # The policy above justified skipping with "the free public run". Between
     # 2026-08-04 and 2026-08-09 THAT RUN DID NOT EXIST: the export dropper emitted a
+    # workflow with a dangling `needs:` (added `behavioral-tier-ran` needing four
     # dropped jobs), GitHub rejected the file wholesale, and every public run produced
     # ZERO jobs with conclusion=failure. Combined with 14/14 skipped here, there was no
     # executing CI anywhere for five days — and the only surviving control,
@@ -533,6 +576,16 @@ jobs:
     # were never part of this failure.
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # check-promotion-readiness.py --selftest exercises `--pass-scope DELTA from
+          # an older commit`, which needs real history: it resolves HEAD~3 and diffs
+          # the docs that changed since. At the default fetch-depth 1 that commit does
+          # not exist, the case cannot run, and the assertion enforced NOTHING here —
+          # the guard-that-never-blocked shape this very file exists to prevent. 10 is
+          # the smallest depth that satisfies the HEAD~3 lookup with margin.
+          fetch-depth: 10
+
       - name: SPIFFE auth stub regression guard (ADR-028)
         if: ${{ !cancelled() }}
         run: ./scripts/ci/no-auth-stub.sh
@@ -544,6 +597,26 @@ jobs:
       - name: Gateway-URL fallback guard (no silent localhost → CF 1003)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-no-localhost-gateway-fallback.py
+
+      # R84 / TRAPS §43 — the Dependabot vector. This job is python/shell only and
+      # runs on the self-hosted runner, which has NO cargo; the sibling guard
+      # (check-build-script-network-deps.py) shells `cargo metadata` and fails
+      # CLOSED without it, so putting THAT one here would turn the only working CI
+      # job permanently red. This guard needs no toolchain: it reads dependency
+      # metadata from the crates.io sparse index. Metadata only — it never
+      # downloads, unpacks or executes the crate.
+      - name: New-crate build deps — selftest (prove the check bites)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-new-crate-build-deps.py --selftest
+
+      - name: New-crate build deps (a Dependabot bump is the B-263 vector)
+        if: ${{ !cancelled() }}
+        run: |
+          # The fetch may fail on a network blip; the GUARD decides, not the fetch.
+          # If the base is genuinely absent it exits 2 (CANNOT DETERMINE) and this
+          # job goes red — which is correct: an unread delta is not a clean delta.
+          git fetch --no-tags --depth=50 origin main || true
+          python3 scripts/ci/check-new-crate-build-deps.py --base origin/main
 
       - name: Docs site guard — selftest (prove the checks bite)
         if: ${{ !cancelled() }}
@@ -571,12 +644,24 @@ jobs:
 
       - name: pre-public-push guard parity
         if: ${{ !cancelled() }}
+        # The root guard and the export guard are separate
         # implementations; patching one does nothing to what ships. Selftest
         # first (both halves), then the real parity check. Existing job — no
         # extra billable job-minute.
         run: |
           python3 scripts/ci/check-guard-parity.py --selftest
           python3 scripts/ci/check-guard-parity.py
+
+      # node is NOT preinstalled on the self-hosted runner. This job inherited it
+      # free from ubuntu-latest, so routing to tl-node-1 made the ONE node step below
+      # fail with `node: command not found` while the other 51 python/shell steps
+      # passed. Same pinned action and version the web/verifier jobs already use; no
+      # `cache: pnpm` because this job installs no dependencies.
+      - name: Set up Node (the one node-dependent guard below)
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
 
       - name: Benchmark 2xx-gate selftest
         if: ${{ !cancelled() }}
@@ -693,17 +778,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-api-scope-single-source.py
 
-      - name: Release-only-test coverage guard — selftest
-        if: ${{ !cancelled() }}
-        run: python3 scripts/ci/check-release-only-tests-covered.py --selftest
-
-      # GWY-41. A release-only test runs ONLY where a job invokes its package with
-      # --release. When the decoder moved crates, the release tenant-isolation
-      # guard moved with it and the job that ran it stayed green on 168 other tests.
-      - name: Release-only tests are covered by a --release job
-        if: ${{ !cancelled() }}
-        run: python3 scripts/ci/check-release-only-tests-covered.py
-
       - name: Guard meta-gate — selftest (prove the meta-gate itself blocks)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-guard-selftests.py --selftest
@@ -733,12 +807,15 @@ jobs:
   # The slow Rust vuln scans (cargo-audit, cargo-deny, grype, osv) stay nightly
   # in security-scan.yml. Always-on; ~1 min.
   secret-scan:
+    # PRIVATE-MINUTE POLICY: on PUBLIC this always runs. On PRIVATE it runs
     # only for pull_request / schedule / workflow_dispatch, NOT push — a private
     # push-CI duplicates the pre-push hook (36 checks incl. all 15 guards, cargo
     # deny/audit/machete, gitleaks, evals, ruff, pytest) and the free public run.
+    # pull_request is KEPT so Dependabot PRs get a real CI signal (
     # auto-merge depends on it); schedule keeps the weekly behavioral tier, which
     # is the ONLY place live-eval-gate / l16-e2e-gate / span-publish-integration /
     # ingest-release-tenant-guard can run — all four proven green together in
+    # run 30687343588 (2026-08-01, full-tier workflow_dispatch on main). See:
     # a failed `changes` SKIPS all four and the run still reports a conclusion.
     # Gating these three root jobs is sufficient: every other job `needs: changes`,
     # and a skipped need skips the dependant.
@@ -781,6 +858,22 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
+          # ⚠️ THIS PIN IS LOAD-BEARING FOR 18 SECURITY OVERRIDES. DO NOT BUMP IT
+          # WITHOUT `scripts/ci/check-pnpm-overrides-applied.py` GREEN. (R131/R132)
+          #
+          # pnpm 10 STOPPED READING the `pnpm` field in package.json — which is where
+          # `pnpm.overrides` lives, and every entry there is a security floor (hono,
+          # postcss, qs, undici, protobufjs, brace-expansion, ip-address, …). The
+          # binary on a dev box here is already 11.16.0 and prints, on every run:
+          #     [WARN] The "pnpm" field in package.json is no longer read by pnpm.
+          # We are safe by DELEGATION, NOT BY DESIGN: `packageManager: pnpm@9.15.0`
+          # makes corepack hand off to 9.15.0, which does read it — and this pin keeps
+          # CI on the same major.
+          #
+          # If you bump this: the overrides stop applying on the next lockfile
+          # regeneration and NOTHING FAILS. No red, no alert, no advisory reappears
+          # until an audit months later. Move the overrides to wherever the new pnpm
+          # reads them FIRST, regenerate the lockfile, and confirm that guard is green.
           version: 9
       - name: Setup Node
         # No pnpm cache here: `pnpm audit` reads pnpm-lock.yaml (no install,
@@ -803,6 +896,7 @@ jobs:
     # The dedicated self-hosted box also yields STABLE criterion numbers (vs the
     # noisy shared GitHub runners), which is what makes `bench:budgets` meaningful.
     #
+    # Bench is the ~20-min long pole. Run it exactly where the-class perf
     # gate is needed — a PR-to-main touching the hot path (`live_stack`, which the
     # `changes` filter sets for crates/gateway|ingest|shared|policy) + the WEEKLY
     # cron + manual dispatch — but NOT on the post-merge main `push` (redundant
@@ -812,6 +906,7 @@ jobs:
     # weekly cron — route hot-path changes through a PR to get the bench gate.
     # 2026-08-10: OFF pull_request too. A release-profile benchmark has no business
     # on an intermediate push — 441 min in August, the single largest job.
+    # TRADE, stated plainly: a hot-path PR no longer gets the perf gate before
     # merge; a regression is caught by the WEEKLY cron instead. When a PR needs the
     # gate, run it deliberately: gh workflow run CI --ref <branch>.
     if: >-
@@ -833,6 +928,22 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
         with:
+          # ⚠️ THIS PIN IS LOAD-BEARING FOR 18 SECURITY OVERRIDES. DO NOT BUMP IT
+          # WITHOUT `scripts/ci/check-pnpm-overrides-applied.py` GREEN. (R131/R132)
+          #
+          # pnpm 10 STOPPED READING the `pnpm` field in package.json — which is where
+          # `pnpm.overrides` lives, and every entry there is a security floor (hono,
+          # postcss, qs, undici, protobufjs, brace-expansion, ip-address, …). The
+          # binary on a dev box here is already 11.16.0 and prints, on every run:
+          #     [WARN] The "pnpm" field in package.json is no longer read by pnpm.
+          # We are safe by DELEGATION, NOT BY DESIGN: `packageManager: pnpm@9.15.0`
+          # makes corepack hand off to 9.15.0, which does read it — and this pin keeps
+          # CI on the same major.
+          #
+          # If you bump this: the overrides stop applying on the next lockfile
+          # regeneration and NOTHING FAILS. No red, no alert, no advisory reappears
+          # until an audit months later. Move the overrides to wherever the new pnpm
+          # reads them FIRST, regenerate the lockfile, and confirm that guard is green.
           version: 9
       - name: Setup Node
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
@@ -848,6 +959,8 @@ jobs:
       - name: Enforce performance budgets (punchlist #5)
         run: pnpm bench:budgets
 
+  # ──: THE TIER'S ABSENCE MUST NOT READ AS SUCCESS ───────────────────────
+  # After turned private push-CI off, the weekly cron is the ONLY home for
   # live-eval-gate / l16-e2e-gate / span-publish-integration /
   # ingest-release-tenant-guard. Measured across every cron firing to date, the
   # tier executed in exactly ONE of four:

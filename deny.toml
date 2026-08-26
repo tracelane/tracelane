@@ -8,6 +8,33 @@ all-features = true
 version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+# RESTORED TO "deny" 2026-08-20, SAME DAY IT WAS RELAXED — the reason went away.
+#
+# For ~90 minutes this was "warn", to work around a yanked `arrayref`. That
+# workaround is recorded here rather than deleted, because the incident behind
+# it is the useful part:
+#
+#   `cargo deny` failed with "detected yanked crate (try `cargo update -p
+#   arrayref`)". FOLLOWING THAT ADVICE WAS THE ATTACK. It resolved `arrayref`
+#   0.3.10 — the only version in the whole 0.3.x line with a non-dev dependency
+#   — and that dependency was `proc-macro1`, whose build.rs downloads and
+#   executes a payload at COMPILE time (see the [bans] entry for the decoded
+#   IOCs). At the time, 0.3.5-0.3.9 were ALL yanked, so 0.3.10 was the only
+#   forward path and `yanked = "deny"` was the pressure pushing you onto it.
+#
+# CRATES.IO HAS SINCE REMEDIATED, verified directly against the sparse index
+# rather than assumed: `proc-macro1` is gone (index 404 NoSuchKey, tarball 403),
+# `arrayref` 0.3.10 is gone, and 0.3.5-0.3.9 are all `yanked=false` again. So
+# there is no yanked crate in our graph and no reason to stay relaxed.
+#
+# `deny` is therefore restored. The [bans] entry on `proc-macro1` STAYS — it is
+# defence in depth, because a removal from the registry does not remove a copy
+# already sitting in a cargo cache, a CI cache, or a `cargo vendor` tree, and
+# those copies still execute.
+#
+# THE RULE THIS OBEYS, since it is the one I wrote into this very comment when
+# relaxing it: a tolerated baseline that outlives its reason becomes permanent.
+# The reason lasted an afternoon; so did the exception.
 yanked = "deny"
 # Kept in sync with .cargo/audit.toml (cargo-deny and cargo-audit read the same
 # advisory DB but separate configs). See (wasmtime) + .
@@ -97,6 +124,39 @@ deny = [
  # default/runtime graph). cargo-deny scans build-deps too, so banning
  # openssl here produces a false positive on a build-only crate. See .
  { name = "litellm" },
+ # ─────────────────────────────────────────────────────────────────────────
+ # MALWARE. `proc-macro1` is a typosquat of `proc-macro2` whose build.rs is a
+ # REMOTE-CODE-EXECUTION DROPPER. Confirmed 2026-08-20 by reading the crate
+ # source, not by reputation:
+ #   * build-dependencies are `ureq` + `rustls` + `base64` — an HTTP client in
+ #     a build script, which runs at COMPILE time before any of our code.
+ #   * it installs a `ServerCertVerifier` returning Ok() unconditionally, so
+ #     TLS validation is fully disabled (needed because the target is a bare IP
+ #     with no valid certificate).
+ #   * `download_bytes()` -> write `/tmp/rust-setup` -> `chmod +x` -> `spawn()`
+ #     with stdio nulled. A `wscript.exe` branch covers Windows.
+ #   * URLs are split base64 constants so a grep for a domain finds nothing.
+ #     Decoded: payload https://23.254.165.112:9089/ , C2 23.254.165.112:443
+ #     passed to the dropped binary as argv[1].
+ #   * the injection is NOT a contiguous tail, and getting that wrong is how a
+ #     reviewer misses it. This comment previously read "lines 212+ are the REAL
+ #     proc-macro2 build.rs copied verbatim" — REFUTED on adversarial re-read of
+ #     the preserved sample. The nine-line TRIGGER sits at 216-224, INSIDE
+ #     `main()`, sandwiched between two blocks of authentic upstream code. The
+ #     malicious region is 14-186 PLUS 216-224, with lines 8/10 modified and 13
+ #     added. A reviewer told "everything after 212 is upstream" skips past the
+ #     actual call site and concludes the injection is confined to the helpers.
+ #     Proven constructively: removing those two regions and restoring the three
+ #     import lines yields a file byte-identical to genuine proc-macro2 1.0.107.
+ #   * the trigger is UNCONDITIONAL and feature-independent — it runs before the
+ #     `proc-macro` feature early-return, so no feature flag avoids it — and the
+ #     payload is re-fetched every build with no hash pin, so with TLS off the
+ #     operator can rotate stage 2 per victim.
+ # It reached us as a new dependency of `arrayref` 0.3.10 (blake3 -> arrayref).
+ # blake3 has been a gateway dependency since `b09bf5dd` (2026-06-20, Guardrails
+ # V1 / R3 tool-definition pinning) — NOT introduced by GWY-24, which is only a
+ # consumer of it. Never build this crate. See the arrayref note under [advisories].
+ { name = "proc-macro1" },
 ]
 
 [sources]

@@ -94,7 +94,7 @@ export function ProfileManager({
 					value={name}
 					onChange={(e) => setName(e.target.value)}
 					placeholder="Your name"
-					className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+					className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 				<label
 					htmlFor="profile-email"
@@ -147,7 +147,7 @@ export function ProfileManager({
 						value={confirmEmail}
 						onChange={(e) => setConfirmEmail(e.target.value)}
 						placeholder={email}
-						className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					/>
 					<button
 						type="button"
@@ -156,7 +156,7 @@ export function ProfileManager({
 							delAccount.isPending
 						}
 						onClick={() => delAccount.mutate(confirmEmail.trim())}
-						className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+						className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{delAccount.isPending ? "Deleting…" : "Delete my account"}
 					</button>
@@ -180,13 +180,13 @@ export function ProfileManager({
 							value={confirmOrg}
 							onChange={(e) => setConfirmOrg(e.target.value)}
 							placeholder="organization name"
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						/>
 						<button
 							type="button"
 							disabled={!confirmOrg.trim() || delOrg.isPending}
 							onClick={() => delOrg.mutate(confirmOrg.trim())}
-							className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+							className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 						>
 							{delOrg.isPending ? "Deleting…" : "Delete organization"}
 						</button>

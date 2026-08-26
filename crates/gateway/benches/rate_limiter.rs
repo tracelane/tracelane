@@ -7,7 +7,7 @@
 //! Run with `cargo bench -p gateway --bench rate_limiter`. The bench prints
 //! mean/median/p99 in ns; CI (or the founder locally) compares against the
 //! 500ns assertion in the eval suite — see
-//! `evals/pain-points/PP-RATELIMIT-OVERAGE.eval.ts` for the merge gate.
+//! the rate-limit conformance eval for the merge gate.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use gateway::rate_limiter::{QuotaConfig, QuotaTracker};

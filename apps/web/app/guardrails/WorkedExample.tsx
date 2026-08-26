@@ -20,12 +20,12 @@ export function WorkedExample() {
 				type="button"
 				aria-expanded={open}
 				onClick={() => setOpen((v) => !v)}
-				className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-seal"
+				className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			>
 				<span className="text-sm font-medium text-ink">
 					Show me a block — what pre-flight prevention looks like
 				</span>
-				<span aria-hidden className="text-[10px] text-ink-3">
+				<span aria-hidden className="text-2xs text-ink-3">
 					{open ? "▲ hide" : "▼ example"}
 				</span>
 			</button>
@@ -40,8 +40,8 @@ export function WorkedExample() {
 						<span className="font-medium text-ink">block</span> verdict that
 						shows up in the table above.
 					</p>
-					<div className="overflow-x-auto rounded-lg bg-surface-2/60 p-3">
-						<pre className="font-mono text-[12px] leading-relaxed text-ink-2">
+					<div className="overflow-x-auto rounded-lg bg-surface-2 p-3">
+						<pre className="font-mono text-xs leading-relaxed text-ink-2">
 							{`# a request that trips the prompt-injection rail
 POST /v1/chat/completions
 { "messages": [{ "role": "user",

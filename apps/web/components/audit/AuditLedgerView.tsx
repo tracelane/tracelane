@@ -6,13 +6,15 @@ import {
 	isAlarm,
 } from "@/app/audit/verdict";
 import { anchoredRecords, auditTrustState } from "@/lib/audit-trust-state";
-import {
-	type VerifyReport,
-	verifyLedgerText,
-} from "@tracelanedev/audit-verifier";
+import type { VerifyReport } from "@tracelanedev/audit-verifier";
 import { Button, Card, StatCard, cn } from "@tracelanedev/ui";
 import Link from "next/link";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+/** Lazy handle on the audit verifier — see the note in `verify` below for why it is
+ * not a static import. Kept at module scope so the click path and the idle warm
+ * share one `import()` (which the bundler already memoises). */
+const loadVerifier = () => import("@tracelanedev/audit-verifier");
 
 interface Row {
 	seq: number;
@@ -179,7 +181,7 @@ function CopyButton({
 			onClick={copy}
 			title={`Copy ${label}`}
 			aria-label={copied ? "Copied!" : `Copy ${label}`}
-			className="rounded px-1 py-0.5 text-[10px] text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+			className="rounded px-1 py-0.5 text-2xs text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 		>
 			{copied ? "✓" : "⎘"}
 		</button>
@@ -195,7 +197,7 @@ function LogIndexChip({ index }: { index: string }) {
 	return (
 		<span
 			title={`Index ${index} in Sigstore Rekor v2 (${PUBLIC_LOG}). Verified offline from your evidence bundle's inclusion proof + signed checkpoint — Rekor v2 is a tiled log with no per-entry web page.`}
-			className="inline-flex items-center gap-1 rounded-md border border-seal-line bg-seal-soft/60 px-1.5 py-0.5 font-mono text-[11px] text-seal-ink"
+			className="inline-flex items-center gap-1 rounded-md border border-seal-line bg-seal-soft px-1.5 py-0.5 font-mono text-2xs text-seal-ink"
 		>
 			logIndex {index}
 		</span>
@@ -237,8 +239,11 @@ function aggregateToWeeks(
 /** Compact inline column chart for event volume. One slim vertical bar per
  * day (or per ISO week when window > 30 days). SQRT scale makes
  * 50 vs 200 vs 300k all distinguishable. Click a column to narrow the window
- * to that day (drives URL so the server refetches). Bars use neutral ink-muted
- * tokens — no purple/accent, supporting context only. */
+ * to that day (drives URL so the server refetches). Bars use the neutral chart
+ * tokens — supporting context, never a coloured series. The previous wording
+ * ("no purple/accent") named a hue the palette no longer holds; the rule it was
+ * reaching for is the durable one: on this page colour means VERIFIED or FAILED,
+ * so a volume bar gets none. */
 function CompactColumnChart({
 	byDay,
 }: {
@@ -256,7 +261,7 @@ function CompactColumnChart({
 
 	return (
 		<details className="group mt-3">
-			<summary className="flex cursor-pointer list-none items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-3 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal [&::-webkit-details-marker]:hidden">
+			<summary className="flex cursor-pointer list-none items-center gap-1.5 t-metric-label hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
 				<span aria-hidden className="transition-transform group-open:rotate-90">
 					▸
 				</span>
@@ -280,7 +285,13 @@ function CompactColumnChart({
 						<div
 							key={b.day}
 							title={`${b.label}: ${fmtCount(b.count)} events (√-scaled)`}
-							className="shrink-0 rounded-sm bg-surface-3"
+							// `--chart-secondary`, the declared "de-emphasised data mark" role.
+							// It was `--surface-3`, a SURFACE token: on the light card that is
+							// #ebebe9 against a #ffffff ground, so the columns were within a
+							// few values of the card they sat on and the chart read as empty.
+							// A data mark takes a chart role (P0.11); a surface role is for
+							// the thing behind it.
+							className="shrink-0 rounded-sm bg-chart-secondary"
 							style={{ width: "8px", height: `${h}px` }}
 						>
 							<span className="sr-only">
@@ -290,7 +301,7 @@ function CompactColumnChart({
 					);
 				})}
 			</div>
-			<p className="mt-1 text-[10px] text-ink-3">
+			<p className="mt-1 text-2xs text-ink-3">
 				One bar per {useWeeks ? "week" : "day"} · √-scaled. This is the complete
 				chain from genesis, so it is not date-filtered.
 			</p>
@@ -305,7 +316,15 @@ function CompactColumnChart({
 function NegativeScenarioPanel() {
 	return (
 		<details className="group">
-			<summary className="flex cursor-pointer list-none items-center gap-2 rounded-lg border border-line bg-surface px-4 py-3 text-[13px] font-medium text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal [&::-webkit-details-marker]:hidden">
+			{/*
+			 * RADIUS RULE APPLIED THROUGHOUT THIS FILE, stated once here: a panel that
+			 * sits on the CANVAS is a card and takes `--radius-card` via
+			 * `.surface-card`; a panel NESTED INSIDE a card stays on the 8px control
+			 * radius. Concentric corners only look right when the inner one is
+			 * smaller, so a `p-3` claim tile inside an 18px card must not also be 18px.
+			 * This summary and the body below it are both on the canvas.
+			 */}
+			<summary className="surface-card flex cursor-pointer list-none items-center gap-2 border border-line bg-surface px-4 py-3 text-sm font-medium text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
 				<span
 					aria-hidden
 					className="shrink-0 text-ink-3 transition-transform group-open:rotate-90"
@@ -314,8 +333,8 @@ function NegativeScenarioPanel() {
 				</span>
 				What does a failed verification look like?
 			</summary>
-			<div className="mt-2 rounded-lg border border-line bg-surface p-5">
-				<p className="max-w-2xl text-[13px] text-ink-2">
+			<div className="surface-card mt-2 border border-line bg-surface p-5">
+				<p className="max-w-2xl text-sm text-ink-2">
 					The verifier runs entirely in your browser — nothing is trusted from
 					our servers. If any event in the ledger is tampered with or reordered
 					after recording, the verifier catches it:
@@ -324,10 +343,10 @@ function NegativeScenarioPanel() {
 					<li className="flex gap-3">
 						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
-							<span className="text-[13px] font-medium text-ink">
+							<span className="text-sm font-medium text-ink">
 								Row hash mismatch.
 							</span>{" "}
-							<span className="text-[13px] text-ink-2">
+							<span className="text-sm text-ink-2">
 								Recomputing a row&apos;s SHA-256 hash over its payload will not
 								match the stored hash. The verifier highlights that row in{" "}
 								<span className="font-medium text-danger-ink">loud red</span>{" "}
@@ -339,10 +358,8 @@ function NegativeScenarioPanel() {
 					<li className="flex gap-3">
 						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
-							<span className="text-[13px] font-medium text-ink">
-								Chain break.
-							</span>{" "}
-							<span className="text-[13px] text-ink-2">
+							<span className="text-sm font-medium text-ink">Chain break.</span>{" "}
+							<span className="text-sm text-ink-2">
 								Every row&apos;s{" "}
 								<code className="font-mono text-ink-2">prev_hash</code> must
 								equal the previous row&apos;s{" "}
@@ -355,10 +372,10 @@ function NegativeScenarioPanel() {
 					<li className="flex gap-3">
 						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
 						<div>
-							<span className="text-[13px] font-medium text-ink">
+							<span className="text-sm font-medium text-ink">
 								Verdict: Integrity check failed.
 							</span>{" "}
-							<span className="text-[13px] text-ink-2">
+							<span className="text-sm text-ink-2">
 								The &ldquo;Verify integrity&rdquo; result shows{" "}
 								<span className="font-medium text-danger-ink">red</span>, not
 								green — with the first broken seq number and the reason (hash
@@ -367,7 +384,7 @@ function NegativeScenarioPanel() {
 						</div>
 					</li>
 				</ul>
-				<p className="mt-3 text-[12px] text-ink-3">
+				<p className="mt-3 text-xs text-ink-3">
 					<span className="font-medium text-ink-2">
 						The word &ldquo;evident&rdquo; is deliberate.
 					</span>{" "}
@@ -414,7 +431,7 @@ function AboutLedger({
 		<Card className="bg-surface p-5">
 			<div className="max-w-3xl">
 				<h2 className="text-sm font-semibold text-ink">About this ledger</h2>
-				<p className="mt-1 text-[13px] text-ink-2">
+				<p className="mt-1 text-sm text-ink-2">
 					An <strong>append-only, tamper-evident</strong> record of what the
 					gateway did — every proxied request and every guardrail / eval verdict
 					— so you can prove to an auditor exactly what ran and that the record
@@ -422,7 +439,7 @@ function AboutLedger({
 					{"; full-fidelity spans sent via the SDK / OTLP live in "}
 					<Link
 						href="/traces"
-						className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						Traces
 					</Link>{" "}
@@ -434,7 +451,9 @@ function AboutLedger({
 			    is publicly anchored, and that it never expires. (The confusing
 			    "First–last event (loaded)" and a redundant event count were removed
 			    — the event count already appears in the verify panel + chain header.) */}
-			<div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-3">
+			{/* P0.17: one column below `sm`. Both tiles carry a full sentence of
+			    `sub` copy, which at ~160px wide wrapped to five lines each. */}
+			<div className="mt-4 grid grid-cols-1 gap-3 border-t border-line pt-3 sm:grid-cols-2">
 				<StatCard
 					label="Public anchoring"
 					value={
@@ -457,7 +476,7 @@ function AboutLedger({
 			</div>
 
 			{retentionDays ? (
-				<p className="mt-2 text-[11px] text-ink-3">
+				<p className="mt-2 text-2xs text-ink-3">
 					Full-fidelity trace data expires after{" "}
 					<span className="tabular-nums">{retentionDays}</span> days on your
 					plan; this evidence ledger does not.
@@ -470,14 +489,14 @@ function AboutLedger({
 
 			{eventTypeCounts.length > 0 && (
 				<div className="mt-3">
-					<div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+					<div className="mb-1 t-metric-label">
 						Event types recorded (this window)
 					</div>
 					<div className="flex flex-wrap gap-1.5">
 						{eventTypeCounts.map(([t, c]) => (
 							<span
 								key={t}
-								className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2/50 px-2 py-0.5 text-[11px]"
+								className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-0.5 text-2xs"
 							>
 								<span className="font-mono text-ink-2">{t}</span>
 								<span className="tabular-nums font-medium text-ink">
@@ -490,7 +509,7 @@ function AboutLedger({
 			)}
 
 			{total > loadedCount && (
-				<p className="mt-3 text-[11px] text-ink-3">
+				<p className="mt-3 text-2xs text-ink-3">
 					The chain view below shows the first{" "}
 					<span className="tabular-nums">{fmtCount(loadedCount)}</span> of{" "}
 					<span className="tabular-nums">{fmtCount(total)}</span> events, from
@@ -503,7 +522,7 @@ function AboutLedger({
 			    than shown. The paid-path `total > loadedCount` note can't fire here
 			    (total === loadedCount by construction), so disclose it explicitly. */}
 			{cappedLoad && (
-				<p className="mt-3 text-[11px] text-ink-3">
+				<p className="mt-3 text-2xs text-ink-3">
 					Loaded the most recent{" "}
 					<span className="tabular-nums">{fmtCount(loadCap)}</span> events to
 					verify in your browser. Your ledger may hold more — this is a fetch
@@ -519,7 +538,10 @@ function AboutLedger({
 // ---------------------------------------------------------------------------
 // TrustPanel — the ONE dominant integrity surface (ADR-062)
 // Combines: anchor status + verify CTA + post-verify verdict + claim breakdown.
-// The ONLY Lava CTA on the page. The ONLY large green element is "Verified".
+// The ONLY primary CTA on the page, and the ONLY large green element is
+// "Verified". ("Lava" was the retired accent this line used to name — the primary
+// button is solid graphite now, so the rationing is about WEIGHT, not hue: one
+// filled button, one green verdict, everything else quiet.)
 // ---------------------------------------------------------------------------
 function TrustPanel({
 	anchoredIndices,
@@ -565,10 +587,7 @@ function TrustPanel({
 	return (
 		<Card
 			provenance={!alarm}
-			className={cn(
-				"p-5",
-				alarm && "border border-danger/50 bg-danger-soft/30",
-			)}
+			className={cn("p-5", alarm && "border border-danger/50 bg-danger-soft")}
 		>
 			{/* ── Status indicator ─────────────────────────────────────────── */}
 			{/* Column on narrow (the CTA sits BELOW the explainer, full-width, so the
@@ -585,7 +604,7 @@ function TrustPanel({
 								<div className="text-base font-semibold text-ink">
 									Ready to verify
 								</div>
-								<p className="mt-0.5 text-[13px] text-ink-2">
+								<p className="mt-0.5 text-sm text-ink-2">
 									<strong>What this does:</strong> re-hashes every event and
 									re-checks each link to the one before it, starting from your
 									chain&apos;s genesis — proving the events are intact and in
@@ -609,7 +628,7 @@ function TrustPanel({
 							</span>
 							<div>
 								<div className="text-xl font-bold text-seal-ink">Verified</div>
-								<p className="mt-0.5 text-[13px] text-seal-ink/80 tabular-nums">
+								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
 									Hash chain intact · {verdict.rows} rows · off-platform
 									reproducible. Signed by your key, and {verdict.anchors} root
 									{verdict.anchors === 1 ? "" : "s"} anchored in Sigstore&apos;s{" "}
@@ -633,7 +652,7 @@ function TrustPanel({
 							</span>
 							<div>
 								<div className="text-xl font-bold text-seal-ink">Verified</div>
-								<p className="mt-0.5 text-[13px] text-seal-ink/80 tabular-nums">
+								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
 									Hash chain intact from seq {verdict.fromSeq} to the latest
 									entry, rooted at {verdict.anchors} public Rekor anchor
 									{verdict.anchors === 1 ? "" : "s"} (Sigstore{" "}
@@ -660,7 +679,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-seal-ink">
 									Chain verified
 								</div>
-								<p className="mt-0.5 text-[13px] text-seal-ink/80 tabular-nums">
+								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
 									Hash chain intact · {verdict.rows} rows · off-platform
 									reproducible, signed by your key. No public anchor fell inside
 									this view — run{" "}
@@ -685,7 +704,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-seal-ink/70">
 									Nothing to verify
 								</div>
-								<p className="mt-0.5 text-[13px] text-seal-ink/60">
+								<p className="mt-0.5 text-sm text-seal-ink/60">
 									This view has no audit entries yet — there is nothing to
 									verify. Entries appear here as your workspace records events.
 								</p>
@@ -706,7 +725,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-danger-ink">
 									Integrity check failed
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger-ink/80">
+								<p className="mt-0.5 text-sm text-danger-ink/80">
 									The hash chain is broken
 									{verdict.firstSeq != null
 										? ` at seq ${verdict.firstSeq}`
@@ -733,7 +752,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-ink">
 									Not verifiable in this view
 								</div>
-								<p className="mt-0.5 text-[13px] text-ink-2">
+								<p className="mt-0.5 text-sm text-ink-2">
 									<strong>Nothing is wrong with your ledger</strong> — this view
 									simply has no public Rekor anchor inside it to verify against,
 									because it starts after your chain&apos;s genesis or loads too
@@ -759,7 +778,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-ink">
 									Anchors not checked — no verification key
 								</div>
-								<p className="mt-0.5 text-[13px] text-ink-2">
+								<p className="mt-0.5 text-sm text-ink-2">
 									<strong>This is not a verification failure.</strong>{" "}
 									<span className="tabular-nums">{verdict.anchors}</span> anchor
 									{verdict.anchors === 1 ? "" : "s"} in this view were skipped
@@ -785,7 +804,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-danger-ink">
 									Anchor proof missing
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger-ink/80">
+								<p className="mt-0.5 text-sm text-danger-ink/80">
 									A batch claims to be publicly anchored but its proof is absent
 									— a possible strip or downgrade.
 								</p>
@@ -806,7 +825,7 @@ function TrustPanel({
 								<div className="text-xl font-bold text-danger-ink">
 									Anchor verification failed
 								</div>
-								<p className="mt-0.5 text-[13px] text-danger-ink/80">
+								<p className="mt-0.5 text-sm text-danger-ink/80">
 									The hash chain is intact, but a public-anchor check did not
 									pass: {verdict.reasons.map(humanizeVerdictKind).join("; ")}.
 								</p>
@@ -815,13 +834,20 @@ function TrustPanel({
 					)}
 				</div>
 
-				{/* The SINGLE Lava CTA — Verify integrity (full-width on narrow). */}
+				{/* The SINGLE primary CTA on this page — Verify integrity (full-width on
+				    narrow). Solid graphite; there is no accent colour to spend here. */}
 				<div className="shrink-0">
 					<Button
 						variant="primary"
 						onClick={onVerify}
 						disabled={verifying || rowCount === 0}
-						className="bg-surface-inverse text-ink-inverse hover:opacity-90 w-full sm:w-auto"
+						// className carries LAYOUT ONLY. It used to re-add `bg-surface-inverse
+						// text-ink-inverse`, which twMerge lets win over the variant — putting back,
+						// on top of the fix, the exact defect Button.tsx documents fixing: in DARK
+						// `--surface-inverse` is #0d0e10, the PAGE GROUND, so the primary CTA was a
+						// 1.07:1 rectangle on its own card. The variant's `bg-selected
+						// text-selected-on` is 17.93:1 light / 17.71:1 dark.
+						className="w-full sm:w-auto"
 					>
 						{verifying ? "Verifying…" : "Verify integrity"}
 					</Button>
@@ -841,11 +867,11 @@ function TrustPanel({
 			    WHAT broke; a user also needs to know it is not their config and what the
 			    remediation path is. */}
 			{alarm && (
-				<div className="mt-4 rounded-lg border border-danger/40 bg-danger-soft/20 p-4">
-					<div className="text-[12px] font-semibold text-ink">
+				<div className="mt-4 rounded-lg border border-danger/40 bg-danger-soft p-4">
+					<div className="text-xs font-semibold text-ink">
 						What this means &amp; what to do next
 					</div>
-					<ol className="mt-1.5 list-decimal space-y-1.5 pl-4 text-[12px] text-ink-2">
+					<ol className="mt-1.5 list-decimal space-y-1.5 pl-4 text-xs text-ink-2">
 						<li>
 							This is the check working, not a product bug: the verifier ran in
 							your browser and the ledger it saw does <strong>not</strong> match
@@ -906,7 +932,7 @@ function TrustPanel({
 							>
 								◆
 							</span>
-							<span className="text-[12px] font-medium text-ink">
+							<span className="text-xs font-medium text-ink">
 								Publicly anchored (Sigstore Rekor v2)
 							</span>
 						</span>
@@ -915,7 +941,7 @@ function TrustPanel({
 							<span aria-hidden className="text-sm text-ink-3">
 								◇
 							</span>
-							<span className="text-[12px] text-ink-3">
+							<span className="text-xs text-ink-3">
 								Signed, not publicly anchored — anchoring is best-effort and
 								does not block the write path
 							</span>
@@ -925,19 +951,19 @@ function TrustPanel({
 							<span aria-hidden className="text-sm text-ink-3">
 								◇
 							</span>
-							<span className="text-[12px] text-ink-3">
+							<span className="text-xs text-ink-3">
 								Not yet anchored — begins with your first gateway-proxied batch
 							</span>
 						</span>
 					)}
 					{anchoredIndices.length > 0 && !alarm && (
-						<span className="text-[12px] text-ink-2 tabular-nums">
+						<span className="text-xs text-ink-2 tabular-nums">
 							{anchoredIndices.length} batch
 							{anchoredIndices.length === 1 ? "" : "es"} anchored
 						</span>
 					)}
 					{alarm && stripped && (
-						<span className="text-[12px] font-medium text-danger-ink">
+						<span className="text-xs font-medium text-danger-ink">
 							Anchor proof missing — possible strip/downgrade
 						</span>
 					)}
@@ -952,22 +978,20 @@ function TrustPanel({
 				{anchoredIndices.length > 0 && (
 					<div>
 						<div className="mb-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-							<span className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-								Anchored roots in
-							</span>
+							<span className="t-metric-label">Anchored roots in</span>
 							<a
 								href={CHECKPOINT_URL}
 								target="_blank"
 								rel="noreferrer noopener"
 								title="Fetch this log's signed checkpoint — its independently-verifiable public state (tree size, root, log signature)."
-								className="break-all font-mono text-[11px] text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+								className="break-all font-mono text-2xs text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 							>
 								{PUBLIC_LOG} · checkpoint ↗
 							</a>
 						</div>
 						{/* Count label — only shown when collapsed and there are hidden chips. */}
 						{anchoredIndices.length > ANCHOR_PREVIEW && !showAllAnchors && (
-							<p className="mb-1 text-[11px] text-ink-3">
+							<p className="mb-1 text-2xs text-ink-3">
 								<span className="tabular-nums font-medium text-ink">
 									{anchoredIndices.length}
 								</span>{" "}
@@ -988,14 +1012,14 @@ function TrustPanel({
 							<button
 								type="button"
 								onClick={() => setShowAllAnchors((v) => !v)}
-								className="mt-1.5 text-[11px] text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+								className="mt-1.5 text-2xs text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 							>
 								{showAllAnchors
 									? "Show fewer ▴"
 									: `Show ${anchoredIndices.length - ANCHOR_PREVIEW} more ▾`}
 							</button>
 						)}
-						<p className="mt-1.5 text-[11px] text-ink-3">
+						<p className="mt-1.5 text-2xs text-ink-3">
 							Clicking that link opens the log&apos;s signed checkpoint — raw
 							text showing the log origin, tree size, current root hash, and the
 							log&apos;s own signature over them. This is expected output, not
@@ -1003,7 +1027,7 @@ function TrustPanel({
 							You verify each anchored batch root against it offline using the
 							inclusion proof bundled in your downloaded evidence.
 						</p>
-						<p className="mt-1 text-[11px] text-ink-3">
+						<p className="mt-1 text-2xs text-ink-3">
 							Rekor v2 is a tiled log with no per-entry web page. Each
 							root&apos;s inclusion proof + the log&apos;s signed checkpoint
 							travel in your downloaded evidence and verify offline against the
@@ -1018,7 +1042,7 @@ function TrustPanel({
 			</div>
 
 			{/* ── Standing facts strip ─────────────────────────────────────── */}
-			<dl className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[12px]">
+			<dl className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs">
 				<div className="flex items-center gap-1.5">
 					<dt
 						className="text-ink-3"
@@ -1078,7 +1102,7 @@ function TrustPanel({
 						</dd>
 						<a
 							href="/settings/audit"
-							className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 							title="Confirm this key out-of-band on Settings → Audit signing key"
 						>
 							verify this key ↗
@@ -1095,11 +1119,11 @@ function TrustPanel({
 						className={cn(
 							"rounded-lg border p-3",
 							report.hash_chain_valid
-								? "border-seal-line bg-seal-soft/40"
-								: "border-danger/40 bg-danger-soft/40",
+								? "border-seal-line bg-seal-soft"
+								: "border-danger/40 bg-danger-soft",
 						)}
 					>
-						<div className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+						<div className="t-metric-label">
 							Claim 1 of 2 · what we recomputed
 						</div>
 						<div className="mt-0.5 t-card-title">Hash chain</div>
@@ -1108,7 +1132,7 @@ function TrustPanel({
 								<div className="mt-1 text-sm font-medium text-seal-ink tabular-nums">
 									Verified · {report.rows_seen} rows · off-platform reproducible
 								</div>
-								<div className="mt-1 text-[11px] text-ink-2">
+								<div className="mt-1 text-2xs text-ink-2">
 									Every row hash + the prev-hash chain recomputed and matched.
 								</div>
 							</>
@@ -1120,7 +1144,7 @@ function TrustPanel({
 								{report.errors.slice(0, 4).map((e) => (
 									<div
 										key={`${e.seq}-${e.kind}`}
-										className="mt-1 font-mono text-[11px] text-danger-ink"
+										className="mt-1 font-mono text-2xs text-danger-ink"
 									>
 										at seq {e.seq ?? "?"}: {e.kind}
 									</div>
@@ -1133,7 +1157,7 @@ function TrustPanel({
 					{(() => {
 						const label = (
 							<>
-								<div className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+								<div className="t-metric-label">
 									Claim 2 of 2 · what the public log proves
 								</div>
 								<div className="mt-0.5 t-card-title">
@@ -1146,12 +1170,12 @@ function TrustPanel({
 								...new Set(report.errors.map((e) => e.kind)),
 							].slice(0, 4);
 							return (
-								<div className="rounded-lg border border-danger/40 bg-danger-soft/40 p-3">
+								<div className="rounded-lg border border-danger/40 bg-danger-soft p-3">
 									{label}
 									<div className="mt-1 text-sm font-medium text-danger-ink">
 										Verification FAILED
 									</div>
-									<div className="mt-1 text-[11px] text-danger-ink">
+									<div className="mt-1 text-2xs text-danger-ink">
 										{report.strip_detected
 											? "An anchor claims to be publicly anchored but its proof is missing (stripped). "
 											: ""}
@@ -1168,7 +1192,7 @@ function TrustPanel({
 							report.hash_chain_valid
 						) {
 							return (
-								<div className="rounded-lg border border-seal-line bg-seal-soft/40 p-3">
+								<div className="rounded-lg border border-seal-line bg-seal-soft p-3">
 									{label}
 									<div className="mt-1 text-sm font-medium text-seal-ink">
 										<span className="tabular-nums">
@@ -1178,7 +1202,7 @@ function TrustPanel({
 										{report.anchors_included === 1 ? "" : "s"} independently
 										verified
 									</div>
-									<div className="mt-1 text-[11px] text-ink-2">
+									<div className="mt-1 text-2xs text-ink-2">
 										Signed by your key, included in Sigstore&apos;s{" "}
 										<span className="font-mono">{PUBLIC_LOG}</span> append-only
 										log, checkpoint verified. Indices in the anchor strip above.
@@ -1188,12 +1212,12 @@ function TrustPanel({
 						}
 						if (report.anchors_included > 0 && !report.hash_chain_valid) {
 							return (
-								<div className="rounded-lg border border-danger/40 bg-danger-soft/40 p-3">
+								<div className="rounded-lg border border-danger/40 bg-danger-soft p-3">
 									{label}
 									<div className="mt-1 text-sm font-medium text-danger-ink">
 										Anchor in log, but rows changed
 									</div>
-									<div className="mt-1 text-[11px] text-danger-ink">
+									<div className="mt-1 text-2xs text-danger-ink">
 										The anchored root is still in the public log, but the
 										ledger&apos;s rows no longer match it — see the broken chain
 										(Claim 1).
@@ -1229,7 +1253,7 @@ function TrustPanel({
 									<div className="mt-1 text-sm font-medium text-ink">
 										No signed batches yet
 									</div>
-									<div className="mt-1 text-[11px] text-ink-2">
+									<div className="mt-1 text-2xs text-ink-2">
 										Signing begins with your first gateway-proxied batch.
 									</div>
 								</div>
@@ -1254,7 +1278,7 @@ function TrustPanel({
 									<div className="mt-1 text-sm font-medium text-ink">
 										Anchored in the public log — not verified here
 									</div>
-									<div className="mt-1 text-[11px] text-ink-2">
+									<div className="mt-1 text-2xs text-ink-2">
 										{tenantPubkeyB64
 											? "Run Verify integrity to check the inclusion proof against your key."
 											: "We cannot check the inclusion proof without a per-workspace verification key, so this batch is not independently verifiable yet."}
@@ -1269,7 +1293,7 @@ function TrustPanel({
 									<div className="mt-1 text-sm font-medium text-ink">
 										Tamper-evident, operator-signed
 									</div>
-									<div className="mt-1 text-[11px] text-ink-2">
+									<div className="mt-1 text-2xs text-ink-2">
 										These batches are signed with Tracelane&apos;s operator key,
 										not your own. That detects later tampering, but it cannot be
 										checked independently of us.{" "}
@@ -1287,7 +1311,7 @@ function TrustPanel({
 								<div className="mt-1 text-sm font-medium text-ink">
 									Tenant-signed (Ed25519)
 								</div>
-								<div className="mt-1 text-[11px] text-ink-2">
+								<div className="mt-1 text-2xs text-ink-2">
 									Signed with your workspace&apos;s own key and verified against
 									it. These batches are not yet publicly anchored (anchoring is
 									best-effort, gateway-path).
@@ -1378,7 +1402,7 @@ function ChainList({
 						<button
 							type="button"
 							onClick={jumpToBroken}
-							className="rounded-md border border-danger/40 bg-danger-soft/50 px-2 py-1 text-[11px] font-medium text-danger-ink hover:bg-danger-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded-md border border-danger/40 bg-danger-soft px-2 py-1 text-2xs font-medium text-danger-ink hover:bg-danger-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							Jump to first break (#{firstBrokenSeq})
 						</button>
@@ -1388,7 +1412,7 @@ function ChainList({
 							type="button"
 							onClick={toggleChain}
 							aria-expanded={chainOpen}
-							className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded-md border border-line px-2 py-1 text-2xs text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							{chainOpen
 								? "Collapse chain ▴"
@@ -1399,7 +1423,7 @@ function ChainList({
 			</div>
 
 			{/* ── Honest scope note — always visible ──────────────────────── */}
-			<p className="mb-2 text-[11px] text-ink-3">
+			<p className="mb-2 text-2xs text-ink-3">
 				{!chainOpen ? (
 					<>
 						Showing first{" "}
@@ -1463,7 +1487,11 @@ function ChainList({
 							onMouseEnter={() => setHoveredSeq(r.seq)}
 							onMouseLeave={() => setHoveredSeq(null)}
 						>
-							{/* chain thread — continuous dotted teal spine */}
+							{/* Chain thread — a continuous dashed SEAL-GREEN spine (danger red when
+							    the link is broken). It was described as "teal"; the spine has always
+							    painted `--seal`, which is the provenance green, and teal is not a
+							    colour this system contains. Green here is load-bearing: it is the
+							    verified-provenance mark, one of the few coloured marks left. */}
 							<div className="relative flex w-3 shrink-0 justify-center">
 								<span
 									aria-hidden
@@ -1484,14 +1512,14 @@ function ChainList({
 								className={cn(
 									"group mb-1.5 min-w-0 flex-1 rounded-lg border transition-colors",
 									broken
-										? "border-danger/50 bg-danger-soft/40"
+										? "border-danger/50 bg-danger-soft"
 										: isHovered
-											? "border-seal/30 bg-seal-soft/20"
+											? "border-seal/30 bg-seal-soft"
 											: "border-line bg-surface",
 								)}
 							>
 								{/* collapsed row — event + time + hash trailing */}
-								<summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[11px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal [&::-webkit-details-marker]:hidden">
+								<summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-2xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
 									<span
 										aria-hidden
 										className="shrink-0 text-ink-3 transition-transform group-open:rotate-90"
@@ -1514,7 +1542,7 @@ function ChainList({
 										</span>
 									)}
 									{/* Full date+time — unambiguous wall-clock (midnight ≠ offset) */}
-									<span className="shrink-0 font-mono tabular-nums text-ink-3 text-[10px]">
+									<span className="shrink-0 font-mono tabular-nums text-ink-3 text-2xs">
 										{fmtDateTime(r.event_time)}
 									</span>
 									<span
@@ -1530,10 +1558,10 @@ function ChainList({
 
 								{/* expanded — data covered by this hash */}
 								<div className="space-y-2 border-t border-line px-3 pb-3 pt-2">
-									<div className="text-[10px] font-semibold uppercase tracking-wide text-ink-3">
+									<div className="t-metric-label">
 										Data covered by this hash
 									</div>
-									<dl className="flex flex-wrap gap-x-5 gap-y-1 text-[11px]">
+									<dl className="flex flex-wrap gap-x-5 gap-y-1 text-2xs">
 										<div className="flex gap-1.5">
 											<dt className="text-ink-3">seq</dt>
 											<dd className="font-mono tabular-nums text-ink">
@@ -1556,15 +1584,13 @@ function ChainList({
 										</div>
 									</dl>
 									<div>
-										<div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink-3">
-											payload
-										</div>
-										<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-md bg-surface-2 p-2 font-mono text-[11px] text-ink">
+										<div className="mb-0.5 t-metric-label">payload</div>
+										<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-md bg-surface-2 p-2 font-mono text-2xs text-ink">
 											{formatPayload(r.payload)}
 										</pre>
 									</div>
 									{/* Hash linkage — show the chain connection explicitly */}
-									<div className="space-y-0.5 break-all font-mono text-[10px]">
+									<div className="space-y-0.5 break-all font-mono text-2xs">
 										<div
 											className={cn(
 												"flex items-start gap-1.5",
@@ -1598,7 +1624,7 @@ function ChainList({
 										</div>
 									</div>
 									{broken && (
-										<div className="text-[11px] font-medium text-danger-ink">
+										<div className="text-2xs font-medium text-danger-ink">
 											row hash mismatch — recomputing this row&apos;s hash over
 											the data above does not match the stored hash.
 										</div>
@@ -1621,7 +1647,7 @@ function ChainList({
 						<button
 							type="button"
 							onClick={() => setChainOpen(true)}
-							className="mb-1.5 flex-1 rounded-lg border border-dashed border-line bg-surface-2/40 px-3 py-2 text-left text-[11px] text-ink-3 hover:bg-surface-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="mb-1.5 flex-1 rounded-lg border border-dashed border-line bg-surface-2 px-3 py-2 text-left text-2xs text-ink-3 hover:bg-surface-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							…{" "}
 							<span className="tabular-nums">
@@ -1657,10 +1683,10 @@ function ChainList({
 						</div>
 						<div
 							className={cn(
-								"mb-1.5 flex min-w-0 flex-1 items-center gap-2 rounded-lg border px-3 py-2 text-[11px]",
+								"mb-1.5 flex min-w-0 flex-1 items-center gap-2 rounded-lg border px-3 py-2 text-2xs",
 								chainBroken
 									? "border-line bg-surface"
-									: "border-seal/30 bg-seal-soft/30",
+									: "border-seal/30 bg-seal-soft",
 							)}
 						>
 							<span
@@ -1682,7 +1708,7 @@ function ChainList({
 
 			{/* Pagination — only visible when the full chain is expanded */}
 			{chainOpen && rows.length > PAGE_SIZE && (
-				<div className="mt-2 flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-ink-2">
+				<div className="mt-2 flex flex-wrap items-center justify-end gap-1.5 text-2xs text-ink-2">
 					<span className="tabular-nums">
 						{start + 1}–{Math.min(start + PAGE_SIZE, rows.length)} of{" "}
 						{fmtCount(rows.length)}
@@ -1691,7 +1717,7 @@ function ChainList({
 						type="button"
 						onClick={() => setPage(Math.max(0, clamped - 1))}
 						disabled={clamped === 0}
-						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						Prev
 					</button>
@@ -1702,7 +1728,7 @@ function ChainList({
 						type="button"
 						onClick={() => setPage(Math.min(totalPages - 1, clamped + 1))}
 						disabled={clamped >= totalPages - 1}
-						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						Next
 					</button>
@@ -1891,11 +1917,39 @@ export function AuditLedgerView({
 			// Runs the open-source verifier over bytes you can inspect — not a server
 			// boolean. With your trusted audit key it verifies signatures + public
 			// anchors offline (Rekor v2 needs no network — the proof is bundled).
+			//
+			// LOADED ON DEMAND, not with the route. As a static import the verifier
+			// was 44 kB of the /audit route's first-load JS (198,881 B of script
+			// transferred vs ~155,000 B on every other route, measured on a
+			// production build) for code that only ever runs from this click. The
+			// idle warm below pulls the chunk in ahead of time, so "verify offline"
+			// still holds for anyone who loaded the page and then lost the network.
+			const { verifyLedgerText } = await loadVerifier();
 			setReport(await verifyLedgerText(ndjson, { tenantPubkey }));
 		} finally {
 			setVerifying(false);
 		}
 	}, [ndjson, tenantPubkey]);
+
+	// Warm the verifier chunk once the page is idle. This is what keeps the
+	// dynamic import from trading a first-load saving for an offline failure: the
+	// bytes are off the critical path, but they are in cache long before anyone
+	// reaches for the button. `import()` is idempotent, so a click that beats the
+	// idle callback simply awaits the same in-flight module.
+	useEffect(() => {
+		// A failed warm is deliberately swallowed: `verify` re-imports on click and
+		// surfaces the failure there, where the user is watching a spinner.
+		const warm = () => {
+			void loadVerifier().catch(() => {});
+		};
+		// Effects never run on the server, so `window` is safe to read directly.
+		if (typeof window.requestIdleCallback !== "function") {
+			const t = setTimeout(warm, 1500);
+			return () => clearTimeout(t);
+		}
+		const id = window.requestIdleCallback(warm);
+		return () => window.cancelIdleCallback(id);
+	}, []);
 
 	function download() {
 		// Download the COMPLETE, UNCAPPED ledger via the streaming proxy — NOT the
@@ -1914,7 +1968,7 @@ export function AuditLedgerView({
 	return (
 		<div className="space-y-5">
 			{/* TRUST PANEL — dominant, top: anchor status + verify CTA + verdict.
-			    The ONLY Lava CTA on the page. The ONLY large green element. */}
+			    Holds the page's only primary CTA and its only large green element. */}
 			<TrustPanel
 				anchoredIndices={anchoredIndices}
 				hasAnchorRecords={anchorRecords.length > 0}
@@ -1939,34 +1993,53 @@ export function AuditLedgerView({
 					<h2 className="text-sm font-semibold text-ink">
 						Download the complete ledger
 					</h2>
-					<p className="mt-0.5 max-w-2xl text-[13px] text-ink-2">
+					<p className="mt-0.5 max-w-2xl text-sm text-ink-2">
 						The chain above is a capped preview (first {fmtCount(rows.length)}
 						). This downloads the <strong>complete</strong>, uncapped ledger as
 						NDJSON — the EU AI Act Article 12 evidence pack — then verify it
 						yourself with the open-source CLI (no account, no network).
 					</p>
-					<div
-						className="mt-1 text-[11px] text-ink-3"
-						data-testid="export-scope"
-					>
+					<div className="mt-1 text-2xs text-ink-3" data-testid="export-scope">
 						{exportScopeLabel}
 					</div>
 					<div className="mt-3 flex flex-wrap items-center gap-3">
 						<Button
 							variant="primary"
 							onClick={download}
-							className="bg-surface-inverse text-ink-inverse hover:opacity-90"
+							// No className: the `primary` variant already paints `bg-selected
+							// text-selected-on hover:opacity-90`. The override that stood here
+							// (`bg-surface-inverse text-ink-inverse`) won through twMerge and put the
+							// dark-theme page-ground colour back on the CTA — see the Verify button
+							// above and Button.tsx.
 						>
 							Download evidence (NDJSON)
 						</Button>
-						<code className="font-mono text-[11px] text-ink-2">
+						<code className="font-mono text-2xs text-ink-2">
 							tlane verify --tenant-pubkey &lt;key&gt;
 						</code>
 					</div>
 				</Card>
 			) : (
 				<div
-					className="flex flex-col gap-4 rounded-lg bg-surface-inverse p-5 sm:flex-row sm:items-center sm:justify-between"
+					// THE BORDER IS `border-ink-inverse/15`, NOT `border-line`, AND THE SWAP IS A
+					// CORRECTION rather than a restyle (2026-08-22 contrast audit). The comment
+					// that stood here claimed this was "the same DSH-08 finding as the dashboard's
+					// error-budget card" while spending a DIFFERENT token, and the dashboard's own
+					// comment (app/dashboard/page.tsx:1005-1012) states why `--line` cannot be used
+					// here: `--line` is a LIGHT-surface hairline (#e7e7e5), so on this near-black
+					// panel it painted a bright ring at 14.61:1 in light theme and a near-invisible
+					// 1.36:1 edge in dark — one panel, loud in one theme and edgeless in the other,
+					// which is exactly the P0.18 parity break a border here exists to prevent.
+					// `border-ink-inverse/15` composites to ~#37373a (light) / ~#303132 (dark) over
+					// the panel — 1.52:1 and 1.48:1, one expression correct twice.
+					// The edge is still load-bearing: in dark `--surface-inverse` IS the canvas
+					// colour, so a borderless inverse PANEL has no edge of any kind there.
+					// `.surface-card` — this div is the ELSE branch of a ternary whose IF
+					// branch renders a <Card>. Two radii in one slot meant the panel
+					// changed shape depending on entitlement, which is the drift the card
+					// primitive exists to prevent. `bg-surface-inverse` is a utility and
+					// therefore still wins over the class's own background.
+					className="surface-card flex flex-col gap-4 border border-ink-inverse/15 bg-surface-inverse p-5 sm:flex-row sm:items-center sm:justify-between"
 					data-testid="export-upsell"
 				>
 					<div>
@@ -1976,7 +2049,7 @@ export function AuditLedgerView({
 						<h2 className="mt-1 text-sm font-semibold text-ink-inverse">
 							Download the complete ledger
 						</h2>
-						<p className="mt-0.5 max-w-2xl text-[13px] text-ink-inverse opacity-70">
+						<p className="mt-0.5 max-w-2xl text-sm text-ink-inverse opacity-70">
 							Seeing and verifying the first {fmtCount(rows.length)} events of
 							your chain (from genesis) is <strong>free</strong> — that is
 							everything above. The downloadable Article-12 evidence pack — the{" "}
@@ -1985,9 +2058,30 @@ export function AuditLedgerView({
 							add-on.
 						</p>
 					</div>
+					{/*
+					 * `bg-ink-inverse text-surface-inverse`, NOT `bg-surface-inverse
+					 * text-ink-inverse`. THE BUG (2026-08-22 contrast audit): this CTA painted
+					 * itself in the SAME token as the panel behind it, so the button measured
+					 * 1.00:1 against its own container in BOTH themes — a floating label with no
+					 * button under it, and the only ink-on-ink pair in this tree that broke in
+					 * light AND dark at once. Both tokens here are theme-stable on an inverse
+					 * surface (`--ink-inverse` is #f5f5f5 in both themes, `--surface-inverse` is
+					 * near-black in both), so it reads as one light pill with a dark label
+					 * everywhere: 16.60:1 light / 17.71:1 dark for the fill against the panel,
+					 * and the same figures for the label against the fill.
+					 *
+					 * `focus-visible:outline-ink-inverse` is the per-site override tokens.css
+					 * (the `--focus-ring` note) says a focusable control inside a
+					 * `--surface-inverse` card "would still need" — and then asserts "there are
+					 * none". There is: this one. `--focus-ring` is `--ink`, which in LIGHT theme
+					 * is #171717 on a #151619 panel = 1.01:1, and `outline-offset: 2px` does not
+					 * save it here because the ring is painted over the PANEL, not over the
+					 * canvas. This overrides the base ring's COLOUR; it is not a second ring
+					 * mechanism and it does not use `outline-none`.
+					 */}
 					<Link
 						href="/settings/billing"
-						className="bg-surface-inverse text-ink-inverse hover:opacity-90 inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-[13px] font-medium"
+						className="bg-ink-inverse text-surface-inverse hover:opacity-90 inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-sm font-medium focus-visible:outline-ink-inverse"
 					>
 						Add the Audit SKU
 					</Link>
@@ -2010,8 +2104,13 @@ export function AuditLedgerView({
 			{/* NEGATIVE SCENARIO — what a failed verification looks like */}
 			<NegativeScenarioPanel />
 
-			{/* CHAIN VIEW — white bg card so the chain spine renders on white, not the
-			    blue canvas (item 4: white result surfaces). Collapsed by default. */}
+			{/* CHAIN VIEW — a `--surface` card so the chain spine renders on the card
+			    rather than on the page ground. The old note said "not the blue canvas";
+			    the canvas is `--canvas` (#fafaf9 light / #0d0e10 dark) and has not been
+			    blue since the P0 palette landed. The reason the card is still here is
+			    unchanged and is not about hue: the ground and the card are different
+			    VALUES, and the spine needs the card's value behind it to read.
+			    Collapsed by default. */}
 			<Card className="bg-surface p-5">
 				<ChainList
 					rows={visibleRows}

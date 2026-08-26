@@ -216,6 +216,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		// Non-fatal: signing in again re-triggers verification.
 	}
 
+	// Mirror into the `users` cache. WorkOS stays authoritative.
 	try {
 		await db
 			.update(users)

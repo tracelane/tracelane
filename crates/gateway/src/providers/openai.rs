@@ -79,6 +79,7 @@ impl OpenAiProvider {
         let oai_request = OpenAiRequest::from_universal(request);
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        // SSRF: validate before the POST (reviewer).
         crate::ssrf_guard::validate_url(&url)
             .await
             .context("SSRF guard rejected OpenAI base URL")?;
@@ -95,6 +96,7 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // SECURITY: do NOT include the upstream body in
             // the bail! string — OpenAI 401/403 bodies routinely echo the
             // offending Authorization header and would leak the customer's
             // BYOK key into our logs / error records / tenant-visible error JSON.
@@ -162,6 +164,7 @@ fn parse_openai_sse(data: &str) -> Result<Option<ProviderEvent>> {
     if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
         let input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
         let output = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+        // Wire-reported cost: OpenRouter (and some OpenAI-compatible
         // hosts) attach `usage.cost` in USD. Absent → None, never computed.
         let cost_usd = usage.get("cost").and_then(|c| c.as_f64());
         return Ok(Some(ProviderEvent::UsageUpdate {
@@ -211,8 +214,15 @@ fn parse_openai_sse(data: &str) -> Result<Option<ProviderEvent>> {
 
 // ── OpenAI request/response types ────────────────────────────────────────────
 
+/// `pub(super)` so `azure` can reuse this EXACT translation.
+///
+/// Azure speaks the OpenAI wire format but had been serialising the internal
+/// `ChatRequest` straight to the wire, which sent Anthropic-shaped `tools`
+/// (`name`/`input_schema`) and Anthropic-shaped `tool_calls` (`{id,name,input}`)
+/// to an endpoint expecting OpenAI's nested forms. Two translations for one wire
+/// format is the drift exist to prevent; there is now one.
 #[derive(Debug, Serialize)]
-struct OpenAiRequest {
+pub(super) struct OpenAiRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,7 +265,7 @@ struct OpenAiFunctionDef {
 }
 
 impl OpenAiRequest {
-    fn from_universal(req: ChatRequest) -> Self {
+    pub(super) fn from_universal(req: ChatRequest) -> Self {
         let messages: Vec<OpenAiMessage> =
             req.messages
                 .into_iter()
@@ -273,6 +283,7 @@ impl OpenAiRequest {
                                 .into_iter()
                                 .map(|p| {
                                     let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+                                    // Cache_control is an Anthropic-only
                                     // prompt-caching marker; OpenAI's caching is
                                     // automatic (no field). Strip it so a cached
                                     // block routed to OpenAI never leaks the field.
@@ -352,6 +363,7 @@ mod tests {
 
     #[test]
     fn cache_control_is_stripped_for_openai() {
+        // Cache_control is an Anthropic-only marker; OpenAI must never
         // receive it (its caching is automatic). A cached block routed here is
         // passed through with the marker removed.
         use serde_json::json;
@@ -417,10 +429,15 @@ mod tests {
 // GWY-26 — the OpenAI Embeddings wire shape, owned by the adapter that speaks it.
 //
 // Why this lives here and not in its own module: `openai.rs` IS the definition
-// of the OpenAI wire format, and the 28 OpenAI-compatible hosts reuse this same
-// adapter. A separate `providers/embeddings.rs` would also be counted as a 36th
-// provider adapter by `scripts/ci/check-provider-count.py`, which globs
-// `providers/*.rs` — and that count has leaked into published marketing copy
+// of the OpenAI wire format, and every OpenAI-compatible provider in
+// `crates/gateway/providers.tsv` reuses this same adapter.
+//
+// GWY-42 retired the second reason this comment used to give — that a new
+// `providers/embeddings.rs` would inflate the provider count.
+// `scripts/ci/check-provider-count.py` no longer globs `providers/*.rs`; it
+// derives the count from `ProviderRegistry`'s adapter fields plus the catalog
+// rows, so adding a module here cannot move it. The leak that guard exists to
+// stop (, a wrong count reaching published marketing copy) is still real.
 //
 // Why the endpoint exists at all: the flight recorder claims full-fidelity
 // capture of what an agent did, but the gateway mounted exactly three top-level
@@ -564,6 +581,7 @@ impl OpenAiProvider {
     ///   [`crate::providers::ProviderHttpError`] carrying the STATUS ONLY. The upstream body is
     ///   read to free the connection and then dropped — provider error bodies
     ///   routinely echo the `Authorization` header, i.e. the tenant's own BYOK
+    ///   key (`.claude/rules/security.md`, /);
     /// - the 2xx body is not an embeddings payload.
     #[instrument(skip(self, request, api_key), fields(
         tenant_id = %tenant_id,

@@ -61,7 +61,7 @@ disclosure, coordinated with reporter.
   (AWS/GCP IMDS), 168.63.129.16 (Azure IMDS), 127/8, ::1, ::,
   fc00::/7, 240/4, 2001:db8::/32, and **IPv4-mapped IPv6**
   (recurses through `to_ipv4_mapped`). HTTP redirects are
-  **disabled** on the SSRF-hardened client (mythos round-3 B-1) —
+  **disabled** on the SSRF-hardened client —
   per-hop sync validation could not catch domain-resolves-to-
   private-IP TOCTOU attacks, so every caller now talks to a fixed
   endpoint. Future callers wanting redirects must re-validate each

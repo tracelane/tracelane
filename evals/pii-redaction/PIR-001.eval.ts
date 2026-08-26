@@ -30,6 +30,7 @@ describe("PIR-001: PII redaction — 100% recall on synthetic patterns", () => {
 			path.resolve(__dirname, "../../crates/policy/src/pii.rs"),
 			"utf8",
 		);
+		// PII categories that must be redacted per
 		const required = ["SSN", "credit", "email", "phone"];
 		for (const category of required) {
 			expect(src.toLowerCase(), `Missing PII category: ${category}`).toContain(

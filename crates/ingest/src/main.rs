@@ -5,6 +5,7 @@
 //! 2. NATS JetStream consumer — reads spans from the message bus
 //! 3. ClickHouse batch writer — drains the span channel into ClickHouse
 //!
+//! Throughput target: ≥50K spans/sec single-node.
 
 // Many modules contain scaffolded items awaiting wiring in upcoming milestones.
 // Suppress dead_code and unused_imports globally for this binary crate during
@@ -94,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let otlp_tx = span_tx.clone();
     let nats_tx = span_tx.clone();
 
+    // PP-O2 tail sampler: keep every error/intervention trace, rate-
     // sample the rest. Shared into the ClickHouse writer, which applies the
     // per-span keep/drop verdict and periodically prunes the sticky map. Before
     // this, `evaluate()` was never called — sampling silently never ran.

@@ -1,6 +1,7 @@
 //! x402 / AP2 / ACP payment event processor.
 //!
 //! Extracts payment span attributes from gateway requests and records them
+//! to the Postgres payment_events table. Per "V1 covers x402 from
 //! day one."
 //!
 //! Span vocabulary:

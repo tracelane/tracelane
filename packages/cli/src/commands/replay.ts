@@ -5,6 +5,7 @@
  * terminal as an ordered table. JSON output is also supported for piping into
  * other tools.
  *
+ * Option 1: reads the gateway `GET /v1/traces/{id}/spans` endpoint
  * (NOT the old dashboard `/api/traces/{id}/steps` route, which doesn't exist on
  * the gateway and required a browser session). Auth aligns with the modern
  * `tlane` family — `Authorization: Bearer <jwt|tlane_apikey>` — and the spans

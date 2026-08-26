@@ -1,6 +1,7 @@
 "use client";
 
 /**
+ * DeletePromptButton — per-row soft-delete on the /prompts list.
  *
  * Confirms, then calls DELETE /api/prompts/[name] (the per-user-JWT proxy) and
  * refreshes the RSC list so the archived prompt drops out. Builder-allowed —

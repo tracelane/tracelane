@@ -13,13 +13,13 @@
 //!     0x02           // version byte
 //!     || 12-byte nonce
 //!     || ciphertext + 16-byte GCM tag
-//! )
+//!
 //! ```
 //!
 //! Wraps the v1 blob format and adds a leading **version byte** so
 //! future algorithm rotations are non-breaking.
 //!
-//! ## AAD (R2 C-1 fix)
+//! ## AAD (fix)
 //!
 //! Previously the AEAD was sealed with `Aad::empty()` — a ciphertext
 //! from `(tenant_A, openai)` could be pasted into the `(tenant_B,
@@ -176,7 +176,7 @@ impl ByokMasterKey {
             } else {
                 // v1 (no version byte) was sealed with EMPTY AAD — no tenant/
                 // provider binding, so a DB-level ciphertext swap decrypts under
-                // the wrong row (R2 C-1). The migration window is CLOSED (prod
+                // the wrong row. The migration window is CLOSED (prod
                 // verified zero v1 rows, 2026-07-22): fail closed.
                 anyhow::bail!(
                     "BYOK v1 ciphertext rejected — v1 blobs have no AAD binding \
@@ -223,7 +223,7 @@ pub fn audit_key_aad(tenant_id: &tracelane_shared::TenantId) -> Vec<u8> {
 /// (ADR-062), the single-purpose key that signs the Rekor v2 `hashedrekord`
 /// entry. Distinct from [`audit_key_aad`] so an anchor-key ciphertext can
 /// never be swapped into the Ed25519 signing-key slot (or vice versa) and
-/// still authenticate under GCM (R2 C-1). Caller is
+/// still authenticate under GCM. Caller is
 /// `crates/gateway/src/audit_keys.rs`.
 pub fn anchor_key_aad(tenant_id: &tracelane_shared::TenantId) -> Vec<u8> {
     format!("anchor-key:{tenant_id}").into_bytes()
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn v2_rejects_cross_tenant_swap() {
-        // R2 C-1 — the exploit case. An attacker copies a ciphertext
+        // The exploit case. An attacker copies a ciphertext
         // from tenant A's openai row into tenant B's openai row.
         // v1's empty AAD would have decrypted it; v2's tenant-bound
         // AAD must fail GCM authentication.
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn v1_ciphertexts_are_rejected() {
-        // v1 blobs (no version byte, EMPTY AAD) allowed the R2 C-1
+        // v1 blobs (no version byte, EMPTY AAD) allowed the
         // cross-tenant ciphertext swap. Prod was verified to hold ZERO v1
         // rows (2026-07-22: provider_keys 3/3 v2, tenant_audit_keys all
         // v2), so the migration window is closed and v1 fails closed.

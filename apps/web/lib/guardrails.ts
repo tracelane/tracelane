@@ -5,6 +5,7 @@
  * Goes through `gatewayGet` (`lib/gateway.ts`), which mints the *per-user* WorkOS
  * access token and forwards it; the gateway resolves the JWT's org → internal
  * tenant UUID and binds it into `WHERE tenant_id = ?`, so a user only ever sees
+ * their own tenant's verdicts. `GATEWAY_BEARER_TOKEN` is never read here.
  *
  * Honesty: every field is captured on every request in `guardrail_verdicts`
  * (decision, per-rail outcomes, fail-open rails, latency). Nothing is derived or

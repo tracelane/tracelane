@@ -1,6 +1,8 @@
+//! HTTP routes for B1 Prompt Promotion (per ADR-009 /).
 //!
 //! Always compiled; never a `cfg(feature)` flag or tier-string compare.
 //!
+//! ## Entitlement gate (/ ADR-009)
 //!
 //! ADR-009 hybrid pricing: the READ surface (list + resolve + history) AND
 //! authoring (create a version — read-adjacent per ADR-054) are available to
@@ -11,10 +13,12 @@
 //! tenant gets a typed `403 entitlement_required` with an upgrade pointer and
 //! **zero routing mutation** — the check runs before any router call. Fail
 //! **closed**: if the entitlement cache is absent (no Postgres), promotions are
+//! refused (503), mirroring the audit-export gate.
 //!
 //! Routes:
 //!   GET  /v1/prompts                       -> list prompts + activity (ADR-054)
 //!   GET  /v1/prompts/:name?env=production  -> resolved PromptVersion JSON
+//!   DELETE /v1/prompts:name -> soft-delete (archive) a prompt (Builder;)
 //!   POST /v1/prompts/:name/versions        -> author a version (Builder; ADR-054)
 //!   GET  /v1/prompts/:name/history         -> promotion history JSON
 //!   POST /v1/prompts/:name/promote         -> PromotionDecision JSON (Team+ gated)
@@ -45,10 +49,12 @@ use crate::entitlement_cache::{EntitlementCache, FeatureKey};
 use crate::prompt_router::{DecisionKind, Env, PromotionDecision, PromptRouter};
 
 /// State for the prompt-promotion routes: the shared B1 router plus the
+/// entitlement cache backing the ADR-009 Team+ write gate.
 #[derive(Clone)]
 pub struct PromptRoutesState {
     pub router: Arc<PromptRouter>,
     /// `None` only when Postgres is unset (no entitlement source) — the write
+    /// gate then FAILS CLOSED (503), same posture as the audit-export
     /// gate. In production the cache is always present.
     pub entitlements: Option<Arc<EntitlementCache>>,
     /// The tamper-evident hash chain. Every promotion/rollback decision is
@@ -56,6 +62,11 @@ pub struct PromptRoutesState {
     /// chained + independently verifiable (wedge item 3). Shared with the chat
     /// hot path via `Arc`.
     pub audit_chain: Arc<AuditChain>,
+    /// `EVL-05`. `None` when `CLICKHOUSE_URL` is unset — the eval routes then
+    /// answer a typed `503` saying so, rather than 404ing as though the feature
+    /// did not exist. A feature that is configured-off and a feature that is
+    /// absent are different facts.
+    pub eval: Option<Arc<crate::prompt_eval::PromptEvalEngine>>,
 }
 
 /// String label for a decision kind — reused by the DTO and the chained
@@ -113,15 +124,95 @@ pub fn routes() -> Router<PromptRoutesState> {
         .route("/v1/prompts/{name}/promote", post(promote_handler))
         .route("/v1/prompts/{name}/rollback", post(rollback_handler))
         .route("/v1/prompts/{name}/observe", post(observe_handler))
+        // EVL-05 — the eval-runs writer. `POST` starts a run (202) because a
+        // real run takes minutes; the two `GET`s poll it.
+        .route(
+            "/v1/prompts/{name}/evals",
+            post(start_eval_handler).get(list_evals_handler),
+        )
+        .route("/v1/prompts/{name}/evals/{run_id}", get(get_eval_handler))
+}
+
+/// Input ceilings for prompt writes.
+///
+/// There is **no Tower layer on the prompt sub-router** — the only layer on the
+/// whole app is `TraceLayer` — so nothing between the socket and these handlers
+/// bounds a body. Every value here is enforced in the handler because there is
+/// nowhere else for it to happen. Each cap is refused with a typed `400` naming
+/// the limit, never silently truncated: a prompt that was quietly cut short
+/// would be served to a model as if it were what the author wrote.
+mod limits {
+    /// Prompt body. Generous — long system prompts with embedded few-shot
+    /// examples are normal — but bounded: `content` is stored verbatim in
+    /// ClickHouse and returned on every read.
+    pub const CONTENT_BYTES: usize = 256 * 1024;
+    /// Declared template variables. They are stored and never substituted by the
+    /// gateway, so a large array is pure storage cost.
+    pub const TEMPLATE_VARS: usize = 64;
+    pub const TEMPLATE_VAR_BYTES: usize = 128;
+    /// Prompt name. It is a routing key and a UUIDv5 input, not free text.
+    pub const NAME_BYTES: usize = 128;
+}
+
+/// Reject a prompt `name` that is not a routing key.
+///
+/// The name is one half of `prompt_id_for` (UUIDv5 over `"{tenant}:{name}"`) and
+/// one third of the in-memory routing key, so it is an identifier rather than a
+/// label. Restricting the charset keeps it printable in a URL path, a log line
+/// and a ClickHouse `LowCardinality(String)` without escaping.
+fn validate_prompt_name(name: &str) -> Result<(), (StatusCode, String)> {
+    if name.is_empty() || name.len() > limits::NAME_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "prompt name must be 1-{} bytes (got {})",
+                limits::NAME_BYTES,
+                name.len()
+            ),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt name may contain only ASCII letters, digits, '-', '_' and '.'".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Error shape for the WRITE handlers: always a typed JSON body (machine-
+/// readable `error` code), matching the gate + hard-cap 429 style.
 type WriteError = (StatusCode, Json<serde_json::Value>);
 
 fn write_err(status: StatusCode, msg: impl Into<String>) -> WriteError {
-    (status, Json(serde_json::json!({ "error": msg.into() })))
+    let msg = msg.into();
+    // Some callers hand us a fully-formed JSON OBJECT as a string —
+    // `auth::role_forbidden_json` and the A13 scope refusal both do. Wrapping
+    // one of those in `{"error": …}` DOUBLE-ENCODES it, so the client receives
+    //
+    //     {"error":"{\"error\":\"…\",\"required_scope\":\"admin\"}"}
+    //
+    // and the machine-readable fields those bodies exist to carry —
+    // `required_scope`, `required_role`, `type` — arrive escaped inside a
+    // string. `body.error.required_scope` is `undefined`; reading it needs a
+    // second parse the caller has no reason to expect.
+    //
+    // OBSERVED ON PROD 2026-08-19, not inferred: a real `403` from the scope
+    // gate came back nested. The tests could not see it because they assert
+    // with `contains()`, which passes on either shape — the substring is
+    // present either way. Only a live request showed it.
+    //
+    // Pass an object through untouched; wrap anything else.
+    match serde_json::from_str::<serde_json::Value>(&msg) {
+        Ok(v) if v.is_object() => (status, Json(v)),
+        _ => (status, Json(serde_json::json!({ "error": msg }))),
+    }
 }
 
+/// ADR-009 Team+ write gate. Checks `f_prompt_promotion_write` for
 /// the already-validated tenant BEFORE any router mutation.
 ///
 /// # Errors
@@ -202,10 +293,15 @@ struct PromoteBody {
     eval_run_id: Option<Uuid>,
     /// When present + non-empty, bypass the eval gate and record a
     /// tamper-evident ManualOverride decision (who + reason). The promote
-    /// entitlement gate (Team+) still applies. This is how a user promotes to
-    /// prod today — the eval gate has no producer of `eval_runs` yet, so the
-    /// non-override path 409s; the override is honest because every use writes
-    /// a durable, attributed promotion record.
+    /// entitlement gate (Team+) still applies.
+    ///
+    /// This comment previously said the gate "has no producer of `eval_runs`
+    /// yet, so the non-override path 409s". That stopped being true when EVL-05
+    /// landed: `prompt_eval.rs` IS the `eval_runs` writer and
+    /// `POST /v1/prompts/{name}/evals` starts a run. So the non-override path
+    /// now SUCCEEDS against a passing run and 409s only on `BlockedByEval`.
+    /// The override remains available and is honest because every use writes a
+    /// durable, attributed promotion record with `eval_run_id: null`.
     #[serde(default)]
     override_reason: Option<String>,
 }
@@ -276,6 +372,26 @@ async fn tenant_from_auth(headers: &HeaderMap) -> Result<TenantId, (StatusCode, 
     let claims = crate::auth::validate_authorization(header_str)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+    // A13 scope gate on the READ surfaces (`GET /v1/prompts`,
+    // `GET /v1/prompts/{name}`, `.../history`). Prompt CONTENT is the tenant's
+    // intellectual property; before this an `ingest`-scoped SDK key — the
+    // credential that ships inside a customer's container image, default-on
+    // since GWY-41 — could read every prompt in the workspace. That is the same
+    // exfiltration shape B-230 closed on `tool_analytics`, `billing/usage` and
+    // the audit routes, left open here.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope");
+        return Err((
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "This API key is not scoped to read recorded data. It needs \
+                          the `read` scope.",
+                "type": "insufficient_scope",
+                "required_scope": "read",
+            })
+            .to_string(),
+        ));
+    }
     Ok(claims.tenant_id)
 }
 
@@ -287,13 +403,52 @@ async fn tenant_from_auth(headers: &HeaderMap) -> Result<TenantId, (StatusCode, 
 /// `validate_authorization` needs a signed token, and a gate that can only be
 /// exercised through one is a gate that gets asserted by description.
 fn authorize_write(claims: &crate::auth::Claims) -> Result<(), (StatusCode, String)> {
-    if claims.can_write_prompts() {
-        return Ok(());
+    if !claims.can_write_prompts() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        ));
     }
-    Err((
-        StatusCode::FORBIDDEN,
-        crate::auth::role_forbidden_json("owner"),
-    ))
+    // A13 scope gate. THE ROLE GATE ABOVE IS NOT A SCOPE GATE, and until this
+    // line the difference was load-bearing: `can_write_prompts` matches the
+    // `role: None` arm for ANY `AuthMethod::ApiKey` without ever reading
+    // `key_scope`, so every scoped key — including a `read`-only key, the one
+    // `api_scope.rs:47-49` calls "the scope an external auditor should be given,
+    // and nothing else" — could author versions, archive a prompt, promote to
+    // production and roll back.
+    //
+    // B-230 audited this surface and fixed the ROLE half (a viewer JWT could
+    // flip prod routing); the scope half survived that audit because the
+    // structural guard `every_b230_route_gates_on_scope_after_authenticating`
+    // checks the other five files for a scope needle and checks this one only
+    // for `actor_from_auth`.
+    //
+    // `Admin` is the right scope, not `Chat`: these routes move production
+    // traffic and mutate workspace configuration, which is what
+    // `api_scope.rs`'s own doc defines `Admin` as. Blast radius measured
+    // against prod before choosing it — 12 live keys are `scope IS NULL`
+    // (`LegacyFullSurface`, allows everything, unchanged) and every
+    // JWT-authenticated dashboard session is also `LegacyFullSurface`, so only
+    // explicitly-scoped machine keys are narrowed.
+    if !claims.allows_scope(crate::auth::scope::Scope::Admin) {
+        tracing::warn!(
+            sub = %claims.sub,
+            "api key lacks the `admin` scope — refusing prompt write"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "This API key is not scoped to manage prompts. Promoting, \
+                          rolling back, authoring and deleting change production \
+                          routing; they need the `admin` scope. Mint a new key with \
+                          it in Settings → API Keys.",
+                "type": "insufficient_scope",
+                "required_scope": "admin",
+            })
+            .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Authenticate **and authorize** a prompt WRITE. One site, all FIVE write
@@ -385,10 +540,45 @@ async fn create_version_handler(
         .await
         .map_err(|(s, m)| write_err(s, m))?;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
+    validate_prompt_name(&name).map_err(|(st, m)| write_err(st, m))?;
     if body.content.trim().is_empty() {
         return Err(write_err(
             StatusCode::BAD_REQUEST,
             "content must not be empty",
+        ));
+    }
+    if body.content.len() > limits::CONTENT_BYTES {
+        return Err(write_err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "content is {} bytes; the limit is {}",
+                body.content.len(),
+                limits::CONTENT_BYTES
+            ),
+        ));
+    }
+    if body.template_variables.len() > limits::TEMPLATE_VARS {
+        return Err(write_err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "at most {} template_variables (got {})",
+                limits::TEMPLATE_VARS,
+                body.template_variables.len()
+            ),
+        ));
+    }
+    if let Some(too_long) = body
+        .template_variables
+        .iter()
+        .find(|v| v.len() > limits::TEMPLATE_VAR_BYTES)
+    {
+        return Err(write_err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "template_variable is {} bytes; the limit is {}",
+                too_long.len(),
+                limits::TEMPLATE_VAR_BYTES
+            ),
         ));
     }
     let v = state
@@ -425,6 +615,7 @@ async fn create_version_handler(
     ))
 }
 
+/// DELETE /v1/prompts/{name} — soft-delete (archive) a prompt.
 /// **Builder-allowed** — the inverse of authoring (`create_version`), NOT the
 /// Team+ promotion gate, so no `require_promotion_write`. Tenant from the JWT
 /// claim only. Idempotent: deleting an already-gone prompt still returns 204.
@@ -463,11 +654,13 @@ async fn promote_handler(
         .await
         .map_err(|(s, m)| write_err(s, m))?;
     tracing::Span::current().record("tenant_id", tenant.to_string());
+    // ADR-009 Team+ write gate — BEFORE any parse/route work so an
     // unentitled tenant causes zero routing mutation.
     require_promotion_write(&state.entitlements, &tenant).await?;
     let from_env = parse_env(&body.from_env).map_err(|(s, m)| write_err(s, m))?;
     let to_env = parse_env(&body.to_env).map_err(|(s, m)| write_err(s, m))?;
 
+    // An explicit override reason bypasses the (currently producer-less)
     // eval gate and records a tamper-evident ManualOverride attributed to the
     // actor; otherwise the normal eval-gated path (which 409s until an eval run
     // is supplied). The Team+ entitlement gate above covers both.
@@ -489,6 +682,7 @@ async fn promote_handler(
                     to_env,
                     body.to_version_id,
                     &format!("user override by {actor}: {reason}"),
+                    Some(actor.as_str()),
                 )
                 .await
         }
@@ -502,6 +696,7 @@ async fn promote_handler(
                     to_env,
                     body.to_version_id,
                     body.eval_run_id,
+                    Some(actor.as_str()),
                 )
                 .await
         }
@@ -534,12 +729,20 @@ async fn rollback_handler(
         .await
         .map_err(|(s, m)| write_err(s, m))?;
     tracing::Span::current().record("tenant_id", tenant.to_string());
+    // ADR-009 Team+ write gate.
     require_promotion_write(&state.entitlements, &tenant).await?;
     let env = parse_env(&body.env).map_err(|(s, m)| write_err(s, m))?;
     let chain_tenant = tenant.clone();
     let decision = state
         .router
-        .rollback(tenant, &name, env, body.to_version_id, &body.reason)
+        .rollback(
+            tenant,
+            &name,
+            env,
+            body.to_version_id,
+            &body.reason,
+            Some(actor.as_str()),
+        )
         .await
         .map_err(|e| write_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // Wedge item 3: chain the rollback decision as a signed eval.verdict.
@@ -602,6 +805,7 @@ async fn observe_handler(
         .await
         .map_err(|(s, m)| write_err(s, m))?;
     tracing::Span::current().record("tenant_id", tenant.to_string());
+    // The observe feed drives auto-rollback (a write workflow) — same
     // ADR-009 Team+ gate as promote/rollback.
     require_promotion_write(&state.entitlements, &tenant).await?;
     let env = parse_env(&body.env).map_err(|(s, m)| write_err(s, m))?;
@@ -685,9 +889,163 @@ async fn history_handler(
     Ok(Json(entries))
 }
 
+/// `POST /v1/prompts/{name}/evals` — start an eval run (EVL-05).
+///
+/// **Gated as a WRITE, not a read**, and that is deliberate: a run spends the
+/// tenant's provider money, so it needs the same owner/machine role and `admin`
+/// scope as promotion. It is NOT entitlement-gated — measuring is free, only
+/// PROMOTING is the paid act, which matches `create_version`.
+///
+/// **`EVL-23` narrows that by exactly one capability, and the narrowing is the
+/// point.** A run that asks for an `llm_judge` assertion needs
+/// `f_prompt_promotion_write`; a run without one is untouched. The judge is a
+/// SECOND provider call per case on the tenant's own key, so it is the new paid
+/// capability — and gating it is not the same as gating the route.
+///
+/// **What was considered and rejected: gating the whole route.** `EVL-23` §2.7
+/// proposed adding `require_promotion_write` unconditionally, arguing the module
+/// header sells this surface as Team+. It does not — the header's Team+
+/// enumeration is at `:9-10` and reads *"the PROMOTION workflow — promote /
+/// rollback / observe … — is Team+"*, which excludes evals (re-verified
+/// 2026-08-24, the one NEVER_TRUE finding of that pass). Doing it anyway would
+/// have been a breaking authorization change to a shipped route, argued from a
+/// misreading, on a money path item 9 had already capped with the workspace
+/// budget below.
+#[tracing::instrument(skip(state, headers, body), fields(prompt_name = %name, tenant_id = tracing::field::Empty))]
+async fn start_eval_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<crate::prompt_eval::EvalRunRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), WriteError> {
+    let (tenant, _actor) = actor_from_auth(&headers)
+        .await
+        .map_err(|(s, m)| write_err(s, m))?;
+    tracing::Span::current().record("tenant_id", tenant.to_string());
+    let Some(engine) = state.eval.clone() else {
+        return Err(write_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "eval runs need a ClickHouse connection and this gateway has none configured",
+        ));
+    };
+    // ── THE MONEY CAP (spec `EVL-02` §2.5, founder ruling R83.2) ────────────
+    //
+    // A run is N real provider calls started by one request, and until now this
+    // surface had no ceiling at all — not a rate limit, not a quota, not a
+    // budget. The chat path has enforced the workspace budget since GWY-43; an
+    // eval run spends from the SAME wallet and was simply not asked. Checked
+    // BEFORE the slot is claimed and before a cent is spent, and the counter is
+    // seeded from the durable ClickHouse total first (: an in-memory counter
+    // alone is not a cap, because a redeploy forgives every dollar accrued).
+    // ── `EVL-23`: the JUDGE is Team+, the eval route is not. ───────────────
+    //
+    // Checked BEFORE the budget seed and before the slot is claimed, so an
+    // unentitled tenant is refused without a ClickHouse round trip and without
+    // holding a slot. `require_promotion_write`'s `None` arm returns 503 rather
+    // than granting — `.claude/rules/tenancy.md`, absent cache is the
+    // unprivileged state — so no control plane means no judge, never a free one.
+    if body.uses_judge() {
+        require_promotion_write(&state.entitlements, &tenant).await?;
+    }
+    let budget_usd = crate::spend::workspace_budget_usd(state.entitlements.as_ref(), &tenant).await;
+    if budget_usd.is_some() {
+        crate::spend::seed_workspace(engine.clickhouse(), &tenant).await;
+        let who = crate::spend::Subject::Workspace(*tenant.as_uuid());
+        if let Some(body) = crate::spend::workspace_refusal(who, budget_usd) {
+            return Err(write_err(StatusCode::PAYMENT_REQUIRED, body.to_string()));
+        }
+    }
+    let ctx = crate::prompt_eval::RunContext {
+        budget_usd,
+        // A standalone run belongs to no experiment. `None` here is what keeps
+        // `tracelane_experiment_id` off its spans, which is what lets the compare
+        // and cost surfaces tell an experiment's spend from an ad-hoc run's.
+        arm: None,
+    };
+    match engine.start_run(tenant, &name, body, ctx).await {
+        Ok(started) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::to_value(started).unwrap_or(serde_json::Value::Null)),
+        )),
+        // The message is the product here — every refusal from `start_run` names
+        // what to do about it (add a key, supply cases inline, wait for the run
+        // in flight), so it is surfaced rather than swallowed into a 500.
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let status = if msg.contains("already in flight") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(write_err(status, msg))
+        }
+    }
+}
+
+/// `GET /v1/prompts/{name}/evals` — recent runs for the tenant.
+#[tracing::instrument(skip(state, headers), fields(prompt_name = %name, tenant_id = tracing::field::Empty))]
+async fn list_evals_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    Query(q): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::prompt_eval::EvalRunSummary>>, (StatusCode, String)> {
+    let tenant = tenant_from_auth(&headers).await?;
+    tracing::Span::current().record("tenant_id", tenant.to_string());
+    let _ = &name;
+    let Some(engine) = state.eval.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "eval runs need a ClickHouse connection and this gateway has none configured".into(),
+        ));
+    };
+    engine
+        .list_runs(&tenant, q.limit.unwrap_or(50))
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = format!("{e:#}"), "eval run list failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't read eval runs — the gateway has logged the details.".into(),
+            )
+        })
+}
+
+/// `GET /v1/prompts/{name}/evals/{run_id}` — one run and its per-case detail.
+#[tracing::instrument(skip(state, headers), fields(prompt_name = %name, tenant_id = tracing::field::Empty))]
+async fn get_eval_handler(
+    State(state): State<PromptRoutesState>,
+    Path((name, run_id)): Path<(String, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tenant = tenant_from_auth(&headers).await?;
+    tracing::Span::current().record("tenant_id", tenant.to_string());
+    let _ = &name;
+    let Some(engine) = state.eval.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "eval runs need a ClickHouse connection and this gateway has none configured".into(),
+        ));
+    };
+    match engine.get_run(&tenant, run_id).await {
+        Ok(Some(v)) => Ok(Json(v)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "no such eval run".into())),
+        Err(e) => {
+            tracing::error!(error = format!("{e:#}"), "eval run read failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't read that eval run — the gateway has logged the details.".into(),
+            ))
+        }
+    }
+}
+
+// ADR-009 Team+ write gate -------------------------------------
 //
 // Drives the REAL handlers (auth → entitlement gate → router) via the
 // `tlane_` dev-stub auth path (debug-only: active when WORKOS_CLIENT_ID is
+// unset), same harness as the audit-export gate tests. Assertions are
 // observable end-states: the routing pointer either flipped or it did not.
 #[cfg(test)]
 #[cfg(debug_assertions)]
@@ -766,25 +1124,87 @@ mod tests {
     }
 
     /// Seed one registered prompt version and return `(state, version_id)`.
-    fn seeded_state(entitlements: Option<Arc<EntitlementCache>>) -> (PromptRoutesState, Uuid) {
+    ///
+    /// ASYNC, and the tenant is resolved through the SAME `tenant_from_auth`
+    /// the handlers use rather than hardcoded. The registry is keyed by
+    /// `(tenant, version_id)`, so a fixture that guessed the tenant would
+    /// register the version under one identity and promote it under another —
+    /// and the ownership guard would (correctly) refuse. Deriving it from the
+    /// fixture's own credential makes the two agree by construction.
+    async fn seeded_state(
+        entitlements: Option<Arc<EntitlementCache>>,
+    ) -> (PromptRoutesState, Uuid) {
         let router = Arc::new(PromptRouter::new());
         let version_id = Uuid::from_u128(0xB074);
-        router.register_version(crate::prompt_router::PromptVersion {
-            prompt_version_id: version_id,
-            prompt_id: Uuid::from_u128(0xB074_0001),
-            version_number: 1,
-            content: "You are the gate-test prompt.".into(),
-            model_pin: None,
-            sha256: [0u8; 32],
-        });
+        let tenant = tenant_from_auth(&auth_headers())
+            .await
+            .expect("fixture credential must authenticate");
+        router.register_version(
+            &tenant,
+            crate::prompt_router::PromptVersion {
+                prompt_version_id: version_id,
+                prompt_id: Uuid::from_u128(0xB074_0001),
+                version_number: 1,
+                content: "You are the gate-test prompt.".into(),
+                model_pin: None,
+                sha256: [0u8; 32],
+            },
+        );
         (
             PromptRoutesState {
                 router,
                 entitlements,
                 audit_chain: Arc::new(AuditChain::new(100, None, None).unwrap()),
+                // These fixtures exercise the auth/entitlement gates, which run
+                // before the engine is ever consulted. `None` also asserts the
+                // typed 503 path is reachable rather than a panic.
+                eval: None,
             },
             version_id,
         )
+    }
+
+    /// The prompt name is a UUIDv5 input (`prompt_id_for`), a routing-key
+    /// component and a URL path segment — an identifier, not free text. These
+    /// assert the rejections; the acceptances below assert it is a gate rather
+    /// than a wall.
+    #[test]
+    fn prompt_name_validation_rejects_non_identifiers() {
+        for bad in [
+            "",               // empty
+            "has space",      // whitespace
+            "slash/es",       // would split the path segment
+            "unicode-\u{e9}", // non-ASCII
+            "semi;colon",
+            "quote'd",
+            "pct%20",
+            "new\nline",
+        ] {
+            assert!(
+                validate_prompt_name(bad).is_err(),
+                "{bad:?} must be refused as a prompt name"
+            );
+        }
+        // Over the byte ceiling.
+        let too_long = "a".repeat(limits::NAME_BYTES + 1);
+        assert!(validate_prompt_name(&too_long).is_err());
+    }
+
+    /// Every prompt name that exists in production today must still be valid —
+    /// checked against prod before choosing the charset, not assumed.
+    #[test]
+    fn prompt_name_validation_accepts_real_names() {
+        for good in [
+            "demo1",
+            "cc-item3-liveproof",
+            "demoprompt2",
+            "demo3",
+            "support_bot.v2",
+            &"a".repeat(limits::NAME_BYTES),
+        ] {
+            validate_prompt_name(good)
+                .unwrap_or_else(|e| panic!("{good:?} must be accepted, got {e:?}"));
+        }
     }
 
     async fn call_promote(
@@ -806,6 +1226,7 @@ mod tests {
         .await
     }
 
+    /// Promote via the override path — no eval run, an explicit reason.
     async fn call_promote_override(
         state: &PromptRoutesState,
         version_id: Uuid,
@@ -840,6 +1261,7 @@ mod tests {
         .await
     }
 
+    // The "curl the paywall" attack on the write workflow: an
     // authenticated tenant WITHOUT the Team+ grant must get a typed 403 AND
     // the routing pointer must not flip (zero mutation — the end-state).
     #[test]
@@ -847,7 +1269,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(false)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(false))).await;
 
             let err = call_promote(&state, version_id)
                 .await
@@ -873,7 +1295,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(true)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(true))).await;
 
             let (status, Json(dto)) = call_promote(&state, version_id)
                 .await
@@ -890,6 +1312,7 @@ mod tests {
         });
     }
 
+    // An override reason promotes to prod WITHOUT an eval run (the normal
     // path would 409), flips the pointer, and records an attributed
     // ManualOverride — the tamper-evident record that keeps this honest.
     #[test]
@@ -897,7 +1320,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(true)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(true))).await;
 
             let (status, Json(dto)) = call_promote_override(&state, version_id, "prod hotfix")
                 .await
@@ -923,7 +1346,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(false)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(false))).await;
             let err = call_promote_override(&state, version_id, "sneaky")
                 .await
                 .expect_err("unentitled override must be refused");
@@ -942,7 +1365,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(None);
+            let (state, version_id) = seeded_state(None).await;
             let err = call_promote(&state, version_id)
                 .await
                 .expect_err("no entitlement source must fail closed");
@@ -958,7 +1381,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(false)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(false))).await;
 
             let rb = rollback_handler(
                 State(state.clone()),
@@ -1019,7 +1442,139 @@ mod tests {
             role,
             // These fixtures test the ROLE gate; scope is orthogonal here.
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
         }
+    }
+
+    /// Same fixture, but with an explicit A13 scope set — the dimension the
+    /// `caller()` fixture deliberately pins to `LegacyFullSurface`.
+    fn scoped_key(scopes: &[tracelane_shared::api_scope::Scope]) -> crate::auth::Claims {
+        use std::collections::BTreeSet;
+        let set: BTreeSet<_> = scopes.iter().copied().collect();
+        crate::auth::Claims {
+            key_scope: crate::auth::scope::KeyScope::Scoped(set),
+            ..caller(crate::auth::AuthMethod::ApiKey, None)
+        }
+    }
+
+    /// The refusal body must be a JSON OBJECT whose machine-readable fields are
+    /// directly reachable — not a JSON string nested inside `{"error": …}`.
+    ///
+    /// This is the assertion the existing tests could not make. They check the
+    /// body with `contains()`, which passes on BOTH shapes because the substring
+    /// is there either way, so a double-encoded body sailed through the suite
+    /// and was only caught by a real `403` from prod. `contains()` on a
+    /// serialized body is a presence check, not a shape check.
+    #[test]
+    fn refusal_bodies_are_objects_not_nested_json_strings() {
+        use tracelane_shared::api_scope::Scope;
+
+        // The A13 scope refusal.
+        let (status, Json(body)) = {
+            let e = authorize_write(&scoped_key(&[Scope::Read])).expect_err("must refuse");
+            write_err(e.0, e.1)
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.get("required_scope").and_then(|v| v.as_str()),
+            Some("admin"),
+            "required_scope must be readable as `body.required_scope`, not escaped \
+             inside a string; got body = {body}"
+        );
+        assert_eq!(
+            body.get("type").and_then(|v| v.as_str()),
+            Some("insufficient_scope")
+        );
+
+        // The pre-existing ROLE refusal had the same defect.
+        let (_, Json(role_body)) = write_err(
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        );
+        assert_eq!(
+            role_body.get("required_role").and_then(|v| v.as_str()),
+            Some("owner"),
+            "role_forbidden_json is also an object and must pass through intact"
+        );
+
+        // ...and a PLAIN message must still be wrapped, or every ordinary error
+        // loses its envelope.
+        let (_, Json(plain)) = write_err(StatusCode::BAD_REQUEST, "content must not be empty");
+        assert_eq!(
+            plain.get("error").and_then(|v| v.as_str()),
+            Some("content must not be empty")
+        );
+    }
+
+    /// THE SCOPE GATE MUST BLOCK. A `read`-scoped key is the credential
+    /// `api_scope.rs:47-49` says to hand an external auditor "and nothing
+    /// else"; before this gate it could promote to production, because
+    /// `can_write_prompts()` matches the `role: None` arm for any API key
+    /// without ever reading `key_scope`.
+    #[test]
+    fn read_scoped_key_cannot_write_prompts() {
+        use tracelane_shared::api_scope::Scope;
+        let err = authorize_write(&scoped_key(&[Scope::Read]))
+            .expect_err("a read-scoped auditor key must NOT be able to write prompts");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("insufficient_scope") && err.1.contains("admin"),
+            "the refusal must name the missing scope so it is actionable, got: {}",
+            err.1
+        );
+    }
+
+    /// The default mint set is `[chat, read, ingest]` — a RUNTIME credential.
+    /// It must not manage workspace configuration either. Measured against prod
+    /// before choosing this: 3 live keys carry exactly this set.
+    #[test]
+    fn default_mint_set_key_cannot_write_prompts() {
+        use tracelane_shared::api_scope::Scope;
+        for s in tracelane_shared::api_scope::Scope::default_mint_set() {
+            assert_ne!(s, Scope::Admin, "default mint set must not include admin");
+        }
+        assert!(
+            authorize_write(&scoped_key(&Scope::default_mint_set())).is_err(),
+            "a chat+read+ingest key must not be able to flip production routing"
+        );
+    }
+
+    /// ...and the gate must OPEN for the scope that is meant to pass, or it is
+    /// a wall rather than a gate.
+    #[test]
+    fn admin_scoped_key_can_write_prompts() {
+        use tracelane_shared::api_scope::Scope;
+        authorize_write(&scoped_key(&[Scope::Admin]))
+            .expect("an admin-scoped key is exactly who may manage prompts");
+    }
+
+    /// NO REGRESSION FOR EXISTING CUSTOMERS. 12 live prod keys are
+    /// `scope IS NULL` and every JWT dashboard session is also
+    /// `LegacyFullSurface`; both must keep working unchanged.
+    #[test]
+    fn legacy_and_jwt_callers_are_unaffected_by_the_scope_gate() {
+        use crate::auth::{AuthMethod, Role};
+        authorize_write(&caller(AuthMethod::ApiKey, None))
+            .expect("legacy NULL-scope key must keep working");
+        authorize_write(&caller(AuthMethod::JwtBearer, Some(Role::Owner)))
+            .expect("an owner dashboard session must keep working");
+    }
+
+    /// The READ surfaces are gated too: an `ingest`-scoped SDK key, which ships
+    /// inside a customer's container image, must not be able to read prompt
+    /// CONTENT. Exercised through the same predicate the read handlers use.
+    #[test]
+    fn ingest_scoped_key_is_refused_the_read_scope() {
+        use tracelane_shared::api_scope::Scope;
+        let ingest_only = scoped_key(&[Scope::Ingest]);
+        assert!(
+            !ingest_only.allows_scope(crate::auth::scope::Scope::Read),
+            "an ingest-only key must not satisfy the read scope that \
+             tenant_from_auth now requires"
+        );
+        let reader = scoped_key(&[Scope::Read]);
+        assert!(reader.allows_scope(crate::auth::scope::Scope::Read));
     }
 
     /// Named per surface so a failure says WHICH write path regressed.
@@ -1117,7 +1672,7 @@ mod tests {
         rt().block_on(async {
             // Seed a production pointer directly on the router (the router
             // itself is not the gate — the HTTP write surface is).
-            let (state, version_id) = seeded_state(Some(fixed_entitlement(false)));
+            let (state, version_id) = seeded_state(Some(fixed_entitlement(false))).await;
             let tenant =
                 crate::auth::validate_authorization("Bearer tlane_b074gateconftestkey0123456789")
                     .await
@@ -1132,6 +1687,7 @@ mod tests {
                     Env::Production,
                     version_id,
                     Some(Uuid::from_u128(0xEA71)),
+                    None,
                 )
                 .await
                 .expect("direct router promote (test seed)");

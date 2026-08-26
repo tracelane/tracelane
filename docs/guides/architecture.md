@@ -21,7 +21,7 @@ Tracelane. Five components, one monorepo.
         │  • Detection layer (observe-first; MCP / agent-tool payloads)│
         │  • Inline guardrail rails (8, request + response side)        │
         │  • Audit publish (v2 SHA-256 chain, PII pre-redacted)        │
-        │  • Provider dispatch (35 routable, prefix-routed, fail-closed)│
+        │  • Dispatch to 150+ providers (prefix-routed, fail-closed)    │
         │  • 1 same-provider retry; cross-provider failover is opt-in  │
         │  • OTLP emit → NATS JetStream (NATS_URL required at boot)    │
         └────────────┬─────────────────────────┬──────────────────────┘
@@ -30,7 +30,7 @@ Tracelane. Five components, one monorepo.
        ┌──────────────────────┐   ┌──────────────────────────────────┐
        │ Anthropic / OpenAI / │   │ ② Rust ingest workers             │
        │ Bedrock / Google /   │   │ ──────────────────────────────────│
-       │ … 35 routable         │   │ • NATS JetStream consumer        │
+       │ … 150+ routable       │   │ • NATS JetStream consumer        │
        └──────────────────────┘   │ • Span enrichment + PII redact    │
                                   │ • ClickHouse batched insert       │
                                   │   (ack AFTER the flush)           │
@@ -248,8 +248,8 @@ verified SLSA Level 3 attestation.
 
 ## Performance budgets (internal CI targets)
 
-These are **internal CI targets**, not measured public benchmarks — the
-`benchmark-runner` subagent rejects PRs that push any p95 over budget. The same
+These are **internal CI targets**, not measured public benchmarks. The
+Benchmarks workflow measures p95 against them. It runs on a schedule or by dispatch, not on pull requests. The same
 budgets are the merge gate documented in
 [CONTRIBUTING.md](../../CONTRIBUTING.md). Published, independently measured
 figures ship with the Reliability Benchmark v1.0; **until then no public
@@ -267,7 +267,7 @@ Throughput floors are likewise internal targets pending the Reliability Benchmar
 - High-throughput single-node and multi-node ingest
 - Single-instance gateway throughput with full tracing on
 
-These targets are enforced by the `benchmark-runner` subagent on every PR
+These targets are measured by the Benchmarks workflow, which runs on a schedule or by dispatch rather than on every PR
 touching the hot path; measured public figures publish with the benchmark.
 
 ---

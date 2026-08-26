@@ -1,4 +1,5 @@
 /**
+ * Tests for lib/sessions — session gateway reads (regression).
  *
  * The deliverable: tenant A's session fetch never returns tenant B's sessions
  * or traces. We mock `requireGatewayToken` to mint a per-tenant JWT and a

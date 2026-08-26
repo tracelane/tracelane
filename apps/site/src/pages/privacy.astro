@@ -34,7 +34,7 @@ import Base from "../layouts/Base.astro";
     <ul class="mt-4 space-y-2 text-fg-muted">
       <li>— <span class="text-fg">Account identity.</span> Your email, name, and workspace membership, held by our identity provider.</li>
       <li>— <span class="text-fg">Trace telemetry.</span> Spans describing each run: model, provider, token counts, latency, cost, status, tool calls, and the causal structure of the run.</li>
-      <li>— <span class="text-fg">Prompt and completion content</span> — only when you enable it. Content capture is controlled by the <code class="font-mono text-fg">TRACELANE_TRACE_CONTENT</code> setting. With it off, we store the shape of a run without its text.</li>
+      <li>— <span class="text-fg">Prompt and completion content</span> — <span class="text-fg">we do not capture it.</span> Neither the gateway nor our SDKs record your message bodies; we store the shape of a run without its text. The only way prompt text reaches us is if your own OpenTelemetry instrumentation sends it to us explicitly.</li>
       <li>— <span class="text-fg">Provider API keys (BYOK).</span> Your own provider keys, envelope-encrypted at rest and bound to your workspace. They are never written to logs, spans, or error messages.</li>
       <li>— <span class="text-fg">Audit ledger records.</span> A tamper-evident hash chain over gateway-proxied calls and guardrail verdicts.</li>
     </ul>

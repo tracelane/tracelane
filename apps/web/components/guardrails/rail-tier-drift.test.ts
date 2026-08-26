@@ -1,6 +1,7 @@
 /**
  * GWY-33 drift guard — the in-app rail→tier map must equal what the BINARY does.
  *
+ * The bug this exists to stop already shipped once. (founder ruling
  * 2026-08-04) made R3_pinning and R4_trifecta UNGATED in the gateway
  * (`Rail::feature()` → `None`), but `lib/guardrail-rails.ts` kept them
  * `gated: true` with `RAIL_TIER[...] = "Team"`. Result: every Free and Builder
@@ -25,6 +26,7 @@
  * nothing — a guard that can quietly match zero rails is not a guard.
  *
  * The negative tests below are this guard's `--selftest`: they replay the
+ * map and three other mutations and prove the checker BLOCKS each.
  */
 
 import { readFileSync, readdirSync } from "node:fs";

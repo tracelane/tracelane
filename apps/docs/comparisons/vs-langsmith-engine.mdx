@@ -49,15 +49,18 @@ on the roadmap and is not shipped.
 
 ### BYOK at 0% markup
 
-Bring your own provider keys across 30+ providers. Keys are stored with envelope
+Bring your own provider keys across 150+ providers. Keys are stored with envelope
 encryption, with the AAD bound to `(tenant_id, provider_id)`. We add no markup to your
 provider spend.
 
-### Auto-rollback on objective metrics
+### Rollback on objective metrics
 
-Prompt promotions can roll back automatically on EWMA thresholds over cost, latency,
-error rate and guardrail-fire rate — objective signals, not a human noticing a
-regression days later.
+Prompt promotions roll back on EWMA thresholds over objective signals — cost, latency
+and guardrail-fire rate — rather than a human noticing a regression days later. **The
+drift is computed from metric observations you post** to `/v1/prompts/:name/observe`;
+gateway traffic updates the baseline but does not itself trigger a revert, and
+autonomous background monitoring is on the V1.1 roadmap. See
+[prompt promotion](/prompt-promotion#auto-rollback).
 
 ### Apache 2.0, self-hostable
 
@@ -107,3 +110,11 @@ ledger. See [Audit Ledger](/audit-ledger).
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+*Verified as of 2026-08-26 against each vendor's public documentation and public
+repositories. A `—` means we found no such capability documented at that date —
+not that the vendor lacks it. Vendors change their products; if anything here is
+inaccurate or out of date, please [open an issue](https://github.com/tracelane/tracelane/issues)
+and we will correct it.*

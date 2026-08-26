@@ -20,7 +20,8 @@ Tracelane sits between your AI agents and your LLM providers. You get:
 - **Full-fidelity traces** — every LLM call, tool invocation, agent step, and retry captured as OTel spans using the GenAI semantic conventions. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
 - **Tamper-evident audit ledger** — every recorded event is hash-chained per tenant and batch-anchored to a public transparency log. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us. That is the part you can hand to an auditor.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
-- **Pain-point evals** — 68 assertions run in CI on every PR. Note the honest scope: they **report, they do not block** — no required status check gates a merge on them. The default job also runs with **mock providers**, so the behavioural half of each assertion is skipped there; a separate live-stack job exercises real behaviour.
+- **Cross-language ledger conformance** — the audit verifier is implemented three times, in Rust, Python and TypeScript, and all three are held to **one shared corpus of 8 conformance vectors** that includes deliberately-forged and boundary-numeric cases. **10 Rust + 14 Python + 19 TypeScript** conformance tests run in CI, plus a round-trip job asserting the three implementations agree. That is the suite behind "a third party can verify offline" — you can run it in this clone.
+  Note the honest scope: `evals/` here carries the 20 conformance evals; some internal suites target private ADRs and infrastructure and are not part of this repo, so the `test` script says so rather than pretending to pass.
 - **Time-travel trace viewer** — step through any recorded agent trace span-by-span with `tlane replay` (read-only). Cross-model re-execution is on the roadmap.
 
 - **MCP tool-definition pinning and lethal-trifecta detection** — shipped, and **free on
@@ -53,22 +54,50 @@ export TRACELANE_API_KEY=tlane_...
 export TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev
 ```
 
-**Self-host** (Docker Compose) — builds the gateway + ingest from source:
+**Self-host** (Docker Compose):
 
 ```bash
 git clone https://github.com/tracelane/tracelane
 cd tracelane
-cp infra/self-host/.env.example infra/self-host/.env   # set TRACELANE_MASTER_KEY
-docker compose -f infra/self-host/docker-compose.yml up -d --build
+cp infra/self-host/.env.example infra/self-host/.env
 
+# Edit infra/self-host/.env and set BOTH:
+#   TRACELANE_MASTER_KEY  — your gateway key:  openssl rand -base64 32
+#   a provider key        — e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY.
+#   Without a provider key the gateway starts fine and every request 401s.
+
+docker compose -f infra/self-host/docker-compose.yml up -d
+
+# Load the file you just edited INTO YOUR SHELL. `export FOO="$BAR"` cannot work
+# here — BAR was set in a file, so it is empty in the shell and the gateway
+# answers 401 on your very first request.
+set -a; source infra/self-host/.env; set +a
 export TRACELANE_GATEWAY_URL=http://localhost:8080
-export TRACELANE_API_KEY="$TRACELANE_MASTER_KEY"       # the key you just set
+export TRACELANE_API_KEY="$TRACELANE_MASTER_KEY"
 ```
+
+Add `--build` to compile the gateway and ingest from source instead of pulling the
+published images. **That is a full Rust release build of the workspace and takes
+roughly 25 minutes on 8 cores** — the images are the fast path, and `--build` is for
+when you are changing the code.
 
 Self-host runs headless: the compose file brings up ClickHouse, NATS, the gateway
 (`:8080`) and ingest. **There is no dashboard container** — the web UI is hosted-only
 today. Authenticate with the `TRACELANE_MASTER_KEY` from your `.env`; per-key minting
 via `POST /v1/keys` needs a Postgres control plane, which self-host does not run.
+
+**The tamper-evident audit ledger DOES run in self-host, with one limit worth knowing
+before you rely on it.** Events are hashed into the chain and persisted to ClickHouse
+`audit_log` — measured on a clean stack, four chat requests produce eight linked rows
+with zero chain breaks. **What self-host does not have is chain resumption across a
+gateway restart.** The head is recovered from the Postgres control plane, which
+self-host does not run, so on restart the sequence begins again at genesis and you get
+duplicate `seq` values that an offline verifier cannot reconstruct across the boundary.
+
+In practice: the ledger is verifiable **within a gateway lifetime**, and a restart
+starts a new segment. If you need one continuous, offline-verifiable chain across
+restarts today, that is Tracelane Cloud. We would rather state the boundary than let
+you find it in a verifier's output.
 
 *(`infra/dev/docker-compose.yml` is the contributor data-plane — ClickHouse, NATS,
 Postgres, Grafana on `:3001` — and deliberately starts no gateway. Use it with
@@ -111,7 +140,7 @@ Agent / SDK
     ▼
 ┌─────────────────────────────────────┐
 │  Rust Gateway (Axum + tokio)        │
-│  - BYOK routing to 30+ providers    │
+│  - BYOK routing to 150+ providers    │
 │  - Inline heuristic guardrails      │
 │  - OTLP span emit                   │
 └────────────────┬────────────────────┘
@@ -144,7 +173,7 @@ ClickHouse              Cloudflare
 | `packages/sdk-typescript/` | TypeScript | Agent instrumentation SDK |
 | `packages/sdk-python/` | Python | Agent instrumentation SDK |
 | `packages/cli/` | TypeScript | `tlane` CLI |
-| `evals/` | TypeScript | 68 pain-point assertions (CI; behavioural half runs in the live-stack job) |
+| `evals/` | TypeScript | 20 conformance evals — 10 fault-tolerance, 7 gateway-correctness, and one each for ingest-schema, PII-redaction and prompt-injection |
 | `ml/` | Python | Trajectory Guard / SLM judge — training + export pipeline; no trained weights ship yet |
 | `spec/openagenttrace/` | Markdown | OpenAgentTrace v0.1 spec |
 | `spec/aft-1/` | Markdown | Agent Failure Taxonomy — 13 published failure modes |
@@ -185,9 +214,9 @@ npx @tracelanedev/cli import-litellm --config litellm_config.yaml
 
 Then point your agents at `TRACELANE_GATEWAY_URL`. The gateway is OpenAI-**path**
 compatible (`/v1/chat/completions`), and the request body follows the Anthropic tool
-schema (`{name, description, input_schema}`). An OpenAI-shaped
-`tools: [{type: "function", function: {...}}]` array is rejected with a 400 today —
-normalising both shapes is tracked and is the first thing we will fix if it blocks you.
+schema (`{name, description, input_schema}`). Both tool shapes are accepted: an OpenAI-shaped
+`tools: [{type: "function", function: {...}}]` array and the Anthropic shape are
+normalised to one internal representation, so no request rewriting is required.
 
 Full guide: [docs.tracelane.dev/migrations/from-litellm](https://docs.tracelane.dev/migrations/from-litellm)
 
@@ -205,6 +234,12 @@ cosign verify-blob \
 All binaries are Cosign-signed (keyless OIDC) with build provenance attested via
 `actions/attest-build-provenance`, and a CycloneDX SBOM is published with each release.
 We use Grype + Syft + OSV-Scanner (not Trivy) in CI.
+
+Honest note on this repository: it is a **one-way export** of a private monorepo, not
+the tree development happens in. Every commit here is a squashed publication, so `main`
+carries no branch protection and no review history you can inspect — the merge gating,
+the full test suite and the guard selftests run upstream before anything is exported.
+Judge the code and the releases, not the commit graph.
 
 Honest note on SLSA: the repository runs `slsa-framework/slsa-github-generator`, but its
 `final` job is currently failing even on successful releases, so **we do not claim a

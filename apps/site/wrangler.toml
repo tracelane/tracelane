@@ -1,10 +1,20 @@
 # Cloudflare Workers config for tracelane-site (static assets + D1).
 #
-# ⚠️ THE WORKER NAME IS THE ONE CURRENTLY SERVING tracelane.dev. A `wrangler deploy`
-# from here REPLACES the live site — that is the cutover, and it has NOT been run.
-# ADR-074 §10 was authorised as a build; the cutover is a separate founder call, and it
-# is irreversible in the sense that matters: the moment it lands, the tracelane/site repo
-# stops being the thing that is deployed while still looking like it is.
+# ⚠️ THE WORKER NAME IS THE ONE SERVING tracelane.dev. A `wrangler deploy` from here
+# REPLACES the live site.
+#
+# THE CUTOVER HAS RUN — 2026-08-18, founder-authorised, worker version
+# 33dc495b-006a-4474-99c4-d70dd01a0331. tracelane.dev is served by THIS directory now.
+# Verified after: 8/8 fresh edge requests on the new build, all 6 routes 200,
+# /pricing rendering 6 tiers.
+#
+# `tracelane/site` IS ARCHIVED AND MUST NEVER BE USED (founder, 2026-08-18) — confirmed
+# `isArchived: true` via `gh repo view`, which makes it read-only at GitHub's end, so a
+# push there is rejected by the server rather than by our discipline. This repo has no
+# remote pointing at it. The old warning here said the cutover "has NOT been run" and
+# that the archived repo would keep "looking like it is" deployed; both premises are
+# now false, and a deploy config that misstates what is live is exactly the kind of
+# stale note that gets someone to deploy the wrong thing.
 #
 # Deploy through `scripts/deploy/site.sh`, never a bare `wrangler deploy` — the bare
 # command is what published a six-commits-behind working copy over the live site on

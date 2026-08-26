@@ -31,7 +31,7 @@ export function NewPromptForm() {
 				onChange={(e) => setName(e.target.value)}
 				placeholder="new-prompt-name"
 				aria-label="New prompt name"
-				className="w-full min-w-0 rounded-sm border border-line bg-bg px-3 py-1.5 font-mono text-xs text-ink outline-none placeholder:text-ink-3 focus:border-action-line sm:w-44"
+				className="w-full min-w-0 rounded-sm border border-line bg-bg px-3 py-1.5 font-mono text-xs text-ink placeholder:text-ink-3 focus:border-action-line sm:w-44"
 			/>
 			<button
 				type="submit"

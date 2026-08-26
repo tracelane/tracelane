@@ -1,4 +1,5 @@
 /**
+ * Unit tests for `tlane replay` (Option 1).
  *
  * Verifies the gateway repoint: the command hits `GET /v1/traces/{id}/spans`
  * with a Bearer token, treats 404 as "no steps", and maps gateway spans to the

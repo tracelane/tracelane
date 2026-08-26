@@ -62,12 +62,14 @@ export function canAdmin(role: string | null | undefined): boolean {
  * broad `try/catch`.
  */
 export async function requireSession(): Promise<Session> {
+	// Dev-only E2E bypass. Fail-closed: e2eAuthEnabled returns true
 	// ONLY in a non-prod build with the opt-in flag set, and THROWS in a prod
 	// build that carries the flag (see lib/e2e-auth.ts for the predicate). The
 	// session is the FIXED disposable test workspace — never derived from the
 	// request, never a real tenant.
 	if (e2eAuthEnabled()) return e2eTestSession();
 
+	// `withAuth({ensureSignedIn:true})`'s internal auto-redirect throws a
 	// form that OpenNext/CF does NOT turn into a 307 — so an unauthenticated hit
 	// on a page that calls `requireSession()` 500s instead of redirecting to
 	// sign-in. Resolve the session WITHOUT the auto-redirect, then redirect
@@ -171,13 +173,38 @@ export const requireGatewayToken = cache(
 		token: string;
 		tenantId: string;
 	}> {
+		// Dev-only E2E bypass — same fail-closed contract as requireSession.
 		// Returns a deliberately-fake token (the gateway 401s it → pages degrade to
 		// the warming/empty state) bound to the disposable test tenant.
 		if (e2eAuthEnabled()) return e2eTestGatewayToken();
 
-		const { organizationId, accessToken } = await withAuth({
-			ensureSignedIn: true,
-		});
+		//  AGAIN, in the function that was never given the fix. `requireSession`
+		// dropped `ensureSignedIn` in 2026-07-28 because its auto-redirect throws a
+		// form OpenNext/CF does NOT turn into a 307 — but THIS function kept it, and
+		// this is the one every `gatewayGet` calls.
+		//
+		// The reachable failure is not "no session", it is a session that cannot be
+		// REFRESHED: an expired `access-token` whose `wos-auth-verifier` cookies have
+		// also expired. `withAuth` then attempts a refresh and writes the new cookie
+		// DURING an RSC render, which Next.js forbids outright:
+		//     Error: Cookies can only be modified in a Server Action or Route Handler
+		// Unhandled, that lands in the error boundary. Measured on prod with a 4-hour-old
+		// session: **7 of 11 pages showed "Something went wrong"** — /dashboard, /gateway,
+		// /guardrails, /plans, /prompts, /settings/team, /signatures — while /audit, which
+		// only reaches `requireSession`, correctly redirected to sign-in. The three that
+		// "rendered" did so because `gatewayGetOrNull` swallows the throw and shows an
+		// empty state, which is arguably worse: a hard auth failure dressed as no data.
+		//
+		// Same remedy, same shape: resolve WITHOUT the auto-redirect, then `redirect()`
+		// explicitly. The `redirect()` calls stay OUTSIDE the catch so their
+		// NEXT_REDIRECT is never swallowed — the contract this file already states.
+		// The EXISTING checks are kept verbatim below — this function's contract is
+		// about the TOKEN, not about `user`, and widening it would change who gets
+		// redirected where. Only the throw becomes a redirect.
+		const auth = await withAuth().catch(() => null);
+
+		if (!auth) redirect("/sign-in");
+		const { organizationId, accessToken } = auth;
 
 		if (!organizationId) redirect("/onboarding");
 		if (!accessToken) redirect("/sign-in");

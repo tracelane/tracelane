@@ -104,6 +104,7 @@ export function registerEvalTools(server: McpServer) {
 			eval_id: z.string().describe("Eval ID, e.g. PP-G3, PP-PR1, FT-01"),
 		},
 		async ({ eval_id }) => {
+			//  (strengthened): the id is looked up in the
 			// generated manifest and the PATH comes from the manifest entry —
 			// never from the caller's string. An `eval_id` of
 			// `../../../etc/passwd` cannot name a manifest entry, so traversal

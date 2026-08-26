@@ -72,6 +72,7 @@ fn no_anchor_vector_chain_still_valid() {
 
 #[test]
 fn v2_1_boundary_number_vector_passes() {
+    // ADR-050: payload is the verbatim canonical STRING carrying the
     // JS-unsafe number class (1.0, >2^53, 1e2, 0.50). Hashed byte-for-byte, so
     // it verifies identically across all three verifiers.
     let path = vector("boundary-numbers.v2_1.ndjson");
@@ -89,6 +90,7 @@ fn v2_1_boundary_number_vector_passes() {
 fn legacy_v2_object_vector_still_verifies_in_rust() {
     // The SAME data as a legacy v2 OBJECT payload. Rust's serde re-derive
     // matches the writer's canonical form for these numbers, so it verifies
+    // green here — was a JS-specific divergence (the TS suite fails on
     // the identical vector). Documents WHY Path 2 (verbatim) was needed.
     let path = vector("boundary-numbers.v2-legacy.ndjson");
     assert!(path.exists(), "conformance vector missing: {path:?}");

@@ -2,6 +2,7 @@
 #
 # Format:  kind|name|column|REASON
 # A line with an empty REASON is REFUSED, not honoured — an override without a record
+# is not a control. `PENDING <YYYY-MM-DD>` expires on that date and the gate
 # fires again, so a deferral cannot quietly become permanent.
 #
 # WHY MOST OF THIS FILE EXISTS — established against the live Frankfurt catalog
@@ -11,6 +12,7 @@
 #   apps/web/db/migrations/          Drizzle. Built prod Neon. CANONICAL (CLAUDE.md r5).
 #   infra/dev/postgres/migrations/   The dev docker-compose Postgres. NOT applied to
 #                                    prod — with ONE exception, migration 14, which was
+#                                    hand-applied and landed HALF-DONE. That is.
 #
 # The two trees name the same logical objects differently: dev uses `idx_<table>_<col>`,
 # Drizzle uses `<table>_<col>_idx`. A rename is INVISIBLE to this tool by construction,
@@ -36,8 +38,10 @@ table|workspace_attr_cardinality||DEV-ONLY tree and UNWIRED — crates/ingest/sr
 index|idx_workspace_attr_cardinality_updated||same as above — index on a table prod never created
 
 # ── REAL DRIFT, deliberately deferred by the founder ─────────────────────────────
+#  residue. infra/dev/postgres/migrations/14_full_capture_sampling.sql was
 # hand-applied to prod: its COLUMNS landed, these three objects did not. Consequence
 # while absent: ingest's tenant-config LISTEN has nothing publishing on the channel,
+# which is precisely the three-week silent fault record.
 # apps/web/db/migrations/0024_a13_scoped_keys_and_b188_residue.sql fixes all three and
 # is drafted but UNAPPLIED (commit 7cd363fc).
 constraint|tenants_sampling_policy_chk||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
@@ -53,3 +57,48 @@ column|api_keys|budget_usd_monthly|PENDING 2026-09-09 — A13, migration 0024 dr
 constraint|api_keys_budget_nonneg_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
 constraint|api_keys_scope_not_empty_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
 index|api_keys_expires_at_idx||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+
+# ── GWY-27 model aliases: an ENTIRE MIGRATION prod has never run (2026-08-23) ──
+#
+# Surfaced on the FIRST run of this detector after it was finally wired into the deploy
+# (founder ruling R96). It had been able to find this for NINE DAYS: B-215 filed on
+# 2026-08-13 that this tool's live half "runs NOWHERE" and recommended exactly that
+# wiring. Nothing was built, and on 2026-08-22 a different instance of the same seam took
+# production down for 4m52s. The cleanest CLASS-2 instance this repo has produced: the
+# detector existed, the recommendation existed, the consumer did not.
+#
+# GWY-27's FOUR OBJECTS WERE ACKNOWLEDGED HERE AND ARE NOW GONE — founder ruling R103,
+# 2026-08-23. `0027_gwy27_model_aliases.sql` was DELETED rather than applied: GWY-27 shipped
+# as config-as-code via `tracelane.yaml`, nothing queried `model_aliases`, and prod had never
+# run the migration. A migration sitting in `MIGRATIONS` that prod has never run and no code
+# reads is a lie in the list — every fresh database and every integration test built a table
+# the product does not use, and this file had to carry four acknowledgements forever to keep
+# the detector quiet about it.
+#
+# THE ACKNOWLEDGEMENTS WERE DROPPED RATHER THAN LEFT. A stale acknowledgement is the same
+# failure as the acknowledgement itself, one level down: it silences a detector about
+# something that no longer exists, so the next real instance at that name reads as
+# already-known.
+
+# ── THE SIX CLICKHOUSE ORPHANS ARE **NOT** ACKNOWLEDGED HERE, AND THAT IS NOT AN OMISSION ──
+#
+# `audit-migration-drift.py` is POSTGRES-ONLY — it reads `information_schema`. The six
+# ClickHouse tables that the repo declares and prod lacks (`slo_alerts`, `slo_minute_stats`,
+# `token_economics`, `ttft_stats`, `audit_log_rmt`, `trace_summaries_v2`) are outside its
+# scope and it never reports them, so there is nothing here to silence.
+#
+# They are also not reported by `scripts/ci/check-deploy-schema.py`, for a DIFFERENT and
+# deliberate reason: that guard requires only tables that are BOTH declared by a migration
+# AND referenced by gateway code. All six are orphans — verified 2026-08-23, none appears
+# in any `FROM`/`INSERT` in `crates/`. The narrowing exists because the guard's first shape
+# required every declared table and consequently REFUSED A HEALTHY PROD over exactly these
+# six; a guard that fires on a condition the deployer cannot act on is one that gets
+# switched off.
+#
+# RECORDED HERE ANYWAY so a future reader does not conclude they were missed. The
+# discriminating check, for the one that looked alarming: the SLO surface reads
+# `slo_hourly_stats` and `v_slo_stats`, and BOTH ARE PRESENT on prod — `slo_alerts` and
+# `slo_minute_stats` are declared and read by nothing. A seventh table named in an earlier
+# sweep, `guardrail_verdicts_timeonly`, is declared only in `infra/prod/partition-cutover.sql`
+# — an operational cutover script, not a migration — so it was never expected on prod.
+

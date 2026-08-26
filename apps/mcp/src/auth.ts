@@ -126,6 +126,7 @@ const NEG_CACHE_TTL_MS = 5_000;
 const CACHE_MAX_ENTRIES = 4_096;
 
 /**
+ * Validate `TRACELANE_GATEWAY_URL` before sending
  * any bearer over the wire. The Node-side MCP would otherwise dispatch
  * customer bearers to whatever the env var resolves to — a misconfigured
  * (or attacker-controlled in a multi-tenant Kubernetes namespace) value
@@ -285,6 +286,7 @@ export async function resolveBearerViaGateway(
 		return null;
 	}
 
+	// Bounded read of the gateway response. The
 	// trusted-gateway hop should never return more than a few hundred
 	// bytes; cap at 64 KiB so a misbehaving gateway can't OOM the MCP.
 	const ct = resp.headers.get("content-length");

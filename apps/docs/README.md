@@ -24,7 +24,7 @@ The site is served at `http://localhost:3000`.
 ## Source-of-truth note
 
 These MDX pages are the **public-facing copy**. The deeper engineering
-prose lives in `/docs/*.md` at the repo root. Both should stay in sync;
+prose lives in `docs/guides/` . Both should stay in sync;
 the public copy is shorter and Mintlify-flavoured (Cards, Steps,
 CodeGroups), while the repo-root copy is plain GitHub-rendered Markdown
 optimised for code review.

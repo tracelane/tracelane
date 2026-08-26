@@ -35,6 +35,7 @@ pub struct PolarSubscriptionId(pub String);
 
 #[derive(Debug, Error)]
 pub enum BillingError {
+    /// Phase 1 + Phase 2 rule: do NOT carry response
     /// body through Display. Polar 401/403 bodies can echo the Bearer
     /// token in some cases; surfacing them through
     /// `tracing::error!(error = %err)` would leak the access token.
@@ -141,6 +142,7 @@ impl PolarClient {
     /// (`apps/web/app/api/webhooks/polar`) dispatches to flip the
     /// tenant's `plan_tier` (correlating by the `external_customer_id`
     /// we set here). The gateway no longer receives Polar webhooks
+    /// (, 2026-07-28).
     ///
     /// `tenant_id` is bound to the session via `external_customer_id`
     /// so the webhook event carries it back without a separate
@@ -245,6 +247,7 @@ impl PolarClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
+            // Drop body without logging (symmetric fix).
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(%status, "Polar API error (customer-sessions)");
             return Err(BillingError::Http { status });
@@ -274,6 +277,7 @@ impl PolarClient {
 
     async fn post_raw(&self, path: &str, body: &serde_json::Value) -> BillingResult<bytes::Bytes> {
         let url = format!("{}{}", self.base_url, path);
+        // SSRF: validate before the POST (symmetric fix).
         crate::ssrf_guard::validate_url(&url).await.map_err(|e| {
             BillingError::Config(format!("Polar base URL rejected by SSRF guard: {e}"))
         })?;

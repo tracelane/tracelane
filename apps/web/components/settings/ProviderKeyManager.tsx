@@ -14,8 +14,15 @@
  * Pain-points: PP-G5 (BYOK key management), PP-G1 (developer onboarding).
  */
 
+import { Modal } from "@/components/Modal";
+import { apiFetch } from "@/lib/api-fetch";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import {
+	type CatalogProvider,
+	PROVIDERS,
+	PROVIDER_LABEL,
+} from "./provider-catalog.generated";
 
 interface ProviderKeySummary {
 	provider_id: string;
@@ -23,55 +30,41 @@ interface ProviderKeySummary {
 }
 
 /**
- * Providers accepted by the gateway allowlist
- * (`crates/gateway/src/byok_api/provider_keys_api.rs::is_known_provider`).
- * The gateway re-validates and rejects unknown ids with 400.
+ * The provider list is GENERATED from the gateway's own catalog
+ * (`crates/gateway/providers.tsv` → `provider-catalog.generated.ts`), so this
+ * file no longer carries one.
  *
- * Together, Fireworks and OpenRouter routed but could not accept a key, and
- * Vertex could not be added from here. "Keep this in sync" is no longer left to
- * memory: `scripts/ci/check-byok-provider-coverage.py` derives the routable set
- * from the registry and fails the build if either list drifts, in either
- * direction. `hint` is a UX nicety for the common ones.
+ *  is why. This list, the gateway's BYOK allowlist and the routing
+ * registry were three hand-maintained lists, and they drifted: Groq, Together,
+ * Fireworks and OpenRouter routed correctly and the API would have stored their
+ * keys, but they were missing HERE — so a customer had no way to add one.
+ * Routed ≠ usable ≠ **offered**, and the third list is the one a customer
+ * actually touches. `scripts/ci/check-byok-provider-coverage.py` proves all
+ * three agree.
+ *
+ * The gateway re-validates every id on upload and rejects an unknown one with
+ * 400, so this list is a convenience and never the security boundary.
  */
-const PROVIDERS: ReadonlyArray<{ id: string; label: string; hint?: string }> = [
-	{ id: "anthropic", label: "Anthropic", hint: "starts with sk-ant-" },
-	{ id: "openai", label: "OpenAI", hint: "starts with sk-" },
-	{ id: "google", label: "Google (Gemini)" },
-	{ id: "vertex", label: "Google Vertex AI" },
-	{ id: "groq", label: "Groq" },
-	{ id: "together", label: "Together AI" },
-	{ id: "fireworks", label: "Fireworks AI" },
-	{ id: "openrouter", label: "OpenRouter" },
-	{ id: "bedrock", label: "AWS Bedrock" },
-	{ id: "azure", label: "Azure OpenAI" },
-	{ id: "cohere", label: "Cohere" },
-	{ id: "mistral", label: "Mistral" },
-	{ id: "perplexity", label: "Perplexity" },
-	{ id: "deepseek", label: "DeepSeek" },
-	{ id: "xai", label: "xAI (Grok)" },
-	{ id: "nvidia", label: "NVIDIA" },
-	{ id: "cerebras", label: "Cerebras" },
-	{ id: "sambanova", label: "SambaNova" },
-	{ id: "lepton", label: "Lepton" },
-	{ id: "lambda", label: "Lambda" },
-	{ id: "novita", label: "Novita" },
-	{ id: "ai21", label: "AI21" },
-	{ id: "hyperbolic", label: "Hyperbolic" },
-	{ id: "deepinfra", label: "DeepInfra" },
-	{ id: "cloudflare", label: "Cloudflare Workers AI" },
-	{ id: "ollama", label: "Ollama" },
-	{ id: "baseten", label: "Baseten" },
-	{ id: "huggingface", label: "Hugging Face" },
-	{ id: "anyscale", label: "Anyscale" },
-	{ id: "modal", label: "Modal" },
-	{ id: "predibase", label: "Predibase" },
-	{ id: "moonshot", label: "Moonshot" },
-	{ id: "upstage", label: "Upstage (Solar)" },
-	{ id: "yi", label: "01.AI (Yi)" },
-	{ id: "aleph-alpha", label: "Aleph Alpha" },
-];
 
-const PROVIDER_LABEL = new Map(PROVIDERS.map((p) => [p.id, p.label]));
+/** The handful worth putting above the fold. Everything else is alphabetical. */
+const POPULAR = [
+	"anthropic",
+	"openai",
+	"google",
+	"vertex",
+	"bedrock",
+	"azure",
+	"groq",
+	"mistral",
+	"openrouter",
+	"together",
+] as const;
+
+const POPULAR_SET = new Set<string>(POPULAR);
+const POPULAR_PROVIDERS = POPULAR.map((id) =>
+	PROVIDERS.find((p) => p.id === id),
+).filter((p): p is CatalogProvider => p !== undefined);
+const OTHER_PROVIDERS = PROVIDERS.filter((p) => !POPULAR_SET.has(p.id));
 
 /** Thrown by the fetchers so the UI can tell "locked" (403) from "broken". */
 class HttpError extends Error {
@@ -81,9 +74,7 @@ class HttpError extends Error {
 }
 
 async function fetchProviderKeys(): Promise<ProviderKeySummary[]> {
-	const res = await fetch("/api/settings/provider-keys");
-	if (!res.ok) throw new HttpError(res.status);
-	return res.json() as Promise<ProviderKeySummary[]>;
+	return apiFetch<ProviderKeySummary[]>("/api/settings/provider-keys");
 }
 
 async function uploadProviderKey(input: {
@@ -121,93 +112,101 @@ function AddKeyDialog({
 	pending: boolean;
 	error: string | null;
 }) {
-	const [providerId, setProviderId] = useState(PROVIDERS[0]?.id ?? "anthropic");
+	const [providerId, setProviderId] = useState<string>(POPULAR[0]);
 	const [plaintext, setPlaintext] = useState("");
 	const hint = PROVIDERS.find((p) => p.id === providerId)?.hint;
 
 	return (
-		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-			{/* rounded-xl, not `surface-card`: this is a modal, and ADR-074 §5 sets
-			    "12–16px large containers", not the 8px card token that class carries. */}
-			<div className="rounded-xl bg-surface border border-line p-6 w-full max-w-md shadow-2xl space-y-4">
-				<h3 className="text-base font-semibold text-ink">Add provider key</h3>
-				<form
-					onSubmit={(e) => {
-						e.preventDefault();
-						if (providerId && plaintext.trim()) {
-							// space (a common paste artifact) was sent verbatim and then
-							// rejected upstream as a 401. The gateway also trims on save,
-							// but trimming here keeps the UI honest about what is stored.
-							onSubmit({
-								provider_id: providerId,
-								plaintext: plaintext.trim(),
-							});
-						}
-					}}
-					className="space-y-3"
-				>
-					<div>
-						<label
-							htmlFor="provider-select"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							Provider
-						</label>
-						<select
-							id="provider-select"
-							value={providerId}
-							onChange={(e) => setProviderId(e.target.value)}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-action-ink"
-						>
-							{PROVIDERS.map((p) => (
+		<Modal title="Add provider key" onClose={onClose}>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (providerId && plaintext.trim()) {
+						// Submit the TRIMMED key. A trailing/leading newline or
+						// space (a common paste artifact) was sent verbatim and then
+						// rejected upstream as a 401. The gateway also trims on save,
+						// but trimming here keeps the UI honest about what is stored.
+						onSubmit({
+							provider_id: providerId,
+							plaintext: plaintext.trim(),
+						});
+					}
+				}}
+				className="space-y-3"
+			>
+				<div>
+					<label
+						htmlFor="provider-select"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						Provider
+					</label>
+					<select
+						id="provider-select"
+						value={providerId}
+						onChange={(e) => setProviderId(e.target.value)}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					>
+						{/* Two groups, not 169 flat options. A native <select> keeps
+						    the browser's type-ahead, which is the fastest way to find
+						    one of 169 names and costs no JavaScript. */}
+						<optgroup label="Popular">
+							{POPULAR_PROVIDERS.map((p) => (
 								<option key={p.id} value={p.id}>
 									{p.label}
 								</option>
 							))}
-						</select>
-					</div>
-					<div>
-						<label
-							htmlFor="provider-key"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							API key
-						</label>
-						<input
-							id="provider-key"
-							type="password"
-							autoComplete="off"
-							value={plaintext}
-							onChange={(e) => setPlaintext(e.target.value)}
-							placeholder={hint ? `${hint}` : "paste your provider API key"}
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus:outline-none focus:ring-2 focus:ring-action-ink"
-							required
-						/>
-						<p className="text-[11px] text-ink-2 mt-1">
-							Encrypted at rest (AES-256-GCM, bound to your tenant). Stored once
-							— we show only the last 4 characters afterward.
-						</p>
-					</div>
-					{error && <p className="text-xs text-danger-ink">{error}</p>}
-					<div className="flex justify-end gap-2 pt-1">
-						<button
-							type="button"
-							onClick={onClose}
-							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
-						>
-							Cancel
-						</button>
-						<button
-							type="submit"
-							disabled={!plaintext.trim() || pending}
-							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
-						>
-							{pending ? "Saving…" : "Save key"}
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
+						</optgroup>
+						<optgroup label={`All providers (${OTHER_PROVIDERS.length})`}>
+							{OTHER_PROVIDERS.map((p) => (
+								<option key={p.id} value={p.id}>
+									{p.label}
+								</option>
+							))}
+						</optgroup>
+					</select>
+				</div>
+				<div>
+					<label
+						htmlFor="provider-key"
+						className="text-xs font-medium text-ink-2 block mb-1"
+					>
+						API key
+					</label>
+					<input
+						id="provider-key"
+						type="password"
+						autoComplete="off"
+						value={plaintext}
+						onChange={(e) => setPlaintext(e.target.value)}
+						placeholder={hint ? `${hint}` : "paste your provider API key"}
+						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+						required
+					/>
+					<p className="text-2xs text-ink-2 mt-1">
+						Encrypted at rest (AES-256-GCM, bound to your tenant). Stored once —
+						we show only the last 4 characters afterward.
+					</p>
+				</div>
+				{error && <p className="text-xs text-danger-ink">{error}</p>}
+				<div className="flex justify-end gap-2 pt-1">
+					<button
+						type="button"
+						onClick={onClose}
+						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
+					>
+						Cancel
+					</button>
+					<button
+						type="submit"
+						disabled={!plaintext.trim() || pending}
+						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
+					>
+						{pending ? "Saving…" : "Save key"}
+					</button>
+				</div>
+			</form>
+		</Modal>
 	);
 }
 
@@ -218,7 +217,7 @@ function AddKeyDialog({
  */
 function OwnerOnlyPanel() {
 	return (
-		<div className="surface-card border border-dashed border-line bg-surface/40 p-8 text-center shadow-none">
+		<div className="surface-card border border-dashed border-line bg-surface p-8 text-center shadow-none">
 			<p className="text-sm text-ink-2">
 				Provider keys are visible to workspace owners only.
 			</p>
@@ -280,7 +279,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 
 	return (
 		<div className="space-y-4">
-			<div className="flex items-center justify-between">
+			<div className="flex items-center justify-between gap-3">
 				<div>
 					<h3 className="text-sm font-semibold text-ink">Your keys</h3>
 				</div>
@@ -304,7 +303,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
-				<div className="surface-card border border-dashed border-line bg-surface/40 p-8 text-center shadow-none">
+				<div className="surface-card border border-dashed border-line bg-surface p-8 text-center shadow-none">
 					<p className="text-sm text-ink-2">No provider keys yet.</p>
 					<p className="text-xs text-ink-3 mt-1">
 						Add your Anthropic, OpenAI, or other provider key to start routing
@@ -314,7 +313,7 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 			)}
 
 			{keys.length > 0 && (
-				<div className="surface-card border border-line overflow-hidden">
+				<div className="surface-card overflow-x-auto border border-line">
 					<table className="w-full text-left">
 						<thead className="bg-surface text-xs text-ink-2">
 							<tr>

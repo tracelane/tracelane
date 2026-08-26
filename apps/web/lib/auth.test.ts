@@ -1,5 +1,6 @@
 /**
  * Tests for the auth gate (`requireSession` / `requireGatewayToken`) with the
+ * dev-only E2E bypass wired in.
  *
  * Proves the bypass short-circuits the WorkOS call entirely (Gate 1 / Gate 4 at
  * the real auth seam): when active it resolves the disposable test tenant and
@@ -132,5 +133,40 @@ describe("requireGatewayToken", () => {
 		expect(h.withAuth).toHaveBeenCalledTimes(1);
 		expect(r.token).toBe("real.jwt.token");
 		expect(r.tenantId).toBe("org_real");
+	});
+
+	// second instance. `withAuth` THROWS when it must refresh an expired
+	// access-token whose verifier cookies have also expired: it writes the new cookie
+	// during an RSC render, which Next.js forbids ("Cookies can only be modified in a
+	// Server Action or Route Handler"). Unhandled that reached the error boundary on
+	// 7 of 11 prod pages. The contract is a REDIRECT, never a throw.
+	it("a THROWING withAuth redirects to sign-in instead of propagating", async () => {
+		vi.stubEnv("NODE_ENV", "test");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "");
+		h.withAuth.mockRejectedValue(
+			new Error(
+				"Cookies can only be modified in a Server Action or Route Handler",
+			),
+		);
+		const { requireGatewayToken } = await import("./auth");
+
+		// `redirect()` is mocked to throw a NEXT_REDIRECT sentinel, so the assertion is
+		// that we get THAT and not the cookie error — the whole point of the fix.
+		await expect(requireGatewayToken()).rejects.toThrow(/NEXT_REDIRECT/);
+		expect(h.redirect).toHaveBeenCalledWith("/sign-in");
+	});
+
+	it("does NOT pass ensureSignedIn — its auto-redirect is the un-convertible throw", async () => {
+		vi.stubEnv("NODE_ENV", "test");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "");
+		h.withAuth.mockResolvedValue({
+			organizationId: "org_real",
+			accessToken: "real.jwt.token",
+		});
+		const { requireGatewayToken } = await import("./auth");
+		await requireGatewayToken();
+
+		const arg = h.withAuth.mock.calls[0]?.[0];
+		expect(arg?.ensureSignedIn).toBeUndefined();
 	});
 });

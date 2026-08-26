@@ -1,3 +1,4 @@
+//! Customer-facing API-key mint endpoint.
 //!
 //! `POST /v1/keys` — mints a `tlane_<base62>` API key for the authenticated
 //! tenant and returns the raw key exactly once. Mounted only when Postgres is
@@ -8,6 +9,7 @@
 //!
 //! The dashboard runs on the Cloudflare Workers runtime, where the web minter's
 //! WASM Argon2 (`hash-wasm`) fails at runtime — every "+ New key" click 500'd
+//! . Minting here runs RustCrypto Argon2 natively and reuses the exact
 //! same peppered-HMAC + Argon2id derivation as the verifier
 //! (`crate::db::api_keys`), so keys stay byte-compatible: a key minted here
 //! verifies through `lookup_tenant_by_key_body` unchanged, and any key minted by
@@ -95,6 +97,16 @@ struct CreateKeyBody {
     expires_at: Option<String>,
     #[serde(default)]
     budget_usd_monthly: Option<f64>,
+    /// GWY-43. Requests-per-minute ceiling for this one key. Omitted ⇒ the key
+    /// inherits the tenant's plan tier, exactly as every key did before GWY-43.
+    ///
+    /// Wire type is `i64`, not `u32`, ON PURPOSE: a `u32` field makes serde
+    /// refuse a negative before the handler runs, and the caller gets axum's
+    /// 422 deserialization text instead of the 400 naming the field that the
+    /// budget next to it returns. Taking the wider type keeps ONE validator,
+    /// here, for every out-of-range value.
+    #[serde(default)]
+    rate_limit_rpm: Option<i64>,
 }
 
 /// `POST /v1/keys` response. camelCase to match the dashboard's `CreateResult`
@@ -113,6 +125,23 @@ struct CreateKeyResponse {
     scope: Option<Vec<String>>,
     /// A13. RFC3339 UTC, `null` = never expires.
     expires_at: Option<String>,
+    /// GWY-43. The ceilings as VALIDATED here and handed to the INSERT — echoed
+    /// back so the 201 reports what the row holds rather than leaving the caller
+    /// to assume its input survived. `null` = uncapped / plan default.
+    budget_usd_monthly: Option<f64>,
+    rate_limit_rpm: Option<i32>,
+}
+
+/// The known scope slugs, for every 400 this route emits.
+///
+/// ONE source for the list so the three refusals (omitted, empty, unknown) can
+/// never disagree about the vocabulary — a caller told two different sets of
+/// "known scopes" by two errors on the same route learns to trust neither.
+fn known_scope_slugs() -> Vec<&'static str> {
+    tracelane_shared::api_scope::Scope::all()
+        .iter()
+        .map(|s| s.as_slug())
+        .collect()
 }
 
 /// Mount the mint route. Merged in `server.rs` when Postgres is configured.
@@ -179,26 +208,56 @@ async fn create_key_handler(
     // Rejected here rather than at the DB so the caller gets a 400 naming the
     // problem instead of a 500 from a constraint violation.
     let scope = match body.scope {
-        None => None,
+        // R73 (founder ruling, 2026-08-22) — **AN OMITTED `scope` IS A 400.**
+        //
+        // This arm used to be `None => None`, with `.with_default_scope()` below
+        // filling in `{chat, read, ingest}`. Migration 0024's hand-off note always
+        // said the mint route must REQUIRE a scope; the deviation was taken on the
+        // stated grounds that requiring one "would 400 every existing caller of
+        // `POST /v1/keys` the moment this deploys, the dashboard proxy included."
+        //
+        // THAT REASON WAS MEASURED AND IS FALSE. Of 37 keys ever minted on prod,
+        // 23 carry SQL NULL and 14 an explicit scope — and all 14 explicit ones are
+        // revoked, so **zero live keys were minted through this default**. The
+        // dashboard cannot reach the arm either: `ApiKeyManager.tsx` gates submit on
+        // `scope.length > 0`, and the proxy forwards the field only when present.
+        // Self-host cannot reach it at all — minting needs a Postgres control plane
+        // that self-host does not run (`README.md:71`).
+        //
+        // Why REQUIRED beats a narrower default: a default is a decision made by
+        // whoever wrote it, for every caller who never reads it. `chat` spends the
+        // tenant's provider money, so the quiet path was handing out the one
+        // capability with a bill attached. Refusing makes the caller state it.
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "scope is required — a key must state what it may do, because \
+                     an omitted scope used to grant `chat`, which spends this \
+                     workspace's provider budget. Pass e.g. \"scope\": [\"chat\", \
+                     \"read\"]. Known scopes: {}",
+                    known_scope_slugs().join(", ")
+                ),
+            ));
+        }
         Some(raw) => {
             if raw.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "scope must not be empty — omit it for a full-surface key".into(),
+                    format!(
+                        "scope must not be empty — state at least one. Known scopes: {}",
+                        known_scope_slugs().join(", ")
+                    ),
                 ));
             }
             let mut out = Vec::with_capacity(raw.len());
             for slug in &raw {
                 let Some(parsed) = tracelane_shared::api_scope::Scope::from_slug(slug) else {
-                    let known: Vec<&str> = tracelane_shared::api_scope::Scope::all()
-                        .iter()
-                        .map(|s| s.as_slug())
-                        .collect();
                     return Err((
                         StatusCode::BAD_REQUEST,
                         format!(
                             "unknown scope {slug:?} — known scopes: {}",
-                            known.join(", ")
+                            known_scope_slugs().join(", ")
                         ),
                     ));
                 };
@@ -245,14 +304,36 @@ async fn create_key_handler(
         ));
     }
 
+    // GWY-43 — same shape as the budget check above, one difference: 0 is
+    // REFUSED rather than accepted. A zero budget is a coherent (if useless)
+    // ceiling, but a zero rate limit is a key that can never be used, and
+    // `revoked_at` is how a key is switched off. `api_keys_rate_limit_rpm_positive_chk`
+    // (migration 0029) says the same thing at the DB; catching it here turns a
+    // constraint-violation 500 into a 400 that names the field. The ceiling is
+    // `i32::MAX` because the column is `integer`.
+    let rate_limit_rpm = match body.rate_limit_rpm {
+        None => None,
+        Some(rpm) => match i32::try_from(rpm) {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "rate_limit_rpm must be a whole number of requests per minute \
+                         between 1 and {} — omit it to use the workspace plan limit",
+                        i32::MAX
+                    ),
+                ));
+            }
+        },
+    };
+
     let opts = crate::db::api_keys::MintOptions {
         scope,
         expires_at,
         budget_usd_monthly: body.budget_usd_monthly,
-    }
-    // An omitted scope becomes the explicit full set here, at the edge, so the
-    // 201 body reports what the row actually holds.
-    .with_default_scope();
+        rate_limit_rpm,
+    };
 
     // Record the minting user (WorkOS `sub`) so §3 member-removal can revoke
     // exactly this user's keys. API-key / dev auth has an `apikey:`/`dev-stub`
@@ -292,6 +373,8 @@ async fn create_key_handler(
             raw_key: minted.raw_key,
             scope: minted.api_key.scope,
             expires_at: minted.api_key.expires_at.map(|t| t.to_rfc3339()),
+            budget_usd_monthly: body.budget_usd_monthly,
+            rate_limit_rpm,
         }),
     ))
 }
@@ -346,6 +429,17 @@ mod tests {
 
     // ── A13: scope / expiry validation at the mint edge ────────────────────
 
+    /// A minimal VALID scope, for the tests that are not about scope.
+    ///
+    /// R73 made `scope` required, so scope validation now short-circuits every
+    /// other validator on the route. A test about expiry or budget that omitted
+    /// scope would stop asserting what it was written to assert and start
+    /// asserting the scope refusal — green for the wrong reason, which is the
+    /// shape `docs/reference/TRAPS.md` §1 exists for.
+    fn a_scope() -> Option<Vec<String>> {
+        Some(vec!["chat".into()])
+    }
+
     fn body_with(
         scope: Option<Vec<String>>,
         expires_at: Option<String>,
@@ -356,74 +450,89 @@ mod tests {
             scope,
             expires_at,
             budget_usd_monthly: budget,
+            rate_limit_rpm: None,
         }
     }
 
-    /// An omitted scope must be stored as the EXPLICIT full set, not SQL NULL.
-    /// NULL is reserved for keys minted before A13; if new keys kept landing as
-    /// NULL, `LegacyFullSurface` would keep growing and the distinction that
-    /// makes scope enforceable would erode.
-    #[tokio::test]
-    async fn omitted_scope_is_recorded_explicitly_not_as_null() {
-        let (state, _seen) = mock_state();
-        let (status, Json(body)) = create_key_handler(
-            State(state),
-            bearer_headers(),
-            Json(body_with(None, None, None)),
-        )
-        .await
-        .expect("mint should succeed");
-        assert_eq!(status, StatusCode::CREATED);
-        let mut got = body.scope.expect("scope must not be null on a new key");
-        got.sort();
-        // HAND-MAINTAINED ON PURPOSE — do NOT derive this from `Scope::all()` or
-        // from `Scope::default_mint_set()`. Deriving it from the same source the
-        // handler reads would make the assertion circular: it would pass for any
-        // vocabulary, including a wrong one. This literal is the independent pin,
-        // and adding a scope is meant to land here as a red test so a human
-        // decides whether "omitted" should really include the new capability.
-        //
-        // GWY-41 added `ingest`, and it should: a key minted with no scope is the
-        // one a customer pastes into an app that both calls models and reports its
-        // traces.
-        //
-        // **`admin` was here and was REMOVED (founder ruling, 2026-08-14).** The
-        // literal above read `["admin", "chat", "ingest", "read"]` and this test
-        // was GREEN the whole time — it pinned the defect rather than catching it,
-        // because the pin was written to match the code instead of to state the
-        // intent. That is the lesson worth more than the fix: an independent pin
-        // is only independent if it encodes a DECISION.
-        assert_eq!(got, vec!["chat", "ingest", "read"]);
-    }
-
-    /// The security half of the rule above, asserted as its own property so it
-    /// cannot be weakened by a future edit to the vocabulary list.
+    /// **An omitted `scope` is REFUSED with a 400 naming the field** — founder
+    /// ruling R73, 2026-08-22.
     ///
-    /// **An omitted scope must NEVER grant `admin`.** `admin` is
-    /// *"manage the workspace — mint/revoke keys, provider keys, settings"*, so a
-    /// silent grant is the exact escalation `is_verified_owner()` was added to
-    /// enforced at the gateway rather than in the dashboard dialog on purpose:
-    /// the dialog is not the only caller, and it was in fact the caller that
-    /// shipped WITHOUT a scope field at all.
+    /// This test replaces `omitted_scope_is_recorded_explicitly_not_as_null`,
+    /// which asserted the opposite (that omission stored `{chat, read, ingest}`)
+    /// together with the hand-maintained literal pin
+    /// `assert_eq!(got, vec!["chat", "ingest", "read"])`. **That pin going red is
+    /// the design working**, and its own comment said so: it existed so a change
+    /// to what "omitted" means would land on a human. It did.
+    ///
+    /// The pin's real lesson is kept and is now enforced structurally instead:
+    /// it read `["admin", "chat", "ingest", "read"]` while `admin` was silently
+    /// granted, and was GREEN the whole time, because it had been written to
+    /// match the code rather than to state the intent. A default that no longer
+    /// exists cannot be pinned to the wrong value.
     #[tokio::test]
-    async fn omitted_scope_never_includes_admin() {
-        let (state, _seen) = mock_state();
-        let (_status, Json(body)) = create_key_handler(
+    async fn omitted_scope_is_refused_with_400_naming_the_field() {
+        let (state, seen) = mock_state();
+        let err = create_key_handler(
             State(state),
             bearer_headers(),
             Json(body_with(None, None, None)),
         )
         .await
-        .expect("mint should succeed");
-        let got = body.scope.expect("scope must not be null on a new key");
+        .expect_err("an omitted scope must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(
-            !got.iter().any(|s| s == "admin"),
-            "omitting `scope` must never grant admin — got {got:?}"
+            err.1.contains("scope is required"),
+            "the 400 must name the field — got {:?}",
+            err.1
+        );
+        assert!(
+            err.1.contains("chat"),
+            "the 400 must list the known scopes — got {:?}",
+            err.1
+        );
+        // THE DISCRIMINATING ASSERTION. A 400 that still minted would be the
+        // worst of both: the caller is told no and a credential exists anyway.
+        // Asserting the refusal message alone cannot tell those apart.
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "a refused mint must not reach the minter"
         );
     }
 
-    /// And the other direction, so the test above cannot be satisfied by
-    /// removing `admin` from the vocabulary entirely: `admin` must still be
+    /// **An omitted scope must NEVER grant `admin`.** `admin` is
+    /// *"manage the workspace — mint/revoke keys, provider keys, settings"*, so a
+    /// silent grant is the exact escalation `is_verified_owner()` was added to
+    /// prevent (/PL-9b), reachable by KEY instead of by JWT.
+    ///
+    /// R73 makes this hold for a stronger reason than it used to: omission no
+    /// longer grants anything at all. **The test is kept rather than deleted**
+    /// because it states the PROPERTY, not the mechanism — if a default is ever
+    /// reintroduced, this is what stops it carrying `admin` again, and it would
+    /// go red on that change rather than on this one.
+    #[tokio::test]
+    async fn omitted_scope_never_includes_admin() {
+        let (state, seen) = mock_state();
+        let outcome = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(None, None, None)),
+        )
+        .await;
+        match outcome {
+            // Today: refused outright, so no scope is granted at all.
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            // If a default is ever reintroduced, it must not carry `admin`.
+            Ok((_status, Json(body))) => {
+                let got = body.scope.expect("scope must not be null on a new key");
+                assert!(
+                    !got.iter().any(|s| s == "admin"),
+                    "omitting `scope` must never grant admin — got {got:?}"
+                );
+            }
+        }
+        let _ = seen;
+    }
+
     /// grantable when it is asked for BY NAME. Opt-in, not unavailable.
     #[tokio::test]
     async fn admin_scope_is_still_grantable_when_requested_explicitly() {
@@ -495,7 +604,19 @@ mod tests {
         .await
         .expect_err("an empty scope must be refused");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.contains("omit it"), "must say how to get a full key");
+        // R73: the old guidance was "omit it for a full-surface key". Omitting is
+        // now itself a 400, so telling the caller to omit would route them into a
+        // second refusal. The message must state the vocabulary instead.
+        assert!(
+            err.1.contains("at least one"),
+            "must say a scope is needed — got {:?}",
+            err.1
+        );
+        assert!(
+            err.1.contains("chat"),
+            "must list the known scopes — got {:?}",
+            err.1
+        );
     }
 
     /// Minting an already-dead credential is almost certainly a mistake, and
@@ -506,7 +627,11 @@ mod tests {
         let err = create_key_handler(
             State(state),
             bearer_headers(),
-            Json(body_with(None, Some("2020-01-01T00:00:00Z".into()), None)),
+            Json(body_with(
+                a_scope(),
+                Some("2020-01-01T00:00:00Z".into()),
+                None,
+            )),
         )
         .await
         .expect_err("a past expiry must be refused");
@@ -520,7 +645,7 @@ mod tests {
         let err = create_key_handler(
             State(state),
             bearer_headers(),
-            Json(body_with(None, Some("next tuesday".into()), None)),
+            Json(body_with(a_scope(), Some("next tuesday".into()), None)),
         )
         .await
         .expect_err("a malformed expiry must be refused");
@@ -535,7 +660,7 @@ mod tests {
             let err = create_key_handler(
                 State(state),
                 bearer_headers(),
-                Json(body_with(None, None, Some(bad))),
+                Json(body_with(a_scope(), None, Some(bad))),
             )
             .await
             .expect_err("a bad budget must be refused");
@@ -543,15 +668,103 @@ mod tests {
         }
     }
 
+    // ── GWY-43: per-key rate limit at the mint edge ────────────────────────
+
+    /// Every value the DB CHECK would reject must be a 400 HERE, naming the
+    /// field. `0` is in the list on purpose: it is the one plausible-looking
+    /// value a user might type meaning "off", and it would mint a key that can
+    /// never serve a request.
+    #[tokio::test]
+    async fn zero_negative_and_oversized_rate_limits_are_refused() {
+        for bad in [0_i64, -1, i64::from(i32::MAX) + 1] {
+            let (state, seen) = mock_state();
+            let mut body = body_with(a_scope(), None, None);
+            body.rate_limit_rpm = Some(bad);
+            let err = create_key_handler(State(state), bearer_headers(), Json(body))
+                .await
+                .expect_err("a bad rate limit must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "rpm {bad} must 400");
+            assert!(
+                err.1.contains("rate_limit_rpm"),
+                "message must name the field — got {:?}",
+                err.1
+            );
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "no mint may happen on an invalid rate limit"
+            );
+        }
+    }
+
+    /// The point of the field: a valid value must reach the INSERT. Asserting
+    /// only the 201 would pass even if the handler dropped it on the floor —
+    /// which is precisely how `budget_usd_monthly` sat in the schema enforcing
+    /// nothing (`db::api_keys::KeyAuth` doc). So assert what the minter was
+    /// HANDED, and separately that the response echoes it.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_valid_rate_limit_reaches_the_minter_and_the_response() {
+        let _g = DevAuthGuard::new();
+        let (state, _seen, last_opts) = mock_state_capturing();
+        let mut body = body_with(a_scope(), None, Some(25.0));
+        body.rate_limit_rpm = Some(120);
+        let (status, Json(out)) = create_key_handler(State(state), bearer_headers(), Json(body))
+            .await
+            .expect("mint should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        let opts = last_opts
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the minter must have been called");
+        assert_eq!(opts.rate_limit_rpm, Some(120), "the INSERT must carry it");
+        assert_eq!(opts.budget_usd_monthly, Some(25.0));
+        assert_eq!(out.rate_limit_rpm, Some(120));
+        assert_eq!(out.budget_usd_monthly, Some(25.0));
+    }
+
+    /// Omitting it stays omitted — `NULL` means "inherit the tenant's plan
+    /// tier", and inventing a number here would silently cap every new key.
+    #[tokio::test]
+    async fn an_omitted_rate_limit_stays_null() {
+        let (state, _seen, last_opts) = mock_state_capturing();
+        let _created = create_key_handler(
+            State(state),
+            bearer_headers(),
+            Json(body_with(a_scope(), None, None)),
+        )
+        .await
+        .expect("mint should succeed");
+        let opts = last_opts
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the minter must have been called");
+        assert_eq!(opts.rate_limit_rpm, None);
+    }
+
     fn mock_state() -> (KeyRoutesState, Arc<Mutex<Vec<String>>>) {
+        let (state, seen, _opts) = mock_state_capturing();
+        (state, seen)
+    }
+
+    /// Same mock, plus the handle on what the handler actually passed down —
+    /// the only way to assert the VALIDATED options rather than just the 201.
+    #[allow(clippy::type_complexity)]
+    fn mock_state_capturing() -> (
+        KeyRoutesState,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Option<crate::db::api_keys::MintOptions>>>,
+    ) {
         let seen = Arc::new(Mutex::new(vec![]));
+        let last_opts = Arc::new(Mutex::new(None));
         let state = KeyRoutesState {
             minter: Arc::new(MockKeyMinter {
                 seen: seen.clone(),
-                last_opts: Arc::new(Mutex::new(None)),
+                last_opts: last_opts.clone(),
             }),
         };
-        (state, seen)
+        (state, seen, last_opts)
     }
 
     /// Replicates the trace_reads dev-auth guard: the dev-stub claims path needs
@@ -602,9 +815,13 @@ mod tests {
             bearer_headers(),
             Json(CreateKeyBody {
                 name: "  prod-agent  ".into(),
-                scope: None,
+                // R73: scope is required, and this test is about the TENANT bind
+                // and name trimming — leaving it `None` would make it assert the
+                // scope refusal instead, which is a different property.
+                scope: a_scope(),
                 expires_at: None,
                 budget_usd_monthly: None,
+                rate_limit_rpm: None,
             }),
         )
         .await
@@ -630,6 +847,7 @@ mod tests {
                 scope: None,
                 expires_at: None,
                 budget_usd_monthly: None,
+                rate_limit_rpm: None,
             }),
         )
         .await
@@ -654,6 +872,7 @@ mod tests {
                 scope: None,
                 expires_at: None,
                 budget_usd_monthly: None,
+                rate_limit_rpm: None,
             }),
         )
         .await

@@ -15,7 +15,10 @@
 
 import {
 	BarChart,
+	Gauge,
 	LedgerSeqChip,
+	ModelDonut,
+	SparkBars,
 	StatCard,
 	StatGrid,
 	TimeRuler,
@@ -63,7 +66,15 @@ describe("BarChart — discrete marks, colour is data", () => {
 			}),
 		);
 		expect(out).toContain("fill-danger");
-		expect(out).toContain("fill-info"); // the default: neutral data
+		// The default neutral-data fill. This asserted `fill-info` until 2026-08-22,
+		// when the P0 palette retired `--info` as a data role: it used to be a blue
+		// (#1d5bd0) serving as "the one free data hue", and the brief bans a
+		// decorative hue outright. `--chart-primary` is the role that replaced it and
+		// says what it is. The assertion had to move with the class, and BOTH halves
+		// of the pair still matter: a semantic tone where the datum carries one, the
+		// neutral chart role everywhere else.
+		expect(out).toContain("fill-chart-primary");
+		expect(out).not.toContain("fill-info");
 	});
 
 	it("emphasises by WEIGHT, not hue — so it survives monochrome", () => {
@@ -216,5 +227,97 @@ describe("LedgerSeqChip — a RANGE, never a per-trace verified claim", () => {
 		expect(out.toLowerCase()).not.toContain("verified");
 		expect(out).not.toContain("text-ok");
 		expect(out).not.toContain("seal");
+	});
+});
+
+/**
+ * DSH-08 — the three chart behaviours the dashboard's new metrics depend on.
+ *
+ * Each is a HONESTY property, not a look: what the component refuses to draw is the
+ * assertion. A spark that interpolates, a donut that recolours an outcome by rank, or
+ * a gauge with no threshold are all things that would render fine and lie.
+ */
+describe("SparkBars — a shape, or nothing", () => {
+	it("REFUSES to draw fewer than two buckets", () => {
+		// One measurement is not a trend. The alternative failure is a flat line,
+		// which claims measured zeros that were never measured.
+		expect(html(createElement(SparkBars, { values: [] }))).toBe("");
+		expect(html(createElement(SparkBars, { values: [7] }))).toBe("");
+	});
+
+	it("draws a zero bucket as a real zero-height mark, never a gap", () => {
+		const out = html(createElement(SparkBars, { values: [10, 0, 5] }));
+		expect((out.match(/<rect/g) ?? []).length).toBe(3);
+		expect(out).toContain('height="0"');
+	});
+
+	it("is decorative unless it is given a name", () => {
+		// A spark beside a number the tile already states must not be read twice by a
+		// screen reader; a spark that IS the only description of the series must be.
+		expect(html(createElement(SparkBars, { values: [1, 2] }))).toContain(
+			'aria-hidden="true"',
+		);
+		const named = html(
+			createElement(SparkBars, { values: [1, 2], ariaLabel: "error rate" }),
+		);
+		expect(named).toContain('role="img"');
+		expect(named).toContain('aria-label="error rate"');
+	});
+});
+
+describe("ModelDonut — rank fades, meaning does not", () => {
+	const seg = (label: string, value: number) => ({ label, value });
+
+	it("fades an UNTONED composition by rank (models are not outcomes)", () => {
+		const out = html(
+			createElement(ModelDonut, {
+				segments: [seg("a", 5), seg("b", 3), seg("c", 2)],
+			}),
+		);
+		expect(out).toContain('stroke-opacity="0.85"');
+		expect(out).not.toContain("var(--danger)");
+	});
+
+	it("paints a TONED slice at full strength — a 4th-ranked block is still a block", () => {
+		const out = html(
+			createElement(ModelDonut, {
+				segments: [
+					seg("allowed", 90),
+					seg("warned", 5),
+					seg("redacted", 3),
+					{ label: "blocked", value: 2, tone: "danger" as const },
+				],
+			}),
+		);
+		expect(out).toContain("var(--danger)");
+		// The ramp would have put the 4th segment at 0.37; a tone opts out of it.
+		expect(out).toContain('stroke="var(--danger)" stroke-opacity="1"');
+	});
+});
+
+describe("Gauge — a value against a threshold", () => {
+	it("draws the marker tick when one is given, and none when it is not", () => {
+		const withMark = html(
+			createElement(Gauge, { value: 35, marker: 50, label: "burn rate" }),
+		);
+		expect((withMark.match(/<line/g) ?? []).length).toBe(1);
+		expect(html(createElement(Gauge, { value: 35 }))).not.toContain("<line");
+	});
+
+	it("uses the inverse ink on an inverse card — the 1:1 class", () => {
+		// --action IS --surface-inverse in light theme, so an inverse gauge painted
+		// with --action would be invisible. This is the same defect StatCard's
+		// `valueCls` comment records having shipped once.
+		const inv = html(createElement(Gauge, { value: 60, onInverse: true }));
+		expect(inv).toContain("var(--ink-inverse)");
+		expect(inv).not.toContain("var(--action)");
+	});
+
+	it("PINS the arc but never the number when the value exceeds the scale", () => {
+		// A saturated arc must not be mistakable for the reading itself.
+		const out = html(
+			createElement(Gauge, { value: 400, display: "7.30×", marker: 50 }),
+		);
+		expect(out).toContain("7.30×");
 	});
 });

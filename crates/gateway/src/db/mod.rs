@@ -11,14 +11,18 @@
 //! via `Arc<DbPool>` on `AppState`.
 //!
 //! Migration discipline: Drizzle (`apps/web/db/migrations/`) is the single
+//! Postgres source of truth (ADR-040 /). The `apply_migrations` helper
 //! embeds those files for integration tests; prod is migrated by
 //! `drizzle-kit migrate`. (The old `infra/dev/postgres/migrations/` divergent
+//! set is being retired in; it survives only for the COGS eval bubble
+//! until that migrates to the id-PK shape — tracked as.)
 //!
 //! Query style: raw SQL with parameter binding, never string-concat. See
 //! `tenants.rs` and `api_keys.rs` for the patterns.
 
 pub mod api_keys;
 pub mod audit_chain_state;
+pub mod keepalive;
 pub mod observed_tools;
 pub mod provider_keys;
 pub mod quota_notifications;
@@ -201,9 +205,11 @@ fn host_to_string(host: &tokio_postgres::config::Host) -> Option<String> {
 }
 
 /// Apply the **canonical Drizzle migrations** (`apps/web/db/migrations/`)
+/// against the pool — the single Postgres source of truth (ADR-040 /).
 ///
 /// The old `infra/dev/postgres/migrations/` set was a divergent second system
 /// (pre-ADR-040 `tenant_id`/`plan_tier` shape); this helper no longer reads it
+/// (that dir is retired in, kept only for the COGS eval until). Each
 /// Drizzle file is `include_str!`'d and applied with `batch_execute` — Drizzle's
 /// `--> statement-breakpoint` markers are `--` line comments, so the whole file
 /// runs as one multi-statement script (each file is its own implicit txn).
@@ -258,8 +264,17 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         ),
         include_str!("../../../../apps/web/db/migrations/0025_obs18_trace_annotations.sql"),
         include_str!("../../../../apps/web/db/migrations/0026_dsh01_notifications.sql"),
-        include_str!("../../../../apps/web/db/migrations/0027_gwy27_model_aliases.sql"),
         include_str!("../../../../apps/web/db/migrations/0028_gwy41_ingest_scope_comment.sql"),
+        include_str!(
+            "../../../../apps/web/db/migrations/0029_gwy43_per_key_rate_limit_and_workspace_budget.sql"
+        ),
+        // EVL-04. Caught by `check-migration-list-complete.py`, which is the whole
+        // reason this list is not a convention: a migration that exists on disk but
+        // not HERE never reaches a fresh database, and every Postgres integration
+        // test builds its schema from this array — so the gateway would read
+        // `f_datasets` from a column that does not exist and 500 the entire
+        // entitlement resolve, on a surface that had passed every local test.
+        include_str!("../../../../apps/web/db/migrations/0030_evl04_dataset_entitlements.sql"),
     ];
     for migration in MIGRATIONS {
         client

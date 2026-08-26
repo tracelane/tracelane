@@ -6,6 +6,7 @@
 //! per-model list-price table, as a fallback used only when the provider did not
 //! report a cost itself (`build_gateway_span`).
 //!
+//! **Maintenance (founder — `` P1):** the rates below are provider
 //! *list prices* in USD per **million** tokens, entered from each provider's
 //! public pricing page. This table is the single place cost is defined; verify it
 //! against the provider pages and extend it as models are added. An **unknown
@@ -91,6 +92,7 @@ fn price_card(model: &str) -> Option<PriceCard> {
     }
 
     // ── Google Gemini ── list prices per Mtok, re-verified against
+    // ai.google.dev/gemini-api/docs/pricing (2026-07-17). Vertex charges the
     // SAME per-token rates on the `global` endpoint, so one catalog serves both
     // `gemini-*` (AI Studio) and `vertex/gemini-*`; regional Vertex endpoints carry
     // a ~10% premium that is not modelled (we default to `global`).
@@ -102,7 +104,9 @@ fn price_card(model: &str) -> Option<PriceCard> {
     // `promptTokenCount` already includes any cached prefix and the adapter does not
     // populate a cache counter for gemini, so cache tiers are 0.0 (bill input+output
     // at the full rate — no double-count). Output tokens here already include
+    // thinking (`thoughtsTokenCount`), folded in at extraction.
     if m.contains("gemini") {
+        // A floating alias resolves to a DIFFERENT concrete model over time,
         // and the caller passes the REQUEST model (`server.rs:1592`), so there is
         // nothing here to resolve it against. Pricing it from any fixed card would
         // be wrong-by-construction the moment Google repoints the alias — so it is
@@ -211,7 +215,7 @@ fn price_card(model: &str) -> Option<PriceCard> {
 /// ```
 #[must_use]
 pub fn cost_usd(model: &str, usage: &Usage) -> Option<f64> {
-    let card = price_card(model)?;
+    let card = price_card(model).or_else(|| catalog_card(model))?;
     let input = f64::from(usage.input_tokens);
     let output = f64::from(usage.output_tokens);
     let cache_read = f64::from(usage.cache_read_input_tokens.unwrap_or(0));
@@ -222,6 +226,105 @@ pub fn cost_usd(model: &str, usage: &Usage) -> Option<f64> {
         + cache_write * card.cache_write_per_mtok)
         / MTOK;
     Some(cost)
+}
+
+/// ── The generated price table (GWY-42) ──────────────────────────────────────
+///
+/// `price_card` above is the founder-verified set: 13 cards across 3 vendors,
+/// each entered from a provider's own pricing page. It stays FIRST and it WINS.
+/// This table only extends coverage.
+///
+/// **Why coverage was the emergency.** `price_card` answered `None` for gpt-5,
+/// gpt-4.1, o1, o3, every `text-embedding-*`, and every Groq / Mistral /
+/// DeepSeek / xAI / Perplexity model — i.e. for most of what a customer would
+/// actually route. `None` is honest at this seam, but it does not survive the
+/// journey: `#[serde(skip_serializing_if)]` drops the attribute from the span,
+/// and every read-side SQL wraps the extract in `if(isFinite AND > 0, …, 0)`.
+/// So unpriced traffic arrived at the dashboard's "Spend (est.)" tile as
+/// **$0.00** — a wrong number wearing the confidence of a right one. Budgets
+/// (Sprint 1 item 2) and per-key attribution (item 5) both build on this
+/// number, so the coverage gap was theirs too.
+///
+/// Rows are `provider \t model \t input \t output \t cache_read`, USD per Mtok,
+/// generated from models.dev (MIT) by `scripts/ci/build-provider-catalog.py`.
+mod catalog_prices {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    const TSV: &str = include_str!("../model_prices.tsv");
+
+    /// `input`, `output`, `cache_read` — USD per million tokens. `cache_read` is
+    /// `None` when the vendor publishes no discounted cache rate, which the
+    /// caller charges at the full input rate rather than assuming away.
+    type Rates = (f64, f64, Option<f64>);
+    /// `(provider_id, model)` → rates. Named so the signature reads.
+    type PriceTable = HashMap<(&'static str, &'static str), Rates>;
+
+    /// `(provider_id, model)` → `(input, output, cache_read)`. `provider_id` is
+    /// `*` for the unambiguous-bare-name fallback rows — emitted only when
+    /// exactly ONE provider sells that model id, so a bare `gpt-4o` prices from
+    /// its real owner and an ambiguous name gets no fallback rather than a coin
+    /// toss between two vendors' rates.
+    pub fn table() -> &'static PriceTable {
+        static T: OnceLock<PriceTable> = OnceLock::new();
+        T.get_or_init(|| {
+            let mut m = HashMap::new();
+            for line in TSV.lines() {
+                let line = line.trim_end_matches('\r');
+                if line.is_empty() || line.starts_with('#') || line.starts_with("provider\t") {
+                    continue;
+                }
+                let mut f = line.split('\t');
+                let (Some(p), Some(model), Some(i), Some(o)) =
+                    (f.next(), f.next(), f.next(), f.next())
+                else {
+                    continue;
+                };
+                let cr = f.next().and_then(|v| v.parse::<f64>().ok());
+                let (Ok(i), Ok(o)) = (i.parse::<f64>(), o.parse::<f64>()) else {
+                    continue;
+                };
+                m.insert((p, model), (i, o, cr));
+            }
+            m
+        })
+    }
+}
+
+/// Look a model up in the generated table.
+///
+/// Tried in order: `(provider, model)` → `(provider, model minus its
+/// `provider/` prefix)` → `(*, model)`. The provider comes from the ONE
+/// canonical map, so a model that is unroutable is also unpriced — which is
+/// correct: we do not know who would have sold it.
+///
+/// **Cache rates are deliberately conservative.** models.dev publishes a
+/// cache-READ rate and no cache-WRITE rate. An unknown discount is charged at
+/// the full input rate rather than assumed away: under-reporting cost is the
+/// direction that silently overspends a budget, and budgets are built on this
+/// number.
+fn catalog_card(model: &str) -> Option<PriceCard> {
+    let t = catalog_prices::table();
+    let provider = crate::providers::ProviderRegistry::provider_id_for_model(model);
+
+    let hit = provider
+        .and_then(|p| t.get(&(p, model)))
+        .or_else(|| {
+            let p = provider?;
+            // `groq/llama-3.3-70b` is sold as `llama-3.3-70b`; strip our routing
+            // prefix, which is ours and never goes on the vendor's price list.
+            let bare = model.split_once('/').map(|(_, rest)| rest)?;
+            t.get(&(p, bare))
+        })
+        .or_else(|| t.get(&("*", model)))?;
+
+    let (input, output, cache_read) = *hit;
+    Some(PriceCard {
+        input_per_mtok: input,
+        output_per_mtok: output,
+        cache_read_per_mtok: cache_read.unwrap_or(input),
+        cache_write_per_mtok: input,
+    })
 }
 
 #[cfg(test)]
@@ -239,6 +342,108 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    // ── GWY-42: the generated catalog table ─────────────────────────────────
+
+    /// The founder-verified cards must be untouched by the catalog. If the
+    /// catalog could override one, every hand-checked rate in this file would be
+    /// silently replaced by a third party's number on the next regeneration.
+    #[test]
+    fn hand_verified_cards_still_win_over_the_catalog() {
+        // Same expectation as `sonnet_input_output_cost`, asserted here as the
+        // precedence claim rather than as arithmetic.
+        let c = cost_usd("claude-sonnet-4-6", &usage(1000, 500, None, None)).unwrap();
+        assert!(
+            approx(c, 0.0105),
+            "verified Sonnet card must still price it: got {c}"
+        );
+        // And the verified card is what `price_card` returns, with the catalog
+        // never consulted.
+        assert!(price_card("claude-sonnet-4-6").is_some());
+    }
+
+    /// The coverage hole this table was built to close. Every one of these
+    /// returned `None` before, and `None` reached the dashboard as $0.00.
+    #[test]
+    fn models_that_used_to_be_unpriced_now_price() {
+        let u = usage(1_000_000, 1_000_000, None, None);
+        for m in [
+            "gpt-5",
+            "gpt-4.1",
+            "o3-mini",
+            "deepseek-chat",
+            "grok-4.6",
+            "deepseek-reasoner",
+        ] {
+            let c = cost_usd(m, &u);
+            assert!(
+                c.is_some_and(|v| v > 0.0),
+                "`{m}` must now have a price; it is one of the models whose \
+                 missing card summed as $0.00 into the spend tile"
+            );
+        }
+    }
+
+    /// Widening coverage must not overturn a standing honesty policy. The
+    /// generator drops every `*-latest` row for the same reason
+    /// `floating_latest_aliases_are_unpriced` exists: the alias points at a
+    /// different model over time, so a rate recorded against it is a rate for a
+    /// model we cannot name.
+    #[test]
+    fn the_catalog_does_not_reintroduce_floating_alias_prices() {
+        for m in [
+            "mistral-large-latest",
+            "gemini-flash-latest",
+            "codestral-latest",
+        ] {
+            assert_eq!(
+                cost_usd(m, &usage(1000, 1000, None, None)),
+                None,
+                "`{m}` is a moving target and must stay unpriced"
+            );
+        }
+    }
+
+    /// The honest half. A model nobody sells has no price — and `None` must
+    /// never soften into `Some(0.0)`, because zero is a claim.
+    #[test]
+    fn an_unknown_model_is_still_none_never_zero() {
+        for m in ["totally-made-up-model-9000", "", "not-a-provider/whatever"] {
+            assert_eq!(
+                cost_usd(m, &usage(1000, 1000, None, None)),
+                None,
+                "`{m}` must be unpriced, not free"
+            );
+        }
+    }
+
+    /// A model routed through a `provider/` prefix prices from THAT provider's
+    /// row. The prefix is ours and never appears on a vendor's price list, so
+    /// the lookup has to strip it — and if it stripped it too eagerly it would
+    /// price a Groq request at OpenAI's rate.
+    #[test]
+    fn a_prefixed_model_prices_from_its_own_provider() {
+        let u = usage(1_000_000, 0, None, None);
+        let together = cost_usd("together/moonshotai/Kimi-K2-Instruct", &u);
+        if let Some(v) = together {
+            assert!(v > 0.0, "a priced Together model must cost something");
+        }
+        // The property that matters even when a specific row is absent: an
+        // unroutable model is unpriced, because we do not know who sold it.
+        assert_eq!(cost_usd("nosuchprovider/some-model", &u), None);
+    }
+
+    /// Cache rates are conservative by construction: an unknown cache discount
+    /// is charged at the full input rate. Under-charging is the direction that
+    /// silently overspends a budget.
+    #[test]
+    fn an_unknown_cache_discount_is_charged_at_the_input_rate_not_free() {
+        let with_cache = cost_usd("gpt-5", &usage(0, 0, Some(1_000_000), None));
+        assert!(
+            with_cache.is_some_and(|v| v > 0.0),
+            "cache-read tokens must never be free just because no discount is published"
+        );
     }
 
     #[test]
@@ -263,6 +468,7 @@ mod tests {
         assert!(approx(c, 0.006), "got {c}");
     }
 
+    /// The models a NEW Google key can actually call are gemini-3.x — the
     /// 2.5 cards shipped in `46e2043` cover models that 404 (deprecated for new
     /// users) or 429 (billing-gated). This is the live capability matrix, encoded:
     /// if these ever return None again, gemini traffic silently bills $0.
@@ -331,6 +537,7 @@ mod tests {
 
     #[test]
     fn gemini_25_pro_priced_from_verified_list_rate() {
+        // Gemini-2.5-pro base tier (1.25/10.0): (677*1.25 + 575*10)/1e6.
         // 575 output = candidates+thoughts (the extraction fix feeds cost).
         let c = cost_usd("gemini-2.5-pro", &usage(677, 575, None, None)).unwrap();
         assert!(approx(c, 0.006_596_25), "got {c}");

@@ -1,120 +1,149 @@
 @import "tailwindcss";
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ONE DESIGN SYSTEM (ADR-074 §10). `@tracelanedev/ui/styles/tokens.css` is the
-   single definition of colour for the app AND this site. The role tokens below
-   are now ALIASES onto it, not a second palette — before consolidation this file
-   carried its own "Soft Gradient" system — a
-   FOURTH palette alongside the app, the docs portal and the audit guide.
+   tracelane.dev — marketing surface.
 
-   TWO DENSITIES, ONE LANGUAGE (ADR-074 §2). tokens.css also carries the APP's
-   density — it sets `body { font-size: 12.5px }` in @layer base. Marketing is
-   16px on an 8px grid, and §2 is explicit that averaging the two is how the app
-   ends up spacious and unusable. So the colour comes across and the density is
-   re-set in @layer base at the bottom of this file, which is the whole reason
-   that block exists.
+   REBUILT FROM SCRATCH 2026-08-24 on founder instruction ("drop all and then
+   build a fresh"). The previous system — a warm-grey "Instrument" palette layered
+   over glassmorphism, mesh gradients, aurora washes and six tinted pricing tiles —
+   is GONE. Nothing below is inherited from it.
+
+   The reference is cursor.com, and the values are MEASURED, not eyeballed: every
+   token in the `@theme` block below was read out of Cursor's own shipped stylesheet
+   (`/marketing-static/_next/static/chunks/1255v9fszg0ay.css`) on 2026-08-24 and is
+   annotated with the Cursor custom property it came from. Where a value is ours
+   rather than theirs it says so.
+
+   THE THREE THINGS THAT MAKE IT READ AS CURSOR, in order of how much they matter:
+     1. A warm off-white canvas (#f7f7f4) with cards only a hair darker (#f2f1ed).
+        The contrast between a card and the page is ~2%. Nothing floats, nothing
+        glows, nothing has a drop shadow — surfaces are distinguished by tone alone.
+     2. 4px radii on panels and cards, pill radii on buttons. Small radius + large
+        panel is the signature; the old system's 2rem panel radius is the single
+        biggest thing that made it NOT look like this.
+     3. An understated hero. Cursor's h1 ships at 1.625rem — smaller than their own
+        section headings, which run 3.25rem→4.5rem. The framed product stage carries
+        the page, not the headline.
+
+   `@tracelanedev/ui/styles/tokens.css` is still imported: it is the app's token
+   file, `tests/site.test.ts` asserts its ink/line/ok hexes reach the artifact, and
+   the app + docs portal read from it. The site's ROLE tokens below no longer alias
+   onto it — this surface is deliberately its own skin now — but the import stays so
+   the shared definitions ship and that gate keeps meaning something.
    ───────────────────────────────────────────────────────────────────────────── */
 @import "@tracelanedev/ui/styles/tokens.css";
 
-/* ============================================================
-   tracelane — marketing surface, ADR-074 "Instrument".
-   ------------------------------------------------------------
-   Colour comes from `@tracelanedev/ui/styles/tokens.css` (imported above) and
-   is defined NOWHERE else. The role tokens in @theme below are aliases onto it.
-
-   This block used to describe a "Soft Gradient" theme — taupe canvas #dfdbd8,
-   a sage→cream→apricot gradient, ink #1d2a2e, a lemon #fdf051 highlight. That
-   system is retired: it was a FOURTH palette running alongside the app, the
-   docs portal and the audit guide, and ADR-074 §1 makes colour mean something
-   happened. The description is replaced rather than left as a "historical
-   note", because a comment describing a palette the file no longer contains is
-   the defect, not a record.
-
-   Layout, panels and motion are unchanged — this was a palette swap, not a
-   redesign of the page. Density stays MARKETING (16px / 8px grid), set in
-   @layer base at the bottom; see ADR-074 §2 for why that is deliberate.
-
-   Display face is Inter Tight (self-hosted); Inter carries body, JetBrains Mono
-   carries data/code — all three local woff2, no third-party font request.
-   ============================================================ */
-
 @theme {
-  /* Type scale */
+  /* ============================================================
+     TYPE SCALE — Cursor's, verbatim.
+     Their names map onto Tailwind's like this:
+       text-xl  = --text-md     (1.375rem)
+       text-2xl = --text-md-lg  (1.625rem)  ← their h1
+       text-3xl = --text-lg     (2.25rem)
+       text-4xl = --text-xl     (3.25rem)
+       text-5xl = --text-2xl    (4.5rem)
+     So `text-3xl sm:text-4xl` on a section heading lands exactly on Cursor's
+     own `type-lg` → `type-xl` step.
+     ============================================================ */
   --text-xs: 0.75rem;
   --text-sm: 0.875rem;
   --text-base: 1rem;
   --text-lg: 1.125rem;
-  /* Hierarchy: the hero h1 (clamped up to 4.5rem) must out-rank every
-     section h2, which tops out at --text-4xl. */
   --text-xl: 1.375rem;
-  --text-2xl: 1.75rem;
+  --text-2xl: 1.625rem;
   --text-3xl: 2.25rem;
-  --text-4xl: 3rem;
-  --text-5xl: 3.75rem;
+  --text-4xl: 3.25rem;
+  --text-5xl: 4.5rem;
 
-  /* Radius — the reference runs large and soft */
-  --radius-sm: 0.75rem;
-  --radius-md: 1rem;
-  --radius-lg: 1.5rem;
-  --radius-panel: 2rem;
+  /* Tracking, per size (Cursor --tracking-*). Negative and small: the scale is
+     tightened as it grows, never loosened. */
+  --tracking-xs: 0.01em;
+  --tracking-sm: 0.01em;
+  --tracking-base: 0.005em;
+  --tracking-md: -0.005em;
+  --tracking-md-lg: -0.0125em;
+  --tracking-lg: -0.02em;
+  --tracking-xl: -0.025em;
+  --tracking-2xl: -0.03em;
 
-  /* Fonts */
-  --font-display: "InterTight", "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-mono: "JetBrainsMono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* ============================================================
+     RADIUS — Cursor --radius-*. The 4px card is the signature.
+     ============================================================ */
+  --radius-2xs: 2px;
+  --radius-xs: 4px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-panel: 4px; /* was 2rem — see header note (3) */
 
-  /* ---- Neutrals ---- */
-  --color-bg: var(--canvas); /* canvas + header */
-  --color-bg-elevated: var(--surface); /* the light full-bleed bands */
-  --color-bg-subtle: var(--canvas-sunken); /* the alternating band — light, barely cool */
-  --color-fg: var(--ink); /* deep teal-charcoal ink */
-  --color-fg-muted: var(--ink-2); /* body copy — 9.4:1 on white */
-  --color-fg-subtle: var(--ink-2); /* the reference's nav tone — 8:1 */
-  --color-fg-dim: var(--ink-3); /* labels only — 5.2:1 */
-  --color-border: var(--line);
-  --color-border-strong: var(--line-2);
+  /* ============================================================
+     FONTS — self-hosted only, no third-party request (the CSP has no
+     font-src for one). Cursor ships "CursorGothic" + "Berkeley Mono",
+     neither of which is licensable here; Inter and JetBrains Mono are the
+     nearest neutral grotesk / neutral mono we already have on disk.
+     ONE sans, like Cursor — Inter Tight is no longer used for display.
+     ============================================================ */
+  --font-sans: "Inter", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-display: var(--font-sans);
+  --font-mono: "JetBrainsMono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-  /* ---- Gradient stops — the reference wash with ~30% white mixed in,
-       so the band reads light and airy rather than dusty. ---- */
-  /* G2 media well (ADR-074 §5), FOUNDER-CORRECTED 2026-08-16 to a LIGHT WASH.
-     The first pass read §5's "saturated indigo->sky field" literally and shipped a
-     full-strength blue-violet hero. On screen it swamped the page: the headline had
-     to fight its own background, and the product screenshot — the thing the well
-     exists to present — became the quietest object on it. §5's own sentence says
-     the field sits BEHIND a visual with the visual inset on top; a background that
-     out-shouts its subject has stopped being a background.
-     These are near-white now (<=6% saturation), in the register of the reference
-     the founder pointed at. */
-  --color-g2-sky: #e8eefc;   /* pale sky */
-  --color-g2-mid: #eef1fa;   /* pale mid */
-  --color-g2-indigo: #f1ecfb; /* pale indigo */
+  /* ============================================================
+     COLOUR — Cursor's light theme, measured.
+       --color-theme-bg        #f7f7f4
+       --color-theme-fg        #26251e
+       --color-theme-card-hex  #f2f1ed
+       --color-theme-card-01   #f0efeb   (hover, light)
+       --color-theme-card-02   #ebeae5   (stage / well)
+       --color-theme-card-03   #e6e5e0   (secondary button, active)
+       --color-theme-card-04   #e1e0db   (secondary button hover)
+       --color-theme-accent    #f54e00
+       text-sec  = fg 60%   text-mid = fg 50%   text-tertiary = fg 40%
+       border-02 = fg 10%   border-02-5 = fg 20%   fg-05 = fg 5%
+     ============================================================ */
+  --color-bg: #f7f7f4;
+  --color-bg-elevated: #f2f1ed; /* card */
+  --color-bg-hover: #f0efeb;
+  --color-bg-subtle: #ebeae5; /* stage / well */
+  --color-bg-sunken: #e6e5e0;
+  --color-bg-sunken-2: #e1e0db;
 
-  /* ---- Accent — brightened off the muddy terracotta ---- */
-  --color-accent: var(--ink); /* FILL */
-  --color-accent-2: #000000; /* hover */
-  --color-accent-ink: var(--ink); /* TEXT ONLY — 4.9:1 on white */
-  --color-pop: var(--ink);
+  --color-fg: #26251e;
+  --color-fg-muted: color-mix(in oklab, #26251e 60%, transparent); /* text-sec */
+  --color-fg-subtle: color-mix(in oklab, #26251e 60%, transparent);
+  --color-fg-dim: color-mix(in oklab, #26251e 40%, transparent); /* text-tertiary */
 
-  /* ---- Proof signal — green. ONLY verify / valid / crypto states.
-       This is the ONLY colour outside ink + gradient + the one accent,
-       and it is kept because the semantic is locked, not for decoration. ---- */
-  --color-verify: var(--ok); /* deepened to sit with the sage family */
-  --color-verify-on-dark: #22c55e; /* the same signal, legible on the teal panel */
+  --color-border: color-mix(in oklab, #26251e 10%, transparent); /* border-02 */
+  --color-border-subtle: color-mix(in oklab, #26251e 5%, transparent);
+  --color-border-strong: color-mix(in oklab, #26251e 20%, transparent); /* border-02-5 */
 
-  /* Dark panel */
-  --color-panel-dark: #0a0c10;
-  --color-on-dark: #f0f3f7;
-  --color-on-dark-muted: #98a1ae;
+  --color-accent: #f54e00; /* Cursor orange, verbatim */
+  --color-accent-2: #d84500;
+  --color-accent-ink: #f54e00;
+  --color-pop: #f54e00;
+
+  /* Proof signal. Cursor's own product green/red, which sit in the same warm
+     family as the canvas — a generic #22c55e reads as a different site. */
+  --color-verify: #1f8a65; /* --color-theme-product-ansi-green */
+  --color-alarm: #cf2d56; /* --color-theme-product-ansi-red */
+
+  /* Dark stage. Cursor's dark theme values, used for the terminal frames. */
+  --color-panel-dark: #14120b; /* --color-theme-bg, dark */
+  --color-panel-dark-card: #1b1913; /* --color-theme-card-hex, dark */
+  --color-on-dark: #edecec; /* --color-theme-fg, dark */
+  --color-on-dark-muted: color-mix(in oklab, #edecec 60%, transparent);
+
+  /* Rhythm. Cursor: --v = 1rem*1.4 (vertical), --g = 10rem/16 (grid gutter). */
+  --spacing-v: 1.4rem;
+  --spacing-g: 0.625rem;
+
+  /* Motion. Two curves and three durations, named once. */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
 }
 
-/* ---- Fonts ---- */
-@font-face {
-  font-family: "InterTight";
-  src: url("/fonts/inter-tight-var-latin.woff2") format("woff2");
-  font-weight: 100 900;
-  font-display: swap;
-  font-style: normal;
-}
+/* ── Self-hosted faces ─────────────────────────────────────────────────────── */
 @font-face {
   font-family: "Inter";
   src: url("/fonts/inter-var-latin.woff2") format("woff2");
@@ -130,730 +159,322 @@
   font-style: normal;
 }
 
-* {
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 5.5rem;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* MARKETING DENSITY, 16px. `tokens.css` sets `body { font-size: 12.5px }` for
+     the app's 4px grid; ADR-074 §2 is explicit that averaging the two densities
+     is how the app ends up unusable. This override is the whole reason this
+     block exists, and `tests/site.test.ts` asserts the 16px reached the
+     artifact. */
+  body {
+    font-size: 16px;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+    letter-spacing: var(--tracking-base);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv05" 1, "ss03" 1;
+  }
+
+  /* Headings: normal weight, tightened tracking, snug leading. Cursor sets
+     font-weight NORMAL on every display size — the size does the work, not the
+     weight, and a 3.25rem bold heading is the other thing that stops a page
+     reading like this one. */
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    line-height: 1.15;
+    letter-spacing: var(--tracking-lg);
+    text-wrap: balance;
+  }
+  h3,
+  h4 {
+    line-height: 1.25;
+    letter-spacing: var(--tracking-md);
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+    color: var(--color-fg);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-fg);
+    outline-offset: 0.3ch;
+    border-radius: var(--radius-2xs);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LAYOUT
+   Cursor's container steps: 420 / 660 / 900 / 1140 / 1380 / 1470, gutter 1.25rem.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.container {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+  max-width: 1140px;
+}
+@media (min-width: 1380px) {
+  .container {
+    max-width: 1380px;
+  }
+}
+@media (min-width: 1470px) {
+  .container {
+    max-width: 1470px;
+  }
+}
+
+.container-prose {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+  max-width: 720px;
+}
+
+/* A section. Cursor's `.section` is padding-block-end: v6 (8.4rem) with no top
+   padding — sections stack bottom-to-bottom, which is why the page reads as one
+   continuous column rather than a stack of bands. */
+.panel {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+  max-width: 1140px;
+  padding-block-end: calc(var(--spacing-v) * 5);
+}
+@media (min-width: 1380px) {
+  .panel {
+    max-width: 1380px;
+  }
+}
+@media (min-width: 1470px) {
+  .panel {
+    max-width: 1470px;
+  }
+}
+@media (min-width: 900px) {
+  .panel {
+    padding-block-end: calc(var(--spacing-v) * 6);
+  }
+}
+
+/* `panel-wash` / `panel-dark` / `panel-rail` are carried over as NAMES because
+   /security, /pricing and /terms use them. Under the new system a "wash" is a
+   one-step tone change, not a gradient. */
+.panel-wash {
+  background: transparent;
+}
+.panel-rail {
+  padding-block: calc(var(--spacing-v) * 1.5);
+}
+.panel-dark {
+  background: transparent;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SURFACES — card and stage
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* `.glass` keeps its name (six files reference it) and loses everything that
+   made it glass. It is now Cursor's `.card`: flat card tone, 4px radius, a
+   1px border at 2.5% ink, no blur, no shadow. */
+.glass {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-xs);
+}
+
+.cards-hover > * {
+  transition:
+    background-color 0.18s var(--ease-out),
+    border-color 0.18s var(--ease-out);
+}
+.cards-hover > *:hover {
+  background: var(--color-bg-hover);
   border-color: var(--color-border);
 }
 
-html {
-  background: var(--color-bg);
-  color: var(--color-fg);
-  font-family: var(--font-sans);
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  scroll-behavior: smooth;
-  color-scheme: light;
-}
-body {
-  margin: 0;
-  min-height: 100vh;
-  overflow-x: hidden;
-}
-
-/* Display voice — Inter Tight, tight tracking, tight leading */
-h1,
-h2,
-h3 {
-  font-family: var(--font-display);
-  font-weight: 600;
-  letter-spacing: -0.035em;
-  line-height: 1.02;
-}
-h1 {
-  letter-spacing: -0.045em;
-}
-
-::selection {
-  background: var(--color-fg);
-  color: var(--color-bg);
-}
-:focus-visible {
-  outline: 2px solid var(--color-fg);
-  outline-offset: 3px;
-  border-radius: 6px;
-}
-
-/* ---- Layout ---- */
-.container-wide {
-  max-width: 1200px;
-  margin-inline: auto;
-  padding-inline: 1.5rem;
-}
-.container {
-  max-width: 1160px;
-  margin-inline: auto;
-  padding-inline: 1.5rem;
-}
-.container-prose {
-  max-width: 760px;
-  margin-inline: auto;
-  padding-inline: 1.5rem;
-}
-
-/* ============================================================
-   Rounded panels — the page's core motif
-   ============================================================ */
-/* FULL-BLEED bands. The background runs edge to edge; only the content
-   inside is held to a readable measure. No frame, no gutters, no cards. */
-.panel {
-  width: 100%;
-  max-width: none;
-  margin: 0;
-  border-radius: 0;
-  background: var(--color-bg-elevated);
-  padding-block: clamp(3.5rem, 7vw, 6.5rem);
-  padding-inline: clamp(1.25rem, 5vw, 4rem);
-  border: none;
-}
-.panel > * {
-  max-width: 1560px;
-  margin-inline: auto;
-}
-/* The G2 media well (ADR-074 §5): a PALE sky -> indigo wash, lifted further by a
-   white veil from the top. Airy band, no heavy radial hot-spots — the screenshot
-   sitting on it is the subject, and this is the paper it sits on. */
-.panel-soft {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0) 52%),
-    linear-gradient(
-      100deg,
-      var(--color-g2-sky) 0%,
-      #cfdbdd 22%,
-      var(--color-g2-mid) 50%,
-      #f6e8dd 78%,
-      var(--color-g2-indigo) 100%
-    );
-}
-/* The gradient is rationed to the opening and closing panels; the middle of
-   the page alternates warm white against this quieter inset tone. */
-.panel-subtle {
+/* THE STAGE — the framed showcase panel from cursor.com.
+   A wide, barely-tinted well (#ebeae5) at 4px radius, with the product frame
+   inset on top of it. This is the "background + frames" the founder pointed at:
+   the well is a TONE, and the frame inside it is a window. */
+.stage-well {
   background: var(--color-bg-subtle);
-}
-.panel-dark {
-  background: var(--color-panel-dark);
-  color: var(--color-on-dark);
-}
-.panel-dark h1,
-.panel-dark h2,
-.panel-dark h3 {
-  color: var(--color-on-dark);
-}
-
-/* ---- Hero panel ---- */
-.panel-rail {
-  width: 100%;
-  padding-inline: clamp(1.25rem, 5vw, 4rem);
-}
-.panel-rail > * {
-  max-width: 1560px;
-  margin-inline: auto;
-}
-
-.hero-panel {
-  position: relative;
+  border-radius: var(--radius-xs);
+  padding: clamp(0.75rem, 2.5vw, 2.25rem);
   overflow: hidden;
-  width: 100%;
-  max-width: none;
-  border-radius: 0;
-  margin: 0;
-  padding: clamp(3rem, 6vw, 6rem) clamp(1.25rem, 5vw, 4rem);
+}
+
+/* Two of Cursor's stages sit on a soft painted backdrop rather than a flat
+   tone. This is that register done as a gradient — a warm stone/sage wash, no
+   imagery, so nothing is invented and nothing is licensed. */
+.stage-well--scenic {
   background:
-    radial-gradient(90% 120% at 2% 8%, var(--color-g2-sky) 0%, transparent 52%),
-    radial-gradient(85% 115% at 99% 4%, var(--color-g2-indigo) 0%, transparent 55%),
-    linear-gradient(115deg, #eef2fb 0%, var(--color-g2-mid) 46%, #f7f4fc 100%);
+    radial-gradient(120% 90% at 12% 4%, #e8e6dd 0%, transparent 55%),
+    radial-gradient(100% 80% at 88% 0%, #dfe2da 0%, transparent 60%),
+    linear-gradient(180deg, #e9e7de 0%, #dcded5 52%, #d5d8cf 100%);
 }
 
-/* Secondary pages (security, privacy, terms, changelog, docs, 404, vs/*)
-   keep their own markup — CSS promotes their sections to the same panels. */
-main > section.container-prose {
-  width: 100%;
-  max-width: none;
-  margin: 0;
-  border-radius: 0;
+.stage-well--dark {
+  background:
+    radial-gradient(110% 90% at 10% 0%, #232019 0%, transparent 60%),
+    linear-gradient(180deg, #1c1a13 0%, #14120b 100%);
+}
+
+/* THE WINDOW FRAME — a macOS-chrome panel. Title bar with three lights, a
+   centred title, then the body. Cursor's frames are pale, borderless-feeling
+   and sit on the well with one soft shadow that reads as depth, not glow. */
+.frame {
   background: var(--color-bg-elevated);
-  padding-block: clamp(3.5rem, 6vw, 5.5rem);
-  padding-inline: clamp(1.25rem, 5vw, 4rem);
-  border-top: none !important;
-}
-main > section.container-prose > * {
-  max-width: 820px; /* prose stays a readable measure */
-  margin-inline: auto;
-}
-main > section.container {
-  width: 100%;
-  max-width: none;
-  margin: 0;
-  border-radius: 0;
-  background: var(--color-bg-elevated);
-  padding-block: clamp(3.5rem, 6vw, 5.5rem);
-  padding-inline: clamp(1.25rem, 5vw, 4rem);
-  border-top: none !important;
-}
-main > section.container > * {
-  max-width: 1560px;
-  margin-inline: auto;
-}
-/* Alternate the bands so consecutive sections separate without a rule */
-main > section.container-prose:nth-of-type(even),
-main > section.container:nth-of-type(even) {
-  background: var(--color-bg-subtle);
+  border: 1px solid color-mix(in oklab, #26251e 8%, transparent);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow:
+    0 1px 2px color-mix(in oklab, #26251e 6%, transparent),
+    0 12px 32px -12px color-mix(in oklab, #26251e 22%, transparent);
 }
 
-/* ---- Footer ---- */
-footer {
-  width: 100%;
-  margin: 0 !important;
-  border-radius: 0;
-  background: var(--color-panel-dark) !important;
-  color: var(--color-on-dark);
-  border-top: none !important;
-  padding-inline: clamp(1.25rem, 5vw, 4rem);
-}
-footer > div {
-  max-width: 1560px;
-  margin-inline: auto;
-}
-footer .text-fg,
-footer p.text-fg {
-  color: var(--color-on-dark) !important;
-}
-footer .text-fg-muted,
-footer .text-fg-subtle {
-  color: var(--color-on-dark-muted) !important;
-}
-footer .text-fg-dim {
-  color: #8ba0a1 !important;
-}
-footer a:hover {
-  color: #ffffff !important;
-}
-footer .border-border {
-  border-color: color-mix(in srgb, #ffffff 14%, transparent) !important;
-}
-
-/* ---- Buttons — pills ---- */
-.btn-primary {
-  display: inline-flex;
+.frame-bar {
+  display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.95rem 1.75rem;
-  background: var(--color-fg);
-  color: var(--color-bg-elevated);
-  font-weight: 500;
-  font-size: var(--text-sm);
-  letter-spacing: -0.01em;
-  border-radius: 999px;
-  border: 1px solid var(--color-fg);
-  cursor: pointer;
-  text-decoration: none;
-  transition:
-    background 0.16s ease,
-    transform 0.16s ease;
+  padding: 0.5rem 0.75rem;
+  background: color-mix(in oklab, #26251e 3%, var(--color-bg-elevated));
+  border-bottom: 1px solid color-mix(in oklab, #26251e 7%, transparent);
+  position: relative;
+  min-height: 2.25rem;
 }
-.btn-primary:hover {
-  background: #121c1f;
-  transform: translateY(-1px);
-}
-.btn-primary:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  transform: none;
-}
-
-.btn-secondary {
+.frame-lights {
   display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.95rem 1.75rem;
-  background: transparent;
-  color: var(--color-fg);
-  font-weight: 500;
-  font-size: var(--text-sm);
-  letter-spacing: -0.01em;
-  border: 1px solid color-mix(in srgb, var(--color-fg) 32%, transparent);
-  border-radius: 999px;
-  cursor: pointer;
-  text-decoration: none;
-  transition:
-    border-color 0.16s ease,
-    background 0.16s ease,
-    transform 0.16s ease;
+  gap: 0.375rem;
 }
-.btn-secondary:hover {
-  border-color: var(--color-fg);
-  background: color-mix(in srgb, var(--color-fg) 6%, transparent);
-  transform: translateY(-1px);
+.frame-lights i {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 999px;
+  background: color-mix(in oklab, #26251e 16%, transparent);
+}
+.frame-title {
+  position: absolute;
+  inset-inline: 0;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--color-fg-muted);
+  pointer-events: none;
+}
+.frame-action {
+  margin-inline-start: auto;
+  font-size: 0.75rem;
+  color: var(--color-fg-dim);
+  z-index: 1;
+}
+.frame-body {
+  padding: 1rem 1.1rem 1.15rem;
 }
 
-/* On the dark panel the pills invert */
-.panel-dark .btn-primary {
-  background: var(--color-on-dark);
-  color: var(--color-fg);
-  border-color: var(--color-on-dark);
-}
-.panel-dark .btn-secondary {
+/* Dark variant — used for the two terminal frames. */
+.frame--dark {
+  background: var(--color-panel-dark-card);
+  border-color: color-mix(in oklab, #edecec 10%, transparent);
   color: var(--color-on-dark);
-  border-color: color-mix(in srgb, var(--color-on-dark) 34%, transparent);
 }
-
-/* ---- Bits ---- */
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.55rem;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0.01em;
-  padding: 0.45rem 0.95rem;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.6);
-  background: rgba(255, 255, 255, 0.45);
-  backdrop-filter: blur(14px) saturate(170%);
-  -webkit-backdrop-filter: blur(14px) saturate(170%);
-  color: var(--color-fg-subtle);
+.frame--dark .frame-bar {
+  background: color-mix(in oklab, #edecec 4%, var(--color-panel-dark-card));
+  border-bottom-color: color-mix(in oklab, #edecec 8%, transparent);
 }
-.badge .dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--color-accent-ink);
+.frame--dark .frame-lights i {
+  background: color-mix(in oklab, #edecec 20%, transparent);
 }
-
-.grad-text {
-  color: var(--color-accent-ink);
-}
-.logo-mark {
-  display: block;
-  color: currentColor;
-}
-
-/* Legacy decorative layers — retired in this theme */
-.glow,
-.hero-aurora,
-.hero-grid {
-  display: none !important;
-}
-
-/* ---- Card surface ---- */
-.glass {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: none;
-  transition:
-    transform 0.18s ease,
-    border-color 0.18s ease,
-    box-shadow 0.18s ease;
-}
-/* Cards invert against their band so one never sits white-on-white.
-   Both tones are neutral — the colour on this page comes from the
-   gradient bands, not from the cards. */
-.panel .glass {
-  background: #f7f9fa;
-  border-color: #e6eaec;
-}
-.panel-subtle .glass {
-  background: #ffffff;
-  border-color: #e1e7e9;
-}
-/* On the soft gradient and the dark panel, cards are translucent inlays */
-.panel-soft .glass,
-.hero-panel .glass {
-  background: color-mix(in srgb, #ffffff 62%, transparent);
-  border-color: color-mix(in srgb, #ffffff 70%, transparent);
-}
-.panel-dark .glass {
-  background: color-mix(in srgb, #ffffff 6%, transparent);
-  border-color: color-mix(in srgb, #ffffff 12%, transparent);
+.frame--dark .frame-title {
   color: var(--color-on-dark-muted);
 }
-.panel-dark .glass .text-fg,
-.panel-dark .text-fg {
-  color: var(--color-on-dark) !important;
+
+/* Media frame — the chrome wraps a video or image edge-to-edge. */
+.frame--media .frame-body {
+  padding: 0;
+  line-height: 0;
 }
-.panel-dark .text-fg-muted,
-.panel-dark .text-fg-subtle {
-  color: var(--color-on-dark-muted) !important;
-}
-.panel-dark .text-fg-dim {
-  color: #8ba0a1 !important;
-}
-.panel-dark .text-verify {
-  color: var(--color-verify-on-dark) !important;
-}
-.panel-dark .text-pop {
-  color: #f0a97f !important;
-}
-.panel-dark .caret {
-  color: var(--color-verify-on-dark);
-}
-.panel-dark a {
-  color: inherit;
+.frame--media video,
+.frame--media img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
-/* ---- Hero product frame ---- */
-.stage-wrap {
+/* The OVERLAP. Cursor's stages layer a second, smaller window over the first,
+   offset down-right. Below 900px they stack — an overlap on a phone is just
+   two things you cannot read. */
+.frame-stack {
   position: relative;
-  z-index: 2;
-  width: 100%;
-  margin: 0;
-  padding: 8px;
-  border-radius: 24px;
-  background: rgba(255, 255, 255, 0.5);
-  backdrop-filter: blur(16px) saturate(170%);
-  -webkit-backdrop-filter: blur(16px) saturate(170%);
-  border: 1px solid rgba(255, 255, 255, 0.62);
-  box-shadow: 0 30px 70px -46px rgba(29, 42, 46, 0.55);
 }
-.stage {
-  position: relative;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  border-radius: 18px;
-  overflow: hidden;
-  border: none;
-  background: var(--color-bg-subtle);
+.frame-over {
+  margin-top: -0.75rem;
 }
-.stage-video {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-.stage-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  width: 100%;
-}
-.play {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: var(--color-fg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: transform 0.18s ease;
-}
-.stage-overlay:hover .play {
-  transform: scale(1.07);
+@media (min-width: 900px) {
+  .frame-over {
+    position: absolute;
+    right: -1rem;
+    bottom: -1.5rem;
+    width: min(50%, 27rem);
+    margin-top: 0;
+    z-index: 2;
+  }
+  /* Room for the overlap to land in — and it must land on EMPTY space, not on
+     the frame beneath it. The first pass sized the overlap at 62% and the
+     `tlane migrate helicone` comment ran underneath it, so the reader lost the
+     end of two lines. An overlap that hides content is a layout bug wearing a
+     style's clothes. */
+  .frame-stack > .frame:first-child .frame-body {
+    padding-bottom: 5.5rem;
+  }
+  /* Only a stage that CARRIES an overlap needs the extra well below it. Applied
+     to every well it just read as an unbalanced bottom margin. */
+  .stage-well:has(.frame-stack) {
+    padding-bottom: clamp(2rem, 4.5vw, 3.75rem);
+  }
 }
 
-/* ---- Floating stat card (reference motif) ---- */
-/* Hangs off the stage's bottom-left corner so it reads as a floating chip
-   rather than an overlay sitting on top of the dashboard. */
-.stat-float {
-  position: absolute;
-  left: -1.1rem;
-  bottom: -1.1rem;
-  z-index: 4;
-  padding: 0.85rem 1.05rem;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.55);
-  backdrop-filter: blur(18px) saturate(180%);
-  -webkit-backdrop-filter: blur(18px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.65);
-  box-shadow: 0 22px 46px -30px rgba(29, 42, 46, 0.65);
-  text-align: left;
-  max-width: 178px;
-}
-.stat-float .n {
-  font-family: var(--font-display);
-  font-size: 1.65rem;
-  font-weight: 600;
-  letter-spacing: -0.04em;
-  color: var(--color-fg);
-  line-height: 1;
-}
-.stat-float .c {
-  margin-top: 0.3rem;
-  font-size: 0.7rem;
-  line-height: 1.3;
-  color: var(--color-fg-subtle);
-}
-
-/* ---- Annotation chip (reference motif) ---- */
-.annot {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.75rem;
-  line-height: 1.3;
-  color: var(--color-fg-subtle);
-}
-
-/* ---- Provider marquee ---- */
-.marquee {
-  border: none;
-  padding-block: 1.75rem;
-  overflow: hidden;
-  white-space: nowrap;
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
-  mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
-}
-.marq-track {
-  display: inline-flex;
-  gap: 2.75rem;
-  animation: marq 30s linear infinite;
-}
-.marq-track span {
+/* ═══════════════════════════════════════════════════════════════════════════
+   TERMINAL — used inside .frame--dark. Real command output only.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.term {
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--color-fg-subtle);
-}
-.marq-track .d {
-  color: var(--color-accent-ink);
-}
-@keyframes marq {
-  to {
-    transform: translateX(-50%);
-  }
-}
-
-/* ---- Header — spans the FULL top bar, liquid glass over whatever scrolls
-   beneath it. Glass is used only on chrome and small floating chips, never
-   on content cards (legibility + paint cost). ---- */
-.site-bar {
-  width: 100%;
-  max-width: none;
+  font-size: 0.8125rem;
+  line-height: 1.65;
+  color: var(--color-on-dark);
+  white-space: pre-wrap;
+  word-break: break-word;
   margin: 0;
-  padding-inline: clamp(1.25rem, 2.5vw, 2.75rem);
 }
-header.site-header {
-  background: rgba(255, 255, 255, 0.6) !important;
-  backdrop-filter: blur(22px) saturate(180%);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.5) !important;
-  transition:
-    background 0.25s ease,
-    box-shadow 0.25s ease;
+.term .c {
+  color: color-mix(in oklab, #edecec 45%, transparent);
 }
-header.site-header.scrolled {
-  background: rgba(255, 255, 255, 0.72) !important;
-  box-shadow: 0 6px 24px -18px rgba(29, 42, 46, 0.5);
+.term .p {
+  color: var(--color-accent);
 }
-@supports not (backdrop-filter: blur(1px)) {
-  header.site-header {
-    background: rgba(255, 255, 255, 0.94) !important;
-  }
+.term .ok {
+  color: #34c39a;
 }
-header nav ul a {
-  position: relative;
-  letter-spacing: -0.01em;
-}
-header nav ul a::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  bottom: -3px;
-  height: 1px;
-  width: 100%;
-  background: var(--color-fg);
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform 0.25s cubic-bezier(0.2, 0.6, 0.2, 1);
-}
-header nav ul a:hover::after {
-  transform: scaleX(1);
-}
-
-/* ---- Hero layout ---- */
-.hero-cols {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 40px;
-  align-items: center;
-}
-.hero-copy {
-  text-align: left;
-}
-@media (min-width: 960px) {
-  .hero-cols {
-    grid-template-columns: 1fr 1.05fr;
-    gap: 48px;
-  }
-}
-
-/* ---- Scroll reveal ---- */
-.reveal {
-  opacity: 0;
-  transform: translateY(16px);
-  transition:
-    opacity 0.7s cubic-bezier(0.2, 0.6, 0.2, 1),
-    transform 0.7s cubic-bezier(0.2, 0.6, 0.2, 1);
-}
-.reveal.in {
-  opacity: 1;
-  transform: none;
-}
-.reveal-group > * {
-  opacity: 0;
-  transform: translateY(18px);
-  transition:
-    opacity 0.65s cubic-bezier(0.2, 0.6, 0.2, 1),
-    transform 0.65s cubic-bezier(0.2, 0.6, 0.2, 1);
-}
-.reveal-group.in > * {
-  opacity: 1;
-  transform: none;
-}
-.reveal-group.in > :nth-child(1) {
-  transition-delay: 0.04s;
-}
-.reveal-group.in > :nth-child(2) {
-  transition-delay: 0.1s;
-}
-.reveal-group.in > :nth-child(3) {
-  transition-delay: 0.16s;
-}
-.reveal-group.in > :nth-child(4) {
-  transition-delay: 0.22s;
-}
-.reveal-group.in > :nth-child(5) {
-  transition-delay: 0.28s;
-}
-.reveal-group.in > :nth-child(6) {
-  transition-delay: 0.34s;
-}
-.reveal-group.in > :nth-child(n + 7) {
-  transition-delay: 0.4s;
-}
-
-@keyframes rise-in {
-  from {
-    opacity: 0;
-    transform: translateY(18px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-.hero-rise {
-  opacity: 0;
-  animation: rise-in 0.75s cubic-bezier(0.2, 0.6, 0.2, 1) both;
-  animation-delay: var(--d, 0s);
-}
-
-/* ---- Card hover ---- */
-.cards-hover > article:hover,
-.cards-hover > div:hover {
-  transform: translateY(-3px);
-  border-color: var(--color-border-strong);
-  box-shadow: 0 18px 40px -32px rgba(29, 42, 46, 0.45);
-}
-.panel-dark.cards-hover > div:hover,
-.panel-dark .cards-hover > div:hover {
-  border-color: color-mix(in srgb, #ffffff 24%, transparent);
-  box-shadow: none;
-}
-
-/* ---- Recommended pricing card ---- */
-.rec-card {
-  position: relative;
-  background: color-mix(in srgb, var(--color-accent) 9%, #ffffff) !important;
-  border-color: var(--color-accent) !important;
-}
-
-/* ---- Feature glyph tiles ---- */
-.feat-glyph {
-  width: 44px;
-  height: 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 14px;
-  border: none;
-  background: var(--color-bg-subtle);
-  margin-bottom: 1.25rem;
-}
-/* Minimal palette: one neutral chip for all three, not three tints. */
-
-.glyph-eq {
-  display: flex;
-  align-items: flex-end;
-  gap: 3px;
-  height: 18px;
-}
-.glyph-eq i {
-  width: 3px;
-  border-radius: 2px;
-  background: var(--color-accent-ink);
-  animation: eq 1.1s ease-in-out infinite;
-}
-.glyph-eq i:nth-child(1) {
-  height: 40%;
-  animation-delay: 0s;
-}
-.glyph-eq i:nth-child(2) {
-  height: 90%;
-  animation-delay: 0.18s;
-}
-.glyph-eq i:nth-child(3) {
-  height: 60%;
-  animation-delay: 0.36s;
-}
-.glyph-eq i:nth-child(4) {
-  height: 100%;
-  animation-delay: 0.1s;
-}
-.glyph-eq i:nth-child(5) {
-  height: 50%;
-  animation-delay: 0.28s;
-}
-@keyframes eq {
-  0%,
-  100% {
-    transform: scaleY(0.35);
-  }
-  50% {
-    transform: scaleY(1);
-  }
-}
-
-.glyph-replay {
-  width: 22px;
-  height: 22px;
-  color: var(--color-fg);
-  animation: spin-slow 3.2s linear infinite;
-}
-@keyframes spin-slow {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.glyph-prove {
-  width: 24px;
-  height: 24px;
-  color: var(--color-verify);
-}
-.glyph-prove path {
-  stroke-dasharray: 26;
-  stroke-dashoffset: 26;
-}
-.cards-hover.in .glyph-prove path,
-.reveal-group.in .glyph-prove path {
-  animation: draw-check 0.7s 0.5s cubic-bezier(0.65, 0, 0.35, 1) forwards;
-}
-@keyframes draw-check {
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-
 .caret {
   display: inline-block;
-  color: var(--color-verify);
-  animation: blink 1.1s steps(1) infinite;
+  width: 0.55ch;
+  background: currentColor;
+  animation: blink 1.05s steps(2, start) infinite;
 }
 @keyframes blink {
   50% {
@@ -861,148 +482,519 @@ header nav ul a:hover::after {
   }
 }
 
-/* ---- Scroll progress ---- */
+/* ═══════════════════════════════════════════════════════════════════════════
+   BUTTONS — Cursor's .btn family, measured.
+     primary   : solid ink, bg-coloured text, pill
+     secondary : card-03 fill, hairline border, pill
+     ghost     : transparent, 20% border, pill
+     text/tert : accent-coloured, no chrome
+   ═══════════════════════════════════════════════════════════════════════════ */
+.btn-primary,
+.btn-secondary,
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  border-radius: 999px;
+  font-size: var(--text-base);
+  font-weight: 400;
+  line-height: 1;
+  padding: 0.78em 1.35em 0.8em;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color 0.16s var(--ease-out),
+    border-color 0.16s var(--ease-out),
+    color 0.16s var(--ease-out);
+}
+
+.btn-primary {
+  background: var(--color-fg);
+  border: 1px solid var(--color-fg);
+  color: var(--color-bg);
+}
+.btn-primary:hover {
+  background: #3b3a33; /* --color-theme-fg-02 */
+  border-color: #3b3a33;
+  color: var(--color-bg);
+}
+
+.btn-secondary {
+  background: var(--color-bg-sunken);
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-fg);
+}
+.btn-secondary:hover {
+  background: var(--color-bg-sunken-2);
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--color-border-strong);
+  color: var(--color-fg);
+}
+.btn-ghost:hover {
+  background: var(--color-bg-elevated);
+}
+
+.btn-sm {
+  font-size: var(--text-sm);
+  padding: 0.45em 0.9em 0.46em;
+}
+
+/* The accent inline link Cursor uses to close a feature block. */
+.link-accent {
+  color: var(--color-accent);
+  text-decoration: none;
+  transition: color 0.16s var(--ease-out);
+}
+.link-accent:hover {
+  color: color-mix(in oklab, var(--color-accent) 75%, transparent);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SMALL PARTS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Eyebrow / kicker — Cursor's `type-sm` label above a heading. */
+.eyebrow {
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-sm);
+  color: var(--color-fg-muted);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
+  padding: 0.35rem 0.8rem;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-sm);
+  color: var(--color-fg-muted);
+}
+.badge .dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+}
+
+/* `grad-text` keeps its name; the gradient is gone. Emphasis is now the accent,
+   which is how Cursor marks a word — one colour, no ramp. */
+.grad-text {
+  color: var(--color-accent);
+}
+
+.text-verify {
+  color: var(--color-verify);
+}
+.text-pop {
+  color: var(--color-accent);
+}
+
+/* Provider tiles — Cursor's logo garden. A flat card, tall, name centred. */
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.625rem;
+}
+@media (min-width: 660px) {
+  .tile-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (min-width: 900px) {
+  .tile-grid {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+}
+.tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 5.5rem;
+  padding: 1rem 0.5rem;
+  background: var(--color-bg-elevated);
+  border-radius: var(--radius-xs);
+  font-size: var(--text-sm);
+  color: color-mix(in oklab, #26251e 75%, transparent);
+  text-align: center;
+  transition: background-color 0.18s var(--ease-out);
+}
+.tile:hover {
+  background: var(--color-bg-hover);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PRICING — /pricing and the homepage anchor share PricingTable.astro.
+   The six tinted "mesh tiles" are retired; a tier header is now type alone.
+   The tile-* class names are kept so the component needs no edit.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.mesh-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding-bottom: 1.1rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.tile-graphite,
+.tile-teal,
+.tile-bronze,
+.tile-forest,
+.tile-wine,
+.tile-indigo {
+  background: transparent;
+}
+.t-name {
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-sm);
+  color: var(--color-fg-muted);
+}
+.t-price {
+  font-size: var(--text-3xl);
+  letter-spacing: var(--tracking-lg);
+  color: var(--color-fg);
+  line-height: 1.05;
+}
+.t-per {
+  font-size: var(--text-base);
+  color: var(--color-fg-muted);
+}
+.t-meta {
+  margin-top: 0.4rem;
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+}
+/* The recommended tier is marked by its border, not by a fill. */
+.rec-card {
+  border-color: var(--color-border-strong);
+}
+
+/* `mesh` / `mesh-aurora` are referenced by /security and the old audit band.
+   They are now inert — kept as no-ops so no page loses a class it names. */
+.mesh,
+.mesh-aurora {
+  background: transparent;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HEADER / FOOTER CHROME
+   ═══════════════════════════════════════════════════════════════════════════ */
+.site-header {
+  background: color-mix(in srgb, var(--color-bg) 88%, transparent);
+  backdrop-filter: saturate(1.1) blur(10px);
+  -webkit-backdrop-filter: saturate(1.1) blur(10px);
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.2s var(--ease-out);
+}
+.site-header.scrolled {
+  border-bottom-color: var(--color-border-subtle);
+}
+.site-bar {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+  max-width: 1140px;
+}
+@media (min-width: 1380px) {
+  .site-bar {
+    max-width: 1380px;
+  }
+}
+@media (min-width: 1470px) {
+  .site-bar {
+    max-width: 1470px;
+  }
+}
+.logo-mark {
+  display: block;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--color-fg);
+  color: var(--color-bg);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-xs);
+}
+.skip-link:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+}
+
 .scroll-progress {
   position: fixed;
   top: 0;
   left: 0;
   height: 2px;
   width: 100%;
-  transform-origin: left;
   transform: scaleX(0);
-  z-index: 200;
-  pointer-events: none;
+  transform-origin: 0 50%;
   background: var(--color-accent);
+  z-index: 60;
 }
 
-/* ---- Skip link ---- */
-.skip-link {
-  position: absolute;
-  top: -100px;
-  left: 1rem;
-  padding: 0.75rem 1.25rem;
-  background: var(--color-fg);
-  color: var(--color-bg-elevated);
-  font-weight: 600;
-  border-radius: 999px;
-  z-index: 100;
-  transition: top 0.15s ease;
+/* ═══════════════════════════════════════════════════════════════════════════
+   MOTION — one entrance, used everywhere. Cursor's page barely moves; a fade
+   with 8px of lift is the whole vocabulary.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.reveal,
+.reveal-group > * {
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity 0.5s var(--ease-out),
+    transform 0.5s var(--ease-out);
 }
-.skip-link:focus {
-  top: 1rem;
+.reveal.in,
+.reveal-group.in > * {
+  opacity: 1;
+  transform: none;
+}
+.reveal-group.in > *:nth-child(2) {
+  transition-delay: 0.06s;
+}
+.reveal-group.in > *:nth-child(3) {
+  transition-delay: 0.12s;
+}
+.reveal-group.in > *:nth-child(4) {
+  transition-delay: 0.18s;
+}
+.reveal-group.in > *:nth-child(5) {
+  transition-delay: 0.24s;
+}
+.reveal-group.in > *:nth-child(6) {
+  transition-delay: 0.3s;
 }
 
-/* ---- FAQ rows read as inlays, not floating cards ---- */
-#faq details.glass {
-  border-radius: var(--radius-md);
+.hero-rise,
+.headline-in {
+  animation: rise 0.6s var(--ease-out) both;
+  animation-delay: var(--d, 0s);
 }
-
-/* ---- Mobile ---- */
-@media (max-width: 640px) {
-  :root,
-  [data-theme] {
-    --text-3xl: 2rem;
-    --text-4xl: 2.4rem;
-    --text-5xl: 2.9rem;
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
   }
-  .container,
-  .container-wide,
-  .container-prose {
-    padding-inline: 1.15rem;
-  }
-  .panel,
-  .hero-panel {
-    padding-block: 3.25rem;
-  }
-  .stat-float {
-    position: static;
-    margin-top: 1rem;
-    width: 100%;
-  }
-  .play {
-    width: 56px;
-    height: 56px;
-  }
-  .play svg {
-    width: 20px;
-    height: 23px;
-  }
-  .marq-track {
-    gap: 1.75rem;
-    animation-duration: 20s;
-  }
-  .btn-primary,
-  .btn-secondary {
-    width: 100%;
-    justify-content: center;
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .reveal,
-  .reveal-group > * {
-    opacity: 1;
-    transform: none;
-    transition: none;
-  }
-  .marq-track,
-  .hero-rise,
-  .caret,
-  .glyph-eq i,
-  .glyph-replay,
-  .glyph-prove path {
-    animation: none;
-  }
-  .hero-rise {
-    opacity: 1;
-  }
-  .glyph-prove path {
-    stroke-dashoffset: 0;
-  }
-  .glyph-eq i {
-    transform: scaleY(0.7);
-  }
-  .cards-hover > article:hover,
-  .cards-hover > div:hover {
-    transform: none;
-    box-shadow: none;
-  }
   html {
     scroll-behavior: auto;
   }
+  .reveal,
+  .reveal-group > *,
+  .hero-rise,
+  .headline-in {
+    opacity: 1 !important;
+    transform: none !important;
+    animation: none !important;
+    transition: none !important;
+  }
+  .caret {
+    animation: none;
+  }
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   MARKETING DENSITY (ADR-074 §2). The colour language above is shared with the
-   app; the SPACING SCALE is deliberately not.
+/* ═══════════════════════════════════════════════════════════════════════════
+   FAQ — <details> as a Cursor list row: hairline separators, no card chrome.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.faq-row {
+  border-top: 1px solid var(--color-border-subtle);
+}
+.faq-row:last-child {
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.faq-row > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 1.15rem 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--text-lg);
+  letter-spacing: var(--tracking-md);
+  transition: color 0.16s var(--ease-out);
+}
+.faq-row > summary::-webkit-details-marker {
+  display: none;
+}
+.faq-row > summary:hover {
+  color: var(--color-accent);
+}
+.faq-row > summary .sign {
+  color: var(--color-fg-dim);
+  transition: transform 0.2s var(--ease-out);
+  flex: none;
+}
+.faq-row[open] > summary .sign {
+  transform: rotate(45deg);
+}
+.faq-row > p {
+  padding-bottom: 1.25rem;
+  max-width: 68ch;
+}
 
-   §2 states the reason plainly: the references are documentation and marketing
-   surfaces, and cloning their sizing into a dense data product makes it worse —
-   but the reverse is equally true, and it is the one this file has to defend
-   against. `tokens.css` sets `body { font-size: 12.5px; line-height: 1.5 }` for
-   the app's 4px grid. Inheriting that here would render marketing copy at app
-   density: technically consistent, and unreadable as a landing page.
+/* ═══════════════════════════════════════════════════════════════════════════
+   FORMS
+   ═══════════════════════════════════════════════════════════════════════════ */
+.field {
+  flex: 1;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-elevated);
+  padding: 0.78em 1.25em 0.8em;
+  font-size: var(--text-base);
+  color: var(--color-fg);
+}
+.field::placeholder {
+  color: var(--color-fg-dim);
+}
+.field:focus {
+  outline: 2px solid var(--color-fg);
+  outline-offset: 0.15ch;
+}
 
-   Both blocks are `@layer base`, and this file imports tokens.css above, so
-   these win by order. That is the entire mechanism — no `!important`, no
-   specificity games, just "the later one in the same layer".
-   ───────────────────────────────────────────────────────────────────────────── */
-@layer base {
-	body {
-		/* §2 marketing column: 16px base, 1.6 body line-height, 8px grid. */
-		font-size: 16px;
-		line-height: 1.6;
-		/* The app sets a tight tracking for 12.5px UI text. At 16px on a measure
-		   of ~720px that reads cramped, so marketing returns to neutral. */
-		letter-spacing: 0;
-	}
+/* ═══════════════════════════════════════════════════════════════════════════
+   LEGACY CLASS NAMES still referenced by /security, /privacy, /terms, /404 and
+   PricingTable. Redefined in the new language rather than deleted, because a
+   page losing a class it names renders unstyled — not "slightly different".
+   ═══════════════════════════════════════════════════════════════════════════ */
+.hero-panel,
+.hero-container {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+  max-width: 1140px;
+}
+@media (min-width: 1380px) {
+  .hero-panel,
+  .hero-container {
+    max-width: 1380px;
+  }
+}
+@media (min-width: 1470px) {
+  .hero-panel,
+  .hero-container {
+    max-width: 1470px;
+  }
+}
+.hero-cols {
+  display: grid;
+  gap: 2rem;
+}
+.hero-copy {
+  max-width: 46rem;
+}
 
-	/* Marketing measure. §2: "centred, ~720px measure" — the opposite of the app,
-	   which §11 makes full-bleed beside the sidebar. Same system, opposite rule,
-	   and writing both down is what stops the next reader "fixing" one to match
-	   the other. */
-	.measure {
-		max-width: 72ch;
-		margin-inline: auto;
-	}
+.feat-glyph {
+  color: var(--color-accent);
+  margin-bottom: 1rem;
+  height: 1.5rem;
+  display: flex;
+  align-items: flex-end;
+}
+.glyph-replay,
+.glyph-prove {
+  width: 1.35rem;
+  height: 1.35rem;
+}
+.glyph-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 1.1rem;
+}
+.glyph-eq i {
+  width: 3px;
+  background: currentColor;
+  border-radius: 1px;
+  height: 40%;
+}
+.glyph-eq i:nth-child(2) {
+  height: 85%;
+}
+.glyph-eq i:nth-child(3) {
+  height: 60%;
+}
+.glyph-eq i:nth-child(4) {
+  height: 100%;
+}
+.glyph-eq i:nth-child(5) {
+  height: 50%;
+}
+
+/* The old hero video stage. /404 and the legacy markup reference these. */
+.stage-wrap,
+.stage {
+  position: relative;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.stage-video {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.stage-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklab, #26251e 8%, transparent);
+  border: 0;
+  cursor: pointer;
+}
+.play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 4rem;
+  height: 4rem;
+  border-radius: 999px;
+  background: var(--color-fg);
+  color: var(--color-bg);
+}
+.stat-float {
+  margin-top: 1rem;
+}
+.stat-float .n {
+  font-size: var(--text-2xl);
+  letter-spacing: var(--tracking-md-lg);
+}
+.stat-float .c {
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+}
+
+/* The provider marquee is replaced by the tile grid on the homepage; the class
+   stays a plain inline row so any other page naming it still reads. */
+.marquee {
+  overflow: hidden;
+}
+.marq-track {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+  color: var(--color-fg-muted);
+  font-size: var(--text-sm);
+  flex-wrap: wrap;
+}
+.marq-track .d {
+  color: var(--color-fg-dim);
 }

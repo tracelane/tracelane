@@ -153,13 +153,13 @@ repository — the eval suites do not ship in the npm package.
 ```bash
 tlane eval run                             # run all evals
 tlane eval run --suite gc                  # gateway-correctness suite only
-tlane eval run --suite pp                  # pain-points suite only
+tlane eval run --suite gc                  # gateway-correctness suite only
 tlane eval run --suite ft --dry-run        # print the command without running it
-tlane eval list                            # list all pain-point evals + status
+tlane eval list                            # list every conformance eval
 ```
 
 Suite ids: `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pp` (pain-points), `pir` (pii-redaction),
+`is` (ingest-schema), `pir` (pii-redaction),
 `pi` (prompt-injection). An unrecognised id exits 2 instead of silently running
 everything.
 
@@ -242,7 +242,7 @@ tlane trace <trace-id> --format timeline
 
 ## Stack
 
-TypeScript 5.5 + Commander.js. Built with `tsup`, distributed via npm. No runtime deps beyond `commander`.
+TypeScript 5.5 + Commander.js. Built with `tsup`, distributed via npm. Runtime deps: `@tracelanedev/audit-verifier`, `chalk`, `commander`, `fflate`, `ora`, `yaml`.
 
 ## License
 

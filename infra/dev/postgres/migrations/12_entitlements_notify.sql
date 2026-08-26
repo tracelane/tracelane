@@ -1,3 +1,4 @@
+-- Migration 12: entitlement-change NOTIFY triggers (ADR-035, TRD §23.1).
 --
 -- Drives the gateway's in-process entitlement cache invalidation
 -- (`crates/gateway/src/entitlement_cache.rs`). A write to either entitlement

@@ -14,5 +14,6 @@
 --
 -- APPLY: hand-written + manual-paste to Neon, matching the 0009/0010 pattern
 -- (un-journaled; recent Neon migrations here are applied by paste, not
+-- drizzle-kit migrate). See.
 
 ALTER TABLE "api_keys" ADD COLUMN IF NOT EXISTS "minted_by" text;

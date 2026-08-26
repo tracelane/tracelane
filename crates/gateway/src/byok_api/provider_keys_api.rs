@@ -69,6 +69,7 @@ async fn upload(
         Err(e) => return e,
     };
 
+    // Trim copy-paste whitespace (a leading/trailing space or newline)
     // before storing. A mangled key was previously stored verbatim, then
     // rejected by the upstream as a 401 — surfaced only as an opaque 502 with no
     // signal the key was wrong. Trim so the stored credential is exact; the empty
@@ -99,6 +100,7 @@ async fn upload(
         }
     };
 
+    // Provider-aware — an opaque key's tail is a fingerprint, a JSON
     // credential's tail is just its closing brace. `fingerprint_of` knows which.
     let last4 = crate::db::provider_keys::fingerprint_of(&req.provider_id, &req.plaintext);
     let secret = SecretString::from(std::mem::take(&mut req.plaintext));
@@ -209,6 +211,7 @@ async fn authenticate_with(
     }
     match crate::auth::validate_authorization(auth).await {
         Ok(claims) => {
+            // . This gate used to be `can_admin` for all three verbs.
             // `can_admin()` grandfathers `role == None` to full access, and
             // API-key auth ALWAYS has `role == None` — while `can_mint_keys()`
             // deliberately lets a MEMBER mint keys. So member → mint a key →
@@ -249,54 +252,25 @@ async fn authenticate_with(
     }
 }
 
-/// Allowlist of known provider IDs. The customer-supplied value is
-/// validated against this so a typo or hostile body can't litter the
-/// table with junk. Mirrors `ProviderRegistry::provider_id_for_model`.
+/// Allowlist of known provider IDs. The customer-supplied value is validated
+/// against this so a typo or hostile body cannot litter the table with junk.
+///
+/// GWY-42: DERIVED, not hand-maintained. This was a 35-arm `matches!` that had
+/// to mirror `ProviderRegistry` by hand, and ** is what happens when it
+/// does not** — Groq, Together, Fireworks and OpenRouter all routed correctly
+/// and all had an env-var entry, but were missing from this list, so
+/// `POST /v1/byok/provider-keys` answered "unknown provider_id" and a customer
+/// could not store a key for them AT ALL. Routed ≠ usable. Deriving it from the
+/// catalog removes the second list rather than re-syncing it.
+///
+/// The six native adapters are named explicitly because they are not catalog
+/// rows; `scripts/ci/check-byok-provider-coverage.py` proves this function
+/// accepts every provider the registry can route.
 fn is_known_provider(p: &str) -> bool {
     matches!(
         p,
-        "anthropic"
-            | "openai"
-            | "google"
-            | "vertex"
-            // `api_key_env_var` entry, but were missing here — so
-            // `POST /v1/byok/provider-keys` 400'd "unknown provider_id" and a
-            // customer could not store a key for them AT ALL. Groq was the worst
-            // routing so a stored Groq key would resolve, but there was no way to
-            // store one. Enforced against the registry by
-            // `scripts/ci/check-byok-provider-coverage.py`.
-            | "groq"
-            | "together"
-            | "fireworks"
-            | "openrouter"
-            | "bedrock"
-            | "azure"
-            | "cohere"
-            | "mistral"
-            | "perplexity"
-            | "deepseek"
-            | "xai"
-            | "nvidia"
-            | "cerebras"
-            | "sambanova"
-            | "lepton"
-            | "lambda"
-            | "novita"
-            | "ai21"
-            | "hyperbolic"
-            | "deepinfra"
-            | "cloudflare"
-            | "ollama"
-            | "baseten"
-            | "huggingface"
-            | "anyscale"
-            | "modal"
-            | "predibase"
-            | "moonshot"
-            | "upstage"
-            | "yi"
-            | "aleph-alpha"
-    )
+        "anthropic" | "google" | "vertex" | "bedrock" | "azure" | "cohere"
+    ) || crate::providers::catalog::by_id(p).is_some()
 }
 
 #[cfg(test)]
@@ -322,8 +296,10 @@ mod tests {
         }
     }
 
+    /// These four route in `ProviderRegistry` and have an
     /// `env_var_for_provider_id` entry, but were missing from the allowlist — so
     /// a customer could not store a key for them at all. Groq was the sharpest
+    /// case: fixed `llama*`/`qwen*`/`gemma*` model routing so a stored Groq
     /// key WOULD resolve, but there was no way to store one.
     /// `scripts/ci/check-byok-provider-coverage.py` enforces the full set.
     #[test]

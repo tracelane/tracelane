@@ -28,6 +28,7 @@ interface ProviderKeySummary {
 }
 
 /**
+ * The gateway's owner-only gate (403) rendered in the typed shape the
  * rest of `/api/settings/*` already emits. Shared by GET/POST so a member sees
  * the same honest "owner-only" signal whichever verb they hit.
  */

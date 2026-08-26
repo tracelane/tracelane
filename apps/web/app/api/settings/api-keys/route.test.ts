@@ -2,6 +2,7 @@
  * Tests for /api/settings/api-keys (GET list, POST create).
  *
  * Focus: tenant scoping (tenant derived from session, body cannot inject one);
+ * POST proxies minting to the gateway (`gatewayPost /v1/keys`) rather
  * than hashing locally, returns the raw key once, and records the audit action
  * with only the non-secret shape; a gateway fault maps to a clean 5xx. Negative
  * cases first per `.claude/rules/testing.md`. The DB, gateway, and admin-audit

@@ -33,19 +33,32 @@ Use the pinned versions in `rust-toolchain.toml` and `package.json` (`engines`, 
 git clone https://github.com/tracelane/tracelane
 cd tracelane
 
+# Enable the repo's git hooks. DO THIS FIRST — see the note below.
+git config core.hooksPath .githooks
+
 # Node dependencies
 pnpm install
 
 # Rust workspace
 cargo build --workspace
 
-# Start ClickHouse, Postgres, NATS, Redis
+# Start ClickHouse, Postgres, NATS, Grafana
 docker compose -f infra/dev/docker-compose.yml up -d
 
 # Apply Postgres migrations
-psql "$DATABASE_URL" -f infra/dev/postgres/migrations/01_tenants.sql
-psql "$DATABASE_URL" -f infra/dev/postgres/migrations/02_payment_events.sql
-psql "$DATABASE_URL" -f infra/dev/postgres/migrations/03_audit_keys.sql
+# Drizzle is canonical for the control plane (apps/web/db/schema.ts). Applying the
+# three legacy .sql files below would give you 3 of 17, and the schema has since moved
+# to Drizzle — an incomplete control plane fails at runtime, not here.
+#
+# READ THIS BEFORE YOU ASSUME THE SCHEMA IS COMPLETE. `drizzle-kit migrate` applies
+# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 30
+# .sql files on disk; 0009+ are hand-written Neon migrations applied out-of-band and
+# deliberately un-journaled, so this command gives you 9 of 30. That is enough for the
+# gateway to boot and for most local work, and it is NOT the production schema.
+pnpm --filter @tracelanedev/web exec drizzle-kit migrate
+
+# infra/dev/postgres/migrations/ is RETAINED FOR REFERENCE, not for applying: several
+# evals and guards read those files. Do not run them by hand and do not delete them.
 
 # Apply ClickHouse schema
 cat infra/dev/clickhouse/schema.sql | clickhouse-client --multiquery
@@ -58,12 +71,26 @@ pip install -e evals/
 cp .env.example .env.local
 ```
 
+> **`git config core.hooksPath .githooks` is not optional, and nothing will remind you.**
+> **On the PUBLIC mirror `.githooks/` is not present** — it is withheld from the export,
+> so this command silently configures a path that does not exist and no hook runs. The
+> gating described here happens in the canonical repo before anything is exported.
+>
+> `core.hooksPath` is per-clone local config — it is not carried by the clone and there is no
+> `postinstall` that sets it. Until you run it, `.githooks/pre-commit` and `.githooks/pre-push`
+> do not execute, so the checks below never run on your machine and nothing reports that they
+> did not. Verify with:
+>
+> ```bash
+> git config --get core.hooksPath   # must print: .githooks
+> ```
+
 Required env vars in `.env.local`:
 
 | Var | Description |
 |---|---|
 | `DATABASE_URL` | Postgres DSN (default: `postgresql://tracelane:tracelane@localhost:5432/tracelane`) |
-| `CLICKHOUSE_DSN` | ClickHouse DSN (default: `http://localhost:8123`) |
+| `CLICKHOUSE_URL` | ClickHouse endpoint (default: `http://localhost:8123`) |
 | `NATS_URL` | NATS JetStream URL (default: `nats://localhost:4222`). **Required** — the gateway refuses to boot without it; set `TRACELANE_ALLOW_NO_CAPTURE=1` to run deliberately without span capture |
 | `TRACELANE_BYOK_MASTER_KEY` | AES-256-GCM master key for BYOK envelope encryption — 32 bytes, **base64** (generate with `openssl rand -base64 32`) |
 | `WORKOS_API_KEY` | WorkOS API key (sign up at workos.com) |
@@ -114,7 +141,7 @@ pytest evals/
 pnpm eval:run --suite=all
 ```
 
-CI fails if `pnpm eval:run --suite=all` regresses. Never disable an eval — mark it flaky in `evals/FLAKY.md` and fix within 48 hours.
+CI fails if `pnpm eval:run --suite=all` regresses. Never disable an eval — mark it flaky in the suite in `evals/FLAKY.md` and fix within 48 hours.
 
 ## Linting and formatting
 
@@ -163,7 +190,7 @@ Open a GitHub issue using the bug report template. Include:
 ### Feature requests
 
 Open a GitHub issue using the feature request template. Before doing so:
-- Browse `evals/pain-points/` — if the feature addresses an assertion that
+- Browse `evals/` — if the feature addresses a conformance eval that
   already has an eval there, it may already be on the roadmap
 - Describe the user pain, not just the solution
 
@@ -178,10 +205,11 @@ Open a GitHub issue using the feature request template. Before doing so:
 
 ### Adding a new instrumentation adapter
 
-1. Create `packages/sdk-python/src/tracelane/adapters/<name>.py` or `packages/sdk-typescript/src/adapters/<name>.ts`.
+1. Create `packages/sdk-python/tracelane/instrumentations/<name>.py` or `packages/sdk-typescript/src/instrumentations/<name>.ts`.
 2. Follow the existing adapter pattern — wrap the provider client, emit OTel spans with GenAI semconv attributes.
 3. Add the adapter to the table in the relevant SDK README.
-4. Add or update the corresponding pain-point eval in `evals/pain-points/`.
+4. Add or update the corresponding instrumentation test beside the adapter
+   (`*.test.ts` for TypeScript, `packages/sdk-python/tests/` for Python).
 
 ### Conventions (non-negotiable)
 

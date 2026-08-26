@@ -13,6 +13,16 @@ from.
 
 ## Use
 
+<!-- This package is `private: true` and is NOT published to npm. It is a
+     workspace-internal design system consumed by `apps/web` through the pnpm
+     workspace. `npm install @tracelanedev/ui` will not resolve. -->
+
+**This package is not published to npm.** It is an internal workspace package
+consumed by `apps/web` through the pnpm workspace; it is included here so the
+dashboard's component source is readable, not as an installable dependency.
+
+From inside this repository:
+
 ```ts
 import "@tracelanedev/ui/styles/tokens.css"; // once, at the app root
 import { Button, Card, TranscriptSpine } from "@tracelanedev/ui";

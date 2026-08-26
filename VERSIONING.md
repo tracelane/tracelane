@@ -22,10 +22,10 @@ Each has its own version and its own SemVer contract:
 | Surface | Where | Version today | SemVer applies to |
 |---|---|---|---|
 | Gateway HTTP API | `https://gateway.tracelane.dev/v1/…` | `v1` (path) | request/response shape of documented `/v1` endpoints |
-| Python SDK | `tracelane` (PyPI) | `0.1.0` | public `import tracelane` surface (`init`, `instrument_*`) |
-| TypeScript SDK | `@tracelanedev/sdk` (npm) | `0.1.0` | public exports (`instrument*`, config types) |
-| CLI | `@tracelanedev/cli` (npm) | `0.2.0` | command names, flags, exit codes |
-| Audit wire format / verifier | `packages/verifier-*`, `spec/` | verifier `0.2.0` | the audit record format a third party verifies |
+| Python SDK | `tracelane` (PyPI) | `0.2.3` | public `import tracelane` surface (`init`, `instrument_*`) |
+| TypeScript SDK | `@tracelanedev/sdk` (npm) | `0.2.3` | public exports (`instrument*`, config types) |
+| CLI | `@tracelanedev/cli` (npm) | `0.2.3` | command names, flags, exit codes |
+| Audit wire format / verifier | `packages/verifier-*`, `spec/` | verifier `0.2.3` | the audit record format a third party verifies |
 | Rust crates | `crates/*` | `0.1.0` | not published for external use in V1 (internal) |
 | Specs (AFT-1, OpenAgentTrace) | `spec/` | AFT-1 `v0.3` draft, OAT `v0.1` draft | see [Spec versioning](#spec-versioning) |
 

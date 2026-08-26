@@ -117,6 +117,7 @@ impl CohereProvider {
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         });
+        // Tool definitions: universal Tool -> Cohere `tools`
         // (`parameter_definitions` keyed off the JSON-schema properties).
         // Previously the adapter dropped tools entirely — a tool-bearing
         // request silently degraded to plain chat.
@@ -127,6 +128,7 @@ impl CohereProvider {
 
         let url = format!("{}/chat", self.base_url);
 
+        // SSRF: validate before the POST (reviewer).
         crate::ssrf_guard::validate_url(&url)
             .await
             .context("SSRF guard rejected Cohere base URL")?;
@@ -142,6 +144,7 @@ impl CohereProvider {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            // SECURITY: drop the response body — Cohere
             // 401/403 bodies can echo the Bearer token.
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(status, "Cohere API error");

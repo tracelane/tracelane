@@ -14,7 +14,7 @@ If you don't have an API key yet, skip ahead to [Onboarding](onboarding.md).
 ## 1. Point an OpenAI-compatible client at the gateway
 
 Tracelane is a drop-in proxy on the **OpenAI wire format**. You reach every
-provider — Anthropic, Bedrock, Google, 35 in all — through
+provider — Anthropic, Bedrock, Google, 150+ in all — through
 `POST /v1/chat/completions`, choosing the upstream with a **model prefix**.
 
 > **Use an OpenAI-compatible client, not a provider-native SDK.** The gateway
@@ -96,10 +96,10 @@ curl $TRACELANE_GATEWAY_URL/v1/chat/completions \
   }'
 ```
 
-`model` selects the upstream by prefix across 35 routable providers (7 native
-adapters + 28 OpenAI-compatible): `claude-*` → Anthropic, `gpt-*` → OpenAI,
-`bedrock/*` → AWS Bedrock, `gemini-*` → Google, and so on. Full list in
-[providers.md](providers.md).
+`model` selects the upstream by prefix across 150+ routable providers (6 native
+adapters plus every row of the OpenAI-compatible catalog): `claude-*` →
+Anthropic, `gpt-*` → OpenAI, `bedrock/*` → AWS Bedrock, `gemini-*` → Google, and
+so on. Full list in [providers.md](providers.md).
 
 ---
 
@@ -198,7 +198,7 @@ See [audit-format.md](audit-format.md) for the canonical format spec.
 
 - [API reference](api-reference.md) — every mounted route, its error codes and
   its rate limits
-- [Providers](providers.md) — the 35 routable providers and their model prefixes
+- [Providers](providers.md) — the 150+ routable providers and their model prefixes
 - [Architecture](architecture.md) — what's running under the hood, including
   which detectors fire on which traffic
 - [Audit format](audit-format.md) — the v2 chain encoding and the two signing keys

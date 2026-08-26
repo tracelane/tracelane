@@ -1,3 +1,4 @@
+//! Federation-signals write path (ADR-056 ·) — the cross-customer
 //! failure-signature substrate for opt-in federated detection across tenants,
 //! accumulating from the first customer.
 //!

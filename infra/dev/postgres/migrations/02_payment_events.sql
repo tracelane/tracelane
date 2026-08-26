@@ -1,4 +1,5 @@
 -- Migration 02: Payment events ledger (x402 / AP2 / ACP protocol spans).
+-- Per-agent payment tracking per
 -- Idempotent — every CREATE has IF NOT EXISTS.
 --
 -- Tenant isolation: every query against this table must filter by tenant_id.

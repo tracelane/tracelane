@@ -4,6 +4,7 @@ import type { SpanKind } from "@tracelanedev/ui";
  * Infer the span kind from a span's attributes JSON, CONSERVATIVELY.
  *
  * There is no authoritative `span_kind` field at ingest yet (tech debt — see
+ * PROGRESS "Open Blockers"; the real fix is to denormalize an
  * OpenInference span-kind column at ingest). Until then we infer — but a
  * misattributed kind is worse than less detail (and error attribution is
  * status-driven, independent of kind), so we assign a kind ONLY on a strong
@@ -36,6 +37,7 @@ export function inferSpanKind(attributesJson: string): SpanKind {
 	// the dotted OTel form and its underscore equivalent — exactly as
 	// `extractGenAi` does. Reading only dotted keys returned "unknown" for all
 	// real spans (the stopgap was green-in-tests, gray-on-real-data). The
+	// authoritative fix — a denormalised span-kind column at ingest — is.
 	const has = (p: string) => {
 		const u = p.replaceAll(".", "_");
 		return keys.some(

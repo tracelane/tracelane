@@ -37,6 +37,7 @@ which forbids present-tense phrasing.
 Usage:
     check-claim-anchors.py             # verify every anchor still holds
     check-claim-anchors.py --coverage  # how much of the export set is anchored
+    check-claim-anchors.py --vs-export <tree>  # anchors must mean the same thing PUBLICLY
     check-claim-anchors.py --selftest  # prove a broken anchor blocks
 """
 
@@ -55,8 +56,11 @@ LEDGER = ROOT / "docs" / "inventory" / "CLAIM_ANCHORS.json"
 # runs the ordinary check and exits 0 — so `--selftesst` (typo) reports PASS while no
 # selftest ran, and the `--selftest` result proves nothing. Enforced by
 # scripts/ci/check-guard-selftests.py.
-KNOWN_FLAGS = {"--selftest", "--coverage"}
-USAGE = "usage: check-claim-anchors.py [--selftest | --coverage]"
+KNOWN_FLAGS = {"--selftest", "--coverage", "--vs-export"}
+USAGE = (
+    "usage: check-claim-anchors.py "
+    "[--selftest | --coverage | --vs-export <built-export-tree>]"
+)
 
 
 def reject_unknown_flags(argv: list[str]) -> None:
@@ -280,6 +284,89 @@ def selftest() -> int:
     return 0
 
 
+def vs_export(rows: list, tree: Path) -> int:
+    """Every anchor must resolve IDENTICALLY in the private tree and the export.
+
+    R167 (2026-08-26). The claims in this ledger are made in documents that SHIP,
+    but every anchor kind globs against ROOT — the private tree. For anything the
+    export transforms or denies, the ledger verifies a different artifact than the
+    one carrying the claim.
+
+    It had exactly one instance and it was live: `68 pain-point evals` anchored to
+    `evals/pain-points/*.eval.ts == 68`. That held here and meant NOTHING in the
+    export, where the directory is denied and the count is zero — a claim row
+    reporting coverage of a claim the published README does not make. Same shape as
+    B-279: a statement about the public artifact has to be checked against the
+    public artifact.
+
+    So this is the rule made mechanical rather than remembered: pick anchors whose
+    resolution does not depend on which tree you are standing in.
+    """
+    if not tree.is_dir():
+        print(f"--vs-export: no such tree: {tree}", file=sys.stderr)
+        return 2
+    bad = []
+    for c in rows:
+        a = c.get("anchor", {})
+        kind = a.get("kind")
+        if kind in ("external", "roadmap", "none"):
+            continue
+
+        # `symbol` needs a CONTENT comparison, not a presence one. The export does
+        # not only omit files, it REWRITES them: step 4b drops five ci.yml jobs and
+        # step 4d replaces evals/package.json's `test` with a no-op. Both files
+        # still ship, at a plausible size, so every count- and presence-based check
+        # passes -- while a symbol anchored into the removed region resolves TRUE
+        # here and FALSE for the reader. That is the direction that matters, because
+        # whoever writes the claim only ever looks at this tree.
+        if kind == "symbol":
+            f_priv, f_pub = ROOT / a["file"], tree / a["file"]
+            sym = a["symbol"]
+            has_priv = f_priv.is_file() and sym in f_priv.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            has_pub = f_pub.is_file() and sym in f_pub.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if has_priv != has_pub:
+                bad.append(
+                    (
+                        c.get("claim", "?"),
+                        c.get("doc", "?"),
+                        f"{a['file']} :: {sym[:40]!r}",
+                        "present" if has_priv else "absent",
+                        "present" if has_pub else "absent",
+                    )
+                )
+            continue
+
+        spec = a.get("glob") or a.get("file")
+        if not spec:
+            continue
+        npriv = len([p for p in ROOT.glob(spec) if p.is_file()])
+        npub = len([p for p in tree.glob(spec) if p.is_file()])
+        if npriv != npub:
+            bad.append(
+                (
+                    c.get("claim", "?"),
+                    c.get("doc", "?"),
+                    spec,
+                    f"{npriv} file(s)",
+                    f"{npub} file(s)",
+                )
+            )
+    if bad:
+        print("FAIL — anchor(s) resolve differently in the export than here:")
+        for claim, doc, spec, x, y in bad:
+            print(f"  ✗ {claim!r} ({doc})")
+            print(f"      {spec}: {x} here, {y} in the export")
+        print("\n  A claim made in a document that ships must be anchored to something")
+        print("  that means the same thing in the tree the reader actually gets.")
+        return 1
+    print(f"OK — all {len(rows)} anchor(s) resolve identically here and in {tree}.")
+    return 0
+
+
 def main() -> int:
     reject_unknown_flags(sys.argv[1:])
     if "--selftest" in sys.argv:
@@ -287,6 +374,12 @@ def main() -> int:
     rows = load()
     if "--coverage" in sys.argv:
         return coverage(rows)
+    if "--vs-export" in sys.argv:
+        i = sys.argv.index("--vs-export")
+        if i + 1 >= len(sys.argv):
+            print(USAGE, file=sys.stderr)
+            return 2
+        return vs_export(rows, Path(sys.argv[i + 1]))
     if not rows:
         print(f"no ledger at {LEDGER.relative_to(ROOT)} — nothing anchored yet")
         return 1

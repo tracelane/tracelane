@@ -1,7 +1,9 @@
 /**
+ * Tests for DELETE /api/prompts/[name] — prompt soft-delete proxy.
  *
  * The route mints the per-user JWT via requireGatewayToken() and forwards it as
  * Bearer to the gateway DELETE (never a body-supplied tenant, per ADR-042 /
+ * . Asserts: the gateway URL + method, the Bearer, name url-encoding, a
  * 204 passthrough, an error-status+body passthrough, and the unreachable 503.
  * Gateway fetch + auth mocked (off the network).
  */

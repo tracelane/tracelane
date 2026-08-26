@@ -27,7 +27,7 @@ export function ComingSoon({
 }) {
 	return (
 		<div className="mx-auto max-w-3xl px-6 py-10">
-			<h1 className="mb-6 text-xl font-semibold text-ink">{title}</h1>
+			<h1 className="t-h1 mb-6">{title}</h1>
 			<EmptyState
 				icon={icon}
 				title={`Tracelane has no ${title} feature`}

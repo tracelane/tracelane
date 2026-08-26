@@ -3,6 +3,7 @@
  *
  * WHY THIS FILE EXISTS AT ALL. Before consolidation the site repo had **no CI, no tests
  * and no workflows** — `.github/` held CODEOWNERS and dependabot.yml and nothing else
+ * (B-142a). Moving the site into the monorepo only helps if something here actually runs:
  * `pnpm --recursive` will call `test` in every workspace package, so an `apps/site` with
  * no `test` script would have been consolidated and STILL ungated — a silent CLASS-1,
  * and the exact failure mode of "we moved it, so it's covered".
@@ -12,6 +13,7 @@
  *  · three indexed URLs would have become 404s when their pages left scope
  *  · www served 200 duplicate content while README-DEPLOY claimed a `_redirects` 301
  *    (`_redirects` is a Pages feature and this is a Worker — it was never running)
+ *  · the CSP's `form-action 'self'` would have silently killed a Polar checkout
  *  · the security page claimed trufflehog runs in CI (it does not) and an SSRF
  *    "redirect cap 3" (redirects are disabled entirely — the truth is stronger)
  *  · the site carried a FOURTH palette

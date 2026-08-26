@@ -4,6 +4,7 @@
 //! `event`, `dispose`. Each component referenced in an A2UI message must be
 //! declared in the surface's `catalogId`.
 //!
+//! Gateway-level validations:
 //! - Component type unknown → Block (AFT-A2UI-CATALOG-001)
 //! - Required props missing → Warn (AFT-A2UI-CATALOG-001)
 //! - `dispose` without `surface_id` → Warn (AFT-A2UI-CATALOG-001)

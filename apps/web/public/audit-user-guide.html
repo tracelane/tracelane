@@ -5,12 +5,32 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Tracelane Audit Ledger — User Guide</title>
 <style>
+  /*
+   * RE-TINTED 2026-08-22 to the "Instrument II" P0 palette. This file is a
+   * STANDALONE print/PDF artifact — it cannot @import packages/ui/src/styles/tokens.css,
+   * so it hand-copies the light-theme values. That is why literals are allowed HERE
+   * and nowhere in a component; re-sync by lookup, not by judgement.
+   *
+   * WHAT CHANGED AND WHY: this page still carried the retired ADR-053 "Lava" accent
+   * (--lava/--lava-deep/--lava-soft) — every hyperlink and the cover dot were
+   * lava-red — plus a cool-cast neutral ramp (--ink #17171a, --ink-2 #4a4a52,
+   * --ink-3 #78787f, --line #e6e6e9 all have B > R) and a pre-P0 seal green
+   * (#1f9d63). It is linked from the app at /audit-user-guide (AuditHelpBar.tsx:42),
+   * so it was the one SHIPPED surface still painted in the previous system. The
+   * lava tokens are deleted rather than re-pointed: a token named for a colour the
+   * system no longer has is the next reader's trap.
+   *
+   * Links lose their colour, so they GAIN a permanent underline. Colour was the
+   * only thing marking a link here; removing it without adding the underline would
+   * have made links indistinguishable from body text — state by colour alone, and
+   * then by nothing at all.
+   */
   :root{
-    --ink:#17171a; --ink-2:#4a4a52; --ink-3:#78787f;
-    --line:#e6e6e9; --line-2:#d8d8dc; --surface:#ffffff; --canvas:#f6f6f7;
-    --lava:#ff5a36; --lava-deep:#c8300f; --lava-soft:#ffe8e2;
-    --seal:#1f9d63; --seal-soft:#e6f6ee; --seal-line:#bfe6d1;
-    --danger:#d64524; --danger-soft:#fdece7;
+    --ink:#171717; --ink-2:#6b6b6b; --ink-3:#828280;
+    --line:#e7e7e5; --line-2:#d8d8d5; --surface:#ffffff; --canvas:#fafaf9;
+    --surface-2:#f5f5f4; --canvas-sunken:#f1f1f0; --ink-inverse:#f5f5f5;
+    --seal:#16803c; --seal-ink:#137035; --seal-soft:#e9f4ec; --seal-line:#c2e0cd;
+    --danger:#dc3b35; --danger-ink:#c62e28; --danger-soft:#fbebea; --danger-line:#f3c9bd;
     --radius:12px;
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -23,31 +43,31 @@
   h2{font-size:22px;margin:38px 0 10px;padding-top:10px}
   h3{font-size:16px;margin:22px 0 6px}
   p{margin:8px 0}
-  code{font-family:var(--mono);font-size:.88em;background:#f0f0f2;padding:1px 5px;border-radius:5px;color:var(--ink)}
+  code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);padding:1px 5px;border-radius:5px;color:var(--ink)}
   strong{font-weight:650}
-  a{color:var(--lava-deep);text-decoration:none}
-  a:hover{text-decoration:underline}
+  a{color:var(--ink);text-decoration:underline;text-underline-offset:2px}
+  a:hover{text-decoration-thickness:2px}
   small{color:var(--ink-3)}
 
   /* Cover */
-  .cover{background:linear-gradient(160deg,#1a1a1f 0%,#26262d 55%,#3a2018 100%);color:#fff;padding:56px 28px 44px;text-align:left}
+  .cover{background:var(--ink);color:var(--ink-inverse);padding:56px 28px 44px;text-align:left}
   .cover .wrap{max-width:820px;margin:0 auto}
   .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.02em}
-  .brand .dot{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--lava),var(--lava-deep));display:inline-block}
+  .brand .dot{width:22px;height:22px;border-radius:6px;background:var(--ink-inverse);display:inline-block}
   .cover h1{font-size:40px;margin:30px 0 8px;font-weight:750}
-  .cover .sub{font-size:17px;color:#d8d4d1;max-width:560px}
-  .cover .meta{margin-top:26px;font-size:12.5px;color:#a9a6a4;display:flex;gap:18px;flex-wrap:wrap}
-  .cover .pill{display:inline-block;margin-top:18px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:5px 13px;font-size:12px;color:#f0ece9}
+  .cover .sub{font-size:17px;color:rgba(255,255,255,.80);max-width:560px}
+  .cover .meta{margin-top:26px;font-size:12.5px;color:rgba(255,255,255,.62);display:flex;gap:18px;flex-wrap:wrap}
+  .cover .pill{display:inline-block;margin-top:18px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:5px 13px;font-size:12px;color:rgba(255,255,255,.88)}
 
   .lead{font-size:16.5px;color:var(--ink-2);margin:18px 0 6px}
   .callout{border:1px solid var(--line);background:var(--surface);border-radius:var(--radius);padding:16px 18px;margin:16px 0}
   .callout.tip{border-color:var(--seal-line);background:var(--seal-soft)}
-  .callout.warn{border-color:#f3c9bd;background:var(--danger-soft)}
+  .callout.warn{border-color:var(--danger-line);background:var(--danger-soft)}
   .callout .k{font-weight:650;font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--ink-3);margin-bottom:4px}
 
   figure{margin:18px 0;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--surface)}
   figure img{display:block;width:100%;height:auto}
-  figcaption{font-size:12.5px;color:var(--ink-3);padding:9px 14px;border-top:1px solid var(--line);background:#fafafa}
+  figcaption{font-size:12.5px;color:var(--ink-3);padding:9px 14px;border-top:1px solid var(--line);background:var(--canvas-sunken)}
 
   .toc{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:20px 24px;margin:26px 0}
   .toc h2{margin:0 0 8px;padding:0;font-size:15px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-3)}
@@ -57,18 +77,18 @@
 
   table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
   th,td{text-align:left;padding:8px 11px;border:1px solid var(--line);vertical-align:top}
-  th{background:#fafafa;font-weight:650;font-size:12.5px}
+  th{background:var(--canvas-sunken);font-weight:650;font-size:12.5px}
   td code{white-space:nowrap}
 
   .flow{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin:16px 0}
   .flow .row{display:flex;gap:0;border-top:1px solid var(--line)}
   .flow .row:first-child{border-top:0}
-  .flow .cond{flex:0 0 210px;padding:12px 14px;background:#fafafa;border-right:1px solid var(--line);font-weight:600;font-size:13.5px}
+  .flow .cond{flex:0 0 210px;padding:12px 14px;background:var(--canvas-sunken);border-right:1px solid var(--line);font-weight:600;font-size:13.5px}
   .flow .act{padding:12px 14px;font-size:13.5px;color:var(--ink-2)}
   .badge{display:inline-block;font-size:11px;font-weight:650;padding:2px 8px;border-radius:999px;vertical-align:middle}
-  .badge.ok{background:var(--seal-soft);color:var(--seal);border:1px solid var(--seal-line)}
-  .badge.bad{background:var(--danger-soft);color:var(--danger);border:1px solid #f3c9bd}
-  .badge.neu{background:#eef0f2;color:var(--ink-2);border:1px solid var(--line-2)}
+  .badge.ok{background:var(--seal-soft);color:var(--seal-ink);border:1px solid var(--seal-line)}
+  .badge.bad{background:var(--danger-soft);color:var(--danger-ink);border:1px solid var(--danger-line)}
+  .badge.neu{background:var(--surface-2);color:var(--ink-2);border:1px solid var(--line-2)}
 
   dl.glossary{margin:10px 0}
   dl.glossary dt{font-weight:650;margin-top:12px}
@@ -83,13 +103,13 @@
   .support a{font-weight:600}
 
   .step{display:flex;gap:14px;margin:14px 0}
-  .step .n{flex:0 0 28px;height:28px;border-radius:50%;background:var(--ink);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
+  .step .n{flex:0 0 28px;height:28px;border-radius:50%;background:var(--ink);color:var(--ink-inverse);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
   .step .b{flex:1}
   .step .b b{font-size:15px}
 
   @page{margin:16mm 14mm}
   @media print{
-    body{background:#fff;font-size:11.5px}
+    body{background:var(--surface);font-size:11.5px}
     .page{max-width:none;padding:0}
     .cover{margin:-16mm -14mm 0;padding:40mm 14mm 24mm;border-radius:0}
     h2{break-after:avoid;page-break-after:avoid}

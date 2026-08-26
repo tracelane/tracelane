@@ -67,7 +67,7 @@ export default async function ByokPage() {
 				for regulated environments. Stored as a fingerprint only.
 			</p>
 			{/* Honest state — this registry is not yet enforced. */}
-			<div className="mb-4 max-w-2xl rounded-lg border border-line bg-surface-2/40 p-3 text-xs text-ink-2">
+			<div className="mb-4 max-w-2xl rounded-lg border border-line bg-surface-2 p-3 text-xs text-ink-2">
 				<div className="mb-1 font-medium text-ink">
 					Registered now · enforcement in a later release
 				</div>

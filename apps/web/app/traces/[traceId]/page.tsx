@@ -37,6 +37,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 async function SpanData({ traceId }: { traceId: string }) {
 	let spans: Span[];
 	try {
+		// Gateway-proxied read (Option 1). A null result is the
 		// gateway's 404 — the SAME response for "trace missing" and "not this
 		// tenant's", so existence never leaks across tenants.
 		const result = await gatewayGetOrNull<Span[]>(

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+#  static guard: the `tenants` table PK is `id`, NEVER `tenant_id`.
 #
 # The old pre-ADR-040 shape used `tenant_id` as the tenants PK. Prod is `id`.
 # Any raw SQL that references the tenants PK as `tenant_id` (a FK target, an
 # INSERT column list, a qualified `tenants.tenant_id`, or a `FROM tenants t ...
 # t.tenant_id` query) fails against prod with "column ... does not exist". This
+# exact seam class has bitten FOUR times, so it
 # is now CI-enforced.
 #
 # NOTE: `<table>.tenant_id` on OTHER tables (workspace_entitlements, api_keys,
@@ -55,10 +57,12 @@ run_guard() {
 local fail=0
 local -a FILES
 
+# Source files to scan (tracked.rs.sql.sh —.sh added because
 # ci/run-cogs.sh embeds a resolver SQL query that had the old shape and slipped
 # the .rs/.sql-only scan). Excludes: docs (may cite the bug), THIS guard script
 # (it contains the anti-patterns as its own regex/comments), and
 # infra/dev/postgres/migrations/ — the RETIRED pre-ADR-040 shape kept only until
+#  D2 migrates its non-Drizzle SQL (NOTIFY triggers, cardinality,
 # tool_capabilities) into Drizzle; it is not live schema (nothing builds/applies
 # it — the gateway include_str!s the Drizzle set; COGS uses Drizzle too).
 mapfile -t FILES < <(git ls-files '*.rs' '*.sql' '*.sh' \
@@ -181,6 +185,7 @@ selftest() {
     "tenants.tenant_id — the tenants PK is id"
 
   # 4. Check 3 — SQL over `FROM tenants` using the alias's .tenant_id. This is
+  #    the exact shape that slipped the.rs.sql-only scan in, so plant it
   #    in a .sh file, the extension added to close that hole.
   d="$selftest_tmp/alias"; mkdir -p "$d/ci"
   cat > "$d/ci/run-cogs.sh" <<'SH'

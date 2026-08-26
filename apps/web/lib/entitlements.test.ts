@@ -284,6 +284,7 @@ describe("full-capture gate (f_full_capture)", () => {
 	});
 
 	it("AUDIT FORCE: an active f_audit_addon grant forces full capture on a tail tier", async () => {
+		// Audit now arrives via the workspace f_audit_addon grant,
 		// not the legacy tenants.auditEnabled column.
 		setDb([[{ fAuditAddon: false }], [{ fAuditAddon: true }]]);
 		const ent = await resolveEntitlements("tenant-uuid", "builder");

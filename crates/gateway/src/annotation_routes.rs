@@ -473,6 +473,8 @@ mod tests {
             auth_method: crate::auth::AuthMethod::JwtBearer,
             role,
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
         }
     }
 

@@ -8,6 +8,7 @@
 !.dev.vars.example
 .env*
 
+# E2E auth/session state — never commit captured sessions.
 e2e/.auth/
 
 # Playwright local run output

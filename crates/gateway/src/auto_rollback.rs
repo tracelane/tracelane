@@ -1,5 +1,6 @@
 //! B1 Auto-Rollback Engine — EWMA-based per-prompt-version drift detection.
 //!
+//! Per ADR-009 and §7.4. Always compiled in V1; product
 //! access is gated at runtime via `workspace_entitlements`, not a
 //! `cfg(feature)` flag. Fed from the production path via
 //! `PromptRouter::observe_and_maybe_rollback` (POST /v1/prompts/:name/observe).
@@ -7,6 +8,7 @@
 //! Subsumes prior PR11 (Cost Drift Sentinel) machinery, repointed at
 //! per-prompt-version granularity instead of per-tenant aggregation.
 //!
+//! Two metric classes:
 //! - **Auto-rollback (objective):** cost, latency, error_rate, guardrail_fire_rate.
 //!   Above 2σ EWMA drift triggers `Some(RollbackMode::Auto)` — caller flips
 //!   the routing pointer back to the previous production version.
@@ -14,6 +16,7 @@
 //!   Above 2σ EWMA drift triggers `Some(RollbackMode::Suggested)` — surface
 //!   a dashboard panel; customer confirms before any pointer swap.
 //!
+//! EWMA window / half-life / drift threshold are PR11-locked.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -203,6 +206,7 @@ impl MetricStates {
     }
 }
 
+/// PR11-locked constants.
 const COLD_START: u64 = 30;
 const MIN_STDDEV: f64 = 1e-6;
 
@@ -307,7 +311,7 @@ impl RollbackEventPersister for ClickHouseRollbackPersister {
             ewma_baseline: decision.ewma_baseline,
             sigma_drift: decision.sigma_drift,
             rollback_mode: mode_str.to_string(),
-            fired_at: chrono::Utc::now().timestamp_micros(),
+            fired_at: crate::clickhouse_query::datetime64_millis_now(),
             confirmed_at: None,
             confirmed_by_user_id: None,
         };
@@ -400,6 +404,7 @@ impl RollbackEngine {
     /// > none. If multiple objective metrics drift simultaneously, the one
     /// with the highest sigma_drift wins.
     ///
+    /// Latency budget: <500ms p99 EWMA-breach → routing-swap
     /// this function takes <1µs since the actual swap is the caller's job.
     #[tracing::instrument(skip(self, metrics), fields(tenant_id = %tenant_id))]
     pub async fn check_and_rollback(

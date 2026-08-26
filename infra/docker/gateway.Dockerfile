@@ -21,6 +21,7 @@ COPY crates/ crates/
 COPY packages/verifier-rust/ packages/verifier-rust/
 # The gateway embeds the authoritative Drizzle migrations at compile time
 # (crates/gateway/src/db include_str!("../../../../apps/web/db/migrations/*.sql");
+# the old infra/dev/postgres/migrations set was deleted per ADR-040/),
 # so they must be present in the build context at the same relative path.
 COPY apps/web/db/migrations/ apps/web/db/migrations/
 # BuildKit cache mounts persist the cargo registry + target/ across deploys, so a

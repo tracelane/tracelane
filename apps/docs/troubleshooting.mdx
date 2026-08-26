@@ -73,8 +73,10 @@ for attempt in range(5):
 
 **Cause:** The upstream LLM provider returned an error (5xx, rate limit, or timeout).
 
-**Fix:** The gateway automatically fails over on upstream **500 / 502 / 503 /
-504** along a fixed cross-provider chain (**Anthropic → OpenAI → Google**). A
+**Fix:** Same-provider retry is automatic. CROSS-PROVIDER failover is **opt-in per
+request** via the `X-Tracelane-Failover: cross-provider` header and is off by
+default; when enabled it tries **500 / 502 / 503 / 504** along the configured
+chain. A
 429 is not eligible for failover — it is returned to you with `Retry-After`. If
 failover is exhausted, or the request targets a single provider with no
 downstream in the chain, the upstream error is proxied back. Per-model,
@@ -86,12 +88,12 @@ config-driven failover chains are on the roadmap — see
 **Cause:** A predictive guardrail blocked the request before it reached the provider.
 
 **Fix:** Check which guard fired — it's recorded in the trace span attributes
-(and, when present, the `x-tracelane-guard` response header). Use `tlane explain`
-or the MCP tool `explain_guardrail_block` for a detailed breakdown.
+(and, when present, the `x-tracelane-guard` response header). Use the MCP tool
+`explain_guardrail_block` (it takes `trace_id` and `span_id`) for a breakdown.
 
 ```bash
-# Get full explanation
-tlane explain <span_id>
+# Get full explanation via the MCP tool
+#   explain_guardrail_block(trace_id, span_id)
 ```
 
 Switching a guard from `block` to `warn` is a workspace policy setting;
@@ -165,8 +167,8 @@ logging.basicConfig(level=logging.DEBUG)
 import tracelane
 tracelane.init(endpoint="http://localhost:4318", api_key="tlane_...")
 
-# SDK — TypeScript
-TRACELANE_LOG_LEVEL=debug node your-agent.js
+# Gateway (the SDKs do not read a log-level variable)
+TRACELANE_LOG_LEVEL=debug cargo run -p gateway
 ```
 
 ## Get help

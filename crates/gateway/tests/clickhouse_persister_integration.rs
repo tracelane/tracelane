@@ -49,11 +49,31 @@ async fn ensure_schema(client: &ClickhouseClient) -> Result<()> {
 
     let migration =
         include_str!("../../../infra/dev/clickhouse/migrations/03_prompt_promotion.sql");
-    // Skip row-policy statements (they need a `tenant_role` not provisioned
-    // in test envs). Skip pure comment lines and empty statements.
-    for stmt in migration.split(';').map(str::trim).filter(|s| {
-        !s.is_empty() && !s.to_lowercase().starts_with("create row policy") && !s.starts_with("--")
-    }) {
+    // STRIP COMMENTS BEFORE SPLITTING ON `;`, not after.
+    //
+    // This test had ZERO callers until `scripts/ci/run-clickhouse-integration.sh`
+    // existed (2026-08-23), and running it for the first time showed it could
+    // never have passed: the old code split on `;` and then filtered statements
+    // that START with `--`, so a leading comment block was sent to the server as
+    // SQL and died with *"Syntax error: failed at position 1 ('the')"*. A
+    // trailing comment containing a semicolon splits a CREATE TABLE in half for
+    // the same reason. `docs/reference/TRAPS.md` §1 CLASS-1: a control that never
+    // ran, which would have gone red on its first execution — exactly what
+    // `postgres_tenant_integration.rs` did.
+    let stripped: String = migration
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Row policies need a `tenant_role` not provisioned in test envs.
+    for stmt in stripped
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.to_lowercase().starts_with("create row policy"))
+    {
         client.query(stmt).execute().await?;
     }
     Ok(())
@@ -64,12 +84,17 @@ async fn ensure_schema(client: &ClickhouseClient) -> Result<()> {
 #[derive(Debug, Serialize, Deserialize, clickhouse::Row)]
 struct PromotionRow {
     tenant_id: String,
+    #[serde(with = "clickhouse::serde::uuid")]
     promotion_id: ::uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
     prompt_id: ::uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid::option")]
     from_version_id: Option<::uuid::Uuid>,
+    #[serde(with = "clickhouse::serde::uuid")]
     to_version_id: ::uuid::Uuid,
     from_env: String,
     to_env: String,
+    #[serde(with = "clickhouse::serde::uuid::option")]
     eval_run_id: Option<::uuid::Uuid>,
     decision: String,
     decided_at: i64,
@@ -81,9 +106,13 @@ struct PromotionRow {
 #[derive(Debug, Serialize, Deserialize, clickhouse::Row)]
 struct RollbackRow {
     tenant_id: String,
+    #[serde(with = "clickhouse::serde::uuid")]
     rollback_id: ::uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
     prompt_id: ::uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
     from_version_id: ::uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
     to_version_id: ::uuid::Uuid,
     trigger_metric: String,
     trigger_value: f64,
@@ -93,6 +122,30 @@ struct RollbackRow {
     fired_at: i64,
     confirmed_at: Option<i64>,
     confirmed_by_user_id: Option<String>,
+}
+
+/// Assert a `DateTime64(3)` column round-tripped to a REAL instant.
+///
+/// This is the assertion both round-trip tests were missing. They wrote and
+/// read every other field and never touched the timestamp, so a 1000×
+/// unit error — `timestamp_micros()` into a millisecond column, which
+/// `clickhouse-rs` stores verbatim as raw ticks — round-tripped "successfully"
+/// into the year ~48000 and the test stayed green. It happened on
+/// `promotion_decisions.decided_at`, was fixed, and then happened again on
+/// `rollback_events.fired_at` in the sibling persister.
+///
+/// A ±1 day window is deliberately loose: it is not trying to measure clock
+/// skew, only to catch an error of three orders of magnitude.
+fn assert_recent_millis(value_ms: i64, column: &str) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let skew = (value_ms - now_ms).abs();
+    assert!(
+        skew < 86_400_000,
+        "{column} round-tripped to {value_ms} ms, which is {} days from now — \
+         a DateTime64(3) column stores MILLIS, so this is almost certainly a \
+         micros/nanos unit error at the insert site",
+        skew / 86_400_000,
+    );
 }
 
 #[tokio::test]
@@ -118,7 +171,10 @@ async fn promotion_decisions_round_trip() -> Result<()> {
         to_env: "production".into(),
         eval_run_id,
         decision: "promoted".into(),
-        decided_at: chrono::Utc::now().timestamp_micros(),
+        // DateTime64(3) is MILLIS. This test wrote micros and never read the
+        // column back, so it round-tripped every field except the one that was
+        // wrong in production. See the assertions below.
+        decided_at: chrono::Utc::now().timestamp_millis(),
         decided_by_user_id: None,
         notes: "integration-test".into(),
     };
@@ -130,15 +186,18 @@ async fn promotion_decisions_round_trip() -> Result<()> {
     #[derive(Debug, Deserialize, clickhouse::Row)]
     struct ReadRow {
         tenant_id: String,
+        #[serde(with = "clickhouse::serde::uuid")]
         promotion_id: ::uuid::Uuid,
         from_env: String,
         to_env: String,
         decision: String,
+        decided_at: i64,
     }
 
     let mut cursor = client
         .query(
-            "SELECT tenant_id, promotion_id, from_env, to_env, decision \
+            "SELECT tenant_id, promotion_id, from_env, to_env, decision, \
+                    toUnixTimestamp64Milli(decided_at) \
              FROM promotion_decisions WHERE tenant_id = ? LIMIT 1",
         )
         .bind(tenant_id.clone())
@@ -154,6 +213,7 @@ async fn promotion_decisions_round_trip() -> Result<()> {
     assert_eq!(read.from_env, "staging");
     assert_eq!(read.to_env, "production");
     assert_eq!(read.decision, "promoted");
+    assert_recent_millis(read.decided_at, "promotion_decisions.decided_at");
     Ok(())
 }
 
@@ -180,7 +240,9 @@ async fn rollback_events_round_trip() -> Result<()> {
         ewma_baseline: 1000.0,
         sigma_drift: 2.5,
         rollback_mode: "auto".into(),
-        fired_at: chrono::Utc::now().timestamp_micros(),
+        // DateTime64(3) is MILLIS — `rollback_events.fired_at` shipped as
+        // micros until 2026-08-19, and this test could not see it.
+        fired_at: chrono::Utc::now().timestamp_millis(),
         confirmed_at: None,
         confirmed_by_user_id: None,
     };
@@ -192,15 +254,18 @@ async fn rollback_events_round_trip() -> Result<()> {
     #[derive(Debug, Deserialize, clickhouse::Row)]
     struct ReadRow {
         tenant_id: String,
+        #[serde(with = "clickhouse::serde::uuid")]
         rollback_id: ::uuid::Uuid,
         trigger_metric: String,
         trigger_value: f64,
         rollback_mode: String,
+        fired_at: i64,
     }
 
     let mut cursor = client
         .query(
-            "SELECT tenant_id, rollback_id, trigger_metric, trigger_value, rollback_mode \
+            "SELECT tenant_id, rollback_id, trigger_metric, trigger_value, rollback_mode, \
+                    toUnixTimestamp64Milli(fired_at) \
              FROM rollback_events WHERE tenant_id = ? LIMIT 1",
         )
         .bind(tenant_id.clone())
@@ -216,6 +281,7 @@ async fn rollback_events_round_trip() -> Result<()> {
     assert_eq!(read.trigger_metric, "latency");
     assert!((read.trigger_value - 1234.5).abs() < 1e-6);
     assert_eq!(read.rollback_mode, "auto");
+    assert_recent_millis(read.fired_at, "rollback_events.fired_at");
     Ok(())
 }
 

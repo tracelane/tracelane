@@ -91,6 +91,7 @@ impl BedrockProvider {
         let path = format!("/model/{model_id}/converse");
         let url = format!("https://{host}{path}");
 
+        // SSRF: validate before the POST (reviewer). Bedrock host is
         // always AWS public, but config injection (AWS_BEDROCK_BASE_URL or
         // region override) could redirect this — validate every hop.
         crate::ssrf_guard::validate_url(&url)
@@ -136,6 +137,7 @@ impl BedrockProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // SECURITY: drop the body — Bedrock can echo
             // the X-Amz-Security-Token or the request's authorization
             // signature in error responses.
             let _body = response.text().await.unwrap_or_default();
@@ -390,6 +392,7 @@ impl ConverseRequest {
             None
         };
 
+        // Tool definitions: universal Tool -> Converse toolConfig.
         // Previously dropped — a tool-bearing request silently degraded to
         // plain chat on Bedrock.
         let tool_config = req.tools.as_ref().filter(|t| !t.is_empty()).map(|tools| {
@@ -469,6 +472,7 @@ impl ConverseResponse {
             cache_creation_input_tokens: None,
         });
 
+        // toolUse blocks: previously dropped — a Converse response
         // asking for a tool call surfaced as empty text with no tool_calls.
         let tool_calls: Vec<ToolCall> = self
             .output
@@ -633,6 +637,7 @@ mod tests {
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, 5);
     }
 
+    /// A tool-bearing universal request must carry Converse
     /// `toolConfig` (previously silently dropped — Bedrock degraded to
     /// plain chat).
     #[test]
@@ -659,6 +664,7 @@ mod tests {
         );
     }
 
+    /// ToolUse blocks in a Converse response must surface as
     /// tool_calls with intact usage (previously dropped: empty text, no
     /// tool_calls, usage-only).
     #[test]

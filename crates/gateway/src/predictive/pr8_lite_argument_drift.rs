@@ -1,6 +1,7 @@
 //! PR8-lite — Argument Drift Detector (AFT-MCP-ARGDRIFT-001 lite variant).
 //!
 //! Implements the lightweight version of PR8 (full PR8 with sentence-transformer
+//! embeddings ships as Tier 2 in Month 6 per BRD §9.3). PR8-lite ships in V1 to
 //! cover the gap between rule-based PR1/2/4/5 and the heavyweight ML PR8.
 //!
 //! Approach:
@@ -23,6 +24,7 @@
 //!   distance > 3σ, can_exfiltrate=false → Warn  (AFT-MCP-ARGDRIFT-001)
 //!   distance > 3σ, can_exfiltrate=true  → Block (AFT-MCP-ARGDRIFT-001)
 //!
+//! Performance budget:
 //!   <10ms p99 per evaluate() call on CCX13 CPU.
 //!
 //! Tenant isolation: drift state is keyed by `(TenantId, tool_name)`. Cross-
@@ -46,6 +48,7 @@ pub const MAX_WINDOW: u32 = 1000;
 /// EMA decay factor (~ half-life 250 events at MAX_WINDOW=1000).
 const EMA_DECAY: f64 = 0.997;
 
+/// Sigma threshold for drift classification.
 const DRIFT_SIGMA: f64 = 3.0;
 
 /// Floor on per-dimension variance so Mahalanobis distance stays well-defined

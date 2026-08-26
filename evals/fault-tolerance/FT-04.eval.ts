@@ -58,6 +58,7 @@ describe("FT-04: R2 outage — degrade to ClickHouse-only, alert fires", () => {
 			path.join(INGEST_SRC, "r2_batcher.rs"),
 			"utf8",
 		);
+		// Key must be {tenant_id}/yyyy/mm/dd/{hash}.ndjson per
 		expect(content).toContain(".ndjson");
 		expect(content).toContain("tenant_id");
 		expect(content).toContain("object_key");

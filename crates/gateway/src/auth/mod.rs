@@ -33,6 +33,7 @@ use tracelane_shared::TenantId;
 use uuid::Uuid;
 
 /// Audience test-bypass gate: debug builds only.
+/// Release builds hard-deny the bypass per M-4.
 #[cfg(debug_assertions)]
 fn is_audience_test_bypass_enabled() -> bool {
     std::env::var("TRACELANE_AUTH_TEST_NO_AUDIENCE").as_deref() == Ok("1")
@@ -45,6 +46,7 @@ fn is_audience_test_bypass_enabled() -> bool {
 
 /// JWT algorithms accepted by the gateway.
 ///
+/// Alg-confusion defence (reviewer): the enforcement is the **upfront
 /// `ALLOWED_JWT_ALGORITHMS.contains(&alg)` bail in `decode_and_validate`**,
 /// which rejects any header-claimed `alg` outside this set BEFORE any crypto or
 /// `Validation` is built. Do NOT remove that bail — the per-request
@@ -98,6 +100,16 @@ pub struct Claims {
     /// the auth cache, so the hot path reads a resolved capability instead of
     /// re-deriving one per route.
     pub key_scope: scope::KeyScope,
+    /// GWY-43 — this key's monthly USD ceiling, resolved in the same SELECT that
+    /// authenticated it, so enforcing it costs no extra round trip. `None` for
+    /// every non-API-key credential (a session has no budget) and for a key with
+    /// no ceiling set. The column existed from A13 and was never read; A13 said
+    /// so explicitly ("v1 RECORDS and REPORTS the budget"), so this is the
+    /// deferred half arriving.
+    pub budget_usd_monthly: Option<f64>,
+    /// GWY-43 — this key's requests-per-minute override. `None` means "use the
+    /// tenant's plan tier", which is what every key did before GWY-43.
+    pub rate_limit_rpm: Option<u32>,
 }
 
 impl Claims {
@@ -171,6 +183,8 @@ impl Claims {
     /// but **API-key auth still has `role == None`** (`auth/api_key.rs`) and
     /// [`Self::can_mint_keys`] deliberately lets a *member* mint keys. Those
     /// compose: member → mint an API key → call an owner-only surface. That
+    /// defeated the guardrail `caps` gate (/A) and the BYOK provider-key
+    /// surface; the `AuthMethod::JwtBearer` requirement here is what
     /// holds that line until PL-9b splits the self-host principal out.
     ///
     /// Use this for actions whose misuse is silent and damaging — moving
@@ -188,6 +202,24 @@ impl Claims {
     /// `member` and `viewer` are denied. A JWT carrying an unrecognised or
     /// absent slug is **denied** — that is PL-9; see
     /// [`Self::has_no_role_system`] for why non-JWT principals differ.
+    /// The `api_keys.id` that authorised this request, if a `tlane_` API key did.
+    ///
+    /// `sub` is `"apikey:<uuid>"` for an API key and a WorkOS user id for a
+    /// session, so `sub` itself is the wrong thing to store in a field called
+    /// `api_key_id` — the two live in different namespaces and a reader
+    /// grouping spend by that column would silently mix users with keys.
+    /// GWY-43 needs the key id specifically, and only when there IS one.
+    ///
+    /// Gated on `auth_method`, not on the string prefix: a WorkOS user id that
+    /// happened to start with `apikey:` would otherwise be read as a key.
+    #[must_use]
+    pub fn api_key_id(&self) -> Option<&str> {
+        if self.auth_method != AuthMethod::ApiKey {
+            return None;
+        }
+        self.sub.strip_prefix("apikey:")
+    }
+
     pub fn can_admin(&self) -> bool {
         match self.role {
             Some(Role::Owner) => true,
@@ -247,6 +279,7 @@ impl Claims {
     /// **Everything else is denied (PL-9b).** A tenant API key used to land here
     /// too, and that was a live escalation: [`Self::can_mint_keys`] deliberately
     /// lets a *member* mint a key, so member → mint → owner-only surface.
+    /// A and closed the two worst surfaces one at a time with
     /// [`Self::is_verified_owner`]; six others stayed open until this. `Mtls` is
     /// ingest's service identity and never needed admin either.
     ///
@@ -258,6 +291,7 @@ impl Claims {
     }
 }
 
+/// Typed `403 role_forbidden` JSON body (shape: `{"error",...}` +
 /// caller hint). Callers wrap this string in their own response type — kept
 /// as a plain string so both the `(StatusCode, String)` and `Response` route
 /// styles emit an identical body. `required` is the minimum role the route
@@ -347,6 +381,9 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
         auth_method: AuthMethod::SelfHostMasterKey,
         role: None,
         key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+        // GWY-43: no budget and no per-key rate override on this credential.
+        budget_usd_monthly: None,
+        rate_limit_rpm: None,
     })
 }
 
@@ -483,6 +520,9 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
         role,
         // A JWT is governed by Role, not by scopes — see the field's invariant.
         key_scope: scope::KeyScope::LegacyFullSurface,
+        // GWY-43: no budget and no per-key rate override on this credential.
+        budget_usd_monthly: None,
+        rate_limit_rpm: None,
     })
 }
 
@@ -546,6 +586,7 @@ async fn resolve_tenant_id(claims: &WorkOsClaims) -> Result<TenantId> {
 /// secrets without touching the global JWKS cache.
 ///
 /// `alg` is the JWT header's claimed algorithm. The alg-confusion defence
+/// (reviewer) is the **upfront allowlist check**: any alg not in
 /// [`ALLOWED_JWT_ALGORITHMS`] (HMAC family, `none`, …) is rejected here, before
 /// any cryptographic work. We then validate against exactly that one
 /// already-allowlisted alg.
@@ -582,6 +623,7 @@ fn decode_and_validate(
             validation.set_audience(&[aud]);
         }
         Err(_) => {
+            //  + M-4: audience MUST be configured. Tests
             // can opt out by setting TRACELANE_AUTH_TEST_NO_AUDIENCE=1, but
             // ONLY in debug builds. Release builds ignore the env var.
             if is_audience_test_bypass_enabled() {
@@ -651,6 +693,9 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
         // is safe; what matters is that it is now a decision, not a default.
         role: Some(Role::Owner),
         key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+        // GWY-43: no budget and no per-key rate override on this credential.
+        budget_usd_monthly: None,
+        rate_limit_rpm: None,
     }
 }
 
@@ -761,16 +806,34 @@ mod tests {
         }
     }
 
+    /// THE one lock for every test in this module that mutates WORKOS_AUDIENCE or
+    /// TRACELANE_AUTH_TEST_NO_AUDIENCE. It is MODULE-LEVEL on purpose.
+    ///
+    /// EARNED 2026-08-22, and the bug is worth stating because it looked correct:
+    /// both sides of this race already took "a lock" — `NoAudienceGuard::new` had
+    /// `static LOCK` inside the fn, and `requires_audience_env_in_non_test_path`
+    /// had `static LOCK` inside ITS fn. Two `static` items in two function scopes
+    /// are two INDEPENDENT mutexes, so each side locked its own and neither ever
+    /// excluded the other. The lock was decorative: present, named, and holding
+    /// nothing — the CLASS-1 shape (a control that is reported but not
+    /// load-bearing), in a test rather than in prod.
+    ///
+    /// The symptom was a gate that failed once and passed in isolation, which is
+    /// the worst kind of red: it trains people to re-run until green, and a gate
+    /// people re-run is not a gate. Env vars are PROCESS-global and `cargo test`
+    /// runs threads in parallel, so anything touching them must serialise here.
+    /// Same pattern as `prompt_routes.rs` / `audit_self_verify.rs`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Convenience guard for tests that need to drive `decode_and_validate`
-    /// without WORKOS_AUDIENCE set. Holds a process-wide lock + sets the
+    /// without WORKOS_AUDIENCE set. Holds the module ENV_LOCK + sets the
     /// `TRACELANE_AUTH_TEST_NO_AUDIENCE=1` opt-out for the test's duration.
     struct NoAudienceGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl NoAudienceGuard {
         fn new() -> Self {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _lock = LOCK.lock().expect("auth-test lock poisoned");
+            let _lock = ENV_LOCK.lock().expect("auth-test env lock poisoned");
             unsafe {
                 std::env::remove_var("WORKOS_AUDIENCE");
                 std::env::set_var("TRACELANE_AUTH_TEST_NO_AUDIENCE", "1");
@@ -846,6 +909,7 @@ mod tests {
 
     #[test]
     fn rejects_hs256_alg_confusion() {
+        // HS256 must be rejected even with a matching secret.
         // Without the allowlist, an attacker who substitutes HS256 alg +
         // the RSA public-key bytes as the HMAC secret could mint forged
         // tokens. The allowlist denies the class.
@@ -899,10 +963,13 @@ mod tests {
 
     #[test]
     fn requires_audience_env_in_non_test_path() {
+        // When TRACELANE_AUTH_TEST_NO_AUDIENCE is unset and
         // WORKOS_AUDIENCE is unset, validate must bail. We avoid
         // touching the allowlist by passing an allowed alg (RS256).
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _l = LOCK.lock().expect("audit lock");
+        // THE SAME lock the guard takes — see ENV_LOCK above. This used to be a
+        // second, private `static LOCK`, which is why the two never excluded
+        // each other and this test failed intermittently under parallel runs.
+        let _l = ENV_LOCK.lock().expect("auth-test env lock poisoned");
         let saved_aud = std::env::var("WORKOS_AUDIENCE").ok();
         let saved_skip = std::env::var("TRACELANE_AUTH_TEST_NO_AUDIENCE").ok();
         unsafe {
@@ -945,6 +1012,9 @@ mod tests {
             auth_method: AuthMethod::JwtBearer,
             role,
             key_scope: scope::KeyScope::LegacyFullSurface,
+            // GWY-43: no budget and no per-key rate override on this credential.
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
         }
     }
 
@@ -988,6 +1058,9 @@ mod tests {
                 auth_method: AuthMethod::JwtBearer,
                 role: role_from_claim(raw),
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+                // GWY-43: no budget and no per-key rate override on this credential.
+                budget_usd_monthly: None,
+                rate_limit_rpm: None,
             };
             assert_eq!(claims.role, None, "{raw:?} must not resolve to a role");
             assert!(
@@ -1013,6 +1086,9 @@ mod tests {
             auth_method: AuthMethod::JwtBearer,
             role: role_from_claim(Some("admin")),
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
+            // GWY-43: no budget and no per-key rate override on this credential.
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
         };
         assert_eq!(admin.role, Some(Role::Owner));
         assert!(admin.can_admin() && admin.can_mint_keys() && admin.is_verified_owner());
@@ -1038,6 +1114,7 @@ mod tests {
     ///
     /// The escalation these close: `can_mint_keys` deliberately lets a MEMBER
     /// mint an API key (IDENTITY_TEAM_SPEC §1), and that key used to clear
+    /// `can_admin` — so member → mint → owner-only surface. /A and
     /// closed the last two rows here one at a time; the other six were open.
     #[test]
     fn pl9b_every_owner_surface_denies_a_tenant_api_key() {
@@ -1101,6 +1178,7 @@ mod tests {
         assert!(!m.can_mint_keys());
     }
 
+    /// MECHANISM (, and /A before it), now CLOSED AT THE ROOT.
     ///
     /// Historically `can_admin()` grandfathered `role == None`, API-key auth
     /// always has `role == None`, and `can_mint_keys()` deliberately lets a

@@ -27,9 +27,16 @@ export interface LogoProps {
  * ONE source of truth so the app header and the site header can't drift (the
  * previous app logo was a separate PNG raster, which is why it looked
  * undersized/underweight). Monochrome per the logo lock via `currentColor` →
- * `--logo-ink` (#0c0d0f on light, off-white on dark; never colored, never
- * lava). The mark's bullseye knocks out to `--surface` (the header behind it).
- * The wordmark font comes from `--font-display` (the app wires Source Serif 4).
+ * `--logo-ink`, which tracks `--ink` in both themes and is never coloured.
+ * The wordmark font comes from `--font-display`.
+ *
+ * TWO STALE FACTS CORRECTED 2026-08-22 (CLAUDE.md §17 — the code wins). This
+ * block said `--logo-ink` was "#0c0d0f on light … never lava" and that the app
+ * "wires Source Serif 4" behind `--font-display`. Neither is true: tokens.css
+ * holds `--logo-ink: #171717` (light) / `#f5f5f5` (dark), lava is deleted from
+ * the system, and `apps/web/app/globals.css:44` points `--font-display` at Geist
+ * — the lockup is sans, and has been since the serif was confined to marketing.
+ * The GEOMETRY below is unchanged and remains the generated brand paths.
  */
 export function Logo({
 	height = 26,

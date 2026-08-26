@@ -6,6 +6,7 @@
  *
  * Returns { url } — the client redirects to the Polar-hosted portal.
  *
+ * This route used to forward `req.headers.get("authorization")`, but the
  * browser calls it with a SESSION COOKIE, not a Bearer — so the header was
  * always null and every gateway call 401'd ("Manage billing" was dead). We now
  * MINT the per-user WorkOS JWT via `requireGatewayToken()` and forward it,

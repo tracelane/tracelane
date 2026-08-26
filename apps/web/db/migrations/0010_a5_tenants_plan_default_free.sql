@@ -15,6 +15,7 @@
 --
 -- APPLY: hand-written + manual-paste to Neon, matching the 0009 pattern
 -- (un-journaled; recent Neon migrations here are applied by paste, not
+-- drizzle-kit migrate). See. Prod is already correct, so this is
 -- a non-urgent reconcile whose real value is rebuild-safety.
 
 ALTER TABLE "tenants" ALTER COLUMN "plan" SET DEFAULT 'free';

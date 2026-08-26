@@ -128,7 +128,7 @@ export async function ChainStatusChip({ traceId }: { traceId: string }) {
 		<Link
 			href="/audit"
 			title={title}
-			className="rounded-md no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+			className="rounded-md no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 		>
 			<Badge tone="seal">
 				<ShieldCheck />

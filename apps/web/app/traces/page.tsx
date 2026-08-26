@@ -24,7 +24,12 @@ import {
 	gatewayGet,
 	gatewayGetOrNull,
 } from "@/lib/gateway";
-import { EmptyState, LedgerSeqChip, Skeleton } from "@tracelanedev/ui";
+import {
+	EmptyState,
+	LedgerSeqChip,
+	SegmentedControl,
+	Skeleton,
+} from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -60,6 +65,16 @@ async function LedgerChip() {
 /** Allowed page sizes (gateway clamps limit to 1..200). Default = 25. */
 const VALID_SIZES = [25, 50, 100, 200] as const;
 type PageSize = (typeof VALID_SIZES)[number];
+
+/**
+ * The same four sizes as `SegmentedControl` options. Derived, not re-typed, so a
+ * size added to `VALID_SIZES` cannot go missing from the control. String values
+ * because `?size=` is a URL param and the primitive is keyed on the param value.
+ */
+const SIZE_OPTIONS = VALID_SIZES.map((s) => ({
+	value: String(s),
+	label: String(s),
+}));
 
 /**
  * Parse the ?size= URL param; falls back to 25 for any invalid/missing value.
@@ -260,25 +275,31 @@ function PaginationBar({
 				)}
 			</span>
 			<div className="flex items-center gap-3">
-				{/* Page-size selector — plain links, no client JS needed */}
-				<div className="flex items-center gap-0.5">
-					{VALID_SIZES.map((s) => (
-						<Link
-							key={s}
-							href={pageHref(sp, {
-								size: s === 25 ? undefined : String(s),
-								cursor: undefined,
-							})}
-							className={`rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors ${
-								pageSize === s
-									? "bg-surface-inverse text-ink-inverse"
-									: "bg-surface-2 text-ink-2 hover:text-ink"
-							}`}
-						>
-							{s}
-						</Link>
-					))}
-				</div>
+				{/* Page-size selector — the shared <SegmentedControl> in LINK mode,
+				    with `linkAs={Link}` so it keeps SOFT client-side navigation. The
+				    group gets an `aria-label` because its only visible label is the
+				    "N per page" sentence at the other end of the row.
+
+				    THIS COMMENT PREVIOUSLY SAID "plain hrefs with no client JS, exactly
+				    as before", AND IT WAS BACKWARDS. Before the conversion this was a
+				    `next/link` <Link> — client JS, soft navigation. The first cut of the
+				    conversion rendered a bare <a>, which silently turned every page-size
+				    click into a FULL DOCUMENT RELOAD; the URLs were byte-identical, so
+				    nothing in the diff or the tests could see it. Caught by planting a
+				    `window` marker across a click and observing it survive on <Link> and
+				    vanish on <a>. `linkAs` restores the original mechanism.*/}
+				<SegmentedControl
+					linkAs={Link}
+					label="Traces per page"
+					value={String(pageSize)}
+					options={SIZE_OPTIONS}
+					hrefFor={(v) =>
+						pageHref(sp, {
+							size: v === "25" ? undefined : v,
+							cursor: undefined,
+						})
+					}
+				/>
 				{paged && (
 					<Link
 						href={pageHref(sp, { cursor: undefined })}
@@ -337,7 +358,7 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 					action={
 						<Link
 							href={pageHref(sp, { cursor: undefined })}
-							className="text-[13px] font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+							className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 						>
 							← Newest
 						</Link>
@@ -368,7 +389,7 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 					action={
 						<Link
 							href="/traces"
-							className="text-[13px] font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+							className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 						>
 							Clear filters
 						</Link>
@@ -384,7 +405,7 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 					action={
 						<Link
 							href="/traces?range=all"
-							className="text-[13px] font-medium text-action-ink underline underline-offset-2 hover:text-ink"
+							className="text-sm font-medium text-action-ink underline underline-offset-2 hover:text-ink"
 						>
 							View all time →
 						</Link>
@@ -463,7 +484,7 @@ export default async function TracesPage({
 
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mb-4 flex items-center justify-between">
+			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div className="flex items-baseline gap-3">
 					<h1 className="t-h1">Traces</h1>
 					<Suspense fallback={null}>
@@ -475,14 +496,14 @@ export default async function TracesPage({
 						<a
 							href={`/api/traces/export?${exportPrefix}format=csv`}
 							download
-							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							Export CSV
 						</a>
 						<a
 							href={`/api/traces/export?${exportPrefix}format=json`}
 							download
-							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							JSON
 						</a>
@@ -493,7 +514,7 @@ export default async function TracesPage({
 			<FilterBar />
 
 			{sp.failover === "true" && (
-				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2/40 px-3 py-1.5 text-xs text-ink-2">
+				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
 					<span className="font-medium text-ink">Failover only</span>
 					<span>— traces where a cross-provider failover fired.</span>
 					<Link
@@ -506,7 +527,7 @@ export default async function TracesPage({
 			)}
 
 			{(sp.since || sp.until) && (
-				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2/40 px-3 py-1.5 text-xs text-ink-2">
+				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
 					<span className="font-medium text-ink">Custom time window</span>
 					<span>— traces within the period you drilled into.</span>
 					<Link

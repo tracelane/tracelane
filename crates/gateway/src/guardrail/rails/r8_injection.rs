@@ -2,6 +2,7 @@
 //! **indirect** (RAG / tool-result) instruction-override (OWASP LLM01).
 //!
 //! V1 is a curated-pattern heuristic (no ML claim — the ONNX Llama Prompt Guard
+//! sidecar is V1.1 = R8b, gated on + an on-hardware benchmark). **The V1
 //! work is making the scan consume `rag_context` + `tool_results`, not only the
 //! user message** — pure plumbing off Phase 0, and the indirect vectors are the
 //! ones that prove it. A high-confidence pattern → **block**; a medium signal →

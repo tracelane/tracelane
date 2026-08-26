@@ -14,8 +14,46 @@
  *   budgetRemaining = 1 - burnRate               (100% untouched, 0% spent, <0 = over budget)
  */
 
-/** Default availability target — three nines. Per-tenant config = future work. */
+/** Fallback availability target — three nines. Used when the plan is unknown. */
 export const SLO_TARGET_AVAILABILITY = 0.999;
+
+/**
+ * Availability target for a `plan_lookup_key`, per the ADR-020 SLAs.
+ *
+ * **THIS MUST MIRROR `crates/gateway/src/alerts/checker.rs::plan_key_to_error_budget`
+ * (`checker.rs:74-79`), which is the authority.** It expresses the same contract as an
+ * availability target rather than an error-budget fraction, so the two are reciprocal:
+ * `errorBudget = 1 - target`.
+ *
+ * WHY THIS EXISTS. Both `/dashboard` and `/slo` called `computeSloBudget(requests, errors)`
+ * with NO target, so every tenant on every plan was measured against the 99.9% default —
+ * while the ALERT ENGINE measured the same tenant against its contracted plan target. The
+ * two surfaces then disagreed about whether the customer was in breach:
+ *
+ *   A Team tenant (99% SLA) at a 0.5% error rate saw burn **5.00x** and
+ *   **"400% over"** budget in danger tone, while the alert engine computed
+ *   **0.5x / 50% remaining** on the same numbers and stayed correctly silent.
+ *
+ * The Enterprise case inverts and is worse: a 99.95% tenant was shown as comfortable
+ * while genuinely burning budget, because 0.001 is a LOOSER budget than their 0.0005.
+ *
+ * Keys, not plan names, on purpose: the gateway keys on `plan_lookup_key` and so does
+ * `plan_entitlements`. Going through `PLAN_TO_LOOKUP_KEY` keeps one vocabulary.
+ */
+export function availabilityTargetForPlanKey(
+	planLookupKey: string | null | undefined,
+): number {
+	switch (planLookupKey) {
+		case "team_v1":
+			return 0.99; // 99%    — error budget 0.01
+		case "enterprise_v1":
+			return 0.9995; // 99.95% — error budget 0.0005
+		default:
+			// business_v1 / free / builder / unknown / missing → 99.9%, matching the
+			// gateway's `_ =>` arm. An unknown key must NOT silently become 100%.
+			return SLO_TARGET_AVAILABILITY;
+	}
+}
 
 export interface SloBudget {
 	/** Target availability as a percentage, e.g. 99.9. */

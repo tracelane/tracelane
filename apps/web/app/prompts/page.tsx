@@ -8,6 +8,7 @@
  *   - Data: table of prompts with env badges + version counts
  *
  * tenant_id is resolved by the gateway from the WorkOS JWT — the dashboard
+ * never binds a tenant id itself (ADR-042 /).
  */
 
 import { DeletePromptButton } from "@/app/prompts/DeletePromptButton";
@@ -42,7 +43,10 @@ async function PromoteGateBanner() {
 	const ent = await resolveEntitlements(row?.id, plan);
 	if (ent.prompt_promotion_write) return null;
 	return (
-		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
+		// `rounded-lg` (the control band), matching WarmingBanner — a full-width
+		// notice strip is not a card, and the two strips in the app were at two
+		// different radii (12px here, 8px there) for no reason anyone recorded.
+		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
 			<span>
 				<span className="font-semibold">
 					🔒 Promoting a version across environments requires Team ($249/mo)
@@ -121,7 +125,7 @@ async function PromptListData() {
 					{list.map((prompt) => (
 						<tr
 							key={prompt.prompt_id}
-							className="transition-colors hover:bg-surface-2/30"
+							className="transition-colors hover:bg-surface-hover"
 						>
 							<td className="px-3 py-2">
 								<Link

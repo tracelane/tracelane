@@ -95,6 +95,7 @@ async fn resolve_uncached(org_id: &str) -> Result<Uuid> {
 /// Dev / no-pool fallback: deterministic hash so local `cargo run` + unit
 /// tests resolve an org without a database.
 ///
+///  hardening: the hash resolves to a tenant that exists in NO real
 /// `tenants` table (prod ids are random), so it must never answer for a
 /// real WorkOS-issued token. If WorkOS IS configured (`workos_configured`,
 /// i.e. real JWTs are being validated) the fallback refuses even in a debug
@@ -152,6 +153,7 @@ mod tests {
 
     #[test]
     fn dev_fallback_refuses_when_workos_is_configured() {
+        // With WorkOS configured (real tokens in play) the hash
         // fallback must refuse even in a debug build — pure fn, no env twiddle.
         let err = no_pool_fallback("org_real_token", true)
             .expect_err("must refuse hash fallback when WorkOS is configured");

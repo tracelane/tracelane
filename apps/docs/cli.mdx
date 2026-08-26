@@ -9,7 +9,7 @@ The `tlane` CLI is the operator-side companion to the Tracelane gateway.
 ```bash
 npm install -g @tracelanedev/cli
 # or
-npx tlane <command>
+npx @tracelanedev/cli <command>
 ```
 
 All commands respect:
@@ -18,7 +18,7 @@ All commands respect:
 |---|---|---|
 | `TRACELANE_API_KEY` | Tenant API key (`tlane_<base62>`) | required for live commands |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL | `https://gateway.tracelane.dev` |
-| `TRACELANE_TRACE_CONTENT` | Capture full prompt/response in spans | `false` |
+| `TRACELANE_TRACE_CONTENT` | **Not implemented — reads are ignored.** Prompt/response text is never captured by the CLI, the SDKs or the gateway. See [Security](/security#prompt-content) | — |
 
 ## Commands
 
@@ -76,14 +76,13 @@ what CI calls; `eval list` reads the local eval index.
 
 ```bash
 tlane eval run                                 # all suites
-tlane eval run --suite pp                      # pain-points only
+tlane eval run --suite gc                      # gateway-correctness only
 tlane eval run --suite ft --dry-run            # print the command, don't run it
 tlane eval list
 ```
 
 Suite ids are `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pp` (pain-points), `pir` (pii-redaction),
-`pi` (prompt-injection). An unrecognised id is a hard error (exit 2), never a
+`is` (ingest-schema), `pir` (pii-redaction), `pi` (prompt-injection). An unrecognised id is a hard error (exit 2), never a
 silent run-everything. Tracelane's own CI runs `--suite all`.
 
 `eval run` and `eval list` take no other flags, and both need a checkout of the

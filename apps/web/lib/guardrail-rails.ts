@@ -64,12 +64,24 @@ export const RAIL_ROSTER: RailMeta[] = [
 	{
 		id: "R3_pinning",
 		name: "Tool-definition pinning",
-		action: "block",
+		// "warn", NOT "block" — the ENGINE warns and the request PROCEEDS.
+		// `r3_tool_safety.rs:322` returns `RailOutcome::warn(TOOL_DEF_DRIFT)` on drift.
+		// The one blocking path (`:310`, TOOL_SUSPENDED) requires
+		// `DriftPosture::Suspend`, which is opt-in via
+		// `TRACELANE_GUARDRAIL_SUSPEND_DRIFTED_TOOLS=1` and OFF BY DEFAULT (`:30`).
+		// So in every default deployment this said "Blocks" while a rug-pulled tool
+		// went through — and a red danger badge promising enforcement we do not
+		// perform is the exact framing the ADR-055 amendment forbids: agent-tool
+		// safety is a DETECTION capability of the recorder, never an
+		// "enforcement / block-before-execution" lead, because a false-positive
+		// block breaks a legitimate run and is worse than the failure it prevents.
+		action: "warn",
 		side: "request",
 		// FREE on every plan, OSS included — `r3_tool_safety.rs:246` returns
+		// `None` from `Rail::feature` (, founder ruling 2026-08-04).
 		gated: false,
 		blurb:
-			"Blocks a request when a tool's definition changed from the last-approved version — a silent MCP rug-pull.",
+			"Records a tamper-evident signature when a tool's definition changes from the last-approved version — a silent MCP rug-pull. The request proceeds; the drift is on the span and surfaced in Signatures. Refusing calls to a drifted tool is opt-in (off by default).",
 	},
 	{
 		id: "R4_trifecta",
@@ -77,6 +89,7 @@ export const RAIL_ROSTER: RailMeta[] = [
 		action: "block",
 		side: "request",
 		// FREE on every plan, OSS included — `r4_trifecta.rs:237` returns `None`
+		// from `Rail::feature` (, founder ruling 2026-08-04). A flagship
 		// agent-safety rail a free tier never sees is worthless as proof.
 		gated: false,
 		blurb:
@@ -130,6 +143,7 @@ export const RAIL_ROSTER: RailMeta[] = [
  * `builder_v1`, `true` from `team_v1` up — so "Team" is a real purchase path.
  *
  * Only the four data-governance / quality rails appear. R3_pinning and
+ * R4_trifecta were removed here (, founder ruling 2026-08-04): the gateway
  * made both UNGATED (`Rail::feature()` → `None`), so a Free tenant already runs
  * them and the old "Team 🔒" badge on those two rows was a false upsell. Their
  * `f_guardrail_r3_pinning` / `f_guardrail_r4` columns are still `true` on every

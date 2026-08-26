@@ -35,19 +35,19 @@ Every edge carries its invariant. Dotted boxes are **not built**.
                     ┌───────────────────────────────────────────────────┐
    SDK / CLI /      │  RUST GATEWAY   crates/gateway  (ONE binary)       │
    OpenAI client ──►│                                                    │
-   Bearer tlane_…   │  chat_completions_handler  server.rs:882-1712      │
-   or WorkOS JWT    │  ── the ENTIRE hot path is this one 860-line fn ── │
+   Bearer tlane_…   │  chat_completions_handler  in server.rs            │
+   or WorkOS JWT    │  ── the ENTIRE hot path is this ONE long fn ──     │
                     │                                                    │
-                    │  1  auth::validate_authorization      :925         │
-                    │  2  entitlement resolve + rate limit  :955         │
-                    │  2b monthly quota hard-cap → 429      :988         │
-                    │  3  detection layer (OBSERVE-first)   :1036        │
-                    │  4  audit publish  ── FAIL-CLOSED 503 :1076        │
-                    │     provider resolve + BYOK key       :1103        │
-                    │  4b inline guardrails ─ FAIL-CLOSED   :1203        │
+                    │  1  auth::validate_authorization                   │
+                    │  2  entitlement resolve + rate limit               │
+                    │  2b monthly quota hard-cap → 429                   │
+                    │  3  detection layer (OBSERVE-first)                │
+                    │  4  audit publish  ── FAIL-CLOSED 503              │
+                    │     provider resolve + BYOK key                    │
+                    │  4b inline guardrails ─ FAIL-CLOSED                │
                     │     <UNTRUSTED_USER_DATA> wrap                     │
                     │     circuit breaker (+ start-time kill flags)      │
-                    │     dispatch                          :1341        │
+                    │     dispatch                                       │
                     └───┬──────────────┬──────────────┬─────────────┬────┘
                         │              │              │             │
         spans │ NATS    │      audit │ NATS          │ Postgres    │ HTTPS
@@ -90,15 +90,15 @@ Every edge carries its invariant. Dotted boxes are **not built**.
 
 | Edge | Invariant | Evidence |
 |---|---|---|
-| client → gateway | `tenant_id` comes ONLY from `Claims.tenant_id`, never a request body. `TenantId` has three named constructors — `from_jwt_claim`, `from_spiffe_svid`, `from_self_host_config` | `crates/shared/src/tenant.rs:25,:33,:45`; `server.rs:947` |
-| client → gateway | **The identity-provider org id is NOT the internal tenant UUID.** It is bridged by `auth::resolve_tenant_id` via a 30s cache; if a JWT carries both, they must agree or the token is rejected | `crates/gateway/src/auth/mod.rs:361-388`; `auth/org_tenant_cache.rs:40` |
-| gateway → NATS (spans) | `NATS_URL` is **REQUIRED** — unset is a **boot refusal**; opt out explicitly with `TRACELANE_ALLOW_NO_CAPTURE=1`. A connect *failure* retries in the background rather than disabling capture for the process lifetime. `/health` reports `capture_enabled` / `spans_dropped` / `capture_healthy` | `server.rs:344-395` |
-| gateway → NATS (audit) | ACKED JetStream publish, **fail-CLOSED** → `503 {"error":"audit_unavailable"}`. `seq` is assigned only by the durable consumer | `audit.rs:493-554`; `server.rs:1111`, `:1239` |
-| NATS → ingest | Ack **after** the ClickHouse flush. OTLP-direct spans carry **no ack** — 200 is returned on channel `try_send` | `nats_consumer.rs:119-130`; `clickhouse_writer.rs:277-280`; `span_envelope.rs:20-23` |
-| ingest → ClickHouse | Ingest is the **sole** span writer. The gateway never writes spans | `clickhouse_writer.rs:374`; no such insert under `crates/gateway/src/` |
-| gateway ↔ Postgres | **Never per-request.** In-process cache, 15-min TTL, invalidated by `LISTEN/NOTIFY` | `entitlement_cache.rs:65`, `:565-567`, `:30-32` |
-| web → data | apps/web has **no ClickHouse client**. Every ClickHouse read is a gateway `/v1/*` call | `apps/web/package.json:22-32`; `lib/gateway.ts:4-13` |
-| gateway → provider | Model→provider map **fails closed** (`_ => return None` → 400 `unroutable_model`). No default provider — defaulting would ship the wrong tenant's BYOK credential | `providers/mod.rs:709-712`; `server.rs:1141-1144` |
+| client → gateway | `tenant_id` comes ONLY from `Claims.tenant_id`, never a request body. `TenantId` has three named constructors — `from_jwt_claim`, `from_spiffe_svid`, `from_self_host_config` | `grep -n 'pub fn from_' crates/shared/src/tenant.rs` |
+| client → gateway | **The identity-provider org id is NOT the internal tenant UUID.** It is bridged by `auth::resolve_tenant_id` via a 30s cache; if a JWT carries both, they must agree or the token is rejected | `grep -n 'fn resolve_tenant_id' crates/gateway/src/auth/mod.rs` |
+| gateway → NATS (spans) | `NATS_URL` is **REQUIRED** — unset is a **boot refusal**; opt out explicitly with `TRACELANE_ALLOW_NO_CAPTURE=1`. A connect *failure* retries in the background rather than disabling capture for the process lifetime. `/health` reports `capture_enabled` / `spans_dropped` / `capture_healthy` | `grep -n 'ALLOW_NO_CAPTURE' crates/gateway/src/server.rs` |
+| gateway → NATS (audit) | ACKED JetStream publish, **fail-CLOSED** → `503 {"error":"audit_unavailable"}`. `seq` is assigned only by the durable consumer | `grep -n 'audit_unavailable' crates/gateway/src/server.rs` |
+| NATS → ingest | Ack **after** the ClickHouse flush. OTLP-direct spans carry **no ack** — 200 is returned on channel `try_send` | `grep -n 'Do NOT ack here' crates/ingest/src/nats_consumer.rs` |
+| ingest → ClickHouse | Ingest is the **sole** span writer. The gateway never writes spans | `grep -n 'insert("tracelane.spans")' crates/ingest/src/clickhouse_writer.rs` |
+| gateway ↔ Postgres | **Never per-request.** In-process cache, 15-min TTL, invalidated by `LISTEN/NOTIFY` | `grep -n 'LISTEN entitlements_changed' crates/gateway/src/entitlement_cache.rs` |
+| web → data | apps/web has **no ClickHouse client**. Every ClickHouse read is a gateway `/v1/*` call | `grep -ci clickhouse apps/web/package.json` → **0** |
+| gateway → provider | Model→provider map **fails closed** (`_ => return None` → 400 `unroutable_model`). No default provider — defaulting would ship the wrong tenant's BYOK credential | `grep -n 'unroutable_model' crates/gateway/src/providers/mod.rs` |
 
 ---
 
@@ -161,7 +161,7 @@ deletes it.
 The identity-provider organisation id is **not** the internal tenant UUID. Binding the raw
 org id into a ClickHouse or Postgres query silently matches **zero rows** — no error, no
 alert. The gateway's `auth::resolve_tenant_id` is the only bridge
-(`crates/gateway/src/auth/mod.rs:361-388`); `scripts/ci/check-tenant-id-provenance.sh`
+(`grep -n 'fn resolve_tenant_id' crates/gateway/src/auth/mod.rs`); `scripts/ci/check-tenant-id-provenance.sh`
 guards `apps/web`, `apps/mcp`, `packages/cli` plus two gateway audit endpoints.
 
 **The tenant-isolation guard is per-query.** `scripts/ci/check-tenant-isolation.py`
@@ -234,18 +234,18 @@ Stated plainly, because several committed documents in this repository still ove
 
 | Thing | Reality |
 |---|---|
-| 3 ML predictors (SLM judge, trajectory guard, prompt guard) | **Unconditional stubs.** `SlmJudge::judge` returns `1.0/1.0/1.0` on **both** branches — shipping a trained model would not switch it on (`crates/gateway/src/predictive/slm_judge.rs:57-73`). No model weights are committed anywhere, and the gateway has **no ONNX runtime dependency**, so in-process inference is impossible as the crate stands |
+| 3 ML predictors (SLM judge, trajectory guard, prompt guard) | **Unconditional stubs.** `SlmJudge::judge` returns `1.0/1.0/1.0` on **both** branches — shipping a trained model would not switch it on (`grep -n 'fn judge' crates/gateway/src/predictive/slm_judge.rs`). No model weights are committed anywhere, and the gateway has **no ONNX runtime dependency**, so in-process inference is impossible as the crate stands |
 | Prompt-guard sidecar | Not in any compose file; its URL defaults to the gateway's own port (self-call → non-2xx → fail-open) |
 | A2UI / stuck-loop / MCP rug-pull / A2A / taint detection | Gated on payload fields **no live ingress produces** (`protocol`, `tool_name`, `mcp_server_name`, `tracelane_message_type`). The gateway has exactly one proxied route. `apps/docs/archive/predictive-guardrails.mdx` correctly labels these **Roadmap** |
-| Detection enforcement | **Observe-first by default** — a `Block` verdict is logged, not a 403, unless `TRACELANE_PREDICTIVE_ENFORCE` is set (`server.rs:486`, `:1052`). This is the intended posture, not a bug |
+| Detection enforcement | **Observe-first by default** — a `Block` verdict is logged, not a 403, unless `TRACELANE_PREDICTIVE_ENFORCE` is set (`grep -n 'TRACELANE_PREDICTIVE_ENFORCE' crates/gateway/src/server.rs`). This is the intended posture, not a bug |
 | Tool-pinning and trifecta rails | No customer-facing write path for `tool_capabilities` yet, so these are inert for real tenants |
 | `crates/policy` | A Cedar **scaffold**, not wired, with no `cedar-policy` dependency. Every method returns `Deny` (fail-closed) |
-| R2 cold tier | The NDJSON batcher exists; **nothing feeds it** — `crates/ingest/src/main.rs:350` does `drop(r2_tx)` |
+| R2 cold tier | The NDJSON batcher exists; **nothing feeds it** — `crates/ingest/src/main.rs` does `drop(r2_tx)` (`grep -n 'drop(r2_tx)' crates/ingest/src/main.rs`) |
 | `ee/` license zone | **Does not exist.** The whole tree is Apache-2.0 |
 | ClickHouse tiered storage | No `storage_policy` or `TTL … TO DISK` anywhere under `infra/` — retention tiers are not backed by a warm/cold tier |
 | Performance budgets (§6) | **Targets, not measurements.** `bench/gateway/RESULTS.md` is explicitly UNPOPULATED; `bench/predictive/RESULTS.md` is empty. Do not quote these as achieved numbers |
 | Eval suite as a merge gate | The gate runs with **mock providers**, so behavioral assertions **SKIP**. Only the separate live-stack job exercises real behaviour, and it currently runs one suite |
-| Provider coverage | **30+.** Exactly 35 are routable — 7 native adapters + 28 OpenAI-compatible — derived by `scripts/ci/check-provider-count.py` |
+| Provider coverage | **150+ providers.** Routable = every row of `crates/gateway/providers.tsv` + 6 native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived, never written down — `scripts/ci/check-provider-count.py` computes it and fails any file that disagrees |
 
 ---
 
@@ -255,7 +255,7 @@ Only what differs from the ecosystem default or is otherwise non-obvious.
 
 ### Rust
 - Edition **2024**. Toolchain pinned in `rust-toolchain.toml` → **1.95**. The MSRV is a
-  **separate contract**: `Cargo.toml:16` → **1.88**.
+  **separate contract**: `grep -n 'rust-version' Cargo.toml` → **1.88**.
 - **No `unwrap()` / `expect()` outside tests.** `?` + `thiserror` internally,
   `anyhow::Context` at boundaries. Never `Box<dyn Error>`.
 - **Fail-CLOSED on security paths, fail-OPEN on fault-tolerance paths.** Each fn's
@@ -388,7 +388,7 @@ pnpm test && cargo test --workspace --all-features && pytest
 pnpm eval:run --suite=all      # valid suites: all, ft, gc, is, pp, pir, pi
 ```
 
-`scripts/verify-all.sh --fast` runs the full local gate (~36 checks: fmt, clippy
+`scripts/verify-all.sh` runs the full local gate (fmt, clippy
 `--all-targets`, `cargo test --all-features`, cargo-deny/audit/machete, 19 guard scripts,
 biome, typecheck, vitest, knip, `pnpm audit`, gitleaks, ruff, pytest). Enable the pre-push
 hook with `git config core.hooksPath .githooks` — it runs that gate and blocks on failure.

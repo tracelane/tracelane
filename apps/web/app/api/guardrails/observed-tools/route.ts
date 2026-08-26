@@ -1,4 +1,5 @@
 /**
+ * Proxy for the observed-tools list (/B).
  *
  * The gateway owns the tenant-scoped read — the tenant comes from the WorkOS
  * JWT we forward, never from anything the browser sends.

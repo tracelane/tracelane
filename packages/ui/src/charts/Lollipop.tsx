@@ -9,9 +9,20 @@ import { cn } from "../lib/cn";
  * from "ADR-051", which is the billing/EE split and carries no design authority;
  * a guard now blocks that mis-citation: scripts/ci/check-adr051-design-miscite.py).
  *
- * The tallest bucket is emphasised by INK WEIGHT, not hue. It used to be painted in
- * the lava action; ADR-074 §1 makes colour mean something happened, and "this is the
- * biggest bar" is already visible from the bar being the biggest.
+ * COLOUR (P0.11, 2026-08-22). Bars are `--chart-primary` — the ONE data colour. The
+ * class was `fill-info` until the P0 palette swap retargeted `--info` from a blue at the
+ * SAME chart neutral, so this is a rename, not a repaint: `chart-primary` says "this is
+ * the series", where `info` said "this is a state". Gridlines moved from `--line` (the
+ * chrome hairline) to `--chart-grid`, which exists for exactly this and is a step
+ * quieter, so the axis recedes behind the bars instead of ruling them.
+ *
+ * The tallest bucket is emphasised by INK WEIGHT, not hue. It was once painted in the
+ * retired accent red; P0 makes colour mean something happened, and "this is the biggest
+ * bar" is already visible from the bar being the biggest. The split is 1.00 vs 0.70 —
+ * against graphite that is #202124 vs an effective ~#636466 on a white card, and #f2f2f2
+ * vs an effective ~#b0b0b0 on a dark one, so the hot bucket reads at both ends. It is
+ * deliberately the same pair `BarChart` uses, so the app's two bar charts emphasise
+ * identically.
  *
  * Pure presentation: `value`s are the real per-bucket counts supplied by the
  * caller; nothing is smoothed or fabricated. An empty bucket (value 0) renders
@@ -109,7 +120,7 @@ export function Lollipop({
 							x2={W - PAD_R}
 							y1={y}
 							y2={y}
-							stroke="var(--line)"
+							stroke="var(--chart-grid)"
 							strokeWidth={1}
 							strokeDasharray={t === 0 ? undefined : "3 3"}
 						/>
@@ -117,6 +128,7 @@ export function Lollipop({
 							x={PAD_L - 6}
 							y={y + 3}
 							textAnchor="end"
+							/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 							className="fill-[var(--ink-3)] text-[9px] tabular-nums"
 						>
 							{compactCount(Math.round(t * yMax))}
@@ -152,7 +164,10 @@ export function Lollipop({
 						width={barW}
 						height={h}
 						rx={Math.min(2, barW / 2)}
-						className={cn("fill-info", hot ? "opacity-100" : "opacity-70")}
+						className={cn(
+							"fill-chart-primary",
+							hot ? "opacity-100" : "opacity-70",
+						)}
 					/>,
 					showLabel ? (
 						<text
@@ -161,7 +176,7 @@ export function Lollipop({
 							y={y - 8}
 							textAnchor="middle"
 							className={cn(
-								"text-[9px] font-semibold tabular-nums",
+								"text-2xs font-semibold tabular-nums",
 								hot ? "fill-[var(--ink)]" : "fill-[var(--ink-2)]",
 							)}
 						>

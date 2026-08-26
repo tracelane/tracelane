@@ -28,7 +28,7 @@ interface ChangeResult {
 }
 
 const FIELD =
-	"w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal";
+	"w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
 
 export function EmailChangeForm({ email }: { email: string }) {
 	const [newEmail, setNewEmail] = useState("");

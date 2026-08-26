@@ -28,6 +28,7 @@ const ERROR_RATE_SQL: &str = "SELECT if(count() = 0, 0.0, \
     WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai_provider_name') != '' \
     AND start_time >= now() - toIntervalMinute(?)";
 // burn = error_fraction / error_budget, where error_budget = 1 - SLO_target.
+//  #6: the budget is the tenant's PLAN target (ADR-020: Team 99%
 // Business 99.9% / Enterprise 99.95%), resolved per-tenant in Rust — NOT a
 // hardcoded 0.001 (99.9%), which overstated a Team tenant's burn 10×. This SQL
 // returns the raw error fraction; `burn_rate()` divides by the tenant budget.
@@ -82,6 +83,7 @@ fn plan_key_to_error_budget(key: Option<&str>) -> f64 {
 /// requires both the control plane (Postgres, for rules) and ClickHouse (metrics).
 /// How long a fetched rule set is reused before Postgres is asked again.
 ///
+///  Neon (2026-08-11). `run_once` used to run the `alert_rules JOIN
 /// alert_destinations` query on EVERY tick. At the 60-second default that is
 /// 1,440 round trips a day to a Frankfurt compute to ask a question that, with
 /// zero alert rules configured, has no rows behind it — and every one of them
@@ -111,6 +113,9 @@ pub struct AlertChecker {
     interval: Duration,
     /// `(fetched_at, rules)`. `None` = never fetched.
     rules_cache: tokio::sync::RwLock<CachedRules>,
+    /// When the daily miss-cohort overhead REPORT last ran. `None` = never.
+    /// See [`AlertChecker::maybe_report_miss_cohort_overhead`].
+    last_overhead_report: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl AlertChecker {
@@ -126,6 +131,7 @@ impl AlertChecker {
             entitlements,
             interval,
             rules_cache: tokio::sync::RwLock::new(None),
+            last_overhead_report: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -164,6 +170,19 @@ impl AlertChecker {
 
     /// One evaluation pass over all enabled rules.
     pub async fn run_once(&self) -> anyhow::Result<()> {
+        // B-264 / R75. Deliberately BEFORE the zero-rules early return below.
+        //
+        // This is an OPERATOR self-check, not a tenant alert rule, and prod has
+        // zero rules — so placing it inside the rule loop would have made it a
+        // control that can never fire. That is the exact CLASS-1 shape B-264 was,
+        // and shipping the detection FOR B-264 in that shape would have been the
+        // joke writing itself.
+        //
+        // It costs one ClickHouse query per DAY, not per tick, so the "zero rules
+        // must cost nothing" invariant below is bent knowingly and bounded: 1
+        // query/day against 96 ticks/day.
+        self.maybe_report_miss_cohort_overhead().await;
+
         let rules = self.cached_rules().await?;
         // Zero rules is the steady state today (alerting ships dark), and it must
         // cost nothing: no ClickHouse queries, no entitlement lookups, no work.
@@ -180,6 +199,7 @@ impl AlertChecker {
                 continue;
             }
             let Some(value) = self.evaluate(&rule).await else {
+                // D-a(ii) / INSIDE THE ALERTING ENGINE. This `continue` treats
                 // "I cannot see" as "nothing to do": the rule is skipped, the customer's
                 // alert silently stops evaluating, and the dashboard still shows it
                 // enabled. Fail-safe is the right CHOICE — firing on an unreadable metric
@@ -247,6 +267,151 @@ impl AlertChecker {
             "cost_usd" => self.ch_scalar(COST_SQL, rule).await,
             "quota_pct" => self.quota_pct(rule.tenant_id).await,
             _ => None,
+        }
+    }
+
+    /// **THE B-264 DETECTION — a REPORT, not a control. Read the last paragraph
+    /// before trusting a green day.**
+    ///
+    /// B-264 was a ~10x gateway-overhead regression that ran in production for
+    /// 5 h 11 m and was caught by the founder disbelieving a headline number,
+    /// not by any gate. Nothing could have seen it: the criterion benches touch
+    /// none of the changed code, the Benchmarks CI job runs weekly on `schedule`
+    /// only, k6 is never invoked by any workflow, and there is no
+    /// ratio-or-baseline-relative perf gate anywhere in the tree —
+    /// `check-bench-budgets.mjs` compares against an ABSOLUTE budget.
+    ///
+    /// **Why every existing threshold was blind: the defect moved the 5-25 ms
+    /// band, and the >30 ms tail actually FELL.** Bucketing `claude-haiku-4-5`
+    /// overhead on the clean day vs the regression window: the 5-25 ms band went
+    /// 2.2% -> 22%. Proof E's 30 ms, `--cold`'s 120 ms, k6's 25 ms and the
+    /// `overhead_p99` alert's 15 ms all sit ABOVE the band that moved.
+    ///
+    /// So this measures the p50 of the **cache-MISS cohort, per model**, which is
+    /// the population the defect actually lived in — a hit is served before
+    /// dispatch and cannot show a dispatch-path regression.
+    ///
+    /// **THREE COHORTS, KEPT DISTINCT, and that is the whole design.** A span
+    /// either carries `tracelane_semantic_cache_hit` false (MISS), true (HIT), or
+    /// not at all (UNKNOWN — written before GWY-24 deployed, or by a path that
+    /// does not set the dimension). Folding UNKNOWN into MISS would pour every
+    /// pre-cache span into the cohort and reproduce the exact mixed-population
+    /// error that made the regression invisible to a per-hour query over all
+    /// models: with n=8-10/hour and two models whose warm overhead differs ~10x
+    /// (haiku ~1.8 ms, vertex ~17 ms), the median flips on traffic mix alone, and
+    /// post-fix hours read HIGHER than regressed ones. Widest scope is necessary
+    /// and NOT sufficient; the cohort must be held fixed.
+    ///
+    /// **⚠️ THIS IS A REPORT UNTIL SOMETHING RELIABLY GENERATES MISSES, AND TODAY
+    /// NOTHING DOES.** Measured on prod 2026-08-22: `n_miss = 0` for BOTH models
+    /// over 24 h **and over 7 days** — every span carrying the dimension is a HIT,
+    /// and the p50 is `nan`. The cause is structural, not a quiet week: the
+    /// dogfood driver replays a FIXED 15-prompt array, so after the first pass it
+    /// can never miss again. **A control over an empty cohort is CLASS-1 with a
+    /// green badge** — which is B-264's own lesson — so this emits and never
+    /// decides. Promoting it to a control needs one thing: vary the dogfood
+    /// prompt set so misses exist. That is a change to
+    /// `/opt/tracelane/dogfood/dogfood.sh`, not new infrastructure.
+    ///
+    /// An empty cohort therefore prints CANNOT DETERMINE and never a number. A
+    /// `nan` or a `0` rendered as a p50 is the zero-vs-unknown failure this
+    /// repo has already paid for.
+    async fn maybe_report_miss_cohort_overhead(&self) {
+        const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+        // THE TENANT IS REQUIRED, AND THAT IS A FEATURE, NOT A CONCESSION.
+        //
+        // The first version of this query had no `tenant_id` filter — an operator
+        // aggregate over every tenant's spans — and `check-tenant-isolation.py`
+        // refused the commit. That guard has NO exemption mechanism, deliberately.
+        // It was right on both counts:
+        //
+        //   * it is a cross-tenant read of customer data for an internal metric,
+        //     which is the #1 recurring bug class in this repo; and
+        //   * on the MERITS it was the mixed-population error this report exists to
+        //     expose. B-264 stayed invisible to a fleet-wide per-hour query
+        //     precisely because two models with ~10x different warm overhead were
+        //     pooled. Pooling TENANTS on top of that is the same mistake one level
+        //     up. A regression signal needs its cohort held FIXED.
+        //
+        // So it names ONE tenant — the controlled dogfood workload whose traffic we
+        // generate — and is OFF when unset rather than silently fleet-wide.
+        let Ok(raw) = std::env::var("TRACELANE_OVERHEAD_REPORT_TENANT") else {
+            return;
+        };
+        let Ok(tenant) = Uuid::parse_str(raw.trim()) else {
+            tracing::warn!("TRACELANE_OVERHEAD_REPORT_TENANT is not a UUID — report skipped");
+            return;
+        };
+        {
+            let mut last = self.last_overhead_report.lock().await;
+            match *last {
+                Some(t) if t.elapsed() < EVERY => return,
+                _ => *last = Some(std::time::Instant::now()),
+            }
+        }
+
+        // `gateway_overhead_us > 0` excludes spans predating the materialized
+        // column; it is NOT a quality filter and must never become one.
+        const SQL: &str = "\
+            SELECT JSONExtractString(attributes, 'gen_ai_request_model'), \
+                   countIf(JSONHas(attributes, 'tracelane_semantic_cache_hit') \
+                           AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')), \
+                   quantileIf(0.5)(gateway_overhead_us, \
+                           JSONHas(attributes, 'tracelane_semantic_cache_hit') \
+                           AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')), \
+                   countIf(NOT JSONHas(attributes, 'tracelane_semantic_cache_hit')) \
+            FROM tracelane.spans \
+            WHERE tenant_id = ? AND name = 'gen_ai.chat' AND gateway_overhead_us > 0 \
+              AND start_time > now() - INTERVAL 24 HOUR \
+            GROUP BY 1 ORDER BY 2 DESC";
+
+        let rows = match self
+            .ch
+            .query(SQL)
+            .bind(tenant.to_string())
+            .fetch_all::<(String, u64, f64, u64)>()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                // "I cannot see" is not "nothing is wrong" (CLAUDE.md §14).
+                tracing::warn!(error = %err, "overhead miss-cohort report query failed");
+                return;
+            }
+        };
+
+        if rows.is_empty() {
+            tracing::info!(
+                report = "gateway_overhead_miss_cohort",
+                verdict = "CANNOT_DETERMINE",
+                reason = "no chat spans with a materialized overhead in the last 24h for the configured tenant",
+            );
+            return;
+        }
+
+        for (model, n_miss, p50_us, n_unknown) in rows {
+            if n_miss == 0 {
+                // The steady state today. Say so explicitly — a missing line, or a
+                // line carrying a 0, would both read as "overhead is fine".
+                tracing::info!(
+                    report = "gateway_overhead_miss_cohort",
+                    model = %model,
+                    verdict = "CANNOT_DETERMINE",
+                    n_miss = 0,
+                    n_unknown,
+                    reason = "cache-miss cohort is EMPTY — every span was a hit, so \
+                              dispatch-path overhead was not observed at all",
+                );
+                continue;
+            }
+            tracing::info!(
+                report = "gateway_overhead_miss_cohort",
+                model = %model,
+                n_miss,
+                n_unknown,
+                p50_ms = p50_us / 1000.0,
+            );
         }
     }
 
@@ -364,9 +529,11 @@ mod tests {
     use super::{RULES_CACHE_TTL, plan_key_to_error_budget};
     use std::time::Duration;
 
+    ///  #6: burn is divided by the tenant's PLAN error budget (ADR-020),
     /// not a hardcoded 99.9%. The discriminating case: a Team tenant's target is
     /// 99% (budget 0.01), so the same error fraction yields a burn 10× lower than
     /// the old hardcoded 0.001 divisor — the exact overstatement this fixes.
+    ///  Neon — the rule-set cache. These assert the PROPERTY that saves
     /// money (Postgres is not consulted on every tick) without needing a live
     /// Neon: the cache decision is a pure function of `fetched_at` vs the TTL.
     #[test]

@@ -136,7 +136,7 @@ export function LiveTraces({
 					type="button"
 					onClick={() => setLive((v) => !v)}
 					aria-pressed={live}
-					className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal ${
+					className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring ${
 						live
 							? "border-line-2 bg-surface-3 text-ink"
 							: "border-line text-ink-2 hover:text-ink"

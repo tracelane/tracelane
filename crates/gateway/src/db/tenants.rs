@@ -103,16 +103,19 @@ pub async fn create(
     Ok(row_to_tenant(&row))
 }
 
+/// Idempotent tenant provisioning keyed on `workos_org_id`.
 ///
 /// If an ACTIVE tenant already carries this `workos_org_id`, that EXISTING row
 /// is returned untouched (its id, plan, and billing state win —
 /// dashboard-onboarded tenants have random UUIDs the caller must never guess).
 /// Otherwise a new tenant is inserted with a **random** UUID — never a UUID
+/// derived from the org id (the split-brain: derived ids matched no real
 /// `tenants` row).
 ///
 /// Returns `Ok(None)` when the org's tenant exists but is ARCHIVED
 /// (kill-switched): the guarded `DO UPDATE ... WHERE archived_at IS NULL`
 /// yields no row, so a kill-switched org can neither be resurrected nor
+/// accumulate phantom users through webhook provisioning (security
 /// review F-2). Callers must treat `None` as "refuse + ack".
 ///
 /// # Errors

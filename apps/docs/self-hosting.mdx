@@ -12,15 +12,19 @@ hardened production Docker Compose stack.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| Rust toolchain | 1.87+ | Build gateway + ingest |
+| Rust toolchain | 1.88+ (MSRV; this repo pins 1.95 via `rust-toolchain.toml`) | Build gateway + ingest |
 | Node.js | 20+ | Dashboard + MCP server |
-| pnpm | 11+ | Node package manager |
+| pnpm | 9.15.0 (pinned in `package.json`) | Node package manager |
 | Postgres | 17+ (Neon-compatible) | Tenant metadata, API keys, billing |
 | ClickHouse | 24.12+ | Span hot tier (365-day TTL) |
 | NATS | 2.10+ with JetStream | Ingest queue |
-| L4 GPU (1×) | — | SLM judge (optional; degrades to regex-only) |
 
-## Quick start — Docker Compose
+## Quick start — local development only
+
+<Warning>
+This section brings up a **local development** stack. It is not a production
+topology — see [Production — Docker Compose](#production--docker-compose) below.
+</Warning>
 
 The fastest path to a running stack:
 
@@ -151,7 +155,7 @@ there is no direct Stripe integration.
    - `tokens_processed`
    - `audit_anchors`
 
-3. Create a **Webhook** at `https://gateway.<your-domain>/v1/webhooks/polar`, subscribed to:
+3. Create a **Webhook** at `https://<your-dashboard-domain>/api/webhooks/polar`, subscribed to:
    `subscription.created`, `subscription.updated`, `subscription.active`,
    `subscription.canceled`, `order.created`, `order.paid`.
 
@@ -211,7 +215,7 @@ Before accepting production traffic:
 - [ ] TLS termination at reverse proxy (Caddy, Nginx, or Cloudflare Tunnel)
 - [ ] Confirm `POSTGRES_URL` is set — a release build has **no** auth fallback and refuses every API key without it
 - [ ] OSV-Scanner + Grype clean on deployed commit
-- [ ] All 68 pain-point evals green: `pnpm eval:run --suite=all`
+- [ ] Conformance suites green: `pnpm --filter @tracelanedev/audit-verifier test`
 
 ## Upgrading
 

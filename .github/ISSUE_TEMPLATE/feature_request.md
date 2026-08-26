@@ -9,7 +9,7 @@ classification: PUBLIC
 Describe the user pain in terms of past behavior — what do you currently have to do that's painful?
 
 **Is this pain point already in the list?**
-Check `evals/pain-points/INDEX.md`. If yes, link it: PP-XXX
+Check the suites under `evals/`. If yes, name the eval.
 
 **Proposed solution**
 Describe the feature. Be specific about the interface (API, span attribute, CLI flag, UI element).

@@ -1,8 +1,8 @@
-<!-- tracelane:classification: INTERNAL -->
+<!-- tracelane:classification: PUBLIC -->
 # `crates/shared`
 
 Shared types and helpers used by **all** Tracelane Rust crates (gateway,
-ingest, policy, mcp-rs). Keeping them here means the two binaries redact logs
+ingest, policy). Keeping them here means the two binaries redact logs
 and model spans with exactly the same code.
 
 ## Modules

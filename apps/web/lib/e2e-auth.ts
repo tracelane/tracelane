@@ -1,4 +1,5 @@
 /**
+ * Dev-only E2E test-auth bypass.
  *
  * Purpose: let an automated *local* E2E run (the dead-button sweep) reach
  * authenticated pages against a dev server without the WorkOS login UI — which
@@ -26,6 +27,7 @@
  * Callers: `lib/auth.ts` (requireSession / requireGatewayToken) and
  * `middleware.ts`.
  *
+ * Scope note: the disposable tenant id is enforced unique-to-test at the
  * Postgres layer (a CHECK on `tenants.id`), but NOT at ClickHouse. That gap is
  * inert under today's threat model — the fake gateway token (below) fails gateway
  * auth with a 401 before any ClickHouse write path is reachable, so no bypass
@@ -62,6 +64,7 @@ export const E2E_TEST_GATEWAY_TOKEN = "e2e-fake-gateway-token-NOT-A-REAL-JWT";
 // dev/test build. Unset / empty / "staging" / a typo'd NODE_ENV is NOT dev — so a
 // stray flag in any non-dev env fails CLOSED (boot-crash + bypass off) instead of
 // silently activating. Removes the dependency on Next.js inlining NODE_ENV as
+// exactly "production" (opus review MED).
 function isExplicitDev(): boolean {
 	const env = process.env.NODE_ENV;
 	return env === "development" || env === "test";
@@ -91,6 +94,7 @@ function assertNotProductionBypass(): void {
 // `cf:deploy` serve a production build (NODE_ENV="production"), so they boot-crash
 // if the flag is set — by design.
 //
+// DO NOT add `"sideEffects": false` to apps/web/package.json (LOW): this
 // boot-crash IS a module-load side effect. A `sideEffects: false` declaration
 // lets a bundler tree-shake a module whose exported bindings look unused, which
 // would silently elide this Layer-1 check and leave only the per-call Layer 2.
@@ -114,6 +118,7 @@ export function e2eAuthEnabled(): boolean {
 }
 
 /**
+ * Defense-in-depth (LOW): refuse to mint a disposable test identity
  * unless the bypass is genuinely active. The mint functions below are exported,
  * so a future caller bug could invoke them WITHOUT first checking
  * {@link e2eAuthEnabled} — this guard makes that fail CLOSED (throw) instead of

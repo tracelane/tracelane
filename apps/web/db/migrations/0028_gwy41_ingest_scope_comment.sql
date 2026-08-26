@@ -15,6 +15,7 @@
 -- unrecognised slug grants nothing — so the comment is the one place a future
 -- reader (or a psql session during an incident) learns what the legal values
 -- ARE. Leaving it three-valued after a fourth exists is the same
+-- second-list drift that produced and, with the extra sting that
 -- this copy lives where nobody greps.
 --
 -- `scripts/ci/check-api-scope-single-source.py` now derives the vocabulary from

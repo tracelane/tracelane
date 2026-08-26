@@ -35,6 +35,7 @@ import { expect } from "../src/harness.js";
  *
  * Status: Structural assertions green. Integration test scaffold lives
  * at `crates/ingest/tests/spiffe_auth_test.rs` and requires testcontainers
+ * + SPIRE Docker images; deferred to Linux CI per.
  */
 
 const INGEST_SRC = path.resolve(__dirname, "../../crates/ingest/src");
@@ -105,6 +106,7 @@ describe("FT-09: SPIRE agent down — refresher fails closed, process exits", ()
 	});
 
 	it("real SPIRE-agent-down chaos test exists in tls.rs (refresher exits with Err)", () => {
+		//  (Linux/WSL2) is resolved, so this now runs in the normal suite.
 		// The test spawns a mock SPIRE, connects, drops it so the agent is down,
 		// then asserts BundleRefresher::run returns Err within budget (not a hang)
 		// so main's try_join! brings the process down for a clean restart.

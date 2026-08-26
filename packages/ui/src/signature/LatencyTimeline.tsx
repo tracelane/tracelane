@@ -47,12 +47,18 @@ function niceCeil(v: number): number {
  * LatencyTimeline — hand-built inline-SVG latency-over-time chart (design system
  * tokens, no charting-lib dependency; sibling to the three signature viz).
  *
- * Plots the p95 trace-line (the `--action-ink` data-line role) over a faint
- * p50–p99 band, one point per hourly bucket. **Real data only:** buckets with no
- * traffic arrive as null percentiles and render as GAPS — each contiguous run is
- * its own bar, so nothing bridges a missing hour and no bucket is
- * interpolated or smoothed. Colors come only from tokens (accent line,
- * `--action-soft` band, `--ink-3` labels) — no hardcoded hex.
+ * Draws one RANGE BAR per hourly bucket — p50→p99, with a p95 tick across it.
+ * **Real data only:** buckets with no traffic arrive as null percentiles and render as
+ * GAPS, so nothing bridges a missing hour and no bucket is interpolated or smoothed.
+ *
+ * COLOUR (P0.11, 2026-08-22). ONE series, so ONE colour at two weights: the p50–p99
+ * body is `--chart-primary` at 35% and the p95 tick is the same token at full strength.
+ * A second TOKEN (`--chart-secondary`) would say "second series", and p95 is not a
+ * second series — it is the same latency read at a different percentile, which is
+ * exactly what a weight step says and a hue step does not. Gridlines are `--chart-grid`,
+ * labels `--ink-3`. The classes were `fill-info` (a blue before the palette swap, now
+ * the same graphite) and `stroke-line`; the figcaption swatches were `--action-ink` and
+ * `--action-soft`, which no longer matched the marks they claim to key.
  */
 export function LatencyTimeline({
 	points,
@@ -114,7 +120,7 @@ export function LatencyTimeline({
 							x2={W - PAD_R}
 							y1={yOf(t)}
 							y2={yOf(t)}
-							className="stroke-line"
+							className="stroke-chart-grid"
 							strokeWidth={1}
 							vectorEffect="non-scaling-stroke"
 						/>
@@ -123,6 +129,7 @@ export function LatencyTimeline({
 							y={yOf(t)}
 							textAnchor="end"
 							dominantBaseline="middle"
+							/* design-constraint-ok: SVG user-space font size, not a DOM font size — it scales with the viewBox, so the ADR-074 §2 DOM ramp does not apply and 11px would collide with tick spacing */
 							className="fill-ink-3 font-mono text-[10px]"
 						>
 							{formatMs(t)}
@@ -156,7 +163,7 @@ export function LatencyTimeline({
 								width={barW}
 								height={h}
 								rx={Math.min(2, barW / 2)}
-								className="fill-info opacity-35"
+								className="fill-chart-primary opacity-35"
 							>
 								<title>{`${q.label} · p50–p99`}</title>
 							</rect>
@@ -167,7 +174,7 @@ export function LatencyTimeline({
 									width={barW}
 									height={2}
 									rx={1}
-									className="fill-info"
+									className="fill-chart-primary"
 								>
 									<title>{`${q.label} · p95`}</title>
 								</rect>
@@ -180,14 +187,20 @@ export function LatencyTimeline({
 				    one time axis. Three bare labels here would be a second one. */}
 			</svg>
 
-			<figcaption className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-3">
+			<figcaption className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-2xs text-ink-3">
 				<span className="inline-flex items-center gap-1.5">
-					<span className="inline-block h-0.5 w-3 bg-action-ink" aria-hidden />
+					{/* The swatches must be the SAME tokens as the marks, at the SAME
+					    weights — a legend keyed to a colour the chart no longer draws is
+					    worse than no legend. */}
+					<span
+						className="inline-block h-0.5 w-3 bg-chart-primary"
+						aria-hidden
+					/>
 					p95 latency
 				</span>
 				<span className="inline-flex items-center gap-1.5">
 					<span
-						className="inline-block h-2 w-3 rounded-sm bg-action-soft"
+						className="inline-block h-2 w-3 rounded-sm bg-chart-primary/35"
 						aria-hidden
 					/>
 					p50–p99 band

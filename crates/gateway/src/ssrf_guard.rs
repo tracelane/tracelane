@@ -192,6 +192,7 @@ fn validate_url_sync(url: &Url) -> Result<(), &'static str> {
 /// Caller must still call [`validate_url`] on any customer-supplied URL
 /// before issuing a request — this builder cannot pre-validate domain DNS.
 pub fn safe_client_builder() -> reqwest::ClientBuilder {
+    //  B1: the previous redirect policy ran
     // `validate_url_sync` per hop — which only blocks IP literals,
     // NOT domains whose A record resolves to a blocked range.
     // A redirect to `attacker.com` (DNS → 169.254.169.254) would
@@ -289,6 +290,7 @@ mod tests {
         assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
+    // entry-point test lives in `tests/ssrf_loopback_entry_point.rs`, NOT
     // here. This file is pulled into `tests/failover_chaos.rs` and
     // `tests/rate_limit_chaos.rs` via `#[path]`, and both of those SET
     // TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS globally (wiremock binds to
@@ -358,7 +360,8 @@ mod tests {
 
     #[test]
     fn blocks_ipv4_mapped_ipv6_loopback() {
-        // ::ffff:127.0.0.1 — IPv4-mapped form of loopback.
+        // :ffff:127.0.0.1 — IPv4-mapped form of loopback.
+        // Reviewer: previously bypassed because `is_loopback` on the
         // IPv6 doesn't catch the mapped form.
         let ip: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
         assert!(is_blocked_ip(&IpAddr::V6(ip)));

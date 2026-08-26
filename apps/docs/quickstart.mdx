@@ -118,9 +118,9 @@ If you use the SDK, `withSession(id, fn)` (TypeScript) and `use_session(id)`
 
 ## What you got for free
 
-- **Routing across 30+ providers** with a single API key, no SDK swap.
+- **Routing across 150+ providers** with a single API key, no SDK swap.
 - **Low-overhead gateway routing** on every call.
-- **Full-fidelity OTLP traces** with prompt + completion, tool calls, retries, predictive verdicts.
+- **Full-fidelity OTLP traces** — tool calls, retries, predictive verdicts and full run shape. Prompt and completion bodies are not captured (see [Security](/security)).
 - **Predictive guardrails** running inline (see [predictive guardrails](/predictive-guardrails)).
 - **Tamper-evident audit log** — a live SHA-256 hash chain and Ed25519 per-tenant signing; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof (best-effort, opt-in), with universal per-run anchoring on the roadmap.
 

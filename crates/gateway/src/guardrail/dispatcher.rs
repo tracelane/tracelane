@@ -9,6 +9,7 @@
 //! rather than spawning `'static` tasks — this avoids an `Arc` clone of the
 //! context on the hot path ("zero allocation past accept where avoidable",
 //! CLAUDE.md) while still satisfying the spec's concurrent-dispatch + per-rail-
+//! timeout + latency-capture contract. (Logged deviation,.md.)
 //!
 //! No `RailError` is ever silently dropped (§5): every error/timeout/panic
 //! produces a recorded outcome with a reason code.

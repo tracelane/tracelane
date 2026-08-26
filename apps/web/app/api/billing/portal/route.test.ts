@@ -1,6 +1,7 @@
 /**
  * Tests for POST /api/billing/portal — Polar customer-portal proxy.
  *
+ * Focus (regression): the route MINTS the per-user JWT via
  * requireGatewayToken() and forwards it as Bearer. It must NOT depend on an
  * incoming `authorization` header — the browser (BillingPortalButton) calls
  * this route with a session COOKIE, not a Bearer, so the old header-forwarding

@@ -20,6 +20,7 @@
  */
 
 import { absoluteDate } from "@/lib/format-date";
+import { useDismiss } from "@/lib/use-dismiss";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
@@ -41,11 +42,46 @@ function kindGlyph(k: Notification["kind"]): string {
 	return k === "quota" ? "▣" : k === "alert" ? "⚑" : "✓";
 }
 
+/**
+ * The bell itself, as a monochrome outline drawn in `currentColor`.
+ *
+ * IT WAS THE 🔔 EMOJI. That is a full-colour bitmap glyph rendered by the
+ * platform's emoji font — orange and yellow on macOS, a different orange on
+ * Windows, a third on Android — sitting in the top bar of a system whose first
+ * rule is that icons are monochrome and nothing decorative carries a hue. It was
+ * also the one control in the bar the app could not restyle, because a font
+ * decides its colour. An inline SVG matches every other icon in the chrome
+ * (`nav-config.tsx`, `ThemeToggle`), adds no dependency, and inherits `--ink`.
+ */
+function BellIcon() {
+	return (
+		<svg
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+			<path d="M13.73 21a2 2 0 0 1-3.46 0" />
+		</svg>
+	);
+}
+
 export function NotificationBell() {
 	const [status, setStatus] = useState<Status>("loading");
 	const [items, setItems] = useState<Notification[]>([]);
 	const [unread, setUnread] = useState(0);
 	const [open, setOpen] = useState(false);
+
+	// Escape and click-outside. The panel used to be closable ONLY by clicking the
+	// bell again — a popover the rest of the page could not dismiss. The ref wraps
+	// the trigger too, so pressing the bell to close is not read as an outside
+	// click that would close and instantly re-open it.
+	const popoverRef = useDismiss<HTMLDivElement>(open, () => setOpen(false));
 
 	useEffect(() => {
 		let live = true;
@@ -96,7 +132,20 @@ export function NotificationBell() {
 	const showBadge = status === "ok" && unread > 0;
 
 	return (
-		<div className="relative">
+		<div className="relative" ref={popoverRef}>
+			{/*
+			 * The trigger is now the same 36px `--surface-2` chip as the theme toggle
+			 * beside it — the brief's container-chip shape for an icon, and the fix
+			 * for a top-bar cluster that carried three controls at three heights.
+			 *
+			 * THE COUNT IS STILL A NUMBER, NOT A DOT. A bare dot would say "something
+			 * happened" where the component knows how many, and the count is already
+			 * load-bearing in the accessible name. It moves to a corner badge in the
+			 * theme-flipped `--action` / `--action-on` pair (ink chip + light label in
+			 * light, light chip + ink label in dark) so it reads at 11px against the
+			 * chip in both themes without introducing a colour. The badge renders ONLY
+			 * for a real positive count — see `showBadge` above.
+			 */}
 			<button
 				type="button"
 				onClick={() => setOpen((v) => !v)}
@@ -104,36 +153,52 @@ export function NotificationBell() {
 					showBadge ? `Notifications, ${unread} unread` : "Notifications"
 				}
 				aria-expanded={open}
-				className="relative rounded-lg border border-line px-2 py-1 text-[13px]"
+				className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3"
 			>
-				<span aria-hidden="true">🔔</span>
-				{showBadge && <span className="ml-1 font-medium">{unread}</span>}
+				<BellIcon />
+				{showBadge && (
+					<span
+						aria-hidden="true"
+						className="-top-0.5 -right-0.5 absolute flex min-w-4 items-center justify-center rounded-full bg-action px-1 font-medium text-2xs text-action-on tabular-nums"
+					>
+						{unread}
+					</span>
+				)}
 			</button>
 
 			{open && (
-				<div className="absolute right-0 z-50 mt-1 w-96 rounded-lg border border-line bg-surface-2 p-3 shadow-lg">
-					<div className="mb-2 flex items-center justify-between">
-						<span className="font-medium">Notifications</span>
-						<span className="text-[12px] text-ink-3">
+				/*
+				 * The panel is a floating CARD: `--surface` at `--radius-card` under
+				 * `--shadow-overlay`. It was `--surface-2` — the inert WELL token, the
+				 * one chips and tracks are painted with — at Tailwind's own radius and
+				 * shadow scale, so a popover claiming to sit above the page wore the
+				 * material of a recess inside it. In dark that was also literally
+				 * backwards: the well (#1c1d20) is lighter than the card (#151619), so
+				 * the panel read as a lifted tray rather than as a sheet.
+				 */
+				<div className="absolute right-0 z-50 mt-2 w-96 rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-[var(--shadow-overlay)]">
+					<div className="mb-3 flex items-center justify-between">
+						<span className="font-medium text-ink">Notifications</span>
+						<span className="text-xs text-ink-3">
 							Shared with your workspace
 						</span>
 					</div>
 
 					{status === "loading" && (
-						<p className="text-[13px] text-ink-3">Loading…</p>
+						<p className="text-sm text-ink-3">Loading…</p>
 					)}
 
 					{/* The whole point of the error state: say it, never render an
 					    empty inbox for a failed fetch. */}
 					{status === "error" && (
-						<p role="alert" className="text-[13px] text-ink-2">
+						<p role="alert" className="text-sm text-ink-2">
 							Couldn&apos;t load notifications. This is a loading problem, not
 							an empty inbox.
 						</p>
 					)}
 
 					{status === "ok" && items.length === 0 && (
-						<p className="text-[13px] text-ink-3">Nothing to catch up on.</p>
+						<p className="text-sm text-ink-3">Nothing to catch up on.</p>
 					)}
 
 					{status === "ok" && items.length > 0 && (
@@ -144,22 +209,33 @@ export function NotificationBell() {
 									className="border-b border-line pb-2 last:border-b-0"
 								>
 									<div className="flex items-start gap-2">
-										<span aria-hidden="true">{kindGlyph(n.kind)}</span>
+										{/* The kind glyph on a `--surface-2` chip — the brief's
+										    container shape for an icon. Text glyphs, so they are
+										    monochrome already and inherit secondary ink. */}
+										<span
+											aria-hidden="true"
+											className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-[var(--radius-control)] bg-surface-2 text-2xs text-ink-2"
+										>
+											{kindGlyph(n.kind)}
+										</span>
 										<div className="min-w-0 flex-1">
-											<div className="text-[13px] font-medium">
+											<div className="font-medium text-ink text-sm">
 												{/* Unread is marked by a word, not only by weight
-												    or colour. */}
+												    or colour. The word takes the metric-label
+												    treatment (11px/600/0.08em small caps) so it reads
+												    as a marker rather than as a shouted word in the
+												    title's own size. */}
 												{n.read_at === null && (
-													<span className="mr-1 text-[11px] uppercase">
+													<span className="mr-1.5 text-2xs uppercase tracking-[0.08em] text-ink-3">
 														new
 													</span>
 												)}
 												{n.title}
 											</div>
 											{n.body && (
-												<div className="text-[12px] text-ink-3">{n.body}</div>
+												<div className="text-xs text-ink-3">{n.body}</div>
 											)}
-											<div className="mt-0.5 flex items-center gap-2 text-[12px] text-ink-3">
+											<div className="mt-0.5 flex items-center gap-2 text-xs text-ink-3">
 												<span>{absoluteDate(n.created_at)}</span>
 												{n.link && (
 													<Link className="underline" href={n.link}>

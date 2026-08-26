@@ -4,6 +4,7 @@
 //! Extended thinking (interleaved-thinking-2025-05-14 beta) is enabled by default.
 //! Prompt caching: `cache_control` markers on message content blocks (text /
 //! tool_result) are preserved verbatim through the universal request into the
+//! Anthropic blocks (/ PP-G8). NOTE: cache_control on the *system* prompt
 //! is not yet preserved — system messages merge into Anthropic's top-level
 //! `system` string, which carries no per-block marker (documented follow-up).
 //!
@@ -82,6 +83,7 @@ impl AnthropicProvider {
             AnthropicRequest::from_universal(request).context("failed to translate request")?;
         let url = format!("{}/v1/messages", self.base_url);
 
+        // SSRF: validate before the POST (reviewer).
         crate::ssrf_guard::validate_url(&url)
             .await
             .context("SSRF guard rejected Anthropic base URL")?;
@@ -100,6 +102,7 @@ impl AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // SECURITY: drop the response body — Anthropic
             // 401/403 bodies can echo the x-api-key header value, leaking
             // the customer's BYOK key to logs.
             let _body = response.text().await.unwrap_or_default();
@@ -369,7 +372,32 @@ impl AnthropicRequest {
             max_tokens: req.max_tokens.unwrap_or(4096),
             system,
             tools,
-            stream: req.stream.unwrap_or(true),
+            // ALWAYS TRUE, REGARDLESS OF WHAT THE CALLER ASKED FOR.
+            //
+            // This adapter has exactly one response reader — `build_event_stream`
+            // — and it is an SSE parser: it reads `data:` lines off
+            // `response.bytes_stream()`. Anthropic honours `stream: false` by
+            // returning a SINGLE JSON OBJECT, which that parser cannot see, so it
+            // yields no events and the caller gets an empty completion.
+            //
+            // THE BUG THIS FIXES, observed on prod 2026-08-22 with unique prompts
+            // so no cache was involved:
+            //     explicit "stream": false  -> content "", usage {0,0,0}, HTTP 200
+            //     "stream" omitted          -> correct content and usage
+            //     "stream": true            -> correct
+            //     vertex, explicit false    -> correct (different adapter)
+            // Omitting the field worked only because `unwrap_or(true)` defaulted
+            // it, which is why this went unnoticed: our own dogfood driver and
+            // canary both stream, and a 200 carrying an empty completion is the
+            // quietest failure this system can produce. Prod is 94% Anthropic.
+            //
+            // The caller's `stream` choice is honoured ONE LAYER UP: the handler
+            // buffers this event stream into a `chat.completion` for a
+            // non-streaming client, which is how the vertex path already behaves.
+            // `:410` (the health-probe request) already hardcodes `Some(true)` for
+            // the same reason. Streaming upstream is not an optimisation here, it
+            // is the adapter's only supported wire format.
+            stream: true,
         })
     }
 }
@@ -391,6 +419,35 @@ fn translate_content(content: MessageContent) -> AnthropicContent {
 mod tests {
     use super::*;
     use tracelane_shared::{ChatRequest, Message, MessageContent, Role};
+
+    /// **The upstream request is ALWAYS `stream: true`, whatever the caller asked.**
+    ///
+    /// This is the regression test for the 2026-08-22 prod defect: an explicit
+    /// `"stream": false` made `to_anthropic_request` forward `false`, Anthropic
+    /// returned a single JSON object, and `build_event_stream` — an SSE parser —
+    /// saw no `data:` lines and produced an EMPTY completion with a 200.
+    ///
+    /// It is written against the THREE inputs that must all agree, because the
+    /// defect was invisible on two of them: omitting the field already defaulted
+    /// to `true` via `unwrap_or(true)`, and `Some(true)` was obviously fine. Only
+    /// `Some(false)` was broken, so a test that exercised the common case would
+    /// have stayed green — which is exactly what happened for the feature's whole
+    /// life. Asserting all three is what makes this a control rather than a
+    /// coincidence.
+    #[test]
+    fn upstream_is_always_streaming_whatever_the_caller_asked() {
+        for asked in [Some(false), Some(true), None] {
+            let mut req = make_simple_request();
+            req.stream = asked;
+            let built = AnthropicRequest::from_universal(req).expect("request must build");
+            assert!(
+                built.stream,
+                "caller stream={asked:?} must still be streamed upstream — this \
+                 adapter's only response reader is an SSE parser, so a \
+                 non-streaming upstream body yields an empty completion"
+            );
+        }
+    }
 
     fn make_simple_request() -> ChatRequest {
         ChatRequest {
@@ -422,6 +479,7 @@ mod tests {
 
     #[test]
     fn cache_control_is_preserved_on_content_blocks() {
+        //  PP-G8: prompt-caching markers on content blocks must survive
         // translation into the Anthropic block (the gateway used to drop them,
         // silently breaking customers' prompt caching — they'd pay full price).
         use serde_json::json;

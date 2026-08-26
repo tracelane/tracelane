@@ -281,6 +281,7 @@ mod tests {
     use ulid::Ulid;
     use uuid::Uuid;
 
+    // Paid rails (R2/R5/R6/R7) must be GRANTED explicitly now that a
     // None cache resolves to the free tier instead of granting everything.
     fn engine_with(rails: Vec<Box<dyn crate::guardrail::rail::Rail>>) -> Arc<GuardrailEngine> {
         let chain = Arc::new(AuditChain::new(100, None, None).expect("chain"));

@@ -1,4 +1,6 @@
+# ── PRIVATE-MINUTE POLICY (2026-08-01) ────────────────────────────────
 # Public Actions are unlimited and free; private are capped at 2,000 min/month
+# and exhausted mid-cycle twice (June, July). These workflow FILES
 # are shared — the public repo is built from this tree — so the trigger list
 # cannot be edited to cut private cost without also disabling the PUBLIC run,
 # which is now the only always-on gate. The split is therefore a job-level
@@ -60,7 +62,19 @@ jobs:
       - name: cargo audit (Rust deps)
         run: |
           cargo install cargo-audit --locked
-          cargo audit --deny warnings
+          # R84 / TRAPS §43 — REPORTED, NOT BLOCKING.
+          #
+          # `--deny warnings` turned advisory text into a blocking gate whose only
+          # documented escape is `cargo update -p <crate>` — and B-263 is the case
+          # where following exactly that advice pulled an RCE dropper. That is §43
+          # in its purest form: the control fires correctly, names a fix, and the
+          # fix is chosen by whoever controls the dependency. A blocking gate adds
+          # PRESSURE to take the attacker-influenced path quickly.
+          #
+          # Same move already made for `yanked` in deny.toml, for the same reason.
+          # The finding is still printed in full and still reaches a human; what is
+          # removed is the urgency to remediate without reading the diff.
+          cargo audit || echo "::warning::cargo audit reported findings — read them, and read any suggested \`cargo update\` BEFORE running it (TRAPS §43)"
 
       - name: pnpm audit (Node deps)
         run: pnpm audit --audit-level=high
@@ -117,6 +131,7 @@ jobs:
         # --config is REQUIRED (grype v0.112 does not auto-discover ./.grype.yaml
         # for a `dir:` source). The .grype.yaml ignore rules are PACKAGE-ONLY —
         # see its schema note: `vulnerability: "*"` was a literal match on a vuln
+        # named "*" and silently disabled every rule (, fixed 2026-07-06,
         # verified locally against grype v0.112: exit 0). Kept FATAL — the ignores
         # are real, not a `continue-on-error` bypass.
         run: grype dir:. --fail-on high --config .grype.yaml --exclude './**/node_modules/**'

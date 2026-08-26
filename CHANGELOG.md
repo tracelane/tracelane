@@ -178,7 +178,7 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
   adapters, never capture keys or content), and the `tlane` CLI (`init`, `verify`,
   `import`, `migrate`, `replay`, `eval`).
 - **Migration tooling** — `tlane migrate helicone` rewrites config + environment
-  (base URL + auth headers) as a reviewable diff; `tlane import langsmith` reads
+  (base URL + auth headers) as a reviewable diff; `tlane import-helicone` reads
   existing projects, traces, and prompt versions. Historical trace-data import is
   **(roadmap)**.
 - **Supply-chain trust** — Cosign keyless signatures, CycloneDX SBOMs, SLSA Build

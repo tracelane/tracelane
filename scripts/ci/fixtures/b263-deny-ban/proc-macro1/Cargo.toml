@@ -1,0 +1,11 @@
+# The banned NAME, and nothing else. No build.rs, no dependencies, no behaviour.
+# This exists so `cargo metadata` puts `proc-macro1 1.0.107` in the resolved graph,
+# which is the only thing `deny.toml`'s ban matches on.
+[package]
+name = "proc-macro1"
+version = "1.0.107"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

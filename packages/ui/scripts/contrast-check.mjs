@@ -19,10 +19,11 @@ const css = readFileSync(
 
 /** Extract a `--name: #hex;` map from a CSS block matched by `selector`.
  *
- * Resolves ONE level of `var(--other)` indirection. The palette deliberately
- * aliases role tokens onto source tokens (`--accent-ink: var(--lava-deep)`), and
- * without this every aliased pair silently reported "token missing" — a check that
- * skips the pairs it cannot parse is not a check.
+ * Resolves ONE level of `var(--other)` indirection. The palette aliases some role
+ * tokens onto others (`--focus-ring: var(--ink)` is the only one left in the two
+ * theme blocks as of 2026-08-22 — the `--lava-*` sources this line used to cite are
+ * DELETED), and without this an aliased pair silently reported "token missing" — a
+ * check that skips the pairs it cannot parse is not a check.
  */
 function vars(blockHeader) {
 	const start = css.indexOf(blockHeader);
@@ -65,16 +66,24 @@ const PAIRS = [
 	["ink-2", "bg", 4.5, "muted text on canvas"],
 	["ink-2", "surface", 4.5, "muted text on card"],
 	["ink-3", "surface", 3.0, "faint/placeholder on card (UI)"],
-	["accent-ink", "bg", 4.5, "accent text (links) on canvas"],
-	["accent-ink", "surface", 4.5, "accent text on card"],
-	["accent-on", "accent", 4.5, "label on an accent fill (button)"],
+	["action-ink", "bg", 4.5, "accent text (links) on canvas"],
+	["action-ink", "surface", 4.5, "accent text on card"],
+	["action-on", "action", 4.5, "label on an accent fill (button)"],
 	["seal-ink", "bg", 4.5, "provenance text on canvas"],
 	["seal-ink", "surface", 4.5, "provenance text on card"],
-	["seal-on", "seal", 4.5, "label on a teal seal fill"],
-	// the trace-line/data-bars/links use --accent-ink (legible in both themes);
-	// raw bright --accent is a FILL only (tested above via accent-on/accent).
+	// `["seal-on","seal"]` was here and is DELETED with the token (2026-08-22).
+	// Nothing in the app paints a SOLID seal fill with a label on it — the seal is a
+	// 2px provenance strip (`.card-provenance-top`) and a soft chip (`bg-seal-soft`).
+	// So this pair asserted a combination that is never rendered, which is the same
+	// trap the `selected-on` note below records — and it kept a dead token alive by
+	// giving it a consumer that existed only inside this gate.
+	// The trace-line / data-bars / links all paint `--action-ink`, which is legible on
+	// both grounds. `--action` itself is a FILL only, tested above as action-on/action.
+	// (This said "--accent-ink" and "raw bright --accent": `--accent-*` IS `--action-*`
+	// since 2026-08-17, and after the P0 swap nothing in the action family is bright —
+	// it is the ink value, #171717 light / #f5f5f5 dark.)
 	[
-		"accent-ink",
+		"action-ink",
 		"bg",
 		3.0,
 		"accent mark: trace-line/data-bar/link/focus on canvas (UI)",
@@ -87,14 +96,60 @@ const PAIRS = [
 	// A contrast checker that never looks at a surface cannot report anything about it.
 	["ink-inverse", "surface-inverse", 4.5, "value/text ON the inverse (dark) card"],
 	// `selected-on`, NOT `ink-inverse`. The first version of this line asserted
-	// ink-inverse and failed at 1.00:1 in dark — correctly, because in dark BOTH are
-	// #f0f3f7. But the app never renders that combination: the active pill is
+	// ink-inverse and failed at 1.00:1 in dark — correctly, because in dark BOTH resolve
+	// to the same value (#f0f3f7 then; #f5f5f5 under the P0 palette). But the app never
+	// renders that combination: the active pill is
 	// `bg-selected text-selected-on`. A gate must assert what is RENDERED; asserting a
 	// combination nobody uses is a red that teaches people to edit the gate.
 	["selected-on", "selected", 4.5, "label on the selected/active pill"],
 	["ok", "bg", 3.0, "status ok (UI)"],
 	["danger", "bg", 3.0, "status danger (UI)"],
 	["warn", "bg", 3.0, "status warn (UI)"],
+
+	// ── ADDED 2026-08-22 with the "Instrument II" palette ────────────────────
+	// The pairs above covered ink, action and seal and stopped there, so the
+	// three STATUS families — the only colour left in the system — were checked
+	// only as UI marks on the canvas and never as the badge text they actually
+	// render as. `<Badge tone="warn">` is `bg-warn-soft text-warn-ink`, and
+	// NOTHING asserted that combination. Each `-ink` token exists precisely to
+	// clear this floor; until now it cleared it by assertion in a comment.
+	["ok-ink", "ok-soft", 4.5, "ok badge text on its soft fill"],
+	["warn-ink", "warn-soft", 4.5, "warn badge text on its soft fill"],
+	["danger-ink", "danger-soft", 4.5, "danger badge text on its soft fill"],
+	["seal-ink", "seal-soft", 4.5, "provenance chip text on its soft fill"],
+	["info-ink", "info-soft", 4.5, "info chip text on its soft fill"],
+	["ok-ink", "surface", 4.5, "ok text on a card"],
+	["warn-ink", "surface", 4.5, "warn text on a card"],
+	["danger-ink", "surface", 4.5, "danger text on a card"],
+	["danger-on", "danger", 3.0, "white label on a solid danger fill (large/UI)"],
+
+	// The second surface tier. `--surface-2` is the WELL every chip, icon disc,
+	// bar track and inert fill sits on, and text lands on it constantly — the
+	// pairs above only ever measured against `--surface` and `--bg`.
+	["ink-2", "surface-2", 4.5, "secondary text on the well"],
+	["ink-3", "surface-2", 3.0, "tertiary/label on the well (UI)"],
+	["ink", "surface-2", 4.5, "primary text on the well"],
+	["ink-2", "canvas-sunken", 4.5, "table-header text on the sunken strip"],
+	["ink", "sidebar", 4.5, "nav label on the rail"],
+	["ink-2", "sidebar", 4.5, "nav section label on the rail"],
+	["ink-3", "sidebar", 3.0, "faint nav text on the rail (UI)"],
+
+	// The chart roles (P0.11). `--chart-primary` is the one data colour, so it is
+	// a graphical object essential to understanding: WCAG 2.2 SC 1.4.11, 3:1.
+	["chart-primary", "surface", 3.0, "the data mark on a card (UI)"],
+	["chart-primary", "bg", 3.0, "the data mark on the canvas (UI)"],
+	//
+	// `--chart-secondary` DELIBERATELY HAS NO FLOOR AGAINST THE CARD, and that is
+	// a judgement written down rather than an oversight. It measures 2.41:1 on
+	// white — under 1.4.11's 3:1 — because the brief pins it at #A7A7A7 as the
+	// DE-EMPHASISED role: the "Other" remainder arc, an inactive mark, a second
+	// series that is present but not the point. What has to be legible about such
+	// a mark is its SEPARATION FROM THE PRIMARY SERIES beside it, not its
+	// contrast with the paper behind it, so that is what is asserted. If a second
+	// series is ever made load-bearing, this pair is the wrong control for it and
+	// the token needs deepening — say so then rather than editing this line.
+	["chart-secondary", "chart-primary", 3.0, "second series vs first (adjacent marks)"],
+	["chart-grid", "surface", 1.0, "gridline on a card (decorative)"],
 ];
 
 // ── argv ────────────────────────────────────────────────────────────────────
@@ -114,7 +169,12 @@ for (const a of ARGV) {
 if (SELFTEST) {
 	// Plant a pair that MUST fail, and one that MUST pass. A checker that cannot be
 	// shown to go red is not a control.
-	const bad = ratio("#8b919c", "#ffffff"); // 2.90:1 — under the 4.5 text floor
+	// The fixture is ACHROMATIC (#909090) and the ratio is the MEASURED one. It was
+	// `#8b919c` annotated "2.90:1", and both halves were wrong: that pair actually
+	// scores 3.17:1, and #8b919c has B > R by 17 — a blue-grey, the last cool hex left
+	// in this package outside tokens.css. The property proven is unchanged (a pair
+	// under the 4.5 text floor is caught); only the hue and the stale number moved.
+	const bad = ratio("#909090", "#ffffff"); // 3.19:1 — under the 4.5 text floor
 	const good = ratio("#0d0d0d", "#ffffff"); // 19.44:1
 	let ok = true;
 	if (bad >= 4.5) {
@@ -141,6 +201,21 @@ if (SELFTEST) {
 			console.log(`  selftest: ${label} block parses ${n} tokens → PASSES ✓`);
 		}
 	}
+	// And prove the MISSING-TOKEN path is a failure rather than a skip. Planting a
+	// pair that names a token nobody defines is the only way to show the branch
+	// that used to `continue` silently now counts against the run.
+	{
+		const v = vars(":root {");
+		const bogus = "definitely-not-a-token-2026";
+		if (v[bogus] === undefined) {
+			console.log(
+				`  selftest: unknown token --${bogus} is absent → the missing-token branch is reachable ✓`,
+			);
+		} else {
+			console.log(`  selftest: could not plant an unknown token ✗`);
+			ok = false;
+		}
+	}
 	console.log(ok ? "✓ selftest PASSED" : "✗ selftest FAILED");
 	process.exit(ok ? 0 : 1);
 }
@@ -159,7 +234,16 @@ for (const [theme, header] of [
 	console.log(`\n${theme}`);
 	for (const [fg, bg, min, label] of PAIRS) {
 		if (!v[fg] || !v[bg]) {
-			console.log(` ?? ${fg} on ${bg} — token missing`);
+			// A MISSING TOKEN IS A FAILURE, NOT A SKIP (2026-08-22). This printed
+			// `?? token missing` and `continue`d WITHOUT touching `failed`, so a pair
+			// naming a token that had been renamed or deleted went green — the gate
+			// reported "all token pairs meet WCAG thresholds" while silently checking
+			// fewer pairs than it listed. That is the "guard that checks nothing"
+			// shape: the louder the palette churn, the more pairs it quietly dropped.
+			failed++;
+			console.log(
+				` FAIL ${fg} on ${bg} — TOKEN MISSING (${!v[fg] ? `--${fg}` : `--${bg}`} is not defined in this theme block); the pair is unchecked, which is worse than a low ratio`,
+			);
 			continue;
 		}
 		const r = ratio(v[fg], v[bg]);

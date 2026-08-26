@@ -1,4 +1,5 @@
 /**
+ * Proxy for one-click tool approval (/B).
  *
  * Forwards only `{tool_name, def_hash}`. The gateway pins the hash it reads back
  * from `observed_tools`, so the value here is a selector, not an input — a hash

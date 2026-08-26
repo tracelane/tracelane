@@ -87,6 +87,7 @@ pub struct PredictiveLayer {
 
 impl PredictiveLayer {
     pub fn new() -> Self {
+        // Tier 1 predictors: mcp-hash-watcher, taint-tracker, stuck-loop
         let mut predictors: Vec<Box<dyn Predictor>> = vec![
             Box::new(McpHashWatcher::new()),
             // ADR-024 §1 item 2 (tool-definition-drift half): catches a tool
@@ -100,6 +101,7 @@ impl PredictiveLayer {
             Box::new(A2aValidator::new()),
             Box::new(A2uiValidator::new()),
             Box::new(CaptchaPreemptor::new()),
+            // PR8-lite: per-(tenant, tool) Mahalanobis
             // arg-drift detector. Default extractor is bag-of-bytes — full
             // PR8 swaps in MiniLM via ort once the model is exported.
             Box::new(Pr8LiteArgumentDrift::new()),
@@ -123,6 +125,7 @@ impl PredictiveLayer {
             // NOT DEPLOYED — a configuration state, not a fault, so no degradation
             // counter and no error. Stated once at startup because "the ML rail is
             // absent" is a fact an operator should be able to read, and silence
+            // about it is how stayed invisible.
             Ok(None) => {
                 tracing::info!(
                     "PR6 PromptGuard: PROMPT_GUARD_URL unset — the optional ML injection \
@@ -132,6 +135,7 @@ impl PredictiveLayer {
                 );
             }
             Err(e) => {
+                // C1. This fires ONCE, at startup, and the predictor is then
                 // absent for the whole process lifetime — the most durable degradation
                 // in the system and the least visible, because a single startup line
                 // scrolls away and nothing afterwards mentions it again.
@@ -190,6 +194,7 @@ impl PredictiveLayer {
             // FT-05: a panicking predictor (e.g. ONNX Runtime OOM / corrupt
             // model) must NOT take the gateway down. Catch the unwind and
             // fail OPEN — false-negatives on a guardrail are strictly better
+            // than a gateway outage. Default unwind panic
             // strategy makes this catchable for Rust-level panics.
             let d =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| predictor.evaluate(ctx)))
@@ -232,7 +237,9 @@ impl PredictiveLayer {
     /// FT-05 fail-open landing pad: a predictor panicked. Emit the degraded
     /// alert span and return `Allow` so the request proceeds. The
     /// `tracelane.predictive.degraded=true` marker is what the SLO dashboard
+    /// and Better Stack alerting key off.
     fn degraded_fail_open(predictor_name: &'static str) -> Decision {
+        // C1. A panicking predictor is allowed to fail open — correct for a blip,
         // and indistinguishable from "detection is working" for as long as it lasts.
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::PredictorError,
@@ -329,8 +336,10 @@ mod tests {
         );
     }
 
+    /// C1: failing open must MOVE A COUNTER, not just log.
     ///
     /// This is the assertion the whole class was missing. FT-05 fail-open is correct
+    /// behaviour, and for three weeks of the equivalent path was also "correct"
     /// while the system was blind. A degradation with no counter cannot be distinguished
     /// from healthy operation by any signal we own.
     ///

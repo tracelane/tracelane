@@ -172,46 +172,45 @@ Each NDJSON line is one audit event:
 
 ```json
 {
-  "event_id": "uuid-v7",
+  "format": "v2.1",
   "tenant_id": "uuid",
-  "timestamp_us": 1748000000000000,
-  "kind": "llm_request",
-  "model": "claude-sonnet-4-6",
-  "provider": "anthropic",
-  "input_tokens": 512,
-  "output_tokens": 128,
-  "predictive_verdict": "warn",
-  "predictive_rule": "PR2",
-  "prompt_version_id": "uuid",
-  "trace_id": "uuid",
-  "span_id": "uuid",
-  "batch_seq": 42,
-  "sha256": "a3f1..."
+  "seq": 42,
+  "event_time": "2026-05-23T14:13:20Z",
+  "event_type": "chat.completions.request",
+  "actor": "tlane_key:…",
+  "payload": "{…}",
+  "prev_hash": "sha256-hex",
+  "row_hash": "sha256-hex",
+  "rekor_entry_id": "hex — present only on anchored rows"
 }
 ```
 
-`kind` values: `llm_request`, `tool_call`, `a2a_handoff`, `prompt_promotion`,
-`rollback`, `api_key_created`, `api_key_revoked`, `cmk_rotation`, `policy_change`.
+`payload` is the verbatim canonical JSON string that `row_hash` was computed
+over — a verifier must re-hash those exact bytes, not a re-serialised copy.
+`event_type` is an open string; the chat hot path writes
+`chat.completions.request`.
 
 ## Batch header schema
 
-Each Audit-add-on batch carries a header. `ed25519_signature` is populated on
-every signed batch. `rekor_entry_id` is **absent from the JSON object entirely**
-until the batch anchors — the field is `skip_serializing_if = "Option::is_none"`
-(`crates/gateway/src/audit_export.rs:98`), asserted by the test
-`export_row_skips_rekor_when_none`. It is never emitted as an empty string or
-`null`. A verifier must treat a **missing key** as "not anchored".
+Each Audit-add-on batch carries an anchor record, discriminated from row records
+by `"type":"anchor"` (row records carry no `type`). `rekor` is **absent from the
+JSON object entirely** unless `anchor_state` is `anchored` — the field is
+`skip_serializing_if = "Option::is_none"`
+(`crates/gateway/src/audit_export.rs:119-120`). It is never emitted as an empty
+string or `null`, so a verifier must treat a **missing key** as "not anchored".
+The row-level `rekor_entry_id` (`:98`) is a separate field on the event record
+above and follows the same rule.
 
 ```json
 {
-  "batch_seq": 42,
+  "type": "anchor",
   "tenant_id": "uuid",
-  "event_count": 100,
-  "first_event_id": "uuid",
-  "last_event_id": "uuid",
+  "batch_start_seq": 1,
+  "batch_end_seq": 100,
   "merkle_root": "sha256-hex",
-  "ed25519_signature": "base64 (Audit add-on)",
-  "rekor_entry_id": "hex — populated on anchored batches"
+  "anchor_state": "anchored",
+  "ed25519": { "…": "tenant attestation over the anchor commitment" },
+  "rekor": { "…": "entry sig + RFC6962 inclusion proof + C2SP checkpoint" }
 }
 ```
 

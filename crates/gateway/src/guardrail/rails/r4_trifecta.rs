@@ -235,6 +235,7 @@ impl Rail for R4Trifecta {
     }
 
     fn feature(&self) -> Option<GuardrailFeature> {
+        // FREE / ungated (, founder ruling 2026-08-04). Agent-safety and
         // basic-correctness rails are free in OSS and on every hosted tier;
         // product/quality/data-governance rails (R2 PII, R5 format, R6
         // sysprompt-leak, R7 topic) stay entitlement-gated. A flagship

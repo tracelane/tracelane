@@ -1,21 +1,50 @@
 import { cn } from "../lib/cn";
 
 /**
- * AgentGraph — the shape of an agent run: agent → tools → models (app design
- * system, docs/design/tracelane-app-full.html "agent execution").
+ * AgentGraph — agent → tools → models topology. Nodes sized by real usage; edges
+ * schematic.
  *
- * Pure presentation + HONEST framing: this is a TOPOLOGY view, not a measured
- * per-edge flow. The nodes are REAL — the tools and models actually seen in the
- * window's traces — and each node dot is sized by its REAL usage (tool calls /
- * model requests). The edges are schematic (which tools and models co-occur in
- * the agent), drawn faintly and uniformly; we do NOT claim a measured tool→model
- * routing we can't attribute. The caller's caption says exactly that.
+ * ── ⚠ THIS COMPONENT IS EXPORTED AND RENDERED NOWHERE. THAT IS A DECISION. ───
+ * Documented 2026-08-22 after a git/docs investigation, because nothing at HEAD said
+ * so and the next reader would otherwise either delete it as dead or "restore" it
+ * believing it was dropped by accident.
  *
- * Layout: unlabeled dots in three columns (agent | tools | models) so it stays
- * legible at 1/3-card width, with column captions beneath and a compact legend
- * mapping dot → name (with drill-through). Edges are a behind-layer SVG stretched
- * to the box; the dots are HTML (true circles, not scaled ellipses). Token-
- * colored: tools = --info (tool-span hue), models = --action (lava), agent = ink.
+ * IT HAD A CALLER AND LOST IT — not forgotten. Built `97035423` (2026-07-26 05:57
+ * UTC) alongside `RequestFlow` and `ModelDonut` to match a founder screenshot
+ * (`:8576`), live at `97035423:apps/web/app/dashboard/page.tsx:41` +
+ * `:669`, and deployed the same day. Removed **2 h 26 min later** by `3a3cc2ae`
+ * (08:23 UTC), whose commit message gives the reason verbatim:
+ *
+ *     "Dropped Model-breakdown donut (kept the Traffic-by-model table)
+ *      + Agent execution (redundant nodes, schematic edges)."
+ *
+ * Founder authority is recorded twice — `:8559` (session header: *"drop
+ * agent, hunt duplicates"*) and `:8565` (*"agent-execution dropped (nodes duplicated
+ * donut+tool-table; edges schematic)"*). `git log -S'<AgentGraph'` returns exactly
+ * two commits, the adder and the remover, so nothing has re-added it. The export in
+ * `index.ts` was simply never withdrawn with the card.
+ *
+ * NOT BLOCKED ON DATA. `/v1/query/tool-analytics` is still fetched by the dashboard.
+ * The sibling proves the point: `ModelDonut` was cut by the SAME sentence and
+ * re-wired 26 days later in `40b69596` (DSH-08) — a sweep whose whole purpose was
+ * rewiring built-but-unused charts. It picked up the donut and passed over this.
+ *
+ * TO SHIP IT, TWO THINGS MUST CHANGE, and only one of them has:
+ *   1. Redundancy — SPENT. The donut got its own home in DSH-08, so this no longer
+ *      duplicates the model breakdown and the tool table.
+ *   2. Honesty — NOT SPENT, and it is the blocker. "Edges schematic" means the
+ *      agent→tool→model links are DRAWN, not MEASURED:
+ *      `crates/gateway/src/tool_analytics.rs` returns per-tool aggregates
+ *      (calls / errors / p95_ms) with no model association at all. Until a read
+ *      exists that can say which model called which tool, every edge here is a
+ *      claim the data does not support — which is the one thing this product does
+ *      not get to draw.
+ *
+ * THE DOCSTRING ANCHOR THAT USED TO BE HERE WAS FALSE. It cited
+ * `docs/design/tracelane-app-full.html "agent execution"`; that string appears
+ * **zero** times in that file, at HEAD and in `0273fd33` which added it — wrong at
+ * birth. `check-spec-anchors.py` only scans `specs/`, so source docstring anchors
+ * are ungated; that gap is why it survived.
  */
 
 export interface AgentGraphNode {
@@ -105,7 +134,7 @@ export function AgentGraph({
 
 	const legendRow = (title: string, nodes: AgentGraphNode[], color: string) =>
 		nodes.length > 0 ? (
-			<div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-ink-3">
+			<div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-ink-3">
 				<span className="font-medium text-ink-2">{title}</span>
 				{nodes.map((n) => {
 					const inner = (
@@ -126,7 +155,7 @@ export function AgentGraph({
 						<a
 							key={n.id ?? n.label}
 							href={n.href}
-							className="rounded hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-seal"
+							className="rounded hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							{inner}
 						</a>
@@ -173,7 +202,7 @@ export function AgentGraph({
 						TOOL_X,
 						toolY[j] ?? 50,
 						dotPx(t.weight, toolMax),
-						"var(--info)",
+						"var(--chart-primary)",
 						t.label,
 					),
 				)}
@@ -182,25 +211,28 @@ export function AgentGraph({
 						MODEL_X,
 						modelY[k] ?? 50,
 						dotPx(m.weight, modelMax),
-						"var(--action)",
+						"var(--chart-secondary)",
 						m.label,
 					),
 				)}
 
 				{/* column captions */}
 				<span
+					/* design-constraint-ok: label positioned by the same pixel scale as the marks it labels — the ramp floor would overlap the neighbouring tick */
 					className="absolute -translate-x-1/2 text-[9px] font-medium uppercase tracking-wide text-ink-3"
 					style={{ left: `${AGENT_X}%`, top: "88%" }}
 				>
 					agent
 				</span>
 				<span
+					/* design-constraint-ok: label positioned by the same pixel scale as the marks it labels — the ramp floor would overlap the neighbouring tick */
 					className="absolute -translate-x-1/2 text-[9px] font-medium uppercase tracking-wide text-ink-3"
 					style={{ left: `${TOOL_X}%`, top: "88%" }}
 				>
 					tools
 				</span>
 				<span
+					/* design-constraint-ok: label positioned by the same pixel scale as the marks it labels — the ramp floor would overlap the neighbouring tick */
 					className="absolute -translate-x-1/2 text-[9px] font-medium uppercase tracking-wide text-ink-3"
 					style={{ left: `${MODEL_X}%`, top: "88%" }}
 				>
@@ -210,8 +242,8 @@ export function AgentGraph({
 
 			{/* legend — dot → name, with drill-through */}
 			<div className="space-y-1">
-				{legendRow("Tools", tools, "var(--info)")}
-				{legendRow("Models", models, "var(--action)")}
+				{legendRow("Tools", tools, "var(--chart-primary)")}
+				{legendRow("Models", models, "var(--chart-secondary)")}
 			</div>
 		</div>
 	);

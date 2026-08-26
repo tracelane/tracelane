@@ -60,6 +60,7 @@ export default defineConfig({
 		// on docs-only changes gets ignored, and an ignored control is the failure
 		// mode this repo keeps re-learning — but the real fix is to stop paying the
 		// boot cost per suite: one shared PGlite instance across the e2e suites, or a
+		// snapshot restored per suite. Tracked in as a small item so
 		// the raised number does not become the resting state.
 		hookTimeout: 180_000,
 		testTimeout: 60_000,

@@ -23,7 +23,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
     adapter — including all of the TypeScript ones — wraps an object only you
     can construct, so the bootstrap imports the right `instrument*` function and
     puts the exact call beside it. The TypeScript SDK has no zero-config
-    patching; `autoInstrument()` throws by design and lands in v1.1.
+    patching; `autoInstrument()` throws by design and is not implemented.
   - The SDK is installed with the package manager your lockfile names (`pnpm`,
     `yarn`, `bun`, `npm`, `uv`, `poetry`, `pipenv`, or `python3 -m pip`). A
     failed install exits non-zero and prints the command to re-run; the

@@ -5,7 +5,7 @@ Tracelane's Rust gateway — the performance-critical hot path.
 
 ## Responsibility
 
-- Proxy LLM requests from customer agents to 30+ providers (BYOK, zero markup)
+- Proxy LLM requests from customer agents to 150+ providers (BYOK, zero markup)
 - Run the predictive guardrail layer inline on every request (<50ms p99)
 - Emit OTLP spans to NATS JetStream for ingest
 - Maintain a tamper-evident SHA-256 audit log with Ed25519 Merkle commitments

@@ -6,7 +6,7 @@
 //!   POST /v1/embeddings             — OpenAI-compatible embeddings endpoint
 //!
 //! AppState bundles all shared components:
-//!   providers    — ProviderRegistry (35 routable: 7 native adapters + 28 OpenAI-compatible + failover chain)
+//!   providers    — ProviderRegistry (6 native adapters + every row of providers.tsv + failover chain)
 //!   audit_chain  — AuditChain (SHA-256 hash chain + Rekor anchoring every 100 events)
 //!   rate_limiter — RateLimiter (per-tenant token bucket, DashMap-backed single-node V1)
 //!   predictive   — PredictiveLayer (8 predictors, inline on every request)
@@ -76,6 +76,7 @@ pub struct Config {
     /// Benchmark-only: when true, requests for the reserved `__bench_mock*`
     /// models return an instant canned response instead of dispatching upstream,
     /// so a load test measures *gateway overhead* with ~0 provider time
+    /// (`bench/gateway/`). Off by default; double-gated (this flag AND the
     /// reserved model prefix), so a normal tenant request can never reach it.
     /// Env: `TRACELANE_BENCH_MOCK_UPSTREAM=1`. NEVER set on a tenant-serving node.
     pub bench_mock_upstream: bool,
@@ -116,11 +117,17 @@ impl Config {
 #[derive(Clone)]
 pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
+    /// GWY-24 semantic cache. `None` when `semantic_cache:` is absent from
+    /// `tracelane.yaml` OR `CLICKHOUSE_URL` is unset — off is the only safe
+    /// default, because a cache that turns itself on serves a remembered answer
+    /// to somebody who never asked for one.
+    pub semantic_cache: Option<Arc<crate::semantic_cache::SemanticCache>>,
     pub audit_chain: Arc<AuditChain>,
     pub rate_limiter: Arc<RateLimiter>,
     /// Monthly trace-quota tracker enforcing the hard 5× cap.
     /// Hot-path budget <500ns p99 (see `benches/rate_limiter.rs`).
     pub quota_tracker: Arc<QuotaTracker>,
+    /// ClickHouse URL the `quota_tracker` rehydrates the durable monthly
     /// baseline from on (re)start / month rollover, so a restart or blue-green
     /// deploy no longer forgives accrued quota. `None` (dev / no CH) disables
     /// rehydration — the counter starts at 0. Mirrors `config.clickhouse_url`.
@@ -260,6 +267,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         match crate::db::build_pool().await {
             Ok(pool) => {
                 tracing::info!("Postgres pool ready");
+                // B-256: hold a few pooled connections warm. Without this a
+                // request arriving after an idle gap pays a fresh connect
+                // (~94 ms measured) and, if the managed compute has suspended,
+                // its resume (~1.2 s). See `db/keepalive.rs` — it documents what
+                // breaks if this line is removed, because the keepalive this
+                // replaces was an accidental side effect of the alert poller and
+                // was deleted without anyone knowing it was load-bearing.
+                crate::db::keepalive::spawn(pool.clone());
+                // B-256: keep ACTIVE api-key entries warm against the control
+                // plane. Without it a key presented less often than the 60s
+                // cache TTL misses on every request and pays a Neon round trip
+                // plus an Argon2id verify — the same defect the entitlement
+                // cache already fixed for itself. The refresh interval becomes
+                // the revocation bound, which is TIGHTER than the TTL it
+                // replaces, so this is not a security relaxation.
+                crate::db::api_keys::spawn_auth_cache_refresher(pool.clone());
                 crate::db::set_global_pool(pool);
             }
             Err(err) => {
@@ -298,6 +321,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Arc::new(cache)
     });
 
+    // Entitlement-driven per-plan retention sweep. Gated OFF by default;
     // `TRACELANE_RETENTION_SWEEP=dryrun|enforce` enables it. The flat 365d table
     // TTL is the fail-safe backstop (never deletes a paying tenant early); this
     // trims each tenant to their plan window (Free 7 … Enterprise 365).
@@ -382,6 +406,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // unwrapping: a panic on a path that cannot happen is strictly worse than a
         // defensive fallthrough, and `.claude/rules/rust.md` bans `expect` here anyway.
         CaptureBoot::Connect => match config.nats_url.as_deref() {
+            // `retry_on_initial_connect` — the connection is established in
             // the BACKGROUND and retried, instead of `connect()` returning `Err` once
             // and capture being dead for the life of the process.
             //
@@ -448,6 +473,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let kill_switch = Arc::new(crate::kill_switch::KillSwitch::from_env());
     let predictive = Arc::new(PredictiveLayer::new().with_kill_switch(kill_switch.clone()));
 
+    // ADR-069: async audit append. Create the JetStream context + the
     // durable TRACELANE_AUDIT stream BEFORE serving (so the first publish lands),
     // enable the acked-publish path on the audit chain, and spawn the sole
     // head-writer consumer. On any setup failure the audit path stays SYNCHRONOUS
@@ -455,6 +481,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(ref nats_client) = nats {
         let js = async_nats::jetstream::new((**nats_client).clone());
         match crate::audit_consumer::ensure_audit_stream(&js).await {
+            // NEVER ENABLE THE ASYNC PATH WITHOUT THE POSTGRES IT REQUIRES.
+            //
+            // `append_from_wire` bails with "audit consumer requires a Postgres pool",
+            // and the consumer does NOT ack a failed append — by design, so a real
+            // PG/CH outage redelivers rather than losing an event. With no pool at all
+            // that correct-for-an-outage behaviour becomes an infinite loop: every
+            // audit event fails forever and JetStream redelivers it forever.
+            //
+            // MEASURED on a self-host stack, which runs no Postgres by design: four
+            // chat requests produced FOUR spans and ZERO audit_log rows, plus a
+            // redelivery storm of ~16 failures/minute that never terminates — on a box
+            // infra/self-host/docker-compose.yml says can be 2 vCPU. The gateway
+            // advertised the ledger at boot and then failed every append silently.
+            //
+            // The SYNC path needs no Postgres and was there all along: `publish()`
+            // falls back to `append()` when no JetStream is wired, and `append()`
+            // falls back to `append_in_memory`, which hashes the chain and persists the
+            // `audit_log` row to ClickHouse. So NOT enabling the async path is what
+            // makes the ledger work here — the bug was enabling a path that could
+            // never succeed and thereby bypassing the one that could.
+            Ok(()) if !audit_chain.has_pg_pool() => {
+                tracing::warn!(
+                    "audit: no Postgres control plane — using the SYNCHRONOUS append \
+                     path (ClickHouse-persisted). The ADR-069 async stream is NOT \
+                     enabled: its consumer requires Postgres and would fail every \
+                     append and redeliver forever. NOTE: without Postgres the chain \
+                     does not resume across a restart (warm_from_postgres is the only \
+                     resume path), so seq restarts at genesis on reboot."
+                );
+            }
             Ok(()) => {
                 audit_chain.set_jetstream(js, kill_switch.clone());
                 crate::audit_consumer::spawn(Arc::clone(&audit_chain), (**nats_client).clone());
@@ -493,6 +549,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // Wire the billing recorder into the audit chain so each SUCCESSFUL
     // Rekor anchor batch meters one `audit_anchors` usage event (ADR-048). Off
     // the anchor path (fire-and-forget, tenant→customer mapped in the hook). No
     // recorder (POLAR_ACCESS_TOKEN unset) → anchoring is simply not metered.
@@ -542,6 +599,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // the NoOp store (CLICKHOUSE_URL unset).
     prompt_router.load_from_clickhouse().await;
 
+    // B-187b (verifier finding 1): make condition 3 a STARTUP INVARIANT.
     //
     // The request-time check is `state.entitlements.is_none()`, which is `Some`
     // iff the Postgres pool initialised. But :244-258 logs a warn and CONTINUES
@@ -634,6 +692,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             engine = engine.with_registry_loader(loader);
             tracing::info!("inline guardrails: per-workspace capability-registry loader wired");
 
+            // B: observe the tool definitions that actually arrive, so a
             // tenant can approve them instead of hand-authoring tool JSON.
             // Postgres-gated for the same reason as the loader — there is
             // nowhere to flush to otherwise. Capture is a DashMap update on the
@@ -656,8 +715,47 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Arc::new(engine)
     };
 
+    // GWY-24. Requires BOTH a `semantic_cache:` block in `tracelane.yaml` and a
+    // ClickHouse URL — either missing means OFF, and off is silent by design:
+    // an operator who has not asked for a cache must not get one.
+    let semantic_cache = match (
+        self::config::semantic_cache(),
+        config.clickhouse_url.as_deref(),
+    ) {
+        (Some(cfg), Some(url)) => {
+            tracing::info!(
+                embedding_models = ?cfg.embedding_models(),
+                dims = cfg.embedding_dimensions(),
+                threshold = cfg.default_threshold(),
+                max_scan_entries = cfg.max_scan_entries(),
+                "semantic cache ENABLED"
+            );
+            Some(Arc::new(crate::semantic_cache::SemanticCache::new(
+                crate::clickhouse_query::ch_client(url),
+                providers.clone(),
+                cfg.clone(),
+            )))
+        }
+        (Some(_), None) => {
+            // Configured but unusable. LOUD, because the operator believes they
+            // enabled a cache and the bill will say otherwise.
+            tracing::warn!(
+                "semantic_cache is configured in tracelane.yaml but CLICKHOUSE_URL is \
+                 unset — the cache is OFF and every request will go to the provider"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    // EVL-04: the dataset routes need the SAME entitlement cache the hot path uses,
+    // and the struct below MOVES it. Clone once, here, rather than resolving a second
+    // cache — two caches would drift and a tenant could be entitled on one surface and
+    // not the other, which is the shape `.claude/rules/tenancy.md` exists to prevent.
+    let entitlements_for_state = entitlements.clone();
     let state = AppState {
         providers,
+        semantic_cache,
         audit_chain,
         rate_limiter,
         quota_tracker,
@@ -670,7 +768,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         guardrail,
         billing,
         nats,
-        entitlements,
+        entitlements: entitlements_for_state,
         circuit_breaker,
         kill_switch,
         prompt_router,
@@ -712,6 +810,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // writes via Drizzle. The gateway once mounted a SECOND receiver here, but
     // it keyed correlation only on `polar_customer_id` — a column no real
     // checkout ever populates — so it could never flip a real subscription, and
+    // two receivers could silently drift. Retired 2026-07-28: one
     // correct path. Polar is registered against the web route; the gateway never
     // received a delivery. (WorkOS webhooks stay on the gateway — separate path.)
 
@@ -752,6 +851,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(wh_cfg) = crate::auth::workos_webhook::WorkOsWebhookConfig::from_env() {
         let wh_state = crate::auth::workos_webhook::WorkOsWebhookState {
             config: Arc::new(wh_cfg),
+            // Ingress cap on control-plane–growing WorkOS events.
             rate_limiter: Arc::new(crate::auth::workos_webhook::WebhookRateLimiter::from_env()),
         };
         let wh_app = Router::new()
@@ -785,6 +885,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let reader = std::sync::Arc::new(crate::audit_export::ClickHouseExportReader::new(ch));
         let export_state = crate::audit_export::ExportState {
             reader,
+            // Audit-SKU entitlement gate. Reuse the app's entitlement
             // cache; `None` only if Postgres is unset, in which case the export
             // fails closed (503) rather than serving a paid capability unverified.
             entitlements: state.entitlements.clone(),
@@ -804,6 +905,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         app = app.merge(self_verify_app);
         tracing::info!("Audit self-verify mounted at /v1/audit/self-verify");
 
+        // Option 1: gateway-proxied trace + SLO reads. The dashboard
         // (off-node on Vercel) and `tlane replay` read ClickHouse ONLY through
         // these endpoints — tenant comes from the validated Claims.tenant_id,
         // never from a session org_id bound into the query. Same CLICKHOUSE_URL
@@ -821,8 +923,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             ch: crate::clickhouse_query::ch_client(ch_url.clone()),
         };
         app = app.merge(crate::tool_analytics::routes().with_state(tool_state));
+        // EVL-04 datasets. Same on-node ClickHouse gate as the trace reads above:
+        // the tables live in ClickHouse beside `prompts`/`eval_runs`, so with no
+        // CLICKHOUSE_URL the surface is simply ABSENT — a clean 404 rather than a
+        // route that answers and cannot read.
+        //
+        // `entitlements` is passed as an `Option` and the gate REFUSES on `None`.
+        // That is the unprivileged direction (`.claude/rules/tenancy.md`): no
+        // control plane means free tier, never paid. `guardrail/rail.rs` once
+        // resolved the opposite way and silently granted every paid rail to OSS
+        // self-hosts — nobody was billed wrongly, so nothing looked wrong.
+        let dataset_state = crate::dataset_routes::DatasetRoutesState {
+            store: std::sync::Arc::new(crate::dataset_routes::ClickHouseDatasetStore::new(
+                crate::clickhouse_query::ch_client(ch_url.clone()),
+            )),
+            entitlements: entitlements.clone(),
+        };
+        app = app.merge(crate::dataset_routes::routes().with_state(dataset_state));
         tracing::info!(
-            "Trace reads mounted at /v1/traces, /v1/traces/{{id}}/spans, /v1/slo, /v1/query/signatures"
+            "Trace reads mounted at /v1/traces, /v1/traces/{{id}}/spans, /v1/slo, /v1/query/signatures; datasets at /v1/datasets"
         );
     } else {
         tracing::info!("CLICKHOUSE_URL not set — audit export + trace read routes not mounted");
@@ -837,6 +956,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         app = app.merge(byok_app);
         tracing::info!("BYOK management mounted at /v1/byok/provider-keys (POST/GET/DELETE)");
 
+        // The WRITE path for R3 rug-pull detection. The read path
         // (registry_loader), the table and the comparison all shipped earlier;
         // with no way to CREATE a pin the rail was correct and permanently
         // inert. Postgres-gated for the same reason as BYOK above: a self-host
@@ -846,6 +966,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("Tool pinning mounted at /v1/guardrails/tool-pins (POST/GET/DELETE)");
     }
 
+    // Gateway-side API-key mint. The dashboard proxies key creation here
     // because the Cloudflare Workers runtime can't run the web minter's WASM
     // Argon2; RustCrypto Argon2 runs natively here. Same pepper + params, so
     // minted keys stay verify-compatible with `lookup_tenant_by_key_body`.
@@ -879,16 +1000,68 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("notifications mounted at /v1/notifications");
     }
 
+    // B1 Prompt Promotion routes (per ADR-009 /). The router was
     // built once (build_prompt_router) and lives in AppState so the chat
     // handler can feed drift metrics into it; here we mount the same shared
     // Arc behind the /v1/prompts/* sub-router. The write workflow
     // (promote/rollback/observe) is gated on FeatureKey::PromptPromotionWrite
+    // via the app entitlement cache (, ADR-009 Team+); with no Postgres
     // the gate fails closed inside the handlers (503 on writes).
     {
+        // EVL-05: the eval engine needs ClickHouse (to write `eval_runs`) and the
+        // provider registry (to run a case through the SAME dispatch the chat
+        // path uses). `None` without ClickHouse — the routes then answer a typed
+        // 503 rather than pretending the feature does not exist.
+        let eval = config.clickhouse_url.as_deref().map(|url| {
+            std::sync::Arc::new(crate::prompt_eval::PromptEvalEngine::new(
+                crate::clickhouse_query::ch_client(url),
+                state.providers.clone(),
+                state.prompt_router.clone(),
+                // R81: the SAME NATS client the chat path publishes through, so an
+                // eval case's span travels the identical route to ClickHouse. A
+                // second publish path would be a second definition of "a span was
+                // captured", and the two would disagree on the first failure.
+                state.nats.clone(),
+            ))
+        });
+        if let Some(engine) = eval.clone() {
+            // Sweep runs orphaned by a restart BEFORE serving. The gate maps
+            // `running` to blocked, so a row left behind by a process death is a
+            // promotion wedged shut until someone notices — the same shape as
+            // `prev_production` never being rebuilt, which silently disarmed
+            // auto-rollback after every deploy.
+            engine.reconcile_stale_runs().await;
+        }
+        // EVL-02 experiments. Mounted only when BOTH ClickHouse (every row this
+        // surface reads and writes lives there) and the eval engine exist — an
+        // experiment is a fan-out over that ONE engine, never a second executor,
+        // so a surface without it could accept a request it could not run.
+        if let (Some(engine), Some(ch_url)) = (eval.clone(), config.clickhouse_url.clone()) {
+            let xstate = crate::experiment_routes::ExperimentRoutesState {
+                store: std::sync::Arc::new(
+                    crate::experiment_routes::ClickHouseExperimentStore::new(
+                        crate::clickhouse_query::ch_client(&ch_url),
+                    ),
+                ),
+                // The SAME dataset store the dataset routes use, so "which
+                // snapshot is latest" has one answer.
+                datasets: std::sync::Arc::new(crate::dataset_routes::ClickHouseDatasetStore::new(
+                    crate::clickhouse_query::ch_client(&ch_url),
+                )),
+                engine,
+                // `Option`, and the gate REFUSES on `None` — no control plane
+                // means free tier, never paid (`.claude/rules/tenancy.md`).
+                entitlements: state.entitlements.clone(),
+            };
+            app = app.merge(crate::experiment_routes::routes().with_state(xstate));
+            tracing::info!("experiments mounted at /v1/experiments (+ /v1/evals/{{id}}/items)");
+        }
+
         let prompt_state = crate::prompt_routes::PromptRoutesState {
             router: state.prompt_router.clone(),
             entitlements: state.entitlements.clone(),
             audit_chain: state.audit_chain.clone(),
+            eval,
         };
         let prompt_app = crate::prompt_routes::routes().with_state(prompt_state);
         app = app.merge(prompt_app);
@@ -938,6 +1111,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
 /// Is span publish WIRED? True once a NATS client exists.
 ///
+/// **Precisely: wired, not necessarily connected right now.** Since the client
 /// is built with `retry_on_initial_connect()`, so it exists and reconnects in the
 /// background even while the server is unreachable. Treating this as "we are currently
 /// publishing" would be the overclaim; the live signal is `spans_dropped`, which only
@@ -1118,50 +1292,49 @@ fn build_prompt_router(clickhouse_url: Option<&str>) -> Arc<crate::prompt_router
     Arc::new(prompt_router)
 }
 
+/// Does the request ask for SSE? Read from the raw body because the cache
+/// decision happens before the typed request is re-serialised anywhere.
+fn is_streaming_request(body: &serde_json::Value) -> bool {
+    body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 /// Optional prompt-promotion correlation extracted from the request body so
 /// the auto-rollback engine can attribute a request's metrics to a specific
 /// prompt version. Absent for ad-hoc (non-managed-prompt) traffic.
+///
+/// **`name` and `env` used to live here and are gone deliberately.** Their only
+/// consumer was the flip inside `observe_and_maybe_rollback` — `env` chose
+/// whether to touch production and `name` chose which pointer to move — and the
+/// hot path no longer has the authority to flip anything (see
+/// `PromptRouter::observe_only`). Two things follow, and the second is why they
+/// were deleted rather than left inert:
+///
+///   * `env` defaulted to `Production` whenever the field was absent **or**
+///     unparseable, conflating "not stated" with "not understood" and resolving
+///     both to the one value that mutates. With no flip there is nothing left to
+///     default.
+///   * A struct that still carried a name and an env would be an invitation to
+///     re-wire the flipping call, since the arguments would be sitting right
+///     there. Removing them makes the capability unreachable rather than merely
+///     unused.
 #[derive(Clone)]
 struct PromptObservation {
     version_id: Uuid,
-    name: String,
-    env: crate::prompt_router::Env,
 }
 
 impl PromptObservation {
-    /// Returns `Some` only when the body carries both a parseable
-    /// `tracelane_prompt_version_id` and a `tracelane_prompt_name`. `env`
-    /// defaults to production.
+    /// Returns `Some` only when the body carries a parseable
+    /// `tracelane_prompt_version_id`.
+    ///
+    /// `tracelane_prompt_name` is no longer required: it selected a flip target
+    /// and there is no flip. The version id alone attributes the metric, and
+    /// `PromptRouter::feed_engine` refuses any id the tenant does not own.
     fn from_body(body: &serde_json::Value) -> Option<Self> {
         let version_id = body
             .get("tracelane_prompt_version_id")
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok())?;
-        let name = body
-            .get("tracelane_prompt_name")
-            .and_then(|v| v.as_str())?
-            .to_string();
-        let env = body
-            .get("tracelane_prompt_env")
-            .and_then(|v| v.as_str())
-            .and_then(parse_prompt_env)
-            .unwrap_or(crate::prompt_router::Env::Production);
-        Some(Self {
-            version_id,
-            name,
-            env,
-        })
-    }
-}
-
-fn parse_prompt_env(s: &str) -> Option<crate::prompt_router::Env> {
-    use crate::prompt_router::Env;
-    match s {
-        "dev" => Some(Env::Dev),
-        "staging" => Some(Env::Staging),
-        "production" => Some(Env::Production),
-        "canary" => Some(Env::Canary),
-        _ => None,
+        Some(Self { version_id })
     }
 }
 
@@ -1197,11 +1370,24 @@ fn spawn_prompt_metric_observation(
             accuracy: None,
             hallucination: None,
         };
+        // `observe_only` — NOT `observe_and_maybe_rollback`. The chat request
+        // body carries `tracelane_prompt_*`, so feeding the flipping variant
+        // from here made the body a prompt-WRITE surface with none of the gates
+        // the HTTP write routes carry. The hot path may move the EWMA; only
+        // `/v1/prompts/{name}/observe` may move production. See
+        // `PromptRouter::observe_only`.
+        //
+        // Only the version id is carried now; `name`/`env` existed only to
+        // choose a flip target and have been removed from the struct.
         if let Err(e) = router
-            .observe_and_maybe_rollback(tenant_id, &obs.name, obs.env, obs.version_id, &metrics)
+            .observe_only(tenant_id, obs.version_id, &metrics)
             .await
         {
-            tracing::warn!(error = %e, "auto-rollback metric observation failed");
+            // Expected and cheap for the common case: a body naming a version
+            // this tenant does not own is refused by `feed_engine`. DEBUG, not
+            // WARN — an untrusted field must not be able to drive log volume
+            // (`.claude/rules/logging.md`).
+            tracing::debug!(error = %e, "prompt metric observation not recorded");
         }
     });
 }
@@ -1264,6 +1450,11 @@ async fn chat_completions_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(tracelane_shared::span::bounded_business_reference);
 
+    // B-256: per-stage hot-path timing. Costs one `Instant::now()` per stage
+    // and emits NOTHING unless the pre-dispatch segment is over threshold —
+    // see `hotpath.rs` for why it is not a per-request log line.
+    let mut timer = crate::hotpath::StageTimer::new();
+
     // --- Step 1: Auth ---
     let authorization = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         Some(v) => v.to_owned(),
@@ -1316,7 +1507,10 @@ async fn chat_completions_handler(
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
+    timer.mark("auth");
+
     // --- Step 2: Rate limit + quota (one warm entitlement resolve) ---
+    //  fix A: derive BOTH the rate-limit tier and the monthly quota config
     // from a single warm entitlement-cache read (in-process Moka, LISTEN/NOTIFY-
     // invalidated) — never a per-request Postgres round-trip. `plan_lookup_key`
     // (`builder_v1`, …) is the authoritative plan (ADR-020) and supersedes the
@@ -1332,11 +1526,13 @@ async fn chat_completions_handler(
         .unwrap_or("claude-sonnet-4-6")
         .to_owned();
 
+    // The ONE bench gate. Sits after Step 1 auth and after
     // tenant_id is bound from claims, so an unauthenticated request can never
     // reach it. Consumed by the rate-limit tier below AND by the routing/BYOK
     // bypass further down — one expression, two uses.
     let bench_mock = bench_mock_active(state.bench_mock_upstream, &model);
 
+    // B-187d: ONE grant at the entitlement layer, not N bypasses at N
     // enforcement points. Four limiters rejected the benchmark in sequence
     // (router 400 -> free-tier 429 -> Bench-tier-ignored 429 -> monthly quota
     // 429); each patch revealed the next. Every per-tenant check reads from
@@ -1358,6 +1554,7 @@ async fn chat_completions_handler(
             None => None,
         }
     };
+    // B-187b: bench tier is TRIPLE-conditioned. (1) the env flag and (2) the
     // reserved `__bench_mock*` model are folded into `bench_mock`; (3) is the
     // structural one — `state.entitlements` is `Some` iff a Postgres control
     // plane exists (`server.rs:278`, `db::global_pool().map(...)`), which is
@@ -1374,7 +1571,16 @@ async fn chat_completions_handler(
     let tier = entitlements
         .as_ref()
         .map_or(RateLimitTier::Free, |e| e.rate_limit_tier());
-    let rl = state.rate_limiter.check(tenant_id, tier);
+    // GWY-43: the tenant bucket AND, when the key carries an override, its own.
+    // A key with no override behaves exactly as it did before — `check_scoped`
+    // falls through to the tenant decision — so this is additive for every key
+    // that exists today.
+    let rl = state.rate_limiter.check_scoped(
+        tenant_id,
+        tier,
+        claims.api_key_id(),
+        claims.rate_limit_rpm,
+    );
     if let RateLimitDecision::Throttle { retry_after_secs } = rl {
         // Count the rejection for the Gateway-ops live counter. A 429 emits no
         // span (no dispatch), so this in-process tally is how the surface reports
@@ -1390,6 +1596,8 @@ async fn chat_completions_handler(
             .into_response();
     }
 
+    timer.mark("entitlements");
+
     // --- Step 2b: Monthly quota hard-cap ---
     // QuotaTracker increments the per-tenant monthly counter and decides
     // Allow / AllowWithOverage / HardCapExceeded. Hot-path budget <500ns
@@ -1400,6 +1608,7 @@ async fn chat_completions_handler(
         || QuotaConfig::from_plan_tier_str("free"),
         |e| e.quota_config(),
     );
+    //  durability: rehydrate the counter from the durable ClickHouse trace
     // count once per tenant per month per process, so a restart / blue-green
     // deploy no longer forgives accrued usage. `needs_seed` keeps the warm path
     // free of the CH read.
@@ -1459,6 +1668,113 @@ async fn chat_completions_handler(
             .into_response();
     }
 
+    timer.mark("quota");
+
+    // --- Step 2c: PER-KEY MONTHLY BUDGET (GWY-43) ---
+    //
+    // `api_keys.budget_usd_monthly` has existed since A13 and enforced nothing:
+    // it was validated at mint, INSERTed, and never selected again. This is the
+    // read, and the cut-off.
+    //
+    // It sits AFTER the tenant quota deliberately — the platform's own limits
+    // decide first, then the customer's self-imposed ceiling on one credential.
+    // And it sits BEFORE the audit publish and the BYOK key fetch, so a key over
+    // its budget never causes a provider credential to be decrypted.
+    //
+    // Cost: one `DashMap` probe and an atomic load on the warm path. The durable
+    // ClickHouse seed happens once per key per month per process ('s
+    // lesson — an in-memory counter that resets on deploy is not a cap).
+    if let (Some(key_id_str), Some(budget)) = (claims.api_key_id(), claims.budget_usd_monthly) {
+        if let Ok(key_uuid) = Uuid::parse_str(key_id_str) {
+            let who = crate::spend::Subject::Key(key_uuid);
+            let spend = crate::spend::tracker();
+            if spend.needs_seed(who, year_month) {
+                let baseline = spend_baseline_from_clickhouse(&state, tenant_id, key_id_str).await;
+                spend.seed_if_needed(who, year_month, baseline);
+            }
+            if let crate::spend::BudgetDecision::Exceeded {
+                budget_usd,
+                spent_usd,
+            } = spend.check(who, Some(budget))
+            {
+                crate::rejection_metrics::registry().record_quota_exceeded(tenant_id);
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    api_key_id = %key_id_str,
+                    budget_usd,
+                    spent_usd,
+                    "API key over its monthly budget — refusing"
+                );
+                return (
+                    // 402, not 429. A 429 says "retry later" and every OpenAI-shaped
+                    // client will; this is a HARD STOP that no amount of retrying
+                    // resolves until the budget is raised or the month rolls.
+                    // Telling a client to retry into a wall is how a budget cap
+                    // becomes a retry storm.
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({
+                        "error": "key_budget_exceeded",
+                        "message": "this API key has reached its monthly budget",
+                        "budget_usd": budget_usd,
+                        "spent_usd": spent_usd,
+                        "resets_at": next_month_boundary_iso(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    timer.mark("budget_key");
+
+    // --- Step 2d: WORKSPACE MONTHLY BUDGET (GWY-43, the "per-team" cap) ---
+    //
+    // A team in this product IS the workspace — there is no `teams` table and
+    // never was — so the per-team cap is a per-tenant dollar ceiling, and it
+    // composes with the per-key one: a request must pass BOTH. That is what
+    // makes "give the CI key $50 of a $500 workspace budget" expressible.
+    //
+    // The ceiling rides the entitlement cache (15-min TTL + LISTEN/NOTIFY), so
+    // reading it costs no PG round trip on the request path.
+    let workspace_budget_micro = entitlements
+        .as_ref()
+        .map_or(0, |e| e.workspace_budget_micro_usd);
+    if workspace_budget_micro > 0 {
+        let who = crate::spend::Subject::Workspace(*tenant_id.as_uuid());
+        let spend = crate::spend::tracker();
+        if spend.needs_seed(who, year_month) {
+            let baseline = workspace_spend_baseline_from_clickhouse(&state, tenant_id).await;
+            spend.seed_if_needed(who, year_month, baseline);
+        }
+        let budget_usd = workspace_budget_micro as f64 / 1_000_000.0;
+        if let crate::spend::BudgetDecision::Exceeded {
+            budget_usd,
+            spent_usd,
+        } = spend.check(who, Some(budget_usd))
+        {
+            crate::rejection_metrics::registry().record_quota_exceeded(tenant_id);
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                budget_usd,
+                spent_usd,
+                "workspace over its monthly budget — refusing"
+            );
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "workspace_budget_exceeded",
+                    "message": "this workspace has reached its monthly budget",
+                    "budget_usd": budget_usd,
+                    "spent_usd": spent_usd,
+                    "resets_at": next_month_boundary_iso(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    timer.mark("budget_workspace");
+
     // --- Step 3: Predictive layer ---
     let ctx = PredictiveContext {
         tenant_id,
@@ -1502,6 +1818,8 @@ async fn chat_completions_handler(
     let prompt_obs = PromptObservation::from_body(&body);
     let guardrail_fired = warn_aft_id.is_some();
 
+    timer.mark("detection");
+
     // --- Step 4: Audit log ---
     let mut audit_payload = serde_json::json!({
         "model": body.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"),
@@ -1541,9 +1859,11 @@ async fn chat_completions_handler(
         )
             .into_response();
     }
+    timer.mark("audit");
     // --- Step 5: Provider dispatch ---
     // `mut`: on a successful cross-provider failover below we reassign this to
     // the provider that actually served the request, so the span, the echoed
+    // response model, and billing all attribute to the real server.
 
     // x402: extract payment event if present and record async.
     // Runs before provider dispatch so intent is captured even on provider error.
@@ -1560,13 +1880,15 @@ async fn chat_completions_handler(
         }
     }
 
+    // Resolve the provider ONCE from the single canonical map and FAIL
     // CLOSED on an unmatched model. There is NO default provider — routing an
     // unknown model to Anthropic (or any provider) would fetch that provider's
     // BYOK key for a model the caller never asked for (credential misrouting).
     // Rejecting is categorically safer than shipping the wrong provider's key.
+    // Bench-mock bypass for routing + BYOK.
     //
-    // POSITION IS THE SECURITY PROPERTY. This sits AFTER Step 1 auth (:925) and
-    // after `tenant_id` is taken from `claims` (:947), so an unauthenticated
+    // POSITION IS THE SECURITY PROPERTY. This sits AFTER Step 1 auth and
+    // after `tenant_id` is taken from `claims`, so an unauthenticated
     // request can never reach the mock arm — it is rejected upstream with 401
     // exactly as before. Asserted by `bench_mock_requires_auth_first`, not by
     // this comment.
@@ -1589,6 +1911,7 @@ async fn chat_completions_handler(
             Some(p) => p,
             None => {
                 // R13, and I did not find this one by reading — the guard did, on its
+                // first run. made the model map fail closed, which is right, but
                 // the ledger row is already published by here, so an unroutable model
                 // produced a ledger entry and no trace. It is also the single most
                 // likely error a new customer hits (a typo'd or unsupported model name),
@@ -1611,6 +1934,7 @@ async fn chat_completions_handler(
     // pool unavailable) fall back to the legacy env var. The env var is derived
     // from THIS provider_id, so a miss yields an empty key (upstream 401), never
     // another provider's key.
+    // The bench mock never dispatches upstream, so there is no credential
     // to resolve. Skipping the lookup also keeps the benchmark honest — it must
     // not measure a Postgres round-trip the mocked request would never make.
     let provider_key = if bench_mock {
@@ -1638,6 +1962,7 @@ async fn chat_completions_handler(
                 };
                 tracing::warn!(provider = provider_id, code, "provider key unresolvable");
                 // Emit the ERROR span so this is visible in /traces and countable —
+                // same reason the dispatch-failure path does (#3). Without it,
                 // the most common first-run failure is invisible in the product.
                 emit_post_ledger_error_span(
                     &state,
@@ -1682,6 +2007,21 @@ async fn chat_completions_handler(
             }
         };
 
+    // GWY-24: the cache identity is derived HERE — after the parse, BEFORE the
+    // guardrail redaction at `redact_request_in_place`.
+    //
+    // The ordering is load-bearing and not obvious. `crates/policy/src/pii.rs`
+    // builds its placeholder as `{REDACT_OPEN}{category}:{idx}}}` — a category
+    // and a running index, carrying no secret and no tenant material. Two
+    // DIFFERENT secrets in the same position therefore redact to a
+    // BYTE-IDENTICAL string, so hashing after redaction would treat two
+    // genuinely different requests as one and serve the wrong answer to the
+    // second. Hashing before redaction is the only correct window.
+    let cache_key = state
+        .semantic_cache
+        .as_ref()
+        .map(|_| crate::semantic_cache::request_key(&chat_request));
+
     // GWY-39: a `tracelane.yaml` alias names the provider (resolved above, via
     // the canonical map) AND the upstream model. Only the OUTGOING request is
     // rewritten. `model` deliberately keeps the caller's alias so the span, the
@@ -1697,6 +2037,8 @@ async fn chat_completions_handler(
         );
         chat_request.model.clone_from(&a.upstream_model);
     }
+
+    timer.mark("route_byok");
 
     // --- Step 4b: Inline guardrails (the guardrail spec) ---
     // Request-side rail dispatch over the parsed request (R4 lethal-trifecta +
@@ -1767,6 +2109,7 @@ async fn chat_completions_handler(
                 correlation_id = %correlation_id,
                 "request blocked by inline guardrail"
             );
+            //  #5: if the blocking reason maps to a canonical AFT-1 signature
             // (tool-description injection → AFT-TOOL-POISON-001), emit an
             // error-status span carrying that `aft_id` BEFORE the 403 short-circuit
             // — otherwise the blocked hit is invisible on /signatures (the very
@@ -1819,6 +2162,7 @@ async fn chat_completions_handler(
 
     // A7: one retry against the same provider on transient failure, within the
     // FT-01 200ms budget. This is the DEFAULT path. Opt-in cross-provider
+    // failover runs AFTER this, only when the request sets
     // `X-Tracelane-Failover: cross-provider` and the primary still failed —
     // re-dispatching the universal ChatRequest to the next provider (no schema
     // translation needed; each adapter translates the canonical request).
@@ -1879,10 +2223,145 @@ async fn chat_completions_handler(
     // untrusted-wrap); everything after, up to provider-complete, is the provider
     // round-trip (incl. A7 retry / cross-provider failover). Stamped once, here.
     let dispatch_ts = chrono::Utc::now();
+    timer.mark("guardrails");
+    // Emit against the SAME interval the span's overhead number opens with —
+    // `dispatch_ts - request_start` — so the log line and the span agree by
+    // construction instead of by two similar-looking clocks.
+    timer.emit_if_slow(
+        u64::try_from(
+            (dispatch_ts - request_start)
+                .num_microseconds()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
+    );
     // A7: one retry against the same provider on transient failure.
+    //  (verifier finding a): consume the SAME `bench_mock` computed at the
     // routing bypass rather than re-deriving the condition here. A second inline
     // copy of the gate is the drift the unified gate exists to prevent — extend
     // `bench_mock_active` and only one of the two decisions would follow it.
+    // ── GWY-24: the cache lookup. THE PLACEMENT IS THE ANSWER TO GWY-25. ────
+    //
+    // Everything above this line has already run: auth, quota, both budget
+    // ceilings, detection, guardrails, and the fail-CLOSED audit publish. So a
+    // hit is served AFTER the ledger append, not instead of it — `audit.rs`'s
+    // invariant ("the audit product does not serve unrecorded requests") is
+    // untouched, which is exactly the objection that killed the exact-match
+    // cache in `specs/GWY-25`.
+    //
+    // Only the DISPATCH is replaced. Not the ledger, not the guardrails, not the
+    // budgets.
+    let cache_hit: Option<crate::semantic_cache::CacheHit> = match (
+        state.semantic_cache.as_ref(),
+        cache_key.as_ref(),
+        is_streaming_request(&body),
+    ) {
+        // Streaming is never served from cache: `provider_stream_to_sse` has no
+        // text accumulator, and replaying a buffered body as SSE would fabricate
+        // timing the recorder never saw.
+        (Some(cache), Some(key), false) => cache.lookup(tenant_id, &model, key).await,
+        _ => None,
+    };
+
+    // SERVE THE HIT — and emit its span before returning, because a served
+    // request that produced no span is precisely the "trace gap" GWY-25 refused
+    // this feature over.
+    if let Some(hit) = cache_hit {
+        let mut span = build_gateway_span(
+            tenant_id,
+            trace_id,
+            &model,
+            agent_id.as_deref(),
+            human_authorizer.as_deref(),
+            business_reference.as_deref(),
+            request_start,
+            hit.prompt_tokens,
+            hit.completion_tokens,
+            None,
+            SpanUsageMeta {
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                stream: false,
+                // EXPLICIT Some(0.0), never None. `build_gateway_span` falls back
+                // to `pricing::cost_usd(model, tokens)` when cost is None — with
+                // replayed tokens that would invent LIST PRICE for a call that
+                // never happened, and the customer would be shown a charge for
+                // an answer we did not buy. `SpendTracker::record` drops
+                // non-positive cost, so 0.0 also adds nothing to spend.
+                cost_usd: Some(0.0),
+            },
+            conversation_id.as_deref(),
+            None,
+            // REAL TIMING, not `None`. `build_gateway_span` only emits
+            // `tracelane_gateway_overhead_us` when timing is present, so passing
+            // `None` made a cache hit the ONE request shape that reports no
+            // overhead at all.
+            //
+            // That is not cosmetic: deploy **Proof E** reads exactly this
+            // attribute, and on the deploy that shipped this feature its two
+            // identical requests meant the MEASURED one was a cache hit — so the
+            // gate reported "0.0 ms" and passed on a missing value rather than a
+            // fast one. The latency gate went vacuous on the very path this
+            // feature exists to make fast. Zero and unknown must never render the
+            // same, least of all inside the control that guards the number.
+            //
+            // For a hit there is no provider round trip, so both boundary stamps
+            // are NOW: overhead becomes (now − received) + (end − now) ≈ the
+            // whole request, which is exactly right — on this path the gateway IS
+            // the entire cost.
+            Some(GatewayTiming {
+                dispatch_ts: chrono::Utc::now(),
+                provider_complete_ts: chrono::Utc::now(),
+                ttft_us: None,
+            }),
+            None,
+            claims.api_key_id(),
+        );
+        span.attributes.tracelane_semantic_cache_hit = Some(true);
+        span.attributes.tracelane_semantic_cache_tier = Some(hit.tier.to_owned());
+        span.attributes.tracelane_semantic_cache_similarity = hit.similarity;
+        span.attributes.tracelane_semantic_cache_source_trace_id =
+            Some(hit.source_trace_id.to_string());
+        span.attributes.tracelane_semantic_cache_cost_saved_usd = Some(hit.cost_saved_usd);
+        // GWY-45: a cache hit is a real served request and must carry the same
+        // captured input as a miss. Omitting it here would silently bias every
+        // eval case set AWAY from repeated prompts — exactly the ones a cache
+        // makes common.
+        if let Some(captured) = CapturedInput::build(tenant_id, &chat_request) {
+            captured.apply(&mut span.attributes);
+        }
+        spawn_span_publish(&state, span);
+
+        // NO `spawn_billing_record` here, and that is not an omission. It meters
+        // `Meter::TokensProcessed` with n_tokens rather than cost, so zeroing the
+        // cost does NOT stop it — a hit would be billed to Polar as if the
+        // provider had been called.
+        tracing::debug!(
+            tier = hit.tier,
+            similarity = ?hit.similarity,
+            lookup_us = hit.lookup_us,
+            saved_usd = hit.cost_saved_usd,
+            "semantic cache hit — served without a provider call"
+        );
+        // `content-type: application/json` EXPLICITLY. The body is a JSON string
+        // and a bare `String` body would go out as `text/plain`, which every
+        // OpenAI-compatible client parses differently or not at all — a cache hit
+        // must be byte-and-header indistinguishable from a real answer, or the
+        // cache becomes a compatibility bug that only appears under load.
+        return (
+            StatusCode::OK,
+            axum::response::AppendHeaders([
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (
+                    axum::http::HeaderName::from_static("x-tracelane-cache"),
+                    hit.tier,
+                ),
+            ]),
+            hit.response_json,
+        )
+            .into_response();
+    }
+
     let mut provider_result = if bench_mock {
         // Bench-only instant upstream (TRACELANE_BENCH_MOCK_UPSTREAM). Replaces
         // ONLY the network dispatch with an instant canned stream, so a load
@@ -1907,10 +2386,20 @@ async fn chat_completions_handler(
     // Feed the breaker: any dispatch error (timeout / 5xx / connection) is a
     // failure outcome; the gen_ai.client.operation.exception event (ADR-032)
     // is the matching telemetry surface.
-    state
-        .circuit_breaker
-        .record(upstream, region, provider_result.is_ok());
+    //
+    // GWY-24: NOT on a cache hit. This call was unconditional, and a hit that
+    // reached it would report SUCCESS for a provider that was never contacted —
+    // which could hold a breaker CLOSED over a dead upstream for as long as the
+    // cache kept serving. The breaker's whole job is to observe the provider, so
+    // feeding it an observation that did not happen is worse than feeding it
+    // nothing.
+    if cache_hit.is_none() {
+        state
+            .circuit_breaker
+            .record(upstream, region, provider_result.is_ok());
+    }
 
+    // Opt-in CROSS-PROVIDER failover. Default OFF — the same-provider
     // path above is unchanged. Enable per request with
     // `X-Tracelane-Failover: cross-provider`. Works with no schema translation
     // because every adapter translates the universal `ChatRequest`: we simply
@@ -1938,6 +2427,7 @@ async fn chat_completions_handler(
             {
                 continue;
             }
+            // Fail closed on an unroutable failover candidate — skip it,
             // never default to a provider (its key would be the wrong one).
             let Some(fo_pid) = crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
             else {
@@ -1992,6 +2482,7 @@ async fn chat_completions_handler(
             let http = err.downcast_ref::<crate::providers::ProviderHttpError>();
             let status_code = http.map(|e| e.status);
 
+            //  GW-SPAN-002: a dispatch failure MUST emit the
             // gen_ai.client.operation.exception event (ADR-032/036) — the breaker
             // trip input and the observability surface. This path was previously
             // silent (no span, no event), so a hard provider outage was invisible
@@ -2004,6 +2495,7 @@ async fn chat_completions_handler(
                 status_code,
             );
 
+            //  #3: also publish an ERROR-status span so this failure is COUNTABLE
             // by the error-rate metric (countIf(status_code = 2)). The event above is
             // the breaker trip input; a span is what /slo + /traces actually render.
             // Without it a hard dispatch failure was invisible — a structural 0% error
@@ -2020,6 +2512,7 @@ async fn chat_completions_handler(
             } else if http
                 .is_some_and(crate::providers::ProviderHttpError::is_unclassified_client_error)
             {
+                // Countable as its own class — an upstream 4xx we could not
                 // classify is NOT an outage, and folding it into
                 // `provider_unavailable` inflated the error-rate metric with
                 // client-side failures.
@@ -2037,6 +2530,7 @@ async fn chat_completions_handler(
                 None,
             );
 
+            // An upstream 401/403 means the tenant's BYOK provider key was
             // rejected — surface that distinctly instead of an opaque 502 (a
             // mangled/expired key otherwise read as "provider unavailable", with
             // no signal the *key* was wrong). The body carries no upstream detail.
@@ -2057,6 +2551,7 @@ async fn chat_completions_handler(
                 );
             }
 
+            // An upstream 429 is NOT an outage — the caller is over quota or
             // rate-limited. Reporting "provider unavailable" sends them to debug
             // the wrong system entirely. Mirrors the breaker's 503 + Retry-After
             // shape (ADR-036/037), but 429 because the limit is the caller's, not
@@ -2077,6 +2572,7 @@ async fn chat_completions_handler(
                 );
             }
 
+            // An upstream 404 means the model does not exist for this
             // account — the caller must change the model string, not retry. As a
             // 502 it read as a Tracelane outage. Observed live: AI Studio 404s
             // gemini-2.5-flash as "no longer available to new users".
@@ -2093,6 +2589,7 @@ async fn chat_completions_handler(
                 );
             }
 
+            // Any OTHER upstream 4xx. We cannot say *why* it was rejected
             // (see `is_unclassified_client_error` — a 400 is a dead key on xAI and
             // a malformed payload everywhere, and the discriminating text is in a
             // body we must not propagate), but a 4xx does prove the upstream
@@ -2191,6 +2688,10 @@ async fn chat_completions_handler(
             response_inputs,
             guardrail_redaction_map,
             failover_from,
+            // GWY-43: the api_keys row id, and ONLY when an API key authorised
+            // the request. A session has no key, and `claims.sub` would hand back
+            // a WorkOS user id — a different namespace in the same column.
+            claims.api_key_id().map(str::to_owned),
         );
         Sse::new(sse).into_response()
     } else {
@@ -2224,6 +2725,10 @@ async fn chat_completions_handler(
             response_inputs,
             guardrail_redaction_map,
             failover_from,
+            claims.api_key_id(),
+            state.semantic_cache.clone(),
+            cache_key,
+            CapturedInput::build(tenant_id, &chat_request),
         )
         .await
         .into_response()
@@ -2234,6 +2739,7 @@ async fn chat_completions_handler(
 /// and the client's `error` code both use.
 ///
 /// One definition so the countable reason and the returned status can never
+/// disagree — #3 was exactly that disagreement (a 502 on the wire, no
 /// error span behind it, a structural 0% error rate on `/slo`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchFailure {
@@ -2244,6 +2750,7 @@ enum DispatchFailure {
     /// Upstream 404 — the provider does not serve this model for this account.
     ModelNotFound,
     /// Any other upstream 4xx. The upstream rejected the REQUEST; we cannot say
+    /// why without propagating a body that may echo the credential.
     RequestRejected(u16),
     /// Timeout, connection failure, or 5xx after retry. A genuine outage.
     Unavailable,
@@ -2354,6 +2861,7 @@ fn dispatch_failure_response(
 /// — which drops the span while the request still succeeds (`server.rs:331-357`).
 fn spawn_span_publish(state: &AppState, span: TracelaneSpan) {
     let Some(nats_client) = state.nats.as_ref() else {
+        // C1: this early return DROPPED THE SPAN SILENTLY. The two chat paths
         // call note_span_dropped_no_nats() on the same condition; this one — the
         // embeddings path — returned with no counter and no log, so an embeddings-only
         // tenant could lose 100% of its spans while every signal we had stayed clean.
@@ -2386,6 +2894,7 @@ fn build_embeddings_span(
     input_tokens: u32,
     timing: Option<GatewayTiming>,
     error_reason: Option<&str>,
+    api_key_id: Option<&str>,
 ) -> TracelaneSpan {
     let mut span = build_gateway_span(
         tenant_id,
@@ -2405,6 +2914,7 @@ fn build_embeddings_span(
         None,
         timing,
         error_reason,
+        api_key_id,
     );
     span.name = "gen_ai.embeddings".to_string();
     span.attributes.gen_ai_operation_name = Some("embeddings".to_string());
@@ -2667,6 +3177,7 @@ async fn embeddings_handler(
             .into_response();
     }
 
+    // Step 6: Route. Fail-CLOSED — no default provider -
     let Some(provider_id) = crate::providers::ProviderRegistry::provider_id_for_model(&model)
     else {
         return unroutable_model_response(&model);
@@ -2724,6 +3235,7 @@ async fn embeddings_handler(
                     0,
                     None,
                     Some(code),
+                    claims.api_key_id(),
                 ),
             );
             return provider_error_response(status, code, Some(message), Some(provider_id), None);
@@ -2790,6 +3302,7 @@ async fn embeddings_handler(
                 "dispatch_failed",
                 status_code,
             );
+            //  #3: a failure MUST be countable (status_code = 2), or the
             // error-rate metric is structurally pinned at 0% for this route.
             spawn_span_publish(
                 &state,
@@ -2805,6 +3318,7 @@ async fn embeddings_handler(
                     0,
                     None,
                     Some(failure.reason()),
+                    claims.api_key_id(),
                 ),
             );
             tracing::warn!(
@@ -2839,6 +3353,7 @@ async fn embeddings_handler(
                 ttft_us: None,
             }),
             None,
+            claims.api_key_id(),
         ),
     );
     if let Some(rec) = state.billing.as_ref() {
@@ -2857,10 +3372,12 @@ async fn embeddings_handler(
 /// Billing is fire-and-forget into a `tokio::spawn`, and a SUCCESSFUL meter logs
 /// nothing (`Recorder::flush` only warns on failure), so from outside the process
 /// "we billed" and "we never billed" were byte-identical. That is not a detail —
+/// it is *why* survived for months: billing sat on 2 of the stream's 4
 /// termination paths and no operator, log, or metric could have told.
 ///
 /// This counter measures **intent-to-bill at the call site** — incremented BEFORE
 /// the spawn, deliberately, so it is independent of whether the tenant has a Polar
+/// customer. That is the right boundary: the call site is what broke;
 /// delivery to Polar is the `Recorder`'s job, is tested separately, and has worked
 /// on the `Done` path throughout.
 static BILLING_RECORDS_SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2877,6 +3394,7 @@ const BILLING_LOG_NEVER: u64 = u64::MAX;
 /// evidence at a readable rate.
 const BILLING_LOG_INTERVAL_SECS: u64 = 60;
 
+/// Read the billing-spawn counter. Test seam for regression test.
 #[cfg(test)]
 fn billing_records_spawned() -> u64 {
     BILLING_RECORDS_SPAWNED.load(std::sync::atomic::Ordering::Relaxed)
@@ -3016,14 +3534,121 @@ fn merge_usage_tokens(acc_input: &mut u32, acc_output: &mut u32, ev_input: u32, 
 /// `build_gateway_span`'s argument list bounded while carrying the v1.41
 /// cache/streaming/conversation attributes (ADR-032).
 #[derive(Debug, Default, Clone, Copy)]
-struct SpanUsageMeta {
-    cache_read_input_tokens: Option<u32>,
-    cache_creation_input_tokens: Option<u32>,
-    stream: bool,
+pub(crate) struct SpanUsageMeta {
+    pub(crate) cache_read_input_tokens: Option<u32>,
+    pub(crate) cache_creation_input_tokens: Option<u32>,
+    pub(crate) stream: bool,
+    /// Upstream-reported cost in USD; `Some` only when the provider
     /// put a cost on the wire. When `None`, `build_gateway_span` derives the
     /// cost from the model price catalog (`crate::pricing`). Lands as
     /// `gen_ai.usage.cost`.
-    cost_usd: Option<f64>,
+    pub(crate) cost_usd: Option<f64>,
+}
+
+/// GWY-45: the captured request content for one span, already truncated.
+///
+/// **Built ONLY when the tenant is on the `trace_content:` allowlist.** The gate
+/// is a single `OnceLock` read (`config::trace_content()`), evaluated before any
+/// allocation, so a non-allowlisted tenant — which is every tenant today — pays
+/// one atomic load and nothing else.
+///
+/// v1 is INPUT ONLY. Output is deliberately absent: the span is published BEFORE
+/// the response-side guardrail seam so that a BLOCKED request still produces a
+/// span (the #81 span-drop), and the comment at that call site justifies the
+/// ordering with "the span carries NO response body". Attaching output there
+/// would make that false and would persist exactly the text the seam redacts.
+/// `prompt_eval.rs` reads only `gen_ai_input_messages`, so input alone is the
+/// whole unblock.
+#[derive(Debug, Clone)]
+struct CapturedInput {
+    /// Serialized `Vec<tracelane_shared::model::Message>` — the SAME type
+    /// `prompt_eval.rs:509` deserializes, so producer and consumer agree by
+    /// construction rather than by convention. Deliberately NOT the canonical
+    /// OTel v1.37 `parts` shape, which our own consumer cannot parse; see
+    /// `specs/GWY-45` §3.
+    messages: serde_json::Value,
+    /// The top-level `system` field, which is a DIFFERENT inbound shape from a
+    /// `role: "system"` message and is what Anthropic-style callers use. Missing
+    /// it would have left system instructions empty for most of prod.
+    system: Option<serde_json::Value>,
+}
+
+impl CapturedInput {
+    /// Returns `None` unless the tenant is allowlisted — the early return IS the
+    /// hot-path guarantee.
+    fn build(
+        tenant_id: &tracelane_shared::TenantId,
+        req: &tracelane_shared::ChatRequest,
+    ) -> Option<Self> {
+        let cfg = self::config::trace_content()?;
+        if !cfg.captures(tenant_id) {
+            return None;
+        }
+        let cap = cfg.max_field_bytes();
+
+        // Truncate DURING construction, not after: serializing a 10 MB prompt and
+        // then throwing it away still cost the 10 MB.
+        let mut msgs = req.messages.clone();
+        for m in &mut msgs {
+            if let tracelane_shared::model::MessageContent::Text(t) = &mut m.content {
+                truncate_utf8(t, cap);
+            }
+        }
+        let messages = serde_json::to_value(&msgs).ok()?;
+
+        let system = req.system.as_ref().map(|sys| {
+            let mut s = sys.clone();
+            truncate_utf8(&mut s, cap);
+            serde_json::Value::String(s)
+        });
+
+        Some(Self { messages, system })
+    }
+
+    /// Post-construction mutation, matching the two existing precedents in this
+    /// file (the semantic-cache hit at the `tracelane_semantic_cache_*` fields,
+    /// and `build_embeddings_span`'s name override). Keeps five other
+    /// `build_gateway_span` call sites at a zero-line diff.
+    fn apply(self, attrs: &mut tracelane_shared::SpanAttributes) {
+        attrs.gen_ai_input_messages = Some(self.messages);
+        attrs.gen_ai_system_instructions = self.system;
+    }
+}
+
+/// Truncate a `String` to at most `max` BYTES without splitting a UTF-8 char,
+/// appending a visible marker so a reader can tell a cut prompt from a short one.
+///
+/// A silent truncation would produce eval cases that look complete and are not —
+/// the marker is what makes that detectable downstream.
+fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    const MARK: &str = "…[truncated]";
+
+    // THE POST-CONDITION IS `s.len() <= max`, ALWAYS. When `max` is smaller than
+    // the marker itself there is no room to say "this was cut", so cut hard
+    // rather than emit a string LONGER than the cap — which is what the first
+    // version of this function did, and what its own test caught.
+    //
+    // Unreachable in production: `build_trace_content` refuses a
+    // `max_field_bytes` under 1 KiB. Handled anyway, because a helper that
+    // silently violates its stated contract is a defect waiting for its second
+    // caller.
+    let mut cut = |limit: usize| {
+        let mut end = limit.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    };
+
+    if max <= MARK.len() {
+        cut(max);
+        return;
+    }
+    cut(max - MARK.len());
+    s.push_str(MARK);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3035,10 +3660,10 @@ struct SpanUsageMeta {
 /// to total with NO unattributed bucket. `ttft_us` (dispatch → provider first
 /// byte) is streaming-only.
 #[derive(Clone, Copy)]
-struct GatewayTiming {
-    dispatch_ts: chrono::DateTime<chrono::Utc>,
-    provider_complete_ts: chrono::DateTime<chrono::Utc>,
-    ttft_us: Option<u32>,
+pub(crate) struct GatewayTiming {
+    pub(crate) dispatch_ts: chrono::DateTime<chrono::Utc>,
+    pub(crate) provider_complete_ts: chrono::DateTime<chrono::Utc>,
+    pub(crate) ttft_us: Option<u32>,
 }
 
 /// Gateway-overhead microseconds = `(dispatch − received) + (sent − provider
@@ -3058,7 +3683,11 @@ fn gateway_overhead_us(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_gateway_span(
+/// R81: `pub(crate)` so `prompt_eval` builds its spans with the SAME function the
+/// chat path uses. A second span builder for eval traffic would be a second source
+/// of truth for "what a gateway span is", and the two would drift on the next
+/// column — which is the failure `S2`/one-execution-engine exists to prevent.
+pub(crate) fn build_gateway_span(
     tenant_id: &TenantId,
     trace_id: Uuid,
     model: &str,
@@ -3074,6 +3703,7 @@ fn build_gateway_span(
     failover_from: Option<&str>,
     timing: Option<GatewayTiming>,
     error_reason: Option<&str>,
+    api_key_id: Option<&str>,
 ) -> TracelaneSpan {
     let provider = provider_name_from_model(model);
     let end_time = chrono::Utc::now();
@@ -3128,15 +3758,19 @@ fn build_gateway_span(
             tracelane_kya_agent_id: agent_id.map(str::to_owned),
             tracelane_kya_human_authorizer: human_authorizer.map(str::to_owned),
             tracelane_business_reference: business_reference.map(str::to_owned),
+            // Present only when a cross-provider failover served this
             // request. The rollup counts `countIf(tracelane_failover_activated)`;
             // `tracelane_failover_from` names the primary provider that errored.
             tracelane_failover_activated: failover_from.map(|_| true),
             tracelane_failover_from: failover_from.map(str::to_owned),
+            // GWY-43: which API key paid for this. `None` for a JWT session.
+            tracelane_api_key_id: api_key_id.map(str::to_owned),
             ..Default::default()
         },
         // A FAILED request (upstream 4xx/5xx/timeout, mid-stream provider error, or
         // dispatch exhaustion) MUST record status Error — otherwise /slo's
         // countIf(status_code = 2) error rate is STRUCTURALLY pinned at ~0% for all
+        // gateway-proxied traffic (#3: every span was hardcoded Ok, so a real
         // provider outage read as "0% errors · no errors in window"). Ok is emitted
         // only on a genuinely successful round-trip.
         status: match error_reason {
@@ -3156,6 +3790,7 @@ fn build_gateway_span(
 /// provider round-trip (dispatch exhaustion, upstream 401/429/404/5xx, timeout).
 /// Zero tokens, no cost, no optional attribution — its whole job is to make the
 /// failure COUNTABLE (status_code = 2) so the error-rate metric reflects reality
+/// The fail-closed response for a model that matches NO provider in the
 /// canonical map. Returned INSTEAD of routing to a default provider — no key is
 /// resolved, no upstream call is made. 400 (the caller sent an unroutable model).
 /// The model string is echoed back (it is the caller's own input, not a secret)
@@ -3183,6 +3818,7 @@ fn unroutable_model_response(model: &str) -> axum::response::Response {
     resp
 }
 
+/// Build a client-facing provider-error response with a defense-in-depth
 /// redaction backstop.
 ///
 /// The body is **allowlist-constructed** — our typed `error` code, an optional
@@ -3305,6 +3941,11 @@ fn build_error_span(
         None,
         None, // timing: no measured provider round-trip on a failure/block span
         Some(reason),
+        // GWY-43: no key attribution on an error span. It carries zero tokens and
+        // zero cost, so it cannot move a per-key spend total; attributing FAILURES
+        // by key is a separate feature, and inventing a value here would put a
+        // dimension on a row whose cost is structurally absent.
+        None,
     )
 }
 
@@ -3312,6 +3953,7 @@ fn build_error_span(
 /// canonical AFT-1 failure signature (today: tool-description injection →
 /// `AFT-TOOL-POISON-001`). Like [`build_error_span`] but carries the `aft_id` so
 /// the blocked hit still lands in `spans.aft_ids` and the tenant sees it on
+/// signatures — a blocked injection is "your hit," not a silent 403 (#5).
 fn build_blocked_aft_span(
     tenant_id: &TenantId,
     trace_id: Uuid,
@@ -3341,19 +3983,26 @@ fn build_blocked_aft_span(
         None,
         None, // timing: no measured provider round-trip on a failure/block span
         Some(reason),
+        // GWY-43: no key attribution on an error span. It carries zero tokens and
+        // zero cost, so it cannot move a per-key spend total; attributing FAILURES
+        // by key is a separate feature, and inventing a value here would put a
+        // dimension on a row whose cost is structurally absent.
+        None,
     )
 }
 
 /// Map a model name to a canonical provider name (OTel `gen_ai.system` /
 /// `gen_ai.provider.name` value) for span attribution.
 ///
+/// This DELEGATES to the canonical `ProviderRegistry::provider_id_for_model`
 /// rather than carrying its own prefix table. A private copy had drifted — it only
-/// knew 8 providers and stamped every other model (groq, mistral, perplexity, xai,
-/// and ~24 more of the 35) as `"unknown"` on the span, so the dashboard's provider
+/// knew 8 prefixes and stamped every other model (groq, mistral, perplexity, xai,
+/// and the rest of the catalog) as `"unknown"` on the span, so the dashboard's provider
 /// column + per-provider latency tiles were blank/"unknown" for most real traffic.
 /// Only the two names that differ from the provider_id (AWS/GCP house style) are
 /// remapped; the rest of the provider_id set already equals the gen_ai.system value.
 fn provider_name_from_model(model: &str) -> &'static str {
+    // An unmatched model has no provider — attribute it "unknown" (this is
     // a span label, never a key lookup, so "unknown" is safe; the key path already
     // fail-closed on None before reaching here).
     match crate::providers::ProviderRegistry::provider_id_for_model(model) {
@@ -3370,7 +4019,7 @@ fn provider_name_from_model(model: &str) -> &'static str {
 /// single `None` is what made an unconfigured provider report
 /// `provider_key_rejected` ("verify the key for this provider") to a user who
 /// had no key to verify.
-enum ProviderKey {
+pub(crate) enum ProviderKey {
     /// A usable key. An EMPTY string is a legitimate value for the no-key
     /// providers (Ollama) — it means "this provider needs no credential".
     Found(String),
@@ -3396,7 +4045,9 @@ enum ProviderKey {
 ///
 /// The `SecretString` is cloned into a plain `String` only at the very
 /// last hop so reqwest can attach it as a header value.
-async fn resolve_provider_key(
+/// `pub(crate)` for `prompt_eval`, for the same reason as `dispatch_to_provider`:
+/// eval traffic resolves credentials exactly the way real traffic does.
+pub(crate) async fn resolve_provider_key(
     tenant_id: &TenantId,
     provider_id: &str,
     env_var: &str,
@@ -3455,12 +4106,14 @@ async fn resolve_provider_key(
 }
 
 /// Current UTC calendar month as `YYYYMM` (e.g. `202607`) — the seed key for the
+/// durable monthly quota counter's month-boundary reset.
 fn current_year_month() -> u32 {
     use chrono::Datelike as _;
     let now = chrono::Utc::now();
     now.year() as u32 * 100 + now.month()
 }
 
+///  durability: read the tenant's trace count for the current calendar month
 /// from ClickHouse — the durable baseline the in-memory quota counter is seeded
 /// from so a restart / blue-green deploy no longer forgives accrued usage. Runs
 /// once per tenant per month per process (gated by `QuotaTracker::needs_seed`),
@@ -3507,6 +4160,126 @@ fn current_year_month() -> u32 {
 /// Pinned by `billing::usage::tests::usage_reads_the_same_predicate_the_quota_enforcer_reads`.
 pub const TRACES_THIS_MONTH_SQL: &str = "SELECT toUInt64(uniqExact(trace_id)) AS n FROM tracelane.trace_summaries \
         WHERE tenant_id = ? AND start_time >= toStartOfMonth(now())";
+
+/// Add a completed request's cost to its API key's monthly total.
+///
+/// Reads the cost off the SPAN, not from a second `pricing::cost_usd` call: the
+/// budget and the dashboard must agree about what a request cost, and the only
+/// way to guarantee that is for both to read one value. A `None` cost — a model
+/// with no known price — adds nothing rather than zero (see `spend.rs`).
+///
+/// A non-UUID key id cannot happen (`claims.api_key_id()` returns the
+/// `api_keys.id` it read from Postgres) but is ignored rather than unwrapped:
+/// this runs on the response path and must not be able to panic a stream.
+fn record_key_spend(api_key_id: Option<&str>, span: &TracelaneSpan) {
+    let cost = span.attributes.gen_ai_usage_cost;
+    let tracker = crate::spend::tracker();
+    // The workspace total counts EVERY request, keyed or not — a session-driven
+    // request spends the workspace's money too, and exempting it would make the
+    // workspace cap quietly smaller than it says.
+    tracker.record(
+        crate::spend::Subject::Workspace(*span.tenant_id.as_uuid()),
+        cost,
+    );
+    let Some(id) = api_key_id else { return };
+    let Ok(uuid) = Uuid::parse_str(id) else {
+        return;
+    };
+    tracker.record(crate::spend::Subject::Key(uuid), cost);
+}
+
+/// This key's recorded spend so far this calendar month, USD.
+///
+/// **Tenant-first, then key** — the same predicate order every ClickHouse read
+/// in this codebase uses, and the reason `tenant_id` leads the table's ORDER BY.
+/// Binding the key alone would be a cross-tenant read; binding it second is the
+/// isolation the schema is shaped for.
+///
+/// Only spans written since migration 16 carry `api_key_id`, so this total
+/// begins at that cutover. Every surface that renders it must say so rather than
+/// implying the history was always attributable.
+pub const KEY_SPEND_THIS_MONTH_SQL: &str = "SELECT toFloat64(sum(cost_usd)) AS usd \
+        FROM tracelane.spans \
+        WHERE tenant_id = ? AND api_key_id = ? \
+          AND cost_usd_present = 1 \
+          AND start_time >= toStartOfMonth(now())";
+
+/// The whole workspace's recorded spend this calendar month, USD.
+///
+/// Deliberately NOT filtered on `api_key_id`: a workspace ceiling covers every
+/// request the tenant made, including session-authenticated ones that carry no
+/// key. Filtering by key here would silently exempt dashboard-driven spend from
+/// the workspace cap.
+pub const WORKSPACE_SPEND_THIS_MONTH_SQL: &str = "SELECT toFloat64(sum(cost_usd)) AS usd \
+        FROM tracelane.spans \
+        WHERE tenant_id = ? \
+          AND cost_usd_present = 1 \
+          AND start_time >= toStartOfMonth(now())";
+
+async fn workspace_spend_baseline_from_clickhouse(state: &AppState, tenant_id: &TenantId) -> f64 {
+    let Some(url) = state.quota_ch_url.clone() else {
+        return 0.0;
+    };
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct SumRow {
+        usd: f64,
+    }
+    match crate::clickhouse_query::ch_client(url)
+        .query(WORKSPACE_SPEND_THIS_MONTH_SQL)
+        .bind(tenant_id.to_string())
+        .fetch_one::<SumRow>()
+        .await
+    {
+        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => row.usd,
+        Ok(_) => 0.0,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant_id = %tenant_id,
+                "workspace spend baseline ClickHouse read failed; seeding 0 (fail-open)"
+            );
+            0.0
+        }
+    }
+}
+
+async fn spend_baseline_from_clickhouse(
+    state: &AppState,
+    tenant_id: &TenantId,
+    api_key_id: &str,
+) -> f64 {
+    let Some(url) = state.quota_ch_url.clone() else {
+        return 0.0;
+    };
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct SumRow {
+        usd: f64,
+    }
+    match crate::clickhouse_query::ch_client(url)
+        .query(KEY_SPEND_THIS_MONTH_SQL)
+        .bind(tenant_id.to_string())
+        .bind(api_key_id)
+        .fetch_one::<SumRow>()
+        .await
+    {
+        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => row.usd,
+        Ok(_) => 0.0,
+        Err(e) => {
+            // Fail OPEN, and say so. A control-plane read failure must not stop a
+            // customer's production traffic — the same choice
+            // `quota_baseline_from_clickhouse` makes. The cost is that a restart
+            // during a ClickHouse outage forgives that key's accrued spend until
+            // the next month rolls; that is stated in `spend.rs`'s module docs
+            // rather than left for an operator to discover.
+            tracing::warn!(
+                error = %e,
+                tenant_id = %tenant_id,
+                "per-key spend baseline ClickHouse read failed; seeding 0 (fail-open)"
+            );
+            0.0
+        }
+    }
+}
 
 async fn quota_baseline_from_clickhouse(state: &AppState, tenant_id: &TenantId) -> u64 {
     let Some(url) = state.quota_ch_url.clone() else {
@@ -3556,7 +4329,7 @@ async fn resolve_tenant_quota_webhook(tenant_id: &TenantId) -> Option<String> {
 /// customers know when their monthly quota counter zeroes. The actual
 /// counter reset is performed by the billing reconciler via
 /// `QuotaTracker::reset_for_period`.
-fn next_month_boundary_iso() -> String {
+pub fn next_month_boundary_iso() -> String {
     use chrono::{Datelike as _, TimeZone as _};
     let now = chrono::Utc::now();
     let (year, month) = if now.month() == 12 {
@@ -3620,6 +4393,7 @@ static SOFT_CAP_SETTLED: std::sync::OnceLock<dashmap::DashMap<String, u32>> =
 /// whether or not either succeeds.
 ///
 /// **Why the claim is persisted.** The in-memory counter reseeds from ClickHouse
+/// on boot, so it cannot answer "did we already tell them this month?"
 /// a restart moves the counter and takes the answer with it. The previous
 /// implementation asked exactly that question (`used == quota`) and was wrong in
 /// both directions on any mid-month deploy: a reseed above quota lost the alert
@@ -3827,6 +4601,7 @@ fn is_bench_mock_model(model: &str) -> bool {
     model.starts_with("__bench_mock")
 }
 
+/// Synthetic `provider_id` for the bench-mock path.
 ///
 /// Deliberately NOT a real provider id. It is used only for span/log
 /// attribution on a request whose dispatch is replaced by the in-gateway mock,
@@ -3835,6 +4610,7 @@ fn is_bench_mock_model(model: &str) -> bool {
 /// `bench_mock_provider_id_is_not_routable` asserts the non-collision.
 const BENCH_MOCK_PROVIDER_ID: &str = "__bench_mock";
 
+/// The double gate, as a pure function so all four quadrants are testable
 /// without standing up the handler.
 ///
 /// BOTH conditions must hold. Either alone fails closed:
@@ -3850,6 +4626,7 @@ fn bench_mock_active(flag: bool, model: &str) -> bool {
 ///
 /// Today this is intentionally same-provider only — true cross-provider
 /// failover (Claude → GPT-5) needs request-shape translation that is
+/// V1.5 work (BLOCKERS).
 async fn dispatch_with_retry(
     registry: &crate::providers::ProviderRegistry,
     chat_request: &tracelane_shared::ChatRequest,
@@ -3857,49 +4634,80 @@ async fn dispatch_with_retry(
     model: &str,
     tenant_id: &tracelane_shared::TenantId,
 ) -> anyhow::Result<crate::providers::ProviderStream> {
+    // GWY-44: the retry count and backoff come from the operator's
+    // `tracelane.yaml` `failover:` block when one is installed, and from
+    // `RetryPolicy::BUILTIN` (1 retry, 100 ms) otherwise — so every deployment
+    // without a config file behaves exactly as it did. One relaxed atomic load,
+    // and only on the error path: a request that succeeds first time never
+    // reaches this.
+    //
+    // The whole loop stays inside `FAILOVER_BUDGET_MS`. That bound is the point:
+    // a retry policy without a wall-clock ceiling turns one slow upstream into a
+    // multiplied slow upstream, and B-256 (an open 13× overhead regression) is
+    // exactly the kind of thing an unbounded retry loop would hide inside.
+    let policy = crate::providers::failover::retry_policy();
+    let budget = std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS);
+    let backoff = std::time::Duration::from_millis(policy.backoff_ms);
     let attempt_started = std::time::Instant::now();
-    match dispatch_to_provider(
-        registry,
-        chat_request.clone(),
-        provider_key,
-        model,
-        tenant_id,
-    )
-    .await
-    {
-        Ok(s) => Ok(s),
-        Err(first_err) => {
-            let backoff = std::time::Duration::from_millis(100);
-            if attempt_started.elapsed() + backoff
-                > std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS)
-            {
-                tracing::warn!(error = %first_err, "provider failed; budget exhausted, no retry");
-                return Err(first_err);
-            }
-            tracing::warn!(
-                error = %first_err,
-                model = %model,
-                "provider attempt failed — retrying once after 100ms"
-            );
-            tokio::time::sleep(backoff).await;
-            match dispatch_to_provider(
-                registry,
-                chat_request.clone(),
-                provider_key,
-                model,
-                tenant_id,
-            )
-            .await
-            {
-                Ok(s) => {
+
+    let mut attempt: u32 = 0;
+    let mut first_err: Option<anyhow::Error> = None;
+    loop {
+        match dispatch_to_provider(
+            registry,
+            chat_request.clone(),
+            provider_key,
+            model,
+            tenant_id,
+        )
+        .await
+        {
+            Ok(s) => {
+                if attempt > 0 {
                     tracing::info!(
                         model = %model,
+                        attempt,
                         elapsed_ms = attempt_started.elapsed().as_millis(),
                         "tracelane.failover.activated=true (same-provider retry succeeded)"
                     );
-                    Ok(s)
                 }
-                Err(second_err) => Err(second_err.context(first_err.to_string())),
+                return Ok(s);
+            }
+            Err(err) => {
+                // Out of attempts.
+                if attempt >= policy.retries {
+                    let err = match first_err {
+                        Some(first) => err.context(first.to_string()),
+                        None => err,
+                    };
+                    return Err(err);
+                }
+                // Out of budget. Checked BEFORE sleeping, so the sleep itself can
+                // never be what breaches the ceiling.
+                if attempt_started.elapsed() + backoff > budget {
+                    tracing::warn!(
+                        error = %err,
+                        attempt,
+                        "provider failed; retry budget exhausted, no further attempt"
+                    );
+                    let err = match first_err {
+                        Some(first) => err.context(first.to_string()),
+                        None => err,
+                    };
+                    return Err(err);
+                }
+                tracing::warn!(
+                    error = %err,
+                    model = %model,
+                    attempt,
+                    backoff_ms = policy.backoff_ms,
+                    "provider attempt failed — retrying"
+                );
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+                attempt += 1;
+                tokio::time::sleep(backoff).await;
             }
         }
     }
@@ -3907,6 +4715,7 @@ async fn dispatch_with_retry(
 
 /// Routes a chat request to the correct provider adapter.
 ///
+/// The provider is resolved by the SINGLE canonical model→provider table
 /// `ProviderRegistry::provider_id_for_model`, then this match selects the typed
 /// adapter by that provider_id. It deliberately does NOT re-match model prefixes
 /// — a second model-prefix table is exactly what drifted (Groq family dispatched
@@ -3914,7 +4723,11 @@ async fn dispatch_with_retry(
 /// provider_id is a fixed enumeration that cannot drift on model names. Keep this
 /// arm set a superset of `provider_id_for_model`'s outputs; `_` mirrors that
 /// table's `anthropic` default. Enforced by `scripts/ci/check-provider-mapping-single-source.py`.
-async fn dispatch_to_provider(
+/// `pub(crate)` for `prompt_eval`: an eval case must go through the SAME
+/// dispatch the chat path uses, with the tenant's own BYOK credential. A second
+/// dispatch path would be a second place for provider routing to drift, which is
+/// the class this function's own comments exist to prevent.
+pub(crate) async fn dispatch_to_provider(
     registry: &crate::providers::ProviderRegistry,
     request: tracelane_shared::ChatRequest,
     api_key: &str,
@@ -3923,49 +4736,30 @@ async fn dispatch_to_provider(
 ) -> anyhow::Result<crate::providers::ProviderStream> {
     use crate::providers::ProviderRegistry;
 
+    // Fail closed. No default provider — an unmatched model bails here too
     // (defense in depth; the handler already rejected it before resolving a key).
     let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
         anyhow::bail!("unroutable model '{model}': no provider configured");
     };
     match provider_id {
+        // The six native adapters — genuinely different wire formats.
         "anthropic" => registry.anthropic.chat(request, api_key, tenant_id).await,
-        "openai" => registry.openai.chat(request, api_key, tenant_id).await,
         "vertex" => registry.vertex.chat(request, api_key, tenant_id).await,
         "google" => registry.google.chat(request, api_key, tenant_id).await,
         "bedrock" => registry.bedrock.chat(request, api_key, tenant_id).await,
         "azure" => registry.azure.chat(request, api_key, tenant_id).await,
         "cohere" => registry.cohere.chat(request, api_key, tenant_id).await,
-        "mistral" => registry.mistral.chat(request, api_key, tenant_id).await,
-        "perplexity" => registry.perplexity.chat(request, api_key, tenant_id).await,
-        "deepseek" => registry.deepseek.chat(request, api_key, tenant_id).await,
-        "xai" => registry.xai.chat(request, api_key, tenant_id).await,
-        "nvidia" => registry.nvidia_nim.chat(request, api_key, tenant_id).await,
-        "cerebras" => registry.cerebras.chat(request, api_key, tenant_id).await,
-        "sambanova" => registry.sambanova.chat(request, api_key, tenant_id).await,
-        "lepton" => registry.lepton.chat(request, api_key, tenant_id).await,
-        "lambda" => registry.lambda.chat(request, api_key, tenant_id).await,
-        "novita" => registry.novita.chat(request, api_key, tenant_id).await,
-        "ai21" => registry.ai21.chat(request, api_key, tenant_id).await,
-        "hyperbolic" => registry.hyperbolic.chat(request, api_key, tenant_id).await,
-        "deepinfra" => registry.deepinfra.chat(request, api_key, tenant_id).await,
-        "cloudflare" => registry.cloudflare.chat(request, api_key, tenant_id).await,
-        "ollama" => registry.ollama.chat(request, api_key, tenant_id).await,
-        "baseten" => registry.baseten.chat(request, api_key, tenant_id).await,
-        "huggingface" => registry.huggingface.chat(request, api_key, tenant_id).await,
-        "anyscale" => registry.anyscale.chat(request, api_key, tenant_id).await,
-        "modal" => registry.modal.chat(request, api_key, tenant_id).await,
-        "predibase" => registry.predibase.chat(request, api_key, tenant_id).await,
-        "moonshot" => registry.moonshot.chat(request, api_key, tenant_id).await,
-        "upstage" => registry.upstage.chat(request, api_key, tenant_id).await,
-        "yi" => registry.yi.chat(request, api_key, tenant_id).await,
-        "aleph-alpha" => registry.aleph_alpha.chat(request, api_key, tenant_id).await,
-        "groq" => registry.groq.chat(request, api_key, tenant_id).await,
-        "together" => registry.together.chat(request, api_key, tenant_id).await,
-        "fireworks" => registry.fireworks.chat(request, api_key, tenant_id).await,
-        "openrouter" => registry.openrouter.chat(request, api_key, tenant_id).await,
-        // is a bug in the map, not "probably Anthropic" — bail rather than ship a
-        // request to the wrong provider with the wrong key.
-        _ => anyhow::bail!("unroutable provider_id '{provider_id}' for model '{model}'"),
+        // GWY-42: every OpenAI-compatible provider, from the one catalog. This
+        // was 29 hand-written arms that had to mirror 29 struct fields, and a
+        // provider present in `provider_id_for_model` but missing an arm here
+        // bailed as "unroutable" AFTER its BYOK key had already been fetched.
+        other => match registry.compat(other) {
+            Some(p) => p.chat(request, api_key, tenant_id).await,
+            // NO default-to-anthropic. A provider_id the dispatch doesn't
+            // know is a bug in the catalog, not "probably Anthropic" — bail
+            // rather than ship a request to the wrong provider with the wrong key.
+            None => anyhow::bail!("unroutable provider_id '{provider_id}' for model '{model}'"),
+        },
     }
 }
 
@@ -3996,6 +4790,7 @@ fn provider_stream_to_sse(
     prompt_router: Arc<crate::prompt_router::PromptRouter>,
     prompt_obs: Option<PromptObservation>,
     guardrail_fired: bool,
+    //  #5: the predictive AFT hit id (observe-first) — threaded onto the published
     // span so the /signatures page shows the tenant's OWN matched signatures instead of
     // demo-seed only. None when no detector matched.
     warn_aft_id: Option<&'static str>,
@@ -4003,6 +4798,10 @@ fn provider_stream_to_sse(
     response_inputs: crate::guardrail::ResponseInputs,
     redaction_map: Vec<tracelane_policy::pii::RedactionEntry>,
     failover_from: Option<&'static str>,
+    // GWY-43: the API key that authorised this request, for per-key cost
+    // attribution and budget enforcement. Owned rather than borrowed because
+    // the stream outlives the handler frame.
+    api_key_id: Option<String>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     stream! {
         let mut input_tokens = 0u32;
@@ -4012,6 +4811,7 @@ fn provider_stream_to_sse(
         // content-filter block leaves them None (partial — the stream was cut).
         let mut cache_read: Option<u32> = None;
         let mut cache_creation: Option<u32> = None;
+        //  #3: set on a mid-stream provider Error so the post-loop span records
         // status Error, not Ok (a streaming failure must move the error-rate metric).
         let mut stream_error: Option<&str> = None;
         let mut cost_usd: Option<f64> = None;
@@ -4068,6 +4868,7 @@ fn provider_stream_to_sse(
                 }
                 Some(Err(err)) => {
                     tracing::warn!(error = %err, "SSE stream error from provider");
+                    //  #1 (mid-stream sub-path): a TRANSPORT-level stream error
                     // — a provider that severs the connection mid-response (TCP
                     // reset, provider crash, truncated body) — surfaces here as
                     // `Some(Err)`, distinct from an explicit `ProviderEvent::Error`
@@ -4219,6 +5020,7 @@ fn provider_stream_to_sse(
                                 });
                                 yield Ok(Event::default().data(data.to_string()));
                                 yield Ok(Event::default().data("[DONE]"));
+                                // Billing fires POST-LOOP — see the note there.
                                 break;
                             }
                         }
@@ -4242,6 +5044,7 @@ fn provider_stream_to_sse(
                         yield Ok(Event::default().data(data.to_string()));
                         yield Ok(Event::default().data("[DONE]"));
 
+                        // Billing fires POST-LOOP — see the note there.
 
                         // B1 auto-rollback drift feed — streaming path, same
                         // as buffered path (fire-and-forget).
@@ -4295,6 +5098,7 @@ fn provider_stream_to_sse(
         // Meter usage ONCE, after the stream loop terminates for ANY reason —
         // exactly like the span publish below, and for exactly the same reason.
         //
+        // Billing used to live INSIDE the match arms, firing only on `Done`
         // and on a mid-stream `Block`. The other two exits — a provider `Error`,
         // and a natural stream-end with no `Done` event — silently skipped it. That
         // is not hypothetical: **Gemini never emits `ProviderEvent::Done`**, it ends
@@ -4349,7 +5153,13 @@ fn provider_stream_to_sse(
                     }),
                 }),
                 stream_error,
+                api_key_id.as_deref(),
             );
+            // GWY-43: add this request's cost to the key's monthly total, read
+            // off the SPAN rather than recomputed — so the number that enforces
+            // the budget and the number the dashboard renders are the same
+            // number by construction, not by two call sites agreeing.
+            record_key_spend(api_key_id.as_deref(), &span);
             let nats_clone = Arc::clone(nats_client);
             tokio::spawn(async move {
                 if let Err(e) = crate::otlp_emit::publish_span(&nats_clone, &span).await {
@@ -4358,6 +5168,7 @@ fn provider_stream_to_sse(
                 }
             });
         } else {
+            // NATS disabled — never drop the span silently.
             crate::otlp_emit::note_span_dropped_no_nats();
         }
     }
@@ -4418,6 +5229,7 @@ async fn buffer_provider_stream(
     conversation_id: Option<&str>,
     prompt_obs: Option<PromptObservation>,
     guardrail_fired: bool,
+    //  #5: the predictive AFT hit id (observe-first) — threaded onto the published
     // span so the /signatures page shows the tenant's OWN matched signatures instead of
     // demo-seed only. None when no detector matched.
     warn_aft_id: Option<&'static str>,
@@ -4425,6 +5237,17 @@ async fn buffer_provider_stream(
     response_inputs: crate::guardrail::ResponseInputs,
     redaction_map: Vec<tracelane_policy::pii::RedactionEntry>,
     failover_from: Option<&str>,
+    // GWY-43: the API key that authorised this request, for per-key cost
+    // attribution and budget enforcement.
+    api_key_id: Option<&str>,
+    // GWY-24: the cache and this request's identity, threaded because the STORE
+    // has to happen where the final body exists. `None` whenever the cache is
+    // off, so the store is unreachable rather than merely skipped.
+    semantic_cache: Option<Arc<crate::semantic_cache::SemanticCache>>,
+    cache_key: Option<crate::semantic_cache::RequestKey>,
+    // GWY-45 captured request content, `None` unless the tenant is allowlisted.
+    // Built by the caller because `chat_request` lives there, not here.
+    captured_input: Option<CapturedInput>,
 ) -> impl IntoResponse {
     use tracelane_shared::model::MessageContent;
 
@@ -4433,6 +5256,7 @@ async fn buffer_provider_stream(
     let mut output_tokens = 0u32;
     let mut cache_read: Option<u32> = None;
     let mut cache_creation: Option<u32> = None;
+    //  #3: set on a mid-stream provider error so the span below records status
     // Error (a buffered-collection failure must move the error-rate metric).
     let mut buffered_error: Option<&str> = None;
     let mut cost_usd: Option<f64> = None;
@@ -4474,6 +5298,7 @@ async fn buffer_provider_stream(
             }
             Ok(ProviderEvent::Error { message, .. }) => {
                 // Symmetry with the transport-`Err` arm below and the streaming
+                // path (#1): an explicit provider error EVENT in a buffered
                 // stream must mark the span Error too, not fall into `Ok(_)` and
                 // read as a success.
                 tracing::warn!(message, "provider error event in buffered response");
@@ -4514,11 +5339,20 @@ async fn buffer_provider_stream(
     // span MUST still be recorded: a flight recorder that drops the span for a
     // blocked request loses exactly the events it most needs (the #81 span-drop:
     // the buffered handler returned content_filter_response before ever reaching
-    // the span publish). The span carries NO response body (only tenant/model/
-    // tokens), so publishing it here vs. after the seam is identical content —
-    // the redaction the seam applies is to `text`, which the span never holds.
+    // the span publish). The span carries NO RESPONSE body, so publishing it here
+    // vs. after the seam is identical content — the redaction the seam applies is
+    // to `text`, which the span never holds.
+    //
+    // GWY-45 AMENDMENT, 2026-08-20: the span MAY now carry captured REQUEST
+    // content (`gen_ai_input_messages`) for an allowlisted tenant. That does not
+    // weaken the reasoning above, and the distinction is the whole reason v1 is
+    // input-only: the response seam rewrites `text`, so anything derived from the
+    // RESPONSE would be pre-redaction here and would persist exactly what the
+    // guardrails removed. The REQUEST is not touched by that seam. Attaching
+    // output content at this point would be a defect, not a feature — see
+    // `specs/GWY-45` §3(2).
     if let Some(ref nats_client) = state.nats {
-        let span = build_gateway_span(
+        let mut span = build_gateway_span(
             tenant_id,
             trace_id,
             model,
@@ -4543,7 +5377,14 @@ async fn buffer_provider_stream(
                 ttft_us: None, // TTFT is a streaming metric; N/A for a buffered response
             }),
             buffered_error,
+            api_key_id,
         );
+        // GWY-45: attach the captured REQUEST content, if the caller built any.
+        // See the amendment above for why this is input-only at this point.
+        if let Some(captured) = captured_input {
+            captured.apply(&mut span.attributes);
+        }
+        record_key_spend(api_key_id, &span);
         let nats = Arc::clone(nats_client);
         tokio::spawn(async move {
             if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
@@ -4552,6 +5393,7 @@ async fn buffer_provider_stream(
             }
         });
     } else {
+        // NATS disabled (no client) — never drop the span silently.
         crate::otlp_emit::note_span_dropped_no_nats();
     }
 
@@ -4613,30 +5455,239 @@ async fn buffer_provider_stream(
 
     // (span already published above, before the guardrail seam — see comment)
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": format!("chatcmpl-{}", Uuid::new_v4()),
-            "object": "chat.completion",
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": input_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
-            }
-        })),
-    )
+    let payload = serde_json::json!({
+        "id": format!("chatcmpl-{}", Uuid::new_v4()),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
+    });
+
+    // GWY-24: remember this answer. Fire-and-forget — a store failure must never
+    // touch the response the customer already has.
+    //
+    // Only reached on the buffered, non-error, `finish_reason: stop` path. The
+    // content-filter branches return ABOVE this point, so a blocked or truncated
+    // answer is never stored — caching a guardrail refusal would serve the
+    // refusal to everyone who asked something similar.
+    if let (Some(cache), Some(key)) = (semantic_cache.as_ref(), cache_key.as_ref()) {
+        if buffered_error.is_none() && !guardrail_fired {
+            let cache = Arc::clone(cache);
+            let key = key.clone();
+            let tenant = tenant_id.clone();
+            let model_owned = model.to_string();
+            let body = payload.to_string();
+            // COST MUST FALL BACK TO THE PRICE CATALOG, exactly as the SPAN does.
+            //
+            // `cost_usd` here is populated ONLY from a provider `UsageUpdate`
+            // that carries a cost. Anthropic does not report one — and Anthropic
+            // is 94% of production traffic — so this was `None` on almost every
+            // real request and `unwrap_or(0.0)` stored a zero. Every subsequent
+            // hit then reported `cost_saved_usd: 0.0`: the feature built for
+            // cost could not state its own saving on the provider that matters.
+            //
+            // `build_gateway_span` already does this `or_else` (see
+            // `gen_ai_usage_cost`), which is why the MISS span showed a real
+            // cost while the cache stored zero from the same request. Two sites
+            // reading the same quantity, one with the fallback and one without,
+            // is the drift `pricing::cost_usd` exists as a single source to
+            // prevent. `None` is still preserved as 0.0 for an unknown model —
+            // the gateway never fabricates a cost (ADR-055).
+            let cost = cost_usd
+                .or_else(|| {
+                    crate::pricing::cost_usd(
+                        model,
+                        &tracelane_shared::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                        },
+                    )
+                })
+                .unwrap_or(0.0);
+            tokio::spawn(async move {
+                cache
+                    .store(
+                        &tenant,
+                        &model_owned,
+                        &key,
+                        &body,
+                        input_tokens,
+                        output_tokens,
+                        cost,
+                        trace_id,
+                    )
+                    .await;
+            });
+        }
+    }
+
+    (StatusCode::OK, Json(payload))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prompt_router::Env;
+
+    /// GWY-45. `truncate_utf8` must cut on a CHARACTER boundary and say that it
+    /// cut. A silent truncation produces eval cases that look complete and are
+    /// not; a byte-boundary cut produces invalid UTF-8 and loses the whole span
+    /// at serialization.
+    #[test]
+    fn truncate_utf8_cuts_on_a_char_boundary_and_marks_the_cut() {
+        // Multi-byte throughout, so a naive byte cut would split a char.
+        let mut s = "héllo wörld ünicode".repeat(20);
+        let original = s.clone();
+        truncate_utf8(&mut s, 40);
+        assert!(s.len() <= 40, "must respect the byte cap, got {}", s.len());
+        assert!(
+            s.ends_with("…[truncated]"),
+            "a cut MUST be visible — a silent one yields eval cases that look              complete and are not; got {s:?}"
+        );
+        // The real assertion: it is still valid UTF-8. `String` guarantees this,
+        // so the way this fails is a PANIC inside truncate_utf8, not a bad value.
+        assert!(s.chars().count() > 0);
+
+        // Under the cap it must be untouched — no marker, no allocation churn.
+        let mut short = "hi".to_owned();
+        truncate_utf8(&mut short, 40);
+        assert_eq!(short, "hi", "a string under the cap must be left alone");
+
+        // THE POST-CONDITION, asserted at the boundary that broke it: the result
+        // is NEVER longer than the cap. The first version of this function
+        // appended a 14-byte marker to a 3-byte budget and returned 14 bytes for
+        // max=3 — longer than the input limit, from the function whose job is to
+        // enforce it. Unreachable in prod (the config floor is 1 KiB) and fixed
+        // anyway.
+        for cap in [0, 1, 3, 13, 14, 15, 64] {
+            let mut tiny = original.clone();
+            truncate_utf8(&mut tiny, cap);
+            assert!(
+                tiny.len() <= cap,
+                "truncate_utf8 must never exceed its cap: cap={cap} produced {} bytes ({tiny:?})",
+                tiny.len()
+            );
+        }
+    }
+
+    /// **THE HOT-PATH GUARANTEE.** With no `trace_content:` block installed —
+    /// which is every deployment today, and the fail-CLOSED default — capture
+    /// must return `None` without touching the request.
+    ///
+    /// This is the test that would catch content leaking for a tenant nobody
+    /// allowlisted, which is the only way this feature can do harm.
+    #[test]
+    fn capture_is_none_when_no_trace_content_block_is_installed() {
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let req = tracelane_shared::ChatRequest {
+            model: "claude-haiku-4-5".to_owned(),
+            messages: vec![tracelane_shared::model::Message {
+                role: tracelane_shared::model::Role::User,
+                content: tracelane_shared::model::MessageContent::Text(
+                    "a secret prompt nobody allowlisted".to_owned(),
+                ),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            stream: None,
+            system: None,
+            metadata: None,
+        };
+        assert!(
+            CapturedInput::build(&tenant, &req).is_none(),
+            "with no trace_content block installed, capture MUST be off — an              absent config is the unprivileged state (.claude/rules/tenancy.md)"
+        );
+    }
+
+    /// GWY-24: the cache must store the CATALOG cost when the provider does not
+    /// report one, or the feature built for cost reports zero saving.
+    ///
+    /// FALSIFIED AGAINST THE OLD CODE: `cost_usd.unwrap_or(0.0)` returns 0.0 for
+    /// the `None` case this asserts is non-zero, so this test fails on the
+    /// pre-fix line and passes on the fixed one. Measured on prod 2026-08-20:
+    /// 41 exact hits, every one reporting `cost_saved_usd = 0`, while the 41
+    /// misses that populated them cost $0.0014598 in total.
+    #[test]
+    fn cache_store_cost_falls_back_to_the_catalog_when_the_provider_reports_none() {
+        // Anthropic never sends a cost on the usage event, so this is the real
+        // shape of the value reaching the store site for 94% of prod traffic.
+        let provider_reported: Option<f64> = None;
+        let input_tokens = 156_u32;
+        let output_tokens = 30_u32;
+        let model = "claude-haiku-4-5";
+
+        let with_fallback = provider_reported
+            .or_else(|| {
+                crate::pricing::cost_usd(
+                    model,
+                    &tracelane_shared::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    },
+                )
+            })
+            .unwrap_or(0.0);
+
+        assert!(
+            with_fallback > 0.0,
+            "a known model with real tokens must produce a non-zero catalog cost; \
+             got {with_fallback} — this is the pre-fix behaviour, where the cache \
+             stored 0.0 and every hit reported cost_saved_usd = 0"
+        );
+
+        // And the catalog must agree with what the SPAN would have recorded for
+        // the same request — two sites reading one quantity must not drift.
+        let span_side = crate::pricing::cost_usd(
+            model,
+            &tracelane_shared::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        )
+        .unwrap_or(0.0);
+        assert!(
+            (with_fallback - span_side).abs() < f64::EPSILON,
+            "the cache store site and the span must derive the SAME cost: \
+             cache={with_fallback} span={span_side}"
+        );
+
+        // An unknown model still yields 0.0 rather than a fabricated number.
+        let unknown = None::<f64>
+            .or_else(|| {
+                crate::pricing::cost_usd(
+                    "totally-not-a-real-model-r13proof",
+                    &tracelane_shared::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    },
+                )
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            unknown, 0.0,
+            "an unknown model must not fabricate a cost (ADR-055)"
+        );
+    }
+
     use serde_json::json;
 
     // ── A1: capture completeness ────────────────────────────────────────────
@@ -4675,6 +5726,7 @@ mod tests {
         assert_eq!(capture_boot_decision(true, true), CaptureBoot::Connect);
     }
 
+    /// . THE DEFECT: a gateway that started while NATS was unreachable had
     /// `nats = None` for the life of the process — 200s and total span loss until a
     /// human restarted it. async_nats already auto-reconnects once connected; the gap
     /// was only ever the FIRST connect, which is exactly when a dependency is most
@@ -4742,6 +5794,7 @@ mod tests {
         );
     }
 
+    /// the LIVE half. The test above proves the client is CONSTRUCTED against a
     /// dead port; it does not prove the client HEALS. This does: build against a dead
     /// port, then start a real NATS on that port and confirm the SAME client publishes.
     ///
@@ -4938,6 +5991,7 @@ mod tests {
     /// as "unknown" on the span. It now delegates to provider_id_for_model.
     #[test]
     fn provider_name_from_model_matches_dispatch_not_unknown() {
+        // Groq-family (the trigger) + other previously-"unknown" providers.
         assert_eq!(provider_name_from_model("llama-3.3-70b-versatile"), "groq");
         assert_eq!(provider_name_from_model("qwen-2.5-32b"), "groq");
         assert_eq!(provider_name_from_model("mistral-large-latest"), "mistral");
@@ -4962,6 +6016,7 @@ mod tests {
             crate::providers::ProviderRegistry::provider_id_for_model("llama-3.3-70b-versatile")
                 .unwrap()
         );
+        // An unmatched model attributes "unknown" (never a default provider).
         assert_eq!(provider_name_from_model("totally-unknown-xyz"), "unknown");
     }
 
@@ -4982,6 +6037,7 @@ mod tests {
     /// terminal item is a transport-level `Err`, which is exactly what a real
     /// provider connection reset / truncated body yields at the `ProviderStream`
     /// level (the adapter propagates the byte-stream error via `?` inside its
+    /// `try_stream!`). Drives the `Some(Err)` arm (#1 mid-stream sub-path).
     fn mock_stream_severing(
         ok_events: Vec<crate::providers::ProviderEvent>,
     ) -> crate::providers::ProviderStream {
@@ -4998,6 +6054,7 @@ mod tests {
         Arc::new(crate::guardrail::GuardrailEngine::new(
             chain,
             None,
+            // R2/R6 are PAID; a None cache is the free tier now.
             Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             Arc::new(crate::guardrail::CapabilityRegistry::new()),
         ))
@@ -5074,6 +6131,7 @@ mod tests {
             e2e_inputs(),
             Vec::new(),
             None,
+            None, // api_key_id: not under test here
         );
         let resp = Sse::new(sse).into_response();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5081,6 +6139,8 @@ mod tests {
             .expect("collect SSE body");
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    // ──: billing must fire on EVERY stream termination path ────────────
 
     /// `BILLING_RECORDS_SPAWNED` is process-global, so these tests must not run
     /// concurrently or their before/after deltas interleave and read each other's
@@ -5095,6 +6155,7 @@ mod tests {
     /// Drive the real `provider_stream_to_sse` with billing wired, returning how
     /// many billing records it spawned. The `Recorder` is real but inert: its
     /// spawned task exits at `global_pool() == None` in tests, so nothing reaches
+    /// Polar — we are asserting the CALL SITE fires, which is exactly what
     /// got wrong.
     async fn billing_spawns_for(events: Vec<crate::providers::ProviderEvent>) -> u64 {
         // Held across the whole measurement so the delta is ours alone.
@@ -5126,6 +6187,7 @@ mod tests {
             e2e_inputs(),
             Vec::new(),
             None,
+            None, // api_key_id: not under test here
         );
         let resp = Sse::new(sse).into_response();
         let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5134,6 +6196,7 @@ mod tests {
         billing_records_spawned() - before
     }
 
+    /// THE REGRESSION: a stream that ends WITHOUT a `Done` event must still
     /// be metered. This is not hypothetical — Gemini never emits `Done`, it just
     /// ends the stream, so every Gemini streaming request was billed to nobody
     /// while its span recorded the usage. Fails on the pre-fix code, where billing
@@ -5197,6 +6260,7 @@ mod tests {
         assert_eq!(unusable.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// An unclassified upstream 4xx mirrors the upstream status as a 4xx
     /// (never 502 "provider unavailable", which blamed us for a client-side
     /// failure) and names BOTH candidate causes without claiming to know which.
     #[tokio::test]
@@ -5231,12 +6295,14 @@ mod tests {
         // Names the upstream status, and both causes — not one of them.
         assert!(s.contains("400"), "must name the upstream status: {s}");
         assert!(s.contains("expired") && s.contains("payload"), "got: {s}");
+        // Must NOT assert the key is the problem (that is the parsed path).
         assert!(
             !s.contains("provider_key_rejected"),
             "an unparsed 4xx must not claim the key was rejected: {s}"
         );
     }
 
+    ///  mechanical control: the provider-error response must NEVER emit a
     /// key-shaped string or an upstream auth header, even if a future bug
     /// interpolates a raw upstream body (which echoes the tenant's BYOK key +
     /// `www-authenticate`) into a client-facing field. Asserts the allowlist +
@@ -5300,6 +6366,7 @@ mod tests {
         assert_eq!(n, 1, "Done path must bill exactly once, not zero or twice");
     }
 
+    ///  #1 (mid-stream sub-path): a transport sever mid-stream (a `Some(Err)`
     /// item — a real provider connection reset / truncated body) must terminate
     /// the SSE cleanly — yield `[DONE]`, no hang, no panic — via the `Some(Err)`
     /// arm. The span that arm builds carries `stream_error` → Error status, which
@@ -5314,6 +6381,7 @@ mod tests {
         );
     }
 
+    ///  #1 + #5: the span builder maps failure reasons to Error status
     /// (`countIf(status_code = 2)`) and a clean finish to Ok — the exact mapping a
     /// mid-stream sever rides on (the `Some(Err)` arm sets
     /// `stream_error = Some("provider_stream_error")`). Also asserts the
@@ -5363,6 +6431,7 @@ mod tests {
             None,
             None, // timing (not under test here)
             None, // error_reason
+            None, // api_key_id
         );
         assert_eq!(ok.status.code, SpanStatusCode::Ok);
         // Mid-stream sever reason (what the `Some(Err)` arm sets) → Error, countable.
@@ -5456,6 +6525,7 @@ mod tests {
         // Regression (input-token clobber): Anthropic streams input on
         // `message_start` then final output on `message_delta` (input hardcoded 0).
         // A plain overwrite clobbered input back to 0 — the max merge must keep
+        // it. This is the fold assertion tests never had.
         let (mut input, mut output) = (0u32, 0u32);
         merge_usage_tokens(&mut input, &mut output, 42, 0); // message_start
         merge_usage_tokens(&mut input, &mut output, 0, 17); // message_delta
@@ -5489,6 +6559,8 @@ mod tests {
         assert!(!is_bench_mock_model("gpt-5"));
         assert!(!is_bench_mock_model("mock-instant")); // un-prefixed ≠ reserved
     }
+
+    // the bench-mock bypass -----------------------------------
 
     #[test]
     fn bench_mock_gate_all_four_quadrants() {
@@ -5557,6 +6629,7 @@ mod tests {
     }
 
     /// Mirrors the THIRD condition (`bench_mock && entitlements.is_none()`) so
+    /// it is testable without standing up a Postgres pool. Post-B-187d the
     /// production site this models is the ENTITLEMENT-SELECTION branch, not the
     /// tier branch — the tier is now derived from the grant via
     /// `rate_limit_tier()`. `bench_grant_branch_matches_production_shape`
@@ -5603,6 +6676,7 @@ mod tests {
         assert_eq!(real.quota_config().trace_quota_monthly, 10_000);
 
         // The hot path must construct the grant in exactly ONE place — the whole
+        // point of B-187d is that bench logic is not scattered across limiters.
         let src = include_str!("server.rs");
         let non_test = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         assert_eq!(
@@ -5616,6 +6690,7 @@ mod tests {
 
     #[test]
     fn bench_tier_is_unreachable_for_a_postgres_backed_tenant() {
+        // FOUNDER CONSTRAINT (B-187b), condition 3. `state.entitlements` is
         // `Some` iff a Postgres control plane exists (server.rs:278), which is
         // what makes a deployment HOSTED. So even with the env flag set AND the
         // reserved model, a tenant that exists in Postgres cannot acquire the
@@ -5636,6 +6711,7 @@ mod tests {
     #[test]
     fn bench_grant_branch_matches_production_shape() {
         // Guards the ENTITLEMENT-SELECTION branch — the one site that constructs
+        // the bench grant. (Before B-187d this string also guarded tier
         // selection; that decision now lives on the grant itself as
         // `rate_limit_tier()`, so the label was corrected to match what it
         // actually guards. Verifier finding: label drift.)
@@ -5705,6 +6781,7 @@ mod tests {
 
     #[test]
     fn bench_mock_bypass_sits_after_auth_and_tenant_resolution() {
+        // FOUNDER CONSTRAINT: an unauthenticated request must never
         // reach the mock arm. This is a STRUCTURAL assertion on source order,
         // not an HTTP-level proof — the crate has no handler test harness
         // (no tower::ServiceExt/oneshot anywhere), so building one is its own
@@ -5879,7 +6956,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_observation_parses_full_body() {
+    fn prompt_observation_carries_only_the_version_id() {
         let body = json!({
             "model": "claude-sonnet-4-6",
             "tracelane_prompt_version_id": UUID_AB,
@@ -5887,30 +6964,40 @@ mod tests {
             "tracelane_prompt_env": "staging"
         });
         let obs = PromptObservation::from_body(&body).expect("should parse");
-        assert_eq!(obs.name, "support-bot");
-        assert_eq!(obs.env, Env::Staging);
         assert_eq!(obs.version_id, Uuid::parse_str(UUID_AB).unwrap());
     }
 
+    /// `tracelane_prompt_name` is no longer required, because it only ever
+    /// selected a flip target and the hot path can no longer flip.
     #[test]
-    fn prompt_observation_defaults_env_to_production() {
-        let body = json!({
-            "tracelane_prompt_version_id": UUID_AB,
-            "tracelane_prompt_name": "p"
-        });
+    fn prompt_observation_parses_without_a_name() {
+        let body = json!({ "tracelane_prompt_version_id": UUID_AB });
         let obs = PromptObservation::from_body(&body).expect("should parse");
-        assert_eq!(obs.env, Env::Production);
+        assert_eq!(obs.version_id, Uuid::parse_str(UUID_AB).unwrap());
+    }
+
+    /// THE ENV FIELD IS INERT AND MUST STAY INERT. It used to decide whether an
+    /// observation could mutate production, and it defaulted to `Production`
+    /// when absent OR unparseable. Nothing on the chat path reads it now; this
+    /// asserts a body claiming production cannot be distinguished from one that
+    /// says nothing, because neither can reach a flip.
+    #[test]
+    fn prompt_observation_ignores_a_claimed_env() {
+        let claims_prod = PromptObservation::from_body(&json!({
+            "tracelane_prompt_version_id": UUID_AB,
+            "tracelane_prompt_env": "production"
+        }))
+        .expect("should parse");
+        let says_nothing =
+            PromptObservation::from_body(&json!({ "tracelane_prompt_version_id": UUID_AB }))
+                .expect("should parse");
+        assert_eq!(claims_prod.version_id, says_nothing.version_id);
     }
 
     #[test]
     fn prompt_observation_none_without_correlation() {
         // Ad-hoc traffic — no prompt fields → no observation.
         assert!(PromptObservation::from_body(&json!({ "model": "x" })).is_none());
-        // version id present but name missing → None.
-        assert!(
-            PromptObservation::from_body(&json!({ "tracelane_prompt_version_id": UUID_AB }))
-                .is_none()
-        );
         // Unparseable uuid → None (never feeds a garbage version id).
         assert!(
             PromptObservation::from_body(&json!({
@@ -5919,15 +7006,6 @@ mod tests {
             }))
             .is_none()
         );
-    }
-
-    #[test]
-    fn parse_prompt_env_known_and_unknown() {
-        assert_eq!(parse_prompt_env("dev"), Some(Env::Dev));
-        assert_eq!(parse_prompt_env("staging"), Some(Env::Staging));
-        assert_eq!(parse_prompt_env("production"), Some(Env::Production));
-        assert_eq!(parse_prompt_env("canary"), Some(Env::Canary));
-        assert_eq!(parse_prompt_env("bogus"), None);
     }
 
     // ── Slack quota-webhook SSRF gate ────────────────────────────────────────
@@ -5982,6 +7060,7 @@ mod tests {
 ///
 /// Gated on `debug_assertions` as well as `test` for the same reason
 /// `providers::smoke_tests` is: the loopback SSRF bypass these tests need is
+/// debug-only, and release hard-denies it.
 #[cfg(all(test, debug_assertions))]
 mod embeddings_route_tests {
     use super::*;
@@ -6015,6 +7094,11 @@ mod embeddings_route_tests {
         );
         AppState {
             providers: Arc::new(providers),
+            // The cache is OFF in the test state, which is the production
+            // default too — every hot-path test therefore exercises the
+            // no-cache path, and the cache's own behaviour is tested in
+            // `semantic_cache`'s module tests rather than implicitly here.
+            semantic_cache: None,
             audit_chain: Arc::clone(&audit_chain),
             rate_limiter: Arc::new(RateLimiter::new()),
             quota_tracker: Arc::new(QuotaTracker::new()),
@@ -6060,7 +7144,7 @@ mod embeddings_route_tests {
     /// the real BYOK resolution path without a Postgres pool or an env var.
     fn registry_pointing_ollama_at(uri: String) -> ProviderRegistry {
         let mut reg = ProviderRegistry::new().expect("provider registry");
-        reg.ollama = crate::providers::OpenAiProvider::compatible(uri, "ollama")
+        reg.set_compat_base_url_for_test("ollama", uri)
             .expect("ollama adapter for the mock");
         reg
     }
@@ -6105,6 +7189,7 @@ mod embeddings_route_tests {
 
     #[tokio::test]
     async fn embeddings_rejects_an_unroutable_model_rather_than_defaulting() {
+        // No default provider. Defaulting here would ship one provider's
         // BYOK key to a model the caller never named.
         let state = test_state(ProviderRegistry::new().expect("registry"));
         let resp = embeddings_handler(

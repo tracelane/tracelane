@@ -19,6 +19,7 @@
  * fabricated scores is a honesty violation — DO NOT add them.
  */
 
+import { SegmentedControl } from "@tracelanedev/ui";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -58,6 +59,13 @@ type Status =
 	| "blocked"
 	| "upgrade_required"
 	| "error";
+
+/** The two promotable source environments. Module scope so the array identity is
+ *  stable across renders and the type is inferred once. */
+const FROM_ENVS = [
+	{ value: "staging" as const, label: "staging" },
+	{ value: "canary" as const, label: "canary" },
+];
 
 export function PromotionPanel({
 	promptName,
@@ -132,7 +140,10 @@ export function PromotionPanel({
 	const isLoading = status === "loading";
 
 	return (
-		<div className="rounded-lg border border-line bg-surface p-5 space-y-4">
+		// `.surface-card` — same panel role, same radius source, as the authoring
+		// form it sits beside on /prompts/[name]. Both used to hardcode the 8px
+		// control radius.
+		<div className="surface-card space-y-4 border border-line bg-surface p-5">
 			<h2 className="text-sm font-semibold text-ink">Promote to production</h2>
 			<p className="text-xs leading-relaxed text-ink-2">
 				Point <span className="text-ink">production</span> at a specific
@@ -141,7 +152,7 @@ export function PromotionPanel({
 				attributed decision.
 			</p>
 			<details className="text-xs text-ink-2">
-				<summary className="cursor-pointer font-medium text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-seal">
+				<summary className="cursor-pointer font-medium text-ink-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring">
 					How promotion works
 				</summary>
 				<p className="mt-1.5 leading-relaxed">
@@ -155,25 +166,26 @@ export function PromotionPanel({
 			</details>
 
 			<form onSubmit={handlePromote} className="space-y-3">
-				{/* From env selector */}
+				{/*
+				 * Source-environment picker — the TENTH hand-rolled one-of-N control,
+				 * and the one the first conversion pass missed because it lives in a
+				 * panel rather than a filter row. Its own comment claimed the solid pill
+				 * matched "every other segment control"; by then no other segment
+				 * control used `--selected` at all, so the comment was documenting a
+				 * consistency that had stopped existing.
+				 *
+				 * It also had no `role="group"`, no accessible name and no
+				 * `aria-pressed` — a screen reader got two unlabelled buttons with no
+				 * indication which was active. The primitive supplies all three.
+				 */}
 				<div>
 					<span className="block text-xs text-ink-2 mb-1.5">Promote from</span>
-					<div className="flex gap-2">
-						{(["staging", "canary"] as const).map((env) => (
-							<button
-								key={env}
-								type="button"
-								onClick={() => setFromEnv(env)}
-								className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
-									fromEnv === env
-										? "bg-surface-3 text-ink"
-										: "text-ink-2 hover:text-ink"
-								}`}
-							>
-								{env}
-							</button>
-						))}
-					</div>
+					<SegmentedControl
+						label="Promote from environment"
+						value={fromEnv}
+						options={FROM_ENVS}
+						onChange={setFromEnv}
+					/>
 				</div>
 
 				{/* Candidate version ID — copy from the env card above */}
@@ -193,7 +205,7 @@ export function PromotionPanel({
 						value={versionId}
 						onChange={(e) => setVersionId(e.target.value)}
 						placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 						required
 						disabled={isLoading}
 					/>
@@ -217,7 +229,7 @@ export function PromotionPanel({
 						value={evalRunId}
 						onChange={(e) => setEvalRunId(e.target.value)}
 						placeholder="Leave blank today — promote with an override reason below"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
@@ -241,7 +253,7 @@ export function PromotionPanel({
 						value={overrideReason}
 						onChange={(e) => setOverrideReason(e.target.value)}
 						placeholder="e.g. urgent prod hotfix — approved by …"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 outline-none focus:border-action-line"
+						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
@@ -260,7 +272,7 @@ export function PromotionPanel({
 			</form>
 
 			{status === "success" && result ? (
-				<div className="rounded-lg border border-ok bg-ok-soft/40 p-3 text-xs space-y-1">
+				<div className="rounded-lg border border-ok bg-ok-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-ok-ink">
 						{result.decision === "manual_override"
 							? "Manual override applied"
@@ -277,7 +289,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "blocked" && result ? (
-				<div className="rounded-lg border border-warn bg-warn-soft/40 p-3 text-xs space-y-1">
+				<div className="rounded-lg border border-warn bg-warn-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-warn-ink">
 						{result.decision === "blocked_by_eval"
 							? "Blocked by eval gate"
@@ -293,7 +305,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "upgrade_required" ? (
-				<div className="rounded-lg border border-action-line bg-action-soft/40 p-3 text-xs space-y-1">
+				<div className="rounded-lg border border-action-line bg-action-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-action-ink">Team plan required</p>
 					<p className="text-ink-2">{errorMsg}</p>
 					<a
@@ -306,12 +318,12 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "error" ? (
-				<div className="rounded-lg border border-danger bg-danger-soft/40 p-3 text-xs text-danger-ink">
+				<div className="rounded-lg border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
 					{errorMsg || "Unexpected failure — check gateway logs."}
 				</div>
 			) : null}
 
-			<p className="text-[10px] text-ink-3">
+			<p className="text-2xs text-ink-3">
 				Promotions are written to the tamper-evident audit ledger and visible
 				under Recent activity below.
 			</p>

@@ -1,3 +1,4 @@
+//! Provider BEHAVIORAL E2E tests via `wiremock`.
 //!
 //! `smoke_tests.rs` proves the wire shape (right path, right headers, mock got
 //! hit) and deliberately discards stream contents. These tests close the
@@ -16,6 +17,7 @@
 //!   - Cohere: tools were dropped from requests AND tool-call events were
 //!     never parsed.
 //!
+//! Same cfg gate as smoke_tests (loopback SSRF bypass is debug-only —).
 
 #![cfg(test)]
 
@@ -76,6 +78,7 @@ fn request_with_tools(model: &str) -> ChatRequest {
 }
 
 /// Collect the FULL stream; any stream-level error fails the test (the
+/// smoke-test `drain` discards errors — that is exactly the critique).
 async fn collect(mut s: crate::providers::ProviderStream) -> Vec<ProviderEvent> {
     let mut out = Vec::new();
     while let Some(item) = s.next().await {
@@ -225,6 +228,7 @@ async fn openai_compatible_class_shares_the_behavioral_contract() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// Azure OpenAI — deployment URL; tool-calls previously DROPPED (fix).
 // ═════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -250,6 +254,7 @@ async fn azure_stream_surfaces_tool_calls_content_and_usage() {
     let events = collect(stream).await;
 
     assert_eq!(assembled_text(&events), "The weather is sunny.");
+    // Regression: these deltas were silently dropped before the fix.
     let (id, name, args) = assembled_tool(&events)
         .expect("azure tool-call deltas must surface (were previously dropped)");
     assert_eq!(id.as_deref(), Some("call_b067"));
@@ -349,6 +354,7 @@ async fn anthropic_stream_assembles_text_tools_and_split_usage() {
 
 // ═════════════════════════════════════════════════════════════════════════
 // Google Gemini — one chunk carrying text + functionCall + usageMetadata.
+// Regression for the early return that dropped content.
 // ═════════════════════════════════════════════════════════════════════════
 
 const GEMINI_BEHAVIORAL_SSE: &str = concat!(
@@ -378,6 +384,7 @@ async fn google_chunk_with_text_tools_and_usage_loses_nothing() {
         .expect("google chat returns stream");
     let events = collect(stream).await;
 
+    // the second chunk's text AND functionCall vanished (the
     // usageMetadata early-return), so the text stopped at "The weather is ".
     assert_eq!(
         assembled_text(&events),
@@ -395,6 +402,7 @@ async fn google_chunk_with_text_tools_and_usage_loses_nothing() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// Cohere — NDJSON events; tools previously dropped end-to-end (fix).
 // ═════════════════════════════════════════════════════════════════════════
 
 const COHERE_BEHAVIORAL_BODY: &str = concat!(

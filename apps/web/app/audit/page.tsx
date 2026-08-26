@@ -121,7 +121,7 @@ interface SelfVerifyResponse {
 function AuditFallback() {
 	return (
 		<div className="space-y-4">
-			<Skeleton className="h-28 w-full rounded-xl" />
+			<Skeleton className="h-28 w-full rounded-[var(--radius-card)]" />
 			<Skeleton className="mt-2 h-5 w-40" />
 			<div className="mt-2 space-y-1.5">
 				{["a", "b", "c", "d", "e", "f", "g", "h"].map((id) => (
@@ -314,7 +314,7 @@ export default async function AuditPage({
 			    complete ledger is the export. */}
 			<div className="mb-4 max-w-2xl">
 				<h1 className="t-h1">Audit Ledger</h1>
-				<p className="mt-1 text-[13px] text-ink-2">
+				<p className="mt-1 text-sm text-ink-2">
 					A tamper-evident, independently verifiable record of every
 					gateway-proxied call and guardrail verdict.
 				</p>
