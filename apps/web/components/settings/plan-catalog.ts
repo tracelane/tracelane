@@ -204,7 +204,12 @@ export function buildCard(
 		tagline: TAGLINE[plan],
 		traces: `${formatQuota(ent.trace_quota_monthly)}${plus} traces/mo`,
 		seats: formatSeats(ent.seat_cap_included, ent.seat_cap_max),
-		retention: `${ent.retention_days}-day trace retention`,
+		// NOT `ent.retention_days`. That value is computed from the plan catalog
+		// and consumed by THIS renderer and nothing else — no delete, reject or
+		// limit path reads it, so displaying it per plan asserted a control that
+		// does not exist. Traces are kept to ONE window for every tenant: the
+		// `spans` TTL, verified on prod as `toDate(start_time) + toIntervalDay(365)`.
+		retention: "Traces kept up to 365 days",
 		overage: formatOverage(
 			ent.overage_hard_cap_multiplier,
 			ent.overage_price_per_10k_usd,
@@ -238,8 +243,13 @@ export function hasCustomLimits(plan: Plan, resolved: Entitlements): boolean {
 	return (
 		base.trace_quota_monthly !== resolved.trace_quota_monthly ||
 		base.seat_cap_included !== resolved.seat_cap_included ||
-		base.seat_cap_max !== resolved.seat_cap_max ||
-		base.retention_days !== resolved.retention_days
+		base.seat_cap_max !== resolved.seat_cap_max
+		// `retention_days` was here and is deliberately gone. The banner this
+		// drives says "the figures below are YOURS, not the stock plan defaults" —
+		// and since B-300 removed the retention figure from the ladder, a
+		// workspace whose ONLY override was retention would have been shown that
+		// claim pointing at no figure at all. Removing the display without
+		// removing what it steered left the assertion behind the number.
 	);
 }
 

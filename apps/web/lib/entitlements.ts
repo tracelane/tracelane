@@ -76,6 +76,9 @@ export interface Entitlements {
 	// User-facing alerting (ADR-059 / migration 0012). DARK on every plan until
 	// the founder flips it; a per-tenant workspace override grants early access.
 	f_alerts: boolean;
+	// EVL-28 online evals (migration 0030). Team+ — it samples live traffic and
+	// spends from the workspace wallet, so the plan boundary is a real one.
+	f_online_evals: boolean;
 }
 
 // Fallback map used when no workspace_entitlements row exists for a tenant
@@ -114,6 +117,7 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_cohort_baselines: false,
 		f_hipaa_gcp_addon: false,
 		f_alerts: false,
+		f_online_evals: false,
 	},
 	builder: {
 		plan: "builder",
@@ -144,6 +148,7 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_cohort_baselines: false,
 		f_hipaa_gcp_addon: false,
 		f_alerts: true,
+		f_online_evals: false,
 	},
 	team: {
 		plan: "team",
@@ -174,6 +179,7 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_cohort_baselines: false,
 		f_hipaa_gcp_addon: false,
 		f_alerts: true,
+		f_online_evals: true,
 	},
 	business: {
 		plan: "business",
@@ -206,6 +212,7 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_cohort_baselines: false,
 		f_hipaa_gcp_addon: false,
 		f_alerts: true,
+		f_online_evals: true,
 	},
 	enterprise: {
 		plan: "enterprise",
@@ -239,6 +246,7 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_cohort_baselines: false, // flipped when cohort size n>=30
 		f_hipaa_gcp_addon: false, // flipped on opt-in GCP deployment +$2k/mo
 		f_alerts: true,
+		f_online_evals: true,
 	},
 };
 
@@ -311,6 +319,10 @@ function rowToOverrides(
 		// ADR-059: alerting feature flag. DARK by default; workspace override
 		// or a future plan-entitlements seed row turns it on.
 		f_alerts: row.fAlerts,
+		// EVL-28: online evals. Team+ by plan default; a workspace override can
+		// grant or deny it, deny winning — the same shape every other flag here
+		// resolves through.
+		f_online_evals: row.fOnlineEvals,
 	};
 }
 

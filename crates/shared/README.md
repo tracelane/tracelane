@@ -7,7 +7,7 @@ and model spans with exactly the same code.
 
 ## Modules
 - **`model`** — universal chat API types (`ChatRequest`, `ChatResponse`, `Message`, `Tool`) that every provider adapter maps to/from.
-- **`span`** — `TracelaneSpan` with OTel-GenAI + OpenInference semantic-convention attributes (the wire format, ADR-001).
+- **`span`** — `TracelaneSpan` with OTel-GenAI + OpenInference semantic-convention attributes (the wire format).
 - **`tenant`** — `TenantId`, an opaque wrapper **only constructible from a validated JWT claim** (`from_jwt_claim`) or a verified SPIFFE SVID — the structural enforcement of tenant isolation (never from a request body).
 - **`redact`** — credential / API-key scrubbing for the `tracing` subscriber (`sk-`, `org-`, `AKIA`, `AIza`, Stripe/Polar, bearer, JWT shapes). Defense in depth — the first line is not logging secrets at all.
 

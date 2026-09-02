@@ -132,10 +132,9 @@ Python / TypeScript verifiers.
 | Datum | Lives in | Rationale |
 |---|---|---|
 | Tenant + user metadata, API keys, billing | Postgres | OLTP: low volume, high integrity |
-| Spans (hot, ≤30 days) | ClickHouse | OLAP: high-throughput fan-out queries |
-| Spans (cold, >30 days) | R2 | Cheap, queryable via `tlane export` |
+| Spans (365-day TTL) | ClickHouse | OLAP: high-throughput fan-out queries |
 | Audit log | NDJSON files in a tamper-evident hash chain (Ed25519 batch signing + Sigstore Rekor v2 anchoring live, best-effort, on the Audit add-on) | Tamper-evident, byte-identical verifier across 3 languages |
-| Prompt versions + pinning | Postgres | Atomic promotion + rollback per [ADR-009](/decisions/index) |
+| Prompt versions + pinning | Postgres | Atomic promotion + rollback |
 | Predictive policies | Postgres | Tenant-scoped, hot-cached in gateway |
 
 ## Performance budgets

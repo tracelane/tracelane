@@ -204,6 +204,47 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 /**
+ * PATCH a gateway resource with the per-user WorkOS JWT as the Bearer.
+ *
+ * Identical to {@link gatewayPost} but for a partial update. It exists rather
+ * than folding an update into POST because the gateway route IS a PATCH: a
+ * proxy that changes the verb makes the two sides disagree about what a partial
+ * update means, and the first casualty is the "unset this field" case.
+ */
+export async function gatewayPatch<T>(path: string, body: unknown): Promise<T> {
+	const { token } = await requireGatewayToken();
+	const base = gatewayBaseUrl();
+
+	let res: Response;
+	try {
+		res = await fetch(`${base}${path}`, {
+			method: "PATCH",
+			headers: {
+				authorization: `Bearer ${token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify(body),
+			cache: "no-store",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+		});
+	} catch (err) {
+		throw new GatewayError(
+			503,
+			`gateway unreachable: ${err instanceof Error ? err.message : "fetch failed"}`,
+		);
+	}
+
+	if (!res.ok) {
+		throw new GatewayError(
+			res.status,
+			`gateway responded ${res.status}`,
+			await readErrorBody(res),
+		);
+	}
+	return (await res.json()) as T;
+}
+
+/**
  * DELETE a gateway resource with the per-user WorkOS JWT as the Bearer.
  *
  * Returns nothing: the gateway answers a successful delete with **204 No

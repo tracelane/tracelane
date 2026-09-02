@@ -85,7 +85,7 @@ Once connected, you can ask Claude:
 
 > "Compare the latency of traces using claude-haiku-4-5 vs claude-sonnet-4-6 in the last hour."
 
-> "Show me the assertions PP-G1 makes."
+> "Show me the assertions that eval makes."
 
 ## Auth
 

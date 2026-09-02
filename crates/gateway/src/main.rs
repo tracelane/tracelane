@@ -74,6 +74,8 @@ mod untrusted_data;
 // prompt_router carry the EWMA + routing-pointer logic; prompt_routes
 // plugs the HTTP endpoints into the server router.
 mod auto_rollback;
+mod online_eval;
+mod online_eval_routes;
 mod prompt_eval;
 mod prompt_history;
 mod prompt_router;

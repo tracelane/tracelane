@@ -119,6 +119,47 @@ scan_tree() {
             # same workspace. Compliant, not exempt, same as trace_reads.rs.
             # The INSERT is a write, which this guard does not police.
             crates/gateway/src/semantic_cache.rs) continue ;;
+            # EVL-28 online evals. COMPLIANT, NOT EXEMPT.
+            #
+            # The one SELECT — the durable monthly judge total that re-seeds the
+            # spend sub-limit — is wrapped by `TenantQuery` at the TIGHTEST
+            # (Builder) caps rather than the tenant's own tier, for the same
+            # reason `prompt_eval.rs` and `semantic_cache.rs` are: it is
+            # BACKGROUND work on a fire-and-forget path and must not be able to
+            # out-consume the interactive queries of the same workspace.
+            #
+            # Listed here only because the grep matches any `.query(` call site
+            # regardless of the wrapper — which is the same reason every entry
+            # below this line is listed, and the reason one of them records
+            # having "fixed" working code on a wrong diagnosis.
+            #
+            # The INSERT into `online_eval_scores` is a write, which this guard
+            # does not police.
+            crates/gateway/src/online_eval.rs) continue ;;
+            # EVL-28 item 11 — the READ side of online evals (`/v1/online-evals/
+            # scores` and `/summary`). All three SELECTs are wrapped by
+            # `TenantQuery` at Builder caps, and every one binds the tenant from
+            # the validated claim; the `?` placeholders are bound, never
+            # interpolated. COMPLIANT, NOT EXEMPT — listed for the same reason as
+            # every other entry here, that the grep matches `.query(` regardless
+            # of the wrapper. The selftest still blocks a planted raw call.
+            crates/gateway/src/online_eval_routes.rs) continue ;;
+            # EVL-29 item 12 — annotation queues. COMPLIANT, NOT EXEMPT.
+            #
+            # ONE SELECT: the read-time candidate query behind a queue (founder
+            # ruling R221.1 — queue membership is a saved filter evaluated at
+            # read time, never a materialised table, so this query IS the
+            # membership). It is built by `candidate_sql`, whose every branch is
+            # a FIXED string, and the whole thing is wrapped by `TenantQuery` at
+            # Builder caps before it is ever executed — tightest tier rather
+            # than the tenant's own, because a reviewer's page load must not be
+            # able to out-consume the interactive queries of the same workspace.
+            # `tenant_id`, the window, the score ceiling and the rubric are all
+            # BOUND `?` placeholders; no caller value reaches statement text.
+            #
+            # Listed for the same reason as every entry above: the grep matches
+            # `.query(` regardless of the wrapper.
+            crates/gateway/src/annotation_routes.rs) continue ;;
             # Gateway-proxied trace + SLO reads (Option 1, ). The .query
             # execution lives here, but every SELECT IS wrapped by
             # clickhouse_query::TenantQuery (ADR-031 caps applied) — so this is

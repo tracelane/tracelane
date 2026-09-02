@@ -381,4 +381,3 @@ catch wire-format drift before it reaches a customer.
 - [API reference](./api-reference.md) — the `/v1/chat/completions` surface
 - [Architecture](./architecture.md) — gateway data flow
 - [`crates/gateway/src/providers/`](../../crates/gateway/src/providers/) — adapters source
-- ADR-006 — BYOK envelope encryption (see the ADR index in the docs site) — key handling

@@ -71,22 +71,68 @@ tlane trace 9f2c8a1b... --format timeline       # ASCII waterfall
 
 ### `tlane eval run` / `tlane eval list`
 
-Drive the eval suite. `eval run` shells out to the repo's vitest runner and is
-what CI calls; `eval list` reads the local eval index.
+**The CI gate.** `eval run` runs a frozen dataset (or an inline case list)
+against a prompt version through the gateway and **exits non-zero when the pass
+score falls below the `--threshold` floor**, so a change that drops below your bar cannot merge. `eval list`
+shows recent eval runs in your workspace.
 
 ```bash
-tlane eval run                                 # all suites
-tlane eval run --suite gc                      # gateway-correctness only
-tlane eval run --suite ft --dry-run            # print the command, don't run it
-tlane eval list
+tlane eval run --prompt support-triage \
+               --dataset golden-cases \
+               --suite-file .tracelane/triage.eval.json \
+               --threshold 0.8
+tlane eval list --limit 20
 ```
 
-Suite ids are `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pir` (pii-redaction), `pi` (prompt-injection). An unrecognised id is a hard error (exit 2), never a
-silent run-everything. Tracelane's own CI runs `--suite all`.
+The prompt version is resolved from `--env` (default `staging`), so no UUID has
+to live in your workflow file. Pass `--version-id` to pin one.
 
-`eval run` and `eval list` take no other flags, and both need a checkout of the
-Tracelane repository — the eval suites are not part of the npm package.
+The suite file holds the **assertions**, which belong in your repo next to the
+prompt and versioned with it:
+
+```json
+{ "assertions": [{ "kind": "contains", "value": "refund" }] }
+```
+
+`assertions` must be non-empty. A run that asserts nothing scores every case as
+passed, so the gate would report 100% on the day the prompt breaks; the CLI
+refuses it with exit 2 before spending a provider call.
+
+**The comparison, stated:** higher is better and `--threshold` is a **floor** —
+`--threshold 0.8` means "fail if the mean score is below 0.8". A **tie passes**
+(`score == threshold` exits 0), because a gate that fails on exactly the number
+you set is a gate nobody can configure. `--threshold` is a fraction in `[0,1]`,
+so a bare `80` is rejected rather than read as 8000%.
+
+**It thresholds the mean SCORE, not the pass rate.** For `contains`,
+`exact_match` and `json_schema` a case scores exactly `1.0` or `0.0`, so the mean
+*is* the pass rate. For an LLM judge the score is continuous, and there the two
+differ: a judge scoring 0.68 against a 0.70 rule and one scoring 0.02 are the
+same "failed" and very different results.
+
+**Errored cases are excluded from the mean**, not scored as zero. One provider
+`429` in a twenty-case run is not a quality problem. They are bounded separately by
+`--max-error-rate` (default `0.10`); above it, and for a run where every case
+errored, the verdict is **could not evaluate** (exit `3`) — never a pass and
+and never a statement about your prompt at all.
+
+**This gate asserts a FLOOR on a single run — it does not detect regressions.**
+There is no baseline, no history and no comparison: the same shape as a coverage
+threshold, which nobody considers broken for lacking a previous run. A run
+scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
+the second "no regression" would be a claim nothing checked. Comparing a run
+against an earlier one is a real gap and is filed, not built — what counts as
+the baseline is a design decision, not a flag.
+
+Running the Tracelane repository's own conformance suite is a separate thing and
+is not part of this command: from a checkout, use `pnpm eval:run --suite=all`.
+
+<Note>
+  **Changed in `0.3.0`.** `tlane eval run` used to shell out to the repo's vitest
+  runner and needed a checkout. It is now the gateway-backed CI gate described
+  above. The old `--suite` flag is still recognised and exits 2 with a pointer to
+  `pnpm eval:run`, rather than failing as an unknown option.
+</Note>
 
 ### `tlane prompt list | show | promote | rollback | diff`
 
@@ -195,11 +241,14 @@ tlane replay 9f2c8a1b... --endpoint https://gateway.tracelane.dev
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Logical failure — verification failed or `INCOMPLETE`, unknown pack, server error |
-| 2 | Bad invocation or I/O — missing file, missing required flag, unknown eval suite |
+| 1 | Logical failure — verification failed or `INCOMPLETE`, unknown pack, server error. For `eval run`, the mean score is **below the `--threshold` floor**. This is the only code that means "your prompt did not meet the bar" |
+| 2 | Bad invocation or I/O — missing file, missing required flag, a suite file with no assertions, `--threshold 90` |
+| 3 | **Could not evaluate** (`eval run` only) — too many cases errored, the run did not finish, or the gateway refused |
 
-Those are the only codes the CLI emits. `tlane eval run` is the exception: it
-passes through the underlying test runner's exit code.
+`3` fails your CI job on purpose, and there is no flag that turns it into `0`.
+"The gate could not check" and "the gate checked and was satisfied" are
+different facts, and a step that goes green on the first silently disarms the
+gate for your whole repo.
 
 ## Related
 

@@ -68,7 +68,7 @@ Eight steps to running Tracelane on your own infra.
 </Step>
 
 <Step title="Configure Polar">
-  Tracelane v2 pricing (ADR-020) requires six `lookup_key`s. Create each as
+  Tracelane v2 pricing requires six `lookup_key`s. Create each as
   a separate product in the [Polar.sh](https://polar.sh) dashboard, with the
   `lookup_key` set on each product's `product_metadata`:
 
@@ -91,8 +91,8 @@ Eight steps to running Tracelane on your own infra.
   - Configure the Polar-hosted customer portal — branding, allowed actions
   - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
 
-  See [ADR-020](/decisions/index)
-  for the rationale behind seat caps, capped overage, and tier-specific retention.
+  for the rationale behind seat caps and capped overage. Retention is NOT
+  tier-specific — one window applies to every plan.
 </Step>
 
 <Step title="Deploy gateway + ingest">

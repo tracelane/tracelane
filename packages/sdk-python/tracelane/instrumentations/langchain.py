@@ -20,9 +20,10 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-import wrapt
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
+
+from tracelane.instrumentations._attach import attach
 
 _tracer = trace.get_tracer("tracelane.langchain", "0.1.0")
 
@@ -112,7 +113,10 @@ def _patch_invoke(client: Any) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    wrapt.wrap_function_wrapper(client, "invoke", lambda w, i, a, k: _patched_invoke(*a, **k))
+    # B-312: these framework objects are pydantic v2 models, whose __setattr__
+    # refuses a non-field attribute — so wrapt cannot patch the instance.
+    # `attach` goes under it, is idempotent, and RAISES rather than no-opping.
+    attach(client, "invoke", lambda _original: _patched_invoke)
 
 
 def _patch_ainvoke(client: Any) -> None:
@@ -141,7 +145,7 @@ def _patch_ainvoke(client: Any) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    client.ainvoke = _patched_ainvoke
+    attach(client, "ainvoke", lambda _original: _patched_ainvoke)
 
 
 def _patch_call(client: Any) -> None:
@@ -176,4 +180,4 @@ def _patch_call(client: Any) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    wrapt.wrap_function_wrapper(client, "__call__", lambda w, i, a, k: _patched_call(*a, **k))
+    attach(client, "__call__", lambda _original: _patched_call)

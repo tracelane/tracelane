@@ -118,7 +118,7 @@ tlane export --pack eu-ai-act-art12 --output-dir ./docs-pack
 One-command migration from Helicone or LiteLLM.
 
 ```bash
-# Helicone → Tracelane (PP-G4). Scans the project root, prints a diff,
+# Helicone → Tracelane. Scans the project root, prints a diff,
 # writes nothing without --apply.
 tlane migrate helicone
 tlane migrate helicone --apply
@@ -137,7 +137,7 @@ provider routing, model aliases, and rate-limit metadata.
 ### `tlane replay`
 
 Read-only time-travel viewer — renders a recorded trace's spans step-by-step
-(PP-O8). It does not re-execute the trace; cross-model re-execution is on the roadmap.
+It does not re-execute the trace; cross-model re-execution is on the roadmap.
 
 ```bash
 tlane replay <trace-id>
@@ -145,26 +145,61 @@ tlane replay <trace-id> --format json
 tlane replay <trace-id> --endpoint https://gateway.tracelane.dev
 ```
 
-### `tlane eval`
+### `tlane eval` — the CI gate
 
-Run the eval suite or list eval status. Both need a checkout of the Tracelane
-repository — the eval suites do not ship in the npm package.
+`eval run` runs a frozen dataset (or an inline case list) against a prompt
+version through the gateway and **exits non-zero when the mean score falls below
+the `--threshold` floor**, so a change that drops below your bar cannot merge. `eval list` shows recent eval runs
+in your workspace. Neither needs a checkout.
 
 ```bash
-tlane eval run                             # run all evals
-tlane eval run --suite gc                  # gateway-correctness suite only
-tlane eval run --suite gc                  # gateway-correctness suite only
-tlane eval run --suite ft --dry-run        # print the command without running it
-tlane eval list                            # list every conformance eval
+tlane eval run --prompt support-triage \
+               --dataset golden-cases \
+               --suite-file .tracelane/triage.eval.json \
+               --threshold 0.8
+tlane eval list --limit 20
 ```
 
-Suite ids: `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pir` (pii-redaction),
-`pi` (prompt-injection). An unrecognised id exits 2 instead of silently running
-everything.
+The prompt version is resolved from `--env` (default `staging`), so no UUID has
+to live in your workflow file; `--version-id` pins one. The suite file holds the
+assertions — `{"assertions":[{"kind":"contains","value":"refund"}]}` — and must
+declare at least one. A run that asserts nothing scores every case as passed, so
+the gate would report 100% on the day the prompt breaks; the CLI refuses it with
+exit 2 before spending a provider call.
 
-`eval run` exits with the underlying test runner's status, so CI gates on
-non-zero — that is the B1 merge gate. There is no `--gate` flag.
+**The comparison, stated:** higher is better and `--threshold` is a **floor** —
+`--threshold 0.8` means "fail if the mean score is below 0.8". A **tie passes**
+(`score == threshold` exits 0), because a gate that fails on exactly the number
+you set is a gate nobody can configure. `--threshold` is a fraction in `[0,1]`,
+so a bare `80` is rejected rather than read as 8000%.
+
+**It thresholds the mean SCORE, not the pass rate.** For `contains`,
+`exact_match` and `json_schema` a case scores exactly `1.0` or `0.0`, so the mean
+*is* the pass rate. For an LLM judge the score is continuous, and there the two
+differ: a judge scoring 0.68 against a 0.70 rule and one scoring 0.02 are the
+same "failed" and very different results.
+
+**Errored cases are excluded from the mean**, not scored as zero. One provider
+`429` in a twenty-case run is not a quality problem. They are bounded separately by
+`--max-error-rate` (default `0.10`); above it, and for a run where every case
+errored, the verdict is **could not evaluate** (exit `3`) — never a pass and
+and never a statement about your prompt at all.
+
+**This gate asserts a FLOOR on a single run — it does not detect regressions.**
+There is no baseline, no history and no comparison: the same shape as a coverage
+threshold, which nobody considers broken for lacking a previous run. A run
+scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
+the second "no regression" would be a claim nothing checked. Comparing a run
+against an earlier one is a real gap and is filed, not built — what counts as
+the baseline is a design decision, not a flag.
+
+The three-line GitHub Action wrapper is at
+[`.github/actions/eval-gate`](https://github.com/tracelane/tracelane/tree/main/.github/actions/eval-gate).
+
+**Changed in `0.3.0`:** `eval run` used to shell out to the repo's vitest runner.
+To run Tracelane's own conformance suite from a checkout, use
+`pnpm eval:run --suite=all`; the old `--suite` flag exits 2 with that pointer
+rather than failing as an unknown option.
 
 ### `tlane init`
 
@@ -230,15 +265,6 @@ tlane trace <trace-id> --format timeline
 | `TRACELANE_API_KEY` | API key used by `tlane trace`, by the bootstrap `tlane init` generates, and as a `TRACELANE_TOKEN` fallback for `tlane replay` |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL (default: `http://localhost:8080`) |
 
-## Pain points addressed
-
-| ID | Description |
-|---|---|
-| PP-G1 | Developer onboarding — `tlane init` scaffolds in < 60 s |
-| PP-G4 | One-command Helicone migration — `tlane migrate helicone --apply` |
-| PP-O8 | Agent replay of a recorded trace — `tlane replay` |
-| PP-O11 | CI eval gate — `tlane eval run --suite all` in GitHub Actions |
-| PP-PR6 | Audit ledger verification — `tlane verify` (exit code 0/1/2) |
 
 ## Stack
 

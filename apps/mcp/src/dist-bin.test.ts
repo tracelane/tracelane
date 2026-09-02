@@ -159,10 +159,17 @@ describe("published tarball", () => {
 		// Guards the assumption the launch test rests on: if the tarball ever
 		// started shipping `evals/`, the no-checkout assertions below would
 		// pass for the wrong reason.
+		//
+		// It probes `evals/` itself, not `evals/pain-points`. The old probe named
+		// a suite the public export withholds, so it asserted the ABSENCE of
+		// something already absent by policy — true for the wrong reason, and one
+		// character away from the defect that shipped in `findRepoRoot`. Absence
+		// of `evals/` at every level is what actually makes the walk return null,
+		// whatever suites the manifest names.
 		expect(existsSync(join(installed, "evals"))).toBe(false);
 		let dir = installed;
 		for (let i = 0; i < 8; i++) {
-			expect(existsSync(join(dir, "evals", "pain-points"))).toBe(false);
+			expect(existsSync(join(dir, "evals"))).toBe(false);
 			dir = resolve(dir, "..");
 		}
 	});
@@ -218,14 +225,29 @@ describe("npx-equivalent launch", () => {
 			// 49-id array could not reach.
 			const expected = JSON.parse(
 				readFileSync(join(PKG_ROOT, "src", "eval-manifest.json"), "utf8"),
-			) as { total: number };
+			) as { total: number; suites: Record<string, { id: string }[]> };
 			expect(payload.eval_count).toBe(expected.total);
 			expect(payload.eval_ids).toHaveLength(expected.total);
 			expect(payload.sources_available).toBe(false);
-			// Ids only a manifest-driven list can hold — the retired regex
-			// `/^(PP-[A-Z0-9]+|FT-\d+|PR\d+)$/` rejected both.
-			expect(payload.eval_ids).toContain("PP-AUDIT-TAMPER-DETECT");
-			expect(payload.eval_ids).toContain("FT-10-concurrent-promotion-rollback");
+
+			// Ids only a manifest-driven list can hold — the retired shape regex
+			// `/^(PP-[A-Z0-9]+|FT-\d+|PR\d+)$/` rejected every one of them.
+			//
+			// TAKEN FROM THE MANIFEST, NOT NAMED. This asserted two literal ids,
+			// one of them from `evals/pain-points` — a suite the public export
+			// withholds — so the exported copy of this test failed on a tarball
+			// that was behaving perfectly. Same defect as the sibling file, found
+			// the same way: by running the suite inside a built export.
+			const hyphenated = Object.values(expected.suites)
+				.flat()
+				.map((e) => e.id)
+				.filter((id) => !/^(PP-[A-Z0-9]+|FT-\d+|PR\d+)$/.test(id));
+			// The corpus must actually CONTAIN such an id, or the loop below
+			// passes by being empty — the regression would go unguarded silently.
+			expect(hyphenated.length).toBeGreaterThan(0);
+			for (const id of hyphenated.slice(0, 2)) {
+				expect(payload.eval_ids).toContain(id);
+			}
 		} finally {
 			await client.close().catch(() => undefined);
 		}

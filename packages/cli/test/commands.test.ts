@@ -18,7 +18,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseEvalIndex } from "../src/commands/eval.js";
 import { buildDpdpPhase2Pack } from "../src/commands/export.js";
 import { buildInitConfig, registerInitCommand } from "../src/commands/init.js";
 import { fetchTrace, renderTrace } from "../src/commands/trace.js";
@@ -49,31 +48,6 @@ describe("tlane init — buildInitConfig", () => {
 			buildInitConfig({ endpoint: "e", serviceName: "s", sampleRate: 0.25 })
 				.sampleRate,
 		).toBe(0.25);
-	});
-});
-
-describe("tlane eval list — parseEvalIndex", () => {
-	const md = [
-		"# Index",
-		"| ID | Title | Status | ref |",
-		"|---|---|---|---|",
-		"| **PP-G1** | **BYOK gateway** | **🟢 structural pass; ⏭️ live-skipped** | spec |",
-		"| **PP-G3** | **5K RPS** | **⏭️ live perf — skipped** | ADR-002 |",
-		"some prose line | not a row",
-	].join("\n");
-
-	it("extracts eval rows and strips bold markers", () => {
-		const entries = parseEvalIndex(md);
-		expect(entries).toHaveLength(2);
-		expect(entries[0]).toMatchObject({ id: "PP-G1", title: "BYOK gateway" });
-		expect(entries[0]?.status).toContain("structural pass");
-		expect(entries[1]?.id).toBe("PP-G3");
-	});
-
-	it("skips header, separator, and prose rows", () => {
-		const ids = parseEvalIndex(md).map((e) => e.id);
-		expect(ids).not.toContain("ID");
-		expect(ids.every((id) => id.startsWith("PP-"))).toBe(true);
 	});
 });
 
@@ -185,7 +159,6 @@ describe("tlane export — DPDP Phase 2 pack writes real evidence files", () => 
 		expect(files).toContain("manifest.json");
 	});
 });
-
 
 describe("tlane init — writes atomically (no check-then-write race)", () => {
 	// Regression for CodeQL js/file-system-race (high): the command used to

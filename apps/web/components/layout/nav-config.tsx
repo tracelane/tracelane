@@ -337,6 +337,11 @@ export const sections: NavSection[] = [
 			{ href: "/dashboard", label: "Dashboard", Icon: DashboardIcon },
 			{ href: "/traces", label: "Traces", Icon: ActivityIcon },
 			{ href: "/sessions", label: "Sessions", Icon: SessionsIcon },
+			// EVL-29 review queues. Added only AFTER a real review produced rows
+			// on prod (BUILD_RUNBOOK S3, the same rule `/experiments` records):
+			// a queue is a live query, so an entry added before the loop closed
+			// would have led to a surface that could not populate.
+			{ href: "/review", label: "Review", Icon: SignatureIcon },
 		],
 	},
 	{

@@ -189,7 +189,7 @@ duplicated.
 
 Every 100 events by default (`TRACELANE_REKOR_ANCHOR_EVERY`) the batch's Merkle
 root is closed out, and **two different keys** sign two different things
-(ADR-062 Amendment 1, byte formats frozen):
+(byte formats frozen):
 
 | Key | Algorithm | Signs | Why this algorithm |
 |---|---|---|---|

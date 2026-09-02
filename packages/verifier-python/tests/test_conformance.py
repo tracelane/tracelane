@@ -264,3 +264,54 @@ def test_multitenant_aggregate_is_latest_start_not_earliest() -> None:
     assert report.trust_established
     # aggregate MUST be MAX (windowed B = 10), never MIN (genesis A = 0).
     assert report.verified_from_seq == 10
+
+
+# ── B-316: the P0 fix had ZERO coverage here ───────────────────────────────
+#
+# `anchors_unverified` (a9a18271) is the field that lets a CALLER fail closed on
+# an anchor the verifier skipped for lack of a trusted key. The TypeScript suite
+# asserts it 4 times and the Rust suite 3; this file asserted it ZERO times, so
+# deleting the increment at __init__.py:733 left every Python test green.
+#
+# The CI round-trip does not cover it either: its verdict() is
+# `hash_chain_valid && signatures_valid && anchors_included >= 1`, so the
+# forged-anchor scenario goes NOTGREEN via `anchors_included: 0` — a different
+# mechanism entirely, which would still hold with the fix removed.
+
+
+def test_forged_anchor_without_a_key_reports_anchors_unverified() -> None:
+    """A skipped anchor must be COUNTED, never silently passed over.
+
+    Without this the report is vacuously green: `signatures_valid` starts True
+    and nothing falsifies it, so the caller has nothing to gate on.
+    """
+    path = _vector("forged-anchor.ndjson")
+    if not path.exists():
+        pytest.skip(f"vector not found at {path}")
+
+    report = verify_ledger(path, VerifyOptions(offline=True))
+
+    assert report.anchors_unverified > 0, (
+        "a forged anchor verified WITHOUT a trusted key must increment "
+        "anchors_unverified — otherwise no caller can fail closed (B-316)"
+    )
+
+
+def test_supplying_the_trusted_key_clears_anchors_unverified() -> None:
+    """The falsifying half: with a key, nothing is skipped, so the count is 0.
+
+    Without this pair, `anchors_unverified > 0` could be satisfied by a constant.
+    """
+    path = _vector("anchored.v1.ndjson")
+    if not path.exists():
+        pytest.skip(f"vector not found at {path}")
+
+    report = verify_ledger(
+        path,
+        VerifyOptions(offline=True, tenant_pubkey=_trusted_tenant_pubkey()),
+    )
+
+    assert report.anchors_unverified == 0, (
+        "with a trusted key the anchor is checked, not skipped: "
+        f"anchors_unverified={report.anchors_unverified}"
+    )

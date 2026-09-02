@@ -1,0 +1,68 @@
+---
+title: "LlamaIndex"
+description: "Send LlamaIndex traces to Tracelane with one exporter config. No Tracelane SDK required."
+classification: PUBLIC
+---
+
+LlamaIndex is OpenTelemetry-native through the community instrumentor. Tracelane accepts
+OTLP directly, so the integration is **exporter configuration, not a Tracelane package**.
+
+## What you get
+
+| | |
+|---|---|
+| **Agent structure** | **Yes** — query engine, retriever, synthesizer and LLM spans, nested. |
+| **The LLM leg** | Yes, with token counts, inside the tree. |
+| **Retrieval steps** | Yes — this is the reason to use the instrumentor over a base-URL swap. |
+
+## Setup
+
+```bash
+pip install openinference-instrumentation-llama-index \
+            opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+import os
+
+provider = TracerProvider(resource=Resource.create({"service.name": "my-rag-app"}))
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
+    endpoint="https://gateway.tracelane.dev/v1/traces",
+    headers={"x-tracelane-api-key": os.environ["TRACELANE_API_KEY"]},
+)))
+trace.set_tracer_provider(provider)
+
+LlamaIndexInstrumentor().instrument(tracer_provider=provider)
+```
+
+Your API key needs the **`ingest`** scope.
+
+## Span volume
+
+A bare `llm.complete()` is **1 span**. A full query-engine call is many more — retriever,
+each retrieved node, synthesizer, and the LLM call.
+<Warning>
+  **An OTel span and a gateway call are not the same unit, and they are not counted the
+  same way.** A gateway request (the base-URL swap) is one unit against your monthly trace
+  quota. On this OTel path your app sends **spans**, and one agent run is many spans — the
+  tree above is 11 for a single `invoke()`. Do not read "10K traces/mo" as "10,000 agent
+  runs". Size against **spans per run**, and see [pricing](/pricing).
+</Warning>
+
+
+## Verification status
+
+The transport is the standard OTLP/HTTP protobuf exporter and is
+[proven against Tracelane production](/integrations/langchain#what-a-trace-looks-like) —
+the same exporter, endpoint and header carry every Python framework on this page.
+
+**The LlamaIndex instrumentor itself was verified locally, not against production.** It
+attaches and emits correctly shaped spans; we have not yet published a production
+read-back for a full query-engine trace the way we have for LangGraph. If you hit a gap,
+[open an issue](https://github.com/tracelane/tracelane/issues).

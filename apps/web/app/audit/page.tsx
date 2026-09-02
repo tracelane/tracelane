@@ -63,7 +63,6 @@ function rangeSinceIso(range: AuditRange): string {
 async function getAuditAccess(): Promise<{
 	selfVerify: boolean;
 	exportEntitled: boolean;
-	retentionDays: number;
 	tenantPubkeyB64: string;
 }> {
 	const session = await requireSession();
@@ -99,7 +98,6 @@ async function getAuditAccess(): Promise<{
 		// The plan's trace-retention (spans TTL). The audit_log itself has NO TTL
 		// (append-only) — shown as a contrast so the user sees the ledger outlives
 		// their trace data.
-		retentionDays: entitlements.retention_days,
 		tenantPubkeyB64: keyRow?.pubkey ?? "",
 	};
 }
@@ -140,13 +138,11 @@ async function SelfVerifyData({
 	range,
 	since,
 	until,
-	retentionDays,
 	tenantPubkeyB64,
 }: {
 	range: AuditRange;
 	since?: string;
 	until?: string;
-	retentionDays: number;
 	tenantPubkeyB64: string;
 }) {
 	let res: SelfVerifyResponse;
@@ -190,7 +186,6 @@ async function SelfVerifyData({
 			windowSince={windowSince}
 			windowUntil={until}
 			windowTotal={res.total_in_window}
-			retentionDays={retentionDays}
 			canExport={false}
 		/>
 	);
@@ -206,13 +201,11 @@ async function LedgerData({
 	range,
 	since,
 	until,
-	retentionDays,
 	tenantPubkeyB64,
 }: {
 	range: AuditRange;
 	since?: string;
 	until?: string;
-	retentionDays: number;
 	tenantPubkeyB64: string;
 }) {
 	// Window resolution: explicit since/until wins over preset range.
@@ -261,7 +254,6 @@ async function LedgerData({
 			range={since ? undefined : range}
 			since={since}
 			until={until}
-			retentionDays={retentionDays}
 			summary={summary}
 			canExport
 		/>
@@ -300,7 +292,6 @@ export default async function AuditPage({
 		? {
 				selfVerify: false as const,
 				exportEntitled: false as const,
-				retentionDays: 0,
 				tenantPubkeyB64: "",
 			}
 		: await getAuditAccess();
@@ -336,7 +327,6 @@ export default async function AuditPage({
 						range={range}
 						since={since}
 						until={until}
-						retentionDays={access.retentionDays}
 						tenantPubkeyB64={access.tenantPubkeyB64}
 					/>
 				</Suspense>
@@ -347,7 +337,6 @@ export default async function AuditPage({
 						range={range}
 						since={since}
 						until={until}
-						retentionDays={access.retentionDays}
 						tenantPubkeyB64={access.tenantPubkeyB64}
 					/>
 				</Suspense>

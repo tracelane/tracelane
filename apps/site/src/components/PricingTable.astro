@@ -18,11 +18,11 @@
  * regulatory language stays exactly as reviewed.
  */
 interface Props {
-  /** Heading level. The homepage renders this as a SECTION (h2); /pricing is a PAGE
-   *  and must lead with an h1 — a page with no h1 is an accessibility and SEO defect,
-   *  and this one shipped exactly that way, because the markup was lifted verbatim
-   *  from a section and nothing re-examined the heading level on the way. */
-  as?: "h1" | "h2";
+	/** Heading level. The homepage renders this as a SECTION (h2); /pricing is a PAGE
+	 *  and must lead with an h1 — a page with no h1 is an accessibility and SEO defect,
+	 *  and this one shipped exactly that way, because the markup was lifted verbatim
+	 *  from a section and nothing re-examined the heading level on the way. */
+	as?: "h1" | "h2";
 }
 const { as: Heading = "h2" } = Astro.props;
 ---
@@ -61,7 +61,7 @@ const { as: Heading = "h2" } = Astro.props;
         </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
           <li>Single workspace, 1 seat</li>
-          <li>7 days of queryable history · 60 RPM</li>
+          <li>60 RPM</li>
           <li>Pre-flight policy checks</li>
           <li>No credit card · no commercial use</li>
         </ul>
@@ -76,7 +76,7 @@ const { as: Heading = "h2" } = Astro.props;
           </div>
         </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>30 days of queryable history · 600 RPM</li>
+          <li>600 RPM</li>
           <li>Guardrail verdict history (read-only)</li>
           <li>Audit ledger + offline verify</li>
           <li>Email support · 24h</li>
@@ -93,7 +93,6 @@ const { as: Heading = "h2" } = Astro.props;
           </div>
         </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>90 days of queryable history</li>
           <li>Pre-flight guardrail rails + tamper-evident promotion record</li>
           <li>WorkOS SSO · 99% SLA</li>
           <li>Slack support · 8h</li>
@@ -109,7 +108,7 @@ const { as: Heading = "h2" } = Astro.props;
           </div>
         </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>180 days of queryable history</li>
+          <li>Priority support</li>
           <li>Inline heuristic guardrails (ML ensemble on the roadmap) · 99.9% SLA</li>
           <li>WorkOS SSO</li>
           <li>Dedicated Slack · 4h</li>
@@ -125,7 +124,7 @@ const { as: Heading = "h2" } = Astro.props;
           </div>
         </div>
         <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>365 days of queryable history · custom seats</li>
+          <li>Custom seats</li>
           <li>Region pinning (EU; US / IN on the roadmap)</li>
           <li>BYOK + CMK self-service</li>
           <li>1h SLA · dedicated CSM</li>
@@ -145,5 +144,5 @@ const { as: Heading = "h2" } = Astro.props;
       </div>
     </div>
 
-    <p class="mt-10 text-center text-sm text-fg-subtle">Metered in traces, not spans — one gateway call is one trace, and overage is $1.20 per 10K traces above your monthly quota. Need more seats than your plan includes? <a href="mailto:support@tracelane.dev?subject=Additional%20seats" class="underline decoration-fg-subtle hover:decoration-fg transition-colors">Talk to us</a>.</p>
+    <p class="mt-10 text-center text-sm text-fg-subtle">Trace retention is the same on every plan: traces are kept up to 365 days. Metered in traces, not spans — one gateway call is one trace, and overage is $1.20 per 10K traces above your monthly quota. Need more seats than your plan includes? <a href="mailto:support@tracelane.dev?subject=Additional%20seats" class="underline decoration-fg-subtle hover:decoration-fg transition-colors">Talk to us</a>.</p>
   </section>

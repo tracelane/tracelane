@@ -133,6 +133,19 @@ pub enum Degradation {
     /// stays normal, and no error is ever raised. `open_for_secs` is the only
     /// thing that can answer "how long has this been degraded?"
     SemanticCacheUnavailable = 8,
+    /// An online-eval judge call failed — provider error, unresolvable rubric,
+    /// or a ClickHouse write that did not land. **The customer's request already
+    /// succeeded**; what failed is the scoring of a sample of it. Fail-open by
+    /// construction (`online_eval::spawn` awaits nothing), so without this
+    /// counter a workspace could stop being scored entirely and nothing would
+    /// say so — the `/sessions` shape, on a paid feature.
+    OnlineEvalJudgeFailed = 9,
+    /// An online-eval judge call was REFUSED because the policy's monthly judge
+    /// budget is spent. Not an error — the cap working — but it must be visible:
+    /// a workspace that thinks it is scoring 1% of traffic and is scoring none
+    /// has a bill-shaped surprise in the other direction, and silence here would
+    /// be indistinguishable from "no traffic".
+    OnlineEvalBudgetExceeded = 10,
 }
 
 impl Degradation {
@@ -151,6 +164,8 @@ impl Degradation {
             Self::AuditBackfillFailed => "audit_backfill_failed",
             Self::AuditAgeSweepSkipped => "audit_age_sweep_skipped",
             Self::SemanticCacheUnavailable => "semantic_cache_unavailable",
+            Self::OnlineEvalJudgeFailed => "online_eval_judge_failed",
+            Self::OnlineEvalBudgetExceeded => "online_eval_budget_exceeded",
         }
     }
 
@@ -200,6 +215,16 @@ impl Degradation {
                  this is invisible without this counter. Check the embedding provider \
                  credential and ClickHouse."
             }
+            Self::OnlineEvalJudgeFailed => {
+                "online-eval scoring is failing; customer requests are UNAFFECTED but a \
+                 workspace that believes it is sampling is scoring nothing. Check the \
+                 judge model's provider key and the ClickHouse write path."
+            }
+            Self::OnlineEvalBudgetExceeded => {
+                "an online-eval policy has spent its monthly judge budget and scoring is \
+                 paused for that workspace. This is the cap WORKING — raise the budget or \
+                 lower the sample rate if the coverage is wanted."
+            }
         }
     }
 
@@ -215,13 +240,15 @@ impl Degradation {
             Self::AuditBackfillFailed,
             Self::AuditAgeSweepSkipped,
             Degradation::SemanticCacheUnavailable,
+            Self::OnlineEvalJudgeFailed,
+            Self::OnlineEvalBudgetExceeded,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 9;
+pub const COUNT: usize = 11;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -251,6 +278,8 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

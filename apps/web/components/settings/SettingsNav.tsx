@@ -23,6 +23,10 @@ const TABS = [
 	{ href: "/settings/workspace", label: "Workspace" },
 	// ADR-059: alerting settings (f_alerts gated; page shows honest not-entitled state)
 	{ href: "/settings/alerts", label: "Alerts" },
+	// EVL-28: online evals (f_online_evals gated; same honest not-entitled state).
+	// Next to Alerts because both are "what Tracelane does with your traffic
+	// while you are not watching", and both spend or notify on their own.
+	{ href: "/settings/evals", label: "Online Evals" },
 	{ href: "/settings/account", label: "Account" },
 ] as const;
 

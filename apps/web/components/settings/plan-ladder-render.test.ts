@@ -184,11 +184,26 @@ describe("SET-15 — every tier is comparable in-app, at its enforced limits", (
 		// Enterprise volume is a negotiated floor, so it reads "25M+".
 		expect(html).toContain("25M+ traces/mo"); // enterprise
 
-		expect(html).toContain("7-day trace retention"); // free
-		expect(html).toContain("30-day trace retention"); // builder
-		expect(html).toContain("90-day trace retention"); // team
-		expect(html).toContain("180-day trace retention"); // business
-		expect(html).toContain("365-day trace retention"); // enterprise
+		// RETENTION IS NOT PER-PLAN, AND THIS TEST USED TO ENFORCE THAT IT WAS.
+		// It asserted "7-day trace retention" ... "365-day trace retention" — five
+		// strings rendered from `ent.retention_days`, a value computed from the plan
+		// catalog and consumed by renderers ONLY. No delete, reject or limit path
+		// reads it; prod applies ONE window to every tenant, the `spans` TTL
+		// (`toDate(start_time) + toIntervalDay(365)`, read from `system.tables`).
+		// So the test was pinning a claim the product does not honour, which is how
+		// the copy survived review: changing it broke a green test.
+		expect(html).toContain("Traces kept up to 365 days");
+		// And the old shape must not come back. A per-plan retention string here is
+		// a customer-visible assertion of a control that has no enforcement site.
+		for (const stale of [
+			"7-day trace retention",
+			"30-day trace retention",
+			"90-day trace retention",
+			"180-day trace retention",
+			"365-day trace retention",
+		]) {
+			expect(html).not.toContain(stale);
+		}
 
 		expect(html).toContain("1 seat"); // free + builder
 		expect(html).toContain("10 seats included, up to 25"); // team

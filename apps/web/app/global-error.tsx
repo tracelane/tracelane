@@ -90,7 +90,7 @@ export default function GlobalError({
 							padding: "1.5rem",
 						}}
 					>
-						{/* Inline Chisel mark — self-contained (no CSS vars), since this
+						{/* Inline aperture mark — self-contained (no CSS vars), since this
 					    last-resort page can render with no stylesheet present. */}
 						<div
 							style={{
@@ -108,19 +108,34 @@ export default function GlobalError({
 								role="img"
 								aria-label="Tracelane"
 							>
-								<path d="M 2,2 L 96,2 L 84,14 L 2,14 Z" fill={C.ink} />
-								<path
-									d="M 2,14 L 14,14 L 14,28 L 44,28 L 44,40 L 12,40 L 2,30 Z"
-									fill={C.ink}
+								{/* The aperture mark, FULL cut — 24px clears the
+								    20px threshold below which the concentric centre
+								    goes sub-pixel. Inlined rather than <Logo> because
+								    this boundary replaces the document and cannot
+								    assume globals.css or the package resolved; the
+								    price is that it is a FOURTH copy of the geometry
+								    and moves with the other three. */}
+								<path d="M 8,8 H 34 V 20 H 20 V 34 H 8 Z" fill={C.ink} />
+								<path d="M 92,8 H 66 V 20 H 80 V 34 H 92 Z" fill={C.ink} />
+								<path d="M 8,92 H 34 V 80 H 20 V 66 H 8 Z" fill={C.ink} />
+								<path d="M 92,92 H 66 V 80 H 80 V 66 H 92 Z" fill={C.ink} />
+								<path d="M 8,44 H 25.5 V 56 H 8 Z" fill={C.ink} />
+								<path d="M 74.5,44 H 92 V 56 H 74.5 Z" fill={C.ink} />
+								<circle
+									cx="50"
+									cy="50"
+									r="22"
+									fill="none"
+									stroke={C.ink}
+									strokeWidth="7"
 								/>
-								<path d="M 32,40 L 44,40 L 44,86 L 32,98 Z" fill={C.ink} />
-								<path
-									d="M 96,16 L 96,28 L 84,40 L 54,40 L 54,28 L 84,28 Z"
-									fill={C.ink}
-								/>
-								<path
-									d="M 54,40 L 66,40 L 66,64 L 78,64 L 54,88 Z"
-									fill={C.ink}
+								<circle
+									cx="50"
+									cy="50"
+									r="8.5"
+									fill="none"
+									stroke={C.ink}
+									strokeWidth="6"
 								/>
 							</svg>
 							<span

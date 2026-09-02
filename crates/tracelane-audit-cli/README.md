@@ -94,5 +94,5 @@ identifying the offending `seq` + which check failed.
 ## V1 launch deferrals
 
 - `--format pdf` (a printable rendering of the verification report) is
-  queued for V1.1 per ADR-034. The `text` and `json` formats carry the
+  queued for V1.1. The `text` and `json` formats carry the
   full report today.

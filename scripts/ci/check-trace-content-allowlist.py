@@ -135,7 +135,7 @@ def main() -> int:
         print(
             "\n  Capturing a customer's prompt text requires content-specific\n"
             "  retention FIRST: dedicated columns with a 30-day ClickHouse column\n"
-            "  TTL. Content in `attributes` inherits the global 90-day row TTL and\n"
+            "  TTL. Content in `attributes` inherits the global 365-day row TTL\n"
             "  cannot be expired separately — `spans.attributes` is one String\n"
             "  column. Land that work, then widen ALLOWED in the same change."
         )

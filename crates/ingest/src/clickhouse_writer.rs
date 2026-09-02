@@ -269,7 +269,7 @@ pub async fn run(
 
         if !batch.is_empty() {
             let n = batch.len();
-            // TODO(T9): per-tenant retention — the global 90d `tracelane.spans` TTL silently evicts any span arriving with an old start_time (replay / backfill / clock-skew) on the next TTL merge, even though the insert succeeds; T9 must make retention per-tenant instead of one global TTL.
+            // TODO(T9): per-tenant retention — the global 365d `tracelane.spans` TTL silently evicts any span arriving with an old start_time (replay / backfill / clock-skew) on the next TTL merge, even though the insert succeeds; T9 must make retention per-tenant instead of one global TTL.
             // Durable-then-ack (#81): if flush fails, `?` propagates BEFORE the
             // acks, so the messages stay unacked and JetStream redelivers them
             // (zero-loss, FT-03). A redelivered duplicate is idempotent — the

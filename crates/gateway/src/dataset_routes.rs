@@ -407,7 +407,7 @@ fn capture_enabled(
 /// newtype — neither buys anything, because the tests below match on the VARIANT,
 /// which is the whole distinction this enum exists to carry.
 #[derive(Debug)]
-enum SpanVerdict {
+pub(crate) enum SpanVerdict {
     /// No row matched `(tenant, trace, span)`.
     NotFound,
     /// The row exists and carries no recorded input messages.
@@ -420,7 +420,7 @@ enum SpanVerdict {
 
 /// Classify a span read. Pure, so the four outcomes are unit-testable without a
 /// ClickHouse.
-fn classify_span(row: Option<SpanContentRow>) -> SpanVerdict {
+pub(crate) fn classify_span(row: Option<SpanContentRow>) -> SpanVerdict {
     let Some(row) = row else {
         return SpanVerdict::NotFound;
     };
@@ -459,7 +459,7 @@ fn classify_span(row: Option<SpanContentRow>) -> SpanVerdict {
 /// # Errors
 /// Serialization failure. Fail-CLOSED: without a hash there is no dedupe key,
 /// and writing an unkeyed item would let the same case land twice.
-fn input_hash(messages: &[Message], system: &str) -> Result<String> {
+pub(crate) fn input_hash(messages: &[Message], system: &str) -> Result<String> {
     let bytes = serde_json::to_vec(&(messages, system))
         .context("serializing (messages, system) for the dedupe hash")?;
     let mut h = Sha256::new();
@@ -547,11 +547,13 @@ pub struct SpanContentRow {
 pub trait DatasetStore: Send + Sync {
     async fn create_dataset(&self, tenant: &TenantId, row: &Dataset) -> Result<()>;
     async fn count_datasets(&self, tenant: &TenantId) -> Result<u64>;
+    /// `name` is an EXACT filter when present (`EVL-30`); `None` lists the page.
     async fn list_datasets(
         &self,
         tenant: &TenantId,
         cursor: Option<(i64, String)>,
         limit: u32,
+        name: Option<&str>,
     ) -> Result<Vec<Dataset>>;
     async fn get_dataset(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<Option<Dataset>>;
     /// Tombstone (`deleted = 1`). Snapshots survive — deleting one would
@@ -601,6 +603,49 @@ pub trait DatasetStore: Send + Sync {
         trace_id: &str,
         span_id: &str,
     ) -> Result<Option<SpanContentRow>>;
+
+    /// EVL-29 — resolve the CONTENT-BEARING span of a trace.
+    ///
+    /// **A trace-level review carries the OBS-18 `''` span sentinel, and `''` is
+    /// not a span id.** `span_content` filters `span_id = ?`, so passing the
+    /// sentinel straight through matched nothing and every `trace_error` /
+    /// `needs_review` review answered `404 span_not_found` — measured on prod:
+    /// 0 of 12,806 spans have an empty `span_id`. The annotation target and the
+    /// content source are two different things; this resolves the second.
+    ///
+    /// Picks the most recent span in the trace that actually carries
+    /// `gen_ai_input_messages`, so a trace whose chat span has content resolves
+    /// even when it also holds tool or retrieval spans that do not.
+    async fn content_span_id(&self, tenant: &TenantId, trace_id: &str) -> Result<Option<String>>;
+
+    /// EVL-29 (R228) — copy this span's content into the snapshot table.
+    /// Idempotent: called from the judge at score time AND from the queue list.
+    async fn snapshot_content(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        span_id: &str,
+        input: &str,
+        system: &str,
+        input_hash: &str,
+    ) -> Result<()>;
+
+    /// EVL-29 (R228) — the snapshot, if one was taken. `None` means never
+    /// snapshotted, which is DIFFERENT from "snapshotted and empty".
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        span_id: &str,
+    ) -> Result<Option<SpanContentRow>>;
+
+    /// EVL-29 (R228) — which of these traces have a snapshot. Bounded by the
+    /// caller to one page, the same shape as the Postgres exclusion join.
+    async fn snapshotted_trace_ids(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<String>>;
 
     async fn count_snapshots(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<u64>;
     async fn snapshot_exists(
@@ -940,6 +985,7 @@ impl DatasetStore for ClickHouseDatasetStore {
         tenant: &TenantId,
         cursor: Option<(i64, String)>,
         limit: u32,
+        name: Option<&str>,
     ) -> Result<Vec<Dataset>> {
         // Built conditionally rather than with a sentinel bind: a `? = 0 OR …`
         // guard reads as clever and hides the branch from anyone auditing the
@@ -949,12 +995,21 @@ impl DatasetStore for ClickHouseDatasetStore {
                     created_at, created_by, updated_at \
              FROM datasets FINAL WHERE tenant_id = ? AND deleted = 0",
         );
+        // BOUND, never formatted in. The clause is appended here and the value
+        // is bound below in the SAME order — the two must be read together, and
+        // that is why the branch is explicit rather than a sentinel.
+        if name.is_some() {
+            sql.push_str(" AND name = ?");
+        }
         if cursor.is_some() {
             sql.push_str(" AND (created_at < ? OR (created_at = ? AND toString(dataset_id) < ?))");
         }
         sql.push_str(" ORDER BY created_at DESC, dataset_id DESC LIMIT ?");
 
         let mut q = self.ch.query(&sql).bind(tenant.to_string());
+        if let Some(n) = name {
+            q = q.bind(n);
+        }
         if let Some((ts, id)) = &cursor {
             q = q.bind(*ts).bind(*ts).bind(id.clone());
         }
@@ -1243,6 +1298,127 @@ impl DatasetStore for ClickHouseDatasetStore {
             .context("span content SELECT failed")
     }
 
+    async fn content_span_id(&self, tenant: &TenantId, trace_id: &str) -> Result<Option<String>> {
+        // `FINAL` for the same reason the content read uses it: a half-merged
+        // duplicate must not decide which span a permanent test case came from.
+        let sql = Self::capped(
+            "SELECT span_id FROM spans FINAL \
+             WHERE tenant_id = ? AND trace_id = ? \
+               AND JSONHas(attributes, 'gen_ai_input_messages') \
+             ORDER BY start_time DESC LIMIT 1",
+        );
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            span_id: String,
+        }
+        Ok(self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_id.to_string())
+            .fetch_optional::<R>()
+            .await
+            .context("content span resolve failed")?
+            .map(|r| r.span_id))
+    }
+
+    async fn snapshot_content(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        span_id: &str,
+        input: &str,
+        system: &str,
+        input_hash: &str,
+    ) -> Result<()> {
+        #[derive(serde::Serialize, clickhouse::Row)]
+        struct SnapRow<'a> {
+            tenant_id: &'a str,
+            trace_id: &'a str,
+            span_id: &'a str,
+            input: &'a str,
+            system: &'a str,
+            // `FixedString(64)`, NOT `String` — and a comment warning about this
+            // exact trap sat here while the code did it wrong anyway. Declaring
+            // it as a str makes clickhouse-rs emit the varint length prefix a
+            // FixedString never carries, desynchronising the RowBinary block:
+            // prod answered `Code: 32 ATTEMPT_TO_READ_AFTER_EOF: While executing
+            // BinaryRowInputFormat` on every write, and the list path folds that
+            // into a warn (fail-OPEN by design), so the queue looked healthy
+            // while nothing was ever snapshotted. Fifth instance of the class;
+            // `FixedHex64` is the type that exists so it stops recurring.
+            input_hash: crate::prompt_router::FixedHex64,
+            captured_at: i64,
+        }
+        let tenant_s = tenant.to_string();
+        // Refuse rather than truncate: a hash that is not 64 hex chars cannot be
+        // stored in a FixedString(64), and silently padding one would put a
+        // WRONG dedupe key on a permanent test case.
+        let hash_fixed = crate::prompt_router::FixedHex64::from_hex_str(input_hash)
+            .ok_or_else(|| anyhow::anyhow!("input_hash is not 64 hex chars: {input_hash:?}"))?;
+        let mut insert = self.ch.insert("trace_content_snapshots")?;
+        insert
+            .write(&SnapRow {
+                tenant_id: &tenant_s,
+                trace_id,
+                span_id,
+                input,
+                system,
+                input_hash: hash_fixed,
+                captured_at: crate::clickhouse_query::datetime64_millis_now(),
+            })
+            .await?;
+        insert.end().await.context("snapshot insert failed")
+    }
+
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        span_id: &str,
+    ) -> Result<Option<SpanContentRow>> {
+        let sql = Self::capped(
+            "SELECT input AS input_messages, system AS system_instructions \
+             FROM trace_content_snapshots FINAL \
+             WHERE tenant_id = ? AND trace_id = ? AND span_id = ? LIMIT 1",
+        );
+        self.ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_id.to_string())
+            .bind(span_id.to_string())
+            .fetch_optional::<SpanContentRow>()
+            .await
+            .context("snapshot read failed")
+    }
+
+    async fn snapshotted_trace_ids(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<String>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = Self::capped(
+            "SELECT DISTINCT trace_id FROM trace_content_snapshots FINAL \
+             WHERE tenant_id = ? AND trace_id IN ?",
+        );
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            trace_id: String,
+        }
+        let rows = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_ids)
+            .fetch_all::<R>()
+            .await
+            .context("snapshot membership read failed")?;
+        Ok(rows.into_iter().map(|r| r.trace_id).collect())
+    }
+
     async fn count_snapshots(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<u64> {
         // Plain MergeTree — no `FINAL`, because a snapshot row is terminal on
         // write and there is nothing to replace.
@@ -1518,6 +1694,21 @@ struct PageQuery {
     /// shape the trace list already uses.
     #[serde(default)]
     cursor: Option<String>,
+    /// `EVL-30` — EXACT dataset name, for resolving a name to an id.
+    ///
+    /// **Why this exists rather than "just page and filter client-side".** The
+    /// listing is keyset-paginated at [`limits::PAGE_MAX`] = 200. A CI gate that
+    /// resolves `--dataset my-golden-set` by reading one page finds it only if
+    /// the dataset happens to be in the newest 200 — and on a workspace where it
+    /// is not, the gate reports "no dataset named …" for a dataset that plainly
+    /// exists. That is a silent wrong answer produced by a paging boundary, so
+    /// the filter belongs in the query rather than in every client.
+    ///
+    /// **Exact only, no prefix and no wildcard.** The gate needs one name to
+    /// mean one dataset; anything looser reintroduces the ambiguity the CLI
+    /// already refuses to guess through.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn page_limit(q: &PageQuery) -> u32 {
@@ -1636,9 +1827,24 @@ async fn list_datasets(
 
     let limit = page_limit(&q);
     let cursor = q.cursor.as_deref().and_then(decode_cursor);
+    // A name longer than a name can be matches nothing, so refuse instead of
+    // spending a ClickHouse round trip to return an empty list that reads as
+    // "no such dataset" rather than "you sent something that is not a name".
+    if let Some(n) = q.name.as_deref()
+        && n.len() > limits::NAME_BYTES
+    {
+        return Err(coded_err(
+            StatusCode::BAD_REQUEST,
+            "name_too_long",
+            "That name is longer than a dataset name can be, so it matches nothing. \
+             This is refused rather than answered with an empty list, which would read \
+             as 'no such dataset'.",
+            serde_json::json!({ "max_bytes": limits::NAME_BYTES, "got_bytes": n.len() }),
+        ));
+    }
     let rows = state
         .store
-        .list_datasets(&tenant, cursor, limit)
+        .list_datasets(&tenant, cursor, limit, q.name.as_deref())
         .await
         .map_err(|e| store_failed("dataset list", &e))?;
 
@@ -2746,6 +2952,98 @@ mod clickhouse_roundtrip {
         }
     }
 
+    /// **EVL-29 R228 — the content snapshot against a REAL ClickHouse.**
+    ///
+    /// THE DEFECT THIS EXISTS FOR, found on prod at the first queue listing:
+    /// `SnapRow.input_hash` was declared `&str` against a `FixedString(64)`
+    /// column, so clickhouse-rs emitted the varint length prefix a FixedString
+    /// never carries. Every write answered `Code: 32 ATTEMPT_TO_READ_AFTER_EOF:
+    /// While executing BinaryRowInputFormat`, and because the list path folds a
+    /// snapshot failure into a `warn!` (fail-OPEN by design — a snapshot failure
+    /// must not hide a trace from a reviewer), the queue looked completely
+    /// healthy while the table stayed at ZERO rows.
+    ///
+    /// **FIFTH INSTANCE OF THE CLASS**, and a comment naming this exact trap was
+    /// sitting on the offending line while it was wrong. A comment is not a
+    /// control; this is.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn a_content_snapshot_survives_a_real_clickhouse_round_trip() {
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_schema(&c).await;
+        // Migration 21 applied for real, same reason as 18: a test that declares
+        // its own schema proves the code agrees with the TEST.
+        let sql = include_str!(
+            "../../../infra/dev/clickhouse/migrations/21_evl29_trace_content_snapshots.sql"
+        );
+        for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+            c.query(&stmt).execute().await.expect("migration 21 stmt");
+        }
+
+        let store = ClickHouseDatasetStore::new(c.clone());
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let trace = Uuid::new_v4().to_string();
+        let hash = "b".repeat(64);
+
+        store
+            .snapshot_content(
+                &tenant,
+                &trace,
+                "span-1",
+                r#"[{"role":"user","content":"hi"}]"#,
+                "sys",
+                &hash,
+            )
+            .await
+            .expect(
+                "the snapshot INSERT must succeed — this is the assertion that was red on prod",
+            );
+
+        let got = store
+            .read_snapshot(&tenant, &trace, "span-1")
+            .await
+            .expect("read")
+            .expect("the row must be there — a silent write failure reads as None");
+        assert_eq!(got.input_messages, r#"[{"role":"user","content":"hi"}]"#);
+        assert_eq!(got.system_instructions, "sys");
+
+        // Idempotent: the queue list re-snapshots on every page load, so a second
+        // write of the same key must collapse rather than duplicate.
+        store
+            .snapshot_content(
+                &tenant,
+                &trace,
+                "span-1",
+                r#"[{"role":"user","content":"hi"}]"#,
+                "sys",
+                &hash,
+            )
+            .await
+            .expect("re-snapshot");
+        let n = store
+            .snapshotted_trace_ids(&tenant, std::slice::from_ref(&trace))
+            .await
+            .expect("membership");
+        assert_eq!(
+            n,
+            vec![trace.clone()],
+            "the trace must report as snapshotted exactly once"
+        );
+
+        // A hash that is NOT 64 hex chars must be REFUSED, not truncated or
+        // padded: a wrong dedupe key on a permanent test case is worse than a
+        // failed write.
+        assert!(
+            store
+                .snapshot_content(&tenant, &trace, "span-2", "[]", "", "too-short")
+                .await
+                .is_err(),
+            "a non-64-hex hash must refuse rather than silently store a wrong key"
+        );
+    }
+
     /// THE ROUND TRIP. Insert through the real store, read back through the real
     /// store, and assert the two properties that were broken on prod.
     ///
@@ -3312,21 +3610,24 @@ mod tests {
         assert_eq!(
             page_limit(&PageQuery {
                 limit: None,
-                cursor: None
+                cursor: None,
+                name: None
             }),
             limits::PAGE_DEFAULT
         );
         assert_eq!(
             page_limit(&PageQuery {
                 limit: Some(1_000_000),
-                cursor: None
+                cursor: None,
+                name: None
             }),
             limits::PAGE_MAX
         );
         assert_eq!(
             page_limit(&PageQuery {
                 limit: Some(0),
-                cursor: None
+                cursor: None,
+                name: None
             }),
             1
         );
@@ -3587,9 +3888,17 @@ mod tests {
             t: &TenantId,
             _c: Option<(i64, String)>,
             _l: u32,
+            name: Option<&str>,
         ) -> Result<Vec<Dataset>> {
             self.note(t);
-            Ok(self.datasets.lock().expect("poisoned").clone())
+            let all = self.datasets.lock().expect("poisoned").clone();
+            // The mock honours the filter so a handler test can observe it
+            // actually narrowing. A mock that ignored `name` would let a
+            // handler that never forwards it pass.
+            Ok(match name {
+                Some(n) => all.into_iter().filter(|d| d.name == n).collect(),
+                None => all,
+            })
         }
         async fn get_dataset(&self, t: &TenantId, id: Uuid) -> Result<Option<Dataset>> {
             self.note(t);
@@ -3706,6 +4015,45 @@ mod tests {
             self.note(t);
             Ok(None)
         }
+        // EVL-29 R228. Minimal, matching this mock's own `span_content`, which
+        // also returns `Ok(None)`: MockStore exists to assert that every store
+        // call carries the tenant, not to simulate ClickHouse. The real
+        // behaviour of these four is covered against a live database by
+        // `scripts/ci/run-clickhouse-integration.sh`, which is the only place
+        // that can prove a RowBinary column mapping.
+        async fn content_span_id(&self, t: &TenantId, _trace: &str) -> Result<Option<String>> {
+            self.note(t);
+            Ok(None)
+        }
+        async fn snapshot_content(
+            &self,
+            t: &TenantId,
+            _trace: &str,
+            _span: &str,
+            _input: &str,
+            _system: &str,
+            _hash: &str,
+        ) -> Result<()> {
+            self.note(t);
+            Ok(())
+        }
+        async fn read_snapshot(
+            &self,
+            t: &TenantId,
+            _trace: &str,
+            _span: &str,
+        ) -> Result<Option<SpanContentRow>> {
+            self.note(t);
+            Ok(None)
+        }
+        async fn snapshotted_trace_ids(
+            &self,
+            t: &TenantId,
+            _trace_ids: &[String],
+        ) -> Result<Vec<String>> {
+            self.note(t);
+            Ok(Vec::new())
+        }
         async fn count_snapshots(&self, t: &TenantId, _id: Uuid) -> Result<u64> {
             self.note(t);
             Ok(0)
@@ -3735,6 +4083,69 @@ mod tests {
     /// the only place a tenant id can enter a query, so this is the structural
     /// half of isolation; the SQL half is the `WHERE tenant_id = ?` bind in
     /// every statement above.
+    /// `EVL-30` / R249 — the exact-name filter must NARROW, and must not be a
+    /// way around the tenant filter.
+    ///
+    /// **Why this exists at all:** the listing is keyset-paginated at
+    /// `PAGE_MAX = 200`, so a CLI resolving `--dataset <name>` by reading one
+    /// page finds it only if it is in the newest 200. On a workspace where it
+    /// is not, the gate says "no dataset named …" about a dataset that plainly
+    /// exists — a wrong answer manufactured by a paging boundary.
+    ///
+    /// The assertion is that the filter SELECTS, not merely that the call
+    /// succeeds: `None` returns both rows and `Some("beta")` returns exactly
+    /// one. A filter that silently did nothing would pass a call-succeeded test.
+    #[tokio::test]
+    async fn dataset_name_filter_narrows_and_stays_tenant_scoped() {
+        let s = MockStore::default();
+        let t = tenant();
+        for (n, name) in [(11u128, "alpha"), (12u128, "beta")] {
+            s.create_dataset(
+                &t,
+                &Dataset {
+                    dataset_id: Uuid::from_u128(n),
+                    name: name.into(),
+                    description: String::new(),
+                    created_at_ms: 1,
+                    created_by: "u".into(),
+                    updated_at_ms: 1,
+                },
+            )
+            .await
+            .expect("create");
+        }
+
+        let all = s.list_datasets(&t, None, 10, None).await.expect("list all");
+        assert_eq!(all.len(), 2, "unfiltered listing should return both");
+
+        let one = s
+            .list_datasets(&t, None, 10, Some("beta"))
+            .await
+            .expect("list filtered");
+        assert_eq!(
+            one.len(),
+            1,
+            "the name filter must NARROW, not pass through"
+        );
+        assert_eq!(one[0].name, "beta");
+
+        // A name nobody has is an empty list, never an error and never a match.
+        let none = s
+            .list_datasets(&t, None, 10, Some("gamma"))
+            .await
+            .expect("list missing");
+        assert!(none.is_empty(), "an unknown name must match nothing");
+
+        // The tenant is still the outer filter: every call above recorded the
+        // tenant it was asked for, and the filter never replaced it.
+        let seen = s.seen_tenant.lock().expect("poisoned").clone();
+        assert!(
+            seen.iter().all(|x| x == &t.to_string()) && !seen.is_empty(),
+            "every call must carry the caller's tenant; the name filter is an \
+             ADDITIONAL narrowing, never a replacement for it"
+        );
+    }
+
     #[tokio::test]
     async fn every_store_call_is_tenant_scoped() {
         let s = MockStore::default();
@@ -3754,7 +4165,7 @@ mod tests {
         .await
         .expect("create");
         s.count_datasets(&t).await.expect("count");
-        s.list_datasets(&t, None, 10).await.expect("list");
+        s.list_datasets(&t, None, 10, None).await.expect("list");
         s.get_dataset(&t, d).await.expect("get");
         s.item_stats(&t, d).await.expect("stats");
         s.list_items(&t, d, None, 10).await.expect("items");

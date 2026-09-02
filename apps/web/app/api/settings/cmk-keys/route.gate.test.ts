@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
 	db: null as DbMock | null,
 	session: { tenantId: "org_SESSION", userId: "user_1", email: "a@b.co" },
 	isAdmin: true as boolean | null,
+	byokCmk: true as boolean,
 	recordAdminAction: vi.fn(async (_entry: unknown) => undefined),
 }));
 
@@ -33,6 +34,10 @@ vi.mock("@/lib/auth", () => ({
 
 vi.mock("@/lib/workos-org", () => ({
 	callerIsOrgAdmin: vi.fn(async () => h.isAdmin),
+}));
+
+vi.mock("@/lib/entitlements", () => ({
+	resolveEntitlements: vi.fn(async () => ({ byok_cmk: h.byokCmk })),
 }));
 
 vi.mock("@/lib/admin-audit", () => ({
@@ -63,6 +68,7 @@ function req(body: unknown): NextRequest {
 describe("/api/settings/cmk-keys role gate", () => {
 	beforeEach(() => {
 		h.isAdmin = true;
+		h.byokCmk = true;
 		h.recordAdminAction.mockClear();
 		vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_unit_only");
 	});
@@ -94,8 +100,23 @@ describe("/api/settings/cmk-keys role gate", () => {
 		expect(m.cursor()).toBe(0);
 	});
 
+	it("REJECT: an admin WITHOUT byok_cmk is 403 and the DB is never touched", async () => {
+		// The role gate answers "may this person do it?"; this answers "did they
+		// buy it?". Before 2026-08-30 only the first existed, so a FREE-TIER org
+		// admin could register a CMK key against copy selling it as Business+.
+		h.byokCmk = false;
+		const m = setDb([[{ id: "tenant-db-uuid", plan: "free" }]]);
+		const res = await POST(req({ alias: "prod", publicKeyPem: PEM }));
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as { error: string }).error).toBe(
+			"byok_cmk_required",
+		);
+		expect(h.recordAdminAction).not.toHaveBeenCalled();
+	});
+
 	it("HAPPY: an admin registers a key (201)", async () => {
 		setDb([
+			[{ id: "tenant-db-uuid", plan: "business" }], // entitlement gate lookup
 			[{ id: "tenant-db-uuid" }], // upsertTenantId: existing tenant
 			[{ id: "cmk-1", fingerprint: "ab".repeat(32) }], // insert returning
 		]);

@@ -13,6 +13,94 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+**Framework integrations — LangChain, LangGraph, LlamaIndex, CrewAI and the Vercel AI
+SDK.** Four of the five are OpenTelemetry-native, so the integration is exporter
+configuration rather than a Tracelane package: point the standard community instrumentor at
+`https://gateway.tracelane.dev/v1/traces` and your agent's structure arrives as a real
+trace tree — the chain, each node, each step. One instrumentor covers LangChain and
+LangGraph together. See the [integration guides](https://docs.tracelane.dev/integrations/langchain).
+
+**`tracelaneTelemetry()` for the Vercel AI SDK (`@tracelanedev/sdk` 0.3.0).** The AI SDK is
+not OpenTelemetry-native — as of `ai@7` it emits no OTel spans on its own — so it needs the
+SDK's own `registerTelemetry()` API. Tracelane now ships an integration for it that produces
+a span per operation, per step, per model call and **per tool call**.
+
+### Fixed
+
+**Framework instrumentation in the Python SDK (`tracelane` 0.3.0).**
+`instrument_langchain()`, `instrument_llamaindex()` and `instrument_crewai()` raised
+`ValueError` against real installs of their frameworks and could not attach. All three now
+work, and the framework extras they need (`tracelane[langgraph]`, `tracelane[llamaindex]`,
+`tracelane[crewai]`) exist for the first time.
+
+> **Two things worth knowing if you are on `tracelane` 0.2.3.**
+>
+> **You were not affected if you use LangGraph.** The LangGraph adapter is untouched by this
+> fix and captures correctly on 0.2.3.
+>
+> **If you were affected, you saw it immediately.** The failure was a raised exception at
+> `instrument_*(...)` setup, not silent data loss — nothing was captured-and-dropped, and no
+> traces went missing without an error. **The upgrade is required rather than optional**,
+> because the fault is in the installed client and no server-side change can reach it.
+
+**`tracelane.__version__` reported the wrong version.** It read `0.1.0` on a `0.2.3`
+install. It is now single-sourced from the installed distribution.
+
+**`instrumentVercelAI()` reported success while capturing nothing under ESM.** Patching the
+imported `ai` module cannot work when it is an ES module namespace, because those are
+read-only. It now raises a clear error there, pointing at `tracelaneTelemetry()`. Where the
+module really is mutable, it keeps working and emits a deprecation warning instead of
+breaking — and instrumenting twice no longer produces duplicate spans.
+
+
+**CI eval gate — `tlane eval run` and a GitHub Action.** Run a frozen dataset
+against a prompt version from your pipeline and fail the build when eval quality falls below a threshold, so a change that drops below your bar cannot merge.
+
+```yaml
+- uses: tracelane/tracelane/.github/actions/eval-gate@main
+  with:
+    prompt: support-triage
+    suite-file: .tracelane/triage.eval.json
+    dataset: golden-cases
+    threshold: "0.8"
+    token: ${{ secrets.TRACELANE_API_KEY }}
+```
+
+The comparison is stated rather than implied: `threshold` is a **floor** on the
+mean score, higher is better, and a **tie passes** — a gate that fails on exactly
+the number you set is a gate nobody can configure. It thresholds the mean score
+rather than the pass rate, which is identical for `contains` / `exact_match` /
+`json_schema` and strictly better for an LLM judge, whose score is continuous.
+
+**"Below your bar" and "we could not measure it" are different answers
+with different exit codes.** Errored cases are excluded from the mean rather than
+scored as zero, so one provider `429` in a twenty-case run is not a 5%
+quality problem; they are bounded separately by `max-error-rate` (default `0.10`).
+Above that cap, and for a run where every case errored, the verdict is **could
+not evaluate** — exit `3`, which fails the job and cannot be turned into `0` by
+any input. A suite file declaring no assertions is refused (exit `2`) before a
+provider call, because a run that asserts nothing scores every case as passed.
+
+**This gate asserts a FLOOR on a single run — it does not detect regressions.**
+There is no baseline, no history and no comparison: the same shape as a coverage
+threshold, which nobody considers broken for lacking a previous run. A run
+scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
+the second "no regression" would be a claim nothing checked. Comparing a run
+against an earlier one is a real gap and is filed, not built — what counts as
+the baseline is a design decision, not a flag.
+
+
+### Removed
+
+**`tlane eval run` no longer shells out to Tracelane's own vitest suite**
+(`@tracelanedev/cli` `0.2.x` → `0.3.0`; the CLI may make breaking changes in a
+`0.minor` bump). It is now the gateway-backed CI gate above. `--suite` stays
+registered as a tombstone and exits `2` pointing at `pnpm eval:run --suite=all`,
+rather than failing as an unknown option. `tlane eval list` now lists eval runs
+in your workspace instead of parsing a local index.
+
 ### Changed — BREAKING for self-host
 
 **Guardrail rails are now split into a free set and a paid set, and a gateway

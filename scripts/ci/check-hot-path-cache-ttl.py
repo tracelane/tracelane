@@ -75,6 +75,13 @@ SITES = [
     # is now `NO_EMBEDDER_TTL_SECS`. The zero-match check below is what makes
     # the second half impossible to get wrong again.
     ("crates/gateway/src/semantic_cache.rs", r"NO_EMBEDDER_TTL_SECS"),
+    # Added 2026-08-27 with the cache itself (EVL-28 item 11). The online-eval
+    # POLICY cache is read on the admission path of every chat request, so it is
+    # a hot-path cache by the definition this guard uses. Listed in the SAME
+    # change that introduces it, and its value is a named const for the reason
+    # the 2026-08-20 note above records: listing a file whose TTL is an inline
+    # Duration matches nothing and reports success.
+    ("crates/gateway/src/online_eval.rs", r"POLICY_CACHE_TTL_SECS"),
 ]
 
 EXEMPT = re.compile(r"hot-path-cache-ttl:\s*exempt\s*--\s*\S")

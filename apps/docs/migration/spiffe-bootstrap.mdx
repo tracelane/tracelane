@@ -39,7 +39,7 @@ installed but not yet wired into Tracelane.
 
 <Note>
   **The ingest receiver has never read an `Authorization` header.** A
-  self-hosted ingest is either plaintext single-tenant (ADR-067 — the tenant
+  self-hosted ingest is either plaintext single-tenant (the tenant
   comes from operator config, so there is exactly one and nothing to spoof) or
   SPIFFE mTLS. A bearer token is what **Tracelane Cloud's gateway** accepts at
   `POST /v1/traces`; it is not an ingest mode, and an earlier revision of the

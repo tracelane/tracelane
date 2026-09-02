@@ -780,7 +780,7 @@ if command -v python3 >/dev/null 2>&1; then
     # The tier-ran assertion is only meaningful if IT can run. Selftest here
     # so the verdict logic is exercised on every local gate, not only in CI.
     area CI
-    run "tier-ran selftest"            python3 scripts/ci/assert-behavioral-tier-ran.py --selftest
+    skip "tier-ran selftest" "guard not exported to the public repo"
     area SCRIPTS
     run "script exec bits"             python3 scripts/ci/check-script-exec-bits.py
     area RUST WEB PY
@@ -796,6 +796,17 @@ if command -v python3 >/dev/null 2>&1; then
     area SCRIPTS
     run "verify-stamp selftest"        bash scripts/ci/check-verify-stamp.sh --selftest
     skip "deploy-provenance selftest" "guard not exported to the public repo"
+    # R293. The on-node watchdog carries 48 selftest assertions and NOTHING RAN THEM —
+    # it is not under scripts/{ci,hooks,export}, so the meta-gate never saw it, and no
+    # `run` line registered it. An unregistered selftest is a claim nobody checks, and
+    # this is the file that decides whether prod pages a human. Pure and 0.7s: the block
+    # exits before `JSON=$(tlane-status.sh …)`, so it touches no docker, no node, no net.
+    skip "watchdog selftest" "guard not exported to the public repo"
+    # R306. The class with 40+ recorded instances and, until now, no gate for its most
+    # expensive shape: a guard inside a script asserting over that same script, with a
+    # pattern its OWN LINE satisfies. The existing hook only sees `pgrep`/`ps|grep` in
+    # Bash TOOL CALLS — seven instances landed in scripts/ops/ after it went live.
+    run "self-matching assertions"     python3 scripts/ci/check-self-matching-assertions.py
     # This one lives under infra/prod/ rather than scripts, but its
     # selftest is pure (no ClickHouse, no network) and registering it here is what
     # makes it RUN — an unregistered selftest is a claim nobody checks. It proves

@@ -258,3 +258,142 @@ fn migration_sql_embeds_and_hash_is_stable() {
     assert_eq!(h1, h2);
     assert_eq!(h1.len(), 32);
 }
+
+/// **EVL-29 — the `jsonb` bind, against a REAL Postgres, in BOTH directions.**
+///
+/// THE DEFECT THIS EXISTS FOR, found on prod 2026-08-29 at the first real
+/// request: `create_queue` bound `filter_json` as `$4::jsonb` while passing a
+/// `&str`, and tokio-postgres refuses that — *"cannot convert between the Rust
+/// type `&str` and the Postgres type `jsonb`"*. Every queue creation 500'd.
+///
+/// **THAT IS THE SAME CLASS THIS FILE'S OWN HEADER RECORDS FOR A13:**
+/// `$9::numeric` bound with an `Option<String>`, which broke `POST /v1/keys`
+/// for two days. A `$n::<type>` cast makes Postgres infer the PLACEHOLDER as
+/// that type, so the Rust value must map to it directly — the cast does not
+/// convert for you. Second occurrence of the class, so it gets a test.
+///
+/// **This asserts the BROKEN direction FAILS**, not just that the fixed one
+/// passes. A test that only exercises the working binding would still pass if
+/// someone reintroduced the cast, which is the whole failure mode.
+///
+/// The 29 `annotation_routes` unit tests passed throughout — they run against
+/// the in-memory mock, which proves handler logic and can NEVER prove wire
+/// types. Nothing exercised these columns against a real database until now.
+#[tokio::test]
+#[ignore]
+async fn evl29_jsonb_columns_reject_a_str_and_accept_a_value() -> Result<()> {
+    let pool = test_pool().await?;
+    let client = pool.get().await?;
+
+    let tenant_id = Uuid::new_v4();
+    let _tenant = db::tenants::create(&pool, tenant_id, "evl29-jsonb-test", "free").await?;
+
+    let filter = serde_json::json!({
+        "source": { "kind": "online_eval_score", "max_score": 0.5 },
+        "window_hours": 168
+    });
+    let rubric = serde_json::json!([
+        { "key": "ideal_answer", "label": "Ideal", "type": "text", "required": true }
+    ]);
+
+    const INSERT: &str = "INSERT INTO annotation_queues \
+         (id, tenant_id, name, filter_json, rubric_json, default_dataset_id, \
+          expected_output_field, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+
+    // ── THE BROKEN DIRECTION. This is what shipped, and it must FAIL. ───────
+    let as_text = filter.to_string();
+    let broken = client
+        .execute(
+            INSERT,
+            &[
+                &Uuid::new_v4(),
+                &tenant_id,
+                &"broken",
+                &as_text, // a String, against a jsonb column
+                &rubric.to_string(),
+                &Uuid::new_v4(),
+                &"ideal_answer",
+                &"test",
+            ],
+        )
+        .await;
+    // Asserted as `is_err()` and NOT on the message text, matching
+    // `budget_param_serialization_contract`'s idiom in `db::api_keys`. The
+    // first version of this checked the string and failed: tokio-postgres's
+    // top-level `Display` is only "error serializing parameter 3", and the
+    // "cannot convert between the Rust type `&str` and the Postgres type
+    // `jsonb`" detail lives in the error's SOURCE CHAIN. Coupling a test to a
+    // dependency's Display format makes it fail on an upgrade that broke
+    // nothing — the refusal itself is the contract.
+    assert!(
+        broken.is_err(),
+        "binding a String to a jsonb column MUST fail — if this ever succeeds, \
+         this test has stopped protecting anything"
+    );
+
+    // ── THE FIXED DIRECTION: a parsed `Value` maps natively. ────────────────
+    let queue_id = Uuid::new_v4();
+    let dataset_id = Uuid::new_v4();
+    client
+        .execute(
+            INSERT,
+            &[
+                &queue_id,
+                &tenant_id,
+                &"low scores",
+                &filter,
+                &rubric,
+                &dataset_id,
+                &"ideal_answer",
+                &"test",
+            ],
+        )
+        .await?;
+
+    // Read back as text and re-parse — proving the bytes that landed are the
+    // JSON we sent, not a quoted string containing JSON (which is what a
+    // successful-but-wrong bind would have produced).
+    let row = client
+        .query_one(
+            "SELECT filter_json::text, rubric_json::text, expected_output_field \
+               FROM annotation_queues WHERE id = $1",
+            &[&queue_id],
+        )
+        .await?;
+    let back: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0))?;
+    assert_eq!(
+        back["window_hours"], 168,
+        "the stored filter must be a JSON OBJECT, not a string containing JSON"
+    );
+    let back_rubric: serde_json::Value = serde_json::from_str(&row.get::<_, String>(1))?;
+    assert!(
+        back_rubric.is_array(),
+        "the rubric must round-trip as an array"
+    );
+    assert_eq!(row.get::<_, String>(2), "ideal_answer");
+
+    // R223's CHECK must be live on the real table: an empty reference field is
+    // refused by the DATABASE, not merely by the handler.
+    let empty_ref = client
+        .execute(
+            INSERT,
+            &[
+                &Uuid::new_v4(),
+                &tenant_id,
+                &"no reference",
+                &filter,
+                &rubric,
+                &dataset_id,
+                &"",
+                &"test",
+            ],
+        )
+        .await;
+    assert!(
+        empty_ref.is_err(),
+        "annotation_queues_expected_field_chk must refuse an empty reference field"
+    );
+
+    Ok(())
+}

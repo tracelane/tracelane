@@ -8,14 +8,21 @@
    over glassmorphism, mesh gradients, aurora washes and six tinted pricing tiles —
    is GONE. Nothing below is inherited from it.
 
-   The reference is cursor.com, and the values are MEASURED, not eyeballed: every
-   token in the `@theme` block below was read out of Cursor's own shipped stylesheet
-   (`/marketing-static/_next/static/chunks/1255v9fszg0ay.css`) on 2026-08-24 and is
-   annotated with the Cursor custom property it came from. Where a value is ours
-   rather than theirs it says so.
+   The TYPE SCALE, RADII, SPACING and LAYOUT below are cursor.com's, measured out
+   of Cursor's own shipped stylesheet (`/marketing-static/_next/static/chunks/
+   1255v9fszg0ay.css`) on 2026-08-24 and annotated with the Cursor custom property
+   each came from. Those are unchanged.
 
-   THE THREE THINGS THAT MAKE IT READ AS CURSOR, in order of how much they matter:
-     1. A warm off-white canvas (#f7f7f4) with cards only a hair darker (#f2f1ed).
+   THE COLOUR IS NOT CURSOR'S ANY MORE — RE-TONED 2026-08-27 on founder
+   instruction, against a reference canvas: a COOL slate/pearl neutral family in
+   place of Cursor's warm stone, with one warm copper accent. Colour only; not one
+   font, layout rule, number or string moved. The Cursor property names left in the
+   COLOUR block below are the ROLE each token still plays, not a claim that the hex
+   was read from Cursor — the hexes there are ours.
+
+   THE THREE THINGS THAT MAKE IT READ THE WAY IT DOES, in order of how much they
+   matter:
+     1. A cool off-white canvas (#f5f6f8) with cards only a hair darker (#eef0f4).
         The contrast between a card and the page is ~2%. Nothing floats, nothing
         glows, nothing has a drop shadow — surfaces are distinguished by tone alone.
      2. 4px radii on panels and cards, pill radii on buttons. Small radius + large
@@ -90,49 +97,57 @@
   --font-mono: "JetBrainsMono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* ============================================================
-     COLOUR — Cursor's light theme, measured.
-       --color-theme-bg        #f7f7f4
-       --color-theme-fg        #26251e
-       --color-theme-card-hex  #f2f1ed
-       --color-theme-card-01   #f0efeb   (hover, light)
-       --color-theme-card-02   #ebeae5   (stage / well)
-       --color-theme-card-03   #e6e5e0   (secondary button, active)
-       --color-theme-card-04   #e1e0db   (secondary button hover)
-       --color-theme-accent    #f54e00
+     COLOUR — OURS, 2026-08-27. A cool slate/pearl neutral ramp, six steps from
+     canvas to sunken, each ~2% apart so surfaces separate by tone alone. The
+     Cursor property names are kept as the ROLE LABEL for each step (this is the
+     card tone, this is the well tone) — the hexes are not Cursor's.
+       --color-theme-bg        #f5f6f8
+       --color-theme-fg        #15181f
+       --color-theme-card-hex  #eef0f4
+       --color-theme-card-01   #e9ecf1   (hover, light)
+       --color-theme-card-02   #e4e7ee   (stage / well)
+       --color-theme-card-03   #dde1e9   (secondary button, active)
+       --color-theme-card-04   #d5dae4   (secondary button hover)
+       --color-theme-accent    #d9542b
        text-sec  = fg 60%   text-mid = fg 50%   text-tertiary = fg 40%
        border-02 = fg 10%   border-02-5 = fg 20%   fg-05 = fg 5%
      ============================================================ */
-  --color-bg: #f7f7f4;
-  --color-bg-elevated: #f2f1ed; /* card */
-  --color-bg-hover: #f0efeb;
-  --color-bg-subtle: #ebeae5; /* stage / well */
-  --color-bg-sunken: #e6e5e0;
-  --color-bg-sunken-2: #e1e0db;
+  --color-bg: #f5f6f8;
+  --color-bg-elevated: #eef0f4; /* card */
+  --color-bg-hover: #e9ecf1;
+  --color-bg-subtle: #e4e7ee; /* stage / well */
+  --color-bg-sunken: #dde1e9;
+  --color-bg-sunken-2: #d5dae4;
 
-  --color-fg: #26251e;
-  --color-fg-muted: color-mix(in oklab, #26251e 60%, transparent); /* text-sec */
-  --color-fg-subtle: color-mix(in oklab, #26251e 60%, transparent);
-  --color-fg-dim: color-mix(in oklab, #26251e 40%, transparent); /* text-tertiary */
+  --color-fg: #15181f;
+  --color-fg-muted: color-mix(in oklab, #15181f 60%, transparent); /* text-sec */
+  --color-fg-subtle: color-mix(in oklab, #15181f 60%, transparent);
+  --color-fg-dim: color-mix(in oklab, #15181f 40%, transparent); /* text-tertiary */
 
-  --color-border: color-mix(in oklab, #26251e 10%, transparent); /* border-02 */
-  --color-border-subtle: color-mix(in oklab, #26251e 5%, transparent);
-  --color-border-strong: color-mix(in oklab, #26251e 20%, transparent); /* border-02-5 */
+  --color-border: color-mix(in oklab, #15181f 10%, transparent); /* border-02 */
+  --color-border-subtle: color-mix(in oklab, #15181f 5%, transparent);
+  --color-border-strong: color-mix(in oklab, #15181f 20%, transparent); /* border-02-5 */
 
-  --color-accent: #f54e00; /* Cursor orange, verbatim */
-  --color-accent-2: #d84500;
-  --color-accent-ink: #f54e00;
-  --color-pop: #f54e00;
+  /* The one warm thing on a cool page. A copper, not a safety orange: against a
+     slate canvas the vivid #f54e00 this replaced read as a warning, and the
+     reference sits in the copper/terracotta range. Used for links, the badge dot,
+     the scroll rail and the feature glyphs — nowhere structural. */
+  --color-accent: #d9542b;
+  --color-accent-2: #b8431f;
+  --color-accent-ink: #d9542b;
+  --color-pop: #d9542b;
 
-  /* Proof signal. Cursor's own product green/red, which sit in the same warm
-     family as the canvas — a generic #22c55e reads as a different site. */
-  --color-verify: #1f8a65; /* --color-theme-product-ansi-green */
-  --color-alarm: #cf2d56; /* --color-theme-product-ansi-red */
+  /* Proof signal. Desaturated and pulled COOL so they sit in the same family as
+     the canvas — a generic #22c55e reads as a different site. */
+  --color-verify: #0f7f60;
+  --color-alarm: #c9314f;
 
-  /* Dark stage. Cursor's dark theme values, used for the terminal frames. */
-  --color-panel-dark: #14120b; /* --color-theme-bg, dark */
-  --color-panel-dark-card: #1b1913; /* --color-theme-card-hex, dark */
-  --color-on-dark: #edecec; /* --color-theme-fg, dark */
-  --color-on-dark-muted: color-mix(in oklab, #edecec 60%, transparent);
+  /* Dark stage — used for the terminal frames. A cool near-black, not Cursor's
+     warm #14120b, so the dark panels belong to the same page as the light ones. */
+  --color-panel-dark: #0d1015; /* --color-theme-bg, dark */
+  --color-panel-dark-card: #151922; /* --color-theme-card-hex, dark */
+  --color-on-dark: #e7eaf0; /* --color-theme-fg, dark */
+  --color-on-dark-muted: color-mix(in oklab, #e7eaf0 60%, transparent);
 
   /* Rhythm. Cursor: --v = 1rem*1.4 (vertical), --g = 10rem/16 (grid gutter). */
   --spacing-v: 1.4rem;
@@ -310,7 +325,7 @@
 }
 
 /* THE STAGE — the framed showcase panel from cursor.com.
-   A wide, barely-tinted well (#ebeae5) at 4px radius, with the product frame
+   A wide, barely-tinted well (#e4e7ee) at 4px radius, with the product frame
    inset on top of it. This is the "background + frames" the founder pointed at:
    the well is a TONE, and the frame inside it is a window. */
 .stage-well {
@@ -321,19 +336,25 @@
 }
 
 /* Two of Cursor's stages sit on a soft painted backdrop rather than a flat
-   tone. This is that register done as a gradient — a warm stone/sage wash, no
-   imagery, so nothing is invented and nothing is licensed. */
+   tone. This is that register done as a soft mesh — the founder's reference
+   canvas (2026-08-27): a cool pearl grey top-left, a slate-periwinkle body,
+   and ONE warm bloom held to the top-right corner. Four stops, no imagery, no
+   licensed asset. The warm bloom is the only saturated thing on the page that
+   is not the accent, and it is deliberately weak — a mesh that competes with
+   the product frame sitting on top of it is decoration, not a backdrop. */
 .stage-well--scenic {
   background:
-    radial-gradient(120% 90% at 12% 4%, #e8e6dd 0%, transparent 55%),
-    radial-gradient(100% 80% at 88% 0%, #dfe2da 0%, transparent 60%),
-    linear-gradient(180deg, #e9e7de 0%, #dcded5 52%, #d5d8cf 100%);
+    radial-gradient(90% 70% at 6% 0%, #f3f5f8 0%, transparent 60%),
+    radial-gradient(66% 92% at 100% 20%, #ecd9cd 0%, transparent 58%),
+    radial-gradient(78% 70% at 100% 82%, #e7dee1 0%, transparent 60%),
+    radial-gradient(120% 110% at 28% 104%, #ccd5e6 0%, transparent 62%),
+    linear-gradient(155deg, #eceff4 0%, #dfe4ee 46%, #d7dce8 100%);
 }
 
 .stage-well--dark {
   background:
-    radial-gradient(110% 90% at 10% 0%, #232019 0%, transparent 60%),
-    linear-gradient(180deg, #1c1a13 0%, #14120b 100%);
+    radial-gradient(110% 90% at 10% 0%, #1b2029 0%, transparent 60%),
+    linear-gradient(180deg, #141821 0%, #0d1015 100%);
 }
 
 /* THE WINDOW FRAME — a macOS-chrome panel. Title bar with three lights, a
@@ -341,12 +362,12 @@
    and sit on the well with one soft shadow that reads as depth, not glow. */
 .frame {
   background: var(--color-bg-elevated);
-  border: 1px solid color-mix(in oklab, #26251e 8%, transparent);
+  border: 1px solid color-mix(in oklab, #15181f 8%, transparent);
   border-radius: var(--radius-md);
   overflow: hidden;
   box-shadow:
-    0 1px 2px color-mix(in oklab, #26251e 6%, transparent),
-    0 12px 32px -12px color-mix(in oklab, #26251e 22%, transparent);
+    0 1px 2px color-mix(in oklab, #15181f 6%, transparent),
+    0 12px 32px -12px color-mix(in oklab, #15181f 22%, transparent);
 }
 
 .frame-bar {
@@ -354,8 +375,8 @@
   align-items: center;
   gap: 0.5rem;
   padding: 0.5rem 0.75rem;
-  background: color-mix(in oklab, #26251e 3%, var(--color-bg-elevated));
-  border-bottom: 1px solid color-mix(in oklab, #26251e 7%, transparent);
+  background: color-mix(in oklab, #15181f 3%, var(--color-bg-elevated));
+  border-bottom: 1px solid color-mix(in oklab, #15181f 7%, transparent);
   position: relative;
   min-height: 2.25rem;
 }
@@ -367,7 +388,7 @@
   width: 0.625rem;
   height: 0.625rem;
   border-radius: 999px;
-  background: color-mix(in oklab, #26251e 16%, transparent);
+  background: color-mix(in oklab, #15181f 16%, transparent);
 }
 .frame-title {
   position: absolute;
@@ -390,15 +411,15 @@
 /* Dark variant — used for the two terminal frames. */
 .frame--dark {
   background: var(--color-panel-dark-card);
-  border-color: color-mix(in oklab, #edecec 10%, transparent);
+  border-color: color-mix(in oklab, #e7eaf0 10%, transparent);
   color: var(--color-on-dark);
 }
 .frame--dark .frame-bar {
-  background: color-mix(in oklab, #edecec 4%, var(--color-panel-dark-card));
-  border-bottom-color: color-mix(in oklab, #edecec 8%, transparent);
+  background: color-mix(in oklab, #e7eaf0 4%, var(--color-panel-dark-card));
+  border-bottom-color: color-mix(in oklab, #e7eaf0 8%, transparent);
 }
 .frame--dark .frame-lights i {
-  background: color-mix(in oklab, #edecec 20%, transparent);
+  background: color-mix(in oklab, #e7eaf0 20%, transparent);
 }
 .frame--dark .frame-title {
   color: var(--color-on-dark-muted);
@@ -462,7 +483,7 @@
   margin: 0;
 }
 .term .c {
-  color: color-mix(in oklab, #edecec 45%, transparent);
+  color: color-mix(in oklab, #e7eaf0 45%, transparent);
 }
 .term .p {
   color: var(--color-accent);
@@ -516,8 +537,8 @@
   color: var(--color-bg);
 }
 .btn-primary:hover {
-  background: #3b3a33; /* --color-theme-fg-02 */
-  border-color: #3b3a33;
+  background: #2b303a; /* --color-theme-fg-02 */
+  border-color: #2b303a;
   color: var(--color-bg);
 }
 
@@ -542,6 +563,23 @@
 .btn-sm {
   font-size: var(--text-sm);
   padding: 0.45em 0.9em 0.46em;
+}
+/* THE HEADER CTA IS A THUMB TARGET ON A PHONE. At the desktop padding it renders
+   25px tall — over WCAG 2.5.8's 24px floor by one pixel, and well under the 44px
+   both Apple and Android ask for. It is the single most important control on the
+   page, so below the `sm` breakpoint it gets height instead of scaling with type.
+
+   THE VALUE IS SET FROM A MEASUREMENT, NOT FROM ARITHMETIC. The first attempt used
+   `0.75em` and I reported "25px -> 38px" — a number I had calculated from the font
+   size and never checked. The live site measured **32px**. Both figures were wrong
+   in the same direction, which is the point: a padding in `em` interacts with
+   line-height and the pill radius, so the only honest way to hit a pixel target is
+   to render it and read it back. 1.25em measures 43px at 320-430px, which is
+   the platform guidance, and fits inside the 64px bar with room to spare. */
+@media (max-width: 639px) {
+  .btn-sm {
+    padding: 1.25em 1.05em 1.26em;
+  }
 }
 
 /* The accent inline link Cursor uses to close a feature block. */
@@ -622,7 +660,7 @@
   background: var(--color-bg-elevated);
   border-radius: var(--radius-xs);
   font-size: var(--text-sm);
-  color: color-mix(in oklab, #26251e 75%, transparent);
+  color: color-mix(in oklab, #15181f 75%, transparent);
   text-align: center;
   transition: background-color 0.18s var(--ease-out);
 }
@@ -956,7 +994,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: color-mix(in oklab, #26251e 8%, transparent);
+  background: color-mix(in oklab, #15181f 8%, transparent);
   border: 0;
   cursor: pointer;
 }

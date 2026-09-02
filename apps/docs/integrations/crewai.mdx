@@ -1,0 +1,70 @@
+---
+title: "CrewAI"
+description: "Send CrewAI traces to Tracelane with one exporter config. No Tracelane SDK required."
+classification: PUBLIC
+---
+
+CrewAI is OpenTelemetry-native through the community instrumentor. Tracelane accepts OTLP
+directly, so the integration is **exporter configuration, not a Tracelane package**.
+
+## What you get
+
+| | |
+|---|---|
+| **Agent structure** | **Yes** — crew, per-agent task spans, tool executions, nested. |
+| **The LLM leg** | Yes, inside the tree. |
+| **Retries** | Yes — CrewAI retries a failing task, and each attempt is its own span. |
+
+## Setup
+
+```bash
+pip install openinference-instrumentation-crewai \
+            opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from openinference.instrumentation.crewai import CrewAIInstrumentor
+import os
+
+provider = TracerProvider(resource=Resource.create({"service.name": "my-crew"}))
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
+    endpoint="https://gateway.tracelane.dev/v1/traces",
+    headers={"x-tracelane-api-key": os.environ["TRACELANE_API_KEY"]},
+)))
+trace.set_tracer_provider(provider)
+
+CrewAIInstrumentor().instrument(tracer_provider=provider)
+```
+
+Your API key needs the **`ingest`** scope.
+
+## Span volume — CrewAI is the heaviest of the four
+
+A crew multiplies: **agents × tasks × retries**, plus a span per tool call and per LLM call.
+CrewAI retries a failing task, and **each attempt is a separate span** — a single failing
+task was observed emitting three. A five-agent crew can emit hundreds of spans for one `kickoff()`.
+
+Plan limits are counted in spans on this path.
+<Warning>
+  **An OTel span and a gateway call are not the same unit, and they are not counted the
+  same way.** A gateway request (the base-URL swap) is one unit against your monthly trace
+  quota. On this OTel path your app sends **spans**, and one agent run is many spans — the
+  tree above is 11 for a single `invoke()`. Do not read "10K traces/mo" as "10,000 crew runs". Size against **spans per run**, and see [pricing](/pricing).
+</Warning>
+
+
+## Verification status
+
+The transport is the standard OTLP/HTTP protobuf exporter and is
+[proven against Tracelane production](/integrations/langchain#what-a-trace-looks-like).
+
+**The CrewAI instrumentor itself has not been run end to end against production** — a
+realistic crew needs live LLM calls. The instrumentor attaches cleanly; the span shape above
+is from CrewAI's documented instrumentation, not from a Tracelane production read-back.
+Treat the volume guidance as the reliable part and
+[tell us](https://github.com/tracelane/tracelane/issues) what you see.

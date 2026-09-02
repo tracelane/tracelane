@@ -10,6 +10,22 @@ CREATE DATABASE IF NOT EXISTS tracelane;
 CREATE TABLE IF NOT EXISTS tracelane.spans
 (
     -- Identity
+    --
+    -- WHY THESE ARE `String` AND MUST NOT BE "TIGHTENED" TO FixedString.
+    -- The ingest path stores them as a 36-char dashed UUID, but the WIRE decides
+    -- the type and the wire is OTLP: a span_id is 8 raw bytes and a trace_id is
+    -- 16 (`crates/shared/src/otlp/decode.rs`, which bails on any other length).
+    -- **8 bytes IS 16 hex chars and 16 bytes IS 32 hex chars** — the byte count
+    -- and the hex-char count are the same width in two notations, not two
+    -- competing widths. `otlp_span_id_to_uuid` left-pads the 8 bytes into a
+    -- 128-bit UUID; the transform is injective, lossless in the low 64 bits, and
+    -- applied identically to span_id and parent_span_id, which is exactly why the
+    -- self-join that rebuilds the tree returns zero orphans.
+    -- A FixedString here would be a guess dressed as a constraint: it would fix a
+    -- RENDERING width while the real constraint lives at the receiver, in bytes.
+    -- Verified end to end on prod 2026-08-31 with an unmodified LangGraph agent
+    -- via stock openinference (trace 32435b24-…): 11 spans, 1 root, 10 parented,
+    -- 11 distinct ids, 0 dangling parents. Harness: scripts/proofs/.
     tenant_id        String,
     trace_id         String,
     span_id          String,

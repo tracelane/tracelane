@@ -186,4 +186,11 @@ __all__ = [
     "instrument_smolagents",
     "instrument_haystack",
 ]
-__version__ = "0.1.0"
+# Single-sourced from the installed distribution so this can never drift from
+# pyproject.toml again — it read "0.1.0" against a 0.2.3 dist until 2026-08-31.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("tracelane")
+except Exception:  # noqa: BLE001 — source checkout, not installed
+    __version__ = "0.0.0+unknown"

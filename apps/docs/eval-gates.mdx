@@ -67,6 +67,14 @@ code rules score it fine.
 The decision is appended to the tenant's audit chain as a signed `eval.verdict` event,
 so who promoted what, when and why is verifiable after the fact.
 
+## The CI gate for your prompts
+
+`tlane eval run` fails a pull request when eval quality falls below a threshold
+you set — see [the CLI reference](/cli#tlane-eval-run--tlane-eval-list)
+for the flags, the exit codes, and how a below-the-floor result (exit 1) is kept distinct
+from a run that could not be measured (exit 3). The GitHub Action wrapper is
+[`.github/actions/eval-gate`](https://github.com/tracelane/tracelane/tree/main/.github/actions/eval-gate).
+
 ## Tracelane's own eval suite
 
 The project's own CI runs 20 conformance evals — 10 fault-tolerance chaos scenarios,
@@ -95,11 +103,21 @@ pnpm eval:run --suite=all
 ```
 
 Valid suite names are `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pir` (PII-redaction) and `pi` (prompt-injection). An unknown suite name exits `2` rather than quietly running
-everything.
+`is` (ingest-schema), `pir` (PII-redaction) and `pi` (prompt-injection). An unknown
+suite name exits `2` rather than quietly running everything.
 
-This suite is Tracelane's own regression harness. It is not a customer-facing eval
-product, and it is not connected to prompt promotion.
+This suite is Tracelane's own regression harness — a different thing from the CI
+gate above. It runs from a checkout with `pnpm eval:run` and tests *our* code; the
+gate at the top of this page runs *your* dataset against *your* prompt and fails
+*your* pull request.
+
+<Note>
+  **Changed 2026-08-30.** This section used to end "it is not a customer-facing eval
+  product", which was true of the whole page until the CI gate shipped and is now
+  true only of this harness. `tlane eval run` is customer-facing, and `tlane eval
+  run --suite` no longer drives this harness at all — it exits `2` pointing at
+  `pnpm eval:run`.
+</Note>
 
 ## Related
 

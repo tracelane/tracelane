@@ -7,7 +7,7 @@ classification: PUBLIC
 
 # Tenant isolation — V1 guarantees
 
-> **Authoritative design:** [ADR-031](/decisions/index). **Composes with:** [ADR-018](/decisions/index) (tamper-evident agent ledger).
+> **Composes with:** the tamper-evident agent ledger.
 
 Tracelane is multi-tenant from day one. Every read, every write, and
 every admin mutation is scoped to one workspace UUID at three
@@ -69,7 +69,7 @@ pub const TENANT_KEY_PREFIX: &str = "tenants/";
 fn assert_tenant_prefix(key: &str) -> bool {
     if !key.starts_with(TENANT_KEY_PREFIX) {
         #[cfg(debug_assertions)]
-        { panic!("ADR-031 tenant isolation invariant violated"); }
+        { panic!("tenant isolation invariant violated"); }
         #[cfg(not(debug_assertions))]
         {
             tracing::error!(/* … */);
@@ -115,7 +115,7 @@ Request → WorkOS AuthKit middleware → session.tenantId (WorkOS orgId)
 
 For mTLS-only ingest (`crates/ingest/src/auth.rs`), the same value
 arrives via the SPIFFE SVID's path component `/tenant/<uuid>/ingest-worker`
-(ADR-028). `TenantId::from_spiffe_svid(uuid)` is structurally
+`TenantId::from_spiffe_svid(uuid)` is structurally
 distinct from `TenantId::from_jwt_claim(uuid)` — downstream code can
 compile-time-prove which path the identity took.
 

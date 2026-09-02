@@ -858,6 +858,30 @@ export const traceAnnotations = pgTable(
 		note: text("note").notNull().default(""),
 		/** The `sub` claim of whoever flagged it. */
 		authorSub: text("author_sub").notNull(),
+		/**
+		 * EVL-29. NULL = an ad-hoc OBS-18 flag rather than a queue review, so a
+		 * trace flagged from the trace header and one reviewed in a queue stay
+		 * the SAME row. Deliberately NOT in the primary key — adding it would
+		 * re-open the duplicate-row bug the `span_id = ''` sentinel prevents.
+		 */
+		queueId: uuid("queue_id").references(() => annotationQueues.id),
+		/** Answers to the queue's rubric fields, keyed by field `key`. */
+		rubricJson: jsonb("rubric_json").notNull().default({}),
+		/**
+		 * IMMUTABLE SNAPSHOT of the rubric definition this answer was given under
+		 * (R224) — the ordered field list, types and options, frozen at submit.
+		 * Same class as `dataset_snapshots`: the frozen set is what makes a past
+		 * judgement re-readable. A version COUNTER would tell you the rubric
+		 * changed; it would not tell you what it SAID, leaving old labels
+		 * uninterpretable. `{}` = an ad-hoc OBS-18 flag, answered under no rubric.
+		 */
+		rubricSnapshot: jsonb("rubric_snapshot").notNull().default({}),
+		/**
+		 * THE REFERENCE — the whole point of item 12. Production captures input
+		 * only (`dataset_routes.rs:35-42`), so a human review is the only source
+		 * of an `expected_output` for a trace-derived dataset item.
+		 */
+		expectedOutput: text("expected_output").notNull().default(""),
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.defaultNow()
 			.notNull(),
@@ -873,10 +897,87 @@ export const traceAnnotations = pgTable(
 		// carry any annotation. Tenant-first so the index is usable by that
 		// predicate alone.
 		index("trace_annotations_tenant_trace_idx").on(t.tenantId, t.traceId),
+		// EVL-29. PARTIAL, on `queue_id IS NOT NULL`: a NULL `queue_id` means
+		// an ad-hoc OBS-18 flag rather than a queue review, and those are the
+		// majority. Indexing them would grow the index without serving the
+		// only query that uses it — "what has been reviewed through queue X".
+		index("trace_annotations_queue_idx")
+			.on(t.tenantId, t.queueId)
+			.where(sql`${t.queueId} IS NOT NULL`),
 	],
 );
 
 export type TraceAnnotation = typeof traceAnnotations.$inferSelect;
+
+/**
+ * EVL-29 — a review queue. **A SAVED FILTER, evaluated at read time** (R221.1),
+ * never a materialised member list: a stored membership is a second copy of a
+ * judgement that goes stale the moment a threshold moves, and reconciling it
+ * against the scores it came from would then be ours to own. Read-time
+ * evaluation cannot drift because there is nothing to drift from.
+ */
+export const annotationQueues = pgTable(
+	"annotation_queues",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		/** The saved filter. Evaluated per read; see the table doc. */
+		filterJson: jsonb("filter_json").notNull(),
+		/** Ordered list of typed fields — `boolean | choice | text` ONLY (R221.2). */
+		rubricJson: jsonb("rubric_json").notNull().default([]),
+		/**
+		 * REQUIRED (R222). Every review creates a dataset item in the SAME
+		 * request, with the reviewer choosing nothing. Nullable-plus-a-picker
+		 * would be TWO paths where one is exercised rarely and rots — and "the
+		 * loop closes by construction" is only true if the field cannot be absent.
+		 */
+		defaultDatasetId: uuid("default_dataset_id").notNull(),
+		/**
+		 * REQUIRED (R223). The `rubric_json` field key whose answer becomes the
+		 * item's `expected_output`. A queue that cannot name its reference field
+		 * would silently emit items no reference-based scorer can score — the
+		 * exact hole item 12 exists to close, reopened by its own tooling.
+		 * The validator refuses a `boolean` field here: "true"/"false" as an
+		 * expected_output is a scorer comparing against a string that means nothing.
+		 */
+		expectedOutputField: text("expected_output_field").notNull(),
+		createdBy: text("created_by").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		/** Archive, never delete — a review's `queue_id` must not dangle. */
+		archivedAt: timestamp("archived_at", { withTimezone: true }),
+	},
+	(t) => [
+		uniqueIndex("annotation_queues_tenant_name_uniq").on(
+			t.tenantId,
+			sql`lower(${t.name})`,
+		),
+		// R223, and the CHECK is the half that makes the NOT NULL mean
+		// something: `expected_output_field` carries `DEFAULT ''` purely so
+		// migration 0033's ADD COLUMN could succeed on the existing empty
+		// table, and this constraint is what makes that default UNREACHABLE.
+		// Without it the column is nominally required and practically optional.
+		check(
+			"annotation_queues_expected_field_chk",
+			sql`length(${t.expectedOutputField}) > 0`,
+		),
+		// PARTIAL, on the live set. Every queue list filters to the tenant and
+		// archived queues are the minority that nothing lists — indexing them
+		// would grow the index without serving the query that uses it.
+		index("annotation_queues_tenant_idx")
+			.on(t.tenantId)
+			.where(sql`${t.archivedAt} IS NULL`),
+	],
+);
+
+export type AnnotationQueue = typeof annotationQueues.$inferSelect;
 
 // ── DSH-01: in-app notifications ─────────────────────────────────────────────
 
@@ -925,3 +1026,64 @@ export const notifications = pgTable(
 );
 
 export type Notification = typeof notifications.$inferSelect;
+
+/**
+ * `online_eval_policies` — per-workspace configuration for scoring LIVE traffic
+ * with the LLM judge that item 10 already shipped (`EVL-28`, Sprint 3 item 11).
+ *
+ * ONE POLICY PER WORKSPACE for now (a unique index on `tenant_id`, not a
+ * primary key on it, so a second policy is a schema change rather than a data
+ * migration if per-prompt policies are ever wanted). The gateway reads this
+ * through a cache — never per request.
+ *
+ * ── THE TWO NUMBERS ARE NOT SYMMETRIC, AND THAT IS THE DESIGN ───────────────
+ * `sample_rate` has a founder-set CEILING and a tenant-set value beneath it:
+ * coverage is the customer's judgement, but a tenant who sets 100% is spending
+ * real money at traffic volume before anyone notices, so the ceiling is ours and
+ * it is enforced by a CHECK here rather than only in a handler.
+ *
+ * `judge_budget_usd_monthly` has NO DEFAULT and is NOT NULL. Creating a policy
+ * without naming a cap is a typed 400 at the route, and the column makes it
+ * impossible to reach the table without one. **Forcing an explicit money
+ * decision beats a silent unlimited** — it is the only shape where a customer
+ * cannot be surprised by the first invoice. Do not "helpfully" add a DEFAULT.
+ *
+ * `sample_salt` exists so sampling is DETERMINISTIC — `hash(salt || trace_id)`
+ * against the rate, never a random draw. A customer must be able to say which
+ * traces were scored and re-run exactly that set. Per-policy rather than global
+ * so two workspaces at the same rate do not score correlated traces.
+ */
+export const onlineEvalPolicies = pgTable(
+	"online_eval_policies",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		/** Off without deleting the policy — keeps the cap and salt for when it resumes. */
+		enabled: boolean("enabled").notNull().default(true),
+		/** `builtin` | `prompt_version` — which of the two rubric sources `rubric` names. */
+		rubricKind: text("rubric_kind").notNull(),
+		/** A built-in rubric name, or a `prompt_versions.id` the tenant owns. */
+		rubric: text("rubric").notNull(),
+		/** The grading model. Routed through the tenant's own BYOK, like every judge call. */
+		judgeModel: text("judge_model").notNull(),
+		/** 0.0–0.10. The ceiling is enforced by a CHECK, not only by a handler. */
+		sampleRate: doublePrecision("sample_rate").notNull().default(0.01),
+		/** Per-policy salt for deterministic `hash(salt || trace_id)` sampling. */
+		sampleSalt: text("sample_salt").notNull(),
+		/** REQUIRED. No default, deliberately — see the table doc. */
+		judgeBudgetUsdMonthly: doublePrecision(
+			"judge_budget_usd_monthly",
+		).notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [uniqueIndex("online_eval_policies_tenant_uniq").on(t.tenantId)],
+);
+
+export type OnlineEvalPolicy = typeof onlineEvalPolicies.$inferSelect;

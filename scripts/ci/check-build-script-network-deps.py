@@ -164,8 +164,23 @@ def selftest() -> int:
     # It is checked HERE rather than in a new guard file because the two controls
     # are one lesson and the repo's rule is no new guards without a reason.
     deny_rc = _falsify_deny_ban()
-    if deny_rc != 0:
-        return deny_rc
+    if deny_rc == 1:
+        return 1
+
+    # THE BANNER MUST NOT CLAIM WHAT DID NOT RUN. B-324, 2026-09-01: this printed
+    # "the ban was OBSERVED BLOCKING on the fixture" unconditionally — including on
+    # every run where `_falsify_deny_ban` had just SKIPPED for want of cargo-deny and
+    # said so two lines above. A summary asserting a stronger verdict than the thing
+    # it summarises is the defect this whole file exists to prevent, printed by the
+    # file itself. `2` is the skip, and it gets its own honest sentence.
+    if deny_rc == 2:
+        print(
+            "SELFTEST PASSED (PARTIAL) — the real proc-macro1 build-dep shape is\n"
+            "  CAUGHT, and a package whose network crates are dev/normal (not build)\n"
+            "  is NOT flagged. deny.toml's ban was NOT falsified on this run: see the\n"
+            "  SKIP above. This run does NOT prove the ban blocks."
+        )
+        return 0
 
     print(
         "SELFTEST PASSED — the real proc-macro1 build-dep shape is CAUGHT, a\n"
@@ -178,19 +193,73 @@ def selftest() -> int:
 def _falsify_deny_ban() -> int:
     """Prove `deny.toml`'s `proc-macro1` ban BLOCKS, against a committed fixture.
 
-    Returns 0 on a proven block, 1 on a proven non-block, and 0 with a loud SKIP
-    when cargo-deny is absent — an ABSENT TOOL IS NOT A PASS, so it says so on its
-    own line rather than folding into the PASSED banner above.
+    Returns 0 on a proven block, 1 on a proven non-block, and 2 when cargo-deny is
+    absent — an ABSENT TOOL IS NOT A PASS. The 2 is load-bearing: the caller uses it
+    to print a PARTIAL banner, because a distinct skip line under a banner that still
+    claims the ban was observed blocking is not honesty, it is a footnote under a
+    false headline.
     """
     fixture = pathlib.Path(__file__).parent / "fixtures" / "b263-deny-ban"
     if not (fixture / "Cargo.toml").is_file():
         print(f"SELFTEST FAILED — the B-263 fixture is missing at {fixture}")
         return 1
-    if shutil.which("cargo-deny") is None and shutil.which("cargo") is None:
+
+    # THE FIXTURE'S `Cargo.lock` MUST NOT BE TRACKED, AND THIS IS WHERE THAT IS
+    # ENFORCED — beside the thing it constrains, not in a note somewhere.
+    #
+    # Earned 2026-08-27. Grype and OSV-Scanner catalog Rust packages FROM LOCKFILES.
+    # A committed `Cargo.lock` here therefore advertised the deliberately-planted
+    # `proc-macro1 1.0.107` to both of them as a live dependency, and the public
+    # repo's Security Scan went red on a TEST FIXTURE — two jobs, every night. That
+    # is worse than a missed finding: a scanner that is permanently red for a reason
+    # everyone knows is a scanner nobody reads.
+    #
+    # The repair is deliberately NOT a suppression. Ignoring `proc-macro1` by name,
+    # or ignoring MAL-2026-14338 / RUSTSEC-2026-0265 by id, would have silenced the
+    # scanners for the REAL crate too — the one whose `build.rs` downloads and
+    # executes a binary with TLS verification off. Not committing the lockfile costs
+    # the scanners nothing: `cargo deny` regenerates it from the path dependency at
+    # selftest time (verified — this function still observes the ban BLOCKING with no
+    # lockfile present), and the ban in `deny.toml` is unchanged.
+    lock = fixture / "Cargo.lock"
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(lock)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tracked.returncode == 0:
         print(
-            "  SKIP  deny.toml ban not falsified — cargo-deny unavailable. NOT a pass."
+            "SELFTEST FAILED — the B-263 fixture's Cargo.lock is TRACKED IN GIT.\n"
+            "  Grype and OSV-Scanner read Rust packages out of lockfiles, so a\n"
+            "  committed one re-publishes the planted `proc-macro1 1.0.107` to every\n"
+            "  vulnerability scanner as a live Critical and turns the public repo's\n"
+            "  Security Scan permanently red on a test fixture.\n"
+            "  Fix: `git rm --cached` it. `cargo deny` regenerates it on demand and\n"
+            "  .gitignore already lists it. Do NOT suppress the advisory instead —\n"
+            "  that would silence the scanners for the real crate too."
         )
-        return 0
+        return 1
+    # `cargo deny` IS `cargo-deny`: cargo resolves a subcommand by looking for a
+    # `cargo-<name>` binary on PATH, so cargo-deny's absence is decided by that ONE
+    # binary. `cargo` being present says nothing about it.
+    #
+    # This condition read `... is None and shutil.which("cargo") is None` — skip only
+    # when BOTH are missing — which is wrong in the one configuration that matters and
+    # was invisible for as long as the two were absent together. B-324, 2026-09-01: the
+    # nightly gate's runner had neither, so it skipped correctly; the moment cargo went
+    # on its PATH the selftest fell through to `cargo deny`, got
+    # `error: no such command: 'deny'`, and reported
+    # "cargo-deny exited non-zero, but not with error[banned]" — a MISSING TOOL
+    # reported as a FAILED PROOF. That is the §14 error inside a guard whose whole
+    # subject is not mistaking one state for another, and it was the last thing
+    # standing between the nightly full gate and its first green.
+    if shutil.which("cargo-deny") is None:
+        print(
+            "  SKIP  deny.toml ban not falsified — cargo-deny is not installed"
+            " (`cargo deny` needs the cargo-deny binary on PATH). NOT a pass."
+        )
+        return 2
 
     proc = subprocess.run(
         [

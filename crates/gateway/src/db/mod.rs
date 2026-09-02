@@ -275,6 +275,16 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         // `f_datasets` from a column that does not exist and 500 the entire
         // entitlement resolve, on a surface that had passed every local test.
         include_str!("../../../../apps/web/db/migrations/0030_evl04_dataset_entitlements.sql"),
+        include_str!("../../../../apps/web/db/migrations/0031_evl28_online_eval_policies.sql"),
+        // EVL-29 item 12. Applied to prod Neon ahead of any reader; listed here
+        // so a FRESH database and every Postgres integration test build the same
+        // schema. 0033 corrects 0032 (nullable target -> NOT NULL, version
+        // counter -> immutable snapshot) per founder rulings R222/R224, on an
+        // empty table with no reader — so the pair must be applied IN ORDER.
+        include_str!("../../../../apps/web/db/migrations/0032_evl29_annotation_queues.sql"),
+        include_str!(
+            "../../../../apps/web/db/migrations/0033_evl29_required_target_and_rubric_snapshot.sql"
+        ),
     ];
     for migration in MIGRATIONS {
         client

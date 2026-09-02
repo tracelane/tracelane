@@ -98,9 +98,12 @@ const DEFAULT_SESSION_LIMIT: u32 = 50;
 /// Hard cap on the session-list page size.
 const MAX_SESSION_LIMIT: u32 = 200;
 /// Default §3 session look-back window in days when neither `since` nor `days`
-/// is given. Bounds the live `spans` aggregation; the spans TTL is 90 days.
+/// is given. Bounds the live `spans` aggregation. (The `spans` TTL is 365 days
+/// — this cap is a query bound, NOT the TTL. They were conflated until 2026-08-29.)
 const DEFAULT_SESSION_WINDOW_DAYS: u32 = 30;
-/// Hard cap on the session look-back window (the spans TTL).
+/// Hard cap on the session look-back window. NOT derived from the TTL (365d):
+/// it is a deliberate query bound, and EVL-29 queue safety now rests on it —
+/// a trace stops matching a queue 275 days before its content could expire.
 const MAX_SESSION_WINDOW_DAYS: u32 = 90;
 
 /// Gateway-ops look-back window (hours) — default 24h, cap 30 days.

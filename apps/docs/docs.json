@@ -22,6 +22,15 @@
 						"pages": ["sdk-python", "sdk-typescript"]
 					},
 					{
+						"group": "Integrations",
+						"pages": [
+							"integrations/langchain",
+							"integrations/llamaindex",
+							"integrations/crewai",
+							"integrations/vercel-ai"
+						]
+					},
+					{
 						"group": "Concepts",
 						"pages": [
 							"architecture",

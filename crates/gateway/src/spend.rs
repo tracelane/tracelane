@@ -84,6 +84,22 @@ pub enum Subject {
     /// The whole workspace — `tenants.id`. The "per-team" cap: a team in this
     /// product IS the workspace (there is no `teams` table and never was).
     Workspace(Uuid),
+    /// ONLINE-EVAL JUDGE SPEND for one workspace — `tenants.id`.
+    ///
+    /// **A SUB-LIMIT, NOT A SECOND WALLET, AND THE DIFFERENCE IS THE POINT.**
+    /// Every dollar counted here is ALSO counted against `Workspace` above.
+    /// `online_eval::judge_one` records to both, deliberately, in that order.
+    ///
+    /// It exists because a customer who turns on online evals needs a ceiling on
+    /// the judge specifically — judge spend scales linearly with traffic, and a
+    /// surprise bill churns them. It does NOT exist to hold judge money apart
+    /// from the workspace budget: doing that would make it invisible to the
+    /// budget and to `/v1/costs`, which is precisely how eval spend first gets
+    /// discovered on an invoice.
+    ///
+    /// If you are reading this because two limits look redundant: they are not
+    /// redundant, they are nested. Remove neither.
+    OnlineEvalJudge(Uuid),
 }
 
 /// Per-subject monthly spend, in micro-USD.

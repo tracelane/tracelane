@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tracelane"
-version = "0.2.3"
+version = "0.3.0"
 description = "Tracelane Python SDK — auto-instrument AI agent frameworks"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -32,11 +32,21 @@ Issues = "https://github.com/tracelane/tracelane/issues"
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.26.0"]
 openai = ["openai>=1.40.0"]
+# Framework extras. Each adapter was RUN against a real install on 2026-08-31 at
+# langchain-core 1.6.1, langgraph 1.2.11, llama-index-core 0.14.24, crewai 1.15.18.
+# The floors below are NOT verified — they are the conservative lower bounds we are
+# willing to claim, and nothing has been run against them.
 langchain = ["langchain-core>=0.2.0"]
+langgraph = ["langgraph>=0.2.0"]
+llamaindex = ["llama-index-core>=0.11.0"]
+crewai = ["crewai>=0.70.0"]
 all = [
  "tracelane[anthropic]",
  "tracelane[openai]",
  "tracelane[langchain]",
+ "tracelane[langgraph]",
+ "tracelane[llamaindex]",
+ "tracelane[crewai]",
 ]
 dev = [
  "pytest>=8.0.0",

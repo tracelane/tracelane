@@ -73,31 +73,62 @@ tlane trace 9f2c8a1b... --format timeline       # ASCII waterfall
 
 ### `tlane eval run` / `tlane eval list`
 
-Drive the eval suite from the command line. `eval run` shells out to the repo's
-vitest runner and is what CI calls; `eval list` reads the local eval index and is
-for humans.
+**The CI gate.** `eval run` runs a frozen dataset (or an inline case list)
+against a prompt version through the gateway and exits non-zero when the pass
+score falls below the `--threshold` floor. `eval list` shows recent eval runs in the
+workspace. Neither needs a checkout.
 
 ```bash
-tlane eval run                                  # all suites
-tlane eval run --suite gc                       # gateway-correctness only
-tlane eval run --suite gc                       # gateway-correctness only
-tlane eval run --suite ft --dry-run             # print the command, don't run it
-tlane eval list
+tlane eval run --prompt support-triage \
+               --dataset golden-cases \
+               --suite-file .tracelane/triage.eval.json \
+               --threshold 0.8
+tlane eval list --limit 20
 ```
 
-Suite ids: `all`, `ft` (fault-tolerance), `gc` (gateway-correctness),
-`is` (ingest-schema), `pir` (pii-redaction),
-`pi` (prompt-injection). An unrecognised id exits 2 rather than falling through
-to a full run — a wrong suite name in a deploy gate must fail loudly. The merge
-gate is `--suite all`.
+The prompt version comes from `--env` (default `staging`), so no UUID lives in a
+workflow file; `--version-id` pins one. The suite file holds the assertions and
+must declare at least one — a run that asserts nothing scores every case as
+passed, which would report 100% on the day the prompt breaks, so the CLI refuses
+it with exit 2 before spending a provider call.
 
-`eval run` takes only `--suite` and `--dry-run`; `eval list` takes no flags. Both
-need a checkout of the Tracelane repository, since the eval suites do not ship in
-the npm package.
+**The comparison, stated:** higher is better and `--threshold` is a **floor** —
+`--threshold 0.8` means "fail if the mean score is below 0.8". A **tie passes**
+(`score == threshold` exits 0), because a gate that fails on exactly the number
+you set is a gate nobody can configure. `--threshold` is a fraction in `[0,1]`,
+so a bare `80` is rejected rather than read as 8000%.
+
+**It thresholds the mean SCORE, not the pass rate.** For `contains`,
+`exact_match` and `json_schema` a case scores exactly `1.0` or `0.0`, so the mean
+*is* the pass rate. For an LLM judge the score is continuous, and there the two
+differ: a judge scoring 0.68 against a 0.70 rule and one scoring 0.02 are the
+same "failed" and very different results.
+
+**Errored cases are excluded from the mean**, not scored as zero. One provider
+`429` in a twenty-case run is not a quality problem. They are bounded separately by
+`--max-error-rate` (default `0.10`); above it, and for a run where every case
+errored, the verdict is **could not evaluate** (exit `3`) — never a pass and
+and never a statement about your prompt at all.
+
+**This gate asserts a FLOOR on a single run — it does not detect regressions.**
+There is no baseline, no history and no comparison: the same shape as a coverage
+threshold, which nobody considers broken for lacking a previous run. A run
+scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
+the second "no regression" would be a claim nothing checked. Comparing a run
+against an earlier one is a real gap and is filed, not built — what counts as
+the baseline is a design decision, not a flag.
+
+Exit codes: `0` pass · `1` below the floor · `2` bad invocation · `3` could not
+evaluate.
+
+**Changed in `0.3.0`:** this command used to shell out to the repo's vitest
+runner. To run Tracelane's own conformance suite from a checkout, use
+`pnpm eval:run --suite=all`; `--suite` remains registered and exits 2 with that
+pointer rather than failing as an unknown option.
 
 ### `tlane prompt list | show | promote | rollback | diff`
 
-Front-end for the B1 Prompt Promotion decision (ADR-009)
+Front-end for prompt promotion
 endpoints. Tenants pin a prompt version per environment, promote with a
 contract test, and roll back instantly.
 
@@ -140,7 +171,7 @@ tlane verify audit-2026-04.ndjson --tenant-pubkey <base64> --json   # machine-re
 **`--tenant-pubkey` is what makes the run mean something.** Without it the verifier checks the hash chain only: signature and Rekor-anchor verification never run, so a forged anchor would not be caught. The CLI therefore exits **non-zero with `INCOMPLETE`** whenever a ledger contains anchor records and no trusted key was supplied. Get the key out-of-band from Settings → Audit signing key, or `GET /v1/audit/pubkey` — not from the export itself.
 
 The Rust, Python, and TypeScript verifiers are **identical by construction**
-on the current `v2.1` format (ADR-050): each hashes the exported payload's
+on the current `v2.1` format: each hashes the exported payload's
 verbatim canonical string byte-for-byte, so there is no re-derivation to
 diverge on. The JS one is what `tlane verify` runs; CI tests all three against
 the same conformance vectors (`evals/audit-ledger/`), including the JS-unsafe
@@ -248,5 +279,3 @@ CI should gate on non-zero.
 - [Quickstart](./quickstart.md) — your first trace in 60 seconds
 - [API reference](./api-reference.md) — what the CLI calls
 - [Onboarding](./onboarding.md) — operator self-host checklist
-- ADR-009 — B1 Prompt Promotion (see the ADR index in the docs site)
-- ADR-011 — Path-to-live sequencing (see the ADR index in the docs site)

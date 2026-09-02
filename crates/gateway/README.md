@@ -27,7 +27,7 @@ Tracelane's Rust gateway — the performance-critical hot path.
 
 - Gateway overhead: <5ms p50, <15ms p95, <25ms p99
 - Predictive layer: <30ms p50, <50ms p99
-- Throughput: measured figures publish with the Reliability Benchmark v1.0. `PP-G3` is a live-perf eval that is SKIPPED in CI (it needs a real gateway), so no throughput number here is currently backed by a measurement.
+- Throughput: measured figures publish with the Reliability Benchmark v1.0. a live-perf eval is SKIPPED in CI (it needs a real gateway), so no throughput number here is currently backed by a measurement.
 
 ## Security invariants
 

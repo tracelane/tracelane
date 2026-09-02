@@ -1,6 +1,6 @@
 {
 	"name": "@tracelanedev/audit-verifier",
-	"version": "0.2.3",
+	"version": "0.3.0",
 	"description": "Reference verifier for Tracelane tamper-evident audit ledgers",
 	"repository": {
 		"type": "git",

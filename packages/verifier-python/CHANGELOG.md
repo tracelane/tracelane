@@ -5,6 +5,23 @@ All notable changes to `tracelane-audit-verifier` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this package
 is versioned in lockstep with the Rust and TypeScript reference verifiers.
 
+## [0.3.0] - 2026-09-01
+
+### Security
+- **An anchor that could not be checked no longer reads as verified.** When a ledger
+  carries anchor records but no trusted tenant public key is supplied, signature and
+  anchor verification does not run. Those anchors were previously skipped in silence
+  while the report could still carry `signatures_valid: true`, leaving a caller no way
+  to tell an unchecked anchor from a verified one. The report now carries
+  `anchors_unverified`; a non-zero value means `signatures_valid` is vacuous and a
+  caller must not report a pass. Exercised by the `forged-anchor` conformance vector.
+
+### Added
+- `anchors_unverified` on the verification report.
+
+### Changed
+- `cryptography` floor raised from 49.0.0 to 50.0.0.
+
 ## [0.2.3] - 2026-08-01
 
 ### Changed
@@ -25,7 +42,7 @@ is versioned in lockstep with the Rust and TypeScript reference verifiers.
 ## [0.2.1] - 2026-07-25
 
 ### Fixed
-- **Windowed verify (ADR-070).** A retention-windowed ledger — one whose genesis
+- **Windowed verify.** A retention-windowed ledger — one whose genesis
   (seq 0) has aged out of the loaded window — now verifies **GREEN** when it is
   rooted at a publicly-included Rekor anchor batch inside the window, instead of
   reporting a false **RED** (`seq_out_of_order`). `_verify_anchors_offline` now

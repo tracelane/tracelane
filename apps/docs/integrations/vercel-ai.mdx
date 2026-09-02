@@ -1,0 +1,131 @@
+---
+title: "Vercel AI SDK"
+description: "Send Vercel AI SDK traces to Tracelane, including steps and tool calls."
+classification: PUBLIC
+---
+
+The Vercel AI SDK is the one framework here that is **not** OpenTelemetry-native, so it
+does not use the exporter-only recipe the others do. It has its own telemetry API, and
+Tracelane ships an integration for it.
+
+<Note>
+  **Why this page is different.** As of `ai@7`, `generateText` emits no OpenTelemetry spans
+  by itself — the package has no `@opentelemetry/api` dependency. Passing
+  `experimental_telemetry: { isEnabled: true }` alone gets you nothing. The AI SDK instead
+  exposes `registerTelemetry()`, and `tracelaneTelemetry()` maps it onto OpenTelemetry.
+</Note>
+
+## What you get
+
+| | |
+|---|---|
+| **Agent structure** | **Yes** — one span per operation, per step, per model call and **per tool call**, correctly nested. |
+| **The LLM leg** | Yes, with token counts and finish reason, inside the tree. |
+| **Multi-step tool loops** | Yes — each step is its own span, so a tool-calling loop is visible as a tree rather than one flat call. |
+
+## Setup
+
+```bash
+npm install @tracelanedev/sdk \
+            @opentelemetry/sdk-trace-node \
+            @opentelemetry/exporter-trace-otlp-proto
+```
+
+```ts
+import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { registerTelemetry } from "ai";
+import { tracelaneTelemetry } from "@tracelanedev/sdk/vercel_ai";
+
+const provider = new NodeTracerProvider({
+  resource: resourceFromAttributes({ "service.name": "my-agent" }),
+  spanProcessors: [
+    new BatchSpanProcessor(
+      new OTLPTraceExporter({
+        url: "https://gateway.tracelane.dev/v1/traces",
+        headers: { "x-tracelane-api-key": process.env.TRACELANE_API_KEY! },
+      }),
+    ),
+  ],
+});
+provider.register();
+
+registerTelemetry(tracelaneTelemetry());
+```
+
+Then enable telemetry per call — the AI SDK requires this, and Tracelane cannot turn it on
+for you:
+
+```ts
+await generateText({
+  model,
+  prompt: "…",
+  experimental_telemetry: { isEnabled: true, functionId: "my-agent" },
+});
+```
+
+Your API key needs the **`ingest`** scope. Mint one in **Settings → API keys**.
+
+<Warning>
+  **Flush before your process exits.** `BatchSpanProcessor` buffers, so a short-lived script
+  or a serverless invocation can exit with spans still in memory and nothing will arrive.
+  Call `await provider.shutdown()` before exit. This is the single most common reason a
+  correct setup shows no traces.
+</Warning>
+
+## What a trace looks like
+
+A two-step tool-calling run, verified end to end against Tracelane production on
+2026-08-31 — **6 spans, 1 root, 5 parented, 0 orphans**, read back from storage:
+
+```
+ai.generateText                    (root)
+├── ai.step 0
+│   ├── ai.languageModelCall
+│   └── ai.toolCall lookup
+└── ai.step 1
+    └── ai.languageModelCall
+```
+
+## Span volume
+
+<Warning>
+  **An OTel span and a gateway call are not the same unit, and they are not counted the
+  same way.** A gateway request (the base-URL swap below) is one unit against your monthly
+  trace quota. On this path your app sends **spans**, and one agent run is many — the trace
+  above is 6 for a single `generateText`, and each extra step and tool call adds more. Do
+  not read "10K traces/mo" as "10,000 agent runs". Size against **spans per run**, and see
+  [pricing](/pricing).
+</Warning>
+
+## The alternative: the gateway base URL
+
+If you only need the model call and want routing, BYOK, guardrails, caching and budgets,
+point the SDK's provider at the Tracelane gateway instead:
+
+```ts
+import { createOpenAI } from "@ai-sdk/openai";
+
+const openai = createOpenAI({
+  baseURL: "https://gateway.tracelane.dev/v1",
+  apiKey: process.env.TRACELANE_API_KEY,
+});
+```
+
+| | Gateway base URL | `registerTelemetry` (above) |
+|---|---|---|
+| Captures the model call | yes | yes |
+| **Captures steps and tool calls** | **no** | **yes** |
+| Trace shape | one span per request | a nested tree |
+| Routing, BYOK, guardrails, caching | yes | no — calls go direct to your provider |
+
+They compose: run both and you get gateway features plus agent structure. Note the two do
+not currently join into a single trace — a gateway-proxied call does not adopt your agent's
+trace context, so it appears as its own single-span trace.
+
+<Note>
+  Earlier releases exported `instrumentVercelAI(ai)`. It never worked — it mutated the
+  imported `ai` module object, and ES module namespaces are read-only. It now throws an
+  error naming this replacement.
+</Note>

@@ -1,0 +1,163 @@
+# EVL-30 — proving the eval-gate composite action by RUNNING it.
+#
+# R199's class, and the reason this file exists: a workflow that looks right and
+# has never executed is not a proven workflow. Reading `action.yml` proves the
+# YAML parses; it does not prove the input plumbing binds, that `npx` resolves
+# the package, or — the one that matters — that a non-zero CLI exit actually
+# turns the step red. Only a runner proves those.
+#
+# `workflow_dispatch` ONLY. Every GitHub job is billed rounded up to a whole
+# minute, so this is opt-in and never fires on a push.
+name: EVL-30 eval-gate action proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt name on the proof tenant"
+        required: true
+        default: "evl30-gate-proof"
+      dataset:
+        description: "Frozen dataset name"
+        required: true
+        default: "evl30-gate-proof-1788080985"
+      version-id:
+        description: "Prompt version id"
+        required: true
+        default: "bb162c05-9511-4d20-89e1-93eabbb6fd0b"
+
+permissions:
+  contents: read
+
+jobs:
+  # Build ONCE and hand both jobs the same tarball, so the two cases differ only
+  # in the assertion they run — not in which bytes they ran.
+  build-cli:
+    # Host-neutral, same as 10 of ci.yml's 14 jobs: hosted runners on this
+    # account are billing-gated and a hardcoded `ubuntu-latest` job is
+    # refused before it starts ("recent account payments have failed").
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "22", cache: "pnpm" }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @tracelanedev/cli build
+      - name: Pack the CLI
+        working-directory: packages/cli
+        run: |
+          set -euo pipefail
+          # `pnpm pack`, NOT `npm pack`. The CLI depends on
+          # `@tracelanedev/audit-verifier: workspace:*`, and only pnpm rewrites
+          # the workspace protocol to a real version at pack time. An npm-packed
+          # tarball installs with EUNSUPPORTEDPROTOCOL, which surfaces as the
+          # gate "failing" for a reason that has nothing to do with any prompt.
+          pnpm pack --pack-destination "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP"/tracelanedev-cli-*.tgz "$RUNNER_TEMP/cli.tgz"
+          test -s "$RUNNER_TEMP/cli.tgz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cli-tarball
+          path: ${{ runner.temp }}/cli.tgz
+
+  # PROOF 1 — a satisfiable assertion. The step must go GREEN.
+  passes:
+    needs: build-cli
+    # Host-neutral, same as 10 of ci.yml's 14 jobs: hosted runners on this
+    # account are billing-gated and a hardcoded `ubuntu-latest` job is
+    # refused before it starts ("recent account payments have failed").
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "22" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cli-tarball
+          path: ${{ runner.temp }}
+      - run: |
+          printf '%s\n' '{"assertions":[{"kind":"contains","value":"OK"}],"model":"claude-haiku-4-5-20251001","suite_name":"gh-action-proof-pass"}' > suite.json
+      - id: gate
+        uses: ./.github/actions/eval-gate
+        with:
+          prompt: ${{ inputs.prompt }}
+          dataset: ${{ inputs.dataset }}
+          version-id: ${{ inputs['version-id'] }}
+          suite-file: suite.json
+          threshold: "0.8"
+          cli-package: ${{ runner.temp }}/cli.tgz
+          token: ${{ secrets.TRACELANE_API_KEY }}
+      - name: The gate step must have passed WITH EXIT 0
+        run: |
+          set -euo pipefail
+          code="$(cat "${RUNNER_TEMP}/tracelane-eval-gate-exit-code" 2>/dev/null || echo missing)"
+          echo "gate exit-code=$code"
+          # A step that never ran the CLI would leave no file. Asserting the
+          # value rather than the step's own green is what distinguishes "the
+          # gate passed" from "the gate did not run".
+          [ "$code" = "0" ] || { echo "::error::expected exit 0, got '$code'"; exit 1; }
+          echo "OK — a satisfiable suite exited 0 and the step stayed green."
+
+  # PROOF 2 — an unsatisfiable assertion. The step must go RED.
+  #
+  # `continue-on-error` is on the STEP so the job can inspect the outcome and
+  # then decide for itself. That is the only way to assert redness without the
+  # job dying first, and it is scoped to this proof — the action itself has no
+  # such escape hatch and must not gain one.
+  fails:
+    needs: build-cli
+    # Host-neutral, same as 10 of ci.yml's 14 jobs: hosted runners on this
+    # account are billing-gated and a hardcoded `ubuntu-latest` job is
+    # refused before it starts ("recent account payments have failed").
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "22" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cli-tarball
+          path: ${{ runner.temp }}
+      - run: |
+          printf '%s\n' '{"assertions":[{"kind":"contains","value":"ZZZ_NEVER_APPEARS"}],"model":"claude-haiku-4-5-20251001","suite_name":"gh-action-proof-fail"}' > suite.json
+      - id: gate
+        continue-on-error: true
+        uses: ./.github/actions/eval-gate
+        with:
+          prompt: ${{ inputs.prompt }}
+          dataset: ${{ inputs.dataset }}
+          version-id: ${{ inputs['version-id'] }}
+          suite-file: suite.json
+          threshold: "0.8"
+          cli-package: ${{ runner.temp }}/cli.tgz
+          token: ${{ secrets.TRACELANE_API_KEY }}
+      # ASSERT THE EXIT CODE, NOT MERELY THAT IT FAILED.
+      #
+      # Earned on this workflow's own first run: `npx` treated the tarball path
+      # as a command, died with 126 "Permission denied", and an assertion that
+      # only checked `outcome == failure` went GREEN. It reported that the gate
+      # blocks a below-the-floor run while having proven nothing of the kind — the exact
+      # shape this whole feature exists to prevent, in the test for it.
+      #
+      # 1 is the ONLY code that means "your prompt got worse". 2, 3 and 126 all
+      # fail the step too, and none of them is what this job is proving.
+      - name: The gate step must have failed WITH EXIT 1 (scored below the floor)
+        run: |
+          set -euo pipefail
+          outcome="${{ steps.gate.outcome }}"
+          code="$(cat "${RUNNER_TEMP}/tracelane-eval-gate-exit-code" 2>/dev/null || echo missing)"
+          echo "gate step outcome=$outcome exit-code=$code"
+          if [ "$outcome" != "failure" ]; then
+            echo "::error::the eval gate did NOT fail the step on a below-floor run."
+            echo "A green here would mean every customer's merge gate is decorative."
+            exit 1
+          fi
+          if [ "$code" != "1" ]; then
+            echo "::error::the step failed with exit '$code', not 1."
+            echo "It failed for the WRONG REASON — 2 is a bad invocation, 3 is"
+            echo "could-not-evaluate, 126 is npx failing to start the CLI at all."
+            echo "None of those proves the gate blocks a below-floor run."
+            exit 1
+          fi
+          echo "OK — a below-floor run exited 1 and turned the step red."

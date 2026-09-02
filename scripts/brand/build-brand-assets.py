@@ -47,27 +47,150 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# THE GEOMETRY. 100x100 grid, y down. Stroke S=12, counter gap G=10, all
-# diagonals exactly 45 degrees. This is the single source of truth for the mark.
-# ─────────────────────────────────────────────────────────────────────────────
-S, G = 12, 10
+# THE GEOMETRY. 100x100 grid, y down. This is the single source of truth for the
+# mark, and every artifact below is derived from it.
+#
+# THE MARK — an aperture. Four crop corners capturing a centre, with a span
+# entering from both edges. Founder's brief: "a span captured in a box,
+# concentric circles in centre".
+#
+# IT IS TRANSCRIBED FROM `apps/site/src/components/Logo.astro`, NOT REDRAWN.
+# That component shipped the mark to tracelane.dev first and carried a written
+# note that `brand/` still generated the retired geometric T monogram — "THE SITE
+# AND THE BRAND SET DISAGREE ... a known, deliberate, temporary divergence".
+# This file is what ends it. The numbers below are the component's numbers; if
+# the mark changes, it changes in BOTH, and the drift guard is that they are the
+# same numbers written twice, once per language. There is no generator that can
+# emit an Astro component.
+#
+# TWO OPTICAL CUTS, and the second is not a nicety. A ring-and-ring centre goes
+# sub-pixel at favicon size: three concentric bands cannot each hold 1.5px inside
+# 16px, and pretending otherwise ships mush. Below SMALL_AT the mark drops to a
+# simplified cut — thicker corners, one solid centre, no rings. Same silhouette,
+# legible where the full cut is not. `_cut_for()` picks; nothing else decides.
+S, G = 12, 10  # retained: the retired T monogram's stroke/counter, cited by docs.
 
-# Component 1 — top bar + left riser + left stem. The bar's bottom-right is chamfered
-# 45 degrees; the left arm's bottom-left is chamfered; the stem ends on a 45 cut.
-BAR_TOP = [(2, 2), (96, 2), (84, 14), (2, 14)]
-LEFT_ARM = [(2, 14), (14, 14), (14, 28), (44, 28), (44, 40), (12, 40), (2, 30)]
-STEM_LEFT = [(32, 40), (44, 40), (44, 86), (32, 98)]
+# The mark's own box is 8..92 on BOTH axes — deliberately square, so every square
+# surface (favicon, app icon, PWA tile, avatar) centres it without hand-nudging.
+BOX_LO, BOX_HI = 8.0, 92.0
+# The retired T monogram spanned 2..98. Every `pad` in `outputs()` was tuned against
+# THAT box, so the new mark is expanded onto it rather than re-tuning 38 pad values —
+# which would be 38 chances to change an asset nobody asked to change.
+EXPAND = (98.0 - 2.0) / (BOX_HI - BOX_LO)
 
-# Component 2 — the diagonal riser and right arm, separated from component 1 by the
-# 45-degree counter. Its edge (84,28)->(96,16) is PARALLEL to the bar's chamfer
-# (96,2)->(84,14); the two lines are x+y=112 and x+y=98, so the counter is
-# 14/sqrt(2) = 9.9 wide — the same 10 as the vertical gap between the stems.
-RIGHT_ARM = [(96, 16), (96, 28), (84, 40), (54, 40), (54, 28), (84, 28)]
-STEM_RIGHT = [(54, 40), (66, 40), (66, 64), (78, 64), (54, 88)]
 
-MARK = [BAR_TOP, LEFT_ARM, STEM_LEFT, RIGHT_ARM, STEM_RIGHT]
+def _e(v: float) -> float:
+    """Expand a 8..92 coordinate onto the 2..98 box the pads were tuned for."""
+    return (v - 50.0) * EXPAND + 50.0
+
+
+def _corners(arm: float, t: float) -> list[tuple]:
+    """Four L-shaped crop corners. `arm` = leg length, `t` = stroke.
+
+    Each is the same six-point L, mirrored into a quadrant — written as one point
+    list per corner rather than a clever transform, because a sign error in a
+    mirror is invisible and a wrong vertex is not.
+    """
+    i = 8 + t
+    a = 8 + arm
+    b = 92 - arm
+    c = 92 - t
+    return [
+        ("poly", [(8, 8), (a, 8), (a, i), (i, i), (i, a), (8, a)]),
+        ("poly", [(92, 8), (b, 8), (b, i), (c, i), (c, a), (92, a)]),
+        ("poly", [(8, 92), (a, 92), (a, c), (i, c), (i, b), (8, b)]),
+        ("poly", [(92, 92), (b, 92), (b, c), (c, c), (c, b), (92, b)]),
+    ]
+
+
+def _expand_shapes(shapes: list[tuple]) -> list[tuple]:
+    out = []
+    for sh in shapes:
+        if sh[0] == "poly":
+            out.append(("poly", [(_e(x), _e(y)) for x, y in sh[1]]))
+        elif sh[0] == "disc":
+            _, cx, cy, r = sh
+            out.append(("disc", _e(cx), _e(cy), r * EXPAND))
+        elif sh[0] == "ring":
+            _, cx, cy, r, w = sh
+            out.append(("ring", _e(cx), _e(cy), r * EXPAND, w * EXPAND))
+        else:
+            raise ValueError(sh[0])
+    return out
+
+
+# THE FULL CUT. The span bars stop at the bracket line rather than the canvas edge:
+# that is what keeps the bounding box square, and each bar ends exactly where the
+# outer ring's outer edge lands (25.5). Two concentric RINGS, hollow centre —
+# "concentric circles in centre, not circle + dot": a ring plus a filled dot is one
+# circle and a disc; two rings is the thing the word describes.
+MARK_FULL = _expand_shapes(
+    _corners(26, 12)
+    + [("poly", [(8, 44), (25.5, 44), (25.5, 56), (8, 56)])]
+    + [("poly", [(74.5, 44), (92, 44), (92, 56), (74.5, 56)])]
+    + [("ring", 50, 50, 22, 7), ("ring", 50, 50, 8.5, 6)]
+)
+
+# THE SMALL CUT. Solid centre, so the bars run to ITS edge rather than the ring's.
+MARK_SMALL = _expand_shapes(
+    _corners(30, 14)
+    + [("poly", [(8, 44), (34, 44), (34, 56), (8, 56)])]
+    + [("poly", [(66, 44), (92, 44), (92, 56), (66, 56)])]
+    + [("disc", 50, 50, 16)]
+)
+
+# Below this rendered pixel size the mark drops to the simplified cut.
+#
+# 20 IS `Logo.astro`'s OWN THRESHOLD, and it is not copied on trust — `--selftest`
+# re-derives it. The binding constraint is that each of the three concentric bands
+# (outer stroke · the gap · inner stroke) must hold ~1.5px, which is the floor the
+# component states from its own 1x-DPR measurements. `_narrowest_band_px()` computes
+# that width from the ring geometry itself, and the selftest asserts it CLEARS the
+# floor at SMALL_AT and MISSES it one pixel below. Change this constant and that
+# two-sided assertion is what argues back.
+SMALL_AT = 20
+
+# The band width `Logo.astro` ITSELF judged acceptable at that threshold, in device
+# px: its raw inner stroke is 6 units on a 100-unit box drawn at SMALL_AT px with no
+# padding, so 6 * SMALL_AT / 100 = 1.20px.
+#
+# THIS NUMBER IS DERIVED, NOT CHOSEN TO MAKE THE ASSERTION PASS. The first version of
+# this said 1.5px, which sounded right and was simply invented — the selftest measured
+# 1.23px and refused, which is the whole reason to compute a threshold instead of
+# asserting one. The 1.5px figure in the component's prose is about 16px, where the
+# bands genuinely cannot hold; it was never the pass mark at 20.
+#
+# What the selftest then holds is a real property: the PADDED raster must never ship a
+# thinner band at a given nominal size than the UNPADDED component does. Padding and
+# EXPAND nearly cancel (0.9 * 1.143 = 1.029), which is why both land on 20 — but that
+# is a result here, not an assumption, and retuning either one breaks it loudly.
+BAND_FLOOR_PX = 6 * SMALL_AT / 100
+
+
+def _cut_for(size: int) -> list[tuple]:
+    return MARK_SMALL if size < SMALL_AT else MARK_FULL
+
+
+def _narrowest_band_px(size: int, pad: float) -> float:
+    """Width, in device px, of the thinnest concentric band in the FULL cut.
+
+    Three bands read as "concentric" only if each survives: the outer ring's stroke,
+    the gap between the rings, and the inner ring's stroke. Derived from the ring
+    shapes rather than written down, so retuning a stroke moves this automatically.
+    """
+    rings = [sh for sh in MARK_FULL if sh[0] == "ring"]
+    outer, inner = max(rings, key=lambda r: r[3]), min(rings, key=lambda r: r[3])
+    gap = (outer[3] - outer[4] / 2) - (inner[3] + inner[4] / 2)
+    scale = (size - 2 * (size * pad)) / 100.0
+    return min(outer[4], inner[4], gap) * scale
+
+
+# `MARK` is the full cut — the reference geometry for the SVG masters and lockups,
+# which are vector and have no pixel size to switch on.
+MARK = MARK_FULL
 
 INK = "#0D0D0D"  # ADR-074 §8: the mark is never coloured.
+SITE_INK = "#15181f"  # apps/site's own --color-fg; see the favicon entry in outputs().
 PAPER = "#FFFFFF"
 
 TAGLINE = "THE FLIGHT RECORDER FOR AI AGENTS"
@@ -79,13 +202,29 @@ FONT_STACK = "Inter, 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif"
 # ─────────────────────────────────────────────────────────────────────────────
 # Rasterizer — scanline polygon fill with NxN supersampling. Exact for straight edges.
 # ─────────────────────────────────────────────────────────────────────────────
-def _coverage(polys, size: int, pad: float, ss: int = 0) -> list[float]:
-    """Per-pixel coverage 0..1 of `polys` (100-unit space) rendered into size x size.
+def _coverage(shapes, size: int, pad: float, ss: int = 0) -> list[float]:
+    """Per-pixel coverage 0..1 of `shapes` (100-unit space) rendered into size x size.
 
-    Supersampling is adaptive: small sizes are where antialiasing quality actually
-    shows, and a 1024px render at 4x would allocate a 16.7M-cell buffer in pure Python
-    for no visible gain (and this machine has an OOM history).
+    TWO RASTERIZERS, because the mark has two kinds of edge and one of them cannot
+    be supersampled honestly.
+
+    Polygons go through the scanline fill below, unchanged and exact for straight
+    edges. Supersampling is adaptive: small sizes are where antialiasing quality
+    actually shows, and a 1024px render at 4x would allocate a 16.7M-cell buffer in
+    pure Python for no visible gain (and this machine has an OOM history).
+
+    Discs and rings are computed ANALYTICALLY at final resolution instead, from the
+    distance to the centre. That is not a shortcut, it is the correct instrument:
+    supersampling drops to 2x above 256px, which gives a curve five alpha levels and
+    visible stair-stepping, while the analytic form is exact at any size for free.
+    It also sidesteps the reason a ring cannot be a polygon here — `acc[...] = 1` is
+    a SET, so shapes UNION and nothing can subtract a hole.
+
+    The two are combined with `max()`, which is the same union the polygon pass does
+    internally, so an overlap brightens nothing.
     """
+    polys = [sh[1] for sh in shapes if sh[0] == "poly"]
+    circles = [sh for sh in shapes if sh[0] in ("disc", "ring")]
     if ss == 0:
         ss = 4 if size <= 256 else 2
     n = size * ss
@@ -121,6 +260,27 @@ def _coverage(polys, size: int, pad: float, ss: int = 0) -> list[float]:
                 row = (py * ss + dy) * n + px * ss
                 t += sum(acc[row : row + ss])
             out[py * size + px] = t * inv
+
+    # Analytic pass. `scale`/`off` above are in SUBSAMPLE space; these are the same
+    # transform at final resolution. Only the shape's bounding box is walked — a full
+    # canvas sweep per circle is ~1M pure-Python iterations at 1024px, for nothing.
+    fscale, foff = scale / ss, off / ss
+    for sh in circles:
+        cx, cy, r = sh[1] * fscale + foff, sh[2] * fscale + foff, sh[3] * fscale
+        half = (sh[4] * fscale) / 2.0 if sh[0] == "ring" else 0.0
+        reach = r + half + 1.0
+        for py in range(max(0, int(cy - reach)), min(size, int(cy + reach) + 1)):
+            dy2 = (py + 0.5 - cy) ** 2
+            base = py * size
+            for px in range(max(0, int(cx - reach)), min(size, int(cx + reach) + 1)):
+                d = (dy2 + (px + 0.5 - cx) ** 2) ** 0.5
+                # 1px-wide antialiasing band with its 50% point ON the true edge.
+                a = (r - d + 0.5) if half == 0.0 else (half - abs(d - r) + 0.5)
+                if a <= 0.0:
+                    continue
+                i = base + px
+                a = min(a, 1.0)
+                out[i] = max(out[i], a)
     return out
 
 
@@ -155,7 +315,7 @@ def render_png(
     size: int, *, ink: str, bg: str | None, shape: str = "none", pad: float = 0.06
 ) -> bytes:
     """Render the mark. bg=None -> transparent. shape: none|square|circle."""
-    cov = _coverage(MARK, size, pad)
+    cov = _coverage(_cut_for(size), size, pad)
     ir, ig, ib = _hex(ink)
     br, bg_, bb = _hex(bg) if bg else (0, 0, 0)
     if shape == "circle":
@@ -221,23 +381,59 @@ def build_ico(pngs: list[tuple[int, bytes]]) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 # SVG
 # ─────────────────────────────────────────────────────────────────────────────
-def _paths(fill: str, dx: float = 0, dy: float = 0, scale: float = 1.0) -> str:
+def _paths(
+    fill: str,
+    dx: float = 0,
+    dy: float = 0,
+    scale: float = 1.0,
+    shapes: list[tuple] | None = None,
+) -> str:
+    """Emit MARK as SVG under one `<g fill>`.
+
+    Rings carry `fill="none"` and their own `stroke`/`stroke-width` at the element,
+    because the group fill would otherwise flood them solid — the ring is the one
+    shape here whose ink is its OUTLINE, not its area.
+    """
     out = []
-    for poly in MARK:
-        d = (
-            "M "
-            + " L ".join(f"{x * scale + dx:g},{y * scale + dy:g}" for x, y in poly)
-            + " Z"
-        )
-        out.append(f'    <path d="{d}"/>')
+    for sh in shapes if shapes is not None else MARK:
+        if sh[0] == "poly":
+            d = (
+                "M "
+                + " L ".join(f"{x * scale + dx:g},{y * scale + dy:g}" for x, y in sh[1])
+                + " Z"
+            )
+            out.append(f'    <path d="{d}"/>')
+        elif sh[0] == "disc":
+            _, cx, cy, r = sh
+            out.append(
+                f'    <circle cx="{cx * scale + dx:g}" cy="{cy * scale + dy:g}" '
+                f'r="{r * scale:g}"/>'
+            )
+        else:
+            _, cx, cy, r, w = sh
+            out.append(
+                f'    <circle cx="{cx * scale + dx:g}" cy="{cy * scale + dy:g}" '
+                f'r="{r * scale:g}" fill="none" stroke="{fill}" '
+                f'stroke-width="{w * scale:g}"/>'
+            )
     return f'  <g fill="{fill}">\n' + "\n".join(out) + "\n  </g>"
 
 
-def svg_mark(fill: str) -> str:
+def svg_mark(fill: str, *, small: bool = False) -> str:
+    """The standalone mark. `small=True` emits the simplified favicon cut.
+
+    A favicon SVG has no fixed size — the browser draws it into a 16-32px slot — so
+    it gets the small cut for the same reason `favicon-16.png` does. The `brand/svg`
+    masters and the lockups stay on the full cut: they are placed at display sizes.
+    """
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" '
-        f'height="100" role="img" aria-label="Tracelane">\n  <title>Tracelane</title>\n'
-        f"{_paths(fill)}\n</svg>\n"
+        f'height="100" role="img" aria-label="Tracelane">\n'
+        # This exact file was hand-authored once, while the generator still emitted
+        # the retired monogram — the divergence the module docstring exists to stop.
+        f"  <!-- GENERATED by scripts/brand/build-brand-assets.py. Do not hand-edit. -->\n"
+        f"  <title>Tracelane</title>\n"
+        f"{_paths(fill, shapes=MARK_SMALL if small else MARK_FULL)}\n</svg>\n"
     )
 
 
@@ -450,8 +646,48 @@ def outputs() -> list[tuple[str, str, dict]]:
             {"fill": PAPER, "stacked": False, "tagline": False},
         )
     )
-    o.append(("apps/docs/favicon.svg", "svg_mark", {"fill": INK}))
+    o.append(("apps/docs/favicon.svg", "svg_mark", {"fill": INK, "small": True}))
+
+    # Marketing site (apps/site). GENERATED HERE, not hand-kept: this file was
+    # hand-authored while `brand/` still emitted the retired T monogram, which is
+    # exactly the second-source-of-truth the module docstring exists to prevent.
+    #
+    # Its ink is the SITE's foreground token (`apps/site/src/styles/global.css:122`),
+    # not the brand INK — deliberately. Each surface draws the mark in its own text
+    # colour (site #15181f · app `--logo-ink` · brand assets #0D0D0D); the founder
+    # asked for one MARK, and unifying the palettes on top of that would be a visible
+    # change to the live site that nobody requested.
+    o.append(
+        ("apps/site/public/favicon.svg", "svg_mark", {"fill": SITE_INK, "small": True})
+    )
+    # The marketing site had NO apple-touch icon, so an iOS "Add to Home Screen"
+    # fell back to a screenshot of the page — the one surface where the mark was
+    # not the icon. Generated in the same polarity as the app's (white mark on the
+    # brand ink, iOS superellipse padding), because a home-screen tile is chrome we
+    # do not control and must read at 60px, not the site's own light canvas.
+    o.append(
+        (
+            "apps/site/public/apple-touch-icon.png",
+            "png",
+            {"size": 180, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
+        )
+    )
     return o
+
+
+# EVERY ROOT THAT A BROWSER WILL ASK FOR `/favicon.ico` BY DEFAULT.
+#
+# It shipped to `brand/` only, and `https://app.tracelane.dev/favicon.ico` and
+# `https://tracelane.dev/favicon.ico` both returned **404** — measured, not assumed.
+# Declaring `<link rel="icon">` does not retire the default request: crawlers, link-preview
+# bots, feed readers and older browsers ask for the well-known path regardless, and a 404
+# there is a blank icon on surfaces we never see. The ICO carries 16/32/48/64/128/256, so
+# `_cut_for` puts the simplified cut in the 16 and the full cut in the rest, inside one file.
+ICO_PATHS = (
+    "brand/png/favicon.ico",
+    "apps/web/public/favicon.ico",
+    "apps/site/public/favicon.ico",
+)
 
 
 def render(kind: str, kw: dict) -> bytes:
@@ -487,9 +723,11 @@ def build(dest: Path) -> list[Path]:
             for s in (16, 32, 48, 64, 128, 256)
         ]
     )
-    p = dest / "brand/png/favicon.ico"
-    p.write_bytes(ico)
-    written.append(p)
+    for rel in ICO_PATHS:
+        p = dest / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(ico)
+        written.append(p)
     return written
 
 
@@ -609,16 +847,29 @@ def verify(dest: Path) -> int:
     """Every PNG must carry a real mark. Fails on blank, transparent, or solid."""
     bad = []
     checked = 0
-    for rel, kind, _ in outputs():
+    for rel, kind, kw in outputs():
         p = dest / rel
         if not p.exists():
             bad.append((rel, "MISSING"))
             continue
         if kind != "png":
+            # Count BOTH element kinds. This asserted `<path` alone, which the ring
+            # geometry emits as `<circle>` — so an SVG master missing both of its
+            # concentric rings would have verified clean.
             t = p.read_text()
-            if "<path" not in t or t.count("<path") < len(MARK):
+            cut = MARK_SMALL if kw.get("small") else MARK_FULL
+            want_p = sum(1 for sh in cut if sh[0] == "poly")
+            want_c = len(cut) - want_p
+            got_p, got_c = t.count("<path"), t.count("<circle")
+            if got_p < want_p or got_c < want_c:
                 bad.append(
-                    (rel, f"SVG has {t.count('<path')} paths, expected {len(MARK)}")
+                    (
+                        rel,
+                        (
+                            f"SVG has {got_p} path(s) + {got_c} circle(s), "
+                            f"expected {want_p} + {want_c}"
+                        ),
+                    )
                 )
             continue
         checked += 1
@@ -641,9 +892,10 @@ def verify(dest: Path) -> int:
                         f"bbox {bw}x{bh} is {fill:.1%} filled — a solid block, not a mark",
                     )
                 )
-    ico = dest / "brand/png/favicon.ico"
-    if not ico.exists() or ico.stat().st_size < 1000:
-        bad.append(("brand/png/favicon.ico", "missing or too small"))
+    for rel in ICO_PATHS:
+        ico = dest / rel
+        if not ico.exists() or ico.stat().st_size < 1000:
+            bad.append((rel, "missing or too small"))
 
     if bad:
         print(f"✗ {len(bad)} asset(s) FAILED verification:")
@@ -738,6 +990,31 @@ def selftest() -> int:
         print(f"  selftest: real mark misjudged ({frac:.2%}) ✗")
         ok = False
 
+    # SMALL_AT IS MEASURED HERE, NOT ASSERTED BY A COMMENT. The full cut is usable
+    # only while all three concentric bands (outer stroke · gap · inner stroke) clear
+    # the ~1.5px floor. BOTH directions are checked: a one-sided test would pass with
+    # SMALL_AT set to any larger number, which is how a threshold quietly becomes
+    # decoration. Move the constant or retune a stroke and this argues back.
+    _at = _narrowest_band_px(SMALL_AT, 0.05)
+    _below = _narrowest_band_px(SMALL_AT - 1, 0.05)
+    if _at >= BAND_FLOOR_PX > _below:
+        print(
+            f"  selftest: SMALL_AT={SMALL_AT} sits on the measured floor → PASSES ✓"
+            f" ({_at:.2f}px at it, {_below:.2f}px below, floor {BAND_FLOOR_PX}px)"
+        )
+    else:
+        print(
+            f"  selftest: SMALL_AT={SMALL_AT} is NOT the floor"
+            f" ({_at:.2f}px at it, {_below:.2f}px below) ✗"
+        )
+        ok = False
+
+    if _cut_for(SMALL_AT) is MARK_FULL and _cut_for(SMALL_AT - 1) is MARK_SMALL:
+        print("  selftest: _cut_for switches AT SMALL_AT → PASSES ✓")
+    else:
+        print("  selftest: _cut_for does not switch at SMALL_AT ✗")
+        ok = False
+
     tiny = render_png(size=16, ink=INK, bg=PAPER, shape="none", pad=0.03)
     i = inspect(tiny)
     if i["mark_px"] >= 20:
@@ -788,7 +1065,7 @@ def main() -> int:
     if args.check_refs:
         return check_refs()
     if args.ascii:
-        cov = _coverage(MARK, 52, 0.02)
+        cov = _coverage(_cut_for(52), 52, 0.02)
         for y in range(52):
             print(
                 "".join(

@@ -50,7 +50,14 @@ export { instrumentLiteLLM } from "./instrumentations/litellm.js";
 export { instrumentOpenRouter } from "./instrumentations/openrouter.js";
 export { instrumentLangGraph } from "./instrumentations/langgraph.js";
 export { instrumentOpenAIAgents } from "./instrumentations/openai_agents.js";
-export { instrumentVercelAI } from "./instrumentations/vercel_ai.js";
+// B-313: `tracelaneTelemetry` is the working integration — the AI SDK is not
+// OTel-native, so it needs `registerTelemetry()`, not a module patch.
+// `instrumentVercelAI` is kept as a throwing stub that names the replacement,
+// because silently dropping an export is worse than a loud, actionable error.
+export {
+	tracelaneTelemetry,
+	instrumentVercelAI,
+} from "./instrumentations/vercel_ai.js";
 export { instrumentMCP } from "./instrumentations/mcp.js";
 export { instrumentClaudeCode } from "./instrumentations/claude_code.js";
 export { instrumentCursor } from "./instrumentations/cursor.js";

@@ -11,12 +11,22 @@ const links = [
 ---
 
 <header class="site-header sticky top-0 z-50">
+  <!-- EVERY CELL IS PLACED EXPLICITLY (`col-start-*`), and that is the whole fix.
+       The columns are `1fr auto 1fr` and the three children used to rely on AUTO
+       PLACEMENT. Below `md` the nav is `hidden`, and a grid item with
+       `display:none` is removed from the grid ENTIRELY — so there were only two
+       items left and the CTA auto-placed into column 2, not column 3. Measured at
+       390px: the CTA sat at x=156-234 with 156px of empty bar to its right, while
+       at 768px it correctly sat 17px from the edge. A `justify-self-end` cannot
+       fix that, because the element was in the wrong COLUMN, not misaligned
+       inside the right one. With all three placed by hand, hiding the nav can no
+       longer move anything. -->
   <div class="site-bar grid h-[4rem] items-center" style="grid-template-columns:1fr auto 1fr">
-    <a href="/" class="flex items-center text-fg justify-self-start" aria-label="tracelane home">
+    <a href="/" class="col-start-1 flex items-center text-fg justify-self-start" aria-label="tracelane home">
       <Logo size={26} />
     </a>
 
-    <nav aria-label="Primary" class="hidden md:block justify-self-center">
+    <nav aria-label="Primary" class="col-start-2 hidden md:block justify-self-center">
       <ul class="flex items-center gap-6 text-sm text-fg-muted">
         {links.map((l) => (
           <li>
@@ -30,7 +40,7 @@ const links = [
       </ul>
     </nav>
 
-    <div class="flex items-center gap-2 justify-self-end">
+    <div class="col-start-3 flex items-center gap-2 justify-self-end">
       <a href="https://github.com/tracelane" class="hidden sm:inline-flex text-sm text-fg-muted hover:text-fg transition-colors" rel="me noopener">GitHub</a>
       <a href="https://app.tracelane.dev/sign-in" class="btn-primary btn-sm">Start free</a>
     </div>

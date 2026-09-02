@@ -4,7 +4,22 @@
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-01
+
+### Security
+- **`tlane verify` fails closed when anchors could not be checked.** A ledger carrying
+  anchor records verified without a trusted tenant key reported a pass, printing
+  `signatures_valid: true` over an anchor that was never checked — `signatures_valid`
+  is vacuously true in chain-only mode. The status is now `INCOMPLETE` and the command
+  exits non-zero, so a verification that could not run can no longer read as one that
+  passed. Requires `@tracelanedev/audit-verifier` 0.3.0, which this release depends on.
+
+### Added
+- **`tlane eval`** — runs a prompt evaluation against a dataset and fails a build when
+  the mean score falls below a floor you set (`--threshold`). Errored cases are excluded
+  from the score and bounded separately by `--max-error-rate`, so a provider `429`
+  cannot be mistaken for a quality drop. Exit codes are distinct by design: `0` pass,
+  `1` below the floor, `2` usage error, `3` could not evaluate.
 
 ### Added
 - **`tlane init` now scaffolds the `.env`, installs the SDK, and wires the
@@ -74,7 +89,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [0.2.1] - 2026-07-25
 
 ### Fixed
-- **`tlane verify` inherits the ADR-070 windowed-verify fix.** The CLI embeds
+- **`tlane verify` inherits the windowed-verify fix.** The CLI embeds
   `@tracelanedev/audit-verifier` (`workspace:*` → pinned at publish time), so
   0.2.1 ships the 0.2.1 verifier: a retention-windowed ledger whose genesis has
   aged out now verifies **GREEN** when rooted at a public Rekor anchor inside the

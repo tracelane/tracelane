@@ -7,7 +7,7 @@ classification: PUBLIC
 
 # Admin audit log
 
-> **Authoritative design:** [ADR-031](/decisions/index). **Schema:** [migration 11](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql).
+> **Schema:** [migration 11](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql).
 
 Every mutating admin action — API-key creation, BYOK provider-key
 rotation, prompt promotion, billing subscription change, member
@@ -98,7 +98,6 @@ gateway control surface — the table you query during an internal
 incident review.
 
 **Is not:** The tamper-evident *agent* event ledger
-([ADR-018](/decisions/index)).
 That ledger captures the runtime behaviour of customer agents (LLM
 calls, tool calls, guardrail decisions) with a tamper-evident SHA-256
 hash chain and customer-runnable verifier CLIs (Ed25519 batch signing
@@ -113,12 +112,12 @@ V1 ships without an automated retention/archive job. The table is
 expected to grow ~100 rows/workspace/day at active use, ~36 K rows
 per workspace per year — well within Postgres comfort for the V1
 single-Neon-region deployment. A V1.1 archive job moves rows older
-than 18 months to R2 cold-tier following the [ADR-022](/decisions/index) tiered-storage pattern.
+than 18 months to R2 cold-tier following a tiered-storage pattern.
 
 ## V1 vs V1.1 wiring status
 
-ADR-031 §"V1 wiring scope" tracks the wired-and-pending list. V1
-ships three demo call sites (api-keys POST + DELETE, prompts
+V1
+ships three call sites (api-keys POST + DELETE, prompts
 promote); V1.1 sweep wires the remaining ~12 mutating admin
 endpoints. Each unwired endpoint still writes its mutation to
 Postgres; only the audit trail row is missing — call this out in any

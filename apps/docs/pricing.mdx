@@ -19,9 +19,34 @@ Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident aud
 | **Audit SKU** | +$999/mo | Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), plus the complete ledger export in the offline-verifier wire format — verify it yourself with `tlane verify --tenant-pubkey`, no Tracelane involvement. See [Audit Ledger](/audit-ledger) for protocol details. |
 
 <Note>
-**One meter.** Quotas are counted once per gateway request against a single monthly
-trace counter — there is no second gateway-call budget to track or run out of.
+**One meter for gateway traffic.** Requests through the Tracelane gateway are counted
+once each against a single monthly trace counter — there is no second gateway-call
+budget to track or run out of.
 </Note>
+
+<Warning>
+**If you send OpenTelemetry spans, the unit is different — read this before choosing a
+plan.** Pointing an OTel exporter at Tracelane (the
+[framework integrations](/integrations/langchain)) does not go through the gateway, so it
+does not consume the gateway trace counter. It is bounded instead by a **per-tenant
+monthly span limit**, and **one agent run is many spans**.
+
+Measured on 2026-08-31 with the standard community instrumentors:
+
+| One run of… | Spans |
+|---|---|
+| a LangChain `prompt \| model \| parser` chain | **4** |
+| a two-node LangGraph agent | **11** |
+| a LlamaIndex `llm.complete()` | **1** |
+| a two-step Vercel AI tool-calling run | **6** |
+
+So **"10K traces/mo" is not "10,000 agent runs"** — on the Free plan, whose span limit
+equals its headline number, a LangGraph agent at 11 spans per run works out to roughly
+**900 runs a month**. A crew-style framework that retries tasks emits more still.
+
+Size against **spans per run**, not runs. If you are unsure, run your agent once against a
+free account and look at the span count on the trace before you commit to a plan.
+</Warning>
 
 <Note>
 **Retention.** Stored traces are kept up to a 365-day maximum. Retention is not

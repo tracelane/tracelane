@@ -1,0 +1,115 @@
+name: "Tracelane eval gate"
+description: "Run a frozen dataset or suite against a prompt version and fail the job when the mean score is below a threshold you set."
+branding: { icon: "check-circle", color: "gray-dark" }
+
+inputs:
+  prompt:
+    description: "Prompt name to evaluate."
+    required: true
+  suite-file:
+    description: >
+      JSON file holding the `assertions` array (and optionally inline `cases`).
+      REQUIRED and must declare at least one assertion: a run with no assertions
+      scores every case as passed, so the gate would be green on the day the
+      prompt breaks.
+    required: true
+  threshold:
+    description: >
+      FLOOR on the mean score, as a FRACTION in 0..1. Higher is better: the job
+      FAILS if the mean score is below this, and a TIE PASSES (score ==
+      threshold exits 0). Use 0.8 for 80%; a bare 80 is rejected, not read as
+      8000%.
+    required: true
+  dataset:
+    description: "Frozen dataset name or id to draw cases from. Omit to use the suite file's inline `cases`."
+    required: false
+  env:
+    description: "Resolve the prompt version routed to this environment. Default staging, so no UUID lives in the workflow."
+    required: false
+    default: "staging"
+  version-id:
+    description: "Pin an exact prompt version id instead of resolving --env."
+    required: false
+  max-error-rate:
+    description: "Above this fraction of errored cases the verdict is cannot-evaluate (exit 3) — the gate did not measure your prompt, which is not the same as it failing. Default 0.10."
+    required: false
+    default: "0.10"
+  model:
+    description: "Override the version's model pin."
+    required: false
+  timeout:
+    description: "Seconds to wait for the run. Default 1800, matching the gateway's own run cap."
+    required: false
+    default: "1800"
+  cli-package:
+    description: >
+      The package spec `npx` installs. Pinned to an exact version deliberately —
+      a floating @latest inside a merge gate is both a flakiness and a
+      supply-chain surface. A full spec rather than a bare version so the action
+      can also be pointed at a local tarball or a private registry, which is how
+      this action is PROVEN by an actual workflow run rather than by reading it.
+    required: false
+    default: "@tracelanedev/cli@0.3.0"
+  token:
+    description: "Tracelane API token. Pass a secret; never a literal."
+    required: true
+  gateway-url:
+    description: "Gateway base URL."
+    required: false
+    default: "https://gateway.tracelane.dev"
+
+runs:
+  using: "composite"
+  steps:
+    # EXIT CODES, and why the job must not swallow them:
+    #   0 pass · 1 below the floor · 2 bad invocation · 3 could not evaluate
+    #
+    # 3 means the gate could not reach a verdict — too many cases errored, the
+    # run never finished, the gateway refused. It did not measure your prompt at
+    # all, and it fails the job on purpose: a gate that goes green when it could
+    # not check anything is worse than no gate.
+    #
+    # There is deliberately no `continue-on-error` and no `|| true` here, and no
+    # input that turns 3 into 0. A gate that can be told to pass when it could
+    # not measure is a green-while-broken generator.
+    #
+    # `--package … -- tlane` and NOT `npx <spec> …`: given a path, npx treats it
+    # as a COMMAND to execute, and a tarball is not executable — that form dies
+    # with exit 126 "Permission denied", which is indistinguishable from a real
+    # below-the-floor result to anything checking only that the step failed.
+    - id: gate
+      shell: bash
+      env:
+        TRACELANE_TOKEN: ${{ inputs.token }}
+        TRACELANE_GATEWAY_URL: ${{ inputs.gateway-url }}
+      run: |
+        set -uo pipefail
+        set +e
+        npx --yes --package="${{ inputs.cli-package }}" -- tlane eval run \
+          --prompt         "${{ inputs.prompt }}" \
+          --suite-file     "${{ inputs.suite-file }}" \
+          --threshold      "${{ inputs.threshold }}" \
+          --max-error-rate "${{ inputs.max-error-rate }}" \
+          --env            "${{ inputs.env }}" \
+          --timeout        "${{ inputs.timeout }}" \
+          ${{ inputs.dataset    && format('--dataset "{0}"', inputs.dataset)       || '' }} \
+          ${{ inputs.version-id && format('--version-id "{0}"', inputs.version-id) || '' }} \
+          ${{ inputs.model      && format('--model "{0}"', inputs.model)           || '' }}
+        code=$?
+        # Recorded BEFORE exiting, and to a FILE as well as $GITHUB_OUTPUT: a
+        # composite action's outputs are not reliably readable once one of its
+        # steps has failed, and the failing case is exactly the one anyone needs
+        # to inspect. The file is what lets a caller tell exit 1 (scored below the
+        # floor) from exit 3 (could not evaluate) or 126 (the runner could not
+        # even start the CLI) — three very different facts that all just "fail".
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "$code" > "${RUNNER_TEMP}/tracelane-eval-gate-exit-code"
+        exit $code
+
+outputs:
+  exit-code:
+    description: >
+      The CLI's exit code: 0 pass, 1 below the floor, 2 bad invocation, 3 could
+      not evaluate. Also written to $RUNNER_TEMP/tracelane-eval-gate-exit-code,
+      which stays readable after the step fails.
+    value: ${{ steps.gate.outputs.exit-code }}

@@ -1,11 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 100" width="500" height="100" role="img" aria-label="Tracelane — the flight recorder for AI agents">
   <title>Tracelane</title>
   <g fill="#FFFFFF">
-    <path d="M 1.68,9.68 L 80.64,9.68 L 70.56,19.76 L 1.68,19.76 Z"/>
-    <path d="M 1.68,19.76 L 11.76,19.76 L 11.76,31.52 L 36.96,31.52 L 36.96,41.6 L 10.08,41.6 L 1.68,33.2 Z"/>
-    <path d="M 26.88,41.6 L 36.96,41.6 L 36.96,80.24 L 26.88,90.32 Z"/>
-    <path d="M 80.64,21.44 L 80.64,31.52 L 70.56,41.6 L 45.36,41.6 L 45.36,31.52 L 70.56,31.52 Z"/>
-    <path d="M 45.36,41.6 L 55.44,41.6 L 55.44,61.76 L 65.52,61.76 L 45.36,81.92 Z"/>
+    <path d="M 1.68,9.68 L 26.64,9.68 L 26.64,21.2 L 13.2,21.2 L 13.2,34.64 L 1.68,34.64 Z"/>
+    <path d="M 82.32,9.68 L 57.36,9.68 L 57.36,21.2 L 70.8,21.2 L 70.8,34.64 L 82.32,34.64 Z"/>
+    <path d="M 1.68,90.32 L 26.64,90.32 L 26.64,78.8 L 13.2,78.8 L 13.2,65.36 L 1.68,65.36 Z"/>
+    <path d="M 82.32,90.32 L 57.36,90.32 L 57.36,78.8 L 70.8,78.8 L 70.8,65.36 L 82.32,65.36 Z"/>
+    <path d="M 1.68,44.24 L 18.48,44.24 L 18.48,55.76 L 1.68,55.76 Z"/>
+    <path d="M 65.52,44.24 L 82.32,44.24 L 82.32,55.76 L 65.52,55.76 Z"/>
+    <circle cx="42" cy="50" r="21.12" fill="none" stroke="#FFFFFF" stroke-width="6.72"/>
+    <circle cx="42" cy="50" r="8.16" fill="none" stroke="#FFFFFF" stroke-width="5.76"/>
   </g>
   <text x="112" y="50.0" font-family="Inter, 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif" font-size="66" font-weight="600" letter-spacing="-2.2" fill="#FFFFFF" dominant-baseline="central">tracelane</text>
 </svg>

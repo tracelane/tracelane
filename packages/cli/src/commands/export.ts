@@ -321,14 +321,22 @@ function writeModelRegistry(outputDir: string): PackItem {
 				provider: "Anthropic",
 				purpose: "Primary LLM gateway — customer agent requests",
 				dataProcessing: "Input/output text via BYOK (customer API key)",
-				retentionDays: 90,
+				// 365, matching `art12-04-data-processing.md` in this same pack.
+				// These rows and that record describe THE SAME BYTES — input/output
+				// text in ClickHouse `spans` — and prod carries
+				// `TTL toDate(start_time) + toIntervalDay(365)`. This said 90 while
+				// art12-04 said 365, so ONE GENERATED COMPLIANCE PACK CONTRADICTED
+				// ITSELF on the retention of the same data. Missed by the R227
+				// sweep, which corrected the prose table and not the JSON beside it.
+				retentionDays: 365,
 			},
 			{
 				id: "openai/gpt-4o",
 				provider: "OpenAI",
 				purpose: "Secondary failover gateway",
 				dataProcessing: "Input/output text via BYOK",
-				retentionDays: 90,
+				// 365 — same bytes, same table, same reason as above.
+				retentionDays: 365,
 			},
 			{
 				id: "tracelane/trajectory-guard-v1",
@@ -367,8 +375,8 @@ function writeDataProcessingRecord(outputDir: string): PackItem {
 		"",
 		"| Source | Data Type | Purpose | Retention | Encryption |",
 		"|---|---|---|---|---|",
-		"| Customer agent traffic | LLM request/response text (only for workspaces on the operator allowlist) | Trace storage | 90 days (ClickHouse hot tier) | AES-256-GCM at rest, TLS 1.3 in transit |",
-		"| OTLP spans | Span metadata (no content by default) | Observability | 90 days ClickHouse | Same |",
+		"| Customer agent traffic | LLM request/response text (only for workspaces on the operator allowlist) | Trace storage | 365 days (ClickHouse hot tier) | AES-256-GCM at rest, TLS 1.3 in transit |",
+		"| OTLP spans | Span metadata (no content by default) | Observability | 365 days ClickHouse | Same |",
 		"| Provider API keys | BYOK keys | Customer-controlled routing | Session only | Envelope-encrypted (AEAD via aws-lc-rs, or AWS KMS) |",
 		"",
 		"## PII Handling",

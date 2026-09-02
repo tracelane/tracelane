@@ -8,7 +8,7 @@ classification: PUBLIC
 # SPIFFE/SPIRE ingest mTLS — operator runbook
 
 > **Audience:** SREs running self-hosted Tracelane or operating the Audit SKU
-> in a customer cluster. **Authoritative design:** [ADR-028](/decisions/index).
+> in a customer cluster.
 
 The Tracelane ingest worker authenticates every connection with a SPIFFE
 X.509-SVID issued by [SPIRE](https://spiffe.io). This page covers the
@@ -70,7 +70,7 @@ helm install spire spiffe/spire -n spire --create-namespace -f values.yaml
 
 ### Bare metal / single-VM (Hetzner-style)
 
-Match the founder's V1 layout:
+A minimal single-node layout:
 
 ```bash
 # 1. Install SPIRE 1.10 from the upstream release.
@@ -196,7 +196,7 @@ refresher boots clean.
 
 Every authentication outcome bumps the
 `tracelane_ingest_auth_total{result=...}` counter. Five-bucket label
-set per ADR-028 §Observability:
+set:
 
 | Label | Means |
 |---|---|
@@ -244,7 +244,7 @@ the failure and keeps ingesting spans without a scrape endpoint.
 <Note>
 **These counters only move on the mTLS path.** They are incremented by the SPIFFE
 authentication middleware, which is attached only when ingest runs with SPIRE. On the
-single-tenant self-host path (`TRACELANE_SPIRE_SOCKET` unset, plaintext — ADR-067),
+single-tenant self-host path (`TRACELANE_SPIRE_SOCKET` unset, plaintext),
 there is no SPIFFE authentication to record, so every bucket stays at `0`
 permanently. Do not read those zeros as "no authentication failures" — on that
 deployment the alerts below have nothing to say, and tenant attribution is handled by
@@ -273,7 +273,6 @@ increase(tracelane_ingest_auth_total{result="wrong_trust_domain"}[15m]) > 0
 
 ## 7. Further reading
 
-- [ADR-028](/decisions/index) — full design decision.
 - [SPIFFE X.509-SVID spec §4](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md) — wire format.
 - [SPIRE Workload API spec](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md) — gRPC contract.
 - [Migration guide](/migration/spiffe-bootstrap) — moving an existing customer cluster onto Tracelane ingest mTLS.

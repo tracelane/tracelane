@@ -16,6 +16,6 @@ verifiers. These are the surfaces customers install; they ship publicly (Apache
 | [`verifier-python`](verifier-python/) | Reference audit-ledger verifier (Python). |
 
 The three verifiers are **identical by construction** on the v2.1 canonical
-format (ADR-050): `payload` is the verbatim stored canonical string, SHA-256'd
+format: `payload` is the verbatim stored canonical string, SHA-256'd
 byte-for-byte, never re-derived — so no cross-language numeric-canonicalization
 drift is possible. Conformance vectors: `../evals/audit-ledger/`.

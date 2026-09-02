@@ -1,0 +1,112 @@
+---
+title: "LangChain & LangGraph"
+description: "Send LangChain and LangGraph traces to Tracelane with one exporter config. No Tracelane SDK required."
+classification: PUBLIC
+---
+
+LangChain and LangGraph are OpenTelemetry-native through the community instrumentors.
+Tracelane accepts OTLP directly, so the integration is **exporter configuration, not a
+Tracelane package** — and one instrumentor covers both libraries.
+
+## What you get
+
+| | |
+|---|---|
+| **Agent structure** | **Yes.** The graph, each node, each chain step, prompt / model / parser spans, nested with real parent-child links. |
+| **The LLM leg** | Yes — model spans with token counts, inside the tree. |
+| **Prompt & response content** | Only if you enable it in the instrumentor. Tracelane stores what you send. |
+
+This is the option that captures the agent, not just the model call. If you instead point
+your OpenAI-compatible client at the Tracelane gateway base URL, you get the LLM leg only —
+one span per request, no tree. See [Which integration should I use?](#which-integration-should-i-use).
+
+## Setup
+
+```bash
+pip install openinference-instrumentation-langchain \
+            opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from openinference.instrumentation.langchain import LangChainInstrumentor
+import os
+
+provider = TracerProvider(resource=Resource.create({"service.name": "my-agent"}))
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
+    endpoint="https://gateway.tracelane.dev/v1/traces",
+    headers={"x-tracelane-api-key": os.environ["TRACELANE_API_KEY"]},
+)))
+trace.set_tracer_provider(provider)
+
+LangChainInstrumentor().instrument(tracer_provider=provider)
+# every LangChain and LangGraph run now exports to Tracelane
+```
+
+Your API key needs the **`ingest`** scope. Mint one in **Settings → API keys**.
+
+<Note>
+  `LangChainInstrumentor` covers **LangGraph too** — LangGraph is built on LangChain
+  runnables, so graph nodes come through the same callback system. You do not need a second
+  instrumentor.
+</Note>
+
+## What a trace looks like
+
+A two-node LangGraph agent, verified end to end against Tracelane production on
+2026-08-31 — **11 spans, 1 root, 10 parented, 0 orphans**:
+
+```
+LangGraph                                    (root)
+├── plan
+│   └── RunnableSequence
+│       ├── ChatPromptTemplate
+│       ├── ChatOpenAI
+│       └── StrOutputParser
+└── act
+    └── RunnableSequence
+        ├── ChatPromptTemplate
+        ├── ChatOpenAI
+        └── StrOutputParser
+```
+
+Read back out of Tracelane's own storage, not asserted from the exporter.
+
+## Span volume — read this before you pick a plan
+
+**One agent run is many spans.** The tree above is **11 spans for one `invoke()`**; a single
+`prompt | model | parser` chain is **4**. That is the point of the integration — the
+structure is the product — but it means span volume is not run volume.
+
+Plan limits are counted in spans on this path.
+<Warning>
+  **An OTel span and a gateway call are not the same unit, and they are not counted the
+  same way.** A gateway request (the base-URL swap) is one unit against your monthly trace
+  quota. On this OTel path your app sends **spans**, and one agent run is many spans — the
+  tree above is 11 for a single `invoke()`. Do not read "10K traces/mo" as "10,000 agent
+  runs". Size against **spans per run**, and see [pricing](/pricing).
+</Warning>
+
+
+## Which integration should I use?
+
+| | Gateway base URL | OTel exporter (this page) |
+|---|---|---|
+| Setup | change one base URL | ~10 lines of exporter config |
+| Captures the LLM call | yes | yes |
+| **Captures chain / nodes / tool calls** | **no** | **yes** |
+| Trace shape | one span per request | a nested tree |
+| Routing, BYOK, guardrails, caching | yes | no — calls go direct to your provider |
+
+They compose: point the gateway at your provider **and** run the instrumentor, and you get
+gateway features plus agent structure.
+
+<Warning>
+  The two paths do not currently join into one trace. A gateway-proxied call does not adopt
+  your agent's trace context, so it appears as its own single-span trace rather than nesting
+  under the LangGraph run. If you need one tree, use the OTel exporter path alone.
+</Warning>

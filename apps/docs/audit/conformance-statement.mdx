@@ -68,7 +68,7 @@ Tool invocations, agent-to-agent handoffs and MCP invocations are
 **captured as spans but are not chained** — they are not in the ledger
 today.
 
-**How the write happens (ADR-069).** The write is **asynchronous by
+**How the write happens.** The write is **asynchronous by
 design**. The gateway hot path performs an **acked** JetStream publish
 *before* it dispatches to the provider (`crates/gateway/src/audit.rs:493`),
 so the event is durably captured before the request is served; a publish
@@ -120,8 +120,8 @@ null) and `trace_id`, plus `business_reference` when the caller supplied
 one (`crates/gateway/src/server.rs:1172-1190`). Payloads pass through PII
 redaction (`crates/policy/src/pii.rs`) and then a structural cap: any
 string **value** longer than 256 characters is replaced by a
-`[content-redacted: len=N, sha256=…]` marker (ADR-068,
-`crates/gateway/src/audit.rs:70`), so long content cannot enter the
+`[content-redacted: len=N, sha256=…]` marker
+(`crates/gateway/src/audit.rs:70`), so long content cannot enter the
 ledger even by accident — while the length and hash preserve the ability
 to prove a specific value was present. A `guardrail.verdict` payload is
 the serialized verdict (rail, decision, matched signature); an
@@ -146,9 +146,11 @@ Retention holds because nothing expires ledger rows automatically, not because
 a runtime check refuses a shorter value. A shorter contractual term would be a
 process failure, not one the software currently refuses.
 
-Workspaces without the Audit add-on are subject to the base-tier
-retention (free 7d / builder 30d / team 90d / business 180d /
-enterprise 365d) and are **not** covered by this mapping.
+Workspaces without the Audit add-on are **not** covered by this mapping.
+There is no per-plan expiry of ledger data to describe: no ledger table
+carries a TTL and the retention sweep operates on span tables only, as
+this document states below. Ledger data is retained indefinitely on every
+plan today.
 
 ### Article 12(3)(a) — reproducible verification procedure
 

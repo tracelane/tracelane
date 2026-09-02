@@ -31,9 +31,10 @@ import {
 } from "@/app/slo/latency";
 import type { SloRow, SloSummary, SloTimePoint } from "@/app/slo/types";
 import { RangeControl } from "@/components/RangeControl";
+import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { db } from "@/db";
-import { tenants } from "@/db/schema";
+import { apiKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { PLAN_TO_LOOKUP_KEY, type Plan } from "@/lib/entitlements";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
@@ -61,7 +62,7 @@ import {
 	SparkBars,
 	TimeRuler,
 } from "@tracelanedev/ui";
-import { eq } from "drizzle-orm";
+import { and, count, eq, isNull } from "drizzle-orm";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { type ReactNode, Suspense } from "react";
@@ -1621,6 +1622,42 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	);
 }
 
+/**
+ * Decides whether the "no active API keys" panel shows. R201.
+ *
+ * ONE INDEXED COUNT, and it is deliberately NOT inside `DashboardData`'s
+ * eight-read fan-out: this is the surface's first-run guidance and must not
+ * wait on the gateway. Its own Suspense boundary with a `null` fallback means a
+ * slow control-plane read delays the panel and nothing else — the dashboard is
+ * never held up by a banner.
+ *
+ * FAILS CLOSED ON ITS OWN QUESTION, which for a hint means staying silent: any
+ * error returns null rather than rendering "you have no keys" to someone who
+ * has seven. Telling an existing customer they have nothing is worse than
+ * telling a new one nothing at all.
+ */
+async function NoApiKeysBanner() {
+	try {
+		const session = await requireSession();
+		const [tenant] = await db
+			.select({ id: tenants.id })
+			.from(tenants)
+			.where(eq(tenants.workosOrgId, session.tenantId))
+			.limit(1);
+		if (!tenant) return null;
+
+		const [keyCount] = await db
+			.select({ cnt: count() })
+			.from(apiKeys)
+			.where(and(eq(apiKeys.tenantId, tenant.id), isNull(apiKeys.revokedAt)));
+
+		if ((keyCount?.cnt ?? 0) > 0) return null;
+		return <NoApiKeysPanel workspaceId={tenant.id} />;
+	} catch {
+		return null;
+	}
+}
+
 export default async function DashboardPage({
 	searchParams,
 }: {
@@ -1654,6 +1691,11 @@ export default async function DashboardPage({
 				</div>
 				<RangeControl />
 			</header>
+			{/* Outside `DashboardData` on purpose — see NoApiKeysBanner. `null`
+			    fallback: a banner must never render a placeholder. */}
+			<Suspense fallback={null}>
+				<NoApiKeysBanner />
+			</Suspense>
 			{/* No `key={range}` — keying on range REMOUNTS the boundary on every
 			    range change and flashes the fallback (the "feels slow" reload).
 			    Without it, the RangeControl's useTransition keeps the current view

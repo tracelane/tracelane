@@ -27,16 +27,16 @@ an engineering target, not yet measured on production-equivalent hardware
   <img src="/images/predictive-layer.svg" alt="Agent-tool safety guardrails (PR1 through PR8) — with per-guard status" />
 </Frame>
 
-| ID | Guard | Status (gateway chat path) | Eval IDs |
-|---|---|---|---|
-| PR1 | MCP rug-pull detection | Live detection, observe-first | PP-MCP1..3 |
-| PR2 | Lethal-trifecta taint tracking | Roadmap / dormant on the chat path | PP-TFT1..4 |
-| PR3 | A2UI component-type check | Never runs on the gateway chat path | PP-UI1..3 |
-| PR4 | Prompt-injection classifier (heuristic) | Partial / dormant on the chat path | PP-PI1..6 |
-| PR5 | Browser stuck-loop prediction | Roadmap (browser spans only) | PP-BR1..3 |
-| PR6 | A2A handoff required-field check | Never runs on the gateway chat path | PP-A2A1..4 |
-| PR7 | Output-policy regex + SLM judge | SLM judge is a stub; regex lives in the rails | PP-OUT1..5 |
-| PR8 | Argument drift | Never runs on the gateway chat path | PP-G3, PP-PR8 |
+| ID | Guard | Status (gateway chat path) |
+|---|---|---|
+| PR1 | MCP rug-pull detection | Live detection, observe-first |
+| PR2 | Lethal-trifecta taint tracking | Roadmap / dormant on the chat path |
+| PR3 | A2UI component-type check | Never runs on the gateway chat path |
+| PR4 | Prompt-injection classifier (heuristic) | Partial / dormant on the chat path |
+| PR5 | Browser stuck-loop prediction | Roadmap (browser spans only) |
+| PR6 | A2A handoff required-field check | Never runs on the gateway chat path |
+| PR7 | Output-policy regex + SLM judge | SLM judge is a stub; regex lives in the rails |
+| PR8 | Argument drift | Never runs on the gateway chat path |
 
 ## PR1 — MCP rug-pull detection
 

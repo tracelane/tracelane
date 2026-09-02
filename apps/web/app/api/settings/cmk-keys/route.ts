@@ -13,11 +13,12 @@
  */
 
 import { db } from "@/db";
-import { cmkKeys } from "@/db/schema";
+import { cmkKeys, tenants } from "@/db/schema";
 import { ipFromRequest, recordAdminAction } from "@/lib/admin-audit";
 import { requireOrgAdmin } from "@/lib/admin-gate";
 import { requireSession } from "@/lib/auth";
 import { sha256Fingerprint } from "@/lib/cmk-fingerprint";
+import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { upsertTenantId } from "@/lib/tenant";
 import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -46,6 +47,32 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	const session = await requireSession();
 	const denied = await requireOrgAdmin(session);
 	if (denied) return denied;
+
+	// ENTITLEMENT GATE — `byok_cmk` is Business+ and this route had NO check for
+	// it. The role gate above answers "may this person do it?"; this answers
+	// "did they buy it?". Both are required for a paid capability, and only the
+	// first existed — so a FREE-TIER ORG ADMIN could register a CMK key against
+	// copy that sells it as Business+ (`plan-catalog.ts` renders the bullet from
+	// `ent.byok_cmk`, and that was the flag's ONLY reader).
+	//
+	// Fail CLOSED to `free`: absent entitlement data resolves to the
+	// unprivileged state, never the privileged one (`.claude/rules/tenancy.md`).
+	// Mirrors the identical fix already applied to `saml_sso` in
+	// `settings/workspace/portal/route.ts`.
+	const [tenantRow] = await db
+		.select({ id: tenants.id, plan: tenants.plan })
+		.from(tenants)
+		.where(eq(tenants.workosOrgId, session.tenantId))
+		.limit(1);
+	const plan: Plan = (tenantRow?.plan as Plan) ?? "free";
+	const entitlements = await resolveEntitlements(tenantRow?.id, plan);
+	if (!entitlements.byok_cmk) {
+		return NextResponse.json(
+			{ error: "byok_cmk_required", upgrade_url: "/settings/billing" },
+			{ status: 403 },
+		);
+	}
+
 	const tenantDbId = await upsertTenantId(session.tenantId);
 
 	let body: AddKeyBody;

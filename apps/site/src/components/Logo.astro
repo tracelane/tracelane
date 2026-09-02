@@ -37,14 +37,21 @@
  * a hard floor at favicon size — three concentric bands cannot each hold 1.5px inside
  * 16px — and pretending otherwise ships mush.
  *
- * ── STATUS: SITE-ONLY PREVIEW ───────────────────────────────────────────────────
- * `brand/` still generates the geometric T monogram, and `apps/web`, `apps/docs`, the
- * README and the social images still ship it. This component is deliberately ahead of
- * them so the mark can be judged in a real header at real size. Making it the brand
- * means editing the polygons at the top of `scripts/brand/build-brand-assets.py` and
- * re-running it — ADR-074 §8 calls that its own workstream, and it is queued, not done.
- * Until it runs, THE SITE AND THE BRAND SET DISAGREE. That is a known, deliberate,
- * temporary divergence and it is written here so nobody discovers it by accident.
+ * ── STATUS: THIS IS THE BRAND. The divergence is CLOSED (2026-08-26) ────────────
+ * This block used to say the mark was a SITE-ONLY PREVIEW and that `brand/`, `apps/web`,
+ * `apps/docs` and the social images still shipped the retired geometric T monogram —
+ * "a known, deliberate, temporary divergence". It ran for two days and is now over:
+ * `scripts/brand/build-brand-assets.py` carries this geometry and regenerates all 54
+ * artifacts from it, and `packages/ui/src/primitives/Logo.tsx` renders it in the app.
+ *
+ * THE COST THAT REPLACED IT, stated plainly because it is permanent: the mark now lives
+ * in FOUR runtimes — this component, the React one, the Python generator, and one
+ * hand-inlined copy in `apps/web/app/global-error.tsx` (which cannot import anything,
+ * by design). No generator emits an Astro component, so there is no way to make that
+ * one. **A change to the mark is a change to all four.** The last replacement updated
+ * the generated assets and left five components rendering the dead mark in production
+ * overnight; `scripts/ci/check-retired-logo.py` is what caught that class, and the
+ * generator's `--check-refs` catches the other half.
  *
  * ── WORDMARK ────────────────────────────────────────────────────────────────────
  * Lowercase — founder ruling 2026-08-24: "it feels like one word rather than trace and

@@ -17,7 +17,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import manifest from "../eval-manifest.json";
@@ -41,14 +41,36 @@ const EVALS: ReadonlyMap<string, EvalEntry> = new Map(
 const EVAL_IDS: readonly string[] = [...EVALS.keys()];
 
 /**
- * Locate a repo checkout by walking up from the bundle looking for
- * `evals/pain-points`. Returns `null` when there is none — the normal
- * case for an `npx`-installed package.
+ * The suite directories the manifest's OWN entries live in, e.g.
+ * `evals/fault-tolerance`. Derived, never written down.
+ */
+const SUITE_DIRS: readonly string[] = [
+	...new Set([...EVALS.values()].map((e) => dirname(e.path))),
+];
+
+/**
+ * Locate a repo checkout by walking up from the bundle looking for a suite
+ * directory THE MANIFEST ITSELF NAMES. Returns `null` when there is none —
+ * the normal case for an `npx`-installed package.
+ *
+ * IT USED TO PROBE `evals/pain-points`, AND THAT WAS A SHIPPED DEFECT, NOT A
+ * TEST PROBLEM. The public export withholds that suite deliberately, so the
+ * probe could never succeed in a public clone — and `get_eval_result` answered
+ * every public user with "eval sources are not bundled in the npm package,
+ * clone the repo", *from inside the clone*, for the ten fault-tolerance evals
+ * that do ship. Found by running the tools against a built export, not by
+ * reading this file.
+ *
+ * Deriving the probe from the manifest makes the lookup describe whatever
+ * corpus this tree actually holds — the same property `gen-eval-manifest.mjs`
+ * already gives the manifest, extended to the code that reads it. A manifest
+ * with no entries yields no probe and therefore no root, which is the honest
+ * answer: there is nothing here to read.
  */
 function findRepoRoot(): string | null {
 	let dir = __dirname;
 	for (let i = 0; i < 8; i++) {
-		if (existsSync(join(dir, "evals", "pain-points"))) return dir;
+		if (SUITE_DIRS.some((s) => existsSync(join(dir, s)))) return dir;
 		dir = join(dir, "..");
 	}
 	return null;

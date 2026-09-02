@@ -160,13 +160,24 @@ const { text } = await generateText({
 });
 ```
 
+<Warning>
+  **Option B is currently broken and is being rewritten.** `instrumentVercelAI(ai)`
+  throws `TypeError: Cannot assign to read only property 'generateText'` — ES module
+  namespace objects are read-only, so it cannot patch the `ai` module. Verified against
+  `ai@7.0.85` on 2026-08-31.
+
+  **Use Option A (the gateway base URL) above until the replacement ships.** The
+  replacement will use the AI SDK's own `registerTelemetry()` integration API, which also
+  captures steps and tool executions rather than just the model call.
+</Warning>
+
 ```typescript
-// Option B — SDK patch (spans reach your OTLP endpoint; calls go direct to provider)
+// Option B — SDK patch. DO NOT USE YET: this throws on ai@7. Shown for reference only.
 import { init, instrumentVercelAI } from "@tracelanedev/sdk";
 import * as ai from "ai";
 
 init({ endpoint: "http://localhost:4318", apiKey: process.env.TRACELANE_API_KEY! });
-instrumentVercelAI(ai); // generateText, streamText, generateObject now traced
+instrumentVercelAI(ai); // TypeError — ESM namespaces are frozen. See the warning above.
 ```
 
 ### MCP (Model Context Protocol)

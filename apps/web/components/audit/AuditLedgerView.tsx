@@ -408,7 +408,6 @@ function AboutLedger({
 	eventTypeCounts,
 	byDay,
 	anchoredCount,
-	retentionDays,
 	serverTotal,
 	loadCap,
 }: {
@@ -417,7 +416,6 @@ function AboutLedger({
 	eventTypeCounts: Array<[string, number]>;
 	byDay: Array<{ day: string; count: number }>;
 	anchoredCount: number;
-	retentionDays?: number;
 	/** True when `total` is the gateway's exact window count (paid export path).
 	 * False on the free self-verify path, where `total` is a CLIENT count over the
 	 * capped fetch — used only for the honest "capped load" note below. */
@@ -471,17 +469,23 @@ function AboutLedger({
 					label="Retention"
 					value="Append-only"
 					sub="no automatic expiry"
-					hint="The audit ledger is append-only — it has no TTL and outlives your plan's trace-retention window"
+					hint="The audit ledger is append-only — it has no TTL and outlives the trace-retention window"
 				/>
 			</div>
 
-			{retentionDays ? (
-				<p className="mt-2 text-2xs text-ink-3">
-					Full-fidelity trace data expires after{" "}
-					<span className="tabular-nums">{retentionDays}</span> days on your
-					plan; this evidence ledger does not.
-				</p>
-			) : null}
+			{/* This block used to render `retentionDays` — the plan's retention
+			    number — as "trace data expires after N days on your plan". That
+			    asserted a per-plan control that does not exist: `retention_days`
+			    is computed from the plan catalog and consumed by renderers only,
+			    and NO delete, reject or limit path reads it. Traces expire on one
+			    window for every tenant, the `spans` TTL, verified on prod as
+			    `toDate(start_time) + toIntervalDay(365)`. It was the only
+			    retention figure a customer ever saw, which is what made it worse
+			    than having none. */}
+			<p className="mt-2 text-2xs text-ink-3">
+				Full-fidelity trace data is kept up to 365 days; this evidence ledger
+				does not expire at all.
+			</p>
 
 			{/* Volume detail — demoted inside <details> so it doesn't fight the
 			    trust panel for attention. The About panel's message is TRUST. */}
@@ -1757,7 +1761,6 @@ export function AuditLedgerView({
 	tenantPubkeyB64,
 	initialReport,
 	range,
-	retentionDays,
 	summary,
 	since,
 	until,
@@ -1785,9 +1788,6 @@ export function AuditLedgerView({
 	/** Active date-range window key (renders the range control). Absent on the
 	 * e2e fixture path (no live query to re-scope). */
 	range?: string;
-	/** The plan's trace-retention days — shown as a contrast to the ledger's own
-	 * (append-only) retention. Absent on the fixture path. */
-	retentionDays?: number;
 	/** Server-computed aggregate (total + per-day + per-type). Exact for a large
 	 * ledger. Absent on the fixture path (and if the summary fetch failed) — the
 	 * "About" panel then falls back to an approximate breakdown from loaded rows. */
@@ -2096,7 +2096,6 @@ export function AuditLedgerView({
 				eventTypeCounts={aboutByType}
 				byDay={aboutByDay}
 				anchoredCount={anchoredIndices.length}
-				retentionDays={retentionDays}
 				serverTotal={hasServerTotal}
 				loadCap={1000}
 			/>

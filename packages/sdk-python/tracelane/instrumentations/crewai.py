@@ -19,9 +19,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import wrapt
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
+
+from tracelane.instrumentations._attach import attach
 
 _tracer = trace.get_tracer("tracelane.crewai", "0.1.0")
 
@@ -37,43 +38,47 @@ def instrument_crewai(agent: Any) -> None:
         agent: A crewai.Agent instance.
 
     Note:
-        Mutates the agent in-place using wrapt. Tool call details and raw
+        Mutates the agent in-place. Tool call details and raw
         LLM responses are never captured — only execution metadata.
     """
     _patch_execute_task(agent)
 
 
 def _patch_execute_task(agent: Any) -> None:
-    if not hasattr(agent, "execute_task"):
-        return
 
     role: str = getattr(agent, "role", "unknown") or "unknown"
 
-    def _patched_execute_task(wrapped: Any, instance: Any, args: Any, kwargs: Any) -> Any:
-        # First positional arg is the Task object; extract description safely
-        task_obj = args[0] if args else kwargs.get("task")
-        task_desc: str = "unknown"
-        if task_obj is not None:
-            raw_desc = getattr(task_obj, "description", None) or str(task_obj)
-            # Truncate to avoid large span attributes
-            task_desc = raw_desc[:120] if isinstance(raw_desc, str) else "unknown"
+    def _wrap(original: Any) -> Any:
+        def _patched_execute_task(*args: Any, **kwargs: Any) -> Any:
+            # First positional arg is the Task object; extract description safely
+            task_obj = args[0] if args else kwargs.get("task")
+            task_desc: str = "unknown"
+            if task_obj is not None:
+                raw_desc = getattr(task_obj, "description", None) or str(task_obj)
+                # Truncate to avoid large span attributes
+                task_desc = raw_desc[:120] if isinstance(raw_desc, str) else "unknown"
 
-        with _tracer.start_as_current_span(
-            "crewai.task",
-            kind=SpanKind.CLIENT,
-            attributes={
-                "gen_ai.provider.name": "crewai",
-                "crewai.agent.role": role,
-                "crewai.task.description": task_desc,
-            },
-        ) as span:
-            try:
-                result = wrapped(*args, **kwargs)
-                span.set_status(StatusCode.OK)
-                return result
-            except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(StatusCode.ERROR, str(exc))
-                raise
+            with _tracer.start_as_current_span(
+                "crewai.task",
+                kind=SpanKind.CLIENT,
+                attributes={
+                    "gen_ai.provider.name": "crewai",
+                    "crewai.agent.role": role,
+                    "crewai.task.description": task_desc,
+                },
+            ) as span:
+                try:
+                    result = original(*args, **kwargs)
+                    span.set_status(StatusCode.OK)
+                    return result
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    raise
 
-    wrapt.wrap_function_wrapper(agent, "execute_task", _patched_execute_task)
+        return _patched_execute_task
+
+    # B-312: crewai.Agent is a pydantic v2 model, whose __setattr__ refuses a
+    # non-field attribute — so wrapt cannot patch the instance. `attach` goes
+    # under it, is idempotent, and RAISES rather than no-opping.
+    attach(agent, "execute_task", lambda original: _wrap(original))

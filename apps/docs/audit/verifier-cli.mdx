@@ -7,7 +7,6 @@ classification: PUBLIC
 
 # `tracelane-audit` verifier CLI
 
-> **Authoritative:** [ADR-034](/decisions/index).
 > Wraps the shipped [`tracelane-audit-verifier`](https://pypi.org/project/tracelane-audit-verifier/) Rust crate
 > with an argument parser, an HTTP fetch step, and PASS/FAIL rendering.
 
@@ -27,7 +26,24 @@ classification: PUBLIC
 
 ## Install
 
-### Pre-built binary (recommended)
+<Warning>
+  **There is no pre-built `tracelane-audit` binary yet.** Its release workflow has never run
+  on a tag, so `releases/latest/download/tracelane-audit-…` returns **404**. Build from
+  source with the command below — it is Apache-2.0 and reproducible. The signed-binary
+  instructions further down describe how it will be distributed once that workflow runs, and
+  do not work today.
+</Warning>
+
+### Build from source (works today)
+
+```bash
+git clone https://github.com/tracelane/tracelane.git
+cd tracelane
+cargo build --release -p tracelane-audit
+./target/release/tracelane-audit --help
+```
+
+### Pre-built binary (not yet published — see the warning above)
 
 ```bash
 # Linux musl (static, no glibc dependency)
@@ -80,7 +96,7 @@ tracelane-audit verify
                                GET /v1/audit/pubkey.
   [--rekor-url <url>]          Default: https://log2025-1.rekor.sigstore.dev (public v2 log)
   [--offline]                  Skip anchor (inclusion-proof) verification entirely
-  [--pinned-pubkey <hex32>]    Legacy pin of the log's own signing key (self-hosted Rekor; R1 H2)
+  [--pinned-pubkey <hex32>]    Legacy pin of the log's own signing key (self-hosted Rekor)
   [--format text|json]         Default: text
   [--format-version v1|v2]     Default: v2 (current); v1 for pre-Phase-3 chains
 ```
@@ -178,8 +194,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: curl -fsSLO https://github.com/tracelane/tracelane/releases/latest/download/tracelane-audit-x86_64-unknown-linux-musl
-      - run: chmod +x tracelane-audit-x86_64-unknown-linux-musl
+      # No published binary yet (see Install above) — build it. Swap this for the
+      # release download once the tracelane-audit release workflow has run on a tag.
+      - run: cargo build --release -p tracelane-audit
+      - run: cp target/release/tracelane-audit tracelane-audit-x86_64-unknown-linux-musl
       - run: |
           FROM=$(date -u -d '24 hours ago' --iso-8601=seconds)
           TO=$(date -u --iso-8601=seconds)

@@ -48,7 +48,15 @@ pub async fn run(
         .get_or_create_stream(async_nats::jetstream::stream::Config {
             name: "TRACELANE_SPANS".into(),
             subjects: vec!["tracelane.spans.>".into()],
-            // Limits-based retention: 90-day hot window mirrors ClickHouse TTL
+            // Limits-based retention: a 90-day hot replay window.
+            //
+            // This comment used to say it "mirrors ClickHouse TTL", and that
+            // stopped being true on 2026-07-16 when the `spans` TTL went
+            // 90d -> 365d. The 90 days here is now an INDEPENDENT choice — how
+            // far back JetStream can replay if ingest is rebuilt — and it is
+            // deliberately NOT raised to match: the stream is a delivery buffer
+            // on the same un-replicated box as ClickHouse, so its bound is disk,
+            // not the retention promise. Kept at 90, justified on its own terms.
             max_age: std::time::Duration::from_secs(90 * 24 * 60 * 60),
             ..Default::default()
         })

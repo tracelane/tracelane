@@ -197,10 +197,10 @@ export function PlanLadder({
 					including free. The $999/mo add-on is the paid evidence-pack export.
 				</p>
 				<p>
-					Retention is not customer-configurable — it follows your plan, up to a
-					365-day maximum. Prices are list prices; the charge that reaches your
-					card is the one Polar bills. Tracelane does not offer a contractual
-					uptime SLA or service credits.
+					Retention is not customer-configurable and is the same on every plan:
+					traces are kept up to 365 days. Prices are list prices; the charge
+					that reaches your card is the one Polar bills. Tracelane does not
+					offer a contractual uptime SLA or service credits.
 				</p>
 			</div>
 		</div>

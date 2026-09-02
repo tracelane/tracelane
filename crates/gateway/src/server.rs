@@ -982,13 +982,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // than in `trace_reads`, which is the ClickHouse surface. Gated on the
         // same `global_pool()` — with no control plane the routes are simply
         // absent, which is a clean 404 rather than a broken surface.
+        //
+        // EVL-29 mounts HERE too, on the same state, because a queue review and
+        // an ad-hoc OBS-18 flag write the same `trace_annotations` row through
+        // the same store. It additionally needs ClickHouse (candidates are a
+        // read-time query — R221.1) and item 8's dataset store (the one action
+        // copies through the path item 8 proved). Both arrive as `Option`: with
+        // no ClickHouse the queue routes answer a typed 503 naming what is
+        // missing, rather than 404-ing a feature the tenant is entitled to.
         let ann_state = crate::annotation_routes::AnnotationRoutesState {
             store: std::sync::Arc::new(crate::annotation_routes::PgAnnotationStore {
                 pool: pool.clone(),
             }),
+            entitlements: entitlements.clone(),
+            datasets: config.clickhouse_url.as_ref().map(|u| {
+                std::sync::Arc::new(crate::dataset_routes::ClickHouseDatasetStore::new(
+                    crate::clickhouse_query::ch_client(u.clone()),
+                )) as std::sync::Arc<dyn crate::dataset_routes::DatasetStore>
+            }),
+            ch_url: config.clickhouse_url.clone(),
         };
         app = app.merge(crate::annotation_routes::routes().with_state(ann_state));
-        tracing::info!("annotations mounted at /v1/traces/{{trace_id}}/annotations");
+        tracing::info!(
+            "annotations mounted at /v1/traces/{{trace_id}}/annotations; \
+             EVL-29 queues at /v1/annotation-queues/*"
+        );
 
         // DSH-01 in-app inbox. Same Postgres gate.
         let notif_state = crate::notification_routes::NotificationRoutesState {
@@ -1094,6 +1112,48 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         app = app.merge(crate::alerts::routes::routes().with_state(alert_state));
         tracing::info!(
             "alerting mounted at /v1/alerts/* (f_alerts-gated, {interval_secs}s checker)"
+        );
+    }
+
+    // Online evals (EVL-28, Sprint 3 item 11) — the SURFACE for the sampling
+    // vertical in `online_eval.rs`.
+    //
+    // Mounting this is what makes that vertical live. Until this router exists
+    // no policy can be created, so `admission()` returns `None` for every
+    // request and nothing samples or spends. Read the gate below as the money
+    // gate it is, not as boilerplate.
+    //
+    // BOTH Postgres AND the entitlement cache are REQUIRED, and the `if let`
+    // is the enforcement rather than a convenience: with no entitlement cache
+    // there is no way to verify `f_online_evals`, and `.claude/rules/tenancy.md`
+    // is explicit that an absent cache is the UNPRIVILEGED state. Not mounting
+    // is the fail-closed answer — a router that answered anything at all here
+    // would have to decide what an unverifiable entitlement means, and every
+    // permissive answer to that spends a customer's money.
+    //
+    // ClickHouse is an `Option` INSIDE the state rather than a mount condition:
+    // the POLICY routes are Postgres-only and must still work so a customer can
+    // switch scoring OFF on a node whose results store is down. Refusing to
+    // disable a spending feature because the read path is unavailable is the
+    // wrong direction.
+    if let (Some(pool), Some(ents)) = (
+        crate::db::global_pool().cloned(),
+        state.entitlements.clone(),
+    ) {
+        let oe_state = crate::online_eval_routes::OnlineEvalRoutesState {
+            pool,
+            entitlements: ents,
+            clickhouse_url: config.clickhouse_url.clone(),
+        };
+        app = app.merge(crate::online_eval_routes::routes().with_state(oe_state));
+        tracing::info!(
+            "online evals mounted at /v1/online-evals/* (f_online_evals-gated, \
+             scores {})",
+            if config.clickhouse_url.is_some() {
+                "readable"
+            } else {
+                "UNCONFIGURED"
+            }
         );
     }
 
@@ -1774,6 +1834,40 @@ async fn chat_completions_handler(
     }
 
     timer.mark("budget_workspace");
+
+    // --- Step 2e: ONLINE-EVAL ADMISSION (EVL-28, item 11) ---
+    //
+    // THE CHEAPEST THING THAT COULD POSSIBLY DECIDE THIS, and it is placed here
+    // for a reason: AFTER the quota, per-key and workspace refusals, so a request
+    // that is about to be refused 429 or 402 never draws a sample and never
+    // spends judge money on an answer that will not exist.
+    //
+    // NO I/O ON A CACHE HIT. One cached entitlement read (already resolved
+    // above), one cached policy read (15-min TTL), one blake3 of
+    // `salt || trace_id`. `None` — not entitled, no policy, disabled, or simply
+    // not in the sample — is the overwhelmingly common answer and costs a hash.
+    //
+    // `Some` does NOT dispatch anything here. It only records that this request
+    // is in the sample, so the response path knows to keep the answer. The judge
+    // runs after the response is sent (`online_eval::spawn`).
+    let online_eval_pending =
+        match crate::online_eval::admission(tenant_id, trace_id, entitlements.as_deref()).await {
+            Some(policy) => Some(crate::online_eval::Pending {
+                policy,
+                providers: Arc::clone(&state.providers),
+                clickhouse_url: state.quota_ch_url.clone(),
+                // The judge publishes its OWN cost span so `/v1/costs` can price
+                // it; the two spend counters are in-memory and no read surface
+                // consults them.
+                nats: state.nats.clone(),
+                // Flattened HERE because the request body does not survive to the
+                // completion site, and the judge cannot grade an answer without the
+                // question it answered.
+                question: crate::online_eval::flatten_request_text(&body),
+            }),
+            None => None,
+        };
+    timer.mark("online_eval_admission");
 
     // --- Step 3: Predictive layer ---
     let ctx = PredictiveContext {
@@ -2692,6 +2786,7 @@ async fn chat_completions_handler(
             // the request. A session has no key, and `claims.sub` would hand back
             // a WorkOS user id — a different namespace in the same column.
             claims.api_key_id().map(str::to_owned),
+            online_eval_pending,
         );
         Sse::new(sse).into_response()
     } else {
@@ -2729,6 +2824,7 @@ async fn chat_completions_handler(
             state.semantic_cache.clone(),
             cache_key,
             CapturedInput::build(tenant_id, &chat_request),
+            online_eval_pending,
         )
         .await
         .into_response()
@@ -4802,6 +4898,10 @@ fn provider_stream_to_sse(
     // attribution and budget enforcement. Owned rather than borrowed because
     // the stream outlives the handler frame.
     api_key_id: Option<String>,
+    // EVL-28. `Some` means this request is in the online-eval sample, and is
+    // the ONLY reason this function accumulates the response text — see the
+    // accumulator below.
+    mut online_eval: Option<crate::online_eval::Pending>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     stream! {
         let mut input_tokens = 0u32;
@@ -4816,6 +4916,18 @@ fn provider_stream_to_sse(
         let mut stream_error: Option<&str> = None;
         let mut cost_usd: Option<f64> = None;
         // Latency split: TTFT = dispatch → the first byte the provider yields.
+        // ── EVL-28: the STREAMING accumulator, and it is gated ──────────────
+        //
+        // `Some` ONLY when this request is in the online-eval sample. That gate
+        // is the whole reason the sample decision happens at admission: the
+        // streaming path has no text accumulator of its own — deltas are yielded
+        // and dropped — so scoring at completion would mean accumulating the
+        // full response on 100% of streaming traffic to serve a 1% sample.
+        //
+        // It accumulates the POST-GUARDRAIL text, not the raw delta. That is
+        // deliberate: the judge should grade what the customer actually saw, and
+        // a redacted or blocked span of text is not part of the answer.
+        let mut online_answer: Option<String> = online_eval.as_ref().map(|_| String::new());
         let mut first_byte_ts: Option<chrono::DateTime<chrono::Utc>> = None;
         // The enforce-before-yield response-side seam — block/redact takes
         // effect before any chunk leaves this generator (the guardrail spec §2.6).
@@ -4902,6 +5014,10 @@ fn provider_stream_to_sse(
                         match guard.on_delta(&delta, Some(&usage)).await {
                             crate::guardrail::GuardStep::Emit(text) => {
                                 if !text.is_empty() {
+                                    // EVL-28: no-op unless this request is sampled.
+                                    if let Some(buf) = online_answer.as_mut() {
+                                        buf.push_str(&text);
+                                    }
                                     let data = serde_json::json!({
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -5160,6 +5276,22 @@ fn provider_stream_to_sse(
             // the budget and the number the dashboard renders are the same
             // number by construction, not by two call sites agreeing.
             record_key_spend(api_key_id.as_deref(), &span);
+
+            // ── EVL-28: the online-eval judge, STREAMING path ───────────────
+            //
+            // Same contract as the buffered site: after the response is done and
+            // the spend recorded, immediately before the span publish, awaiting
+            // nothing. The answer is the gated accumulator above rather than a
+            // local `text` — this path has no local, which is exactly why the
+            // sample decision was made at admission.
+            if let (Some(pending), Some(answer)) = (online_eval.take(), online_answer.take()) {
+                crate::online_eval::spawn(pending.into_job(
+                    tenant_id.clone(),
+                    trace_id,
+                    span.span_id.to_string(),
+                    answer,
+                ));
+            }
             let nats_clone = Arc::clone(nats_client);
             tokio::spawn(async move {
                 if let Err(e) = crate::otlp_emit::publish_span(&nats_clone, &span).await {
@@ -5248,6 +5380,8 @@ async fn buffer_provider_stream(
     // GWY-45 captured request content, `None` unless the tenant is allowlisted.
     // Built by the caller because `chat_request` lives there, not here.
     captured_input: Option<CapturedInput>,
+    // EVL-28. `Some` means this request is in the online-eval sample.
+    online_eval: Option<crate::online_eval::Pending>,
 ) -> impl IntoResponse {
     use tracelane_shared::model::MessageContent;
 
@@ -5385,6 +5519,31 @@ async fn buffer_provider_stream(
             captured.apply(&mut span.attributes);
         }
         record_key_spend(api_key_id, &span);
+
+        // ── EVL-28: the online-eval judge, BUFFERED path ────────────────────
+        //
+        // AFTER the response is complete and the spend recorded, immediately
+        // before the span publish. `online_eval::spawn` awaits nothing, so a
+        // slow judge, a provider outage or a ClickHouse blip is invisible to the
+        // customer whose request already succeeded.
+        //
+        // It sits inside the span-publish branch DELIBERATELY: a score is an
+        // annotation on a trace, and a request that produced no span has nothing
+        // for a score to attach to. Scoring where the trace does not exist would
+        // write rows the surface can never join.
+        //
+        // `text` is the buffered accumulator — the whole reason the sample
+        // decision was made at admission is that THIS path has the answer in a
+        // local and the streaming path does not.
+        if let Some(pending) = online_eval {
+            crate::online_eval::spawn(pending.into_job(
+                tenant_id.clone(),
+                trace_id,
+                span.span_id.to_string(),
+                text.clone(),
+            ));
+        }
+
         let nats = Arc::clone(nats_client);
         tokio::spawn(async move {
             if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
@@ -6132,6 +6291,8 @@ mod tests {
             Vec::new(),
             None,
             None, // api_key_id: not under test here
+            // EVL-28: these harnesses drive the SSE shape, not the eval path.
+            None,
         );
         let resp = Sse::new(sse).into_response();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -6188,6 +6349,8 @@ mod tests {
             Vec::new(),
             None,
             None, // api_key_id: not under test here
+            // EVL-28: this harness drives the SSE shape, not the eval path.
+            None,
         );
         let resp = Sse::new(sse).into_response();
         let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
