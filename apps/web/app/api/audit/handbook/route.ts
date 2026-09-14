@@ -32,7 +32,12 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 	const entitlements = await resolveEntitlements(tenantRow?.id, plan);
 	if (!entitlements.audit_ledger) {
 		return NextResponse.json(
-			{ error: "audit_addon_required", upgrade_url: "/settings/billing" },
+			{
+				error: "enterprise_plan_required",
+				message:
+					"The Compliance Handbook and the Article-12 export ship on the Enterprise plan.",
+				upgrade_url: "/settings/billing",
+			},
 			{ status: 403 },
 		);
 	}

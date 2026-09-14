@@ -1,5 +1,6 @@
 /**
- * Audit Ledger page — the tamper-evident record, gated honestly to the Audit SKU.
+ * Audit Ledger page — the tamper-evident record; the chain + self-verify on every
+ * plan, the Article-12 export gated honestly to Enterprise (f_audit_addon).
  *
  * Entitled tenants get the chain visualization + a client-side "Verify integrity"
  * (the real verifier runs in their browser) + the Article-12 export. Non-entitled
@@ -76,8 +77,9 @@ async function getAuditAccess(): Promise<{
 		.limit(1);
 	const plan: Plan = (row?.plan as Plan) ?? "builder";
 	// ADR-066 split: `audit_self_verify` (default TRUE, all plans) renders the
-	// chain + in-browser verify; `audit_ledger` (= f_audit_addon, the $999 paid
-	// add-on) gates ONLY the Article-12 evidence-pack export. So a non-entitled
+	// chain + in-browser verify; `audit_ledger` (= f_audit_addon, seeded TRUE on
+	// Enterprise only — the paid Article-12 add-on is NOT sold, BILL-01 §10.4 / B-392)
+	// gates ONLY the Article-12 export. So a non-entitled
 	// tenant still SEEs + verifies their own chain; the export is the upsell.
 	//
 	// Resolve entitlements + audit key in parallel (both depend on tenant id).
@@ -131,7 +133,7 @@ function AuditFallback() {
 }
 
 /** FREE self-verify surface (ADR-066): render the caller's OWN recent chain +
- * the in-browser "Verify integrity" for tenants WITHOUT the paid Audit add-on.
+ * the in-browser "Verify integrity" for tenants WITHOUT the Enterprise export entitlement.
  * The export affordance is hidden (canExport=false) and replaced by the upsell.
  * `tenantPubkeyB64` is resolved once by getAuditAccess() — not re-fetched here. */
 async function SelfVerifyData({
@@ -192,10 +194,16 @@ async function SelfVerifyData({
 }
 
 /**
- * Paid Audit add-on surface (f_audit_addon).
+ * Enterprise export surface (f_audit_addon, seeded TRUE on Enterprise only).
  * `tenantPubkeyB64` is resolved once by getAuditAccess() — not re-fetched here.
- * The two gateway calls (summary + export) fire in parallel; a summary failure
- * is best-effort (falls back to client-computed breakdown from loaded rows).
+ * The two gateway calls (summary + export) fire in parallel. A summary failure
+ * is DEGRADED, not silent (B-335c): `/v1/audit/export` is capped at 1,000 rows
+ * (`limit=1000` below), and `summary.total` is the ONLY exact, uncapped count —
+ * without it, `AuditLedgerView` falls back to the loaded-row count, which is
+ * indistinguishable from the true total once the ledger exceeds the cap. So a
+ * failed summary read is surfaced with the same unreachable notice the rest of
+ * this file uses, never folded into `undefined` and rendered as if nothing
+ * happened.
  */
 async function LedgerData({
 	range,
@@ -212,13 +220,23 @@ async function LedgerData({
 	const sinceIso = since ?? rangeSinceIso(range);
 	const untilIso = until ?? new Date().toISOString();
 
-	// Parallel gateway fetches — summary is best-effort (can fail without aborting
-	// the export); the export fetch determines the render path.
-	const [summary, ndjsonOrNull] = await Promise.all([
-		// Best-effort aggregate. Catch any error → undefined (client fallback).
+	// Parallel gateway fetches. The export fetch determines the render path (no
+	// export, no page); the summary fetch degrades gracefully — `undefined`
+	// summary is a real, tracked state (`summaryUnreachable`), not a discard.
+	const [summaryOutcome, ndjsonOrNull] = await Promise.all([
 		gatewayGet<AuditSummary>(
 			`/v1/audit/summary?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`,
-		).catch((_: unknown): AuditSummary | undefined => undefined),
+		)
+			.then((s): { summary: AuditSummary; unreachable: false } => ({
+				summary: s,
+				unreachable: false,
+			}))
+			.catch((err: unknown): { summary: undefined; unreachable: true } => {
+				if (err instanceof GatewayError) {
+					return { summary: undefined, unreachable: true };
+				}
+				throw err;
+			}),
 		// Required export. GatewayError → null (show empty state); other errors propagate.
 		gatewayGetText(
 			`/v1/audit/export?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}&limit=1000`,
@@ -227,6 +245,7 @@ async function LedgerData({
 			throw err;
 		}),
 	]);
+	const { summary, unreachable: summaryUnreachable } = summaryOutcome;
 
 	if (ndjsonOrNull === null) {
 		return (
@@ -248,15 +267,31 @@ async function LedgerData({
 		);
 	}
 	return (
-		<AuditLedgerView
-			ndjson={ndjsonOrNull}
-			tenantPubkeyB64={tenantPubkeyB64}
-			range={since ? undefined : range}
-			since={since}
-			until={until}
-			summary={summary}
-			canExport
-		/>
+		<>
+			{/* The exact, uncapped total (`summary.total`) could not be read — the
+			    same unreachable notice used elsewhere on this page, so the count
+			    the ledger view falls back to (the loaded/capped rows) is never
+			    mistaken for the whole ledger. */}
+			{summaryUnreachable && (
+				<>
+					<WarmingBanner />
+					<p className="-mt-4 mb-6 text-xs text-ink-2">
+						The exact ledger total couldn&apos;t be read from the gateway — the
+						counts below reflect only the rows loaded for this view (capped at
+						1,000), not necessarily the complete ledger.
+					</p>
+				</>
+			)}
+			<AuditLedgerView
+				ndjson={ndjsonOrNull}
+				tenantPubkeyB64={tenantPubkeyB64}
+				range={since ? undefined : range}
+				since={since}
+				until={until}
+				summary={summary}
+				canExport
+			/>
+		</>
 	);
 }
 
@@ -304,7 +339,18 @@ export default async function AuditPage({
 			    24h-shows-0 bug). The view shows the first N events from genesis; the
 			    complete ledger is the export. */}
 			<div className="mb-4 max-w-2xl">
-				<h1 className="t-h1">Audit Ledger</h1>
+				<h1 className="flex items-center gap-2.5 t-h1">
+					Audit Ledger
+					{/* DSH-16: the recorder's amber — this workspace's own indicator
+					    light for "everything below is being continuously ledgered".
+					    Decorative only; the h1's text and the paragraph's claim are
+					    unchanged. */}
+					<span
+						aria-hidden="true"
+						className="recorder-dot"
+						title="Continuously recorded to the tamper-evident ledger"
+					/>
+				</h1>
 				<p className="mt-1 text-sm text-ink-2">
 					A tamper-evident, independently verifiable record of every
 					gateway-proxied call and guardrail verdict.
@@ -319,7 +365,7 @@ export default async function AuditPage({
 					tenantPubkeyB64={fixture.tenantPubkeyB64}
 				/>
 			) : access.exportEntitled ? (
-				// Paid Audit add-on: full chain + verify + Article-12 evidence export.
+				// Enterprise (f_audit_addon): full chain + verify + Article-12 export.
 				// Wrapped in Suspense so the page shell (header) streams first; the
 				// ledger content streams in after the gateway round-trips complete.
 				<Suspense fallback={<AuditFallback />}>

@@ -218,10 +218,15 @@ mod tests {
 
     fn request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages,
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

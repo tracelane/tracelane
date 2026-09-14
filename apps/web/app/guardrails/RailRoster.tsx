@@ -48,12 +48,9 @@ import {
 import Link from "next/link";
 import { useId, useMemo, useState } from "react";
 
-/** Verdict-detail list for blocked verdicts, preserving the active range. */
-function blockHref(range?: string): string {
-	return range
-		? `/guardrails/verdicts?decision=block&range=${range}`
-		: "/guardrails/verdicts?decision=block";
-}
+// The blocked-verdicts href is built by the page from the shared window
+// (`withWindow`), so a custom `since/until` window survives the click; this
+// component only renders it. (DSH-11 — it used to rebuild `?range=` here.)
 
 export interface LiveRail {
 	rail: string;
@@ -138,10 +135,16 @@ function SortTh({
 	);
 }
 
+/** Append `rail=` to a base href that already carries the window and decision. */
+export function railHref(base: string, rail: string): string {
+	const sep = base.includes("?") ? "&" : "?";
+	return `${base}${sep}rail=${encodeURIComponent(rail)}`;
+}
+
 export function RailRoster({
 	live,
-	range,
-}: { live: LiveRail[]; range?: string }) {
+	blockedHrefBase,
+}: { live: LiveRail[]; blockedHrefBase: string }) {
 	const byId = useMemo(() => new Map(live.map((r) => [r.rail, r])), [live]);
 	const [sort, setSort] = useState<SortState | null>(null);
 
@@ -210,7 +213,7 @@ export function RailRoster({
 							key={r.metaId}
 							live={r.live}
 							metaId={r.metaId}
-							range={range}
+							blockedHrefBase={blockedHrefBase}
 						/>
 					))}
 				</TBody>
@@ -222,15 +225,24 @@ export function RailRoster({
 function RailRow({
 	live,
 	metaId,
-	range,
-}: { live?: LiveRail; metaId: string; range?: string }) {
+	blockedHrefBase,
+}: {
+	live?: LiveRail;
+	metaId: string;
+	/** The window+decision href WITHOUT a rail; a string, because a function
+	 *  cannot cross the server→client boundary (this file is a client component). */
+	blockedHrefBase: string;
+}) {
+	// B-335a: the "Blocked" link is scoped to THIS rail — the gateway filters
+	// `/v1/guardrails/verdicts?rail=` inside the `rails` JSON array.
+	const blockedHref = railHref(blockedHrefBase, live?.rail ?? metaId);
 	const [open, setOpen] = useState(false);
 	const detailId = useId();
 	const m = railMeta(metaId);
 	// A gated rail with NO verdicts in this window. Note carefully what this does and
 	// does not mean: it is NOT evidence the workspace lacks the entitlement.
 	//
-	// This component receives only `live` and `range` — no plan and no entitlement flags
+	// This component receives only `live` and a href — no plan and no entitlement flags
 	// (the web `Entitlements` interface does not even expose the per-rail guardrail flags).
 	// So "gated and quiet" is indistinguishable from "gated, granted, and nothing tripped
 	// it", which is the NORMAL state for clean traffic. The old copy resolved that
@@ -337,7 +349,7 @@ function RailRow({
 					    it no longer restates them and cannot drift from its column. */}
 					{live && live.blocks > 0 ? (
 						<Link
-							href={blockHref(range)}
+							href={blockedHref}
 							onClick={(e) => e.stopPropagation()}
 							title="See the blocked verdicts →"
 							className="text-danger-ink underline decoration-danger/30 underline-offset-2 hover:decoration-danger focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"

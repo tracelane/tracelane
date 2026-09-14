@@ -63,7 +63,6 @@ Tracelane is five components in one monorepo:
                                     ▼
                        ┌──────────────────────────┐
                        │  ClickHouse (hot tier)   │
-                       │  R2 (cold tier, built    │
                        │  Postgres (metadata)     │
                        └────────────┬─────────────┘
                                     ▲
@@ -83,7 +82,8 @@ to a real crate or service — no aspirational components.
   <img src="/images/write-path.svg" alt="Write path: client → gateway (auth, rate/quota, inline pre-flight policy, audit chain append, provider dispatch) → NATS JetStream → ingest (OTLP receiver, decode, tail-sample, ack-after-write) → ClickHouse hot + R2 cold" />
 </Frame>
 
-A request enters the gateway (`crates/gateway/src/server.rs`), which validates the
+A request enters the gateway (the typed admission pipeline in
+`crates/gateway/src/admission.rs`, then `server/chat.rs`), which validates the
 WorkOS JWT into an internal tenant UUID (`auth/api_key.rs`,
 `TenantId::from_jwt_claim`), applies per-tenant rate + quota
 (`rate_limiter.rs`), runs the inline pre-flight guardrail rails and observe-first
@@ -93,8 +93,8 @@ with cross-provider failover (`providers/`, `failover.rs`). Emitted OTel-GenAI s
 travel over **NATS JetStream** to the ingest workers, which authenticate over SPIFFE
 mTLS (`ingest/src/otlp_receiver.rs:103`, `auth.rs`), decode (`otlp_decode.rs:86`),
 tail-sample (`tail_sampler.rs`), and only acknowledge after a durable ClickHouse
-flush (`nats_consumer.rs`, `span_envelope.rs`) — then write **ClickHouse** (hot) and
-**R2** (cold, 1 MB-batched, EU — `r2_batcher.rs`).
+flush (`nats_consumer.rs`, `span_envelope.rs`) — then write **ClickHouse**. Spans
+live in ClickHouse only; there is no cold-tier archival in this product today.
 
 ### Read path
 
@@ -133,25 +133,26 @@ Python / TypeScript verifiers.
 |---|---|---|
 | Tenant + user metadata, API keys, billing | Postgres | OLTP: low volume, high integrity |
 | Spans (365-day TTL) | ClickHouse | OLAP: high-throughput fan-out queries |
-| Audit log | NDJSON files in a tamper-evident hash chain (Ed25519 batch signing + Sigstore Rekor v2 anchoring live, best-effort, on the Audit add-on) | Tamper-evident, byte-identical verifier across 3 languages |
+| Audit log | NDJSON files in a tamper-evident hash chain (Ed25519 batch signing + Sigstore Rekor v2 anchoring live, best-effort, on every plan) | Tamper-evident, byte-identical verifier across 3 languages |
 | Prompt versions + pinning | Postgres | Atomic promotion + rollback |
 | Predictive policies | Postgres | Tenant-scoped, hot-cached in gateway |
 
 ## Performance budgets
 
-These are **internal CI targets**, not measured public benchmarks — the benchmark suite
-rejects PRs that push any p95 over budget. Published, independently measured figures will
-ship with the Reliability Benchmark v1.0; until then we quote no public
-performance numbers.
+The gateway-overhead row is **measured** (2026-09-07, LiteLLM's AIGatewayBench harness, 4 vCPU,
+two runs, capture on — [benchmark page](/benchmarks)); the pre-flight policy rows are still
+**internal CI targets** the benchmark suite enforces on PRs, not published measurements.
 
-| Metric (internal target) | p50 | p95 | p99 |
+| Metric | p50 | p95 | p99 |
 |---|---|---|---|
-| Gateway overhead (excl. provider time) | `<5ms` | `<15ms` | `<25ms` |
+| Gateway overhead (excl. provider time) | `2ms` measured (target `<5ms`) | `4ms` measured (target `<15ms`) | `5ms` measured (target `<25ms`) |
 | Ingest end-to-end | `<1s` | `<3s` | `<5s` |
 | Dashboard 10K-span trace load | `<200ms` | `<500ms` | `<1s` |
 | MCP query (filtered, indexed) | `<50ms` | `<150ms` | `<300ms` |
 | Predictive layer (inline, combined) | `<30ms` | `<50ms` | `<100ms` |
 | SLM judge (1B encoder, L4 GPU) | `<50ms` | `<100ms` | `<200ms` |
+
+Measured 2026-09-07 with LiteLLM's AIGatewayBench harness on a 4 vCPU host, two runs, capture on — method, caveats and the other gateways on the [benchmark page](/benchmarks).
 
 Throughput floors are likewise internal targets pending the Reliability Benchmark v1.0:
 - High-throughput single-node and multi-node ingest

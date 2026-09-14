@@ -1,64 +1,63 @@
 /**
- * RangeControl — a shared time-range segment (24h / 7d / 30d) that drives a
- * server-rendered page via the `?range=` URL param. Server-driven (updates the
- * URL, the RSC re-fetches) — never a client-only illusion. Used by Dashboard,
- * SLO, and Gateway so the range control is consistent across surfaces.
+ * RangeControl — the ONE time-range control (DSH-11 §3b). Presets from the
+ * shared `PRESETS` list plus a **Custom** window, driving a server-rendered page
+ * through the shared URL grammar (`?range=` or `?since=&until=`).
  *
- * Smoothness (founder: "changing 24h→30d refetches the whole page, feels slow"):
- * the navigation runs inside `useTransition`, so React KEEPS the current view on
- * screen and swaps in the new data when it arrives — no unmount, no "Loading…"
- * flash (the page's Suspense boundary must NOT be keyed on `range`). The clicked
- * pill highlights OPTIMISTICALLY (instant feedback) and the control shows a quiet
- * pending state while the RSC re-fetches — the Instagram/Meta feel.
+ * Extends the control the app already had rather than inventing a second one:
+ * the optimistic pill, the `useTransition` that keeps the current view on screen,
+ * the top progress bar and the hover-only prefetch are unchanged (the header of
+ * the previous revision carried the measurements that set them — 33 gateway
+ * subrequests from a mount-time prefetch of every preset — and they stand).
  *
- * PREFETCH POLICY — HOVER ONLY, and the reason is measured, not stylistic.
- * This control used to `router.prefetch()` all three presets from a mount effect.
- * Every preset is a FULL server render of the host page, so on a production build
- * (`next start`, local fixture gateway, 2026-08-22) one browser load cost:
- *
- *     /dashboard  33 gateway subrequests   (the page needs  8)  — 4.1×
- *     /slo        13 gateway subrequests   (the page needs  3)  — 4.3×
- *     /gateway     9 gateway subrequests   (the page needs  2)  — 4.5×
- *
- * plus 77.6 kB of extra transfer on /dashboard alone. One of the three renders is
- * the range ALREADY ON SCREEN — waste with no upside in any scenario — and another
- * is `range=30d`, the exact 906-row window this repo already blew the Cloudflare
- * Worker CPU ceiling on (Error 1102; see the `bucket=` note in
- * `app/dashboard/page.tsx`). Speculatively running that on every dashboard view is
- * the opposite of what that fix was for.
- *
- * What replaces it: `onOptionHover` below, which prefetches the ONE preset the
- * pointer is actually on. KNOWN LIMIT, stated because it is a real trade: the
- * primitive wires hover via `onMouseEnter` only, so a touch device gets no
- * prefetch and its range switch is a cold RSC fetch — covered by the
- * `useTransition` + optimistic pill + top progress bar above, which are what make
- * the wait legible. If touch prefetch is wanted back, prefetch the two INACTIVE
- * presets, never all three.
+ * WHAT IS NEW. A `Custom` option opens a small popover with two UTC
+ * `datetime-local` fields. Apply writes `since`/`until` and DELETES `range`;
+ * choosing a preset DELETES `since`/`until` — the two forms are mutually
+ * exclusive, the rule `app/traces/filter-params.ts` states for the traces bar,
+ * now applied to every page. The popover is a plain positioned card: no portal,
+ * no blur, one overlay shadow.
  */
 "use client";
 
 import { useNavProgress } from "@/components/NavProgress";
+import {
+	PRESETS,
+	type Preset,
+	formatWindowUtc,
+	parseInstant,
+} from "@/lib/metrics/time-range";
 import { SegmentedControl } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useId, useRef, useState, useTransition } from "react";
 
-const PRESETS = [
-	{ value: "24h", label: "24h" },
-	{ value: "7d", label: "7d" },
-	{ value: "30d", label: "30d" },
-] as const;
+const CUSTOM = "custom" as const;
+type Value = Preset | typeof CUSTOM;
 
-export const DEFAULT_RANGE = "24h";
+const OPTIONS: readonly { value: Value; label: string; title?: string }[] = [
+	...PRESETS.map((p) => ({
+		value: p.value,
+		label: p.label,
+		title: `last ${p.long}`,
+	})),
+	{ value: CUSTOM, label: "Custom", title: "An absolute window, in UTC" },
+];
+
+/** `datetime-local` wants `YYYY-MM-DDTHH:MM` in the field's own zone; we show UTC. */
+function toLocalInput(ms: number): string {
+	const d = new Date(ms);
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
 
 /**
- * @param defaultRange the preset a page treats as its no-param default (so the
- *   active pill matches the data window). Sessions uses "30d" because sessions
- *   are sparse aggregates — a 24h default reads as "empty" on low traffic; most
- *   surfaces keep 24h.
+ * @param defaultPreset the preset a page treats as its no-param default, so the
+ *   active pill matches the data window. Sessions uses "30d"; most keep "24h".
  */
 export function RangeControl({
-	defaultRange = DEFAULT_RANGE,
+	defaultPreset = "24h",
+	defaultRange,
 }: {
+	defaultPreset?: Preset;
+	/** @deprecated use `defaultPreset` — kept for one release so no caller breaks. */
 	defaultRange?: string;
 } = {}) {
 	const router = useRouter();
@@ -66,59 +65,184 @@ export function RangeControl({
 	const sp = useSearchParams();
 	const [isPending, startTransition] = useTransition();
 	const { setPending } = useNavProgress();
-	// Optimistic selection: highlight the clicked pill immediately, before the
-	// URL/RSC catches up. Reset whenever the committed range changes (navigation
-	// finished, or the user hit back) via React's render-time state-reset pattern
-	// — no effect needed.
-	const [optimistic, setOptimistic] = useState<string | null>(null);
-	const [seenUrl, setSeenUrl] = useState<string | null>(null);
-	const urlRange = sp.get("range") ?? defaultRange;
-	if (seenUrl !== urlRange) {
-		setSeenUrl(urlRange);
+	const fallback: Preset =
+		defaultRange && PRESETS.some((p) => p.value === defaultRange)
+			? (defaultRange as Preset)
+			: defaultPreset;
+
+	const urlSince = sp.get("since");
+	const urlUntil = sp.get("until");
+	const urlRange = sp.get("range");
+	const committed: Value = urlSince
+		? CUSTOM
+		: urlRange && PRESETS.some((p) => p.value === urlRange)
+			? (urlRange as Preset)
+			: fallback;
+
+	// Optimistic selection — reset when the committed value changes (render-time
+	// state reset, no effect).
+	const [optimistic, setOptimistic] = useState<Value | null>(null);
+	const [seen, setSeen] = useState<string | null>(null);
+	const urlKey = `${committed}|${urlSince ?? ""}|${urlUntil ?? ""}`;
+	if (seen !== urlKey) {
+		setSeen(urlKey);
 		setOptimistic(null);
 	}
-	const active = optimistic ?? urlRange;
+	const active = optimistic ?? committed;
 
-	const hrefFor = (v: string) => {
-		const p = new URLSearchParams(sp.toString());
-		p.set("range", v);
-		return `${pathname}?${p.toString()}`;
-	};
+	const [open, setOpen] = useState(false);
+	const sinceMs = parseInstant(urlSince) ?? Date.now() - 3 * 3_600_000;
+	const untilMs = parseInstant(urlUntil) ?? Date.now();
+	const [from, setFrom] = useState(() => toLocalInput(sinceMs));
+	const [to, setTo] = useState(() => toLocalInput(untilMs));
+	const [error, setError] = useState<string | null>(null);
+	const popRef = useRef<HTMLDivElement>(null);
+	const formId = useId();
 
-	// Surface the transition's pending state to the global top loading bar (the
-	// visible "loading" sign the founder asked for — the view itself stays put).
 	useEffect(() => {
 		setPending(isPending);
 	}, [isPending, setPending]);
 
-	const set = (v: string) => {
+	// Close on outside click / Escape.
+	useEffect(() => {
+		if (!open) return;
+		const onDown = (e: MouseEvent) => {
+			if (popRef.current && !popRef.current.contains(e.target as Node))
+				setOpen(false);
+		};
+		const onKey = (e: globalThis.KeyboardEvent) => {
+			if (e.key === "Escape") setOpen(false);
+		};
+		document.addEventListener("mousedown", onDown);
+		document.addEventListener("keydown", onKey);
+		return () => {
+			document.removeEventListener("mousedown", onDown);
+			document.removeEventListener("keydown", onKey);
+		};
+	}, [open]);
+
+	const hrefForPreset = (v: Preset) => {
+		const p = new URLSearchParams(sp.toString());
+		p.set("range", v);
+		p.delete("since");
+		p.delete("until");
+		p.delete("cursor");
+		return `${pathname}?${p.toString()}`;
+	};
+
+	const choose = (v: Value) => {
+		if (v === CUSTOM) {
+			setFrom(toLocalInput(sinceMs));
+			setTo(toLocalInput(untilMs));
+			setError(null);
+			setOpen(true);
+			return;
+		}
 		if (v === active) return;
-		setOptimistic(v); // instant pill feedback (outside the transition)
-		// The transition keeps the current page visible while the RSC re-fetches.
-		startTransition(() => router.push(hrefFor(v)));
+		setOpen(false);
+		setOptimistic(v);
+		startTransition(() => router.push(hrefForPreset(v)));
+	};
+
+	const apply = () => {
+		// The fields are labelled UTC and read as UTC: append `Z`.
+		const a = parseInstant(`${from}:00Z`);
+		const b = parseInstant(`${to}:00Z`);
+		if (a === null || b === null) {
+			setError("Enter both times (UTC).");
+			return;
+		}
+		if (!(b > a)) {
+			setError("The end must be after the start.");
+			return;
+		}
+		const p = new URLSearchParams(sp.toString());
+		p.set("since", new Date(a).toISOString());
+		p.set("until", new Date(b).toISOString());
+		p.delete("range");
+		p.delete("cursor");
+		setError(null);
+		setOpen(false);
+		setOptimistic(CUSTOM);
+		startTransition(() => router.push(`${pathname}?${p.toString()}`));
 	};
 
 	return (
-		/*
-		 * The well-with-a-lifted-segment treatment this control pioneered now lives
-		 * in `SegmentedControl` (`@tracelanedev/ui`), which is where the nine
-		 * hand-rolled copies of this pattern converged. The long note that used to
-		 * sit here — including how the lift reads as an INSET in dark theme — moved
-		 * with the markup it describes; it would be a comment about code that is no
-		 * longer in this file.
-		 *
-		 * What stays here is the only part that is this control's own: the
-		 * optimistic selection, the `useTransition` that keeps the current view on
-		 * screen, and the HOVER prefetch (the mount-time prefetch of every preset is
-		 * gone — the header block above carries the measurement that removed it).
-		 */
-		<SegmentedControl
-			label="Time range"
-			value={active}
-			options={PRESETS}
-			pending={isPending}
-			onChange={set}
-			onOptionHover={(v) => router.prefetch(hrefFor(v))}
-		/>
+		<div className="relative inline-flex flex-col items-end gap-1">
+			<SegmentedControl<Value>
+				label="Time range"
+				value={active}
+				options={OPTIONS}
+				pending={isPending}
+				onChange={choose}
+				onOptionHover={(v) => {
+					if (v !== CUSTOM) router.prefetch(hrefForPreset(v));
+				}}
+			/>
+			{active === CUSTOM && urlSince && (
+				<span
+					className="font-mono text-2xs text-ink-3"
+					style={{ fontVariantNumeric: "tabular-nums" }}
+				>
+					{formatWindowUtc(sinceMs, untilMs)}
+				</span>
+			)}
+			{open && (
+				<div
+					ref={popRef}
+					// biome-ignore lint/a11y/useSemanticElements: a positioned popover beside the control, not a modal — `<dialog>` carries top-layer/modal semantics and its own positioning, neither of which this is.
+					role="dialog"
+					aria-label="Custom time range (UTC)"
+					className="absolute right-0 top-full z-40 mt-2 w-72 rounded-[var(--radius-card)] border border-line bg-surface p-3 text-sm shadow-[var(--shadow-overlay)]"
+				>
+					<p className="t-metric-label mb-2">Custom window · UTC</p>
+					<label
+						htmlFor={`${formId}-from`}
+						className="block text-2xs text-ink-3"
+					>
+						From
+					</label>
+					<input
+						id={`${formId}-from`}
+						type="datetime-local"
+						value={from}
+						onChange={(e) => setFrom(e.target.value)}
+						className="mb-2 w-full rounded-[var(--radius-control)] border border-line bg-surface-2 px-2 py-1 font-mono text-xs text-ink"
+					/>
+					<label htmlFor={`${formId}-to`} className="block text-2xs text-ink-3">
+						To
+					</label>
+					<input
+						id={`${formId}-to`}
+						type="datetime-local"
+						value={to}
+						onChange={(e) => setTo(e.target.value)}
+						className="mb-2 w-full rounded-[var(--radius-control)] border border-line bg-surface-2 px-2 py-1 font-mono text-xs text-ink"
+					/>
+					{error && <p className="mb-2 text-2xs text-danger-ink">{error}</p>}
+					<div className="flex items-center justify-between gap-2">
+						<span className="text-2xs text-ink-3">up to 30 days wide</span>
+						<div className="flex gap-1.5">
+							<button
+								type="button"
+								onClick={() => setOpen(false)}
+								className="rounded-[var(--radius-control)] px-2 py-1 text-xs text-ink-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							>
+								Cancel
+							</button>
+							<button
+								type="button"
+								onClick={apply}
+								className="rounded-[var(--radius-control)] bg-ink px-2.5 py-1 text-xs font-medium text-ink-inverse focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							>
+								Apply
+							</button>
+						</div>
+					</div>
+				</div>
+			)}
+		</div>
 	);
 }
+
+export const DEFAULT_RANGE = "24h";

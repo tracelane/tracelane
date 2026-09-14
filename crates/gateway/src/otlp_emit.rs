@@ -1,156 +1,27 @@
 //! OTLP span exporter.
 //!
-//! Two paths:
-//!   1. `emit_span` — structured tracing log for local debugging / OTLP collector.
-//!   2. `publish_span` — serialises a span to JSON and publishes to NATS JetStream
-//!      on subject `tracelane.spans.{tenant_id}`. The ingest workers consume from
-//!      `tracelane.spans.>` and write to ClickHouse.
+//! One path: `publish_span` — serialises a span to JSON and publishes to NATS
+//! JetStream on subject `tracelane.spans.{tenant_id}`, acked (B-376). The ingest
+//! workers consume from `tracelane.spans.>` and write to ClickHouse. (A second,
+//! log-only emitter was removed 2026-09-12 — see the note below the imports.)
 //!
 //! Provider keys are NEVER included in span attributes. The tracing redaction
 //! filter in `init_tracing()` enforces this at the subscriber level.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use tracelane_shared::{TenantId, TracelaneSpan};
 use tracing::instrument;
 
-/// OTel semconv stability mode, selected by `OTEL_SEMCONV_STABILITY_OPT_IN`
-/// (ADR-032). The value is a comma-separated opt-in list; we look for the
-/// `gen_ai_latest_experimental` token.
-///
-/// - `Experimental` → emit the **v1.41** schema only (`gen_ai.provider.name`,
-///   the v1.40/41 token + streaming attributes, structured message arrays).
-///   Deprecated per-message events are **not** emitted.
-/// - `Legacy` (unset / any other value) → emit the **pre-1.36** schema
-///   (`gen_ai.system`, per-message events) for un-migrated downstreams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemconvMode {
-    Experimental,
-    Legacy,
-}
-
-/// Resolve the semconv emission mode from the environment. V1 production sets
-/// `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`; absence means a
-/// downstream that still wants the legacy wire format.
-pub fn semconv_mode() -> SemconvMode {
-    match std::env::var("OTEL_SEMCONV_STABILITY_OPT_IN") {
-        Ok(v)
-            if v.split(',')
-                .any(|t| t.trim() == "gen_ai_latest_experimental") =>
-        {
-            SemconvMode::Experimental
-        }
-        _ => SemconvMode::Legacy,
-    }
-}
-
-/// Emits a completed span to the OTLP exporter (structured log).
-///
-/// Dual-emission (ADR-032 / §9.5): under `Experimental` the canonical v1.41
-/// schema is emitted (`gen_ai.provider.name` + cache/reasoning/stream/TTFT +
-/// `gen_ai.conversation.id` + structured message arrays, no deprecated
-/// per-message events); under `Legacy` the pre-1.36 schema (`gen_ai.system` +
-/// deprecated per-message events) is emitted. The OpenInference `llm.*` mirror
-/// is emitted in both modes. The persisted NATS→ClickHouse path always carries
-/// the full canonical struct (see [`publish_span`]); this function is the
-/// OTLP-collector-facing surface.
-#[instrument(
-    skip(span),
-    fields(
-        tenant_id = %span.tenant_id,
-        span_id = %span.span_id,
-        trace_id = %span.trace_id,
-    )
-)]
-pub async fn emit_span(span: TracelaneSpan) -> anyhow::Result<()> {
-    let attrs = &span.attributes;
-
-    // Attributes common to both schema modes.
-    let operation = attrs.gen_ai_operation_name.as_deref().unwrap_or("chat");
-    let system = attrs.gen_ai_system.as_deref().unwrap_or("");
-    let provider = attrs.gen_ai_provider_name.as_deref().unwrap_or(system);
-    let req_model = attrs.gen_ai_request_model.as_deref().unwrap_or("");
-    let resp_model = attrs.gen_ai_response_model.as_deref().unwrap_or(req_model);
-    let input_tokens = attrs.gen_ai_usage_input_tokens.unwrap_or(0);
-    let output_tokens = attrs.gen_ai_usage_output_tokens.unwrap_or(0);
-    let agent_name = attrs.gen_ai_agent_name.as_deref().unwrap_or("");
-
-    let intervention = attrs
-        .tracelane_intervention
-        .map(|i| format!("{i:?}").to_lowercase())
-        .unwrap_or_else(|| "none".to_string());
-    let aft_id = attrs.tracelane_aft_id.as_deref().unwrap_or("");
-
-    match semconv_mode() {
-        SemconvMode::Experimental => {
-            // v1.41 canonical schema. v1.40/41 token + streaming additions
-            // default to 0 / "" when absent (consistent with the existing
-            // input/output-token handling).
-            tracing::info!(
-                span_id = %span.span_id,
-                trace_id = %span.trace_id,
-                parent_span_id = ?span.parent_span_id,
-                name = %span.name,
-                "semconv.mode" = "gen_ai_latest_experimental",
-                "gen_ai.operation.name" = operation,
-                "gen_ai.provider.name" = provider,
-                "gen_ai.request.model" = req_model,
-                "gen_ai.response.model" = resp_model,
-                "gen_ai.usage.input_tokens" = input_tokens,
-                "gen_ai.usage.output_tokens" = output_tokens,
-                "gen_ai.usage.cache_read.input_tokens" =
-                    attrs.gen_ai_usage_cache_read_input_tokens.unwrap_or(0),
-                "gen_ai.usage.cache_creation.input_tokens" =
-                    attrs.gen_ai_usage_cache_creation_input_tokens.unwrap_or(0),
-                "gen_ai.usage.reasoning.output_tokens" =
-                    attrs.gen_ai_usage_reasoning_output_tokens.unwrap_or(0),
-                // Upstream-reported cost; 0.0 = not reported on the wire.
-                "gen_ai.usage.cost" = attrs.gen_ai_usage_cost.unwrap_or(0.0),
-                "gen_ai.request.stream" = attrs.gen_ai_request_stream.unwrap_or(false),
-                "gen_ai.response.time_to_first_chunk" =
-                    attrs.gen_ai_response_time_to_first_chunk.unwrap_or(0.0),
-                "gen_ai.agent.name" = agent_name,
-                "gen_ai.agent.version" = attrs.gen_ai_agent_version.as_deref().unwrap_or(""),
-                "gen_ai.conversation.id" = attrs.gen_ai_conversation_id.as_deref().unwrap_or(""),
-                // OpenInference mirror (both modes)
-                "llm.model_name" = req_model,
-                "llm.token_count.prompt" = input_tokens,
-                "llm.token_count.completion" = output_tokens,
-                "tracelane.tenant_id" = %span.tenant_id,
-                "tracelane.intervention" = %intervention,
-                "tracelane.aft_id" = aft_id,
-                "span emitted"
-            );
-        }
-        SemconvMode::Legacy => {
-            // pre-1.36 schema for un-migrated downstreams.
-            tracing::info!(
-                span_id = %span.span_id,
-                trace_id = %span.trace_id,
-                parent_span_id = ?span.parent_span_id,
-                name = %span.name,
-                "semconv.mode" = "legacy",
-                "gen_ai.operation.name" = operation,
-                "gen_ai.system" = provider,
-                "gen_ai.request.model" = req_model,
-                "gen_ai.response.model" = resp_model,
-                "gen_ai.usage.input_tokens" = input_tokens,
-                "gen_ai.usage.output_tokens" = output_tokens,
-                "gen_ai.agent.name" = agent_name,
-                "llm.model_name" = req_model,
-                "llm.token_count.prompt" = input_tokens,
-                "llm.token_count.completion" = output_tokens,
-                "tracelane.tenant_id" = %span.tenant_id,
-                "tracelane.intervention" = %intervention,
-                "tracelane.aft_id" = aft_id,
-                "span emitted"
-            );
-        }
-    }
-
-    Ok(())
-}
+// B-390 (2026-09-12): `SemconvMode`, `semconv_mode()` and `emit_span()` — the
+// "structured tracing log for a local OTLP collector" surface, ~130 lines with a
+// dual-schema switch on `OTEL_SEMCONV_STABILITY_OPT_IN` — were DELETED here. No
+// call site existed in the tree (the crate-wide `#![allow(dead_code)]` hid that),
+// no doc, compose file or env example named the variable, and the persisted
+// NATS → ClickHouse path (`publish_span` below) has always carried the full
+// canonical struct. Restorable from `git show 9da05da2:crates/gateway/src/otlp_emit.rs`.
 
 /// Emits a `gen_ai.client.operation.exception` event (v1.41, ADR-032).
 ///
@@ -310,21 +181,39 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Publishes a span to NATS JetStream (subject from [`span_subject`]).
+/// Publishes a span to the JetStream `TRACELANE_SPANS` stream (subject from
+/// [`span_subject`]) and **waits for the stream's ack**.
 ///
-/// Fire-and-forget: caller should `tokio::spawn` this so it does not block the
-/// hot path. On failure the error is logged and the span is dropped — we prefer
-/// low-latency over perfect delivery (ingest has its own DLQ for resilience).
+/// Off the hot path by construction: every call site wraps this in
+/// `tokio::spawn`, so the ack round trip costs the request nothing. What the ack
+/// buys is that `Ok` now means *the stream has the span* — and `Err` means it
+/// does not, which is the only condition under which `note_span_publish_failed`
+/// carries information.
 ///
-/// Note: this is a *core* NATS publish; the JetStream `TRACELANE_SPANS` stream
-/// captures it via its `tracelane.spans.>` subject binding. `publish()` returns
-/// once the server accepts the message, not once JetStream has acked it.
+/// **B-376 (2026-09-12), the reason this is an acked publish and not a core one.**
+/// The previous version was `nats.publish(..)`, a CORE publish, and its doc
+/// comment claimed *"`publish()` returns once the server accepts the message"*.
+/// That is false against the pinned dependency: `async-nats 0.42.0`'s
+/// `Client::publish` does `self.sender.send(Command::Publish(..))` into an
+/// in-process mpsc and returns (`src/client.rs:303-329`). It returns `Ok` for a
+/// message that never reached the server — on a disconnect, a full buffer, or
+/// a JetStream reject — so the `/health` capture counter this feeds was
+/// structurally unable to fire on the loss modes it exists to detect. For a
+/// product whose thesis is "full-fidelity flight recorder", the capture path
+/// must have at least the durability the audit path already has in
+/// `audit.rs` (an acked JetStream publish). Now it does.
+///
+/// The stream's `DiscardPolicy::Old` (`crates/ingest/src/nats_consumer.rs`)
+/// is unchanged: at the byte cap the server drops the OLDEST spans and still
+/// acks this one. That is a declared delivery-buffer tradeoff, bounded and
+/// counted on the ingest side; it is not the silent per-publish loss this
+/// change closes.
 ///
 /// Parameters:
 /// - `nats`  — connected NATS client (from `AppState::nats`)
 /// - `span`  — fully-populated `TracelaneSpan`
 ///
-/// Errors: serialization failure or NATS publish failure.
+/// Errors: serialization failure, publish failure, or a missing / negative ack.
 #[instrument(
     skip(nats, span),
     fields(
@@ -335,10 +224,200 @@ fn unix_now_secs() -> u64 {
 pub async fn publish_span(nats: &async_nats::Client, span: &TracelaneSpan) -> anyhow::Result<()> {
     let subject = span_subject(span);
     let payload = serde_json::to_vec(span).context("span serialize")?;
-    nats.publish(subject, payload.into())
+    // `jetstream::new` is a cheap context wrapper around the (Arc-backed) client;
+    // building it per call keeps the signature the six call sites already use.
+    let js = async_nats::jetstream::new(nats.clone());
+    let ack = js
+        .publish(subject, payload.into())
         .await
-        .context("NATS publish")?;
+        .context("JetStream publish")?;
+    // Fail-OPEN, bounded: a slow-but-alive JetStream must not hold one task per
+    // request for the length of the outage. After ACK_TIMEOUT the span is counted
+    // as a publish failure (it may still land — the stream may ack late — but the
+    // gateway stops waiting). Security review of B-376, 2026-09-12.
+    tokio::time::timeout(ACK_TIMEOUT, ack)
+        .await
+        .context("JetStream ack timed out")?
+        .context("JetStream ack")?;
     Ok(())
+}
+
+/// How long a span publish waits for its JetStream ack before it is counted as
+/// lost. Off the hot path, so generous; bounded, so an outage cannot grow memory.
+pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most span publishes that may be in flight at once. Beyond this a span is
+/// counted as lost WITHOUT spawning — the alternative under a NATS slowdown is one
+/// task per request until the process is OOM-killed, which loses every span.
+pub const MAX_IN_FLIGHT: usize = 8_192;
+
+/// Spans whose JetStream publish has been spawned and not yet acked (or failed).
+/// The number graceful shutdown waits on — see [`drain_in_flight`].
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many span publishes are currently in flight.
+pub fn in_flight() -> usize {
+    IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Test-only span sink (B-385 2c): every span the gateway BUILDS on a dispatch
+/// route is recorded here before the NATS branch decides whether it can be
+/// published — so a test with no NATS (every unit test) can still assert
+/// "exactly one span, with these attributes" instead of asserting nothing.
+///
+/// Keyed by `trace_id` / tenant, which each test sets to its own UUID, so the
+/// parallel suite never reads another test's row. Compiled out of every
+/// non-test build. Absorbed `anthropic_messages::span_capture`, which did the
+/// same for one route.
+#[cfg(test)]
+pub(crate) mod test_sink {
+    use std::sync::{Mutex, OnceLock};
+    use tracelane_shared::{TenantId, TracelaneSpan};
+    use uuid::Uuid;
+
+    fn sink() -> &'static Mutex<Vec<TracelaneSpan>> {
+        static SINK: OnceLock<Mutex<Vec<TracelaneSpan>>> = OnceLock::new();
+        SINK.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(crate) fn record(span: &TracelaneSpan) {
+        if let Ok(mut v) = sink().lock() {
+            v.push(span.clone());
+        }
+    }
+
+    /// Every span built for `trace_id` so far, in order.
+    pub(crate) fn for_trace(trace_id: Uuid) -> Vec<TracelaneSpan> {
+        sink()
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter(|s| s.trace_id == trace_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every span built for one tenant. Each test uses a fresh tenant UUID, so
+    /// this is race-free across the parallel suite — which matters for the
+    /// assertions that must prove NO span was emitted, where a shared counter
+    /// would read another test's row.
+    pub(crate) fn for_tenant(tenant: &TenantId) -> Vec<TracelaneSpan> {
+        sink()
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter(|s| s.tenant_id.as_uuid() == tenant.as_uuid())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Serialises every test that touches the process-global in-flight counter —
+/// in this module AND in `server.rs`. Two tests faking in-flight publishes at
+/// once read each other's count, which is exactly what happened on first run.
+#[cfg(test)]
+pub(crate) static DRAIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Test hook: pretend `n` publishes are in flight (and return a guard that
+/// releases them). Lets the drain contract be proven without a NATS server.
+#[cfg(test)]
+pub(crate) fn fake_in_flight(n: usize) -> impl Drop {
+    struct Release(usize);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    IN_FLIGHT.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    Release(n)
+}
+
+/// Spawn the publish of `span`, off the hot path, counted in flight until it is
+/// acked or fails, and with the failure counted on the ONE counter `/health`
+/// reads.
+///
+/// **This is the only place a span publish may be spawned.** Six sites carried
+/// the same seven lines (spawn, publish, `note_span_publish_failed`, warn) and
+/// none of them was tracked — so a `SIGTERM` between the spawn and the ack lost
+/// the span with no record (B-377). Consolidating them here is what makes
+/// [`drain_in_flight`] mean something.
+///
+/// `site` names the caller in the warn so a failure in the streaming path reads
+/// differently from one in the judge, as the six inline copies used to.
+///
+/// Called from a `Drop` impl on the streaming path (B-375), which can run
+/// outside a runtime during process teardown: `Handle::try_current` guards
+/// that, and the span is counted as a publish failure rather than panicking.
+pub fn spawn_publish(nats: Arc<async_nats::Client>, span: TracelaneSpan, site: &'static str) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        note_span_publish_failed();
+        tracing::warn!(
+            site,
+            "span publish requested with no runtime — counted as lost"
+        );
+        return;
+    };
+    // Bounded in-flight: claim a slot or count the span as lost. Compare-and-swap
+    // so two concurrent callers cannot both pass the check at MAX_IN_FLIGHT - 1.
+    let mut cur = IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if cur >= MAX_IN_FLIGHT {
+            note_span_publish_failed();
+            tracing::warn!(
+                site,
+                in_flight = cur,
+                "span publish refused — in-flight ceiling reached; counted as lost"
+            );
+            return;
+        }
+        match IN_FLIGHT.compare_exchange_weak(
+            cur,
+            cur + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
+    // The slot is released by `Drop`, so a panic inside `publish_span` (a
+    // pathological span that will not serialise, say) cannot leak it and make
+    // every later shutdown wait the full drain timeout on a phantom.
+    let _slot = InFlightSlot;
+    handle.spawn(async move {
+        let slot = _slot;
+        if let Err(e) = publish_span(&nats, &span).await {
+            note_span_publish_failed();
+            tracing::warn!(error = %e, site, "span JetStream publish failed");
+        }
+        drop(slot);
+    });
+}
+
+/// One claimed in-flight slot; released on drop, panic or not.
+struct InFlightSlot;
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Wait up to `timeout` for every in-flight span publish to be acked or fail.
+/// Returns the number still in flight when it gave up — `0` is the only clean
+/// answer, and the caller logs anything else as spans the shutdown lost.
+pub async fn drain_in_flight(timeout: std::time::Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let n = in_flight();
+        if n == 0 || tokio::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 #[cfg(test)]
@@ -350,7 +429,7 @@ mod span_publish_tests {
     /// A fixed synthetic tenant id for the span-publish tests.
     const INCIDENT_TENANT: &str = "11111111-1111-4111-8111-111111111111";
 
-    fn test_span(tenant: &str) -> TracelaneSpan {
+    pub(super) fn test_span(tenant: &str) -> TracelaneSpan {
         TracelaneSpan {
             span_id: Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap(),
             trace_id: Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap(),
@@ -469,5 +548,131 @@ mod span_publish_tests {
         // to ignore guards. The cross-kind separation property is proven in the shared
         // crate's own `note_advances_the_counter_for_that_kind_only`, where the kinds
         // under test have no other writer in that binary.
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_tests {
+    //! B-376 / B-377. The drain contract and the no-runtime branch of
+    //! `spawn_publish`, proven without a NATS server. The acked publish itself is
+    //! proven against a live JetStream by `tests/span_publish_integration.rs`,
+    //! which asserts the stream's `last_sequence` advanced — an ack is the only
+    //! thing that can guarantee that.
+    use super::*;
+    use tracelane_shared::degradation::{Degradation, count};
+
+    use super::DRAIN_TEST_LOCK as DRAIN_LOCK;
+
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_publishes_to_finish() {
+        let _g = DRAIN_LOCK.lock().await;
+        let release = fake_in_flight(2);
+        // Something finishes the publishes 120 ms from now.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            drop(release);
+        });
+        let t0 = tokio::time::Instant::now();
+        let left = drain_in_flight(std::time::Duration::from_secs(2)).await;
+        assert_eq!(left, 0, "drain must return only once nothing is in flight");
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(100),
+            "drain returned before the publishes finished: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_gives_up_at_the_deadline_and_reports_what_is_left() {
+        let _g = DRAIN_LOCK.lock().await;
+        let _release = fake_in_flight(3);
+        let left = drain_in_flight(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            left, 3,
+            "at the deadline the outstanding count must be reported, not hidden"
+        );
+    }
+
+    /// Security review of B-376: above the in-flight ceiling a publish is refused
+    /// and COUNTED, never spawned — the OOM alternative loses every span.
+    #[tokio::test]
+    async fn spawn_publish_refuses_and_counts_above_the_ceiling() {
+        let _g = DRAIN_LOCK.lock().await;
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("client without a server");
+        let client = Arc::new(client);
+        let _full = fake_in_flight(MAX_IN_FLIGHT);
+        let before = count(Degradation::SpanPublishFailed);
+        spawn_publish(
+            client,
+            span_publish_tests::test_span("11111111-1111-4111-8111-111111111111"),
+            "ceiling test",
+        );
+        assert_eq!(count(Degradation::SpanPublishFailed), before + 1);
+        assert_eq!(
+            in_flight(),
+            MAX_IN_FLIGHT,
+            "nothing was spawned above the ceiling"
+        );
+    }
+
+    /// The in-flight slot is released even when the publish task PANICS, so a
+    /// pathological span cannot leave a phantom that every later shutdown waits on.
+    #[tokio::test]
+    async fn in_flight_slot_is_released_on_panic() {
+        let _g = DRAIN_LOCK.lock().await;
+        let before = in_flight();
+        IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let task = tokio::spawn(async move {
+            let _slot = InFlightSlot;
+            panic!("pathological span");
+        });
+        assert!(task.await.is_err(), "the task panicked");
+        assert_eq!(
+            in_flight(),
+            before,
+            "the slot must be released by Drop on the panic path"
+        );
+    }
+
+    /// `spawn_publish` is reachable from a `Drop` impl (B-375), which can run on a
+    /// thread with no runtime during teardown. It must count the span as lost and
+    /// NOT panic — a panic in `Drop` during shutdown aborts the process.
+    #[tokio::test]
+    async fn spawn_publish_with_no_runtime_counts_a_failure_instead_of_panicking() {
+        let _g = DRAIN_LOCK.lock().await;
+        // A client that never connects is fine: the branch under test returns
+        // before any I/O.
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("retry_on_initial_connect returns a client without a server");
+        let client = Arc::new(client);
+        let span = span_publish_tests::test_span("11111111-1111-4111-8111-111111111111");
+        let before = count(Degradation::SpanPublishFailed);
+        let handle = std::thread::spawn(move || {
+            spawn_publish(client, span, "no-runtime test");
+        });
+        handle
+            .join()
+            .expect("spawn_publish must not panic without a runtime");
+        // `>=`, not `==`: the counter is process-wide and `span_publish_tests`
+        // in the same binary increment it concurrently (CI run 34686533037
+        // read 3 against an expected 2). The property is that THIS call landed
+        // on the counter, which a strict equality cannot state under parallel
+        // tests without serialising every test that touches it.
+        assert!(
+            count(Degradation::SpanPublishFailed) > before,
+            "a publish that cannot be spawned must land on the loss counter"
+        );
+        assert_eq!(
+            in_flight(),
+            0,
+            "nothing was spawned, so nothing is in flight"
+        );
     }
 }

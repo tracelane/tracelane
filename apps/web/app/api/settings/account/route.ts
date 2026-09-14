@@ -17,7 +17,7 @@
 
 import { db } from "@/db";
 import { apiKeys, tenants, users } from "@/db/schema";
-import { requireSession } from "@/lib/auth";
+import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
 import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
 import { and, eq, isNull } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -157,6 +157,10 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 					.update(tenants)
 					.set({ archivedAt: new Date() })
 					.where(eq(tenants.id, t.id));
+				// B-361: same-isolate immediacy for the acting user; see the
+				// function doc on `invalidateOrgArchivedCache` for the
+				// cross-isolate staleness this deliberately accepts.
+				invalidateOrgArchivedCache(session.tenantId);
 				await db
 					.update(apiKeys)
 					.set({ revokedAt: new Date() })

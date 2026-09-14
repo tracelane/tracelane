@@ -104,16 +104,14 @@ impl Predictor for A2uiValidator {
                     }
                 }
             }
-            "dispose" => {
-                if req.get("surface_id").and_then(|v| v.as_str()).is_none() {
-                    tracing::warn!(
-                        tenant_id = %ctx.tenant_id,
-                        "A2UI dispose missing surface_id"
-                    );
-                    return Decision::Warn {
-                        aft_id: "AFT-A2UI-CATALOG-001",
-                    };
-                }
+            "dispose" if req.get("surface_id").and_then(|v| v.as_str()).is_none() => {
+                tracing::warn!(
+                    tenant_id = %ctx.tenant_id,
+                    "A2UI dispose missing surface_id"
+                );
+                return Decision::Warn {
+                    aft_id: "AFT-A2UI-CATALOG-001",
+                };
             }
             _ => {}
         }

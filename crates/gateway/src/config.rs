@@ -32,7 +32,7 @@
 //! ## The `failover:` block, and why it refuses so much
 //!
 //! A chain entry is `provider` or `provider:model`. Bare providers take their
-//! model from `failover::DEFAULT_CHAIN`, which covers three of the 169 routable
+//! model from `failover::DEFAULT_CHAIN`, which covers three of the 191 routable
 //! providers; every other provider must name its model.
 //!
 //! Every hop is proved dispatchable **at parse time**: the provider id must be
@@ -228,9 +228,60 @@ impl TraceContentConfig {
     }
 
     /// The allowlist, for the guard and for tests.
+    ///
+    /// No production caller — `server.rs`/`dataset_routes.rs` call the
+    /// global `config::trace_content()` accessor and read `.tenants` as a
+    /// field directly rather than through this method. Used only by tests,
+    /// hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn tenants(&self) -> &std::collections::BTreeSet<uuid::Uuid> {
         &self.tenants
+    }
+}
+
+/// The parsed `model_policy:` block (`OBS-52`). Absent ⇒ **no checks run at
+/// all**, which is fail-CLOSED in the CLAUDE.md sense: no config, no opinion.
+///
+/// **This configures a DETECTOR, never an enforcer.** Nothing here can block a
+/// request, change a status code or alter a response — ADR-055's founder
+/// amendment locks the lead as observe-first, and a temperature of 1.4 is a
+/// style, not an attack. What it produces is one span attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPolicyConfig {
+    /// Ceilings in THOUSANDTHS (1200 = 1.2). Integer for the same reason
+    /// `SemanticCacheConfig::default_threshold_milli` is: `FileConfig` derives
+    /// `Eq`, and a float in a config struct invites equality comparisons that
+    /// are wrong for reasons unrelated to the config.
+    temperature_max_milli: Option<u32>,
+    top_p_max_milli: Option<u32>,
+    require_max_tokens: bool,
+}
+
+impl ModelPolicyConfig {
+    /// The configured temperature ceiling, or `None` when the operator set none
+    /// — in which case the temperature check does not run. Absence of a ceiling
+    /// is not a ceiling of infinity; it is "no opinion", and it produces no
+    /// verdict rather than an `ok` one.
+    #[must_use]
+    pub fn temperature_max(&self) -> Option<f32> {
+        #[allow(clippy::cast_precision_loss)]
+        self.temperature_max_milli.map(|m| m as f32 / 1000.0)
+    }
+
+    /// The configured `top_p` ceiling, or `None`. Same three-state reasoning.
+    #[must_use]
+    pub fn top_p_max(&self) -> Option<f32> {
+        #[allow(clippy::cast_precision_loss)]
+        self.top_p_max_milli.map(|m| m as f32 / 1000.0)
+    }
+
+    /// Whether a request that sent no `max_tokens` should be flagged. Defaults
+    /// to `false`: the check whose subject IS an absence is the one that
+    /// misfires hardest, so it must be asked for explicitly.
+    #[must_use]
+    pub const fn require_max_tokens(&self) -> bool {
+        self.require_max_tokens
     }
 }
 
@@ -241,6 +292,7 @@ pub struct FileConfig {
     failover: Option<FailoverConfig>,
     semantic_cache: Option<SemanticCacheConfig>,
     trace_content: Option<TraceContentConfig>,
+    model_policy: Option<ModelPolicyConfig>,
 }
 
 impl FileConfig {
@@ -250,18 +302,32 @@ impl FileConfig {
         self.models.get(model)
     }
 
-    /// The `semantic_cache:` block, or `None` when the key is absent — which
-    /// means the cache is OFF.
-    #[must_use]
-    pub fn semantic_cache(&self) -> Option<&SemanticCacheConfig> {
-        self.semantic_cache.as_ref()
-    }
+    // `semantic_cache(&self) -> Option<&SemanticCacheConfig>` was deleted
+    // 2026-09-12 (B-390) — zero callers anywhere, including tests; the free
+    // function `config::semantic_cache()` below (which production calls)
+    // reads `CONFIG.get()...semantic_cache` as a field directly instead.
 
     /// The `trace_content:` block, or `None` when absent — which means content
     /// capture is OFF for everyone.
+    ///
+    /// No production caller — same reasoning as `semantic_cache` above (the
+    /// free function reads the field directly). Used only by tests, hence
+    /// gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn trace_content(&self) -> Option<&TraceContentConfig> {
         self.trace_content.as_ref()
+    }
+
+    /// The `model_policy:` block, or `None` when absent — which means `OBS-52`
+    /// runs no checks at all and writes no flags.
+    ///
+    /// No production caller — same reasoning as `semantic_cache` above. Used
+    /// only by tests, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
+    #[must_use]
+    pub fn model_policy(&self) -> Option<&ModelPolicyConfig> {
+        self.model_policy.as_ref()
     }
 
     /// Number of aliases defined.
@@ -271,6 +337,9 @@ impl FileConfig {
     }
 
     /// True when the file defined no aliases at all.
+    ///
+    /// No production caller — used only by a test. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
@@ -319,6 +388,38 @@ pub fn semantic_cache() -> Option<&'static SemanticCacheConfig> {
 #[must_use]
 pub fn trace_content() -> Option<&'static TraceContentConfig> {
     CONFIG.get().and_then(|c| c.trace_content.as_ref())
+}
+
+/// The installed `model_policy:` block (`OBS-52`), or `None` when absent —
+/// which means no misconfiguration check runs and no span carries a flag.
+#[must_use]
+pub fn model_policy() -> Option<&'static ModelPolicyConfig> {
+    CONFIG.get().and_then(|c| c.model_policy.as_ref())
+}
+
+/// THE content-capture decision — the ONE policy (B-299, founder-ruled 2026-09-03).
+///
+/// Every consumer of a tenant's prompt/response TEXT routes through here: span
+/// storage (`server::CapturedInput::build`), dataset export
+/// (`dataset_routes::capture_enabled`) and the online-eval judge
+/// (`online_eval::admission`). A second check with its own reading of the config
+/// is how the judge came to see content that storage refused to keep — B-299.
+///
+/// Pure so it is testable without the process-global config: pass
+/// `trace_content()` for the live answer.
+#[must_use]
+pub fn capture_decision(
+    cfg: Option<&TraceContentConfig>,
+    tenant_id: &tracelane_shared::TenantId,
+) -> bool {
+    cfg.is_some_and(|c| c.captures(tenant_id))
+}
+
+/// `capture_decision` against the installed config. Fail-CLOSED: no block, no
+/// allowlist entry, or no config at all ⇒ `false`.
+#[must_use]
+pub fn content_capture_enabled(tenant_id: &tracelane_shared::TenantId) -> bool {
+    capture_decision(trace_content(), tenant_id)
 }
 /// `failover::retry_policy`. One relaxed atomic load when it is reached.
 #[must_use]
@@ -464,6 +565,31 @@ pub fn install_for_test(cfg: FileConfig) -> bool {
 // time because include_str! resolves at compile time, so leaving it would
 // break `cargo test` for everyone who clones this repo.
 
+/// Parse the strict `tracelane.yaml` subset.
+///
+/// Accepts exactly the documented shape:
+///
+/// ```yaml
+/// models:
+///   <alias>:
+///     provider: <provider-id>
+///     model: <upstream-model>
+///
+/// failover:
+///   chain: <provider>[:<model>], …
+///   retries: <0..=MAX_RETRIES>
+///   backoff_ms: <milliseconds>
+/// ```
+///
+/// # Errors
+///
+/// **Fails CLOSED on anything it does not fully understand**, naming the line
+/// number: tabs in the indentation, an unknown top-level key, an unknown key
+/// under an alias or under `failover:`, a missing `provider` or `model`, a
+/// duplicate alias, a duplicate block or key, a provider id no adapter serves,
+/// and every way a failover hop could turn out to be undispatchable (see
+/// [`build_failover`]). Refusing is deliberate — a routing file the reader
+/// silently half-applies is worse than no routing file.
 pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
     let mut models: BTreeMap<String, ModelAlias> = BTreeMap::new();
     let mut section = Section::None;
@@ -471,6 +597,7 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
     let mut seen_failover = false;
     let mut seen_semantic_cache = false;
     let mut seen_trace_content = false;
+    let mut seen_model_policy = false;
     // Indent at which alias names sit. Fixed by the first alias line, so an
     // inconsistently-indented sibling is an error rather than a silent skip.
     let mut alias_indent: Option<usize> = None;
@@ -484,6 +611,10 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
     let mut trace_content_indent: Option<usize> = None;
     let mut tc_tenants: Option<(String, usize)> = None;
     let mut tc_max_bytes: Option<(String, usize)> = None;
+    let mut model_policy_indent: Option<usize> = None;
+    let mut mp_temperature_max: Option<(String, usize)> = None;
+    let mut mp_top_p_max: Option<(String, usize)> = None;
+    let mut mp_require_max_tokens: Option<(String, usize)> = None;
     let mut sc_models: Option<(String, usize)> = None;
     let mut sc_dims: Option<(String, usize)> = None;
     let mut sc_threshold: Option<(String, usize)> = None;
@@ -533,10 +664,17 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
                     seen_trace_content = true;
                     section = Section::TraceContent;
                 }
+                "model_policy:" => {
+                    if seen_model_policy {
+                        bail!("line {lineno}: duplicate `model_policy:` block");
+                    }
+                    seen_model_policy = true;
+                    section = Section::ModelPolicy;
+                }
                 other => bail!(
                     "line {lineno}: unsupported top-level key `{other}` — this reader \
-                     understands only `models:`, `failover:`, `semantic_cache:` and \
-                     `trace_content:`"
+                     understands only `models:`, `failover:`, `semantic_cache:`, \
+                     `trace_content:` and `model_policy:`"
                 ),
             }
             continue;
@@ -642,6 +780,45 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
                 }
                 continue;
             }
+            Section::ModelPolicy => {
+                let mp_at = *model_policy_indent.get_or_insert(indent);
+                if indent != mp_at {
+                    bail!(
+                        "line {lineno}: inconsistent indentation — `model_policy:` keys \
+                         are indented {mp_at} spaces, this line is indented {indent}"
+                    );
+                }
+                let (key, value) = content.split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "line {lineno}: expected `key: value` under `model_policy:`, \
+                         found `{content}`"
+                    )
+                })?;
+                let value = scalar(value, lineno)?;
+                if value.is_empty() {
+                    bail!("line {lineno}: `{}` has an empty value", key.trim());
+                }
+                match key.trim() {
+                    "temperature_max" => {
+                        set_once(&mut mp_temperature_max, "temperature_max", value, lineno)?;
+                    }
+                    "top_p_max" => set_once(&mut mp_top_p_max, "top_p_max", value, lineno)?,
+                    "require_max_tokens" => {
+                        set_once(
+                            &mut mp_require_max_tokens,
+                            "require_max_tokens",
+                            value,
+                            lineno,
+                        )?;
+                    }
+                    other => bail!(
+                        "line {lineno}: unsupported key `{other}` under `model_policy:` \
+                         — only `temperature_max`, `top_p_max` and `require_max_tokens` \
+                         are read"
+                    ),
+                }
+                continue;
+            }
             Section::Models => {}
         }
 
@@ -708,6 +885,15 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
     } else {
         None
     };
+    let model_policy = if seen_model_policy {
+        Some(build_model_policy(
+            mp_temperature_max,
+            mp_top_p_max,
+            mp_require_max_tokens,
+        )?)
+    } else {
+        None
+    };
     let semantic_cache = if seen_semantic_cache {
         Some(build_semantic_cache(
             sc_models,
@@ -725,6 +911,7 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
         failover,
         semantic_cache,
         trace_content,
+        model_policy,
     })
 }
 
@@ -737,6 +924,7 @@ enum Section {
     Failover,
     SemanticCache,
     TraceContent,
+    ModelPolicy,
 }
 
 /// Record a `failover:` scalar, refusing a second one.
@@ -871,6 +1059,71 @@ fn build_failover(
 /// performance feature, but a MIS-configured one serves wrong answers, so a
 /// nonsense threshold is a boot refusal rather than a clamp — clamping would
 /// leave the operator believing a number that is not in force.
+/// Build the `model_policy:` block (`OBS-52`), refusing anything ambiguous.
+///
+/// **A refusal here is a BOOT REFUSAL**, matching every other block in this file.
+/// That is deliberate even though the feature itself is observe-only: a typo'd
+/// ceiling that parsed to something else would produce flags nobody asked for,
+/// and a flag a customer cannot explain is worse than no flag at all.
+fn build_model_policy(
+    temperature_max: Option<(String, usize)>,
+    top_p_max: Option<(String, usize)>,
+    require_max_tokens: Option<(String, usize)>,
+) -> anyhow::Result<ModelPolicyConfig> {
+    // Bounds are the parameters' own legal ranges, not a policy preference: a
+    // ceiling outside what the wire accepts can never fire, and a check that can
+    // never fire is a control observed doing nothing (CLAUDE.md §1).
+    let temperature_max_milli = parse_milli(temperature_max, "temperature_max", 0.0, 2.0)?;
+    let top_p_max_milli = parse_milli(top_p_max, "top_p_max", 0.0, 1.0)?;
+
+    let require_max_tokens = match require_max_tokens {
+        None => false,
+        Some((v, ln)) => match v.as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                bail!("line {ln}: `require_max_tokens` must be `true` or `false`, got `{other}`")
+            }
+        },
+    };
+
+    // A block with no keys at all is far more likely to be a mistake than an
+    // intent — the same argument `build_trace_content` makes for `tenants`.
+    if temperature_max_milli.is_none() && top_p_max_milli.is_none() && !require_max_tokens {
+        bail!(
+            "`model_policy:` is present but enables no check — omit the whole block, or \
+             set at least one of `temperature_max`, `top_p_max` or `require_max_tokens: true`"
+        );
+    }
+
+    Ok(ModelPolicyConfig {
+        temperature_max_milli,
+        top_p_max_milli,
+        require_max_tokens,
+    })
+}
+
+/// Parse a decimal ceiling into THOUSANDTHS, bounded. See
+/// [`ModelPolicyConfig`] for why the stored form is an integer.
+fn parse_milli(
+    raw: Option<(String, usize)>,
+    key: &str,
+    lo: f64,
+    hi: f64,
+) -> anyhow::Result<Option<u32>> {
+    let Some((v, ln)) = raw else {
+        return Ok(None);
+    };
+    let n: f64 = v
+        .parse()
+        .with_context(|| format!("line {ln}: `{key}` must be a decimal number, got `{v}`"))?;
+    if !n.is_finite() || n < lo || n > hi {
+        bail!("line {ln}: `{key}` must be between {lo} and {hi}, got {n}");
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(Some((n * 1000.0).round() as u32))
+}
+
 /// Build the `trace_content:` block, refusing anything ambiguous.
 ///
 /// **Every failure here is a BOOT REFUSAL**, which is the correct direction for a
@@ -1775,6 +2028,203 @@ failover:
         // Read-only: does not mutate process env (parallel tests).
         if std::env::var(PATH_ENV).is_err() {
             assert_eq!(resolved_path(), PathBuf::from(DEFAULT_PATH));
+        }
+    }
+
+    // ── Config-block parsers (`model_policy:`, `trace_content:`, the top-level
+    // key error). These sat in `prod_config_tests` until 2026-09-14, but they
+    // parse INLINE yaml and never touch `PROD_CONFIG`. The public export excises
+    // that whole module (its subject, infra/prod/tracelane.yaml, is not
+    // published), which left the `#[cfg(test)]` getters they call dead in the
+    // export — clippy -D warnings red on the mirror, green here. Tests that do
+    // not need the prod file live here so the export keeps them AND compiles. ──
+
+    /// OBS-52. The parser reads the block, and a decimal ceiling survives the
+    /// integer-thousandths round trip it is stored as.
+    #[test]
+    fn model_policy_parses_and_round_trips_its_ceilings() {
+        let cfg =
+            parse("model_policy:\n  temperature_max: 1.2\n  top_p_max: 0.95\n").expect("parses");
+        let mp = cfg.model_policy().expect("block present");
+        assert_eq!(mp.temperature_max(), Some(1.2));
+        assert_eq!(mp.top_p_max(), Some(0.95));
+        assert!(
+            !mp.require_max_tokens(),
+            "defaults to off — it is the noisy one"
+        );
+    }
+
+    /// **THE FAIL-CLOSED DEFAULT.** No block ⇒ `None` ⇒ OBS-52 runs no check and
+    /// writes no flag. This is the state of every deployment that has not opted
+    /// in, and the one that must never produce a verdict.
+    #[test]
+    fn an_absent_model_policy_block_is_none_not_a_permissive_default() {
+        let cfg = parse("failover:\n  chain: anthropic\n").expect("parses");
+        assert!(cfg.model_policy().is_none());
+    }
+
+    /// A block that enables nothing is a mistake, not an intent — the same
+    /// argument `build_trace_content` makes for a missing `tenants` key.
+    #[test]
+    fn an_empty_model_policy_block_is_refused() {
+        assert!(parse("model_policy:\n  require_max_tokens: false\n").is_err());
+    }
+
+    /// Out-of-range ceilings are BOOT REFUSALS. A `temperature_max` of 5 can
+    /// never fire (the wire caps at 2), and a check that can never fire is a
+    /// control observed doing nothing.
+    #[test]
+    fn model_policy_refuses_a_ceiling_that_could_never_fire() {
+        assert!(parse("model_policy:\n  temperature_max: 5\n").is_err());
+        assert!(parse("model_policy:\n  top_p_max: 2\n").is_err());
+        assert!(parse("model_policy:\n  temperature_max: -1\n").is_err());
+        assert!(parse("model_policy:\n  temperature_max: banana\n").is_err());
+        assert!(parse("model_policy:\n  require_max_tokens: yes\n").is_err());
+        assert!(parse("model_policy:\n  unknown_key: 1\n").is_err());
+        assert!(
+            parse("model_policy:\n  temperature_max: 1.0\nmodel_policy:\n  top_p_max: 1.0\n")
+                .is_err(),
+            "a duplicate block must be refused like every other"
+        );
+    }
+
+    /// **THE NEGATIVE HALF, at the unit level.** With a block installed naming
+    /// tenant A, tenant B must NOT capture.
+    ///
+    /// This exists because the live proof can only reliably demonstrate the
+    /// POSITIVE half — our dogfood tenant produces traffic every few minutes,
+    /// while the other prod tenants are sparse and may not send anything during
+    /// a proof window. A capture proof that only ever shows capture HAPPENING
+    /// cannot distinguish "on for this tenant" from "on for everyone", which is
+    /// the failure that would matter.
+    #[test]
+    fn the_allowlist_excludes_a_tenant_it_does_not_name() {
+        let cfg = parse("trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n")
+            .expect("parses")
+            .trace_content()
+            .expect("block present")
+            .clone();
+
+        let named = tracelane_shared::TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("a4037bef-e786-44e3-bfb6-88c93ba9d381").expect("uuid"),
+        );
+        let other = tracelane_shared::TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("32ccef57-0000-0000-0000-000000000000").expect("uuid"),
+        );
+
+        assert!(cfg.captures(&named), "the named tenant must capture");
+        assert!(
+            !cfg.captures(&other),
+            "a tenant NOT on the allowlist must never capture — this is the whole \
+             safety property of the feature"
+        );
+    }
+
+    /// GWY-45. The allowlist is the ONLY thing standing between a tenant and
+    /// having its prompt text persisted, so every way of getting it wrong must be
+    /// a BOOT REFUSAL rather than a silent mis-parse. Each case below is a
+    /// falsification: the parser is asked to accept something it must not.
+    #[test]
+    fn trace_content_block_parses_and_refuses_every_ambiguity() {
+        let ok = parse(
+            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 65536\n",
+        )
+        .expect("a well-formed trace_content block must parse");
+        let tc = ok.trace_content().expect("block present");
+        assert_eq!(tc.tenants().len(), 1);
+        assert_eq!(tc.max_field_bytes(), 65_536);
+
+        // ABSENT BLOCK => capture OFF for everyone. This is the fail-closed
+        // default and the pre-GWY-45 behaviour.
+        assert!(
+            parse("failover:\n  chain: anthropic\n")
+                .expect("parses")
+                .trace_content()
+                .is_none(),
+            "an absent trace_content block must mean capture is OFF, not on"
+        );
+        assert!(
+            parse("")
+                .expect("an empty config parses")
+                .trace_content()
+                .is_none(),
+            "an empty config must mean capture is OFF"
+        );
+
+        // max_field_bytes defaults rather than failing — it is a tuning knob, not
+        // a safety one.
+        assert_eq!(
+            parse("trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n")
+                .expect("parses without max_field_bytes")
+                .trace_content()
+                .expect("present")
+                .max_field_bytes(),
+            65_536
+        );
+
+        // ── every refusal, each one a way this could silently do the wrong thing ──
+        for (src, why) in [
+            (
+                "trace_content:\n  max_field_bytes: 65536\n",
+                "a block with no `tenants` key is far more likely a mistake than an \
+                 intent to disable — omitting the block is how you disable it",
+            ),
+            (
+                "trace_content:\n  tenants: not-a-uuid\n",
+                "a malformed uuid must refuse: silently dropping it fails OPEN on the \
+                 day someone REMOVES a tenant expecting it to take effect",
+            ),
+            (
+                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381,\n",
+                "a trailing comma leaves an empty entry — refuse rather than guess",
+            ),
+            (
+                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381,                  a4037bef-e786-44e3-bfb6-88c93ba9d381\n",
+                "a duplicated tenant is a copy-paste error worth surfacing",
+            ),
+            (
+                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 8\n",
+                "below 1 KiB every realistic prompt truncates to nothing, producing \
+                 unusable eval cases while appearing to work",
+            ),
+            (
+                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n                   max_field_bytes: 99999999\n",
+                "above 1 MiB the span can exceed the NATS payload limit and be dropped \
+                 WHOLE — losing the trace, not just the text",
+            ),
+            (
+                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  bogus: 1\n",
+                "an unknown key inside the block must refuse — the strict-subset parser \
+                 is the thing that makes a typo loud",
+            ),
+            (
+                "trace_content:\n  tenants: a\ntrace_content:\n  tenants: b\n",
+                "a duplicate block must refuse rather than let one silently win",
+            ),
+        ] {
+            assert!(
+                parse(src).is_err(),
+                "MUST REFUSE and did not — {why}\n---\n{src}"
+            );
+        }
+    }
+
+    /// The top-level key list in the parser's own error message must name every
+    /// block it accepts. If `trace_content:` is missing from that string the
+    /// parser still works, but the operator who typos it is told the reader
+    /// understands only three blocks — and the prod config itself would refuse
+    /// to boot. Cheap to assert, and it caught exactly this during the build.
+    #[test]
+    fn unsupported_top_level_key_error_names_every_supported_block() {
+        let err = parse("nonsense_block:\n  a: b\n")
+            .expect_err("an unknown top-level key must refuse")
+            .to_string();
+        for expected in ["models:", "failover:", "semantic_cache:", "trace_content:"] {
+            assert!(
+                err.contains(expected),
+                "the unsupported-key error must name `{expected}` so an operator can \
+                 see what IS accepted; got: {err}"
+            );
         }
     }
 }

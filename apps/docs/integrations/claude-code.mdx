@@ -1,0 +1,153 @@
+---
+title: "Claude Code"
+description: "Record Claude Code sessions as trace trees in Tracelane with one command."
+classification: PUBLIC
+---
+
+Claude Code exports OpenTelemetry traces natively. Tracelane accepts OTLP directly, so
+recording a session is exporter configuration — one command sets it up, no Tracelane SDK
+required.
+
+## What you get
+
+| | |
+|---|---|
+| **Session structure** | **Yes.** One root span per interaction, with each LLM request and tool call nested underneath as children. |
+| **Tokens & cost** | Token counts on the LLM request spans, and cost for models in our price table. |
+| **Prompt & tool content** | **No, not by default.** See [What is not captured](#what-is-not-captured) below. |
+
+<Note>
+  **Chain scope.** Recorded sessions are full-fidelity in your trace store and queryable
+  like any other trace, the same as traces from any OTel exporter or self-host
+  instrumentation. They are **not yet in the tamper-evident hash chain** — chaining the
+  OTLP/SDK path is on the roadmap. See [Audit Ledger](/audit-ledger) for what is chained
+  today. **[Proxy mode](#proxy-mode-every-claude-code-call-in-the-ledger) is the other
+  half and does chain** — a call routed through the gateway is a ledger row; a span
+  exported over OTLP is not. The two are separate paths, so which one you set up decides
+  what is chained.
+</Note>
+
+## Setup
+
+```bash
+tlane init claude-code --api-key tlane_...
+```
+
+The key needs the **`ingest`** scope. Mint one in **Settings → API keys**. The command
+validates the key against the gateway, merges the env block below into
+`~/.claude/settings.json` (or `./.claude/settings.json` with `--project`), and never
+overwrites a value already set there.
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `--api-key <key>` | The key to use. Defaults to `TRACELANE_API_KEY` in your shell. |
+| `--gateway <url>` | Gateway base URL. Defaults to `https://gateway.tracelane.dev`. |
+| `--print` | Print the env block instead of writing anything. |
+| `--project` | Write `./.claude/settings.json` instead of the user-level file. |
+| `--proxy` | Also route Claude Code's API calls through the gateway. See [Proxy mode](#proxy-mode-every-claude-code-call-in-the-ledger). |
+
+### Setting it up by hand
+
+If you'd rather paste the env block yourself — into `settings.json`'s `env` object, a
+shell profile, or a CI job — this is the equivalent of what the command above writes:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_METRICS_EXPORTER": "none",
+    "OTEL_LOGS_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://gateway.tracelane.dev/v1/traces",
+    "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer tlane_your_key_here",
+    "OTEL_RESOURCE_ATTRIBUTES": "service.name=claude-code,gen_ai.agent.name=claude-code"
+  }
+}
+```
+
+Start a new Claude Code session after either path — it picks up the env on launch, not
+mid-session.
+
+## Proxy mode — every Claude Code call in the ledger
+
+The setup above records what Claude Code *did*: its session tree, over OTLP. Proxy mode
+records what it *asked the model*. Point `ANTHROPIC_BASE_URL` at the gateway and every
+API call the session makes becomes a gateway span — tokens, cost, and a row in the
+tamper-evident hash chain — while the response your session receives is Anthropic's,
+relayed unchanged.
+
+```bash
+tlane init claude-code --proxy --api-key tlane_...
+```
+
+Three things, in this order:
+
+1. **Store your own Anthropic key** in **Settings → LLM providers**. The gateway holds no
+   Anthropic credential of its own — it uses yours, envelope-encrypted per workspace, at
+   0% markup. Proxied calls are refused until one is there.
+2. Run the command. It adds two variables to the same `env` block as the OTel ones:
+
+   ```json
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "https://gateway.tracelane.dev",
+       "ANTHROPIC_AUTH_TOKEN": "tlane_your_key_here"
+     }
+   }
+   ```
+
+3. Start a new session — Claude Code reads the env on launch.
+
+The key needs the **`chat`** scope for this, on top of the `ingest` scope the OTel export
+needs. `--proxy` probes for it and refuses to write the file if the key does not carry it,
+rather than leaving you with a session that fails on its first request.
+
+### What proxy mode does and does not change
+
+| | |
+|---|---|
+| **Your responses** | Unchanged. The gateway forwards your request body to Anthropic as-is and relays the response — streaming included — so `thinking` blocks, tool calls, prompt caching and beta features behave exactly as they do direct. The exception is a response your own workspace guardrails redact or block. |
+| **What is recorded** | One `gen_ai.chat` span per API call, with input / output / cache token counts from Anthropic's own `usage`, cost for models in our price table, and a ledger row. |
+| **Models** | Anthropic models only on this route. It is the Anthropic wire, so there is no cross-provider failover here. |
+| **The two recordings** | Separate. The OTLP session tree and the proxied API-call spans are recorded independently today; we have not verified that they join into a single trace, so read them as two views rather than one tree. |
+
+## What a trace looks like
+
+```
+claude_code.interaction                         (root — one per user turn)
+├── claude_code.llm_request
+├── claude_code.tool
+│   └── claude_code.tool.execution
+└── claude_code.tool
+    └── claude_code.tool.blocked_on_user
+```
+
+## What is not captured
+
+**Prompt and tool content are not captured by default.** Anthropic gates the message
+bodies behind its own flags — `OTEL_LOG_USER_PROMPTS` and `OTEL_LOG_TOOL_CONTENT` — and
+`tlane init claude-code` does not set either. Without them, Claude Code sends
+`user_prompt="<REDACTED>"`.
+
+Claude Code also attaches your account email and ids to each span (`user.email`,
+`user.id`, `organization.id`). Tracelane's decoder maps only the token, model and tool
+attributes it knows about and drops everything else — so those identity fields are never
+stored.
+
+## Span volume and the Free plan
+
+This path is metered in **spans**, not the gateway's trace counter — see
+[pricing](/pricing) for the full explanation. The Free plan's span limit is **10,000
+spans/mo**, and one Claude Code interaction is several spans (a root plus one per tool
+call and LLM request), so a busy day can use a meaningful share of it. Run a session
+against a free account and check the span count on the trace before you commit to a plan.
+
+## What you see
+
+Recorded sessions show up on [/sessions](https://app.tracelane.dev/sessions) — one row per
+Claude Code session, tagged `claude-code`, with each interaction as a turn. Opening a turn
+shows its trace: the LLM requests and tool calls nested under the interaction.

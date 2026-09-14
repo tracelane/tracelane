@@ -14,27 +14,15 @@
 
 import { requireGatewayToken, requireSession } from "@/lib/auth";
 import { gatewayBaseUrl } from "@/lib/gateway";
+import { parseOptionalTimeRange, windowParams } from "@/lib/metrics/time-range";
 import { type NextRequest, NextResponse } from "next/server";
 
 /**
- * range preset → RFC3339 lower bound (mirrors /traces buildQuery / rangeSince).
- * No range param defaults to 24h (the list's default window), so the export
- * matches what the user sees; explicit "all"/"" scans everything.
+ * The export covers the SAME window the list shows — the shared grammar via
+ * `tracesWindow` (`range=` preset, a custom `since/until` pair, or `all`). It used
+ * to default to 24h while the list defaulted to 1h, so a default export covered
+ * 24× the rows on screen (DSH-11 §3.1).
  */
-function rangeSince(range: string | null): string | null {
-	const r = range ?? "24h";
-	const ms =
-		r === "1h"
-			? 3_600_000
-			: r === "24h"
-				? 86_400_000
-				: r === "7d"
-					? 604_800_000
-					: r === "30d"
-						? 2_592_000_000
-						: 0; // "all" / "" / unknown → no lower bound
-	return ms ? new Date(Date.now() - ms).toISOString() : null;
-}
 
 export async function GET(req: NextRequest) {
 	await requireSession();
@@ -52,11 +40,23 @@ export async function GET(req: NextRequest) {
 	if (minLat) g.set("min_latency_ms", minLat);
 	const sig = sp.get("signature_id");
 	if (sig) g.set("signature_id", sig);
+	// OBS-20. THE ONE THAT MATTERS MOST of the three: without it, "Export CSV" on a
+	// user-filtered view silently exports EVERY user's traces. A wrong export reads
+	// as data the customer can act on, and nothing on the page says it is wrong.
+	const endUser = sp.get("end_user");
+	if (endUser) g.set("end_user", endUser);
 	const status = sp.get("status");
 	if (status === "error") g.set("has_error", "true");
 	else if (status === "ok") g.set("has_error", "false");
-	const since = rangeSince(sp.get("range"));
-	if (since) g.set("since", since);
+	const w = parseOptionalTimeRange(
+		{
+			range: sp.get("range") ?? undefined,
+			since: sp.get("since") ?? undefined,
+			until: sp.get("until") ?? undefined,
+		},
+		{ defaultPreset: "1h", nowMs: Date.now() },
+	);
+	if (w) for (const [k, v] of windowParams(w)) g.set(k, v);
 	// Forward the active sort so the CSV matches what the user sees on /traces
 	// (without this the gateway defaults to start_time DESC — a different set).
 	const sort = sp.get("sort");

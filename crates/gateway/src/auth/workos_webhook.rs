@@ -273,10 +273,13 @@ struct WorkOsEvent {
     data: serde_json::Value,
 }
 
+// `name: String` (deleted 2026-09-12, B-390) — deserialized from the
+// WorkOS webhook payload but never read; only `id` below is used
+// (`create_or_get_by_workos_org`). Nothing stores the org's display name
+// from this event today.
 #[derive(Debug, Deserialize)]
 struct OrganizationData {
     id: String,
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,19 +360,19 @@ pub async fn handler(
     // plane draw from the budget. A throttled event is NOT recorded processed,
     // so WorkOS redelivers it once budget frees up (at-least-once preserved — no
     // lost signups). Log-only events skip the cap (they can't grow rows).
-    if is_provisioning_event(&event.event) {
-        if let RateLimitDecision::Throttle { retry_after_secs } = state.rate_limiter.check() {
-            tracing::warn!(
-                event_id = %event.id,
-                event = %event.event,
-                retry_after_secs,
-                "WorkOS webhook provisioning rate cap hit — deferring (WorkOS will redeliver)"
-            );
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                "provisioning rate limit exceeded — retry shortly",
-            );
-        }
+    if is_provisioning_event(&event.event)
+        && let RateLimitDecision::Throttle { retry_after_secs } = state.rate_limiter.check()
+    {
+        tracing::warn!(
+            event_id = %event.id,
+            event = %event.event,
+            retry_after_secs,
+            "WorkOS webhook provisioning rate cap hit — deferring (WorkOS will redeliver)"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "provisioning rate limit exceeded — retry shortly",
+        );
     }
 
     if let Err(err) = dispatch(&event).await {
@@ -381,20 +384,19 @@ pub async fn handler(
         return (StatusCode::SERVICE_UNAVAILABLE, "dispatch failed");
     }
 
-    if let Some(pool) = crate::db::global_pool() {
-        if let Err(err) = crate::db::webhook_events::try_record_processed(
+    if let Some(pool) = crate::db::global_pool()
+        && let Err(err) = crate::db::webhook_events::try_record_processed(
             pool,
             crate::db::webhook_events::WebhookSource::WorkOs,
             &event.id,
         )
         .await
-        {
-            tracing::warn!(
-                error = %crate::db::pg_error_chain(&err),
-                event_id = %event.id,
-                "post-dispatch dedup record failed (side effect already applied)"
-            );
-        }
+    {
+        tracing::warn!(
+            error = %crate::db::pg_error_chain(&err),
+            event_id = %event.id,
+            "post-dispatch dedup record failed (side effect already applied)"
+        );
     }
     (StatusCode::OK, "ok")
 }

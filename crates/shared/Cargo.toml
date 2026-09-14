@@ -23,6 +23,13 @@ tracing = { workspace = true }
 # `otlp::decode` returns anyhow errors with context, matching the shape both
 # callers (ingest's receiver, the gateway's POST /v1/traces) already handle.
 anyhow = { workspace = true }
+# `jetstream_limits` — the one place a JetStream stream/consumer limit is made TRUE on an
+# existing stream (SRE register #50). Gateway and ingest both create streams and both
+# had the `get_or_create` blind spot; one helper, not two copies.
+async-nats = { workspace = true }
+# `nats_connect` — the NATS password lifted out of `NATS_URL` (B-383 b) is held as a
+# SecretString so it is zeroized on drop and never Debug-printed.
+secrecy = { workspace = true }
 # OTLP protobuf decoder + `prost::Message::encoded_len` for the ADR-029 span-size
 # cap. Moved here with the decoder for GWY-41 so there is ONE decoder, not two.
 # `gen-tonic-messages` gives the trace-service message types; we consume the
@@ -34,3 +41,12 @@ anyhow = { workspace = true }
 # TypeScript SDK cannot deliver a span to Tracelane at all.
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "with-serde"] }
 prost = { workspace = true }
+# `email` (BILL-01 step 2) — the Resend transactional-email sender shared by
+# ingest and the gateway. No `ssrf_guard` dependency here (see the module doc);
+# the caller supplies both the client and the target URL.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+# `jetstream_limits`' live proof (an `#[ignore]` tokio test against a throwaway server).
+tokio = { workspace = true }
+wiremock = "0.6"

@@ -3,7 +3,12 @@
  *
  * Resolution order:
  *   1. PLAN_ENTITLEMENTS map (fallback when no Postgres row exists yet —
- *      e.g. fresh signup before workspace_entitlements is seeded).
+ *      e.g. fresh signup before workspace_entitlements is seeded). DERIVED
+ *      from `apps/web/db/plans.v3.json` at import time for every BILL-01 /
+ *      ADR-076 numeric field — never re-typed here (`.claude/rules/
+ *      reference-tables.md`). A handful of pre-existing feature flags
+ *      (full-capture, BYOK, prompt-promotion-write, …) are outside that
+ *      ADR's scope and stay in the small `LEGACY_FLAGS` table below.
  *   2. plan_entitlements row keyed by `<plan>_v1`.
  *   3. workspace_entitlements row (per-tenant overrides) — every non-NULL
  *      column overrides the plan default. A FALSE here overrides a TRUE
@@ -16,6 +21,14 @@
  * drizzle migration 0005. One source of truth: a tenant either has the
  * f_audit_addon grant (page renders AND export succeeds) or has neither.
  *
+ * **ADR-076 (2026-09-12 ruling): the Audit SKU is NOT SOLD** — spec
+ * `BILL-01` §10.4 found `/v1/audit/export` is not yet a complete offline
+ * evidence package (no per-record Merkle proof, no completeness attestation
+ * — filed `B-392`). `audit_ledger` therefore stays FALSE by default on every
+ * plan, Enterprise included: the SKU that used to flip it is off the price
+ * list. Enterprise's 7-year LEDGER RETENTION (`ledger_days`, below) is a
+ * separate, already-granted concept and is unaffected.
+ *
  * Extracted from `app/api/entitlements/route.ts` so the seat-cap enforcement
  * in `app/api/settings/team/invite` and the GET handler share one
  * authoritative resolver. tenant_id always derives from the WorkOS session,
@@ -23,16 +36,75 @@
  */
 
 import { db } from "@/db";
+import plansV3Json from "@/db/plans.v3.json";
 import { planEntitlements, workspaceEntitlements } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 export type Plan = "free" | "builder" | "team" | "business" | "enterprise";
 
+/** The shape of `apps/web/db/plans.v3.json` — READ-ONLY here (BILL-01 B3). */
+export interface PlansV3Meters {
+	ingest_usd_per_gb: number;
+	hot_window_usd_per_gb_month_ladder: [number, number | null, number][];
+	series_usd_per_series_month: number;
+	query_usd_per_scan_unit: number;
+	cold_usd_per_gb_month: number;
+	eval_usd_per_judge_run: number;
+	never_metered: string[];
+}
+export interface PlansV3Policy {
+	burst_multiple_of_trailing_30d_avg: number;
+	warning_thresholds_pct: number[];
+	rollover: boolean;
+	price_protection_months: number;
+	free_idle_reclaim_days: number;
+	dunning_retry_days: number[];
+	dunning_data_hold_days: number;
+	refund_days_base_first_cycle: number;
+	enterprise_onboarding_fee_usd: number;
+	prepaid_credits: [number, number][];
+	prepaid_expiry_months: number;
+	audit_sku: { sold: boolean; reason: string };
+}
+export interface PlansV3PlanRow {
+	name: string;
+	price_monthly_usd: number | null;
+	price_annual_month_usd: number | null;
+	price_from_usd: number | null;
+	hot_gb_included: number | null;
+	ingest_gb_included: number | null;
+	series_included: number | null;
+	scan_units_included: number | null;
+	eval_runs_included: number | null;
+	indexed_window_days: number;
+	queryable_days: number;
+	ledger_days: number;
+	cold_archive_days: number | null;
+	unlimited_seats: boolean;
+	f_sso: boolean;
+	overage_allowed: boolean;
+	rate_limit_rpm: number | null;
+}
+export interface PlansV3 {
+	meters: PlansV3Meters;
+	policy: PlansV3Policy;
+	plans: Record<string, PlansV3PlanRow>;
+}
+
+export const PLANS_V3 = plansV3Json as unknown as PlansV3;
+
+export const PLAN_TO_LOOKUP_KEY: Record<Plan, string> = {
+	free: "free_v1",
+	builder: "builder_v1",
+	team: "team_v1",
+	business: "business_v1",
+	enterprise: "enterprise_v1",
+};
+
 export interface Entitlements {
 	plan: Plan;
 	// Gateway + tracing
 	gateway_35_providers: boolean;
-	traces_90_day: boolean;
 	// Prompt promotion. `prompt_promotion_read` is TRUE on every plan, free
 	// included: reading a prompt's version history is gated nowhere. The gateway
 	// `history_handler` (`crates/gateway/src/prompt_routes.rs`) carries no
@@ -43,27 +115,42 @@ export interface Entitlements {
 	prompt_promotion_write: boolean;
 	// Security
 	byok_cmk: boolean;
-	// Paid Article-12 evidence-pack export (f_audit_addon, $999 add-on).
+	// Article-12 export (f_audit_addon, Enterprise-seeded). ADR-076: the paid SKU
+	// is NOT SOLD — see the module doc above. Stays FALSE by plan default here.
 	audit_ledger: boolean;
 	// ADR-066: FREE, default-TRUE self-verify — SEE + verify your OWN recent
 	// chain in-app. A workspace FALSE override (deny-overrides-grant) turns it
-	// off. Distinct from audit_ledger (the paid export).
+	// off. Distinct from audit_ledger (the Enterprise export).
 	audit_self_verify: boolean;
 	// Full-capture gate. Business + Enterprise
-	// base; an active Audit SKU forces it on any tier (non-overridable). Tail
+	// base; the Article-12 export grant (`f_audit_addon`, Enterprise-seeded) forces it (non-overridable). Tail
 	// sampling otherwise. Workspace-overridable via rowToOverrides.
 	f_full_capture: boolean;
-	// Team / seats
-	team_members_max: number; // -1 sentinel = unlimited
-	saml_sso: boolean;
-	// Seat caps + retention + overage
-	seat_cap_included: number;
-	seat_cap_max: number; // 0 sentinel = unlimited
-	retention_days: number;
-	trace_quota_monthly: number;
-	gateway_quota_monthly: number;
-	overage_hard_cap_multiplier: number;
-	overage_price_per_10k_usd: number;
+	// ── ADR-076 / BILL-01 — the six-meter ruled model ─────────────────────────
+	// Seats: 1 on Free; UNLIMITED on every paid tier. There is no included/max
+	// ladder any more — `unlimited_seats` is the whole seat model.
+	unlimited_seats: boolean;
+	f_sso: boolean; // Team+ (from plans.v3.json), replaces the old saml_sso field
+	// Included allowances, per calendar month, no rollover. `null` = custom
+	// (Enterprise) — the UI renders "custom", never a number.
+	hot_gb_included: number | null;
+	ingest_gb_included: number | null;
+	series_included: number | null;
+	scan_units_included: number | null;
+	eval_runs_included: number | null;
+	// Retention/window axes (spec §0.3): the indexed (hot) window, the longer
+	// queryable-history window, the audit ledger's own retention, and the cold
+	// archive window on Free (`null` = complete/whole queryable history).
+	indexed_window_days: number;
+	queryable_days: number;
+	ledger_days: number;
+	cold_archive_days: number | null;
+	// Free has no overage — it ages out, never bills past the allowance. Every
+	// paid tier bills continuously per unit past its included allowance
+	// (no rollover, no hard cap — "ingest is never blocked by billing state").
+	overage_allowed: boolean;
+	overflow_mode: "auto_age" | "auto_overage";
+	rate_limit_rpm: number | null; // null = no limit (Enterprise)
 	// Predictive-feature flags
 	f_pr7_trajectory: boolean;
 	f_pr8_argdrift: boolean;
@@ -72,7 +159,6 @@ export interface Entitlements {
 	f_pr11_slo_drift: boolean;
 	f_pr12_langgraph_branch: boolean;
 	f_cohort_baselines: boolean;
-	f_hipaa_gcp_addon: boolean;
 	// User-facing alerting (ADR-059 / migration 0012). DARK on every plan until
 	// the founder flips it; a per-tenant workspace override grants early access.
 	f_alerts: boolean;
@@ -81,33 +167,33 @@ export interface Entitlements {
 	f_online_evals: boolean;
 }
 
-// Fallback map used when no workspace_entitlements row exists for a tenant
-// (fresh signup, OSS self-host, or before the entitlements seed lands). Once
-// the Postgres row exists it always wins.
-export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
-	// Free hosted / unbilled / post-cancellation (free_v1). Matches the
-	// db/seed.mjs free_v1 row: 10K quotas, 7d retention, 1 seat,
-	// no overage, no audit/byok/promotion-write, all predictive flags off.
+/**
+ * Feature flags outside ADR-076's scope (unchanged by the six-meter ruling).
+ * Kept as a small hand-typed table rather than derived from `plans.v3.json`,
+ * which does not carry them.
+ */
+const LEGACY_FLAGS: Record<
+	Plan,
+	Pick<
+		Entitlements,
+		| "f_full_capture"
+		| "byok_cmk"
+		| "prompt_promotion_write"
+		| "f_pr7_trajectory"
+		| "f_pr8_argdrift"
+		| "f_pr9_a2a_handoff"
+		| "f_pr10_inline_slm_judge"
+		| "f_pr11_slo_drift"
+		| "f_pr12_langgraph_branch"
+		| "f_cohort_baselines"
+		| "f_alerts"
+		| "f_online_evals"
+	>
+> = {
 	free: {
-		plan: "free",
 		f_full_capture: false,
-		gateway_35_providers: true,
-		traces_90_day: false,
-		prompt_promotion_read: true,
-		prompt_promotion_write: false,
 		byok_cmk: false,
-		audit_ledger: false,
-		// ADR-066: free self-verify is ON for every plan by default.
-		audit_self_verify: true,
-		team_members_max: 1,
-		saml_sso: false,
-		seat_cap_included: 1,
-		seat_cap_max: 1,
-		retention_days: 7,
-		trace_quota_monthly: 10_000,
-		gateway_quota_monthly: 10_000,
-		overage_hard_cap_multiplier: 1.0,
-		overage_price_per_10k_usd: 0.0,
+		prompt_promotion_write: false,
 		f_pr7_trajectory: false,
 		f_pr8_argdrift: false,
 		f_pr9_a2a_handoff: false,
@@ -115,30 +201,13 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_pr11_slo_drift: false,
 		f_pr12_langgraph_branch: false,
 		f_cohort_baselines: false,
-		f_hipaa_gcp_addon: false,
 		f_alerts: false,
 		f_online_evals: false,
 	},
 	builder: {
-		plan: "builder",
 		f_full_capture: false,
-		gateway_35_providers: true,
-		traces_90_day: true,
-		prompt_promotion_read: true,
-		prompt_promotion_write: false,
 		byok_cmk: false,
-		audit_ledger: false,
-		// ADR-066: free self-verify is ON for every plan by default.
-		audit_self_verify: true,
-		team_members_max: 1,
-		saml_sso: false,
-		seat_cap_included: 1,
-		seat_cap_max: 1,
-		retention_days: 30,
-		trace_quota_monthly: 150_000,
-		gateway_quota_monthly: 150_000,
-		overage_hard_cap_multiplier: 5.0,
-		overage_price_per_10k_usd: 1.2,
+		prompt_promotion_write: false,
 		f_pr7_trajectory: false,
 		f_pr8_argdrift: false,
 		f_pr9_a2a_handoff: false,
@@ -146,30 +215,13 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_pr11_slo_drift: false,
 		f_pr12_langgraph_branch: false,
 		f_cohort_baselines: false,
-		f_hipaa_gcp_addon: false,
 		f_alerts: true,
 		f_online_evals: false,
 	},
 	team: {
-		plan: "team",
 		f_full_capture: false,
-		gateway_35_providers: true,
-		traces_90_day: true,
-		prompt_promotion_read: true,
-		prompt_promotion_write: true,
 		byok_cmk: false,
-		audit_ledger: false,
-		// ADR-066: free self-verify is ON for every plan by default.
-		audit_self_verify: true,
-		team_members_max: 10,
-		saml_sso: false,
-		seat_cap_included: 10,
-		seat_cap_max: 25,
-		retention_days: 90,
-		trace_quota_monthly: 1_000_000,
-		gateway_quota_monthly: 1_000_000,
-		overage_hard_cap_multiplier: 5.0,
-		overage_price_per_10k_usd: 1.2,
+		prompt_promotion_write: true,
 		f_pr7_trajectory: false,
 		f_pr8_argdrift: false,
 		f_pr9_a2a_handoff: false,
@@ -177,32 +229,13 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_pr11_slo_drift: false,
 		f_pr12_langgraph_branch: false,
 		f_cohort_baselines: false,
-		f_hipaa_gcp_addon: false,
 		f_alerts: true,
 		f_online_evals: true,
 	},
 	business: {
-		plan: "business",
 		f_full_capture: true,
-		gateway_35_providers: true,
-		traces_90_day: true,
-		prompt_promotion_read: true,
-		prompt_promotion_write: true,
 		byok_cmk: true,
-		// Audit is the $999/mo ADD-ON at every tier (ADR-020/025) — never
-		// plan-bundled. Matches plan_entitlements.f_audit_addon = FALSE.
-		audit_ledger: false,
-		// ADR-066: free self-verify is ON for every plan by default.
-		audit_self_verify: true,
-		team_members_max: -1,
-		saml_sso: false,
-		seat_cap_included: 25,
-		seat_cap_max: 50,
-		retention_days: 180,
-		trace_quota_monthly: 5_000_000,
-		gateway_quota_monthly: 5_000_000,
-		overage_hard_cap_multiplier: 5.0,
-		overage_price_per_10k_usd: 1.2,
+		prompt_promotion_write: true,
 		f_pr7_trajectory: false,
 		f_pr8_argdrift: false,
 		f_pr9_a2a_handoff: false,
@@ -210,31 +243,13 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_pr11_slo_drift: false,
 		f_pr12_langgraph_branch: false,
 		f_cohort_baselines: false,
-		f_hipaa_gcp_addon: false,
 		f_alerts: true,
 		f_online_evals: true,
 	},
 	enterprise: {
-		plan: "enterprise",
 		f_full_capture: true,
-		gateway_35_providers: true,
-		traces_90_day: true,
-		prompt_promotion_read: true,
-		prompt_promotion_write: true,
 		byok_cmk: true,
-		// Add-on-only, same as Business (ADR-020/025).
-		audit_ledger: false,
-		// ADR-066: free self-verify is ON for every plan by default.
-		audit_self_verify: true,
-		team_members_max: -1,
-		saml_sso: true,
-		seat_cap_included: 0,
-		seat_cap_max: 0, // unlimited
-		retention_days: 365,
-		trace_quota_monthly: 25_000_000,
-		gateway_quota_monthly: 25_000_000,
-		overage_hard_cap_multiplier: 99.0,
-		overage_price_per_10k_usd: 1.0,
+		prompt_promotion_write: true,
 		// Per-tenant grants flip these TRUE via workspace_entitlements when the
 		// feature ships.
 		f_pr7_trajectory: false,
@@ -244,18 +259,67 @@ export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
 		f_pr11_slo_drift: false,
 		f_pr12_langgraph_branch: false,
 		f_cohort_baselines: false, // flipped when cohort size n>=30
-		f_hipaa_gcp_addon: false, // flipped on opt-in GCP deployment +$2k/mo
 		f_alerts: true,
 		f_online_evals: true,
 	},
 };
 
-export const PLAN_TO_LOOKUP_KEY: Record<Plan, string> = {
-	free: "free_v1",
-	builder: "builder_v1",
-	team: "team_v1",
-	business: "business_v1",
-	enterprise: "enterprise_v1",
+/** Build one plan's entitlement defaults from `plans.v3.json` + `LEGACY_FLAGS`. */
+function buildPlanEntitlements(plan: Plan): Entitlements {
+	const row = PLANS_V3.plans[PLAN_TO_LOOKUP_KEY[plan]];
+	if (!row) {
+		throw new Error(`plans.v3.json has no row for ${PLAN_TO_LOOKUP_KEY[plan]}`);
+	}
+	const legacy = LEGACY_FLAGS[plan];
+	return {
+		plan,
+		gateway_35_providers: true,
+		prompt_promotion_read: true,
+		prompt_promotion_write: legacy.prompt_promotion_write,
+		byok_cmk: legacy.byok_cmk,
+		// ADR-076: the Audit SKU is not sold — see the module doc. Never TRUE by
+		// plan default, on any tier including Enterprise.
+		audit_ledger: false,
+		audit_self_verify: true,
+		f_full_capture: legacy.f_full_capture,
+		unlimited_seats: row.unlimited_seats,
+		f_sso: row.f_sso,
+		hot_gb_included: row.hot_gb_included,
+		ingest_gb_included: row.ingest_gb_included,
+		series_included: row.series_included,
+		scan_units_included: row.scan_units_included,
+		eval_runs_included: row.eval_runs_included,
+		indexed_window_days: row.indexed_window_days,
+		queryable_days: row.queryable_days,
+		ledger_days: row.ledger_days,
+		cold_archive_days: row.cold_archive_days,
+		overage_allowed: row.overage_allowed,
+		overflow_mode: "auto_age",
+		rate_limit_rpm: row.rate_limit_rpm,
+		f_pr7_trajectory: legacy.f_pr7_trajectory,
+		f_pr8_argdrift: legacy.f_pr8_argdrift,
+		f_pr9_a2a_handoff: legacy.f_pr9_a2a_handoff,
+		f_pr10_inline_slm_judge: legacy.f_pr10_inline_slm_judge,
+		f_pr11_slo_drift: legacy.f_pr11_slo_drift,
+		f_pr12_langgraph_branch: legacy.f_pr12_langgraph_branch,
+		f_cohort_baselines: legacy.f_cohort_baselines,
+		f_alerts: legacy.f_alerts,
+		f_online_evals: legacy.f_online_evals,
+	};
+}
+
+/**
+ * Fallback map used when no workspace_entitlements row exists for a tenant
+ * (fresh signup, OSS self-host, or before the entitlements seed lands). Once
+ * the Postgres row exists it always wins. DERIVED from `plans.v3.json` at
+ * import time for every ADR-076 field — see `buildPlanEntitlements` above.
+ */
+export const PLAN_ENTITLEMENTS: Record<Plan, Entitlements> = {
+	free: buildPlanEntitlements("free"),
+	builder: buildPlanEntitlements("builder"),
+	team: buildPlanEntitlements("team"),
+	business: buildPlanEntitlements("business"),
+	enterprise: buildPlanEntitlements("enterprise"),
 };
 
 /**
@@ -293,13 +357,22 @@ function rowToOverrides(
 	row: Record<string, unknown>,
 ): Partial<Record<keyof Entitlements, unknown>> {
 	return {
-		seat_cap_included: row.seatCapIncluded,
-		seat_cap_max: row.seatCapMax,
-		retention_days: row.retentionDays,
-		trace_quota_monthly: row.traceQuotaMonthly,
-		gateway_quota_monthly: row.gatewayQuotaMonthly,
-		overage_hard_cap_multiplier: row.overageHardCapMultiplier,
-		overage_price_per_10k_usd: row.overagePricePer10kUsd,
+		// ── ADR-076 / BILL-01 six-meter fields ──────────────────────────────
+		unlimited_seats: row.unlimitedSeats,
+		f_sso: row.fSso,
+		hot_gb_included: row.hotGbIncluded,
+		ingest_gb_included: row.ingestGbIncluded,
+		series_included: row.seriesIncluded,
+		scan_units_included: row.scanUnitsIncluded,
+		eval_runs_included: row.evalRunsIncluded,
+		indexed_window_days: row.indexedWindowDays,
+		queryable_days: row.queryableDays,
+		ledger_days: row.ledgerDays,
+		// cold_archive_days has no workspace override column (plan-level only).
+		overage_allowed: row.overageAllowed,
+		overflow_mode: row.overflowMode,
+		rate_limit_rpm: row.rateLimitRpm,
+		// ── pre-existing fields, unaffected by ADR-076 ──────────────────────
 		f_pr7_trajectory: row.fPr7Trajectory,
 		f_pr8_argdrift: row.fPr8Argdrift,
 		f_pr9_a2a_handoff: row.fPr9A2aHandoff,
@@ -307,10 +380,9 @@ function rowToOverrides(
 		f_pr11_slo_drift: row.fPr11SloDrift,
 		f_pr12_langgraph_branch: row.fPr12LanggraphBranch,
 		f_cohort_baselines: row.fCohortBaselines,
-		f_hipaa_gcp_addon: row.fHipaaGcpAddon,
 		f_full_capture: row.fFullCapture,
 		// Audit access resolves from f_audit_addon — the same column
-		// the gateway export gate checks (one source of truth).
+		// the gateway export gate checks.
 		audit_ledger: row.fAuditAddon,
 		// ADR-066: free self-verify grant (default TRUE; workspace FALSE overrides).
 		audit_self_verify: row.fAuditSelfverify,
@@ -376,11 +448,13 @@ export async function resolveEntitlements(
 	}
 
 	if (entitlements.audit_ledger) {
-		// An active Audit SKU (f_audit_addon grant) forces full capture on the
+		// The export grant (f_audit_addon, Enterprise-seeded) forces full capture on the
 		// audited scope — full-fidelity capture cannot tail-drop spans (the audit
 		// trail must be complete). Applied AFTER the override merge so a workspace
 		// `f_full_capture = false` cannot disable it while audit is active
-		// (non-overridable, ADR-048 D2).
+		// (non-overridable, ADR-048 D2). ADR-076: the SKU is not sold today, so
+		// this branch is dormant until a workspace override or a future ruling
+		// grants it — kept because a stray manual grant must still force capture.
 		entitlements.f_full_capture = true;
 	}
 

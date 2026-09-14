@@ -1,11 +1,28 @@
 {
 	"$schema": "https://mintlify.com/docs.json",
-	"theme": "mint",
+	"theme": "maple",
 	"name": "Tracelane",
 	"colors": {
-		"primary": "#0F62FE",
-		"light": "#4589FF",
-		"dark": "#0043CE"
+		"primary": "#0071e3",
+		"light": "#2997ff",
+		"dark": "#0071e3"
+	},
+	"appearance": {
+		"default": "system",
+		"strict": false
+	},
+	"background": {
+		"color": {
+			"light": "#f5f5f7",
+			"dark": "#000000"
+		}
+	},
+	"fonts": {
+		"family": "Geist"
+	},
+	"styling": {
+		"eyebrows": "section",
+		"codeblocks": "system"
 	},
 	"favicon": "/favicon.svg",
 	"navigation": {
@@ -27,13 +44,15 @@
 							"integrations/langchain",
 							"integrations/llamaindex",
 							"integrations/crewai",
-							"integrations/vercel-ai"
+							"integrations/vercel-ai",
+							"integrations/claude-code"
 						]
 					},
 					{
 						"group": "Concepts",
 						"pages": [
 							"architecture",
+							"benchmarks",
 							"predictive-guardrails",
 							"providers",
 							"audit-ledger",
@@ -43,7 +62,7 @@
 					},
 					{
 						"group": "Features",
-						"pages": ["prompt-promotion", "eval-gates", "slo", "time-travel"]
+						"pages": ["ask-tara", "prompt-promotion", "eval-gates", "slo", "time-travel"]
 					},
 					{
 						"group": "Tools",
@@ -66,6 +85,7 @@
 					{
 						"group": "Comparisons",
 						"pages": [
+							"comparisons/index",
 							"comparisons/vs-langsmith-engine",
 							"comparisons/vs-litellm",
 							"comparisons/vs-portkey",
@@ -91,6 +111,10 @@
 	},
 	"navbar": {
 		"links": [
+			{
+				"label": "Dashboard",
+				"href": "https://app.tracelane.dev"
+			},
 			{
 				"label": "GitHub",
 				"href": "https://github.com/tracelane/tracelane"

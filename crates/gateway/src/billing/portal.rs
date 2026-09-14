@@ -103,7 +103,8 @@ async fn handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "billing portal auth failed");
-            return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error(status, msg);
         }
     };
 
@@ -195,7 +196,9 @@ mod tests {
         unsafe {
             std::env::remove_var("TRACELANE_BILLING_RETURN_URL");
         }
-        let state = PortalState::from_env(Arc::new(PolarClient::new("polar_pat_fake")));
+        let state = PortalState::from_env(Arc::new(PolarClient::new(secrecy::SecretString::from(
+            "polar_pat_fake".to_string(),
+        ))));
         assert_eq!(state.return_url, "https://app.tracelane.dev/billing");
         if let Some(v) = saved {
             unsafe {
@@ -238,7 +241,9 @@ mod tests {
     #[test]
     fn portal_state_honours_an_on_allowlist_env_override() {
         with_return_url_env(Some("https://billing.tracelane.dev/back"), || {
-            let state = PortalState::from_env(Arc::new(PolarClient::new("polar_pat_fake")));
+            let state = PortalState::from_env(Arc::new(PolarClient::new(
+                secrecy::SecretString::from("polar_pat_fake".to_string()),
+            )));
             assert_eq!(state.return_url, "https://billing.tracelane.dev/back");
         });
     }
@@ -250,7 +255,9 @@ mod tests {
     #[test]
     fn portal_state_refuses_an_off_allowlist_env_override_and_falls_back() {
         with_return_url_env(Some("https://custom.example/back"), || {
-            let state = PortalState::from_env(Arc::new(PolarClient::new("polar_pat_fake")));
+            let state = PortalState::from_env(Arc::new(PolarClient::new(
+                secrecy::SecretString::from("polar_pat_fake".to_string()),
+            )));
             assert_eq!(
                 state.return_url, DEFAULT_RETURN_URL,
                 "an off-allowlist operator default must be ignored, not honoured"

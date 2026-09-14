@@ -149,7 +149,7 @@ export function Gauge({
 					// render, invisible in the diff, because the class name did not change.
 					// `t-metric-sm` restores the size this geometry was measured against.
 					// If the arc is ever scaled up, this is the line that moves with it.
-					"-mt-10 font-mono t-metric-sm",
+					"-mt-10 t-metric-sm",
 					onInverse ? "text-ink-inverse" : "text-ink",
 				)}
 			>

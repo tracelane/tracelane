@@ -109,13 +109,13 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::get,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Claims;
-use crate::clickhouse_query::{PlanTier, TenantQuery, datetime64_millis_now};
+use crate::clickhouse_query::{TenantQuery, datetime64_millis_now};
 use crate::dataset_routes::DatasetStore;
 use crate::entitlement_cache::{EntitlementCache, FeatureKey};
 use crate::prompt_eval::{
@@ -244,7 +244,7 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, ApiError> {
         .map_err(|_| api_err(StatusCode::BAD_REQUEST, "Authorization must be ASCII"))?;
     crate::auth::validate_authorization(s)
         .await
-        .map_err(|e| api_err(StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))
+        .map_err(|e| api_err(crate::auth::failure_status(&e), format!("auth failed: {e}")))
 }
 
 /// A13 scope gate for the READ surfaces.
@@ -656,13 +656,33 @@ struct CountRow {
 }
 
 pub struct ClickHouseExperimentStore {
+    /// SRE #20: the entitlement cache, so reads run at the tenant's OWN cap tier.
+    /// `None` (no control plane) resolves to FREE — fail-closed.
+    entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ch: clickhouse::Client,
 }
 
 impl ClickHouseExperimentStore {
     #[must_use]
     pub fn new(ch: clickhouse::Client) -> Self {
-        Self { ch }
+        Self {
+            entitlements: None,
+            ch,
+        }
+    }
+
+    /// SRE #20: the tenant's own ADR-031 tier (`clickhouse_query::tier_for_tenant`).
+    async fn tier_for(&self, tenant: &TenantId) -> crate::clickhouse_query::PlanTier {
+        crate::clickhouse_query::tier_for_tenant(self.entitlements.as_ref(), tenant).await
+    }
+
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
     }
 
     fn write_row(
@@ -699,7 +719,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
     async fn count_experiments(&self, tenant: &TenantId) -> Result<u64> {
         let sql = TenantQuery::new(
             "SELECT toUInt64(count()) AS n FROM experiments FINAL WHERE tenant_id = ?",
-            PlanTier::Builder,
+            self.tier_for(tenant).await,
         )
         .sql_with_settings();
         Ok(self
@@ -761,7 +781,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
              FROM experiments FINAL \
              WHERE tenant_id = ? AND experiments.experiment_id = toUUID(?) \
              LIMIT 1",
-            PlanTier::Builder,
+            self.tier_for(tenant).await,
         )
         .sql_with_settings();
         let rows = self
@@ -805,7 +825,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
                  ORDER BY created_at DESC, experiments.experiment_id DESC \
                  LIMIT ?"
             ),
-            PlanTier::Builder,
+            self.tier_for(tenant).await,
         )
         .sql_with_settings();
         let mut q = self.ch.query(&sql).bind(tenant.to_string());
@@ -835,7 +855,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
                  FROM experiment_arms FINAL \
                  WHERE tenant_id = ? AND toString(experiment_arms.experiment_id) IN ? \
                  GROUP BY experiment_id",
-                PlanTier::Builder,
+                self.tier_for(tenant).await,
             )
             .sql_with_settings();
             self.ch
@@ -938,7 +958,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
              WHERE tenant_id = ? AND experiment_arms.experiment_id = toUUID(?) \
              ORDER BY ordinal ASC \
              LIMIT ?",
-            PlanTier::Builder,
+            self.tier_for(tenant).await,
         )
         .sql_with_settings();
         let rows = self
@@ -1026,7 +1046,7 @@ impl ExperimentStore for ClickHouseExperimentStore {
                  ORDER BY item_ordinal ASC \
                  LIMIT ?"
             ),
-            PlanTier::Builder,
+            self.tier_for(tenant).await,
         )
         .sql_with_settings();
         let mut q = self
@@ -1816,7 +1836,12 @@ async fn create_experiment(
     // the single largest new money risk in this sprint.
     let budget_usd = crate::spend::workspace_budget_usd(state.entitlements.as_ref(), &tenant).await;
     if budget_usd.is_some() {
-        crate::spend::seed_workspace(state.engine.clickhouse(), &tenant).await;
+        crate::spend::seed_workspace(
+            state.engine.clickhouse(),
+            &tenant,
+            crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant).await,
+        )
+        .await;
         let who = crate::spend::Subject::Workspace(*tenant.as_uuid());
         if let Some(refusal) = crate::spend::workspace_refusal(who, budget_usd) {
             return Err(api_err(StatusCode::PAYMENT_REQUIRED, refusal.to_string()));
@@ -2330,15 +2355,14 @@ impl ExperimentRunner {
                     // version's pin"). Recording the resolved value is what makes
                     // the surface able to say WHICH model an arm ran, rather than
                     // which one was asked for.
-                    if self.arms[idx].model.is_empty() {
-                        if let Some(v) = self
+                    if self.arms[idx].model.is_empty()
+                        && let Some(v) = self
                             .state
                             .engine
                             .router()
                             .version_for_tenant(&self.tenant, arm.prompt_version_id)
-                        {
-                            self.arms[idx].model = v.model_pin.unwrap_or_default();
-                        }
+                    {
+                        self.arms[idx].model = v.model_pin.unwrap_or_default();
                     }
                 }
                 Err(e) => {

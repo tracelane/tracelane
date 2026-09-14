@@ -43,7 +43,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tracelane_shared::TenantId;
 
 use crate::server::AppState;
 
@@ -127,7 +126,8 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
         }
         Err(err) => {
             tracing::warn!(error = %err, "tool-pins auth failed");
-            Err(error(StatusCode::UNAUTHORIZED, "invalid credentials"))
+            let (status, msg) = crate::auth::failure(&err);
+            Err(error(status, msg))
         }
     }
 }
@@ -478,12 +478,12 @@ mod tests {
             Claims {
                 tenant_id: TenantId::from_jwt_claim(uuid::Uuid::nil()),
                 sub: "u".into(),
-                exp: u64::MAX,
                 auth_method,
                 role,
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: crate::spend::BudgetReset::Monthly,
             }
         }
 

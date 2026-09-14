@@ -142,7 +142,7 @@ today:
 > emits**. Separately, `f_full_capture` — the entitlement that forces the
 > full-capture sampling policy — is **false on Free, Builder and Team**
 > (`apps/web/db/seed.mjs`); it is granted on Business and Enterprise, and the
-> Audit add-on forces full capture on any plan.
+> The Enterprise export grant forces full capture on any plan.
 
 ---
 
@@ -151,7 +151,7 @@ today:
 ```bash
 npm install -g @tracelanedev/cli
 
-# Pull your ledger as NDJSON (requires the Audit add-on)
+# Pull your ledger as NDJSON (Enterprise plan)
 curl -H "authorization: Bearer $TRACELANE_API_KEY" \
   "$TRACELANE_GATEWAY_URL/v1/audit/export?since=2026-01-01T00:00:00Z" > audit.ndjson
 
@@ -187,7 +187,7 @@ lines in the NDJSON.
 
 Tracelane makes **no eIDAS or qualified-timestamp claim**.
 
-Not on the Audit add-on? `GET /v1/audit/self-verify` runs a chain check over
+Not on Enterprise? `GET /v1/audit/self-verify` runs a chain check over
 your own ledger within your retention window, on every plan.
 
 See [audit-format.md](audit-format.md) for the canonical format spec.

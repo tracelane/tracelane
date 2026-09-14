@@ -121,7 +121,10 @@ describe("POST /api/webhooks/polar", () => {
 	it("200 and applies the plan on a valid subscription event", async () => {
 		setDb([
 			[], // dedup select → not seen
-			[{ id: "ten_1" }], // tenant select → found
+			// tenant select → found. priceProtectedUntil already set (an existing
+			// paying customer) so this exercise does not also need to stub the
+			// first-paid-activation reads — those get their own dedicated test.
+			[{ id: "ten_1", priceProtectedUntil: new Date("2020-01-01T00:00:00Z") }],
 			[], // update tenants
 			[], // upsert workspace_entitlements
 			[], // record webhook_events
@@ -130,6 +133,195 @@ describe("POST /api/webhooks/polar", () => {
 		expect(res.status).toBe(200);
 		expect(h.db?.db.update).toHaveBeenCalledTimes(1); // tenants update ran
 		expect(h.db?.db.insert).toHaveBeenCalledTimes(2); // ws upsert + dedup record
+		// subEvent()'s default status is "active" — dunning is explicitly cleared.
+		const setArg = h.db?.setCalls[0]?.[0] as { dunningStartedAt?: unknown };
+		expect(setArg?.dunningStartedAt).toBeNull();
+	});
+
+	it("ADR-076: first paid activation sets price_protected_until + price_version, read from the DB", async () => {
+		setDb([
+			[], // dedup select → not seen
+			[{ id: "ten_1", plan: "free", priceProtectedUntil: null }], // tenant select
+			[{ value: 12 }], // billing_policy.price_protection_months
+			[{ priceVersion: "v3" }], // pricing_rates WHERE is_current
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(makeReq(subEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			priceProtectedUntil?: Date;
+			priceVersion?: string;
+			billingInterval?: string;
+		};
+		expect(setArg?.priceVersion).toBe("v3");
+		expect(setArg?.billingInterval).toBe("month");
+		expect(setArg?.priceProtectedUntil).toBeInstanceOf(Date);
+	});
+
+	it("ADR-076: subscription.past_due starts the dunning clock; plan is UNCHANGED", async () => {
+		setDb([
+			[], // dedup select
+			[
+				{
+					id: "ten_1",
+					plan: "team",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({ status: "past_due", modified_at: "2026-09-13T00:00:00Z" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			dunningStartedAt?: Date;
+		};
+		expect(setArg?.plan).toBe("team"); // ingest never blocked — plan unchanged
+		expect(setArg?.dunningStartedAt).toBeInstanceOf(Date);
+	});
+
+	it("ADR-076: .unpaid drops the tenant to free and sets data_hold_until from billing_policy", async () => {
+		setDb([
+			[], // dedup select
+			[
+				{
+					id: "ten_1",
+					plan: "team",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[{ value: 30 }], // billing_policy.dunning_data_hold_days
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({ status: "unpaid", modified_at: "2026-09-13T00:00:00Z" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			dataHoldUntil?: Date;
+		};
+		expect(setArg?.plan).toBe("free");
+		expect(setArg?.dataHoldUntil).toBeInstanceOf(Date);
+	});
+
+	it("re-cancelling an already-free tenant does not re-arm the data-hold clock", async () => {
+		setDb([
+			[], // dedup select
+			[
+				{
+					id: "ten_1",
+					plan: "free",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[], // update tenants (no policy read — planValue===free already)
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({ status: "canceled", modified_at: "2026-09-13T00:00:00Z" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as { dataHoldUntil?: unknown };
+		expect(setArg?.dataHoldUntil).toBeUndefined();
+	});
+
+	it("ADR-076: an annual (_year) lookup key sets billing_interval='year'", async () => {
+		setDb([
+			[], // dedup select
+			[{ id: "ten_1", priceProtectedUntil: new Date("2020-01-01T00:00:00Z") }],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					product: {
+						organization_id: ORG,
+						metadata: { lookup_key: "team_v1_year" },
+					},
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as { billingInterval?: string };
+		expect(setArg?.billingInterval).toBe("year");
+	});
+
+	// B-388. HMAC + idempotency stop the SAME delivery twice; they say nothing
+	// about two DIFFERENT events out of order. This is the review's exact
+	// scenario: a `canceled` applied, then a stale retried `updated` (active).
+	it("B-388: a stale `updated` after a `canceled` is acked and NOT applied", async () => {
+		setDb([
+			[], // dedup select → not seen
+			// tenant select → found, and the last APPLIED clock is the cancel's
+			[
+				{
+					id: "ten_1",
+					plan: "free",
+					polarSubscriptionModifiedAt: new Date("2026-09-12T10:00:05Z"),
+				},
+			],
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					id: "sub_1",
+					status: "active",
+					modified_at: "2026-09-12T10:00:01Z", // OLDER than the cancel
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(h.db?.db.update).not.toHaveBeenCalled(); // plan NOT re-activated
+		expect(h.db?.db.insert).toHaveBeenCalledTimes(1); // only the dedup record
+	});
+
+	it("B-388: a NEWER event still applies and writes its clock", async () => {
+		setDb([
+			[], // dedup select
+			[
+				{
+					id: "ten_1",
+					plan: "free",
+					polarSubscriptionModifiedAt: new Date("2026-09-12T10:00:01Z"),
+					// Already price-protected — this test is about the CLOCK, not
+					// first-paid-activation, which has its own dedicated test.
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(subEvent({ modified_at: "2026-09-12T10:00:05Z" })),
+		);
+		expect(res.status).toBe(200);
+		expect(h.db?.db.update).toHaveBeenCalledTimes(1);
+		const setArg = h.db?.setCalls[0]?.[0] as
+			| { polarSubscriptionModifiedAt?: Date }
+			| undefined;
+		expect(setArg?.polarSubscriptionModifiedAt?.toISOString()).toBe(
+			"2026-09-12T10:00:05.000Z",
+		);
 	});
 
 	it("200 and no plan change on an unknown plan key", async () => {
@@ -158,14 +350,15 @@ describe("POST /api/webhooks/polar", () => {
 	// which removed that log line and left this test red on a clean tree — a red
 	// test on the payment path. It now asserts the GRANT, which is the behaviour
 	// that must never regress.
-	it("audit_addon_v1 purchase GRANTS f_audit_addon", async () => {
-		const info = vi.spyOn(console, "info").mockImplementation(() => {});
-		setDb([
-			[], // dedup select → not seen
-			[{ id: TENANT_DB_ID, plan: "team" }], // correlateTenant
-			[], // entitlement upsert
-			[], // record webhook_events
-		]);
+	// ADR-076 / BILL-01 §10.4 (B-392): the Audit SKU is NOT SOLD and its Polar
+	// product is archived. The add-on grant path (`handleAddOnChange`, B-131) was
+	// DELETED on 2026-09-14 (founder: "no old code logic should exist"), so a
+	// stray `audit_addon_v1` event is a plain unknown-key no-op: acked, nothing
+	// written, `f_audit_addon` untouched. Re-selling the SKU means re-adding a
+	// grant path, not un-archiving a product.
+	it("an archived add-on (audit_addon_v1) is a plain unknown-key no-op — no grant path exists", async () => {
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		setDb([[], []]); // dedup empty, record
 		const res = await POST(
 			makeReq(
 				subEvent({
@@ -177,16 +370,25 @@ describe("POST /api/webhooks/polar", () => {
 			),
 		);
 		expect(res.status).toBe(200);
-		// The add-on must NOT touch tenants.plan — it is orthogonal to the tier.
 		expect(h.db?.db.update).not.toHaveBeenCalled();
-		expect(info).toHaveBeenCalledWith(
-			expect.stringContaining("audit add-on GRANTED (f_audit_addon=true)"),
+		expect(h.db?.db.insert).not.toHaveBeenCalledWith(
+			expect.objectContaining({ f_audit_addon: expect.anything() }),
 		);
-		info.mockRestore();
+		expect(spy).toHaveBeenCalledWith(
+			"[polar-webhook] unknown lookup_key — acked, no plan change:",
+			expect.anything(),
+		);
+		spy.mockRestore();
 	});
 
-	it("an unrecognised add-on stays a LOUD no-op (needs manual ops)", async () => {
-		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+	// ADR-076: hipaa_gcp_addon_v1 (and the two seat SKUs) are RETIRED and
+	// archived in Polar (`scripts/ops/polar-sync.mjs`) — the webhook no longer
+	// recognises them as add-ons at all, so a stray legacy event for one falls
+	// through to the generic "unknown lookup_key" path, exactly like any other
+	// key nothing maps to. This replaces the old "LOUD no-op, needs manual ops"
+	// behaviour, which was specific to a SKU this ruling retires outright.
+	it("a retired SKU (hipaa_gcp_addon_v1) is now a plain unknown-key no-op", async () => {
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		setDb([[], []]); // dedup empty, record
 		const res = await POST(
 			makeReq(
@@ -201,7 +403,8 @@ describe("POST /api/webhooks/polar", () => {
 		expect(res.status).toBe(200);
 		expect(h.db?.db.update).not.toHaveBeenCalled();
 		expect(spy).toHaveBeenCalledWith(
-			expect.stringContaining("grant NOT auto-wired"),
+			"[polar-webhook] unknown lookup_key — acked, no plan change:",
+			expect.anything(),
 		);
 		spy.mockRestore();
 	});

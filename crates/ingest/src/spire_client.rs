@@ -32,7 +32,6 @@ use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint, Uri};
-use tower_service::Service;
 use x509_parser::prelude::FromDer as _;
 
 use crate::spire_proto::spiffe_workload_api_client::SpiffeWorkloadApiClient;
@@ -41,9 +40,6 @@ use crate::spire_proto::{X509BundlesRequest, X509svidRequest};
 /// Header SPIRE requires on every Workload API call. Without it the agent
 /// rejects the request with `PERMISSION_DENIED`.
 const SPIFFE_SECURITY_HEADER: &str = "workload.spiffe.io";
-
-/// Default SPIRE agent socket path (per the SPIFFE spec).
-pub const DEFAULT_SPIRE_SOCKET: &str = "/tmp/spire-agent/public/api.sock";
 
 /// One snapshot of trust material for a single trust domain.
 ///
@@ -136,11 +132,9 @@ struct SpireClientInner {
 }
 
 impl SpireClient {
-    /// Connect to the SPIRE agent at the default socket path.
-    #[tracing::instrument]
-    pub async fn connect_default() -> Result<Self> {
-        Self::connect(PathBuf::from(DEFAULT_SPIRE_SOCKET)).await
-    }
+    // `connect_default` (a wrapper connecting to a hardcoded default socket
+    // path) was deleted 2026-09-12 (B-390) — zero callers anywhere; `main.rs`
+    // always calls `connect` below with an explicit socket path from config.
 
     /// Connect to a specific SPIRE agent socket path. Use in tests with a
     /// `tempfile::tempdir()`-rooted socket.

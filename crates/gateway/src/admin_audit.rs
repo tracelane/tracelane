@@ -18,20 +18,26 @@
 //! ~12 admin endpoints get a V1.1 sweep — tracked in CHANGELOG +
 //! ADR-031 §V1 wiring scope.
 
-use anyhow::{Context as _, Result};
-use deadpool_postgres::Pool;
+// No production caller today (B-390, 2026-09-12) — see the note above
+// `record_admin_action` below for the full picture. This struct + its
+// builder methods are exercised by a test; gated accordingly rather than
+// deleted, since AUD-16 tracks this as a real, deferred (not abandoned)
+// wiring gap.
+#[cfg(test)]
 use serde_json::Value as JsonValue;
-use tracing::instrument;
+#[cfg(test)]
 use uuid::Uuid;
 
 /// A pending audit entry. Construct with the helpers and submit via
-/// [`record_admin_action`].
+/// `record_admin_action` (deleted 2026-09-12, B-390 — see its former
+/// location's supersession note below).
 ///
 /// `actor_user_id` is the WorkOS user id string (opaque, e.g.
 /// `user_01HXYZ...`). The schema column is `TEXT` because Tracelane
 /// does not maintain a local `users` table — WorkOS is the identity
 /// system of record.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct AdminAuditEntry {
     pub actor_user_id: String,
     pub actor_workspace_id: Option<Uuid>,
@@ -55,6 +61,7 @@ pub struct AdminAuditEntry {
     pub user_agent: Option<String>,
 }
 
+#[cfg(test)]
 impl AdminAuditEntry {
     /// Construct a minimal entry for a `<target>.<verb>` action; fill in
     /// before/after with the chaining setters.
@@ -81,10 +88,12 @@ impl AdminAuditEntry {
         self.actor_workspace_id = Some(ws);
         self
     }
-    pub fn before(mut self, before: JsonValue) -> Self {
-        self.before_json = Some(before);
-        self
-    }
+    // `before(mut self, before: JsonValue)` (the `before_json` counterpart of
+    // `after` below) was deleted 2026-09-12 (B-390) — zero callers anywhere,
+    // including this file's own test, unlike `after`. The `before_json`
+    // field itself is untouched (`pub`, directly settable) — this only
+    // removed the unused chaining-setter sugar for it. Restorable from git
+    // history at `ba4627ccd53d35054629832edc11db7288acbceb`.
     pub fn after(mut self, after: JsonValue) -> Self {
         self.after_json = Some(after);
         self
@@ -101,89 +110,15 @@ impl AdminAuditEntry {
     }
 }
 
-/// Record one admin action. Returns `Ok(())` on success; logs and
-/// returns `Err` on Postgres failure (caller decides whether to fail
-/// the request or proceed). Cheap (~1 ms on a warm pool).
-#[instrument(
-    skip(pool, entry),
-    fields(
-        actor_user_id = %entry.actor_user_id,
-        action = %entry.action,
-        target_type = %entry.target_type,
-        target_id = %entry.target_id
-    )
-)]
-pub async fn record_admin_action(pool: &Pool, entry: AdminAuditEntry) -> Result<i64> {
-    let client = pool
-        .get()
-        .await
-        .context("admin_audit: acquire postgres connection")?;
-
-    // Cast `ip_addr` via the text→inet implicit conversion. If the
-    // string isn't a valid INET literal Postgres errors at parse time;
-    // we swallow that and retry with NULL so a bad client IP doesn't
-    // block the audit row.
-    let row_id_res: Result<i64, _> = client
-        .query_one(
-            r#"
-            INSERT INTO admin_audit_log
-                (actor_user_id, actor_workspace_id, action, target_type, target_id,
-                 before_json, after_json, ip_addr, user_agent)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::inet, $9)
-            RETURNING id
-            "#,
-            &[
-                &entry.actor_user_id,
-                &entry.actor_workspace_id,
-                &entry.action,
-                &entry.target_type,
-                &entry.target_id,
-                &entry.before_json,
-                &entry.after_json,
-                &entry.ip_addr,
-                &entry.user_agent,
-            ],
-        )
-        .await
-        .map(|row| row.get::<_, i64>("id"));
-
-    match row_id_res {
-        Ok(id) => Ok(id),
-        Err(e) => {
-            // Best-effort retry with NULL ip_addr if the cast failed.
-            let msg = e.to_string();
-            if entry.ip_addr.is_some() && msg.contains("invalid input syntax for type inet") {
-                tracing::warn!(error = %e, "admin_audit: ip_addr parse failed; retrying with NULL");
-                let row = client
-                    .query_one(
-                        r#"
-                        INSERT INTO admin_audit_log
-                            (actor_user_id, actor_workspace_id, action, target_type, target_id,
-                             before_json, after_json, ip_addr, user_agent)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
-                        RETURNING id
-                        "#,
-                        &[
-                            &entry.actor_user_id,
-                            &entry.actor_workspace_id,
-                            &entry.action,
-                            &entry.target_type,
-                            &entry.target_id,
-                            &entry.before_json,
-                            &entry.after_json,
-                            &entry.user_agent,
-                        ],
-                    )
-                    .await
-                    .context("admin_audit: insert (retry without ip_addr)")?;
-                Ok(row.get::<_, i64>("id"))
-            } else {
-                tracing::error!(error = %e, "admin_audit: insert failed");
-                Err(e).context("admin_audit: insert")
-            }
-        }
-    }
-}
+// `record_admin_action` (the Postgres INSERT writer this builder fed) was
+// deleted 2026-09-12 (B-390) — zero callers anywhere in the tree, including
+// tests (it needs a live `deadpool_postgres::Pool`, so no unit test ever
+// exercised it). AUD-16 already documents this honestly as a "V1.1 sweep"
+// gap with the web-side TS mirror (`apps/web/lib/admin-audit.ts`) doing the
+// real writing today for the 7 wired endpoints; this Rust-side function had
+// none. Restorable from git history at
+// `ba4627ccd53d35054629832edc11db7288acbceb` (the last commit that carried
+// it) when a gateway-side admin route needs to write this table directly.
 
 #[cfg(test)]
 mod tests {

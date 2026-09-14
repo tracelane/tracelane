@@ -53,12 +53,15 @@
 //!
 //! ## Resource caps
 //!
-//! Every SELECT goes through `clickhouse_query::TenantQuery` at
-//! `PlanTier::Builder` — the TIGHTEST tier, deliberately, for the reason
-//! `trace_reads.rs` already writes down: these are background/curation queries
-//! and must never out-consume the interactive dashboard queries of the same
-//! workspace. Dataset routes buy no inference, so the only thing they can spend
-//! is ClickHouse time.
+//! Every SELECT goes through `clickhouse_query::TenantQuery` at the TENANT'S OWN
+//! tier (`tier_for`, via `clickhouse_query::tier_for_tenant` — SRE register #20,
+//! 2026-09-05). Until then this module pinned the tightest tier for every tenant,
+//! on the argument that curation queries must never out-consume the interactive
+//! dashboard queries of the same workspace; that held for Free and Builder, whose
+//! caps are the same, and silently under-served Team and Business. With no
+//! entitlement cache the reader resolves to FREE — fail-closed, never a grant.
+//! Dataset routes buy no inference, so the only thing they can spend is
+//! ClickHouse time, and that is now bounded by what the workspace pays for.
 //!
 //! ## The schema this module is written against
 //!
@@ -249,7 +252,7 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, ApiError> {
     })?;
     crate::auth::validate_authorization(s)
         .await
-        .map_err(|e| api_err(StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))
+        .map_err(|e| api_err(crate::auth::failure_status(&e), format!("auth failed: {e}")))
 }
 
 /// A13 scope gate for the READ surfaces.
@@ -396,7 +399,8 @@ fn capture_enabled(
     cfg: Option<&crate::server::config::TraceContentConfig>,
     tenant: &TenantId,
 ) -> bool {
-    cfg.is_some_and(|c| c.captures(tenant))
+    // B-299: the ONE policy. Not re-derived here.
+    crate::server::config::capture_decision(cfg, tenant)
 }
 
 /// What a span lookup produced. Four outcomes, four different things to tell the
@@ -641,6 +645,12 @@ pub trait DatasetStore: Send + Sync {
 
     /// EVL-29 (R228) — which of these traces have a snapshot. Bounded by the
     /// caller to one page, the same shape as the Postgres exclusion join.
+    ///
+    /// No production caller today — used only by a test at the
+    /// `ClickHouseDatasetStore` call site below, hence gated (B-390,
+    /// 2026-09-12). Gated consistently on the trait declaration and both
+    /// implementations.
+    #[cfg(test)]
     async fn snapshotted_trace_ids(
         &self,
         tenant: &TenantId,
@@ -845,19 +855,41 @@ struct IdRow {
 /// The ClickHouse-backed store. Every SELECT carries the ADR-031 caps; every
 /// statement binds `tenant_id` first.
 pub struct ClickHouseDatasetStore {
+    /// The same cache the hot path reads — no Postgres per request. `None` on a
+    /// stack with no control plane, which resolves to the FREE tier (fail-closed).
+    entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ch: clickhouse::Client,
 }
 
 impl ClickHouseDatasetStore {
     #[must_use]
     pub fn new(ch: clickhouse::Client) -> Self {
-        Self { ch }
+        Self {
+            entitlements: None,
+            ch,
+        }
+    }
+
+    /// Thread the entitlement cache in (server.rs). Without it every read runs at
+    /// the FREE tier — never at a paid one.
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
     }
 
     /// Every SELECT on this surface, at the tightest tier. One helper so a new
     /// query cannot forget the caps.
-    fn capped(sql: &str) -> String {
-        TenantQuery::new(sql, PlanTier::Builder).sql_with_settings()
+    async fn capped(&self, sql: &str, tenant: &TenantId) -> String {
+        TenantQuery::new(sql, self.tier_for(tenant).await).sql_with_settings()
+    }
+
+    /// SRE register #20: the tenant's OWN tier, via `clickhouse_query::tier_for_tenant`.
+    async fn tier_for(&self, tenant: &TenantId) -> PlanTier {
+        crate::clickhouse_query::tier_for_tenant(self.entitlements.as_ref(), tenant).await
     }
 
     /// The item projection, shared by every item read so the column list and
@@ -882,12 +914,12 @@ impl ClickHouseDatasetStore {
         dataset_id: Uuid,
         item_id: Uuid,
     ) -> Result<Option<DatasetItem>> {
-        let sql = Self::capped(&format!(
+        let sql = self.capped(&format!(
             "SELECT {cols} FROM dataset_items FINAL \
              WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND dataset_items.item_id = toUUID(?) \
                AND deleted = 0 LIMIT 1",
             cols = Self::ITEM_COLUMNS
-        ));
+        ), tenant).await;
         let row = self
             .ch
             .query(&sql)
@@ -967,9 +999,12 @@ impl DatasetStore for ClickHouseDatasetStore {
     }
 
     async fn count_datasets(&self, tenant: &TenantId) -> Result<u64> {
-        let sql = Self::capped(
-            "SELECT count() AS n FROM datasets FINAL WHERE tenant_id = ? AND deleted = 0",
-        );
+        let sql = self
+            .capped(
+                "SELECT count() AS n FROM datasets FINAL WHERE tenant_id = ? AND deleted = 0",
+                tenant,
+            )
+            .await;
         let row = self
             .ch
             .query(&sql)
@@ -1006,6 +1041,10 @@ impl DatasetStore for ClickHouseDatasetStore {
         }
         sql.push_str(" ORDER BY created_at DESC, dataset_id DESC LIMIT ?");
 
+        // SRE #20 follow-up: this list read was the ONE uncapped ClickHouse read in
+        // this file — built dynamically, it never went through `capped`. Found by the
+        // prod query_log proof (empty Settings on exactly this query), not by the guard.
+        let sql = self.capped(&sql, tenant).await;
         let mut q = self.ch.query(&sql).bind(tenant.to_string());
         if let Some(n) = name {
             q = q.bind(n);
@@ -1025,12 +1064,15 @@ impl DatasetStore for ClickHouseDatasetStore {
     }
 
     async fn get_dataset(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<Option<Dataset>> {
-        let sql = Self::capped(
-            "SELECT toString(dataset_id) AS dataset_id, name, description, \
+        let sql = self
+            .capped(
+                "SELECT toString(dataset_id) AS dataset_id, name, description, \
                     created_at, created_by, updated_at \
              FROM datasets FINAL \
              WHERE tenant_id = ? AND datasets.dataset_id = toUUID(?) AND deleted = 0",
-        );
+                tenant,
+            )
+            .await;
         let row = self
             .ch
             .query(&sql)
@@ -1074,14 +1116,17 @@ impl DatasetStore for ClickHouseDatasetStore {
     }
 
     async fn item_stats(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<ItemStats> {
-        let sql = Self::capped(
-            "SELECT count() AS items, \
+        let sql = self
+            .capped(
+                "SELECT count() AS items, \
                     countIf(expected_output IS NOT NULL AND trimBoth(expected_output) != '') \
                       AS with_reference, \
                     countIf(source_trace_id IS NOT NULL) AS from_traces \
              FROM dataset_items FINAL \
              WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND deleted = 0",
-        );
+                tenant,
+            )
+            .await;
         let row = self
             .ch
             .query(&sql)
@@ -1116,6 +1161,8 @@ impl DatasetStore for ClickHouseDatasetStore {
         // order are the SAME order, so what the user froze is what they saw.
         sql.push_str(" ORDER BY created_at ASC, item_id ASC LIMIT ?");
 
+        // SRE #20 follow-up: capped now (was the second uncapped read in this file).
+        let sql = self.capped(&sql, tenant).await;
         let mut q = self
             .ch
             .query(&sql)
@@ -1136,12 +1183,17 @@ impl DatasetStore for ClickHouseDatasetStore {
     }
 
     async fn all_items(&self, tenant: &TenantId, dataset_id: Uuid) -> Result<Vec<DatasetItem>> {
-        let sql = Self::capped(&format!(
-            "SELECT {cols} FROM dataset_items FINAL \
+        let sql = self
+            .capped(
+                &format!(
+                    "SELECT {cols} FROM dataset_items FINAL \
              WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND deleted = 0 \
              ORDER BY created_at ASC, item_id ASC LIMIT ?",
-            cols = Self::ITEM_COLUMNS
-        ));
+                    cols = Self::ITEM_COLUMNS
+                ),
+                tenant,
+            )
+            .await;
         // ORDER IS DETERMINISTIC, BUT IT IS NOT THE IMPORT FILE'S LINE ORDER.
         // One import stamps every row with the SAME `created_at`, so the
         // tie-break is `item_id` — a random v4. That keeps `snapshot_id`
@@ -1172,11 +1224,10 @@ impl DatasetStore for ClickHouseDatasetStore {
         dataset_id: Uuid,
         hash: &str,
     ) -> Result<Option<Uuid>> {
-        let sql = Self::capped(
+        let sql = self.capped(
             "SELECT toString(item_id) AS id FROM dataset_items FINAL \
              WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND input_hash = ? AND deleted = 0 \
-             LIMIT 1",
-        );
+             LIMIT 1", tenant).await;
         let row = self
             .ch
             .query(&sql)
@@ -1280,33 +1331,52 @@ impl DatasetStore for ClickHouseDatasetStore {
         // dataset copy and the eval engine read the identical bytes. `FINAL`
         // because `spans` is a ReplacingMergeTree and a half-merged duplicate
         // must not decide what a permanent test case contains.
-        let sql = Self::capped(
-            "SELECT JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, \
+        let sql = self
+            .capped(
+                "SELECT JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, \
                     JSONExtractRaw(attributes, 'gen_ai_system_instructions') \
                       AS system_instructions \
              FROM spans FINAL \
              WHERE tenant_id = ? AND trace_id = ? AND span_id = ? \
              LIMIT 1",
-        );
-        self.ch
+                tenant,
+            )
+            .await;
+        let mut row: Option<SpanContentRow> = self
+            .ch
             .query(&sql)
             .bind(tenant.to_string())
             .bind(trace_id.to_string())
             .bind(span_id.to_string())
             .fetch_optional::<SpanContentRow>()
             .await
-            .context("span content SELECT failed")
+            .context("span content SELECT failed")?;
+        // BILL-01 / ADR-076 §2.3 — `JSONExtractRaw` returns the value VERBATIM,
+        // which is `{"$ref":"blake3:<hex>"}` when ingest deduplicated it.
+        // Fail-open (a read path): a rehydration failure leaves the `$ref`
+        // text in the exported dataset item rather than failing the export.
+        if let Some(r) = row.as_mut() {
+            let mut fields: Vec<&mut String> =
+                vec![&mut r.input_messages, &mut r.system_instructions];
+            if let Err(e) = crate::billing::blobs::rehydrate(&self.ch, tenant, &mut fields).await {
+                tracing::warn!(error = %e, "blob rehydration failed for dataset span_content");
+            }
+        }
+        Ok(row)
     }
 
     async fn content_span_id(&self, tenant: &TenantId, trace_id: &str) -> Result<Option<String>> {
         // `FINAL` for the same reason the content read uses it: a half-merged
         // duplicate must not decide which span a permanent test case came from.
-        let sql = Self::capped(
-            "SELECT span_id FROM spans FINAL \
+        let sql = self
+            .capped(
+                "SELECT span_id FROM spans FINAL \
              WHERE tenant_id = ? AND trace_id = ? \
                AND JSONHas(attributes, 'gen_ai_input_messages') \
              ORDER BY start_time DESC LIMIT 1",
-        );
+                tenant,
+            )
+            .await;
         #[derive(serde::Deserialize, clickhouse::Row)]
         struct R {
             span_id: String,
@@ -1377,11 +1447,14 @@ impl DatasetStore for ClickHouseDatasetStore {
         trace_id: &str,
         span_id: &str,
     ) -> Result<Option<SpanContentRow>> {
-        let sql = Self::capped(
-            "SELECT input AS input_messages, system AS system_instructions \
+        let sql = self
+            .capped(
+                "SELECT input AS input_messages, system AS system_instructions \
              FROM trace_content_snapshots FINAL \
              WHERE tenant_id = ? AND trace_id = ? AND span_id = ? LIMIT 1",
-        );
+                tenant,
+            )
+            .await;
         self.ch
             .query(&sql)
             .bind(tenant.to_string())
@@ -1392,6 +1465,7 @@ impl DatasetStore for ClickHouseDatasetStore {
             .context("snapshot read failed")
     }
 
+    #[cfg(test)]
     async fn snapshotted_trace_ids(
         &self,
         tenant: &TenantId,
@@ -1400,10 +1474,13 @@ impl DatasetStore for ClickHouseDatasetStore {
         if trace_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = Self::capped(
-            "SELECT DISTINCT trace_id FROM trace_content_snapshots FINAL \
+        let sql = self
+            .capped(
+                "SELECT DISTINCT trace_id FROM trace_content_snapshots FINAL \
              WHERE tenant_id = ? AND trace_id IN ?",
-        );
+                tenant,
+            )
+            .await;
         #[derive(serde::Deserialize, clickhouse::Row)]
         struct R {
             trace_id: String,
@@ -1430,10 +1507,13 @@ impl DatasetStore for ClickHouseDatasetStore {
         // twice against the 100-snapshot cap for one snapshot. Migration 18 says
         // this in its own DDL, and notes that the spec's §3 `count()` is the
         // spec being loose — the query is the thing that has to be right.
-        let sql = Self::capped(
-            "SELECT uniqExact(snapshot_id) AS n FROM dataset_snapshots \
+        let sql = self
+            .capped(
+                "SELECT uniqExact(snapshot_id) AS n FROM dataset_snapshots \
              WHERE tenant_id = ? AND dataset_snapshots.dataset_id = toUUID(?)",
-        );
+                tenant,
+            )
+            .await;
         let row = self
             .ch
             .query(&sql)
@@ -1451,10 +1531,9 @@ impl DatasetStore for ClickHouseDatasetStore {
         dataset_id: Uuid,
         snapshot_id: Uuid,
     ) -> Result<bool> {
-        let sql = Self::capped(
+        let sql = self.capped(
             "SELECT count() AS n FROM dataset_snapshots \
-             WHERE tenant_id = ? AND dataset_snapshots.dataset_id = toUUID(?) AND dataset_snapshots.snapshot_id = toUUID(?)",
-        );
+             WHERE tenant_id = ? AND dataset_snapshots.dataset_id = toUUID(?) AND dataset_snapshots.snapshot_id = toUUID(?)", tenant).await;
         let row = self
             .ch
             .query(&sql)
@@ -1543,14 +1622,17 @@ impl DatasetStore for ClickHouseDatasetStore {
         // concurrent freezes of one content set can write two identical rows,
         // and rendering the same snapshot twice would read as two frozen sets.
         // `min(created_at)` is the freeze that actually happened first.
-        let sql = Self::capped(
-            "SELECT toString(snapshot_id) AS snapshot_id, any(item_count) AS item_count, \
+        let sql = self
+            .capped(
+                "SELECT toString(snapshot_id) AS snapshot_id, any(item_count) AS item_count, \
                     min(created_at) AS created_at, any(created_by) AS created_by \
              FROM dataset_snapshots \
              WHERE tenant_id = ? AND dataset_snapshots.dataset_id = toUUID(?) \
              GROUP BY snapshot_id \
              ORDER BY created_at DESC LIMIT ?",
-        );
+                tenant,
+            )
+            .await;
         let rows = self
             .ch
             .query(&sql)
@@ -3249,12 +3331,12 @@ mod tests {
         Claims {
             tenant_id: tenant(),
             sub: "user-a".to_string(),
-            exp: u64::MAX,
             auth_method: method,
             role,
             key_scope,
             budget_usd_monthly: None,
             rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
         }
     }
 

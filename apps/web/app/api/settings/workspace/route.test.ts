@@ -25,6 +25,9 @@ vi.mock("@/lib/auth", () => ({
 		userId: "user_ME",
 		email: "e@x.co",
 	})),
+	// B-361: the route calls this after archiving; a mock without it throws
+	// "not a function" and the route's own catch silently swallows that.
+	invalidateOrgArchivedCache: vi.fn(),
 }));
 
 import { PATCH } from "./route";

@@ -13,14 +13,5 @@
 //! the bench needs library access without forcing `main.rs` to re-route
 //! every internal call through the library path.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    clippy::needless_return,
-    clippy::collapsible_match,
-    clippy::collapsible_if,
-    clippy::manual_is_multiple_of
-)]
-
 pub mod circuit_breaker;
 pub mod rate_limiter;

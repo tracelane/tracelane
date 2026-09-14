@@ -36,6 +36,10 @@ pub fn record_disk_shed() {
 }
 
 /// Snapshot the disk-shed counter (test + metrics).
+///
+/// No production caller today — the metrics endpoint doesn't read this yet.
+/// Used only by tests, hence gated (B-390, 2026-09-12).
+#[cfg(test)]
 pub fn disk_shed_total() -> u64 {
     DISK_SHED_TOTAL.load(Ordering::Relaxed)
 }

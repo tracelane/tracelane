@@ -19,6 +19,49 @@
 # Exit code: 0 iff every selected step passed.
 
 set -uo pipefail
+
+# ── MEMORY CEILING (earned 2026-09-10, three OOM kills in one session) ────────
+# `cargo clippy --workspace --all-targets` and `cargo test --workspace
+# --all-features` compile every target at once. On this 15 GB WSL box that peaked
+# past available memory and the KERNEL KILLED THE GATE MID-RUN — three times,
+# twice inside the compile and once after a deploy had already landed, which is
+# the worst shape: the gate looked "not green" when it had never finished.
+#
+# HONEST STATUS: this is a MITIGATION, NOT A CURE. `nproc/2` was tried first and a
+# SIXTH kill landed on clippy with that cap in effect and resolving correctly to 4
+# — so `--all-targets` across eight crates can still spike past this box. `nproc/4`
+# lowers the peak further at the cost of wall-clock. If it still dies, the honest
+# answer is that a 15 GB box is MARGINAL for a workspace-wide compile, not that
+# one more knob is missing.
+#
+# Do NOT read a single completed run as proof the cap is sufficient — one run
+# completed at nproc/2 and the next died at the same setting. The difference was
+# ambient headroom, not the cap.
+#
+# Deliberately NOT a `.cargo/config.toml`, which would slow every incremental
+# build too — the pressure only exists under the workspace-wide compile this
+# script runs. Override with CARGO_BUILD_JOBS=<n> on a bigger box.
+: "${CARGO_BUILD_JOBS:=$(( $(nproc) / 4 > 0 ? $(nproc) / 4 : 1 ))}"
+export CARGO_BUILD_JOBS
+# AND THE TEST RUNNER, which is a SEPARATE knob — corrected the same day, after a
+# FOURTH kill with CARGO_BUILD_JOBS already capped and resolving correctly to 4.
+# `CARGO_BUILD_JOBS` caps COMPILATION only. `cargo test` then runs the built
+# binaries with one thread per core by default, and this suite's tests spawn tokio
+# runtimes, wiremock servers and a PGlite instance — the kill landed on test NAMES
+# (spire_client, r2_batcher, cardinality), not on a compile unit, which is what
+# showed the first fix was aimed at the wrong phase.
+#
+# STATUS AFTER SEVEN KILLS, said plainly rather than dressed as a fix: BOTH caps
+# are in effect and verified at runtime (jobs=2, test-threads=2) and the gate
+# STILL died in the test phase. These caps reduce the frequency; they do not cure
+# it. A 15 GB box is marginal for `--workspace --all-targets` plus a test run that
+# spawns PGlite, wiremock and tokio runtimes. If this keeps happening the answer is
+# more memory (WSL's `.wslconfig` memory= is the founder's to raise) or splitting
+# the gate into phases — NOT another knob. I have twice claimed a cap fixed this
+# and been falsified within the hour; a single completed run is not evidence a
+# resource ceiling moved.
+: "${RUST_TEST_THREADS:=$(( $(nproc) / 4 > 0 ? $(nproc) / 4 : 1 ))}"
+export RUST_TEST_THREADS
 cd "$(dirname "$0")/.."
 
 # ── SINGLE-RUN LOCK ───────────────────────────────────────────────────────────
@@ -343,9 +386,15 @@ _area_active() {
 }
 
 # ── result accounting ──────────────────────────────────────────────────────
-declare -a NAMES STATUSES
+# DURATIONS is index-aligned with NAMES/STATUSES (one entry per step, in the same
+# order) so the "slowest 10" table at the end can name a step from its position
+# alone. A step that never actually executed (SKIP, SCOPED-OUT, an --explain-scope
+# probe) has nothing to measure and records 0 — it sorts to the bottom of "slowest"
+# rather than lying about a duration that was never observed.
+declare -a NAMES STATUSES DURATIONS
 overall=0
 declare -a SCOPED_OUT=()
+declare -a WARNED=()
 
 run() {
     local name="$1"; shift
@@ -358,26 +407,184 @@ run() {
         return
     fi
     if ! _area_active; then
-        NAMES+=("$name"); STATUSES+=("SCOPED-OUT")
+        NAMES+=("$name"); STATUSES+=("SCOPED-OUT"); DURATIONS+=(0)
         SCOPED_OUT+=("$name [$AREA]")
         return
     fi
     echo "──────────────────────────────────────────────────────────────"
     echo "▶ $name"
     echo "  \$ $*"
+    local _t0=$SECONDS _dur
     if "$@"; then
-        NAMES+=("$name"); STATUSES+=("PASS")
-        echo "✔ $name"
+        _dur=$((SECONDS - _t0))
+        NAMES+=("$name"); STATUSES+=("PASS"); DURATIONS+=("$_dur")
+        echo "✔ $name (${_dur}s)"
     else
         local rc=$?
-        NAMES+=("$name"); STATUSES+=("FAIL($rc)")
-        echo "x $name FAILED (exit $rc)"
+        _dur=$((SECONDS - _t0))
+        NAMES+=("$name"); STATUSES+=("FAIL($rc)"); DURATIONS+=("$_dur")
+        echo "x $name FAILED (exit $rc, ${_dur}s)"
         overall=1
     fi
 }
 
+# run_advisory — same signature and same PASS/FAIL mechanics as run(), for a check
+# whose failure is a NETWORK-reachability fact rather than a defect in this tree:
+# `cargo audit` and `pnpm audit` both need a live registry, and a dev box offline
+# or behind a flaky proxy is not "the code regressed". Locally that failure records
+# WARN — a new status, counted as NOT a failure, so `overall` stays 0 — and prints
+# loudly that it is advisory here. It is never silently swallowed: WARNED tracks it
+# for the summary, and the NIGHTLY unscoped run (TRACELANE_GATE_STRICT_NETWORK=1,
+# job-level env in nightly-full-gate.yml) is where the same failure blocks for
+# real, so an advisory finding still meets a red gate within 24h (the same
+# R142/R144 shape as the push-only integration suites above).
+# SRE audit finding 18, 2026-09-04. In the nightly, TRACELANE_GATE_STRICT_NETWORK=1 turns
+# these advisory steps into BLOCKING ones — and `pnpm audit` / `cargo audit` exit non-zero
+# for a registry socket timeout exactly as they do for a real high advisory. The nightly was
+# red 11 of its last 16 runs, mostly on ERR_SOCKET_TIMEOUT, so "the gate is red" stopped
+# carrying information and the channel stopped being opened. That is the same cost as a
+# false green, arriving from the other direction.
+#
+# This does NOT downgrade a real finding, and it does not let a failed scan pass: a
+# transport failure retries, and if it still cannot reach the registry it fails with
+# CANNOT DETERMINE and says in its own output that NOTHING WAS SCANNED. Red either way —
+# but the reader can now tell "you have a vulnerability" from "we could not look",
+# which is the whole difference between a gate and a noise source (CLAUDE.md §14).
+# A scan fails for two reasons that must never share an exit code: it FOUND
+# something, or it could not LOOK. `_audit_with_retry` already tells them apart
+# internally — this is how it tells its CALLER, which is what `run_blocking_scan`
+# below needs in order to block on the first and not the second. 90 is outside the
+# range either audit tool uses (both exit 1 on findings, 2 on usage), so no real
+# finding can be mistaken for it.
+readonly AUDIT_CANNOT_DETERMINE=90
+
+_audit_with_retry() {
+    local label="$1"; shift
+    local out rc attempt
+    for attempt in 1 2 3; do
+        out=$("$@" 2>&1); rc=$?
+        [[ $rc -eq 0 ]] && { printf '%s\n' "$out"; return 0; }
+        case "$out" in
+            *ERR_SOCKET_TIMEOUT*|*ENOTFOUND*|*ECONNRESET*|*ETIMEDOUT*|*EAI_AGAIN*|\
+            *"socket hang up"*|*"error sending request"*|*"failed to fetch"*)
+                echo "  $label: registry unreachable (attempt $attempt/3) — retrying in 5s…"
+                sleep 5; continue ;;
+        esac
+        printf '%s\n' "$out"          # a REAL finding — report it and fail immediately
+        return $rc
+    done
+    printf '%s\n' "$out"
+    echo "  ✗ CANNOT DETERMINE — $label could not reach the registry after 3 attempts."
+    echo "    THIS IS NOT A VULNERABILITY FINDING. Nothing was scanned, so nothing is"
+    echo "    known about advisories in this tree. Re-run when the network is available."
+    return "$AUDIT_CANNOT_DETERMINE"
+}
+
+run_advisory() {
+    local name="$1"; shift
+    if [[ "${TRACELANE_GATE_STRICT_NETWORK:-0}" == "1" ]]; then
+        # Quoted command name is deliberate, not stylistic: `check-verify-all-scoping.py`
+        # and `check-guard-selftests.py` both discover steps by textually matching
+        # `^\s*run\s+"..."` against this FILE, not by executing it. An unquoted
+        # `run "$name" "$@"` here is indistinguishable from a real step declaration to
+        # that regex — it matched, with the label read as the literal text `$name` (the
+        # variable, not its value) and no `area` before it, which is exactly the
+        # "'$name': no area declared" false step the scoping guard caught. Quoting the
+        # command name changes nothing bash does (quote removal still resolves it to the
+        # `run` function) but the line no longer starts with the bare word `run`.
+        "run" "$name" "$@"
+        return
+    fi
+    if [[ "$EXPLAIN" -eq 1 ]]; then
+        if _area_active; then printf 'RUN\t%s\n' "$name"; else printf 'SKIP\t%s\n' "$name"; fi
+        return
+    fi
+    if ! _area_active; then
+        NAMES+=("$name"); STATUSES+=("SCOPED-OUT"); DURATIONS+=(0)
+        SCOPED_OUT+=("$name [$AREA]")
+        return
+    fi
+    echo "──────────────────────────────────────────────────────────────"
+    echo "▶ $name (advisory locally — TRACELANE_GATE_STRICT_NETWORK=1 to block)"
+    echo "  \$ $*"
+    local _t0=$SECONDS _dur
+    if "$@"; then
+        _dur=$((SECONDS - _t0))
+        NAMES+=("$name"); STATUSES+=("PASS"); DURATIONS+=("$_dur")
+        echo "✔ $name (${_dur}s)"
+    else
+        local rc=$?
+        _dur=$((SECONDS - _t0))
+        NAMES+=("$name"); STATUSES+=("WARN"); DURATIONS+=("$_dur")
+        WARNED+=("$name")
+        echo "⚠ $name ADVISORY FAIL — blocking in the nightly (exit $rc, ${_dur}s)"
+    fi
+}
+
+# run_blocking_scan — the middle setting between `run` and `run_advisory`, and B-373
+# is exactly why it has to exist. `run_advisory` was the right answer to a gate going
+# red on socket timeouts, but it answered with "no advisory can EVER block here", and
+# that is indefensible at CRITICAL: `next` 15.5.21 carried an *unauthenticated remote
+# code execution* on the production dashboard, and every green run in this repo's
+# history was green with it live — because `pnpm audit` reached the gate through
+# `run_advisory` and `run_advisory` cannot fail anything.
+#
+# So this splits the two outcomes the audit tools flatten into one non-zero exit:
+#   - a REAL FINDING at the requested severity -> FAIL, locally too. The point.
+#   - CANNOT DETERMINE ($AUDIT_CANNOT_DETERMINE — the registry was unreachable after
+#     three tries, so NOTHING WAS SCANNED) -> WARN, exactly as before. A dev box
+#     offline is not a vulnerability, and SRE finding 18 is still right that failing
+#     on it is how "the gate is red" stopped carrying information.
+# Under TRACELANE_GATE_STRICT_NETWORK=1 (the nightly) both block, unchanged — there,
+# "we could not look" IS a failure, because the nightly has a network.
+#
+# DELIBERATELY NOT APPLIED TO `cargo audit`: it has no severity filter, so there is no
+# critical-only invocation to hand it. It is clean today (exit 0 over 503 crates,
+# 2026-09-10) and stays advisory until it has one.
+run_blocking_scan() {
+    local name="$1"; shift
+    if [[ "${TRACELANE_GATE_STRICT_NETWORK:-0}" == "1" ]]; then
+        # Quoted command name for the same reason as in run_advisory above, and it is
+        # the same two guards that read this file textually.
+        "run" "$name" "$@"
+        return
+    fi
+    if [[ "$EXPLAIN" -eq 1 ]]; then
+        if _area_active; then printf 'RUN\t%s\n' "$name"; else printf 'SKIP\t%s\n' "$name"; fi
+        return
+    fi
+    if ! _area_active; then
+        NAMES+=("$name"); STATUSES+=("SCOPED-OUT"); DURATIONS+=(0)
+        SCOPED_OUT+=("$name [$AREA]")
+        return
+    fi
+    echo "──────────────────────────────────────────────────────────────"
+    echo "▶ $name (BLOCKS on a finding; advisory ONLY if the registry is unreachable)"
+    echo "  \$ $*"
+    local _t0=$SECONDS _dur
+    if "$@"; then
+        _dur=$((SECONDS - _t0))
+        NAMES+=("$name"); STATUSES+=("PASS"); DURATIONS+=("$_dur")
+        echo "✔ $name (${_dur}s)"
+    else
+        local rc=$?
+        _dur=$((SECONDS - _t0))
+        if [[ "$rc" -eq "$AUDIT_CANNOT_DETERMINE" ]]; then
+            NAMES+=("$name"); STATUSES+=("WARN"); DURATIONS+=("$_dur")
+            WARNED+=("$name")
+            echo "⚠ $name COULD NOT RUN — NOTHING WAS SCANNED (exit $rc, ${_dur}s)."
+            echo "  Advisory here because the registry was unreachable, NOT because a"
+            echo "  finding was waved through. This blocks in the nightly."
+        else
+            NAMES+=("$name"); STATUSES+=("FAIL($rc)"); DURATIONS+=("$_dur")
+            echo "x $name FAILED (exit $rc, ${_dur}s) — a finding at this severity BLOCKS."
+            overall=1
+        fi
+    fi
+}
+
 skip() {
-    NAMES+=("$1"); STATUSES+=("SKIP")
+    NAMES+=("$1"); STATUSES+=("SKIP"); DURATIONS+=(0)
     echo "- skipping $1 ($2)"
 }
 
@@ -402,14 +609,21 @@ run "trace-content allowlist"          python3 scripts/ci/check-trace-content-al
 run "build-script network deps"      python3 scripts/ci/check-build-script-network-deps.py
 run "new-crate build deps"           python3 scripts/ci/check-new-crate-build-deps.py
 
-# cargo-deny / cargo-audit are advisory locally (network); run if present.
+# cargo-deny / cargo-audit are advisory locally (network — both fetch the RustSec
+# advisory-db, `cargo deny` per `deny.toml`'s `db-urls`). `cargo audit` is the one
+# this session moved to run_advisory (WARN locally on failure, counted as not-
+# failed; blocking for real in the nightly under TRACELANE_GATE_STRICT_NETWORK=1).
+# `cargo deny check` is UNCHANGED here — it stays a hard `run` — because it is
+# also the bans/licenses gate (`deny.toml`'s `[bans]`/`[licenses]`, offline once
+# the db is cached) and moving it was out of this task's scope; it is a candidate
+# for the same treatment if it proves equally network-flaky.
 if command -v cargo-deny >/dev/null 2>&1; then
     run "cargo deny check"         cargo deny check
 else
     skip "cargo deny check" "cargo-deny not installed"
 fi
 if command -v cargo-audit >/dev/null 2>&1; then
-    run "cargo audit"              cargo audit
+    run_advisory "cargo audit"     _audit_with_retry "cargo audit" cargo audit
 else
     skip "cargo audit" "cargo-audit not installed"
 fi
@@ -426,13 +640,40 @@ fi
 run "no-auth-stub guard"           bash scripts/ci/no-auth-stub.sh
 area RUST WEB
 run "no-raw-ch-query guard"        bash scripts/ci/no-raw-ch-query.sh
+run "ch reads capped per call"     python3 scripts/ci/check-ch-reads-capped.py
 run "no-llm-in-recovery guard"     bash scripts/ci/no-llm-in-recovery.sh
+# ── PUSH-STAGE DEDUP (this session). Every one of these `X selftest` lines
+# targets a script the guard-selftest meta-gate ALSO discovers (verified against
+# `check-guard-selftests.py --list`) — and at push, "guard-selftest meta-gate
+# (FULL)" already calls `<script> --selftest` on every discovered guard directly.
+# So on a FULL (push) run the standalone line below is a second, identical call
+# to the exact same selftest; gating it to COMMIT_STAGE removes the duplicate
+# while keeping it as the actual per-guard coverage locally, where the meta-gate
+# runs `--changed-only` and only re-selftests what the diff touched (existence-
+# checking the rest, not re-running their selftests). Never applied to the
+# meta-gate's OWN selftest line (`guard-selftest meta-gate selftest`, line ~915)
+# — that one must run unconditionally at push, per check-verify-all-scoping.py's
+# `_check_meta_gate_selftest`.
 if [[ -f scripts/hooks/protect-uncommitted-from-git-restore.sh ]]; then
     area SCRIPTS
-    skip "git-restore guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "git-restore guard selftest" "guard not exported to the public repo"
+    else
+        skip "git-restore guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 if [[ -f scripts/hooks/protect-ponytail-markers.sh ]]; then
-    skip "ponytail guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "ponytail guard selftest" "guard not exported to the public repo"
+    else
+        skip "ponytail guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
+    # NEON-COMPUTE-PIN's one-click switch (founder, 2026-09-03). Same commit-stage rule.
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "growth-mode selftest" "guard not exported to the public repo"
+    else
+        skip "growth-mode selftest" "redundant at push — meta-gate (FULL) selftests this script directly"
+    fi
 fi
 # R60. TEN instances of the self-matching-probe class in one session, three of them AFTER
 # the memory note documenting it, and four shells left spinning (two for 1h13m, found only
@@ -440,7 +681,11 @@ fi
 # against the four commands that ACTUALLY hung, verbatim — a guard that cannot block the
 # exact instances that produced it is not armed.
 if [[ -f scripts/hooks/protect-self-matching-process-probe.sh ]]; then
-    skip "self-matching-probe guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "self-matching-probe guard selftest" "guard not exported to the public repo"
+    else
+        skip "self-matching-probe guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 # W2 (2026-08-21) — four PreToolUse hooks for rules that were prose-only at the EDIT
 # layer. Two of the four rules already have CI guards (check-plan-write-single-source.py,
@@ -452,16 +697,32 @@ fi
 # runs in Claude Code and NOWHERE ELSE. A cofounder using another agent, or plain git,
 # gets none of them. An editor hook is an accelerator; it is never a rule's only copy.
 if [[ -f scripts/hooks/protect-drizzle-only-postgres.sh ]]; then
-    skip "drizzle-only guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "drizzle-only guard selftest" "guard not exported to the public repo"
+    else
+        skip "drizzle-only guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 if [[ -f scripts/hooks/protect-billing-webhook-single-source.sh ]]; then
-    skip "billing-source guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "billing-source guard selftest" "guard not exported to the public repo"
+    else
+        skip "billing-source guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 if [[ -f scripts/hooks/protect-two-trackers.sh ]]; then
-    skip "two-trackers guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "two-trackers guard selftest" "guard not exported to the public repo"
+    else
+        skip "two-trackers guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 if [[ -f scripts/hooks/protect-audit-fail-closed.sh ]]; then
-    skip "audit-fail-closed guard selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "audit-fail-closed guard selftest" "guard not exported to the public repo"
+    else
+        skip "audit-fail-closed guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 fi
 # A deferred item must be able to come back. The `Review:` convention was referenced
 # in and read by nothing, so five rows were deferred with no trigger
@@ -577,6 +838,14 @@ fi
 # carries the load-bearing ones so a disabled CI can't silently un-guard them.
 area RUST WEB
 run "tenant-id-provenance guard"   bash scripts/ci/check-tenant-id-provenance.sh
+# DSH-11 §3c — every windowed metric is computed in apps/web/lib/metrics/ and the
+# registry defines each label once. Ratchets the legacy pages down by exact count.
+run "metric single-source guard"   python3 scripts/ci/check-metric-single-source.py
+if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+    run "metric single-source selftest" python3 scripts/ci/check-metric-single-source.py --selftest
+else
+    skip "metric single-source selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+fi
 area INFRA
 run "prod-nats-wiring guard"       bash scripts/ci/check-span-publish-wiring.sh
 run "genai-attr-keys guard"        bash scripts/ci/check-genai-attr-keys.sh
@@ -608,6 +877,15 @@ if command -v python3 >/dev/null 2>&1; then
     # CONFIDENTIAL one and a bogus level, and proves each blocks.
     area DOCS SCRIPTS
     skip "doc-classification guard" "guard not exported to the public repo"
+    # docs/archive/ is never read as current truth (founder ruling 2026-09-03 §4).
+    # Every file there must carry a machine header naming what superseded it and
+    # when, plus a human banner a reader sees even with HTML comments stripped —
+    # CLAUDE.md §19 (SUPERSESSION, NEVER SILENT DELETION) made mechanical. Selftest
+    # first, per the same-commit rule for a new guard. NOTE: most files under
+    # docs/archive/ predate this guard and lack the header, so this step is RED on
+    # a plain run until the separate sweep that adds headers to the existing tree
+    # lands — the guard's job is only to make that absence visible, not to fix it.
+    run "archive headers"              python3 scripts/ci/check-archive-headers.py
     # CLAUDE.md is always-resident, so a `file.rs:882` anchor in it is read as fact by
     # every session and rots the moment a line is inserted above it. W1 (2026-08-21)
     # found the §2 hot-path map citing `server.rs:882-1712` for a handler that is at
@@ -660,6 +938,13 @@ if command -v python3 >/dev/null 2>&1; then
     run "retired logo (ADR-074 §8)"    python3 scripts/ci/check-retired-logo.py
     area WEB
     run "design constraints (§9)"      python3 scripts/ci/check-design-constraints.py
+    # B-373/B-374: apps/site's browser floor and whitespace mode must be DECLARED, not
+    # inherited. Astro 7 moved both defaults under us in one bump — inline whitespace
+    # was deleted from real copy, and every media query switched to a syntax iOS
+    # 16.0-16.3 drops whole. `astro check`, 15 site tests, biome and the full gate were
+    # all green through both. Same class as the retired-logo guard above: the artifact
+    # was correct and the rendered page was not.
+    run "site browser floor"           python3 scripts/ci/check-site-browser-floor.py
     # R6's REPLACEMENT CONTROL. Consolidation closes instance (a) — the site repo had
     # no CI at all — but it also gives up the one server-side required status check the
     # marketing site ever had: the PUBLIC tracelane/site repo can carry a ruleset, this
@@ -670,7 +955,11 @@ if command -v python3 >/dev/null 2>&1; then
     # apps/site now DEFINES those three scripts — without them consolidation would have
     # gated nothing). This adds the site's own content gates: the four assertions that
     # caught the 2026-07-29 live-site revert, proven discriminating on every run.
-    skip "site deploy-gate selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "site deploy-gate selftest" "guard not exported to the public repo"
+    else
+        skip "site deploy-gate selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     # The map is generated; a stale map is a lying map. Same reasoning as the guard above:
     # this must live in verify-all (the pre-push hook) because private-repo CI skips the
     # root jobs on a direct push.
@@ -684,6 +973,7 @@ if command -v python3 >/dev/null 2>&1; then
     run "index parity + links"         python3 scripts/ci/check-index-parity.py
     area ALWAYS
     run "spec anchors"                 python3 scripts/ci/check-spec-anchors.py
+    run "skill routing graph"          python3 scripts/ci/check-skill-routing-graph.py
     # ADR-062 anchoring honesty over apps/web + apps/docs. It has the best falsification
     # battery in the tree — 12 cases, clause-scoped so a deferral in a NEIGHBOURING clause
     # cannot launder an over-claim — and until 2026-08-15 it was invoked by NOTHING: not
@@ -705,7 +995,11 @@ if command -v python3 >/dev/null 2>&1; then
     # promotions; failing every push on that would be noise. The selftest proves the two
     # hard blockers still fire.
     area DOCS SCRIPTS
-    skip "promotion-gate selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "promotion-gate selftest" "guard not exported to the public repo"
+    else
+        skip "promotion-gate selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     # Offline banned-link guard (no network here — the merge gate must stay
     # offline/fast). The full liveness+identity pass runs pre-deploy in web.sh.
     area WEB
@@ -733,6 +1027,29 @@ if command -v python3 >/dev/null 2>&1; then
     # to diagnose. That shape hid five days of dead public CI (2026-08-04 → 08-09).
     area CI
     run "workflow job-graph"           python3 scripts/ci/check-workflow-job-graph.py
+    # Founder ruling 2026-09-07: hosted GitHub Actions runners are billed on this
+    # account and are approved "only in extreme case with my approval" — earned the
+    # same day by FOUR hosted Benchmarks runs (one 55 minutes) firing on plain
+    # dispatches with nobody watching. Every hosted `runs-on` in this tree must carry
+    # `inputs.hosted_runners == 'approved-by-founder'` on its own `if:` (schedule
+    # excluded too), or the stronger `github.repository == 'tracelane/tracelane'`.
+    area CI
+    run "hosted-runner opt-in guard"   python3 scripts/ci/check-hosted-runner-optin.py
+    # Founder-found 2026-09-07: `/review`'s create-queue path had a gateway route and a
+    # web proxy and NO caller anywhere in the UI — reachable only by curl. The L16
+    # Playwright gate cannot see a button that was never built. Bucket is WEB, not CI,
+    # because this reads apps/web/app/api/** + apps/web/{app,components}/** — a CI
+    # bucket would scope it out of exactly the diffs it exists to police.
+    area WEB
+    run "unreachable write routes"     python3 scripts/ci/check-unreachable-write-routes.py
+    # GWY-48, 2026-09-08. The spec named this as the build's likeliest defect BEFORE the
+    # code existed: `RequestConfig` must reach all FOUR span sites, and the streaming one
+    # is the only one that needed a new function argument rather than a line beside an
+    # existing apply. Drop it and everything still compiles, every unit test still passes
+    # (they exercise `apply` directly), and OBS-52 mis-flags every streamed request.
+    # RUST bucket: it reads crates/gateway/**.
+    area RUST
+    run "GWY-48 span sites"            python3 scripts/ci/check-request-config-span-sites.py
     # THE META-GATE. Every scripts/** guard invoked above must (a) reject an unknown flag
     # and (b) pass its own --selftest. 20 scripts used to accept `--selftest` silently and
     # exit 0 having proven nothing, so every falsification claim in this repo was
@@ -780,9 +1097,24 @@ if command -v python3 >/dev/null 2>&1; then
     # The tier-ran assertion is only meaningful if IT can run. Selftest here
     # so the verdict logic is exercised on every local gate, not only in CI.
     area CI
-    skip "tier-ran selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "tier-ran selftest" "guard not exported to the public repo"
+    else
+        skip "tier-ran selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     area SCRIPTS
     run "script exec bits"             python3 scripts/ci/check-script-exec-bits.py
+    # B-384 (2026-09-12): this clone must have `core.hooksPath = .githooks`, or the
+    # pre-push hook that runs THIS gate on a direct push does not exist here.
+    area ALWAYS
+    run "git hooks installed"          python3 scripts/ci/check-hooks-installed.py
+    # B-383 (e), 2026-09-12: security.md's "these patterns block merge" now does.
+    area RUST
+    run "banned security patterns"     python3 scripts/ci/check-banned-patterns.py
+    # B-383 (d), 2026-09-12: every mounted /v1 route authenticates AND checks a
+    # scope or role, or is allowlisted with a written reason.
+    area RUST
+    run "route auth + scope"           python3 scripts/ci/check-route-auth.py
     area RUST WEB PY
     skip "federation hash deferral" "guard not exported to the public repo"
     # infra/prod/** is excluded from ci.yml path-filtering; this is the CONDITION on
@@ -794,14 +1126,39 @@ if command -v python3 >/dev/null 2>&1; then
     area RUST WEB
     area RUST WEB CI
     area SCRIPTS
-    run "verify-stamp selftest"        bash scripts/ci/check-verify-stamp.sh --selftest
-    skip "deploy-provenance selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        run "verify-stamp selftest"        bash scripts/ci/check-verify-stamp.sh --selftest
+    else
+        skip "verify-stamp selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "deploy-provenance selftest" "guard not exported to the public repo"
+    else
+        skip "deploy-provenance selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     # R293. The on-node watchdog carries 48 selftest assertions and NOTHING RAN THEM —
     # it is not under scripts/{ci,hooks,export}, so the meta-gate never saw it, and no
     # `run` line registered it. An unregistered selftest is a claim nobody checks, and
     # this is the file that decides whether prod pages a human. Pure and 0.7s: the block
     # exits before `JSON=$(tlane-status.sh …)`, so it touches no docker, no node, no net.
-    skip "watchdog selftest" "guard not exported to the public repo"
+    # NOTE (this session): despite the "not under scripts/{ci,hooks,export}" framing
+    # above, `check-guard-selftests.py --list` DOES discover this script — discovery
+    # is keyed on ANY `scripts/`-prefixed .py|.sh target in a `run` line, not scoped
+    # to those three directories (that scoping only governs full_run_reason's CHANGE
+    # classification). Verified directly before gating it the same as the others.
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "watchdog selftest" "guard not exported to the public repo"
+        # S8 (2026-09-04). The canary's FULL --selftest drives five real legs against
+        # prod and needs TLANE_CANARY_KEY, which is why it has never been in a gate.
+        # --selftest-offline is the hermetic half: it evals the REAL alert_on_change()
+        # out of the file with a stubbed send_smtp and proves a FAILED send leaves the
+        # state file unadvanced (so the transition retries) while a DELIVERED send
+        # advances it (so the fix is not a no-op). Record-before-act already cost this
+        # repo 14 alerts in the watchdog; the canary carried the same defect untouched.
+        skip "canary alert-ordering selftest" "guard not exported to the public repo"
+    else
+        skip "watchdog selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     # R306. The class with 40+ recorded instances and, until now, no gate for its most
     # expensive shape: a guard inside a script asserting over that same script, with a
     # pattern its OWN LINE satisfies. The existing hook only sees `pgrep`/`ps|grep` in
@@ -815,7 +1172,11 @@ if command -v python3 >/dev/null 2>&1; then
     area INFRA
     run "partition-cutover selftest"   bash infra/prod/partition-cutover-check.sh --selftest
     area ALWAYS
-    skip "never-say-again selftest" "guard not exported to the public repo"
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "never-say-again selftest" "guard not exported to the public repo"
+    else
+        skip "never-say-again selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     area RUST WEB
     run "alert-metrics single-source"  python3 scripts/ci/check-alert-metrics-single-source.py
     # GWY-41: the API-key scope vocabulary is spelled in the Rust enum, the mint
@@ -823,6 +1184,16 @@ if command -v python3 >/dev/null 2>&1; then
     # capability no customer can grant; a UI checkbox for a slug Rust refuses is a
     # permission that silently denies. Caught real drift on its first run.
 run "plan-write single-source"          python3 scripts/ci/check-plan-write-single-source.py
+    # BILL-01 / ADR-076: every price/allowance/rate/policy figure in customer-facing
+    # copy (apps/docs, apps/site, README, docs/guides, packages/*/README,
+    # CHANGELOG.public.md) must agree with apps/web/db/plans.v3.json. 173 rows across
+    # the tree still carried the retired $59/$249/$899/$2,999 ladder and the
+    # $1.20-per-10K overage model at the time this guard was written — proof a
+    # repricing this wide WILL drift again without something reading every surface.
+    area DOCS WEB
+    run "pricing copy vs seed"         python3 scripts/ci/check-pricing-copy-vs-seed.py
+    run "polar-sync unit (fake Polar)"   bash -c 'cd apps/web && ./node_modules/.bin/vitest run --dir ../../scripts/ops'
+    area RUST WEB
     run "api-scope single-source"      python3 scripts/ci/check-api-scope-single-source.py
     # GWY-41: a `#[cfg(not(debug_assertions))]` test cannot run under `cargo test`
     # (cfg(test) implies debug_assertions), so it runs ONLY where a job invokes its
@@ -832,6 +1203,16 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
     area RUST WEB CI
     skip "release-only tests covered" "guard not exported to the public repo"
     area SCRIPTS
+    # B-373: the gate's own plumbing, checked with the same suspicion as the code it
+    # gates. `pnpm audit` sat here for months finding a live unauthenticated RCE in
+    # `next` and never failed anything, because it reached the gate through
+    # `run_advisory`. Nothing else here checks what the gate DOES with a failure — only
+    # what it runs. Sits in SCRIPTS beside the meta-gate, and that bucket is exact
+    # rather than cautious: its entire input is scripts/verify-all.sh, so SCRIPTS is
+    # the widest scope it can ever need — and verify-all.sh is a stamp TRIPWIRE
+    # besides, forcing a FULL run whenever it is the file that changed. ~1.5s.
+    run "gate runner semantics" python3 scripts/ci/check-gate-runner-semantics.py
+
     # ── time-2: SELFTEST DIFF-GATING IS COMMIT-STAGE ONLY ────────────────────
     # A guard's selftest answers "does this guard still detect its violation?" — an
     # answer that can only change when the guard, or a config the guard READS,
@@ -857,7 +1238,10 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
     if [[ "$COMMIT_STAGE" -eq 1 ]]; then
         run "guard-selftest meta-gate (commit stage)" python3 scripts/ci/check-guard-selftests.py --changed-only
     else
-        run "guard-selftest meta-gate (FULL)" python3 scripts/ci/check-guard-selftests.py
+        # The meta-gate caches selftest results by content hash (guard bytes + the tripwire
+        # files); the nightly runs cold — `--no-cache` rides the same strict flag that makes
+        # the network audits block there, so "strict" means one thing.
+        run "guard-selftest meta-gate (FULL)" python3 scripts/ci/check-guard-selftests.py ${TRACELANE_GATE_STRICT_NETWORK:+--no-cache}
     fi
     # The scoping map is itself a control now: --scoped decides WHICH of the steps in
     # this file run, so a mis-declared `area` is a coverage change nobody would see. Its
@@ -866,6 +1250,11 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
     skip "verify-all scoping" "guard not exported to the public repo"
     area RUST
     run "provider-mapping guard"       python3 scripts/ci/check-provider-mapping-single-source.py
+    area RUST SCRIPTS
+    # Proof F's contract: every GET /v1 route the gateway mounts is in the deploy smoke
+    # table (B-336 — five routes 502'd on `until=` behind five green deploy proofs).
+    run "read-route smoke coverage"    python3 scripts/ci/check-read-route-smoke-coverage.py
+    area RUST
     # Migration drift. What runs here is the detector's own proof that it
     # BLOCKS — planted drift, a refused reasonless acknowledgement, and an expired
     # PENDING. Without this the gate could rot to always-pass.
@@ -886,7 +1275,11 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
     #   python3 scripts/ci/audit-migration-drift.py --live /tmp/live.tsv
     # Tracked as a row in.
     area WEB INFRA
-    run "migration-drift selftest"     python3 scripts/ci/audit-migration-drift.py --selftest
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        run "migration-drift selftest"     python3 scripts/ci/audit-migration-drift.py --selftest
+    else
+        skip "migration-drift selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
     # No UI/API reads of dead/legacy entitlement columns (tenants.auditEnabled) —
     # the "invisible entitlement-gated UI" class (internal incident review).
     area WEB
@@ -945,8 +1338,20 @@ if command -v pnpm >/dev/null 2>&1; then
 # written by the pnpm that actually did the install: the only evidence of what was really
 # read. Exact values — a "looks equivalent" range is a different constraint.
 run "pnpm overrides applied"       python3 scripts/ci/check-pnpm-overrides-applied.py
-run "pnpm overrides selftest"      python3 scripts/ci/check-pnpm-overrides-applied.py --selftest
-run "pnpm audit (high)"        pnpm audit --audit-level=high
+if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+    run "pnpm overrides selftest"      python3 scripts/ci/check-pnpm-overrides-applied.py --selftest
+else
+    skip "pnpm overrides selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+fi
+# CRITICAL BLOCKS. B-373, 2026-09-10: `pnpm audit` was already wired here and still
+# missed an unauthenticated RCE in `next` for the entire life of this repo, because
+# the only wiring it had was `run_advisory`. A critical advisory is not registry
+# noise and is not a judgement call — it fails the gate, here, now, on this box.
+# See `run_blocking_scan` for why a registry timeout still does not.
+run_blocking_scan "pnpm audit (critical)" _audit_with_retry "pnpm audit (critical)" pnpm audit --audit-level=critical
+# high-and-below stays ADVISORY (registry network fetch) — same reasoning as
+# `cargo audit` above: WARN here, blocking in the nightly (TRACELANE_GATE_STRICT_NETWORK=1).
+run_advisory "pnpm audit (high)"   _audit_with_retry "pnpm audit" pnpm audit --audit-level=high
 fi
 # Secret scan — mirrors ci.yml `secret-scan`'s gitleaks. This
 # was CI-ONLY: a per-push secret hole whenever CI is dark, and verify-all never
@@ -980,7 +1385,11 @@ fi
 # every push.
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     area RUST INFRA
-    run "trace-summary consistency selftest" bash scripts/ci/check-trace-summary-consistency.sh --selftest
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        run "trace-summary consistency selftest" bash scripts/ci/check-trace-summary-consistency.sh --selftest
+    else
+        skip "trace-summary consistency selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
 else
     skip "trace-summary consistency selftest" "docker unavailable — this guard CANNOT run here; it runs in CI and as a deploy proof"
 fi
@@ -1033,7 +1442,27 @@ fi
 # is what made the gap invisible. Static, no docker, milliseconds.
 area SCRIPTS INFRA
 run "proof exit-verdict agreement" python3 scripts/ci/check-proof-exit-verdicts.py
-run "proof exit-verdict selftest"  python3 scripts/ci/check-proof-exit-verdicts.py --selftest
+if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+    run "proof exit-verdict selftest"  python3 scripts/ci/check-proof-exit-verdicts.py --selftest
+else
+    skip "proof exit-verdict selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+fi
+
+# A DEPLOY GATE MUST READ COVERAGE, AND A DEPLOY RECORD MUST NOT ASSERT COVERAGE IT LACKS
+# (SRE audit S4/S5, 2026-09-04). R206 fixed `web.sh` to take its CI verdict from
+# `ci-status.sh` and left the identical defect in `gateway.sh` (filed as B-295); eight days
+# later that survivor printed "CI green for f6d00ab1" for a run `ci-status.sh` calls
+# CANNOT DETERMINE — 15 of 16 jobs skipped. Separately `web.sh` printed "all proofs passed"
+# even when Proof D — the only authenticated-render proof — had been skipped. One guard for
+# both, because a fix applied to one sibling does not survive the next one. Falsified
+# against the real pre-fix bytes: it names gateway.sh:67,:69 and web.sh:241.
+area SCRIPTS INFRA
+run "deploy gate honesty"          python3 scripts/ci/check-deploy-gate-honesty.py
+if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+    run "deploy gate honesty selftest" python3 scripts/ci/check-deploy-gate-honesty.py --selftest
+else
+    skip "deploy gate honesty selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+fi
 
 # REAL-CLICKHOUSE integration (founder ruling R97, 2026-08-23). Every one of the
 # 49 dataset tests drives a MOCK STORE, so 49 green tests, a clean gate and a
@@ -1052,8 +1481,19 @@ if [[ "$COMMIT_STAGE" -eq 1 ]]; then
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     area RUST
     run "dataset round trip (real ClickHouse)" bash scripts/ci/run-clickhouse-integration.sh
+    # B-383 (c): the per-service ClickHouse grants, proven on the prod image with the
+    # prod users file — the refusals (gateway cannot delete a ledger row, ingest cannot
+    # read content) are observed, not assumed. ~40 s; same docker precondition.
+    area INFRA
+    run "clickhouse per-service grants (real ClickHouse)" bash scripts/ci/check-clickhouse-users.sh
+    # B-383 (b): the prod nats.conf's users, driven through the two clients' REAL
+    # connect/ensure/publish code on the prod image — the proof that found async-nats
+    # ignoring `user:pass@` in the URL. ~60 s.
+    run "nats per-service users (real nats-server)" bash scripts/ci/check-nats-auth.sh
 else
     skip "dataset round trip (real ClickHouse)" "docker unavailable — this guard CANNOT run here"
+    skip "clickhouse per-service grants (real ClickHouse)" "docker unavailable — this guard CANNOT run here"
+    skip "nats per-service users (real nats-server)" "docker unavailable — this guard CANNOT run here"
 fi
 if [[ "$WITH_EVAL_SUITE" -eq 1 ]]; then
     area PY
@@ -1118,6 +1558,22 @@ for i in "${!NAMES[@]}"; do
     printf "  %-32s %s\n" "${NAMES[$i]}" "${STATUSES[$i]}"
 done
 echo "═══════════════════════════════════════════════════════════════════════"
+echo
+echo "── slowest 10 steps ──────────────────────────────────────────────────"
+# Same DURATIONS array the per-step list above drew from — a SKIP or SCOPED-OUT
+# step never executed and carries duration 0, so it sorts to the bottom rather
+# than claiming a measurement nothing took.
+_dur_rows=()
+for i in "${!NAMES[@]}"; do
+    _dur_rows+=("${DURATIONS[$i]}"$'\t'"${NAMES[$i]}")
+done
+if (( ${#_dur_rows[@]} > 0 )); then
+    printf '%s\n' "${_dur_rows[@]}" \
+        | sort -t $'\t' -k1,1nr \
+        | head -10 \
+        | while IFS=$'\t' read -r _d _n; do printf "  %-40s %ss\n" "$_n" "$_d"; done
+fi
+echo "═══════════════════════════════════════════════════════════════════════"
 # A SKIP is NOT coverage, and "ALL GREEN" must never be printed as if it were.
 #
 # FOUNDER, 2026-08-14: "a guard that silently disappears on a machine without
@@ -1165,6 +1621,16 @@ if [[ "$overall" -eq 0 ]]; then
     fi
 else
     echo "FAILURES PRESENT ✗ — do not merge"
+fi
+# WARN is not a FAILURE (overall stays 0 for it) and must not be folded into
+# either "ALL GREEN" above or the FAIL(rc) accounting — it is its own, separate
+# claim: a network-dependent advisory check (cargo audit / pnpm audit) could not
+# be confirmed clean here. Printed regardless of overall's verdict, because a red
+# run can ALSO carry an advisory warning and both facts are true at once.
+if (( ${#WARNED[@]} > 0 )); then
+    echo "  ⚠ ${#WARNED[@]} check(s) reported ADVISORY WARNINGS (non-blocking here):"
+    for n in "${WARNED[@]}"; do echo "    ⚠ $n"; done
+    echo "  These block for real in the nightly full gate (TRACELANE_GATE_STRICT_NETWORK=1)."
 fi
 
 # ── the STAMP (§1.14 control, 2026-08-10) ─────────────────────────────────────

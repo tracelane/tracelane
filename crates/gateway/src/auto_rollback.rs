@@ -49,17 +49,9 @@ impl TriggerMetric {
         )
     }
 
-    /// All metric classes, in canonical order (objective first).
-    pub fn all() -> [TriggerMetric; 6] {
-        [
-            Self::Cost,
-            Self::Latency,
-            Self::ErrorRate,
-            Self::GuardrailFire,
-            Self::Accuracy,
-            Self::Hallucination,
-        ]
-    }
+    // `all() -> [TriggerMetric; 6]` (every metric class, objective first)
+    // was deleted 2026-09-12 (B-390) — zero callers anywhere, including
+    // tests.
 }
 
 /// Aggregate metrics observed for a single prompt-version request.
@@ -98,6 +90,15 @@ impl PromptMetrics {
     }
 }
 
+/// Found 2026-09-12 (B-390): `HumanConfirmed`/`HumanDismissed` are matched
+/// by two production files (this one and `prompt_routes.rs`, both
+/// stringifying them for the API response) but never CONSTRUCTED anywhere —
+/// nothing sets a suggested rollback to confirmed/dismissed yet, so the
+/// customer-confirm/dismiss half of this workflow is designed but unwired.
+/// `#[allow(dead_code)]` rather than deleted: removing the variants would
+/// also require deleting real handling code in `prompt_routes.rs` for a
+/// feature that is partially built, not abandoned.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollbackMode {
     /// Objective metric drifted; routing pointer should flip immediately.
@@ -334,6 +335,11 @@ impl RollbackEventPersister for ClickHouseRollbackPersister {
 /// Per-(tenant, prompt-version) EWMA aggregator + rollback dispatcher.
 pub struct RollbackEngine {
     /// Effective EWMA window length in samples. PR11-locked at 100.
+    ///
+    /// No production reader — `half_life` alone drives the actual EWMA
+    /// alpha; this is recorded for reference and read only by a test
+    /// asserting the locked value. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
     window: usize,
     /// Half-life in samples. PR11-locked at 25 — alpha = 1 - 0.5^(1/25).
     half_life: f64,
@@ -351,6 +357,7 @@ impl RollbackEngine {
     /// PR11-locked defaults: window 100, half-life 25, drift 2σ.
     pub fn new() -> Self {
         Self {
+            #[cfg(test)]
             window: 100,
             half_life: 25.0,
             drift_sigma: 2.0,

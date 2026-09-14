@@ -49,9 +49,19 @@
  * title is `.t-h1` over one `text-sm text-ink-2` line.
  */
 
+import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { LIVE_SIGNATURE_IDS, aftFor } from "@/lib/aft-taxonomy";
-import { GatewayError, gatewayGet } from "@/lib/gateway";
+import { fetchSignaturesFor } from "@/lib/metrics/fetch";
+import { fmtCount } from "@/lib/metrics/format";
+import { hintOf } from "@/lib/metrics/hint";
+import { METRICS } from "@/lib/metrics/registry";
+import {
+	type TimeRange,
+	parseTimeRange,
+	withWindow,
+} from "@/lib/metrics/time-range";
 import {
 	Badge,
 	Card,
@@ -72,9 +82,6 @@ import { Suspense } from "react";
 import { type SignatureHit, SignatureRow } from "./SignatureRow";
 
 export const metadata: Metadata = { title: "Failure Signatures — Tracelane" };
-
-/** Window for the live aggregate — last 30 days. */
-const WINDOW_DAYS = 30;
 
 /**
  * Header row for the live-signatures table — EIGHT columns. The detail panel's
@@ -120,10 +127,13 @@ function RoadmapHeadRow() {
  * supporting material, and the one thing in it that DOES something keeps its
  * action tone.
  */
-function RoadmapRow({ sig }: { sig: SignatureHit }) {
+function RoadmapRow({
+	sig,
+	windowQuery,
+}: { sig: SignatureHit; windowQuery: string }) {
 	const t = aftFor(sig.signature_id);
-	// range=30d so the destination matches the 30-day signature aggregate.
-	const tracesHref = `/traces?signature_id=${encodeURIComponent(sig.signature_id)}&range=30d`;
+	// The destination carries the SAME window as the aggregate (preset or custom).
+	const tracesHref = `/traces?signature_id=${encodeURIComponent(sig.signature_id)}&${windowQuery}`;
 	return (
 		<TR>
 			<TD muted className="font-medium">
@@ -231,39 +241,30 @@ function SignaturesSkeleton() {
 	);
 }
 
-async function SignaturesData() {
-	let signatures: SignatureHit[];
-	let tracesAffected = 0;
-	try {
-		const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-		// Scope "traces affected" to LIVE detector ids so it matches its hint and
-		// never counts a demo-seeder roadmap id (provenance audit P2 #11). The
-		// gateway format-validates + binds each id.
-		const liveIds = LIVE_SIGNATURE_IDS.join(",");
-		const data = await gatewayGet<{
-			signatures: SignatureHit[];
-			total_traces_affected: number;
-		}>(
-			`/v1/query/signatures?since=${encodeURIComponent(since)}&live_ids=${encodeURIComponent(liveIds)}`,
+async function SignaturesData({ range }: { range: TimeRange }) {
+	// Scope "traces affected" to LIVE detector ids so it matches its hint and
+	// never counts a demo-seeder roadmap id (provenance audit P2 #11). The
+	// gateway format-validates + binds each id.
+	const data = await fetchSignaturesFor(range, LIVE_SIGNATURE_IDS);
+	if (data === null) {
+		// Unreachable ≠ "nothing matched" (B-334): the old title here was the
+		// zero-shaped one, so an outage read as a clean bill of health.
+		return (
+			<>
+				<WarmingBanner />
+				<EmptyState
+					title="Waiting on the gateway"
+					description="Signatures appear here once the gateway is reachable and a request matches a known failure pattern."
+				/>
+			</>
 		);
-		signatures = data.signatures;
-		// Distinct traces with at least one LIVE signature — a trace hitting several
-		// counts once. NEVER the sum of per-signature counts (that double-counts).
-		tracesAffected = data.total_traces_affected ?? 0;
-	} catch (err) {
-		if (err instanceof GatewayError) {
-			return (
-				<>
-					<WarmingBanner />
-					<EmptyState
-						title="No known failure patterns matched yet"
-						description="Signatures appear here once a request matches a known failure pattern."
-					/>
-				</>
-			);
-		}
-		throw err;
 	}
+	const signatures: SignatureHit[] = data.signatures;
+	// Distinct traces with at least one LIVE signature — a trace hitting several
+	// counts once. NEVER the sum of per-signature counts (that double-counts).
+	// `null` is UNKNOWN (an older gateway) and renders `—`, never `?? 0`.
+	const tracesAffected = data.total_traces_affected;
+	const windowQuery = withWindow("", range).replace(/^\?/, "");
 
 	// Split live-detected signatures from roadmap entries so the two surfaces
 	// are never conflated. Live → main table. Roadmap → separate section below.
@@ -292,22 +293,28 @@ async function SignaturesData() {
 			<StatGrid cols={2} title="Detection volume" className="sm:max-w-xl">
 				<StatCard
 					icon="failure-signatures"
-					label="Signatures matched · 30d"
-					value={matched.toLocaleString()}
-					hint="Live-detected AFT-1 failure patterns matched in the last 30 days. V1.1 roadmap entries are listed separately below."
+					label={METRICS.signatures_matched.label}
+					value={fmtCount(matched)}
+					sub={range.label}
+					hint={hintOf(METRICS.signatures_matched)}
 				/>
 				<StatCard
 					icon="traffic"
-					label="Traces affected · 30d"
-					value={tracesAffected.toLocaleString()}
-					hint="Distinct traces with at least one live failure signature — never a sum of per-signature counts."
+					label={METRICS.traces_affected.label}
+					value={tracesAffected === null ? "—" : fmtCount(tracesAffected)}
+					sub={
+						tracesAffected === null
+							? "not reported by this gateway"
+							: range.label
+					}
+					hint={hintOf(METRICS.traces_affected)}
 				/>
 			</StatGrid>
 
 			{/* LIVE TABLE — only signatures with a shipped reference detector. */}
 			{matched === 0 ? (
 				<EmptyState
-					title="No known failure patterns matched in the last 30 days"
+					title={`No known failure patterns matched — ${range.label}`}
 					description="When a request matches a known AFT-1 failure pattern (e.g. a tool-schema violation), it shows up here with your occurrence count, affected traces, and its AFT-1 id."
 					action={
 						<Link
@@ -326,7 +333,11 @@ async function SignaturesData() {
 						</THead>
 						<TBody>
 							{live.map((s) => (
-								<SignatureRow key={s.signature_id} sig={s} />
+								<SignatureRow
+									key={s.signature_id}
+									sig={s}
+									windowQuery={windowQuery}
+								/>
 							))}
 						</TBody>
 					</Table>
@@ -359,7 +370,11 @@ async function SignaturesData() {
 							</THead>
 							<TBody>
 								{roadmapHits.map((s) => (
-									<RoadmapRow key={s.signature_id} sig={s} />
+									<RoadmapRow
+										key={s.signature_id}
+										sig={s}
+										windowQuery={windowQuery}
+									/>
 								))}
 							</TBody>
 						</Table>
@@ -373,7 +388,13 @@ async function SignaturesData() {
 // Queries ClickHouse (via the gateway) at request time — never prerender.
 export const dynamic = "force-dynamic";
 
-export default function SignaturesPage() {
+export default async function SignaturesPage({
+	searchParams,
+}: {
+	searchParams: Promise<{ range?: string; since?: string; until?: string }>;
+}) {
+	const sp = await searchParams;
+	const range = parseTimeRange(sp, { defaultPreset: "30d", nowMs: Date.now() });
 	return (
 		// Padding ramp + `space-y-8` copied from /dashboard, the P0 reference
 		// surface: this page pinned `px-2 py-3` and sat ~7px off the content
@@ -393,12 +414,15 @@ export default function SignaturesPage() {
 					<h1 className="t-h1">Failure Signatures</h1>
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Live-detected failures matched against the AFT-1 taxonomy —
-						canonical id, your per-tenant counts, and affected traces.
+						canonical id, your per-tenant counts, and affected traces.{" "}
+						{range.label}.
 					</p>
 				</div>
+				<RangeControl defaultPreset="30d" />
 			</header>
+			<WindowNotice range={range} />
 			<Suspense fallback={<SignaturesSkeleton />}>
-				<SignaturesData />
+				<SignaturesData range={range} />
 			</Suspense>
 		</div>
 	);

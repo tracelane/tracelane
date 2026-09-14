@@ -101,7 +101,7 @@ incident review.
 That ledger captures the runtime behaviour of customer agents (LLM
 calls, tool calls, guardrail decisions) with a tamper-evident SHA-256
 hash chain and customer-runnable verifier CLIs (Ed25519 batch signing
-+ Sigstore Rekor v2 anchoring live, best-effort, on the Audit add-on).
++ Sigstore Rekor v2 anchoring live, best-effort, on every plan).
 The admin audit
 log is the application-control mirror — a separate, simpler promise
 backed by Postgres + indexes, not by cryptographic anchoring.
@@ -126,9 +126,14 @@ day one.
 
 ## Failure mode: write failure does not fail the request
 
-`recordAdminAction()` (TS) and `record_admin_action()` (Rust) are
-best-effort: a Postgres blip writes a `console.error` /
-`tracing::error!` line and lets the calling route succeed. Rationale:
-we'd rather lose one audit row than return a 5xx to the user on a
-transient connection error. Operators tail the error log to catch
-sustained write failures.
+`recordAdminAction()` (TypeScript, `apps/web/lib/admin-audit.ts`) is
+best-effort: a Postgres blip writes a `console.error` line and lets
+the calling route succeed. Rationale: we'd rather lose one audit row
+than return a 5xx to the user on a transient connection error.
+Operators tail the error log to catch sustained write failures.
+
+A Rust-side `record_admin_action()` existed alongside it but was never
+called from any gateway route — the three V1 call sites above are all
+TypeScript. It was deleted on 2026-09-12 rather than left unreferenced; a
+gateway-side writer can be rebuilt if an admin route ever needs to write
+this table directly.

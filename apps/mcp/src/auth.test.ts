@@ -11,6 +11,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	bootstrapStdioTenant,
+	getActiveBearer,
 	getTenantId,
 	resolveBearerViaGateway,
 	runWithTenant,
@@ -153,5 +154,50 @@ describe("bootstrapStdioTenant (stdio API-key auth — L3 sweep)", () => {
 		await expect(bootstrapStdioTenant()).rejects.toThrow(
 			/could not be validated/,
 		);
+	});
+});
+
+describe("getActiveBearer (PLT-22 cross-tenant-read fix)", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		vi.restoreAllMocks();
+	});
+
+	it("returns undefined with no request context at all (Stdio)", async () => {
+		expect(getActiveBearer()).toBeUndefined();
+	});
+
+	it("returns the bound bearer inside a runWithTenant context (HTTP)", async () => {
+		await runWithTenant(
+			"tenant-A",
+			async () => {
+				expect(getActiveBearer()).toBe("bearer-for-tenant-A");
+			},
+			"bearer-for-tenant-A",
+		);
+	});
+
+	it("returns null (fail-closed signal) when a context exists but carries no bearer", async () => {
+		await runWithTenant("tenant-A", async () => {
+			expect(getActiveBearer()).toBeNull();
+		});
+	});
+
+	it("isolates the bearer across concurrent requests, same as the tenant", async () => {
+		const observe = (bearer: string, delayMs: number) =>
+			runWithTenant(
+				"tenant-shared",
+				async () => {
+					await new Promise((r) => setTimeout(r, delayMs));
+					return getActiveBearer();
+				},
+				bearer,
+			);
+		const [a, b] = await Promise.all([
+			observe("bearer-X", 20),
+			observe("bearer-Y", 5),
+		]);
+		expect(a).toBe("bearer-X");
+		expect(b).toBe("bearer-Y");
 	});
 });

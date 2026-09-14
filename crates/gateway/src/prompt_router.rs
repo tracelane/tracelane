@@ -655,10 +655,10 @@ impl VersionStore for ClickHouseVersionStore {
     async fn next_version_number(&self, tenant_id: &TenantId, prompt_id: Uuid) -> Result<u32> {
         let current: u32 = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT toUInt32(ifNull(max(version_number), 0)) \
                  FROM prompt_versions WHERE tenant_id = ? AND prompt_id = ?",
-            )
+            ))
             .bind(tenant_id.to_string())
             .bind(prompt_id)
             .fetch_one::<u32>()
@@ -670,11 +670,11 @@ impl VersionStore for ClickHouseVersionStore {
     async fn load_versions(&self) -> Result<Vec<(TenantId, PromptVersion)>> {
         let rows = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT tenant_id, prompt_version_id, prompt_id, version_number, content, \
                  ifNull(model_pin, '') FROM prompt_versions \
                  WHERE prompt_id NOT IN (SELECT prompt_id FROM prompts FINAL WHERE archived = 1)",
-            )
+            ))
             .fetch_all::<VersionLoadRow>()
             .await
             .context("prompt_versions load")?;
@@ -712,7 +712,7 @@ impl VersionStore for ClickHouseVersionStore {
         // nil UUID keeps argMax over the full set and lets Rust drop it.
         let rows = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT tenant_id, prompt_name, \
                  argMax(ifNull(from_version_id, toUUID('00000000-0000-0000-0000-000000000000')), \
                         decided_at) AS prev_version_id \
@@ -721,7 +721,7 @@ impl VersionStore for ClickHouseVersionStore {
                  AND decision IN ('promoted', 'manual_override') \
                  AND prompt_id NOT IN (SELECT prompt_id FROM prompts FINAL WHERE archived = 1) \
                  GROUP BY tenant_id, prompt_name",
-            )
+            ))
             .fetch_all::<PrevProductionRow>()
             .await
             .context("promotion_decisions prev_production reconstruction")?;
@@ -745,14 +745,14 @@ impl VersionStore for ClickHouseVersionStore {
         // set routing. Empty prompt_name (pre-migration-07 test rows) is skipped.
         let rows = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT tenant_id, prompt_name, to_env, \
                  argMax(to_version_id, decided_at) AS to_version_id \
                  FROM promotion_decisions \
                  WHERE prompt_name != '' AND decision IN ('promoted', 'manual_override') \
                  AND prompt_id NOT IN (SELECT prompt_id FROM prompts FINAL WHERE archived = 1) \
                  GROUP BY tenant_id, prompt_name, to_env",
-            )
+            ))
             .fetch_all::<RoutingLoadRow>()
             .await
             .context("promotion_decisions routing reconstruction")?;
@@ -776,14 +776,14 @@ impl VersionStore for ClickHouseVersionStore {
         // env — two tenant-scoped reads, joined in Rust.
         let summaries = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT prompt_name, any(prompt_id) AS prompt_id, \
                  toUInt32(uniqExact(version_number)) AS versions, \
                  toUInt32(max(version_number)) AS latest_version, \
                  toInt64(toUnixTimestamp64Milli(max(created_at))) AS updated_at_ms \
                  FROM prompt_versions WHERE tenant_id = ? \
                  GROUP BY prompt_name ORDER BY updated_at_ms DESC",
-            )
+            ))
             .bind(tenant_id.to_string())
             .fetch_all::<SummaryRow>()
             .await
@@ -791,7 +791,7 @@ impl VersionStore for ClickHouseVersionStore {
 
         let active = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT prompt_name, to_env, \
                  argMax(pv.version_number, pd.decided_at) AS version_number \
                  FROM promotion_decisions AS pd \
@@ -799,7 +799,7 @@ impl VersionStore for ClickHouseVersionStore {
                  WHERE pd.tenant_id = ? AND pd.prompt_name != '' \
                  AND pd.decision IN ('promoted', 'manual_override') \
                  GROUP BY prompt_name, to_env",
-            )
+            ))
             .bind(tenant_id.to_string())
             .fetch_all::<ActiveRow>()
             .await
@@ -808,9 +808,9 @@ impl VersionStore for ClickHouseVersionStore {
         // Soft-deleted (archived) prompts are excluded from the list.
         let archived: std::collections::HashSet<Uuid> = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT DISTINCT prompt_id FROM prompts FINAL WHERE tenant_id = ? AND archived = 1",
-            )
+            ))
             .bind(tenant_id.to_string())
             .fetch_all::<ArchivedRow>()
             .await
@@ -1743,12 +1743,12 @@ impl EvalGate for ClickHouseEvalGate {
         // `scripts/ci/no-raw-ch-query.sh`; V1.1 routes through TenantQuery.
         let rows = self
             .client
-            .query(
+            .query(&crate::clickhouse_query::ceiling(
                 "SELECT status FROM eval_runs \
                  WHERE tenant_id = ? AND eval_run_id = ? \
                  ORDER BY completed_at DESC \
                  LIMIT 1",
-            )
+            ))
             .bind(tenant_id.to_string())
             .bind(eval_run_id)
             .fetch_all::<EvalStatusRow>()

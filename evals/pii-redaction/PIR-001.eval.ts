@@ -39,23 +39,52 @@ describe("PIR-001: PII redaction — 100% recall on synthetic patterns", () => {
 		}
 	});
 
-	it("TRACELANE_TRACE_CONTENT env var is documented in SDK", async () => {
-		// Both SDKs must respect TRACELANE_TRACE_CONTENT=false to redact payloads
+	// B-371, inverted 2026-09-10. This assertion used to require that both SDK
+	// READMEs CONTAIN `TRACELANE_TRACE_CONTENT` — "both SDKs must respect
+	// TRACELANE_TRACE_CONTENT=false to redact payloads".
+	//
+	// NO COMPONENT HAS EVER READ THAT VARIABLE. A repo-wide grep finds it in
+	// documentation, archived TRDs and comments only — never in an `env::var`, and
+	// never in either SDK's source. So this test was ENFORCING A FALSE PRIVACY
+	// CLAIM on two published READMEs: correcting the copy broke a passing eval,
+	// which is exactly how the claim survived every prior docs pass. Same shape as
+	// B-300, where `plan-ladder-render.test.ts` asserted five retention strings the
+	// product did not implement.
+	//
+	// It now asserts the CORRECTION and refuses the resurrection: the READMEs must
+	// state that no switch is needed, and must not re-introduce the instruction.
+	it("SDK READMEs do not advertise the inert TRACELANE_TRACE_CONTENT switch", async () => {
 		const fs = await import("node:fs");
 		const path = await import("node:path");
 		const sdkFiles = [
 			"../../packages/sdk-python/README.md",
 			"../../packages/sdk-typescript/README.md",
 		];
+		let checked = 0;
 		for (const rel of sdkFiles) {
 			const p = path.resolve(__dirname, rel);
 			if (!fs.existsSync(p)) continue;
+			checked++;
 			const src = fs.readFileSync(p, "utf8");
+			// The instruction must be gone. The variable NAME may still appear in
+			// the sentence explaining that it never worked — that is the honest
+			// correction, not a resurrection — so match the instruction, not the name.
 			expect(
 				src,
-				`SDK README missing TRACELANE_TRACE_CONTENT: ${rel}`,
-			).toContain("TRACELANE_TRACE_CONTENT");
+				`SDK README still instructs setting the inert switch: ${rel}`,
+			).not.toMatch(/set `?TRACELANE_TRACE_CONTENT=false`? to redact/);
+			// And the positive claim must be present, so deleting the paragraph
+			// entirely does not silently pass this test.
+			expect(
+				src,
+				`SDK README no longer states the capture posture: ${rel}`,
+			).toContain("no switch you need");
 		}
+		// A `continue` on a missing file would let this pass having checked
+		// nothing — the exact failure mode this suite exists to catch.
+		expect(checked, "neither SDK README was found; this test checked nothing").toBe(
+			sdkFiles.length,
+		);
 	});
 
 	it("provider keys are never included in span attributes (gateway guarantee)", async () => {

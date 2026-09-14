@@ -29,7 +29,7 @@
 //! appends the per-tier `max_memory_usage` / `max_execution_time` /
 //! `max_rows_to_read` SETTINGS block. The per-tenant tier is not yet threaded
 //! here (mirrors the dashboard's hardcoded Builder default in
-//! `apps/web/lib/clickhouse.ts`); we fall back to `PlanTier::Builder`, the
+//! `apps/web/lib/clickhouse.ts`); we fall back to `self.tier_for(tenant_id).await`, the
 //! ADR-031 fail-safe. `// TODO(ADR-031 V1.1): thread the real per-tenant tier.`
 //! This file is on the `scripts/ci/no-raw-ch-query.sh` allow-list because the
 //! `.query` execution lives here while caps are applied via `TenantQuery`.
@@ -132,6 +132,152 @@ const _WINDOW_CAPS_COVER_WIDEST_CHIP: () = {
 };
 /// Per-rail row cap (there are ~10 rails; a safety cap, not a real limit).
 const GUARDRAIL_RAIL_CAP: u32 = 50;
+
+/// DSH-11 / B-331 — the WIDEST absolute window any spans/SLO/guardrail read serves.
+/// `since=` used to REPLACE the `hours` predicate on every windowed route with no
+/// width check, so a hand-written `since=2020-01-01` scanned the tenant's whole
+/// history under `max_rows_to_read` alone. A `since/until` pair wider than this is
+/// clamped to `[until − cap, until]` and the response says so
+/// (`X-Tracelane-Window: …;clamped=1`). Equal to the `hours` caps by construction —
+/// the compile-time assertion below keeps it that way.
+const MAX_WINDOW_SECS: i64 = MAX_SLO_HOURS as i64 * 3600;
+/// Sessions are capped in DAYS (`MAX_SESSION_WINDOW_DAYS`); same clamp, that unit.
+const MAX_SESSION_WINDOW_US: i64 = MAX_SESSION_WINDOW_DAYS as i64 * 86_400 * 1_000_000;
+/// Never more buckets than this on one series (the UI's ladder never asks for more;
+/// the gateway widens the bucket rather than answer 8,760 rows).
+const MAX_SERIES_BUCKETS: i64 = 96;
+/// Sub-hour buckets are served from raw `spans FINAL` (the hourly view cannot go
+/// finer) and only for windows this wide or narrower — the cost bound.
+const SUB_HOUR_MAX_WINDOW_SECS: i64 = 24 * 3600;
+/// The minute widths a sub-hour bucket may take.
+const BUCKET_MINUTES_ALLOWED: [u32; 5] = [1, 5, 10, 15, 30];
+#[allow(clippy::assertions_on_constants)]
+const _WINDOW_CLAMP_MATCHES_CAPS: () = {
+    assert!(MAX_WINDOW_SECS == MAX_GATEWAY_HOURS as i64 * 3600);
+    assert!(MAX_WINDOW_SECS == MAX_GUARDRAIL_HOURS as i64 * 3600);
+};
+
+/// The window a handler actually served, echoed on every windowed route as
+/// `X-Tracelane-Window: since=<rfc3339>;until=<rfc3339>;clamped=<0|1>` so a
+/// caller can see a clamp without the response shape changing (several of these
+/// routes return a bare JSON array).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServedWindow {
+    pub since_secs: i64,
+    pub until_secs: i64,
+    pub clamped: bool,
+}
+
+const X_WINDOW: axum::http::HeaderName = axum::http::HeaderName::from_static("x-tracelane-window");
+
+impl ServedWindow {
+    /// Resolve `(since, until)` seconds against `now`, clamping the width to `cap_secs`.
+    /// `since = None` means the rolling `hours` window, which is within the cap by
+    /// construction (the handler clamps `hours` first).
+    pub(crate) fn resolve(
+        since: Option<i64>,
+        until: Option<i64>,
+        hours: u32,
+        now: i64,
+        cap_secs: i64,
+    ) -> Self {
+        let until_eff = until.unwrap_or(now).min(now);
+        match since {
+            None => Self {
+                since_secs: until_eff - i64::from(hours) * 3600,
+                until_secs: until_eff,
+                clamped: false,
+            },
+            Some(s) if until_eff - s > cap_secs => Self {
+                since_secs: until_eff - cap_secs,
+                until_secs: until_eff,
+                clamped: true,
+            },
+            Some(s) => Self {
+                since_secs: s,
+                until_secs: until_eff,
+                clamped: false,
+            },
+        }
+    }
+    pub(crate) fn width_secs(&self) -> i64 {
+        (self.until_secs - self.since_secs).max(0)
+    }
+    pub(crate) fn header_value(&self) -> String {
+        let iso = |s: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)
+                .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default()
+        };
+        format!(
+            "since={};until={};clamped={}",
+            iso(self.since_secs),
+            iso(self.until_secs),
+            u8::from(self.clamped)
+        )
+    }
+    /// Attach the header to a response.
+    pub(crate) fn stamp(&self, mut resp: Response) -> Response {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&self.header_value()) {
+            resp.headers_mut().insert(X_WINDOW, v);
+        }
+        resp
+    }
+}
+
+/// `bucket_minutes` must be one of the allowed widths, the window must be ≤ 24 h
+/// (the raw-spans cost bound), and the series must fit the bucket ceiling.
+fn validate_bucket_minutes(m: Option<u32>, width_secs: i64) -> Result<Option<u32>, &'static str> {
+    let Some(m) = m else { return Ok(None) };
+    if !BUCKET_MINUTES_ALLOWED.contains(&m) {
+        return Err("invalid bucket_minutes (allowed: 1, 5, 10, 15, 30)");
+    }
+    if width_secs > SUB_HOUR_MAX_WINDOW_SECS {
+        return Err("bucket_too_fine: sub-hour buckets are served for windows of 24 hours or less");
+    }
+    if width_secs / (i64::from(m) * 60) > MAX_SERIES_BUCKETS {
+        return Err("bucket_too_fine: more than 96 buckets in the window");
+    }
+    Ok(Some(m))
+}
+
+trait StampWindow {
+    fn pipe_stamp(self, w: &ServedWindow) -> Response;
+}
+impl StampWindow for Response {
+    fn pipe_stamp(self, w: &ServedWindow) -> Response {
+        w.stamp(self)
+    }
+}
+
+/// Widen a bucket so a series never exceeds `MAX_SERIES_BUCKETS` rows.
+fn cap_bucket_secs(bucket_secs: i64, width_secs: i64) -> i64 {
+    let mut b = bucket_secs.max(60);
+    while width_secs / b > MAX_SERIES_BUCKETS {
+        b *= 2;
+    }
+    b
+}
+
+/// `MV_PROVIDER_EXPR` / `MV_MODEL_EXPR` are the provider / model derivations of
+/// `mv_slo_hourly_stats`, VERBATIM from
+/// `infra/dev/clickhouse/migrations/06_genai_attr_keys_and_slo.sql`, so a
+/// sub-hour bucket read off raw spans counts EXACTLY what the hourly view counts
+/// (`slo_sub_hour_paths_read_spans_with_the_mv_expressions`). They are used ONLY
+/// by the SLO sub-hour readers (`build_slo_sql` / `build_slo_timeseries_sql`).
+///
+/// SRE register #55 (2026-09-05) compared `MV_MODEL_EXPR` against the WRONG view —
+/// `mv_trace_summaries` in `schema.sql`, which writes `trace_summaries.model` and
+/// carries a fifth arm, the dotted `gen_ai.request.model`. That arm is DEAD at the
+/// storage boundary: `crates/shared/src/otlp/decode.rs` maps the dotted wire key
+/// into the typed `gen_ai_request_model` field (`grep -n '"gen_ai.request.model" =>'`)
+/// and the gateway's own spans set the underscored key directly, so no stored span
+/// resolves its model through the dotted arm alone. Adding it here would have
+/// broken the parity that matters (5-minute bar == hourly bar) to buy one that
+/// cannot be observed. `mv_exprs_match_migration_06_and_trace_summaries_only_adds_the_dead_arm`
+/// pins BOTH facts from the checked-in SQL, never from a hand copy.
+const MV_PROVIDER_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider'))";
+const MV_MODEL_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name'))";
 /// Default / max verdict-list page size (the decision-mix click-through).
 const DEFAULT_VERDICT_LIMIT: u32 = 100;
 const MAX_VERDICT_LIMIT: u32 = 500;
@@ -139,6 +285,15 @@ const MAX_VERDICT_LIMIT: u32 = 500;
 /// session (thread) grouping key. Spans store OTel-GenAI attrs underscore-
 /// flattened (see `mv_trace_summaries`), so this is the primary lookup.
 const CONVERSATION_ID_ATTR: &str = "gen_ai_conversation_id";
+
+/// `OBS-20`. The span-attribute key holding the customer's own end user.
+///
+/// UNDERSCORED, not dotted, and that distinction is the B-232 class: a
+/// first-class `SpanAttributes` field serialises under its snake_case Rust name
+/// (`user_id`), while a key that only ever reaches `extra` keeps its literal
+/// dotted string. Querying `'user.id'` here would match a key no writer in this
+/// repo ever writes, and the surface would be empty for every tenant forever.
+const END_USER_ID_ATTR: &str = "user_id";
 
 // ── Wire types ──────────────────────────────────────────────────────────────
 
@@ -520,7 +675,8 @@ pub struct CompareQuery {
 /// verifier a customer runs. The chip links there for the actual proof.
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceChainStatus {
-    /// True iff a `chat.completions.request` chain row carries this `trace_id`.
+    /// True iff a gateway-call chain row (`chat.completions.request` or, since GWY-47,
+    /// `messages.request`) carries this `trace_id`.
     pub chained: bool,
     /// The chain sequence number of that row (audit-ledger position).
     pub seq: Option<u64>,
@@ -603,6 +759,8 @@ pub struct SloTimePoint {
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub requests: u64,
+    /// Errored requests in the bucket (DSH-11) — the chart's second series.
+    pub errors: u64,
 }
 
 /// Window-wide latency **split** — the honest "what Tracelane adds vs the LLM"
@@ -731,7 +889,7 @@ pub struct GatewayProviderHealth {
 ///   • span-derived, rolling `window_hours` (24h default): requests, errors,
 ///     latency, cache-hit, and `total_failovers` (`countIf` over `spans`).
 ///   • process-lifetime counters (since gateway start, reset on redeploy):
-///     `rate_limited_since_start`, `quota_exceeded_since_start` — a 429 emits no
+///     `rate_limited_since_start`, `budget_exceeded_since_start` — a 429 emits no
 ///     span, so these come from the in-process [`crate::rejection_metrics`]
 ///     registry instead of a fabricated zero.
 /// `uninstrumented` remains for forward-compat (empty now that both former gaps
@@ -752,8 +910,11 @@ pub struct GatewayStatsResponse {
     pub total_cost_usd: f64,
     /// Rate-limit (token-bucket) 429s for this tenant since the gateway started.
     pub rate_limited_since_start: u64,
-    /// Monthly-quota hard-cap 429s for this tenant since the gateway started.
-    pub quota_exceeded_since_start: u64,
+    /// Budget-exceeded 429s (per-key/workspace USD budget, GWY-43 + BILL-01 A3)
+    /// for this tenant since the gateway started. Was `quota_exceeded_since_start`
+    /// until 2026-09-14: BILL-01 / ADR-076 retired the monthly trace-count hard
+    /// cap that name described, and `apps/web/lib/gateway-ops.ts` renamed with it.
+    pub budget_exceeded_since_start: u64,
     pub providers: Vec<GatewayProviderHealth>,
     /// Upstreams whose breaker is currently Open or Half-Open (ADR-036) — a live
     /// resilience signal counted across ALL breakers, not just this window's rows
@@ -1002,6 +1163,184 @@ pub struct CostBreakdownResponse {
     pub judge_requests: u64,
     pub rows: Vec<CostBreakdownRow>,
 }
+// ── DSH-13: metric breakdown by a closed dimension set ───────────────────────
+//
+// `GET /v1/metrics/breakdown?metric=&by=&since=&until=&limit=` serves the `breakdown`
+// tiles whose (metric, dimension) pair no existing route covers. Both axes are CLOSED
+// enums: `metric` and `by` are matched against fixed strings and the SQL is composed
+// from fixed expressions — no caller value ever reaches statement text (the
+// `CostDimension` / `TraceGroupBy` pattern above). Custom means composition, not
+// authorship (spec §1, founder prior).
+
+/// The aggregate a breakdown tile asks for. Every arm is a fixed ClickHouse expression
+/// that yields a Float64 — one row shape for every metric (RowBinary is positional and
+/// typed; a `u64` column here would desynchronise the stream, B-274 class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownMetric {
+    Requests,
+    Errors,
+    ErrorRate,
+    P50Ms,
+    P95Ms,
+    InputTokens,
+    OutputTokens,
+    CostUsd,
+}
+
+impl BreakdownMetric {
+    // No production caller today — used only by a test enumerating every
+    // metric/dimension combination. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
+    pub const ALL: [Self; 8] = [
+        Self::Requests,
+        Self::Errors,
+        Self::ErrorRate,
+        Self::P50Ms,
+        Self::P95Ms,
+        Self::InputTokens,
+        Self::OutputTokens,
+        Self::CostUsd,
+    ];
+
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        Some(match s? {
+            "requests" => Self::Requests,
+            "errors" => Self::Errors,
+            "error_rate" => Self::ErrorRate,
+            "p50_ms" => Self::P50Ms,
+            "p95_ms" => Self::P95Ms,
+            "input_tokens" => Self::InputTokens,
+            "output_tokens" => Self::OutputTokens,
+            "cost_usd" => Self::CostUsd,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requests => "requests",
+            Self::Errors => "errors",
+            Self::ErrorRate => "error_rate",
+            Self::P50Ms => "p50_ms",
+            Self::P95Ms => "p95_ms",
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::CostUsd => "cost_usd",
+        }
+    }
+
+    /// The SAME definitions the built-in pages use (cost via `cost_usd_present`,
+    /// errors via `status_code = 2`, latency from `duration_us`), so a custom tile can
+    /// never disagree with the page it mirrors.
+    fn expr(self) -> &'static str {
+        match self {
+            Self::Requests => "toFloat64(count())",
+            Self::Errors => "toFloat64(countIf(status_code = 2))",
+            Self::ErrorRate => {
+                "if(count() = 0, 0.0, round(countIf(status_code = 2) / count() * 100.0, 2))"
+            }
+            Self::P50Ms => "quantileExact(0.5)(duration_us) / 1000.0",
+            Self::P95Ms => "quantileExact(0.95)(duration_us) / 1000.0",
+            Self::InputTokens => {
+                "toFloat64(sum(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens')))"
+            }
+            Self::OutputTokens => {
+                "toFloat64(sum(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens')))"
+            }
+            Self::CostUsd => {
+                "round(sumIf(cost_usd, cost_usd_present = 1 AND isFinite(cost_usd)), 6)"
+            }
+        }
+    }
+}
+
+/// The dimension a breakdown tile groups by — the ones the gateway already groups by
+/// elsewhere, spelled the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownBy {
+    Model,
+    Provider,
+    Key,
+    Status,
+    Operation,
+}
+
+impl BreakdownBy {
+    // No production caller today — same reasoning as `BreakdownMetric::ALL`
+    // above. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
+    pub const ALL: [Self; 5] = [
+        Self::Model,
+        Self::Provider,
+        Self::Key,
+        Self::Status,
+        Self::Operation,
+    ];
+
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        Some(match s? {
+            "model" => Self::Model,
+            "provider" => Self::Provider,
+            "key" => Self::Key,
+            "status" => Self::Status,
+            "operation" => Self::Operation,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Provider => "provider",
+            Self::Key => "key",
+            Self::Status => "status",
+            Self::Operation => "operation",
+        }
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Self::Model => "JSONExtractString(attributes, 'gen_ai_request_model')",
+            Self::Provider => "JSONExtractString(attributes, 'gen_ai_provider_name')",
+            Self::Key => "api_key_id",
+            Self::Status => "if(status_code = 2, 'error', 'ok')",
+            Self::Operation => "JSONExtractString(attributes, 'gen_ai_operation_name')",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BreakdownFilters {
+    pub metric: BreakdownMetric,
+    pub by: BreakdownBy,
+    pub since_us: i64,
+    pub until_us: i64,
+    pub limit: u32,
+}
+
+/// One breakdown row. `value` is the metric (always Float64 — see `BreakdownMetric`),
+/// `n` the request count behind it, so the tile can show a sample size.
+#[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
+pub struct BreakdownRow {
+    pub key: String,
+    pub value: f64,
+    pub n: u64,
+}
+
+/// Bind order: tenant, since_us, until_us, limit. Exactly four `?`; nothing else in
+/// the text varies with the caller.
+fn build_metric_breakdown_sql(metric: BreakdownMetric, by: BreakdownBy) -> String {
+    format!(
+        "SELECT {dim} AS key, {expr} AS value, toUInt64(count()) AS n \
+FROM spans FINAL \
+WHERE tenant_id = ? \
+  AND start_time >= fromUnixTimestamp64Micro(?) \
+  AND start_time < fromUnixTimestamp64Micro(?) \
+GROUP BY key ORDER BY value DESC, key ASC LIMIT ?",
+        dim = by.column(),
+        expr = metric.expr(),
+    )
+}
 
 /// Build the cost-attribution SELECT. `?` order: tenant, hours, limit.
 ///
@@ -1068,7 +1407,7 @@ fn pct(num: u64, denom: u64) -> f64 {
 impl GatewayStatsResponse {
     /// Fold the per-provider rows into the response, deriving the tenant-wide
     /// totals from summed counts (rates recomputed from sums, never averaged).
-    /// `rejections` is `(rate_limited, quota_exceeded)` process-lifetime counts
+    /// `rejections` is `(rate_limited, budget_exceeded)` process-lifetime counts
     /// injected by the handler from [`crate::rejection_metrics`] (they have no
     /// span to aggregate from).
     fn from_rows(
@@ -1118,7 +1457,7 @@ impl GatewayStatsResponse {
                 )
             })
             .count() as u32;
-        let (rate_limited_since_start, quota_exceeded_since_start) = rejections;
+        let (rate_limited_since_start, budget_exceeded_since_start) = rejections;
         Self {
             window_hours,
             total_requests,
@@ -1129,7 +1468,7 @@ impl GatewayStatsResponse {
             total_failovers,
             total_cost_usd,
             rate_limited_since_start,
-            quota_exceeded_since_start,
+            budget_exceeded_since_start,
             providers,
             open_breakers,
             // Both former gaps (failover + rate-limit) are now recorded; nothing
@@ -1372,6 +1711,23 @@ pub struct SessionSummary {
     pub total_tokens: i64,
     /// Representative (latest) model across the session.
     pub model: String,
+    /// `gen_ai.agent.name` (PLT-46) — e.g. `"claude-code"` when the session was
+    /// recorded via Claude Code's OTLP exporter. Empty string when never set, the
+    /// same "absent, not fabricated" posture as every other best-effort column
+    /// here; the dashboard renders no chip rather than a fake one.
+    pub agent_name: String,
+    /// `OBS-20`. The customer's own END USER — who initiated this conversation.
+    /// Latest non-empty wins across the session's spans.
+    ///
+    /// THREE distinguishable values, and the read surface must render all three
+    /// differently or a working privacy control reads as a broken feature:
+    /// `""` — nobody sent one, which is the expected state for a tenant that has
+    /// not instrumented it; a real id; or the literal `[REDACTED:email]`, which
+    /// means the customer sent an email address and ingest's PII redaction
+    /// removed it (`crates/ingest/src/clickhouse_writer.rs` runs
+    /// `pii::redact_json` over the whole attribute blob and `email` is one of its
+    /// categories).
+    pub end_user: String,
 }
 
 /// Internal ClickHouse row for the session list. POSITIONAL — field order MUST
@@ -1388,6 +1744,21 @@ pub struct SessionSummaryRow {
     pub cost_usd: f64,
     pub total_tokens: i64,
     pub model: String,
+    /// Appended LAST — the SELECT appends it last too, so the `?` bind
+    /// positions ahead of it (tenant, [model], since/window, limit) do not move
+    /// (TRAPS §58 bind-order class).
+    pub agent_name: String,
+    /// `OBS-20`. The customer's own end user, latest non-empty wins within the
+    /// session. Appended after `agent_name` for the same reason `agent_name` was
+    /// appended after `model`: the SELECT appends it last, so no bind position
+    /// ahead of it moves.
+    ///
+    /// `String`, not `Option<String>`: ClickHouse's `argMax` over a
+    /// `JSONExtractString` yields `''` for a session no span of which carried
+    /// one, and collapsing that to `None` here would lose the distinction the
+    /// read surface needs between "" (nobody sent one) and the literal
+    /// `[REDACTED:email]` (somebody sent one and PII redaction removed it).
+    pub end_user: String,
 }
 
 impl From<SessionSummaryRow> for SessionSummary {
@@ -1404,6 +1775,8 @@ impl From<SessionSummaryRow> for SessionSummary {
             cost_usd: r.cost_usd,
             total_tokens: r.total_tokens,
             model: r.model,
+            agent_name: r.agent_name,
+            end_user: r.end_user,
         }
     }
 }
@@ -1519,6 +1892,19 @@ pub struct TraceListFilters {
     /// **tenant-scoped** `spans` subquery (no failover column on `trace_summaries`).
     /// `None` / `Some(false)` → no failover filter.
     pub failover: Option<bool>,
+    /// `OBS-20`. Keep only traces with ≥1 span carrying this end-user id — the
+    /// "show me this person's traces" filter.
+    ///
+    /// Resolved via a **tenant-scoped `spans` subquery**, the same shape as
+    /// `failover` above and for the same reason: it is a per-span JSON
+    /// attribute and `trace_summaries` has no column for it. The value is BOUND,
+    /// never interpolated — it is caller-supplied text, so interpolating it here
+    /// would be a SQL-injection seam on the one field an attacker controls.
+    ///
+    /// Matched EXACTLY, not by substring. A prefix match would silently return
+    /// `u_1`'s traces when asked for `u_10`, which for an identity filter is a
+    /// wrong answer rather than a loose one.
+    pub end_user: Option<String>,
     /// Inclusive lower bound on `start_time`, microseconds since epoch.
     pub since_us: Option<i64>,
     /// Inclusive upper bound on `start_time`, microseconds since epoch.
@@ -1551,6 +1937,10 @@ pub struct SloFilters {
     /// Inclusive lower bound on `bucket_hour`, seconds since epoch. When set it
     /// overrides `hours`.
     pub since_secs: Option<i64>,
+    /// Sub-hour bucket width in minutes (DSH-11 §3a.4). `Some` switches the two
+    /// series routes from the hourly view to `spans FINAL`; only allowed for
+    /// windows ≤ 24 h. `None` = the hourly-view paths, unchanged.
+    pub bucket_minutes: Option<u32>,
     /// Inclusive upper bound on `bucket_hour`, seconds since epoch.
     pub until_secs: Option<i64>,
     /// Rolling look-back window in hours (used only when `since_secs` is None).
@@ -1580,6 +1970,8 @@ pub struct GatewayStatsFilters {
     /// Inclusive lower bound on `start_time`, seconds since epoch. When set it
     /// overrides `hours`.
     pub since_secs: Option<i64>,
+    /// Inclusive upper bound on `start_time`, seconds since epoch (DSH-11).
+    pub until_secs: Option<i64>,
     /// Rolling look-back window in hours (used only when `since_secs` is None).
     pub hours: u32,
     /// Per-provider row cap (bound `?`).
@@ -1592,6 +1984,8 @@ pub struct GatewayStatsFilters {
 pub struct GuardrailStatsFilters {
     /// Inclusive lower bound on `event_time`, seconds since epoch. Overrides `hours`.
     pub since_secs: Option<i64>,
+    /// Inclusive upper bound on `event_time`, seconds since epoch (DSH-11).
+    pub until_secs: Option<i64>,
     /// Rolling look-back window in hours (used only when `since_secs` is None).
     pub hours: u32,
     /// Per-rail row cap (bound `?`).
@@ -1604,6 +1998,8 @@ pub struct GuardrailStatsFilters {
 pub struct GuardrailVerdictListFilters {
     /// Inclusive lower bound on `event_time`, seconds since epoch. Overrides `hours`.
     pub since_secs: Option<i64>,
+    /// Inclusive upper bound on `event_time`, seconds since epoch (DSH-11).
+    pub until_secs: Option<i64>,
     /// Rolling look-back window in hours (used only when `since_secs` is None).
     pub hours: u32,
     /// Allowlisted decision filter (`allow`|`block`|`redact`|`warn`); `None` = all.
@@ -1613,6 +2009,10 @@ pub struct GuardrailVerdictListFilters {
     /// body). Charset-validated in the handler, then a bound `?`. Lets a caller
     /// paste the id from a blocked request and land on that verdict.
     pub correlation_id: Option<String>,
+    /// Per-rail filter (B-335a): rows whose `rails` JSON array carries an entry with
+    /// `"rail" == <id>`, e.g. `R4_trifecta`. Charset-validated in the handler
+    /// (`[A-Za-z0-9_]{1,40}`), then a bound `?` inside `arrayExists`.
+    pub rail: Option<String>,
     /// Row cap (bound `?`).
     pub limit: u32,
 }
@@ -1621,7 +2021,11 @@ pub struct GuardrailVerdictListFilters {
 #[derive(Debug, Clone, Default)]
 pub struct SignatureFilters {
     /// Inclusive lower bound on the matched span's `start_time`, microseconds.
+    /// ALWAYS set by the handler since DSH-11: a bare call used to scan the
+    /// tenant's whole history under `ARRAY JOIN` (B-331).
     pub since_us: Option<i64>,
+    /// Inclusive upper bound, microseconds (DSH-11).
+    pub until_us: Option<i64>,
     pub limit: u32,
     /// The web's LIVE-detector AFT-1 id allowlist (from `aft-taxonomy.ts`, the
     /// canonical `detectorStatus` source). When non-empty it scopes the
@@ -1639,6 +2043,8 @@ pub struct SessionListFilters {
     /// Inclusive lower bound on `start_time`, microseconds. When set it
     /// overrides `window_days`.
     pub since_us: Option<i64>,
+    /// Inclusive upper bound on `start_time`, microseconds (DSH-11).
+    pub until_us: Option<i64>,
     /// Rolling look-back window in days (used only when `since_us` is None).
     pub window_days: u32,
     /// Keep only spans of this response model (bound `?`); scopes each session's
@@ -1656,20 +2062,46 @@ pub struct SessionListFilters {
 
 // ── SQL builders (pure — unit-tested without a ClickHouse client) ────────────
 
-/// Build the trace-list SELECT. `tenant_id = ?` is always the first WHERE
-/// predicate; every filter is a bound `?` placeholder. The `?` order is:
-/// tenant, [model], [min_duration_us], [sig_tenant, sig_id], [since_us],
-/// [until_us], [cursor_us, cursor_us, cursor_id], limit — kept in lockstep with
-/// the bind chain in [`ClickHouseTraceReader::list_traces`].
-fn build_trace_list_sql(f: &TraceListFilters) -> String {
-    let mut sql = String::from(
-        "SELECT trace_id, root_name, \
-toString(start_time) AS start_time_iso, \
-toInt64(toUnixTimestamp64Micro(start_time)) AS start_time_us, \
-duration_us, span_count, error_count, intervention, model \
-FROM trace_summaries FINAL \
-WHERE tenant_id = ?",
-    );
+/// B-379 (2026-09-12): the read window, ALWAYS present, bound FIRST as two `WITH`
+/// clocks that every subquery sees (ClickHouse propagates `WITH` into subqueries —
+/// `enable_global_with_statement`, on by default). Before this the window was
+/// optional and, when absent, "last 50 traces" read the tenant's entire history
+/// (measured: 1,000,576 rows / 72 MB on 1M traces) and hit `max_rows_to_read` at
+/// ~50M — it FAILED, not slowed. Two `?` here, then the tenant, then the filters.
+const WINDOW_WITH: &str = "WITH fromUnixTimestamp64Micro(?) AS w_since, \
+fromUnixTimestamp64Micro(?) AS w_until ";
+
+/// B-379: the merge `FINAL` used to do, done as GROUP BY over ONLY the window's
+/// rows. `SimpleAggregateFunction(max/min/sum)` merges ARE max/min/sum, so this
+/// is the same collapse of partial rows `trace_summaries FINAL` performs — and
+/// unlike `FINAL` it can use the time-ordered projection `p_by_time` (migration
+/// 22). `st_min`/`et_max` are NOT named `start_time`/`end_time`: an alias equal to
+/// the column name makes the inner `WHERE start_time >= w_since` resolve to the
+/// aggregate (`ILLEGAL_AGGREGATION`). `duration_us` is computed here from the
+/// MERGED bounds, so every outer reader (filter, sort, p95) sees the true value.
+/// One `?` (the tenant); the clocks come from [`WINDOW_WITH`].
+const MERGED_SUMMARIES: &str = "(SELECT tenant_id, trace_id, \
+max(root_name) AS root_name, \
+min(start_time) AS st_min, \
+max(end_time) AS et_max, \
+dateDiff('microsecond', min(start_time), max(end_time)) AS duration_us, \
+sum(span_count) AS span_count, \
+sum(error_count) AS error_count, \
+max(intervention) AS intervention, \
+max(model) AS model \
+FROM trace_summaries \
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
+GROUP BY tenant_id, trace_id)";
+
+/// The filter clauses shared by the list, the count and the groups queries —
+/// ONE function so the three cannot drift (they had, once: the B-368 identity
+/// fix landed in one copy). Appended after `WHERE tenant_id = ?`; the `?` order
+/// is `[model], [min_duration_us], [sig_tenant, sig_id], [q_tenant, q, q_lower,
+/// q, q_lower], [failover_tenant], [end_user_tenant, end_user]`, which
+/// [`bind_trace_filters`] mirrors. Every `spans` subquery carries the window
+/// (`w_since`/`w_until`) so it prunes on the time-first key of migration 22
+/// instead of scanning the tenant's history.
+fn push_trace_filters(sql: &mut String, f: &TraceListFilters) {
     if f.model.is_some() {
         sql.push_str(" AND model = ?");
     }
@@ -1682,19 +2114,20 @@ WHERE tenant_id = ?",
         // outer query. `has(aft_ids, ?)` matches the per-span signature array.
         sql.push_str(
             " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND has(aft_ids, ?))",
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND has(aft_ids, ?))",
         );
     }
     if f.q.is_some() {
         // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
         // as the signature filter, it can never widen across tenants.
-        // `multiSearchAny` on the RAW column is deliberate: it is a form the
-        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
-        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
-        // would silently disable the index and restore the full scan.
+        // `multiSearchAny` on the RAW column: the `name` ngram index (migration 14)
+        // serves it and prunes; the `attributes` ngram index was deleted in
+        // migration 22 on measurement (it pruned nothing on the JSON blob) — the
+        // window is what bounds that half now.
         sql.push_str(
             " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
+AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
         );
     }
     if f.failover == Some(true) {
@@ -1702,7 +2135,19 @@ WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attribut
         // tenant-scoped subquery, same isolation invariant as the signature filter.
         sql.push_str(
             " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
+AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
+        );
+    }
+    if f.end_user.is_some() {
+        // OBS-20. Same tenant-scoped-subquery shape as the failover filter above,
+        // and it inherits the same isolation invariant: the subquery is itself
+        // `tenant_id = ?`-bound, so an end-user id from another tenant can never
+        // widen the result.
+        sql.push_str(
+            " AND trace_id IN (SELECT trace_id FROM spans \
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
+AND JSONExtractString(attributes, 'user_id') = ?)",
         );
     }
     match f.has_error {
@@ -1710,19 +2155,29 @@ WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activate
         Some(false) => sql.push_str(" AND error_count = 0"),
         None => {}
     }
-    if f.since_us.is_some() {
-        sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
-    }
-    if f.until_us.is_some() {
-        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
-    }
+}
+
+/// Build the trace-list SELECT. `?` order: `w_since, w_until, inner tenant,
+/// outer tenant`, then [`push_trace_filters`]'s order, then `[cursor ×3]`, `limit`.
+fn build_trace_list_sql(f: &TraceListFilters) -> String {
+    let mut sql = String::from(WINDOW_WITH);
+    sql.push_str(
+        "SELECT trace_id, root_name, \
+toString(st_min) AS start_time_iso, \
+toInt64(toUnixTimestamp64Micro(st_min)) AS start_time_us, \
+duration_us, span_count, error_count, intervention, model \
+FROM ",
+    );
+    sql.push_str(MERGED_SUMMARIES);
+    sql.push_str(" WHERE tenant_id = ?");
+    push_trace_filters(&mut sql, f);
     // Sort column + direction from a fixed allowlist (never user input → safe to
     // interpolate; the `?` values stay bound). `cursor_expr` is the sort column's
     // value used by the keyset comparison — for start_time it references the
-    // DateTime64 column via toUnixTimestamp64Micro (the `start_time_us` alias would
+    // merged DateTime64 via toUnixTimestamp64Micro (the `start_time_us` alias would
     // trip the ILLEGAL_TYPE_OF_ARGUMENT class).
     let (sort_col, cursor_expr) = match f.sort {
-        TraceSort::StartTime => ("start_time", "toUnixTimestamp64Micro(start_time)"),
+        TraceSort::StartTime => ("st_min", "toUnixTimestamp64Micro(st_min)"),
         TraceSort::Duration => ("duration_us", "duration_us"),
         TraceSort::SpanCount => ("span_count", "span_count"),
     };
@@ -1743,60 +2198,18 @@ WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activate
 }
 
 /// Build the trace-COUNT scalar — the tenant total matching the SAME filters as
-/// the list (for the "50 of N traces" footer). Same WHERE + `?` bind order as
-/// [`build_trace_list_sql`], MINUS sort/cursor/limit. One row: `total`.
+/// the list (for the "50 of N traces" footer). Same `?` order as
+/// [`build_trace_list_sql`] MINUS cursor/limit. One row: `total`.
 ///
-/// `uniqExact(trace_id)`, NOT `count()`: `trace_summaries` is a write-time MV, so
-/// if ingest splits a trace across batches the MV can emit >1 partial row for the
-/// same `trace_id` (different `min(start_time)` → distinct ReplacingMergeTree
-/// key), and a raw `count()` would over-count the footer total — the "tile says
-/// 180, list says 202" class (provenance audit P1 #7). `uniqExact` counts each
-/// trace once regardless of partial rows, so the footer reconciles with the list.
+/// `count()` over the MERGED subquery: partial rows are already collapsed by the
+/// GROUP BY, so the `uniqExact(trace_id)` the pre-B-379 query needed against
+/// `FINAL`'s leftovers is no longer the question.
 fn build_trace_count_sql(f: &TraceListFilters) -> String {
-    let mut sql = String::from(
-        "SELECT toUInt64(uniqExact(trace_id)) AS total FROM trace_summaries FINAL WHERE tenant_id = ?",
-    );
-    if f.model.is_some() {
-        sql.push_str(" AND model = ?");
-    }
-    if f.min_duration_us.is_some() {
-        sql.push_str(" AND duration_us >= ?");
-    }
-    if f.signature_id.is_some() {
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND has(aft_ids, ?))",
-        );
-    }
-    if f.q.is_some() {
-        // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
-        // as the signature filter, it can never widen across tenants.
-        // `multiSearchAny` on the RAW column is deliberate: it is a form the
-        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
-        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
-        // would silently disable the index and restore the full scan.
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
-        );
-    }
-    if f.failover == Some(true) {
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
-        );
-    }
-    match f.has_error {
-        Some(true) => sql.push_str(" AND error_count > 0"),
-        Some(false) => sql.push_str(" AND error_count = 0"),
-        None => {}
-    }
-    if f.since_us.is_some() {
-        sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
-    }
-    if f.until_us.is_some() {
-        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
-    }
+    let mut sql = String::from(WINDOW_WITH);
+    sql.push_str("SELECT toUInt64(count()) AS total FROM ");
+    sql.push_str(MERGED_SUMMARIES);
+    sql.push_str(" WHERE tenant_id = ?");
+    push_trace_filters(&mut sql, f);
     sql
 }
 
@@ -1859,70 +2272,30 @@ fn parse_group_by(s: &str) -> Option<TraceGroupBy> {
 /// Build the trace group-by aggregation SELECT. The `GROUP BY` expression is
 /// chosen from the [`TraceGroupBy`] allowlist (never input); the filter WHERE
 /// clauses + their `?` bind order MIRROR [`build_trace_list_sql`] so
-/// [`ClickHouseTraceReader::list_trace_groups`] binds them identically. `tenant_id
-/// = ?` stays the first predicate.
+/// [`ClickHouseTraceReader::list_trace_groups`] binds them identically.
 fn build_trace_groups_sql(by: TraceGroupBy, f: &TraceListFilters) -> String {
     let group_expr = match by {
         TraceGroupBy::Model => "model",
         TraceGroupBy::Operation => "root_name",
         TraceGroupBy::Status => "if(error_count > 0, 'error', 'ok')",
     };
-    // `uniqExact(trace_id)` (not `count()`) for the same MV partial-row reason as
-    // [`build_trace_count_sql`], so a group's trace total reconciles with the list.
-    // `quantileExact` (not the approximate `quantile`) so the p95 column is the
-    // TRUE 95th percentile of the group's trace durations, not ClickHouse's
-    // reservoir estimate shown as if exact (provenance audit P2 #8).
-    let mut sql = format!(
+    // `count()` / `countIf` over the merged subquery (one row per trace after the
+    // GROUP BY, so no `uniqExact` is needed). `quantileExact` (not the approximate
+    // `quantile`) so the p95 column is the TRUE 95th percentile of the group's
+    // trace durations, not ClickHouse's reservoir estimate shown as if exact
+    // (provenance audit P2 #8).
+    let mut sql = String::from(WINDOW_WITH);
+    sql.push_str(&format!(
         "SELECT {group_expr} AS group_key, \
-toUInt64(uniqExact(trace_id)) AS trace_count, \
-toUInt64(uniqExactIf(trace_id, error_count > 0)) AS error_traces, \
+toUInt64(count()) AS trace_count, \
+toUInt64(countIf(error_count > 0)) AS error_traces, \
 avg(duration_us) AS avg_duration_us, \
 quantileExact(0.95)(duration_us) AS p95_duration_us \
-FROM trace_summaries FINAL \
-WHERE tenant_id = ?"
-    );
-    // Filter WHERE mirrors build_trace_list_sql (same clauses, same bind order).
-    if f.model.is_some() {
-        sql.push_str(" AND model = ?");
-    }
-    if f.min_duration_us.is_some() {
-        sql.push_str(" AND duration_us >= ?");
-    }
-    if f.signature_id.is_some() {
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND has(aft_ids, ?))",
-        );
-    }
-    if f.q.is_some() {
-        // OBS-01 free-text search. Tenant-scoped subquery — same isolation invariant
-        // as the signature filter, it can never widen across tenants.
-        // `multiSearchAny` on the RAW column is deliberate: it is a form the
-        // `ngrambf_v1` skip index (migration 14) can serve, so this PRUNES GRANULES
-        // instead of scanning the tenant's parts. Wrapping the column in `lower()`
-        // would silently disable the index and restore the full scan.
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
-        );
-    }
-    if f.failover == Some(true) {
-        sql.push_str(
-            " AND trace_id IN (SELECT trace_id FROM spans \
-WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
-        );
-    }
-    match f.has_error {
-        Some(true) => sql.push_str(" AND error_count > 0"),
-        Some(false) => sql.push_str(" AND error_count = 0"),
-        None => {}
-    }
-    if f.since_us.is_some() {
-        sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
-    }
-    if f.until_us.is_some() {
-        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
-    }
+FROM "
+    ));
+    sql.push_str(MERGED_SUMMARIES);
+    sql.push_str(" WHERE tenant_id = ?");
+    push_trace_filters(&mut sql, f);
     sql.push_str(" GROUP BY group_key ORDER BY trace_count DESC LIMIT ?");
     sql
 }
@@ -1940,13 +2313,16 @@ ORDER BY start_time ASC, span_id ASC";
 /// Per-trace ledger-status lookup (wedge item 4). Tenant-first, both binds
 /// parameterized. Matches the gateway-proxied chain row to the trace by the
 /// `trace_id` embedded in the (verbatim-canonical-JSON) `payload`. `event_type`
-/// is pinned to `chat.completions.request` so only a real gateway call counts —
-/// a `guardrail.verdict`/`eval.verdict` row is never mistaken for the call. Newest
+/// is pinned to the two GATEWAY-CALL event types — `chat.completions.request` and, since
+/// GWY-47 (2026-09-06), `messages.request` for the Anthropic-native route — so only a real
+/// gateway call counts; a `guardrail.verdict`/`eval.verdict` row is never mistaken for the
+/// call. B-358: the first `/v1/messages` deploy wrote its ledger rows (3 observed on prod)
+/// and this read still said `chained:false`, because it named one event type. Newest
 /// row wins (a trace_id is unique per request, but be defensive). One row max.
 const TRACE_CHAIN_SQL: &str = "SELECT seq, rekor_entry_id \
 FROM tracelane.audit_log \
 WHERE tenant_id = ? \
-AND event_type = 'chat.completions.request' \
+AND event_type IN ('chat.completions.request', 'messages.request') \
 AND JSONExtractString(payload, 'trace_id') = ? \
 ORDER BY seq DESC LIMIT 1";
 
@@ -1993,6 +2369,43 @@ GROUP BY trace_id"
 /// Build the SLO SELECT against `v_slo_stats`. `?` order: tenant,
 /// (since_secs | hours), [until_secs], [provider], [model].
 fn build_slo_sql(f: &SloFilters) -> String {
+    // SUB-HOUR (DSH-11 §3a.4): the hourly view cannot go finer than an hour, so a
+    // 1h/6h/24h window reads `spans FINAL` directly, bucketed by minute, with the
+    // MV's OWN provider/model derivation so the count means the same thing. Same
+    // eleven columns in the same order — only the granularity differs.
+    if let Some(m) = f.bucket_minutes {
+        let mut sql = format!(
+            "SELECT toString(toStartOfInterval(start_time, toIntervalMinute({m}))) AS bucket_hour_iso, \
+{MV_PROVIDER_EXPR} AS provider, \
+{MV_MODEL_EXPR} AS model, \
+round(quantile(0.50)(duration_us) / 1000, 1) AS p50_ms, \
+round(quantile(0.95)(duration_us) / 1000, 1) AS p95_ms, \
+round(quantile(0.99)(duration_us) / 1000, 1) AS p99_ms, \
+toUInt64(count()) AS requests, \
+toUInt64(countIf(status_code = 2)) AS errors, \
+round(countIf(status_code = 2) * 100.0 / greatest(count(), 1), 2) AS error_rate_pct, \
+toInt64(sum(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_input_tokens')))) AS total_input_tokens, \
+toInt64(sum(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_output_tokens')))) AS total_output_tokens \
+FROM spans FINAL \
+WHERE tenant_id = ? AND {MV_PROVIDER_EXPR} != ''"
+        );
+        if f.since_secs.is_some() {
+            sql.push_str(" AND start_time >= toDateTime(?)");
+        } else {
+            sql.push_str(" AND start_time >= now() - toIntervalHour(?)");
+        }
+        if f.until_secs.is_some() {
+            sql.push_str(" AND start_time <= toDateTime(?)");
+        }
+        if f.provider.is_some() {
+            sql.push_str(&format!(" AND {MV_PROVIDER_EXPR} = ?"));
+        }
+        if f.model.is_some() {
+            sql.push_str(&format!(" AND {MV_MODEL_EXPR} = ?"));
+        }
+        sql.push_str(" GROUP BY bucket_hour_iso, provider, model ORDER BY bucket_hour_iso DESC");
+        return sql;
+    }
     // HOURLY (bucket_hours 0 or 1) keeps the exact pre-existing query against the
     // view, so the default response is unchanged for every existing caller.
     //
@@ -2144,13 +2557,44 @@ WHERE tenant_id = ?",
 /// never user free-text) — this keeps `tenant_id` the first BOUND `?`. `?` order:
 /// tenant, (since_secs | hours), [until_secs].
 fn build_slo_timeseries_sql(f: &SloFilters, bucket_hours: u32) -> String {
+    // SUB-HOUR (DSH-11 §3a.4) — raw spans, minute buckets, MV-identical scoping.
+    if let Some(m) = f.bucket_minutes {
+        let mut sql = format!(
+            "SELECT \
+toString(toStartOfInterval(start_time, toIntervalMinute({m}))) AS bucket_start, \
+round(quantile(0.50)(duration_us) / 1000, 1) AS p50_ms, \
+round(quantile(0.95)(duration_us) / 1000, 1) AS p95_ms, \
+round(quantile(0.99)(duration_us) / 1000, 1) AS p99_ms, \
+toUInt64(count()) AS requests, \
+toUInt64(countIf(status_code = 2)) AS errors \
+FROM spans FINAL \
+WHERE tenant_id = ? AND {MV_PROVIDER_EXPR} != ''"
+        );
+        if f.since_secs.is_some() {
+            sql.push_str(" AND start_time >= toDateTime(?)");
+        } else {
+            sql.push_str(" AND start_time >= now() - toIntervalHour(?)");
+        }
+        if f.until_secs.is_some() {
+            sql.push_str(" AND start_time <= toDateTime(?)");
+        }
+        if f.provider.is_some() {
+            sql.push_str(&format!(" AND {MV_PROVIDER_EXPR} = ?"));
+        }
+        if f.model.is_some() {
+            sql.push_str(&format!(" AND {MV_MODEL_EXPR} = ?"));
+        }
+        sql.push_str(" GROUP BY bucket_start ORDER BY bucket_start ASC");
+        return sql;
+    }
     let mut sql = format!(
         "SELECT \
 toString(toStartOfInterval(bucket_hour, toIntervalHour({bucket_hours}))) AS bucket_start, \
 round(quantileMerge(0.50)(latency_p50) / 1000, 1) AS p50_ms, \
 round(quantileMerge(0.95)(latency_p95) / 1000, 1) AS p95_ms, \
 round(quantileMerge(0.99)(latency_p99) / 1000, 1) AS p99_ms, \
-toUInt64(countMerge(request_count)) AS requests \
+toUInt64(countMerge(request_count)) AS requests, \
+toUInt64(countIfMerge(error_count)) AS errors \
 FROM slo_hourly_stats \
 WHERE tenant_id = ? AND provider <> ''"
     );
@@ -2161,6 +2605,14 @@ WHERE tenant_id = ? AND provider <> ''"
     }
     if f.until_secs.is_some() {
         sql.push_str(" AND bucket_hour <= toDateTime(?)");
+    }
+    // B-332: `provider` / `model` were parsed into the filters and NEVER bound here,
+    // so a model-filtered chart drew tenant-wide data under a model label.
+    if f.provider.is_some() {
+        sql.push_str(" AND provider = ?");
+    }
+    if f.model.is_some() {
+        sql.push_str(" AND model = ?");
     }
     sql.push_str(" GROUP BY bucket_start ORDER BY bucket_start ASC");
     sql
@@ -2205,6 +2657,9 @@ WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai_provider_name') !=
     } else {
         sql.push_str(" AND start_time >= now() - toIntervalHour(?)");
     }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND start_time <= toDateTime(?)");
+    }
     sql
 }
 
@@ -2228,6 +2683,9 @@ AND JSONExtractString(attributes, 'gen_ai_provider_name') != ''",
         sql.push_str(" AND start_time >= toDateTime(?)");
     } else {
         sql.push_str(" AND start_time >= now() - toIntervalHour(?)");
+    }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND start_time <= toDateTime(?)");
     }
     sql.push_str(" GROUP BY provider, model ORDER BY samples DESC LIMIT ?");
     sql
@@ -2254,7 +2712,7 @@ round(quantile(0.95)(duration_us) / 1000, 1) AS p95_ms, \
 round(quantile(0.99)(duration_us) / 1000, 1) AS p99_ms, \
 toUInt64(countIf(JSONExtractUInt(attributes, 'gen_ai_usage_cache_read_input_tokens') > 0)) AS cache_hits, \
 toUInt64(countIf(JSONExtractBool(attributes, 'tracelane_failover_activated'))) AS failovers, \
-round(sum(if(isFinite(JSONExtractFloat(attributes, 'gen_ai_usage_cost')) AND JSONExtractFloat(attributes, 'gen_ai_usage_cost') > 0, JSONExtractFloat(attributes, 'gen_ai_usage_cost'), 0)), 6) AS cost_usd, \
+round(sumIf(spans.cost_usd, spans.cost_usd_present = 1 AND isFinite(spans.cost_usd)), 6) AS cost_usd, \
 if(countIf(JSONHas(attributes, 'tracelane_gateway_overhead_us')) = 0, 0, round(quantileIf(0.95)(gateway_overhead_us, JSONHas(attributes, 'tracelane_gateway_overhead_us')) / 1000, 1)) AS overhead_p95_ms \
 FROM spans FINAL \
 WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai_provider_name') != ''",
@@ -2263,6 +2721,9 @@ WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai_provider_name') !=
         sql.push_str(" AND start_time >= toDateTime(?)");
     } else {
         sql.push_str(" AND start_time >= now() - toIntervalHour(?)");
+    }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND start_time <= toDateTime(?)");
     }
     sql.push_str(" GROUP BY provider ORDER BY requests DESC LIMIT ?");
     sql
@@ -2294,6 +2755,9 @@ WHERE tenant_id = ?",
     } else {
         sql.push_str(" AND event_time >= now() - toIntervalHour(?)");
     }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND event_time <= toDateTime(?)");
+    }
     sql
 }
 
@@ -2317,6 +2781,9 @@ WHERE tenant_id = ? AND JSONExtractString(rail_json, 'rail') != ''",
         sql.push_str(" AND event_time >= toDateTime(?)");
     } else {
         sql.push_str(" AND event_time >= now() - toIntervalHour(?)");
+    }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND event_time <= toDateTime(?)");
     }
     sql.push_str(" GROUP BY rail ORDER BY evaluations DESC LIMIT ?");
     sql
@@ -2346,10 +2813,19 @@ WHERE tenant_id = ?",
     if f.correlation_id.is_some() {
         sql.push_str(" AND correlation_id = ?");
     }
+    if f.rail.is_some() {
+        // `rails` is a JSON array string of per-rail verdicts (`[{"rail":"R4_trifecta",…}]`).
+        sql.push_str(
+            " AND arrayExists(r -> JSONExtractString(r, 'rail') = ?, JSONExtractArrayRaw(rails))",
+        );
+    }
     if f.since_secs.is_some() {
         sql.push_str(" AND event_time >= toDateTime(?)");
     } else {
         sql.push_str(" AND event_time >= now() - toIntervalHour(?)");
+    }
+    if f.until_secs.is_some() {
+        sql.push_str(" AND event_time <= toDateTime(?)");
     }
     sql.push_str(" ORDER BY event_time DESC LIMIT ?");
     sql
@@ -2378,6 +2854,9 @@ WHERE tenant_id = ? AND notEmpty(aft_id)",
     );
     if f.since_us.is_some() {
         sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
+    }
+    if f.until_us.is_some() {
+        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
     }
     sql.push_str(" GROUP BY aft_id ORDER BY your_hits DESC, signature_id ASC LIMIT ?");
     sql
@@ -2411,6 +2890,9 @@ WHERE tenant_id = ?",
     if f.since_us.is_some() {
         sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
     }
+    if f.until_us.is_some() {
+        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
+    }
     sql
 }
 
@@ -2431,6 +2913,7 @@ struct TraceTotalRow {
 /// user input. `?` order: tenant, (since_us | window_days), limit.
 fn build_session_list_sql(f: &SessionListFilters) -> String {
     let conv = CONVERSATION_ID_ATTR;
+    let enduser = END_USER_ID_ATTR;
     let mut sql = format!(
         "SELECT \
 JSONExtractString(attributes, '{conv}') AS session_id, \
@@ -2444,7 +2927,9 @@ AND JSONExtractFloat(attributes, 'gen_ai_usage_cost') > 0, \
 JSONExtractFloat(attributes, 'gen_ai_usage_cost'), 0)) AS cost_usd, \
 toInt64(sum(toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens')) \
 + toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens')))) AS total_tokens, \
-argMax(JSONExtractString(attributes, 'gen_ai_response_model'), start_time) AS model \
+argMax(JSONExtractString(attributes, 'gen_ai_response_model'), start_time) AS model, \
+argMax(JSONExtractString(attributes, 'gen_ai_agent_name'), start_time) AS agent_name, \
+argMax(JSONExtractString(attributes, '{enduser}'), start_time) AS end_user \
 FROM spans FINAL \
 WHERE tenant_id = ? AND JSONExtractString(attributes, '{conv}') != ''"
     );
@@ -2457,6 +2942,9 @@ WHERE tenant_id = ? AND JSONExtractString(attributes, '{conv}') != ''"
         sql.push_str(" AND start_time >= fromUnixTimestamp64Micro(?)");
     } else {
         sql.push_str(" AND start_time >= now() - toIntervalDay(?)");
+    }
+    if f.until_us.is_some() {
+        sql.push_str(" AND start_time <= fromUnixTimestamp64Micro(?)");
     }
     sql.push_str(" GROUP BY session_id");
     // Status filter — post-aggregation, literal comparison (no bind).
@@ -2565,6 +3053,17 @@ pub trait TraceReader: Send + Sync {
         tenant_id: &TenantId,
         filters: &CostFilters,
     ) -> Result<Vec<CostRow>>;
+    /// DSH-13: one `breakdown` tile for a (metric, dimension) pair no other route serves.
+    /// Default is EMPTY so the mock readers stay untouched; the ClickHouse reader
+    /// overrides it.
+    async fn metric_breakdown(
+        &self,
+        tenant_id: &TenantId,
+        f: &BreakdownFilters,
+    ) -> Result<Vec<BreakdownRow>> {
+        let _ = (tenant_id, f);
+        Ok(Vec::new())
+    }
     /// Window-wide latency split (overhead / provider / TTFT) + per-(provider,
     /// model) overhead for the SLO table. Two live `spans` aggregates. Returns
     /// `(totals, by_model)`.
@@ -2619,12 +3118,124 @@ pub trait TraceReader: Send + Sync {
 /// wrapped by [`TenantQuery`] for ADR-031 resource caps.
 pub struct ClickHouseTraceReader {
     client: ClickhouseClient,
+    /// The same cache the hot path reads — no Postgres per request. `None` on a
+    /// stack with no control plane, which resolves to the FREE tier (fail-closed,
+    /// `.claude/rules/tenancy.md`).
+    entitlements: Option<Arc<crate::entitlement_cache::EntitlementCache>>,
 }
 
 impl ClickHouseTraceReader {
     pub fn new(client: ClickhouseClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            entitlements: None,
+        }
     }
+
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
+    }
+
+    /// The ADR-031 cap tier for THIS tenant — the tenant's own plan, read from the
+    /// entitlement cache.
+    ///
+    /// B-330 / DSH-13 §3 (2026-09-05): every read in this file ran as
+    /// `self.tier_for(tenant_id).await` — 26 literals — so a Business tenant queried under
+    /// Builder's 512 MiB / 10 s / 50 M-row caps whatever it paid for, and a custom
+    /// dashboard multiplies reads by tiles, which is exactly where a tier-blind cap
+    /// becomes a support ticket. A test below asserts the literal is GONE from this
+    /// file. Fails CLOSED: no cache → `Free`; an unknown plan key → the conservative
+    /// default `from_plan_key` already carries.
+    async fn tier_for(&self, tenant_id: &TenantId) -> PlanTier {
+        match self.entitlements.as_ref() {
+            None => PlanTier::Free,
+            Some(cache) => {
+                let resolved = cache.resolved(*tenant_id.as_uuid()).await;
+                PlanTier::from_plan_key(&resolved.plan_lookup_key)
+            }
+        }
+    }
+}
+
+/// B-379: the list window when the caller sends none. Seven days is the product
+/// default the UI already sends; the API's previous default was "everything the
+/// tenant ever recorded", which is the unbounded scan the migration-22 projection
+/// cannot save. A caller that wants more sends `since`, up to its retention.
+pub(crate) const DEFAULT_LIST_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// Slack on the upper bound so a span whose `start_time` sits a little in the
+/// future (OTLP client clock skew) is not excluded from "now".
+const UNTIL_SLACK_SECS: i64 = 60 * 60;
+
+impl TraceListFilters {
+    /// The effective `(since_us, until_us)` window — ALWAYS present (B-379).
+    /// Pure, so the default is testable.
+    #[must_use]
+    pub(crate) fn window_bounds(&self, now_us: i64) -> (i64, i64) {
+        (
+            self.since_us
+                .unwrap_or(now_us - DEFAULT_LIST_WINDOW_SECS * 1_000_000),
+            self.until_us
+                .unwrap_or(now_us + UNTIL_SLACK_SECS * 1_000_000),
+        )
+    }
+}
+
+fn now_us() -> i64 {
+    chrono::Utc::now().timestamp_micros()
+}
+
+/// Bind the prefix every trace_summaries query shares: `w_since, w_until`
+/// ([`WINDOW_WITH`]), the inner tenant ([`MERGED_SUMMARIES`]) and the outer
+/// tenant, then the filters in [`push_trace_filters`]'s exact order. Cursor and
+/// limit are the caller's.
+fn bind_trace_prefix_and_filters(
+    mut q: clickhouse::query::Query,
+    tenant_id: &TenantId,
+    f: &TraceListFilters,
+) -> clickhouse::query::Query {
+    let (since, until) = f.window_bounds(now_us());
+    q = q
+        .bind(since)
+        .bind(until)
+        .bind(tenant_id.to_string())
+        .bind(tenant_id.to_string());
+    if let Some(m) = &f.model {
+        q = q.bind(m.clone());
+    }
+    if let Some(d) = f.min_duration_us {
+        q = q.bind(d);
+    }
+    if let Some(sig) = &f.signature_id {
+        // Subquery binds: tenant_id (again — tenant-scoped) then the AFT id.
+        q = q.bind(tenant_id.to_string()).bind(sig.clone());
+    }
+    if let Some(term) = &f.q {
+        // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
+        // form for BOTH columns — four probes mirroring the two
+        // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
+        let lower = term.to_lowercase();
+        q = q
+            .bind(tenant_id.to_string())
+            .bind(term.clone())
+            .bind(lower.clone())
+            .bind(term.clone())
+            .bind(lower);
+    }
+    if f.failover == Some(true) {
+        // Failover subquery binds tenant_id (tenant-scoped).
+        q = q.bind(tenant_id.to_string());
+    }
+    if let Some(u) = &f.end_user {
+        // OBS-20 subquery binds tenant_id THEN the id — the two `?` in
+        // `WHERE tenant_id = ? AND … = ?`, in that order (TRAPS §58).
+        q = q.bind(tenant_id.to_string()).bind(u.clone());
+    }
+    q
 }
 
 #[async_trait::async_trait]
@@ -2634,40 +3245,9 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &TraceListFilters,
     ) -> Result<Vec<TraceSummaryRow>> {
-        let sql = TenantQuery::new(build_trace_list_sql(f), PlanTier::Builder).sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
-        if let Some(m) = &f.model {
-            q = q.bind(m.clone());
-        }
-        if let Some(d) = f.min_duration_us {
-            q = q.bind(d);
-        }
-        if let Some(sig) = &f.signature_id {
-            // Subquery binds: tenant_id (again — tenant-scoped) then the AFT id.
-            q = q.bind(tenant_id.to_string()).bind(sig.clone());
-        }
-        if let Some(term) = &f.q {
-            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
-            // form for BOTH columns — four probes mirroring the two
-            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
-            let lower = term.to_lowercase();
-            q = q
-                .bind(tenant_id.to_string())
-                .bind(term.clone())
-                .bind(lower.clone())
-                .bind(term.clone())
-                .bind(lower);
-        }
-        if f.failover == Some(true) {
-            // Failover subquery binds tenant_id (tenant-scoped).
-            q = q.bind(tenant_id.to_string());
-        }
-        if let Some(s) = f.since_us {
-            q = q.bind(s);
-        }
-        if let Some(u) = f.until_us {
-            q = q.bind(u);
-        }
+        let sql = TenantQuery::new(build_trace_list_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
+        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
         if let Some((cts, cid)) = &f.cursor {
             q = q.bind(*cts).bind(*cts).bind(cid.clone());
         }
@@ -2683,40 +3263,13 @@ impl TraceReader for ClickHouseTraceReader {
         by: TraceGroupBy,
         f: &TraceListFilters,
     ) -> Result<Vec<TraceGroupRow>> {
-        let sql =
-            TenantQuery::new(build_trace_groups_sql(by, f), PlanTier::Builder).sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let sql = TenantQuery::new(
+            build_trace_groups_sql(by, f),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         // Filter binds MIRROR list_traces (same order as build_trace_groups_sql).
-        if let Some(m) = &f.model {
-            q = q.bind(m.clone());
-        }
-        if let Some(d) = f.min_duration_us {
-            q = q.bind(d);
-        }
-        if let Some(sig) = &f.signature_id {
-            q = q.bind(tenant_id.to_string()).bind(sig.clone());
-        }
-        if let Some(term) = &f.q {
-            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
-            // form for BOTH columns — four probes mirroring the two
-            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
-            let lower = term.to_lowercase();
-            q = q
-                .bind(tenant_id.to_string())
-                .bind(term.clone())
-                .bind(lower.clone())
-                .bind(term.clone())
-                .bind(lower);
-        }
-        if f.failover == Some(true) {
-            q = q.bind(tenant_id.to_string());
-        }
-        if let Some(s) = f.since_us {
-            q = q.bind(s);
-        }
-        if let Some(u) = f.until_us {
-            q = q.bind(u);
-        }
+        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
         q = q.bind(f.limit);
         q.fetch_all::<TraceGroupRow>()
             .await
@@ -2724,39 +3277,10 @@ impl TraceReader for ClickHouseTraceReader {
     }
 
     async fn count_traces(&self, tenant_id: &TenantId, f: &TraceListFilters) -> Result<u64> {
-        let sql = TenantQuery::new(build_trace_count_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_trace_count_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         // Bind order MIRRORS build_trace_list_sql's filter binds, minus cursor/limit.
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
-        if let Some(m) = &f.model {
-            q = q.bind(m.clone());
-        }
-        if let Some(d) = f.min_duration_us {
-            q = q.bind(d);
-        }
-        if let Some(sig) = &f.signature_id {
-            q = q.bind(tenant_id.to_string()).bind(sig.clone());
-        }
-        if let Some(term) = &f.q {
-            // OBS-01 binds: tenant_id (tenant-scoped), then the term and its lowercase
-            // form for BOTH columns — four probes mirroring the two
-            // `multiSearchAny(col, [?, ?])` pairs, in that exact order.
-            let lower = term.to_lowercase();
-            q = q
-                .bind(tenant_id.to_string())
-                .bind(term.clone())
-                .bind(lower.clone())
-                .bind(term.clone())
-                .bind(lower);
-        }
-        if f.failover == Some(true) {
-            q = q.bind(tenant_id.to_string());
-        }
-        if let Some(s) = f.since_us {
-            q = q.bind(s);
-        }
-        if let Some(u) = f.until_us {
-            q = q.bind(u);
-        }
+        let q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
         let row = q
             .fetch_one::<TraceTotalRow>()
             .await
@@ -2765,14 +3289,25 @@ impl TraceReader for ClickHouseTraceReader {
     }
 
     async fn list_spans(&self, tenant_id: &TenantId, trace_id: &str) -> Result<Vec<SpanRow>> {
-        let sql = TenantQuery::new(SPANS_SQL, PlanTier::Builder).sql_with_settings();
-        self.client
+        let sql = TenantQuery::new(SPANS_SQL, self.tier_for(tenant_id).await).sql_with_settings();
+        let mut spans: Vec<SpanRow> = self
+            .client
             .query(&sql)
             .bind(tenant_id.to_string())
             .bind(trace_id.to_string())
             .fetch_all::<SpanRow>()
             .await
-            .context("spans SELECT failed")
+            .context("spans SELECT failed")?;
+        // BILL-01 / ADR-076 §2.3 — reverse any content-addressed dedup ingest
+        // applied. Fail-open (a read path): a rehydration failure leaves the
+        // `$ref` placeholders exactly as stored rather than failing the whole
+        // trace view.
+        let mut attrs: Vec<&mut String> = spans.iter_mut().map(|s| &mut s.attributes).collect();
+        if let Err(e) = crate::billing::blobs::rehydrate(&self.client, tenant_id, &mut attrs).await
+        {
+            tracing::warn!(error = %e, "blob rehydration failed; spans returned with $ref placeholders unexpanded");
+        }
+        Ok(spans)
     }
 
     async fn trace_chain_status(
@@ -2780,7 +3315,8 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         trace_id: &str,
     ) -> Result<Option<TraceChainStatus>> {
-        let sql = TenantQuery::new(TRACE_CHAIN_SQL, PlanTier::Builder).sql_with_settings();
+        let sql =
+            TenantQuery::new(TRACE_CHAIN_SQL, self.tier_for(tenant_id).await).sql_with_settings();
         let row = self
             .client
             .query(&sql)
@@ -2807,7 +3343,7 @@ impl TraceReader for ClickHouseTraceReader {
         }
         let sql = TenantQuery::new(
             build_trace_cost_rollup_sql(trace_ids.len()),
-            PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
@@ -2820,7 +3356,8 @@ impl TraceReader for ClickHouseTraceReader {
     }
 
     async fn slo(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<Vec<SloRow>> {
-        let sql = TenantQuery::new(build_slo_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql =
+            TenantQuery::new(build_slo_sql(f), self.tier_for(tenant_id).await).sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
@@ -2842,7 +3379,8 @@ impl TraceReader for ClickHouseTraceReader {
     }
 
     async fn slo_summary(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<SloSummary> {
-        let sql = TenantQuery::new(build_slo_summary_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_slo_summary_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
@@ -2866,8 +3404,8 @@ impl TraceReader for ClickHouseTraceReader {
     }
 
     async fn slo_by_model(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<Vec<SloModelRow>> {
-        let sql =
-            TenantQuery::new(build_slo_by_model_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_slo_by_model_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
@@ -2895,8 +3433,11 @@ impl TraceReader for ClickHouseTraceReader {
         f: &SloFilters,
         bucket_hours: u32,
     ) -> Result<Vec<SloTimePoint>> {
-        let sql = TenantQuery::new(build_slo_timeseries_sql(f, bucket_hours), PlanTier::Builder)
-            .sql_with_settings();
+        let sql = TenantQuery::new(
+            build_slo_timeseries_sql(f, bucket_hours),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
@@ -2905,6 +3446,12 @@ impl TraceReader for ClickHouseTraceReader {
         }
         if let Some(u) = f.until_secs {
             q = q.bind(u);
+        }
+        if let Some(p) = &f.provider {
+            q = q.bind(p.clone());
+        }
+        if let Some(m) = &f.model {
+            q = q.bind(m.clone());
         }
         q.fetch_all::<SloTimePoint>()
             .await
@@ -2916,13 +3463,16 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &GatewayStatsFilters,
     ) -> Result<Vec<GatewayProviderRow>> {
-        let sql =
-            TenantQuery::new(build_gateway_stats_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_gateway_stats_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
             q = q.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            q = q.bind(u);
         }
         q = q.bind(f.limit);
         q.fetch_all::<GatewayProviderRow>()
@@ -2930,9 +3480,30 @@ impl TraceReader for ClickHouseTraceReader {
             .context("gateway stats SELECT failed")
     }
 
+    async fn metric_breakdown(
+        &self,
+        tenant_id: &TenantId,
+        f: &BreakdownFilters,
+    ) -> Result<Vec<BreakdownRow>> {
+        let sql = TenantQuery::new(
+            build_metric_breakdown_sql(f.metric, f.by),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
+        self.client
+            .query(&sql)
+            .bind(tenant_id.to_string())
+            .bind(f.since_us)
+            .bind(f.until_us)
+            .bind(f.limit)
+            .fetch_all::<BreakdownRow>()
+            .await
+            .context("metric breakdown SELECT failed")
+    }
+
     async fn cost_breakdown(&self, tenant_id: &TenantId, f: &CostFilters) -> Result<Vec<CostRow>> {
-        let sql =
-            TenantQuery::new(build_cost_breakdown_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_cost_breakdown_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         self.client
             .query(&sql)
             .bind(tenant_id.to_string())
@@ -2951,12 +3522,16 @@ impl TraceReader for ClickHouseTraceReader {
         // (1) window-wide totals — one aggregate row (always present, all-zero on
         //     an empty window thanks to the SQL guards → fetch_one is total).
         let totals_sql =
-            TenantQuery::new(build_latency_totals_sql(f), PlanTier::Builder).sql_with_settings();
+            TenantQuery::new(build_latency_totals_sql(f), self.tier_for(tenant_id).await)
+                .sql_with_settings();
         let mut tq = self.client.query(&totals_sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             tq = tq.bind(s);
         } else {
             tq = tq.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            tq = tq.bind(u);
         }
         let totals = tq
             .fetch_one::<LatencyTotalsRow>()
@@ -2964,13 +3539,19 @@ impl TraceReader for ClickHouseTraceReader {
             .context("latency totals SELECT failed")?;
 
         // (2) per-(provider, model) overhead — the SLO-table column.
-        let by_model_sql =
-            TenantQuery::new(build_latency_by_model_sql(f), PlanTier::Builder).sql_with_settings();
+        let by_model_sql = TenantQuery::new(
+            build_latency_by_model_sql(f),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         let mut mq = self.client.query(&by_model_sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             mq = mq.bind(s);
         } else {
             mq = mq.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            mq = mq.bind(u);
         }
         mq = mq.bind(f.limit);
         let by_model = mq
@@ -2986,13 +3567,19 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &GuardrailStatsFilters,
     ) -> Result<GuardrailSummaryRow> {
-        let sql =
-            TenantQuery::new(build_guardrail_summary_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(
+            build_guardrail_summary_sql(f),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
             q = q.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            q = q.bind(u);
         }
         // Single aggregate row (always exactly one, even on an empty window).
         q.fetch_one::<GuardrailSummaryRow>()
@@ -3005,13 +3592,16 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &GuardrailStatsFilters,
     ) -> Result<Vec<GuardrailRailRow>> {
-        let sql =
-            TenantQuery::new(build_guardrail_rails_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_guardrail_rails_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
             q = q.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            q = q.bind(u);
         }
         q = q.bind(f.limit);
         q.fetch_all::<GuardrailRailRow>()
@@ -3024,21 +3614,30 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &GuardrailVerdictListFilters,
     ) -> Result<Vec<GuardrailVerdictListRow>> {
-        let sql = TenantQuery::new(build_guardrail_verdicts_sql(f), PlanTier::Builder)
-            .sql_with_settings();
+        let sql = TenantQuery::new(
+            build_guardrail_verdicts_sql(f),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
-        // Bind order mirrors the SQL: tenant, [decision], [correlation_id],
-        // (since_secs | hours), limit.
+        // Bind order mirrors the SQL: tenant, [decision], [correlation_id], [rail],
+        // (since_secs | hours), [until], limit.
         if let Some(d) = f.decision.as_deref() {
             q = q.bind(d);
         }
         if let Some(c) = f.correlation_id.as_deref() {
             q = q.bind(c);
         }
+        if let Some(r) = f.rail.as_deref() {
+            q = q.bind(r);
+        }
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
             q = q.bind(f.hours);
+        }
+        if let Some(u) = f.until_secs {
+            q = q.bind(u);
         }
         q = q.bind(f.limit);
         q.fetch_all::<GuardrailVerdictListRow>()
@@ -3051,10 +3650,14 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &SignatureFilters,
     ) -> Result<Vec<SignatureHitRow>> {
-        let sql = TenantQuery::new(build_signatures_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_signatures_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(s) = f.since_us {
             q = q.bind(s);
+        }
+        if let Some(u) = f.until_us {
+            q = q.bind(u);
         }
         q = q.bind(f.limit);
         q.fetch_all::<SignatureHitRow>()
@@ -3067,8 +3670,11 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &SignatureFilters,
     ) -> Result<u64> {
-        let sql = TenantQuery::new(build_signatures_trace_total_sql(f), PlanTier::Builder)
-            .sql_with_settings();
+        let sql = TenantQuery::new(
+            build_signatures_trace_total_sql(f),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         // Bind order MIRRORS build_signatures_trace_total_sql: tenant, live_ids…,
         // [since_us]. The live-id IN list is bound (never interpolated).
@@ -3077,6 +3683,9 @@ impl TraceReader for ClickHouseTraceReader {
         }
         if let Some(s) = f.since_us {
             q = q.bind(s);
+        }
+        if let Some(u) = f.until_us {
+            q = q.bind(u);
         }
         let row = q
             .fetch_one::<TraceTotalRow>()
@@ -3090,8 +3699,8 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         f: &SessionListFilters,
     ) -> Result<Vec<SessionSummaryRow>> {
-        let sql =
-            TenantQuery::new(build_session_list_sql(f), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_session_list_sql(f), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         let mut q = self.client.query(&sql).bind(tenant_id.to_string());
         if let Some(m) = f.model.as_deref() {
             q = q.bind(m);
@@ -3100,6 +3709,9 @@ impl TraceReader for ClickHouseTraceReader {
             q = q.bind(s);
         } else {
             q = q.bind(f.window_days);
+        }
+        if let Some(u) = f.until_us {
+            q = q.bind(u);
         }
         q = q.bind(f.limit);
         q.fetch_all::<SessionSummaryRow>()
@@ -3112,8 +3724,8 @@ impl TraceReader for ClickHouseTraceReader {
         tenant_id: &TenantId,
         session_id: &str,
     ) -> Result<Vec<SessionTraceRow>> {
-        let sql =
-            TenantQuery::new(build_session_traces_sql(), PlanTier::Builder).sql_with_settings();
+        let sql = TenantQuery::new(build_session_traces_sql(), self.tier_for(tenant_id).await)
+            .sql_with_settings();
         self.client
             .query(&sql)
             .bind(tenant_id.to_string())
@@ -3131,6 +3743,10 @@ impl TraceReader for ClickHouseTraceReader {
 #[derive(Clone)]
 pub struct TraceReadState {
     pub reader: Arc<dyn TraceReader>,
+    /// B-386 (b): the SAME per-tenant rejection counters the admission pipeline
+    /// records on (`AppState::rejection_metrics`), shared by `Arc`. A separate
+    /// instance here would report zeros for a tenant the hot path is throttling.
+    pub rejections: Arc<crate::rejection_metrics::RejectionRegistry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3149,6 +3765,10 @@ pub struct TraceListQuery {
     /// `"true"` → only traces where a cross-provider failover fired (Gateway page
     /// "Failovers" click-through). Any other value → no filter.
     failover: Option<String>,
+    /// `OBS-20` — keep only traces carrying this end-user id. Exact match,
+    /// bound not interpolated. Empty string is treated as absent so a
+    /// cleared filter chip does not become a search for the empty id.
+    end_user: Option<String>,
     /// Opaque keyset token from a previous `next_cursor`.
     cursor: Option<String>,
     /// RFC3339 inclusive lower bound on start_time.
@@ -3173,6 +3793,10 @@ pub struct TraceExportQuery {
     signature_id: Option<String>,
     /// `"true"` → export only failover traces (mirrors the list filter).
     failover: Option<String>,
+    /// `OBS-20` — keep only traces carrying this end-user id. Exact match,
+    /// bound not interpolated. Empty string is treated as absent so a
+    /// cleared filter chip does not become a search for the empty id.
+    end_user: Option<String>,
     since: Option<String>,
     until: Option<String>,
     sort: Option<String>,
@@ -3190,6 +3814,10 @@ pub struct TraceGroupsQuery {
     signature_id: Option<String>,
     /// `"true"` → group only failover traces (mirrors the list filter).
     failover: Option<String>,
+    /// `OBS-20` — keep only traces carrying this end-user id. Exact match,
+    /// bound not interpolated. Empty string is treated as absent so a
+    /// cleared filter chip does not become a search for the empty id.
+    end_user: Option<String>,
     since: Option<String>,
     until: Option<String>,
 }
@@ -3204,6 +3832,9 @@ pub struct SloQuery {
     /// Display-bucket width in hours for `/v1/slo/timeseries` (default 1 =
     /// hourly). Clamped to `1..=MAX_SLO_HOURS`; unused by the other SLO routes.
     bucket: Option<u32>,
+    /// Sub-hour bucket width in minutes (1|5|10|15|30) for `/v1/slo` and
+    /// `/v1/slo/timeseries`; only for windows ≤ 24 h (DSH-11 §3a.4).
+    bucket_minutes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3212,6 +3843,8 @@ pub struct GatewayStatsQuery {
     hours: Option<u32>,
     /// RFC3339 inclusive lower bound on `start_time` (overrides `hours`).
     since: Option<String>,
+    /// RFC3339 inclusive upper bound on `start_time` (DSH-11).
+    until: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3220,6 +3853,8 @@ pub struct GuardrailStatsQuery {
     hours: Option<u32>,
     /// RFC3339 inclusive lower bound on `event_time` (overrides `hours`).
     since: Option<String>,
+    /// RFC3339 inclusive upper bound on `event_time` (DSH-11).
+    until: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3228,12 +3863,29 @@ pub struct GuardrailVerdictsQuery {
     hours: Option<u32>,
     /// RFC3339 inclusive lower bound on `event_time` (overrides `hours`).
     since: Option<String>,
+    /// RFC3339 inclusive upper bound on `event_time` (DSH-11).
+    until: Option<String>,
     /// Decision filter: `allow` | `block` | `redact` | `warn` (allowlisted).
     decision: Option<String>,
     /// Exact correlation-id (ULID) lookup — the id returned in a 403 block body.
     correlation_id: Option<String>,
+    /// Per-rail filter (B-335a), e.g. `R4_trifecta`. `[A-Za-z0-9_]{1,40}`.
+    rail: Option<String>,
     /// Row cap (default 100, max 500).
     limit: Option<u32>,
+}
+
+/// Validate a `rail` query value: an identifier of at most 40 chars from
+/// `[A-Za-z0-9_]` (the recorder writes ids like `R1_cost`…`R7_topic`). Bound,
+/// never interpolated.
+fn parse_rail_filter(raw: Option<&str>) -> Result<Option<String>, ()> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) if s.len() <= 40 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => {
+            Ok(Some(s.to_string()))
+        }
+        Some(_) => Err(()),
+    }
 }
 
 /// Validate a `decision` query value against the allowlist. Returns the owned
@@ -3269,6 +3921,8 @@ fn parse_decision_filter(s: Option<&str>) -> Result<Option<String>, ()> {
 pub struct SignatureQuery {
     /// RFC3339 inclusive lower bound on the matched span's start_time.
     since: Option<String>,
+    /// RFC3339 inclusive upper bound (DSH-11).
+    until: Option<String>,
     limit: Option<u32>,
     /// Comma-separated LIVE-detector AFT-1 id allowlist (from `aft-taxonomy.ts`),
     /// scoping the "traces affected" scalar to LIVE signatures. Each id is
@@ -3310,6 +3964,8 @@ pub struct SessionListQuery {
     days: Option<u32>,
     /// RFC3339 inclusive lower bound on `start_time` (overrides `days`).
     since: Option<String>,
+    /// RFC3339 inclusive upper bound on `start_time` (DSH-11).
+    until: Option<String>,
     /// Sort column: `turns` | `cost` | `tokens` | `duration` | (default) last-activity.
     sort: Option<String>,
     /// Sort direction: `asc` | (default) `desc`.
@@ -3341,6 +3997,7 @@ pub fn routes() -> Router<TraceReadState> {
         .route("/v1/slo/timeseries", get(slo_timeseries_handler))
         .route("/v1/gateway/stats", get(gateway_stats_handler))
         .route("/v1/costs", get(cost_breakdown_handler))
+        .route("/v1/metrics/breakdown", get(metric_breakdown_handler))
         .route(
             "/v1/query/latency-breakdown",
             get(latency_breakdown_handler),
@@ -3382,17 +4039,24 @@ async fn trace_count_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
+    // B-333: the list applies `q` and this handler dropped it, so the "N of M"
+    // footer reported the UNFILTERED total during a search.
+    let search = match validate_search_term(q.q.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
     let min_duration_us = q
         .min_latency_ms
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
-        q: None,
+        q: search,
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
+        end_user: q.end_user.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor: None,
@@ -3480,6 +4144,7 @@ async fn list_traces_handler(
         min_duration_us,
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
+        end_user: q.end_user.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor,
@@ -3588,6 +4253,7 @@ async fn export_traces_handler(
         min_duration_us,
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
+        end_user: q.end_user.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor: None,
@@ -3752,6 +4418,7 @@ async fn list_trace_groups_handler(
         min_duration_us,
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
+        end_user: q.end_user.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor: None,
@@ -3919,16 +4586,33 @@ async fn slo_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
-    let filters = SloFilters {
+    let hours = q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS);
+    // DSH-11 / B-331: an absolute window is clamped to the cap; the served window is
+    // echoed in `X-Tracelane-Window`. When `since` is absent the rolling `hours`
+    // predicate is kept byte-identical for every existing caller.
+    let served = ServedWindow::resolve(
         since_secs,
         until_secs,
-        hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let bucket_minutes = match validate_bucket_minutes(q.bucket_minutes, served.width_secs()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let filters = SloFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
+        bucket_minutes,
+        hours,
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
         // Clamped like the timeseries route. Absent => 1 => the historical hourly
         // response, so adding this parameter changes nothing for a caller that
         // never sends it.
-        bucket_hours: q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS),
+        bucket_hours: (q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS) as i64)
+            .max(cap_bucket_secs(3600, served.width_secs()) / 3600) as u32,
     };
 
     let rows = match state.reader.slo(&claims.tenant_id, &filters).await {
@@ -3938,7 +4622,7 @@ async fn slo_handler(
             return error_response(StatusCode::BAD_GATEWAY, "slo read failed");
         }
     };
-    Json(rows).into_response()
+    served.stamp(Json(rows).into_response())
 }
 
 /// GET /v1/slo/summary — the window-WIDE TRUE p50/p95/p99 (quantileMerge over the
@@ -3966,10 +4650,26 @@ async fn slo_summary_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
-    let filters = SloFilters {
+    let hours = q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS);
+    // DSH-11 / B-331: an absolute window is clamped to the cap; the served window is
+    // echoed in `X-Tracelane-Window`. When `since` is absent the rolling `hours`
+    // predicate is kept byte-identical for every existing caller.
+    let served = ServedWindow::resolve(
         since_secs,
         until_secs,
-        hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let bucket_minutes = match validate_bucket_minutes(q.bucket_minutes, served.width_secs()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let filters = SloFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
+        bucket_minutes,
+        hours,
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
         // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
@@ -3978,7 +4678,7 @@ async fn slo_summary_handler(
     };
 
     match state.reader.slo_summary(&claims.tenant_id, &filters).await {
-        Ok(s) => Json(s).into_response(),
+        Ok(s) => served.stamp(Json(s).into_response()),
         Err(err) => {
             tracing::error!(error = %err, "slo summary read failed");
             error_response(StatusCode::BAD_GATEWAY, "slo summary read failed")
@@ -4009,10 +4709,26 @@ async fn slo_by_model_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
-    let filters = SloFilters {
+    let hours = q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS);
+    // DSH-11 / B-331: an absolute window is clamped to the cap; the served window is
+    // echoed in `X-Tracelane-Window`. When `since` is absent the rolling `hours`
+    // predicate is kept byte-identical for every existing caller.
+    let served = ServedWindow::resolve(
         since_secs,
         until_secs,
-        hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let bucket_minutes = match validate_bucket_minutes(q.bucket_minutes, served.width_secs()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let filters = SloFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
+        bucket_minutes,
+        hours,
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
         // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
@@ -4021,7 +4737,7 @@ async fn slo_by_model_handler(
     };
 
     match state.reader.slo_by_model(&claims.tenant_id, &filters).await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => served.stamp(Json(rows).into_response()),
         Err(err) => {
             tracing::error!(error = %err, "slo per-model read failed");
             error_response(StatusCode::BAD_GATEWAY, "slo per-model read failed")
@@ -4053,24 +4769,41 @@ async fn slo_timeseries_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
-    let filters = SloFilters {
+    let hours = q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS);
+    // DSH-11 / B-331: an absolute window is clamped to the cap; the served window is
+    // echoed in `X-Tracelane-Window`. When `since` is absent the rolling `hours`
+    // predicate is kept byte-identical for every existing caller.
+    let served = ServedWindow::resolve(
         since_secs,
         until_secs,
-        hours: q.hours.unwrap_or(DEFAULT_SLO_HOURS).clamp(1, MAX_SLO_HOURS),
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let bucket_minutes = match validate_bucket_minutes(q.bucket_minutes, served.width_secs()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let filters = SloFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
+        bucket_minutes,
+        hours,
         provider: q.provider.filter(|s| !s.is_empty()),
         model: q.model.filter(|s| !s.is_empty()),
         // Not the /v1/slo row-bucketing path: summary merges over the WHOLE window
         // and timeseries takes its width as an explicit argument. 1 = no re-grouping.
         bucket_hours: 1,
     };
-    let bucket_hours = q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS);
+    let bucket_hours = (q.bucket.unwrap_or(1).clamp(1, MAX_SLO_HOURS) as i64)
+        .max(cap_bucket_secs(3600, served.width_secs()) / 3600) as u32;
 
     match state
         .reader
         .slo_timeseries(&claims.tenant_id, &filters, bucket_hours)
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => served.stamp(Json(rows).into_response()),
         Err(err) => {
             tracing::error!(error = %err, "slo timeseries read failed");
             error_response(StatusCode::BAD_GATEWAY, "slo timeseries read failed")
@@ -4084,6 +4817,114 @@ struct CostQuery {
     by: Option<String>,
     /// `all` (default) | `production` | `eval`. See [`CostScope`].
     scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricBreakdownQuery {
+    metric: Option<String>,
+    by: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    hours: Option<u32>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct BreakdownWindow {
+    since: String,
+    until: String,
+    clamped: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricBreakdownResponse {
+    metric: &'static str,
+    by: &'static str,
+    rows: Vec<BreakdownRow>,
+    window: BreakdownWindow,
+}
+
+/// Breakdown tiles show at most this many rows.
+const BREAKDOWN_LIMIT_CAP: u32 = 50;
+
+#[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn metric_breakdown_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<MetricBreakdownQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+
+    let Some(metric) = BreakdownMetric::parse(q.metric.as_deref()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid `metric` — expected one of: requests, errors, error_rate, p50_ms, p95_ms, \
+             input_tokens, output_tokens, cost_usd",
+        );
+    };
+    let Some(by) = BreakdownBy::parse(q.by.as_deref()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid `by` — expected one of: model, provider, key, status, operation",
+        );
+    };
+    let since_secs = match parse_rfc3339_secs(q.since.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
+    };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let hours = q
+        .hours
+        .unwrap_or(DEFAULT_GATEWAY_HOURS)
+        .clamp(1, MAX_GATEWAY_HOURS);
+    let served = ServedWindow::resolve(
+        since_secs,
+        until_secs,
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let filters = BreakdownFilters {
+        metric,
+        by,
+        since_us: served.since_secs.saturating_mul(1_000_000),
+        until_us: served.until_secs.saturating_mul(1_000_000),
+        limit: q.limit.unwrap_or(10).clamp(1, BREAKDOWN_LIMIT_CAP),
+    };
+    let rows = match state
+        .reader
+        .metric_breakdown(&claims.tenant_id, &filters)
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(error = %err, "metric breakdown read failed");
+            return error_response(StatusCode::BAD_GATEWAY, "metric breakdown read failed");
+        }
+    };
+    let iso = |secs: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default()
+    };
+    let out = MetricBreakdownResponse {
+        metric: metric.as_str(),
+        by: by.as_str(),
+        rows,
+        window: BreakdownWindow {
+            since: iso(served.since_secs),
+            until: iso(served.until_secs),
+            clamped: served.clamped,
+        },
+    };
+    served.stamp(Json(out).into_response())
 }
 
 /// `GET /v1/costs` — spend attributed by key, model or provider.
@@ -4213,12 +5054,27 @@ async fn gateway_stats_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
     };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
     let hours = q
         .hours
         .unwrap_or(DEFAULT_GATEWAY_HOURS)
         .clamp(1, MAX_GATEWAY_HOURS);
-    let filters = GatewayStatsFilters {
+    let served = ServedWindow::resolve(
         since_secs,
+        until_secs,
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    // The echoed `window_hours` is the window ACTUALLY served — it used to echo the
+    // clamped `hours` even when `since` governed the query (inventory finding).
+    let hours = (served.width_secs() / 3600).max(1) as u32;
+    let filters = GatewayStatsFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
         hours,
         limit: GATEWAY_PROVIDER_CAP,
     };
@@ -4237,7 +5093,7 @@ async fn gateway_stats_handler(
     // Rate-limit / quota 429s never reach a span (rejected pre-dispatch), so the
     // live per-tenant counters supply those numbers — process-lifetime, disclosed
     // as "since gateway start" by the surface.
-    let rejections = crate::rejection_metrics::registry().snapshot(&claims.tenant_id);
+    let rejections = state.rejections.snapshot(&claims.tenant_id);
     // Live circuit-breaker states (global read handle; ADR-036). Breakers are
     // per-(provider, region) and shared across tenants — upstream health, not
     // tenant data — so this is a process-wide snapshot, collapsed to per-provider.
@@ -4255,10 +5111,12 @@ async fn gateway_stats_handler(
             })
             .or_insert(state);
     }
-    Json(GatewayStatsResponse::from_rows(
-        rows, hours, rejections, &breakers,
-    ))
-    .into_response()
+    served.stamp(
+        Json(GatewayStatsResponse::from_rows(
+            rows, hours, rejections, &breakers,
+        ))
+        .into_response(),
+    )
 }
 
 /// GET /v1/query/latency-breakdown — the honest latency SPLIT for the authenticated
@@ -4283,12 +5141,27 @@ async fn latency_breakdown_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
     };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
     let hours = q
         .hours
         .unwrap_or(DEFAULT_GATEWAY_HOURS)
         .clamp(1, MAX_GATEWAY_HOURS);
-    let filters = GatewayStatsFilters {
+    let served = ServedWindow::resolve(
         since_secs,
+        until_secs,
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    // The echoed `window_hours` is the window ACTUALLY served — it used to echo the
+    // clamped `hours` even when `since` governed the query (inventory finding).
+    let hours = (served.width_secs() / 3600).max(1) as u32;
+    let filters = GatewayStatsFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
         hours,
         limit: GATEWAY_PROVIDER_CAP,
     };
@@ -4313,7 +5186,8 @@ async fn latency_breakdown_handler(
             ttft_samples: t.ttft_samples,
             by_model,
         })
-        .into_response(),
+        .into_response()
+        .pipe_stamp(&served),
         Err(err) => {
             tracing::error!(error = %err, "latency breakdown read failed");
             error_response(StatusCode::BAD_GATEWAY, "latency breakdown read failed")
@@ -4344,12 +5218,25 @@ async fn guardrail_stats_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
     };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
     let hours = q
         .hours
         .unwrap_or(DEFAULT_GUARDRAIL_HOURS)
         .clamp(1, MAX_GUARDRAIL_HOURS);
-    let filters = GuardrailStatsFilters {
+    let served = ServedWindow::resolve(
         since_secs,
+        until_secs,
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let hours = (served.width_secs() / 3600).max(1) as u32;
+    let filters = GuardrailStatsFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
         hours,
         limit: GUARDRAIL_RAIL_CAP,
     };
@@ -4376,7 +5263,7 @@ async fn guardrail_stats_handler(
             return error_response(StatusCode::BAD_GATEWAY, "guardrail read failed");
         }
     };
-    Json(GuardrailStatsResponse::build(summary, rails, hours)).into_response()
+    served.stamp(Json(GuardrailStatsResponse::build(summary, rails, hours)).into_response())
 }
 
 /// GET /v1/guardrails/verdicts — the verdict-detail rows behind the decision-mix
@@ -4408,14 +5295,32 @@ async fn guardrail_verdicts_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid correlation_id"),
     };
-    let filters = GuardrailVerdictListFilters {
+    let rail = match parse_rail_filter(q.rail.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid rail filter"),
+    };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let hours = q
+        .hours
+        .unwrap_or(DEFAULT_GUARDRAIL_HOURS)
+        .clamp(1, MAX_GUARDRAIL_HOURS);
+    let served = ServedWindow::resolve(
         since_secs,
-        hours: q
-            .hours
-            .unwrap_or(DEFAULT_GUARDRAIL_HOURS)
-            .clamp(1, MAX_GUARDRAIL_HOURS),
+        until_secs,
+        hours,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    let filters = GuardrailVerdictListFilters {
+        since_secs: since_secs.map(|_| served.since_secs),
+        until_secs: until_secs.map(|_| served.until_secs),
+        hours,
         decision,
         correlation_id,
+        rail,
         limit: q
             .limit
             .unwrap_or(DEFAULT_VERDICT_LIMIT)
@@ -4433,7 +5338,7 @@ async fn guardrail_verdicts_handler(
             return error_response(StatusCode::BAD_GATEWAY, "guardrail read failed");
         }
     };
-    Json(GuardrailVerdictListResponse { verdicts }).into_response()
+    served.stamp(Json(GuardrailVerdictListResponse { verdicts }).into_response())
 }
 
 /// GET /v1/query/signatures — the §4 failure-signatures "your hits" aggregate for
@@ -4452,12 +5357,27 @@ async fn signatures_handler(
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
 
-    let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
+    let since_secs = match parse_rfc3339_secs(q.since.as_deref()) {
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
     };
+    let until_secs = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    // B-331: this route had NO default window — a bare call was a full-history
+    // ARRAY JOIN over the tenant's spans. It now defaults to the widest window the
+    // other families serve (720 h), and an absolute pair is clamped to that.
+    let served = ServedWindow::resolve(
+        since_secs,
+        until_secs,
+        MAX_SLO_HOURS,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
     let filters = SignatureFilters {
-        since_us,
+        since_us: Some(served.since_secs * 1_000_000),
+        until_us: until_secs.map(|_| served.until_secs * 1_000_000),
         limit: q
             .limit
             .unwrap_or(DEFAULT_SIGNATURE_LIMIT)
@@ -4484,11 +5404,13 @@ async fn signatures_handler(
         }
     };
     let signatures = rows.into_iter().map(SignatureHit::from).collect();
-    Json(SignaturesResponse {
-        signatures,
-        total_traces_affected,
-    })
-    .into_response()
+    served.stamp(
+        Json(SignaturesResponse {
+            signatures,
+            total_traces_affected,
+        })
+        .into_response(),
+    )
 }
 
 /// GET /v1/sessions — §3 multi-turn session list for the authenticated tenant.
@@ -4510,12 +5432,27 @@ async fn list_sessions_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
     };
+    let until_us = match parse_rfc3339_micros(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let window_days = q
+        .days
+        .unwrap_or(DEFAULT_SESSION_WINDOW_DAYS)
+        .clamp(1, MAX_SESSION_WINDOW_DAYS);
+    // B-331 for sessions: `since` used to replace the day predicate with no width
+    // check. Clamp in seconds, keep the micro unit the SQL binds.
+    let served = ServedWindow::resolve(
+        since_us.map(|u| u / 1_000_000),
+        until_us.map(|u| u / 1_000_000),
+        window_days * 24,
+        chrono::Utc::now().timestamp(),
+        MAX_SESSION_WINDOW_US / 1_000_000,
+    );
     let filters = SessionListFilters {
-        since_us,
-        window_days: q
-            .days
-            .unwrap_or(DEFAULT_SESSION_WINDOW_DAYS)
-            .clamp(1, MAX_SESSION_WINDOW_DAYS),
+        since_us: since_us.map(|_| served.since_secs * 1_000_000),
+        until_us: until_us.map(|_| served.until_secs * 1_000_000),
+        window_days,
         model: q.model.filter(|m| !m.trim().is_empty()),
         status_error: parse_status_filter(q.status.as_deref()),
         sort: parse_session_sort(q.sort.as_deref()),
@@ -4538,7 +5475,7 @@ async fn list_sessions_handler(
         }
     };
     let sessions = rows.into_iter().map(SessionSummary::from).collect();
-    Json(SessionListResponse { sessions }).into_response()
+    served.stamp(Json(SessionListResponse { sessions }).into_response())
 }
 
 /// GET /v1/sessions/{session_id}/traces — the ordered turns (traces) of one
@@ -4597,7 +5534,8 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
         .await
         .map_err(|err| {
             tracing::warn!(error = %err, "trace read auth failed");
-            error_response(StatusCode::UNAUTHORIZED, "invalid credentials")
+            let (status, msg) = crate::auth::failure(&err);
+            error_response(status, msg)
         })?;
 
     // A13: every read route funnels through this ONE helper, so the `read` scope
@@ -5014,6 +5952,12 @@ mod obs01_search_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-386 (b): a fresh rejection registry per test — the read state carries
+    /// the SAME `Arc` the hot path records on in production.
+    fn test_rejections() -> Arc<crate::rejection_metrics::RejectionRegistry> {
+        Arc::new(crate::rejection_metrics::RejectionRegistry::new())
+    }
     use std::sync::Mutex;
 
     // ── Pure SQL-builder tests (no client, no env) ───────────────────────────
@@ -5030,8 +5974,17 @@ mod tests {
         let where_pos = sql.find("WHERE tenant_id = ?").unwrap();
         // No other predicate precedes the tenant filter.
         assert!(!sql[..where_pos].contains("AND "));
-        assert!(sql.contains("FROM trace_summaries FINAL"));
-        assert!(sql.contains("ORDER BY start_time DESC, trace_id DESC"));
+        // B-379: the merge is a GROUP BY over the window, never `FINAL` (which
+        // cannot use the time-ordered projection), and the window is ALWAYS bound
+        // — two `WITH` clocks before anything else.
+        assert!(sql.starts_with(WINDOW_WITH), "sql: {sql}");
+        assert!(
+            !sql.contains("FINAL"),
+            "FINAL disables the projection: {sql}"
+        );
+        assert!(sql.contains("GROUP BY tenant_id, trace_id"));
+        assert!(sql.contains("start_time >= w_since AND start_time <= w_until"));
+        assert!(sql.contains("ORDER BY st_min DESC, trace_id DESC"));
         assert!(sql.trim_end().ends_with("LIMIT ?"));
     }
 
@@ -5049,17 +6002,14 @@ mod tests {
             limit: 25,
             ..Default::default()
         });
-        // model ? before the keyset ?s before limit ?.
+        // B-379: the window's two ?s come FIRST (the WITH clocks), then the inner
+        // tenant, the outer tenant, model ?, the keyset ?s, limit ?.
+        let i_since = sql.find("fromUnixTimestamp64Micro(?) AS w_since").unwrap();
+        let i_until = sql.find("fromUnixTimestamp64Micro(?) AS w_until").unwrap();
         let i_model = sql.find("model = ?").unwrap();
-        let i_since = sql
-            .find("start_time >= fromUnixTimestamp64Micro(?)")
-            .unwrap();
-        let i_until = sql
-            .find("start_time <= fromUnixTimestamp64Micro(?)")
-            .unwrap();
-        let i_cursor = sql.find("toUnixTimestamp64Micro(start_time) < ?").unwrap();
+        let i_cursor = sql.find("toUnixTimestamp64Micro(st_min) < ?").unwrap();
         let i_limit = sql.rfind("LIMIT ?").unwrap();
-        assert!(i_model < i_since && i_since < i_until && i_until < i_cursor && i_cursor < i_limit);
+        assert!(i_since < i_until && i_until < i_model && i_model < i_cursor && i_cursor < i_limit);
         assert!(sql.contains("error_count > 0"));
         // Three placeholders in the keyset clause.
         let cursor_clause = &sql[i_cursor..i_limit];
@@ -5076,7 +6026,7 @@ mod tests {
             ..Default::default()
         });
         assert!(on.contains(
-            "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = ? AND JSONExtractBool(attributes, 'tracelane_failover_activated'))"
+            "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND JSONExtractBool(attributes, 'tracelane_failover_activated'))"
         ), "sql: {on}");
         // groups builder mirrors the same clause (so a failover view groups honestly).
         let grp = build_trace_groups_sql(
@@ -5108,6 +6058,80 @@ mod tests {
         assert_eq!(parse_failover(None), None);
     }
 
+    /// `OBS-20`. **The B-232 class, pinned: the stored key is UNDERSCORED.**
+    ///
+    /// A first-class `SpanAttributes` field serialises under its snake_case Rust
+    /// name, so the writer emits `user_id`. A key that only ever reaches `extra`
+    /// keeps its literal dotted form. Query `'user.id'` here and the read path
+    /// matches a key nothing in this repo writes — the sessions page would be
+    /// empty for every tenant, forever, with no error anywhere.
+    ///
+    /// So this asserts the underscored key is present AND the dotted one is
+    /// absent. The second half is the one that catches the mistake.
+    #[test]
+    fn obs20_session_sql_reads_the_underscored_key_never_the_dotted_one() {
+        let sql = build_session_list_sql(&SessionListFilters {
+            limit: 50,
+            ..Default::default()
+        });
+        assert!(
+            sql.contains("JSONExtractString(attributes, 'user_id'), start_time) AS end_user"),
+            "sql: {sql}"
+        );
+        assert!(
+            !sql.contains("'user.id'"),
+            "the dotted key matches nothing this repo writes: {sql}"
+        );
+        // Appended LAST, after agent_name — the bind positions ahead of it must
+        // not move (TRAPS §58). Assert the ORDER, not just presence.
+        let agent_at = sql.find("AS agent_name").expect("agent_name projected");
+        let user_at = sql.find("AS end_user").expect("end_user projected");
+        assert!(
+            agent_at < user_at,
+            "end_user must be appended AFTER agent_name: {sql}"
+        );
+    }
+
+    /// `OBS-20`. The end-user trace filter is a TENANT-SCOPED subquery in all
+    /// three builders, and absent when the filter is.
+    #[test]
+    fn obs20_end_user_filter_is_tenant_scoped_subquery_in_all_three_builders() {
+        const CLAUSE: &str = "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND JSONExtractString(attributes, 'user_id') = ?)";
+        let f = TraceListFilters {
+            q: None,
+            end_user: Some("u_1".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        assert!(build_trace_list_sql(&f).contains(CLAUSE));
+        assert!(build_trace_count_sql(&f).contains(CLAUSE));
+        assert!(build_trace_groups_sql(TraceGroupBy::Model, &f).contains(CLAUSE));
+
+        // Absent when unset — no silent full-scan predicate.
+        let off = TraceListFilters {
+            q: None,
+            end_user: None,
+            limit: 50,
+            ..Default::default()
+        };
+        assert!(!build_trace_list_sql(&off).contains("'user_id'"));
+
+        // The id is BOUND (`= ?`), never interpolated. It is caller-supplied
+        // text, so an interpolated form would be the one SQL-injection seam on
+        // this surface.
+        let injected = TraceListFilters {
+            q: None,
+            end_user: Some("' OR 1=1 --".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        let sql = build_trace_list_sql(&injected);
+        assert!(
+            !sql.contains("OR 1=1"),
+            "the end-user id must never reach the SQL text: {sql}"
+        );
+    }
+
     #[test]
     fn trace_count_sql_is_tenant_first_no_order_no_limit() {
         let sql = build_trace_count_sql(&TraceListFilters {
@@ -5119,19 +6143,21 @@ mod tests {
             limit: 50,
             ..Default::default()
         });
-        // uniqExact(trace_id), not count() — dedupes MV partial rows so the footer
-        // reconciles with the list (provenance audit P1 #7).
+        // B-379: `count()` over the MERGED subquery — the GROUP BY already
+        // collapsed the MV's partial rows, which is what `uniqExact` was for
+        // against FINAL's leftovers (provenance audit P1 #7 still holds: the
+        // footer reconciles with the list because both read the same merge).
+        assert!(sql.starts_with(WINDOW_WITH), "sql: {sql}");
         assert!(
-            sql.starts_with(
-                "SELECT toUInt64(uniqExact(trace_id)) AS total FROM trace_summaries FINAL WHERE tenant_id = ?"
-            ),
+            sql.contains("SELECT toUInt64(count()) AS total FROM (SELECT tenant_id, trace_id"),
             "sql: {sql}"
         );
+        assert!(!sql.contains("FINAL"));
         // mirrors the list filters, but NO ORDER BY / LIMIT / cursor.
         assert!(sql.contains("model = ?"));
         assert!(sql.contains("error_count > 0"));
         assert!(sql.contains("tracelane_failover_activated"));
-        assert!(sql.contains("start_time >= fromUnixTimestamp64Micro(?)"));
+        assert!(sql.contains("start_time >= w_since AND start_time <= w_until"));
         assert!(!sql.contains("ORDER BY"));
         assert!(!sql.contains("LIMIT"));
     }
@@ -5163,7 +6189,12 @@ mod tests {
         let where_pos = TRACE_CHAIN_SQL.find("WHERE tenant_id = ?").unwrap();
         assert!(!TRACE_CHAIN_SQL[..where_pos].contains("JSONExtract"));
         // Only a real gateway call counts — never a guardrail/eval verdict row.
-        assert!(TRACE_CHAIN_SQL.contains("event_type = 'chat.completions.request'"));
+        // B-358: BOTH gateway-call event types, never a verdict row.
+        assert!(
+            TRACE_CHAIN_SQL
+                .contains("event_type IN ('chat.completions.request', 'messages.request')")
+        );
+        assert!(!TRACE_CHAIN_SQL.contains("guardrail.verdict"));
         // trace_id matched out of the canonical payload, parameter-bound.
         assert!(TRACE_CHAIN_SQL.contains("JSONExtractString(payload, 'trace_id') = ?"));
         assert!(TRACE_CHAIN_SQL.contains("FROM tracelane.audit_log"));
@@ -5183,6 +6214,281 @@ mod tests {
         assert!(anchored_from(Some(
             "24296fb24b8ad77aabcdef0123456789abcdef0123456789abcdef0123456789"
         )));
+    }
+
+    // ── DSH-11 ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn served_window_clamps_a_wide_pair_to_the_cap_and_says_so() {
+        let now = 1_800_000_000;
+        let cap = MAX_WINDOW_SECS;
+        let w = ServedWindow::resolve(Some(now - 365 * 86_400), Some(now), 24, now, cap);
+        assert!(w.clamped);
+        assert_eq!(w.until_secs, now);
+        assert_eq!(w.since_secs, now - cap);
+        assert_eq!(w.width_secs(), cap);
+        let v = w.header_value();
+        assert!(v.ends_with(";clamped=1"), "{v}");
+        // inside the cap: untouched
+        let ok = ServedWindow::resolve(Some(now - 3600), Some(now - 60), 24, now, cap);
+        assert!(!ok.clamped);
+        assert_eq!((ok.since_secs, ok.until_secs), (now - 3600, now - 60));
+        // a future `until` is pulled back to now
+        let fut = ServedWindow::resolve(Some(now - 3600), Some(now + 3600), 24, now, cap);
+        assert_eq!(fut.until_secs, now);
+        // no `since`: the rolling window, never clamped
+        let roll = ServedWindow::resolve(None, None, 720, now, cap);
+        assert!(!roll.clamped);
+        assert_eq!(roll.width_secs(), 720 * 3600);
+    }
+
+    #[test]
+    fn bucket_ceiling_widens_rather_than_answering_thousands_of_rows() {
+        assert_eq!(cap_bucket_secs(3600, 24 * 3600), 3600);
+        assert_eq!(cap_bucket_secs(3600, 720 * 3600), 3600 * 8);
+        assert_eq!(validate_bucket_minutes(Some(5), 6 * 3600), Ok(Some(5)));
+        assert!(validate_bucket_minutes(Some(7), 3600).is_err());
+        assert!(validate_bucket_minutes(Some(1), 25 * 3600).is_err());
+        assert!(
+            validate_bucket_minutes(Some(1), 3 * 3600).is_err(),
+            "180 buckets > 96"
+        );
+        assert_eq!(validate_bucket_minutes(None, 365 * 86_400), Ok(None));
+    }
+
+    #[test]
+    fn every_windowed_builder_binds_until_after_since() {
+        let gw = build_gateway_stats_sql(&GatewayStatsFilters {
+            since_secs: Some(1),
+            until_secs: Some(2),
+            hours: 24,
+            limit: 10,
+        });
+        let a = gw.find("start_time >= toDateTime(?)").unwrap();
+        let b = gw.find("start_time <= toDateTime(?)").unwrap();
+        assert!(a < b, "until must bind AFTER since: {gw}");
+        assert!(
+            !build_gateway_stats_sql(&GatewayStatsFilters {
+                hours: 24,
+                limit: 10,
+                ..Default::default()
+            })
+            .contains("start_time <=")
+        );
+        let g = build_guardrail_summary_sql(&GuardrailStatsFilters {
+            since_secs: Some(1),
+            until_secs: Some(2),
+            hours: 24,
+            limit: 10,
+        });
+        assert!(g.contains("event_time >= toDateTime(?) AND event_time <= toDateTime(?)"));
+        let v = build_guardrail_verdicts_sql(&GuardrailVerdictListFilters {
+            since_secs: Some(1),
+            until_secs: Some(2),
+            hours: 24,
+            decision: Some("block".into()),
+            correlation_id: None,
+            rail: None,
+            limit: 5,
+        });
+        let d = v.find("decision = ?").unwrap();
+        let s = v.find("event_time >= toDateTime(?)").unwrap();
+        let u = v.find("event_time <= toDateTime(?)").unwrap();
+        assert!(d < s && s < u, "bind order decision, since, until: {v}");
+        let sg = build_signatures_sql(&SignatureFilters {
+            since_us: Some(1),
+            until_us: Some(2),
+            limit: 5,
+            live_signature_ids: vec![],
+        });
+        assert!(sg.contains("start_time >= fromUnixTimestamp64Micro(?) AND start_time <= fromUnixTimestamp64Micro(?)"));
+        let ss = build_session_list_sql(&SessionListFilters {
+            since_us: Some(1),
+            until_us: Some(2),
+            window_days: 30,
+            limit: 5,
+            ..Default::default()
+        });
+        assert!(ss.contains("start_time >= fromUnixTimestamp64Micro(?) AND start_time <= fromUnixTimestamp64Micro(?) GROUP BY"));
+    }
+
+    /// B-332 — the filters were parsed and never bound.
+    #[test]
+    fn slo_timeseries_binds_provider_and_model_and_carries_errors() {
+        let sql = build_slo_timeseries_sql(
+            &SloFilters {
+                hours: 24,
+                provider: Some("openai".into()),
+                model: Some("gpt-4o".into()),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(sql.contains(" AND provider = ?"), "{sql}");
+        assert!(sql.contains(" AND model = ?"), "{sql}");
+        assert!(
+            sql.contains("countIfMerge(error_count)) AS errors"),
+            "{sql}"
+        );
+        let bare = build_slo_timeseries_sql(
+            &SloFilters {
+                hours: 24,
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(!bare.contains("provider = ?"));
+    }
+
+    /// Sub-hour buckets read raw spans with the MV's own provider/model derivation,
+    /// so a 5-minute bar and an hourly bar count the same thing.
+    #[test]
+    fn slo_sub_hour_paths_read_spans_with_the_mv_expressions() {
+        let f = SloFilters {
+            since_secs: Some(1),
+            until_secs: Some(2),
+            hours: 1,
+            bucket_minutes: Some(5),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        for sql in [build_slo_sql(&f), build_slo_timeseries_sql(&f, 1)] {
+            assert!(sql.contains("FROM spans FINAL"), "{sql}");
+            assert!(sql.contains("toIntervalMinute(5)"), "{sql}");
+            assert!(sql.contains(MV_PROVIDER_EXPR), "{sql}");
+            assert!(sql.contains(&format!(" AND {MV_MODEL_EXPR} = ?")), "{sql}");
+            assert!(sql.contains("WHERE tenant_id = ?"), "{sql}");
+            assert!(!sql.contains("slo_hourly_stats"), "{sql}");
+        }
+        // The row shape of /v1/slo is unchanged: same eleven names, same order.
+        let sql = build_slo_sql(&f);
+        for (a, b) in [
+            ("bucket_hour_iso", "provider"),
+            ("provider", "model"),
+            ("model", "p50_ms"),
+            ("p99_ms", "requests"),
+            ("requests", "errors"),
+            ("errors", "error_rate_pct"),
+            ("total_input_tokens", "total_output_tokens"),
+        ] {
+            assert!(
+                sql.find(&format!("AS {a}")).unwrap() < sql.find(&format!("AS {b}")).unwrap(),
+                "{a} before {b}"
+            );
+        }
+    }
+
+    /// Extracts the ordered list of JSON attribute keys read by every
+    /// `JSONExtractString(<anything>, '<key>')` call inside `text`. Deliberately
+    /// ignores the qualifier (`s.attributes` in the view, bare `attributes` in
+    /// the Rust constant) — only the KEY and its ORDER are the parity claim.
+    fn json_extract_keys(text: &str) -> Vec<String> {
+        let needle = "JSONExtractString(";
+        let mut keys = Vec::new();
+        let mut rest = text;
+        while let Some(i) = rest.find(needle) {
+            let after = &rest[i + needle.len()..];
+            let quote_start = after
+                .find('\'')
+                .expect("JSONExtractString(...) must take a quoted string key");
+            let key_body = &after[quote_start + 1..];
+            let quote_end = key_body
+                .find('\'')
+                .expect("attribute key must close with a quote");
+            keys.push(key_body[..quote_end].to_string());
+            rest = &key_body[quote_end + 1..];
+        }
+        keys
+    }
+
+    /// Returns the argument list of the FIRST top-level `coalesce(...)` call in
+    /// `text`, found by paren-depth counting rather than naive matching — the
+    /// arms themselves contain nested `nullIf(...)` / `JSONExtractString(...)`
+    /// calls, so the first `)` is never the coalesce's own close paren.
+    fn first_coalesce_args(text: &str) -> &str {
+        let start = text.find("coalesce(").expect("no coalesce( found") + "coalesce(".len();
+        let mut depth = 1usize;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..start + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parens reading coalesce(...) out of: {text}");
+    }
+
+    /// PARITY GUARD — SRE register #55 / B-336 family.
+    ///
+    /// The SLO sub-hour readers re-derive `provider` / `model` off raw spans with
+    /// `MV_PROVIDER_EXPR` / `MV_MODEL_EXPR`; the hourly readers take them from
+    /// `slo_hourly_stats`, written by `mv_slo_hourly_stats` (migration 06). If
+    /// either constant ever carries a different SET or ORDER of coalesce arms than
+    /// the view, a 5-minute bar and an hourly bar silently count different things.
+    /// Both lists are read from the checked-in migration, never hand-copied.
+    ///
+    /// The second half records WHY register #55 was refuted as framed:
+    /// `mv_trace_summaries` (`schema.sql`) derives `model` with exactly ONE extra
+    /// arm, the dotted `gen_ai.request.model`, which decode.rs normalises away
+    /// before storage. If the schema ever grows a different extra arm, or the
+    /// migration and the schema diverge further, this fails and names the arm.
+    ///
+    /// FALSIFICATION: delete the `gen_ai.response.model` arm from `MV_MODEL_EXPR`
+    /// and the first assertion fails with `left` (the view) still listing it.
+    #[test]
+    fn mv_exprs_match_migration_06_and_trace_summaries_only_adds_the_dead_arm() {
+        let mig =
+            include_str!("../../../infra/dev/clickhouse/migrations/06_genai_attr_keys_and_slo.sql");
+        let view = &mig[mig
+            .find("CREATE MATERIALIZED VIEW tracelane.mv_slo_hourly_stats")
+            .expect("migration 06 must define mv_slo_hourly_stats")..];
+        let provider_end = view.find("AS provider").expect("view projects provider");
+        let model_start = provider_end + "AS provider".len();
+        let model_end = model_start
+            + view[model_start..]
+                .find("AS model")
+                .expect("view projects model");
+        let view_provider = json_extract_keys(first_coalesce_args(&view[..provider_end]));
+        let view_model = json_extract_keys(first_coalesce_args(&view[model_start..model_end]));
+        assert_eq!(
+            view_provider,
+            json_extract_keys(first_coalesce_args(MV_PROVIDER_EXPR)),
+            "MV_PROVIDER_EXPR drifted from mv_slo_hourly_stats (migration 06)"
+        );
+        assert_eq!(
+            view_model,
+            json_extract_keys(first_coalesce_args(MV_MODEL_EXPR)),
+            "MV_MODEL_EXPR drifted from mv_slo_hourly_stats (migration 06)"
+        );
+
+        let schema = include_str!("../../../infra/dev/clickhouse/schema.sql");
+        let ts = &schema[schema
+            .find("CREATE MATERIALIZED VIEW IF NOT EXISTS tracelane.mv_trace_summaries")
+            .expect("mv_trace_summaries must exist in schema.sql")..];
+        let ts_model_end = ts
+            .find("AS model")
+            .expect("mv_trace_summaries projects model");
+        let ts_model = json_extract_keys(first_coalesce_args(&ts[..ts_model_end]));
+        let rust_model = json_extract_keys(first_coalesce_args(MV_MODEL_EXPR));
+        let extra: Vec<&String> = ts_model
+            .iter()
+            .filter(|k| !rust_model.contains(k))
+            .collect();
+        assert_eq!(
+            extra,
+            vec![&"gen_ai.request.model".to_string()],
+            "mv_trace_summaries' model derivation differs from the SLO expression by \
+             something other than the one dead dotted arm — re-read register #55"
+        );
+        assert!(
+            rust_model.iter().all(|k| ts_model.contains(k)),
+            "MV_MODEL_EXPR reads an arm mv_trace_summaries does not: {rust_model:?} vs {ts_model:?}"
+        );
     }
 
     #[test]
@@ -5351,6 +6657,7 @@ mod tests {
     #[test]
     fn slo_sql_since_overrides_hours_window() {
         let sql = build_slo_sql(&SloFilters {
+            bucket_minutes: None,
             since_secs: Some(1000),
             until_secs: Some(2000),
             provider: Some("openai".into()),
@@ -5441,6 +6748,7 @@ mod tests {
         // With a live-id allowlist the match becomes arrayExists(... IN (?, …))
         // over BOUND placeholders — no `notEmpty(aft_ids)`, no interpolated id.
         let sql = build_signatures_trace_total_sql(&SignatureFilters {
+            until_us: None,
             since_us: Some(1),
             limit: 50,
             live_signature_ids: vec!["AFT-TOOL-SCHEMA-001".into(), "AFT-PI-CASCADE-001".into()],
@@ -5503,7 +6811,7 @@ mod tests {
         // (a cross-tenant signature can never widen the outer result).
         assert!(
             sql.contains(
-                "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = ? AND has(aft_ids, ?))"
+                "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND has(aft_ids, ?))"
             ),
             "sql: {sql}"
         );
@@ -5565,6 +6873,7 @@ mod tests {
         // no since → rolling window; with since → an explicit lower bound.
         assert!(sql.contains("now() - toIntervalHour(?)"));
         let with_since = build_latency_totals_sql(&GatewayStatsFilters {
+            until_secs: None,
             since_secs: Some(1),
             hours: 24,
             limit: 100,
@@ -6230,6 +7539,7 @@ mod tests {
     #[test]
     fn gateway_stats_sql_is_tenant_first_and_windowed() {
         let sql = build_gateway_stats_sql(&GatewayStatsFilters {
+            until_secs: None,
             since_secs: None,
             hours: 24,
             limit: 100,
@@ -6260,6 +7570,7 @@ mod tests {
     #[test]
     fn gateway_stats_sql_since_overrides_window() {
         let sql = build_gateway_stats_sql(&GatewayStatsFilters {
+            until_secs: None,
             since_secs: Some(1_700_000_000),
             hours: 24,
             limit: 100,
@@ -6321,7 +7632,7 @@ mod tests {
         assert_eq!(resp.total_failovers, 5);
         assert_eq!(resp.providers[0].failovers, 3);
         assert_eq!(resp.rate_limited_since_start, 7);
-        assert_eq!(resp.quota_exceeded_since_start, 4);
+        assert_eq!(resp.budget_exceeded_since_start, 4);
     }
 
     #[test]
@@ -6392,10 +7703,12 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = gateway_stats_handler(
             State(state),
             Query(GatewayStatsQuery {
+                until: None,
                 hours: None,
                 since: None,
             }),
@@ -6417,7 +7730,7 @@ mod tests {
         // has had no failover/rejection, so they read a genuine 0.
         assert_eq!(v["total_failovers"], 0);
         assert_eq!(v["rate_limited_since_start"], 0);
-        assert_eq!(v["quota_exceeded_since_start"], 0);
+        assert_eq!(v["budget_exceeded_since_start"], 0);
         assert!(v["uninstrumented"].as_array().unwrap().is_empty());
     }
 
@@ -6426,6 +7739,7 @@ mod tests {
     #[test]
     fn guardrail_sql_is_tenant_first_and_windowed() {
         let f = GuardrailStatsFilters {
+            until_secs: None,
             since_secs: None,
             hours: 24,
             limit: 50,
@@ -6457,13 +7771,46 @@ mod tests {
     }
 
     #[test]
+    fn guardrail_verdicts_sql_binds_rail_between_correlation_and_since() {
+        // B-335a. The rail clause sits AFTER correlation_id and BEFORE the window, and
+        // the reader binds in that order — the B-336 class, pinned at the builder.
+        let f = GuardrailVerdictListFilters {
+            since_secs: Some(1),
+            until_secs: Some(2),
+            hours: 24,
+            decision: Some("block".into()),
+            correlation_id: None,
+            rail: Some("R4_trifecta".into()),
+            limit: 10,
+        };
+        let sql = build_guardrail_verdicts_sql(&f);
+        let i_dec = sql.find("AND decision = ?").expect("decision");
+        let i_rail = sql
+            .find("arrayExists(r -> JSONExtractString(r, 'rail') = ?, JSONExtractArrayRaw(rails))")
+            .expect("rail clause");
+        let i_since = sql.find("event_time >= toDateTime(?)").expect("since");
+        assert!(i_dec < i_rail && i_rail < i_since, "order: {sql}");
+        assert_eq!(
+            sql.matches('?').count(),
+            6,
+            "tenant, decision, rail, since, until, limit: {sql}"
+        );
+        assert!(parse_rail_filter(Some("R4_trifecta")).unwrap().is_some());
+        assert!(parse_rail_filter(Some("")).unwrap().is_none());
+        assert!(parse_rail_filter(Some("r4; DROP")).is_err());
+        assert!(parse_rail_filter(Some(&"x".repeat(41))).is_err());
+    }
+
+    #[test]
     fn guardrail_verdicts_sql_is_tenant_first_decision_bound_and_ordered() {
         // With a decision filter: tenant first, decision bound BEFORE the window.
         let sql = build_guardrail_verdicts_sql(&GuardrailVerdictListFilters {
+            until_secs: None,
             since_secs: None,
             hours: 24,
             decision: Some("block".to_string()),
             correlation_id: None,
+            rail: None,
             limit: 100,
         });
         assert!(sql.contains("WHERE tenant_id = ?"), "sql: {sql}");
@@ -6489,10 +7836,12 @@ mod tests {
 
         // No decision filter → no decision predicate.
         let all = build_guardrail_verdicts_sql(&GuardrailVerdictListFilters {
+            until_secs: None,
             since_secs: Some(1),
             hours: 24,
             decision: None,
             correlation_id: None,
+            rail: None,
             limit: 50,
         });
         assert!(!all.contains("AND decision = ?"), "sql: {all}");
@@ -6541,6 +7890,7 @@ mod tests {
         // Present → a BOUND predicate, and tenant_id stays the first WHERE term.
         let with_id = GuardrailVerdictListFilters {
             correlation_id: Some("01KXZH4Z4Q3VABCDEFGHJKMNPQ".to_string()),
+            rail: None,
             ..base
         };
         let sql = build_guardrail_verdicts_sql(&with_id);
@@ -6577,6 +7927,7 @@ mod tests {
     #[test]
     fn guardrail_sql_since_overrides_window() {
         let f = GuardrailStatsFilters {
+            until_secs: None,
             since_secs: Some(1_700_000_000),
             hours: 24,
             limit: 50,
@@ -6665,10 +8016,12 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = guardrail_stats_handler(
             State(state),
             Query(GuardrailStatsQuery {
+                until: None,
                 hours: None,
                 since: None,
             }),
@@ -6699,6 +8052,7 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = list_traces_handler(
             State(state),
@@ -6709,6 +8063,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: None,
                 since: None,
@@ -6743,7 +8098,10 @@ mod tests {
             ..MockTraceReader::new()
         });
         let resp = list_traces_handler(
-            State(TraceReadState { reader }),
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
             Query(TraceListQuery {
                 q: None,
                 limit: Some(50),
@@ -6751,6 +8109,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: None,
                 since: None,
@@ -6790,6 +8149,7 @@ mod tests {
         let resp = chain_status_handler(
             State(TraceReadState {
                 reader: reader.clone(),
+                rejections: test_rejections(),
             }),
             Path("d9690c98-59c4-413c-86d2-5cabc857e6b6".into()),
             bearer_headers(),
@@ -6811,7 +8171,10 @@ mod tests {
         let _g = DevAuthGuard::new();
         let reader = Arc::new(MockTraceReader::new()); // chain_status: None
         let resp = chain_status_handler(
-            State(TraceReadState { reader }),
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
             Path("sdk-only-trace-00000000".into()),
             bearer_headers(),
         )
@@ -6831,13 +8194,17 @@ mod tests {
             ..MockTraceReader::new()
         });
         let resp = export_traces_handler(
-            State(TraceReadState { reader }),
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
             Query(TraceExportQuery {
                 format: Some("csv".into()),
                 model: None,
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 since: None,
                 until: None,
@@ -6884,13 +8251,17 @@ mod tests {
             ..MockTraceReader::new()
         });
         let resp = export_traces_handler(
-            State(TraceReadState { reader }),
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
             Query(TraceExportQuery {
                 format: Some("json".into()),
                 model: None,
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 since: None,
                 until: None,
@@ -6934,13 +8305,57 @@ mod tests {
         assert_eq!(csv_field("-2"), "\"'-2\"");
     }
 
+    /// B-379: the window is ALWAYS present. Absent `since` → 7 days back; absent
+    /// `until` → now plus an hour of clock-skew slack; explicit values win.
+    #[test]
+    fn list_window_defaults_to_seven_days_and_explicit_bounds_win() {
+        let now = 1_800_000_000_000_000_i64;
+        let f = TraceListFilters::default();
+        let (since, until) = f.window_bounds(now);
+        assert_eq!(since, now - DEFAULT_LIST_WINDOW_SECS * 1_000_000);
+        assert_eq!(until, now + 60 * 60 * 1_000_000);
+        let f = TraceListFilters {
+            since_us: Some(5),
+            until_us: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(f.window_bounds(now), (5, 9));
+    }
+
+    /// B-379: every `spans` subquery a filter adds is bounded by the same window,
+    /// so it prunes on the time-first key instead of scanning the tenant.
+    #[test]
+    fn every_spans_subquery_carries_the_window() {
+        let f = TraceListFilters {
+            q: Some("needle".into()),
+            signature_id: Some("AFT-1".into()),
+            failover: Some(true),
+            end_user: Some("u".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        for sql in [
+            build_trace_list_sql(&f),
+            build_trace_count_sql(&f),
+            build_trace_groups_sql(TraceGroupBy::Model, &f),
+        ] {
+            let subqueries = sql.matches("SELECT trace_id FROM spans").count();
+            assert_eq!(subqueries, 4, "four filters, four subqueries: {sql}");
+            let windowed = sql
+                .matches("FROM spans WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until")
+                .count();
+            assert_eq!(windowed, 4, "every subquery must carry the window: {sql}");
+        }
+    }
+
     #[test]
     fn build_trace_list_sql_honors_sort_and_order() {
-        // Default → newest-first (start_time DESC).
+        // Default → newest-first (start_time DESC; `st_min` is the merged min).
         let sql = build_trace_list_sql(&TraceListFilters::default());
-        assert!(sql.contains("ORDER BY start_time DESC, trace_id DESC"));
-        // Every query is still tenant-first (isolation invariant).
-        assert!(sql.trim_start().starts_with("SELECT") && sql.contains("WHERE tenant_id = ?"));
+        assert!(sql.contains("ORDER BY st_min DESC, trace_id DESC"));
+        // Every query is still tenant-first (isolation invariant) — after the
+        // B-379 WITH clocks, which bind no tenant data.
+        assert!(sql.trim_start().starts_with(WINDOW_WITH) && sql.contains("WHERE tenant_id = ?"));
 
         // duration ASC.
         let sql = build_trace_list_sql(&TraceListFilters {
@@ -6967,7 +8382,7 @@ mod tests {
             cursor: Some((5, "t".into())),
             ..Default::default()
         });
-        assert!(sql.contains("toUnixTimestamp64Micro(start_time) > ?"));
+        assert!(sql.contains("toUnixTimestamp64Micro(st_min) > ?"));
         assert!(sql.contains("trace_id > ?"));
     }
 
@@ -6987,7 +8402,7 @@ mod tests {
         let sql = build_trace_groups_sql(TraceGroupBy::Model, &TraceListFilters::default());
         assert!(sql.contains("SELECT model AS group_key"));
         assert!(sql.contains("GROUP BY group_key ORDER BY trace_count DESC"));
-        assert!(sql.trim_start().starts_with("SELECT") && sql.contains("WHERE tenant_id = ?"));
+        assert!(sql.trim_start().starts_with(WINDOW_WITH) && sql.contains("WHERE tenant_id = ?"));
 
         let sql = build_trace_groups_sql(TraceGroupBy::Operation, &TraceListFilters::default());
         assert!(sql.contains("SELECT root_name AS group_key"));
@@ -7032,6 +8447,7 @@ mod tests {
         let resp = list_trace_groups_handler(
             State(TraceReadState {
                 reader: reader.clone(),
+                rejections: test_rejections(),
             }),
             Query(TraceGroupsQuery {
                 by: Some("model".into()),
@@ -7039,6 +8455,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 since: None,
                 until: None,
@@ -7054,13 +8471,17 @@ mod tests {
 
         // Unknown `by` → 400 (grouping has no default).
         let resp = list_trace_groups_handler(
-            State(TraceReadState { reader }),
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
             Query(TraceGroupsQuery {
                 by: Some("bogus".into()),
                 model: None,
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 since: None,
                 until: None,
@@ -7079,7 +8500,10 @@ mod tests {
             traces: vec![trace_row("t1", 100), trace_row("t2", 90)],
             ..MockTraceReader::new()
         });
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
@@ -7089,6 +8513,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: None,
                 since: None,
@@ -7110,6 +8535,7 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new()); // no spans
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         // A path that looks like another tenant's id must NOT change the tenant
         // the reader is queried with.
@@ -7131,7 +8557,10 @@ mod tests {
             spans: vec![span_row("s1"), span_row("s2")],
             ..MockTraceReader::new()
         });
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp = list_spans_handler(
             State(state),
             Path("trace-abcdefgh".to_string()),
@@ -7151,7 +8580,10 @@ mod tests {
     async fn spans_short_trace_id_is_400() {
         let _g = DevAuthGuard::new();
         let reader = Arc::new(MockTraceReader::new());
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp =
             list_spans_handler(State(state), Path("short".to_string()), bearer_headers()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -7179,10 +8611,12 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = slo_handler(
             State(state),
             Query(SloQuery {
+                bucket_minutes: None,
                 hours: Some(24),
                 provider: None,
                 model: None,
@@ -7204,6 +8638,7 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new());
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = list_traces_handler(
             State(state),
@@ -7214,6 +8649,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: None,
                 since: None,
@@ -7234,7 +8670,10 @@ mod tests {
     async fn malformed_cursor_is_400() {
         let _g = DevAuthGuard::new();
         let reader = Arc::new(MockTraceReader::new());
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
@@ -7244,6 +8683,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: Some("garbage".into()),
                 since: None,
@@ -7264,6 +8704,7 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new());
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = list_traces_handler(
             State(state),
@@ -7274,6 +8715,7 @@ mod tests {
                 has_error: None,
                 min_latency_ms: None,
                 failover: None,
+                end_user: None,
                 signature_id: None,
                 cursor: None,
                 since: Some("not-a-timestamp".into()),
@@ -7315,10 +8757,12 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = signatures_handler(
             State(state),
             Query(SignatureQuery {
+                until: None,
                 since: None,
                 limit: None,
                 live_ids: None,
@@ -7356,10 +8800,14 @@ mod tests {
     async fn signatures_handler_empty_is_ok_empty_list() {
         let _g = DevAuthGuard::new();
         let reader = Arc::new(MockTraceReader::new());
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp = signatures_handler(
             State(state),
             Query(SignatureQuery {
+                until: None,
                 since: None,
                 limit: None,
                 live_ids: None,
@@ -7378,10 +8826,12 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new());
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = signatures_handler(
             State(state),
             Query(SignatureQuery {
+                until: None,
                 since: None,
                 limit: None,
                 live_ids: None,
@@ -7526,6 +8976,8 @@ mod tests {
             cost_usd: 0.0123,
             total_tokens: 4200,
             model: "claude-sonnet-4-6".into(),
+            agent_name: String::new(),
+            end_user: String::new(),
         }
     }
 
@@ -7552,10 +9004,12 @@ mod tests {
         });
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = list_sessions_handler(
             State(state),
             Query(SessionListQuery {
+                until: None,
                 limit: Some(50),
                 days: None,
                 since: None,
@@ -7586,6 +9040,7 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new()); // no traces
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         // A session id that looks like another tenant's id must NOT change the
         // tenant the reader is queried with (existence never leaks cross-tenant).
@@ -7607,7 +9062,10 @@ mod tests {
             session_traces: vec![session_trace_row("t1"), session_trace_row("t2")],
             ..MockTraceReader::new()
         });
-        let state = TraceReadState { reader };
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
         let resp =
             session_traces_handler(State(state), Path("conv-abc".to_string()), bearer_headers())
                 .await;
@@ -7623,10 +9081,12 @@ mod tests {
         let reader = Arc::new(MockTraceReader::new());
         let state = TraceReadState {
             reader: reader.clone(),
+            rejections: test_rejections(),
         };
         let resp = list_sessions_handler(
             State(state),
             Query(SessionListQuery {
+                until: None,
                 limit: None,
                 days: None,
                 since: None,
@@ -7665,6 +9125,16 @@ mod tests {
 #[cfg(test)]
 mod clickhouse_roundtrip {
     use super::*;
+
+    /// These tests share ONE database and ONE `spans` table, and
+    /// `ensure_slo_view` applies migration 06, which DROPS and recreates
+    /// `mv_trace_summaries`. Run in parallel, a test that inserts spans while
+    /// another is between the drop and the recreate gets no summary rows — the
+    /// B-379 round trip found that on the gate's fresh container (2026-09-12,
+    /// three runs, three failures, every one `recent.len() == 0`). One lock, held
+    /// for the whole test, is the honest fix: the hazard is real sharing, not a
+    /// flaky assertion.
+    static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn ch() -> Option<clickhouse::Client> {
         let url = std::env::var("CLICKHOUSE_TEST_URL").ok()?;
@@ -7709,9 +9179,495 @@ mod clickhouse_roundtrip {
     ///
     /// A failure here is `Code 184` / `Code 47` / `Code 386` — the classes that
     /// are invisible to a string assertion and visible only to a server.
+    /// Bring up the hourly SLO view too — migration 06 owns `slo_hourly_stats`
+    /// and its MV; `schema.sql` alone leaves the MV-backed builders untestable.
+    async fn ensure_slo_view(c: &clickhouse::Client) {
+        // Migration 06 owns `slo_hourly_stats` + its MV, 13 the `gateway_overhead_us`
+        // column, 16 the cost-attribution columns — every one a column or table a
+        // DSH-11 builder reads. Without them the round trip REJECTS a query prod
+        // accepts (this test's first run: `Unknown identifier gateway_overhead_us`).
+        for m in [
+            include_str!("../../../infra/dev/clickhouse/migrations/06_genai_attr_keys_and_slo.sql"),
+            include_str!("../../../infra/dev/clickhouse/migrations/13_gateway_overhead_column.sql"),
+            include_str!("../../../infra/dev/clickhouse/migrations/16_span_cost_attribution.sql"),
+        ] {
+            for stmt in crate::clickhouse_query::split_migration_statements(m) {
+                let _ = c.query(&stmt).execute().await;
+            }
+        }
+        let exists: u64 = c
+            .query("SELECT count() FROM system.tables WHERE database='tracelane' AND name='slo_hourly_stats'")
+            .fetch_one()
+            .await
+            .expect("system.tables read");
+        assert_eq!(
+            exists, 1,
+            "`slo_hourly_stats` was not created — the hourly builders would pass by querying nothing"
+        );
+    }
+
+    /// THE READER, not the builder — with `until` set on every windowed method.
+    ///
+    /// Written after the 2026-09-02 deploy shipped a BIND-ORDER defect that neither the
+    /// unit tests (they assert SQL strings) nor the round trip below (it binds by hand)
+    /// could see: a patch anchored on `async fn guardrail_summary(` matched the TRAIT
+    /// declaration first, so three `until` binds landed in `slo()` and none in the
+    /// guardrail or signature readers. Prod answered 502 on every request carrying
+    /// `until` to five routes until the parity proof ran. This test drives the real
+    /// `ClickHouseTraceReader` bind code; a bind mismatch is a ClickHouse error here.
+    /// B-379: the list / count / groups queries against a REAL ClickHouse, on the
+    /// migration-22 schema (`ensure_spans` applies `schema.sql`, which carries the
+    /// time-first key and the `p_by_time` projection). Three properties:
+    /// (1) every filter combination binds and executes — a `?`/bind mismatch is a
+    /// ClickHouse error here; (2) the merge is RIGHT: a trace whose spans land in
+    /// two insert blocks (two MV partial rows) reads back as ONE trace with the
+    /// summed span_count, which is exactly what `FINAL` used to guarantee and the
+    /// GROUP BY must; (3) the default window excludes a trace older than 7 days
+    /// and an explicit `since` brings it back.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn b379_list_count_groups_merge_and_window_on_a_real_clickhouse() {
+        let _serial = SHARED_DB.lock().await;
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_spans(&c).await;
+        let r = ClickHouseTraceReader::new(c.clone());
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let t = tenant.to_string();
+        let trace_recent = uuid::Uuid::new_v4().to_string();
+        let trace_old = uuid::Uuid::new_v4().to_string();
+        let insert = |trace: &str, name: &str, age_secs: i64, parent: bool| {
+            let c = c.clone();
+            let t = t.clone();
+            let trace = trace.to_string();
+            let name = name.to_string();
+            async move {
+                c.query(
+                    "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, parent_span_id, name, \
+                     start_time, end_time, status_code, attributes) VALUES \
+                     (?, ?, ?, ?, ?, now64(6) - toIntervalSecond(?), now64(6) - toIntervalSecond(?) + toIntervalMillisecond(300), 1, \
+                     '{\"gen_ai_request_model\":\"claude-sonnet-4-6\"}')",
+                )
+                .bind(&t)
+                .bind(&trace)
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(if parent { Some("p") } else { None::<&str> })
+                .bind(&name)
+                .bind(age_secs)
+                .bind(age_secs)
+                .execute()
+                .await
+                .expect("insert span");
+            }
+        };
+        // Two SEPARATE inserts for the recent trace → two MV partial rows.
+        insert(&trace_recent, "root", 60, false).await;
+        insert(&trace_recent, "child", 59, true).await;
+        // One old trace, outside the 7-day default window.
+        insert(&trace_old, "root", 10 * 24 * 3600, false).await;
+
+        // (2) merge: ONE row for the recent trace, span_count 2.
+        let rows = r
+            .list_traces(
+                &tenant,
+                &TraceListFilters {
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list (default window)");
+        let recent: Vec<_> = rows.iter().filter(|x| x.trace_id == trace_recent).collect();
+        assert_eq!(
+            recent.len(),
+            1,
+            "two partial rows must merge to one trace: {rows:?}"
+        );
+        assert_eq!(
+            recent[0].span_count, 2,
+            "span_count is the SUM of the partials"
+        );
+        // (3) window: the old trace is outside the default, inside an explicit since.
+        assert!(
+            rows.iter().all(|x| x.trace_id != trace_old),
+            "10-day-old trace must be outside the 7-day default"
+        );
+        let wide = r
+            .list_traces(
+                &tenant,
+                &TraceListFilters {
+                    since_us: Some(
+                        chrono::Utc::now().timestamp_micros() - 30 * 24 * 3600 * 1_000_000,
+                    ),
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list (explicit since)");
+        assert!(
+            wide.iter().any(|x| x.trace_id == trace_old),
+            "explicit since must reach it: {wide:?}"
+        );
+        assert_eq!(
+            r.count_traces(&tenant, &TraceListFilters::default())
+                .await
+                .expect("count"),
+            1
+        );
+        // (1) every filter binds and runs, on all three builders.
+        let every = TraceListFilters {
+            model: Some("claude-sonnet-4-6".into()),
+            has_error: Some(false),
+            min_duration_us: Some(1),
+            signature_id: Some("AFT-1".into()),
+            failover: Some(true),
+            end_user: Some("u".into()),
+            q: Some("root".into()),
+            cursor: Some((chrono::Utc::now().timestamp_micros(), "z".into())),
+            limit: 5,
+            ..Default::default()
+        };
+        r.list_traces(&tenant, &every)
+            .await
+            .expect("list (every filter)");
+        r.count_traces(&tenant, &every)
+            .await
+            .expect("count (every filter)");
+        for by in [
+            TraceGroupBy::Model,
+            TraceGroupBy::Operation,
+            TraceGroupBy::Status,
+        ] {
+            r.list_trace_groups(&tenant, by, &every)
+                .await
+                .expect("groups (every filter)");
+        }
+        for sort in [
+            TraceSort::StartTime,
+            TraceSort::Duration,
+            TraceSort::SpanCount,
+        ] {
+            for order in [SortOrder::Asc, SortOrder::Desc] {
+                r.list_traces(
+                    &tenant,
+                    &TraceListFilters {
+                        sort,
+                        order,
+                        limit: 5,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("list (every sort)");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn the_reader_binds_until_on_every_windowed_method() {
+        let _serial = SHARED_DB.lock().await;
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_spans(&c).await;
+        ensure_slo_view(&c).await;
+        let r = ClickHouseTraceReader::new(c);
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let now = chrono::Utc::now().timestamp();
+        let (since, until) = (now - 6 * 3600, now);
+        let slo = SloFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            bucket_minutes: Some(5),
+            bucket_hours: 1,
+        };
+        r.slo(&tenant, &slo)
+            .await
+            .expect("slo (sub-hour, until, filters)");
+        r.slo(
+            &tenant,
+            &SloFilters {
+                bucket_minutes: None,
+                bucket_hours: 3,
+                ..slo.clone()
+            },
+        )
+        .await
+        .expect("slo (hourly view, until)");
+        r.slo_summary(&tenant, &slo)
+            .await
+            .expect("slo_summary (until)");
+        r.slo_by_model(&tenant, &slo)
+            .await
+            .expect("slo_by_model (until)");
+        r.slo_timeseries(&tenant, &slo, 1)
+            .await
+            .expect("slo_timeseries (until, filters)");
+        let g = GatewayStatsFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            limit: 10,
+        };
+        r.gateway_stats(&tenant, &g)
+            .await
+            .expect("gateway_stats (until)");
+        r.latency_breakdown(&tenant, &g)
+            .await
+            .expect("latency_breakdown (until)");
+        let gr = GuardrailStatsFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            limit: 10,
+        };
+        r.guardrail_summary(&tenant, &gr)
+            .await
+            .expect("guardrail_summary (until) — the prod 502");
+        r.guardrail_rails(&tenant, &gr)
+            .await
+            .expect("guardrail_rails (until)");
+        let v = GuardrailVerdictListFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            decision: Some("block".into()),
+            correlation_id: None,
+            rail: Some("R4_trifecta".into()),
+            limit: 5,
+        };
+        r.guardrail_verdicts(&tenant, &v)
+            .await
+            .expect("guardrail_verdicts (until + rail)");
+        let s = SignatureFilters {
+            since_us: Some(since * 1_000_000),
+            until_us: Some(until * 1_000_000),
+            limit: 5,
+            live_signature_ids: vec!["AFT-1.3".into()],
+        };
+        r.signatures(&tenant, &s).await.expect("signatures (until)");
+        r.signatures_distinct_traces(&tenant, &s)
+            .await
+            .expect("signatures total (until)");
+        let sl = SessionListFilters {
+            since_us: Some(since * 1_000_000),
+            until_us: Some(until * 1_000_000),
+            window_days: 30,
+            limit: 5,
+            ..Default::default()
+        };
+        r.list_sessions(&tenant, &sl)
+            .await
+            .expect("list_sessions (until)");
+        let tl = TraceListFilters {
+            since_us: Some(since * 1_000_000),
+            until_us: Some(until * 1_000_000),
+            limit: 5,
+            ..Default::default()
+        };
+        r.list_traces(&tenant, &tl)
+            .await
+            .expect("list_traces (until)");
+        r.count_traces(&tenant, &tl)
+            .await
+            .expect("count_traces (until)");
+        r.list_trace_groups(&tenant, TraceGroupBy::Model, &tl)
+            .await
+            .expect("list_trace_groups (until)");
+    }
+
+    /// DSH-11 — every SQL shape this batch ADDED or CHANGED is sent to a real
+    /// ClickHouse and deserialised into the real row struct. A unit test proves the
+    /// string; this proves the wire (B-257: a column-width mismatch 502'd every
+    /// tenant for 12 hours while `clickhouse-client` printed correct numbers).
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn every_dsh11_sql_is_accepted_by_a_real_clickhouse() {
+        let _serial = SHARED_DB.lock().await;
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_spans(&c).await;
+        ensure_slo_view(&c).await;
+        let tenant = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let (since, until) = (now - 6 * 3600, now);
+        let tq = |sql: String| TenantQuery::new(sql, PlanTier::Free).sql_with_settings();
+
+        // 1. /v1/slo and /v1/slo/timeseries, SUB-HOUR off raw spans, with both filters.
+        let f = SloFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            bucket_minutes: Some(5),
+            bucket_hours: 1,
+        };
+        c.query(&tq(build_slo_sql(&f)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind("openai")
+            .bind("gpt-4o")
+            .fetch_all::<SloRow>()
+            .await
+            .unwrap_or_else(|e| panic!("sub-hour /v1/slo REJECTED: {e}"));
+        c.query(&tq(build_slo_timeseries_sql(&f, 1)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind("openai")
+            .bind("gpt-4o")
+            .fetch_all::<SloTimePoint>()
+            .await
+            .unwrap_or_else(|e| panic!("sub-hour /v1/slo/timeseries REJECTED: {e}"));
+
+        // 2. The hourly-view paths, now carrying `errors` and the two bound filters.
+        let h = SloFilters {
+            bucket_minutes: None,
+            ..f.clone()
+        };
+        c.query(&tq(build_slo_timeseries_sql(&h, 3)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind("openai")
+            .bind("gpt-4o")
+            .fetch_all::<SloTimePoint>()
+            .await
+            .unwrap_or_else(|e| panic!("hourly /v1/slo/timeseries REJECTED: {e}"));
+        c.query(&tq(build_slo_sql(&SloFilters {
+            bucket_hours: 3,
+            ..h.clone()
+        })))
+        .bind(&tenant)
+        .bind(since)
+        .bind(until)
+        .bind("openai")
+        .bind("gpt-4o")
+        .fetch_all::<SloRow>()
+        .await
+        .unwrap_or_else(|e| panic!("bucketed /v1/slo REJECTED: {e}"));
+
+        // 3. `until` on the spans / guardrail / signature / session families, and the
+        //    gateway-stats cost expression aligned to /v1/costs.
+        let g = GatewayStatsFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            limit: 10,
+        };
+        c.query(&tq(build_gateway_stats_sql(&g)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind(10_u32)
+            .fetch_all::<GatewayProviderRow>()
+            .await
+            .unwrap_or_else(|e| panic!("gateway stats REJECTED: {e}"));
+        c.query(&tq(build_latency_totals_sql(&g)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .fetch_one::<LatencyTotalsRow>()
+            .await
+            .unwrap_or_else(|e| panic!("latency totals REJECTED: {e}"));
+        c.query(&tq(build_latency_by_model_sql(&g)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind(10_u32)
+            .fetch_all::<LatencyModelRow>()
+            .await
+            .unwrap_or_else(|e| panic!("latency by model REJECTED: {e}"));
+        let gr = GuardrailStatsFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            limit: 10,
+        };
+        c.query(&tq(build_guardrail_summary_sql(&gr)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .fetch_one::<GuardrailSummaryRow>()
+            .await
+            .unwrap_or_else(|e| panic!("guardrail summary REJECTED: {e}"));
+        c.query(&tq(build_guardrail_rails_sql(&gr)))
+            .bind(&tenant)
+            .bind(since)
+            .bind(until)
+            .bind(10_u32)
+            .fetch_all::<GuardrailRailRow>()
+            .await
+            .unwrap_or_else(|e| panic!("guardrail rails REJECTED: {e}"));
+        let v = GuardrailVerdictListFilters {
+            since_secs: Some(since),
+            until_secs: Some(until),
+            hours: 6,
+            decision: Some("block".into()),
+            correlation_id: None,
+            rail: None,
+            limit: 5,
+        };
+        c.query(&tq(build_guardrail_verdicts_sql(&v)))
+            .bind(&tenant)
+            .bind("block")
+            .bind(since)
+            .bind(until)
+            .bind(5_u32)
+            .fetch_all::<GuardrailVerdictListRow>()
+            .await
+            .unwrap_or_else(|e| panic!("guardrail verdicts REJECTED: {e}"));
+        let s = SignatureFilters {
+            since_us: Some(since * 1_000_000),
+            until_us: Some(until * 1_000_000),
+            limit: 5,
+            live_signature_ids: vec![],
+        };
+        c.query(&tq(build_signatures_sql(&s)))
+            .bind(&tenant)
+            .bind(since * 1_000_000)
+            .bind(until * 1_000_000)
+            .bind(5_u32)
+            .fetch_all::<SignatureHitRow>()
+            .await
+            .unwrap_or_else(|e| panic!("signatures REJECTED: {e}"));
+        c.query(&tq(build_signatures_trace_total_sql(&s)))
+            .bind(&tenant)
+            .bind(since * 1_000_000)
+            .bind(until * 1_000_000)
+            .fetch_one::<TraceTotalRow>()
+            .await
+            .unwrap_or_else(|e| panic!("signatures total REJECTED: {e}"));
+        let sl = SessionListFilters {
+            since_us: Some(since * 1_000_000),
+            until_us: Some(until * 1_000_000),
+            window_days: 30,
+            limit: 5,
+            ..Default::default()
+        };
+        c.query(&tq(build_session_list_sql(&sl)))
+            .bind(&tenant)
+            .bind(since * 1_000_000)
+            .bind(until * 1_000_000)
+            .bind(5_u32)
+            .fetch_all::<SessionSummaryRow>()
+            .await
+            .unwrap_or_else(|e| panic!("sessions REJECTED: {e}"));
+    }
+
     #[tokio::test]
     #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
     async fn the_cost_sql_is_accepted_by_a_real_clickhouse() {
+        let _serial = SHARED_DB.lock().await;
         let Some(c) = ch() else {
             panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
         };
@@ -7731,7 +9687,7 @@ mod clickhouse_roundtrip {
                     limit: 100,
                     scope,
                 };
-                let sql = TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder)
+                let sql = TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Free)
                     .sql_with_settings();
                 c.query(&sql)
                     .bind(&tenant)
@@ -7769,6 +9725,7 @@ mod clickhouse_roundtrip {
     #[tokio::test]
     #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
     async fn the_judge_split_is_a_subset_of_the_eval_split_on_real_rows() {
+        let _serial = SHARED_DB.lock().await;
         let Some(c) = ch() else {
             panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
         };
@@ -7820,7 +9777,7 @@ mod clickhouse_roundtrip {
             scope: CostScope::All,
         };
         let sql =
-            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder).sql_with_settings();
+            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Free).sql_with_settings();
         let rows: Vec<CostRow> = c
             .query(&sql)
             .bind(&tenant)
@@ -7865,7 +9822,7 @@ mod clickhouse_roundtrip {
             ..f
         };
         let sql =
-            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Builder).sql_with_settings();
+            TenantQuery::new(build_cost_breakdown_sql(&f), PlanTier::Free).sql_with_settings();
         let rows: Vec<CostRow> = c
             .query(&sql)
             .bind(&tenant)
@@ -7877,5 +9834,81 @@ mod clickhouse_roundtrip {
         assert_eq!(rows[0].requests, 2);
         assert_eq!(rows[0].judge_requests, 1);
         assert!(near(rows[0].cost_usd, 0.03));
+    }
+}
+
+#[cfg(test)]
+mod dsh13_tests {
+    use super::*;
+
+    /// Spec §7.3: a fuzzed `metric` / `by` never reaches SQL — it fails the parse, which
+    /// the handler turns into a 400 before any reader call.
+    #[test]
+    fn fuzzed_axes_are_refused_at_the_parse() {
+        for bad in [
+            "",
+            " ",
+            "model ",
+            "MODEL",
+            "model;",
+            "1=1",
+            "model' OR 1=1 --",
+            "requests\n",
+            "cost_usd,requests",
+            "unknown",
+            "tenant_id",
+        ] {
+            assert_eq!(BreakdownMetric::parse(Some(bad)), None, "{bad:?}");
+            assert_eq!(BreakdownBy::parse(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(BreakdownMetric::parse(None), None);
+        assert_eq!(BreakdownBy::parse(None), None);
+        for m in BreakdownMetric::ALL {
+            assert_eq!(BreakdownMetric::parse(Some(m.as_str())), Some(m));
+        }
+        for b in BreakdownBy::ALL {
+            assert_eq!(BreakdownBy::parse(Some(b.as_str())), Some(b));
+        }
+    }
+
+    /// Spec §7.3: the SQL text is one of N constants — 8 metrics × 5 dimensions = 40
+    /// distinct strings, each with exactly the four binds and the tenant filter first.
+    #[test]
+    fn breakdown_sql_is_a_closed_set_of_forty_constants() {
+        let mut seen = std::collections::HashSet::new();
+        for m in BreakdownMetric::ALL {
+            for b in BreakdownBy::ALL {
+                let sql = build_metric_breakdown_sql(m, b);
+                assert!(sql.contains("WHERE tenant_id = ?"), "{sql}");
+                assert_eq!(sql.matches('?').count(), 4, "{sql}");
+                assert!(sql.contains("FROM spans FINAL"), "{sql}");
+                assert!(seen.insert(sql));
+            }
+        }
+        assert_eq!(seen.len(), 40);
+    }
+
+    /// B-330 / DSH-13 §3: the tier-blind literal is gone from this file. The needle is
+    /// assembled so this test's own source cannot satisfy it.
+    #[test]
+    fn no_tier_blind_builder_literal_remains_in_this_file() {
+        let src = include_str!("trace_reads.rs");
+        let needle = ["PlanTier", "::", "Builder"].concat();
+        assert_eq!(
+            src.matches(&needle).count(),
+            0,
+            "a ClickHouse read in trace_reads.rs is capped at a fixed tier again — \
+             route it through tier_for(tenant_id)"
+        );
+        assert!(src.contains("fn tier_for("));
+    }
+
+    /// Fail-closed: no entitlement cache resolves to the FREE tier, never a wider one.
+    #[tokio::test]
+    async fn tier_for_without_a_cache_is_free() {
+        let reader =
+            ClickHouseTraceReader::new(crate::clickhouse_query::ch_client("http://127.0.0.1:1"));
+        let tid = TenantId::from_jwt_claim(uuid::Uuid::from_u128(0xD5813));
+        assert_eq!(reader.tier_for(&tid).await, PlanTier::Free);
     }
 }

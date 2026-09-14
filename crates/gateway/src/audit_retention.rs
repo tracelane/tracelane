@@ -1,10 +1,9 @@
 //! Audit-data retention floor for the Audit add-on SKU (ADR-034).
 //!
 //! EU AI Act Article 12(2)(c) requires a minimum 6-month retention
-//! for high-risk-AI-system logs. The Audit add-on contract promises
-//! at least 180 days regardless of the base tier's `retention_days`
-//! (free 7d / builder 30d / team 90d / business 180d / enterprise
-//! 365d per ADR-020).
+//! for high-risk-AI-system logs. The Enterprise export contract promises
+//! at least 180 days regardless of the base tier's ledger window
+//! (`ledger_days` under ADR-076: Free 30 d, paid tiers 2 y, Enterprise 7 y).
 //!
 //! [`resolve_audit_retention`] is the single source of truth. V1
 //! ships the function + the constant; V1.1 wires it into an
@@ -14,6 +13,11 @@
 /// Hard floor for audit data retention when a workspace has the
 /// `f_audit_addon` entitlement. Six months — matches Article 12(2)(c).
 /// **Do not** lower this without a new ADR.
+///
+/// No production caller today (AUD-15, tracked DORMANT in
+/// `docs/product/AUDIT.md` — no cleanup job calls this yet). Used only by
+/// tests, hence gated (B-390, 2026-09-12).
+#[cfg(test)]
 pub const AUDIT_ADDON_MIN_RETENTION_DAYS: i32 = 180;
 
 /// Resolve the effective audit-data retention in days for a workspace.
@@ -36,6 +40,7 @@ pub const AUDIT_ADDON_MIN_RETENTION_DAYS: i32 = 180;
 /// cases only. A future caller wanting a *shorter* retention must
 /// either (a) not be on the Audit add-on, or (b) get an explicit ADR
 /// amendment.
+#[cfg(test)]
 pub fn resolve_audit_retention(
     base_tier_days: i32,
     has_audit_addon: bool,

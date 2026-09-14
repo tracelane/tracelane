@@ -70,24 +70,6 @@ impl GuardrailRecorder {
         Self { audit_chain, ch }
     }
 
-    /// Record a side's verdict: build → redact → append to the ledger → mirror
-    /// to ClickHouse. Errors are logged and swallowed (availability fail-open,
-    /// matching the audit-log pattern) — recording must never block the request.
-    pub async fn record(
-        &self,
-        side_outcome: &SideOutcome,
-        ctx: &GuardrailContext<'_>,
-        actor: &str,
-    ) {
-        if let Err(err) = self.record_to_ledger(side_outcome, ctx, actor).await {
-            tracing::warn!(
-                error = %err,
-                side = side_outcome.side.as_str(),
-                "guardrail verdict ledger append failed — request proceeds"
-            );
-        }
-    }
-
     /// Build → redact → (spawn ClickHouse mirror) → append to the tamper-evident
     /// ledger; returns the **ledger-append** result. The `GuardrailEngine`
     /// surfaces this so the request path (and the e2e) can confirm the verdict
@@ -137,12 +119,24 @@ impl GuardrailRecorder {
 /// Insert one verdict row. Table is fully qualified so it resolves regardless
 /// of the client's default database. Parameter binding via the `clickhouse::Row`
 /// derive — no raw SQL strings (CLAUDE.md).
+///
+/// B-378: SERVER-SIDE `async_insert`. This mirror is fail-open and spawned —
+/// nothing awaits it — so it is the one ledger-adjacent write that can let
+/// ClickHouse buffer and coalesce: 1,000 verdicts/s become a handful of parts
+/// per second instead of 1,000 (one part per single-row insert was the
+/// review's finding). `wait_for_async_insert=0` returns on buffer, which is
+/// the right durability for a fail-open mirror. `audit_log` does NOT use this:
+/// its rows must be durable before the chain head advances, inside the row
+/// lock, and a buffered write would put that wait under the lock.
 async fn write_verdict_row(
     ch: &clickhouse::Client,
     row: GuardrailVerdictRow,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let mut insert = ch
+        .clone()
+        .with_option("async_insert", "1")
+        .with_option("wait_for_async_insert", "0")
         .insert("tracelane.guardrail_verdicts")
         .context("clickhouse guardrail_verdicts insert init")?;
     insert
@@ -169,6 +163,10 @@ mod tests {
 
     fn minimal_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -178,6 +176,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -255,8 +254,5 @@ mod tests {
             .record_to_ledger(&side_outcome(), &ctx, "apikey:test")
             .await
             .expect("guardrail verdict must append to the ledger");
-
-        // The public path also completes without panicking.
-        recorder.record(&side_outcome(), &ctx, "apikey:test").await;
     }
 }

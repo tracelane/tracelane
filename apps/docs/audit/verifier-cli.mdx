@@ -105,9 +105,12 @@ tracelane-audit verify
 
 | Code | Meaning |
 |---|---|
-| `0` | PASS — every check passed. |
+| `0` | PASS — every check passed **and at least one publicly-included Rekor anchor covers the verified range**. This is the only exit that means a third party can trust the ledger without trusting Tracelane. |
 | `1` | FAIL — at least one check failed; output includes field-level diff identifying the offending `seq`. |
 | `2` | I/O or network failure before verification could run. |
+| `3` | CHAIN-ONLY — the hash chain is internally consistent and nothing is positively wrong, but no publicly-included anchor covers it. A consistent chain can be produced by anyone holding the hashing code, so this is *not tampered, not yet independently verifiable*. A new workspace sees this until its first anchor lands. |
+
+A CI gate or auditor script should treat only `0` as a pass. `3` is the honest state of a ledger nobody outside Tracelane has witnessed yet.
 
 ## Usage examples
 

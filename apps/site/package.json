@@ -3,7 +3,7 @@
 	"type": "module",
 	"version": "0.1.0",
 	"private": true,
-	"description": "tracelane.dev \u2014 the marketing site, consolidated into the monorepo (ADR-074 \u00a710).",
+	"description": "tracelane.dev — the marketing site, consolidated into the monorepo (ADR-074 §10).",
 	"license": "MIT",
 	"scripts": {
 		"dev": "astro dev",
@@ -12,11 +12,12 @@
 		"astro": "astro",
 		"lint": "astro check",
 		"typecheck": "astro check",
+		"pretest": "astro check && astro build",
 		"test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
 		"cf:deploy": "wrangler deploy"
 	},
 	"dependencies": {
-		"astro": "6.4.8"
+		"astro": "7.3.2"
 	},
 	"devDependencies": {
 		"@astrojs/check": "^0.9.0",

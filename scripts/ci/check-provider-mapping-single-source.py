@@ -23,10 +23,13 @@ Three properties, re-established against the new shape:
 
   **1. ONE table.** `ProviderRegistry::provider_id_for_model` is the single
   model→provider map: its six native arms, then `catalog::provider_id_for_model`
-  for everything else. `api_key_env_var`, `provider_name_from_model` and
-  `dispatch_to_provider` DELEGATE to it; `env_var_for_provider_id` and
-  `openai_compatible` are keyed on the provider_id it returns. NO other function
-  in the three sources may match a model on a literal prefix.
+  for everything else. `provider_name_from_model` and `dispatch_to_provider`
+  DELEGATE to it; `env_var_for_provider_id` and `openai_compatible` are keyed on
+  the provider_id it returns. (`api_key_env_var`, the model-keyed env-var wrapper,
+  was DELETED in B-390, 2026-09-12 — the hot path resolves the id first and then
+  the env var, so a model never reaches an env-var lookup at all; the property
+  this guard held for it is now structural and the delegate is off the list.)
+  NO other function in the three sources may match a model on a literal prefix.
 
   **2. FAIL-CLOSED (B-127) — in the SOURCE *and* in the DATA.** Both resolvers
   return `Option`. No catch-all arm and no `unwrap_or` may yield a provider id or
@@ -61,6 +64,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 MOD_RS = REPO / "crates/gateway/src/providers/mod.rs"
 SERVER_RS = REPO / "crates/gateway/src/server.rs"
+# B-385 §2d (2026-09-12): `server.rs` was split by concern into `server/*.rs`.
+# The two model delegates this guard reads (`provider_name_from_model`,
+# `dispatch_to_provider`) live in `server/dispatch.rs`, and the GLOBAL
+# no-second-prefix-table scan must cover every file a routing rule could hide
+# in — so the "server" source is `server.rs` + every `server/*.rs`, read as one.
+SERVER_DIR = REPO / "crates/gateway/src/server"
+SERVER_LABEL = "crates/gateway/src/server.rs + server/*.rs"
+
+
+def read_server_sources() -> str:
+    """`server.rs` followed by every `server/*.rs`, sorted, as one string."""
+    parts = [SERVER_RS.read_text(encoding="utf-8")]
+    parts.extend(p.read_text(encoding="utf-8") for p in sorted(SERVER_DIR.glob("*.rs")))
+    return "\n".join(parts)
+
+
 CATALOG_RS = REPO / "crates/gateway/src/providers/catalog.rs"
 PROVIDERS_TSV = REPO / "crates/gateway/providers.tsv"
 GATEWAY_DIR = REPO / "crates/gateway"
@@ -85,7 +104,6 @@ NATIVE_KEY_ENVS = frozenset(
 
 # Delegates that take a MODEL: each must consult the canonical resolver.
 MODEL_DELEGATES = {
-    "api_key_env_var": "mod",
     "provider_name_from_model": "server",
     "dispatch_to_provider": "server",
 }
@@ -575,10 +593,6 @@ impl ProviderRegistry {{
         catalog::provider_id_for_model(model)
     }}
 
-    pub fn api_key_env_var(model: &str) -> Option<&'static str> {{
-        Self::provider_id_for_model(model).map(Self::env_var_for_provider_id)
-    }}
-
     pub fn env_var_for_provider_id(provider_id: &str) -> &'static str {{
         match provider_id {{
             "anthropic" => "ANTHROPIC_API_KEY",
@@ -912,10 +926,11 @@ def main() -> int:
 
     errors = run(
         MOD_RS.read_text(encoding="utf-8"),
-        SERVER_RS.read_text(encoding="utf-8"),
+        read_server_sources(),
         CATALOG_RS.read_text(encoding="utf-8"),
         PROVIDERS_TSV.read_text(encoding="utf-8"),
         find_data_files(),
+        server_label=SERVER_LABEL,
     )
 
     if errors:

@@ -34,6 +34,19 @@
 //! on the request path. The caller additionally holds a process-local "already
 //! attempted" set so a tenant sitting above quota does not spawn a task per
 //! request. CLAUDE.md's "never per-request Postgres" invariant holds.
+//!
+//! # BILL-01 / ADR-076 (2026-09-13) — orphaned, not deleted
+//!
+//! The trace-count monthly quota this table's ONE caller
+//! (`server/quota.rs::maybe_notify_soft_cap`) existed for is gone — ADR-076
+//! replaces it with six per-unit meters and its own 75%/90% warning
+//! thresholds (spec §0.4), which are NOT wired to this table in this build.
+//! Left in place, `#[allow(dead_code)]`'d with a reason, rather than deleted:
+//! the `quota_notifications` Postgres table (migration `0023`) still exists,
+//! and dropping its Rust reader is a decision about that table's fate, not a
+//! rename. If BILL-01's meter warnings reuse this exact-once-per-period
+//! pattern, this module is the mechanism to resume; if not, deleting both the
+//! Rust and the table is a follow-up, not implied by this change.
 
 use anyhow::Result;
 
@@ -43,6 +56,7 @@ use tracelane_shared::TenantId;
 /// Notification kind. Text in the DB, not a PG enum — binding a Rust `&str`
 /// into a PG enum needs a `$N::text::enum` cast and has already cost this repo
 /// one debugging session.
+#[allow(dead_code)] // orphaned by BILL-01 — see the module doc above
 pub const KIND_SOFT_CAP: &str = "soft_cap";
 
 /// Attempt to claim the right to notify `tenant_id` for `period`/`kind`.
@@ -56,6 +70,7 @@ pub const KIND_SOFT_CAP: &str = "soft_cap";
 /// notify": a failed claim must not be retried into a duplicate alert, and a
 /// missed alert is strictly better than a flood that trains the tenant to mute
 /// the channel their hard-cap 429 also arrives on.
+#[allow(dead_code)] // orphaned by BILL-01 — see the module doc above
 pub async fn claim(pool: &Pool, tenant_id: &TenantId, period: &str, kind: &str) -> Result<bool> {
     let client = pool.get().await?;
     let stmt = client

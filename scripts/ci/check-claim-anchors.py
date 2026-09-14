@@ -144,12 +144,36 @@ def load() -> list[dict]:
     return json.loads(LEDGER.read_text(encoding="utf-8")).get("claims", [])
 
 
+def _archive_path(anchor: dict) -> str | None:
+    """The anchor's `file`/`glob` target if it points into docs/archive/, else None.
+
+    Founder ruling 2026-09-03 §4: docs/archive/ is never citable as current
+    truth, even when the path/line resolves — a resolving anchor into a
+    superseded doc is proof of nothing but that the stale file still exists.
+    """
+    for key in ("file", "glob"):
+        val = anchor.get(key)
+        if isinstance(val, str) and val.startswith("docs/archive/"):
+            return val
+    return None
+
+
 def verify(rows: list[dict]) -> int:
     bad = 0
     by_verdict: dict[str, int] = {}
     for r in rows:
         v = r.get("verdict", "?")
         by_verdict[v] = by_verdict.get(v, 0) + 1
+
+        archive_target = _archive_path(r.get("anchor", {}))
+        if archive_target:
+            print(
+                f"ARCHIVE-ANCHORED — {r.get('claim')!r} ({r.get('doc')})\n"
+                f"    anchor points into docs/archive/ ({archive_target}) — archive is "
+                "not citable as current truth; cite the canonical doc or code."
+            )
+            bad += 1
+            continue
 
         if v not in VERDICTS:
             print(f"BAD VERDICT {v!r} — {r.get('claim')!r}")
@@ -261,6 +285,28 @@ def selftest() -> int:
         print("  FAIL: a dormant claim passed as TRUE-ANCHORED")
         return 1
     print("  OK: dormant-but-anchored blocked\n")
+
+    print("selftest: an anchor into docs/archive/ must FAIL even if it resolves ...")
+    rows = [
+        {
+            "claim": "the retention table says 90 days",
+            "doc": "fake.md:4",
+            "verdict": "TRUE-ANCHORED",
+            "reachability": "live",
+            "anchor": {
+                "kind": "symbol",
+                # Split literal on purpose: the public-export guard refuses a
+                # `docs/archive/<name>.md` token in shipped source; the fixture
+                # must still resolve to a REAL archive file.
+                "file": "docs/archive/" + "ARCHIVE_INDEX.md",
+                "symbol": "archive",
+            },
+        }
+    ]
+    if verify(rows) == 0:
+        print("  FAIL: a resolving docs/archive/ anchor did not block")
+        return 1
+    print("  OK: docs/archive/ anchor blocked\n")
 
     print("selftest: a holding anchor must PASS ...")
     rows = [

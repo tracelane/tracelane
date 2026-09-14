@@ -107,6 +107,14 @@ struct CreateKeyBody {
     /// here, for every out-of-range value.
     #[serde(default)]
     rate_limit_rpm: Option<i64>,
+    /// BILL-01 A3. `"daily" | "weekly" | "monthly"`. Omitted ⇒ `"monthly"`
+    /// (the column's own default, and every key minted before A3).
+    #[serde(default)]
+    budget_reset: Option<String>,
+    /// BILL-01 A3. Opt IN to the velocity breaker for this key. Omitted ⇒
+    /// `false` — a customer must ask for it.
+    #[serde(default)]
+    velocity_breaker: bool,
 }
 
 /// `POST /v1/keys` response. camelCase to match the dashboard's `CreateResult`
@@ -130,6 +138,8 @@ struct CreateKeyResponse {
     /// to assume its input survived. `null` = uncapped / plan default.
     budget_usd_monthly: Option<f64>,
     rate_limit_rpm: Option<i32>,
+    budget_reset: &'static str,
+    velocity_breaker: bool,
 }
 
 /// The known scope slugs, for every 400 this route emits.
@@ -167,7 +177,7 @@ async fn claims_from_auth(
     })?;
     crate::auth::validate_authorization(header_str)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))
+        .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))
 }
 
 /// POST /v1/keys — mint an API key for the authenticated tenant.
@@ -328,11 +338,29 @@ async fn create_key_handler(
         },
     };
 
+    // BILL-01 A3: validated the same way as every other field here — a 400
+    // naming the problem, before the mint, rather than a constraint
+    // violation from the CHECK-constrained column.
+    let budget_reset = match body.budget_reset.as_deref() {
+        None => None,
+        Some("daily") => Some(crate::spend::BudgetReset::Daily),
+        Some("weekly") => Some(crate::spend::BudgetReset::Weekly),
+        Some("monthly") => Some(crate::spend::BudgetReset::Monthly),
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("budget_reset must be one of daily, weekly, monthly (got {other:?})"),
+            ));
+        }
+    };
+
     let opts = crate::db::api_keys::MintOptions {
         scope,
         expires_at,
         budget_usd_monthly: body.budget_usd_monthly,
         rate_limit_rpm,
+        budget_reset,
+        velocity_breaker: body.velocity_breaker,
     };
 
     // Record the minting user (WorkOS `sub`) so §3 member-removal can revoke
@@ -375,6 +403,10 @@ async fn create_key_handler(
             expires_at: minted.api_key.expires_at.map(|t| t.to_rfc3339()),
             budget_usd_monthly: body.budget_usd_monthly,
             rate_limit_rpm,
+            budget_reset: budget_reset
+                .unwrap_or(crate::spend::BudgetReset::Monthly)
+                .as_str(),
+            velocity_breaker: body.velocity_breaker,
         }),
     ))
 }
@@ -413,11 +445,8 @@ mod tests {
             Ok(MintedKey {
                 api_key: ApiKey {
                     id: Uuid::nil(),
-                    tenant_id: *tenant.as_uuid(),
                     name: name.to_string(),
                     created_at: DateTime::<Utc>::from_timestamp(1_778_000_000, 0).unwrap(),
-                    last_used_at: None,
-                    revoked_at: None,
                     scope,
                     expires_at,
                 },
@@ -451,6 +480,8 @@ mod tests {
             expires_at,
             budget_usd_monthly: budget,
             rate_limit_rpm: None,
+            budget_reset: None,
+            velocity_breaker: false,
         }
     }
 
@@ -822,6 +853,8 @@ mod tests {
                 expires_at: None,
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: None,
+                velocity_breaker: false,
             }),
         )
         .await
@@ -848,6 +881,8 @@ mod tests {
                 expires_at: None,
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: None,
+                velocity_breaker: false,
             }),
         )
         .await
@@ -873,6 +908,8 @@ mod tests {
                 expires_at: None,
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: None,
+                velocity_breaker: false,
             }),
         )
         .await

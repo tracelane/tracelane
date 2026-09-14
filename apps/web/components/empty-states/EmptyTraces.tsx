@@ -69,8 +69,12 @@ export function EmptyTraces({ gatewayUrl }: { gatewayUrl?: string }) {
 			<div className="mb-6 flex flex-col items-center gap-3">
 				<span
 					aria-hidden="true"
-					className="grid h-9 w-9 place-items-center rounded-xl bg-surface-2 text-ink-2"
+					className="relative grid h-9 w-9 place-items-center rounded-xl bg-surface-2 text-ink-2"
 				>
+					{/* DSH-16: same soft amber halo as the shared `EmptyState` primitive's
+					    full variant — this file hand-rolls the primitive's markup (see the
+					    file header for why), so the two chips have to move together. */}
+					<span aria-hidden="true" className="empty-icon-glow" />
 					<svg
 						aria-hidden="true"
 						focusable="false"

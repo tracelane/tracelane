@@ -14,11 +14,18 @@
  */
 
 import { RangeControl } from "@/components/RangeControl";
+import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { SessionFilters } from "@/components/sessions/SessionFilters";
-import { formatDateTimeUtc } from "@/lib/format-date";
-import { rangeToHours } from "@/lib/range";
-import { type SessionSummary, fetchSessions } from "@/lib/sessions";
-import { Badge, Card, EmptyState, Skeleton, TimeRuler } from "@tracelanedev/ui";
+import { SessionRow, parseDate } from "@/components/sessions/SessionRow";
+import { fetchSessionsFor } from "@/lib/metrics/fetch";
+import {
+	MAX_SESSION_WINDOW_MS,
+	type TimeRange,
+	parseTimeRange,
+} from "@/lib/metrics/time-range";
+import type { SessionSummary } from "@/lib/sessions";
+import { Card, EmptyState, Skeleton, TimeRuler } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense } from "react";
@@ -33,33 +40,6 @@ type SP = Record<string, string | undefined>;
 /** Sortable columns → the gateway `sort` param (allowlisted both ends). */
 type SortCol = "turns" | "cost" | "tokens" | "duration" | "last_activity";
 const SORT_PARAMS = ["status", "model", "range", "sort", "order"] as const;
-
-/** Format a ClickHouse toString datetime or ISO 8601 string for display. */
-function parseDate(s: string): Date {
-	// A "…T08:45:53" with a T but NO zone parses as LOCAL — anchor to UTC unless
-	// the string already carries a zone (the naive-timestamp class; see parseUtcMs).
-	const hasZone = /([zZ]|[+-]\d{2}:?\d{2})$/.test(s);
-	return new Date(hasZone ? s : `${s.replace(" ", "T")}Z`);
-}
-
-function formatCost(usd: number): string {
-	if (usd === 0) return "—";
-	return `$${usd.toFixed(4)}`;
-}
-
-function formatTokens(n: number): string {
-	if (n <= 0) return "—";
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-	return String(n);
-}
-
-function formatDuration(us: number): string {
-	if (us <= 0) return "—";
-	if (us < 1_000) return `${us}µs`;
-	if (us < 1_000_000) return `${(us / 1_000).toFixed(1)}ms`;
-	return `${(us / 1_000_000).toFixed(2)}s`;
-}
 
 /**
  * A /sessions URL that sets the sort column and toggles direction (clicking the
@@ -105,34 +85,6 @@ function sessionWindow(
 	return { startMs, endMs };
 }
 
-/** One session's bar — real start, real duration, inside the shared window. */
-function SessionBar({
-	s,
-	win,
-}: { s: SessionSummary; win: { startMs: number; endMs: number } }) {
-	const span = win.endMs - win.startMs;
-	const end = parseDate(s.last_activity).getTime();
-	if (!Number.isFinite(end) || span <= 0) return null;
-	const start = end - Math.max(0, s.duration_us) / 1_000;
-	const leftPct = ((start - win.startMs) / span) * 100;
-	const widthPct = Math.min(
-		Math.max(((end - start) / span) * 100, 0.6),
-		Math.max(0, 100 - leftPct),
-	);
-	return (
-		<span className="relative flex h-4 items-center" aria-hidden="true">
-			<span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line/60" />
-			<span
-				// `--chart-secondary` (the de-emphasised data-mark role) rather than
-				// `bg-ink-2/70`: an alpha re-composites against the row behind it, so
-				// the same bar changed value the moment the row was hovered.
-				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm bg-chart-secondary"
-				style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
-			/>
-		</span>
-	);
-}
-
 function SortHeader({
 	sp,
 	col,
@@ -159,70 +111,27 @@ function SortHeader({
 	);
 }
 
-function SessionRow({
-	s,
-	win,
-}: { s: SessionSummary; win: { startMs: number; endMs: number } | null }) {
-	const isError = s.status === "error";
-	return (
-		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-hover">
-			<td className="px-3 py-2">
-				<Link
-					href={`/sessions/${encodeURIComponent(s.session_id)}`}
-					className="font-mono text-xs text-action-ink hover:underline"
-				>
-					{s.session_id.length > 24
-						? `${s.session_id.slice(0, 12)}…${s.session_id.slice(-8)}`
-						: s.session_id}
-				</Link>
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
-				{s.turns}
-			</td>
-			<td className="px-3 py-2 font-mono text-xs text-ink-2">
-				{s.model || "—"}
-			</td>
-			{win && (
-				<td className="px-3 py-2">
-					<SessionBar s={s} win={win} />
-				</td>
-			)}
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
-				{formatTokens(s.total_tokens)}
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
-				{formatDuration(s.duration_us)}
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
-				{formatCost(s.cost_usd)}
-			</td>
-			<td className="px-3 py-2">
-				{isError ? (
-					<Badge tone="danger">error</Badge>
-				) : (
-					<Badge tone="ok">ok</Badge>
-				)}
-			</td>
-			<td className="px-3 py-2 text-right text-xs text-ink-2">
-				{formatDateTimeUtc(parseDate(s.last_activity).toISOString())}
-			</td>
-		</tr>
-	);
-}
-
-async function SessionsData({ sp }: { sp: SP }) {
-	// Sessions are sparse multi-turn aggregates, so a 24h default reads as "empty"
-	// on low traffic — default to 30d so recent conversations actually show.
-	const since = new Date(
-		Date.now() - rangeToHours(sp.range ?? "30d") * 3_600_000,
-	).toISOString();
-	const sessions = await fetchSessions({
-		since,
+async function SessionsData({ sp, range }: { sp: SP; range: TimeRange }) {
+	const sessions = await fetchSessionsFor(range, {
 		sort: sp.sort,
 		order: sp.order,
 		status: sp.status,
 		model: sp.model,
 	});
+
+	// Unreachable ≠ empty (B-334): an outage used to render as "No sessions in
+	// this window", which is a confident zero over a read that never happened.
+	if (sessions === null) {
+		return (
+			<>
+				<WarmingBanner />
+				<EmptyState
+					title="Waiting on the gateway"
+					description="Sessions appear here once the gateway is reachable."
+				/>
+			</>
+		);
+	}
 
 	if (sessions.length === 0) {
 		const filtered = Boolean(sp.status || sp.model);
@@ -242,7 +151,7 @@ async function SessionsData({ sp }: { sp: SP }) {
 		) : (
 			<EmptyState
 				title="No sessions in this window"
-				description="Sessions thread an agent's related traces by conversation id. Widen the range, or once your agents emit `gen_ai.conversation.id`, multi-turn runs show up here."
+				description="Sessions thread an agent's related traces by conversation id. Widen the range, or once your agents emit `gen_ai.conversation.id`, multi-turn runs show up here. Recording Claude Code? Run `tlane init claude-code`."
 			/>
 		);
 	}
@@ -260,6 +169,15 @@ async function SessionsData({ sp }: { sp: SP }) {
 					<thead>
 						<tr className="border-b border-line">
 							<th className="px-3 py-1.5 text-left t-metric-label">Session</th>
+							{/* OBS-20. Not sortable: sorting is an allowlisted ORDER BY on
+							    the aggregate (`SessionSort`), and an identity column is a
+							    thing you filter to, not a thing you rank by. */}
+							<th
+								className="px-3 py-1.5 text-left t-metric-label"
+								title="Who initiated the session — the end-user id your application sent via the x-tracelane-user-id header. Empty when none was sent."
+							>
+								User
+							</th>
 							<SortHeader sp={sp} col="turns" label="Turns" />
 							<th
 								className="px-3 py-1.5 text-left t-metric-label"
@@ -301,6 +219,26 @@ async function SessionsData({ sp }: { sp: SP }) {
 					to see more.
 				</p>
 			)}
+			{/* OBS-20. Shown when there ARE sessions but not one carries a user id —
+			    the expected state for a correctly deployed tenant that has simply
+			    not instrumented it yet. Without this the User column is a row of
+			    dashes that reads as broken, which is exactly how the existing
+			    `x-human-authorizer` header came to be built and never once used:
+			    nothing customer-readable ever mentioned it. */}
+			{sessions.length > 0 && sessions.every((s) => !s.end_user) && (
+				<p className="px-1 text-xs text-ink-3">
+					No user ids yet — send an{" "}
+					<code className="font-mono text-2xs">x-tracelane-user-id</code> header
+					(or OpenAI&rsquo;s <code className="font-mono text-2xs">user</code>{" "}
+					field) to attribute traces to your end users.{" "}
+					<a
+						className="text-action-ink hover:underline"
+						href="https://docs.tracelane.dev/concepts"
+					>
+						Docs
+					</a>
+				</p>
+			)}
 			<p className="px-1 text-2xs text-ink-3">
 				Tokens and cost are summed per session across all turns — they may
 				double-count when usage is recorded on both a wrapper span and its inner
@@ -316,20 +254,29 @@ export default async function SessionsPage({
 	searchParams: Promise<SP>;
 }) {
 	const sp = await searchParams;
+	// Sessions are sparse multi-turn aggregates, so a 24h default reads as "empty"
+	// on low traffic — 30d, and the sessions family's own 90 d cap.
+	const range = parseTimeRange(sp, {
+		defaultPreset: "30d",
+		nowMs: Date.now(),
+		maxWidthMs: MAX_SESSION_WINDOW_MS,
+	});
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div>
 					<h1 className="t-h1">Sessions</h1>
 					<p className="mt-1 text-sm text-ink-2">
-						Multi-turn conversations grouped from related traces.
+						Multi-turn conversations grouped from related traces — {range.label}
+						.
 					</p>
 				</div>
 				<div className="flex flex-wrap items-center gap-2">
 					<SessionFilters />
-					<RangeControl defaultRange="30d" />
+					<RangeControl defaultPreset="30d" />
 				</div>
 			</div>
+			<WindowNotice range={range} />
 			<Suspense
 				// `range` intentionally OMITTED from the key: the RangeControl's
 				// useTransition swaps the range data in place with no remount/flash
@@ -344,7 +291,7 @@ export default async function SessionsPage({
 					</div>
 				}
 			>
-				<SessionsData sp={sp} />
+				<SessionsData sp={sp} range={range} />
 			</Suspense>
 		</div>
 	);

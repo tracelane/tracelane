@@ -14,7 +14,6 @@
 use anyhow::{Context as _, Result};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::Stream;
 use reqwest::Client;
 use serde_json::Value;
 use tracing::instrument;
@@ -66,6 +65,13 @@ impl AzureOpenAiProvider {
     }
 
     /// Deployment name from model field (`azure/gpt-4o` → `gpt-4o`, `gpt-4o` → `gpt-4o`).
+    ///
+    /// **Stays private, and GWY-48 deliberately does NOT reuse it** — the two look
+    /// alike and answer different questions. This one must ALWAYS yield a name
+    /// because it builds a URL, so it falls back to the whole model string;
+    /// `server::deployment_identity` must yield `None` when there is no deployment,
+    /// because an invented one would render as a value. Sharing them would force one
+    /// of those two contracts to be wrong.
     fn deployment(model: &str) -> &str {
         model.strip_prefix("azure/").unwrap_or(model)
     }
@@ -137,10 +143,34 @@ impl AzureOpenAiProvider {
             // api-key header value in 401 responses.
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(status, "Azure OpenAI API error");
-            anyhow::bail!("azure openai error: status {status}");
+            // B-391: typed (see cohere.rs) — a rejected `api-key` is 401
+            // `provider_key_rejected`, not 502.
+            return Err(crate::providers::ProviderHttpError {
+                provider: "azure",
+                status,
+                reason: None,
+            }
+            .into());
         }
 
-        // Reuse OpenAI SSE parsing by delegating to the openai module's stream parser
+        // ⚠️ THIS COMMENT USED TO SAY "reuse OpenAI SSE parsing by delegating to
+        // the openai module's stream parser". IT DELEGATES TO NOTHING. What
+        // follows is a SECOND, hand-rolled parser of the same wire format, with
+        // its own `data: ` split, content, tool_calls, finish_reason and usage
+        // extraction. `parse_openai_sse` is private to `openai.rs` and is never
+        // named here.
+        //
+        // Corrected 2026-09-08 (GWY-48/OBS-53) per CLAUDE.md §17 — where a doc
+        // and the code disagree, the code wins and the doc is the defect. The
+        // request side of this same file is emphatic that "two translations for
+        // one wire format is the drift [this] exist[s] to prevent"; the response
+        // side is that exact drift, and the comment was hiding it.
+        //
+        // CONSEQUENCE FOR OBS-53, stated so it is not mistaken for a bug later:
+        // this parser has NO logprobs handling, so an Azure stream captures no
+        // confidence summary even when the client asks for one. Filed, not fixed
+        // here — unifying the two parsers is a behaviour change to a live
+        // provider path and does not belong in an observability block.
         let mut byte_stream = response.bytes_stream();
         let stream = try_stream! {
             use futures::StreamExt as _;
@@ -173,6 +203,15 @@ impl AzureOpenAiProvider {
                                             .to_owned(),
                                     };
                                 }
+                            }
+                            // B-354: Azure speaks the OpenAI wire format, so
+                            // its stop reason is OpenAI's, on its own terminal
+                            // chunk. Same pass-through as `openai.rs`.
+                            if let Some(reason) = v["choices"][0]["finish_reason"]
+                                .as_str()
+                                .and_then(crate::providers::FinishReason::from_openai_finish_reason)
+                            {
+                                yield ProviderEvent::Finish { reason };
                             }
                             if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
                                 yield ProviderEvent::UsageUpdate {
@@ -210,6 +249,10 @@ mod tests {
     #[test]
     fn azure_sends_tools_in_the_openai_shape_not_the_internal_one() {
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "azure/gpt-4o".into(),
             messages: vec![Message {
                 role: Role::User,
@@ -225,6 +268,7 @@ mod tests {
                     "properties": {"city": {"type": "string"}}
                 }),
             }]),
+            tool_choice: None,
             max_tokens: Some(10),
             temperature: None,
             stream: Some(true),

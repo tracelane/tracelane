@@ -1,0 +1,121 @@
+From 6438f3580cd27d4dcef164a12d227a313ec53902 Mon Sep 17 00:00:00 2001
+From: Tracelane Bench <bench@tracelane.dev>
+Date: Sun, 6 Sep 2026 19:27:57 +0000
+Subject: [PATCH] gateways: add Tracelane + an OpenAI-route overhead scenario
+
+Tracelane has no POST /v1/messages route (OpenAI-shaped
+/v1/chat/completions only), so it cannot run the existing Anthropic-route
+scenarios. scenarios/openai_overhead is a non-streaming variant of the
+overhead measurement that runs on /v1/chat/completions instead, against
+the same mock (which already serves both routes), so every gateway in the
+comparison -- Tracelane included -- runs the identical scenario on a
+route it actually has.
+---
+ gateways/tracelane/README.md            | 38 +++++++++++++++++++
+ scenarios/openai_overhead/locustfile.py | 49 +++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+)
+ create mode 100644 gateways/tracelane/README.md
+ create mode 100644 scenarios/openai_overhead/locustfile.py
+
+diff --git a/gateways/tracelane/README.md b/gateways/tracelane/README.md
+new file mode 100644
+index 0000000..ae0411f
+--- /dev/null
++++ b/gateways/tracelane/README.md
+@@ -0,0 +1,38 @@
++# Tracelane
++
++Tracelane (`tracelane.dev`) has no `POST /v1/messages` route — only
++OpenAI-shaped `POST /v1/chat/completions` — so it cannot run this harness's
++existing Anthropic-route scenarios unmodified. It CAN run the OpenAI-route
++`scenarios/openai_overhead` scenario added alongside this file, on the same
++mock every other gateway in the comparison uses.
++
++Run self-host (single-tenant, no external control plane needed):
++
++```bash
++docker run --rm -p 8080:8080 \
++  -e TRACELANE_SELF_HOST=1 \
++  -e TRACELANE_MASTER_KEY=<random> \
++  -e ANTHROPIC_API_KEY=bench \
++  -e ANTHROPIC_BASE_URL=<this harness's mock URL> \
++  -e NATS_URL=<a NATS JetStream URL — required, capture cannot be disabled> \
++  -e CLICKHOUSE_URL=<a ClickHouse HTTP URL> \
++  ghcr.io/tracelane/tracelane/gateway:latest
++```
++
++Point the OpenAI-route scenario at it with `GWBENCH_ENDPOINT=/v1/chat/completions`
++and a model string that starts with `claude` (Tracelane's model→provider
++catalog routes by literal prefix and fails closed on anything else), e.g.
++`GWBENCH_MODEL=claude-mock-gwbench`.
++
++**Known limitation, not a bug in this harness:** a **release-build** Tracelane
++gateway's own SSRF hardening rejects a loopback or RFC1918
++`ANTHROPIC_BASE_URL` (no debug-only bypass exists in release binaries, by
++design). Point `ANTHROPIC_BASE_URL` at the mock's address as reached from a
++genuinely public IP (or run a debug build with
++`TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS=1`, which is not a representative
++overhead number — debug builds are materially slower than release).
++
++Capture (NATS + ClickHouse) must stay on — Tracelane refuses to boot without
++`NATS_URL` set (there is no flag to disable span capture entirely), and a
++gateway measured with its own capture pipeline dropped would not be measuring
++the product this harness is comparing.
+diff --git a/scenarios/openai_overhead/locustfile.py b/scenarios/openai_overhead/locustfile.py
+new file mode 100644
+index 0000000..02789c7
+--- /dev/null
++++ b/scenarios/openai_overhead/locustfile.py
+@@ -0,0 +1,49 @@
++from __future__ import annotations
++
++import os
++
++from locust import HttpUser, between, task
++
++from common.payloads import openai_body
++
++
++class OpenAIOverheadUser(HttpUser):
++    """PLT-23: gateway-overhead on the OpenAI chat-completions route.
++
++    AIGatewayBench's scenarios all target Anthropic's `/v1/messages`. Tracelane
++    has no such route (only OpenAI-shaped `/v1/chat/completions`), and every
++    gateway under comparison also speaks OpenAI chat completions, so this
++    variant drives the SAME overhead measurement — a non-streaming round trip
++    through the gateway to the deterministic mock and back — on that route
++    instead, for every gateway in the comparison including the direct
++    (gateway-less) baseline. Same mock, same body shape, same `-u 16 -r 16
++    -t 30s` parameters as the project's published post.
++    """
++
++    wait_time = between(0.05, 0.15)
++    host = os.getenv("GWBENCH_TARGET", "http://127.0.0.1:8000")
++    endpoint = os.getenv("GWBENCH_ENDPOINT", "/v1/chat/completions")
++    model = os.getenv("GWBENCH_MODEL", "mock")
++
++    @staticmethod
++    def _extra_headers() -> dict[str, str]:
++        # "k1:v1|k2:v2" — used for gateways that route by header rather than by
++        # model string or path (Portkey: x-portkey-provider / x-portkey-custom-host).
++        raw = os.getenv("GWBENCH_EXTRA_HEADERS", "")
++        headers: dict[str, str] = {}
++        for pair in filter(None, raw.split("|")):
++            name, _, value = pair.partition(":")
++            if name:
++                headers[name.strip()] = value.strip()
++        return headers
++
++    @task
++    def overhead_turn(self) -> None:
++        headers = {"Authorization": f"Bearer {os.getenv('GWBENCH_API_KEY', 'gwbench')}"}
++        headers.update(self._extra_headers())
++        self.client.post(
++            self.endpoint,
++            json=openai_body(model=self.model, stream=False),
++            headers=headers,
++            name="openai_overhead",
++        )
+-- 
+2.53.0
+

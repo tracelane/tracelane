@@ -1,163 +1,122 @@
-//! FT-01 chaos test (A17): provider 500 storm + same-provider retry.
+//! FT-01 chaos test (A17, rebuilt under B-385 2c): a provider 5xx storm and the
+//! same-provider retry, THROUGH THE REAL GATEWAY.
 //!
-//! Pre-A17 the FT eval suite was a "string contains" check against
-//! `crates/gateway/src/providers/failover.rs`. This test exercises the
-//! real retry path end-to-end with `wiremock` as the upstream:
+//! Until 2026-09-12 this file drove a bare `reqwest::Client` against wiremock and
+//! slept 100 ms between two hand-made requests — it proved that wiremock answers
+//! and that `tokio::time::sleep` sleeps. Its `failover_budget_is_200ms` compared a
+//! local constant to itself. Nothing here touched the gateway.
 //!
-//!   1. Start a wiremock server that answers the first request with
-//!      HTTP 500, then 200 OK on the retry.
-//!   2. Call `dispatch_with_retry` (via the OpenAI-compatible adapter)
-//!      pointing at the wiremock URL.
-//!   3. Assert the call succeeds within the FT-01 200ms total budget
-//!      and that the retry actually fired.
+//! Now each test boots the real binary (`tests/common`) with its Ollama adapter
+//! pointed at a wiremock upstream and sends ONE request over HTTP. The retry
+//! (`server.rs::retry_loop`, closure-driven since B-391) runs inside the
+//! gateway; what this file asserts is what the gateway did:
 //!
-//! The test runs with the SSRF loopback bypass enabled (debug builds
-//! only) because wiremock binds to 127.0.0.1.
+//!   - how many requests reached the provider (the mock's own log),
+//!   - what the caller got back (status + body),
+//!   - how many spans the gateway emitted (`/health.spans_dropped` — with
+//!     capture opted out, every emitted span is counted there, which is exactly
+//!     the A1 contract).
+//!
+//! The in-process twin — which can also read the breaker's window — is
+//! `src/handler_harness.rs::a_503_then_200_is_retried_once_records_one_span_and_feeds_the_breaker_once`.
+//!
+//! Debug builds only: the dev-stub credential and the loopback SSRF bypass the
+//! child process needs both exist only there.
 
 #![cfg(debug_assertions)]
-#![allow(dead_code)]
 
-use std::time::Instant;
+mod common;
 
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "../src/ssrf_guard.rs"]
-#[allow(dead_code)]
-mod ssrf_guard;
+use common::{BEARER, Gateway, chat_ok_body, chat_request};
 
-/// Enable the loopback SSRF bypass for this test binary.
-///
-/// Set exactly once for the whole process via `OnceLock` and **never
-/// removed**. Every test in this binary needs loopback enabled (wiremock
-/// binds 127.0.0.1), and an integration-test binary is process-isolated
-/// from every other, so leaking the var here is correct.
-///
-/// This deliberately replaces the previous set-var-on-`install`/
-/// remove-var-on-`Drop` guard: `#[tokio::test]`s in one file run on
-/// multiple threads by default, so a per-test Drop that `remove_var`s a
-/// process-global env var races with another test's `validate_url` read —
-/// the bypass would intermittently be unset mid-call and the SSRF guard
-/// would reject 127.0.0.1 (the flaky failure this fixes). Per
-/// `.claude/rules/testing.md`: never set/remove a process-global env var
-/// from parallel tests. `OnceLock` makes the single write happen-before
-/// every subsequent read, so there is no write-vs-read race.
-fn enable_loopback_bypass() {
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| {
-        // SAFETY: runs exactly once, before any test reads the var; the
-        // OnceLock barrier serialises it ahead of all readers. Debug-only
-        // escape hatch — release builds ignore the var entirely.
-        unsafe {
-            std::env::set_var("TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS", "1");
-        }
-    });
-}
-
-/// Sanity: the FT-01 retry budget is the documented 200ms.
-#[test]
-fn failover_budget_is_200ms() {
-    // Pulled in via path-include to avoid touching the gateway public surface.
-    // The constant lives in `crates/gateway/src/providers/failover.rs` —
-    // we reference its numeric value here so a future change is caught.
-    const EXPECTED_FAILOVER_BUDGET_MS: u64 = 200;
-    assert_eq!(EXPECTED_FAILOVER_BUDGET_MS, 200);
-}
-
-/// Wiremock-driven retry chaos: first call returns 500, second 200.
-///
-/// We don't drive the full gateway hot path here (that requires booting
-/// axum + Postgres + ClickHouse), but we DO exercise the same shape:
-/// fire a request, observe an upstream 500, retry once, succeed.
+/// Upstream 503 then 200 ⇒ the caller gets the 200, the provider saw exactly two
+/// requests (one retry), and the gateway emitted exactly one span.
 #[tokio::test]
-async fn wiremock_500_then_200_succeeds_within_200ms() {
-    enable_loopback_bypass();
-
-    let server = MockServer::start().await;
-
-    // First request: 500. Up to second request: 200.
+async fn a_503_then_200_is_retried_once_and_served_with_one_span() {
+    let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("upstream broke"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream broke"))
         .up_to_n_times(1)
-        .mount(&server)
+        .mount(&upstream)
         .await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(b"data: [DONE]\n\n".to_vec(), "text/event-stream"),
-        )
-        .mount(&server)
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+        .mount(&upstream)
         .await;
+    let gw = Gateway::spawn(&upstream.uri()).await;
+    let spans_before = gw.spans_dropped().await;
 
-    // Validate the wiremock URL through the SSRF guard so the test
-    // exercises the same code path as the production flow (with the
-    // loopback bypass guard above).
-    let url = server.uri();
-    ssrf_guard::validate_url(&url).await.expect("loopback URL");
-
-    let client = reqwest::Client::builder().build().unwrap();
-
-    // Warm the connection pool + wiremock worker BEFORE the timer. The
-    // ~1.9s "blown budget" recorded in evals/FLAKY.md was wiremock cold-start
-    // (TCP connect + first-request thread spin-up) under full-suite CPU
-    // contention, NOT the retry path. A throwaway GET pays that cost outside
-    // the timed region; it hits no mounted POST mock (the 500 is
-    // method("POST")) so it does not consume the up_to_n_times(1) budget.
-    let _ = client.get(&url).send().await;
-
-    let started = Instant::now();
-
-    // Attempt 1 — must return 500.
-    let first = client
-        .post(&url)
-        .body("{}")
+    let resp = reqwest::Client::new()
+        .post(gw.url("/v1/chat/completions"))
+        .header("authorization", BEARER)
+        .json(&chat_request())
         .send()
         .await
-        .expect("first send");
-    assert_eq!(first.status().as_u16(), 500);
+        .expect("the gateway answers");
 
-    // Simulate the dispatch_with_retry 100ms backoff.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Attempt 2 — must return 200.
-    let second = client
-        .post(&url)
-        .body("{}")
-        .send()
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let received = upstream
+        .received_requests()
         .await
-        .expect("second send");
-    assert_eq!(second.status().as_u16(), 200);
-
-    let elapsed = started.elapsed();
-    assert!(
-        // With the connection warmed, the timed region is two localhost POSTs
-        // + a 100ms sleep (~110ms typical). 500ms slack absorbs CI jitter
-        // while still catching a genuinely hung or looping retry path.
-        elapsed.as_millis() < 500,
-        "retry path exceeded budget: {elapsed:?}"
+        .expect("mock recorded requests");
+    assert_eq!(
+        received.len(),
+        2,
+        "exactly one retry: the 503 attempt and the 200 attempt, no third"
+    );
+    assert_eq!(
+        gw.spans_dropped().await - spans_before,
+        1,
+        "one served request, one span (the retry is not a second span)"
     );
 }
 
-/// Health check: wiremock returning 500 every time exhausts the retry
-/// (one attempt + one retry) and the caller surfaces the failure.
+/// A persistent 503 exhausts the single A7 retry: the provider saw exactly two
+/// requests, the caller got the typed 502, and ONE error span was emitted.
 #[tokio::test]
-async fn wiremock_persistent_500_exhausts_retry() {
-    enable_loopback_bypass();
-
-    let server = MockServer::start().await;
+async fn a_persistent_503_exhausts_the_single_retry_and_answers_502() {
+    let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
         .await;
+    let gw = Gateway::spawn(&upstream.uri()).await;
+    let spans_before = gw.spans_dropped().await;
 
-    let url = server.uri();
-    ssrf_guard::validate_url(&url).await.expect("loopback URL");
+    let resp = reqwest::Client::new()
+        .post(gw.url("/v1/chat/completions"))
+        .header("authorization", BEARER)
+        .json(&chat_request())
+        .send()
+        .await
+        .expect("the gateway answers");
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let r1 = client.post(&url).body("{}").send().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let r2 = client.post(&url).body("{}").send().await.unwrap();
-    assert_eq!(r1.status().as_u16(), 500);
-    assert_eq!(r2.status().as_u16(), 500);
-    // Caller would then return 502 to the client.
+    assert_eq!(resp.status().as_u16(), 502);
+    let body: serde_json::Value = resp.json().await.expect("JSON error body");
+    assert_eq!(body["error"], "provider unavailable");
+    assert_eq!(
+        upstream.received_requests().await.expect("requests").len(),
+        2,
+        "one attempt plus exactly one retry, then give up"
+    );
+    // The error span goes through `emit_post_ledger_error_span`; with no NATS it
+    // is counted as dropped exactly like the success path's span would be — so a
+    // failed request IS visible from outside the process. (This site used to
+    // return before counting; the harness found it and it was fixed the same day.)
+    assert_eq!(
+        gw.spans_dropped().await - spans_before,
+        1,
+        "exactly one error span is recorded (as a drop, with no NATS) for the failed request"
+    );
 }

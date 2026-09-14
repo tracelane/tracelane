@@ -22,15 +22,10 @@
 //! buffer. A field with no signal is `None`/empty — a rail that needs an absent
 //! signal records `not_applicable`, never `fail_open`.
 
-use std::time::Duration;
-
 use tracelane_shared::{ChatRequest, ContentPart, Message, MessageContent, Role, TenantId, Usage};
 use ulid::Ulid;
 
 use crate::guardrail::capability::{CapabilityRegistry, RegistryPosture, ToolDef};
-
-/// Default rolling window for session cost/loop signals (§2.2 `[IMPL-CHOICE]`).
-pub const DEFAULT_SESSION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Minimum streaming lookback so entities/secret tokens straddling an SSE chunk
 /// boundary are not missed (§2.6 `[IMPL-CHOICE]` ≥ 64 chars).
@@ -78,64 +73,86 @@ pub struct IncomingToolResult<'r> {
     pub content: &'r str,
 }
 
-/// Why a session became tainted, for the R4 ledger explanation (§2.4). Every
-/// source is untrusted by construction (that is what taints), so the variants
-/// name the *carrier*, not the trust level.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaintSource {
-    /// An untrusted tool result re-entered the model.
-    ToolResult { tool_call_id: Option<String> },
-    /// An untrusted RAG chunk was retrieved.
-    RagChunk { source: Option<String> },
-    /// A `SEES_UNTRUSTED_CONTENT` tool ran.
-    ContentTool { tool: String },
-}
-
 /// R4 taint-engine state (§2.4). Carried into a request from the session and
 /// advanced as untrusted content / private reads are observed.
 #[derive(Debug, Clone, Default)]
 pub struct TaintState {
     /// Untrusted content has entered the session.
     pub tainted: bool,
-    /// For the ledger explanation (bounded).
-    pub taint_sources: Vec<TaintSource>,
     /// A `READS_PRIVATE_DATA` tool has run this session.
     pub private_data_read: bool,
 }
+
+// `TaintSource` (an enum naming which carrier tainted the session:
+// `ToolResult` / `RagChunk` / `ContentTool`) and its holder field
+// `TaintState::taint_sources: Vec<TaintSource>` were deleted 2026-09-12
+// (B-390) — the original guardrails spec (internal, §118) specified this
+// "for the ledger explanation", but nothing anywhere in the tree ever wrote
+// to it (no `.push`, no `TaintSource::` construction) or read it — R4's own
+// rail (`rails/r4_trifecta.rs`) recomputes `tainted`/`private_data_read`
+// fresh from the current turn's content and reads only those two booleans,
+// never the source list. Designed, never wired — restorable from git
+// history at `607aaa205d52f2545ab6bf81a76ed524f2747f44` if the R4 verdict
+// ledger is built out to explain which carrier tainted a session.
 
 /// Cost / loop session signals (§2.2). `spend_cents_in_window` is `None` on a
 /// cache miss — R1 fails **closed** on unknown spend under a hard budget cap
 /// (`BUDGET_STATE_UNKNOWN`), rather than silently allowing.
 #[derive(Debug, Clone)]
 pub struct SessionState {
+    // No production reader — used only by a test. `rails/r1_cost.rs`'s own
+    // module doc already says the window-based caps this would key a
+    // session cache by are "inert until a session cache is wired" (the hot
+    // path always constructs `SessionState::fresh`). Gated (B-390,
+    // 2026-09-12) rather than deleted, since a future session cache reads
+    // this exact field to key its lookup.
+    #[cfg(test)]
     pub session_id: Option<String>,
     pub calls_in_window: u32,
     pub spend_cents_in_window: Option<u64>,
-    pub window: Duration,
     pub taint: TaintState,
 }
+
+// `window: Duration` and its `DEFAULT_SESSION_WINDOW` constant (deleted
+// 2026-09-12, B-390) — never read anywhere, including tests (unlike
+// `session_id` above, which at least a test reads). Same "inert until a
+// session cache is wired" story as `rails/r1_cost.rs` documents for
+// `calls_in_window`; restorable from git history at
+// `607aaa205d52f2545ab6bf81a76ed524f2747f44` if the window-based caps are
+// wired up.
 
 impl SessionState {
     /// A fresh, clean session with unknown spend (cache cold). Used request-side
     /// before the session cache is consulted, and in tests.
     #[must_use]
     pub fn fresh(session_id: Option<String>) -> Self {
+        // `session_id` is `#[cfg(test)]`-only on the struct (B-390); outside
+        // `cfg(test)` this parameter would otherwise go unused, even though
+        // every real caller passes a real conversation id.
+        #[cfg(not(test))]
+        let _ = session_id;
         Self {
+            #[cfg(test)]
             session_id,
             calls_in_window: 0,
             spend_cents_in_window: None,
-            window: DEFAULT_SESSION_WINDOW,
             taint: TaintState::default(),
         }
     }
 }
 
-/// Streaming-aware response accumulator (§2.6). Rails scan [`Self::accumulated`]
-/// for full matches and [`Self::lookback_window`] for entities straddling SSE
-/// chunk boundaries. The lookback is clamped to ≥ [`MIN_LOOKBACK_CHARS`].
+/// Streaming-aware response accumulator (§2.6). Rails scan
+/// [`Self::accumulated`] for matches; `lookback_window` (test-only, see its
+/// own doc) was meant to additionally catch entities straddling SSE chunk
+/// boundaries but nothing ever called it. The lookback is clamped to ≥
+/// [`MIN_LOOKBACK_CHARS`].
 #[derive(Debug, Clone)]
 pub struct ResponseBuffer {
     full: String,
+    // No production reader — only `lookback_window()` below reads it, and
+    // that method is itself used only by tests. Gated together
+    // (B-390, 2026-09-12).
+    #[cfg(test)]
     lookback: usize,
 }
 
@@ -147,8 +164,14 @@ impl ResponseBuffer {
 
     #[must_use]
     pub fn with_lookback(lookback: usize) -> Self {
+        // `lookback` is `#[cfg(test)]`-only on the struct; outside
+        // `cfg(test)` this parameter would otherwise go unused, even though
+        // every real caller (e.g. `streaming.rs`) passes a real value.
+        #[cfg(not(test))]
+        let _ = lookback;
         Self {
             full: String::new(),
+            #[cfg(test)]
             lookback: lookback.max(MIN_LOOKBACK_CHARS),
         }
     }
@@ -166,6 +189,12 @@ impl ResponseBuffer {
 
     /// The trailing window used to catch an entity/secret split across the
     /// previous and current chunk (last `lookback` chars, on a char boundary).
+    ///
+    /// No production caller today (corrected 2026-09-12, B-390 — the struct
+    /// doc above used to claim rails scan this for straddling entities; none
+    /// do, they all read `accumulated()` instead). Used only by tests,
+    /// hence gated.
+    #[cfg(test)]
     #[must_use]
     pub fn lookback_window(&self) -> &str {
         let len = self.full.len();
@@ -180,15 +209,8 @@ impl ResponseBuffer {
         &self.full[start..]
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.full.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.full.is_empty()
-    }
+    // `len`/`is_empty` (plain accessors on `self.full`) were deleted
+    // 2026-09-12 (B-390) — zero callers anywhere, including tests.
 }
 
 impl Default for ResponseBuffer {
@@ -263,6 +285,12 @@ pub struct GuardrailContext<'r> {
     pub correlation_id: Ulid,
     /// The API-key id / subject (ADR-042 `apikey:<uuid>` or WorkOS `sub`) —
     /// never the secret.
+    ///
+    /// No rail reads this field today — used only by tests. Gated
+    /// (B-390, 2026-09-12) rather than deleted, since the doc's claim that
+    /// it "threads to the ledger verdict + spans" describes a real, intended
+    /// use this field's shape is ready for.
+    #[cfg(test)]
     pub api_key_id: Option<&'r str>,
 
     // ── request-side signals ───────────────────────────────────────────────
@@ -277,7 +305,13 @@ pub struct GuardrailContext<'r> {
     /// tools referenced but not declared in the request.
     pub registry_posture: RegistryPosture,
     pub est_input_tokens: u32,
+    // No rail reads `model`/`provider` today — used only by tests. Gated
+    // (B-390, 2026-09-12) rather than deleted; `provider` costs a real
+    // `provider_id_for_model` lookup at construction, skipped outside
+    // `cfg(test)` below.
+    #[cfg(test)]
     pub model: &'r str,
+    #[cfg(test)]
     pub provider: &'static str,
 
     // ── session / cumulative signals ───────────────────────────────────────
@@ -305,6 +339,12 @@ impl<'r> GuardrailContext<'r> {
         rag_context: Vec<RetrievedChunk<'r>>,
         session: SessionState,
     ) -> Self {
+        // `api_key_id`, `model`, `provider` are `#[cfg(test)]`-only fields
+        // (B-390) — outside `cfg(test)` the parameter/computation would
+        // otherwise go unused, even though every real caller passes/derives
+        // a real value.
+        #[cfg(not(test))]
+        let _ = api_key_id;
         let tool_defs = request
             .tools
             .as_deref()
@@ -315,6 +355,7 @@ impl<'r> GuardrailContext<'r> {
         Self {
             tenant_id,
             correlation_id,
+            #[cfg(test)]
             api_key_id,
             system_prompt: extract_system_prompt(request),
             messages: &request.messages,
@@ -324,9 +365,11 @@ impl<'r> GuardrailContext<'r> {
             rag_context,
             registry_posture: registry.posture(),
             est_input_tokens: estimate_input_tokens(request),
+            #[cfg(test)]
             model: &request.model,
             // Guardrail label only (not a key lookup) — "unknown" on an
             // unmatched model is safe; the key path fail-closes separately.
+            #[cfg(test)]
             provider: crate::providers::ProviderRegistry::provider_id_for_model(&request.model)
                 .unwrap_or("unknown"),
             session,
@@ -337,6 +380,11 @@ impl<'r> GuardrailContext<'r> {
     }
 
     /// Attach response-side signals for the response/streaming pass (§2.6).
+    ///
+    /// No production caller today — `from_response` above is what the real
+    /// response/streaming path uses instead. Used only by tests, hence
+    /// gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn with_response(mut self, buf: &'r ResponseBuffer, usage: Option<&'r Usage>) -> Self {
         self.response_buf = Some(buf);
@@ -355,10 +403,23 @@ impl<'r> GuardrailContext<'r> {
         response_buf: &'r ResponseBuffer,
         usage: Option<&'r Usage>,
     ) -> Self {
+        // `ResponseInputs::api_key_id`/`::model` are read here unconditionally
+        // (not only under `cfg(test)`) even though `GuardrailContext`'s own
+        // copies below are test-only (B-390) — `ResponseInputs` is
+        // constructed in `server.rs`, which this change does not touch, so
+        // its fields must stay genuinely read rather than only conditionally
+        // read, or they would themselves go dead outside `cfg(test)`.
+        let api_key_id = inputs.api_key_id.as_deref();
+        let model: &str = &inputs.model;
+        let provider = crate::providers::ProviderRegistry::provider_id_for_model(&inputs.model)
+            .unwrap_or("unknown");
+        #[cfg(not(test))]
+        let _ = (api_key_id, model, provider);
         Self {
             tenant_id: &inputs.tenant_id,
             correlation_id: inputs.correlation_id,
-            api_key_id: inputs.api_key_id.as_deref(),
+            #[cfg(test)]
+            api_key_id,
             system_prompt: inputs.system_prompt.as_deref(),
             messages: &[],
             tool_defs: Vec::new(),
@@ -368,10 +429,11 @@ impl<'r> GuardrailContext<'r> {
             // No tools evaluated response-side (R4 is request-side).
             registry_posture: RegistryPosture::Permissive,
             est_input_tokens: 0,
-            model: &inputs.model,
+            #[cfg(test)]
+            model,
             // Guardrail label only (see above).
-            provider: crate::providers::ProviderRegistry::provider_id_for_model(&inputs.model)
-                .unwrap_or("unknown"),
+            #[cfg(test)]
+            provider,
             session: inputs.session.clone(),
             response_buf: Some(response_buf),
             usage,
@@ -404,6 +466,11 @@ impl<'r> GuardrailContext<'r> {
     }
 
     /// Is this session tainted by untrusted content (R4 convenience)?
+    ///
+    /// No production caller today — `rails/r4_trifecta.rs` reads
+    /// `ctx.session.taint.tainted` directly. Used only by tests, hence
+    /// gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn is_tainted(&self) -> bool {
         self.session.taint.tainted
@@ -462,13 +529,13 @@ pub fn collect_tool_calls(messages: &[Message]) -> Vec<ProposedToolCall<'_>> {
 pub fn collect_tool_results(messages: &[Message]) -> Vec<IncomingToolResult<'_>> {
     let mut out = Vec::new();
     for m in messages {
-        if m.role == Role::Tool {
-            if let MessageContent::Text(s) = &m.content {
-                out.push(IncomingToolResult {
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    content: s,
-                });
-            }
+        if m.role == Role::Tool
+            && let MessageContent::Text(s) = &m.content
+        {
+            out.push(IncomingToolResult {
+                tool_call_id: m.tool_call_id.as_deref(),
+                content: s,
+            });
         }
         if let MessageContent::Parts(parts) = &m.content {
             for p in parts {
@@ -573,6 +640,10 @@ mod tests {
     /// declared tool. Exercises every §2.1 request-side signal.
     fn representative_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: Some("You are a careful assistant.".to_string()),
             messages: vec![
@@ -604,6 +675,7 @@ mod tests {
                 description: Some("Fetch a URL".to_string()),
                 input_schema: json!({ "type": "object" }),
             }]),
+            tool_choice: None,
             max_tokens: Some(1024),
             temperature: None,
             stream: None,
@@ -870,6 +942,10 @@ mod tests {
     #[test]
     fn estimate_input_tokens_is_nonzero_and_grows() {
         let small = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "m".to_string(),
             system: None,
             messages: vec![Message {
@@ -879,6 +955,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

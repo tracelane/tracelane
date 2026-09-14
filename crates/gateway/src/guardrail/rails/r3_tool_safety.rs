@@ -254,6 +254,12 @@ pub struct R3Pinning {
 }
 
 impl R3Pinning {
+    // No production caller — production constructs via `from_env()` below.
+    // Used only by tests, hence gated (B-390, 2026-09-12; corrected from an
+    // earlier, wrong pass in the same session that deleted this after an
+    // incomplete usage check — `guardrail/rails/*.rs` needs `grep -r`, not a
+    // `**` glob, since this shell has no `globstar`).
+    #[cfg(test)]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -276,6 +282,11 @@ impl R3Pinning {
     }
 
     /// The posture this rail is running under.
+    ///
+    /// No production caller — used only by a test, hence gated
+    /// (B-390, 2026-09-12; corrected from an earlier, wrong deletion in the
+    /// same session — see the note on `new()` above for why).
+    #[cfg(test)]
     #[must_use]
     pub fn drift_posture(&self) -> DriftPosture {
         self.config.drift_posture
@@ -404,10 +415,15 @@ mod tests {
 
     fn request(messages: Vec<Message>, tools: Vec<Tool>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages,
             tools: Some(tools),
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

@@ -35,7 +35,11 @@ use tracelane_shared::TenantId;
 /// One row of `provider_keys`. `ciphertext_b64` is the BYOK v2 wire blob.
 #[derive(Debug, Clone)]
 pub struct ProviderKeyRow {
-    pub tenant_id: Uuid,
+    // `tenant_id: Uuid` (deleted 2026-09-12, B-390) — never read by either
+    // caller (`byok_api/provider_keys_api.rs`, `server.rs`); both already
+    // scoped their query by tenant, so the row's own copy was redundant.
+    // The SELECT column list and its `r.get(N)` positions are unchanged —
+    // only the struct field and its assignment were removed.
     pub provider_id: String,
     pub ciphertext_b64: String,
     pub last4: String,
@@ -44,7 +48,6 @@ pub struct ProviderKeyRow {
 impl From<&Row> for ProviderKeyRow {
     fn from(r: &Row) -> Self {
         Self {
-            tenant_id: r.get(0),
             provider_id: r.get(1),
             ciphertext_b64: r.get(2),
             last4: r.get(3),

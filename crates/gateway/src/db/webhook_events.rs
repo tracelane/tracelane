@@ -20,10 +20,20 @@ use tracing::instrument;
 /// Event source identifier. Used as the first column of the composite
 /// primary key so different webhook providers don't collide on the
 /// same opaque event-id string.
+///
+/// `Polar` (deleted 2026-09-12, B-390) was never constructed anywhere — the
+/// live Polar webhook handler is TypeScript, at
+/// `apps/web/app/api/webhooks/polar/route.ts`, with its own idempotency
+/// mechanism; this Rust-side `webhook_events` table's Polar half was a
+/// carryover from an earlier `crates/gateway/src/billing/webhook.rs` (PR
+/// #8/#9, 2026-05-22) that no longer exists in this tree.
+/// the internal security review's REPLAY-001 finding still cites that
+/// deleted file and is stale (flagged, not edited here — that doc has its
+/// own pending fold-in ruling). Restorable from git history at
+/// `d0d2d6dbf0d5a1432bfdffba50dd511b49197b1d` if a Rust-side Polar webhook
+/// consumer is ever built.
 #[derive(Debug, Clone, Copy)]
 pub enum WebhookSource {
-    /// Polar.sh — Standard Webhooks signing. Canonical payment provider.
-    Polar,
     /// WorkOS — auth provider (organisation lifecycle).
     WorkOs,
 }
@@ -31,7 +41,6 @@ pub enum WebhookSource {
 impl WebhookSource {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Polar => "polar",
             Self::WorkOs => "workos",
         }
     }

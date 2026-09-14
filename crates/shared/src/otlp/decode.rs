@@ -210,7 +210,7 @@ fn map_span(tenant_id: &TenantId, span: OtlpSpan) -> Result<TracelaneSpan> {
 }
 
 /// Convert a 16-byte OTLP trace ID to a UUID.
-fn otlp_trace_id_to_uuid(bytes: &[u8]) -> Result<Uuid> {
+pub fn otlp_trace_id_to_uuid(bytes: &[u8]) -> Result<Uuid> {
     if bytes.len() != 16 {
         bail!("OTLP trace_id must be 16 bytes, got {}", bytes.len());
     }
@@ -220,7 +220,11 @@ fn otlp_trace_id_to_uuid(bytes: &[u8]) -> Result<Uuid> {
 
 /// Convert an 8-byte OTLP span ID to a UUID by zero-padding the high
 /// 8 bytes. The original 8-byte ID is recoverable as the low 64 bits.
-fn otlp_span_id_to_uuid(bytes: &[u8]) -> Result<Uuid> {
+///
+/// `pub` since 2026-09-05 (ADR-075 / GWY-46): the gateway's inbound `traceparent` join
+/// MUST use this exact transform for the parent id, or a framework span shipped via OTLP
+/// would never match its gateway child. One transform, two callers, never a copy.
+pub fn otlp_span_id_to_uuid(bytes: &[u8]) -> Result<Uuid> {
     if bytes.len() != 8 {
         bail!("OTLP span_id must be 8 bytes, got {}", bytes.len());
     }
@@ -238,9 +242,24 @@ fn nanos_to_utc(nanos: u64) -> Result<DateTime<Utc>> {
 }
 
 /// Pull the OTel-GenAI-semconv-mapped fields out of the span's
-/// attributes vector. Anything not on the curated list is kept in
-/// `_extra` (JSON) for forensic visibility but not used by the
-/// gateway's hot-path queries.
+/// attributes vector.
+///
+/// **Anything not on the curated list is DROPPED.** Corrected 2026-09-10
+/// (`OBS-20`): this comment used to say unmapped attributes were *"kept in
+/// `_extra` (JSON) for forensic visibility"*, and that has never been true — the
+/// `_` arm at the bottom of the match is empty and says so in its own body. Only
+/// keys with an explicit arm reach `extra` (`gen_ai.tool.name`, `tool.name`,
+/// `tool_name`, `gen_ai.agent.id`, `agent_id`, `parent_agent_id`, the
+/// `gen_ai.openai.*` / `openai.*` pair).
+///
+/// The difference is not cosmetic and it is why `OBS-20` needed an alias table
+/// rather than a read-side lookup: a customer running stock OpenInference or
+/// Langfuse instrumentation emits `user.id`, and with no arm for it the value was
+/// silently discarded at ingest — there is no forensic fallback catching it
+/// later. CLAUDE.md §17: the code wins and the comment was the defect.
+///
+/// Curated keys that DO land are not used by the gateway's hot-path queries;
+/// they are read back with `JSONExtract*` over the `attributes` blob.
 fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
     let mut out = SpanAttributes::default();
     for kv in attrs {
@@ -289,6 +308,111 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             "gen_ai.response.time_to_first_chunk" => {
                 out.gen_ai_response_time_to_first_chunk = any_value_f64(av);
             }
+            // GWY-48 request configuration. These four have REGISTRY names, so an
+            // SDK/OTLP span and a gateway-published span land in the SAME field —
+            // the ADR-032 PP-SCHEMA-EVOLUTION property. Without these arms a
+            // customer instrumenting with a stock OTel exporter would have their
+            // temperature swept into `_extra` under a dotted key, and any query
+            // over `gen_ai_request_temperature` would see gateway traffic only.
+            //
+            // The four `tracelane.request.*` attributes deliberately get NO arms:
+            // they are OUR names, no SDK emits them, and adding arms for keys
+            // nothing sends is a control that can never fire.
+            // `any_value_f64(..) as f32`, NOT `any_value_f32`. `any_value_f32`
+            // matches `DoubleValue` ONLY, so an SDK that encodes a whole-number
+            // `temperature: 1` as an `IntValue` — legal, and what you get when the
+            // value came from a JSON `1` rather than `1.0` — would decode to
+            // `None`. That is the "absence is absence" rule producing a FALSE
+            // absence, and no test that plants a double can see it.
+            // `any_value_f64` accepts both encodings and exists for exactly this
+            // reason (`ttft_ms` arrives as an int).
+            "gen_ai.request.temperature" => {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    out.gen_ai_request_temperature = any_value_f64(av).map(|v| v as f32);
+                }
+            }
+            "gen_ai.request.top_p" => {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    out.gen_ai_request_top_p = any_value_f64(av).map(|v| v as f32);
+                }
+            }
+            "gen_ai.request.max_tokens" => {
+                out.gen_ai_request_max_tokens = any_value_u32(av);
+            }
+            // `u64` and not `u32`: a seed is an opaque 64-bit number, and
+            // silently dropping every seed above 4.29e9 would make the attribute
+            // absent exactly where a caller was most deliberate about it.
+            "gen_ai.request.seed" => {
+                out.gen_ai_request_seed = any_value_u64(av);
+            }
+            // PLT-46: Claude Code's own OTLP exporter spells these facts differently
+            // from the GenAI semconv. Every arm below only sets the field when it is
+            // still `None`, so a canonical `gen_ai.*` key — whichever order it arrives
+            // in relative to the alias — always wins (same idiom as `gen_ai.system` /
+            // `gen_ai.provider.name` above and `tool.name` below). Tested both orders.
+            // Guarded match arms, not a nested `if`: when the guard is false there is
+            // no other arm for this literal, so the key falls through to `_` and is
+            // dropped — same effect as the canonical key having already won.
+            "session.id" if out.gen_ai_conversation_id.is_none() => {
+                out.gen_ai_conversation_id = any_value_string(av);
+            }
+            // ── OBS-20: the customer's own end user ──────────────────────────
+            // `user.id` is the canonical spelling and is a three-for-one: it is
+            // the OTel registry attribute, OpenInference's reserved attribute,
+            // and one of Langfuse's two accepted spellings. The others are
+            // aliases onto the SAME field, guarded `is_none()` so the canonical
+            // key wins whichever order it arrives in — the `session.id` idiom
+            // directly above.
+            //
+            // Among the three ALIASES it is first-one-wins in attribute order,
+            // not a preference ranking — they share one guarded arm. Said
+            // explicitly because the obvious reading is that `enduser.pseudo.id`
+            // (the non-PII spelling by definition) outranks `enduser.id`, and it
+            // does not. Ranking them would need a second field tracking which
+            // spelling won, to serve a producer that sends two contradictory
+            // ids for the same user — which is a bug in that producer, not a
+            // case worth carrying state for.
+            //
+            // There is deliberately no `user.email` / `user.name` arm. Those are
+            // PII by name rather than by accident, and ingest's `redact_json`
+            // would turn an email into `[REDACTED:email]` anyway — decoding it
+            // would only manufacture a field that is always a placeholder.
+            "user.id" => {
+                out.user_id =
+                    any_value_string(av).and_then(|s| crate::span::bounded_end_user_id(&s));
+            }
+            "enduser.pseudo.id" | "enduser.id" | "langfuse.user.id" if out.user_id.is_none() => {
+                out.user_id =
+                    any_value_string(av).and_then(|s| crate::span::bounded_end_user_id(&s));
+            }
+            "input_tokens" if out.gen_ai_usage_input_tokens.is_none() => {
+                out.gen_ai_usage_input_tokens = any_value_u32(av);
+            }
+            "output_tokens" if out.gen_ai_usage_output_tokens.is_none() => {
+                out.gen_ai_usage_output_tokens = any_value_u32(av);
+            }
+            "cache_read_tokens" if out.gen_ai_usage_cache_read_input_tokens.is_none() => {
+                out.gen_ai_usage_cache_read_input_tokens = any_value_u32(av);
+            }
+            "cache_creation_tokens" if out.gen_ai_usage_cache_creation_input_tokens.is_none() => {
+                out.gen_ai_usage_cache_creation_input_tokens = any_value_u32(av);
+            }
+            // Claude Code emits `ttft_ms` in milliseconds; the canonical column
+            // (`gen_ai.response.time_to_first_chunk`, migration 04's
+            // `time_to_first_chunk_s`) is SECONDS — confirmed at `trace_reads.rs`
+            // (`JSONExtractFloat(...) * 1000` to render ms), so divide by 1000 here
+            // rather than pushing the conversion onto every reader.
+            "ttft_ms" if out.gen_ai_response_time_to_first_chunk.is_none() => {
+                out.gen_ai_response_time_to_first_chunk = any_value_f64(av).map(|ms| ms / 1000.0);
+            }
+            // `model` only fills the request-model column when the canonical semconv
+            // key never set it — Claude Code emits `model` on some span kinds where
+            // `gen_ai.request.model` is absent entirely, not merely a duplicate of it.
+            "model" if out.gen_ai_request_model.is_none() => {
+                out.gen_ai_request_model = any_value_string(av);
+            }
             // Structured message capture (v1.37+, replaces per-message events)
             "gen_ai.system_instructions" => {
                 out.gen_ai_system_instructions = any_value_json(av);
@@ -298,6 +422,69 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             }
             "gen_ai.output.messages" => {
                 out.gen_ai_output_messages = any_value_json(av);
+            }
+            // B-232 (2026-09-05): `GET /v1/query/tool-analytics` reads
+            // `JSONExtractString(attributes, 'gen_ai.tool.name')` and NO ingest path
+            // ever wrote that key — the decoder dropped it here, so the page rendered
+            // empty for every tenant, always. `extra` is `#[serde(flatten)]`, so a
+            // dotted key placed there lands in the `attributes` JSON exactly as the
+            // SQL reads it. OpenInference (item 14's LangChain/LangGraph path) spells
+            // the same fact `tool.name`; it maps to the canonical key so those tool
+            // spans count too, and the canonical spelling wins when both are present.
+            "gen_ai.tool.name" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .insert("gen_ai.tool.name".to_string(), serde_json::Value::String(v));
+                }
+            }
+            "tool.name" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .entry("gen_ai.tool.name".to_string())
+                        .or_insert(serde_json::Value::String(v));
+                }
+            }
+            // PLT-46: Claude Code's own spelling for the same fact. Same
+            // `or_insert` idiom as `tool.name` above, so the canonical
+            // `gen_ai.tool.name` wins regardless of attribute order.
+            "tool_name" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .entry("gen_ai.tool.name".to_string())
+                        .or_insert(serde_json::Value::String(v));
+                }
+            }
+            // OBS-49: OTel GenAI semconv / OpenInference agent identity, needed
+            // to build multi-agent swimlanes client-side. `extra` is
+            // `#[serde(flatten)]`, so this lands in the `attributes` JSON under
+            // the dotted key exactly as `lib/trace/lanes.ts` reads it — same
+            // pattern as `gen_ai.tool.name` above.
+            "gen_ai.agent.id" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .insert("gen_ai.agent.id".to_string(), serde_json::Value::String(v));
+                }
+            }
+            // Claude Code's own spelling for the same fact (PLT-46 spec). Same
+            // `or_insert` idiom as `tool.name`/`tool_name`, so the canonical
+            // `gen_ai.agent.id` wins regardless of attribute order.
+            "agent_id" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .entry("gen_ai.agent.id".to_string())
+                        .or_insert(serde_json::Value::String(v));
+                }
+            }
+            // Claude Code's sub-agent hand-off parent — no competing spelling
+            // exists today, so this is a plain insert rather than an
+            // `.or_insert` alias.
+            "parent_agent_id" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra.insert(
+                        "gen_ai.agent.parent_id".to_string(),
+                        serde_json::Value::String(v),
+                    );
+                }
             }
             // Tracelane-specific
             "tracelane.predictive.rug_pull_detected" => {
@@ -387,6 +574,23 @@ fn any_value_f32(av: &AnyValue) -> Option<f32> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(d)) => {
             Some(*d as f32)
+        }
+        _ => None,
+    }
+}
+
+/// GWY-48. A seed arrives as a protobuf `IntValue`, which is SIGNED. A negative
+/// value is not a seed, so it is dropped rather than wrapped into a huge
+/// positive one — a silently-wrong seed is worse than an absent one.
+///
+/// **A REAL CEILING, not a code smell:** OTLP's `AnyValue::IntValue` is an `i64`,
+/// so a seed above `i64::MAX` — which the OpenAI API permits — is unrepresentable
+/// on the OTLP wire whatever this function does. The GATEWAY path carries the
+/// full `u64` (it reads `req.seed` directly); only the SDK/OTLP path is bounded.
+fn any_value_u64(av: &AnyValue) -> Option<u64> {
+    match &av.value {
+        Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(n)) => {
+            u64::try_from(*n).ok()
         }
         _ => None,
     }
@@ -636,6 +840,95 @@ mod tests {
 
     fn tenant() -> TenantId {
         TenantId::from_jwt_claim(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
+    }
+
+    /// GWY-48. An SDK/OTLP span carrying the four REGISTRY-named request-config
+    /// attributes must land in the same `SpanAttributes` fields a gateway span
+    /// does — the ADR-032 PP-SCHEMA-EVOLUTION property. Without the arms, these
+    /// are swept into `extra` under dotted keys and any query over
+    /// `gen_ai_request_temperature` silently sees gateway traffic only.
+    #[test]
+    fn otlp_request_config_attributes_land_in_the_same_fields_as_a_gateway_span() {
+        let attrs = build_attributes(&[
+            ProtoKeyValue {
+                key: "gen_ai.request.temperature".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::DoubleValue(0.7)),
+                }),
+            },
+            ProtoKeyValue {
+                key: "gen_ai.request.top_p".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::DoubleValue(0.9)),
+                }),
+            },
+            ProtoKeyValue {
+                key: "gen_ai.request.max_tokens".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::IntValue(512)),
+                }),
+            },
+            ProtoKeyValue {
+                key: "gen_ai.request.seed".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::IntValue(9_007_199_254_740_993)),
+                }),
+            },
+        ]);
+        assert!((attrs.gen_ai_request_temperature.expect("temp") - 0.7).abs() < 1e-6);
+        assert!((attrs.gen_ai_request_top_p.expect("top_p") - 0.9).abs() < 1e-6);
+        assert_eq!(attrs.gen_ai_request_max_tokens, Some(512));
+        assert_eq!(
+            attrs.gen_ai_request_seed,
+            Some(9_007_199_254_740_993),
+            "a seed is 64-bit; narrowing it to u32 would drop exactly the values a \
+             caller was most deliberate about"
+        );
+        assert!(
+            !attrs.extra.contains_key("gen_ai.request.temperature"),
+            "a mapped key must not ALSO sit in the catch-all"
+        );
+    }
+
+    /// **A WHOLE-NUMBER TEMPERATURE ARRIVES AS AN `IntValue`, AND MUST NOT BE
+    /// DROPPED.** `any_value_f32` matches `DoubleValue` only, so the obvious arm
+    /// silently decodes `temperature: 1` to `None` — a FALSE absence, invisible
+    /// to any test that plants a double. This is the falsification for that.
+    #[test]
+    fn an_integer_encoded_temperature_is_decoded_not_dropped() {
+        let attrs = build_attributes(&[
+            ProtoKeyValue {
+                key: "gen_ai.request.temperature".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::IntValue(1)),
+                }),
+            },
+            ProtoKeyValue {
+                key: "gen_ai.request.top_p".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::IntValue(1)),
+                }),
+            },
+        ]);
+        assert_eq!(
+            attrs.gen_ai_request_temperature,
+            Some(1.0),
+            "an int-encoded temperature must decode, not read as 'the client sent none'"
+        );
+        assert_eq!(attrs.gen_ai_request_top_p, Some(1.0));
+    }
+
+    /// A negative `IntValue` is not a seed. Dropped rather than wrapped into a
+    /// huge positive one — a silently-wrong seed is worse than an absent one.
+    #[test]
+    fn a_negative_otlp_seed_is_dropped_not_wrapped() {
+        let attrs = build_attributes(&[ProtoKeyValue {
+            key: "gen_ai.request.seed".into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::IntValue(-1)),
+            }),
+        }]);
+        assert_eq!(attrs.gen_ai_request_seed, None);
     }
 
     fn sample_span() -> ProtoSpan {
@@ -1341,6 +1634,51 @@ mod tests {
         }
     }
 
+    /// B-232: the key the tool-analytics SQL reads must come out of the decoder under
+    /// EXACTLY that name in the serialized attributes JSON — the flatten is what makes a
+    /// dotted key survive, so the assertion is on the JSON, not on `extra`.
+    #[test]
+    fn b232_tool_name_reaches_the_attributes_json_under_the_key_the_sql_reads() {
+        let a = build_attributes(&[kv_str("gen_ai.tool.name", "web_search")]);
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(j["gen_ai.tool.name"], "web_search");
+
+        // OpenInference spelling maps to the canonical key.
+        let a = build_attributes(&[kv_str("tool.name", "calculator")]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "calculator"
+        );
+
+        // Canonical wins over the alias regardless of order.
+        let a = build_attributes(&[
+            kv_str("tool.name", "alias"),
+            kv_str("gen_ai.tool.name", "canonical"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "canonical"
+        );
+        let a = build_attributes(&[
+            kv_str("gen_ai.tool.name", "canonical"),
+            kv_str("tool.name", "alias"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "canonical"
+        );
+
+        // Falsification arm: an unmapped key is still dropped, so the test above is
+        // measuring the arm, not a general pass-through.
+        let a = build_attributes(&[kv_str("tool.description", "x")]);
+        assert!(
+            serde_json::to_value(&a)
+                .unwrap()
+                .get("tool.description")
+                .is_none()
+        );
+    }
+
     #[test]
     fn legacy_gen_ai_system_normalizes_to_canonical_provider_name() {
         // A pre-1.36 adapter emits only `gen_ai.system`.
@@ -1445,5 +1783,269 @@ mod tests {
         let long = "x".repeat(crate::span::MAX_BUSINESS_REFERENCE_LEN + 1);
         let b = build_attributes(&[kv_str("tracelane.business_reference", &long)]);
         assert_eq!(b.tracelane_business_reference, None);
+    }
+
+    // ── PLT-46: Claude Code's OTLP spellings alias onto the canonical GenAI
+    // semconv fields, and the canonical key wins regardless of attribute order. ──
+
+    fn kv_double(key: &str, val: f64) -> ProtoKeyValue {
+        ProtoKeyValue {
+            key: key.into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::DoubleValue(val)),
+            }),
+        }
+    }
+
+    #[test]
+    fn plt46_session_id_alias_maps_to_conversation_id_and_canonical_wins() {
+        // Alias alone.
+        let a = build_attributes(&[kv_str("session.id", "sess-1")]);
+        assert_eq!(a.gen_ai_conversation_id.as_deref(), Some("sess-1"));
+
+        // Canonical wins, alias first.
+        let a = build_attributes(&[
+            kv_str("session.id", "alias"),
+            kv_str("gen_ai.conversation.id", "canonical"),
+        ]);
+        assert_eq!(a.gen_ai_conversation_id.as_deref(), Some("canonical"));
+
+        // Canonical wins, canonical first.
+        let a = build_attributes(&[
+            kv_str("gen_ai.conversation.id", "canonical"),
+            kv_str("session.id", "alias"),
+        ]);
+        assert_eq!(a.gen_ai_conversation_id.as_deref(), Some("canonical"));
+    }
+
+    /// `OBS-20`. The end-user alias table, and the property that matters is that
+    /// the CANONICAL spelling wins in EITHER arrival order — attribute order on
+    /// the wire is not something a producer guarantees.
+    #[test]
+    fn obs20_end_user_aliases_map_to_user_id_and_canonical_wins_either_order() {
+        // The canonical spelling — simultaneously OTel's registry attribute,
+        // OpenInference's reserved key, and one of Langfuse's two.
+        let a = build_attributes(&[kv_str("user.id", "u_1")]);
+        assert_eq!(a.user_id.as_deref(), Some("u_1"));
+
+        // Each alias alone.
+        for k in ["enduser.id", "enduser.pseudo.id", "langfuse.user.id"] {
+            let a = build_attributes(&[kv_str(k, "u_alias")]);
+            assert_eq!(a.user_id.as_deref(), Some("u_alias"), "alias {k} dropped");
+        }
+
+        // Canonical wins, alias first.
+        let a = build_attributes(&[
+            kv_str("enduser.id", "alias"),
+            kv_str("user.id", "canonical"),
+        ]);
+        assert_eq!(a.user_id.as_deref(), Some("canonical"));
+
+        // Canonical wins, canonical first.
+        let a = build_attributes(&[
+            kv_str("user.id", "canonical"),
+            kv_str("enduser.id", "alias"),
+        ]);
+        assert_eq!(a.user_id.as_deref(), Some("canonical"));
+    }
+
+    /// `OBS-20`. The bound is applied AT THE DECODER, not left to a later layer.
+    ///
+    /// An OTLP producer is not a trusted source, and this is the seam where an
+    /// unbounded attribute would otherwise reach a span. Over-length is DROPPED,
+    /// never truncated — a truncated id silently attributes one person's traces
+    /// to another.
+    #[test]
+    fn obs20_an_over_length_end_user_id_is_dropped_at_the_otlp_boundary() {
+        let long = "x".repeat(257);
+        let a = build_attributes(&[kv_str("user.id", &long)]);
+        assert_eq!(a.user_id, None, "an over-length id must be dropped");
+
+        let at_cap = "x".repeat(256);
+        let a = build_attributes(&[kv_str("user.id", &at_cap)]);
+        assert_eq!(a.user_id.as_deref(), Some(at_cap.as_str()));
+
+        // Whitespace-only is absence, not an id.
+        let a = build_attributes(&[kv_str("user.id", "   ")]);
+        assert_eq!(a.user_id, None);
+    }
+
+    /// `OBS-20` / CLAUDE.md §17. The decoder's catch-all is EMPTY — an unmapped
+    /// attribute is dropped, not stashed in `extra`. `build_attributes`' own doc
+    /// comment claimed the opposite for months, and that false comment is
+    /// precisely why `user.id` needed an explicit arm rather than a read-side
+    /// lookup into `extra`.
+    ///
+    /// This pins the real behaviour so the comment cannot drift back.
+    #[test]
+    fn an_unmapped_attribute_is_dropped_not_swept_into_extra() {
+        let a = build_attributes(&[kv_str("totally.unmapped.key", "v")]);
+        assert!(
+            a.extra.is_empty(),
+            "unmapped attributes are DROPPED; extra was {:?}",
+            a.extra
+        );
+    }
+
+    #[test]
+    fn plt46_token_aliases_map_to_canonical_fields_and_canonical_wins() {
+        // All four Claude Code token spellings, alias alone.
+        let a = build_attributes(&[
+            kv_int("input_tokens", 11),
+            kv_int("output_tokens", 22),
+            kv_int("cache_read_tokens", 33),
+            kv_int("cache_creation_tokens", 44),
+        ]);
+        assert_eq!(a.gen_ai_usage_input_tokens, Some(11));
+        assert_eq!(a.gen_ai_usage_output_tokens, Some(22));
+        assert_eq!(a.gen_ai_usage_cache_read_input_tokens, Some(33));
+        assert_eq!(a.gen_ai_usage_cache_creation_input_tokens, Some(44));
+
+        // Canonical wins, alias first.
+        let a = build_attributes(&[
+            kv_int("input_tokens", 7),
+            kv_int("gen_ai.usage.input_tokens", 5),
+        ]);
+        assert_eq!(a.gen_ai_usage_input_tokens, Some(5));
+        // Canonical wins, canonical first.
+        let a = build_attributes(&[
+            kv_int("gen_ai.usage.input_tokens", 5),
+            kv_int("input_tokens", 7),
+        ]);
+        assert_eq!(a.gen_ai_usage_input_tokens, Some(5));
+
+        let a = build_attributes(&[
+            kv_int("output_tokens", 7),
+            kv_int("gen_ai.usage.output_tokens", 5),
+        ]);
+        assert_eq!(a.gen_ai_usage_output_tokens, Some(5));
+
+        let a = build_attributes(&[
+            kv_int("cache_read_tokens", 7),
+            kv_int("gen_ai.usage.cache_read.input_tokens", 5),
+        ]);
+        assert_eq!(a.gen_ai_usage_cache_read_input_tokens, Some(5));
+
+        let a = build_attributes(&[
+            kv_int("cache_creation_tokens", 7),
+            kv_int("gen_ai.usage.cache_creation.input_tokens", 5),
+        ]);
+        assert_eq!(a.gen_ai_usage_cache_creation_input_tokens, Some(5));
+    }
+
+    #[test]
+    fn plt46_tool_name_alias_reaches_the_attributes_json_and_canonical_wins() {
+        let a = build_attributes(&[kv_str("tool_name", "Bash")]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "Bash"
+        );
+
+        // Canonical wins, alias first.
+        let a = build_attributes(&[
+            kv_str("tool_name", "alias"),
+            kv_str("gen_ai.tool.name", "canonical"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "canonical"
+        );
+        // Canonical wins, canonical first.
+        let a = build_attributes(&[
+            kv_str("gen_ai.tool.name", "canonical"),
+            kv_str("tool_name", "alias"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.tool.name"],
+            "canonical"
+        );
+    }
+
+    #[test]
+    fn plt46_ttft_ms_alias_converts_milliseconds_to_seconds_and_canonical_wins() {
+        // Claude Code's `ttft_ms` is milliseconds; the canonical column is seconds.
+        let a = build_attributes(&[kv_int("ttft_ms", 234)]);
+        assert_eq!(a.gen_ai_response_time_to_first_chunk, Some(0.234));
+
+        // Canonical (already seconds) wins over the alias, either order — and is
+        // NOT re-divided by 1000.
+        let a = build_attributes(&[
+            kv_int("ttft_ms", 9999),
+            kv_double("gen_ai.response.time_to_first_chunk", 0.5),
+        ]);
+        assert_eq!(a.gen_ai_response_time_to_first_chunk, Some(0.5));
+        let a = build_attributes(&[
+            kv_double("gen_ai.response.time_to_first_chunk", 0.5),
+            kv_int("ttft_ms", 9999),
+        ]);
+        assert_eq!(a.gen_ai_response_time_to_first_chunk, Some(0.5));
+    }
+
+    #[test]
+    fn plt46_model_alias_fills_request_model_only_when_canonical_absent() {
+        // No canonical key present → alias fills the field.
+        let a = build_attributes(&[kv_str("model", "claude-sonnet-4-5-20250929")]);
+        assert_eq!(
+            a.gen_ai_request_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+
+        // Canonical present → alias never overwrites it, either order.
+        let a = build_attributes(&[
+            kv_str("model", "alias-model"),
+            kv_str("gen_ai.request.model", "canonical-model"),
+        ]);
+        assert_eq!(a.gen_ai_request_model.as_deref(), Some("canonical-model"));
+        let a = build_attributes(&[
+            kv_str("gen_ai.request.model", "canonical-model"),
+            kv_str("model", "alias-model"),
+        ]);
+        assert_eq!(a.gen_ai_request_model.as_deref(), Some("canonical-model"));
+    }
+
+    // ── OBS-49: agent identity for multi-agent swimlanes ────────────────────
+
+    #[test]
+    fn obs49_gen_ai_agent_id_reaches_the_attributes_json() {
+        let a = build_attributes(&[kv_str("gen_ai.agent.id", "a1f9")]);
+        assert_eq!(serde_json::to_value(&a).unwrap()["gen_ai.agent.id"], "a1f9");
+    }
+
+    #[test]
+    fn obs49_agent_id_alias_reaches_the_attributes_json_and_canonical_wins() {
+        // Alias alone.
+        let a = build_attributes(&[kv_str("agent_id", "researcher-1")]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.agent.id"],
+            "researcher-1"
+        );
+
+        // Canonical wins, alias first.
+        let a = build_attributes(&[
+            kv_str("agent_id", "alias"),
+            kv_str("gen_ai.agent.id", "canonical"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.agent.id"],
+            "canonical"
+        );
+        // Canonical wins, canonical first.
+        let a = build_attributes(&[
+            kv_str("gen_ai.agent.id", "canonical"),
+            kv_str("agent_id", "alias"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.agent.id"],
+            "canonical"
+        );
+    }
+
+    #[test]
+    fn obs49_parent_agent_id_reaches_the_attributes_json_under_the_dotted_key() {
+        let a = build_attributes(&[kv_str("parent_agent_id", "planner-0")]);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["gen_ai.agent.parent_id"],
+            "planner-0"
+        );
     }
 }

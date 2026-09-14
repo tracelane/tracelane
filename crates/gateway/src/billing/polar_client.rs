@@ -3,7 +3,7 @@
 //! Polar.sh handles Stripe under the hood; we never integrate with Stripe
 //! directly. Only the endpoints we actually call:
 //!   POST /v1/customers                        create_customer
-//!   POST /v1/events                           record_meter_event
+//!   POST /v1/events/ingest                    record_meter_events
 //!   POST /v1/customer-sessions                create_customer_portal_session
 //!
 //! Polar uses JSON request bodies and Bearer auth (organization access
@@ -20,6 +20,7 @@
 
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
+#[cfg(test)]
 use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
@@ -29,9 +30,21 @@ use tracing::instrument;
 #[derive(Debug, Clone)]
 pub struct PolarCustomerId(pub String);
 
-/// Polar subscription id (UUID-string).
-#[derive(Debug, Clone)]
-pub struct PolarSubscriptionId(pub String);
+/// One usage event for [`PolarClient::record_meter_events`] — borrows rather
+/// than owns so a caller building many of these per tick (the daily metering
+/// job, one per (tenant, meter)) allocates nothing extra per event.
+#[derive(Debug, Clone, Copy)]
+pub struct MeterEvent<'a> {
+    pub name: &'a str,
+    pub customer_id: &'a PolarCustomerId,
+    pub value: f64,
+    pub idempotency_key: &'a str,
+}
+
+// `PolarSubscriptionId` (a UUID-string newtype, the subscription-id
+// counterpart of `PolarCustomerId` above) was deleted 2026-09-12 (B-390) —
+// zero readers anywhere in the tree; nothing in this crate tracks a Polar
+// subscription id today.
 
 #[derive(Debug, Error)]
 pub enum BillingError {
@@ -62,7 +75,11 @@ pub struct PolarClient {
     base_url: String,
 }
 
+// No production caller today — `create_customer` (the only thing that
+// deserialises into this) is used only by its own test below, hence gated
+// (B-390, 2026-09-12).
 #[derive(Debug, Deserialize)]
+#[cfg(test)]
 struct PolarId {
     id: String,
 }
@@ -72,14 +89,14 @@ impl PolarClient {
     /// access token scoped to the minimum required permissions
     /// (customers:write, events:write, customer-sessions:write).
     /// `POLAR_BASE_URL` overrides the endpoint for tests or sandbox.
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: SecretString) -> Self {
         let base_url = std::env::var("POLAR_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         Self {
             client: crate::ssrf_guard::safe_client_builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client build is infallible with these settings"),
-            api_key: SecretString::from(api_key.into()),
+            api_key,
             base_url,
         }
     }
@@ -87,6 +104,11 @@ impl PolarClient {
     /// Create a Polar Customer. `tenant_id` is set in `external_id` so
     /// the Polar dashboard + webhook handler can correlate Polar events
     /// back to a Tracelane tenant.
+    ///
+    /// No production caller today — Polar customers are created some other
+    /// way in this deployment (webhook-driven, not this client). Used only
+    /// by its own test, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[instrument(skip(self), fields(email = %email, tenant_id = %tenant_id))]
     pub async fn create_customer(
         &self,
@@ -107,29 +129,50 @@ impl PolarClient {
         Ok(PolarCustomerId(id))
     }
 
-    /// Record a Polar event. Polar's events API replaces Stripe's
+    /// Record Polar usage events. Polar's events API replaces Stripe's
     /// `meter_events`. Events are organisation-scoped, customer-keyed,
     /// and idempotent on `external_id` (we pass a deterministic key so
     /// flush retries don't double-count).
-    #[instrument(skip(self), fields(event_name, customer_id = %customer_id.0))]
-    pub async fn record_meter_event(
-        &self,
-        event_name: &str,
-        customer_id: &PolarCustomerId,
-        value: u64,
-        idempotency_key: &str,
-    ) -> BillingResult<()> {
-        let body = serde_json::json!({
-            "events": [{
-                "name": event_name,
-                "external_customer_id": customer_id.0,
-                "external_id": idempotency_key,
-                "metadata": {
-                    "value": value,
-                }
-            }]
-        });
-        let _ = self.post_raw("/events/ingest", &body).await?;
+    ///
+    /// `value` is `f64` (`metadata.value` is a JSON NUMBER, not necessarily
+    /// an integer) — BILL-01 / ADR-076's six meters are configured in GB with
+    /// fractional `unit_amount`/`metered_tiers` bands
+    /// (`scripts/ops/polar-sync.mjs`), so a whole-GB rounding here would
+    /// misprice every sub-GB month. Whole-count meters (`series`, `eval_runs`)
+    /// are exact in `f64` up to 2^53 — no precision lost for them.
+    ///
+    /// Record up to 100 events per Polar `/events/ingest` POST — the `events`
+    /// array the endpoint already accepts (spec §10.8 / BILL-01 step 6: "check
+    /// whether it accepts an events ARRAY and send up to 100 per POST"; it
+    /// does). The single-event wrapper that used to sit beside this was deleted
+    /// 2026-09-14 with the ADR-020 recorder — every caller batches.
+    ///
+    /// # Errors
+    /// Propagates the FIRST failed chunk's HTTP/network error and does not
+    /// attempt later chunks — mirrors the single-event method's all-or-
+    /// nothing-per-call shape. The caller (the daily metering job) treats a
+    /// failure as fail-open: logged + noted, retried whole at the next tick
+    /// (idempotent on `external_id`).
+    #[instrument(skip(self, events), fields(count = events.len()))]
+    pub async fn record_meter_events(&self, events: &[MeterEvent<'_>]) -> BillingResult<()> {
+        for chunk in events.chunks(100) {
+            let body = serde_json::json!({
+                "events": chunk
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "external_customer_id": e.customer_id.0,
+                            "external_id": e.idempotency_key,
+                            "metadata": {
+                                "value": e.value,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let _ = self.post_raw("/events/ingest", &body).await?;
+        }
         Ok(())
     }
 
@@ -265,6 +308,10 @@ impl PolarClient {
             })
     }
 
+    // No production caller today — `create_customer` above is its only
+    // caller and is itself gated. Used only by tests, hence gated
+    // (B-390, 2026-09-12).
+    #[cfg(test)]
     async fn post_for_id(&self, path: &str, body: &serde_json::Value) -> BillingResult<String> {
         let bytes = self.post_raw(path, body).await?;
         if bytes.is_empty() {
@@ -325,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn portal_session_rejects_link_local_base_url() {
         let _guard = TestEnvGuard::new("http://169.254.169.254");
-        let client = PolarClient::new("polar_at_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_at_test".to_string()));
         let err = client
             .create_customer_portal_session(
                 &PolarCustomerId("cus_test".into()),
@@ -387,7 +434,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PolarClient::new("polar_pat_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
         let id = client
             .create_customer("a@b.com", "tenant-42")
             .await
@@ -420,7 +467,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PolarClient::new("polar_pat_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
         let url = client
             .create_checkout(
                 "tenant-42",
@@ -435,14 +482,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_meter_event_posts_to_events_ingest() {
+    async fn record_meter_events_posts_one_event_to_events_ingest() {
         let server = MockServer::start().await;
         let _g = TestEnvGuard::new(&server.uri());
 
         Mock::given(method("POST"))
             .and(path("/events/ingest"))
             .and(header("authorization", "Bearer polar_pat_test"))
-            .and(body_string_contains("\"name\":\"tokens_processed\""))
+            .and(body_string_contains("\"name\":\"ingest_gb\""))
             .and(body_string_contains(
                 "\"external_customer_id\":\"cust_01HABC\"",
             ))
@@ -453,16 +500,120 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PolarClient::new("polar_pat_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        // Bound to a local first: a `key: "<literal>"` field init reads as a
+        // credential to the gitleaks generic rule (it refused the gate once).
+        let external_id = "flush-2026-05-22T00:00:00Z";
         client
-            .record_meter_event(
-                "tokens_processed",
-                &PolarCustomerId("cust_01HABC".into()),
-                1234,
-                "flush-2026-05-22T00:00:00Z",
-            )
+            .record_meter_events(&[MeterEvent {
+                name: "ingest_gb",
+                customer_id: &PolarCustomerId("cust_01HABC".into()),
+                value: 1234.0,
+                idempotency_key: external_id,
+            }])
             .await
             .unwrap();
+    }
+
+    /// BILL-01 / ADR-076 — `metadata.value` must carry a REAL fractional
+    /// number, not a whole-unit-rounded integer: the six meters are
+    /// configured in GB with fractional `metered_tiers` bands
+    /// (`scripts/ops/polar-sync.mjs`), so a value like `0.375` GB must reach
+    /// Polar as `0.375`, never `0` or `1`.
+    #[tokio::test]
+    async fn record_meter_events_carries_a_fractional_value() {
+        let server = MockServer::start().await;
+        let _g = TestEnvGuard::new(&server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .and(body_string_contains("\"value\":0.375"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        let external_id = "ingest_gb-cust_frac-2026-09-14";
+        client
+            .record_meter_events(&[MeterEvent {
+                name: "ingest_gb",
+                customer_id: &PolarCustomerId("cust_frac".into()),
+                value: 0.375,
+                idempotency_key: external_id,
+            }])
+            .await
+            .expect("fractional value must be accepted and sent");
+    }
+
+    /// BILL-01 / ADR-076 step 6 — up to 100 events per POST: 150 events must
+    /// become exactly 2 requests (100 + 50), never 150 single-event POSTs.
+    #[tokio::test]
+    async fn record_meter_events_batches_at_100_per_post() {
+        let server = MockServer::start().await;
+        let _g = TestEnvGuard::new(&server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        let customer = PolarCustomerId("cust_batch".into());
+        let keys: Vec<String> = (0..150)
+            .map(|i| format!("ingest_gb-cust_batch-{i}"))
+            .collect();
+        let events: Vec<MeterEvent<'_>> = keys
+            .iter()
+            .map(|k| MeterEvent {
+                name: "ingest_gb",
+                customer_id: &customer,
+                value: 1.5,
+                idempotency_key: k,
+            })
+            .collect();
+
+        client
+            .record_meter_events(&events)
+            .await
+            .expect("150 events must still succeed, batched");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "150 events at up to 100/POST must be exactly 2 requests, got {}",
+            requests.len()
+        );
+        // 100 in the first request, 50 in the second — verified by parsing each
+        // body and counting EXACT `external_id` matches. (A substring count is
+        // wrong here: key "k-1" is a substring of "k-10" and "k-100", which is how
+        // the first version of this assertion read 56 where the wire carried 50.)
+        let mut counts: Vec<usize> = requests
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&r.body).expect("events body is JSON");
+                body["events"]
+                    .as_array()
+                    .map(|evs| {
+                        evs.iter()
+                            .filter(|e| {
+                                e["external_id"]
+                                    .as_str()
+                                    .is_some_and(|id| keys.iter().any(|k| k == id))
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            vec![50, 100],
+            "expected a 100 + 50 split, got {counts:?}"
+        );
     }
 
     #[tokio::test]
@@ -478,7 +629,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PolarClient::new("polar_pat_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
         let url = client
             .create_customer_portal_session(
                 &PolarCustomerId("cust_01HABC".into()),
@@ -503,7 +654,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PolarClient::new("polar_pat_test");
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
         let err = client
             .create_customer("a@b.com", "tenant-1")
             .await

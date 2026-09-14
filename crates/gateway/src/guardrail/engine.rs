@@ -48,6 +48,11 @@ pub struct RequestEvaluation {
     /// even when `ch = None` (the ledger is the source of truth; the ClickHouse
     /// mirror is fire-and-forget). `false` only if the ledger append itself
     /// errored — logged, never blocking.
+    ///
+    /// No production reader today — the request-side caller acts on
+    /// `audit_publish_failed` instead. Used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     pub ledger_recorded: bool,
     /// ADR-069: `true` when the async audit PUBLISH failed (fail-closed) — the
     /// request-side caller turns this into a 503 (the audit product does not serve
@@ -104,6 +109,10 @@ pub struct GuardrailEngine {
     /// R7 term lists — shared (this one `Arc`) by the R7 rail (detection) and
     /// the response-streaming seam (competitor redaction). Empty by default.
     r7_config: Arc<R7Config>,
+    /// B-386 (b): the per-rail outcome counters, owned by the engine — one
+    /// instance per process because there is one engine per `AppState`, and no
+    /// longer a `LazyLock` global.
+    metrics: Arc<crate::guardrail::metrics::GuardrailMetrics>,
 }
 
 impl GuardrailEngine {
@@ -151,6 +160,10 @@ impl GuardrailEngine {
 
     /// Attach R7 term lists (denied topics + competitors). Rebuilds the default
     /// rail set so the R7 rail and the seam share the same compiled config.
+    ///
+    /// No production caller today — used only by a test. Gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn with_r7_config(mut self, config: Arc<R7Config>) -> Self {
         self.dispatcher = Dispatcher::new(Self::default_rails(&config));
@@ -183,7 +196,17 @@ impl GuardrailEngine {
             tool_observer: None,
             entitlements,
             r7_config: Arc::new(R7Config::default()),
+            metrics: Arc::new(crate::guardrail::metrics::GuardrailMetrics::new()),
         }
+    }
+
+    /// The engine's outcome counters (B-386 b). Test-only until a `/metrics`
+    /// renderer wires them in (none does today — `render_prometheus` says so);
+    /// gated rather than left as dead code (B-390).
+    #[cfg(test)]
+    #[must_use]
+    pub fn metrics(&self) -> &crate::guardrail::metrics::GuardrailMetrics {
+        &self.metrics
     }
 
     /// Attach the tool observer (/B). Without it, tool definitions are
@@ -280,7 +303,7 @@ impl GuardrailEngine {
             .evaluate_side(Side::Request, &ctx, &gate)
             .await;
 
-        crate::guardrail::metrics::record_side_outcome(&outcome, &ctx);
+        self.metrics.record(&outcome, &ctx);
 
         // Ledger append is the source of truth; ClickHouse mirror is spawned
         // inside the recorder (only when configured). On `ch = None` the ledger
@@ -302,8 +325,11 @@ impl GuardrailEngine {
                 }
             };
 
+        #[cfg(not(test))]
+        let _ = ledger_recorded;
         RequestEvaluation {
             outcome,
+            #[cfg(test)]
             ledger_recorded,
             audit_publish_failed,
         }
@@ -316,9 +342,14 @@ impl GuardrailEngine {
     ///
     /// With no response-side rail enabled (the V1 default until R5/R6/R7 land)
     /// the dispatcher returns an empty allow and recording is skipped — the
-    /// ledger is not spammed with no-op response verdicts. As response rails
-    /// land this lights up automatically; the streaming + buffered paths already
-    /// call it.
+    /// ledger is not spammed with no-op response verdicts.
+    ///
+    /// No production caller today (corrected 2026-09-12, B-390 — this used
+    /// to claim "the streaming + buffered paths already call it"; both
+    /// actually call `evaluate_response_outcome` + `record_response`
+    /// separately, in `streaming.rs`). This convenience combination of the
+    /// two is used only by tests, hence gated.
+    #[cfg(test)]
     pub async fn evaluate_response(
         &self,
         inputs: &ResponseInputs,
@@ -372,7 +403,7 @@ impl GuardrailEngine {
             return;
         }
         let ctx = GuardrailContext::from_response(inputs, response_buf, usage);
-        crate::guardrail::metrics::record_side_outcome(outcome, &ctx);
+        self.metrics.record(outcome, &ctx);
         if let Err(err) = self
             .recorder
             .record_to_ledger(outcome, &ctx, &inputs.actor)
@@ -475,6 +506,10 @@ mod tests {
     /// outbound email call.
     fn tainted_exfil_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![
@@ -489,6 +524,7 @@ mod tests {
                 tool("db_query"),
                 tool("send_email"),
             ]),
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -498,6 +534,10 @@ mod tests {
 
     fn benign_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -507,6 +547,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -558,6 +599,17 @@ mod tests {
         assert_eq!(
             r4.outcome.reason_code,
             Some(reason_codes::TRIFECTA_EXFIL_IN_TAINTED_SESSION)
+        );
+        // B-386 (b): the block landed on THIS engine's own registry — the
+        // counters are constructed with the engine, not read from a process
+        // global another test could have moved.
+        assert_eq!(
+            engine.metrics().block_count(
+                "R4_trifecta",
+                reason_codes::TRIFECTA_EXFIL_IN_TAINTED_SESSION
+            ),
+            1,
+            "the engine records its verdicts on the registry it owns"
         );
     }
 
@@ -641,6 +693,10 @@ mod tests {
         let engine = GuardrailEngine::new(chain, None, None, enforcing_registry());
 
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -656,6 +712,7 @@ mod tests {
                 ),
                 input_schema: json!({ "type": "object" }),
             }]),
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -711,6 +768,10 @@ mod tests {
         );
 
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -722,6 +783,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -779,6 +841,10 @@ mod tests {
         );
 
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -788,6 +854,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -901,10 +968,15 @@ mod tests {
 
     fn agent_request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages,
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -1308,6 +1380,10 @@ mod tests {
         let correlation = Ulid::new();
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -1319,6 +1395,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -1356,6 +1433,10 @@ mod tests {
         let correlation = Ulid::new();
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -1371,6 +1452,7 @@ mod tests {
                 ),
                 input_schema: json!({ "type": "object" }),
             }]),
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -1485,6 +1567,10 @@ mod tests {
         let correlation = Ulid::new();
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -1496,6 +1582,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -1533,6 +1620,10 @@ mod tests {
         let correlation = Ulid::new();
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -1544,6 +1635,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

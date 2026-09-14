@@ -16,6 +16,16 @@
  * Both writes that could destroy something refuse to: the config uses an
  * exclusive-create (`wx`) syscall and needs `--force`, and `.env` is only ever
  * appended to. `--no-env`, `--no-instrument` and `--no-install` opt out.
+ *
+ * A fifth thing lives here as a nested subcommand rather than a fifth step:
+ * `tlane init claude-code` (PLT-46) targets a different runtime entirely — it
+ * does not scaffold a project, it wires an already-installed Claude Code CLI
+ * to export its own trace tree. Nesting it under `init` rather than adding a
+ * top-level command groups "things that wire Tracelane into a tool" in one
+ * place; it is registered as a genuine commander subcommand, not a branch
+ * inside this file's `.action()`, so `tlane init` (no args) is byte-for-byte
+ * unchanged — commander runs the parent's own action when no child name
+ * matches, and the child's action when one does.
  */
 
 import { spawnSync } from "node:child_process";
@@ -23,6 +33,20 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import process from "node:process";
 import type { Command } from "commander";
+import { assertNoReservedFlags } from "./eval.js";
+import {
+	DEFAULT_GATEWAY,
+	type SettingsMerge,
+	buildClaudeCodeEnv,
+	checkChatScope,
+	checkIngestScope,
+	checkWhoami,
+	envAsShellExports,
+	mergeClaudeSettings,
+	readIfExists,
+	settingsPath,
+	writeSettings,
+} from "./init-claude-code.js";
 import {
 	type Detection,
 	buildEnvEntries,
@@ -54,6 +78,8 @@ export type CommandRunner = (
 
 export interface InitDeps {
 	run?: CommandRunner;
+	/** Injected for `init claude-code`'s gateway calls — no live server in tests. */
+	fetchImpl?: typeof fetch;
 }
 
 const defaultRunner: CommandRunner = (command, args, cwd) => {
@@ -200,7 +226,7 @@ export function registerInitCommand(
 	deps: InitDeps = {},
 ): void {
 	const run = deps.run ?? defaultRunner;
-	program
+	const initCmd = program
 		.command("init")
 		.description("Initialise Tracelane in the current project")
 		// NB: the default is an ingest receiver YOU run. Tracelane Cloud has no
@@ -290,5 +316,144 @@ export function registerInitCommand(
 			);
 
 			if (!installOk) process.exit(1);
+		});
+
+	registerClaudeCodeSubcommand(initCmd, deps);
+}
+
+/**
+ * `tlane init claude-code` — PLT-46: point an already-installed Claude Code
+ * CLI at the Tracelane gateway via its OTel env block.
+ */
+function registerClaudeCodeSubcommand(initCmd: Command, deps: InitDeps): void {
+	const fetchImpl = deps.fetchImpl ?? fetch;
+	const flags = ["--api-key", "--gateway", "--print", "--project", "--proxy"];
+	assertNoReservedFlags(flags);
+
+	initCmd
+		.command("claude-code")
+		.description(
+			"Wire an existing Claude Code CLI to export its trace tree to Tracelane",
+		)
+		.option(
+			"--api-key <key>",
+			"Tenant API key (tlane_…); else TRACELANE_API_KEY",
+		)
+		.option("--gateway <url>", "Gateway base URL", DEFAULT_GATEWAY)
+		.option(
+			"--print",
+			"Print the env block (JSON and shell export lines) and write nothing",
+		)
+		.option(
+			"--project",
+			"Write ./.claude/settings.json instead of ~/.claude/settings.json",
+		)
+		.option(
+			"--proxy",
+			"Also route Claude Code's API calls through the gateway (GWY-47): writes ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN. Needs the `chat` scope and your own Anthropic key stored in Settings -> LLM providers.",
+		)
+		.action(async (opts) => {
+			const apiKey: string | undefined =
+				opts.apiKey ?? process.env.TRACELANE_API_KEY;
+			if (!apiKey) {
+				console.error(
+					"tlane init claude-code: no API key. Pass --api-key tlane_…, or set TRACELANE_API_KEY.",
+				);
+				process.exit(2);
+			}
+			const gateway: string = opts.gateway ?? DEFAULT_GATEWAY;
+
+			const who = await checkWhoami(gateway, apiKey, fetchImpl);
+			if (!who.ok) {
+				console.error(
+					`tlane init claude-code: key rejected by ${gateway} — ${who.message}`,
+				);
+				process.exit(1);
+			}
+
+			// `whoami` exposes no scopes (`crates/gateway/src/server.rs:1359` returns
+			// only tenant_id + auth_method) — do not fabricate a scope check from it.
+			// A dry, empty POST /v1/traces reaches the real scope gate instead; see
+			// init-claude-code.ts's module docs for why that probe is side-effect-free.
+			const scope = await checkIngestScope(gateway, apiKey, fetchImpl);
+			if (scope.verdict === "missing_ingest") {
+				console.error(`tlane init claude-code: ${scope.message}`);
+				process.exit(1);
+			}
+			if (scope.verdict === "undetermined") {
+				console.error(
+					`  note: could not confirm the \`ingest\` scope (probe returned ${scope.status || "a network error"}); continuing — if no traces show up, mint a key with the \`ingest\` scope in Settings → API Keys.`,
+				);
+			}
+
+			// GWY-47 proxy mode needs a SECOND capability: `chat`, because every
+			// Claude Code API call will now spend the workspace's provider budget
+			// through the gateway. Probed the same way, with the same posture — only
+			// an explicit 403 refuses, so an older gateway (404) is a note, not a
+			// wall. Writing ANTHROPIC_BASE_URL for a key that cannot use it would
+			// break every session with a 403 the user cannot explain.
+			const proxy = Boolean(opts.proxy);
+			if (proxy) {
+				const chat = await checkChatScope(gateway, apiKey, fetchImpl);
+				if (chat.verdict === "missing_chat") {
+					console.error(`tlane init claude-code --proxy: ${chat.message}`);
+					process.exit(1);
+				}
+				if (chat.verdict === "undetermined") {
+					console.error(
+						`  note: could not confirm the \`chat\` scope (probe returned ${chat.status || "a network error"}); continuing — if proxied calls are refused, mint a key with the \`chat\` scope in Settings → API Keys, and check that this gateway serves POST /v1/messages.`,
+					);
+				}
+			}
+
+			const env = buildClaudeCodeEnv(gateway, apiKey, proxy);
+
+			if (opts.print) {
+				console.log(JSON.stringify(env, null, 2));
+				console.log("");
+				console.log(envAsShellExports(env));
+				return;
+			}
+
+			const target = settingsPath(Boolean(opts.project));
+			let merge: SettingsMerge;
+			try {
+				merge = mergeClaudeSettings(readIfExists(target), env, target);
+			} catch (err) {
+				console.error(`tlane init claude-code: ${(err as Error).message}`);
+				process.exit(1);
+			}
+			writeSettings(target, merge.content);
+
+			if (merge.written.length > 0) {
+				console.log(`Wrote ${target}  +${merge.written.join(", +")}`);
+			} else {
+				console.log(`${target}  unchanged — all keys already present`);
+			}
+			if (merge.skipped.length > 0) {
+				console.log(
+					`  left untouched (already set): ${merge.skipped.join(", ")}`,
+				);
+			}
+
+			console.log("\nNext step:");
+			if (proxy) {
+				// BYOK is a PREREQUISITE, not a nicety: the gateway holds no Anthropic
+				// credential of its own, so without a stored key every proxied call is
+				// refused `provider_not_configured`. Said before "start a session" so
+				// the user does the thing that has to happen first, first.
+				console.log(
+					"  1. Store your own Anthropic key in Settings → LLM providers (https://app.tracelane.dev/settings/providers) — BYOK, encrypted per workspace. Proxied calls use it, and are refused `provider_not_configured` until it is there.",
+				);
+				console.log(
+					"  2. Start a new Claude Code session — it picks up the new env on launch.",
+				);
+				console.log("  3. Open https://app.tracelane.dev/sessions");
+			} else {
+				console.log(
+					"  1. Start a new Claude Code session — it picks up the new env on launch.",
+				);
+				console.log("  2. Open https://app.tracelane.dev/sessions");
+			}
 		});
 }

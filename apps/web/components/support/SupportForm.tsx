@@ -1,32 +1,27 @@
 "use client";
 
 /**
- * SupportForm — the "Reach out" form body (Question / Feedback / Bug + area +
- * message + Send). Extracted from the old slide-out `SupportWidget` so it can
- * render as a full route (`/support`) instead of a right-hand sidebar overlay.
- * Posts to POST /api/support, which persists the message with the session actor.
+ * SupportForm — the "Reach out" form body (Question / Feedback / Bug /
+ * Feature request + area + message + Send). Extracted from the old slide-out
+ * `SupportWidget` so it can render as a full route (`/support`) instead of a
+ * right-hand sidebar overlay. Posts to POST /api/support, which persists the
+ * message with the session actor.
+ *
+ * The kind and area option lists live in `@/lib/support-taxonomy` — the same
+ * module the route imports — so the client and server can never drift apart
+ * on what a valid `kind`/`category` is (founder, 2026-09-07: widened the area
+ * list from 7 to 14 and added a fourth kind, "Feature request").
  */
 
+import {
+	SUPPORT_AREAS as AREAS,
+	type SupportKind,
+	SUPPORT_KINDS as TABS,
+} from "@/lib/support-taxonomy";
 import { SegmentedControl } from "@tracelanedev/ui";
 import { useState } from "react";
 
-const TABS = [
-	{ key: "query", label: "Question" },
-	{ key: "feedback", label: "Feedback" },
-	{ key: "bug", label: "Bug" },
-] as const;
-type Kind = (typeof TABS)[number]["key"];
-
-/** Broad product area so a request arrives with routing context. */
-const AREAS = [
-	{ key: "gateway", label: "Gateway & providers" },
-	{ key: "traces", label: "Traces & sessions" },
-	{ key: "guardrails", label: "Guardrails" },
-	{ key: "audit", label: "Audit ledger" },
-	{ key: "billing", label: "Billing & plan" },
-	{ key: "account", label: "Account & team" },
-	{ key: "other", label: "Something else" },
-] as const;
+type Kind = SupportKind;
 
 const MAX = 5000;
 

@@ -15,7 +15,6 @@
 //!   3. Bail (release without pool, or dev escape hatch disabled).
 
 use anyhow::{Result, bail};
-use base64::Engine as _;
 use ring::digest;
 use tracelane_shared::TenantId;
 use uuid::Uuid;
@@ -48,6 +47,7 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     scope: key_scope,
                     budget_usd_monthly,
                     rate_limit_rpm,
+                    budget_reset,
                 } = auth;
                 return Ok(Claims {
                     tenant_id,
@@ -56,7 +56,6 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     // observability product, no secret-derived value may land in
                     // claims/spans/logs.
                     sub: format!("apikey:{key_id}"),
-                    exp: u64::MAX,
                     auth_method: AuthMethod::ApiKey,
                     // API keys carry no role. That is NOT full access: since PL-9b
                     // `has_no_role_system` covers only the self-host master key, so a
@@ -72,15 +71,22 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     // budget and a per-key rate limit without a second lookup.
                     budget_usd_monthly,
                     rate_limit_rpm,
+                    // BILL-01 A3: same SELECT, same zero-extra-round-trip shape.
+                    budget_reset,
                 });
             }
             Ok(None) => bail!("API key not found or revoked"),
             Err(err) => {
-                // DB outage shouldn't surface as auth failure with a leaky
-                // error message — log the real cause, return generic auth
-                // error to the caller.
-                tracing::error!(error = %err, "api_key Postgres lookup failed");
-                bail!("API key validation transient failure");
+                // B-391 (c): a DB outage is NOT an auth failure. Typed, so every
+                // handler answers 503 `auth_unavailable` (via `auth::failure`)
+                // instead of 401 — a customer must not rotate a good key because
+                // Neon was resuming. The real cause is logged here and carried
+                // in the error for the log line at the handler; the client sees
+                // only the static message.
+                return Err(super::AuthStoreUnavailable::new(format!(
+                    "api_key Postgres lookup failed: {err:#}"
+                ))
+                .into());
             }
         }
     }
@@ -105,13 +111,13 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     &hex::encode(digest::digest(&digest::SHA256, key_body.as_bytes()).as_ref())
                         [..16]
                 ),
-                exp: u64::MAX,
                 auth_method: AuthMethod::ApiKey,
                 role: None,
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
                 // GWY-43: no budget and no per-key rate override on this credential.
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: crate::spend::BudgetReset::Monthly,
             });
         }
     }
@@ -120,35 +126,28 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
     bail!("API key validation requires Postgres pool (set POSTGRES_URL)")
 }
 
-/// Generate a new API key for a tenant — returned once, never stored raw.
-///
-/// Uses 32 bytes of `ring::rand::SystemRandom`, base64url-encoded.
-///
-/// # Errors
-/// Returns `Err` if the OS RNG fails (should never happen).
-pub fn generate() -> Result<String> {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let rng = SystemRandom::new();
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("RNG failure generating API key"))?;
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    Ok(format!("tlane_{encoded}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Runtime::new().unwrap()
+    /// A well-formed `tlane_` key for the tests below. The production
+    /// generator lives in `db::api_keys` (peppered, minted into Postgres); the
+    /// old `generate()` here fed nothing but these tests and was deleted (B-390).
+    fn generate() -> Result<String> {
+        use base64::Engine as _;
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut bytes = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+        Ok(format!(
+            "tlane_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        ))
     }
 
-    #[test]
-    fn generate_produces_correct_prefix() {
-        let key = generate().unwrap();
-        assert!(key.starts_with("tlane_"));
-        assert!(key.len() > "tlane_".len() + 20);
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
     }
 
     #[test]

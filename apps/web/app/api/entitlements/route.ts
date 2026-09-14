@@ -1,5 +1,5 @@
 /**
- * GET /api/entitlements — feature flags + quota + seat caps + retention for
+ * GET /api/entitlements — feature flags + the six-meter allowances and windows (ADR-076) for
  * the authenticated tenant.
  *
  * Resolution order (deny-overrides-grant per ADR-009 §7.4.9) lives in

@@ -15,11 +15,25 @@ THE SAME TEN LINES COPY-PASTED — which is how the other three came to be misse
 six onto `emit_post_ledger_error_span(...)`; this guard is the half that stops a seventh
 from landing silently.
 
-WHAT IT CHECKS. Inside `chat_completions_handler`, from the `audit_chain.publish(` anchor
-to the end of the function, every `return` must have a call to
-`emit_post_ledger_error_span(` reachable before it — searched across the return's own
-block and every ENCLOSING block, which is exactly the set of statements that could have
+WHAT IT CHECKS. Inside `chat_completions_handler`, from the ADMISSION anchor to the end of
+the function, every `return` must have a span-recording construction reachable before it
+— `emit_post_ledger_error_span(` or `dispatch_guard.abort(` (B-385: the guard armed by
+admission records the error span AND disarms in one call) — searched across the return's
+own block and every ENCLOSING block, which is exactly the set of statements that could have
 run on the way to it. Anything else must be named in ALLOWLIST with a written reason.
+
+B-385 §2d (2026-09-12) MOVED THE FILE. `chat_completions_handler` lives in
+`crates/gateway/src/server/chat.rs` now — `server.rs` keeps only what boots the gateway —
+so TARGET follows it. The selftest cannot see a stale TARGET (it feeds text in memory),
+which is why `main` refuses with exit 2 rather than passing when the file is missing.
+
+B-385 (2026-09-12) MOVED THE ANCHOR. The ledger publish no longer sits in the handler: the
+whole admission cascade — auth → … → audit publish — is `crate::admission::admit::<Chat>`,
+and the row exists exactly when that call returns `Ok`. So the region starts after the
+`let admitted = match crate::admission::admit::<Chat>(..)` statement closes; its own
+`Err(..) => return` arm is BEFORE the region, correctly — a refusal means no row landed.
+A bare `dispatch_guard.disarm()` before a return does NOT count: disarming without
+recording is the silent exit this guard exists to catch (the selftest plants it).
 
 HONEST LIMITS, because a guard that oversells is worse than none:
   * It matches a CONSTRUCTION (`emit_post_ledger_error_span(`), never a word, and it
@@ -43,11 +57,15 @@ import re
 import sys
 from pathlib import Path
 
-TARGET = Path("crates/gateway/src/server.rs")
+TARGET = Path("crates/gateway/src/server/chat.rs")
 HANDLER = "async fn chat_completions_handler"
 # Split so this file cannot match its own needle when someone greps the tree.
-ANCHOR = "audit_chain" + ".publish("
-EMIT = "emit_post_ledger_error_span" + "("
+# B-385: the row exists once the admission pipeline returns `Ok` — the anchor
+# is the call, and the region starts where its `match` closes.
+ANCHOR = "admission::admit" + "::<Chat>("
+# Either construction records the post-ledger error span; `abort(` also disarms
+# the guard so `Drop` does not record a second, `client_cancelled`, span.
+EMITS = ("emit_post_ledger_error_span" + "(", "dispatch_guard" + ".abort(")
 
 # A return that legitimately carries no error span. Each entry is (marker, reason) where
 # `marker` is a literal appearing in the return's OWN statement — never a fixed line
@@ -129,19 +147,19 @@ def check(src: str) -> list[str]:
     )
     if anchor is None:
         sys.exit(
-            f"CANNOT DETERMINE — `{ANCHOR}` not found inside {HANDLER}. The ledger "
-            "publish moved; this guard cannot locate the region it protects."
+            f"CANNOT DETERMINE — `{ANCHOR}` not found inside {HANDLER}. The admission "
+            "call moved; this guard cannot locate the region it protects."
         )
 
     d = depths(lines, start, end)
 
-    # THE REGION STARTS WHERE THE ROW EXISTS, NOT WHERE THE PUBLISH IS ATTEMPTED.
-    # `if let Err(..) = publish(..) { return 503 }` is the FAIL-CLOSED branch: the publish
-    # failed, so there is no ledger row, so there is nothing for a span to reconcile
-    # against and that return is correctly silent. Starting at the publish line flags it,
-    # which is a false positive — and a guard that cries wolf gets waved away
-    # (`TRAPS.md` §1 CLASS-3). Advance past the error branch: the row exists only once
-    # brace depth returns to the publish statement's own level.
+    # THE REGION STARTS WHERE THE ROW EXISTS, NOT WHERE ADMISSION IS ATTEMPTED.
+    # `Err(refusal) => return Chat::refuse(refusal)` is the REFUSAL arm: admission
+    # refused, so there is no ledger row (the publish is its LAST step), so there is
+    # nothing for a span to reconcile against and that return is correctly silent.
+    # Starting at the call line flags it, which is a false positive — and a guard that
+    # cries wolf gets waved away (`TRAPS.md` §1 CLASS-3). Advance past the match: the
+    # row exists only once brace depth returns to the statement's own level.
     anchor_depth = d[anchor - start]
     region_start = anchor
     for j in range(anchor + 1, end + 1):
@@ -175,7 +193,7 @@ def check(src: str) -> list[str]:
             min_depth = min(min_depth, dj)
             if dj <= min_depth:
                 reachable.append(lines[j])
-        if any(EMIT in ln for ln in reachable):
+        if any(e in ln for ln in reachable for e in EMITS):
             continue
 
         # The allowlist must match THIS return's own statement, not a fixed window.
@@ -197,12 +215,12 @@ def check(src: str) -> list[str]:
         snippet = lines[i].strip()[:90]
         violations.append(
             f"{TARGET}:{i + 1}: post-ledger `return` with no reachable "
-            f"emit_post_ledger_error_span(...)\n"
+            f"emit_post_ledger_error_span(...) or dispatch_guard.abort(...)\n"
             f"      {snippet}\n"
             f"      The audit ledger already recorded this request. Returning here "
             f"leaves a ledger row the product cannot show (B-245 §5.2).\n"
-            f"      Fix: call emit_post_ledger_error_span(&state, tenant_id, trace_id, "
-            f'&model, request_start, "<reason>", None) before the return —\n'
+            f'      Fix: call dispatch_guard.abort("<reason>", None) before the return '
+            f"(it records the error span and disarms) —\n"
             f"      or add it to ALLOWLIST in this file WITH A REASON if it genuinely "
             f"carries a span another way."
         )
@@ -211,28 +229,50 @@ def check(src: str) -> list[str]:
 
 SELFTEST_CLEAN = """
 async fn chat_completions_handler() -> Response {
-    if let Err(e) = state.audit_chain.publish(ev).await {
-        return bad();
-    }
+    let admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
+        Ok(a) => a,
+        Err(refusal) => return Chat::refuse(refusal),
+    };
     if thing {
         emit_post_ledger_error_span(&state, t, id, &m, s, "x", None);
+        return oops();
+    }
+    if other_thing {
+        dispatch_guard.abort("unroutable_model", None);
         return oops();
     }
     return dispatch_result;
 }
 """
 
-# The exact B-245 shape: a new exit added after the ledger publish, no span.
+# The exact B-245 shape: a new exit added after the ledger row exists, no span.
 SELFTEST_DIRTY = """
 async fn chat_completions_handler() -> Response {
-    if let Err(e) = state.audit_chain.publish(ev).await {
-        return bad();
-    }
+    let admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
+        Ok(a) => a,
+        Err(refusal) => return Chat::refuse(refusal),
+    };
     if thing {
-        emit_post_ledger_error_span(&state, t, id, &m, s, "x", None);
+        dispatch_guard.abort("x", None);
         return oops();
     }
     if breaker_open {
+        return five_oh_three();
+    }
+    return dispatch_result;
+}
+"""
+
+# B-385: a `disarm()` with no record is a SILENT exit wearing the guard's name —
+# the ledger row exists, the guard is told not to speak, and nothing else does.
+SELFTEST_DISARM_ONLY = """
+async fn chat_completions_handler() -> Response {
+    let admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
+        Ok(a) => a,
+        Err(refusal) => return Chat::refuse(refusal),
+    };
+    if breaker_open {
+        dispatch_guard.disarm();
         return five_oh_three();
     }
     return dispatch_result;
@@ -243,11 +283,12 @@ async fn chat_completions_handler() -> Response {
 # a COMMENT, the guard must still go red.
 SELFTEST_COMMENT_ONLY = """
 async fn chat_completions_handler() -> Response {
-    if let Err(e) = state.audit_chain.publish(ev).await {
-        return bad();
-    }
+    let admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
+        Ok(a) => a,
+        Err(refusal) => return Chat::refuse(refusal),
+    };
     if breaker_open {
-        // we should call emit_post_ledger_error_span( here one day
+        // we should call dispatch_guard.abort( here one day
         return five_oh_three();
     }
     return dispatch_result;
@@ -272,8 +313,13 @@ def selftest() -> int:
 
     # BOTH HALVES, or the carve-out is indistinguishable from not scanning at all
     # (`TRAPS.md` §31). A guard that only proves the allow-case proves nothing.
-    expect("a guarded post-ledger return passes", SELFTEST_CLEAN, False)
+    expect(
+        "a guarded post-ledger return passes (either construction)",
+        SELFTEST_CLEAN,
+        False,
+    )
     expect("a NEW unguarded post-ledger return BLOCKS", SELFTEST_DIRTY, True)
+    expect("a bare disarm() before a return BLOCKS", SELFTEST_DISARM_ONLY, True)
     expect(
         "an emit that exists only in a COMMENT still BLOCKS",
         SELFTEST_COMMENT_ONLY,

@@ -6,9 +6,12 @@
  * Guards (all server-side; the gateway/WorkOS are the real barriers, UI only hides):
  *   - Owner-only: a member/viewer cannot invite (callerIsOrgAdmin, fail-closed).
  *   - Role picker: member | viewer only. Owner-grant is a separate explicit action.
- *   - Seat cap (ADR-020): active_memberships + pending_invitations >= seat_cap_max
- *     → typed 403 seat_limit_reached. seat_cap_max == 0 = Enterprise unlimited.
- *     Pending invites count so a Free org cannot stage unlimited invites.
+ *   - Seat cap (ADR-076): seats are UNLIMITED on every paid tier — the only
+ *     surviving gate is Free's single seat. `entitlements.unlimited_seats ===
+ *     false` (Free) ⇒ active_memberships + pending_invitations >= 1 → typed
+ *     403 seat_limit_reached. The old multi-tier ladder (Team 10/25, Business
+ *     25/50) and its `upgrade_url` "buy more seats" framing are retired —
+ *     there is nothing to buy; moving off Free removes the cap entirely.
  *   - Rate-limit (per-tenant + per-IP) to suppress bursts.
  *
  * Enumeration-safe by construction: invite is owner-only and an owner already
@@ -110,12 +113,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		.where(eq(tenants.workosOrgId, session.tenantId))
 		.limit(1);
 
-	const plan: Plan = (tenantRow[0]?.plan as Plan) ?? "builder";
+	// Fail CLOSED to `free` (1 seat) when the tenant row is unresolvable —
+	// `.claude/rules/tenancy.md`: an absent control-plane read must resolve to
+	// the unprivileged state, never silently grant unlimited seats.
+	const plan: Plan = (tenantRow[0]?.plan as Plan) ?? "free";
 	const entitlements = await resolveEntitlements(tenantRow[0]?.id, plan);
 
-	// seat_cap_max == 0 → unlimited (Enterprise). Otherwise: seats consumed =
-	// accepted memberships + PENDING invitations (both reserve a seat). WorkOS
-	// lookup failure fails the gate CLOSED. Both lists are cursor-paginated.
+	// unlimited_seats === true (every paid tier, ADR-076) → no cap at all.
+	// Free (unlimited_seats === false) caps at 1: seats consumed = accepted
+	// memberships + PENDING invitations (both reserve a seat). WorkOS lookup
+	// failure fails the gate CLOSED. Both lists are cursor-paginated.
 	// ponytail: no cross-request lock — two invites at cap-1 can both pass (org
 	// lands at cap+1). A one-seat overshoot is acceptable for MVP; add a Postgres
 	// advisory lock on (tenant,"seat_invite") if it must be exact.
@@ -143,29 +150,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	if (entitlements.seat_cap_max > 0) {
+	// ADR-076: the ONLY seat cap left is Free's single seat. Every paid tier
+	// resolves `unlimited_seats: true` (plans.v3.json) and skips this entirely.
+	if (!entitlements.unlimited_seats) {
+		const FREE_SEAT_CAP = 1;
 		const used = members.length + pendingInvites.length;
-		if (used >= entitlements.seat_cap_max) {
-			// ADR-020 amendment, condition B (founder, 2026-08-12): once there are
-			// customers, measure whether ANY tenant hits the seat cap before its
-			// trace cap. If one does, the CAPS are wrong, not the model — the
-			// response is to raise 25/50, never to sell seat overage.
-			//
-			// This marker is what makes that a measurement rather than a note: the
-			// trigger is "the first time this fires in prod", and with zero users it
-			// cannot fire yet, so a date-based review would just expire unread. The
-			// string is stable and greppable on purpose.
-			// (The decision reference stays in this comment, not in the string:
-			// `no-internal-refs-in-ui.py` blocks ADR-###/§#/B-### inside any
-			// user-facing or API-visible text, and it is right to — the marker has
-			// to carry the MEANING, not our filing system.)
-			console.warn(
-				`[SEAT-CAP-MEASURE] seat cap reached plan=${entitlements.plan} cap=${entitlements.seat_cap_max} used=${used} — record whether this tenant hit its TRACE cap first; if not, the cap is set wrong`,
-			);
+		if (used >= FREE_SEAT_CAP) {
 			return NextResponse.json(
 				{
 					error: "seat_limit_reached",
-					seat_cap_max: entitlements.seat_cap_max,
+					seat_cap_max: FREE_SEAT_CAP,
 					used,
 					upgrade_url: "/settings/billing",
 				},

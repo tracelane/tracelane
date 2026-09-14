@@ -16,24 +16,44 @@
 //!   - Wrapped in `secrecy::SecretString` with `Zeroize`-on-drop.
 //!
 //! Plans + meters:
-//!   PlanTier::{Free, Builder, Team, Business, Enterprise} — string form
-//!     is the `lookup_key` value in the Polar product's metadata
+//!   `crate::clickhouse_query::PlanTier` (Free/Builder/Team/Business/Enterprise)
+//!     is the live tier enum — this module's own copy was deleted 2026-09-12
+//!     (B-390), zero readers
 //!   Meter::{TokensProcessed, AuditAnchors} — event names on Polar's
 //!     /events/ingest endpoint
 //!
 //! See `.claude/rules/billing.md` for the canonical rules.
 
+/// BILL-01 / ADR-076 §2.3 — read-side rehydration of content-addressed blobs
+/// ingest substitutes into oversized attribute values.
+pub mod blobs;
 pub mod checkout;
-pub mod meter;
+/// BILL-01 / ADR-076 step 8 — usage-warning emails (75%/90% of an included
+/// allowance), sent by the daily metering job.
+pub mod email;
+
+/// BILL-01 / ADR-076 — the daily metering job (meters 2-5: hot window,
+/// series, query, cold) + Polar usage emission + weekly blob GC.
+pub mod metering_job;
+/// BILL-01 / ADR-076 — the six-meter usage model's gateway half (ingest
+/// bytes, eval runs, per-key token/spend sub-meters). Distinct from `meter`
+/// (singular — the legacy Polar `TokensProcessed`/`AuditAnchors` recorder,
+/// unchanged): two systems billing two different things, not a rename.
+pub mod meters;
 pub mod polar_client;
 pub mod portal;
+/// BILL-01 / ADR-076 — the pure rating engine (bands, burst exemption) plus
+/// the `RateCard`/`Policy` loaded from `pricing_rates` + `billing_policy`.
+pub mod rating;
 pub mod usage;
+/// BILL-01 / ADR-076 A3 — the velocity breaker (a per-key token-generation
+/// anomaly detector that freezes prompt promotion).
+pub mod velocity_breaker;
 
-pub use meter::{Meter, Recorder};
-pub use polar_client::{
-    BillingError, BillingResult, PolarClient, PolarCustomerId, PolarSubscriptionId,
-};
+pub use meters::{MeterSink, UsageMeter};
+pub use polar_client::PolarClient;
 pub use portal::PortalState;
+pub use rating::RateCard;
 
 // NOTE: the Polar webhook RECEIVER lives in the web tier
 // (`apps/web/app/api/webhooks/polar`), the single correct handler. The former
@@ -87,37 +107,10 @@ pub(crate) fn validate_redirect_url(url: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Plan tier the customer is on. The string form is the
-/// `lookup_key` value in the Polar product's metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanTier {
-    Free,
-    Builder,
-    Team,
-    Business,
-    Enterprise,
-}
-
-impl PlanTier {
-    /// Value of `product.metadata.lookup_key` in Polar (unprefixed, set in the
-    /// Polar dashboard May 2026 — not the draft `tracelane_*` form).
-    pub fn metadata_key(&self) -> &'static str {
-        match self {
-            PlanTier::Free => "free_v1",
-            PlanTier::Builder => "builder_v1",
-            PlanTier::Team => "team_v1",
-            PlanTier::Business => "business_v1",
-            PlanTier::Enterprise => "enterprise_v1",
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PlanTier::Free => "free",
-            PlanTier::Builder => "builder",
-            PlanTier::Team => "team",
-            PlanTier::Business => "business",
-            PlanTier::Enterprise => "enterprise",
-        }
-    }
-}
+// `PlanTier` (this module's own copy — Free/Builder/Team/Business/Enterprise
+// with `metadata_key()`/`as_str()`) was deleted 2026-09-12 (B-390) — zero
+// readers anywhere in the tree. `crates/gateway/src/clickhouse_query.rs`
+// carries the live `PlanTier` used throughout the crate, and its own doc
+// comment says why it exists as a second copy: "mirrors the Polar/ADR-020
+// plan keys without pulling in the full billing crate" — this was the
+// original it was mirroring, orphaned once every caller moved to the mirror.

@@ -47,6 +47,18 @@ export interface GenAiSummary {
 	 * here. Absent when the model isn't priced and the provider reported none.
 	 */
 	cost?: number;
+	/**
+	 * OBS-20: the customer's own end user — who initiated this request.
+	 *
+	 * The stored key is `user_id` (underscored — a first-class span field
+	 * serialises under its snake_case Rust name). The dotted `user.id` and
+	 * `enduser.id` are read as fallbacks only so a span written by some future
+	 * path that lands them in `extra` still renders; nothing in this repo writes
+	 * them today.
+	 *
+	 * May be the literal `[REDACTED:email]` — see `REDACTED_END_USER`.
+	 */
+	endUser?: string;
 }
 
 /**
@@ -346,6 +358,7 @@ export function extractGenAi(attributesJson: string): GenAiSummary {
 			"gen_ai.request.model",
 		),
 		operation: str("gen_ai_operation_name", "gen_ai.operation.name"),
+		endUser: str("user_id", "user.id", "enduser.id"),
 		inputTokens,
 		outputTokens,
 		totalTokens,

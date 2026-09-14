@@ -65,7 +65,7 @@
   <text class="ref" x="36" y="224">domain-separated, length-prefixed · audit_format/mod.rs:102 (row_hash_v2)</text>
 
   <!-- pipeline: merkle -> sign -> anchor -->
-  <text class="grp" x="600" y="34">2 · BATCH ANCHORING — Audit SKU</text>
+  <text class="grp" x="600" y="34">2 · BATCH ANCHORING — every plan</text>
 
   <rect class="led" x="600" y="52" width="176" height="86" rx="9"/>
   <text class="ledt" x="612" y="76">Merkle root</text>

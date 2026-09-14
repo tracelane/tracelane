@@ -42,6 +42,9 @@ impl CapabilitySet {
     /// Parse a single capability tag (case-insensitive). Used by config-driven
     /// workspace registration. Unknown tags return `None` so a typo in config
     /// is surfaced rather than silently dropped.
+    /// No production caller today — used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag.trim().to_ascii_uppercase().as_str() {
@@ -138,6 +141,9 @@ pub struct ToolDef<'r> {
 impl ToolDef<'_> {
     /// Hex-encoded `def_hash` for verdict details / pinned-hash storage. R3
     /// records the **hash**, never the full tool text (§3 R3 tests).
+    /// No production caller today — used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn def_hash_hex(&self) -> String {
         self.def_hash.to_hex().to_string()
@@ -195,6 +201,9 @@ impl CapabilityRegistry {
 
     /// Opt this (possibly empty) registry into ENFORCING posture — untagged
     /// tools become fail-closed even before any tool is registered.
+    /// No production caller today — used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn enforcing(mut self) -> Self {
         self.opt_in_enforcing = true;

@@ -1,0 +1,172 @@
+{
+  "_comment": "BILL-01 / ADR-076 \u2014 the founder's 2026-09-12 pricing ruling, verbatim (specs/BILL-01-metering-and-tiers.md \u00a70). THE single source for every public price, allowance, window and seat figure: seed.mjs upserts these into plan_entitlements, and scripts/ci/check-pricing-copy-vs-seed.py refuses any docs/site/README figure that disagrees. Rates are market-anchored and never adjusted for cost; null = custom/contract (Enterprise).",
+  "meters": {
+    "ingest_usd_per_gb": 0.2,
+    "hot_window_usd_per_gb_month_ladder": [
+      [
+        0,
+        500,
+        16.0
+      ],
+      [
+        500,
+        2000,
+        8.0
+      ],
+      [
+        2000,
+        10000,
+        4.5
+      ],
+      [
+        10000,
+        null,
+        3.0
+      ]
+    ],
+    "series_usd_per_series_month": 0.008,
+    "query_usd_per_scan_unit": 0.15,
+    "cold_usd_per_gb_month": 0.08,
+    "eval_usd_per_judge_run": 0.005,
+    "never_metered": [
+      "per host / peak host",
+      "per seat on paid tiers",
+      "egress (priced into ingest and query)",
+      "retention as a multiplier",
+      "OTel attributes as premium metrics"
+    ]
+  },
+  "policy": {
+    "burst_multiple_of_trailing_30d_avg": 5,
+    "warning_thresholds_pct": [
+      75,
+      90
+    ],
+    "rollover": false,
+    "price_protection_months": 12,
+    "free_idle_reclaim_days": 14,
+    "dunning_retry_days": [
+      1,
+      5,
+      14
+    ],
+    "dunning_data_hold_days": 30,
+    "refund_days_base_first_cycle": 30,
+    "enterprise_onboarding_fee_usd": 5000,
+    "prepaid_credits": [
+      [
+        5000,
+        5750
+      ],
+      [
+        20000,
+        24000
+      ]
+    ],
+    "prepaid_expiry_months": 12,
+    "audit_sku": {
+      "sold": false,
+      "reason": "specs/BILL-01 \u00a710.4 \u2014 /v1/audit/export is not yet a complete offline evidence pack (B-392); 7-year ledger retention folds into Enterprise"
+    },
+    "velocity_sigma": 2,
+    "velocity_window_days": 7,
+    "velocity_interval_secs": 300
+  },
+  "plans": {
+    "free_v1": {
+      "name": "Free",
+      "price_monthly_usd": 0,
+      "price_annual_month_usd": null,
+      "price_from_usd": null,
+      "hot_gb_included": 0.25,
+      "ingest_gb_included": 1,
+      "series_included": 100,
+      "scan_units_included": 10,
+      "eval_runs_included": 50,
+      "indexed_window_days": 3,
+      "queryable_days": 30,
+      "ledger_days": 30,
+      "cold_archive_days": 7,
+      "unlimited_seats": false,
+      "f_sso": false,
+      "overage_allowed": false,
+      "rate_limit_rpm": 60
+    },
+    "builder_v1": {
+      "name": "Builder",
+      "price_monthly_usd": 29,
+      "price_annual_month_usd": 24,
+      "price_from_usd": null,
+      "hot_gb_included": 5,
+      "ingest_gb_included": 25,
+      "series_included": 2000,
+      "scan_units_included": 150,
+      "eval_runs_included": 2000,
+      "indexed_window_days": 30,
+      "queryable_days": 730,
+      "ledger_days": 730,
+      "cold_archive_days": null,
+      "unlimited_seats": true,
+      "f_sso": false,
+      "overage_allowed": true,
+      "rate_limit_rpm": 600
+    },
+    "team_v1": {
+      "name": "Team",
+      "price_monthly_usd": 229,
+      "price_annual_month_usd": 190,
+      "price_from_usd": null,
+      "hot_gb_included": 75,
+      "ingest_gb_included": 300,
+      "series_included": 15000,
+      "scan_units_included": 2000,
+      "eval_runs_included": 40000,
+      "indexed_window_days": 90,
+      "queryable_days": 730,
+      "ledger_days": 730,
+      "cold_archive_days": null,
+      "unlimited_seats": true,
+      "f_sso": true,
+      "overage_allowed": true,
+      "rate_limit_rpm": 6000
+    },
+    "business_v1": {
+      "name": "Business",
+      "price_monthly_usd": 799,
+      "price_annual_month_usd": 665,
+      "price_from_usd": null,
+      "hot_gb_included": 300,
+      "ingest_gb_included": 1500,
+      "series_included": 75000,
+      "scan_units_included": 12000,
+      "eval_runs_included": 250000,
+      "indexed_window_days": 180,
+      "queryable_days": 730,
+      "ledger_days": 730,
+      "cold_archive_days": null,
+      "unlimited_seats": true,
+      "f_sso": true,
+      "overage_allowed": true,
+      "rate_limit_rpm": 60000
+    },
+    "enterprise_v1": {
+      "name": "Enterprise",
+      "price_monthly_usd": null,
+      "price_annual_month_usd": null,
+      "price_from_usd": 2499,
+      "hot_gb_included": null,
+      "ingest_gb_included": null,
+      "series_included": null,
+      "scan_units_included": null,
+      "eval_runs_included": null,
+      "indexed_window_days": 365,
+      "queryable_days": 730,
+      "ledger_days": 2555,
+      "cold_archive_days": null,
+      "unlimited_seats": true,
+      "f_sso": true,
+      "overage_allowed": true,
+      "rate_limit_rpm": null
+    }
+  }
+}

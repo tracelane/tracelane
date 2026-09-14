@@ -22,10 +22,12 @@
 
 pub mod api_keys;
 pub mod audit_chain_state;
+pub mod idle_evict;
 pub mod keepalive;
 pub mod observed_tools;
 pub mod provider_keys;
 pub mod quota_notifications;
+pub mod singleton;
 pub mod tenants;
 pub mod tool_capabilities;
 pub mod webhook_events;
@@ -44,6 +46,13 @@ pub type DbPool = Pool;
 /// sites like `auth::api_key::validate` can reach the DB without
 /// threading the pool through every function signature. `OnceLock`
 /// semantics: set returns `Err` on second call.
+///
+/// B-386 (b): stays global — MIGRATING, not staying. The same pool is now
+/// `AppState::pg` (the EXPAND step); `server::run` and the chat handler read
+/// the field. This static remains readable for the callers that have no state
+/// handle yet (`auth::api_key::validate`, `resolve_provider_key`, the quota
+/// webhook, the WorkOS webhook, the BYOK / tool-pin routes …), converted per
+/// module; it is deleted when its last reader is gone (CONTRACT).
 static GLOBAL_POOL: OnceLock<DbPool> = OnceLock::new();
 
 /// Install the global pool. Call once at gateway startup. Panics if
@@ -111,35 +120,104 @@ pub fn pg_error_chain(err: &anyhow::Error) -> String {
 ///
 /// # Errors
 /// Returns `Err` if the URL parse fails or the initial connection probe fails.
+/// The five connection fields every Postgres session in this process is built
+/// from — the pool AND the single-instance lock's dedicated session. ONE
+/// derivation, so the two cannot disagree: on 2026-09-12 the lock parsed the
+/// raw `POSTGRES_URL` (with its `sslmode=require&channel_binding=require`
+/// query) into a `tokio_postgres::Config` while the pool used these fields,
+/// and the lock's connect failed on prod (`Network is unreachable`) in the same
+/// process where the pool had just connected. The deploy rolled back on it.
+pub(crate) struct PgFields {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub dbname: Option<String>,
+}
+
+impl PgFields {
+    /// `POSTGRES_URL` (parsed positionally) or the libpq `PG*` variables.
+    ///
+    /// # Errors
+    /// The URL does not parse, or neither a host nor a database is configured.
+    pub(crate) fn from_env() -> Result<Self> {
+        Self::from_url_var("POSTGRES_URL")
+    }
+
+    /// The same, from a named URL variable — `POSTGRES_DIRECT_URL` for the
+    /// sessions that must NOT go through a pooler (the singleton lock; the
+    /// LISTEN connection in `entitlement_cache`). Falls back to the `PG*`
+    /// variables like `from_env` when the variable is unset.
+    ///
+    /// # Errors
+    /// As `from_env`.
+    pub(crate) fn from_url_var(var: &str) -> Result<Self> {
+        let mut f = Self {
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            dbname: None,
+        };
+        if let Ok(url) = std::env::var(var) {
+            // tokio-postgres only does positional URL parsing via tokio_postgres::Config
+            let pg_cfg: tokio_postgres::Config = url
+                .parse()
+                .with_context(|| format!("{var} is not a valid Postgres URL"))?;
+            f.host = pg_cfg.get_hosts().first().and_then(host_to_string);
+            f.port = pg_cfg.get_ports().first().copied();
+            f.user = pg_cfg.get_user().map(str::to_owned);
+            f.password = pg_cfg
+                .get_password()
+                .map(|p| String::from_utf8_lossy(p).to_string());
+            f.dbname = pg_cfg.get_dbname().map(str::to_owned);
+        } else {
+            // Component env-var fallback — same names libpq honours.
+            f.host = std::env::var("PGHOST").ok();
+            f.port = std::env::var("PGPORT").ok().and_then(|p| p.parse().ok());
+            f.user = std::env::var("PGUSER").ok();
+            f.password = std::env::var("PGPASSWORD").ok();
+            f.dbname = std::env::var("PGDATABASE").ok();
+        }
+        if f.host.is_none() || f.dbname.is_none() {
+            anyhow::bail!(
+                "Postgres connection config missing: set POSTGRES_URL or PGHOST + PGDATABASE"
+            );
+        }
+        Ok(f)
+    }
+
+    /// A standalone `tokio_postgres::Config` with exactly these fields — the
+    /// shape deadpool builds from the same struct for the pool.
+    pub(crate) fn to_tokio_config(&self) -> tokio_postgres::Config {
+        let mut c = tokio_postgres::Config::new();
+        if let Some(h) = &self.host {
+            c.host(h);
+        }
+        if let Some(p) = self.port {
+            c.port(p);
+        }
+        if let Some(u) = &self.user {
+            c.user(u);
+        }
+        if let Some(p) = &self.password {
+            c.password(p);
+        }
+        if let Some(d) = &self.dbname {
+            c.dbname(d);
+        }
+        c
+    }
+}
+
 pub async fn build_pool() -> Result<DbPool> {
     let mut cfg = Config::new();
-
-    if let Ok(url) = std::env::var("POSTGRES_URL") {
-        // tokio-postgres only does positional URL parsing via tokio_postgres::Config
-        let pg_cfg: tokio_postgres::Config = url
-            .parse()
-            .context("POSTGRES_URL is not a valid Postgres URL")?;
-        cfg.host = pg_cfg.get_hosts().first().and_then(host_to_string);
-        cfg.port = pg_cfg.get_ports().first().copied();
-        cfg.user = pg_cfg.get_user().map(str::to_owned);
-        cfg.password = pg_cfg
-            .get_password()
-            .map(|p| String::from_utf8_lossy(p).to_string());
-        cfg.dbname = pg_cfg.get_dbname().map(str::to_owned);
-    } else {
-        // Component env-var fallback — same names libpq honours.
-        cfg.host = std::env::var("PGHOST").ok();
-        cfg.port = std::env::var("PGPORT").ok().and_then(|p| p.parse().ok());
-        cfg.user = std::env::var("PGUSER").ok();
-        cfg.password = std::env::var("PGPASSWORD").ok();
-        cfg.dbname = std::env::var("PGDATABASE").ok();
-    }
-
-    if cfg.host.is_none() || cfg.dbname.is_none() {
-        anyhow::bail!(
-            "Postgres connection config missing: set POSTGRES_URL or PGHOST + PGDATABASE"
-        );
-    }
+    let f = PgFields::from_env()?;
+    cfg.host = f.host;
+    cfg.port = f.port;
+    cfg.user = f.user;
+    cfg.password = f.password;
+    cfg.dbname = f.dbname;
 
     let pool_cfg = deadpool_postgres::PoolConfig {
         max_size: 16,
@@ -217,6 +295,13 @@ fn host_to_string(host: &tokio_postgres::config::Host) -> Option<String> {
 /// **Fresh-database helper for integration tests only.** The Drizzle SQL is NOT
 /// `IF NOT EXISTS`-guarded, so re-running against a populated DB fails.
 /// Production is migrated by `drizzle-kit migrate`, never this.
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs`,
+/// which compiles as a SEPARATE crate linking against this one — invisible
+/// to this crate's own `dead_code` reachability analysis, hence the allow
+/// (B-390, 2026-09-12; not a case of genuinely dead code, confirmed by
+/// grep — deleting this breaks that integration test).
+#[allow(dead_code)]
 pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
     let client = pool
         .get()
@@ -284,6 +369,37 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         include_str!("../../../../apps/web/db/migrations/0032_evl29_annotation_queues.sql"),
         include_str!(
             "../../../../apps/web/db/migrations/0033_evl29_required_target_and_rubric_snapshot.sql"
+        ),
+        // DSH-13 custom dashboards (2026-09-05): `dashboards` + `dashboard_tiles`, CHECK-
+        // constrained closed sets; additive, no reader in the gateway.
+        include_str!("../../../../apps/web/db/migrations/0034_dsh13_dashboards.sql"),
+        include_str!("../../../../apps/web/db/migrations/0035_dsh13_tile_position_unique.sql"),
+        // OBS-48 shareable trace links. Un-journaled (TRAPS §9): applied to Neon
+        // BEFORE the gateway build that reads/writes `trace_shares` deploys.
+        include_str!("../../../../apps/web/db/migrations/0036_trace_shares.sql"),
+        // DSH-13 tile height (2026-09-07): `dashboard_tiles.height` compact|regular|tall,
+        // DEFAULT 'regular'. Un-journaled (TRAPS §9): applied to Neon BEFORE the web
+        // build that reads/writes it deploys; additive, idempotent, no gateway reader.
+        include_str!("../../../../apps/web/db/migrations/0037_dashboard_tile_height.sql"),
+        // DSH-13 §9 section dividers (2026-09-07): widens `dashboard_tiles_shape_chk` to
+        // admit 'divider' and adds a CHECK pinning a divider row to width=12/metric_id=
+        // '__divider__'. Additive, idempotent, no gateway reader.
+        include_str!("../../../../apps/web/db/migrations/0038_dashboard_tile_divider.sql"),
+        include_str!("../../../../apps/web/db/migrations/0039_polar_event_ordering.sql"),
+        // BILL-01 / ADR-076 (2026-09-13/14): the six-meter allowances, prices, windows,
+        // `pricing_rates`, `billing_policy`, `meter_warnings`, the tenant ceiling /
+        // dunning / price-version columns and the per-key `budget_reset` +
+        // `velocity_breaker` — every one of which `db/api_keys.rs` and
+        // `entitlement_cache.rs` now READ. Applied to prod Neon by hand (TRAPS §9) before
+        // the binary; listed here so the Postgres integration harness builds the same
+        // shape — its first run without these lines failed on the api_keys INSERT.
+        include_str!("../../../../apps/web/db/migrations/0040_bill01_pricing_v3_entitlements.sql"),
+        // 0041: `tenants.auto_age_window_days` / `auto_age_since` (ceiling AUTO-AGE).
+        include_str!("../../../../apps/web/db/migrations/0041_bill01_auto_age_window.sql"),
+        // BILL-01 contract step: the ADR-020 columns go. On prod this is applied BY
+        // HAND after web + gateway deploy (this list feeds the test databases only).
+        include_str!(
+            "../../../../apps/web/db/migrations/0042_bill01_contract_drop_adr020_columns.sql"
         ),
     ];
     for migration in MIGRATIONS {

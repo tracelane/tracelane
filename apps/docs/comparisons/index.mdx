@@ -1,0 +1,189 @@
+---
+title: How Tracelane compares
+description: A sourced feature matrix against LiteLLM, Portkey, Bifrost, Helicone, Langfuse, LangSmith, Braintrust and Arize Phoenix — every competitor cell links to the vendor's own page.
+classification: PUBLIC
+---
+
+Four tables — gateway, observability, evals, trust — built the same way as our
+[gateway-overhead benchmark](/benchmarks): every number and every claim is sourced, and a
+`—` is not a loss, it's a "we didn't find it," which is not the same thing.
+
+## Method
+
+- **Every competitor cell is a link to a numbered source**, fetched from the vendor's own
+  page — docs site, pricing page, or public GitHub repository — on **2026-09-07**. No
+  third-party blogs, no re-published "comparison" pages from a fourth party.
+- **Every Tracelane cell cites a code path, a public doc** ([`/pricing`](/pricing),
+  [`/benchmarks`](/benchmarks)) **or a dated production proof** — never a spec or a
+  marketing draft. Behind each is a row in our internal, code-verified feature
+  inventory, where a row only reads BUILT once someone has read the source that builds
+  it; the feature ids in the footnotes name those rows.
+- **A cell marked "Not documented" means we did not find that capability documented on
+  the vendor's own site as of the fetch date — it does not mean the vendor lacks it.**
+  Vendors change their products continuously; if something below is stale, [open an
+  issue](https://github.com/tracelane/tracelane/issues) and we'll fix it.
+- **"Yes" for Tracelane always means shipped and either deployed to production or
+  reproducible from the public repo** — not planned, not "in the design doc." Where a
+  capability is partial or gated by plan, the cell says so and the FAQ or a footnote
+  explains the boundary.
+
+See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
+[Tracelane vs Portkey](/comparisons/vs-portkey) ·
+[Tracelane vs Helicone](/comparisons/vs-helicone) ·
+[Tracelane vs LangSmith Engine](/comparisons/vs-langsmith-engine) ·
+[the gateway-overhead benchmark](/benchmarks).
+
+## Gateway
+
+| Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
+|---|---|---|---|---|---|---|---|---|---|
+| Hot-path runtime | Rust <sup>[T1]</sup> | Python proxy (the build measured in [/benchmarks](/benchmarks)); a "Rust core" is announced on GitHub with no public build as of 2026-09-07 <sup>[1]</sup> <sup>[6]</sup> | TypeScript/Node.js <sup>[2]</sup> | Go <sup>[3]</sup> | Not documented <sup>[4]</sup> | N/A — no gateway | N/A — no self-hostable gateway runtime documented <sup>[5]</sup> | N/A — no gateway | N/A — no gateway |
+| Measured gateway overhead (p50) | **2 ms** — AIGatewayBench, CCX23, 2026-09-07 <sup>[T2]</sup> | Python proxy: 14–15 ms p50, same bench run <sup>[T2]</sup>; the announced Rust gateway has no public build, and its self-reported "8 ms P95 at 1k RPS" is not independently measured <sup>[6]</sup> | 3–4 ms p50, same bench run <sup>[T2]</sup> | 2 ms p50, same bench run <sup>[T2]</sup> | Not published <sup>[4]</sup> | — | — | — | — |
+| Providers supported | 150+ <sup>[T3]</sup> | 140+ upstream vendors / ~1,892 models (its own count) <sup>[7]</sup> | Claims 1,600+ LLMs <sup>[8]</sup>; source code lists ~75 provider modules <sup>[9]</sup> — see "Portkey's provider count" below | 23+ upstream vendors (its own count) <sup>[3]</sup> | Multiple — count not documented <sup>[4]</sup> | — | — | — | — |
+| BYOK, 0% token markup | Yes <sup>[T3]</sup> | Yes — per-key `api_key` in config <sup>[10]</sup> | Yes — virtual keys with your own provider keys <sup>[8]</sup> | Yes — virtual keys <sup>[3]</sup> | Yes — routes through your keys <sup>[4]</sup> | — | Partial — lists an "LLM Gateway" to "control agent model calls"; BYOK not documented on that page <sup>[5]</sup> | — | — |
+| Response caching | Exact-match caching in production. Embedding-similarity caching is built but not active on the hosted product — 94% of production traffic is Anthropic, which has no embeddings API <sup>[T4]</sup> | Yes — exact + semantic, 8+ backends <sup>[11]</sup> | Yes — simple + semantic <sup>[12]</sup> | Yes — semantic caching <sup>[3]</sup> | Partial — caching listed as a feature; exact vs. semantic not documented <sup>[4]</sup> | No | No | No | No |
+| Rate limits + budgets per key | Yes — per-key RPM, overage 429 + alert <sup>[T3]</sup> | Yes — per key/team/user RPM + TPM <sup>[10]</sup> | Yes — hourly/daily/per-minute on requests or tokens <sup>[12]</sup> | Yes — budget management <sup>[3]</sup> | Yes — rate limiting feature <sup>[4]</sup> | No | No | No | No |
+| Guardrails on the hot path | Yes — **R1–R8**, deterministic rule-based rails inline at the gateway (cost/budget, secrets+PII redaction, tool pinning, lethal-trifecta, format, system-prompt-leak, topic/competitor, prompt-injection); every verdict is written to the audit ledger. R1/R3/R4/R8 free on every deployment incl. OSS self-host; R2/R5/R6/R7 (data-governance + quality) on Team and above <sup>[T5]</sup> | Yes — PII masking, prompt-injection detection, secret detection <sup>[1]</sup> | Yes — "50+ AI Guardrails" <sup>[2]</sup> | Partial — enterprise only, custom plugin <sup>[3]</sup> | Not documented <sup>[4]</sup> | No | No | No | No |
+| Failover / routing | Partial — model→provider map fails closed (400 `unroutable_model`, no silent default); multi-key routing built <sup>[T6]</sup> | Yes — fallback chains, context-window fallback, cooldown <sup>[13]</sup> | Yes — automatic fallbacks, circuit breaker <sup>[2]</sup> | Yes — automatic failover, load balancing <sup>[3]</sup> | Not documented <sup>[4]</sup> | No | No | No | No |
+| OpenAI-compatible endpoint | Yes — `/v1/chat/completions` <sup>[T1]</sup> | Yes <sup>[1]</sup> | Yes <sup>[2]</sup> | Yes <sup>[3]</sup> | Yes <sup>[4]</sup> | — | Partial — gateway is managed <sup>[5]</sup> | — | — |
+| Anthropic-native `/v1/messages` | Yes — `GWY-47`, proven on production with a real Claude Code session <sup>[T7]</sup> | Partial — routes Anthropic models, but via OpenAI-shaped format <sup>[10]</sup> | Not documented <sup>[2]</sup> | Not documented <sup>[3]</sup> | Yes — direct integration listed <sup>[4]</sup> | — | — | — | — |
+
+## Observability
+
+| Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
+|---|---|---|---|---|---|---|---|---|---|
+| OTel-native ingest (OTLP) | Yes — the OTLP decode path preserves `parent_span_id` by design <sup>[T8]</sup> | Partial — emits OTel spans for guardrail violations <sup>[1]</sup>; native ingest not confirmed | Partial — OTel emission, not primary ingest <sup>[8]</sup> | Partial — Prometheus + distributed tracing <sup>[3]</sup> | Not documented <sup>[4]</sup> | Yes — OTel-native, primary wire format <sup>[14]</sup> | Partial — proprietary format primary <sup>[5]</sup> | Partial — proprietary format primary <sup>[15]</sup> | Yes — native OTel <sup>[16]</sup> |
+| Full-fidelity capture (no default sampling) | Yes — no default sampling; capture on in the published benchmark <sup>[T2]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — all LLM and non-LLM calls <sup>[14]</sup> | Yes — "full visibility" <sup>[5]</sup> | Not documented | Not documented |
+| Trace tree + tool spans | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — traces include tool calls <sup>[14]</sup> | Yes — step-by-step agent view <sup>[5]</sup> | Yes — tracing with spans <sup>[15]</sup> | Yes — every step incl. tool calls <sup>[16]</sup> |
+| Sessions / threads | Yes — `OBS-19` (`/sessions`, `gen_ai.conversation.id`); per-user identity within a session is on the roadmap <sup>[T10]</sup> | Not documented | Not documented | Not documented | Yes — sessions listed <sup>[4]</sup> | Yes — multi-turn sessions <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — "Loop thread" <sup>[15]</sup> | Not documented |
+| Multi-agent swimlanes / agent graph | Yes — `OBS-49` <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — agent graphs <sup>[14]</sup> | Yes — agent step view <sup>[5]</sup> | Not documented | Not documented |
+| Full-text trace search | Yes — `OBS-01` <sup>[T9]</sup> | Not documented | Not documented | Not documented | Partial — HQL query language <sup>[4]</sup> | Not documented <sup>[14]</sup> | Yes — production monitoring + search <sup>[5]</sup> | Not documented | Not documented |
+| Cost per request / model | Yes <sup>[T11]</sup> | Yes — per key/team/user tracking <sup>[1]</sup> | Yes — usage analytics <sup>[2]</sup> | Yes — budget management <sup>[3]</sup> | Not documented | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Not documented |
+| In-app AI assistant over your traces | Yes — `OBS-40` ("Ask Tara"), a natural-language query surface over your own traces, deployed to production <sup>[T12]</sup> | No | No | No | No | Not documented | Not documented | Not documented | Not documented |
+| MCP server for trace access | Yes — `PLT-22`, `@tracelanedev/mcp` (published on npm, `0.3.0`), read-only and tenant-scoped: it reads through the gateway's own `/v1/*` routes with the caller's own bearer token <sup>[T13]</sup> | No | No | Yes — MCP for external tool integration <sup>[3]</sup> | No | No | No | No | No |
+| Claude Code / coding-agent integration | Yes — two paths: `PLT-46` (an OTLP flight recorder that decodes Claude Code's native span shape) and `GWY-47` (an Anthropic-native `/v1/messages` proxy), both proven on production with real Claude Code sessions <sup>[T14]</sup> | Not documented — routing Claude models is not a coding-agent integration | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
+| Shareable trace links | Yes — `OBS-48`, a public `/s/<token>` page carrying the audit-ledger badge <sup>[T15]</sup> | No | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
+
+## Evals
+
+| Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
+|---|---|---|---|---|---|---|---|---|---|
+| Datasets | Yes — proven on production <sup>[T16]</sup> | No | Not documented | No | Yes — listed <sup>[4]</sup> | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes <sup>[16]</sup> |
+| Experiments | Yes — proven on production <sup>[T16]</sup> | No | Not documented | No | Not documented | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes <sup>[16]</sup> |
+| LLM-as-judge online evals with sampling | Yes — `EVL-28`, 11.11% sampling against a 10% configured rate, proven on production <sup>[T17]</sup> | No | Not documented | No | Not documented | Yes — LLM-as-judge evaluators <sup>[14]</sup> | Yes — online evaluations <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes — LLM-as-judge <sup>[16]</sup> |
+| Annotation / review queues | Yes — `EVL-29`, proven on production <sup>[T18]</sup> | No | Not documented | No | Not documented | Yes — annotation queues <sup>[14]</sup> | Yes — annotation queues <sup>[5]</sup> | Not documented | Yes — human review <sup>[16]</sup> |
+| CI eval gate (GitHub Action / CLI) | Yes — `EVL-30`, `@tracelanedev/cli` (published on npm, `0.3.0`), proven on production <sup>[T19]</sup> | No | No | No | No | Partial — webhooks + GitHub Actions for alerts <sup>[14]</sup> | Not documented | Not documented | Not documented |
+| Prompt management + playground | Yes — `EVL-03` + `OBS-01` <sup>[T20]</sup> | No | Yes — prompt templates across tiers <sup>[12]</sup> | Not documented | Yes — prompts listed as a feature <sup>[4]</sup> | Yes — versioning + deployment without code changes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — playground <sup>[15]</sup> | Yes — Prompt IDE <sup>[16]</sup> |
+
+## Trust
+
+| Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
+|---|---|---|---|---|---|---|---|---|---|
+| Tamper-evident / hash-chained audit ledger | Yes — Merkle-batched hash chain + Ed25519 per-tenant signing, included on every tier <sup>[T21]</sup> | No | No | No | No | No | No | No | No |
+| Third-party verifiable offline | Yes — Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; `tlane verify --tenant-pubkey` needs no call back to us <sup>[T21]</sup> | No | No | No | No | No | No | No | No |
+| Self-host in one binary / Compose | Yes — single-node Docker Compose, ClickHouse-backed <sup>[T3]</sup> | Yes — Docker Compose <sup>[1]</sup> | Yes — `npx @portkey-ai/gateway` or Docker <sup>[2]</sup> | Yes — Docker/self-host <sup>[3]</sup> | Partial — Enterprise tier only <sup>[4]</sup> | Yes — Docker Compose + Kubernetes <sup>[14]</sup> | Partial — Enterprise BYOC/self-hosted SKU <sup>[5]</sup> | Partial — Enterprise on-premise <sup>[15]</sup> | Yes — Docker, Kubernetes <sup>[16]</sup> |
+| Open-source license | Apache 2.0 <sup>[T3]</sup> | MIT <sup>[1]</sup> | MIT <sup>[2]</sup> | Apache 2.0 <sup>[3]</sup> | Not confirmed | MIT <sup>[14]</sup> | None for OSS; Enterprise self-hosted SKU is proprietary <sup>[5]</sup> | Not confirmed | ELv2 (not Apache/MIT) <sup>[16]</sup> |
+| SOC 2 / ISO 27001 (published report) | **No** <sup>[T22]</sup> | Not documented <sup>[7]</sup> | Yes — SOC2 + ISO27001 + GDPR + HIPAA; reports via paid plans <sup>[17]</sup> | Not documented <sup>[3]</sup> | Yes — SOC2 Type II at Team tier ($799/mo) <sup>[18]</sup> | Yes — SOC2 Type II + ISO27001 at Pro tier ($199/mo)<!-- pricing-guard: allow $199 competitor-price --> <sup>[19]</sup> | Partial — Trust Center referenced, no detail <sup>[5]</sup> | Yes — SOC2 Type II, all tiers <sup>[20]</sup> | Not documented <sup>[16]</sup> |
+| Data residency / regions | No customer-configurable data residency is documented on our pricing page as of 2026-09-07 <sup>[T22]</sup> | Self-host anywhere; no hosted multi-region <sup>[1]</sup> | VPC hosting for Enterprise <sup>[17]</sup> | Not documented <sup>[3]</sup> | Not documented <sup>[4]</sup> | US, EU, JP (vendor abbreviation) <sup>[19]</sup> | US or EU cloud; BYOC for custom <sup>[21]</sup> | Not documented <sup>[20]</sup> | Not documented <sup>[16]</sup> |
+| Free tier | 1 GB ingest / 0.25 GB hot / 100 series / 10 scan-units per mo, 60 RPM, 1 seat, no commercial use, rule-based PR1+PR2 <sup>[T3]</sup> | Free core; cloud pricing not public <sup>[7]</sup> | 10K logs/mo, 3-day retention, 1 user <sup>[12]</sup> | Not documented <sup>[3]</sup> | 10K requests/mo, 1 GB, 1 seat <sup>[18]</sup> | 50K units/mo, 30-day data access, 2 users <sup>[19]</sup> | 5K traces/mo, 14-day retention, 1 seat <sup>[21]</sup> | $0 + $10 credits/mo, 1 GB data, 14-day retention<!-- pricing-guard: allow $10 competitor-price --> <sup>[20]</sup> | 2 Phoenix Cloud instances free <sup>[16]</sup> |
+| Pricing model summary | Six usage meters (ingest/hot/series/query/cold/evals) + tier price; $29 Builder / $229 Team / $799 Business / $2,499+ Enterprise <sup>[T3]</sup> | Free core; Enterprise sales-only <sup>[7]</sup> | $49/mo Production; Enterprise custom<!-- pricing-guard: allow $49 competitor-price --> <sup>[12]</sup> | Not published <sup>[3]</sup> | $79/mo Pro; $799/mo Team<!-- pricing-guard: allow $79 competitor-price --> <sup>[18]</sup> | $29/mo Core; $199/mo Pro; $2,499/mo Enterprise<!-- pricing-guard: allow $199 competitor-price --> <sup>[19]</sup> | $39/seat/mo Plus; Enterprise custom<!-- pricing-guard: allow $39 competitor-price --> <sup>[21]</sup> | $249/mo Pro; Enterprise custom<!-- pricing-guard: allow $249 competitor-price --> <sup>[20]</sup> | Cloud pricing not public <sup>[16]</sup> |
+
+## Portkey's provider count
+
+Portkey's homepage says **"1,600+ LLMs."** Its own GitHub repository's `src/providers`
+directory, read the same day, lists roughly **75 provider modules** — one module (e.g.
+`openrouter`) can route to many models, which partly explains the gap between a provider
+count and a model count. But Portkey's own pages are not internally consistent: across
+different pages we found **three different figures — 250+, 1,600+, and 3,000+** — for what
+should be one number. We're not asserting which is "the" real count; we're reporting that
+the vendor's own marketing disagrees with itself. Read their repository yourself before
+treating any of the three as ground truth: `github.com/portkey-ai/gateway/tree/main/src/providers`.
+
+For our own "150+ providers" claim: it is deliberately conservative against
+`crates/gateway/providers.tsv`, the actual provider adapter table in the repo — count it
+yourself.
+
+## Honest gaps
+
+Things competitors publish that we do not have. In rough order of how likely they are to
+block a deal on day one:
+
+1. **SOC 2 Type II report (published).** Portkey, Helicone (Team+), Langfuse (Pro+),
+   Braintrust (all tiers) and LangSmith (Trust Center) all have or reference a published
+   SOC 2. **Not yet.**
+2. **Data residency / multi-region.** Langfuse offers US, EU, JP (its own abbreviation); LangSmith offers US
+   or EU; Portkey and Helicone offer VPC hosting on Enterprise. Tracelane is single-region
+   and residency is not customer-configurable. **Not yet.**
+3. **HIPAA / BAA.** Documented by Portkey, Langfuse, Helicone, Braintrust and LangSmith,
+   each on their higher tiers. **Not yet.**
+4. **SAML SSO, documented as a self-serve feature.** Tracelane authenticates through
+   WorkOS, but SAML is not documented as an available feature on any public Tracelane
+   page today. **Not yet.**
+5. **Contractual SLA / uptime guarantee.** `apps/docs/pricing.mdx` states plainly:
+   *"Tracelane does not offer a contractual uptime SLA or service credits."* Langfuse and
+   Braintrust document one on their Enterprise tiers. **Not yet.**
+6. **Slack / PagerDuty alert integrations, documented.** LangSmith documents webhooks +
+   PagerDuty; Langfuse documents Slack/GitHub Actions/webhooks; Helicone documents alerts.
+   Tracelane's burn-rate alerts on paid plans are not documented as integrating with a
+   specific paging tool. **Not yet.**
+
+None of these are silent gaps — every one is stated as a limit in a public Tracelane doc
+(mostly [pricing](/pricing)) rather than only showing up when you ask.
+
+## Sources
+
+### Tracelane (code-verified)
+
+- **[T1]** `crates/gateway/src/admission.rs` + `crates/gateway/src/server/chat.rs` — the Rust gateway hot path
+- **[T2]** [`/benchmarks`](/benchmarks) — AIGatewayBench CCX23, 2026-09-07: Tracelane 2/4/5 ms, Portkey 3–4/5–7/8–9 ms, Bifrost 2/2/3 ms, LiteLLM Python 14–15/34–36/47–52 ms
+- **[T3]** [`/pricing`](/pricing) — 150+ providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
+- **[T4]** feature `GWY-24` — exact-match caching built and proven; the semantic tier is built but has never run in production (0 rows), because 94% of production traffic is Anthropic, which has no embeddings API
+- **[T5]** `crates/gateway/src/guardrail/rails/` (`r1_cost.rs` … `r8_injection.rs`) + [`/pricing`](/pricing) FAQ ("What inline guardrails run on every request?") for the free-vs-Team+ split
+- **[T6]** the feature inventory; `crates/gateway/src/providers/mod.rs` — model→provider routing fails closed to `unroutable_model`
+- **[T7]** feature `GWY-47` — Anthropic-native `POST /v1/messages`, deployed and proven on production 2026-09-06 with a real Claude Code session (3 proxied spans, tokens and cost present)
+- **[T8]** `crates/shared/src/otlp/decode.rs` — the `parent_span_id must survive` comment and the OTLP decode path
+- **[T9]** feature `OBS-49` (multi-agent swimlanes) and `OBS-01` (full-text trace search) rows, both shipped and deployed 2026-09-06
+- **[T10]** feature `OBS-19` — `/v1/sessions` and `/v1/sessions/{id}/traces` handlers in `crates/gateway/src/server.rs`
+- **[T11]** the feature inventory — cost-per-request tracking, built
+- **[T12]** feature `OBS-40` — "Ask Tara," the in-app natural-language query surface, shipped and deployed 2026-09-06; distinct from the MCP server (`PLT-22`, below)
+- **[T13]** feature `PLT-22` — `apps/mcp/src/reader.ts`, `GatewayReader` reads `/v1/*` with the caller's own bearer, tenant isolation proven against production ClickHouse; `@tracelanedev/mcp@0.3.0` published to npm 2026-09-07, confirmed by `npm view @tracelanedev/mcp version`
+- **[T14]** feature `PLT-46` (Claude Code flight recorder, OTLP decoder aliases + cost backfill, deployed and proven 2026-09-06) and `GWY-47` row (Anthropic-native proxy, see [T7])
+- **[T15]** feature `OBS-48` — public `/s/<token>` page, built and deployed 2026-09-06; the per-IP rate limiter defect found in the first prod proof (`B-352`) was fixed and re-proven
+- **[T16]** the feature inventory — Sprint 3 items 8 (datasets) and 9 (experiments), proven on production
+- **[T17]** feature `EVL-28` — online evals with sampling, proven on production 2026-08-29, achieved 11.11% against a configured 10% rate
+- **[T18]** feature `EVL-29` — annotation queues, proven on production 2026-08-29
+- **[T19]** feature `EVL-30` — the CI eval gate and `@tracelanedev/cli`, proven on production 2026-08-30; `@tracelanedev/cli@0.3.0` published to npm 2026-09-07
+- **[T20]** the feature inventory `EVL-03` + `OBS-01` rows — prompt management, playground and trace search, shipped 2026-09-06
+- **[T21]** [`/pricing`](/pricing) audit-ledger description and [`/audit-ledger`](/audit-ledger) — Merkle-batched hash chain, Ed25519 per-tenant signing (live), best-effort Sigstore Rekor v2 inclusion proof on anchored batches
+- **[T22]** [`/pricing`](/pricing) — no SOC 2 / ISO 27001 mentioned, no SLA clause; single-region, 365-day maximum retention, not configurable
+
+### Competitors (all fetched 2026-09-07 from vendors' own pages)
+
+1. [github.com/BerriAI/litellm](https://github.com/BerriAI/litellm) — "Rust core with Python SDK. Call 100+ LLM APIs in OpenAI (or native) format"; MIT license
+2. [github.com/portkey-ai/gateway](https://github.com/portkey-ai/gateway) — "routes to 1,600+ LLMs across 45+ [vendors]"; "50+ AI Guardrails"; MIT license
+3. [github.com/maximhq/bifrost](https://github.com/maximhq/bifrost) — "high-performance AI gateway unifying access to 23+ [vendors]"; Apache 2.0
+4. [helicone.ai](https://helicone.ai) — "10,000 free requests, 1 GB storage, 1 seat, 1 organization"
+5. [langchain.com/langsmith](https://www.langchain.com/langsmith) — "Control agent model calls" under the LLM Gateway heading
+6. [github.com/BerriAI/litellm](https://github.com/BerriAI/litellm) — "8ms P95 latency at 1k RPS" (self-reported, not independently measured)
+7. [litellm.ai](https://www.litellm.ai) — "One OpenAI-compatible API to 140+ [vendors] and 1,800+ models"
+8. [portkey.ai](https://portkey.ai) — "Portkey lets you access 1,600+ LLMs via a unified API"
+9. [github.com/portkey-ai/gateway/tree/main/src/providers](https://github.com/portkey-ai/gateway/tree/main/src/providers) — directory listing, ~75 provider-module entries counted by hand; see "Portkey's provider count" above
+10. [docs.litellm.ai/docs/proxy/configs](https://docs.litellm.ai/docs/proxy/configs) — BYOK via `litellm_params.api_key`; per-deployment RPM/TPM
+11. [docs.litellm.ai/docs/caching/all_caches](https://docs.litellm.ai/docs/caching/all_caches) — "similarity threshold for cache hits, 0 == no similarity, 1 = exact matches"; 8+ backend options
+12. [portkey.ai/pricing](https://portkey.ai/pricing) — "$49/month Production"<!-- pricing-guard: allow $49 competitor-price -->; "100k logs/month"; semantic caching; "10k logs free / 3-day retention"; SOC2 + ISO27001
+13. [docs.litellm.ai/docs/proxy/reliability](https://docs.litellm.ai/docs/proxy/reliability) — "If a call fails after num_retries, LiteLLM falls back to another model group"
+14. [langfuse.com](https://langfuse.com) — OTel-native; "US, EU, or Japan"; free 50K units / 2 users / 30-day; annotation queues; agent graphs
+15. [braintrust.dev](https://braintrust.dev) — "Tracing, evaluation, and storage infrastructure"; SOC2 Type II all tiers; "$249/mo Pro"<!-- pricing-guard: allow $249 competitor-price -->; "14-day retention Starter"
+16. [arize.com/phoenix](https://arize.com/phoenix) — "ELv2 licensed"; "native OpenTelemetry support"; "2 Phoenix Cloud instances for free"; Docker/Kubernetes self-host
+17. [portkey.ai/pricing](https://portkey.ai/pricing) — "SOC2, ISO27001, GDPR, HIPAA Compliance Certificates"; VPC hosting Enterprise
+18. [helicone.ai/pricing](https://helicone.ai/pricing) — "SOC-2 Type II at Team tier ($799/mo)"; "10,000 free requests, 1 seat"
+19. [langfuse.com/pricing](https://langfuse.com/pricing) — "SOC2 Type II + ISO27001 reports at Pro ($199/mo)"<!-- pricing-guard: allow $199 competitor-price -->; "US, EU, or Japan"; "Hobby: 50K units/30-day/2 users"
+20. [braintrust.dev/pricing](https://www.braintrust.dev/pricing) — "SOC 2 Type II" (all tiers); "$249/mo Pro"<!-- pricing-guard: allow $249 $10 competitor-price -->; "14-day retention Starter"; "$0 + $10 credits/mo free"
+21. [langchain.com/pricing](https://langchain.com/pricing) — "$39/seat/mo Plus"<!-- pricing-guard: allow $39 competitor-price -->; "5K traces/mo free"; "14-day retention base"; "US or EU cloud"
+
+---
+
+*Matrix compiled 2026-09-07. Every competitor source above was fetched that day from an
+official vendor page — a docs site, a pricing page, or a public GitHub repository. If
+anything here is inaccurate or out of date, please [open an
+issue](https://github.com/tracelane/tracelane/issues) and we'll correct it.*

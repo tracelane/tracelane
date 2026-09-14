@@ -45,6 +45,11 @@ tower-http = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
+# BILL-01 / ADR-076 §2.3 — content-addressed blob dedup. Same version as the
+# gateway's own `blake3 = "1"` (semantic cache, `b09bf5dd`) so both binaries
+# hash identical bytes to identical digests; not a `workspace.dependencies`
+# entry because the gateway's own declaration isn't one either.
+blake3 = "1"
 ring = { workspace = true }
 # FT-08 disk-pressure self-protection: safe statvfs wrapper (no openssl, no
 # unsafe at our call site). Already vendored transitively; pinned here as a
@@ -67,7 +72,6 @@ hyper-util = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tower = { workspace = true }
-tower-service = "0.3"
 
 # SecretString wrapping for SVID private keys (Zeroize-on-drop).
 secrecy = { workspace = true }

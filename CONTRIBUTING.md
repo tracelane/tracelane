@@ -51,9 +51,9 @@ docker compose -f infra/dev/docker-compose.yml up -d
 # to Drizzle — an incomplete control plane fails at runtime, not here.
 #
 # READ THIS BEFORE YOU ASSUME THE SCHEMA IS COMPLETE. `drizzle-kit migrate` applies
-# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 33
+# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 42
 # .sql files on disk; 0009+ are hand-written Neon migrations applied out-of-band and
-# deliberately un-journaled, so this command gives you 9 of 31. That is enough for the
+# deliberately un-journaled, so this command gives you 9 of 39. That is enough for the
 # gateway to boot and for most local work, and it is NOT the production schema.
 pnpm --filter @tracelanedev/web exec drizzle-kit migrate
 
@@ -137,11 +137,11 @@ pytest packages/sdk-python/
 # Eval orchestrator
 pytest evals/
 
-# Full eval suite — merge gate, must pass before PR
+# Full eval suite — CI runs it with MOCK providers; behavioural assertions need a live stack
 pnpm eval:run --suite=all
 ```
 
-CI fails if `pnpm eval:run --suite=all` regresses. Never disable an eval — mark it flaky in the suite in `evals/FLAKY.md` and fix within 48 hours.
+CI runs `pnpm eval:run --suite=all` with `TRACELANE_EVAL_MOCK_PROVIDERS=true`, so every behavioural assertion SKIPS there; the live-stack eval job is opt-in (`workflow_dispatch`). A red eval is acted on rather than automatically refused. Never disable an eval — mark it flaky in the suite and fix within 48 hours.
 
 ## Linting and formatting
 
@@ -166,7 +166,7 @@ pnpm bench:ingest
 pnpm bench:gateway
 ```
 
-A >10% regression blocks merge. Hard budgets:
+The benchmark job is NOT on the PR path — it runs only on a founder-approved `workflow_dispatch` (hosted runners are billed). The budgets it measures against:
 
 | Surface | p99 |
 |---|---|

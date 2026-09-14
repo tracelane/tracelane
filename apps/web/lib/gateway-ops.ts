@@ -14,11 +14,9 @@
  * the UI labels each. Span-derived over the rolling `window_hours`: request
  * volume, error rate, latency percentiles, prompt-cache hit rate, and failover
  * activations. Process-lifetime (since the gateway started, reset on redeploy):
- * `rate_limited_since_start` / `quota_exceeded_since_start` — a 429 emits no
+ * `rate_limited_since_start` / `budget_exceeded_since_start` — a 429 emits no
  * span, so those come from the gateway's in-process counters, never a fake 0.
  */
-
-import { GatewayError, gatewayGet } from "@/lib/gateway";
 
 /** One provider's health, as returned by `GET /v1/gateway/stats`. */
 export type GatewayProviderHealth = {
@@ -59,8 +57,8 @@ export type GatewayStats = {
 	total_cost_usd: number;
 	/** Rate-limit 429s for this tenant since the gateway started. */
 	rate_limited_since_start: number;
-	/** Monthly-quota hard-cap 429s for this tenant since the gateway started. */
-	quota_exceeded_since_start: number;
+	/** Budget-exceeded 429s (per-key/workspace USD budget) for this tenant since the gateway started. */
+	budget_exceeded_since_start: number;
 	providers: GatewayProviderHealth[];
 	/** Upstreams whose circuit breaker is currently Open or Half-Open (ADR-036). */
 	open_breakers: number;
@@ -68,32 +66,7 @@ export type GatewayStats = {
 	uninstrumented: string[];
 };
 
-/**
- * Fetch per-provider gateway health for the authenticated tenant.
- *
- * Returns `null` on any `GatewayError` (gateway unreachable) so the page can
- * show its warming state — distinct from a real empty result (`provider_count
- * === 0`), which means "reachable, but no requests in the window". Any
- * non-`GatewayError` (e.g. the `NEXT_REDIRECT` from `requireGatewayToken`)
- * propagates so the auth redirect is honored.
- *
- * @param opts.hours Look-back window in hours forwarded to the gateway.
- */
-export async function fetchGatewayStats(opts?: {
-	hours?: number;
-}): Promise<GatewayStats | null> {
-	const q = new URLSearchParams();
-	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
-	const qs = q.toString();
-	try {
-		return await gatewayGet<GatewayStats>(
-			`/v1/gateway/stats${qs ? `?${qs}` : ""}`,
-		);
-	} catch (err) {
-		if (err instanceof GatewayError) return null;
-		throw err;
-	}
-}
+// `fetchGatewayStats` moved to `lib/metrics/fetch.ts` (DSH-11): one read layer, one window.
 
 // ── Cost attribution (GWY-43, Sprint 1 item 5) ───────────────────────────────
 
@@ -160,24 +133,4 @@ export type CostBreakdown = {
 	rows: CostBreakdownRow[];
 };
 
-/**
- * Fetch the spend breakdown for the authenticated tenant.
- *
- * `null` on `GatewayError` (unreachable) so the page can show its warming state,
- * exactly as `fetchGatewayStats` does — distinct from a real empty result.
- */
-export async function fetchCostBreakdown(opts?: {
-	hours?: number;
-	by?: "key" | "model" | "provider";
-}): Promise<CostBreakdown | null> {
-	const q = new URLSearchParams();
-	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
-	if (opts?.by !== undefined) q.set("by", opts.by);
-	const qs = q.toString();
-	try {
-		return await gatewayGet<CostBreakdown>(`/v1/costs${qs ? `?${qs}` : ""}`);
-	} catch (err) {
-		if (err instanceof GatewayError) return null;
-		throw err;
-	}
-}
+// `fetchCostBreakdown` moved to `lib/metrics/fetch.ts` (DSH-11): one read layer, one window.

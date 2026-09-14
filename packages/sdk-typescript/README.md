@@ -212,8 +212,12 @@ const hits = await tracer.startActiveSpan("retrieval", async (span) => {
 - Telemetry goes to your configured `endpoint` only — the SDK never calls home.
 - Instrumentation is additive — `instrument*` patches a client in place and does
   not modify the OpenAI/Anthropic module exports.
-- **Redaction** — set `TRACELANE_TRACE_CONTENT=false` to redact prompt and
-  completion text from captured traces (honored on the gateway path).
+- **Prompt and completion text is not captured, and there is no switch you need
+  to set.** The SDK never sends it, and the gateway stores it only for tenants an
+  operator has explicitly allowlisted in its own `tracelane.yaml` — off for
+  everyone otherwise. Earlier revisions of this file told you to set
+  `TRACELANE_TRACE_CONTENT=false`; **no component has ever read that variable**,
+  so the instruction was inert and the honest statement is the stronger one.
 - Zero runtime dependencies beyond the OpenTelemetry SDK.
 
 ## Documentation

@@ -119,14 +119,14 @@ fn validate_one(call: &str, schema: &Value, input: &Value, out: &mut Vec<ToolCal
     if !object_shaped {
         // Non-object top-level schema (rare for tools) — only a declared-type
         // contradiction is meaningful.
-        if let Some(t) = schema.get("type") {
-            if !type_matches(t, input) {
-                out.push(ToolCallViolation::TypeMismatch {
-                    call: call.to_owned(),
-                    field: "<root>".to_owned(),
-                    expected: t.to_string(),
-                });
-            }
+        if let Some(t) = schema.get("type")
+            && !type_matches(t, input)
+        {
+            out.push(ToolCallViolation::TypeMismatch {
+                call: call.to_owned(),
+                field: "<root>".to_owned(),
+                expected: t.to_string(),
+            });
         }
         return;
     }
@@ -155,14 +155,14 @@ fn validate_one(call: &str, schema: &Value, input: &Value, out: &mut Vec<ToolCal
     // 2. present fields type-check against their declared property schema
     if let Some(props) = properties {
         for (field, sub) in props {
-            if let (Some(declared), Some(actual)) = (sub.get("type"), args.get(field)) {
-                if !type_matches(declared, actual) {
-                    out.push(ToolCallViolation::TypeMismatch {
-                        call: call.to_owned(),
-                        field: field.clone(),
-                        expected: declared.to_string(),
-                    });
-                }
+            if let (Some(declared), Some(actual)) = (sub.get("type"), args.get(field))
+                && !type_matches(declared, actual)
+            {
+                out.push(ToolCallViolation::TypeMismatch {
+                    call: call.to_owned(),
+                    field: field.clone(),
+                    expected: declared.to_string(),
+                });
             }
         }
     }
@@ -201,13 +201,13 @@ fn extract_calls(request: &Value) -> Vec<ExtractedCall> {
         }
         if let Some(parts) = msg.get("content").and_then(Value::as_array) {
             for part in parts {
-                if part.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    if let Some(name) = part.get("name").and_then(Value::as_str) {
-                        calls.push(ExtractedCall {
-                            name: name.to_owned(),
-                            input: part.get("input").cloned().unwrap_or(Value::Null),
-                        });
-                    }
+                if part.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(name) = part.get("name").and_then(Value::as_str)
+                {
+                    calls.push(ExtractedCall {
+                        name: name.to_owned(),
+                        input: part.get("input").cloned().unwrap_or(Value::Null),
+                    });
                 }
             }
         }

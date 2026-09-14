@@ -11,4 +11,4 @@
  * It was hardcoded at "0.1.0" while the package moved on, so every MCP
  * client displayed a version that had not existed for two releases.
  */
-export const MCP_SERVER_VERSION = "0.2.4";
+export const MCP_SERVER_VERSION = "0.3.0";

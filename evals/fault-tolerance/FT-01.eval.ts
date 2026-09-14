@@ -85,8 +85,17 @@ describe("FT-01: Gateway provider failover within 200ms", () => {
 		// The test fires a wiremock 500 then a 200 and asserts the retry
 		// stays inside the 200ms budget. If you reword the helper names,
 		// update both call sites.
-		expect(content).toContain("wiremock_500_then_200_succeeds_within_200ms");
-		expect(content).toContain("wiremock_persistent_500_exhausts_retry");
+		// B-385 2c (2026-09-12): the chaos tests boot the REAL gateway binary and
+		// assert the mock's request log, the response bytes and /health — the
+		// earlier pair asserted their own literals. Pinned by name.
+		expect(content).toContain("a_503_then_200_is_retried_once_and_served_with_one_span");
+		expect(content).toContain("a_persistent_503_exhausts_the_single_retry_and_answers_502");
 		expect(content).toContain("MockServer");
+		// The binary boot lives in the shared harness both chaos files use.
+		const harness = fs.readFileSync(
+			path.resolve(__dirname, "../../crates/gateway/tests/common/mod.rs"),
+			"utf8",
+		);
+		expect(harness).toContain("CARGO_BIN_EXE_gateway");
 	});
 });

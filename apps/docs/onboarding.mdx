@@ -14,7 +14,7 @@ operators self-hosting Tracelane.
 2. Sign in with WorkOS Connect (Google / Microsoft / SAML).
 3. The first sign-in for a domain creates a tenant; subsequent users on the
    same domain join it.
-4. Pick a plan (Builder $59 / Team $249 / Business $899 / Enterprise).
+4. Pick a plan (Builder $29 / Team $229 / Business $799 / Enterprise from $2,499).
 5. Generate a tenant API key (`tlane_<base62>`). Copy it once — we hash + store.
 6. Drop it in your env as `TRACELANE_API_KEY`.
 7. Make a call. The trace shows up at [app.tracelane.dev/traces](https://app.tracelane.dev/traces) within a second.
@@ -32,8 +32,8 @@ Eight steps to running Tracelane on your own infra.
 
 <Step title="Reserve infra">
   - Postgres 17 (Neon, RDS, or self-hosted) — tenant + user metadata
-  - ClickHouse 24+ — span/audit hot tier
-  - R2 (or S3) — span/audit cold tier
+  - ClickHouse 24+ — span/audit storage. There is no cold tier: spans live in
+    ClickHouse only, and no object storage (R2/S3) is required.
   - L4 GPU pool — optional, only for the roadmap SLM-judge inference tier; not required at V1
   - Outbound network to Sigstore Rekor (`rekor.sigstore.dev`) — for best-effort, opt-in Rekor v2 anchoring of audit batches; universal per-run anchoring is on the roadmap
 </Step>
@@ -43,8 +43,8 @@ Eight steps to running Tracelane on your own infra.
   - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_WEBHOOK_SECRET` — auth
   - `TRACELANE_BYOK_MASTER_KEY` — provider-key envelope encryption (32 bytes, base64-encoded; AES-256-GCM via `ring`)
   - `TRACELANE_APIKEY_PEPPER` — API-key hashing pepper (release builds refuse to boot without it)
-  - `CLICKHOUSE_URL`, `POSTGRES_URL` — datastore endpoints. (The R2 cold tier is
-    built but not fed in V1, so its `TRACELANE_R2_*` variables are not required.)
+  - `CLICKHOUSE_URL`, `POSTGRES_URL` — datastore endpoints. (There is no cold
+    tier; no `TRACELANE_R2_*` variables exist to set.)
 </Step>
 
 <Step title="Apply migrations">
@@ -68,31 +68,31 @@ Eight steps to running Tracelane on your own infra.
 </Step>
 
 <Step title="Configure Polar">
-  Tracelane v2 pricing requires six `lookup_key`s. Create each as
-  a separate product in the [Polar.sh](https://polar.sh) dashboard, with the
-  `lookup_key` set on each product's `product_metadata`:
+  Tracelane v3 pricing requires five base plans (monthly + annual = ten Polar
+  products) plus six usage meters. Create each product in the
+  [Polar.sh](https://polar.sh) dashboard, with the `lookup_key` set on each
+  product's `product_metadata`:
 
-  | Product | `lookup_key` | Price |
-  |---|---|---|
-  | Builder plan | `builder_v1` | $59/mo |
-  | Team plan | `team_v1` | $249/mo |
-  | Business plan | `business_v1` | $899/mo |
-  | Enterprise plan | `enterprise_v1` | from $2,999/mo (custom) |
-  | Audit add-on | `audit_addon_v1` | $999/mo |
-  | Trace overage meter | `overage_v1` | $1.20 per 10K traces (metered) |
+  | Product | `lookup_key` (monthly / annual) | Monthly | Annual (per mo) |
+  |---|---|---|---|
+  | Builder plan | `builder_v1` / `builder_v1_year` | $29/mo | $24/mo |
+  | Team plan | `team_v1` / `team_v1_year` | $229/mo | $190/mo |
+  | Business plan | `business_v1` / `business_v1_year` | $799/mo | $665/mo |
+  | Enterprise plan | `enterprise_v1` | from $2,499/mo (custom) | contract |
 
-  Seats are a per-tier **cap**, not a billable meter — an invite past the cap is
-  refused with `403 seat_limit_reached`. There is no extra-seat product to create.
+  Seats are unlimited on every paid tier — Free is capped at one seat, and
+  there is no per-seat product to create.
 
   Then:
-  - Create Polar meters with these event names: `tokens_processed`, `audit_anchors`
+  - Create the six usage meters with these names: `ingest_gb`, `hot_gb_month`, `series`, `scan_units`, `cold_gb_month`, `eval_runs`
   - Add the Tracelane webhook URL `https://<your-dashboard-domain>/api/webhooks/polar`
   - Subscribe to events: `subscription.created`, `subscription.updated`, `subscription.active`, `subscription.canceled`, `order.created`, `order.paid`
   - Configure the Polar-hosted customer portal — branding, allowed actions
   - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
 
-  for the rationale behind seat caps and capped overage. Retention is NOT
-  tier-specific — one window applies to every plan.
+  for the rationale behind unlimited seats and the six usage meters. Retention
+  is tier-specific: the indexed window runs 3/30/90/180/365+ days by tier, and
+  queryable history is 30 days on Free and 2 years on every paid tier.
 </Step>
 
 <Step title="Deploy gateway + ingest">

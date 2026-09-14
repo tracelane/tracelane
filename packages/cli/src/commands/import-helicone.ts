@@ -46,18 +46,18 @@ const ENV_VAR_MAP: ReadonlyArray<readonly [string, string, string]> = [
 	],
 	[
 		"HELICONE_USER_ID",
-		"TRACELANE_USER_ID",
-		"Per-request actor; set via metadata.user_id in body",
+		"",
+		"Not an env var — send the X-Tracelane-User-Id header (or OpenAI's `user` field) per request",
 	],
 	[
 		"HELICONE_PROPERTY_PREFIX",
 		"",
-		"No equivalent — Tracelane uses spans + metadata",
+		"No equivalent — Tracelane has no custom-property header",
 	],
 	[
 		"HELICONE_CACHE_ENABLED",
 		"",
-		"Tracelane has no built-in caching layer in V1 — drop",
+		"Not a client toggle — Tracelane's response cache is operator-configured; drop",
 	],
 	[
 		"HELICONE_RATE_LIMIT_ENABLED",
@@ -70,14 +70,14 @@ const ENV_VAR_MAP: ReadonlyArray<readonly [string, string, string]> = [
 const HEADER_MAP: ReadonlyArray<readonly [string, string]> = [
 	["Helicone-Auth", "Authorization"],
 	["Helicone-User-Id", "X-Tracelane-User-Id"],
-	["Helicone-Session-Id", "X-Tracelane-Session-Id"],
+	["Helicone-Session-Id", "X-Conversation-Id (X-Session-Id also accepted)"],
 	[
 		"Helicone-Property-*",
-		"X-Tracelane-Property-* (carried through to span attributes)",
+		"(no equivalent — drop; nearest is the single X-Business-Reference)",
 	],
 	[
 		"Helicone-Cache-Enabled",
-		"(no equivalent — drop; Tracelane has no V1 cache)",
+		"(no equivalent — the response cache is operator-configured, not per-request)",
 	],
 	["Helicone-RateLimit-Policy", "(handled server-side per tenant — drop)"],
 ];

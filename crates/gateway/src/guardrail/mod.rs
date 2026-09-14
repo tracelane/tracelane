@@ -38,17 +38,18 @@ pub mod tool_observer;
 pub mod tool_pins_api;
 pub mod verdict;
 
-pub use capability::{CapabilityRegistry, CapabilitySet, RegistryPosture, ToolCapability, ToolDef};
-pub use context::{
-    GuardrailContext, IncomingToolResult, ProposedToolCall, Provenance, ResponseBuffer,
-    ResponseInputs, RetrievedChunk, SessionState, TaintSource, TaintState,
-};
-pub use dispatcher::{Dispatcher, RailRecord, SideOutcome};
-pub use engine::{GuardrailEngine, RequestEvaluation, RequestInputs};
-pub use metrics::{GuardrailMetrics, record_side_outcome};
-pub use outcome::{Decision, FailMode, Outcome, RailError, RailOutcome, Side, Sides, reason_codes};
-pub use rail::{GuardrailFeature, Rail, RailFuture, RailGate};
-pub use recorder::GuardrailRecorder;
+// B-390 (2026-09-12): this re-export block used to name every public item in
+// every submodule, most of which nothing ever consumed via `guardrail::X` —
+// callers that need e.g. `outcome::FailMode` reach it through the submodule
+// path directly (`crate::guardrail::outcome::FailMode`), not through here.
+// Pruned to exactly what `crate::guardrail::X` (this top-level path) is
+// actually used for elsewhere in the crate. `CapabilitySet` is used only by
+// a test in `context.rs`, hence gated rather than deleted.
+pub use capability::CapabilityRegistry;
+#[cfg(test)]
+pub use capability::CapabilitySet;
+pub use context::{ResponseInputs, SessionState};
+pub use engine::{GuardrailEngine, RequestInputs};
+pub use outcome::{Decision, Outcome};
 pub use registry_loader::{RegistryLoader, pg_registry_resolver};
-pub use streaming::{GuardStep, ResponseGuard, STREAM_HOLDBACK_CHARS};
-pub use verdict::{GuardrailVerdict, RailVerdict, VERDICT_SCHEMA};
+pub use streaming::{GuardStep, ResponseGuard};

@@ -99,18 +99,83 @@ export async function requireSession(): Promise<Session> {
 }
 
 /**
+ * Per-`workosOrgId` memoization for {@link isOrgArchived} (B-361).
+ *
+ * `isOrgArchived` ran on EVERY authenticated page/API request — a live Neon
+ * query on `tenants` per hit. One open dashboard tab (LiveTraces reconnects,
+ * nav) fired it every few seconds, which is why Neon's Operations log showed
+ * the compute waking every 5-15 minutes during working hours at zero users.
+ * The gateway and ingest already hold no idle connections; this was the one
+ * remaining hot-path Postgres read with no cache at all.
+ *
+ * Module-level, not per-request `cache()` — the whole point is to survive
+ * ACROSS requests within a Worker isolate.
+ */
+const orgArchivedCache = new Map<
+	string,
+	{ archived: boolean; expiresAt: number }
+>();
+
+/**
+ * TTL for the archived-org cache, in ms. Deliberately **longer than Neon's
+ * 5-minute autosuspend** (default 900_000 = 15 min) so an open tab wakes the
+ * compute at most ~4x/hour instead of continuously. Read LAZILY, never at
+ * module top level (the Workers build reads env lazily — see `db/index.ts`).
+ * `TRACELANE_ORG_ARCHIVED_TTL_MS` override exists so a test can set it small.
+ */
+function orgArchivedCacheTtlMs(): number {
+	const raw = process.env.TRACELANE_ORG_ARCHIVED_TTL_MS;
+	const parsed = raw ? Number(raw) : Number.NaN;
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 900_000;
+}
+
+/**
+ * Invalidate the cached archived-state for one org. Call this immediately
+ * after a write that sets `tenants.archivedAt` so the ACTING isolate (the
+ * admin who just archived their own org) sees the new state on its very next
+ * request, rather than waiting out the TTL.
+ *
+ * This does NOT reach other Worker isolates — each isolate holds its own
+ * module-level `Map`, and Cloudflare Workers have no cross-isolate broadcast
+ * available here. So another isolate serving a DIFFERENT in-flight request
+ * for the SAME now-archived org may still answer "not archived" for up to
+ * `orgArchivedCacheTtlMs()`. That staleness is accepted deliberately: the
+ * archive action was taken by the org's OWN admin (never triggered by
+ * another tenant or an attacker), and every actual data read still goes
+ * through the gateway's own tenant checks regardless of what this page-gate
+ * believes — the worst case is a few extra minutes of dashboard access for
+ * an org that just deleted itself, not a cross-tenant leak.
+ */
+export function invalidateOrgArchivedCache(workosOrgId: string): void {
+	orgArchivedCache.delete(workosOrgId);
+}
+
+/**
  * True only when the tenant row is positively read as archived. Any error
  * (Postgres down, no row yet) returns `false` — fail-open, so a DB blip can't
  * lock a live org out of its dashboard. `redirect()` is never called here.
+ *
+ * Memoized per `workosOrgId` for `orgArchivedCacheTtlMs()` (B-361). Only a
+ * POSITIVE read (the query succeeded, whether archived or not) is cached — an
+ * error is never cached, so a transient Postgres blip is retried on the very
+ * next call rather than being pinned to `false` for the whole TTL.
  */
 async function isOrgArchived(workosOrgId: string): Promise<boolean> {
+	const cached = orgArchivedCache.get(workosOrgId);
+	if (cached && cached.expiresAt > Date.now()) return cached.archived;
+
 	try {
 		const [row] = await db
 			.select({ archivedAt: tenants.archivedAt })
 			.from(tenants)
 			.where(eq(tenants.workosOrgId, workosOrgId))
 			.limit(1);
-		return !!row?.archivedAt;
+		const archived = !!row?.archivedAt;
+		orgArchivedCache.set(workosOrgId, {
+			archived,
+			expiresAt: Date.now() + orgArchivedCacheTtlMs(),
+		});
+		return archived;
 	} catch {
 		return false;
 	}

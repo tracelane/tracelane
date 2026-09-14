@@ -50,6 +50,19 @@ There are exactly two ways to say it, and they end up in the same place:
 | Gateway | the `x-conversation-id` request header (`x-session-id` is accepted as an alias) | the span's `gen_ai.conversation_id` |
 | OTLP | the `gen_ai.conversation.id` span attribute | the same column |
 
+**Who** is a separate question from **which conversation**, and a separate field.
+Same shape, same rule that Tracelane never invents one:
+
+| Path | What you send | Where it lands |
+|---|---|---|
+| Gateway | the `x-tracelane-user-id` header (`x-user-id` alias), or OpenAI's `user` / `safety_identifier` body field, or Anthropic's `metadata.user_id` | the span's `user_id` |
+| OTLP | the `user.id` span attribute (`enduser.id`, `enduser.pseudo.id`, `langfuse.user.id` accepted) | the same field |
+
+If you already run OpenInference or Langfuse instrumentation, `user.id` is what
+they emit and nothing needs changing. Use an opaque id: the value is stored, and
+an email address is scrubbed to `[REDACTED:email]` by PII redaction on the way
+in.
+
 Both SDKs set it for you. Wrap the turn, and every call inside the scope joins
 the session:
 
@@ -110,12 +123,14 @@ conversation id — it is still a trace, just not part of a conversation.
 
 ## How usage is metered
 
-Billing is measured in **traces**, not spans and not raw gateway calls. Each plan
-includes one monthly **trace** quota and nothing else to track — there is no
-separate gateway-call budget (Builder includes 150K traces). Above the included
-trace quota, overage meters at **$1.20 per 10K traces**, up to a **5× hard cap** —
-past which the gateway returns HTTP 429. See [Pricing](/pricing) for the exact
-per-tier numbers (they are the source of truth).
+Billing is measured across **six usage meters** — ingest, hot indexed window,
+series, query compute, cold archive and evaluations — not a single trace
+count. Each plan includes a monthly allowance on every meter (Builder, for
+example, includes 25 GB of ingest); usage above the included allowance bills
+continuously per unit, with no rollover. **Ingest is never blocked by billing
+state** — sending traces never stops because of usage or an unpaid invoice.
+See [Pricing](/pricing) for the exact per-tier numbers (they are the source of
+truth).
 
 Tenants with no billing account — OSS self-host and unbilled workspaces — are
 **never metered**.
@@ -130,6 +145,6 @@ in Polar, not by this page — always reconcile any usage number against
 ## Related
 
 - [Quickstart](/quickstart) — send your first traced call
-- [Pricing](/pricing) — quotas, overage, seat caps
+- [Pricing](/pricing) — the six usage meters, included allowances and windows
 - [Architecture](/architecture) — how traces are captured and stored
 - [Audit ledger](/audit-ledger) — how each event is made provable

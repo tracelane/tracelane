@@ -1,5 +1,22 @@
 name: Release
 
+# ── HOSTED-RUNNER COST (founder, 2026-09-07) ────────────────────────────────
+# Every job here is hardcoded `ubuntu-latest`/`macos-latest` — deliberately: cross
+# builds (linux+darwin) and the OIDC-scoped npm/PyPI/MCP-registry publishers all
+# require a GitHub-hosted environment, so `ci.yml`'s `hosted_runners` dispatch
+# opt-in does not apply to this file. Instead: A `v*` TAG PUSH IS ITSELF A
+# FOUNDER ACTION and counts as the approval the cost rule asks for ("only in
+# extreme case with my approval") — cutting a signed release tag is already a
+# deliberate, rare, human act, not something CI does on its own.
+#
+# THE RELEASE PROCESS RUNS ON THE PUBLIC MIRROR (`tracelane/tracelane`), where
+# Actions minutes are free — that is where a real tag is meant to be pushed.
+# But `on: push: tags` fires wherever the tag lands, and this file carried NO
+# repository condition, so a tag pushed to THIS (private, billed) repo would
+# also run every job here on hosted runners for nothing. Every job below now
+# carries (or has ANDed into its existing `if:`) `github.repository ==
+# 'tracelane/tracelane'`, so the private copy never spends on a release run —
+# push the tag to the public mirror to actually cut a release.
 on:
   push:
     tags:
@@ -20,7 +37,7 @@ on:
 #   verify-signed-tag / build-rust  -> read (checkout, build, upload-artifact)
 #   sign-and-release                -> contents:write (creates the Release)
 #                                    + id-token:write (cosign sign-blob keyless)
-#   slsa-provenance / slsa-framework-generator / publish-* -> declare their own
+#   slsa-provenance / publish-*      -> declare their own
 permissions:
   contents: read
 
@@ -32,7 +49,11 @@ jobs:
     # is what keeps a dry run from publishing: every publish-* job `needs:` this
     # one, and a skipped need skips the dependant. The tag path is unchanged —
     # the cryptographic gate below still runs and still fails closed.
-    if: startsWith(github.ref, 'refs/tags/')
+    # PUBLIC-ONLY (2026-09-07, see header): a tag pushed to the private repo must
+    # not spend hosted minutes here.
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     # The release gate is CRYPTOGRAPHIC, not human — and it is ENFORCED HERE, in this
     # job, NOT by a ruleset. (GitHub's `required_signatures` ruleset rule is
     # commit-oriented and was empirically proven NOT to block unsigned tags — via API
@@ -83,7 +104,13 @@ jobs:
     # `!= 'failure'` (not `== 'success'`) so a dispatch dry run, where
     # verify-signed-tag is SKIPPED, still builds — while a tag whose signature
     # check FAILED still blocks here, including a dispatch aimed at a tag ref.
-    if: ${{ !cancelled() && needs.verify-signed-tag.result != 'failure' }}
+    # PUBLIC-ONLY (2026-09-07, see header) — EXPLICIT, not inherited from
+    # `needs.verify-signed-tag`: on the private repo that job now ALSO SKIPS
+    # (repo mismatch), and skipped != failure, so `!= 'failure'` alone would
+    # still let this 4-target hosted matrix build run privately for nothing.
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && !cancelled() && needs.verify-signed-tag.result != 'failure'
     strategy:
       # One target's failure must not cancel the others: the v0.2.1 run lost the
       # aarch64-darwin result to fail-fast, hiding whether the break was
@@ -155,7 +182,10 @@ jobs:
     # Tag refs only — a dispatch dry run builds and stops. Unlike the publish-*
     # jobs it cannot inherit the skip from verify-signed-tag (it hangs off
     # build-rust, which DOES run on dispatch), so it is gated explicitly.
-    if: startsWith(github.ref, 'refs/tags/')
+    # PUBLIC-ONLY (2026-09-07, see header) — explicit, same reason as build-rust.
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -269,7 +299,10 @@ jobs:
   slsa-provenance:
     name: Generate SLSA Build Level 3 provenance
     needs: build-rust
-    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see sign-and-release)
+    # PUBLIC-ONLY (2026-09-07, see header) + tag refs only (see sign-and-release).
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -312,18 +345,25 @@ jobs:
           name: binary-hashes
           path: binary-hashes.txt
 
-  slsa-framework-generator:
-    name: SLSA L3 provenance (slsa-github-generator)
-    needs: [build-rust, slsa-provenance]
-    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see sign-and-release)
-    permissions:
-      actions: read
-      id-token: write
-      contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563  # v2.0.0
-    with:
-      base64-subjects: "${{ needs.slsa-provenance.outputs.hashes }}"
-      upload-assets: true
+  # `slsa-framework-generator` (slsa-framework/slsa-github-generator's
+  # generator_generic_slsa3.yml) DROPPED 2026-09-05 (B-172): its `final` job
+  # reddened every one of 9 runs since v0.2.2, including releases that
+  # produced a real GitHub Release with all 10 expected assets — the
+  # `upload-assets` step it depends on set `SUCCESS=false` regardless, so
+  # `final`'s `[ "$CONTINUE" == "true" ] || [ "$SUCCESS" == "true" ] || exit 27`
+  # gate fired even on a fully green release. Nothing in this workflow, or
+  # any other, consumed its output: no job's `needs:` referenced this one,
+  # and its only artifact was the `.intoto.jsonl` provenance bundle it never
+  # managed to attach. It was pure decoration — red on 9/9 runs, contributing
+  # nothing to a real release.
+  # Build provenance is NOT lost: `slsa-provenance` above already attests it
+  # via `actions/attest-build-provenance` (GitHub's own Sigstore-backed
+  # attestation, predicateType `https://slsa.dev/provenance/v1`), and that job
+  # is unchanged and keeps succeeding. HONESTY LOCK: that is the SLSA provenance
+  # FORMAT, which GitHub documents as SLSA Build Level 2 — nothing in this repo
+  # claims a verified Level 3, and the public copy (README, SECURITY,
+  # CHANGELOG.public) was reworded in the same change to say exactly that.
+  # B-172 in the internal ledger has the incident history.
 
   # publish-crate (tracelane-shared) DROPPED for v0.2.1 (2026-07-27): crates.io
   # Trusted Publishing cannot create a NEW crate — RFC 3691 requires an initial
@@ -342,6 +382,11 @@ jobs:
     # cross-compile failure must not strand a verifier hotfix. The signed tag is
     # the real authorization gate; each job's own build step is its compile gate.
     needs: verify-signed-tag
+    # PUBLIC-ONLY (2026-09-07, see header). Also already inherited via the
+    # `needs:` cascade (a skipped verify-signed-tag skips this job by default),
+    # but stated explicitly so a static reader (or a guard parsing this file)
+    # doesn't have to trace the cascade to see it.
+    if: github.repository == 'tracelane/tracelane'
     runs-on: ubuntu-latest
     # NO `environment:` — npm Trusted Publishing requires the token's environment
     # claim to EXACTLY match the package config (unlike PyPI, where blank = any).
@@ -426,7 +471,16 @@ jobs:
               continue
             fi
             if ! npm view "$pkg" version >/dev/null 2>&1; then
-              echo "::warning title=First publish of ${pkg}::${pkg} has never been published. npm Trusted Publishing is configured on an existing package's settings page, so this PUT may 404/401 until a maintainer bootstraps the first version and registers the trusted publisher (owner=tracelane, repo=tracelane, workflow=release.yml, environment=BLANK)."
+              # DECIDED 2026-09-03 (B-327): a package that has NEVER been published cannot be
+              # published by OIDC — npm creates the Trusted Publishing config on an EXISTING
+              # package's settings page, so the very first version needs a human with the
+              # account's 2FA (`npm publish --access public` from apps/mcp, then register the
+              # trusted publisher). Two consecutive releases ended RED on exactly this, and a
+              # red that is expected is a red that stops being read. So: a LOUD skip with a
+              # workflow annotation, never a silent one, and never a failure that hides the
+              # next real one. The manual step is tracked in the private board.
+              echo "::warning title=First publish of ${pkg} needs a human::${pkg}@${ver} has never been published; OIDC Trusted Publishing cannot create a package. Publish it once by hand with the account's 2FA, register the trusted publisher, and the next release picks it up. SKIPPED, not failed."
+              continue
             fi
             packdir="${RUNNER_TEMP}/pack-$(echo "$pkg" | tr '/@' '__')"
             mkdir -p "$packdir"
@@ -445,6 +499,10 @@ jobs:
         # `npm exec` would run the server and block on stdio, so this inspects
         # the fetched package instead of starting it.
         run: |
+          if ! npm view @tracelanedev/mcp version >/dev/null 2>&1; then
+            echo "::warning title=npx @tracelanedev/mcp not assertable::@tracelanedev/mcp is not on npm yet (first publish is a human step — see the publish step above). Assertion SKIPPED, not passed."
+            exit 0
+          fi
           set -euo pipefail
           ver=$(node -p "require('./apps/mcp/package.json').version")
           work="${RUNNER_TEMP}/npx-proof"
@@ -469,7 +527,10 @@ jobs:
     # (registry internal/validators/registries/npm.go:90,94). Submitting before
     # the npm version exists is a guaranteed rejection.
     needs: [verify-signed-tag, publish-npm]
-    if: startsWith(github.ref, 'refs/tags/')
+    # PUBLIC-ONLY (2026-09-07, see header) + tag refs only.
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     # NO `environment:` — the registry's OIDC exchange grants `io.github.<owner>/*`
     # off the `repository_owner` claim alone; it does not read an environment
@@ -554,6 +615,9 @@ jobs:
     # cross-compile failure must not strand a verifier hotfix. The signed tag is
     # the real authorization gate; each job's own build step is its compile gate.
     needs: verify-signed-tag
+    # PUBLIC-ONLY (2026-09-07, see header). Also already inherited via the
+    # `needs:` cascade, stated explicitly for the same reason as publish-npm.
+    if: github.repository == 'tracelane/tracelane'
     runs-on: ubuntu-latest
     # PyPI project "tracelane". Trusted publisher (entry 1):
     # owner=tracelane, repo=tracelane, workflow=release.yml, environment=pypi.
@@ -599,6 +663,9 @@ jobs:
     # cross-compile failure must not strand a verifier hotfix. The signed tag is
     # the real authorization gate; each job's own build step is its compile gate.
     needs: verify-signed-tag
+    # PUBLIC-ONLY (2026-09-07, see header). Also already inherited via the
+    # `needs:` cascade, stated explicitly for the same reason as publish-npm.
+    if: github.repository == 'tracelane/tracelane'
     runs-on: ubuntu-latest
     # PyPI project "tracelane-audit-verifier" — a SEPARATE pending trusted
     # publisher from "tracelane" above. PyPI keys pending-publisher identity

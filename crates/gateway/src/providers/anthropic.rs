@@ -17,14 +17,11 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::pin::Pin;
 use tracing::instrument;
 
-use tracelane_shared::{
-    ChatRequest, ChatResponse, Choice, Message, MessageContent, Role, TenantId, Usage,
-};
+use tracelane_shared::{ChatRequest, MessageContent, Role, TenantId, ToolChoice};
 
-use crate::providers::{ProviderEvent, ProviderStream};
+use crate::providers::{FinishReason, ProviderEvent, ProviderStream};
 
 /// Anthropic Messages API provider adapter.
 ///
@@ -50,6 +47,17 @@ impl AnthropicProvider {
             base_url: std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".into()),
         })
+    }
+
+    /// The resolved Anthropic origin this adapter talks to (`ANTHROPIC_BASE_URL`
+    /// or the public API). GWY-47's `/v1/messages` relay forwards the customer's
+    /// ORIGINAL body bytes rather than a translated `ChatRequest`, so it makes its
+    /// own HTTP call — and it must reach the SAME origin this adapter would, or a
+    /// self-hosted / proxied deployment would have two different upstreams for the
+    /// same provider. Reading the origin from here is what keeps that one value.
+    #[must_use]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Construct against an explicit base URL, reading no process env. Used by
@@ -124,16 +132,11 @@ impl AnthropicProvider {
 
 // A14: `Default` removed — `new()` is now fallible (see ProviderRegistry).
 
-/// Extended thinking configuration for the Anthropic Messages API.
-///
-/// Enabled via `interleaved-thinking-2025-05-14` beta header.
-/// When `extended_thinking` is requested, the SSE stream emits
-/// `content_block_delta` events with `delta.type = "thinking_delta"`.
-#[derive(Debug, Serialize)]
-struct ExtendedThinkingConfig {
-    r#type: String,
-    budget_tokens: u32,
-}
+// `ExtendedThinkingConfig` (a typed `{type, budget_tokens}` request-body
+// struct) was deleted 2026-09-12 (B-390) — never constructed anywhere.
+// Extended thinking is enabled entirely via the `anthropic-beta:
+// interleaved-thinking-2025-05-14` header above; the SSE response parser
+// below already handles `thinking_delta` events without this struct.
 
 /// Build a ProviderEvent stream from an Anthropic SSE response.
 fn build_event_stream(
@@ -162,8 +165,10 @@ fn build_event_stream(
                     if data == "[DONE]" {
                         return;
                     }
-                    if let Ok(Some(provider_event)) = parse_anthropic_sse_event(data) {
-                        yield provider_event;
+                    if let Ok(provider_events) = parse_anthropic_sse_event(data) {
+                        for provider_event in provider_events {
+                            yield provider_event;
+                        }
                     }
                 }
             }
@@ -171,11 +176,17 @@ fn build_event_stream(
     }
 }
 
-/// Parse a single Anthropic SSE data payload into a ProviderEvent.
-fn parse_anthropic_sse_event(data: &str) -> Result<Option<ProviderEvent>> {
+/// Parse a single Anthropic SSE data payload into zero or more `ProviderEvent`s.
+///
+/// **Returns a `Vec`, not an `Option`, because ONE Anthropic frame can carry TWO
+/// facts.** `message_delta` holds both the output-token count and the
+/// `stop_reason`, and collapsing it to a single event is how the stop reason
+/// went unread for the life of the adapter (B-354).
+fn parse_anthropic_sse_event(data: &str) -> Result<Vec<ProviderEvent>> {
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
     let event_type = v["type"].as_str().unwrap_or("");
 
+    let mut events: Vec<ProviderEvent> = Vec::new();
     let event = match event_type {
         "content_block_delta" => {
             let delta_type = v["delta"]["type"].as_str().unwrap_or("");
@@ -218,6 +229,14 @@ fn parse_anthropic_sse_event(data: &str) -> Result<Option<ProviderEvent>> {
             }
         }
         "message_delta" => {
+            // B-354: the stop reason rides on the SAME frame as the usage
+            // update. `Vec` return exists for this one case.
+            if let Some(reason) = v["delta"]["stop_reason"]
+                .as_str()
+                .and_then(FinishReason::from_anthropic_stop_reason)
+            {
+                events.push(ProviderEvent::Finish { reason });
+            }
             // Usage update in streaming mode
             if let Some(usage) = v["usage"].as_object() {
                 let output_tokens = usage
@@ -265,7 +284,8 @@ fn parse_anthropic_sse_event(data: &str) -> Result<Option<ProviderEvent>> {
         _ => None,
     };
 
-    Ok(event)
+    events.extend(event);
+    Ok(events)
 }
 
 // ── Anthropic-native request/response types ──────────────────────────────────
@@ -279,6 +299,33 @@ struct AnthropicRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
+    /// B-355, translated: Anthropic spells the modes `auto` / `any` / `tool`.
+    /// There is no `none` — that is expressed by omitting `tools` entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    /// GWY-48. Forwarded so a parameter the span RECORDS is a parameter the
+    /// provider actually RECEIVED. `skip_serializing_if`, so a request that did
+    /// not send it serialises byte-identically to before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    /// **B-363 — the field this adapter simply did not have.** A caller who set
+    /// `temperature` on a Claude model got the provider's default and no signal
+    /// that their instruction had been discarded: `AnthropicRequest` carried no
+    /// such field and `from_universal` never read `req.temperature`. Same shape as
+    /// B-355 (`tool_choice` dropped) and B-353 (`tool_calls` dropped), and this one
+    /// reached ~94% of prod traffic.
+    ///
+    /// **This is a BEHAVIOUR CHANGE, deliberately taken (founder, 2026-09-08).** An
+    /// existing caller who has been sending `temperature` to Claude through this
+    /// gateway will now get different sampling — because they will finally get the
+    /// sampling they asked for. Honouring an explicit parameter is the correct
+    /// direction; silently discarding it was the defect.
+    ///
+    /// `skip_serializing_if`, so a request that sent none is byte-identical on the
+    /// wire to before this field existed — the change is scoped exactly to callers
+    /// who were being ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     stream: bool,
 }
 
@@ -334,7 +381,19 @@ impl AnthropicRequest {
                 }),
                 Role::Assistant => messages.push(AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: translate_content(msg.content),
+                    // B-356 (the outbound half): an assistant turn replayed from
+                    // history carries its `tool_calls` in the OpenAI-shaped
+                    // sibling field, and Anthropic requires them as `tool_use`
+                    // CONTENT BLOCKS immediately before the matching
+                    // `tool_result`. Dropping them — which is what happened
+                    // until this line — makes Anthropic reject the very next
+                    // message with "tool_result without tool_use", so accepting
+                    // the OpenAI history shape on the way IN would have bought
+                    // the caller a provider 400 instead of a gateway 400.
+                    content: append_tool_use_blocks(
+                        translate_content(msg.content),
+                        msg.tool_calls.as_deref(),
+                    ),
                 }),
                 Role::Tool => {
                     // Tool results go as user messages with tool_result content blocks
@@ -355,16 +414,35 @@ impl AnthropicRequest {
             }
         }
 
-        let tools = req.tools.map(|tools| {
-            tools
-                .into_iter()
-                .map(|t| AnthropicTool {
-                    name: t.name,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                })
-                .collect()
-        });
+        // B-355. Anthropic has no `none`, and the documented way to say it is to
+        // send no tools at all — so `none` DROPS the tool definitions rather
+        // than being silently ignored (which is the defect being fixed) or
+        // downgraded to `auto` (which would be worse: the model could then call
+        // a tool the caller explicitly forbade).
+        let forbid_tools = matches!(req.tool_choice, Some(ToolChoice::None));
+        let tool_choice = match &req.tool_choice {
+            None | Some(ToolChoice::None) => None,
+            Some(ToolChoice::Auto) => Some(serde_json::json!({ "type": "auto" })),
+            Some(ToolChoice::Required) => Some(serde_json::json!({ "type": "any" })),
+            Some(ToolChoice::Function { name }) => {
+                Some(serde_json::json!({ "type": "tool", "name": name }))
+            }
+        };
+
+        let tools = if forbid_tools {
+            None
+        } else {
+            req.tools.map(|tools| {
+                tools
+                    .into_iter()
+                    .map(|t| AnthropicTool {
+                        name: t.name,
+                        description: t.description,
+                        input_schema: t.input_schema,
+                    })
+                    .collect()
+            })
+        };
 
         Ok(Self {
             model: req.model,
@@ -372,6 +450,7 @@ impl AnthropicRequest {
             max_tokens: req.max_tokens.unwrap_or(4096),
             system,
             tools,
+            tool_choice,
             // ALWAYS TRUE, REGARDLESS OF WHAT THE CALLER ASKED FOR.
             //
             // This adapter has exactly one response reader — `build_event_stream`
@@ -397,9 +476,46 @@ impl AnthropicRequest {
             // `:410` (the health-probe request) already hardcodes `Some(true)` for
             // the same reason. Streaming upstream is not an optimisation here, it
             // is the adapter's only supported wire format.
+            top_p: req.top_p,
+            // B-363. Forwarded VERBATIM — Anthropic's `temperature` is the same
+            // 0.0–1.0-and-above scalar the OpenAI-shaped request carries, so there
+            // is no translation to get wrong. `None` stays absent.
+            temperature: req.temperature,
             stream: true,
         })
     }
+}
+
+/// Append `tool_use` blocks for an assistant turn's `tool_calls`.
+///
+/// Anthropic carries a model's tool calls as content BLOCKS; OpenAI carries
+/// them as a sibling `tool_calls` array. A history replayed from an
+/// OpenAI-shaped client therefore arrives with the calls in the sibling field
+/// and nothing in `content`, and Anthropic rejects the following `tool_result`
+/// unless the `tool_use` precedes it. Text content, when present, is preserved
+/// and the blocks are appended after it — the order Anthropic documents.
+fn append_tool_use_blocks(
+    content: AnthropicContent,
+    tool_calls: Option<&[tracelane_shared::ToolCall]>,
+) -> AnthropicContent {
+    let Some(calls) = tool_calls.filter(|c| !c.is_empty()) else {
+        // No tool calls: byte-identical to the pre-B-356 translation.
+        return content;
+    };
+    let mut blocks = match content {
+        AnthropicContent::Blocks(b) => b,
+        AnthropicContent::Text(t) if t.is_empty() => Vec::new(),
+        AnthropicContent::Text(t) => vec![serde_json::json!({ "type": "text", "text": t })],
+    };
+    blocks.extend(calls.iter().map(|c| {
+        serde_json::json!({
+            "type": "tool_use",
+            "id": c.id,
+            "name": c.name,
+            "input": c.input,
+        })
+    }));
+    AnthropicContent::Blocks(blocks)
 }
 
 fn translate_content(content: MessageContent) -> AnthropicContent {
@@ -449,8 +565,179 @@ mod tests {
         }
     }
 
+    // ── B-355: tool_choice, translated rather than dropped ──────────────────
+
+    /// OpenAI's vocabulary → Anthropic's. `required` is Anthropic's `any`, a
+    /// named function is `{"type":"tool","name":…}`, and `auto` is explicit
+    /// rather than omitted so the wire says what the caller asked for.
+    #[test]
+    fn tool_choice_translates_to_anthropics_vocabulary() {
+        use tracelane_shared::ToolChoice;
+        for (asked, want) in [
+            (ToolChoice::Auto, serde_json::json!({ "type": "auto" })),
+            (ToolChoice::Required, serde_json::json!({ "type": "any" })),
+            (
+                ToolChoice::Function {
+                    name: "get_weather".into(),
+                },
+                serde_json::json!({ "type": "tool", "name": "get_weather" }),
+            ),
+        ] {
+            let mut req = make_request_with_tools();
+            req.tool_choice = Some(asked.clone());
+            let built = AnthropicRequest::from_universal(req).expect("request must build");
+            assert_eq!(built.tool_choice.as_ref(), Some(&want), "for {asked:?}");
+            assert!(
+                built.tools.is_some(),
+                "tools must still be sent for {asked:?}"
+            );
+        }
+    }
+
+    /// **Anthropic has no `none`.** The documented way to say it is to send no
+    /// tools at all — so `none` DROPS the definitions rather than being ignored
+    /// (the B-355 defect) or downgraded to `auto` (worse: the model could then
+    /// call a tool the caller explicitly forbade).
+    #[test]
+    fn tool_choice_none_omits_the_tools_entirely() {
+        use tracelane_shared::ToolChoice;
+        let mut req = make_request_with_tools();
+        req.tool_choice = Some(ToolChoice::None);
+        let built = AnthropicRequest::from_universal(req).expect("request must build");
+        assert!(built.tool_choice.is_none(), "Anthropic has no `none` mode");
+        assert!(
+            built.tools.is_none(),
+            "`none` must remove the tools, or the model may still call one"
+        );
+    }
+
+    /// The control: a request that never mentioned `tool_choice` must reach the
+    /// wire exactly as it did before B-355 — no key at all.
+    #[test]
+    fn a_request_without_tool_choice_is_unchanged() {
+        let built =
+            AnthropicRequest::from_universal(make_request_with_tools()).expect("request builds");
+        assert!(built.tool_choice.is_none());
+        assert!(built.tools.is_some());
+        let wire = serde_json::to_value(&built).expect("serialize");
+        assert!(
+            wire.get("tool_choice").is_none(),
+            "an absent tool_choice must not reach the wire: {wire}"
+        );
+    }
+
+    // ── B-356 (outbound half): an assistant turn's tool_calls ────────────────
+
+    /// **Accepting the OpenAI history shape on the way IN is only half the
+    /// round trip.** Anthropic carries a model's tool calls as `tool_use`
+    /// CONTENT BLOCKS and rejects the following `tool_result` unless one
+    /// precedes it — so an assistant turn whose calls live in the sibling
+    /// `tool_calls` field must be rebuilt into blocks, or fixing the 400 in the
+    /// gateway just buys the caller a 400 from Anthropic.
+    #[test]
+    fn an_assistant_turns_tool_calls_become_tool_use_blocks() {
+        use tracelane_shared::ToolCall;
+        let mut req = make_request_with_tools();
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({ "city": "Paris" }),
+            }]),
+        });
+        req.messages.push(Message {
+            role: Role::Tool,
+            content: MessageContent::Text("18C".into()),
+            tool_call_id: Some("toolu_1".into()),
+            tool_calls: None,
+        });
+        let built = AnthropicRequest::from_universal(req).expect("request builds");
+
+        let assistant = serde_json::to_value(&built.messages[1]).expect("serialize");
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(
+            assistant["content"],
+            serde_json::json!([{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": { "city": "Paris" }
+            }]),
+            "an empty text turn becomes tool_use blocks only"
+        );
+
+        // And the tool RESULT — already correct before this change, asserted
+        // here because the two must line up for the loop to work at all.
+        let result = serde_json::to_value(&built.messages[2]).expect("serialize");
+        assert_eq!(result["role"], "user");
+        assert_eq!(
+            result["content"],
+            serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "18C"
+            }])
+        );
+    }
+
+    /// Text and a tool call in the same turn: the text block comes FIRST, which
+    /// is the order Anthropic documents.
+    #[test]
+    fn text_is_preserved_before_the_tool_use_blocks() {
+        use tracelane_shared::ToolCall;
+        let mut req = make_request_with_tools();
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("Let me check.".into()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_2".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({}),
+            }]),
+        });
+        let built = AnthropicRequest::from_universal(req).expect("request builds");
+        let assistant = serde_json::to_value(&built.messages[1]).expect("serialize");
+        assert_eq!(assistant["content"][0]["type"], "text");
+        assert_eq!(assistant["content"][0]["text"], "Let me check.");
+        assert_eq!(assistant["content"][1]["type"], "tool_use");
+    }
+
+    /// The control: an assistant turn with NO tool calls translates exactly as
+    /// it did before — a plain string, not a one-element block array.
+    #[test]
+    fn an_assistant_turn_without_tool_calls_is_unchanged() {
+        let mut req = make_request_with_tools();
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("Sunny.".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        let built = AnthropicRequest::from_universal(req).expect("request builds");
+        let assistant = serde_json::to_value(&built.messages[1]).expect("serialize");
+        assert_eq!(assistant["content"], serde_json::json!("Sunny."));
+    }
+
+    fn make_request_with_tools() -> ChatRequest {
+        let mut req = make_simple_request();
+        req.tools = Some(vec![tracelane_shared::Tool {
+            name: "get_weather".into(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }]);
+        req
+    }
+
     fn make_simple_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message {
                 role: Role::User,
@@ -459,6 +746,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: Some(100),
             temperature: None,
             stream: Some(true),
@@ -522,6 +810,37 @@ mod tests {
         let translated = AnthropicRequest::from_universal(req).unwrap();
         assert_eq!(translated.system.as_deref(), Some("you are helpful"));
         assert_eq!(translated.messages.len(), 1);
+    }
+
+    /// **B-363.** A `temperature` the caller sent must reach the Anthropic wire.
+    /// Before this fix the field did not exist on `AnthropicRequest` at all, so the
+    /// value was discarded with a 200 and no signal — on the adapter carrying ~94%
+    /// of prod traffic. Asserted on the SERIALIZED body, not the struct: the wire
+    /// is what the provider sees.
+    #[test]
+    fn a_temperature_the_caller_sent_reaches_the_anthropic_wire() {
+        let mut req = make_simple_request();
+        req.temperature = Some(0.2);
+        let translated = AnthropicRequest::from_universal(req).unwrap();
+        assert_eq!(translated.temperature, Some(0.2));
+        let wire = serde_json::to_string(&translated).expect("serialises");
+        assert!(wire.contains(r#""temperature":0.2"#), "got {wire}");
+    }
+
+    /// The other half, and the one that bounds the blast radius: a request that
+    /// sent NO temperature must serialise byte-identically to before this field
+    /// existed. So the behaviour change reaches exactly the callers who were being
+    /// ignored, and nobody else.
+    #[test]
+    fn a_request_without_a_temperature_is_byte_identical_on_the_wire() {
+        let req = make_simple_request();
+        assert_eq!(req.temperature, None, "fixture precondition");
+        let wire = serde_json::to_string(&AnthropicRequest::from_universal(req).unwrap())
+            .expect("serialises");
+        assert!(
+            !wire.contains("temperature"),
+            "an unsent temperature must not appear on the wire at all: {wire}"
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ vi.mock("next/link", () => ({
 }));
 
 import { Sidebar } from "./Sidebar";
-import { sections } from "./nav-config";
+import { EXTERNAL_LINKS, sections } from "./nav-config";
 import {
 	ALL_CHROME_ROUTES,
 	NAV_ITEMS,
@@ -127,6 +127,20 @@ describe("R12 after-proof — the sidebar strands nothing", () => {
 		const html = render();
 		expect(html).toContain('aria-current="page"');
 		expect(html.match(/aria-current="page"/g)?.length).toBe(1);
+	});
+
+	it("renders the external Docs link, safely, from the account area (DSH-15)", () => {
+		// Deliberately outside NAV_ITEMS / ALL_CHROME_ROUTES — an absolute-URL
+		// destination has no `app/<href>/page.tsx` for the dead-link sweep to
+		// check against, so it is modelled as EXTERNAL_LINKS and asserted here
+		// instead of widening a control built to prove something else.
+		const html = render();
+		for (const { href, label } of EXTERNAL_LINKS) {
+			expect(html, `${label} not rendered`).toContain(`href="${href}"`);
+			expect(html, `${label} label missing`).toContain(label);
+		}
+		expect(html).toContain('target="_blank"');
+		expect(html).toContain('rel="noopener noreferrer"');
 	});
 
 	it("sweeps /settings/account — reachable but previously outside the dead-button walk", () => {

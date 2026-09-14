@@ -4,7 +4,11 @@
  * Tracelane design system tokens — THE single source of truth for colour, type and
  * layout. Nothing else may define them; a palette swap happens HERE and nowhere else.
  *
- * VALUES CURRENTLY HELD: **"Instrument II"** — the founder's P0 premium-UI brief of
+ * VALUES CURRENTLY HELD: **"Cupertino" — ADR-074 Amendment 4 (2026-09-03)**: Apple light ground
+ * #f5f5f7 with floating white cards, near-black ink, Apple blue as the ONE accent and data hue,
+ * iOS-depth dark (black ground, #1c1c1e cards). The paragraph below is A2 history, kept.
+ *
+ * PREVIOUSLY (A2): **"Instrument II"** — the founder's P0 premium-UI brief of
  * 2026-08-22. A warm-neutral graphite system: no brand accent, no blue, no violet,
  * no teal, no lava. The ground is #fafaf9 and the card is #ffffff, so a card
  * separates by TONE before it separates by border or shadow. COLOUR IS DATA — green
@@ -110,6 +114,32 @@
 	--color-chart-secondary: var(--chart-secondary);
 	--color-chart-grid: var(--chart-grid);
 	--color-chart-fill: var(--chart-fill);
+
+	/* CATEGORICAL CHART PALETTE (DSH-16, ADR-074 A5). Four hues for the one case
+	   the P0.11 "colour is data, told apart by value not hue" rule does NOT cover:
+	   a genuinely categorical series (not models, not outcomes — those keep the
+	   rules above) where identity IS the datum and there is nowhere else to put
+	   it. `--chart-1` and `--chart-4` are ALIASES onto `--chart-primary` /
+	   `--accent-warm` on purpose — reusing hues that already exist keeps the
+	   palette to two NEW colours (violet, teal), not four, which is the
+	   difference between "a little personality" and "a little confetti". Built
+	   for `DSH-13`'s custom-dashboard tile renderer; NOT wired into
+	   ModelDonut/bar-data/the guardrail donut — see DSH-16 §4 for the considered
+	   reasons each of those keeps its existing colouring. */
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+
+	/* THE RECORDER'S AMBER (DSH-16). The one companion hue to `--action`'s blue —
+	   used for "this is being captured right now", never for a clickable
+	   affordance and never for a state (`--warn` stays the degraded colour, even
+	   though both are amber-family: they mean different things and are tuned to
+	   a distinct hex on purpose, see tokens.css's amber block below). */
+	--color-accent-warm: var(--accent-warm);
+	--color-accent-warm-ink: var(--accent-warm-ink);
+	--color-accent-warm-soft: var(--accent-warm-soft);
+	--color-accent-warm-line: var(--accent-warm-line);
 
 	/* The shadcn-compat aliases (--color-background / -foreground / -muted /
 	   -muted-foreground / -border / -primary / -primary-foreground / -destructive)
@@ -306,32 +336,37 @@
 	color-scheme: light;
 
 	/* ── ground ──────────────────────────────────────────────────────────── */
-	--bg: #fafaf9; /* the page ground — warm neutral, NOT white */
-	--canvas: #fafaf9; /* = --bg; the content column paints the same ground */
+	--bg: #f5f5f7; /* the page ground — cool neutral (DSH-12 B "Linear", founder pick 2026-09-02), NOT white */
+	--canvas: #f5f5f7; /* = --bg; the content column paints the same ground */
 	/* Flat. Kept as a gradient token because `.app-canvas` and the dark theme
 	   both consume the name, and a one-stop gradient is how you say "there is
 	   deliberately no gradient here" without deleting the seam. */
-	--canvas-gradient: linear-gradient(180deg, #fafaf9 0%, #fafaf9 100%);
+	--canvas-gradient: linear-gradient(
+		180deg,
+		#f7f7f9 0%,
+		#f5f5f7 45%,
+		#f1f1f4 100%
+	);
 	/* The rail. LIGHTER than the canvas (#fcfcfb vs #fafaf9), which is the
 	   opposite of the usual "sunken sidebar" instinct and is what the brief
 	   specifies: the navigation reads as a near-white sheet the content sits
 	   beside, not as a well the content climbs out of. */
-	--sidebar: #fcfcfb;
+	--sidebar: #fbfbfd;
 	/* One step UNDER the canvas — sub-nav strips, table headers, <kbd>. The
 	   ordering (sunken < canvas < surface) is the contract, not the value. */
-	--canvas-sunken: #f1f1f0;
+	--canvas-sunken: #f3f3f6;
 
 	/* ── surfaces ────────────────────────────────────────────────────────── */
 	--surface: #ffffff; /* cards — the only pure white left in the system */
-	--surface-2: #f5f5f4; /* the well: icon chips, tray, inert fills, tracks */
-	--surface-hover: #f8f8f7; /* row/cell hover ON a white card — one step off white */
-	--surface-3: #ebebe9; /* the press step, one below the well */
+	--surface-2: #f2f2f5; /* the well: icon chips, tray, inert fills, tracks */
+	--surface-hover: #f7f7fa; /* row/cell hover ON a white card — one step off white */
+	--surface-3: #e8e8ed; /* the press step, one below the well */
 	/* The deliberate dark card in a light UI (P0.10 error budget) + tooltips.
 	   #151619 is the brief's dark-mode --surface, used here on purpose so the one
 	   inverted surface in light theme is the SAME material as an ordinary card in
 	   dark theme rather than a fourth near-black nobody else uses. */
-	--surface-inverse: #151619;
-	--ink-inverse: #f5f5f5; /* text/icons ON --surface-inverse — 16.60:1 */
+	--surface-inverse: #1d1d1f;
+	--ink-inverse: #f5f5f7; /* text/icons ON --surface-inverse — 16.60:1 */
 
 	/* ── elevation ───────────────────────────────────────────────────────── */
 	/* P0.5, to the byte: one tight contact shadow for the EDGE, one wide soft
@@ -345,7 +380,8 @@
 	   sanctioned way to do a thing, so the next person reaches for an elevation
 	   the system does not actually have. The system has exactly two: a card sits,
 	   or an overlay floats. */
-	--shadow-card: 0 1px 2px rgb(0 0 0 / 0.02), 0 4px 12px rgb(0 0 0 / 0.025);
+	--shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 1px 2px
+		rgb(0 0 0 / 0.04), 0 8px 24px rgb(0 0 0 / 0.06); /* + a 1px inset top highlight: the "bevel" that makes a hairline read as an edge, not a smudge */
 	--shadow-overlay: 0 2px 6px rgb(0 0 0 / 0.06), 0 20px 44px rgb(0 0 0 / 0.12);
 
 	/* ── glass (CHROME ONLY — see the note at `.glass`) ──────────────────── */
@@ -354,14 +390,14 @@
 	--glass-blur: 12px;
 
 	/* ── lines ───────────────────────────────────────────────────────────── */
-	--line: #e7e7e5; /* the hairline. 1.24:1 on white — quiet BY DESIGN now that
+	--line: #e2e2e7; /* the hairline, cool (Linear B) (DSH-12b, founder: "borders elegantly designed"); a hex, not color-mix, so contrast-check.mjs can read it. Was #e7e7e5 — 1.24:1 on white — quiet BY DESIGN now that
 	                    the card/ground tone split carries the edge. */
-	--line-2: #d8d8d5; /* the emphasis step: hover borders, dividers that must read */
+	--line-2: #d2d2d7; /* the emphasis step: hover borders, dividers that must read */
 
 	/* ── ink ─────────────────────────────────────────────────────────────── */
-	--ink: #171717; /* 17.93:1 on card, 17.17:1 on canvas */
+	--ink: #1d1d1f; /* 18.40:1 on card */
 	--logo-ink: #171717; /* brand lockup mono — tracks --ink */
-	--ink-2: #6b6b6b; /* 5.33:1 on card — clears AA for body/secondary text */
+	--ink-2: #424245; /* 11.15:1 on card — lean NEAR-BLACK, not grey (founder 2026-09-02: "no blurry grey.. lean black is good too") */
 	/*
 	 * #828280, NOT the brief's #9a9a9a, AND THE REASON IS THE BRIEF'S OWN P0.18.
 	 *
@@ -377,7 +413,7 @@
 	 * P0.3's "Do not make secondary text too faint. The dashboard must remain
 	 * readable" is the same instruction from the other side.
 	 */
-	--ink-3: #828280;
+	--ink-3: #6e6e73; /* 7.18:1 on card — the tertiary step, still a dark tone rather than a grey */
 
 	/* ── interactive surfaces (the `--action*` roles) ────────────────────── */
 	/* NO BRAND ACCENT IN P0. Every action role resolves into the ink family, so
@@ -390,27 +426,31 @@
 	   `text-lava-*`. The comment that stood here claimed "~50 files still saying
 	   `bg-lava-*`", which was false when it was written and is the reason the
 	   aliases survived two palette swaps. */
-	--action: #171717;
-	--action-ink: #171717;
-	--action-on: #ffffff; /* label ON an action fill — 17.93:1 */
-	--action-soft: #f5f5f4;
-	--action-line: #e7e7e5;
+	/* DSH-12 (ADR-074 A3, founder 2026-09-02 "the palette is too dull"): ONE hue,
+	   indigo-violet, carried by the interaction roles AND the data roles below. It
+	   collides with none of ok/warn/danger, so a link and a failure metric can no
+	   longer share a colour — the §1 argument survives the accent's return. */
+	--action: #0071e3; /* 4.70:1 on card, 4.54:1 on canvas — AA as text too (Linear's periwinkle, founder pick 2026-09-02) */
+	--action-ink: #0066cc;
+	--action-on: #ffffff; /* label ON an action fill — 4.70:1 */
+	--action-soft: #e8f1fc; /* the tinted well behind an active row/chip */
+	--action-line: #b8d3f5;
 
 	/* ── semantic status — the ONLY colour in the system ─────────────────── */
 	/* The `--x` value is the FILL (dots, bars, arcs, chart marks, solid buttons);
 	   the `--x-ink` value is the TEXT tone. They differ where the brief's fill
 	   value does not clear 4.5:1 as small text — the same dual-tone split this
 	   palette has always made, now applied to all three states. */
-	--ok: #16803c; /* brief value. 5.02:1 on card, 4.80:1 on canvas */
-	--ok-ink: #137035; /* 6.18:1 on card, 5.48:1 on --ok-soft */
-	--ok-soft: #e9f4ec;
+	--ok: #1b7f3b; /* brief value. 5.02:1 on card, 4.80:1 on canvas */
+	--ok-ink: #166b32; /* 6.18:1 on card, 5.48:1 on --ok-soft */
+	--ok-soft: #e6f4ea;
 	--warn: #c77a00; /* brief value. 3.38:1 — a UI/graphic mark, never small text */
 	--warn-ink: #9c6000; /* 5.14:1 on card, 4.59:1 on --warn-soft */
-	--warn-soft: #faf1e3;
-	--danger: #dc3b35; /* brief value. 4.45:1; white-on-it is 4.45:1 */
-	--danger-ink: #c62e28; /* 5.49:1 on card, 4.75:1 on --danger-soft */
+	--warn-soft: #fbf2e2;
+	--danger: #d70015; /* brief value. 4.45:1; white-on-it is 4.45:1 */
+	--danger-ink: #c40012; /* 5.49:1 on card, 4.75:1 on --danger-soft */
 	--danger-on: #ffffff; /* label ON a solid danger fill */
-	--danger-soft: #fbebea;
+	--danger-soft: #fdebec;
 	/*
 	 * --info AND --data-2 ARE NOW CHART NEUTRALS, AND THAT IS THE BIGGEST
 	 * SEMANTIC CHANGE IN THIS PASS.
@@ -427,16 +467,49 @@
 	 * apart by hue they are now told apart by VALUE, which is the monochrome
 	 * information design the rest of the system already uses.
 	 */
-	--info: #202124; /* = --chart-primary. 16.10:1 on card */
-	--info-ink: #202124;
-	--info-soft: #f1f1f0; /* = --chart-fill */
-	--data-2: #a7a7a7; /* = --chart-secondary — the second series, by value not hue */
+	--info: #0071e3; /* = --chart-primary (DSH-12: the data hue is back) */
+	--info-ink: #0066cc; /* on --info-soft — checked by contrast-check.mjs */
+	--info-soft: #e8f1fc; /* = --chart-fill */
+	--data-2: #bcd5f4; /* = --chart-secondary — the second series, a tint of the same hue, 3:1 from the first */
 
 	/* ── charts (P0.11) ──────────────────────────────────────────────────── */
-	--chart-primary: #202124; /* the one data colour */
-	--chart-secondary: #a7a7a7; /* the second series / de-emphasised marks */
-	--chart-grid: #eeeeec; /* axis + gridlines — barely there on purpose */
-	--chart-fill: #f1f1f0; /* area fill under a line, and inert bar tracks */
+	--chart-primary: #0071e3; /* the one data colour — a HUE again (DSH-12), 4.70:1 on card */
+	--chart-secondary: #bcd5f4; /* the second series — same hue, lighter, ≥3:1 from the primary */
+	--chart-grid: #e6e6eb; /* axis + gridlines — barely there on purpose */
+	--chart-fill: #e8f1fc; /* area fill under a line, and inert bar tracks — tinted, not grey */
+
+	/* ── categorical chart palette (DSH-16, ADR-074 A5) ───────────────────── */
+	/* Four hues for a genuinely categorical series — built for DSH-13's custom
+	   dashboard tiles, not wired into any Phase-1 chart (see tokens.css's
+	   `@theme inline` note above for why). `--chart-1`/`--chart-4` are aliases so
+	   the palette costs exactly two NEW hexes. */
+	--chart-1: var(--chart-primary); /* blue — reused, 4.70:1 on card */
+	--chart-2: #6d4de0; /* violet — 5.54:1 on card, 5.09:1 on canvas */
+	--chart-3: #0c877c; /* teal — 4.40:1 on card, 4.04:1 on canvas */
+	--chart-4: var(--accent-warm); /* amber — reused, see below */
+
+	/* ── the recorder's amber (DSH-16, ADR-074 A5) ────────────────────────── */
+	/* "colour is data" holds: this hue means exactly one thing — capture is
+	   happening right now (a live stream, a mic listening, a record entering the
+	   tamper-evident ledger) — never a clickable affordance (that stays --action)
+	   and never a status (that stays --ok/--warn/--danger). Deliberately a
+	   DIFFERENT hex from --warn (#c77a00, 1.53:1 apart) even though both are
+	   "amber": they answer different questions and the repo's contrast gate
+	   would not catch them being silently unified into one token later if they
+	   started from the same value. */
+	--accent-warm: #c2410c; /* graphic mark — 5.18:1 on card, 4.76:1 on canvas (≥3:1 floor) */
+	--accent-warm-ink: #9a3412; /* text — 7.31:1 on card, 6.71:1 on canvas (≥4.5:1 floor) */
+	--accent-warm-soft: #fdece0; /* tinted well behind a chip/badge */
+	--accent-warm-line: #f2c19f; /* border tint */
+	/* A very soft, STATIC radial wash (ADR-074 §9's mechanical bans allow a
+	   static gradient; only mesh and animated forms are banned) — the empty-state
+	   icon glow (DSH-16 §1.6). Not a solid colour, so it carries no contrast
+	   pair in contrast-check.mjs, the same treatment as --glass-bg/--shadow-*. */
+	--glow-warm: radial-gradient(
+		circle at 50% 45%,
+		color-mix(in oklab, var(--accent-warm) 16%, transparent) 0%,
+		transparent 70%
+	);
 
 	/* ── provenance seal ─────────────────────────────────────────────────── */
 	/* The audit ledger's verified mark. It is the SAME green as --ok, deliberately:
@@ -447,14 +520,14 @@
 	   a filled button. The contrast gate asserted `seal-on` on `seal`, i.e. it
 	   proved a combination that is never rendered, which is exactly the trap the
 	   `selected-on` note in contrast-check.mjs records. Both went together. */
-	--seal: #16803c;
-	--seal-ink: #137035;
-	--seal-soft: #e9f4ec;
+	--seal: #1b7f3b;
+	--seal-ink: #166b32;
+	--seal-soft: #e6f4ea;
 	--seal-line: #c2e0cd;
 
 	/* ── selected / active pill ──────────────────────────────────────────── */
-	--selected: #171717; /* solid ink in light … */
-	--selected-on: #ffffff; /* … white label — 17.93:1 */
+	--selected: #0071e3; /* the active pill takes the hue (DSH-12) … */
+	--selected-on: #ffffff; /* … white label — 4.70:1 */
 
 	/*
 	 * FOCUS IS CHROME, SO FOCUS IS MONOCHROME. It is not a datum, so under
@@ -483,7 +556,7 @@
 	 * mechanism or `outline-none` is not (the design-constraints guard blocks the
 	 * latter).
 	 */
-	--focus-ring: var(--ink);
+	--focus-ring: var(--action); /* DSH-12: the hue */
 }
 
 /*
@@ -509,26 +582,32 @@
 	color-scheme: dark;
 
 	/* ── ground ──────────────────────────────────────────────────────────── */
-	--bg: #0d0e10;
-	--canvas: #0d0e10;
-	--canvas-gradient: linear-gradient(180deg, #0d0e10 0%, #0d0e10 100%);
-	--sidebar: #101113; /* one step ABOVE the ground, mirroring light's #fcfcfb */
+	--bg: #000000;
+	--canvas: #000000;
+	--canvas-gradient: linear-gradient(
+		180deg,
+		#0a0a0c 0%,
+		#000000 60%,
+		#000000 100%
+	);
+	--sidebar: #0b0b0d; /* one step ABOVE the ground, mirroring light's #fcfcfb */
 	--canvas-sunken: #0a0a0c; /* under the ground — table headers, <kbd> */
 
 	/* ── surfaces ────────────────────────────────────────────────────────── */
-	--surface: #151619;
-	--surface-2: #1c1d20;
-	--surface-hover: #202125;
-	--surface-3: #26272b;
+	--surface: #1c1c1e;
+	--surface-2: #2c2c2e;
+	--surface-hover: #232326;
+	--surface-3: #3a3a3c;
 	/* The inverse card in dark is the GROUND colour, so the P0.10 error-budget
 	   tile reads as recessed rather than lifted. It therefore has NO tonal edge
 	   of its own and MUST carry `border border-line` at the call site — which the
 	   dashboard does, for exactly this reason. */
-	--surface-inverse: #0d0e10;
-	--ink-inverse: #f5f5f5;
+	--surface-inverse: #f5f5f7;
+	--ink-inverse: #1d1d1f;
 
 	/* ── elevation: a hairline, not a drop ───────────────────────────────── */
-	--shadow-card: 0 1px 2px rgb(0 0 0 / 0.2);
+	--shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.06), 0 1px 2px
+		rgb(0 0 0 / 0.5), 0 10px 30px rgb(0 0 0 / 0.4);
 	--shadow-overlay: 0 2px 6px rgb(0 0 0 / 0.5), 0 20px 44px rgb(0 0 0 / 0.45);
 
 	/* ── glass (CHROME ONLY) ─────────────────────────────────────────────── */
@@ -537,63 +616,80 @@
 	--glass-blur: 12px;
 
 	/* ── lines ───────────────────────────────────────────────────────────── */
-	--line: #292b2f;
-	--line-2: #383a3f;
+	--line: #38383a; /* cool hairline at dark parity */
+	--line-2: #48484a;
 
 	/* ── ink ─────────────────────────────────────────────────────────────── */
-	--ink: #f5f5f5; /* 16.60:1 on card */
+	--ink: #f5f5f7; /* 16.00:1 on card */
 	--logo-ink: #f5f5f5;
-	--ink-2: #a1a1aa; /* 7.06:1 on card */
-	--ink-3: #71717a; /* 3.74:1 on card — the brief's value, and the reference the
+	--ink-2: #d1d1d6; /* 11.05:1 on card — lean near-white at dark parity */
+	--ink-3: #a1a1a6; /* 7.47:1 on card — lifted with the light theme for the same reason. Was: the brief's value, and the reference the
 	                     light theme's --ink-3 was tuned to match (see there) */
 
 	/* ── interactive surfaces ────────────────────────────────────────────── */
-	--action: #f5f5f5;
-	--action-ink: #f5f5f5;
-	--action-on: #0d0e10;
-	--action-soft: #1c1d20;
-	--action-line: #292b2f;
+	--action: #2997ff; /* DSH-12 hue at dark parity — 6.86:1 on card */
+	--action-ink: #5eb1ff;
+	--action-on: #000000; /* dark label on the light-violet fill */
+	--action-soft: #112438;
+	--action-line: #1f4b7d;
 
 	/* ── semantic status ─────────────────────────────────────────────────── */
 	/* All three brief values clear 4.5:1 as text on the card, so the -ink variants
 	   equal their fills here. That asymmetry with light is correct: a token pair
 	   exists to guarantee legibility, not to be different for its own sake. */
-	--ok: #34a853; /* 5.92:1 on card */
-	--ok-ink: #34a853;
-	--ok-soft: #10281a;
-	--warn: #f0a43c; /* 8.68:1 on card */
-	--warn-ink: #f0a43c;
-	--warn-soft: #2a1f0c;
-	--danger: #ff5a52; /* 5.89:1 on card */
-	--danger-ink: #ff5a52;
-	--danger-on: #ffffff; /* white label on the danger fill — 3.07:1, the large/UI
+	--ok: #30d158; /* 5.92:1 on card */
+	--ok-ink: #4ade80;
+	--ok-soft: #0f2a18;
+	--warn: #ff9f0a; /* 8.68:1 on card */
+	--warn-ink: #ffb340;
+	--warn-soft: #2b1d08;
+	--danger: #ff453a; /* 5.89:1 on card */
+	--danger-ink: #ff6b62;
+	--danger-on: #000000; /* white label on the danger fill — 3.07:1, the large/UI
 	                         floor. Deepening the fill for a text-AA label would cost
 	                         the fill its legibility as a MARK, which is its main job. */
-	--danger-soft: #2b1414;
+	--danger-soft: #2d1412;
 	/* Chart neutrals — see the light block for why these are no longer a blue and
 	   a violet. */
-	--info: #f2f2f2; /* = --chart-primary */
-	--info-ink: #f2f2f2;
-	--info-soft: #242528; /* = --chart-fill */
-	--data-2: #777777; /* = --chart-secondary. 4.04:1 on card */
+	--info: #2997ff; /* = --chart-primary */
+	--info-ink: #5eb1ff;
+	--info-soft: #112438; /* = --chart-fill */
+	--data-2: #144a80; /* = --chart-secondary — ≥3:1 from the primary, de-emphasised on the card */
 
 	/* ── charts (P0.11) ──────────────────────────────────────────────────── */
-	--chart-primary: #f2f2f2;
-	--chart-secondary: #777777;
-	--chart-grid: #292b2f;
-	--chart-fill: #242528;
+	--chart-primary: #2997ff; /* the data hue, 6.86:1 on card */
+	--chart-secondary: #144a80; /* second series — same hue, deeper, ≥3:1 from the primary */
+	--chart-grid: #2a2a2d;
+	--chart-fill: #112438; /* tinted fill */
+
+	/* ── categorical chart palette (DSH-16, ADR-074 A5) — dark parity ─────── */
+	--chart-1: var(--chart-primary);
+	--chart-2: #a892ff; /* violet — 6.66:1 on card, 8.22:1 on canvas */
+	--chart-3: #3ddfc9; /* teal — 10.21:1 on card, 12.60:1 on canvas */
+	--chart-4: var(--accent-warm);
+
+	/* ── the recorder's amber — dark parity ───────────────────────────────── */
+	--accent-warm: #ff7a1a; /* graphic mark — 6.52:1 on card, 8.05:1 on canvas */
+	--accent-warm-ink: #ffab6b; /* text — 9.15:1 on card */
+	--accent-warm-soft: #2e1608;
+	--accent-warm-line: #5a2c10;
+	--glow-warm: radial-gradient(
+		circle at 50% 45%,
+		color-mix(in oklab, var(--accent-warm) 20%, transparent) 0%,
+		transparent 70%
+	);
 
 	/* ── provenance seal — the same green as --ok, same reason ───────────── */
-	--seal: #34a853;
-	--seal-ink: #34a853;
-	--seal-soft: #10281a;
+	--seal: #30d158;
+	--seal-ink: #4ade80;
+	--seal-soft: #0f2a18;
 	--seal-line: #1c4630;
 
 	/* ── selected / active pill — INVERTS, so it never reads dark-on-dark ── */
-	--selected: #f5f5f5;
-	--selected-on: #0d0e10; /* 17.71:1 */
+	--selected: #2997ff; /* the active pill takes the hue (DSH-12) */
+	--selected-on: #000000;
 
-	--focus-ring: var(--ink);
+	--focus-ring: var(--action); /* DSH-12: the hue */
 }
 
 @layer components {
@@ -613,8 +709,8 @@
 		 * the range the app is actually used at. A px value would have been 18px on
 		 * every screen and would not have tracked the density clamp.
 		 */
-		--radius-card: 1.125rem; /* 16–20px — cards, tiles, panels */
-		--radius-control: 0.5rem; /* 8px — buttons, inputs, chips, pills */
+		--radius-card: 1rem; /* 16px — Cupertino cards (A4): floating white panels read as objects, not bubbles, once controls sit at 10px */
+		--radius-control: 0.625rem; /* 10px — buttons, inputs, chips (A4) */
 	}
 
 	/*
@@ -647,6 +743,7 @@
 	 */
 	.surface-card {
 		border-radius: var(--radius-card);
+		border: 1px solid var(--line);
 		background-color: var(--surface);
 		box-shadow: var(--shadow-card);
 	}
@@ -743,6 +840,71 @@
 	}
 
 	/*
+	 * ── THE RECORDER'S AMBER (DSH-16) ─────────────────────────────────────────
+	 * Three small, purpose-built pieces of the one companion hue, kept together
+	 * so a reader who finds one finds all three.
+	 */
+
+	/* A small pulsing dot — "this is being captured right now": the ledger badge
+	   (ShareLedgerBadge) and the Audit Ledger page's own h1. Opacity-only
+	   animation (ADR-074 §9 bans an ANIMATED GRADIENT, not an animated opacity),
+	   and it respects reduced-motion. */
+	.recorder-dot {
+		display: inline-block;
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 9999px;
+		background-color: var(--accent-warm);
+		box-shadow: 0 0 0 4px
+			color-mix(in oklab, var(--accent-warm) 22%, transparent);
+	}
+	@media (prefers-reduced-motion: no-preference) {
+		.recorder-dot {
+			animation: recorder-pulse 2.4s ease-in-out infinite;
+		}
+	}
+	@keyframes recorder-pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.55;
+		}
+	}
+
+	/* A very soft halo behind an empty-state icon chip (DSH-16 §1.6). The parent
+	   MUST be `position: relative`; this paints BEHIND the parent's own
+	   background (negative z-index inside that stacking context), so it reads as
+	   a glow bleeding out from the edges of the chip rather than a wash over the
+	   glyph itself. Scoped to the full/page-level empty state only — see the
+	   call sites for why the compact/inline variants never render this. */
+	.empty-icon-glow {
+		position: absolute;
+		inset: -14px;
+		z-index: -1;
+		border-radius: 9999px;
+		background-image: var(--glow-warm);
+		pointer-events: none;
+	}
+
+	/* The ONE gradient headline this pass adds (DSH-16 §1.4) — blue → amber,
+	   large text only. `-webkit-background-clip`/`-webkit-text-fill-color`
+	   because Safari does not honour the unprefixed properties reliably at the
+	   text sizes this class is used at. */
+	.heading-gradient-warm {
+		background-image: linear-gradient(
+			90deg,
+			var(--action) 0%,
+			var(--accent-warm) 100%
+		);
+		background-clip: text;
+		-webkit-background-clip: text;
+		color: transparent;
+		-webkit-text-fill-color: transparent;
+	}
+
+	/*
 	 * The tooltip surface. Deliberately the INVERSE surface, not a white card: a
 	 * white tooltip on a white card is another card, and a tooltip's whole job is
 	 * to read as a layer ABOVE the page.
@@ -801,7 +963,7 @@
 	 * case at body size, and the metric is the biggest thing inside its card.
 	 */
 	.t-h1 {
-		font-size: var(--text-ramp-32); /* 28–32px per P0.3 */
+		font-size: var(--text-ramp-28); /* 28px — A4-7 density */
 		font-weight: 600;
 		letter-spacing: -0.022em; /* tighter at the top of the ramp */
 		line-height: 1.1;
@@ -814,7 +976,7 @@
 	   faintest thing on the page. */
 	.t-eyebrow {
 		font-size: var(--text-xs); /* 12px */
-		font-weight: 600;
+		font-weight: 500; /* lean (founder 2026-09-02: "do not make darker BOLD fonts") */
 		letter-spacing: 0.1em;
 		text-transform: uppercase;
 		color: var(--ink-2);
@@ -823,7 +985,7 @@
 	   uppercase treatment now belongs to section labels alone. */
 	.t-card-title {
 		font-size: var(--text-sm); /* 13px */
-		font-weight: 600;
+		font-weight: 500; /* lean */
 		letter-spacing: -0.005em;
 		line-height: 1.3;
 		color: var(--ink);
@@ -834,7 +996,7 @@
 	   classes so the KPI strip and the tiles cannot drift apart. */
 	.t-metric-label {
 		font-size: var(--text-2xs); /* 11px */
-		font-weight: 600;
+		font-weight: 500; /* lean; the label reads through its dark tone, not its weight */
 		/* 0.06em, down from 0.08. At 11px in Geist the wider value opened "TE" and
 		   "SE" pairs far enough that "ERROR RATE" read as "ERROR RAT E" on the
 		   render. Tracking has to be set against the face that ships, not against
@@ -847,9 +1009,10 @@
 	   that is ~25.5px at 1440 and 28px at 1920. `tabular-nums` is mandatory — a
 	   value that changes must not make its own row jitter. */
 	.t-metric {
+		font-family: var(--font-sans); /* A4-7 density (founder 2026-09-04): 32 → 28 px */ /* A4: the number is typography, not a terminal readout — sans with tabular figures, as Apple sets numerals */
 		font-size: var(--text-ramp-28);
-		font-weight: 600;
-		letter-spacing: -0.022em;
+		font-weight: 600; /* Cupertino numerals (A4): large, tight, confident — the number IS the tile */
+		letter-spacing: -0.032em;
 		line-height: 1.05;
 		font-variant-numeric: tabular-nums;
 	}
@@ -857,7 +1020,8 @@
 	   size would wrap a five-figure number. Same weight and tracking, one ramp
 	   step down, so a dense row still reads as the same instrument. */
 	.t-metric-sm {
-		font-size: var(--text-ramp-20);
+		font-family: var(--font-sans);
+		font-size: 1.375rem; /* 22px — the compact strip numeral (A4-7) */
 		font-weight: 600;
 		letter-spacing: -0.02em;
 		line-height: 1.1;

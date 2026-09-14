@@ -1,18 +1,25 @@
 ---
+import CompareTable from "../components/CompareTable.astro";
+import Icon from "../components/Icon.astro";
 /**
  * tracelane.dev homepage.
  *
- * REBUILT 2026-08-24 against cursor.com's layout language (founder instruction).
- * The rhythm is theirs: an understated hero over a framed product stage, a logo
- * garden, then alternating copy/stage rows, a card grid, and hairline FAQ rows.
+ * REBUILT 2026-08-24 against cursor.com's layout language (founder instruction),
+ * RENOVATED 2026-09-02 for a premium finish, RE-UNIFIED 2026-09-04 onto the app's
+ * shared Cupertino palette + a very-low-text pass (founder ruling, overriding the
+ * 2026-09-03 "site keeps its warm palette" ruling — see `global.css`'s header).
  *
- * NOTHING FACTUAL CHANGED. Every number, price, date, citation, link and copy
- * lock is the one that was already on the page — the prose is shorter, not
- * different. The two terminal frames render text that already existed here
- * verbatim (`tlane verify` output; the `tlane migrate helicone` /
- * `tlane import-litellm` commands and what the copy says they do). No trace id,
- * latency, cost or row count is invented anywhere on this page, which is why the
- * frames show a CLI and the shipped demo video rather than a mocked dashboard.
+ * NOTHING FACTUAL CHANGED and no number was added. Every price, date, citation and
+ * link is the one already on the page; the fact strip repeats claims made further
+ * down. Paragraphs were CUT to a headline + one line per section — the sell now
+ * happens in the visuals: an animated, hover-reactive request-flow diagram in the
+ * hero (CSS + vanilla JS, no libraries, `prefers-reduced-motion` respected), icon
+ * chips for the three failure modes, and Record → Replay → Prove as a 3-step
+ * "how it works". The audit ledger's ledger-chain diagram and the two terminal
+ * frames are unchanged — they were already visuals, not prose. FAQ and the
+ * compliance/trust cards keep their full text: those are regulatory and licensing
+ * claims under the honesty locks, not marketing copy, and trimming them would cut
+ * the substantiating detail the locks require.
  */
 import Base from "../layouts/Base.astro";
 import PricingTable from "../components/PricingTable.astro";
@@ -27,41 +34,133 @@ const providers = [
   "Groq",
   "150+ providers",
 ];
+
+/**
+ * Gateway-overhead benchmark — every number here is copied verbatim from
+ * `apps/docs/benchmarks.mdx` (2026-09-07 run). Do not hand-edit a number;
+ * change the source file and copy it across. `run2` is what the chart bars
+ * and headline show; `run1` is the second line under each row. `rssMb` is
+ * peak RSS of the gateway process, run 2 unless `rssNote` says otherwise.
+ * `footnote` keys the † / ‡ markers reproduced below the chart.
+ */
+type BenchMetric = { p50: number; p95: number; p99: number };
+type BenchRow = {
+  name: string;
+  version: string | null;
+  run1: BenchMetric | null;
+  run2: BenchMetric | null;
+  rssMb: number | null;
+  rssNote?: string;
+  highlight?: boolean;
+  footnote?: "bifrost" | "litellm-rust";
+};
+
+const benchRows: BenchRow[] = [
+  {
+    name: "Tracelane",
+    version: "1f3af9ad",
+    run1: { p50: 2, p95: 4, p99: 5 },
+    run2: { p50: 2, p95: 4, p99: 5 },
+    rssMb: 14,
+    highlight: true,
+  },
+  {
+    name: "Bifrost",
+    version: "v2.0.0",
+    run1: { p50: 2, p95: 2, p99: 3 },
+    run2: { p50: 2, p95: 2, p99: 3 },
+    rssMb: 101,
+    footnote: "bifrost",
+  },
+  {
+    name: "Portkey (OSS)",
+    version: "1.15.2",
+    run1: { p50: 4, p95: 7, p99: 9 },
+    run2: { p50: 3, p95: 5, p99: 8 },
+    rssMb: 177,
+    rssNote: "run 1; run 2 not sampled",
+  },
+  {
+    name: "LiteLLM Python",
+    version: "1.100.0",
+    run1: { p50: 15, p95: 36, p99: 52 },
+    run2: { p50: 14, p95: 34, p99: 47 },
+    rssMb: 323,
+  },
+  {
+    name: "LiteLLM Rust",
+    version: null,
+    run1: null,
+    run2: null,
+    rssMb: null,
+    footnote: "litellm-rust",
+  },
+];
+
+// Bar-width scale: the largest measured value across every row is LiteLLM
+// Python's run-2 p99 (47ms); round up to a clean ceiling so bars have a
+// little headroom rather than the longest bar touching the edge.
+const benchScaleMax = 50;
+const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 ---
 
 <Base>
   {/* ===== Hero ===== */}
-  <section class="panel" style="padding-top:clamp(3rem,7vw,5.5rem)">
-    <div class="max-w-prose text-left">
+  <section class="panel hero" style="padding-top:clamp(3.5rem,8vw,6.5rem)">
+    <div class="max-w-3xl text-left">
       <span class="badge hero-rise" style="--d:0s"><span class="dot"></span>open source · self-host · your keys, 0% markup</span>
 
-      <h1 class="mt-6 text-2xl sm:text-3xl text-fg headline-in" style="--d:0.06s">
-        The <span class="grad-text">flight recorder</span> for AI agents
+      <h1 class="mt-7 display-xl text-fg headline-in" style="--d:0.06s">
+        The <span class="grad-text">flight recorder</span><br class="hidden sm:block" /> for AI agents
       </h1>
 
-      <p class="mt-5 text-base text-fg-muted leading-relaxed hero-rise" style="--d:0.12s">
-        Agents fail without crashing — every call returns a clean 200 while the run drifts off course.
-        Tracelane records the whole execution path to a tamper-evident, cryptographically signed ledger.
-        See where it drifted. Prove what happened.
+      <p class="mt-6 lede hero-rise" style="--d:0.12s">
+        Every call, traced. Every trace, provable.
       </p>
 
-      <div class="mt-8 flex flex-wrap items-center gap-3 hero-rise" style="--d:0.18s">
+      <div class="mt-9 flex flex-wrap items-center gap-3 hero-rise" style="--d:0.18s">
         <a href="https://app.tracelane.dev/sign-in" class="btn-primary">Start free <span aria-hidden="true">→</span></a>
         <a href="https://github.com/tracelane" class="btn-secondary" rel="me noopener">GitHub</a>
-        <span class="text-sm text-fg-dim">no credit card · apache-2.0 core</span>
+        <span class="text-sm text-fg-dim sm:ml-1">no credit card · apache-2.0 core</span>
+      </div>
+
+      <div class="mt-8 fact-strip hero-rise" style="--d:0.22s" aria-label="At a glance">
+        <span>sha-256 hash chain</span>
+        <span>ed25519-signed merkle root</span>
+        <span>150+ providers</span>
+        <span>one rust binary</span>
       </div>
     </div>
 
-    {/* The stage: a scenic well with the product frame inset on it. */}
-    <div class="mt-12 stage-well stage-well--scenic hero-rise" style="--d:0.26s">
-      <div class="frame frame--media" id="hero-stage">
+    {/* The stage: an animated, hover-reactive request-flow diagram, then the
+        product tour underneath it. Both are visuals, not prose. */}
+    <div class="mt-14 stage-well stage-well--scenic hero-rise" style="--d:0.28s">
+      <div class="hero-flow" id="hero-flow" aria-label="A request flowing through the gateway to a provider, then hash-chained into the audit ledger">
+        <button class="flow-node" type="button" data-state="Every call enters through one gateway.">
+          <span class="flow-node-glyph" aria-hidden="true"><Icon name="agent" /></span>
+          <span class="flow-node-label">Agent</span>
+        </button>
+        <div class="flow-line"><span class="flow-pulse" style="--delay:0s"></span></div>
+        <button class="flow-node flow-node--gw" type="button" data-state="Recorded in full fidelity — your keys, 0% markup.">
+          <span class="flow-node-glyph" aria-hidden="true"><Icon name="gateway" /></span>
+          <span class="flow-node-label">Gateway</span>
+        </button>
+        <div class="flow-line"><span class="flow-pulse" style="--delay:0.9s"></span></div>
+        <button class="flow-node" type="button" data-state="Routed to any of 150+ providers, one wire format.">
+          <span class="flow-node-glyph" aria-hidden="true"><Icon name="provider" /></span>
+          <span class="flow-node-label">Provider</span>
+        </button>
+      </div>
+      <p class="hero-flow-readout" id="hero-flow-readout" aria-live="polite">Hover a step to see it recorded.</p>
+
+      <div class="mt-6 frame frame--media" id="hero-stage">
         <div class="frame-bar">
           <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
           <span class="frame-title">tracelane — replay</span>
         </div>
         <div class="frame-body" style="position:relative">
-          <video id="hero-video" class="stage-video" poster="/tracelane-demo-v4-poster.jpg" playsinline preload="none">
-            <source src="/tracelane-demo-v4.mp4" type="video/mp4" />
+          <video id="hero-video" class="stage-video" poster="/tracelane-intro-v6-poster.jpg" playsinline preload="none">
+            <source src="/tracelane-intro-v6.mp4" type="video/mp4" />
           </video>
           <button class="stage-overlay" id="hero-play" type="button" aria-label="Play the Tracelane tour with sound">
             <span class="play" aria-hidden="true">
@@ -73,125 +172,240 @@ const providers = [
     </div>
   </section>
 
-  {/* ===== Provider garden ===== */}
+  {/* ===== Provider rail ===== */}
   <section class="panel">
-    <h2 class="eyebrow text-center mb-6">150+ providers, one canonical wire format</h2>
-    <div class="tile-grid reveal">
+    <h2 class="eyebrow eyebrow--center w-full mb-6">150+ providers, one canonical wire format</h2>
+    <div class="provider-rail reveal">
       {providers.map((p) => <div class="tile">{p}</div>)}
     </div>
   </section>
 
-  {/* ===== Why agent failures stay invisible ===== */}
+  {/* ===== Why agent failures stay invisible — icon chips, not paragraphs ===== */}
   <section id="why" class="panel">
-    <div class="reveal max-w-3xl">
-      <h2 class="text-3xl sm:text-4xl text-fg">Why agent failures stay invisible</h2>
+    <div class="reveal section-head">
+      <p class="eyebrow mb-4">The problem</p>
+      <h2 class="display-lg text-fg">Agents fail without crashing.</h2>
     </div>
-    <div class="mt-10 grid gap-2.5 md:grid-cols-3 reveal-group cards-hover">
-      <article class="glass p-7">
-        <h3 class="text-lg text-fg">State drift compounds</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">A bad tool output at step 2 corrupts every step after it. The model keeps going — confidently, further from the goal.</p>
-      </article>
-      <article class="glass p-7">
-        <h3 class="text-lg text-fg">Success codes lie</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">A 200 says nothing about whether the state is still valid three steps later. Tracelane reconstructs the causal path, not just the request log.</p>
-      </article>
-      <article class="glass p-7">
-        <h3 class="text-lg text-fg">Tools are an open surface</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">Every tool call is code running on your behalf. The ledger records exactly what ran.</p>
-      </article>
+    <div class="mt-10 flex flex-wrap gap-3 reveal-group">
+      <div class="chip">
+        <span class="chip-glyph" aria-hidden="true"><Icon name="drift" dot={false} /></span>
+        State drift compounds
+      </div>
+      <div class="chip">
+        <span class="chip-glyph" aria-hidden="true"><Icon name="check" dot={false} /></span>
+        A 200 doesn't mean it worked
+      </div>
+      <div class="chip">
+        <span class="chip-glyph" aria-hidden="true"><Icon name="tool" dot={false} /></span>
+        Every tool call is code running on your behalf
+      </div>
     </div>
   </section>
 
-  {/* ===== Record / Replay / Prove ===== */}
+  {/* ===== Record / Replay / Prove — the 3-step how-it-works ===== */}
   <section id="what" class="panel">
-    <div class="reveal max-w-3xl">
-      <h2 class="text-3xl sm:text-4xl text-fg">Everything your agent does, on the record.</h2>
-      <p class="mt-4 text-base text-fg-muted">Three things, one Rust binary. Open core, Apache 2.0.</p>
+    <div class="reveal section-head">
+      <p class="eyebrow mb-4">How it works</p>
+      <h2 class="display-lg text-fg">Record. Replay. Prove.</h2>
+      <p class="lede">One Rust binary. Open core, Apache 2.0.</p>
     </div>
-    <div class="mt-10 grid gap-2.5 md:grid-cols-3 reveal-group cards-hover">
-      <article class="glass p-7">
-        <div class="feat-glyph" aria-hidden="true"><span class="glyph-eq"><i></i><i></i><i></i><i></i><i></i></span></div>
-        <p class="font-mono text-xs text-pop mb-2 lowercase">01 — record</p>
-        <h3 class="text-lg text-fg">Universal gateway</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">One endpoint in front of every model. Your keys, 0% markup, bounded overhead — every call captured in full fidelity.</p>
+    <div class="mt-12 grid gap-4 md:grid-cols-3 reveal-group cards-hover">
+      <article class="glass p-7 step-card">
+        <span class="step-num" aria-hidden="true">1</span>
+        <div class="feat-glyph" aria-hidden="true"><Icon name="record" size={20} /></div>
+        <h3 class="card-title">Record</h3>
+        <p class="card-body">Every call, full fidelity, your keys.</p>
       </article>
-      <article class="glass p-7">
-        <div class="feat-glyph" aria-hidden="true"><svg class="glyph-replay" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg></div>
-        <p class="font-mono text-xs text-pop mb-2 lowercase">02 — replay</p>
-        <h3 class="text-lg text-fg">Replay the failure</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">Step-level trace of prompts, tool calls, latency and cost — down to the call that broke, and whether you've seen it before.</p>
+      <article class="glass p-7 step-card">
+        <span class="step-num" aria-hidden="true">2</span>
+        <div class="feat-glyph" aria-hidden="true"><Icon name="replay" size={20} dot={false} /></div>
+        <h3 class="card-title">Replay</h3>
+        <p class="card-body">Step to the exact call that broke.</p>
       </article>
-      <article class="glass p-7">
-        <div class="feat-glyph" aria-hidden="true"><svg class="glyph-prove" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6"/></svg></div>
-        <p class="font-mono text-xs text-pop mb-2 lowercase">03 — prove</p>
-        <h3 class="text-lg text-fg">Prove it</h3>
-        <p class="mt-3 text-fg-muted leading-relaxed">A tamper-evident ledger — SHA-256 hash chain, Ed25519-signed Merkle root — anyone can verify offline. Logs you can't argue with.</p>
+      <article class="glass p-7 step-card">
+        <span class="step-num" aria-hidden="true">3</span>
+        <div class="feat-glyph" aria-hidden="true"><Icon name="prove" size={20} dot={false} /></div>
+        <h3 class="card-title">Prove</h3>
+        <p class="card-body">Hash-chained, signed, verifiable offline.</p>
       </article>
     </div>
   </section>
 
-  {/* ===== Audit ledger — copy left, terminal frame right ===== */}
-  <section id="audit" class="panel">
-    <div class="grid gap-8 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] lg:gap-12 lg:items-center reveal">
-      <div>
-        <p class="eyebrow mb-3">The audit ledger</p>
-        <h2 class="text-3xl text-fg">Every run. On the record. <span class="grad-text">Provably.</span></h2>
-        <p class="mt-4 text-fg-muted leading-relaxed">
-          Each event is hash-chained with SHA-256. Every 100 events, the Merkle root is signed with
-          Ed25519. Verify the whole chain offline — tampering means breaking SHA-256 or forging a
-          signature, not editing a row.
-        </p>
-        <p class="mt-5"><a href="/security" class="link-accent">Full security posture →</a></p>
+  {/* ===== Benchmarks — measured gateway overhead, not a claimed number ===== */}
+  <section id="benchmarks" class="panel">
+    <div class="reveal section-head">
+      <p class="eyebrow mb-4">Measured, not claimed</p>
+      <h2 class="display-lg text-fg">2ms added at p50. 4ms at p95. 5ms at p99.</h2>
+      <p class="lede">
+        Gateway overhead on top of the model call, with capture on — measured with
+        LiteLLM's own open <a href="https://github.com/BerriAI/ai-gateway-bench" class="link-accent" rel="noopener">AIGatewayBench</a> harness,
+        not one we wrote ourselves.
+      </p>
+    </div>
+
+    <div class="mt-10 reveal">
+      <div class="bench-chart" aria-hidden="true">
+        {benchRows.map((g) => (
+          <div class={`bench-row${g.highlight ? " bench-row--highlight" : ""}`}>
+            <div class="bench-row-head">
+              <span class="bench-name">
+                {g.name}
+                {g.highlight && <span class="bench-tag">tracelane</span>}
+              </span>
+              <span class="bench-version">
+                {g.version ?? "—"}
+                {g.footnote === "bifrost" && <sup>&nbsp;†</sup>}
+              </span>
+            </div>
+            {g.run2 ? (
+              <div class="bench-bars">
+                {(["p50", "p95", "p99"] as const).map((k) => (
+                  <div class="bench-bar-line">
+                    <span class="bench-bar-label">{k}</span>
+                    <div class="bench-bar-track" aria-label={`${g.name} ${k}: ${g.run2![k]} milliseconds`}>
+                      <div class="bench-bar-fill" style={`width:${benchPct(g.run2![k])}`}></div>
+                    </div>
+                    <span class="bench-bar-value">{g.run2![k]} ms</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p class="bench-not-measured">not measured&nbsp;<sup>‡</sup></p>
+            )}
+            {g.run1 && g.run2 && (g.run1.p50 !== g.run2.p50 || g.run1.p95 !== g.run2.p95 || g.run1.p99 !== g.run2.p99) && (
+              <p class="bench-run1">run 1: {g.run1.p50} / {g.run1.p95} / {g.run1.p99} ms</p>
+            )}
+          </div>
+        ))}
       </div>
 
-      <div class="stage-well stage-well--dark">
-        <div class="frame frame--dark">
-          <div class="frame-bar">
-            <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span class="frame-title">tlane — verify</span>
+      {/* Same numbers, as a real table, for anyone not looking at the bars.
+
+          `sr-only` GOES ON THE WRAPPER, NEVER ON THE <table>. A table's used
+          width is its auto table layout, so `sr-only`'s `width: 1px` is only a
+          suggestion it ignores — this table laid out at 938px and, being
+          absolutely positioned, pushed the document's scrollable width to 954px
+          on a 390px phone. `html/body { overflow-x: clip }` hid that from a
+          desktop Chromium (`scrollWidth` read 390), but iOS Safari computes its
+          minimum zoom scale from the content width, so pinch-zooming out on the
+          real page showed the content in the left 41% and 564px of white to the
+          right. A block wrapper has no such exemption and collapses to 1px.
+          Guarded by `check-sr-only-tables.py`. */}
+      <div class="sr-only">
+      <table>
+        <caption>Gateway overhead in milliseconds added over a direct call to the mock upstream, run 2 (run 1 in parentheses where it differs)</caption>
+        <thead>
+          <tr><th scope="col">Gateway</th><th scope="col">Version</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">p99</th><th scope="col">Peak RSS</th></tr>
+        </thead>
+        <tbody>
+          {benchRows.map((g) => (
+            <tr>
+              <th scope="row">{g.name}</th>
+              <td>{g.version ?? "not measured"}</td>
+              <td>{g.run2 ? `${g.run2.p50} ms${g.run1 && g.run1.p50 !== g.run2.p50 ? ` (run 1: ${g.run1.p50} ms)` : ""}` : "not measured"}</td>
+              <td>{g.run2 ? `${g.run2.p95} ms${g.run1 && g.run1.p95 !== g.run2.p95 ? ` (run 1: ${g.run1.p95} ms)` : ""}` : "not measured"}</td>
+              <td>{g.run2 ? `${g.run2.p99} ms${g.run1 && g.run1.p99 !== g.run2.p99 ? ` (run 1: ${g.run1.p99} ms)` : ""}` : "not measured"}</td>
+              <td>{g.rssMb ? `${g.rssMb} MB${g.rssNote ? ` (${g.rssNote})` : ""}` : "not measured"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="mt-8 reveal">
+      <p class="eyebrow mb-3">Peak memory (RSS), gateway process only</p>
+      <div class="bench-rss-row">
+        {benchRows.filter((g) => g.rssMb).map((g) => (
+          <span><b>{g.name}</b> {g.rssMb} MB{g.rssNote ? ` (${g.rssNote})` : ""}</span>
+        ))}
+      </div>
+    </div>
+
+    <p class="mt-8 text-sm text-fg-dim bench-footnotes">
+      Direct-to-mock baseline (already subtracted from every figure above): 1 / 2 / 3 ms p50/p95/p99.
+      Host: one Hetzner CCX23 (4 vCPU, 16 GB). 16 concurrent clients, 30 seconds, two runs.<br />
+      † Bifrost via <code>npx -y @maximhq/bifrost</code>, both runs — its version string is only
+      emitted on first install, so run 2's CSV records it as "unknown"; v2.0.0 is from run 1.<br />
+      ‡ LiteLLM Rust: as of 2026-09-07 no public build exists — the harness's own notes build it
+      from a private branch on LiteLLM's machine. We'll run it when one is published.
+    </p>
+
+    <div class="mt-8 flex flex-wrap items-center gap-4">
+      <code class="bench-repro">bash bench/gateway/aigatewaybench/run.sh</code>
+      <a href="https://docs.tracelane.dev/benchmarks" class="link-accent">Full method, caveats and the raw CSVs →</a>
+    </div>
+
+    
+  </section>
+
+  <CompareTable />
+
+  {/* ===== Audit ledger — the dark band: copy left, terminal frame right ===== */}
+  <section id="audit" class="band band--dark">
+    <div class="band-inner">
+      <div class="grid gap-10 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:gap-16 lg:items-center reveal">
+        <div>
+          <p class="eyebrow mb-4">The audit ledger</p>
+          <h2 class="display-lg text-fg">Every run. On the record. <span class="grad-text-warm">Provably.</span></h2>
+          <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
+            SHA-256 hash-chained, Ed25519-signed — verify any trace offline.
+          </p>
+          <p class="mt-6"><a href="/security" class="link-accent">Full security posture →</a></p>
+
+          <div class="chain" aria-hidden="true">
+            <div class="chain-node"><b>event</b><span>sha-256</span></div>
+            <div class="chain-link"></div>
+            <div class="chain-node"><b>event</b><span>sha-256</span></div>
+            <div class="chain-link"></div>
+            <div class="chain-node"><b>event</b><span>sha-256</span></div>
+            <div class="chain-link"></div>
+            <div class="chain-node chain-node--root"><b>merkle root</b><span>ed25519</span></div>
           </div>
-          <div class="frame-body">
+        </div>
+
+        <div class="stage-well stage-well--dark">
+          <div class="frame frame--dark">
+            <div class="frame-bar">
+              <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span class="frame-title">tlane — verify</span>
+            </div>
+            <div class="frame-body">
 <pre class="term"><code><span class="c"># verify any trace offline — no trust in us required</span>
 <span class="p">$</span> tlane verify &lt;trace-id&gt;
 <span class="ok">✓</span> signature valid (Ed25519, Merkle root)
 <span class="ok">✓</span> hash chain unbroken (SHA-256)
 <span class="ok">✓</span> tamper-evident: yes <span class="caret">&nbsp;</span></code></pre>
+            </div>
           </div>
         </div>
       </div>
-    </div>
 
-    <div class="mt-2.5 grid gap-2.5 md:grid-cols-3 text-sm reveal-group cards-hover">
-      <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">eu ai act</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">Article 12 export pack — full audit trail for high-risk AI systems. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>); the ledger is available today.</p>
-      </div>
-      <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">india dpdp</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">Phase II enforcement Nov 13, 2026. Tracelane enforces no per-tenant storage region today; region pinning is on the roadmap. The audit ledger has no expiry clock — it is kept for the life of the ledger.</p>
-      </div>
-      <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">hipaa</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">BAA available on Business tier. PII redaction inline. Provider keys envelope-encrypted.</p>
+      <div class="mt-12 grid gap-4 md:grid-cols-3 text-sm reveal-group cards-hover">
+        <div class="glass p-6">
+          <p class="card-index">eu ai act</p>
+          <p class="card-body text-sm">Article 12 export pack — full audit trail for high-risk AI systems. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>); the ledger is available today.</p>
+        </div>
+        <div class="glass p-6">
+          <p class="card-index">india dpdp</p>
+          <p class="card-body text-sm">Phase II enforcement Nov 13, 2026. Tracelane enforces no per-tenant storage region today; region pinning is on the roadmap. The audit ledger has no expiry clock — it is kept for the life of the ledger.</p>
+        </div>
+        <div class="glass p-6">
+          <p class="card-index">hipaa</p>
+          <p class="card-body text-sm">No signed BAA today — PII redaction inline and provider keys envelope-encrypted, so healthcare pilots can start without PHI in the trace store.</p>
+        </div>
       </div>
     </div>
   </section>
 
   {/* ===== Migration — copy left, two overlapping frames right ===== */}
   <section id="migrate" class="panel">
-    <div class="grid gap-8 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] lg:gap-12 lg:items-center reveal">
+    <div class="grid gap-10 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:gap-16 lg:items-center reveal">
       <div>
-        <p class="eyebrow mb-3">Migration</p>
-        <h2 class="text-3xl text-fg">Moving off a tool that got acquired or breached?</h2>
-        <p class="mt-4 text-fg-muted leading-relaxed">
-          Migration is forward re-instrumentation: we rewrite your config and SDK wiring to point at
-          Tracelane. No data leaves your infrastructure; your history stays where it is.
-        </p>
-        <p class="mt-4 text-sm text-fg-muted leading-relaxed">
-          New runs land in Tracelane the moment you apply the diff; historical traces stay in the tool
-          you came from. LiteLLM is a drop-in gateway replacement on a Rust request path — with
-          Sigstore-signed releases, attested build provenance and Trusted Publishing OIDC, so there are
-          no long-lived registry tokens.
+        <p class="eyebrow mb-4">Migration</p>
+        <h2 class="display-md text-fg">Moving off a tool that got acquired or breached?</h2>
+        <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
+          One command rewrites your config. Nothing leaves your infrastructure.
         </p>
       </div>
 
@@ -230,42 +444,45 @@ const providers = [
 
   {/* ===== Trust ===== */}
   <section id="trust" class="panel">
-    <div class="reveal max-w-3xl">
-      <p class="eyebrow mb-3">Security posture</p>
-      <h2 class="text-3xl sm:text-4xl text-fg">Built for procurement reviews.</h2>
+    <div class="reveal section-head">
+      <p class="eyebrow mb-4">Security posture</p>
+      <h2 class="display-lg text-fg">Built for procurement reviews.</h2>
     </div>
-    <div class="mt-10 grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3 text-sm reveal-group cards-hover">
+    <div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 text-sm reveal-group cards-hover">
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">release integrity</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">Sigstore Cosign keyless signing with attested build provenance. Trusted Publishing OIDC — no long-lived registry tokens.</p>
+        <p class="card-index">release integrity</p>
+        <p class="card-body text-sm">Sigstore Cosign keyless signing with attested build provenance. Trusted Publishing OIDC — no long-lived registry tokens.</p>
       </div>
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">sbom</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">CycloneDX SBOM published with every release, verifiable from GitHub release artifacts.</p>
+        <p class="card-index">sbom</p>
+        <p class="card-body text-sm">CycloneDX SBOM published with every release, verifiable from GitHub release artifacts.</p>
       </div>
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">vuln scanning</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">OSV-Scanner + Grype + Syft on every commit.</p>
+        <p class="card-index">vuln scanning</p>
+        <p class="card-body text-sm">OSV-Scanner + Grype + Syft on every commit.</p>
       </div>
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">pre-flight policy</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">Policy checks run inline at the gateway before the call leaves. Today: schema-violation + tool-definition-drift, fail-open. More on a published roadmap.</p>
+        <p class="card-index">pre-flight policy</p>
+        <p class="card-body text-sm">Policy checks run inline at the gateway before the call leaves. Today: schema-violation + tool-definition-drift, fail-open. More on a published roadmap.</p>
       </div>
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">transport</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">TLS 1.3 minimum. mTLS via SPIFFE/SPIRE for ingest. SSRF defense — RFC1918 + link-local denied.</p>
+        <p class="card-index">transport</p>
+        <p class="card-body text-sm">TLS 1.3 minimum. mTLS via SPIFFE/SPIRE for ingest. SSRF defense — RFC1918 + link-local denied.</p>
       </div>
       <div class="glass p-6">
-        <p class="font-mono text-xs text-fg-dim lowercase">standards</p>
-        <p class="mt-3 text-fg-muted leading-relaxed">OTel GenAI semconv — tracking the pre-execution judgment / negative-proof proposal (<a href="https://github.com/open-telemetry/semantic-conventions/issues/3244" class="link-accent" rel="noopener">#3244</a>).</p>
+        <p class="card-index">standards</p>
+        <p class="card-body text-sm">OTel GenAI semconv — tracking the pre-execution judgment / negative-proof proposal (<a href="https://github.com/open-telemetry/semantic-conventions/issues/3244" class="link-accent" rel="noopener">#3244</a>).</p>
       </div>
     </div>
   </section>
 
   {/* ===== FAQ ===== */}
   <section id="faq" class="panel">
-    <div class="grid gap-8 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)] lg:gap-12">
-      <h2 class="text-3xl sm:text-4xl text-fg">Frequently asked.</h2>
+    <div class="grid gap-10 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)] lg:gap-16">
+      <div>
+        <p class="eyebrow mb-4">FAQ</p>
+        <h2 class="display-lg text-fg">Frequently asked.</h2>
+      </div>
       <div class="reveal">
         <details class="faq-row">
           <summary class="text-fg">What is Tracelane?<span class="sign" aria-hidden="true">+</span></summary>
@@ -294,12 +511,12 @@ const providers = [
 
         <details class="faq-row">
           <summary class="text-fg">Does Tracelane support EU AI Act Article 12?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">The Tamper-Evident Agent Ledger is a $999/mo add-on, available on any plan. The audit ledger (SHA-256 hash chain, Ed25519-signed Merkle root) and an Article 12 documentation pack are available today. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim. EU AI Act Annex III obligations were originally scheduled for Aug 2, 2026; the Digital Omnibus political agreement (May 7, 2026) provisionally deferred enforcement to Dec 2, 2027, pending formal adoption (<a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>). The ledger ships now so regulated buyers can build audit history before binding enforcement.</p>
+          <p class="text-fg-muted leading-relaxed">The Tamper-Evident Agent Ledger (SHA-256 hash chain, Ed25519-signed Merkle root, Rekor anchoring, self-verification) is included on every tier, free and paid — no add-on to buy. The Article 12 evidence export and seven-year ledger retention are included on Enterprise. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim. EU AI Act Annex III obligations were originally scheduled for Aug 2, 2026; the Digital Omnibus political agreement (May 7, 2026) provisionally deferred enforcement to Dec 2, 2027, pending formal adoption (<a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>). The ledger ships now so regulated buyers can build audit history before binding enforcement.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">What's the latency overhead?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Gateway overhead targets p50 &lt;5ms, p95 &lt;15ms, p99 &lt;25ms (excluding provider time). Pre-flight policy layer targets p99 &lt;50ms on commodity CPU. These are engineering targets — measured numbers will publish as the Tracelane Reliability Benchmark v1.0.</p>
+          <p class="text-fg-muted leading-relaxed">Measured, not targeted: <strong>2ms p50, 4ms p95, 5ms p99</strong> of added latency (excluding provider time), taken with LiteLLM's open AIGatewayBench harness on a 4 vCPU host with capture on, two runs, alongside Bifrost, Portkey and LiteLLM — see the <a class="underline" href="#benchmarks">full breakdown above</a> or the <a class="underline" href="https://docs.tracelane.dev/benchmarks">benchmark page</a> for method, caveats and the raw CSVs. The pre-flight policy layer is still an engineering target (p99 &lt;50ms on commodity CPU).</p>
         </details>
 
         <details class="faq-row">
@@ -317,10 +534,11 @@ const providers = [
 
   {/* ===== Notify ===== */}
   <section id="notify" class="panel">
-    <div class="stage-well" style="padding-block:clamp(2.5rem,6vw,4.5rem)">
+    <div class="stage-well stage-well--scenic" style="padding-block:clamp(3rem,7vw,5.5rem)">
       <div class="max-w-2xl mx-auto text-center">
-        <h2 class="text-3xl text-fg">Get product updates.</h2>
-        <p class="mt-4 text-base text-fg-muted">Occasional email when something ships that changes how you use Tracelane. Unsubscribe in one click.</p>
+        <p class="eyebrow eyebrow--center w-full mb-4">Stay close</p>
+        <h2 class="display-md text-fg">Get product updates.</h2>
+        <p class="mt-4 lede mx-auto text-center">One email when something ships. Unsubscribe in one click.</p>
         <form id="notify-form" class="mt-8 flex flex-col sm:flex-row gap-2.5 max-w-lg mx-auto" method="POST" action="/api/notify">
           <label for="email" class="sr-only">email address</label>
           <input id="email" type="email" name="email" required autocomplete="email" placeholder="you@company.com" class="field" />
@@ -348,6 +566,33 @@ const providers = [
     vid.addEventListener("ended", function () {
       vid.controls = false;
       play.style.display = "";
+    });
+  })();
+
+  // hero request-flow diagram — hover/focus a node, the readout line updates
+  // and the connecting pulse highlights. No libraries; CSS keyframes drive the
+  // idle animation, this only swaps text + an "active" class on hover/focus.
+  (function () {
+    var flow = document.getElementById("hero-flow");
+    var readout = document.getElementById("hero-flow-readout");
+    if (!flow || !readout) return;
+    var nodes = flow.querySelectorAll(".flow-node");
+    var defaultText = readout.textContent;
+    nodes.forEach(function (node) {
+      var setActive = function () {
+        flow.classList.add("is-focused");
+        node.classList.add("is-active");
+        readout.textContent = node.dataset.state || defaultText;
+      };
+      var clearActive = function () {
+        flow.classList.remove("is-focused");
+        node.classList.remove("is-active");
+        readout.textContent = defaultText;
+      };
+      node.addEventListener("mouseenter", setActive);
+      node.addEventListener("focus", setActive);
+      node.addEventListener("mouseleave", clearActive);
+      node.addEventListener("blur", clearActive);
     });
   })();
 

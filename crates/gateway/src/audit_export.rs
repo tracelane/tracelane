@@ -68,6 +68,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracelane_shared::TenantId;
 
+use crate::clickhouse_query::{PlanTier, TenantQuery};
+
 /// Rows per DB round-trip when the export pages the full ledger (bounded memory).
 const MAX_LIMIT: u32 = 50_000;
 
@@ -274,12 +276,51 @@ pub trait AuditExportReader: Send + Sync {
 /// ClickHouse-backed reader. Issues a single `SELECT ... ORDER BY seq
 /// LIMIT ?` against `tracelane.audit_log`.
 pub struct ClickHouseExportReader {
+    /// The same cache the hot path reads — no Postgres per request. `None` on a
+    /// stack with no control plane, which resolves to the FREE tier (fail-closed).
+    entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     client: ClickhouseClient,
 }
 
 impl ClickHouseExportReader {
     pub fn new(client: ClickhouseClient) -> Self {
-        Self { client }
+        Self {
+            entitlements: None,
+            client,
+        }
+    }
+
+    /// Thread the entitlement cache in (server.rs). Without it every read runs at
+    /// the FREE tier — never at a paid one.
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
+    }
+
+    /// ADR-031 resource caps for EVERY read in this file, at the TENANT'S OWN tier
+    /// (SRE #20, 2026-09-05; was the literal Builder tier until then) — `max_execution_time = 10`, `max_rows_to_read = 50 M`, `max_memory_usage`
+    /// — appended as a `SETTINGS` block the way `trace_reads.rs` does it.
+    ///
+    /// SRE register #28 (2026-09-04, fixed 2026-09-05): this file carried a comment
+    /// saying its reads "route through TenantQuery" while NONE of them did, and it sat
+    /// on the guard's exemption list, so an authenticated `/v1/audit/export`,
+    /// `/v1/audit/self-verify` or `/v1/audit/ledger-range` call could scan a tenant's
+    /// whole ledger with no execution-time or row ceiling — on the one box whose
+    /// filesystem also holds ClickHouse, NATS and the ledger itself. The Builder tier is
+    /// used rather than the tenant's own because the export streams by PAGE
+    /// (`read_range_page`, ≤ `MAX_LIMIT` rows each) and never needs more than the
+    /// smallest tier's caps for one page; a page that trips 10 s is a page too big.
+    async fn capped(&self, sql: &str, tenant: &TenantId) -> String {
+        TenantQuery::new(sql, self.tier_for(tenant).await).sql_with_settings()
+    }
+
+    /// SRE register #20: the tenant's OWN tier, via `clickhouse_query::tier_for_tenant`.
+    async fn tier_for(&self, tenant: &TenantId) -> PlanTier {
+        crate::clickhouse_query::tier_for_tenant(self.entitlements.as_ref(), tenant).await
     }
 }
 
@@ -336,14 +377,13 @@ impl AuditExportReader for ClickHouseExportReader {
         let until_us = until.timestamp_micros();
         let limit = limit.clamp(1, MAX_LIMIT);
 
-        // ADR-031 V1.1 sweep: audit-log export is bounded per-tenant +
-        // time-windowed; per-tier resource caps would be additive. The
-        // V1.1 sweep routes through TenantQuery so the export command
-        // inherits the tier-derived 10s/30s/60s/300s execution caps.
-        // Exempted in `scripts/ci/no-raw-ch-query.sh`.
+        // Bounded per-tenant + time-windowed, AND capped (`Self::capped`, ADR-031 at
+        // the Builder tier). Until 2026-09-05 this comment claimed the read "routes
+        // through TenantQuery" while it did not — a comment asserting a control the
+        // code does not implement (SRE register #28).
         let rows = self
             .client
-            .query(
+            .query(&self.capped(
                 // The output alias MUST differ from the column name: aliasing
                 // `toUnixTimestamp64Micro(event_time) AS event_time` makes the
                 // WHERE's `toUnixTimestamp64Micro(event_time)` resolve `event_time`
@@ -365,8 +405,7 @@ impl AuditExportReader for ClickHouseExportReader {
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ? \
                  ORDER BY seq ASC \
-                 LIMIT ?",
-            )
+                 LIMIT ?", tenant_id).await)
             .bind(tenant_id.to_string())
             .bind(since_us)
             .bind(until_us)
@@ -410,11 +449,11 @@ impl AuditExportReader for ClickHouseExportReader {
         let until_us = until.timestamp_micros();
         let limit = limit.clamp(1, MAX_LIMIT);
 
-        // Bounded per-tenant + time-windowed (mirrors read_range). tenant_id
-        // filter present per the CLAUDE.md hard rule. Exempted in no-raw-ch-query.sh.
+        // Bounded per-tenant + time-windowed (mirrors read_range), capped by
+        // `Self::capped`. tenant_id filter present per the CLAUDE.md hard rule.
         let rows = self
             .client
-            .query(
+            .query(&self.capped(
                 "SELECT tenant_id, batch_start_seq, batch_end_seq, merkle_root, anchor_state, \
                         ed25519_sig, ed25519_pubkey, rekor_log_url, rekor_log_index, \
                         canonicalized_body, inclusion_proof, checkpoint_envelope \
@@ -423,8 +462,7 @@ impl AuditExportReader for ClickHouseExportReader {
                    AND toUnixTimestamp64Micro(anchored_at) >= ? \
                    AND toUnixTimestamp64Micro(anchored_at) <= ? \
                  ORDER BY batch_start_seq ASC \
-                 LIMIT ?",
-            )
+                 LIMIT ?", tenant_id).await)
             .bind(tenant_id.to_string())
             .bind(since_us)
             .bind(until_us)
@@ -482,8 +520,13 @@ impl AuditExportReader for ClickHouseExportReader {
         let r = self
             .client
             .query(
-                "SELECT min(seq) AS lo, max(seq) AS hi, count() AS total \
+                &self
+                    .capped(
+                        "SELECT min(seq) AS lo, max(seq) AS hi, count() AS total \
                  FROM audit_log FINAL WHERE tenant_id = ?",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .fetch_one::<RangeRow>()
@@ -507,9 +550,10 @@ impl AuditExportReader for ClickHouseExportReader {
         let since_us = since.timestamp_micros();
         let until_us = until.timestamp_micros();
 
-        // Totals + span. tenant_id filter present (CLAUDE.md hard rule); the whole
-        // file is allow-listed in no-raw-ch-query.sh. `event_time_us` alias avoids
-        // the same alias-collision class documented in read_range.
+        // Totals + span. tenant_id filter present (CLAUDE.md hard rule); every read
+        // here is capped by `Self::capped`, which is what the guard's entry for this
+        // file now asserts. `event_time_us` alias avoids the same alias-collision
+        // class documented in read_range.
         #[derive(Deserialize, clickhouse::Row)]
         struct Totals {
             total: u64,
@@ -519,15 +563,20 @@ impl AuditExportReader for ClickHouseExportReader {
         let totals = self
             .client
             .query(
-                // FINAL so a crash-retry duplicate (ADR-065) is counted once —
-                // the total tracks distinct (tenant_id, seq) rows, not orphans.
-                "SELECT count() AS total, \
+                &self
+                    .capped(
+                        // FINAL so a crash-retry duplicate (ADR-065) is counted once —
+                        // the total tracks distinct (tenant_id, seq) rows, not orphans.
+                        "SELECT count() AS total, \
                         toUnixTimestamp64Micro(min(event_time)) AS first_us, \
                         toUnixTimestamp64Micro(max(event_time)) AS last_us \
                  FROM audit_log FINAL \
                  WHERE tenant_id = ? \
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ?",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .bind(since_us)
@@ -545,12 +594,17 @@ impl AuditExportReader for ClickHouseExportReader {
         let day_rows = self
             .client
             .query(
-                "SELECT toString(toDate(event_time)) AS day, count() AS c \
+                &self
+                    .capped(
+                        "SELECT toString(toDate(event_time)) AS day, count() AS c \
                  FROM audit_log FINAL \
                  WHERE tenant_id = ? \
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ? \
                  GROUP BY day ORDER BY day ASC LIMIT 400",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .bind(since_us)
@@ -568,12 +622,17 @@ impl AuditExportReader for ClickHouseExportReader {
         let type_rows = self
             .client
             .query(
-                "SELECT event_type, count() AS c \
+                &self
+                    .capped(
+                        "SELECT event_type, count() AS c \
                  FROM audit_log FINAL \
                  WHERE tenant_id = ? \
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ? \
                  GROUP BY event_type ORDER BY c DESC LIMIT 50",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .bind(since_us)
@@ -629,10 +688,15 @@ impl AuditExportReader for ClickHouseExportReader {
         let row = self
             .client
             .query(
-                "SELECT count() AS n FROM audit_log FINAL \
+                &self
+                    .capped(
+                        "SELECT count() AS n FROM audit_log FINAL \
                  WHERE tenant_id = ? \
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ?",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .bind(since_us)
@@ -666,7 +730,14 @@ impl AuditExportReader for ClickHouseExportReader {
         let rows = match after_seq {
             Some(after) => {
                 self.client
-                    .query(&format!("{base} AND seq > ? ORDER BY seq ASC LIMIT ?"))
+                    .query(
+                        &self
+                            .capped(
+                                &format!("{base} AND seq > ? ORDER BY seq ASC LIMIT ?"),
+                                tenant_id,
+                            )
+                            .await,
+                    )
                     .bind(tenant_id.to_string())
                     .bind(since_us)
                     .bind(until_us)
@@ -677,7 +748,11 @@ impl AuditExportReader for ClickHouseExportReader {
             }
             None => {
                 self.client
-                    .query(&format!("{base} ORDER BY seq ASC LIMIT ?"))
+                    .query(
+                        &self
+                            .capped(&format!("{base} ORDER BY seq ASC LIMIT ?"), tenant_id)
+                            .await,
+                    )
                     .bind(tenant_id.to_string())
                     .bind(since_us)
                     .bind(until_us)
@@ -725,9 +800,9 @@ impl AuditExportReader for ClickHouseExportReader {
         let rows = match after {
             Some(a) => {
                 self.client
-                    .query(&format!(
+                    .query(&self.capped(&format!(
                         "{base} AND batch_start_seq > ? ORDER BY batch_start_seq ASC LIMIT ?"
-                    ))
+                    ), tenant_id).await)
                     .bind(tenant_id.to_string())
                     .bind(since_us)
                     .bind(until_us)
@@ -738,7 +813,9 @@ impl AuditExportReader for ClickHouseExportReader {
             }
             None => {
                 self.client
-                    .query(&format!("{base} ORDER BY batch_start_seq ASC LIMIT ?"))
+                    .query(&self.capped(&format!(
+                        "{base} ORDER BY batch_start_seq ASC LIMIT ?"
+                    ), tenant_id).await)
                     .bind(tenant_id.to_string())
                     .bind(since_us)
                     .bind(until_us)
@@ -852,7 +929,8 @@ async fn summary_handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "audit summary auth failed");
-            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error_response(status, msg);
         }
     };
 
@@ -927,7 +1005,8 @@ async fn handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "audit export auth failed");
-            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error_response(status, msg);
         }
     };
 
@@ -1104,10 +1183,14 @@ pub(crate) fn error_response(status: StatusCode, msg: &str) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Typed `403` for the Audit-SKU paywall. Mirrors the hard-cap `429`
-/// error schema (`server.rs::notify_quota_exceeded`): a machine-readable `error`
-/// code + human `message` + an `upgrade_url` pointer — never an opaque error.
-/// `serde_json` handles escaping (no `format!` string injection).
+/// Typed `403` for the Audit-SKU paywall. Mirrors the shape every other
+/// refusal on this codebase uses: a machine-readable `error` code + human
+/// `message` + an `upgrade_url` pointer — never an opaque error. (This
+/// comment used to point at `server.rs::notify_quota_exceeded`; BILL-01 /
+/// ADR-076, 2026-09-13, deleted that function along with the monthly
+/// trace-count hard cap it served — see `admission.rs`'s `Refusal` enum for
+/// the current 402 budget-exceeded shape.) `serde_json` handles escaping (no
+/// `format!` string injection).
 fn entitlement_required_response() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -1124,6 +1207,30 @@ fn entitlement_required_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ClickHouse read in this file goes through `capped`; this pins what that
+    /// means so a looser tier cannot creep in silently (SRE register #28). With no
+    /// entitlement cache the reader resolves to the FREE tier (SRE #20, fail-closed),
+    /// whose caps equal Builder's — so the numbers below are the floor, never a grant.
+    #[tokio::test]
+    async fn capped_appends_the_floor_tier_settings_after_the_limit() {
+        let reader =
+            ClickHouseExportReader::new(crate::clickhouse_query::ch_client("http://127.0.0.1:1"));
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::nil());
+        let sql = reader
+            .capped(
+                "SELECT seq FROM audit_log WHERE tenant_id = ? LIMIT ?",
+                &tenant,
+            )
+            .await;
+        assert!(
+            sql.starts_with("SELECT seq FROM audit_log WHERE tenant_id = ? LIMIT ?\n"),
+            "{sql}"
+        );
+        assert!(sql.contains("SETTINGS max_memory_usage = "), "{sql}");
+        assert!(sql.contains("max_execution_time = 10"), "{sql}");
+        assert!(sql.contains("max_rows_to_read = 50000000"), "{sql}");
+    }
 
     pub struct MockExportReader {
         pub rows: Vec<ExportRow>,

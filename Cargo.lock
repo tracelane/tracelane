@@ -1498,6 +1498,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tokio-test",
+ "tower 0.5.3",
  "tower-http",
  "tracelane-audit-verifier",
  "tracelane-policy",
@@ -1985,6 +1986,7 @@ dependencies = [
  "arc-swap",
  "async-nats",
  "axum 0.8.9",
+ "blake3",
  "bytes",
  "chrono",
  "clickhouse",
@@ -2020,7 +2022,6 @@ dependencies = [
  "tonic-build",
  "tower 0.5.3",
  "tower-http",
- "tower-service",
  "tracelane-policy",
  "tracelane-shared",
  "tracing",
@@ -4214,15 +4215,20 @@ name = "tracelane-shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "chrono",
  "opentelemetry-proto",
  "prost",
+ "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

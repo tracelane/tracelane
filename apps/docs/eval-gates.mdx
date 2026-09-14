@@ -8,7 +8,7 @@ Promoting a prompt version from `staging` to `production` is a recorded decision
 an automated test run. Every promotion writes an attributed, tamper-evident entry to
 the promotion ledger — see [Prompt Promotion](/prompt-promotion).
 
-Promotion writes are available on **Team $249/mo and above**.
+Promotion writes are available on **Team $229/mo and above**.
 
 <Note>
 **Eval gating is live.** `POST /v1/prompts/{name}/evals` runs a set of cases against
@@ -31,7 +31,7 @@ calls rather than 200 — the `202` tells you the number as `provider_calls` bef
 run spends anything. The judge appears in your traces like any other request, and
 `GET /v1/costs` reports `judge_cost_usd` separately from the rest of the eval spend.
 Rubrics are `answers_the_question`, `groundedness` and `instruction_following`, or
-your own prompt version. **`llm_judge` needs Team $249/mo and above**; every other
+your own prompt version. **`llm_judge` needs Team $229/mo and above**; every other
 scorer does not.
 
 **A judge that does not answer in its contract errors the case — it never fails it.**

@@ -14,9 +14,7 @@
 
 use anyhow::{Context as _, Result};
 use async_stream::try_stream;
-use futures::Stream;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::instrument;
 
@@ -117,6 +115,20 @@ impl CohereProvider {
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         });
+        // GWY-48. Cohere spells nucleus sampling `p`, not `top_p`.
+        //
+        // TWO honest caveats, written here rather than discovered later: the
+        // wire name is NOT verifiable from this tree (no Cohere schema is
+        // vendored), and this body is a `json!` literal with no
+        // `skip_serializing_if`, so it already sends explicit `"temperature":
+        // null` / `"max_tokens": null` on every request that omits them. Adding
+        // `p` the same way would send a third null to an endpoint whose
+        // tolerance for one is equally unverified — so it is inserted ONLY when
+        // present, which also makes every request that omits `top_p`
+        // byte-identical to before this line existed.
+        if let Some(p) = request.top_p {
+            body["p"] = serde_json::json!(p);
+        }
         // Tool definitions: universal Tool -> Cohere `tools`
         // (`parameter_definitions` keyed off the JSON-schema properties).
         // Previously the adapter dropped tools entirely — a tool-bearing
@@ -148,7 +160,15 @@ impl CohereProvider {
             // 401/403 bodies can echo the Bearer token.
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(status, "Cohere API error");
-            anyhow::bail!("cohere error: status {status}");
+            // B-391: typed, so `classify_dispatch_error` sees a 401 as a
+            // rejected key and a 429 as a rate limit instead of folding every
+            // non-2xx into 502. Status only — the body is dropped above.
+            return Err(crate::providers::ProviderHttpError {
+                provider: "cohere",
+                status,
+                reason: None,
+            }
+            .into());
         }
 
         let mut byte_stream = response.bytes_stream();

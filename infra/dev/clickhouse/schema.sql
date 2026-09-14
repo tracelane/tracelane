@@ -67,26 +67,37 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     cost_usd         Float64 MATERIALIZED JSONExtractFloat(attributes, 'gen_ai_usage_cost'),
     cost_usd_present UInt8   MATERIALIZED toUInt8(JSONHas(attributes, 'gen_ai_usage_cost')),
 
-    -- OBS-01 full-text search. ORDER BY is (tenant_id, trace_id, span_id), so a
-    -- content predicate hits NO index and degenerates to a full scan of the
-    -- tenant's parts. Measured on prod 2026-08-08 at 12,453 spans for the largest
-    -- tenant: substring search read 4.70 MiB / 14,436 rows in 24 ms, against
-    -- 634 KiB / 3 ms for an ORDER-BY-aligned count — 8x on both, and read_bytes
-    -- grows LINEARLY with tenant volume because nothing prunes granules. At the
-    -- 5M-traces/mo Business tier that is a multi-GB scan on an interactive read.
-    --
-    -- ngrambf_v1 (not tokenbf_v1) because the predicate is a SUBSTRING match:
-    -- `LIKE '%q%'`, matching what apps/mcp already does and what a user expects
-    -- from a search box. tokenbf_v1 only serves whole-token equality, so "auth"
-    -- would not find "authorize". n=4 sets the minimum useful query length; the
-    -- route enforces it so a 3-char query cannot silently fall back to a scan.
+    -- BILL-01 (migration 24): LOGICAL bytes of the span as the customer sent it — the
+    -- number meters 1 (ingest), 2 (hot window) and 5 (cold) read. DEFAULT, not
+    -- MATERIALIZED: the ingest writer overrides it with the PRE-dedup size (blobs are our
+    -- margin, never a markdown — ADR-076 §3), and rows older than the column get the
+    -- expression at read time so history is billable without rewriting parts.
+    span_bytes       UInt32  DEFAULT toUInt32(length(attributes) + length(name) + length(status_message) + 96),
+
+    -- OBS-01 full-text search on `name`: ngrambf_v1 (not tokenbf_v1) because the
+    -- predicate is a SUBSTRING match (`LIKE '%q%'`); n=4 sets the minimum useful
+    -- query length and the route enforces it. The SAME index over `attributes`
+    -- (the ~450-byte JSON blob) was deleted in migration 22 (B-379, 2026-09-12) on
+    -- measurement: it pruned NOTHING — the bloom saturates on ~450 4-grams per row.
+    -- A substring search over the blob is a scan by nature; the time-first ORDER BY
+    -- below bounds it to the requested window instead, and the read path always
+    -- sends one.
     INDEX idx_api_key_id       api_key_id TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_name_ngram       name       TYPE ngrambf_v1(4, 4096, 3, 0) GRANULARITY 4,
-    INDEX idx_attributes_ngram attributes TYPE ngrambf_v1(4, 8192, 3, 0) GRANULARITY 4
+    -- B-379 (migration 22): the single-trace waterfall (`trace_id = ?`, no time
+    -- predicate) lost its key prefix when the key became time-first; this bloom
+    -- prunes it to the trace's own hourly bucket(s). Measured: 24,576 → 8,192 rows.
+    INDEX idx_trace_id         trace_id   TYPE bloom_filter(0.01) GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(start_time)
-ORDER BY (tenant_id, trace_id, span_id)
+-- B-379 (migration 22, 2026-09-12): TIME-FIRST. `trace_id` is random, so the old
+-- `(tenant_id, trace_id, span_id)` pruned no granule for the `start_time` predicate
+-- that 10 of the 22 read sites carry — every metric breakdown read the tenant's whole
+-- history (measured: 384,602 rows for a 1-hour window on 1M spans; 20,247 with this
+-- key). `toStartOfHour(start_time)` is deterministic per span, so this is still a valid
+-- Replacing dedup key. HOUR is the finest bucket that keeps a trace's spans adjacent.
+ORDER BY (tenant_id, toStartOfHour(start_time), trace_id, span_id)
 -- 365d = the MAX plan retention (Enterprise) — a fail-safe BACKSTOP, not the
 -- per-plan window. Per-tenant retention (Free 7 / Builder 30 / Team 90 / Business 180
 -- / Enterprise 365) is enforced by the entitlement-driven sweep job
@@ -111,7 +122,14 @@ CREATE TABLE IF NOT EXISTS tracelane.trace_summaries
     model            SimpleAggregateFunction(max, String),
     -- Read-time from the MERGED bounds; a per-batch duration is not a component of the
     -- trace's duration, so it must never be stored.
-    duration_us      Int64 ALIAS dateDiff('microsecond', start_time, end_time)
+    duration_us      Int64 ALIAS dateDiff('microsecond', start_time, end_time),
+    -- B-379 (migration 22): the table's key STAYS (tenant_id, trace_id) — B-243's
+    -- constraint below holds — and the LIST query reads through this time-ordered
+    -- projection instead. It cannot be used under FINAL, so the list query does its
+    -- own merge with GROUP BY (SimpleAggregateFunction(max/min/sum) merges ARE
+    -- max/min/sum) over only the rows the projection returns for the window.
+    -- Measured: 1,000,576 rows for "last 50" → 33,920 at a 1-day window.
+    PROJECTION p_by_time (SELECT * ORDER BY tenant_id, start_time)
 )
 -- B-243 (migration 15): was ReplacingMergeTree(end_time) ORDER BY (tenant_id, start_time,
 -- trace_id) PARTITION BY toYYYYMM(start_time). A materialized view aggregates PER INSERT
@@ -126,7 +144,18 @@ ENGINE = AggregatingMergeTree
 PARTITION BY tuple()
 ORDER BY (tenant_id, trace_id)
 TTL toDate(start_time) + INTERVAL 365 DAY
-SETTINGS index_granularity = 8192;
+-- `deduplicate_merge_projection_mode = 'rebuild'`: 24.12 refuses a projection on an
+-- AggregatingMergeTree otherwise; `rebuild` recomputes the projection part from the
+-- merged rows, the only mode that keeps it correct as partial rows combine (B-379).
+-- `lightweight_mutation_projection_mode` is deliberately LEFT AT ITS DEFAULT (`throw`):
+-- a lightweight DELETE on this table is REFUSED (Code 344). Migration 23 (2026-09-12)
+-- reverted the `rebuild` migration 22 set, because on prod a lightweight delete under
+-- `rebuild` left `p_by_time` holding the deleted rows (14,980 in the projection over
+-- a 794-row base after the merge) — a read routed through the projection returned rows
+-- the retention sweep had removed. The sweep deletes from this table with a HEAVY
+-- `ALTER TABLE … DELETE` (`retention_sweep.rs`), which rewrites part and projection
+-- from the same surviving rows; `throw` is what stops the unsafe form coming back.
+SETTINGS index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild';
 
 -- NOTE: source columns are qualified with the table alias `s` (e.g.
 -- `min(s.start_time)`) so they resolve to the spans COLUMN, not the output
@@ -161,23 +190,6 @@ SELECT
 FROM tracelane.spans AS s
 GROUP BY s.tenant_id, s.trace_id;
 
--- ── Per-tenant usage counters ────────────────────────────────────────────────
--- Used for billing and rate-limit reporting. SummingMergeTree accumulates deltas.
-CREATE TABLE IF NOT EXISTS tracelane.usage_counters
-(
-    tenant_id     String,
-    bucket_hour   DateTime,              -- truncated to hour
-    provider      String,
-    model         String,
-    input_tokens  Int64,
-    output_tokens Int64,
-    request_count Int64
-)
-ENGINE = SummingMergeTree((input_tokens, output_tokens, request_count))
-PARTITION BY toYYYYMM(bucket_hour)
-ORDER BY (tenant_id, bucket_hour, provider, model)
-TTL toDate(bucket_hour) + INTERVAL 365 DAY
-SETTINGS index_granularity = 8192;
 
 -- ── Audit log (tamper-evident) ───────────────────────────────────────────────
 -- Append-only; hash_chain forms a Merkle chain per tenant.
@@ -356,3 +368,80 @@ CREATE TABLE IF NOT EXISTS tracelane.federation_signals (
 ) ENGINE = SummingMergeTree((signal_count, confidence_sum))
 ORDER BY (aft_class, bucket_hour, tenant_id_hash)
 TTL toDate(bucket_hour) + INTERVAL 365 DAY;
+
+-- ── SLO hourly stats (migration 06, DSH-11) — prod's definitions, verbatim ────────
+-- Added to the canonical schema 2026-09-12 (B-383 c): prod has carried this table, its
+-- MV over `spans` and the read view since migration 06, and schema.sql did not — so a
+-- self-host built from this file had no SLO view, and the per-service ClickHouse grants
+-- proof (`check-clickhouse-users.sh`) passed against ONE MV over spans while prod has
+-- TWO. Every MV over `spans` runs its SELECT as the INSERTING user, and the one this
+-- file lacked is why every span flush on prod failed for 70 minutes on 2026-09-12.
+-- Read from prod with `SELECT create_table_query FROM system.tables`; only the
+-- `IF NOT EXISTS` guards were added.
+
+CREATE TABLE IF NOT EXISTS tracelane.slo_hourly_stats (`tenant_id` String, `bucket_hour` DateTime, `provider` String, `model` String, `latency_p50` AggregateFunction(quantile(0.5), Int64), `latency_p95` AggregateFunction(quantile(0.95), Int64), `latency_p99` AggregateFunction(quantile(0.99), Int64), `request_count` AggregateFunction(count, UInt8), `error_count` AggregateFunction(countIf, UInt8), `input_tokens` AggregateFunction(sum, Int64), `output_tokens` AggregateFunction(sum, Int64)) ENGINE = AggregatingMergeTree PARTITION BY toYYYYMM(bucket_hour) ORDER BY (tenant_id, bucket_hour, provider, model) TTL toDate(bucket_hour) + toIntervalDay(365) SETTINGS index_granularity = 8192;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS tracelane.mv_slo_hourly_stats TO tracelane.slo_hourly_stats (`tenant_id` String, `bucket_hour` DateTime('UTC'), `provider` String, `model` String, `latency_p50` AggregateFunction(quantile(0.5), Int64), `latency_p95` AggregateFunction(quantile(0.95), Int64), `latency_p99` AggregateFunction(quantile(0.99), Int64), `request_count` AggregateFunction(count), `error_count` AggregateFunction(countIf, UInt8), `input_tokens` AggregateFunction(sum, Int64), `output_tokens` AggregateFunction(sum, Int64)) AS SELECT tenant_id, toStartOfHour(start_time) AS bucket_hour, coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider')) AS provider, coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name')) AS model, quantileState(0.5)(duration_us) AS latency_p50, quantileState(0.95)(duration_us) AS latency_p95, quantileState(0.99)(duration_us) AS latency_p99, countState() AS request_count, countIfState(status_code = 2) AS error_count, sumState(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_input_tokens'))) AS input_tokens, sumState(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_output_tokens'))) AS output_tokens FROM tracelane.spans GROUP BY tenant_id, bucket_hour, provider, model;
+
+CREATE VIEW IF NOT EXISTS tracelane.v_slo_stats (`tenant_id` String, `bucket_hour` DateTime, `provider` String, `model` String, `p50_ms` Float64, `p95_ms` Float64, `p99_ms` Float64, `requests` UInt64, `errors` UInt64, `error_rate_pct` Float64, `total_input_tokens` Int64, `total_output_tokens` Int64) AS SELECT tenant_id, bucket_hour, provider, model, round(quantileMerge(0.5)(latency_p50) / 1000, 1) AS p50_ms, round(quantileMerge(0.95)(latency_p95) / 1000, 1) AS p95_ms, round(quantileMerge(0.99)(latency_p99) / 1000, 1) AS p99_ms, countMerge(request_count) AS requests, countMerge(error_count) AS errors, round((countMerge(error_count) * 100.) / greatest(countMerge(request_count), 1), 2) AS error_rate_pct, sumMerge(input_tokens) AS total_input_tokens, sumMerge(output_tokens) AS total_output_tokens FROM tracelane.slo_hourly_stats GROUP BY tenant_id, bucket_hour, provider, model;
+
+-- ── BILL-01 (migration 24, 2026-09-13, ADR-076) — meter storage + content-addressed blobs ──
+-- Mirrors infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql so a FRESH
+-- install gets the six meters' tables. The hot→cold tiering ALTERs are NOT here: they need
+-- the `hot_cold` storage policy from infra/prod/clickhouse/config.xml and are applied by
+-- hand after that policy exists (see the migration's §5). Column docs live in the migration.
+
+CREATE TABLE IF NOT EXISTS tracelane.meter_counters
+(
+    tenant_id   String,
+    day         Date,
+    meter       LowCardinality(String),
+    dim         String DEFAULT '',
+    value       Float64,
+    source      LowCardinality(String) DEFAULT '',
+    recorded_at DateTime64(3, 'UTC') DEFAULT now64()
+)
+ENGINE = SummingMergeTree(value)
+PARTITION BY toYYYYMM(day)
+ORDER BY (tenant_id, day, meter, dim, source)
+TTL day + INTERVAL 800 DAY
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.meter_gauges
+(
+    tenant_id   String,
+    day         Date,
+    meter       LowCardinality(String),
+    value       Float64,
+    computed_at DateTime64(3, 'UTC') DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(computed_at)
+PARTITION BY toYYYYMM(day)
+ORDER BY (tenant_id, day, meter)
+TTL day + INTERVAL 800 DAY
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.blobs
+(
+    tenant_id  String,
+    hash       FixedString(32),
+    bytes      String CODEC(ZSTD(3)),
+    size       UInt32,
+    first_seen DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (tenant_id, hash)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.blob_refs
+(
+    tenant_id String,
+    hash      FixedString(32),
+    span_id   String,
+    day       Date
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(day)
+ORDER BY (tenant_id, hash, day)
+TTL day + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;

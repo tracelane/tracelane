@@ -9,7 +9,7 @@
 # `llama-3.3-70b` goes to groq, exactly as the hand-written match arms did.
 #
 # New rows derive from https://models.dev/api.json (MIT, (c) 2025 models.dev).
-# source sha256: f3d0434884abb43cac98fbfd95d5f925ffd2695754d73762c20233a6d914d12c
+# source sha256: 7cdd618b8f1917689567c70fb7433b9d7160dcad27f8085a17f5775406e6f9de
 # Existing rows derive from crates/gateway/src/providers/mod.rs itself, so a
 # regeneration can never re-point live production traffic.
 id	label	base_url	base_url_env	api_key_env	prefixes
@@ -176,3 +176,25 @@ zenifra	Zenifra	https://ai.zenifra.com	ZENIFRA_BASE_URL	ZENIFRA_AI_KEY	zenifra/
 zenmux	ZenMux	https://zenmux.ai/api	ZENMUX_BASE_URL	ZENMUX_API_KEY	zenmux/
 zhipuai	Zhipu AI	https://open.bigmodel.cn/api/paas/v4	ZHIPUAI_BASE_URL	ZHIPU_API_KEY	zhipuai/
 zhipuai-coding-plan	Zhipu AI Coding Plan	https://open.bigmodel.cn/api/coding/paas/v4	ZHIPUAI_CODING_PLAN_BASE_URL	ZHIPU_API_KEY	zhipuai-coding-plan/
+above	above.dev	https://api.above.dev	ABOVE_BASE_URL	ABOVE_API_KEY	above/
+agentrouter	AgentRouter	https://agentrouter.org	AGENTROUTER_BASE_URL	AGENTROUTER_API_KEY	agentrouter/
+agnes	Agnes AI	https://apihub.agnes-ai.com	AGNES_BASE_URL	AGNES_API_KEY	agnes/
+aixy	Aixy	https://api.aixy-gateway.com	AIXY_BASE_URL	AIXY_API_KEY	aixy/
+bothub	Bothub	https://openai.bothub.ru	BOTHUB_BASE_URL	BOTHUB_API_KEY	bothub/
+echo	Echo	https://echo.tracerml.ai	ECHO_BASE_URL	ECHO_API_KEY	echo/
+iteracompute	IteraCompute	https://api.iteracompute.com	ITERACOMPUTE_BASE_URL	ITERACOMPUTE_API_KEY	iteracompute/
+klokintegration	klokintegration.se	https://api-gw.klok.ipaas.se/proxy/kloker-key	KLOKINTEGRATION_BASE_URL	KLOKINTEGRATION_API_KEY	klokintegration/
+llmgateway-providers	LLM Gateway	https://api.llmgateway.io	LLMGATEWAY_PROVIDERS_BASE_URL	LLMGATEWAY_API_KEY	llmgateway-providers/
+llmtech	LLM Tech	https://api.llmtech.eu	LLMTECH_BASE_URL	LLMTECH_API_KEY	llmtech/
+nan	NaN	https://api.nan.builders	NAN_BASE_URL	NAN_API_KEY	nan/
+openreason	OpenReason	https://api.openreason.app	OPENREASON_BASE_URL	OPENREASON_API_KEY	openreason/
+opper	Opper	https://api.opper.ai/v3/compat	OPPER_BASE_URL	OPPER_API_KEY	opper/
+pendra	Pendra	https://api.pendra.ai/api	PENDRA_BASE_URL	PENDRA_API_KEY	pendra/
+scx-ai	SCX.ai	https://api.scx.ai	SCX_AI_BASE_URL	SCX_API_KEY	scx-ai/
+sensenova	SenseNova (China)	https://token.sensenova.cn	SENSENOVA_BASE_URL	SENSENOVA_API_KEY	sensenova/
+standardcompute	Standard Compute	https://api.stdcmpt.com	STANDARDCOMPUTE_BASE_URL	STANDARDCOMPUTE_API_KEY	standardcompute/
+tokengo	TokenGo	https://api.tokengo.com	TOKENGO_BASE_URL	TOKENGO_API_KEY	tokengo/
+tokenrouter	TokenRouter	https://api.tokenrouter.com	TOKENROUTER_BASE_URL	TOKENROUTER_API_KEY	tokenrouter/
+vancine	Vancine	https://vancine.com	VANCINE_BASE_URL	VANCINE_API_KEY	vancine/
+volcengine	Volcengine Ark	https://ark.cn-beijing.volces.com/api/v3	VOLCENGINE_BASE_URL	ARK_API_KEY	volcengine/
+volcengine-coding-plan	Volcengine Ark Coding Plan	https://ark.cn-beijing.volces.com/api/coding/v3	VOLCENGINE_CODING_PLAN_BASE_URL	ARK_CODING_PLAN_API_KEY	volcengine-coding-plan/

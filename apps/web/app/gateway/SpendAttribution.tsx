@@ -70,11 +70,12 @@ function label(by: CostBreakdown["by"], dimension: string): string {
 
 export function SpendAttribution({
 	data,
-	range,
+	hrefFor,
 	by,
 }: {
 	data: CostBreakdown | null;
-	range?: string;
+	/** The `?by=` href for a dimension, carrying the page's window (built by the page). */
+	hrefFor: (by: CostBreakdown["by"]) => string;
 	by: CostBreakdown["by"];
 }) {
 	/**
@@ -100,12 +101,7 @@ export function SpendAttribution({
 			label="Attribute spend by"
 			value={by}
 			options={DIMENSIONS.map((d) => ({ value: d.by, label: d.label }))}
-			hrefFor={(v) => {
-				const params = new URLSearchParams();
-				if (range) params.set("range", range);
-				params.set("by", v);
-				return `/gateway?${params.toString()}`;
-			}}
+			hrefFor={hrefFor}
 		/>
 	);
 

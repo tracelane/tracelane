@@ -11,6 +11,14 @@ name: Release container (GHCR)
 # the signature + the SLSA attestation against the pushed digest. The repo's
 # WSL/CI dev box has no Docker, so this path is validated on a Docker host only.
 
+# ── HOSTED-RUNNER COST (founder, 2026-09-07) ────────────────────────────────
+# Hardcoded `ubuntu-latest` (needs Docker Buildx + GHCR OIDC) — cannot move to
+# the self-hosted opt-in the way light workflows did. A `v*` TAG PUSH IS ITSELF
+# A FOUNDER ACTION and counts as the approval the cost rule asks for. `on: push:
+# tags` fires wherever the tag lands, and this file carried no repository
+# condition — a tag pushed to THIS (private, billed) repo would also build+push
+# GHCR images under `ghcr.io/<this repo>/...` for nothing. PUBLIC-ONLY now
+# (release.yml carries the same reasoning at more length).
 on:
   push:
     tags: ["v*"]
@@ -22,6 +30,7 @@ permissions:
 jobs:
   build-push-sign:
     name: Build · push · sign · SBOM · provenance (${{ matrix.image }})
+    if: github.repository == 'tracelane/tracelane'
     runs-on: ubuntu-latest
     # BOTH images, because infra/self-host/docker-compose.yml pulls BOTH.
     # Until 2026-08-01 this workflow built only `gateway`, so

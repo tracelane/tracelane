@@ -1,0 +1,86 @@
+---
+title: "Gateway overhead benchmark"
+description: "How much latency the Tracelane gateway adds on top of the model, measured with LiteLLM's open AIGatewayBench harness on a 4 vCPU host, alongside Bifrost, Portkey and LiteLLM."
+classification: PUBLIC
+---
+
+Gateway overhead is the time a gateway adds between your client and the model provider:
+authentication, policy, capture, routing, and the network hop. It is the one number every
+gateway comparison argues about, so we measured ours with a harness we did not write.
+
+## Method
+
+- **Harness:** [AIGatewayBench](https://github.com/BerriAI/ai-gateway-bench) by LiteLLM
+  (MIT), commit `ff372fc`, plus three patches of ours (below). Every gateway is pointed at
+  the harness's deterministic mock upstream with **zero injected latency**, so
+  `overhead = latency(client → gateway → mock) − latency(client → mock)` per percentile.
+- **Route:** `POST /v1/chat/completions` with an OpenAI-shaped body for every gateway,
+  16 concurrent clients for 30 seconds (Locust). Each run drove about 4,400 to 4,600 requests
+  per gateway; LiteLLM Python drove about 3,800, because its higher per-request latency means
+  fewer requests fit in the same 30 seconds.
+- **Host:** one Hetzner CCX23 (4 vCPU, 16 GB), provisioned for the run and deleted afterwards.
+  LiteLLM's own [benchmark post](https://docs.litellm.ai/blog/rust-ai-gateway-benchmarks) states
+  a 4 vCPU / 16 GB instance for its published numbers. The mock, the load
+  generator and each gateway ran on that host; the mock was addressed by the host's public
+  address for every gateway.
+- **Tracelane configuration:** self-host mode, capture **on** (spans written to NATS and
+  ClickHouse during the run), `TRACELANE_SELF_HOST_TIER=enterprise`. A gateway that scores
+  well because it stopped recording is not the product.
+- **Two runs**, back to back, both reported.
+
+### The three patches
+
+1. `gateways/tracelane/` and an OpenAI-route overhead scenario, so every gateway runs the
+   same request on the same route.
+2. `mock-upstream`: zero pacing means zero. With `MOCK_TTFT_MS=0 MOCK_ITL_MS=0` the mock's
+   streaming path still cost about 50 ms per response, because each zero-length
+   `tokio::time::sleep` waits for the runtime's timer tick.
+3. `mock-upstream`: `TCP_NODELAY` on accepted connections. Without it, a streamed response
+   of many small writes stalls about 40 ms on the last segment.
+
+Patches 2 and 3 only affect a gateway that **streams** from the mock. Tracelane's Anthropic
+adapter always streams upstream, so without them Tracelane alone was charged 40 to 250 ms
+of mock behaviour. The patches are in our fork and offered upstream; the other gateways'
+figures were unchanged by them.
+
+## Results, 2026-09-07
+
+Overhead over the direct-to-mock baseline, milliseconds. Lower is less added latency.
+
+| Gateway | Version | Run 1 p50 / p95 / p99 | Run 2 p50 / p95 / p99 | Peak RSS |
+|---|---|---|---|---|
+| Tracelane | `1f3af9ad` | 2 / 4 / 5 | 2 / 4 / 5 | 14 MB |
+| Bifrost | v2.0.0 † | 2 / 2 / 3 | 2 / 2 / 3 | 101 MB |
+| Portkey (OSS) | 1.15.2 | 4 / 7 / 9 | 3 / 5 / 8 | 177 MB (run 1; run 2 not sampled) |
+| LiteLLM Python | 1.100.0 | 15 / 36 / 52 | 14 / 34 / 47 | 323 MB |
+| LiteLLM Rust | — | not measured ‡ | not measured ‡ | — |
+
+The direct baseline was p50 1 ms, p95 2 ms, p99 3 ms. Peak RSS is the gateway process only,
+from run 2 unless stated; Tracelane's figure excludes the NATS and ClickHouse containers it
+writes to, which are part of a Tracelane deployment and are not part of the others.
+
+† The same `npx -y @maximhq/bifrost` invocation both runs; the version string is emitted only
+on first install, so the run 2 CSV records it as `unknown`.
+‡ As of 2026-09-07 no public build exists: the harness's own notes build LiteLLM Rust from a
+private branch on LiteLLM's machine. When one is published we will run it.
+
+## What this does and does not say
+
+- It measures added latency at 16 concurrent clients on one small host with a mock
+  upstream. It does not measure throughput ceilings, streaming inter-chunk latency, or
+  behaviour against a real provider.
+- Capture was on for Tracelane. The other gateways ran their default configurations as
+  documented in the harness.
+- The numbers are two runs, one day. Our own hot-path check on production, taken at each
+  deploy, reads p50 below 1 ms for the gateway's processing alone; that is a different
+  measurement (no client-side network, no load generator) and is not the figure above.
+
+## Reproduce it
+
+```bash
+git clone https://github.com/tracelane/tracelane && cd tracelane
+bash bench/gateway/aigatewaybench/run.sh      # clones the pinned harness, applies the patches, runs every gateway
+```
+
+The raw CSVs for the runs above are in `bench/gateway/aigatewaybench/results/`, each with
+the host, kernel, load average, harness commit and mock settings in its header.

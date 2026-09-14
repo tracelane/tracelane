@@ -132,18 +132,18 @@ impl BreakerState {
 static TRIP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot for the `tracelane_circuit_breaker_*` metrics scrape.
-pub fn metrics_snapshot() -> (u64, u64) {
-    (
-        TRIP_TOTAL.load(Ordering::Relaxed),
-        REJECT_TOTAL.load(Ordering::Relaxed),
-    )
-}
+// `metrics_snapshot` (a `(trip_total, reject_total)` reader for the
+// `tracelane_circuit_breaker_*` scrape) was deleted 2026-09-12 (B-390) —
+// zero callers anywhere, including tests; nothing exports these two
+// counters to the metrics endpoint yet.
 
 /// Process-wide read handle to the live breaker, registered once at server start
 /// (mirrors `rejection_metrics::registry()`). Lets the /gateway stats handler read
 /// a breaker snapshot without threading `Arc<CircuitBreaker>` through every read
 /// state. Unregistered (e.g. unit tests) → an empty snapshot.
+// B-386: stays global — a READ HANDLE only. The breaker itself is owned by
+// `AppState::circuit_breaker`; this is registered from it at boot so the
+// `/v1/gateway` stats route (a different state type) can snapshot it.
 static BREAKER_REGISTRY: OnceLock<Arc<CircuitBreaker>> = OnceLock::new();
 
 /// Register the process breaker for the read surfaces. Idempotent (first wins).
@@ -292,9 +292,29 @@ impl CircuitBreaker {
         }
     }
 
-    /// Current state — for tests and the `tracelane.upstream.circuit` attribute.
+    /// Current state.
+    ///
+    /// No production caller today — nothing sets a
+    /// `tracelane.upstream.circuit` span attribute from this yet (corrected
+    /// 2026-09-12, B-390; the doc used to claim it did). Used only by
+    /// tests, hence gated.
+    #[cfg(test)]
     pub fn state(&self, provider: &str, region: &str) -> State {
         self.entry(provider, region).lock().state
+    }
+
+    /// The outcomes recorded for `(provider, region)`, oldest first — i.e. how
+    /// many times, and with what, the breaker was FED. B-385 (2c): the chaos
+    /// harness asserts a 503-then-200 dispatch feeds the breaker ONCE, with the
+    /// final outcome, rather than once per attempt. Test-only.
+    #[cfg(test)]
+    pub fn outcomes(&self, provider: &str, region: &str) -> Vec<bool> {
+        self.entry(provider, region)
+            .lock()
+            .window
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Current state of every LIVE breaker as `(provider, region, state)`, for the

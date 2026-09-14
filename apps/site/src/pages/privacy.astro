@@ -1,79 +1,86 @@
 ---
 import Base from "../layouts/Base.astro";
+import { plan } from "../lib/plans";
+
+// ADR-076: retention is now tier-differentiated (an indexed window plus a
+// longer queryable-history window), read from apps/web/db/plans.v3.json —
+// never a flat figure typed here.
+const free = plan("free_v1");
+const enterprise = plan("enterprise_v1");
 ---
 
 <Base
   title="Privacy · Tracelane"
   description="What Tracelane collects across the website and the hosted product, where it lives, how long it is kept, and how to have it deleted."
 >
-  <section class="container-prose py-24">
-    <p class="font-mono text-xs text-fg-dim mb-4 tracking-wider lowercase">privacy policy</p>
-    <h1 class="text-3xl sm:text-4xl font-semibold tracking-tight text-fg">Privacy.</h1>
-    <p class="mt-6 text-lg text-fg-muted leading-relaxed">
+  <section class="container-prose prose-page" style="padding-block:clamp(3.5rem,8vw,6.5rem) clamp(5rem,9vw,8.5rem)">
+    <p class="eyebrow mb-5">privacy policy</p>
+    <h1 class="display-lg text-fg">Privacy.</h1>
+    <p class="mt-6 lede">
       This is the single privacy policy for Tracelane. It covers both tracelane.dev — the website you are reading — and the hosted product: the gateway, the dashboard, and the audit ledger.
     </p>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">What we collect on the website</h2>
-    <ul class="mt-4 space-y-2 text-fg-muted">
-      <li>— Your email address, if you submit the product-updates form.</li>
-      <li>— Your IP country (two-letter code, from Cloudflare's CF-IPCountry header) and a truncated User-Agent string, stored alongside your email for abuse detection only.</li>
-      <li>— Cloudflare Web Analytics aggregate data: page views, referrer, geographic region. Server-side beacon, no cookies set in your browser.</li>
+    <h2 class="text-fg">What we collect on the website</h2>
+    <ul class="text-fg-muted">
+      <li>Your email address, if you submit the product-updates form.</li>
+      <li>Your IP country (two-letter code, from Cloudflare's CF-IPCountry header) and a truncated User-Agent string, stored alongside your email for abuse detection only.</li>
+      <li>Cloudflare Web Analytics aggregate data: page views, referrer, geographic region. Server-side beacon, no cookies set in your browser.</li>
     </ul>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">What we don't collect on the website</h2>
-    <ul class="mt-4 space-y-2 text-fg-muted">
-      <li>— No cookies are set by tracelane.dev. Nothing in your browser to delete.</li>
-      <li>— No third-party trackers. No Google Analytics. No Plausible JS. No Segment. No HubSpot. No Marketo. No Intercom widget.</li>
-      <li>— No fingerprinting.</li>
+    <h2 class="text-fg">What we don't collect on the website</h2>
+    <ul class="text-fg-muted">
+      <li>No cookies are set by tracelane.dev. Nothing in your browser to delete.</li>
+      <li>No third-party trackers. No Google Analytics. No Plausible JS. No Segment. No HubSpot. No Marketo. No Intercom widget.</li>
+      <li>No fingerprinting.</li>
     </ul>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">What the product processes</h2>
+    <h2 class="text-fg">What the product processes</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
       When you send traffic through the Tracelane gateway or ship telemetry to it, we process:
     </p>
-    <ul class="mt-4 space-y-2 text-fg-muted">
-      <li>— <span class="text-fg">Account identity.</span> Your email, name, and workspace membership, held by our identity provider.</li>
-      <li>— <span class="text-fg">Trace telemetry.</span> Spans describing each run: model, provider, token counts, latency, cost, status, tool calls, and the causal structure of the run.</li>
-      <li>— <span class="text-fg">Prompt and completion content</span> — <span class="text-fg">we do not capture it.</span> Neither the gateway nor our SDKs record your message bodies; we store the shape of a run without its text. The only way prompt text reaches us is if your own OpenTelemetry instrumentation sends it to us explicitly.</li>
-      <li>— <span class="text-fg">Provider API keys (BYOK).</span> Your own provider keys, envelope-encrypted at rest and bound to your workspace. They are never written to logs, spans, or error messages.</li>
-      <li>— <span class="text-fg">Audit ledger records.</span> A tamper-evident hash chain over gateway-proxied calls and guardrail verdicts.</li>
+    <ul class="text-fg-muted">
+      <li><span class="text-fg">Account identity.</span> Your email, name, and workspace membership, held by our identity provider.</li>
+      <li><span class="text-fg">Trace telemetry.</span> Spans describing each run: model, provider, token counts, latency, cost, status, tool calls, and the causal structure of the run.</li>
+      <li><span class="text-fg">Prompt and completion content</span> — <span class="text-fg">we do not capture it.</span> Neither the gateway nor our SDKs record your message bodies; we store the shape of a run without its text. The only way prompt text reaches us is if your own OpenTelemetry instrumentation sends it to us explicitly.</li>
+      <li><span class="text-fg">Provider API keys (BYOK).</span> Your own provider keys, envelope-encrypted at rest and bound to your workspace. They are never written to logs, spans, or error messages.</li>
+      <li><span class="text-fg">Audit ledger records.</span> A tamper-evident hash chain over gateway-proxied calls and guardrail verdicts.</li>
     </ul>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Where your data lives</h2>
+    <h2 class="text-fg">Where your data lives</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
       Hosted Tracelane runs in the European Union. Trace data is not replicated outside your region.
     </p>
-    <ul class="mt-4 space-y-2 text-fg-muted">
-      <li>— <span class="text-fg">Compute and hot trace storage</span> — Hetzner, Falkenstein, Germany.</li>
-      <li>— <span class="text-fg">Cold trace storage</span> — Cloudflare R2, EU jurisdiction.</li>
-      <li>— <span class="text-fg">Account and workspace metadata</span> — Neon Postgres, Frankfurt, Germany.</li>
-      <li>— <span class="text-fg">Website updates list</span> — Cloudflare D1, pinned to Cloudflare's nearest edge to the submitter, not replicated cross-region.</li>
+    <ul class="text-fg-muted">
+      <li><span class="text-fg">Compute and hot trace storage</span> — Hetzner, Falkenstein, Germany.</li>
+      <li><span class="text-fg">Cold trace storage</span> — Cloudflare R2, EU jurisdiction.</li>
+      <li><span class="text-fg">Account and workspace metadata</span> — Neon Postgres, Frankfurt, Germany.</li>
+      <li><span class="text-fg">Website updates list</span> — Cloudflare D1, pinned to Cloudflare's nearest edge to the submitter, not replicated cross-region.</li>
     </ul>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Sub-processors</h2>
+    <h2 class="text-fg">Sub-processors</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
       A deliberately short list. Each one is here because it is load-bearing, not for convenience.
     </p>
-    <ul class="mt-4 space-y-2 text-fg-muted">
-      <li>— <span class="text-fg">Hetzner Online GmbH</span> (Falkenstein, DE) — compute and hot trace storage.</li>
-      <li>— <span class="text-fg">Cloudflare, Inc.</span> — CDN, Workers, R2 cold storage (EU), and D1 for the website updates list.</li>
-      <li>— <span class="text-fg">Neon, Inc.</span> (Frankfurt, DE) — Postgres for account and workspace metadata.</li>
-      <li>— <span class="text-fg">WorkOS, Inc.</span> — authentication, workspace membership, and SSO.</li>
-      <li>— <span class="text-fg">Polar Software Inc.</span> — Merchant of Record for subscriptions and payments. Card details go to Polar and its processor; we never see or store them.</li>
+    <ul class="text-fg-muted">
+      <li><span class="text-fg">Hetzner Online GmbH</span> (Falkenstein, DE) — compute and hot trace storage.</li>
+      <li><span class="text-fg">Cloudflare, Inc.</span> — CDN, Workers, R2 cold storage (EU), and D1 for the website updates list.</li>
+      <li><span class="text-fg">Neon, Inc.</span> (Frankfurt, DE) — Postgres for account and workspace metadata.</li>
+      <li><span class="text-fg">WorkOS, Inc.</span> — authentication, workspace membership, and SSO.</li>
+      <li><span class="text-fg">Polar Software Inc.</span> — Merchant of Record for subscriptions and payments. Card details go to Polar and its processor; we never see or store them.</li>
     </ul>
     <p class="mt-4 text-fg-muted leading-relaxed">
       We never send your prompts or completions to a model provider on our own initiative. You bring your own provider keys, and traffic goes to the provider you selected.
     </p>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">How long we keep it</h2>
+    <h2 class="text-fg">How long we keep it</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
-      Trace retention is <span class="text-fg">the same on every plan</span>: data may be retained up to 365 days. There is no per-tier expiry clock — automated per-tier trimming is built but not enabled, so nothing trims your data below that window today. Longer retention is never a shortcut around erasure: deletion on request is unaffected.
+      Trace retention has two windows that differ by plan: an <span class="text-fg">indexed window</span> for fast queries ({free.indexed_window_days} days on Free, up to {enterprise.indexed_window_days}+ days on Enterprise) and a longer <span class="text-fg">queryable history</span> ({free.queryable_days} days on Free, {enterprise.queryable_days} days on every paid tier) during which older data is still readable from cold storage. See <a href="/pricing" class="link-accent">/pricing</a> for the full per-tier figures. Longer retention is never a shortcut around erasure: deletion on request is unaffected.
     </p>
     <p class="mt-4 text-fg-muted leading-relaxed">
       The tamper-evident audit ledger is retained for the life of the ledger by design: a record you can selectively delete is not a tamper-evident record.
     </p>
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Deletion and your rights</h2>
+    <h2 class="text-fg">Deletion and your rights</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
       Email <code class="font-mono text-fg">support@tracelane.dev</code> and we will remove your tenant's trace data and account metadata. Deletion is handled manually by our team today — there is no self-serve erasure endpoint, and the append-only audit ledger is retained as described above. GDPR data-subject requests and India DPDP rights requests are handled through the same address, as is removal from the website updates list.
     </p>
@@ -83,7 +90,7 @@ import Base from "../layouts/Base.astro";
          route, DPDP Consent Manager position, whether a DPO is required at this scale, and
          the international-transfer basis (SCCs) for WorkOS and Polar as US sub-processors. */}
 
-    <h2 class="mt-16 text-2xl font-semibold tracking-tight text-fg">Changes</h2>
+    <h2 class="text-fg">Changes</h2>
     <p class="mt-4 text-fg-muted leading-relaxed">
       This policy may change. If it changes materially, anyone with an account or on the updates list gets a single email explaining what changed before the change takes effect.
     </p>

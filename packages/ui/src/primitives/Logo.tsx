@@ -79,11 +79,11 @@ export function Logo({
 	// each bar ends exactly where the outer ring begins. In the small cut the centre
 	// is a solid disc, so the bars run to ITS edge instead.
 	const paths = small
-		? [...corners(30, 14), "M 8,44 H 34 V 56 H 8 Z", "M 66,44 H 92 V 56 H 66 Z"]
+		? [...corners(28, 10), "M 8,46 H 34 V 54 H 8 Z", "M 66,46 H 92 V 54 H 66 Z"]
 		: [
-				...corners(26, 12),
-				"M 8,44 H 25.5 V 56 H 8 Z",
-				"M 74.5,44 H 92 V 56 H 74.5 Z",
+				...corners(22, 8),
+				"M 8,46.5 H 25.5 V 53.5 H 8 Z",
+				"M 74.5,46.5 H 92 V 53.5 H 74.5 Z",
 			];
 
 	return (
@@ -104,7 +104,7 @@ export function Logo({
 					<path key={d} d={d} fill="currentColor" />
 				))}
 				{small ? (
-					<circle cx="50" cy="50" r="16" fill="currentColor" />
+					<circle cx="50" cy="50" r="12" fill="currentColor" />
 				) : (
 					<>
 						<circle
@@ -113,7 +113,7 @@ export function Logo({
 							r="22"
 							fill="none"
 							stroke="currentColor"
-							strokeWidth="7"
+							strokeWidth="4"
 						/>
 						<circle
 							cx="50"
@@ -121,7 +121,7 @@ export function Logo({
 							r="8.5"
 							fill="none"
 							stroke="currentColor"
-							strokeWidth="6"
+							strokeWidth="3.5"
 						/>
 					</>
 				)}

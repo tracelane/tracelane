@@ -52,7 +52,17 @@ ignore:
   # This rule names the ADVISORY as well as the package (unlike the package-only rules
   # above) so any OTHER brace-expansion advisory still fires. The genuinely vulnerable
   # 2.1.2 cannot return: pnpm overrides floor the 2.x line at >=2.1.4 and the >=3 line
-  # at >=5.0.8. Mirrors osv-scanner.toml + package.json auditConfig.ignoreGhsas.
+  # at >=5.0.8. Mirrors osv-scanner.toml.
+  #
+  # ⚠️ 2026-09-10 — THE "not branch-aware" PREMISE ABOVE IS NO LONGER TRUE, and the
+  # package.json half of this mirror is GONE. GitHub has since re-cut the advisory into
+  # per-branch ranges (`>=4.0.0 <5.0.8`, `>=3.0.0 <3.0.3`, `>=2.0.0 <2.1.3`, `<1.1.17`),
+  # read from `gh api /advisories/GHSA-mh99-v99m-4gvg`. Our resolved copies are 2.1.4 and
+  # 5.0.9, both above their branch's fix — so `pnpm audit` with ignoreGhsas EMPTIED no
+  # longer reports it at all (measured), and the entry was deleted from package.json as a
+  # mute that muted nothing. THIS rule is kept only because Grype carries its own
+  # vulnerability DB and may still hold the flat range; delete it the first time a Grype
+  # run reports it as unused. Do not re-add the package.json entry.
   # REVIEW: 2026-11-07
   - vulnerability: GHSA-mh99-v99m-4gvg
     package:

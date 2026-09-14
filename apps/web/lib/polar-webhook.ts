@@ -139,44 +139,49 @@ export function verifySignature(opts: {
 /** tenants.plan enum values (planEnum in db/schema.ts). */
 export type PlanEnum = "builder" | "team" | "business" | "enterprise";
 
-/** Polar product `metadata.lookup_key` → (plan enum, lookup key). */
-const PLAN_KEYS: Record<string, PlanEnum> = {
-	builder_v1: "builder",
-	team_v1: "team",
-	business_v1: "business",
-	enterprise_v1: "enterprise",
-};
+export type BillingInterval = "month" | "year";
 
 /**
- * Add-on / meter lookup keys (ADR-020). These are NOT plans (see ADR-020 / G5)
- * — a subscription event carrying one is a real purchase we do not yet apply
- * (add-on grant wiring is P2), so the caller logs it LOUDLY rather than
- * treating it as a silent unknown.
+ * Polar product `metadata.lookup_key` → (plan enum, lookup key, interval).
+ * ADR-076: monthly and annual are SEPARATE Polar products (Polar's own rule —
+ * one product per pricing model), so each paid tier carries TWO lookup keys:
+ * `<plan>_v1` (monthly) and `<plan>_v1_year` (annual). Both map to the same
+ * plan; the interval is read off which key actually arrived.
  */
-export const ADD_ON_LOOKUP_KEYS = new Set([
-	"audit_addon_v1",
-	"overage_v1",
-	"team_extra_seat_v1",
-	"business_extra_seat_v1",
-	"hipaa_gcp_addon_v1",
-]);
-
-/** Is `key` a known add-on/meter lookup key (vs a base plan or truly unknown)? */
-export function isAddOnLookupKey(key: string | null | undefined): boolean {
-	return key != null && ADD_ON_LOOKUP_KEYS.has(key);
-}
+const PLAN_KEYS: Record<string, { plan: PlanEnum; interval: BillingInterval }> =
+	{
+		builder_v1: { plan: "builder", interval: "month" },
+		builder_v1_year: { plan: "builder", interval: "year" },
+		team_v1: { plan: "team", interval: "month" },
+		team_v1_year: { plan: "team", interval: "year" },
+		business_v1: { plan: "business", interval: "month" },
+		business_v1_year: { plan: "business", interval: "year" },
+		// Enterprise has no self-serve annual product (custom contract) — monthly
+		// key only.
+		enterprise_v1: { plan: "enterprise", interval: "month" },
+	};
 
 export type PlanResolution =
-	| { kind: "plan"; planEnum: PlanEnum; lookupKey: string }
+	| {
+			kind: "plan";
+			planEnum: PlanEnum;
+			lookupKey: string;
+			interval: BillingInterval;
+	  }
 	| { kind: "free"; lookupKey: "free_v1" }
 	| { kind: "unknown"; rawKey: string | null };
 
+// `unpaid` is a Polar SUBSCRIPTION STATUS (past the retry schedule, benefits
+// revoked on Polar's side) — ADR-076 drops the tenant to Free on it exactly
+// like canceled/revoked, with data held (`billing_policy.dunning_data_hold_days`).
 const CANCEL_EVENTS = /canceled|revoked/;
+const CANCEL_STATUSES = new Set(["canceled", "revoked", "unpaid"]);
 
 /**
- * Resolve the target plan from a subscription event. Canceled/revoked → free.
- * A known `lookup_key` → that plan. Anything else → unknown (caller acks 200
- * so Polar stops retrying, and logs it; add-on keys are logged loudly).
+ * Resolve the target plan from a subscription event. Canceled/revoked/unpaid
+ * → free. A known `lookup_key` → that plan + its interval. Anything else →
+ * unknown (caller acks 200 so Polar stops retrying, and logs it; add-on keys
+ * are logged loudly).
  */
 export function resolvePlan(opts: {
 	eventType: string;
@@ -185,17 +190,70 @@ export function resolvePlan(opts: {
 }): PlanResolution {
 	const canceled =
 		CANCEL_EVENTS.test(opts.eventType) ||
-		opts.status === "canceled" ||
-		opts.status === "revoked";
+		(opts.status != null && CANCEL_STATUSES.has(opts.status));
 	if (canceled) return { kind: "free", lookupKey: "free_v1" };
 
 	const key = opts.lookupKey ?? null;
-	if (key && key in PLAN_KEYS) {
+	const mapped = key ? PLAN_KEYS[key] : undefined;
+	if (mapped) {
 		return {
 			kind: "plan",
-			planEnum: PLAN_KEYS[key] as PlanEnum,
-			lookupKey: key,
+			planEnum: mapped.plan,
+			lookupKey: key as string,
+			interval: mapped.interval,
 		};
 	}
 	return { kind: "unknown", rawKey: key };
+}
+
+/** True on any Polar subscription status meaning "currently paying, healthy". */
+export function isActiveStatus(status: string | null | undefined): boolean {
+	return status === "active" || status === "trialing";
+}
+
+/** True on the "in dunning, still trying to collect" status. */
+export function isPastDueStatus(status: string | null | undefined): boolean {
+	return status === "past_due";
+}
+
+// ── B-388 (2026-09-12): event ordering ──────────────────────────────────────
+//
+// HMAC + idempotency stop the SAME event applying twice; they say nothing about
+// two DIFFERENT events arriving out of order — a retried `subscription.updated`
+// (active) delivered after `subscription.canceled` would re-activate the plan.
+// The subscription object carries Polar's own clock (`modified_at`); we persist
+// the last one applied per tenant and refuse anything older.
+
+/**
+ * The event's own clock: Polar's `data.modified_at`, else the Standard Webhooks
+ * envelope `timestamp`. `null` when neither parses — the caller then APPLIES
+ * (fail-open for the plan state: refusing a customer's paid plan because a
+ * timestamp was malformed is the worse failure).
+ */
+export function eventClock(
+	data: Record<string, unknown>,
+	envelopeTimestamp: unknown,
+): Date | null {
+	for (const raw of [data.modified_at, envelopeTimestamp]) {
+		if (typeof raw === "string") {
+			const d = new Date(raw);
+			if (!Number.isNaN(d.getTime())) return d;
+		}
+	}
+	return null;
+}
+
+/**
+ * True when the stored clock is STRICTLY newer than the event's — the event is
+ * a stale retry and must not be applied. Equal clocks apply (Polar can emit
+ * `created` and `updated` in the same instant, and the later-received one is
+ * idempotently the same state); a missing stored clock (every tenant before
+ * this shipped) applies; an unparsable event clock applies.
+ */
+export function isStale(
+	storedAt: Date | null | undefined,
+	eventAt: Date | null,
+): boolean {
+	if (!storedAt || !eventAt) return false;
+	return storedAt.getTime() > eventAt.getTime();
 }

@@ -93,6 +93,120 @@ if [ "${1:-}" = "--selftest" ]; then
     fi
     cp "$tmpd/nsa.bak" "$ROOT/docs/reference/NEVER_SAY_AGAIN.md"
 
+    # 5. B-217 SIGPIPE regression guard. The original defect: `echo "$hits" |
+    # head -8` under `set -eo pipefail` exited 141 whenever a check had MORE
+    # than 8 hits — which was the private tree's steady state (hundreds of
+    # hits per leakage category), so the guard died mid-run on nearly every
+    # real invocation and reported only the checks it reached before dying.
+    # Fixed by `printf '%s\n' "$hits" | sed -n '1,8p'`, which reads its input
+    # to the end and cannot close the pipe early. A synthetic few-line fixture
+    # cannot reliably reproduce the timing (a small write can complete before
+    # `head` even closes its end), so this proves it against the REAL tree,
+    # which already carries hundreds of hits per category — comfortably past
+    # any pipe-buffer timing that could hide a regression.
+    rc=0
+    bash "$0" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 141 ]; then
+        echo "  ✗ SIGPIPE REGRESSION: a full run exited 141 instead of completing"
+        st_fail=$((st_fail+1))
+    elif [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+        echo "  ✓ a full run against the real tree completes (exit $rc, never 141)"
+    else
+        echo "  ✗ a full run exited $rc — neither a pass (0) nor the expected BLOCK (1)"
+        st_fail=$((st_fail+1))
+    fi
+
+    # 6. Deny-awareness (B-217 part 2). `docs` is ALLOW-listed WHOLESALE, so the
+    # scan's directory walk reaches `docs/deploy` even though that subtree is
+    # export-DENIED (RESTRICTED — a signing-key-rotation warning). A phrase
+    # planted there is true about the text and false about the risk: the file
+    # cannot ship, so it must not block. The positive control (same phrase, an
+    # ALLOW-scanned, non-denied file under docs/guides) proves deny_filter
+    # narrows to denied paths specifically rather than swallowing the scan.
+    denied_planted="$ROOT/docs/deploy/_nsa_selftest_denied.md"
+    printf '<!-- tracelane:classification: RESTRICTED -->\n# probe\n\nOur ledger is tamper-proof.\n' > "$denied_planted"
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✗ a banned phrase in an export-DENIED file (docs/deploy) still BLOCKED — deny_filter is not filtering"
+        st_fail=$((st_fail+1))
+    else
+        echo "  ✓ a banned phrase in an export-DENIED file (docs/deploy) does not block"
+    fi
+    rm -f "$denied_planted"
+
+    planted_allow="$ROOT/docs/guides/_nsa_selftest_deny_control.md"
+    printf '<!-- tracelane:classification: PUBLIC -->\n# probe\n\nOur ledger is tamper-proof.\n' > "$planted_allow"
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✓ the same phrase in an ALLOW-scanned public file (docs/guides) still blocks"
+    else
+        echo "  ✗ the same phrase in docs/guides did NOT block — the scan itself, not just deny_filter, is broken"
+        st_fail=$((st_fail+1))
+    fi
+    rm -f "$planted_allow"
+
+    # 7. B-325: a banned phrase in a NESTED package CHANGELOG must still block.
+    # `packages` is ALLOW-listed and its per-package CHANGELOG.md files are real
+    # markdown that ships — a basename-only `--exclude=CHANGELOG.md` silently
+    # stripped ALL of them, which is how a banned phrase in one reached the
+    # public repo unscanned. Copy-first, mutate, restore-from-copy (case 4's
+    # rule, immediately above): a MOVE would put the only copy of a tracked
+    # file inside this trap's own `rm -rf` EXIT handler.
+    target_changelog="$ROOT/packages/cli/CHANGELOG.md"
+    cp "$target_changelog" "$tmpd/cli-changelog.bak"
+    printf '\n## Unreleased\n\nOur ledger is tamper-proof.\n' >> "$target_changelog"
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✓ a banned phrase in a NESTED package CHANGELOG.md still blocks"
+    else
+        echo "  ✗ a banned phrase in packages/cli/CHANGELOG.md was NOT caught — the basename-exclude bug is back"
+        st_fail=$((st_fail+1))
+    fi
+    cp "$tmpd/cli-changelog.bak" "$target_changelog"
+
+    # 8. B-340(b): scan_docs() must read .astro. It used to be markdown-only
+    # (`.md`/`.mdx`/`.mdc`), so a banned phrase sitting in the marketing SITE's own
+    # prose (apps/site/src/**/*.astro — pricing / security / index) was invisible to
+    # it while the identical phrase in a neighbouring .md file was caught.
+    astro_planted="$ROOT/apps/site/src/components/_nsa_selftest_planted.astro"
+    printf -- '---\nconst x = 1;\n---\n<p>Our ledger is tamper-proof.</p>\n' > "$astro_planted"
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✓ a planted banned phrase in a .astro file is caught"
+    else
+        echo "  ✗ a planted banned phrase in a .astro file was NOT caught — scan_docs() is still markdown-only"
+        st_fail=$((st_fail+1))
+    fi
+    rm -f "$astro_planted"
+
+    # 9. The false positive the case-8 widening would otherwise create, PROVEN AGAINST
+    # THE REAL FILE, not a fixture: apps/site/src/components/PricingTable.astro:19
+    # carries a genuine, unplanted JS comment inside its frontmatter fence that NAMES
+    # "tamper-proof" in order to FORBID it ("Copy locks apply here as everywhere:
+    # \"tamper-evident\", never \"tamper-proof\""). This is the counter-example
+    # B-340(b) was filed over — a naive widening flags the rule's own enforcement
+    # comment as the violation it forbids. `comment_filter()` must keep it quiet.
+    # (Confirmed by direct grep before this test was written: it is the ONLY
+    # "tamper-proof" occurrence across apps/site + docs/guides + apps/docs + packages,
+    # so an unplanted BLOCKED here can only be this line.)
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✗ PricingTable.astro's own comment forbidding \"tamper-proof\" was flagged as a violation"
+        st_fail=$((st_fail+1))
+    else
+        echo "  ✓ the real PricingTable.astro comment naming \"tamper-proof\" to forbid it is not flagged"
+    fi
+
+    # 10. comment_filter() must stay SCOPED to .astro, not widen to .md/.mdx too. A
+    # markdown bullet list item starts with "* " exactly like a JS block-comment
+    # continuation does, and filtering that out in markdown would silently un-scan
+    # real bulleted prose — the same shape of hole B-325 (case 7) closed for
+    # basename-only CHANGELOG excludes.
+    md_bullet="$ROOT/docs/guides/_nsa_selftest_bullet.md"
+    printf '<!-- tracelane:classification: PUBLIC -->\n# probe\n\n* Our ledger is tamper-proof.\n' > "$md_bullet"
+    if run_gate | grep -q 'BLOCKED \[tamper-proof\]'; then
+        echo "  ✓ a banned phrase in a markdown BULLET line still blocks (comment_filter stays .astro-only)"
+    else
+        echo "  ✗ a banned phrase in a markdown bullet line was NOT caught — comment_filter over-scoped past .astro"
+        st_fail=$((st_fail+1))
+    fi
+    rm -f "$md_bullet"
+
     [ "$st_fail" -eq 0 ] && { echo "never-say-again selftest PASSED."; exit 0; }
     echo "never-say-again selftest FAILED — $st_fail case(s)."; exit 1
 fi
@@ -134,6 +248,47 @@ deny_filter() {  # stdin: "path:line:text" -> stdout: same, minus denied paths
     }'
 }
 
+# B-340(b). `.astro` is where the marketing site's OWN prose lives (pricing / security
+# / index render from apps/site/src/**/*.astro), and scan_docs() never read it — a
+# never-say-again phrase could sit in shipped site copy indefinitely while the same
+# phrase in a .md file next door was caught. Widened below to `--include='*.astro'`.
+#
+# THAT WIDENING FALSE-POSITIVES ON ITS OWN COUNTER-EXAMPLE. `PricingTable.astro`
+# carries a code comment that NAMES the banned phrase in order to FORBID it
+# (`apps/site/src/components/PricingTable.astro:19` — "Copy locks apply here as
+# everywhere: \"tamper-evident\", never \"tamper-proof\""). A guard that cannot tell a
+# comment enforcing the rule from a violation of it either false-positives on its own
+# documentation or — worse, if someone "fixes" that by weakening the regex — stops
+# catching the real case too. The fix is a comment-line exclusion, not a phrase
+# exemption: an exemption list grows one entry per false positive and stops meaning
+# anything (the exact shape `deny_filter`'s own header comment warns about above).
+#
+# comment_filter() drops a hit only when BOTH hold: (a) the file is `.astro`, and
+# (b) the matched line, with leading whitespace stripped, starts with a comment
+# marker — `//` or `*` or `/*` (JS-style, used inside the `---`-fenced frontmatter
+# script) or `<!--` (HTML, used in the template body below the fence). This is
+# intentionally NOT applied to `.md`/`.mdx`: a markdown bullet list item starts with
+# `* ` too, and treating that as a comment would silently un-scan real bulleted
+# prose — the exact "the fix creates a bigger hole" failure this file's other
+# comments repeatedly warn about. The check is line-local (no frontmatter-fence
+# tracking), which means a `//` that starts a line of ACTUAL rendered template markup
+# would also be excluded — astro templates are HTML/JSX, not JS statements, so a
+# bare `//`-led markup line does not occur in practice, and false-negating a genuine
+# violation on this specific shape is judged lower risk than the alternative
+# (re-adding the astro-comment false positive scan_docs was just fixed to remove).
+comment_filter() {  # stdin: "path:line:text" -> stdout: same, minus .astro COMMENT lines
+  awk '
+    {
+      line = $0
+      i = index(line, ":"); path = substr(line, 1, i - 1); rest = substr(line, i + 1)
+      j = index(rest, ":"); text = substr(rest, j + 1)
+      trimmed = text
+      sub(/^[ \t]+/, "", trimmed)
+      if (path ~ /\.astro$/ && trimmed ~ /^(\/\/|\/\*|\*|<!--)/) next
+      print
+    }'
+}
+
 scan() { # <label> <regex> <path...>
   local label="$1"; shift
   local re="$1"; shift
@@ -141,7 +296,7 @@ scan() { # <label> <regex> <path...>
   hits=$(grep -rIniE \
     --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.next \
     --exclude-dir=target --exclude-dir=dist \
-    --exclude=CHANGELOG.md --exclude=pre-public-push.sh \
+    --exclude="$ROOT/CHANGELOG.md" --exclude=pre-public-push.sh \
     "$re" "$@" 2>/dev/null | deny_filter || true)
   if [ -n "$hits" ]; then
     # `echo "$hits" | head -8` SIGPIPEd whenever there were MORE than 8 hits:
@@ -158,24 +313,44 @@ scan() { # <label> <regex> <path...>
   fi
 }
 
-# Marketing scans read PROSE a customer sees, so they are markdown-only. Scanning
-# .rs/.ts as well false-positives on internal code comments (an ADR-009 comment in
-# main.rs is not marketing copy) and a noisy guard gets ignored, which is worse
-# than a narrow one.
+# Marketing scans read PROSE a customer sees, so the file types below are markup/prose
+# formats (`.md` / `.mdx` / `.mdc` / `.astro`), never general source (`.rs` / `.ts`).
+# Scanning those as well false-positives on internal code comments (an ADR-009 comment
+# in main.rs is not marketing copy) and a noisy guard gets ignored, which is worse than
+# a narrow one. `.astro` is in scope because the marketing site's OWN prose renders
+# from it (pricing / security / index — B-340(b)); `comment_filter()` above keeps its
+# JS/HTML comment lines out of scope for the same false-positive reason.
+#
+# B-325: the three CHANGELOG excludes below are ANCHORED TO THE FULL PATH, not
+# bare basenames. `--exclude=CHANGELOG.md` (no `/`) is a BASENAME glob to grep —
+# it matches a file named `CHANGELOG.md` at ANY depth, not just the one at
+# `$ROOT`. That silently stripped `packages/{cli,verifier-python,verifier-rust,
+# verifier-typescript}/CHANGELOG.md` from the scan even though `packages` is
+# ALLOW-listed — exactly how a banned phrase in a package CHANGELOG reached the
+# public repo unscanned. Worse, the exclude had ZERO legitimate effect the
+# whole time: the root `CHANGELOG.md`/`CHANGELOG.public.md` it was written to
+# protect are not in `DOCS` at all (they ship via a separate sanitized-twin
+# copy step in build-public-export.sh, never through the ALLOW-list scan
+# scope), so the bare-basename form only ever had a cost, never a benefit.
+# Anchoring to `$ROOT/<path>` makes grep match the whole constructed pathname,
+# so only the ROOT file with that exact path is excluded and every nested
+# package CHANGELOG is scanned like any other markdown file. Proven both
+# directions by `--selftest` case 7.
 scan_docs() { # <label> <regex> <path...>
   local label="$1"; shift
   local re="$1"; shift
   local hits
-  hits=$(grep -rIniE --include='*.md' --include='*.mdx' --include='*.mdc' \
+  hits=$(grep -rIniE --include='*.md' --include='*.mdx' --include='*.mdc' --include='*.astro' \
     --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.next \
     --exclude-dir=target --exclude-dir=dist --exclude-dir=archive \
-    --exclude=CHANGELOG.md --exclude=CHANGELOG.public.md --exclude=changelog.mdx \
+    --exclude="$ROOT/CHANGELOG.md" --exclude="$ROOT/CHANGELOG.public.md" \
+    --exclude="$ROOT/apps/docs/changelog.mdx" \
     --exclude=pre-public-push.sh \
     `# evals/*/INDEX.md are denied by export-deny.txt, so they do not exist in the` \
     `# public tree. Excluded so a private-tree run is not noisy with hits that` \
     `# cannot ship. A guard people learn to ignore stops being a guard.` \
     --exclude=INDEX.md \
-    "$re" "$@" 2>/dev/null | deny_filter || true)
+    "$re" "$@" 2>/dev/null | deny_filter | comment_filter || true)
   if [ -n "$hits" ]; then
     # `echo "$hits" | head -8` SIGPIPEd whenever there were MORE than 8 hits:
     # head closed the pipe, echo took SIGPIPE, `pipefail` propagated 141, and
@@ -256,12 +431,22 @@ else
   echo "scan scope: ${#DOCS[@]} path(s) derived from $(basename "$ALLOW_LIST") ($_al_seen entries)"
 fi
 
-# NOTE (2026-08-13): this scan is NOT deny-aware, and that is a real gap —
-# see PROGRESS.md B-217. A first attempt at filtering here was REMOVED rather than
-# left in place: DOCS holds DIRECTORY paths for whole trees, so comparing them
-# against export-deny.txt's file entries matched nothing. It ran, changed no
-# behaviour, and read like a working control. Inert machinery that looks live is
-# worse than a named gap.
+# B-217 CLOSED (2026-08-13, same day as filed, commit a821442e9): this scan IS
+# now deny-aware. The note used to say the opposite — it described the state
+# BEFORE `deny_filter` existed, and survived un-updated after the fix landed 27
+# minutes later in the same day's work, which is exactly the §17 "doc disagrees
+# with the code, doc is the bug" shape this repo warns about elsewhere.
+#
+# A first attempt at filtering here WAS removed rather than left in place: it
+# compared the `DOCS` array (which holds DIRECTORY paths for whole trees, e.g.
+# `$ROOT/docs`) against export-deny.txt's FILE entries, so it matched nothing —
+# it ran, changed no behaviour, and read like a working control. The fix that
+# replaced it filters HITS, not inputs: `deny_filter()` below runs on the
+# "path:line:text" output of `grep`, which carries a real file path, so it
+# cannot silently do nothing. It is piped in at both call sites (`scan()` and
+# `scan_docs()` below) and is proven live and in both directions by
+# `--selftest` cases 5-6: a banned phrase in an ALLOW-scanned public file
+# BLOCKS, the same phrase in an export-DENIED file does not.
 
 if [ ${#DOCS[@]} -gt 0 ]; then
   # THE NEVER-SAY-AGAIN LIST IS DATA, NOT CODE (2026-08-10).

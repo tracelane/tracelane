@@ -11,9 +11,19 @@
 //!
 //! ## Exit codes
 //!
-//! - `0` PASS — every check passed.
+//! - `0` PASS — every check passed AND at least one publicly-included Rekor
+//!   anchor covers the verified range. This is the only exit that means
+//!   "a third party can trust this ledger".
 //! - `1` FAIL — at least one check failed; field-level diff printed.
 //! - `2` I/O or network failure before verification could run.
+//! - `3` CHAIN-ONLY — the hash chain is internally consistent and nothing is
+//!   positively wrong, but NO publicly-included anchor covers it. **B-381
+//!   (2026-09-12):** before this exit existed, a ledger fabricated from scratch
+//!   — two rows, a real-looking tenant id, no key, no anchor, produced in twenty
+//!   lines of Python from the public hashing code — printed `PASS — every check
+//!   passed.` and exited 0. Consistency is not evidence. A brand-new tenant whose
+//!   first anchor has not landed yet gets this exit too, honestly: not tampered,
+//!   not yet verifiable by anyone but us.
 //!
 //! ## V1 deferrals (ADR-034)
 //!
@@ -182,21 +192,50 @@ fn decode_pubkey32(s: &str) -> Result<[u8; 32]> {
     Ok(pk)
 }
 
+/// The three things a verified ledger can be, and the exit code each maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Chain valid, signatures valid, no errors, no unverified anchors, AND at
+    /// least one publicly-included anchor — exit 0.
+    Pass,
+    /// Nothing positively wrong, but no publicly-included anchor — exit 3.
+    ChainOnly,
+    /// Positive evidence of a problem, or anchors present but unverifiable — exit 1.
+    Fail,
+}
+
+impl Verdict {
+    /// The ONE place the report becomes a verdict. Kept pure so the fabricated-
+    /// ledger case is a unit test rather than a regulator's discovery.
+    fn of(report: &VerifyReport) -> Self {
+        let clean = report.anchors_unverified == 0
+            && report.hash_chain_valid
+            && report.signatures_valid
+            && !report.strip_detected
+            && report.errors.is_empty();
+        if !clean {
+            return Verdict::Fail;
+        }
+        if report.anchors_included == 0 {
+            return Verdict::ChainOnly;
+        }
+        Verdict::Pass
+    }
+
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Verdict::Pass => ExitCode::from(0),
+            Verdict::Fail => ExitCode::from(1),
+            Verdict::ChainOnly => ExitCode::from(3),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Verify(args) => match run_verify(args) {
-            Ok(report) => {
-                if report.anchors_unverified == 0
-                    && report.hash_chain_valid
-                    && report.signatures_valid
-                    && report.errors.is_empty()
-                {
-                    ExitCode::from(0)
-                } else {
-                    ExitCode::from(1)
-                }
-            }
+            Ok(report) => Verdict::of(&report).exit_code(),
             Err(e) => {
                 eprintln!("tracelane-audit: error: {e:#}");
                 ExitCode::from(2)
@@ -372,8 +411,20 @@ fn print_text(report: &VerifyReport) {
              dashboard Settings → Audit signing key, or GET /v1/audit/pubkey).",
             report.anchors_unverified
         );
-    } else if report.errors.is_empty() && report.hash_chain_valid && report.signatures_valid {
-        let _ = writeln!(out, "PASS — every check passed.");
+    } else if Verdict::of(report) == Verdict::Pass {
+        let _ = writeln!(
+            out,
+            "PASS — every check passed; {} publicly-included anchor(s) cover the verified range.",
+            report.anchors_included
+        );
+    } else if Verdict::of(report) == Verdict::ChainOnly {
+        let _ = writeln!(
+            out,
+            "CHAIN-ONLY — the hash chain is internally consistent and nothing is positively wrong,\n\
+             but NO publicly-included Rekor anchor covers this range. A consistent chain can be\n\
+             produced by anyone holding the hashing code; only an anchor lets a third party trust\n\
+             it. Not tampered — not yet verifiable. (exit 3)"
+        );
     } else {
         let _ = writeln!(out, "FAIL — {} error(s) detected:", report.errors.len());
         for err in &report.errors {
@@ -455,6 +506,100 @@ mod tests {
         writeln!(f, "{}", serde_json::to_string(&line).unwrap()).unwrap();
     }
 
+    /// B-381 — THE PROBE THE REVIEW RAN, as a test. A ledger built from the public
+    /// hashing code alone (rows chained from the deterministic genesis seed, no key,
+    /// no anchor) is exactly what `write_minimal_ledger_to` produces. It must never
+    /// be PASS / exit 0; it is CHAIN-ONLY / exit 3.
+    #[test]
+    fn a_fabricated_unanchored_ledger_is_chain_only_never_pass() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_ledger_to(tmp.path());
+        let args = VerifyArgs {
+            workspace: None,
+            from: None,
+            to: None,
+            api_url: String::new(),
+            read_key: None,
+            file: Some(tmp.path().to_path_buf()),
+            rekor_url: "http://localhost:0".into(),
+            tenant_pubkey: None,
+            offline: true,
+            pinned_pubkey: None,
+            format: OutputFormat::Json,
+            format_version: FormatVersionArg::V2,
+        };
+        let report = run_verify(args).expect("verify runs");
+        assert!(
+            report.hash_chain_valid && report.errors.is_empty(),
+            "the fabrication IS consistent"
+        );
+        assert_eq!(
+            report.anchors_included, 0,
+            "…and nothing external vouches for it"
+        );
+        assert_eq!(
+            Verdict::of(&report),
+            Verdict::ChainOnly,
+            "a consistent, unanchored ledger must be CHAIN-ONLY, never PASS"
+        );
+        assert_ne!(Verdict::of(&report), Verdict::Pass);
+    }
+
+    /// The verdict table, every row — including that an included anchor is what
+    /// separates PASS from CHAIN-ONLY, and that positive evidence outranks both.
+    #[test]
+    fn verdict_table() {
+        fn base() -> VerifyReport {
+            VerifyReport {
+                ledger_path: "x".into(),
+                rows_seen: 2,
+                hash_chain_valid: true,
+                signatures_valid: true,
+                rekor_anchors_seen: 1,
+                rekor_anchors_resolved: 1,
+                anchors_included: 1,
+                anchors_unverified: 0,
+                strip_detected: false,
+                verified_from_seq: 0,
+                trust_established: true,
+                errors: Vec::new(),
+            }
+        }
+        assert_eq!(Verdict::of(&base()), Verdict::Pass);
+        let mut r = base();
+        r.anchors_included = 0;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::ChainOnly,
+            "no included anchor → chain-only"
+        );
+        let mut r = base();
+        r.hash_chain_valid = false;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::Fail,
+            "broken chain → fail, anchors or not"
+        );
+        let mut r = base();
+        r.strip_detected = true;
+        assert_eq!(Verdict::of(&r), Verdict::Fail, "a stripped anchor → fail");
+        let mut r = base();
+        r.anchors_unverified = 1;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::Fail,
+            "unverifiable anchors → fail, never pass"
+        );
+        let mut r = base();
+        r.anchors_included = 0;
+        r.hash_chain_valid = false;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::Fail,
+            "positive evidence outranks chain-only"
+        );
+    }
+
     #[test]
     fn offline_file_mode_passes_on_known_good_ledger() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -482,6 +627,9 @@ mod tests {
             "no errors expected: {:?}",
             report.errors
         );
+        // B-381: "passes" above means the CHECKS pass. With no anchor the
+        // VERDICT is chain-only — the test's name predates that distinction.
+        assert_eq!(Verdict::of(&report), Verdict::ChainOnly);
     }
 
     #[test]

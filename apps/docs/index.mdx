@@ -4,6 +4,8 @@ description: The flight recorder for AI agents — full-fidelity traces, a tampe
 classification: PUBLIC
 ---
 
+**The flight recorder for AI agents.**
+
 Tracelane is a Rust gateway and ClickHouse-backed observability tier that
 captures every LLM and tool call at full fidelity, with a tamper-evident audit
 ledger that makes each run provable. Its sharpest edge is **MCP and agent-tool
@@ -11,7 +13,9 @@ safety**: it surfaces tool-definition-drift, rug-pull substitution, and
 hallucinated tool-call arguments as first-class signals (drift and rug-pull compare
 against a definition you approved in one click from the tools Tracelane has
 observed on your own traffic) and records each with a
-tamper-evident signature. Heuristic checks for the lethal trifecta and prompt
+tamper-evident signature.
+
+Heuristic checks for the lethal trifecta and prompt
 injection observe alongside, on every request and on every tier. A2A/A2UI drift,
 browser stuck-loops and argument drift are **roadmap**: those detectors gate on
 payload fields a `/v1/chat/completions` request does not carry, so they do not
@@ -47,7 +51,7 @@ positioning, Apache 2.0, no SaaS-blocked license games.
     Tool-definition-drift is flagged or halted inline at the gateway, not
     reconstructed from an incident write-up.
   </Card>
-  <Card title="Every claim carries an eval" icon="circle-check">
+  <Card title="Every claim carries an eval" icon="clipboard-check">
     20 conformance evals — 10 fault-tolerance chaos scenarios, 7 gateway-correctness,
     and one each for ingest-schema, PII-redaction and prompt-injection. They run in
     the canonical repository's CI; in this public mirror they ship as readable
@@ -55,7 +59,7 @@ positioning, Apache 2.0, no SaaS-blocked license games.
     withholds. Structural assertions run green; behavioral ones report as
     **skipped** without a live gateway rather than as a pass.
   </Card>
-  <Card title="Tamper-evident ledger" icon="lock">
+  <Card title="Tamper-evident ledger" icon="fingerprint">
     SHA-256 hash chain and Ed25519 per-tenant signing, with byte-identical
     verifiers in Rust + Python + TypeScript. Anchored batches carry a resolved
     Sigstore Rekor v2 inclusion proof (best-effort, opt-in); universal per-run

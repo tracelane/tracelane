@@ -7,7 +7,7 @@ classification: PUBLIC
 
 # SPIFFE/SPIRE ingest mTLS — operator runbook
 
-> **Audience:** SREs running self-hosted Tracelane or operating the Audit SKU
+> **Audience:** SREs running self-hosted Tracelane or federating with the Tracelane control plane (Enterprise)
 > in a customer cluster.
 
 The Tracelane ingest worker authenticates every connection with a SPIFFE
@@ -55,7 +55,7 @@ is the supported path. Minimum settings for a Tracelane install:
 # values.yaml
 spire-server:
   trustDomain: tracelane.dev
-  # If you're federating with our control plane (Audit SKU): set
+  # If you're federating with our control plane (Enterprise): set
   # federation.bundleEndpoint to the URL we send during onboarding.
 spire-agent:
   trustDomain: tracelane.dev

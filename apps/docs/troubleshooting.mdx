@@ -35,6 +35,7 @@ curl "$TRACELANE_GATEWAY_URL/v1/audit/export?since=$(date -u -d '5 minutes ago' 
 **Fix:**
 - Confirm `TRACELANE_API_KEY` starts with `tlane_`.
 - Check the key hasn't been revoked in **Settings → API Keys**.
+- Revocation takes effect at the gateway within 60 seconds; a key that has been idle for over a minute may be accepted once more on its next use while the gateway re-checks it.
 - For JWT auth: confirm the `organizationId` claim is present and the JWKS URL
   is reachable from the gateway.
 

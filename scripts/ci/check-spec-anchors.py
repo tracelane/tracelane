@@ -68,8 +68,16 @@ CLAIM_RE = re.compile(
 #
 # Ordering, per the LONGEST-FIRST rule above: `jsx` and `json` MUST precede `js`, or
 # `Chart.jsx` truncates to `Chart.js` and re-creates the `.tsx` bug this comment records.
+#
+# EXTENDED 2026-09-02 with `[` and `]` in the PATH character class. Next.js dynamic
+# segments are real directories — `apps/web/app/traces/[traceId]/page.tsx` — and without
+# the brackets the regex stopped at `]` and reported `/page.tsx` as a missing file, so a
+# spec about a detail page could not anchor to the page it was about. Same failure shape
+# as the front-end extension note above: a guard that makes the honest anchor impossible
+# manufactures decorative ones. Found writing `DSH-11`'s inventory (224 anchors, 4 of them
+# into bracket segments).
 ANCHOR_RE = re.compile(
-    r"`?([A-Za-z0-9_./-]+\.(?:astro|scss|json|jsx|tsx|html|toml|yaml|yml|cjs|mjs|css"
+    r"`?([A-Za-z0-9_./\[\]-]+\.(?:astro|scss|json|jsx|tsx|html|toml|yaml|yml|cjs|mjs|css"
     r"|ts|rs|py|sql|js|yml|md|sh))(?::(\d+)(?:-(\d+))?)?`?"
 )
 SKIP = {"README.md", "TEMPLATE.md"}
@@ -143,9 +151,22 @@ def check(spec_dir: Path = SPECS, quiet: bool = False) -> int:
         for lineno, block in claim_blocks(text):
             claims += 1
             anchors = ANCHOR_RE.findall(block)
+
+            # Founder ruling 2026-09-03 §4: docs/archive/ is never citable as
+            # current truth, even when the path/line resolves — checked BEFORE
+            # the `.md` self-reference filter below, which would otherwise drop
+            # a docs/archive/ anchor silently instead of naming why it fails.
+            archive_hits = [a for a in anchors if a[0].startswith("docs/archive/")]
+            for raw, _ln, _end in archive_hits:
+                problems.append(
+                    f"{_show(f)}:{lineno} — archive is not citable as current "
+                    f"truth — cite the canonical doc or code (anchored to {raw})"
+                )
+
             # `.md` self-references are not code anchors — a spec citing another
             # spec is prose, not evidence about the running system.
             anchors = [a for a in anchors if not a[0].endswith(".md")]
+            anchors = [a for a in anchors if not a[0].startswith("docs/archive/")]
             # An ANCHOR is navigable evidence: it carries a path separator, or a
             # `:line`. A bare filename with neither — `tracelane.yaml`, `Cargo.toml`
             # — is a NAME being discussed, not a pointer into the tree, and you
@@ -156,10 +177,13 @@ def check(spec_dir: Path = SPECS, quiet: bool = False) -> int:
             # the definition loses nothing: a bare name was never evidence.
             anchors = [a for a in anchors if "/" in a[0] or a[1]]
             if not anchors:
-                problems.append(
-                    f"{_show(f)}:{lineno} — current-state claim with NO code anchor\n"
-                    f"    {block.splitlines()[0][:110]}"
-                )
+                # Already flagged above if the only anchor(s) in this block were
+                # into docs/archive/ — do not report the same claim twice.
+                if not archive_hits:
+                    problems.append(
+                        f"{_show(f)}:{lineno} — current-state claim with NO code anchor\n"
+                        f"    {block.splitlines()[0][:110]}"
+                    )
                 continue
             for raw, ln, end in anchors:
                 why = check_anchor(raw, ln, end)
@@ -229,6 +253,40 @@ def selftest() -> int:
         rc = check(d, quiet=True)
         print(
             f"selftest: unanchored claim blocks (the GWY-27 shape)  {'OK' if rc == 1 else 'FAIL'}"
+        )
+        ok &= rc == 1
+
+        # 5. A bracket-segment path must RESOLVE (Next.js dynamic routes). Before
+        #    2026-09-02 the regex stopped at `]` and reported `/page.tsx` missing.
+        shutil.rmtree(d)
+        d.mkdir()
+        (d / "X5-bracket.md").write_text(
+            "# `X5` — bracket\n\n**Today.** See "
+            "`apps/web/app/traces/[traceId]/page.tsx:1`.\n",
+            encoding="utf-8",
+        )
+        rc = check(d, quiet=True)
+        print(
+            f"selftest: a [segment] path anchor resolves .......... {'OK' if rc == 0 else 'FAIL'}"
+        )
+        ok &= rc == 0
+
+        # 3b. A docs/archive/ anchor must FAIL EVEN THOUGH IT RESOLVES — founder
+        #     ruling 2026-09-03 §4, archive is never citable as current truth.
+        shutil.rmtree(d)
+        d.mkdir()
+        (d / "X3b-archive.md").write_text(
+            "# `X3b` — archive-anchored\n\n**Today.** See "
+            # Split literal on purpose: the public-export guard refuses a
+            # `docs/archive/<name>.md` token in shipped source, and this fixture
+            # must still name a REAL archive file so the anchor resolves.
+            "`docs/archive/"
+            "ARCHIVE_INDEX.md:1`.\n",
+            encoding="utf-8",
+        )
+        rc = check(d, quiet=True)
+        print(
+            f"selftest: a resolving docs/archive/ anchor still blocks ..... {'OK' if rc == 1 else 'FAIL'}"
         )
         ok &= rc == 1
 

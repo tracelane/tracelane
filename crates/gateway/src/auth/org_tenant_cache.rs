@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use moka::future::Cache;
 use uuid::Uuid;
 
@@ -71,7 +71,18 @@ pub(crate) async fn resolve(org_id: &str) -> Result<Uuid> {
     cache()
         .try_get_with(key.clone(), async move { resolve_uncached(&key).await })
         .await
-        .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("org→tenant resolve failed: {e}"))
+        .map_err(|e: Arc<anyhow::Error>| {
+            // B-391 (c): moka hands the init error back behind an `Arc`, which
+            // would flatten the typed outage into a string. Re-type it so the
+            // handler still answers 503, not 401, when Postgres was the problem.
+            if super::is_store_unavailable(&e) {
+                anyhow::Error::from(super::AuthStoreUnavailable {
+                    detail: format!("org→tenant resolve: {e:#}"),
+                })
+            } else {
+                anyhow::anyhow!("org→tenant resolve failed: {e}")
+            }
+        })
 }
 
 /// The uncached resolution: authoritative Postgres lookup when a pool exists.
@@ -83,7 +94,10 @@ async fn resolve_uncached(org_id: &str) -> Result<Uuid> {
     match crate::db::global_pool() {
         Some(pool) => crate::db::tenants::get_tenant_id_by_workos_org(pool, org_id)
             .await
-            .context("workos_org_id lookup failed")?
+            // B-391 (c): a failed LOOKUP (Postgres error) is an outage of the
+            // auth store — typed so it surfaces as 503. A successful lookup
+            // that finds no tenant stays a plain `Err` → 401.
+            .map_err(|e| super::AuthStoreUnavailable::new(format!("workos_org_id lookup: {e:#}")))?
             .ok_or_else(|| anyhow::anyhow!("no active tenant for the presented organization")),
         None => {
             let workos_configured = std::env::var("WORKOS_CLIENT_ID").is_ok();

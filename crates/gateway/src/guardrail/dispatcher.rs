@@ -81,6 +81,9 @@ impl Dispatcher {
         }
     }
 
+    // No production caller today — used only by a test overriding the
+    // default timeout. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn with_timeout(mut self, per_rail_timeout: Duration) -> Self {
         self.per_rail_timeout = per_rail_timeout;
@@ -190,6 +193,10 @@ mod tests {
 
     fn minimal_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -199,6 +206,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

@@ -1,94 +1,47 @@
 /**
- * GET /api/billing/usage — current plan + Polar meter totals for the
- * authenticated tenant.
+ * GET /api/billing/usage — a PURE PASSTHROUGH to `GET /v1/billing/usage`
+ * (spec `BILL-01-metering-and-tiers.md` §2.6; gateway:
+ * `crates/gateway/src/billing/usage.rs:110-181`).
  *
- * Stripe direct calls are banned post Phase-2 (`.claude/rules/billing.md`).
- * The dashboard proxies through the Rust gateway, which holds the
- * `POLAR_ACCESS_TOKEN`. Meter readings come from
- * `crates/gateway/src/billing/polar_client.rs`'s `meter_events_summary`
- * endpoint (Polar's `/v1/meters/{id}/quantities`).
+ * ONE gateway call per page load (§2.5b — "the usage page is ONE gateway
+ * call per load"): this route makes exactly one upstream fetch and forwards
+ * its body and status verbatim — no re-shaping, no `{plan, usage}` wrapper.
+ * `lib/billing-usage.ts`'s `GatewayUsageResponse` is the pinned contract the
+ * client parses; this route does not need to know its shape at all.
  *
- * If the gateway responds with no usage data (e.g. meter not configured
- * for the tenant), `usage` is null rather than failing the request.
+ * The gateway itself resolves the tenant from the JWT and fails closed to
+ * the Free-tier defaults for an unseeded tenant (`.claude/rules/
+ * tenancy.md`), so this route does not pre-check Postgres for a tenant row —
+ * that would be a second, redundant source of the same answer.
+ *
+ * A network failure (gateway unreachable) is the ONLY case this route
+ * itself decides: it returns 502, which the client's `deriveUsageState`
+ * reads as `httpOk: false` → the `"error"` state (the recorder never stops
+ * on a metering outage — spec §4).
  */
 
-import { db } from "@/db";
-import { tenants } from "@/db/schema";
-import { requireGatewayToken, requireSession } from "@/lib/auth";
-import { type Plan, resolveEntitlements } from "@/lib/entitlements";
+import { requireGatewayToken } from "@/lib/auth";
 import { gatewayBaseUrl } from "@/lib/gateway";
-import { eq } from "drizzle-orm";
-import { type NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 
-interface GatewayUsageResponse {
-	tokens_processed?: number | null;
-	audit_anchors?: number | null;
-}
+export async function GET(): Promise<NextResponse> {
+	const { token } = await requireGatewayToken();
+	const base = gatewayBaseUrl();
 
-async function fetchMeterUsage(
-	gatewayBase: string,
-	authHeader: string | null,
-): Promise<{
-	tokens_processed: number | null;
-	audit_anchors: number | null;
-} | null> {
 	try {
-		const res = await fetch(`${gatewayBase}/v1/billing/usage`, {
-			headers: authHeader ? { authorization: authHeader } : undefined,
+		const upstream = await fetch(`${base}/v1/billing/usage`, {
+			headers: { authorization: `Bearer ${token}` },
 		});
-		if (!res.ok) return null;
-		const body = (await res.json()) as GatewayUsageResponse;
-		return {
-			tokens_processed: body.tokens_processed ?? null,
-			audit_anchors: body.audit_anchors ?? null,
-		};
+		const body = await upstream.text();
+		return new NextResponse(body, {
+			status: upstream.status,
+			headers: { "content-type": "application/json" },
+		});
 	} catch {
-		return null;
+		// The recorder never stops on a metering outage — say so, don't 5xx.
+		return NextResponse.json(
+			{ error: "usage metering unavailable" },
+			{ status: 502 },
+		);
 	}
-}
-
-export async function GET(req: NextRequest): Promise<NextResponse> {
-	const session = await requireSession();
-
-	const tenant = await db
-		.select({
-			id: tenants.id,
-			plan: tenants.plan,
-			polarCustomerId: tenants.polarCustomerId,
-		})
-		.from(tenants)
-		.where(eq(tenants.workosOrgId, session.tenantId))
-		.limit(1);
-
-	if (!tenant[0]) {
-		// No tenant row → treat as the unbilled default (A5): a missing tenant is
-		// not a paying Builder. Consistent with tenants.plan DEFAULT 'free'.
-		return NextResponse.json({
-			plan: "free",
-			auditEnabled: false,
-			usage: null,
-		});
-	}
-
-	const { id, plan, polarCustomerId } = tenant[0];
-	// Audit add-on status = the REAL entitlement (workspace_entitlements.f_audit_addon),
-	// NOT the dead legacy tenants.auditEnabled column (never written since the
-	// entitlements move — the invisible entitlement-gated UI bug class).
-	const auditEnabled = (await resolveEntitlements(id, plan as Plan))
-		.audit_ledger;
-	const gatewayBase = gatewayBaseUrl();
-
-	let usage: {
-		tokens_processed: number | null;
-		audit_anchors: number | null;
-	} | null = null;
-	if (polarCustomerId) {
-		// Mint the per-user gateway JWT — NEVER forward the client's own
-		// Authorization header (browsers send none → silent null usage; a
-		// foreign bearer would mix another tenant's meter totals in).
-		const { token } = await requireGatewayToken();
-		usage = await fetchMeterUsage(gatewayBase, `Bearer ${token}`);
-	}
-
-	return NextResponse.json({ plan, auditEnabled, usage });
 }

@@ -17,8 +17,6 @@
  * streaming traffic in this window" — the tile renders "—", never a fake `0ms`.
  */
 
-import { GatewayError, gatewayGet } from "@/lib/gateway";
-
 /** One per-(provider, model) overhead row — the SLO table's "our slice" column. */
 export type LatencyModelRow = {
 	provider: string;
@@ -46,31 +44,7 @@ export type LatencyBreakdown = {
 	by_model: LatencyModelRow[];
 };
 
-/**
- * Fetch the window-wide latency split for the authenticated tenant.
- *
- * Returns `null` on any `GatewayError` (gateway unreachable → the caller shows
- * its warming state), distinct from a reachable-but-empty window (all-zero with
- * `overhead_samples === 0`). Any non-`GatewayError` (e.g. the auth redirect)
- * propagates.
- *
- * @param opts.hours Look-back window in hours forwarded to the gateway.
- */
-export async function fetchLatencyBreakdown(opts?: {
-	hours?: number;
-}): Promise<LatencyBreakdown | null> {
-	const q = new URLSearchParams();
-	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
-	const qs = q.toString();
-	try {
-		return await gatewayGet<LatencyBreakdown>(
-			`/v1/query/latency-breakdown${qs ? `?${qs}` : ""}`,
-		);
-	} catch (err) {
-		if (err instanceof GatewayError) return null;
-		throw err;
-	}
-}
+// `fetchLatencyBreakdown` moved to `lib/metrics/fetch.ts` (DSH-11): one read layer, one window.
 
 /** Build a `"provider::model" → overhead_p95_ms` lookup for the SLO table. */
 export function overheadByModelKey(

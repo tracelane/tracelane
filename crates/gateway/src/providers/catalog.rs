@@ -54,6 +54,13 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone)]
 pub struct ProviderDef {
     pub id: &'static str,
+    // Column 2 of `providers.tsv` (see the header at its top). Parsed to keep
+    // this struct a faithful 1:1 mirror of the TSV row shape, but no Rust
+    // code reads it today: the dashboard dropdown's display name is
+    // generated straight from the TSV by `scripts/ci/build-provider-catalog.py`
+    // (its own `label` variable), not from this struct. A test asserts every
+    // row's label is non-empty.
+    #[allow(dead_code)]
     pub label: &'static str,
     /// Compiled-in default. `base_url()` prefers the env override.
     pub base_url_default: &'static str,

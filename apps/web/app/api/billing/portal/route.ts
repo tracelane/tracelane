@@ -36,9 +36,22 @@ export async function POST(): Promise<NextResponse> {
 	if (!upstream.ok) {
 		// A3 / A27: never propagate the upstream body (Polar error JSON can
 		// include request IDs that hint at the org-scoped access token). The
-		// gateway already redacts its own logs; return a generic message.
+		// gateway already redacts its own logs; return a generic message — plus a
+		// `reason` derived from the STATUS alone (never the body), because two of
+		// the gateway's refusals are not portal failures at all and the button
+		// used to render both as "billing portal unavailable" (founder, 2026-09-14):
+		// 409 = the tenant has no Polar customer yet (`portal.rs`, a Free workspace
+		// that never checked out), 403 = the caller is not a workspace owner.
+		const reason =
+			upstream.status === 409
+				? "no_billing_account"
+				: upstream.status === 403
+					? "owner_required"
+					: upstream.status === 503
+						? "not_configured"
+						: undefined;
 		return NextResponse.json(
-			{ error: "billing portal unavailable" },
+			{ error: "billing portal unavailable", ...(reason ? { reason } : {}) },
 			{ status: upstream.status >= 500 ? 502 : upstream.status },
 		);
 	}

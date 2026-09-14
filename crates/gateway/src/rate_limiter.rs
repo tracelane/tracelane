@@ -1,69 +1,62 @@
-//! Per-tenant token-bucket rate limiter + monthly quota tracker.
+//! Per-tenant token-bucket rate limiter (BILL-01 / ADR-076).
 //!
 //! In-process DashMap implementation for single-node V1. Redis-backed
 //! multi-node version is V1.5 (Upstash Redis via deadpool).
 //!
-//! Two independent layers:
-//!   - `RateLimiter`  — RPM token bucket (short-window burst control).
-//!   - `QuotaTracker` — monthly trace counter with hard 5× cap.
+//! **BILL-01 deleted the trace-count monthly quota and the `RateLimitTier`
+//! enum entirely** (ADR-076 supersedes ADR-020's ladder). There is no more
+//! "plan tier" as a rate-limiting concept: the limiter takes a plain
+//! `Option<u32>` requests-per-minute figure straight from
+//! `ResolvedEntitlements.rate_limit_rpm` (`plan_entitlements.rate_limit_rpm`,
+//! overlaid by a `workspace_entitlements` override) — `None` means unlimited,
+//! which is what Enterprise, the bench grant, and a self-hosted gateway with
+//! no declared cap all resolve to. `RateLimitTier::from_plan_tier_str` and its
+//! four siblings (`clickhouse_query.rs`'s `PlanTier::from_plan_key` is a
+//! DIFFERENT, unrelated enum — see that file's module doc — and stays) were a
+//! parallel, hardcoded mirror of the same number the entitlement cache
+//! already resolves; keeping both was the drift SRE register #20 kept
+//! finding.
 //!
-//! Enterprise is always-allow on RPM.
-//! Quota config is supplied by the caller (read from the cached
-//! `workspace_entitlements` row), never fetched inside the hot path —
-//! hot-path budget is single atomic load + compare (<500ns p99).
+//! Enterprise is always-allow on RPM (via `rate_limit_rpm: None`).
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::instrument;
 
 use tracelane_shared::TenantId;
 
-/// Per-tenant rate limit tiers (requests per minute).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum RateLimitTier {
-    Free = 0,
-    Builder = 1,
-    Team = 2,
-    Business = 3,
-    Enterprise = 4,
-    /// Benchmark-only (B-187b). NOT a commercial tier and NOT reachable for any
-    /// tenant that exists in Postgres — the caller grants it only when the
-    /// entitlement cache is absent, which is exactly "no control plane, so not
-    /// hosted". Never returned by `from_plan_tier_str`, so no plan string can
-    /// select it.
-    Bench = 5,
+/// The rate-limit RPM a request resolves to when there is **NO control
+/// plane** (`state.entitlements` is `None` — dev, or an OSS self-host with no
+/// Postgres). Hosted deployments never reach this: they always have a control
+/// plane, so `state.entitlements` is `Some` and `ResolvedEntitlements
+/// .rate_limit_rpm` is what governs.
+///
+/// **B-357/F8, 2026-09-07, preserved under BILL-01:** a self-hosted gateway
+/// defaults to UNLIMITED (`None`) — the operator owns the compute, and the
+/// hosted Free tier's RPM figure exists to meter OUR plans, not to throttle
+/// someone's own box. A hosted-but-poolless process (should not happen in
+/// practice) still gets the conservative Free-equivalent 60 rpm, fail-
+/// restricted.
+///
+/// **The `TRACELANE_SELF_HOST_TIER` operator override is REMOVED with the
+/// tier concept itself (ADR-076).** There is no named tier left to declare;
+/// a self-hoster who wants a cap sets one on their own reverse proxy. Read
+/// ONCE, at boot, into `AppState::no_control_plane_rate_limit_rpm` (mirrors
+/// B-386 b's `no_control_plane_tier` pattern). `# Errors`: none — fail-CLOSED
+/// (the conservative 60 rpm) on any doubt, i.e. whenever self-host cannot be
+/// confirmed.
+#[must_use]
+pub fn no_control_plane_rate_limit_rpm_from_env() -> Option<u32> {
+    let self_host = matches!(tracelane_shared::self_host::from_env(), Ok(Some(_)));
+    resolve_no_control_plane_rate_limit_rpm(self_host)
 }
 
-impl RateLimitTier {
-    /// RPM limits per tier.
-    pub fn requests_per_minute(self) -> u32 {
-        match self {
-            Self::Free => 60,
-            Self::Builder => 600,
-            Self::Team => 6_000,
-            Self::Business => 60_000,
-            Self::Enterprise => u32::MAX,
-            Self::Bench => u32::MAX,
-        }
-    }
-
-    /// Parse the tier from the string Polar stores in `tenants.plan_tier`
-    /// (lowercase, single word). Anything unknown falls back to Free —
-    /// fail-restricted is the safe default for an unrecognized plan
-    /// string, never grant higher limits than we billed for.
-    pub fn from_plan_tier_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "builder" => Self::Builder,
-            "team" => Self::Team,
-            "business" => Self::Business,
-            "enterprise" => Self::Enterprise,
-            // "free" and anything else
-            _ => Self::Free,
-        }
-    }
+/// Pure half of [`no_control_plane_rate_limit_rpm_from_env`] so the rule is
+/// unit-testable without env mutation.
+#[must_use]
+pub(crate) const fn resolve_no_control_plane_rate_limit_rpm(self_host: bool) -> Option<u32> {
+    if self_host { None } else { Some(60) }
 }
 
 /// Single token bucket. `pub(crate)` so the WorkOS webhook ingress limiter
@@ -109,15 +102,15 @@ impl BucketState {
 
 /// Token-bucket rate limiter backed by an in-process DashMap.
 ///
-/// Each entry is keyed by `(tenant_id_string, tier_discriminant)` so
-/// different tiers for the same tenant get independent buckets. In practice
-/// we always call with one tier per tenant; the u8 key prevents future
-/// collision if multiple tiers are checked.
+/// Each entry is keyed by `(tenant_id_string, bucket_kind)` so the tenant
+/// bucket and a key's own override bucket (GWY-43) never collide.
 ///
 /// Thread-safe: DashMap uses fine-grained shard locking.
-/// Bucket discriminant for the PER-KEY bucket. 255 cannot collide with a
-/// `RateLimitTier`, which is a small contiguous enum — asserted by
-/// `key_bucket_discriminant_cannot_collide_with_a_tier`.
+/// Bucket discriminant for the TENANT bucket.
+const TENANT_BUCKET: u8 = 0;
+/// Bucket discriminant for the PER-KEY bucket (GWY-43). Distinct from
+/// [`TENANT_BUCKET`] so a key's own override never shares state with its
+/// tenant's platform bucket.
 const KEY_BUCKET: u8 = 255;
 
 pub struct RateLimiter {
@@ -131,59 +124,49 @@ impl RateLimiter {
         }
     }
 
-    /// Check whether `tenant_id` is within the RPM cap for `tier`.
+    /// Check whether `tenant_id` is within `rpm` requests/minute.
     ///
-    /// Returns `Allow` immediately for Enterprise (no bucket needed).
-    /// Returns `Throttle { retry_after_secs }` when the bucket is empty.
+    /// `rpm` of `None` means unlimited (Enterprise, bench, or a self-hosted
+    /// gateway with no declared cap) and short-circuits before touching the
+    /// bucket map at all — the same MECHANISM the old `RateLimitTier::Bench`
+    /// short-circuit proved matters (B-187c): a huge-but-finite capacity on
+    /// the float bucket path is NOT the same as unlimited under a k6-scale
+    /// burst.
     #[instrument(skip(self), fields(tenant_id = %tenant_id))]
-    pub fn check(&self, tenant_id: &TenantId, tier: RateLimitTier) -> RateLimitDecision {
-        // B-187c: `Bench` must short-circuit here alongside `Enterprise`.
-        //
-        // Granting the tier was not enough. Both report `u32::MAX` rpm, but only
-        // `Enterprise` was listed here — so `Bench` fell through to the token
-        // bucket, where `capacity = f64::from(u32::MAX)` with float refill does
-        // NOT behave as unlimited. Live consequence: the acceptance-bar request
-        // returned 200, k6 then aborted with "NO requests completed", and a
-        // single request after the burst returned 429. The tier was granted and
-        // then ignored one layer down — the third rejection-measurement trap in
-        // the same benchmark path (see docs/reference/TRAPS.md).
-        self.check_scoped(tenant_id, tier, None, None)
+    pub fn check(&self, tenant_id: &TenantId, rpm: Option<u32>) -> RateLimitDecision {
+        self.check_scoped(tenant_id, rpm, None, None)
     }
 
     /// Check a request against a **per-key** RPM cap, falling back to the
-    /// tenant's plan tier when the key has none (GWY-43).
+    /// tenant's own `rpm` when the key has none (GWY-43).
     ///
     /// Two separate buckets, and the request must pass BOTH:
     ///
-    ///   - the **tenant** bucket, keyed `(tenant_id, tier)` — unchanged, and the
-    ///     one that protects the platform;
-    ///   - the **key** bucket, keyed `(tenant_id + key_id, 255)` — a customer's
-    ///     own ceiling on one credential, so a runaway script holding one key
-    ///     cannot consume the whole workspace's allowance.
-    ///
-    /// The key bucket is keyed on tenant AND key id, never on key id alone: the
-    /// id is a UUID and collisions are not the concern, but a cache keyed on a
-    /// value that arrives from the request is a shape this repo has been burned
-    /// by, and prefixing the tenant makes the isolation structural.
+    ///   - the **tenant** bucket, keyed `(tenant_id, TENANT_BUCKET)` —
+    ///     unchanged, and the one that protects the platform;
+    ///   - the **key** bucket, keyed `(tenant_id + key_id, KEY_BUCKET)` — a
+    ///     customer's own ceiling on one credential, so a runaway script
+    ///     holding one key cannot consume the whole workspace's allowance.
     ///
     /// `key_rpm` of `None` — no override configured — leaves behaviour exactly
     /// as it was before GWY-43. The tenant check still runs first, so an
-    /// Enterprise/Bench short-circuit is unchanged for keys without an override.
+    /// unlimited (`rpm: None`) tenant short-circuits for keys without an
+    /// override too.
     #[instrument(skip(self), fields(tenant_id = %tenant_id))]
     pub fn check_scoped(
         &self,
         tenant_id: &TenantId,
-        tier: RateLimitTier,
+        rpm: Option<u32>,
         key_id: Option<&str>,
         key_rpm: Option<u32>,
     ) -> RateLimitDecision {
-        let tenant_decision = self.check_tier(tenant_id, tier);
+        let tenant_decision = self.check_tenant(tenant_id, rpm);
         if matches!(tenant_decision, RateLimitDecision::Throttle { .. }) {
             return tenant_decision;
         }
-        // A per-key cap is a customer's own ceiling and applies even on tiers
-        // that skip the platform bucket — an Enterprise workspace that sets a
-        // 10 rpm cap on a CI key means it.
+        // A per-key cap is a customer's own ceiling and applies even on a
+        // tenant with no platform-level cap — an Enterprise workspace that
+        // sets a 10 rpm cap on a CI key means it.
         match (key_id, key_rpm) {
             (Some(id), Some(rpm)) if rpm > 0 => {
                 self.consume(format!("{tenant_id}/{id}"), KEY_BUCKET, f64::from(rpm))
@@ -192,32 +175,18 @@ impl RateLimiter {
         }
     }
 
-    fn check_tier(&self, tenant_id: &TenantId, tier: RateLimitTier) -> RateLimitDecision {
-        // B-187c: `Bench` must short-circuit here alongside `Enterprise`.
-        //
-        // Granting the tier was not enough. Both report `u32::MAX` rpm, but only
-        // `Enterprise` was listed here — so `Bench` fell through to the token
-        // bucket, where `capacity = f64::from(u32::MAX)` with float refill does
-        // NOT behave as unlimited. Live consequence: the acceptance-bar request
-        // returned 200, k6 then aborted with "NO requests completed", and a
-        // single request after the burst returned 429. The tier was granted and
-        // then ignored one layer down — the third rejection-measurement trap in
-        // the same benchmark path (see docs/reference/TRAPS.md).
-        if matches!(tier, RateLimitTier::Enterprise | RateLimitTier::Bench) {
+    fn check_tenant(&self, tenant_id: &TenantId, rpm: Option<u32>) -> RateLimitDecision {
+        let Some(rpm) = rpm else {
             return RateLimitDecision::Allow;
-        }
-        self.consume(
-            tenant_id.to_string(),
-            tier as u8,
-            f64::from(tier.requests_per_minute()),
-        )
+        };
+        self.consume(tenant_id.to_string(), TENANT_BUCKET, f64::from(rpm))
     }
 
-    fn consume(&self, bucket_id: String, tier_key: u8, rpm: f64) -> RateLimitDecision {
+    fn consume(&self, bucket_id: String, bucket_kind: u8, rpm: f64) -> RateLimitDecision {
         let capacity = rpm;
         // Tokens refilled at rpm/60_000 per millisecond (= rpm per minute)
         let refill_per_ms = rpm / 60_000.0;
-        let key = (bucket_id, tier_key);
+        let key = (bucket_id, bucket_kind);
 
         let mut entry = self
             .buckets
@@ -249,261 +218,16 @@ pub enum RateLimitDecision {
     },
 }
 
-// ---------------------------------------------------------------------------
-// QuotaTracker — monthly trace counter with hard 5× cap
-// ---------------------------------------------------------------------------
-
-/// Per-tenant monthly quota configuration. Sourced from `workspace_entitlements`
-/// (deny-overrides-grant) with fallback to `plan_entitlements` defaults.
-///
-/// Copy semantics so the hot-path call site holds it by value without
-/// touching DashMap; refresh is done out-of-band by the entitlements cache.
-#[derive(Debug, Clone, Copy)]
-pub struct QuotaConfig {
-    /// Monthly included quota — e.g. 150_000 for Builder. 0 means "no quota
-    /// enforced" (only the OSS self-host path passes 0; hosted plans always
-    /// have a positive quota, even Free at 10_000).
-    pub trace_quota_monthly: u64,
-    /// Hard-cap multiplier on the included quota. 5.0 for paid plans →
-    /// usage > quota*5 returns 429. Stored as integer tenths so the hot
-    /// path stays integer-only (5.0 → 50).
-    pub hard_cap_tenths: u32,
-}
-
-impl QuotaConfig {
-    /// Returns the absolute hard-cap usage value above which requests are
-    /// rejected with 429. Saturates on overflow (caller treats saturation
-    /// as "no cap" — only triggers at Enterprise quota * 99× ≈ 2.5e12).
-    #[inline]
-    pub fn hard_cap_absolute(&self) -> u64 {
-        self.trace_quota_monthly
-            .saturating_mul(u64::from(self.hard_cap_tenths))
-            / 10
-    }
-
-    /// Map the `tenants.plan_tier` string to a QuotaConfig.
-    ///
-    /// Values mirror the `plan_entitlements` seed rows (`apps/web/db/seed.mjs`;
-    /// schema in the Drizzle migrations per ADR-040/). This is the
-    /// in-memory fallback for
-    /// the gateway hot path; the dashboard reads the same values through
-    /// `plan_entitlements` + `workspace_entitlements` (deny-overrides-grant).
-    /// Drift between the two is a bug — keep them synchronised with the
-    /// entitlement seed rows (the authoritative numbers).
-    ///
-    /// Anything unknown falls back to Free quota (10K/mo) — fail-restricted
-    /// for the same reason `RateLimitTier::from_plan_tier_str` does.
-    pub fn from_plan_tier_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "builder" => Self {
-                trace_quota_monthly: 150_000,
-                hard_cap_tenths: 50, // 5.0×
-            },
-            "team" => Self {
-                trace_quota_monthly: 1_000_000,
-                hard_cap_tenths: 50,
-            },
-            "business" => Self {
-                trace_quota_monthly: 5_000_000,
-                hard_cap_tenths: 50,
-            },
-            "enterprise" => Self {
-                trace_quota_monthly: 25_000_000,
-                hard_cap_tenths: 990, // 99.0× — effectively unlimited
-            },
-            // "free" and anything else
-            _ => Self {
-                trace_quota_monthly: 10_000,
-                hard_cap_tenths: 10, // 1.0× — Free has no overage allowed
-            },
-        }
-    }
-}
-
-/// Decision returned by `QuotaTracker::check`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuotaDecision {
-    /// Within the included monthly quota.
-    Allow,
-    /// `used == quota`: the last request INSIDE the included allowance. Served,
-    /// and NOT billable overage.
-    QuotaReached { quota: u64, used: u64 },
-    /// `quota < used <= hard cap` — billable overage. Served.
-    /// Caller meters this to Polar via `overage_v1` lookup_key.
-    AllowWithOverage { quota: u64, used: u64 },
-    /// Above `quota * hard_cap_tenths/10`. Caller must return 429 +
-    /// the structured body `{error,limit,used,reset_at,upgrade_url}` and
-    /// fire-and-forget the Slack webhook POST.
-    HardCapExceeded { limit: u64, used: u64 },
-}
-
-impl QuotaDecision {
-    /// SET-08 notify predicate: at or over the included quota, and still served.
-    ///
-    /// A **position** test, deliberately not a transition test. The in-memory
-    /// counter reseeds from ClickHouse on boot, so after a restart it can
-    /// land anywhere relative to the quota; an `== quota` transition test misses
-    /// the alert entirely when the reseed lands above, and re-fires when it lands
-    /// below. Both happen on any mid-month deploy.
-    ///
-    /// Fire-once is therefore NOT this function's job — it belongs to the
-    /// persisted marker in `db::quota_notifications`, which outlives the process
-    /// and is shared across replicas.
-    pub fn at_or_over_included_quota(&self) -> Option<(u64, u64)> {
-        match *self {
-            QuotaDecision::QuotaReached { quota, used }
-            | QuotaDecision::AllowWithOverage { quota, used } => Some((quota, used)),
-            QuotaDecision::Allow | QuotaDecision::HardCapExceeded { .. } => None,
-        }
-    }
-}
-
-/// Tracks monthly trace usage per tenant with sub-microsecond decision overhead.
-///
-/// Storage: `DashMap<TenantId, AtomicU64>` — the AtomicU64 is the only state
-/// touched on the request hot path. DashMap entry lookup is the dominant cost;
-/// once the entry exists it's a single relaxed `fetch_add` + compare.
-///
-/// Reset: callers are expected to swap counters at month boundary via
-/// `reset_for_period(tenant_id)`. The 60s entitlements cache refresh is the
-/// usual trigger; the month boundary is a once-a-month batch elsewhere.
-pub struct QuotaTracker {
-    /// Per-tenant atomic monthly usage counter.
-    ///
-    /// `String` key (TenantId serialised) so we don't depend on TenantId
-    /// implementing `Hash + Eq` (it currently does, but keeping this
-    /// loose mirrors the existing RateLimiter pattern).
-    usage: Arc<DashMap<String, AtomicU64>>,
-    ///  durability: per-tenant `YYYYMM` the in-memory counter was last
-    /// seeded from the durable ClickHouse trace count for. Empty = never seeded
-    /// this process (fresh start / post-deploy). Drives both restart-durability
-    /// (re-seed after a restart) and the month-boundary reset (`reset_for_period`
-    /// was never wired up); see `needs_seed` / `seed_if_needed`.
-    seeded: Arc<DashMap<String, u32>>,
-}
-
-impl QuotaTracker {
-    pub fn new() -> Self {
-        Self {
-            usage: Arc::new(DashMap::new()),
-            seeded: Arc::new(DashMap::new()),
-        }
-    }
-
-    /// Increment the monthly counter by 1 and return the decision.
-    ///
-    /// Hot-path budget: <500ns p99. Implementation is a single DashMap
-    /// entry lookup + atomic `fetch_add(1, Relaxed)` + two integer compares.
-    /// No locks held across the comparison. `Relaxed` ordering is correct:
-    /// the counter is only ever read for billing/decision purposes, never
-    /// used to synchronise other memory.
-    #[instrument(skip(self, config), fields(tenant_id = %tenant_id))]
-    pub fn check(&self, tenant_id: &TenantId, config: QuotaConfig) -> QuotaDecision {
-        if config.trace_quota_monthly == 0 {
-            return QuotaDecision::Allow;
-        }
-        // Bypass the DashMap entirely on the hot-cap fast path: a single
-        // atomic load if the entry already exists.
-        let key = tenant_id.to_string();
-        let counter = self.usage.entry(key).or_insert_with(|| AtomicU64::new(0));
-        let used = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let limit = config.hard_cap_absolute();
-        let quota = config.trace_quota_monthly;
-        if used > limit {
-            QuotaDecision::HardCapExceeded { limit, used }
-        } else if used == quota {
-            QuotaDecision::QuotaReached { quota, used }
-        } else if used > quota {
-            QuotaDecision::AllowWithOverage { quota, used }
-        } else {
-            QuotaDecision::Allow
-        }
-    }
-
-    /// Read current monthly usage without incrementing. For status endpoints
-    /// and the 429 response body. Returns 0 for tenants with no recorded usage.
-    pub fn current_usage(&self, tenant_id: &TenantId) -> u64 {
-        let key = tenant_id.to_string();
-        self.usage
-            .get(&key)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    /// Reset the monthly counter for a tenant. Called at month boundary
-    /// by the billing reconciler (not on the hot path).
-    pub fn reset_for_period(&self, tenant_id: &TenantId) {
-        let key = tenant_id.to_string();
-        if let Some(counter) = self.usage.get(&key) {
-            counter.store(0, Ordering::Relaxed);
-        }
-    }
-
-    ///  durability: does this tenant's counter need (re)seeding for
-    /// `year_month` (`YYYYMM`)? True if never seeded this process (post-restart)
-    /// or last seeded for a different month (month boundary). The hot path calls
-    /// this FIRST so the durable ClickHouse baseline read happens once per tenant
-    /// per month per process, never per request (warm path stays allocation-free
-    /// past this cheap map probe).
-    pub fn needs_seed(&self, tenant_id: &TenantId, year_month: u32) -> bool {
-        let key = tenant_id.to_string();
-        self.seeded
-            .get(&key)
-            .map(|m| *m != year_month)
-            .unwrap_or(true)
-    }
-
-    ///  durability: seed the in-memory monthly counter from a durable
-    /// `baseline` (the ClickHouse trace count for `year_month`) so a restart or
-    /// blue-green deploy no longer forgives accrued usage — the counter
-    /// silently reset to 0 on every restart, making the hard cap bypassable by a
-    /// redeploy.
-    ///
-    /// Race-safe + idempotent: the `seeded` entry is the guard, so concurrent
-    /// first-requests for the same tenant seed exactly once. A caller that finds
-    /// the current month already recorded skips (returns `false`) and never
-    /// clobbers increments that the first seed's requests already made. The month
-    /// is part of the guard, so the first request of a new calendar month
-    /// re-seeds from the reset monthly count — the boundary reset `reset_for_period`
-    /// never wired up. Returns whether it actually seeded.
-    pub fn seed_if_needed(&self, tenant_id: &TenantId, year_month: u32, baseline: u64) -> bool {
-        use dashmap::mapref::entry::Entry;
-        let key = tenant_id.to_string();
-        match self.seeded.entry(key.clone()) {
-            // Already seeded for this month — do NOT re-store (would clobber the
-            // live increments made since the first seed).
-            Entry::Occupied(e) if *e.get() == year_month => false,
-            Entry::Occupied(mut e) => {
-                self.store_baseline(&key, baseline);
-                e.insert(year_month);
-                true
-            }
-            Entry::Vacant(v) => {
-                self.store_baseline(&key, baseline);
-                v.insert(year_month);
-                true
-            }
-        }
-    }
-
-    /// Overwrite a tenant's counter with `baseline` (the durable rehydration
-    /// value). Only called from `seed_if_needed` under the `seeded`-entry guard.
-    fn store_baseline(&self, key: &str, baseline: u64) {
-        self.usage
-            .entry(key.to_string())
-            .and_modify(|c| c.store(baseline, Ordering::Relaxed))
-            .or_insert_with(|| AtomicU64::new(baseline));
-    }
-}
-
-impl Default for QuotaTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn no_control_plane_rpm_is_60_unless_self_host() {
+        assert_eq!(resolve_no_control_plane_rate_limit_rpm(false), Some(60));
+        // F8/B-357: self-host with no declared cap is UNLIMITED.
+        assert_eq!(resolve_no_control_plane_rate_limit_rpm(true), None);
+    }
 
     // ── GWY-43: per-key rate limits ─────────────────────────────────────────
 
@@ -517,11 +241,11 @@ mod tests {
     fn a_per_key_cap_throttles_that_key() {
         let rl = RateLimiter::new();
         let tenant = t();
-        // Team tier is generous; the KEY cap is 3.
+        // The tenant is unlimited; the KEY cap is 3.
         let mut allowed = 0;
         for _ in 0..10 {
             if matches!(
-                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(3)),
+                rl.check_scoped(&tenant, None, Some("key-a"), Some(3)),
                 RateLimitDecision::Allow
             ) {
                 allowed += 1;
@@ -541,18 +265,18 @@ mod tests {
         let rl = RateLimiter::new();
         let tenant = t();
         for _ in 0..5 {
-            let _ = rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(2));
+            let _ = rl.check_scoped(&tenant, None, Some("key-a"), Some(2));
         }
         assert!(
             matches!(
-                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), Some(2)),
+                rl.check_scoped(&tenant, None, Some("key-a"), Some(2)),
                 RateLimitDecision::Throttle { .. }
             ),
             "key-a must be exhausted"
         );
         assert!(
             matches!(
-                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-b"), Some(2)),
+                rl.check_scoped(&tenant, None, Some("key-b"), Some(2)),
                 RateLimitDecision::Allow
             ),
             "key-b has its own bucket and must still pass"
@@ -567,26 +291,24 @@ mod tests {
         let tenant = t();
         for _ in 0..50 {
             assert_eq!(
-                rl.check_scoped(&tenant, RateLimitTier::Team, Some("key-a"), None),
-                rl_reference(&tenant),
-                "a key with no override must not be limited more than its tenant"
+                rl.check_scoped(&tenant, None, Some("key-a"), None),
+                RateLimitDecision::Allow,
+                "a key with no override must not be limited more than its (unlimited) tenant"
             );
-        }
-        fn rl_reference(_t: &TenantId) -> RateLimitDecision {
-            RateLimitDecision::Allow
         }
     }
 
     /// A per-key cap applies even where the platform bucket short-circuits. An
-    /// Enterprise workspace that puts a 2 rpm cap on a CI key means it.
+    /// unlimited (`rpm: None`) workspace that puts a 2 rpm cap on a CI key
+    /// means it.
     #[test]
-    fn a_key_cap_binds_even_on_enterprise() {
+    fn a_key_cap_binds_even_on_an_unlimited_tenant() {
         let rl = RateLimiter::new();
         let tenant = t();
         let mut allowed = 0;
         for _ in 0..6 {
             if matches!(
-                rl.check_scoped(&tenant, RateLimitTier::Enterprise, Some("ci"), Some(2)),
+                rl.check_scoped(&tenant, None, Some("ci"), Some(2)),
                 RateLimitDecision::Allow
             ) {
                 allowed += 1;
@@ -594,7 +316,7 @@ mod tests {
         }
         assert_eq!(
             allowed, 2,
-            "the customer's own cap is not waived by their plan"
+            "the customer's own cap is not waived by an unlimited platform tier"
         );
     }
 
@@ -604,12 +326,11 @@ mod tests {
     fn a_generous_key_cap_cannot_exceed_the_tenant_limit() {
         let rl = RateLimiter::new();
         let tenant = t();
-        let tier = RateLimitTier::Free;
-        let cap = tier.requests_per_minute();
+        let cap = 60u32;
         let mut allowed = 0;
         for _ in 0..(cap + 20) {
             if matches!(
-                rl.check_scoped(&tenant, tier, Some("k"), Some(u32::MAX)),
+                rl.check_scoped(&tenant, Some(cap), Some("k"), Some(u32::MAX)),
                 RateLimitDecision::Allow
             ) {
                 allowed += 1;
@@ -622,133 +343,64 @@ mod tests {
     }
 
     #[test]
-    fn key_bucket_discriminant_cannot_collide_with_a_tier() {
-        for tier in [
-            RateLimitTier::Free,
-            RateLimitTier::Builder,
-            RateLimitTier::Team,
-            RateLimitTier::Business,
-            RateLimitTier::Enterprise,
-            RateLimitTier::Bench,
-        ] {
-            assert_ne!(
-                tier as u8, KEY_BUCKET,
-                "{tier:?} collides with the key bucket"
-            );
-        }
+    fn key_bucket_discriminant_cannot_collide_with_tenant_bucket() {
+        assert_ne!(TENANT_BUCKET, KEY_BUCKET);
     }
-    use super::*;
-    use tracelane_shared::TenantId;
 
     fn tid(s: &str) -> TenantId {
         TenantId::from_jwt_claim(uuid::Uuid::parse_str(s).unwrap_or_else(|_| uuid::Uuid::new_v4()))
     }
 
-    /// A5 revenue-leak guard (2026-07-10): a freshly-provisioned tenant is plan
-    /// "free" (the WorkOS webhook provisions "free"; `tenants.plan` DEFAULT
-    /// 'free'). That MUST resolve to the 10K free quota — never the 150K Builder
-    /// quota (the leak was fresh signups landing on Builder). Unknown/blank plan
-    /// strings are ALSO free-quota (fail-restricted).
+    /// B-187c, ported: `None` (unlimited) must never throttle, and it must do
+    /// so by SHORT-CIRCUITING before the bucket map, not by sitting under a
+    /// huge-but-finite capacity — the same discriminating-mechanism test the
+    /// old `RateLimitTier::Bench` had.
     #[test]
-    fn fresh_signup_resolves_to_free_quota_not_builder() {
-        let fresh = QuotaConfig::from_plan_tier_str("free");
-        assert_eq!(fresh.trace_quota_monthly, 10_000, "free = 10K, not 150K");
-        assert_eq!(fresh.hard_cap_tenths, 10, "free = no overage (1.0x)");
-
-        // A NULL/blank/unrecognized plan column must also fail-restricted to free.
-        for s in ["", "  ", "bogus", "BUILDER_TYPO"] {
-            assert_eq!(
-                QuotaConfig::from_plan_tier_str(s).trace_quota_monthly,
-                10_000,
-                "unrecognized plan {s:?} must fall back to free quota, not Builder",
-            );
-        }
-
-        // Builder is the paid 150K tier — prove the two are distinct so a
-        // regression that maps free/unknown → Builder fails loudly here.
-        assert_eq!(
-            QuotaConfig::from_plan_tier_str("builder").trace_quota_monthly,
-            150_000,
-        );
-        assert_ne!(fresh.trace_quota_monthly, 150_000);
-
-        // The RPM tier is fail-restricted the same way.
-        assert!(matches!(
-            RateLimitTier::from_plan_tier_str("free"),
-            RateLimitTier::Free
-        ));
-        assert!(matches!(
-            RateLimitTier::from_plan_tier_str("nonsense"),
-            RateLimitTier::Free
-        ));
-    }
-
-    #[test]
-    fn bench_tier_is_never_throttled() {
-        // B-187c. Free throttles at 60/min; Bench must not throttle at all.
-        // N is deliberately far past every other tier's ceiling (Business =
-        // 60_000) so this cannot pass by sitting under some other limit.
+    fn unlimited_rpm_is_never_throttled_and_never_touches_the_bucket_map() {
         let rl = RateLimiter::new();
         let t = TenantId::from_jwt_claim(uuid::Uuid::nil());
         for i in 0..1_000u32 {
             assert_eq!(
-                rl.check(&t, RateLimitTier::Bench),
+                rl.check(&t, None),
                 RateLimitDecision::Allow,
-                "Bench tier throttled at request {i}"
+                "unlimited rpm throttled at request {i}"
             );
         }
-        // MECHANISM, not just the outcome. Asserting only "Allow" is NOT
-        // discriminating: `capacity = f64::from(u32::MAX)` is ~4.29e9 tokens, so
-        // a bucket-path Bench tier also returns Allow for any test-sized N — the
-        // first version of this test passed with the bug still present. What
-        // separates fixed from broken is whether `check` short-circuits BEFORE
-        // touching the bucket map at all.
         assert!(
             rl.buckets.is_empty(),
-            "Bench created a rate-limit bucket — it is going through the token-bucket \
-             path instead of the :135 early-return, so it is NOT treated as unlimited"
+            "an unlimited rpm created a rate-limit bucket — it is going through the \
+             token-bucket path instead of short-circuiting, so it is NOT actually unlimited"
         );
-        // Discriminating control: the same limiter DOES throttle Free, so the
-        // assertion above is not passing because throttling is broken entirely.
+        // Discriminating control: the same limiter DOES throttle a finite rpm,
+        // so the assertion above is not passing because throttling is broken
+        // entirely.
         let f = TenantId::from_jwt_claim(uuid::Uuid::from_u128(1));
         let mut throttled = false;
         for _ in 0..200 {
-            if rl.check(&f, RateLimitTier::Free) != RateLimitDecision::Allow {
+            if rl.check(&f, Some(60)) != RateLimitDecision::Allow {
                 throttled = true;
                 break;
             }
         }
         assert!(
             throttled,
-            "Free tier never throttled — the control is vacuous"
+            "a finite rpm never throttled — the control is vacuous"
         );
     }
 
     #[test]
-    fn free_tier_allows_up_to_60_rpm() {
+    fn finite_rpm_allows_up_to_the_configured_rate() {
         let rl = RateLimiter::new();
         let t = tid("00000000-0000-0000-0000-000000000001");
         // First 60 requests should all pass (bucket starts full)
         for _ in 0..60 {
-            assert_eq!(rl.check(&t, RateLimitTier::Free), RateLimitDecision::Allow);
+            assert_eq!(rl.check(&t, Some(60)), RateLimitDecision::Allow);
         }
         // 61st should throttle
         assert!(matches!(
-            rl.check(&t, RateLimitTier::Free),
+            rl.check(&t, Some(60)),
             RateLimitDecision::Throttle { .. }
         ));
-    }
-
-    #[test]
-    fn enterprise_always_allows() {
-        let rl = RateLimiter::new();
-        let t = tid("00000000-0000-0000-0000-000000000002");
-        for _ in 0..10_000 {
-            assert_eq!(
-                rl.check(&t, RateLimitTier::Enterprise),
-                RateLimitDecision::Allow
-            );
-        }
     }
 
     #[test]
@@ -758,10 +410,10 @@ mod tests {
         let t2 = tid("00000000-0000-0000-0000-000000000004");
         // Drain t1's bucket
         for _ in 0..60 {
-            rl.check(&t1, RateLimitTier::Free);
+            rl.check(&t1, Some(60));
         }
         // t2 should still have a full bucket
-        assert_eq!(rl.check(&t2, RateLimitTier::Free), RateLimitDecision::Allow);
+        assert_eq!(rl.check(&t2, Some(60)), RateLimitDecision::Allow);
     }
 
     #[test]
@@ -770,9 +422,9 @@ mod tests {
         let t = tid("00000000-0000-0000-0000-000000000005");
         // Drain bucket
         for _ in 0..60 {
-            rl.check(&t, RateLimitTier::Free);
+            rl.check(&t, Some(60));
         }
-        match rl.check(&t, RateLimitTier::Free) {
+        match rl.check(&t, Some(60)) {
             RateLimitDecision::Throttle { retry_after_secs } => {
                 assert!(
                     retry_after_secs >= 1,
@@ -781,326 +433,5 @@ mod tests {
             }
             RateLimitDecision::Allow => panic!("expected throttle"),
         }
-    }
-
-    // -----------------------------------------------------------------
-    // QuotaTracker tests
-    // -----------------------------------------------------------------
-    fn builder_cfg() -> QuotaConfig {
-        QuotaConfig {
-            trace_quota_monthly: 150_000,
-            hard_cap_tenths: 50, // 5.0x
-        }
-    }
-
-    #[test]
-    fn quota_allow_within_quota() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-000000000001");
-        let cfg = builder_cfg();
-        assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
-    }
-
-    #[test]
-    fn quota_overage_above_quota_below_cap() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-000000000002");
-        // Bigger-than-test quota would burn a few seconds in a tight loop;
-        // drive the counter directly via the public API.
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 5,
-            hard_cap_tenths: 50, // 5×5 = 25
-        };
-        // 1..=4 are plain Allow; the 5th lands EXACTLY on the quota and is the
-        // SET-08 soft-cap crossing, not Allow and not overage.
-        for _ in 0..4 {
-            assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
-        }
-        assert_eq!(
-            q.check(&t, cfg),
-            QuotaDecision::QuotaReached { quota: 5, used: 5 }
-        );
-        assert_eq!(
-            q.check(&t, cfg),
-            QuotaDecision::AllowWithOverage { quota: 5, used: 6 }
-        );
-        // Many more overage calls still allowed until 25
-        for used in 7..=24 {
-            assert_eq!(
-                q.check(&t, cfg),
-                QuotaDecision::AllowWithOverage { quota: 5, used }
-            );
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // SET-08 fire-once ACROSS RESTARTS.
-    //
-    // The first implementation fired on the transition `used == quota`. The
-    // counter below is process-local and reseeds from ClickHouse on boot
-    // so on any mid-month deploy that equality is wrong in BOTH
-    // directions. These tests pin the corrected behaviour: the predicate is the
-    // POSITION test `used >= quota`, and fire-once comes from a persisted
-    // marker whose real guarantee is the `quota_notifications` primary key.
-    // ------------------------------------------------------------------
-
-    /// Stands in for the persisted marker. `claim` returns true only the first
-    /// time for a given key — exactly the contract of
-    /// `INSERT … ON CONFLICT DO NOTHING` in `db::quota_notifications::claim`.
-    #[derive(Default)]
-    struct MarkerStub(std::collections::HashSet<(String, u32)>);
-
-    impl MarkerStub {
-        fn claim(&mut self, tenant: &TenantId, period: u32) -> bool {
-            self.0.insert((tenant.to_string(), period))
-        }
-    }
-
-    /// Run one process lifetime: fresh tracker, seeded from "ClickHouse" at
-    /// `seed`, then `requests` calls. Returns how many notifications fired.
-    fn notifications_in_lifetime(
-        cfg: QuotaConfig,
-        tenant: &TenantId,
-        period: u32,
-        seed: u64,
-        requests: u64,
-        marker: &mut MarkerStub,
-    ) -> usize {
-        let q = QuotaTracker::new();
-        q.seed_if_needed(tenant, period, seed);
-        let mut fired = 0;
-        for _ in 0..requests {
-            if q.check(tenant, cfg).at_or_over_included_quota().is_some()
-                && marker.claim(tenant, period)
-            {
-                fired += 1;
-            }
-        }
-        fired
-    }
-
-    fn soft_cap_cfg() -> QuotaConfig {
-        QuotaConfig {
-            trace_quota_monthly: 10,
-            hard_cap_tenths: 50, // hard cap 50 — well clear of these runs
-        }
-    }
-
-    /// Case 1 — a plain crossing fires exactly once.
-    #[test]
-    fn soft_cap_crossing_fires_once() {
-        let t = tid("11111111-0000-0000-0000-0000000000c1");
-        let mut m = MarkerStub::default();
-        let fired = notifications_in_lifetime(soft_cap_cfg(), &t, 202608, 0, 20, &mut m);
-        assert_eq!(fired, 1, "a single crossing must notify exactly once");
-    }
-
-    /// Case 2 — after the alert has been sent, a restart whose reseed lands
-    /// ABOVE the quota fires ZERO more. Under the old `== quota` predicate this
-    /// lifetime could never fire at all, which is how the alert got lost.
-    #[test]
-    fn soft_cap_restart_above_quota_fires_zero_more() {
-        let t = tid("11111111-0000-0000-0000-0000000000c2");
-        let cfg = soft_cap_cfg();
-        let mut m = MarkerStub::default();
-        assert_eq!(
-            notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m),
-            1,
-            "precondition: the first lifetime notifies"
-        );
-        let after_restart = notifications_in_lifetime(cfg, &t, 202608, 35, 10, &mut m);
-        assert_eq!(after_restart, 0, "a restart above quota must not re-notify");
-    }
-
-    /// Case 3 — a restart whose reseed lands BELOW the quota, then re-crosses,
-    /// fires ZERO more. This is the double-fire the transition predicate caused.
-    #[test]
-    fn soft_cap_restart_below_then_recross_fires_zero_more() {
-        let t = tid("11111111-0000-0000-0000-0000000000c3");
-        let cfg = soft_cap_cfg();
-        let mut m = MarkerStub::default();
-        assert_eq!(
-            notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m),
-            1,
-            "precondition: the first lifetime notifies"
-        );
-        let after_restart = notifications_in_lifetime(cfg, &t, 202608, 3, 20, &mut m);
-        assert_eq!(
-            after_restart, 0,
-            "a restart below quota that re-crosses must not re-notify"
-        );
-    }
-
-    /// A NEW billing period is a different marker key, so the alert is allowed
-    /// to fire again — otherwise a tenant is told once, ever.
-    #[test]
-    fn soft_cap_fires_again_in_the_next_period() {
-        let t = tid("11111111-0000-0000-0000-0000000000c4");
-        let cfg = soft_cap_cfg();
-        let mut m = MarkerStub::default();
-        assert_eq!(notifications_in_lifetime(cfg, &t, 202608, 0, 20, &mut m), 1);
-        assert_eq!(
-            notifications_in_lifetime(cfg, &t, 202609, 0, 20, &mut m),
-            1,
-            "a new period must be able to notify again"
-        );
-    }
-
-    /// Pins WHY the predicate changed: with the counter reseeded above quota,
-    /// `used == quota` is never true again, so the old transition test yields
-    /// zero notifications where the position test yields one.
-    #[test]
-    fn position_predicate_catches_what_the_equality_predicate_missed() {
-        let t = tid("11111111-0000-0000-0000-0000000000c5");
-        let cfg = soft_cap_cfg();
-        let q = QuotaTracker::new();
-        q.seed_if_needed(&t, 202608, 35); // restart landed above quota=10
-
-        let mut equality_hits = 0;
-        let mut position_hits = 0;
-        for _ in 0..10 {
-            let d = q.check(&t, cfg);
-            if matches!(d, QuotaDecision::QuotaReached { .. }) {
-                equality_hits += 1;
-            }
-            if d.at_or_over_included_quota().is_some() {
-                position_hits += 1;
-            }
-        }
-        assert_eq!(equality_hits, 0, "the old predicate sees nothing here");
-        assert!(
-            position_hits > 0,
-            "the position predicate must still see it"
-        );
-    }
-
-    #[test]
-    fn quota_hard_cap_returns_429_signal() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-000000000003");
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 5,
-            hard_cap_tenths: 50, // hard cap = 25
-        };
-        for _ in 0..25 {
-            q.check(&t, cfg);
-        }
-        match q.check(&t, cfg) {
-            QuotaDecision::HardCapExceeded { limit, used } => {
-                assert_eq!(limit, 25);
-                assert_eq!(used, 26);
-            }
-            other => panic!("expected HardCapExceeded, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn quota_zero_quota_always_allows() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-000000000004");
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 0,
-            hard_cap_tenths: 50,
-        };
-        for _ in 0..100 {
-            assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
-        }
-    }
-
-    #[test]
-    fn quota_reset_for_period_zeroes_counter() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-000000000005");
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 5,
-            hard_cap_tenths: 50,
-        };
-        for _ in 0..10 {
-            q.check(&t, cfg);
-        }
-        assert_eq!(q.current_usage(&t), 10);
-        q.reset_for_period(&t);
-        assert_eq!(q.current_usage(&t), 0);
-        // After reset, next call is back to Allow
-        assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
-    }
-
-    #[test]
-    fn quota_independent_tenants() {
-        let q = QuotaTracker::new();
-        let t1 = tid("11111111-0000-0000-0000-000000000006");
-        let t2 = tid("11111111-0000-0000-0000-000000000007");
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 2,
-            hard_cap_tenths: 50,
-        };
-        for _ in 0..10 {
-            q.check(&t1, cfg);
-        }
-        assert!(matches!(
-            q.check(&t1, cfg),
-            QuotaDecision::HardCapExceeded { .. }
-        ));
-        assert_eq!(q.check(&t2, cfg), QuotaDecision::Allow);
-    }
-
-    ///  regression: the counter is durable across "restart" (re-seeds from a
-    /// baseline instead of resetting to 0), race-safe (a redundant same-month seed
-    /// does not clobber live increments), and month-aware (a new month re-seeds).
-    /// the counter zeroed on every restart, making the hard cap
-    /// bypassable by a redeploy.
-    #[test]
-    fn seed_is_durable_race_safe_and_month_aware() {
-        let q = QuotaTracker::new();
-        let t = tid("11111111-0000-0000-0000-00000000000a");
-
-        // Fresh process: the tenant needs seeding for the current month.
-        assert!(q.needs_seed(&t, 202607));
-        // Rehydrate from a durable baseline of 900 (e.g. the ClickHouse month
-        // count) — this is what a restart re-reads instead of starting at 0.
-        assert!(q.seed_if_needed(&t, 202607, 900));
-        assert_eq!(
-            q.current_usage(&t),
-            900,
-            "counter rehydrated to the baseline"
-        );
-
-        // Already seeded this month: needs_seed is false and a redundant seed must
-        // NOT clobber the live counter back down (the concurrent-first-request race).
-        assert!(!q.needs_seed(&t, 202607));
-        assert!(
-            !q.seed_if_needed(&t, 202607, 5),
-            "redundant same-month seed no-ops"
-        );
-        assert_eq!(
-            q.current_usage(&t),
-            900,
-            "redundant seed did not clobber to 5"
-        );
-
-        // Increments accrue on top of the durable baseline, so the hard cap trips
-        // WITHOUT a restart having forgiven the earlier 900.
-        let cfg = QuotaConfig {
-            trace_quota_monthly: 1_000,
-            hard_cap_tenths: 10, // 1.0× → cap == quota (strict "429 at quota")
-        };
-        for _ in 0..100 {
-            q.check(&t, cfg);
-        }
-        assert_eq!(q.current_usage(&t), 1_000);
-        assert!(
-            matches!(q.check(&t, cfg), QuotaDecision::HardCapExceeded { .. }),
-            "seeded baseline + increments trips the cap; a redeploy no longer resets it"
-        );
-
-        // New calendar month → re-seed from the reset monthly count (0).
-        assert!(q.needs_seed(&t, 202608));
-        assert!(q.seed_if_needed(&t, 202608, 0));
-        assert_eq!(
-            q.current_usage(&t),
-            0,
-            "month boundary re-seeds from the reset count"
-        );
-        assert_eq!(q.check(&t, cfg), QuotaDecision::Allow);
     }
 }

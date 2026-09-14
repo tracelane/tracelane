@@ -8,6 +8,16 @@ name: Release tracelane-audit CLI
 # Tag format: v<semver>-audit-cli (e.g. `v0.1.0-audit-cli`). Triggers
 # this workflow without firing the general `release.yml` (which keys
 # off plain `v*` tags but excludes the `-audit-cli` suffix).
+#
+# ── HOSTED-RUNNER COST (founder, 2026-09-07) ────────────────────────────────
+# `build`'s matrix is FOUR hosted runners incl. TWO macOS and ONE Windows —
+# none of which has a self-hosted equivalent here. A `v*-audit-cli` TAG PUSH IS
+# ITSELF A FOUNDER ACTION and counts as the approval the cost rule asks for
+# ("only in extreme case with my approval"); see release.yml's header for the
+# full argument. `on: push: tags` fires wherever the tag lands and this file
+# carried no repository condition at all — every job below now carries
+# `github.repository == 'tracelane/tracelane'` so a tag pushed to THIS
+# (private, billed) repo never spends.
 
 on:
   push:
@@ -32,6 +42,9 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    # PUBLIC-ONLY (2026-09-07, see header) — four hosted runners in the matrix
+    # below, two of them macOS and one Windows.
+    if: github.repository == 'tracelane/tracelane'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write   # `Upload to release` (tag refs only)
@@ -155,7 +168,13 @@ jobs:
     # gates a dispatch fell straight through to publish-crates-io and attempted a
     # real publish — and crates.io versions are immutable (yank-only). This
     # workflow had never run at all, so that footgun was never observed.
-    if: startsWith(github.ref, 'refs/tags/')
+    # PUBLIC-ONLY (2026-09-07, see header) — explicit, not only inherited from
+    # `needs: build` (build's own `if:` has no status function, so GitHub's
+    # skip cascade already covers this, but stated here too per the file's own
+    # existing style of not relying on the cascade alone).
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     outputs:
       hashes: ${{ steps.collect.outputs.hashes }}
@@ -190,7 +209,10 @@ jobs:
   slsa-l3:
     name: SLSA L3 provenance generator
     needs: slsa-provenance
-    if: startsWith(github.ref, 'refs/tags/')  # tag refs only (see slsa-provenance)
+    # PUBLIC-ONLY (2026-09-07, see header) + tag refs only (see slsa-provenance).
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     permissions:
       id-token: write
       contents: write
@@ -208,7 +230,10 @@ jobs:
     # pending pre-registration), so if `tracelane-audit` is not yet on crates.io
     # this job 403s until one manual token publish seeds it. Same reason
     # publish-crate was dropped from release.yml for v0.2.1.
-    if: startsWith(github.ref, 'refs/tags/')
+    # PUBLIC-ONLY (2026-09-07, see header) + tag refs only.
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     environment: crates-io
     permissions:

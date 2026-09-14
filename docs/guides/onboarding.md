@@ -28,8 +28,7 @@ You're now logged in.
 
 In the dashboard: **Settings → API Keys → Create**. We display the
 raw key (`tlane_<base62>`) **once** — copy it now; we never store it
-in plaintext (only a SHA-256 hash). Lost keys must be revoked +
-re-issued.
+in plaintext (only a SHA-256 hash). Lost keys must be revoked + re-issued; revocation propagates within 60 seconds (an idle key may be accepted once more on its next use while the gateway re-checks it).
 
 ### 3. Configure your client
 
@@ -145,21 +144,29 @@ hood; we never call the Stripe API directly). In the Polar dashboard:
 
 1. Create the base-plan **Products** and set each product's
    `metadata.lookup_key` (unprefixed) — the gateway maps plans by
-   `lookup_key`, so you can rename products without a redeploy:
-   - `builder_v1` ($59)
-   - `team_v1` ($249)
-   - `business_v1` ($899)
-   - `enterprise_v1` (from $2,999, custom)
+   `lookup_key`, so you can rename products without a redeploy. Monthly and
+   annual are separate Polar products:
+   - `builder_v1` ($29) / `builder_v1_year` ($24/mo billed annually)
+   - `team_v1` ($229) / `team_v1_year` ($190/mo billed annually)
+   - `business_v1` ($799) / `business_v1_year` ($665/mo billed annually)
+   - `enterprise_v1` (from $2,499, custom)
 
    The `$0 OSS self-host` and `$0 hosted free` tiers have no Polar
-   product — they're the default for unbilled tenants.
-2. Create the metered add-on products with these `lookup_key`s:
-   - `overage_v1` — trace overage meter ($1.20 per 10K)
-   - `team_extra_seat_v1` / `business_extra_seat_v1` — seat overage ($19/seat/mo)
-   - `audit_addon_v1` — $999/mo Audit SKU
-   - `hipaa_gcp_addon_v1` — $2,000/mo Enterprise GCP/BAA opt-in
+   product — they're the default for unbilled tenants. Seats are unlimited
+   on every paid tier (Free stays capped at one) — there is no per-seat
+   product to create.
+2. Create the six usage meters with these `lookup_key`s / event names:
+   - `ingest_gb` — $0.20/GB
+   - `hot_gb_month` — laddered $16.00 / $8.00 / $4.50 / $3.00 per resident GB-month
+   - `series` — $0.008/series-month
+   - `scan_units` — $0.15/scan-unit
+   - `cold_gb_month` — $0.08/GB-month
+   - `eval_runs` — $0.005/judge run
 
-   (Five plans + four meters/add-ons = nine total Polar products.)
+   (Five plans × monthly+annual = ten base products, plus six meters. There
+   is no paid audit product — `/v1/audit/export` does not yet meet the founder
+   ruling's evidence-pack bar (spec `BILL-01` §10.4), so 7-year ledger
+   retention folds into Enterprise instead of shipping as a paid SKU.)
 3. Create a **Webhook** (Standard Webhooks spec) at
    `$YOUR_DASHBOARD/api/webhooks/polar` — the dashboard origin, NOT the gateway; the
    gateway has no Polar receiver and a webhook pointed there 404s, so no plan ever
@@ -211,7 +218,6 @@ Before flipping a tenant to a paid plan:
 - [ ] Audit anchoring keypair generated + `TRACELANE_REKOR_SIGNING_KEY` set
 - [ ] `CLICKHOUSE_URL` pointing at production cluster (not dev compose)
 - [ ] `POSTGRES_URL` pointing at Neon production branch
-- [ ] R2 bucket + IAM configured for cold-tier Parquet
 - [ ] OpenSSF Scorecard ≥ 9.0 on the public repo
 - [ ] OSV-Scanner clean across Rust + TS + Python lockfiles
 - [ ] All 20 conformance evals green on the production gateway

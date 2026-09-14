@@ -12,10 +12,27 @@
  *   5. Dispatch subscription.* → BASE plan events update tenants (plan,
  *      polar_customer_id, polar_subscription_id) + upsert
  *      workspace_entitlements.plan_lookup_key (plan membership only).
- *      ADD-ON events (a separate Polar subscription — the $999 Audit SKU) grant
- *      the matching workspace_entitlements boolean and NEVER touch the base plan
+ *      ADD-ON events: none are handled since 2026-09-14 — the Audit SKU is not
+ *      sold (B-392); a stray `audit_addon_v1` event is an unknown-key no-op and
+ *      NEVER touches the base plan
  * . Per-plan feature flags are NOT set here (those are plan defaults).
  *   6. Unknown plan key / unresolved tenant → log + 200 (no infinite retry).
+ *
+ * ── ADR-076 / BILL-01 additions, all in the SAME tenants UPDATE as the plan +
+ * B-388 clock (never a second statement — a crash between two writes must
+ * never leave one applied without the other) ──
+ *   - `<plan>_v1` AND `<plan>_v1_year` both resolve to the plan; the interval
+ *     sets `tenants.billing_interval`.
+ *   - The FIRST paid activation (no `price_protected_until` yet) sets it to
+ *     now + `billing_policy.price_protection_months`, and pins
+ *     `tenants.price_version` to the CURRENT `pricing_rates.price_version` —
+ *     both read from the tables, never literals.
+ *   - `subscription.past_due` sets `dunning_started_at = now`; any active
+ *     status clears it. The PLAN NEVER CHANGES on past_due — ingest is never
+ *     gated on billing state (spec §0.4).
+ *   - `.unpaid` / `.revoked` / `.canceled` reaching its end drop the tenant to
+ *     `free` and, only when it was PREVIOUSLY paid, set
+ *     `data_hold_until = now + billing_policy.dunning_data_hold_days`.
  *
  * E2E is gated on the founder: register the webhook in the Polar dashboard and
  * set POLAR_WEBHOOK_SECRET + POLAR_EXPECTED_ORGANIZATION_ID (+ POLAR_ACCESS_TOKEN)
@@ -23,11 +40,26 @@
  */
 
 import { db } from "@/db";
-import { tenants, webhookEvents, workspaceEntitlements } from "@/db/schema";
 import {
+	billingPolicy,
+	pricingRates,
+	tenants,
+	webhookEvents,
+	workspaceEntitlements,
+} from "@/db/schema";
+import {
+	sendDroppedToFreeEmail,
+	sendDunningStartedEmail,
+	sendPlanChangedEmail,
+} from "@/lib/email";
+import {
+	type BillingInterval,
 	type PlanResolution,
 	decodeWebhookSecret,
-	isAddOnLookupKey,
+	eventClock,
+	isActiveStatus,
+	isPastDueStatus,
+	isStale,
 	logSafe,
 	resolvePlan,
 	verifySignature,
@@ -104,7 +136,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	// Polar's Standard Webhooks envelope is `{ type, timestamp, data }`: the
 	// unique delivery id is the `webhook-id` HEADER, not a body field, so we do
 	// NOT require a top-level `id`. Idempotency keys on `webhookId` (below).
-	let event: { type: string; data: Record<string, unknown> };
+	let event: {
+		type: string;
+		timestamp?: unknown;
+		data: Record<string, unknown>;
+	};
 	try {
 		event = JSON.parse(body);
 	} catch {
@@ -186,10 +222,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
 async function dispatch(event: {
 	type: string;
+	timestamp?: unknown;
 	data: Record<string, unknown>;
 }): Promise<void> {
 	if (event.type.startsWith("subscription.")) {
-		await handleSubscriptionChange(event.type, event.data);
+		await handleSubscriptionChange(
+			event.type,
+			event.data,
+			eventClock(event.data, event.timestamp),
+		);
 		return;
 	}
 	if (event.type.startsWith("order.")) {
@@ -202,9 +243,61 @@ async function dispatch(event: {
 	// Unhandled event types are acked (recorded) without action.
 }
 
+/**
+ * `billing_policy.value` for `price_protection_months` / `dunning_data_hold_days`
+ * is stored as `jsonb` — a bare number (`12`, `30`). Reference-tables rule:
+ * never a literal fallback baked into behaviour, only a defensive "policy row
+ * missing" case that fails toward the SHORTER (customer-safe) side rather than
+ * silently granting an unbounded promise.
+ */
+async function readPolicyNumber(key: string): Promise<number | null> {
+	const [row] = await db
+		.select({ value: billingPolicy.value })
+		.from(billingPolicy)
+		.where(eq(billingPolicy.key, key))
+		.limit(1);
+	if (!row) return null;
+	const v = row.value;
+	return typeof v === "number" ? v : null;
+}
+
+/** `billing_policy.dunning_retry_days` is stored as a jsonb array, e.g. `[1,5,14]`. */
+async function readPolicyDayArray(key: string): Promise<number[]> {
+	const [row] = await db
+		.select({ value: billingPolicy.value })
+		.from(billingPolicy)
+		.where(eq(billingPolicy.key, key))
+		.limit(1);
+	const v = row?.value;
+	return Array.isArray(v) && v.every((n) => typeof n === "number") ? v : [];
+}
+
+/** The `pricing_rates.price_version` currently marked `is_current`. */
+async function readCurrentPriceVersion(): Promise<string | null> {
+	const [row] = await db
+		.select({ priceVersion: pricingRates.priceVersion })
+		.from(pricingRates)
+		.where(eq(pricingRates.isCurrent, true))
+		.limit(1);
+	return row?.priceVersion ?? null;
+}
+
+function addMonths(d: Date, months: number): Date {
+	const out = new Date(d);
+	out.setUTCMonth(out.getUTCMonth() + months);
+	return out;
+}
+
+function addDays(d: Date, days: number): Date {
+	return new Date(d.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
 async function handleSubscriptionChange(
 	eventType: string,
 	data: Record<string, unknown>,
+	// B-388: the event's own clock (Polar `modified_at`, else the envelope
+	// timestamp); `null` = unparsable, which APPLIES.
+	eventAt: Date | null,
 ): Promise<void> {
 	const subId = typeof data.id === "string" ? data.id : null;
 	const customerId =
@@ -218,16 +311,6 @@ async function handleSubscriptionChange(
 	// May 2026), not `tracelane_plan_key`.
 	const lookupKeyVal = product?.metadata?.lookup_key;
 	const lookupKey = typeof lookupKeyVal === "string" ? lookupKeyVal : null;
-
-	// Add-on subscriptions (the $999 Audit SKU, seat/overage meters, HIPAA-GCP)
-	// are a SEPARATE Polar subscription from the base plan. Route them BEFORE the
-	// plan resolver — which would otherwise class every add-on as "unknown" and
-	// no-op — so a real Audit-SKU purchase actually flips f_audit_addon.
-	// They must never touch tenants.plan / polar_subscription_id.
-	if (isAddOnLookupKey(lookupKey)) {
-		await handleAddOnChange(eventType, data, lookupKey as string, status);
-		return;
-	}
 
 	const resolution: PlanResolution = resolvePlan({
 		eventType,
@@ -260,22 +343,85 @@ async function handleSubscriptionChange(
 		return;
 	}
 
+	// B-388: refuse an event OLDER than the last one applied to this tenant.
+	// Acked (200), not applied, logged with both clocks — a stale retry after a
+	// cancellation must not re-activate the plan. Compared per TENANT, not per
+	// subscription id: a plan cannot go backwards in time whichever subscription
+	// object carries the older clock.
+	if (isStale(tenant.polarSubscriptionModifiedAt, eventAt)) {
+		console.warn(
+			"[polar-webhook] STALE subscription event — acked, NOT applied:",
+			logSafe(eventType),
+			"event",
+			eventAt?.toISOString() ?? "unparsable",
+			"< applied",
+			tenant.polarSubscriptionModifiedAt?.toISOString(),
+		);
+		return;
+	}
+
 	// `free` is now a valid tenants.plan value, so cancellation sets it
 	// explicitly (was previously left stale because the enum had no `free`).
 	const planValue = resolution.kind === "free" ? "free" : resolution.planEnum;
+	const interval: BillingInterval | null =
+		resolution.kind === "plan" ? resolution.interval : null;
+	const now = new Date();
+
+	// ── ADR-076 / BILL-01, §0.5 billing mechanics — ALL of these land in the
+	// SAME statement as the plan + clock below (B-388's ordering guard: a crash
+	// between two writes must never leave the plan applied with a stale clock,
+	// and the same now holds for price protection / dunning / data-hold). ──
+	const extra: Record<string, unknown> = {};
+
+	if (interval) extra.billingInterval = interval;
+
+	// Dunning: past_due starts the clock; any active status clears it. Plan is
+	// UNCHANGED either way — `resolvePlan` never resolves `past_due` to `free`,
+	// so ingest is never gated on billing state (spec §0.4).
+	if (isPastDueStatus(status)) {
+		extra.dunningStartedAt = now;
+	} else if (isActiveStatus(status)) {
+		extra.dunningStartedAt = null;
+	}
+
+	// Drop-to-Free from a previously PAID plan: hold the data per
+	// `billing_policy.dunning_data_hold_days`, read from the table — never a
+	// literal (`.claude/rules/reference-tables.md`). Re-cancelling an
+	// already-Free tenant does not re-arm the hold clock.
+	if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
+		const holdDays = await readPolicyNumber("dunning_data_hold_days");
+		if (holdDays !== null) extra.dataHoldUntil = addDays(now, holdDays);
+	}
+
+	// First paid activation: price protection pins BOTH the expiry and the
+	// rate version, both read from the DB, never a literal. Gated on
+	// `priceProtectedUntil` being unset rather than on the specific event type
+	// — the property that matters is "this tenant has never been price
+	// -protected before", however that transition arrived.
+	if (planValue !== "free" && !tenant.priceProtectedUntil) {
+		const months = await readPolicyNumber("price_protection_months");
+		const version = await readCurrentPriceVersion();
+		if (months !== null) extra.priceProtectedUntil = addMonths(now, months);
+		if (version) extra.priceVersion = version;
+	}
+
 	await db
 		.update(tenants)
 		.set({
 			plan: planValue,
 			...(customerId ? { polarCustomerId: customerId } : {}),
 			polarSubscriptionId: resolution.kind === "free" ? null : subId,
-			updatedAt: new Date(),
+			// The clock is set in the SAME statement as the plan, so a crash
+			// between the two cannot leave a plan applied with no clock.
+			...(eventAt ? { polarSubscriptionModifiedAt: eventAt } : {}),
+			...extra,
+			updatedAt: now,
 		})
 		.where(eq(tenants.id, tenant.id));
 
 	// Polar = plan membership only: set plan_lookup_key, never per-feature flags
 	// (those are workspace overrides under deny-overrides-grant). onConflict sets
-	// ONLY plan_lookup_key, so a previously-granted add-on flag (f_audit_addon)
+	// ONLY plan_lookup_key, so a per-workspace `f_audit_addon` override (the Enterprise export grant)
 	// survives a plan change.
 	await db
 		.insert(workspaceEntitlements)
@@ -284,6 +430,30 @@ async function handleSubscriptionChange(
 			target: workspaceEntitlements.tenantId,
 			set: { planLookupKey: resolution.lookupKey, updatedAt: new Date() },
 		});
+
+	// ── item 8: transactional emails, fire-and-forget-safe (sendEmail never
+	// throws) — sent AFTER the state write succeeds, never before, and gated on
+	// an ACTUAL transition (never re-sent on a same-state retry delivery). No
+	// billingEmail on file is a silent no-op, not a failure.
+	if (tenant.billingEmail) {
+		if (isPastDueStatus(status) && !tenant.dunningStartedAt) {
+			const retryDays = await readPolicyDayArray("dunning_retry_days");
+			await sendDunningStartedEmail(tenant.billingEmail, {
+				plan: tenant.plan ?? planValue,
+				retryDays,
+			});
+		} else if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
+			await sendDroppedToFreeEmail(tenant.billingEmail, {
+				previousPlan: tenant.plan,
+				dataHoldUntil: (extra.dataHoldUntil as Date | undefined) ?? now,
+			});
+		} else if (tenant.plan && tenant.plan !== planValue) {
+			await sendPlanChangedEmail(tenant.billingEmail, {
+				fromPlan: tenant.plan,
+				toPlan: planValue,
+			});
+		}
+	}
 }
 
 /**
@@ -295,9 +465,14 @@ async function handleSubscriptionChange(
  * error → 5xx → Polar retry loop. Returns the tenant row (id + current plan) or
  * null (the caller acks 200).
  */
-async function correlateTenant(
-	data: Record<string, unknown>,
-): Promise<{ id: string; plan: string | null } | null> {
+async function correlateTenant(data: Record<string, unknown>): Promise<{
+	id: string;
+	plan: string | null;
+	polarSubscriptionModifiedAt: Date | null;
+	priceProtectedUntil: Date | null;
+	billingEmail: string | null;
+	dunningStartedAt: Date | null;
+} | null> {
 	const customerId =
 		typeof data.customer_id === "string" ? data.customer_id : null;
 	const customer = data.customer as { external_id?: unknown } | undefined;
@@ -310,7 +485,14 @@ async function correlateTenant(
 			: null;
 	if (!tenantExternalId && !customerId) return null;
 	const [row] = await db
-		.select({ id: tenants.id, plan: tenants.plan })
+		.select({
+			id: tenants.id,
+			plan: tenants.plan,
+			polarSubscriptionModifiedAt: tenants.polarSubscriptionModifiedAt,
+			priceProtectedUntil: tenants.priceProtectedUntil,
+			billingEmail: tenants.billingEmail,
+			dunningStartedAt: tenants.dunningStartedAt,
+		})
 		.from(tenants)
 		.where(
 			tenantExternalId
@@ -319,69 +501,4 @@ async function correlateTenant(
 		)
 		.limit(1);
 	return row ?? null;
-}
-
-/**
- * Apply an add-on subscription (a SEPARATE Polar subscription from the base
- * plan). Only add-ons with a WIRED boolean grant mutate state — currently the
- * $999 Audit SKU (`audit_addon_v1` → `workspace_entitlements.f_audit_addon`),
- * which unlocks the Article-12 evidence-pack export + Compliance Handbook and
- * forces full-capture (see `lib/entitlements.ts`). Everything else (overage /
- * seat meters — metered, not a boolean; HIPAA-GCP — needs a manual BAA + GCP
- * deploy, never an auto-flip) is logged LOUDLY for manual handling and leaves
- * state unchanged.
- *
- * NEVER touches `tenants.plan` / `polar_subscription_id` — those belong to the
- * base plan's own subscription. Cancellation of the add-on (canceled/revoked)
- * sets the grant FALSE, so a churned Audit SKU actually re-locks the export.
- *
- * The upsert preserves the tenant's real `plan_lookup_key`: on CONFLICT it sets
- * ONLY `f_audit_addon`; on INSERT (no row yet) `plan_lookup_key` is derived from
- * the tenant's current plan (the column is NOT NULL + FK to plan_entitlements).
- */
-async function handleAddOnChange(
-	eventType: string,
-	data: Record<string, unknown>,
-	lookupKey: string,
-	status: string | null,
-): Promise<void> {
-	if (lookupKey !== "audit_addon_v1") {
-		// Known add-on, but its grant is not a simple auto-flippable boolean.
-		console.error(
-			`[polar-webhook] add-on ${lookupKey} purchased — grant NOT auto-wired (metered, or needs manual ops e.g. HIPAA BAA + GCP deploy). State unchanged; may need manual handling.`,
-		);
-		return;
-	}
-
-	const tenant = await correlateTenant(data);
-	if (!tenant) {
-		console.warn(
-			`[polar-webhook] audit add-on: no tenant correlation — acked (${lookupKey})`,
-		);
-		return;
-	}
-
-	const canceled =
-		/canceled|revoked/.test(eventType) ||
-		status === "canceled" ||
-		status === "revoked";
-	const active = !canceled;
-	// plan_lookup_key is NOT NULL + FK; on INSERT derive it from the current plan.
-	const planKey = `${tenant.plan ?? "free"}_v1`;
-
-	await db
-		.insert(workspaceEntitlements)
-		.values({
-			tenantId: tenant.id,
-			planLookupKey: planKey,
-			fAuditAddon: active,
-		})
-		.onConflictDoUpdate({
-			target: workspaceEntitlements.tenantId,
-			set: { fAuditAddon: active, updatedAt: new Date() },
-		});
-
-	console.info(
-		`[polar-webhook] audit add-on ${active ? "GRANTED" : "REVOKED"} (f_audit_addon=${active}) for tenant ${tenant.id}`,
-	);
 }

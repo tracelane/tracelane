@@ -171,7 +171,7 @@ impl HistoryReader for ClickHouseHistoryReader {
         // `scripts/ci/no-raw-ch-query.sh`.
         let promotions_fut = self
             .client
-            .query(PROMOTIONS_SQL)
+            .query(&crate::clickhouse_query::ceiling(PROMOTIONS_SQL))
             .bind(tenant_id.to_string())
             .bind(prompt_name)
             .bind(limit)
@@ -179,7 +179,7 @@ impl HistoryReader for ClickHouseHistoryReader {
 
         let rollbacks_fut = self
             .client
-            .query(ROLLBACKS_SQL)
+            .query(&crate::clickhouse_query::ceiling(ROLLBACKS_SQL))
             .bind(tenant_id.to_string())
             .bind(tenant_id.to_string())
             .bind(prompt_name)

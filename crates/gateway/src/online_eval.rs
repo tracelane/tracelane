@@ -42,6 +42,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use secrecy::ExposeSecret as _;
 use tracelane_shared::{ChatRequest, Message, MessageContent, Role, TenantId};
 use uuid::Uuid;
 
@@ -186,18 +187,43 @@ pub fn should_sample(salt: &str, trace_id: Uuid, rate: f64) -> bool {
     u128::from(drawn) < threshold
 }
 
+/// Requests refused by `admission` because the tenant's content is not captured
+/// (B-299). Process-wide, monotonic; read by `/v1/online-evals/summary` so an
+/// operator can see that the judge is being kept away from content on purpose.
+static SKIPPED_CAPTURE_OFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many admissions this process refused on the capture policy.
+#[must_use]
+pub fn skipped_capture_off() -> u64 {
+    SKIPPED_CAPTURE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The ONLY thing the chat handler calls. No I/O on a cache hit.
 ///
 /// Returns the policy iff this request should be scored: the workspace is
 /// entitled, has an enabled policy, and this `trace_id` falls in the sample.
+///
+/// `content_capture` is `crate::server::config::content_capture_enabled(tenant)` —
+/// the ONE capture policy (B-299). The judge reads the live request body, so a
+/// tenant whose content is not captured for STORAGE must not have it read for
+/// JUDGING either: `false` refuses here, before the body is flattened, before
+/// any provider call, before any `online_eval_scores.reason` could paraphrase it.
+/// Counted on `skipped_capture_off()` so the refusal is observable, not silent.
 pub async fn admission(
     tenant_id: &TenantId,
     trace_id: Uuid,
     entitlements: Option<&crate::entitlement_cache::ResolvedEntitlements>,
+    content_capture: bool,
 ) -> Option<Arc<Policy>> {
     // Entitlement first: it is the cheapest check and the one that must fail
     // closed. `None` (no control plane) is the unprivileged state — no feature.
     if !entitlements?.has(crate::entitlement_cache::FeatureKey::OnlineEvals) {
+        return None;
+    }
+    // B-299: capture policy BEFORE the policy lookup, so a capture-off tenant
+    // costs no I/O and no judge, whatever policy it has configured.
+    if !content_capture {
+        SKIPPED_CAPTURE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     let policy = policy_for(tenant_id).await?;
@@ -268,6 +294,8 @@ pub fn flatten_request_text(body: &serde_json::Value) -> String {
 /// on 100% of streaming traffic to serve a 1% sample is a cost paid by every
 /// request that will never be scored.
 pub struct Pending {
+    /// SRE #20: the entitlement cache, so the judge's spend read runs at the tenant's tier.
+    pub entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     pub policy: Arc<Policy>,
     pub providers: Arc<ProviderRegistry>,
     pub clickhouse_url: Option<String>,
@@ -292,6 +320,7 @@ impl Pending {
         answer: String,
     ) -> JudgeJob {
         JudgeJob {
+            entitlements: self.entitlements,
             policy: self.policy,
             tenant_id,
             trace_id,
@@ -310,6 +339,7 @@ impl Pending {
 /// Owned rather than borrowed because it crosses a `tokio::spawn` boundary and
 /// must not keep the request alive.
 pub struct JudgeJob {
+    pub entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     pub policy: Arc<Policy>,
     pub tenant_id: TenantId,
     pub trace_id: Uuid,
@@ -420,9 +450,16 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
         crate::server::ProviderKey::Unusable => {
             anyhow::bail!("stored '{provider_id}' key could not be decrypted")
         }
+        crate::server::ProviderKey::LookupFailed => {
+            anyhow::bail!("key store unreachable for '{provider_id}' — judge skipped, not guessed")
+        }
     };
 
     let request = ChatRequest {
+        top_p: None,
+        seed: None,
+        logprobs: None,
+        top_logprobs: None,
         model: model.clone(),
         messages: vec![Message {
             role: Role::User,
@@ -431,6 +468,7 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
             tool_call_id: None,
         }],
         tools: None,
+        tool_choice: None,
         max_tokens: None,
         temperature: None,
         stream: Some(false),
@@ -438,9 +476,32 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
         metadata: None,
     };
 
-    let mut stream =
-        crate::server::dispatch_to_provider(&job.providers, request, &key, &model, &job.tenant_id)
-            .await?;
+    let dispatch_result = crate::server::dispatch_to_provider(
+        &job.providers,
+        request,
+        key.expose_secret(),
+        &model,
+        &job.tenant_id,
+    )
+    .await;
+    // BILL-01 meter 6 (eval_runs): ONE unit per judge call that reached a
+    // provider — an errored call still counts (the provider was reached and
+    // presumably billed us), a call that never got this far (the earlier
+    // budget refusal, `return Ok(())` above) does not. Never counted under
+    // `TRACELANE_EVAL_MOCK_PROVIDERS` — a CI mock-provider run is not a
+    // billable judge run.
+    if std::env::var("TRACELANE_EVAL_MOCK_PROVIDERS").is_err()
+        && let Some(sink) = crate::billing::meters::global()
+    {
+        sink.record(
+            &job.tenant_id,
+            crate::billing::UsageMeter::EvalRuns,
+            "",
+            1.0,
+        )
+        .await;
+    }
+    let mut stream = dispatch_result?;
 
     let mut text = String::new();
     // Upstream-reported cost, `Some` ONLY when the provider puts one on the
@@ -481,12 +542,11 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
                 }
             }
             crate::providers::ProviderEvent::Done { response } => {
-                if let Some(choice) = response.choices.first() {
-                    if let MessageContent::Text(t) = &choice.message.content {
-                        if !t.is_empty() {
-                            text = t.clone();
-                        }
-                    }
+                if let Some(choice) = response.choices.first()
+                    && let MessageContent::Text(t) = &choice.message.content
+                    && !t.is_empty()
+                {
+                    text = t.clone();
                 }
                 if let Some(usage) = response.usage {
                     if usage.input_tokens > 0 {
@@ -622,10 +682,13 @@ fn emit_judge_span(
     let mut span = crate::server::build_gateway_span(
         &job.tenant_id,
         Uuid::new_v4(),
+        None,
         model,
-        None,
-        None,
-        None,
+        // This span is Tracelane's OWN call, not a customer request — there is
+        // no caller identity on the other side of it, and inventing one would
+        // put a synthetic agent or end user into the same aggregates real ones
+        // are counted in.
+        &crate::server::CallerIdentity::default(),
         started_at,
         input_tokens,
         output_tokens,
@@ -644,17 +707,10 @@ fn emit_judge_span(
         None,
         None,
         None,
-        None,
     );
     span.attributes.tracelane_eval_role = Some("judge".to_string());
     span.attributes.tracelane_eval_run_id = Some(job.policy.id.to_string());
-    let nats = Arc::clone(nats);
-    tokio::spawn(async move {
-        if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-            crate::otlp_emit::note_span_publish_failed();
-            tracing::warn!(error = %e, "online eval judge span NATS publish failed");
-        }
-    });
+    crate::otlp_emit::spawn_publish(Arc::clone(nats), span, "online-eval judge");
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -750,7 +806,7 @@ async fn judge_spend_this_month(job: &JudgeJob) -> f64 {
     let sql = crate::clickhouse_query::TenantQuery::new(
         "SELECT toFloat64(sum(cost_usd)) AS usd FROM online_eval_scores \
           WHERE tenant_id = ? AND toYYYYMM(scored_at) = toYYYYMM(now())",
-        crate::clickhouse_query::PlanTier::Builder,
+        crate::clickhouse_query::tier_for_tenant(job.entitlements.as_ref(), &job.tenant_id).await,
     )
     .sql_with_settings();
     match crate::clickhouse_query::ch_client(url)
@@ -1089,5 +1145,57 @@ mod tests {
             .filter(|_| should_sample("salt", Uuid::new_v4(), 0.01))
             .count();
         assert!((100..=320).contains(&hits), "1% of 20000 drew {hits}");
+    }
+}
+
+#[cfg(test)]
+mod capture_policy {
+    // B-299 (founder-ruled 2026-09-03): the judge obeys the SAME content-capture
+    // policy as storage. A capture-off tenant is refused at admission — before
+    // the policy lookup, before the body is flattened, before any judge call.
+    use super::*;
+
+    fn tenant() -> TenantId {
+        TenantId::from_jwt_claim(Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn capture_off_refuses_before_any_policy_lookup_and_is_counted() {
+        // Entitled for online evals, so ONLY the capture decision can refuse here.
+        let mut ents = crate::entitlement_cache::ResolvedEntitlements::bench_unlimited();
+        ents.f_online_evals = true;
+        assert!(ents.has(crate::entitlement_cache::FeatureKey::OnlineEvals));
+        let before = skipped_capture_off();
+        // No control-plane pool exists in a unit test: had this reached
+        // `policy_for`, it would have hit the pool, not returned on the flag.
+        let verdict = admission(&tenant(), Uuid::new_v4(), Some(&ents), false).await;
+        assert!(
+            verdict.is_none(),
+            "a capture-off tenant must never be admitted"
+        );
+        assert_eq!(
+            skipped_capture_off(),
+            before + 1,
+            "the refusal is counted, not silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_entitled_is_refused_before_the_capture_counter_moves() {
+        let before = skipped_capture_off();
+        let verdict = admission(&tenant(), Uuid::new_v4(), None, false).await;
+        assert!(verdict.is_none());
+        assert_eq!(
+            skipped_capture_off(),
+            before,
+            "entitlement refuses first; the capture counter is untouched"
+        );
+    }
+
+    /// The pure predicate storage, datasets and the judge all share.
+    #[test]
+    fn capture_decision_is_fail_closed_without_a_block() {
+        let t = tenant();
+        assert!(!crate::server::config::capture_decision(None, &t));
     }
 }

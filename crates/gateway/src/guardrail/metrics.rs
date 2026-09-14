@@ -13,10 +13,10 @@
 //! secrets/PII (§4). The **fail-open rate** is deliberately first-class: it is
 //! the honesty signal (`fail_open_total` > 0 must be visible).
 //!
-//! Recording is done on a `&GuardrailMetrics` instance so tests use a fresh
-//! local registry; production records onto the process-global [`metrics`].
+//! Recording is done on a `&GuardrailMetrics` instance; production's instance
+//! is owned by `GuardrailEngine` (B-386 b — it used to be a `LazyLock` global),
+//! and tests build a fresh local one.
 
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
@@ -130,24 +130,34 @@ impl GuardrailMetrics {
         }
     }
 
-    // ── Snapshot accessors (tests + scrape) ─────────────────────────────────
+    // ── Snapshot accessors (tests only today — see below, B-390) ────────────
+    //
+    // None of the six methods in this section have a production caller
+    // (found 2026-09-12, B-390) — no `/metrics` route serves
+    // `render_prometheus`'s output yet, despite its doc comment. All six are
+    // gated `#[cfg(test)]` together, along with the private `load` helper
+    // three of them share.
 
+    #[cfg(test)]
     #[must_use]
     pub fn eval_count(&self, rail: &'static str, outcome: &'static str) -> u64 {
         load(&self.evaluations, (rail, outcome))
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn block_count(&self, rail: &'static str, reason_code: &'static str) -> u64 {
         load(&self.block, (rail, reason_code))
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn fail_open_count(&self, rail: &'static str, reason: &'static str) -> u64 {
         load(&self.fail_open, (rail, reason))
     }
 
     /// Total fail-opens across all rails — the headline honesty signal (§4).
+    #[cfg(test)]
     #[must_use]
     pub fn fail_open_total(&self) -> u64 {
         self.fail_open
@@ -156,6 +166,7 @@ impl GuardrailMetrics {
             .sum()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn latency_count(&self, rail: &'static str) -> u64 {
         self.latency
@@ -165,6 +176,9 @@ impl GuardrailMetrics {
 
     /// Render the counters in Prometheus text exposition format, ready to serve
     /// from a `/metrics` route. Eventually-consistent snapshot.
+    ///
+    /// No production caller today — no `/metrics` route wires this in yet.
+    #[cfg(test)]
     #[must_use]
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
@@ -224,6 +238,7 @@ fn bump(map: &DashMap<(&'static str, &'static str), AtomicU64>, key: (&'static s
     map.entry(key).or_default().fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(test)]
 fn load(
     map: &DashMap<(&'static str, &'static str), AtomicU64>,
     key: (&'static str, &'static str),
@@ -231,18 +246,11 @@ fn load(
     map.get(&key).map_or(0, |c| c.load(Ordering::Relaxed))
 }
 
-/// The process-global metrics registry. The gateway records onto this; a
-/// `/metrics` route renders [`GuardrailMetrics::render_prometheus`].
-#[must_use]
-pub fn metrics() -> &'static GuardrailMetrics {
-    static M: LazyLock<GuardrailMetrics> = LazyLock::new(GuardrailMetrics::new);
-    &M
-}
-
-/// Record onto the process-global registry (production hot path).
-pub fn record_side_outcome(side_outcome: &SideOutcome, ctx: &GuardrailContext<'_>) {
-    metrics().record(side_outcome, ctx);
-}
+// `metrics()` — the process-global `LazyLock` — and `record_side_outcome` were
+// DELETED 2026-09-12 (B-386 b). The ONE registry is now owned by
+// `GuardrailEngine` (`engine.metrics()`), constructed with it; the engine
+// records on it directly. Nothing rendered the global — `render_prometheus`
+// has no production caller yet (its doc says so).
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +265,10 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -266,6 +278,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

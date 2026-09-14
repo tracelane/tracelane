@@ -38,6 +38,11 @@ const SIGNING_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub struct BedrockProvider {
     client: Client,
     region: String,
+    /// Test-only: an explicit `scheme://host[:port]` that replaces the AWS host
+    /// and static credentials that replace the env read, so the typed-status
+    /// contract can be exercised against a mock without touching process env.
+    #[cfg(test)]
+    test_override: Option<(String, AwsCredentials)>,
 }
 
 impl BedrockProvider {
@@ -52,6 +57,34 @@ impl BedrockProvider {
                 .build()
                 .context("build Bedrock reqwest client")?,
             region,
+            #[cfg(test)]
+            test_override: None,
+        })
+    }
+
+    /// Construct against an explicit endpoint with static credentials, reading
+    /// no process env. Used by `providers::smoke_tests` so the parallel suite
+    /// never mutates `AWS_*`.
+    #[cfg(test)]
+    pub(crate) fn for_test_endpoint(
+        endpoint: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: crate::ssrf_guard::safe_client_builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .context("build Bedrock reqwest client")?,
+            region: "us-east-1".into(),
+            test_override: Some((
+                endpoint.into(),
+                AwsCredentials {
+                    access_key_id: access_key_id.into(),
+                    secret_access_key: secret_access_key.into(),
+                    session_token: None,
+                },
+            )),
         })
     }
 
@@ -74,6 +107,17 @@ impl BedrockProvider {
     ) -> Result<ProviderStream> {
         let _ = tenant_id; // logged via instrument fields
 
+        #[cfg(test)]
+        let creds = match &self.test_override {
+            Some((_, c)) => AwsCredentials {
+                access_key_id: c.access_key_id.clone(),
+                secret_access_key: c.secret_access_key.clone(),
+                session_token: c.session_token.clone(),
+            },
+            None => AwsCredentials::from_env()
+                .context("Bedrock requires AWS credentials in the environment")?,
+        };
+        #[cfg(not(test))]
         let creds = AwsCredentials::from_env()
             .context("Bedrock requires AWS credentials in the environment")?;
 
@@ -87,9 +131,28 @@ impl BedrockProvider {
         let body_json =
             serde_json::to_vec(&converse).context("failed to serialise Converse body")?;
 
-        let host = format!("bedrock-runtime.{}.amazonaws.com", self.region);
         let path = format!("/model/{model_id}/converse");
-        let url = format!("https://{host}{path}");
+        #[cfg(test)]
+        let (host, url) = match &self.test_override {
+            Some((endpoint, _)) => (
+                endpoint
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .to_owned(),
+                format!("{endpoint}{path}"),
+            ),
+            None => {
+                let host = format!("bedrock-runtime.{}.amazonaws.com", self.region);
+                let url = format!("https://{host}{path}");
+                (host, url)
+            }
+        };
+        #[cfg(not(test))]
+        let (host, url) = {
+            let host = format!("bedrock-runtime.{}.amazonaws.com", self.region);
+            let url = format!("https://{host}{path}");
+            (host, url)
+        };
 
         // SSRF: validate before the POST (reviewer). Bedrock host is
         // always AWS public, but config injection (AWS_BEDROCK_BASE_URL or
@@ -142,7 +205,14 @@ impl BedrockProvider {
             // signature in error responses.
             let _body = response.text().await.unwrap_or_default();
             tracing::warn!(status = %status, "Bedrock Converse error");
-            bail!("Bedrock Converse error: status {status}");
+            // B-391: typed (see cohere.rs) — an invalid security token is a
+            // 403 auth rejection, not 502.
+            return Err(crate::providers::ProviderHttpError {
+                provider: "bedrock",
+                status: status.as_u16(),
+                reason: None,
+            }
+            .into());
         }
 
         let bytes = response
@@ -328,6 +398,11 @@ struct InferenceConfig {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// GWY-48. Forwarded so a parameter the span RECORDS is a parameter the
+    /// provider actually RECEIVED. `skip_serializing_if`, so a request that did
+    /// not send it serialises byte-identically to before this field existed.
+    #[serde(rename = "topP", skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 impl ConverseRequest {
@@ -337,10 +412,10 @@ impl ConverseRequest {
 
         // The universal ChatRequest has a top-level `system: Option<String>`
         // AND can encode system messages via `Role::System`. Honour both.
-        if let Some(sys) = req.system.clone() {
-            if !sys.is_empty() {
-                system.push(ConverseSystemBlock { text: sys });
-            }
+        if let Some(sys) = req.system.clone()
+            && !sys.is_empty()
+        {
+            system.push(ConverseSystemBlock { text: sys });
         }
 
         for m in &req.messages {
@@ -383,14 +458,19 @@ impl ConverseRequest {
             bail!("Converse request requires at least one user/assistant message");
         }
 
-        let inference_config = if req.max_tokens.is_some() || req.temperature.is_some() {
-            Some(InferenceConfig {
-                max_tokens: req.max_tokens,
-                temperature: req.temperature,
-            })
-        } else {
-            None
-        };
+        // GWY-48: see the identical widening in `google.rs` — without
+        // `|| req.top_p.is_some()` a top_p-only request silently builds no
+        // `inferenceConfig` and the value never leaves the process.
+        let inference_config =
+            if req.max_tokens.is_some() || req.temperature.is_some() || req.top_p.is_some() {
+                Some(InferenceConfig {
+                    max_tokens: req.max_tokens,
+                    temperature: req.temperature,
+                    top_p: req.top_p,
+                })
+            } else {
+                None
+            };
 
         // Tool definitions: universal Tool -> Converse toolConfig.
         // Previously dropped — a tool-bearing request silently degraded to
@@ -554,9 +634,14 @@ mod tests {
         temp: Option<f32>,
     ) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
             messages,
             tools: None,
+            tool_choice: None,
             max_tokens,
             temperature: temp,
             stream: Some(false),

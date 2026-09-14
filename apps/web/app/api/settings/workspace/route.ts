@@ -9,7 +9,7 @@
 
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
-import { requireSession } from "@/lib/auth";
+import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
 import { callerIsOrgAdmin } from "@/lib/workos-org";
 import { and, eq, isNull } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -162,6 +162,11 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 			.update(tenants)
 			.set({ archivedAt: new Date() })
 			.where(eq(tenants.id, t.id));
+		// B-361: this isolate's cached "not archived" read is now stale — clear
+		// it so this admin's own next request sees the archived state at once
+		// instead of waiting out the TTL (other isolates may lag; see the
+		// function doc on `invalidateOrgArchivedCache`).
+		invalidateOrgArchivedCache(session.tenantId);
 		await db
 			.update(apiKeys)
 			.set({ revokedAt: new Date() })

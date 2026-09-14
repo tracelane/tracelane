@@ -48,9 +48,7 @@ use tracing::instrument;
 use tracelane_shared::{
     TenantId,
     otlp::{
-        decode::{
-            BatchReject, DecodeOutcome, Wire, decode_batch_with_limits, wire_from_content_type,
-        },
+        decode::{BatchReject, DecodeOutcome, decode_batch_with_limits, wire_from_content_type},
         limits::{IngestLimits, RejectReason, WARNING_ENFORCEMENT_DATE, record_reject},
     },
 };
@@ -172,6 +170,47 @@ fn json_error(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// PLT-46: derive `gen_ai.usage.cost` from the price catalog for every span this
+/// route decoded that doesn't already carry one.
+///
+/// Mirrors `build_gateway_span`'s fallback in `server.rs`
+/// (`gen_ai_usage_cost: usage_meta.cost_usd.or_else(|| pricing::cost_usd(..))`),
+/// but is a **separate** call site: the chat path never calls this function, and
+/// this function is the OTLP write path's only new logic (spec §2). An unknown
+/// model, or a span with no model at all, is left `None` — the gateway never
+/// fabricates a cost (ADR-021/055), so an unpriced span shows no dollars rather
+/// than a wrong $0.00 (the same honesty posture `pricing::cost_usd` itself
+/// documents).
+fn backfill_span_costs(spans: &mut [tracelane_shared::TracelaneSpan]) {
+    for span in spans {
+        let attrs = &mut span.attributes;
+        if attrs.gen_ai_usage_cost.is_some() {
+            continue;
+        }
+        let Some(model) = attrs
+            .gen_ai_request_model
+            .clone()
+            .or_else(|| attrs.gen_ai_response_model.clone())
+        else {
+            continue;
+        };
+        let has_any_tokens = attrs.gen_ai_usage_input_tokens.is_some()
+            || attrs.gen_ai_usage_output_tokens.is_some()
+            || attrs.gen_ai_usage_cache_read_input_tokens.is_some()
+            || attrs.gen_ai_usage_cache_creation_input_tokens.is_some();
+        if !has_any_tokens {
+            continue;
+        }
+        let usage = tracelane_shared::Usage {
+            input_tokens: attrs.gen_ai_usage_input_tokens.unwrap_or(0),
+            output_tokens: attrs.gen_ai_usage_output_tokens.unwrap_or(0),
+            cache_read_input_tokens: attrs.gen_ai_usage_cache_read_input_tokens,
+            cache_creation_input_tokens: attrs.gen_ai_usage_cache_creation_input_tokens,
+        };
+        attrs.gen_ai_usage_cost = crate::pricing::cost_usd(&model, &usage);
+    }
+}
+
 /// `POST /v1/traces` — accept an OTLP/HTTP protobuf trace export.
 ///
 /// # Errors
@@ -194,10 +233,8 @@ pub async fn ingest_traces_handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "trace ingest: authentication failed");
-            return json_error(
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!({ "error": "invalid or expired credentials" }),
-            );
+            let (status, msg) = crate::auth::failure(&err);
+            return json_error(status, serde_json::json!({ "error": msg }));
         }
     };
 
@@ -221,19 +258,19 @@ pub async fn ingest_traces_handler(
     let tenant_id = claims.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tracing::field::display(&tenant_id));
 
-    // ── 3. Rate limit, on the tenant's real plan tier ───────────────────────
-    // The same limiter and the same tier resolution the chat path uses. Note it
-    // does NOT touch `quota_tracker`: that counter meters billable overage
-    // (SET-13), and feeding a telemetry export into a billing counter is a money
-    // decision, not a plumbing one.
-    let tier = match &state.entitlements {
-        Some(cache) => cache.resolved(*tenant_id.as_uuid()).await.rate_limit_tier(),
-        None => crate::rate_limiter::RateLimitTier::Free,
+    // ── 3. Rate limit, on the tenant's real plan RPM ────────────────────────
+    // The same limiter and the same RPM resolution the chat path uses
+    // (BILL-01: `rate_limit_rpm` straight from `ResolvedEntitlements`, `None`
+    // = unlimited). Does NOT touch any billing meter: feeding a telemetry
+    // export into a billing counter is a money decision, not a plumbing one.
+    let rpm = match &state.entitlements {
+        Some(cache) => cache.resolved(*tenant_id.as_uuid()).await.rate_limit_rpm,
+        None => state.no_control_plane_rate_limit_rpm,
     };
     if let crate::rate_limiter::RateLimitDecision::Throttle { retry_after_secs } =
-        state.rate_limiter.check(&tenant_id, tier)
+        state.rate_limiter.check(&tenant_id, rpm)
     {
-        crate::rejection_metrics::registry().record_rate_limited(&tenant_id);
+        state.rejection_metrics.record_rate_limited(&tenant_id);
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({
@@ -358,7 +395,7 @@ pub async fn ingest_traces_handler(
         }
     };
 
-    let batch = match outcome {
+    let mut batch = match outcome {
         DecodeOutcome::Ok(b) => b,
         DecodeOutcome::Rejected(r) => return reject_response(r, Some(&tenant_id)),
         DecodeOutcome::Malformed(msg) => {
@@ -368,6 +405,17 @@ pub async fn ingest_traces_handler(
     };
 
     tracing::Span::current().record("spans", batch.spans.len());
+
+    // ── 6b. Backfill cost from the price catalog (PLT-46) ───────────────────
+    // Claude Code's own OTLP export never puts a cost on the wire — Anthropic's
+    // per-request spend lives on the `claude_code.api_request` LOG event, which
+    // this route does not ingest (out of scope, PLT-46 §6) — so without this
+    // every one of its spans would carry tokens with no dollars. A free function
+    // rather than inline: it is unit-tested directly (below) instead of only
+    // through the full authenticated handler, and it is the ONE call site this
+    // change adds — the chat path (`server.rs`) is untouched, proven by
+    // `chat_path_source_gains_no_new_cost_usd_call_site` below.
+    backfill_span_costs(&mut batch.spans);
 
     // ── 7. Serialize everything BEFORE publishing anything ──────────────────
     // All-or-nothing at the size gate. Publishing half a batch and then returning
@@ -511,5 +559,148 @@ mod tests {
     #[test]
     fn nats_payload_ceiling_matches_the_broker_default() {
         assert_eq!(MAX_NATS_PAYLOAD_BYTES, 1_048_576);
+    }
+
+    // ── PLT-46: cost backfill from the price catalog ────────────────────────
+
+    fn bare_span() -> tracelane_shared::TracelaneSpan {
+        tracelane_shared::TracelaneSpan {
+            span_id: uuid::Uuid::new_v4(),
+            trace_id: uuid::Uuid::new_v4(),
+            parent_span_id: None,
+            tenant_id: TenantId::from_jwt_claim(uuid::Uuid::new_v4()),
+            name: "claude_code.llm_request".into(),
+            start_time: chrono::Utc::now(),
+            end_time: None,
+            attributes: tracelane_shared::SpanAttributes::default(),
+            status: tracelane_shared::SpanStatus::default(),
+        }
+    }
+
+    /// A known model + real tokens + no pre-existing cost → the catalog price
+    /// lands on the span.
+    #[test]
+    fn known_model_with_tokens_and_no_cost_gets_backfilled() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_request_model = Some("claude-sonnet-4-5-20250929".into());
+        span.attributes.gen_ai_usage_input_tokens = Some(1000);
+        span.attributes.gen_ai_usage_output_tokens = Some(500);
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        // Claude Sonnet: (1000*3 + 500*15) / 1e6 = 0.0105
+        let cost = spans[0].attributes.gen_ai_usage_cost;
+        assert!(
+            cost.is_some(),
+            "a known model with real tokens must get a cost"
+        );
+        assert!((cost.unwrap() - 0.0105).abs() < 1e-9);
+    }
+
+    /// The spec's central invariant: an unknown model is left `None`, never a
+    /// fabricated zero (ADR-021/055).
+    #[test]
+    fn unknown_model_stays_none_never_a_fabricated_zero() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_request_model = Some("not-a-real-model-xyz".into());
+        span.attributes.gen_ai_usage_input_tokens = Some(1000);
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        assert_eq!(
+            spans[0].attributes.gen_ai_usage_cost, None,
+            "unknown model must stay None, never 0.0"
+        );
+    }
+
+    /// A span with no model at all — never fabricate a model to price against.
+    #[test]
+    fn no_model_at_all_is_left_untouched() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_usage_input_tokens = Some(1000);
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        assert_eq!(spans[0].attributes.gen_ai_usage_cost, None);
+    }
+
+    /// A model with no token counts at all — nothing to price.
+    #[test]
+    fn model_with_no_token_counts_is_left_untouched() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_request_model = Some("claude-sonnet-4-5-20250929".into());
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        assert_eq!(spans[0].attributes.gen_ai_usage_cost, None);
+    }
+
+    /// A span that already carries a cost (a provider that DOES report one, or
+    /// an earlier pass) must never be overwritten.
+    #[test]
+    fn a_pre_existing_cost_is_never_overwritten() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_request_model = Some("claude-sonnet-4-5-20250929".into());
+        span.attributes.gen_ai_usage_input_tokens = Some(1000);
+        span.attributes.gen_ai_usage_output_tokens = Some(500);
+        span.attributes.gen_ai_usage_cost = Some(1.2345);
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        assert_eq!(spans[0].attributes.gen_ai_usage_cost, Some(1.2345));
+    }
+
+    /// `gen_ai.response.model` is a valid fallback when the request model was
+    /// never set (some span kinds only carry the response model).
+    #[test]
+    fn falls_back_to_response_model_when_request_model_absent() {
+        let mut span = bare_span();
+        span.attributes.gen_ai_response_model = Some("claude-haiku-4-5".into());
+        span.attributes.gen_ai_usage_input_tokens = Some(100);
+        span.attributes.gen_ai_usage_output_tokens = Some(50);
+        let mut spans = vec![span];
+        backfill_span_costs(&mut spans);
+        assert!(spans[0].attributes.gen_ai_usage_cost.is_some());
+    }
+
+    /// **THE ISOLATION PROOF (spec §7 proof 6).** `backfill_span_costs` must be
+    /// the ONLY new cost-derivation call site this change adds — the chat path
+    /// (`server.rs` and, since B-385 §2d split it, every `server/*.rs`) must gain
+    /// none. Grepping the checked-in source is a real, falsifiable assertion (not
+    /// a description): the baseline below was measured on `server.rs` BEFORE this
+    /// change and is unaffected by anything written in THIS file, since the two
+    /// are counted separately. The needle is built with `concat!` and never
+    /// written un-split anywhere in this file (comments included) — same
+    /// self-match hazard, and the same fix, as
+    /// `bench_gate_and_grant_each_have_exactly_one_site` in `server/dispatch.rs`:
+    /// `include_str!` pulls in this test's own source, so writing the joined
+    /// literal here would make the count include this sentence.
+    #[test]
+    fn chat_path_source_gains_no_new_cost_usd_call_site() {
+        const CALL: &str = concat!("crate", "::pricing::cost_usd(");
+
+        // The whole chat path, one file per concern after the B-385 §2d split.
+        // Adding a file under `server/` means adding it here, or its call sites
+        // fall outside this count.
+        let chat_path: [&str; 9] = [
+            include_str!("server.rs"),
+            include_str!("server/chat.rs"),
+            include_str!("server/embeddings.rs"),
+            include_str!("server/dispatch.rs"),
+            include_str!("server/stream.rs"),
+            include_str!("server/buffered.rs"),
+            include_str!("server/spans.rs"),
+            include_str!("server/errors.rs"),
+            include_str!("server/quota.rs"),
+        ];
+        let server_count: usize = chat_path.iter().map(|s| s.matches(CALL).count()).sum();
+        assert_eq!(
+            server_count, 5,
+            "the chat path's cost_usd call-site count changed ({server_count}, \
+             expected 5) — PLT-46's cost backfill must live only in \
+             trace_ingest.rs, not on the chat path"
+        );
+
+        // And the backfill logic DOES live here, exactly once.
+        let this_count = include_str!("trace_ingest.rs").matches(CALL).count();
+        assert_eq!(
+            this_count, 1,
+            "expected exactly one cost_usd call site in trace_ingest.rs"
+        );
     }
 }

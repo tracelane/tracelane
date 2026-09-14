@@ -169,7 +169,37 @@ impl PredictiveLayer {
         kill_switch: std::sync::Arc<crate::kill_switch::KillSwitch>,
     ) -> Self {
         self.kill_switch = Some(kill_switch);
+        // B-237: a `kill.predictive.<name>` key is matched VERBATIM against `fn name()`.
+        // `argdrift` was documented for a predictor named `pr8-lite-argument-drift`, so an
+        // operator could arm the switch, read "flags forced ON" in the boot log, and kill
+        // nothing. The layer's own `predictors` vec IS the registry, so the check lives here
+        // rather than in `KillSwitch`, which knows no names. Boot-time, one line, `error!`
+        // because a safety control that silently cannot fire is worse than a missing one.
+        let unknown = self.unknown_predictive_keys();
+        if !unknown.is_empty() {
+            let known: Vec<&str> = self.predictors.iter().map(|p| p.name()).collect();
+            tracing::error!(
+                unknown = %unknown.join(","),
+                known = %known.join(","),
+                "kill-switch: kill.predictive key matches NO registered predictor — it is INERT; \
+                 valid names are the exact `fn name()` strings"
+            );
+        }
         self
+    }
+
+    /// The `kill.predictive.<name>` keys forced ON whose `<name>` is not a registered
+    /// predictor — each one is a switch an operator believes is armed and is not.
+    #[must_use]
+    pub fn unknown_predictive_keys(&self) -> Vec<String> {
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return Vec::new();
+        };
+        ks.forced_keys()
+            .into_iter()
+            .filter_map(|k| k.strip_prefix("kill.predictive.").map(str::to_owned))
+            .filter(|name| !self.predictors.iter().any(|p| p.name() == name))
+            .collect()
     }
 
     /// Is this predictor disabled by `kill.predictive.<name>`?
@@ -181,9 +211,13 @@ impl PredictiveLayer {
 }
 
 impl PredictiveLayer {
-    /// Legacy sync entry — kept so existing tests and the few callers
-    /// that have no Tokio runtime context still compile. The hot path
+    /// Legacy sync entry — kept so existing tests still compile. The hot path
     /// in `server.rs::chat_completions_handler` uses `evaluate_async`.
+    ///
+    /// No production caller today (corrected 2026-09-12, B-390 — this used
+    /// to also claim "the few callers that have no Tokio runtime context",
+    /// which do not exist). Used only by tests, hence gated.
+    #[cfg(test)]
     #[tracing::instrument(skip(self, ctx), fields(tenant_id = %ctx.tenant_id))]
     pub fn evaluate(&self, ctx: &PredictiveContext<'_>) -> Decision {
         let mut result = Decision::Allow;
@@ -289,6 +323,71 @@ mod tests {
         }
         // evaluate_async uses the default forward to `evaluate`, so the
         // panic also fires on the async hot path.
+    }
+
+    /// A predictor that always blocks — the shape a kill switch exists to silence.
+    struct BlockingPredictor;
+
+    impl Predictor for BlockingPredictor {
+        fn name(&self) -> &'static str {
+            "blocking-test-predictor"
+        }
+
+        fn evaluate(&self, _ctx: &PredictiveContext<'_>) -> Decision {
+            Decision::Block {
+                aft_id: "test-block",
+            }
+        }
+    }
+
+    fn blocking_layer(flags: &str) -> PredictiveLayer {
+        PredictiveLayer {
+            predictors: vec![Box::new(BlockingPredictor)],
+            kill_switch: None,
+        }
+        .with_kill_switch(std::sync::Arc::new(
+            crate::kill_switch::KillSwitch::from_flag_list(flags),
+        ))
+    }
+
+    /// B-237, the detector: a key naming no predictor is reported, a key naming a real one
+    /// is not. Falsification: drop the `!any(..)` filter and the second assertion fails;
+    /// drop the prefix filter and `kill.upstream.*` keys would be reported as predictors.
+    #[test]
+    fn b237_unknown_kill_key_is_reported_and_known_key_is_not() {
+        let layer = blocking_layer(
+            "kill.predictive.argdrift,kill.predictive.blocking-test-predictor,kill.upstream.anthropic",
+        );
+        assert_eq!(
+            layer.unknown_predictive_keys(),
+            vec!["argdrift".to_string()]
+        );
+        let layer = blocking_layer("kill.predictive.blocking-test-predictor");
+        assert!(layer.unknown_predictive_keys().is_empty());
+    }
+
+    /// B-237, the switch itself: never before proven for ANY predictive key. The exact
+    /// name silences the predictor; the typo shape (`_` for `-`) leaves it firing.
+    #[test]
+    fn b237_kill_switch_silences_the_exact_name_and_not_its_typo() {
+        let tid = TenantId::from_jwt_claim(Uuid::from_u128(0xB237));
+        let req = serde_json::json!({"messages": []});
+        let ctx = PredictiveContext {
+            tenant_id: &tid,
+            request_json: &req,
+        };
+        let killed = blocking_layer("kill.predictive.blocking-test-predictor");
+        assert_eq!(
+            killed.evaluate(&ctx),
+            Decision::Allow,
+            "armed switch must silence it"
+        );
+        let typo = blocking_layer("kill.predictive.blocking_test_predictor");
+        assert!(
+            matches!(typo.evaluate(&ctx), Decision::Block { .. }),
+            "a typo'd key must NOT silence it — and it is now reported: {:?}",
+            typo.unknown_predictive_keys()
+        );
     }
 
     fn panicking_layer() -> PredictiveLayer {

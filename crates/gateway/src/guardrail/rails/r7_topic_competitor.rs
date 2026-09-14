@@ -45,6 +45,12 @@ impl R7Config {
     /// Compile the denied-topic + competitor term lists. Empty lists compile to
     /// `None` (match nothing). A malformed automaton degrades to `None` (logged)
     /// rather than failing construction — R7 is fail-open.
+    ///
+    /// No production caller — production always builds via `R7Config::default()`
+    /// (empty lists); this constructor is reachable only through
+    /// `GuardrailEngine::with_r7_config`, itself test-only. Used only by
+    /// tests, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn new<S: AsRef<str>>(denied_topics: &[S], competitor_terms: &[S]) -> Self {
         Self {
@@ -54,6 +60,7 @@ impl R7Config {
         }
     }
 
+    #[cfg(test)]
     fn build<S: AsRef<str>>(terms: &[S]) -> Option<AhoCorasick> {
         if terms.is_empty() {
             return None;
@@ -220,6 +227,10 @@ mod tests {
 
     fn req(user_text: &str) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -229,6 +240,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

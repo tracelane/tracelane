@@ -36,14 +36,26 @@
 //! With **no** `failover:` block the built-ins below apply, so a deployment
 //! that ships no config file is unchanged.
 
+// These four imports serve only the `#[cfg(all(test, debug_assertions))]`
+// `execute_with_failover` mechanism below (B-390, 2026-09-12) — gated to
+// match, since nothing else in this file needs them.
+#[cfg(all(test, debug_assertions))]
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, debug_assertions))]
 use anyhow::Result;
+#[cfg(all(test, debug_assertions))]
 use tracing::instrument;
 
+#[cfg(all(test, debug_assertions))]
 use tracelane_shared::TenantId;
 
 /// Error codes that trigger failover (not caller errors like 400, 401).
+///
+/// No production caller — this constant belongs to the `execute_with_failover`
+/// mechanism below, which the chat handler does not use (see its doc
+/// comment). Used only by tests, hence gated (B-390, 2026-09-12).
+#[cfg(all(test, debug_assertions))]
 pub const FAILOVER_CODES: &[u16] = &[500, 502, 503, 504];
 
 /// Maximum time budget for the entire failover chain.
@@ -146,15 +158,23 @@ const _: () = assert!(RetryPolicy::BUILTIN.backoff_ms < FAILOVER_BUDGET_MS);
 ///
 /// `retries:` and `backoff_ms:` are ALSO validated at parse time — an
 /// out-of-budget value refuses the boot rather than being silently clamped.
+///
+/// B-386 (b): takes the block the caller holds (`AppState::failover`, read once
+/// at boot) instead of reading the process-wide installed config here.
 #[must_use]
-pub fn retry_policy() -> RetryPolicy {
-    crate::server::config::failover().map_or(RetryPolicy::BUILTIN, |f| RetryPolicy {
+pub fn retry_policy(cfg: Option<&crate::server::config::FailoverConfig>) -> RetryPolicy {
+    cfg.map_or(RetryPolicy::BUILTIN, |f| RetryPolicy {
         retries: f.retries(),
         backoff_ms: f.backoff_ms(),
     })
 }
 
 /// Records the outcome of a failover chain execution.
+///
+/// No production caller — belongs to `execute_with_failover` below, which
+/// the chat handler does not use. Used only by tests, hence gated
+/// (B-390, 2026-09-12).
+#[cfg(all(test, debug_assertions))]
 #[derive(Debug, Clone)]
 pub struct FailoverRecord {
     /// Index of the provider that succeeded (0 = primary, 1 = secondary, …)
@@ -169,6 +189,7 @@ pub struct FailoverRecord {
     pub total_elapsed_ms: u64,
 }
 
+#[cfg(all(test, debug_assertions))]
 impl FailoverRecord {
     /// Render this record as `(key, value)` pairs.
     ///
@@ -200,6 +221,10 @@ impl FailoverRecord {
 }
 
 /// Determine whether an HTTP status code should trigger provider failover.
+///
+/// No production caller — belongs to the `execute_with_failover` mechanism.
+/// Used only by tests, hence gated (B-390, 2026-09-12).
+#[cfg(all(test, debug_assertions))]
 #[inline]
 pub fn is_failover_eligible(status_code: u16) -> bool {
     FAILOVER_CODES.contains(&status_code)
@@ -207,7 +232,7 @@ pub fn is_failover_eligible(status_code: u16) -> bool {
 
 /// The built-in model for a provider in [`DEFAULT_CHAIN`], or `None`.
 ///
-/// `None` is a real answer, and the common one: only three of the 169 routable
+/// `None` is a real answer, and the common one: only three of the 191 routable
 /// providers have a built-in entry. A `failover:` chain that names any other
 /// provider must spell the model out (`chain: groq:llama-3.3-70b-versatile`),
 /// and [`crate::server::config`] refuses the block if it does not — rather than
@@ -223,7 +248,8 @@ pub fn failover_model_for(provider: &str) -> Option<&'static str> {
 /// Ordered `(provider, model)` candidates to try when failing over AWAY
 /// from `primary_family`. Skips the primary; empty when it is the only hop.
 ///
-/// Reads the `failover:` chain from `tracelane.yaml` when one was installed,
+/// Reads the `failover:` chain the caller holds (`AppState::failover`, read
+/// once at boot from `tracelane.yaml` — B-386 b) when one was installed,
 /// otherwise [`DEFAULT_CHAIN`]. Both are already validated — every id is a
 /// provider some adapter serves, every model resolves back to its own provider
 /// — so this cannot silently drop a hop the operator *wrote*.
@@ -234,8 +260,11 @@ pub fn failover_model_for(provider: &str) -> Option<&'static str> {
 /// that provider (one `DEBUG`). Both are properties of the moment, not of the
 /// config, so neither is knowable at parse time.
 #[must_use]
-pub fn cross_provider_candidates(primary_family: &str) -> Vec<(&'static str, &'static str)> {
-    match crate::server::config::failover() {
+pub fn cross_provider_candidates<'c>(
+    primary_family: &str,
+    cfg: Option<&'c crate::server::config::FailoverConfig>,
+) -> Vec<(&'c str, &'c str)> {
+    match cfg {
         Some(cfg) => cfg
             .chain()
             .iter()
@@ -250,15 +279,10 @@ pub fn cross_provider_candidates(primary_family: &str) -> Vec<(&'static str, &'s
     }
 }
 
-/// Trait implemented by provider executor closures.
-/// Returns `Ok(output)` on success, `Err(status_code)` on retryable failure.
-pub trait ProviderAttempt: Send + Sync {
-    type Output: Send;
-    fn execute(
-        &self,
-        provider_name: &str,
-    ) -> impl std::future::Future<Output = std::result::Result<Self::Output, u16>> + Send;
-}
+// `ProviderAttempt` (a trait for "provider executor closures") was deleted
+// 2026-09-12 (B-390) — zero implementors anywhere, including tests;
+// `execute_with_failover` below never actually took this trait, it uses a
+// generic `F: Fn(&str) -> Fut` closure bound instead.
 
 /// Execute a closure against each provider in `chain` until one succeeds.
 ///
@@ -279,6 +303,7 @@ pub trait ProviderAttempt: Send + Sync {
 /// Fails when every provider in the chain returned a failover-eligible status,
 /// and short-circuits with an error on the first NON-retryable status (a 401 is
 /// the same 401 from every provider, so trying the next one only costs money).
+#[cfg(all(test, debug_assertions))]
 #[instrument(skip(chain, attempt_fn), fields(tenant_id = %tenant_id))]
 pub async fn execute_with_failover<F, Fut, T>(
     tenant_id: &TenantId,
@@ -501,12 +526,12 @@ mod tests {
         // No `failover:` block is installed in this test binary, so these
         // exercise the DEFAULT_CHAIN branch.
         assert_eq!(
-            cross_provider_candidates("anthropic"),
+            cross_provider_candidates("anthropic", None),
             vec![("openai", "gpt-4o"), ("google", "gemini-1.5-pro")],
         );
         // From OpenAI → anthropic then google (primary excluded, order kept).
         assert_eq!(
-            cross_provider_candidates("openai"),
+            cross_provider_candidates("openai", None),
             vec![
                 ("anthropic", "claude-3-5-sonnet-latest"),
                 ("google", "gemini-1.5-pro"),
@@ -514,13 +539,13 @@ mod tests {
         );
         // A primary outside the chain still yields the full chain.
         assert_eq!(
-            cross_provider_candidates("cohere").len(),
+            cross_provider_candidates("cohere", None).len(),
             DEFAULT_CHAIN.len()
         );
     }
 
     #[test]
     fn retry_policy_is_the_builtin_when_no_failover_block_is_installed() {
-        assert_eq!(retry_policy(), RetryPolicy::BUILTIN);
+        assert_eq!(retry_policy(None), RetryPolicy::BUILTIN);
     }
 }

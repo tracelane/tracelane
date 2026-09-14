@@ -27,13 +27,14 @@ const ALLOWED_INTENTS = new Set([
 ]);
 
 /**
- * Intents that are the PAID `saml_sso` capability (SET-24 / 5D-3).
+ * Intents that are the PAID `f_sso` capability (SET-24 / 5D-3).
  *
- * `sso` is SAML configuration and `dsync` is SCIM directory sync — both are sold
- * on Enterprise only (`PLAN_ENTITLEMENTS.enterprise.saml_sso`, the sole `true`).
- * Until 2026-08-10 this route gated on `callerIsOrgAdmin` ALONE, so any org admin
- * on ANY plan — including Free — could open the portal and configure SAML. Role is
- * not a plan: being an admin says who you are, not what you bought.
+ * `sso` is SAML configuration and `dsync` is SCIM directory sync — sold from
+ * Team upward under ADR-076 (`plans.v3.json` `f_sso: true` on team/business/
+ * enterprise, `false` on free/builder). Until 2026-08-10 this route gated on
+ * `callerIsOrgAdmin` ALONE, so any org admin on ANY plan — including Free —
+ * could open the portal and configure SAML. Role is not a plan: being an
+ * admin says who you are, not what you bought.
  *
  * `domain_verification` and `audit_logs` are deliberately NOT here: domain
  * verification is a prerequisite step with no paid capability behind it, and
@@ -99,9 +100,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		// to the UNPRIVILEGED state, never the privileged one.
 		const plan: Plan = (tenantRow?.plan as Plan) ?? "free";
 		const entitlements = await resolveEntitlements(tenantRow?.id, plan);
-		if (!entitlements.saml_sso) {
+		if (!entitlements.f_sso) {
 			return NextResponse.json(
-				{ error: "saml_sso_required", upgrade_url: "/settings/billing" },
+				{ error: "sso_required", upgrade_url: "/settings/billing" },
 				{ status: 403 },
 			);
 		}

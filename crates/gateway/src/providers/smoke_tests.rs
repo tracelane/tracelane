@@ -72,6 +72,10 @@ fn test_tenant() -> TenantId {
 
 fn simple_request() -> ChatRequest {
     ChatRequest {
+        top_p: None,
+        seed: None,
+        logprobs: None,
+        top_logprobs: None,
         model: "gpt-5".into(),
         messages: vec![Message {
             role: Role::User,
@@ -83,6 +87,7 @@ fn simple_request() -> ChatRequest {
         temperature: Some(0.0),
         stream: Some(true),
         tools: None,
+        tool_choice: None,
         system: None,
         metadata: None,
     }
@@ -380,6 +385,217 @@ async fn bedrock_provider_fails_without_aws_credentials() {
         }
         if let Some(v) = saved_sk {
             std::env::set_var("AWS_SECRET_ACCESS_KEY", v);
+        }
+    }
+}
+
+// =============================================================================
+// B-391 (b): the typed-status contract holds for EVERY adapter, not just the
+// OpenAI-shaped ones. Before this, Cohere / Azure / Bedrock returned a stringly
+// `anyhow::bail!("… error: status 401")` that `classify_dispatch_error` could
+// not see, so a rejected BYOK key on those three providers reached the customer
+// as 502 `provider_unavailable` — "our outage" — instead of 401
+// `provider_key_rejected`. One test per adapter, one status each, and the
+// credential-echo assertion on every one.
+// =============================================================================
+
+#[tokio::test]
+async fn cohere_401_surfaces_typed_auth_rejection() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string("{\"message\":\"invalid api token co-leaked-secret\"}"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = match CohereProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(simple_request(), "co-leaked-secret", &test_tenant())
+        .await
+    {
+        Ok(_) => panic!("upstream 401 must surface as an error, not Ok"),
+        Err(e) => e,
+    };
+    let http = err
+        .downcast_ref::<crate::providers::ProviderHttpError>()
+        .expect("Cohere non-2xx must be a typed ProviderHttpError");
+    assert_eq!(http.status, 401);
+    assert_eq!(http.provider, "cohere");
+    assert!(http.is_auth_rejection());
+    assert!(
+        !format!("{err:#}").contains("co-leaked-secret"),
+        "upstream 401 body must not leak into the error chain"
+    );
+}
+
+#[tokio::test]
+async fn azure_429_surfaces_typed_rate_limit() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/openai/deployments/.+/chat/completions$"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(
+            "{\"error\":{\"code\":\"429\",\"message\":\"rate limited az-leaked-secret\"}}",
+        ))
+        .mount(&server)
+        .await;
+
+    let err = match AzureOpenAiProvider::for_endpoint(server.uri(), "2025-01-01-preview")
+        .unwrap()
+        .chat(simple_request(), "az-leaked-secret", &test_tenant())
+        .await
+    {
+        Ok(_) => panic!("upstream 429 must surface as an error, not Ok"),
+        Err(e) => e,
+    };
+    let http = err
+        .downcast_ref::<crate::providers::ProviderHttpError>()
+        .expect("Azure non-2xx must be a typed ProviderHttpError");
+    assert_eq!(http.status, 429);
+    assert_eq!(http.provider, "azure");
+    assert!(http.is_rate_limited());
+    assert!(
+        !format!("{err:#}").contains("az-leaked-secret"),
+        "upstream 429 body must not leak into the error chain"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_403_surfaces_typed_auth_rejection() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/model/.+/converse$"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "{\"message\":\"The security token included in the request is invalid: br-leaked-token\"}",
+        ))
+        .mount(&server)
+        .await;
+
+    // Static test credentials + an endpoint override: reads NO process env, so
+    // this is safe beside the env-mutating `bedrock_*` test above.
+    let err =
+        match BedrockProvider::for_test_endpoint(server.uri(), "AKIATESTKEY", "br-leaked-token")
+            .unwrap()
+            .chat(simple_request(), "ignored", &test_tenant())
+            .await
+        {
+            Ok(_) => panic!("upstream 403 must surface as an error, not Ok"),
+            Err(e) => e,
+        };
+    let http = err
+        .downcast_ref::<crate::providers::ProviderHttpError>()
+        .expect("Bedrock non-2xx must be a typed ProviderHttpError");
+    assert_eq!(http.status, 403);
+    assert_eq!(http.provider, "bedrock");
+    assert!(http.is_auth_rejection());
+    assert!(
+        !format!("{err:#}").contains("br-leaked-token"),
+        "upstream 403 body must not leak into the error chain"
+    );
+}
+
+/// B-391 (b), the table: EVERY mockable adapter × the four statuses the
+/// handler classifies (401 key rejected · 404 model not found · 429 rate
+/// limited · 503 unavailable). Each cell asserts the typed status AND that the
+/// upstream body — which carries a credential-shaped string on purpose — never
+/// reaches the error chain. Bedrock is covered by its own test above (it needs
+/// static credentials); Vertex needs a GCP token exchange and is out of this
+/// table.
+#[tokio::test]
+async fn every_adapter_types_its_upstream_status() {
+    let _bypass = allow_loopback_for_this_test();
+    type Predicate = fn(&crate::providers::ProviderHttpError) -> bool;
+    let statuses: [(u16, Predicate); 4] = [
+        (401, |h| h.is_auth_rejection()),
+        (404, |h| h.is_model_not_found()),
+        (429, |h| h.is_rate_limited()),
+        (503, |h| {
+            !h.is_auth_rejection()
+                && !h.is_model_not_found()
+                && !h.is_rate_limited()
+                && !h.is_unclassified_client_error()
+        }),
+    ];
+    // (adapter, mock path, a request whose model routes to it)
+    let adapters: [(&str, &str); 5] = [
+        ("openai", "/v1/chat/completions"),
+        ("anthropic", "/v1/messages"),
+        (
+            "google",
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ),
+        ("azure", "/openai/deployments/gpt-4o/chat/completions"),
+        ("cohere", "/chat"),
+    ];
+    for (adapter, mock_path) in adapters {
+        for (status, predicate) in statuses {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(mock_path))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string("{\"error\":\"see key sk-table-leaked-secret\"}"),
+                )
+                .mount(&server)
+                .await;
+            let mut req = simple_request();
+            let result = match adapter {
+                "openai" => {
+                    OpenAiProvider::compatible(server.uri(), "openai")
+                        .unwrap()
+                        .chat(req, "sk-table-leaked-secret", &test_tenant())
+                        .await
+                }
+                "anthropic" => {
+                    req.model = "claude-sonnet-4-6".into();
+                    AnthropicProvider::for_base_url(server.uri())
+                        .unwrap()
+                        .chat(req, "sk-table-leaked-secret", &test_tenant())
+                        .await
+                }
+                "google" => {
+                    req.model = "gemini-2.5-flash".into();
+                    GoogleProvider::for_base_url(server.uri())
+                        .unwrap()
+                        .chat(req, "sk-table-leaked-secret", &test_tenant())
+                        .await
+                }
+                "azure" => {
+                    req.model = "azure/gpt-4o".into();
+                    AzureOpenAiProvider::for_endpoint(server.uri(), "2025-01-01-preview")
+                        .unwrap()
+                        .chat(req, "sk-table-leaked-secret", &test_tenant())
+                        .await
+                }
+                "cohere" => {
+                    req.model = "command-r".into();
+                    CohereProvider::for_base_url(server.uri())
+                        .unwrap()
+                        .chat(req, "sk-table-leaked-secret", &test_tenant())
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            let err = match result {
+                Ok(_) => panic!("{adapter}: upstream {status} must surface as an error"),
+                Err(e) => e,
+            };
+            let http = err
+                .downcast_ref::<crate::providers::ProviderHttpError>()
+                .unwrap_or_else(|| {
+                    panic!("{adapter}: upstream {status} must be a typed ProviderHttpError, got: {err:#}")
+                });
+            assert_eq!(http.status, status, "{adapter}");
+            assert!(predicate(http), "{adapter}: {status} classified wrong");
+            assert!(
+                !format!("{err:#}").contains("sk-table-leaked-secret"),
+                "{adapter}: upstream {status} body leaked into the error chain"
+            );
         }
     }
 }

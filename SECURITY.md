@@ -76,7 +76,7 @@ disclosure, coordinated with reporter.
   KeyUsage::digital_signature, ASCII-case-insensitive trust domain,
   path shape `/tenant/<uuid>/ingest-worker`) live in
   `crates/ingest/src/auth.rs`.
-- **Tamper-evident audit ledger** (`$999/mo` SKU): per-tenant SHA-256
+- **Tamper-evident audit ledger** (included on every plan): per-tenant SHA-256
   hash chain. Row hash uses length-prefixed, domain-separated framing
   (`tracelane-audit-row-v2\0`) — field-boundary attacks via
   attacker-controlled `actor` cannot collide rows. Merkle tree per
@@ -96,10 +96,9 @@ disclosure, coordinated with reporter.
 - **Supply chain:** Trusted Publishing OIDC only (no long-lived
   tokens). Sigstore Cosign keyless signatures on all releases.
   CycloneDX SBOM attached. Build provenance is attested via GitHub
-  `attest-build-provenance`, alongside the Cosign bundle. **We do not
-  claim a verified SLSA Level 3 attestation** — the repository runs
-  `slsa-github-generator` but its `final` job currently fails even on
-  successful releases. `.pth` file scanner in CI.
+  `attest-build-provenance` (Sigstore-backed, SLSA provenance format
+  — predicate type `https://slsa.dev/provenance/v1`), alongside the
+  Cosign bundle. `.pth` file scanner in CI.
 - **No admin endpoints:** Tracelane has no `/config/update`-style
   endpoints. No `eval` or import-by-string of untrusted
   configuration.
@@ -240,8 +239,8 @@ cosign verify \
 ```
 
 SBOM (CycloneDX JSON) is attached to every GitHub release as `sbom.cyclonedx.json`.
-Build provenance is attached via GitHub `attest-build-provenance`. A verified
-SLSA Level 3 attestation is **not** claimed — see the note above.
+Build provenance is attached via GitHub `attest-build-provenance`, in the SLSA
+provenance format (predicate type `https://slsa.dev/provenance/v1`).
 
 ### How our scanners and CI actions are pinned
 

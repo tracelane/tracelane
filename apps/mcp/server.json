@@ -2,7 +2,7 @@
 	"$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
 	"name": "io.github.tracelane/tracelane-mcp",
 	"description": "Read-only, tenant-scoped access to Tracelane agent traces and guardrail verdicts",
-	"version": "0.2.4",
+	"version": "0.3.0",
 	"websiteUrl": "https://tracelane.dev/docs/mcp-server",
 	"repository": {
 		"url": "https://github.com/tracelane/tracelane",
@@ -14,29 +14,28 @@
 			"registryType": "npm",
 			"registryBaseUrl": "https://registry.npmjs.org",
 			"identifier": "@tracelanedev/mcp",
-			"version": "0.2.4",
+			"version": "0.3.0",
 			"runtimeHint": "npx",
 			"transport": { "type": "stdio" },
 			"environmentVariables": [
 				{
 					"name": "TRACELANE_API_KEY",
-					"description": "Tracelane API key (tlane_…). Resolved to a tenant once at startup via the gateway's /v1/auth/whoami; the server refuses to start if the key is rejected.",
+					"description": "Tracelane API key (tlane_…). Resolved to a tenant once at startup via the gateway's /v1/auth/whoami; the server refuses to start if the key is rejected. Also the credential used to read trace data through the gateway when CLICKHOUSE_URL is unset.",
 					"isRequired": true,
 					"isSecret": true
 				},
 				{
 					"name": "TRACELANE_GATEWAY_URL",
-					"description": "Base URL of the Tracelane gateway used to validate TRACELANE_API_KEY. Must be https://…tracelane.dev outside development.",
+					"description": "Base URL of the Tracelane gateway. Validates TRACELANE_API_KEY, and — when CLICKHOUSE_URL is unset — is where every trace read goes. Must be https://…tracelane.dev outside development.",
 					"isRequired": true,
 					"format": "string",
 					"default": "https://gateway.tracelane.dev"
 				},
 				{
 					"name": "CLICKHOUSE_URL",
-					"description": "ClickHouse endpoint the server reads spans from. This server queries ClickHouse directly, so it targets a self-hosted or local Tracelane stack.",
-					"isRequired": true,
-					"format": "string",
-					"default": "http://localhost:8123"
+					"description": "self-host only; when unset the server reads through the gateway. Set this to point the server at your own ClickHouse instead of Tracelane Cloud.",
+					"isRequired": false,
+					"format": "string"
 				},
 				{
 					"name": "CLICKHOUSE_USER",

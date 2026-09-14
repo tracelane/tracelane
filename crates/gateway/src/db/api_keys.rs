@@ -197,6 +197,9 @@ pub struct KeyAuth {
     /// Per-key requests-per-minute override. `None` = fall back to the tenant's
     /// plan tier, which is the behaviour every key had before GWY-43.
     pub rate_limit_rpm: Option<u32>,
+    /// BILL-01 A3 — this key's budget reset cadence (`api_keys.budget_reset`).
+    /// `Monthly` for every key minted before A3.
+    pub budget_reset: tracelane_shared::spend::BudgetReset,
 }
 
 /// What the auth cache stores. Mirrors [`KeyAuth`] minus the `TenantId` wrapper,
@@ -208,6 +211,7 @@ type CachedAuth = (
     tracelane_shared::api_scope::KeyScope,
     Option<f64>,
     Option<u32>,
+    tracelane_shared::spend::BudgetReset,
 );
 
 static AUTH_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -217,7 +221,12 @@ static AUTH_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 ///
 // hot-path-cache-ttl: exempt -- 60s is BELOW the floor deliberately, and it is
 // safe here for a reason that does not generalise: `spawn_auth_cache_refresher`
-// renews active entries every `refresh_interval_secs()` (20s), so a short TTL
+// renews active entries every `refresh_interval_secs()` (20s by default) — BUT PROD SETS
+// `TRACELANE_AUTH_REFRESH_SECS=0`, WHICH MAKES THAT TASK A NO-OP (see `start_warm_refresh`).
+// Read this bound as the DEFAULT-CONFIG behaviour, never as the deployed one: on prod the
+// only things bounding staleness are the 60 s TTL and `stale_max_secs()`. A comment that
+// asserts a mechanism the deployment has switched off is worse than none — it retires the
+// question for the next reader (SRE audit finding 41, 2026-09-04). So: a short TTL
 // costs no cache misses and buys a revocation bound three times TIGHTER than the
 // TTL itself. Remove the refresher and this exemption is void — the cache goes
 // back to missing on every sparse request, which is exactly B-256.
@@ -260,6 +269,12 @@ fn auth_cache_capacity() -> u64 {
         .unwrap_or(500_000)
 }
 
+// B-386: stays global (for now) — this cache, the negative cache, `last_known`
+// and `active_digests` below are read by `api_key::validate`, which has no state
+// handle; converting them means threading an auth context through
+// `validate_authorization`'s ~25 callers. Deferred and listed in the B-386
+// report; the refresher (`spawn_auth_cache_refresher`) is spawned from `run()`
+// against the same pool that is now `AppState::pg`.
 fn auth_cache() -> &'static Cache<[u8; 32], CachedAuth> {
     static C: OnceLock<Cache<[u8; 32], CachedAuth>> = OnceLock::new();
     C.get_or_init(|| {
@@ -278,6 +293,35 @@ fn auth_cache() -> &'static Cache<[u8; 32], CachedAuth> {
             .time_to_live(Duration::from_secs(auth_cache_ttl_secs()))
             .build()
     })
+}
+
+/// B-383 (f), 2026-09-12: the NEGATIVE cache. A lookup that found no row is
+/// remembered for [`NEGATIVE_TTL`], so a scan of random `tlane_` strings is a
+/// scan of this map, not of Neon — before this, every unknown key cost one
+/// Postgres round trip and every retry of it cost another. Keyed on the same
+/// peppered lookup hash as the positive cache; bounded so a scan cannot grow it.
+///
+/// The one cost, stated: a key MINTED inside the window is refused for up to
+/// 30 s on its first use if that exact key was probed before it existed. The
+/// mint route says so.
+const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+const NEGATIVE_CAPACITY: u64 = 10_000;
+pub(crate) static AUTH_NEGATIVE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn negative_cache() -> &'static Cache<[u8; 32], ()> {
+    static C: OnceLock<Cache<[u8; 32], ()>> = OnceLock::new();
+    C.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(NEGATIVE_CAPACITY)
+            .time_to_live(NEGATIVE_TTL)
+            .build()
+    })
+}
+
+/// Test/ops hook: forget a key's negative entry (a mint route may call this so
+/// a just-minted key authenticates immediately).
+pub async fn forget_negative(lookup: &[u8; 32]) {
+    negative_cache().invalidate(lookup).await;
 }
 
 // ---------------------------------------------------------------------
@@ -308,7 +352,8 @@ fn auth_cache() -> &'static Cache<[u8; 32], CachedAuth> {
 // 60s TTL: a revoked key keeps working until its cached entry expires. The
 // refresher re-runs the SAME `WHERE revoked_at IS NULL AND (expires_at IS NULL
 // OR expires_at > now())` predicate the miss path uses, every
-// `refresh_interval_secs()` (default 20s), and INVALIDATES on a row that no
+// `refresh_interval_secs()` (default 20s — A NO-OP ON PROD, which sets
+// TRACELANE_AUTH_REFRESH_SECS=0), and INVALIDATES on a row that no
 // longer qualifies. So the bound becomes the refresh interval, three times
 // tighter than what shipped.
 //
@@ -412,6 +457,90 @@ fn active_idle_secs() -> u64 {
 /// Digests presented on the hot path, and when each was last seen. Separate from
 /// the moka cache on purpose: moka entries expire, and the set of keys we want to
 /// KEEP alive has to outlive the entries it is keeping alive.
+/// STALE-WHILE-REVALIDATE (2026-09-04, the p95 investigation). The moka cache
+/// EVICTS at its TTL, so a key presented less often than 60 s missed every time
+/// and paid the control-plane round trip on the hot path — with the keepalive
+/// off (NEON-COMPUTE-PIN) that is a fresh connect plus, when the compute had
+/// suspended, its ~1.2 s resume. This map keeps the last successful answer per
+/// digest for up to [`stale_max_secs`] beyond the TTL; a miss that finds one is
+/// served from it and the row is re-checked OFF-PATH (`refresh_one`).
+///
+/// What that means for revocation, stated honestly (B-303, accepted 2026-09-03):
+/// a key revoked while idle may be accepted ONCE more on its next use, and is
+/// refused from the refresh that use triggers (seconds). A key in steady use is
+/// still refused within the 60 s TTL. Nothing is served past `stale_max_secs`.
+type LastKnownMap = std::sync::Mutex<HashMap<[u8; 32], (CachedAuth, Instant)>>;
+
+fn last_known() -> &'static LastKnownMap {
+    static M: OnceLock<LastKnownMap> = OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// How long past the TTL a last-known answer may still be served: 15× the TTL,
+/// capped at 15 minutes — the entitlement cache's own staleness bound.
+fn stale_max_secs() -> u64 {
+    (auth_cache_ttl_secs() * 15).min(900)
+}
+
+/// Ceiling on remembered answers, mirroring `MAX_ACTIVE_DIGESTS` above.
+///
+/// SRE audit finding 49, 2026-09-04. This map grew without any bound while the sibling
+/// map twenty lines up carries one, and nothing ever removed an entry except an explicit
+/// invalidation — so an answer that can NEVER be served again (past `stale_max_secs`,
+/// where `last_known_fresh_enough` refuses it) still held its slot forever. Unbounded
+/// growth on the auth path is not a thing to leave to chance, which is the reasoning
+/// already written at `MAX_ACTIVE_DIGESTS`; it simply was not applied here.
+const MAX_LAST_KNOWN: usize = 10_000;
+
+fn remember_last_known(digest: [u8; 32], entry: CachedAuth) {
+    if let Ok(mut m) = last_known().lock() {
+        evict_last_known_if_full(&mut m, MAX_LAST_KNOWN, stale_max_secs());
+        m.insert(digest, (entry, Instant::now()));
+    }
+}
+
+/// The bound itself, factored out so it is testable without the global map or a clock —
+/// the same reason `parse_refresh_interval` is pure (`docs/reference/TRAPS.md` §20).
+fn evict_last_known_if_full(
+    m: &mut HashMap<[u8; 32], (CachedAuth, Instant)>,
+    cap: usize,
+    cutoff_secs: u64,
+) {
+    if m.len() < cap {
+        return;
+    }
+    // Expired entries are pure dead weight: `last_known_fresh_enough` already refuses
+    // anything past this bound, so dropping them costs nothing and is usually enough.
+    m.retain(|_, (_, at)| at.elapsed().as_secs() < cutoff_secs);
+    // Still full of LIVE entries — evict the stalest, which is the one closest to being
+    // refused anyway.
+    while m.len() >= cap {
+        let Some(stalest) = m
+            .iter()
+            .max_by_key(|(_, (_, at))| at.elapsed())
+            .map(|(k, _)| *k)
+        else {
+            break;
+        };
+        m.remove(&stalest);
+    }
+}
+
+fn forget_last_known(digest: [u8; 32]) {
+    if let Ok(mut m) = last_known().lock() {
+        m.remove(&digest);
+    }
+}
+
+fn last_known_fresh_enough(digest: [u8; 32]) -> Option<CachedAuth> {
+    let m = last_known().lock().ok()?;
+    let (entry, at) = m.get(&digest)?;
+    (at.elapsed().as_secs() < stale_max_secs()).then(|| entry.clone())
+}
+
+/// Misses served from the last-known answer while a refresh ran off-path.
+pub static AUTH_STALE_SERVED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 fn active_digests() -> &'static std::sync::Mutex<HashMap<[u8; 32], Instant>> {
     static A: OnceLock<std::sync::Mutex<HashMap<[u8; 32], Instant>>> = OnceLock::new();
     A.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -508,7 +637,7 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
     // is what makes that obvious in review.
     let row = client
         .query_opt(
-            "SELECT tenant_id, id, scope, budget_usd_monthly::text, rate_limit_rpm
+            "SELECT tenant_id, id, scope, budget_usd_monthly::text, rate_limit_rpm, budget_reset
              FROM api_keys
              WHERE lookup_hash = $1
                AND revoked_at IS NULL
@@ -521,6 +650,7 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
     let Some(row) = row else {
         // Revoked, expired, or deleted — drop it now rather than at TTL.
         auth_cache().invalidate(&digest).await;
+        forget_last_known(digest);
         if let Ok(mut map) = active_digests().lock() {
             map.remove(&digest);
         }
@@ -539,22 +669,21 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
         .get::<_, Option<i32>>(4)
         .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0);
+    let budget_reset = tracelane_shared::spend::BudgetReset::from_column(row.get::<_, &str>(5));
 
     // Re-inserting resets the TTL, which is what keeps a sparse tenant warm. It
     // also picks up a budget or rate-limit change within one interval instead of
     // one TTL — the live-proof found that both ceilings took up to 60s to bind.
-    auth_cache()
-        .insert(
-            digest,
-            (
-                tenant_uuid,
-                id,
-                key_scope,
-                budget_usd_monthly,
-                rate_limit_rpm,
-            ),
-        )
-        .await;
+    let entry = (
+        tenant_uuid,
+        id,
+        key_scope,
+        budget_usd_monthly,
+        rate_limit_rpm,
+        budget_reset,
+    );
+    auth_cache().insert(digest, entry.clone()).await;
+    remember_last_known(digest, entry);
     Ok(true)
 }
 
@@ -611,17 +740,14 @@ pub fn spawn_auth_cache_refresher(pool: Pool) {
 /// false in production for a structural reason, not an occasional one.
 pub async fn invalidate(digest: [u8; 32]) {
     auth_cache().invalidate(&digest).await;
+    // An explicit invalidation (our own revoke path) is immediate: the
+    // last-known answer must not outlive it.
+    forget_last_known(digest);
 }
 
-/// Snapshot `(hits, misses)` of the auth-result cache — for the health/metrics
-/// surface (the loud hit-rate signal).
-#[must_use]
-pub fn auth_cache_stats() -> (u64, u64) {
-    (
-        AUTH_CACHE_HIT_TOTAL.load(Ordering::Relaxed),
-        AUTH_CACHE_MISS_TOTAL.load(Ordering::Relaxed),
-    )
-}
+// `auth_cache_stats` (a `(hits, misses)` reader for the health/metrics
+// surface) was deleted 2026-09-12 (B-390) — zero callers anywhere, including
+// tests; nothing exports these two counters to the metrics endpoint yet.
 
 // ---------------------------------------------------------------------
 // Key material primitives
@@ -683,6 +809,33 @@ pub fn argon2id_verify(phc: &str, key_body: &str) -> Result<bool> {
     Ok(Argon2::default()
         .verify_password(key_body.as_bytes(), &parsed)
         .is_ok())
+}
+
+/// `argon2id_verify` moved OFF the tokio worker threads.
+///
+/// SRE audit finding 9, 2026-09-04. The verify is ~35 ms of CPU at the default params
+/// (m=19456, t=2, p=1 — measured on this box: min 28.9 / median 35.3 / max 45.4 ms),
+/// and it ran inline on the async task. The gateway is a bare `#[tokio::main]`, so it
+/// gets one worker per core — **FOUR on prod**, confirmed from `/proc/<pid>/task` on
+/// tl-node-1 (4x `tokio-rt-worker`, and ZERO blocking-pool threads, which is its own
+/// evidence that `spawn_blocking` was unused). An inline verify therefore parks a
+/// QUARTER of the runtime for ~35 ms, including whatever else lives in this process —
+/// the audit head-writer consumer among it.
+///
+/// Scope, stated so the fix is not over-read: this is a LATENCY defect, not a DoS
+/// amplifier. The KDF only runs after a peppered-HMAC `lookup_hash` row match, which
+/// an attacker cannot produce without `TRACELANE_APIKEY_PEPPER` — the `let Some(row)
+/// = row else { return Ok(None) }` above returns first. It is reached on a COLD auth
+/// only (cache miss AND no fresh last-known answer), which prod hits more often than
+/// most deployments because it sets `TRACELANE_AUTH_REFRESH_SECS=0`, disabling the
+/// warm refresher that would otherwise keep entries hot.
+///
+/// `block_in_place` is deliberately NOT used: it panics on a current-thread runtime,
+/// and this crate's tests default to `#[tokio::test]`.
+async fn argon2id_verify_blocking(phc: String, key_body: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || argon2id_verify(&phc, &key_body))
+        .await
+        .map_err(|e| anyhow::anyhow!("argon2id verify task join failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------
@@ -797,11 +950,14 @@ pub async fn mint(
 pub struct ApiKey {
     /// The `id` PK column (uuid, DB-generated).
     pub id: Uuid,
-    pub tenant_id: Uuid,
+    // `tenant_id`, `last_used_at`, `revoked_at` (deleted 2026-09-12, B-390) —
+    // never read after construction; `create`'s sole caller
+    // (`crates/gateway/tests/postgres_tenant_integration.rs`) only reads
+    // `.id` off the returned value. The `RETURNING` clause and the SQL
+    // column list in `create` are unchanged — only the struct fields and
+    // their three positional `row.get(N)` assignments were removed.
     pub name: String,
     pub created_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
     /// A13. `None` = the legacy full-surface key; see `api_scope::KeyScope`.
     pub scope: Option<Vec<String>>,
     /// A13. `None` = never expires.
@@ -838,6 +994,14 @@ pub struct MintOptions {
     /// `api_keys_rate_limit_rpm_positive_chk` (migration 0029) is the backstop
     /// for any other caller.
     pub rate_limit_rpm: Option<i32>,
+    /// BILL-01 A3. `None` ⇒ the column's own `DEFAULT 'monthly'` — every key
+    /// minted before A3 (and any caller that does not set this) keeps the
+    /// pre-A3 monthly cadence.
+    pub budget_reset: Option<tracelane_shared::spend::BudgetReset>,
+    /// BILL-01 A3. Opt IN to the velocity breaker for this key. `false` by
+    /// default (the column's own `DEFAULT false`) — a customer must ask for
+    /// anomaly-triggered promotion freezes, not receive them unasked.
+    pub velocity_breaker: bool,
 }
 
 impl MintOptions {
@@ -912,13 +1076,24 @@ pub async fn create(
 ) -> Result<ApiKey> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let budget_text: Option<String> = opts.budget_usd_monthly.map(|b| format!("{b:.4}"));
+    // `budget_reset` binds as TEXT into a `CHECK`-constrained column, same
+    // shape as the `plan` enum cast (`db/tenants.rs::PLAN_ENUM_CAST`) — a bare
+    // Rust `&str` serializes fine into `text`, so no `::text::` detour is
+    // needed here (unlike the `numeric` budget above); `None` lets the
+    // column's own `DEFAULT 'monthly'` apply.
+    let budget_reset: Option<&'static str> = opts
+        .budget_reset
+        .map(tracelane_shared::spend::BudgetReset::as_str);
     let sql = format!(
         // `$10` is bare on purpose: `rate_limit_rpm` is `integer`, and an `i32`
         // binds to `int4` natively. Only the `numeric` column needs the
-        // `::text::` detour above.
+        // `::text::` detour above. `$11`/`$12` (budget_reset/velocity_breaker)
+        // are likewise bare — `text` and `boolean` both bind natively.
         "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by, \
-                               scope, expires_at, budget_usd_monthly, rate_limit_rpm)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST}, $10)
+                               scope, expires_at, budget_usd_monthly, rate_limit_rpm, \
+                               budget_reset, velocity_breaker)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST}, $10, \
+                 COALESCE($11, 'monthly'), $12)
          RETURNING id, tenant_id, name, created_at, last_used_at, revoked_at, scope, expires_at"
     );
     let row = client
@@ -935,17 +1110,19 @@ pub async fn create(
                 &opts.expires_at,
                 &budget_text,
                 &opts.rate_limit_rpm,
+                &budget_reset,
+                &opts.velocity_breaker,
             ],
         )
         .await
         .context("INSERT INTO api_keys failed")?;
+    // B-383 (f): a probe of this exact key before it existed would have left a
+    // negative entry; a freshly minted key must authenticate at once.
+    forget_negative(&material.lookup_hash).await;
     Ok(ApiKey {
         id: row.get(0),
-        tenant_id: row.get(1),
         name: row.get(2),
         created_at: row.get(3),
-        last_used_at: row.get(4),
-        revoked_at: row.get(5),
         scope: row.get(6),
         expires_at: row.get(7),
     })
@@ -965,7 +1142,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
 
     // fix B: warm-cache hit — the peppered-HMAC digest matched a previously
     // authenticated key. Skip the PG SELECT + the ~50ms Argon2id verify.
-    if let Some((tenant, key_id, key_scope, budget_usd_monthly, rate_limit_rpm)) =
+    if let Some((tenant, key_id, key_scope, budget_usd_monthly, rate_limit_rpm, budget_reset)) =
         auth_cache().get(&lookup).await
     {
         let hits = AUTH_CACHE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -989,9 +1166,37 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
             scope: key_scope,
             budget_usd_monthly,
             rate_limit_rpm,
+            budget_reset,
         }));
     }
     AUTH_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // B-383 (f): a key that was NOT FOUND within the last 30 s is not found now
+    // either — answer without a round trip.
+    if negative_cache().get(&lookup).await.is_some() {
+        AUTH_NEGATIVE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    if let Some((tenant, key_id, key_scope, budget_usd_monthly, rate_limit_rpm, budget_reset)) =
+        last_known_fresh_enough(lookup)
+    {
+        // Serve the last-known answer NOW; re-check the row off the request path.
+        AUTH_STALE_SERVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = refresh_one(&pool, lookup).await {
+                tracing::debug!(error = %err, "off-path auth re-check failed; the entry ages out on its own");
+            }
+        });
+        note_active(lookup);
+        return Ok(Some(KeyAuth {
+            tenant_id: TenantId::from_jwt_claim(tenant),
+            key_id,
+            scope: key_scope,
+            budget_usd_monthly,
+            rate_limit_rpm,
+            budget_reset,
+        }));
+    }
 
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
 
@@ -1013,7 +1218,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
             // and parsed — the mirror image of the `::text::numeric` cast the
             // INSERT side needs, and for the same reason.
             "SELECT tenant_id, id, argon2id_phc, scope, expires_at,
-                    budget_usd_monthly::text, rate_limit_rpm
+                    budget_usd_monthly::text, rate_limit_rpm, budget_reset
              FROM api_keys
              WHERE lookup_hash = $1
                AND revoked_at IS NULL
@@ -1023,7 +1228,12 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         .await
         .context("SELECT api_keys by lookup_hash failed")?;
 
-    let Some(row) = row else { return Ok(None) };
+    let Some(row) = row else {
+        // B-383 (f): remember the miss. Revoked and expired keys land here too
+        // (the SELECT filters them), which is right: a revoked key stays revoked.
+        negative_cache().insert(lookup, ()).await;
+        return Ok(None);
+    };
 
     let tenant_uuid: Uuid = row.get(0);
     let id: Uuid = row.get(1);
@@ -1042,13 +1252,14 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         .get::<_, Option<i32>>(6)
         .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0);
+    let budget_reset = tracelane_shared::spend::BudgetReset::from_column(row.get::<_, &str>(7));
 
     // KDF verify — defense in depth. The peppered HMAC already authenticated,
     // but the strong scheme REQUIRES the Argon2id PHC: a row with a NULL or
     // failing PHC is rejected (a tampered row, or a row that should
     // have been re-minted).
-    let phc_ok = match phc.as_deref() {
-        Some(p) => match argon2id_verify(p, key_body) {
+    let phc_ok = match phc {
+        Some(p) => match argon2id_verify_blocking(p, key_body.to_string()).await {
             Ok(ok) => ok,
             Err(e) => {
                 // Malformed PHC on a lookup_hash hit = a corrupted/tampered row,
@@ -1077,18 +1288,16 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
     // would force the caller to re-derive a capability it cannot see on a warm
     // hit — and the only available default is full-surface, which would be a
     // privilege escalation on every cached request.
-    auth_cache()
-        .insert(
-            lookup,
-            (
-                tenant_uuid,
-                id,
-                key_scope.clone(),
-                budget_usd_monthly,
-                rate_limit_rpm,
-            ),
-        )
-        .await;
+    let entry = (
+        tenant_uuid,
+        id,
+        key_scope.clone(),
+        budget_usd_monthly,
+        rate_limit_rpm,
+        budget_reset,
+    );
+    auth_cache().insert(lookup, entry.clone()).await;
+    remember_last_known(lookup, entry);
     note_active(lookup);
     // ponytail: last_used_at is refreshed only on the (cold) miss path — a
     // warm-cached key updates it at most every 15m (TTL refill). Fine for a
@@ -1101,6 +1310,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         scope: key_scope,
         budget_usd_monthly,
         rate_limit_rpm,
+        budget_reset,
     }))
 }
 
@@ -1114,6 +1324,11 @@ async fn touch_last_used(client: &deadpool_postgres::Client, id: Uuid) {
 }
 
 /// Revoke a key by id. Idempotent — repeated revoke is a no-op.
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs`
+/// (a separate crate, invisible to this crate's own `dead_code` analysis).
+/// Allow justified the same way as `db::apply_migrations` (B-390, 2026-09-12).
+#[allow(dead_code)]
 pub async fn revoke(pool: &Pool, id: Uuid) -> Result<()> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     client
@@ -1344,6 +1559,40 @@ mod tests {
         );
     }
 
+    // SRE audit finding 9, 2026-09-04. STRUCTURAL, and deliberately so.
+    //
+    // I tried three times to write a behavioural test — a 1-worker multi-thread runtime
+    // with a 1 ms ticker, asserting the ticker keeps ticking across the verify — and
+    // ALL THREE PASSED WITH THE PRE-FIX INLINE CALL STILL IN PLACE. First it counted
+    // ticks from t=0 (they accumulated before the verify ran); then it called the verify
+    // from the test body, which `#[tokio::test(flavor = "multi_thread")]` drives with
+    // `block_on` on the MAIN thread, never touching the worker; then it moved the verify
+    // into a spawned task and STILL did not discriminate.
+    //
+    // A test that passes whether or not the fix is present proves nothing, and shipping
+    // one as a regression guard is the exact defect this audit spent its time removing.
+    // So this asserts the SHAPE instead, which does catch the regression that matters
+    // (someone putting the KDF back on the async task), and says plainly what it cannot
+    // prove: that the runtime is actually unblocked. That half is the reasoning at
+    // `argon2id_verify_blocking`, backed by the measurement in its doc comment.
+    #[test]
+    fn cold_auth_runs_the_kdf_off_the_tokio_workers() {
+        let src = include_str!("api_keys.rs");
+        assert!(
+            src.contains("async fn argon2id_verify_blocking"),
+            "the off-runtime wrapper is gone"
+        );
+        assert!(
+            src.contains("tokio::task::spawn_blocking(move || argon2id_verify("),
+            "argon2id_verify_blocking no longer uses spawn_blocking"
+        );
+        assert!(
+            src.contains("argon2id_verify_blocking(p, key_body.to_string()).await"),
+            "the COLD AUTH path no longer calls the off-runtime wrapper — a ~35 ms KDF \
+             is back on a tokio worker, and prod has only four"
+        );
+    }
+
     #[test]
     fn argon2id_roundtrip_succeeds() {
         let phc = argon2id_hash("a-secret-key-body").unwrap();
@@ -1541,5 +1790,75 @@ mod tests {
                 .await
                 .expect("text-routed numeric must serialize and round-trip");
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_while_revalidate {
+
+    // SRE audit finding 49. Falsifies the bound in BOTH directions: under the cap
+    // nothing is evicted, at the cap the map does not grow past it. Without
+    // `evict_last_known_if_full` the second assert fails (the map was unbounded).
+    #[test]
+    fn last_known_is_bounded_and_evicts_the_stalest() {
+        use std::collections::HashMap;
+        let mk = |n: u8| {
+            let mut d = [0u8; 32];
+            d[0] = n;
+            d
+        };
+        let mut m: HashMap<[u8; 32], (CachedAuth, Instant)> = HashMap::new();
+        let sample: CachedAuth = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            tracelane_shared::api_scope::KeyScope::from_column(None),
+            None,
+            None,
+            tracelane_shared::spend::BudgetReset::Monthly,
+        );
+        for n in 0..5u8 {
+            m.insert(mk(n), (sample.clone(), Instant::now()));
+        }
+        // Under the cap: untouched.
+        evict_last_known_if_full(&mut m, 10, 900);
+        assert_eq!(m.len(), 5, "nothing should be evicted below the cap");
+
+        // At the cap with every entry live: it must still come down below it.
+        evict_last_known_if_full(&mut m, 5, 900);
+        assert!(
+            m.len() < 5,
+            "at the cap the map must shed an entry; it was unbounded before finding 49"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn stale_bound_is_fifteen_ttls_capped_at_fifteen_minutes() {
+        assert_eq!(stale_max_secs(), (auth_cache_ttl_secs() * 15).min(900));
+        assert!(stale_max_secs() <= 900);
+    }
+
+    #[test]
+    fn a_remembered_answer_is_served_until_forgotten() {
+        let digest = [7u8; 32];
+        let entry: CachedAuth = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            tracelane_shared::api_scope::KeyScope::from_column(None),
+            None,
+            None,
+            tracelane_shared::spend::BudgetReset::Monthly,
+        );
+        remember_last_known(digest, entry);
+        assert!(
+            last_known_fresh_enough(digest).is_some(),
+            "served while fresh enough"
+        );
+        forget_last_known(digest);
+        assert!(
+            last_known_fresh_enough(digest).is_none(),
+            "a revoked key is never served stale"
+        );
     }
 }

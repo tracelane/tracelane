@@ -145,7 +145,12 @@ RE_CREATE_TABLE = re.compile(
 )
 RE_ADD_COLUMN = re.compile(
     rf"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?{IDENT}"
-    rf"[\s\S]{{0,200}}?ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?{IDENT}",
+    # B-338: `[^;]` not `[\s\S]` — the lookahead may NOT cross a statement boundary.
+    # It did: `ALTER TABLE annotation_queues … DROP CONSTRAINT …; ALTER TABLE
+    # trace_annotations ADD COLUMN queue_id` attributed `queue_id` to the FIRST table,
+    # and the 2026-09-02 gateway deploy reported three prod columns "absent" that were
+    # either present on the right table or dropped by the next migration.
+    rf"[^;]{{0,200}}?ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?{IDENT}",
     re.IGNORECASE,
 )
 RE_CREATE_INDEX = re.compile(
@@ -163,11 +168,59 @@ RE_DROP = re.compile(
     rf"DROP\s+(TABLE|INDEX|TRIGGER|FUNCTION|CONSTRAINT)\s+(?:IF\s+EXISTS\s+)?{IDENT}",
     re.IGNORECASE,
 )
+# B-338: `DROP COLUMN` was never parsed, so a column a later migration REMOVED stayed
+# "declared" and was reported absent from prod forever (`rubric_version`, dropped by
+# 0033 after 0032 added it). Same statement-bounded lookahead as RE_ADD_COLUMN.
+RE_DROP_COLUMN = re.compile(
+    rf"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?{IDENT}"
+    rf"[^;]{{0,200}}?DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?{IDENT}",
+    re.IGNORECASE,
+)
 
 
 def strip_sql_comments(sql: str) -> str:
     sql = re.sub(r"/\*[\s\S]*?\*/", " ", sql)
     return re.sub(r"--[^\n]*", " ", sql)
+
+
+def parse_sql_events(raw: str, rel: str) -> list[tuple]:
+    """Every declaration/drop event in ONE migration's (comment-stripped) SQL.
+
+    Split out of `parse_migrations` so the selftest can feed it planted SQL — the
+    two B-338 shapes are parser bugs, and a parser is only testable in isolation.
+    """
+    events: list[tuple] = []
+    for m in RE_CREATE_TABLE.finditer(raw):
+        events.append((m.start(), rel, "create", "table", m.group(1).lower(), ""))
+    for m in RE_ADD_COLUMN.finditer(raw):
+        events.append(
+            (
+                m.start(),
+                rel,
+                "create",
+                "column",
+                m.group(1).lower(),
+                m.group(2).lower(),
+            )
+        )
+    for m in RE_CREATE_INDEX.finditer(raw):
+        events.append((m.start(), rel, "create", "index", m.group(1).lower(), ""))
+    for m in RE_CREATE_TRIGGER.finditer(raw):
+        events.append((m.start(), rel, "create", "trigger", m.group(1).lower(), ""))
+    for m in RE_CREATE_FUNCTION.finditer(raw):
+        events.append((m.start(), rel, "create", "function", m.group(1).lower(), ""))
+    for m in RE_ADD_CONSTRAINT.finditer(raw):
+        events.append((m.start(), rel, "create", "constraint", m.group(1).lower(), ""))
+    for m in RE_DROP.finditer(raw):
+        events.append(
+            (m.start(), rel, "drop", m.group(1).lower(), m.group(2).lower(), "")
+        )
+    for m in RE_DROP_COLUMN.finditer(raw):
+        events.append(
+            (m.start(), rel, "drop", "column", m.group(1).lower(), m.group(2).lower())
+        )
+
+    return events
 
 
 def parse_migrations() -> list[tuple]:
@@ -185,41 +238,7 @@ def parse_migrations() -> list[tuple]:
         for path in sorted((ROOT / d).glob("*.sql")):
             raw = strip_sql_comments(path.read_text(encoding="utf-8", errors="ignore"))
             rel = f"{d}/{path.name}"
-            for m in RE_CREATE_TABLE.finditer(raw):
-                events.append(
-                    (m.start(), rel, "create", "table", m.group(1).lower(), "")
-                )
-            for m in RE_ADD_COLUMN.finditer(raw):
-                events.append(
-                    (
-                        m.start(),
-                        rel,
-                        "create",
-                        "column",
-                        m.group(1).lower(),
-                        m.group(2).lower(),
-                    )
-                )
-            for m in RE_CREATE_INDEX.finditer(raw):
-                events.append(
-                    (m.start(), rel, "create", "index", m.group(1).lower(), "")
-                )
-            for m in RE_CREATE_TRIGGER.finditer(raw):
-                events.append(
-                    (m.start(), rel, "create", "trigger", m.group(1).lower(), "")
-                )
-            for m in RE_CREATE_FUNCTION.finditer(raw):
-                events.append(
-                    (m.start(), rel, "create", "function", m.group(1).lower(), "")
-                )
-            for m in RE_ADD_CONSTRAINT.finditer(raw):
-                events.append(
-                    (m.start(), rel, "create", "constraint", m.group(1).lower(), "")
-                )
-            for m in RE_DROP.finditer(raw):
-                events.append(
-                    (m.start(), rel, "drop", m.group(1).lower(), m.group(2).lower(), "")
-                )
+            events.extend(parse_sql_events(raw, rel))
 
     # Sort by (file, offset) so statements replay in the order they would execute.
     for _pos, rel, action, kind, name, col in sorted(
@@ -344,6 +363,27 @@ def selftest() -> int:
 
     declared = parse_migrations()
     assert declared, "selftest cannot run: no migrations parsed"
+
+    # B-338 (a): the ADD COLUMN lookahead must not cross a statement boundary.
+    ev = parse_sql_events(
+        "ALTER TABLE a DROP CONSTRAINT IF EXISTS a_chk; "
+        "ALTER TABLE b ADD COLUMN IF NOT EXISTS c1 integer;",
+        "x.sql",
+    )
+    cols = {(e[3], e[4], e[5]) for e in ev if e[2] == "create" and e[3] == "column"}
+    assert cols == {("column", "b", "c1")}, f"B-338a attribution: {cols}"
+    print(
+        "✓ selftest: ADD COLUMN after a foreign ALTER attributes to ITS table (B-338a)"
+    )
+    # B-338 (b): a column dropped by a later statement is not declared.
+    ev = parse_sql_events(
+        "ALTER TABLE t ADD COLUMN v integer; ALTER TABLE t DROP COLUMN IF EXISTS v;",
+        "y.sql",
+    )
+    assert any(
+        e[2] == "drop" and e[3] == "column" and (e[4], e[5]) == ("t", "v") for e in ev
+    ), f"B-338b drop parsed: {ev}"
+    print("✓ selftest: DROP COLUMN is parsed and cancels the earlier ADD (B-338b)")
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)

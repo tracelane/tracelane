@@ -17,6 +17,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::clickhouse_query::{PlanTier, TenantQuery};
+
 /// Per-tool aggregate row. Positional column order matches the SELECT.
 #[derive(Debug, Clone, Deserialize, Serialize, clickhouse::Row)]
 pub struct ToolUsageRow {
@@ -29,6 +31,8 @@ pub struct ToolUsageRow {
 #[derive(Clone)]
 pub struct ToolAnalyticsState {
     pub ch: clickhouse::Client,
+    /// SRE #20: the entitlement cache, so the read runs at the tenant's OWN cap tier.
+    pub entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
 }
 
 pub fn routes() -> Router<ToolAnalyticsState> {
@@ -41,9 +45,12 @@ struct ToolAnalyticsQuery {
     limit: Option<u32>,
 }
 
-/// Bind order: tenant, hours, limit. Tool identity is the ingest-normalized
-/// `gen_ai.tool.name` attribute; the non-empty filter isolates real tool spans
-/// (both the SDK `tool.call` shape and gateway `execute_tool` ops carry it).
+/// Bind order: tenant, hours, limit. Tool identity is the `gen_ai.tool.name` attribute
+/// as written by the OTLP decoder (`crates/shared/src/otlp/decode.rs`, B-232: it maps
+/// both `gen_ai.tool.name` and OpenInference's `tool.name` into the flattened attribute
+/// map). Until 2026-09-05 NO ingest path wrote that key and this comment claimed the
+/// gateway's `execute_tool` ops carry it — no gateway span sets it; only SDK/OTLP tool
+/// spans do.
 const SQL: &str = "SELECT JSONExtractString(attributes, 'gen_ai.tool.name') AS tool, \
     toUInt64(count()) AS calls, \
     toUInt64(countIf(status_code = 2)) AS errors, \
@@ -52,6 +59,14 @@ const SQL: &str = "SELECT JSONExtractString(attributes, 'gen_ai.tool.name') AS t
     WHERE tenant_id = ? AND JSONExtractString(attributes, 'gen_ai.tool.name') != '' \
     AND start_time >= now() - toIntervalHour(?) \
     GROUP BY tool ORDER BY calls DESC LIMIT ?";
+
+/// `SQL` with the ADR-031 caps appended, at the TIGHTEST (Builder) tier: a tool-usage
+/// rollup is a background dashboard read and must not out-consume the workspace's
+/// interactive queries. SRE register #28 / B-225 (2026-09-04, fixed 2026-09-05): this
+/// route scanned `spans FINAL` over up to 90 days with no execution-time or row ceiling.
+fn capped_sql(tier: PlanTier) -> String {
+    TenantQuery::new(SQL, tier).sql_with_settings()
+}
 
 async fn handler(
     State(state): State<ToolAnalyticsState>,
@@ -66,7 +81,7 @@ async fn handler(
     };
     let claims = match crate::auth::validate_authorization(header).await {
         Ok(c) => c,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "auth failed").into_response(),
+        Err(err) => return (crate::auth::failure_status(&err), "auth failed").into_response(),
     };
     // A13 scope gate — B-230. Entitlement/role gates are NOT scope gates: until
     // 2026-08-13 this route returned tenant data to any authenticated key, so an
@@ -88,7 +103,13 @@ async fn handler(
 
     match state
         .ch
-        .query(SQL)
+        .query(&capped_sql(
+            crate::clickhouse_query::tier_for_tenant(
+                state.entitlements.as_ref(),
+                &claims.tenant_id,
+            )
+            .await,
+        ))
         .bind(&tenant)
         .bind(hours)
         .bind(limit)
@@ -123,5 +144,18 @@ mod tests {
         assert!(SQL.contains("LIMIT ?"));
         // No cross-tenant widening — a single tenant bind, then the window + limit.
         assert_eq!(SQL.matches('?').count(), 3);
+    }
+
+    #[test]
+    fn executed_sql_carries_builder_tier_caps() {
+        let sql = capped_sql(PlanTier::Free);
+        assert!(
+            sql.starts_with(SQL),
+            "the cap is appended, never rewrites the body"
+        );
+        assert!(sql.contains("max_execution_time = 10"), "{sql}");
+        assert!(sql.contains("max_rows_to_read = 50000000"), "{sql}");
+        // The SETTINGS block carries no placeholder, so the bind count is unchanged.
+        assert_eq!(sql.matches('?').count(), 3);
     }
 }

@@ -185,7 +185,7 @@ pub(crate) fn compute_merkle_root(hashes: &[String]) -> String {
     }
     let mut level: Vec<String> = hashes.to_vec();
     while level.len() > 1 {
-        if level.len() % 2 != 0 {
+        if !level.len().is_multiple_of(2) {
             let last = level.last().cloned().unwrap_or_default();
             level.push(last);
         }
@@ -375,13 +375,6 @@ impl TenantChainState {
     }
 }
 
-/// Hook invoked once per **successful** Rekor anchor batch, with the anchoring
-/// tenant. Prod wires this to the Polar billing recorder via
-/// [`AuditChain::set_billing`] so each anchor batch meters one `audit_anchors`
-/// usage event (ADR-048); tests inject a channel. Sync — it only *dispatches*
-/// fire-and-forget work, never blocking or awaiting on the anchor path.
-type AnchorHook = Arc<dyn Fn(TenantId) + Send + Sync>;
-
 pub struct AuditChain {
     /// Per-tenant locks.
     states: DashMap<TenantId, Mutex<TenantChainState>>,
@@ -390,9 +383,6 @@ pub struct AuditChain {
     clickhouse_client: Option<ClickhouseClient>,
     /// Postgres pool for the persistent chain-state table.
     pg_pool: Option<deadpool_postgres::Pool>,
-    /// Per-successful-anchor hook (usage metering). Set once at startup
-    /// via [`set_billing`](Self::set_billing); unset = anchoring is not metered.
-    anchor_hook: OnceLock<AnchorHook>,
     /// ADR-069: JetStream context for the async audit publish path. Set once at
     /// startup via [`set_jetstream`](Self::set_jetstream) AFTER NATS connects;
     /// unset = synchronous append (dev / no-NATS / self-host).
@@ -403,6 +393,8 @@ pub struct AuditChain {
 }
 
 impl AuditChain {
+    /// Test-only since B-390: production builds through `with_tenant_keys`.
+    #[cfg(test)]
     pub fn new(
         anchor_every: usize,
         signing_key_b64: Option<&str>,
@@ -411,6 +403,7 @@ impl AuditChain {
         Self::with_pg_pool(anchor_every, signing_key_b64, clickhouse_url, None)
     }
 
+    #[cfg(test)]
     pub fn with_pg_pool(
         anchor_every: usize,
         signing_key_b64: Option<&str>,
@@ -447,15 +440,11 @@ impl AuditChain {
             anchor_every,
             clickhouse_client,
             pg_pool,
-            anchor_hook: OnceLock::new(),
             jetstream: OnceLock::new(),
             kill_switch: OnceLock::new(),
         })
     }
 
-    /// Inject the per-successful-anchor hook. First set wins; a no-op if
-    /// already set. Prod uses [`set_billing`](Self::set_billing); tests inject a
-    /// counter/channel to assert the anchor→meter wiring without Postgres/Rekor.
     /// R21 — read this tenant's anchor watermark. `None` = never anchored, or the
     /// tenant is unknown to this process (which is also "never" as far as the
     /// threshold path is concerned, and falls back to today's arithmetic).
@@ -520,7 +509,7 @@ impl AuditChain {
         // its OWN batch state in `pending_hashes` / `batch_start_seq` and is a THIRD
         // batch-start arithmetic that R34 did not unify. Running both against one tenant
         // produces exactly the overlap R34 exists to prevent — a duplicate anchor record
-        // and a duplicate billable `audit_anchors` event over the same rows.
+        // and a duplicate anchor (and hook firing) over the same rows.
         let Some(ref pool) = self.pg_pool else {
             return 0;
         };
@@ -529,7 +518,7 @@ impl AuditChain {
         // Enumerate from the DURABLE store, never from `self.states`.
         //
         // `self.states` is populated at exactly ONE non-test site — `warm_from_postgres`,
-        // at boot. The prod append path (`append_pg_serialized`) never inserts, so on the
+        // at boot. The prod append path (`append_pg_batch`) never inserts, so on the
         // PG path that map is a boot-time SNAPSHOT: sweeping it would silently exclude
         // every tenant onboarded since the last restart, i.e. exactly the new low-volume
         // customer this feature is for. It is a `GROUP BY` over one column every 15
@@ -624,7 +613,6 @@ impl AuditChain {
                 tenant_id.clone(),
                 batch_start,
                 batch_end,
-                self.anchor_hook.get().cloned(),
             )
             .await;
             // Release the claim. A rollback, because the transaction wrote nothing and
@@ -664,24 +652,6 @@ impl AuditChain {
                  occurrences are counted, not logged (kind=audit_age_sweep_skipped)"
             );
         }
-    }
-
-    pub fn set_anchor_hook(&self, hook: AnchorHook) {
-        let _ = self.anchor_hook.set(hook);
-    }
-
-    /// Wire the Polar billing recorder so each successful Rekor anchor batch
-    /// meters one `audit_anchors` usage event (/ ADR-048).
-    ///
-    /// Called once at startup, after the recorder is built (see `server.rs`).
-    /// Off the anchor path: the hook only **spawns** the tenant → Polar-customer
-    /// lookup + `record()`, mirroring the `TokensProcessed` fire-and-forget
-    /// pattern. A tenant with no Polar customer (unbilled) or no Postgres pool is
-    /// a silent no-op — the audit ledger is unaffected either way.
-    pub fn set_billing(&self, recorder: Arc<crate::billing::Recorder>) {
-        self.set_anchor_hook(Arc::new(move |tenant_id: TenantId| {
-            spawn_anchor_meter(Arc::clone(&recorder), tenant_id);
-        }));
     }
 
     /// ADR-069: wire the async audit publish path. Sets the JetStream context +
@@ -806,20 +776,48 @@ impl AuditChain {
     /// head-advance from the wire envelope (owned `event_type` + the
     /// pre-canonicalized `payload_json`), keyed on `event_id` for idempotent
     /// crash-replay. Requires a Postgres pool (the async path only runs in prod).
+    /// Since B-378 the head-writer batches (`append_batch_from_wire`); only the
+    /// hop measurement and tests still take the one-event form.
+    #[cfg(test)]
     pub(crate) async fn append_from_wire(&self, wire: &AuditEventWire) -> Result<()> {
+        self.append_batch_from_wire(std::slice::from_ref(wire))
+            .await
+    }
+
+    /// **B-378** — append K wire events of ONE tenant in ONE transaction and ONE
+    /// ClickHouse insert (`append_atomic_batch`). The batch must be homogeneous
+    /// in tenant (the consumer groups by tenant before calling); a mixed batch
+    /// is refused, because the row lock is per tenant and a second tenant's
+    /// rows under the first's lock would be an unserialized append.
+    ///
+    /// # Errors
+    ///
+    /// Fail-closed: any PG / CH failure aborts the whole batch (no seq consumed,
+    /// no head advance); the caller leaves every message unacked for
+    /// redelivery, where `audit_appended` makes the replay a no-op.
+    pub(crate) async fn append_batch_from_wire(&self, wires: &[AuditEventWire]) -> Result<()> {
         let Some(pool) = self.pg_pool.clone() else {
             anyhow::bail!("audit consumer requires a Postgres pool");
         };
-        let tenant_id = TenantId::from_jwt_claim(wire.tenant_id);
-        self.append_pg_serialized(
-            &pool,
-            &tenant_id,
-            &wire.event_type,
-            &wire.actor,
-            wire.payload_json.clone(),
-            Some(&wire.event_id),
-        )
-        .await
+        let Some(first) = wires.first() else {
+            return Ok(());
+        };
+        let tenant_id = TenantId::from_jwt_claim(first.tenant_id);
+        anyhow::ensure!(
+            wires.iter().all(|w| w.tenant_id == first.tenant_id),
+            "append_batch_from_wire: a batch must carry ONE tenant"
+        );
+        let items: Vec<PendingLedgerRow> = wires
+            .iter()
+            .map(|w| PendingLedgerRow {
+                event_type: w.event_type.clone(),
+                actor: w.actor.clone(),
+                payload_json: w.payload_json.clone(),
+            })
+            .collect();
+        let ids: Vec<String> = wires.iter().map(|w| w.event_id.clone()).collect();
+        self.append_pg_batch(&pool, &tenant_id, items, Some(&ids))
+            .await
     }
 
     /// Load persisted chain state at startup, reconciling any durable ClickHouse
@@ -845,6 +843,17 @@ impl AuditChain {
     #[must_use]
     pub(crate) fn has_pg_pool(&self) -> bool {
         self.pg_pool.is_some()
+    }
+
+    /// B-385 (2b): the tenant's in-memory chain head — how many rows the
+    /// in-process ledger has appended for `tenant_id` (0 for a tenant it has
+    /// never seen). `audit_publish_stats()` counts only the JetStream path, so
+    /// a test with no NATS could assert "the ledger did not move" and be
+    /// vacuously right; this reads the row count the sync path actually
+    /// advanced. Test-only: production reads the chain through Postgres.
+    #[cfg(test)]
+    pub(crate) fn in_memory_seq(&self, tenant_id: &TenantId) -> u64 {
+        self.states.get(tenant_id).map_or(0, |cell| cell.lock().seq)
     }
 
     pub async fn warm_from_postgres(&self) -> Result<()> {
@@ -965,7 +974,7 @@ impl AuditChain {
     /// ** forward fix (ADR-065 F1):** when a Postgres pool is configured
     /// (always true in prod), seq assignment + chain-head advance are
     /// serialized **across processes** by a per-tenant `SELECT … FOR UPDATE`
-    /// row lock ([`append_pg_serialized`](Self::append_pg_serialized)), and the
+    /// row lock ([`append_pg_batch`](Self::append_pg_batch)), and the
     /// ClickHouse row is written durably *inside* that transaction. This closes
     /// the cross-process duplicate-seq race that a process-local
     /// `parking_lot::Mutex` could not (blue-green deploy overlap /
@@ -1001,12 +1010,14 @@ impl AuditChain {
 
         match self.pg_pool.clone() {
             Some(pool) => {
-                self.append_pg_serialized(
+                self.append_pg_batch(
                     &pool,
                     &event.tenant_id,
-                    event.event_type,
-                    &event.actor,
-                    payload_json,
+                    vec![PendingLedgerRow {
+                        event_type: event.event_type.to_string(),
+                        actor: event.actor.clone(),
+                        payload_json,
+                    }],
                     None,
                 )
                 .await
@@ -1015,10 +1026,13 @@ impl AuditChain {
         }
     }
 
-    /// **ADR-065 F1** — the cross-process-safe append. One Postgres transaction
-    /// per event: `FOR UPDATE`-lock the tenant head, compute `row_hash`, write
-    /// the ClickHouse row durably, advance the head, commit. The row lock is the
-    /// cross-process serialization the Mutex could not provide.
+    /// **ADR-065 F1 (+ B-378 batching)** — the cross-process-safe append. One
+    /// Postgres transaction per BATCH: `FOR UPDATE`-lock the tenant head, compute
+    /// the K chained `row_hash`es, write the K ClickHouse rows durably in ONE
+    /// insert (one MergeTree part instead of K), advance the head to the end of
+    /// the batch, commit. The row lock is the cross-process serialization the
+    /// Mutex could not provide; the batch changes how much work happens under it,
+    /// never what it guards.
     ///
     /// Anchor batches are **seq-aligned** (`[k·N … (k+1)·N−1]`), not driven by a
     /// per-process in-memory counter: exactly one process commits each
@@ -1027,102 +1041,122 @@ impl AuditChain {
     /// contiguous rows back from ClickHouse (deduped) — never from a
     /// per-process `pending_hashes` that, under two co-running processes, would
     /// hold a non-contiguous subset and produce a Merkle root the verifier
-    /// cannot reconstruct.
-    async fn append_pg_serialized(
+    /// cannot reconstruct. A batch of K may straddle an anchor boundary, so the
+    /// rule is applied to EVERY seq the batch committed, not only its last.
+    async fn append_pg_batch(
         &self,
         pool: &deadpool_postgres::Pool,
         tenant_id: &TenantId,
-        event_type: &str,
-        actor: &str,
-        payload_json: String,
-        event_id: Option<&str>,
+        items: Vec<PendingLedgerRow>,
+        event_ids: Option<&[String]>,
     ) -> Result<()> {
         let tenant_id = tenant_id.clone();
         let genesis = audit_format::genesis_prev_hash(&tenant_id);
         let ch_for_write = self.clickhouse_client.clone();
-        let event_type = event_type.to_string();
-        let actor = actor.to_string();
+        let count = items.len();
 
         // The closure is the durable-CH-write step, run INSIDE the PG tx between
-        // the FOR UPDATE read and the head advance. It computes row_hash over the
-        // seq/prev the lock just claimed, then writes (and awaits) the CH row.
-        let outcome = crate::db::audit_chain_state::append_atomic(
+        // the FOR UPDATE read and the head advance. It chains the row hashes over
+        // the seqs the lock just claimed, then writes (and awaits) ALL the rows
+        // in one insert. `kept` names which of `items` survived dedup.
+        let outcome = crate::db::audit_chain_state::append_atomic_batch(
             pool,
             &tenant_id,
             genesis,
-            event_id,
-            |seq, prev_hash| {
+            event_ids,
+            count,
+            |first_seq, prev_hash, kept| {
                 let ch = ch_for_write.clone();
                 let tenant_id = tenant_id.clone();
-                let event_type = event_type.clone();
-                let actor = actor.clone();
-                let payload_json = payload_json.clone();
                 async move {
-                    let row_hash = audit_format::row_hash_v2(
-                        &prev_hash,
-                        &tenant_id,
-                        seq,
-                        &event_type,
-                        &actor,
-                        &payload_json,
-                    );
-                    if let Some(ch) = ch {
-                        let row = AuditLogRow {
+                    let mut prev = prev_hash;
+                    let mut hashes = Vec::with_capacity(kept.len());
+                    let mut rows = Vec::with_capacity(kept.len());
+                    let event_time = Utc::now().timestamp_micros();
+                    for (i, idx) in kept.iter().enumerate() {
+                        let item = &items[*idx];
+                        let seq = first_seq + i as u64;
+                        let row_hash = audit_format::row_hash_v2(
+                            &prev,
+                            &tenant_id,
+                            seq,
+                            &item.event_type,
+                            &item.actor,
+                            &item.payload_json,
+                        );
+                        rows.push(AuditLogRow {
                             tenant_id: tenant_id.to_string(),
                             seq,
-                            event_time: Utc::now().timestamp_micros(),
-                            event_type,
-                            actor,
-                            payload: payload_json,
-                            prev_hash: audit_format::hex_encode(&prev_hash),
+                            event_time,
+                            event_type: item.event_type.clone(),
+                            actor: item.actor.clone(),
+                            payload: item.payload_json.clone(),
+                            prev_hash: audit_format::hex_encode(&prev),
                             row_hash: audit_format::hex_encode(&row_hash),
                             rekor_entry_id: None,
                             // Backfilled per anchor batch by `backfill_signature`.
                             signature: String::new(),
                             signing_pubkey: String::new(),
-                        };
-                        // Awaited — durable before the head advances (F1).
-                        write_audit_row(&ch, row)
-                            .await
-                            .context("durable audit_log row write")?;
+                        });
+                        hashes.push(row_hash);
+                        prev = row_hash;
                     }
-                    Ok(row_hash)
+                    if let Some(ch) = ch {
+                        // Awaited — durable before the head advances (F1). ONE
+                        // insert for the batch: one part, not K.
+                        write_audit_rows(&ch, rows)
+                            .await
+                            .context("durable audit_log rows write")?;
+                    }
+                    Ok(hashes)
                 }
             },
         )
         .await?;
 
-        // Sync path passes `event_id = None`, which never skips; guard the Option
-        // for type-correctness (only the async consumer path returns `None`).
+        // `None` = every event in the batch was a redelivery already appended —
+        // nothing was written, nothing to anchor. (The sync path never dedups,
+        // so it never sees this.)
         let Some(outcome) = outcome else {
             return Ok(());
         };
-        let seq = outcome.seq;
+        let n_appended = outcome.row_hashes.len() as u64;
+        let last_seq = outcome.first_seq + n_appended - 1;
         tracing::debug!(
-            row_hash_hex = %audit_format::hex_encode(&outcome.row_hash),
-            seq,
-            "audit event hashed (pg-serialized)"
+            prev_hash_hex = %audit_format::hex_encode(&outcome.prev_hash),
+            head_hash_hex = %audit_format::hex_encode(&outcome.row_hashes[outcome.row_hashes.len() - 1]),
+            first_seq = outcome.first_seq,
+            last_seq,
+            n_appended,
+            n_deduped = count - outcome.kept.len(),
+            "audit events hashed (pg-serialized batch)"
         );
 
         // Seq-aligned anchor batches. The append that commits a batch-final seq
         // (there is exactly one, seqs being globally serialized) anchors
         // `[batch_start … seq]`, reading the contiguous leaf set back from
         // ClickHouse. Requires a CH client; without one there are no rows to
-        // anchor (dev). Off the hot path (spawned).
+        // anchor (dev). Off the hot path (spawned). Checked for EVERY seq this
+        // batch committed — a batch of K can cross an anchor boundary.
         let n = self.anchor_every as u64;
-        if n > 0 && (seq + 1).is_multiple_of(n) {
-            if let Some(ch) = self.clickhouse_client.clone() {
-                // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n` directly —
-                // that is correct only if no batch was ever closed early by age.
-                let prev_end = self.last_anchored_end(&tenant_id);
-                let batch_start = anchor_batch_start(prev_end, seq, n);
-                self.set_last_anchored_end(&tenant_id, seq);
-                let rekor = self.rekor_client.clone();
-                let tid = tenant_id.clone();
-                let anchor_hook = self.anchor_hook.get().cloned();
-                tokio::spawn(async move {
-                    anchor_batch_from_ch(rekor, ch, tid, batch_start, seq, anchor_hook).await;
-                });
+        if n > 0 {
+            for seq in outcome.first_seq..=last_seq {
+                if !(seq + 1).is_multiple_of(n) {
+                    continue;
+                }
+                if let Some(ch) = self.clickhouse_client.clone() {
+                    // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n`
+                    // directly — that is correct only if no batch was ever closed
+                    // early by age.
+                    let prev_end = self.last_anchored_end(&tenant_id);
+                    let batch_start = anchor_batch_start(prev_end, seq, n);
+                    self.set_last_anchored_end(&tenant_id, seq);
+                    let rekor = self.rekor_client.clone();
+                    let tid = tenant_id.clone();
+                    tokio::spawn(async move {
+                        anchor_batch_from_ch(rekor, ch, tid, batch_start, seq).await;
+                    });
+                }
             }
         }
 
@@ -1214,18 +1248,8 @@ impl AuditChain {
             let rekor = self.rekor_client.clone();
             let ch = self.clickhouse_client.clone();
             let tenant_id = event.tenant_id.clone();
-            let anchor_hook = self.anchor_hook.get().cloned();
             tokio::spawn(async move {
-                anchor_task(
-                    rekor,
-                    ch,
-                    tenant_id,
-                    pending_snapshot,
-                    batch_start,
-                    seq,
-                    anchor_hook,
-                )
-                .await;
+                anchor_task(rekor, ch, tenant_id, pending_snapshot, batch_start, seq).await;
             });
         }
 
@@ -1246,18 +1270,35 @@ impl AuditChain {
 // future `Default::default()` would be a compile error.
 
 async fn write_audit_row(client: &ClickhouseClient, row: AuditLogRow) -> anyhow::Result<()> {
+    write_audit_rows(client, vec![row]).await
+}
+
+/// B-378: K rows in ONE insert — one MergeTree part per batch instead of per
+/// event. The single-row form above is this with K = 1.
+async fn write_audit_rows(client: &ClickhouseClient, rows: Vec<AuditLogRow>) -> anyhow::Result<()> {
     let mut insert = client
         .insert("audit_log")
         .context("clickhouse audit_log insert init")?;
-    insert
-        .write(&row)
-        .await
-        .context("clickhouse audit_log insert write")?;
+    for row in &rows {
+        insert
+            .write(row)
+            .await
+            .context("clickhouse audit_log insert write")?;
+    }
     insert
         .end()
         .await
         .context("clickhouse audit_log insert end")?;
     Ok(())
+}
+
+/// One ledger row waiting for its seq — the per-event fields of an
+/// [`AuditEvent`] after redaction/capping/canonicalisation, before the chain
+/// assigns `(seq, prev_hash, row_hash)` under the row lock.
+struct PendingLedgerRow {
+    event_type: String,
+    actor: String,
+    payload_json: String,
 }
 
 /// One per-batch anchor bundle (ADR-062 Amendment 1) — the offline-verifiable
@@ -1428,60 +1469,12 @@ async fn backfill_signature(
 // Rekor HTTP client
 // ---------------------------------------------------------------------------
 
-/// Fire the per-anchor billing hook for a batch that produced a REAL Rekor
-/// entry. `(no-key)` sentinels — returned by `submit_for_tenant` when no signing
-/// key is configured — produced NO Rekor entry, so metering `audit_anchors` for
-/// them would over-charge a billed tenant whose signing key was mis-provisioned
-/// (security review HIGH). This matches the `(no-key)`-is-not-an-anchor
-/// convention the ClickHouse `rekor_entry_id` backfill already enforces.
-/// Extracted (not inlined) so the meter-vs-no-meter decision is unit-testable
-/// without a live Rekor round-trip.
 /// Whether a `rekor_entry_id` denotes a REAL external Rekor anchor, vs a
 /// sentinel: `(no-key)` (unsigned), `(no-rekor)` (signed but not externally
 /// anchored, ADR-057), or `(unknown-uuid)` (Rekor response had no parseable
-/// entry). Sentinels must never be metered (HIGH) or backfilled as a UUID.
+/// entry). Sentinels must never be reported as an anchor or backfilled as a UUID.
 pub(crate) fn is_real_rekor_entry(entry_id: &str) -> bool {
     !matches!(entry_id, "(no-key)" | "(no-rekor)" | "(unknown-uuid)")
-}
-
-fn fire_anchor_hook(anchor_hook: &Option<AnchorHook>, entry_uuid: &str, tenant_id: &TenantId) {
-    // Only a REAL external Rekor anchor is metered (HIGH).
-    if !is_real_rekor_entry(entry_uuid) {
-        return;
-    }
-    if let Some(hook) = anchor_hook {
-        hook(tenant_id.clone());
-    }
-}
-
-/// Meter one successful Rekor anchor batch against the tenant's Polar customer
-/// (/ ADR-048). Fire-and-forget, OFF the anchor path: maps `tenant_id` →
-/// `polar_customer_id` via Postgres, then records `audit_anchors += 1`. Mirrors
-/// `server.rs::spawn_billing_record` (the `TokensProcessed` path). Only real
-/// anchors reach here — `(no-key)` batches are gated out by `fire_anchor_hook`.
-/// A tenant with no Polar customer (unbilled) or no Postgres pool is a silent
-/// no-op, so an unbilled tenant is never charged.
-fn spawn_anchor_meter(recorder: Arc<crate::billing::Recorder>, tenant_id: TenantId) {
-    tokio::spawn(async move {
-        let pool = match crate::db::global_pool() {
-            Some(p) => p,
-            None => return,
-        };
-        let customer_id = match crate::db::tenants::get(pool, &tenant_id).await {
-            Ok(Some(t)) => match t.polar_customer_id {
-                Some(id) => crate::billing::PolarCustomerId(id),
-                None => return, // unbilled tenant — never metered
-            },
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(error = %err, "audit-anchor billing tenant lookup failed");
-                return;
-            }
-        };
-        recorder
-            .record(crate::billing::Meter::AuditAnchors, &customer_id, 1)
-            .await;
-    });
 }
 
 async fn anchor_task(
@@ -1491,7 +1484,6 @@ async fn anchor_task(
     hashes: Vec<audit_format::Hash>,
     start_seq: u64,
     end_seq: u64,
-    anchor_hook: Option<AnchorHook>,
 ) {
     let root = audit_format::merkle_root_v2(&hashes);
     let root_hex = audit_format::hex_encode(&root);
@@ -1604,11 +1596,6 @@ async fn anchor_task(
             });
         }
     }
-
-    // Meter only a REAL external Rekor anchor — AFTER the backfill spawns.
-    // `(no-key)` / `(no-rekor)` batches produced no Rekor entry and are gated out
-    // by `fire_anchor_hook`. The hook only dispatches fire-and-forget work.
-    fire_anchor_hook(&anchor_hook, &entry_id, &tenant_id);
 }
 
 /// **ADR-065 F1 anchor path** — anchor a seq-aligned batch `[start_seq …
@@ -1674,7 +1661,7 @@ pub fn spawn_anchor_age_sweeper(chain: Arc<AuditChain>) {
 /// a time-based flush could close a batch early: an age-flushed `[0..36]` followed by
 /// the threshold firing at seq 99 would have re-anchored `[0..99]`, **covering rows
 /// 0–36 twice** — a second `audit_anchor_records` row over the same rows and a second
-/// `audit_anchors` meter event for them.
+/// Rekor entry (and anchor-hook firing) for them.
 ///
 /// Taking `max(last_anchored_end + 1, …)` makes a batch start where the previous one
 /// ended, whichever trigger closed it. The founder's reasoning for collapsing them
@@ -1707,7 +1694,6 @@ async fn anchor_batch_from_ch(
     tenant_id: TenantId,
     start_seq: u64,
     end_seq: u64,
-    anchor_hook: Option<AnchorHook>,
 ) -> bool {
     let hashes =
         match read_batch_row_hashes(&clickhouse_client, &tenant_id, start_seq, end_seq).await {
@@ -1738,7 +1724,6 @@ async fn anchor_batch_from_ch(
         hashes,
         start_seq,
         end_seq,
-        anchor_hook,
     )
     .await;
     true
@@ -1766,7 +1751,9 @@ async fn read_tenants_with_audit_rows(client: &ClickhouseClient) -> anyhow::Resu
     // here that is deliberately NOT tenant-scoped, because producing the tenant list is
     // its entire purpose.
     let rows = client
-        .query("SELECT tenant_id FROM audit_log GROUP BY tenant_id")
+        .query(&crate::clickhouse_query::ceiling(
+            "SELECT tenant_id FROM audit_log GROUP BY tenant_id",
+        ))
         .fetch_all::<TenantRow>()
         .await
         .context("enumerate tenants with audit_log rows")?;
@@ -1784,7 +1771,7 @@ async fn read_tenants_with_audit_rows(client: &ClickhouseClient) -> anyhow::Resu
 /// per-tenant `SELECT … FOR UPDATE` on the chain head. The age sweep reads ClickHouse and
 /// touches no such row, so two gateway processes sweeping the same tenant would both
 /// compute the same batch and both anchor it — a duplicate `audit_anchor_records` row and
-/// a duplicate BILLABLE `audit_anchors` meter event over identical rows. Two processes is
+/// a duplicate Rekor entry over identical rows. Two processes is
 /// the designed state, not an accident: `infra/prod/blue-green-deploy.sh:84-85` keeps the
 /// BLUE pool running after the cutover for instant rollback.
 ///
@@ -1825,10 +1812,10 @@ async fn read_last_anchored_end(
     // batch [x..0]" — so carry an explicit presence flag rather than treating 0 as a
     // sentinel. Same class as TRAPS §25: a value that happens to be zero.
     let row = client
-        .query(
+        .query(&crate::clickhouse_query::ceiling(
             "SELECT toUInt64(max(batch_end_seq)) AS n, toUInt8(count() > 0) AS present \
              FROM audit_anchor_records WHERE tenant_id = ?",
-        )
+        ))
         .bind(tenant_id.to_string())
         .fetch_one::<MaxRow>()
         .await?;
@@ -1865,11 +1852,11 @@ async fn read_oldest_unanchored_age_secs(
     // test is pure arithmetic or a hand-built fixture, and all of them stayed green.
     let from_seq = after_seq.map_or(0, |s| s.saturating_add(1));
     let row = client
-        .query(
+        .query(&crate::clickhouse_query::ceiling(
             "SELECT toUInt64(greatest(0, dateDiff('second', min(event_time), now()))) AS age_secs, \
                     toUInt64(max(seq)) AS head, toUInt8(count() > 0) AS present \
              FROM audit_log FINAL WHERE tenant_id = ? AND seq >= ?",
-        )
+        ))
         .bind(tenant_id.to_string())
         .bind(from_seq)
         .fetch_one::<AgeRow>()
@@ -1897,11 +1884,11 @@ async fn read_batch_row_hashes(
     // tenant_id filter is the CLAUDE.md hard rule; audit.rs is allow-listed in
     // no-raw-ch-query.sh (bounded, single-tenant, seq-windowed).
     let rows = client
-        .query(
+        .query(&crate::clickhouse_query::ceiling(
             "SELECT seq, row_hash FROM audit_log FINAL \
              WHERE tenant_id = ? AND seq >= ? AND seq <= ? \
              ORDER BY seq ASC",
-        )
+        ))
         .bind(tenant_id.to_string())
         .bind(start_seq)
         .bind(end_seq)
@@ -1942,12 +1929,12 @@ async fn read_rows_after(
     limit: u32,
 ) -> anyhow::Result<Vec<ReconcileRow>> {
     let rows = client
-        .query(
+        .query(&crate::clickhouse_query::ceiling(
             "SELECT seq, prev_hash, row_hash FROM audit_log FINAL \
              WHERE tenant_id = ? AND seq > ? \
              ORDER BY seq ASC \
              LIMIT ?",
-        )
+        ))
         .bind(tenant_id.to_string())
         .bind(after_seq)
         .bind(limit)
@@ -2323,7 +2310,6 @@ mod tests {
             vec![[9u8; 32]],
             1,
             1,
-            None,
         )
         .await;
 
@@ -2365,8 +2351,7 @@ mod tests {
     /// NON-OVERLAPPING ranges.** This is the defect the unified rule exists to prevent:
     /// under the old `seq + 1 - n` arithmetic the threshold would have re-anchored from
     /// 0, covering the age-flushed rows a second time — a duplicate
-    /// `audit_anchor_records` row and a duplicate `audit_anchors` meter event over the
-    /// SAME rows.
+    /// `audit_anchor_records` row and a duplicate Rekor entry over the SAME rows.
     #[test]
     fn age_flush_then_threshold_produces_non_overlapping_batches() {
         const N: u64 = 100;
@@ -3263,6 +3248,147 @@ mod tests {
     }
 
     /// Build a deadpool from `POSTGRES_TEST_URL`.
+    /// B-378 — the head-writer hop, MEASURED, same binary, two shapes.
+    ///
+    /// (a) the pre-B-378 shape: one `append_from_wire` per event, sequential —
+    ///     one PG transaction + one ClickHouse insert (one part) per event;
+    /// (b) the B-378 shape: `append_batch_from_wire` in batches of `BATCH_MAX`
+    ///     for one tenant — one transaction + one insert per batch.
+    ///
+    /// Same tenant, same event count, real Postgres + real ClickHouse (the
+    /// throwaway containers `run-postgres-integration.sh` /
+    /// `run-clickhouse-integration.sh` start). Prints events/s for both and the
+    /// ClickHouse PART count each produced — the two numbers the review said
+    /// were never measured. Recorded in the B-378 row, never on a public
+    /// surface: this box is not the CCX23 and the number is the RATIO.
+    ///
+    ///   POSTGRES_TEST_URL=… CLICKHOUSE_TEST_URL=… \
+    ///   cargo test -p gateway --bin gateway -- b378_head_writer_hop_measured --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "measurement — needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn b378_head_writer_hop_measured() {
+        let Some(url) = ch_test_url() else {
+            eprintln!("skip: CLICKHOUSE_TEST_URL unset");
+            return;
+        };
+        if std::env::var("POSTGRES_TEST_URL").is_err() {
+            eprintln!("skip: POSTGRES_TEST_URL unset");
+            return;
+        }
+        ClickhouseClient::default()
+            .with_url(&url)
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        let pool = pg_test_pool();
+        // Fresh tables in the test DB: the integration DB may already have them.
+        let client = pool.get().await.unwrap();
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS audit_chain_state (tenant_id uuid PRIMARY KEY, \
+                 last_seq bigint NOT NULL, last_row_hash bytea NOT NULL, \
+                 updated_at timestamptz NOT NULL DEFAULT now()); \
+                 CREATE TABLE IF NOT EXISTS audit_appended (event_id text PRIMARY KEY, \
+                 appended_at timestamptz NOT NULL DEFAULT now());",
+            )
+            .await
+            .unwrap();
+        drop(client);
+        // anchor_every = 0: no Rekor traffic inside the measurement.
+        let chain = AuditChain::with_pg_pool(0, None, Some(&url), Some(pool)).unwrap();
+
+        const N: usize = 320;
+        let batch_max = crate::audit_consumer::BATCH_MAX;
+        let wires = |tenant: uuid::Uuid, tag: &str| -> Vec<AuditEventWire> {
+            (0..N)
+                .map(|i| AuditEventWire {
+                    event_id: format!("{tag}-{i}-{}", uuid::Uuid::new_v4()),
+                    tenant_id: tenant,
+                    event_type: "chat.completions.request".into(),
+                    actor: "measure".into(),
+                    payload_json: format!("{{\"i\":{i},\"model\":\"claude-sonnet-4-6\"}}"),
+                })
+                .collect()
+        };
+        async fn parts_written(ch: &ClickhouseClient, rows_per_part: u64) -> u64 {
+            // `system.part_log` records every part CREATED by an insert, which is
+            // the number that matters here — `system.parts` (active) undercounts
+            // as soon as background merges absorb the small parts, and they do
+            // within seconds. A part of `rows_per_part` rows is one insert of that
+            // shape; the two phases use different sizes, so each is countable.
+            // `part_log` is flushed on a timer (7.5 s by default) — force it.
+            ch.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
+            ch.query(
+                "SELECT count() FROM system.part_log WHERE database='tracelane' AND \
+                 table='audit_log' AND event_type='NewPart' AND rows = ?",
+            )
+            .bind(rows_per_part)
+            .fetch_one::<u64>()
+            .await
+            .unwrap_or(0)
+        }
+
+        // (a) sequential, one event per transaction.
+        let t_a = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let w_a = wires(*t_a.as_uuid(), "seq");
+        let start = std::time::Instant::now();
+        for w in &w_a {
+            chain.append_from_wire(w).await.unwrap();
+        }
+        let dur_a = start.elapsed();
+        let parts_a = parts_written(&ch, 1).await;
+
+        // (b) batched, BATCH_MAX events per transaction.
+        let t_b = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let w_b = wires(*t_b.as_uuid(), "batch");
+        let start = std::time::Instant::now();
+        for chunk in w_b.chunks(batch_max) {
+            chain.append_batch_from_wire(chunk).await.unwrap();
+        }
+        let dur_b = start.elapsed();
+        let parts_b = parts_written(&ch, batch_max as u64).await;
+
+        let eps = |d: std::time::Duration| N as f64 / d.as_secs_f64();
+        eprintln!(
+            "B378_MEASURED events={N} sequential={:.0} ev/s ({:?}, {parts_a} parts) \
+             batched(K={batch_max})={:.0} ev/s ({:?}, {parts_b} parts) ratio={:.1}x",
+            eps(dur_a),
+            dur_a,
+            eps(dur_b),
+            dur_b,
+            eps(dur_b) / eps(dur_a)
+        );
+        // The chain must be intact in BOTH shapes: N rows, seqs 0..N-1, no gaps.
+        for t in [&t_a, &t_b] {
+            let (n, max_seq): (u64, u64) = ch
+                .query(
+                    "SELECT count(), max(seq) FROM tracelane.audit_log FINAL WHERE tenant_id = ?",
+                )
+                .bind(t.to_string())
+                .fetch_one::<(u64, u64)>()
+                .await
+                .unwrap();
+            assert_eq!(n, N as u64);
+            assert_eq!(max_seq, N as u64 - 1);
+        }
+        assert!(
+            dur_b < dur_a,
+            "batching must not be slower than one transaction per event"
+        );
+        assert_eq!(
+            parts_a, N as u64,
+            "the sequential shape writes one part per event"
+        );
+        assert_eq!(
+            parts_b,
+            (N / batch_max) as u64,
+            "the batched shape writes one part per batch"
+        );
+    }
+
     fn pg_test_pool() -> deadpool_postgres::Pool {
         let url = std::env::var("POSTGRES_TEST_URL")
             .expect("POSTGRES_TEST_URL required (live Postgres with audit_chain_state)");
@@ -3792,49 +3918,25 @@ mod tests {
         assert_eq!(state.lock().pending_hashes.len(), 0);
     }
 
-    ///  regression (security-review HIGH): the anchor billing hook meters a
-    /// REAL Rekor entry but NEVER a `(no-key)` sentinel. `Meter::AuditAnchors`
-    /// previously had NO call-site at all (the ADR-048 "Polar meters
-    /// TokensProcessed + AuditAnchors" claim was false; the dashboard
-    /// `audit_anchors` dimension was permanently 0). Now it is wired — but a
-    /// `(no-key)` batch (no signing key configured) produced no Rekor entry, so
-    /// metering it would over-charge a billed tenant whose key was mis-provisioned.
-    /// Pure + deterministic: exercises the meter-vs-no-meter gate directly, with
-    /// no Rekor round-trip. The append→anchor path that invokes this hook is
-    /// covered by `audit_chain_anchors_at_threshold`.
+    /// The `(no-key)` / `(no-rekor)` / `(unknown-uuid)` sentinels produced NO
+    /// Rekor entry and must never read as an anchor — the read side
+    /// (`trace_reads.rs` chain status) and the backfill both gate on this.
+    /// (Security-review HIGH, originally: when a Polar `audit_anchors` meter hung
+    /// off the anchor path, a sentinel would have billed an anchor that never
+    /// happened. That meter is gone — ADR-076 — the gate is still the truth.)
     #[test]
-    fn fire_anchor_hook_meters_real_entry_but_not_no_key() {
-        let fired: Arc<Mutex<Vec<TenantId>>> = Arc::new(Mutex::new(Vec::new()));
-        let f = fired.clone();
-        let hook: Option<AnchorHook> = Some(Arc::new(move |tid: TenantId| f.lock().push(tid)));
-
-        // A real Rekor entry uuid → meters exactly one anchor for the tenant.
-        fire_anchor_hook(&hook, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4", &tenant());
-        assert_eq!(
-            fired.lock().len(),
-            1,
-            "a real Rekor entry meters one anchor"
-        );
-        assert_eq!(
-            fired.lock()[0],
-            tenant(),
-            "hook receives the anchoring tenant"
-        );
-
-        // The `(no-key)` sentinel produced no Rekor entry → MUST NOT meter.
-        fired.lock().clear();
-        fire_anchor_hook(&hook, "(no-key)", &tenant());
-        assert!(
-            fired.lock().is_empty(),
-            "a (no-key) batch produced no anchor and must never be metered"
-        );
-
-        // No hook wired (billing unconfigured) → no-op, no panic.
-        fire_anchor_hook(&None, "a1b2c3d4", &tenant());
+    fn sentinels_are_never_real_rekor_entries() {
+        for sentinel in ["(no-key)", "(no-rekor)", "(unknown-uuid)"] {
+            assert!(
+                !is_real_rekor_entry(sentinel),
+                "{sentinel} is not an anchor"
+            );
+        }
+        assert!(is_real_rekor_entry("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"));
     }
 
-    /// A chain with NO billing hook set still anchors without panicking
-    /// unmetered anchoring (POLAR_ACCESS_TOKEN unset) must never break the ledger.
+    /// A chain with no billing wiring of any kind anchors without panicking —
+    /// anchoring is included on every tier (ADR-076) and never depends on Polar.
     #[tokio::test]
     async fn anchor_without_billing_hook_is_a_noop_not_a_panic() {
         let chain = AuditChain::new(1, None, None).unwrap(); // anchor every event

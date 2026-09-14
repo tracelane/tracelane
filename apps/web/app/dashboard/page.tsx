@@ -22,45 +22,63 @@
 import {
 	SLO_TARGET_AVAILABILITY,
 	availabilityTargetForPlanKey,
-	computeSloBudget,
 } from "@/app/slo/budget";
-import {
-	buildTrafficPoints,
-	chartWindow,
-	latencyPointsFromTimeseries,
-} from "@/app/slo/latency";
-import type { SloRow, SloSummary, SloTimePoint } from "@/app/slo/types";
 import { RangeControl } from "@/components/RangeControl";
 import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { MetricChart } from "@/components/metrics/MetricChart";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { PLAN_TO_LOOKUP_KEY, type Plan } from "@/lib/entitlements";
-import { GatewayError, gatewayGet } from "@/lib/gateway";
-import { fetchGatewayStats } from "@/lib/gateway-ops";
-import { fetchGuardrailStats } from "@/lib/guardrails";
-import { fetchLatencyBreakdown } from "@/lib/latency";
 import {
-	rangeBucketMs,
-	rangeLabel,
-	rangeShort,
-	rangeToHours,
-} from "@/lib/range";
+	fetchGatewayStatsFor,
+	fetchGuardrailStatsFor,
+	fetchLatencyBreakdownFor,
+	fetchSignaturesFor,
+	fetchSloRows,
+	fetchSloSummary,
+	fetchSloTimeseries,
+	fetchToolAnalyticsFor,
+} from "@/lib/metrics/fetch";
+import {
+	fmtBudget,
+	fmtCompact,
+	fmtCount,
+	fmtDurationMs,
+	fmtFraction,
+	fmtPercent,
+	fmtRatio,
+	fmtUsd,
+} from "@/lib/metrics/format";
+import { hintOf } from "@/lib/metrics/hint";
+import { METRICS } from "@/lib/metrics/registry";
+import {
+	type ChartData,
+	drawableBuckets,
+	sloLatencySeries,
+	sloTrafficSeries,
+	sparkOf,
+} from "@/lib/metrics/series";
+import { sloHeadline } from "@/lib/metrics/tiles";
+import {
+	type TimeRange,
+	bucketLabel,
+	parseTimeRange,
+	withWindow,
+} from "@/lib/metrics/time-range";
 import {
 	Badge,
 	Card,
 	ConcentricRings,
 	EmptyState,
 	Gauge,
-	LatencyTimeline,
-	Lollipop,
 	MetricIcon,
 	type MetricIconName,
 	ModelDonut,
 	RequestFlow,
 	SparkBars,
-	TimeRuler,
 } from "@tracelanedev/ui";
 import { and, count, eq, isNull } from "drizzle-orm";
 import type { Metadata } from "next";
@@ -72,57 +90,13 @@ export const metadata: Metadata = { title: "Overview — Tracelane" };
 // Reads the session + gateway at request time — never prerender.
 export const dynamic = "force-dynamic";
 
-/** A failure-signature hit — mirrors the /signatures read shape. */
-type SignatureHit = {
-	signature_id: string;
-	your_hits: number;
-	action: "blocking" | "flag-only";
-};
+// Formatting is the registry's — ONE rule per kind (`lib/metrics/format.ts`).
+// The five local formatters that lived here (a fourth cost rule, a second
+// zero-duration glyph) are gone with the inventory that found them (DSH-11 §3.1).
+const fmtMs = fmtDurationMs;
+const fmtBurn = fmtRatio;
 
-/** One tool row from the /v1/query/tool-analytics response. */
-type ToolRow = {
-	tool: string;
-	calls: number;
-	errors: number;
-	p95_ms: number;
-};
-
-/** Full response from GET /v1/query/tool-analytics?hours=N. */
-type ToolAnalyticsResponse = {
-	window_hours: number;
-	total_calls: number;
-	tools: ToolRow[];
-};
-
-/** ms → human latency. Non-positive (no data) renders an em-dash, never "0ms". */
-function fmtMs(ms: number): string {
-	if (ms <= 0) return "—";
-	if (ms < 1000) return `${ms.toFixed(0)}ms`;
-	return `${(ms / 1000).toFixed(2)}s`;
-}
-
-function fmtBurn(x: number): string {
-	return Number.isFinite(x) ? `${x.toFixed(2)}×` : "∞×";
-}
-
-function fmtBudget(pct: number): string {
-	if (!Number.isFinite(pct)) return "over budget";
-	if (pct < 0) return `${Math.abs(pct).toFixed(0)}% over`;
-	return `${pct.toFixed(0)}%`;
-}
-
-function fmtTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-	return String(n);
-}
-
-function fmtCost(usd: number): string {
-	if (usd < 0.01) return `$${usd.toFixed(4)}`;
-	if (usd < 1) return `$${usd.toFixed(3)}`;
-	if (usd < 1000) return `$${usd.toFixed(2)}`;
-	return `$${(usd / 1000).toFixed(1)}K`;
-}
+// `fmtBudget` is the registry's too since B-341 (custom-dashboard tiles print the same string).
 
 /** Focus ring shared by every click-through card wrapper.
  *
@@ -336,172 +310,72 @@ async function availabilityTarget(): Promise<number> {
 	}
 }
 
-async function DashboardData({ range }: { range: string | undefined }) {
-	// The global range control drives EVERY read and every card href on this
-	// surface, so the numbers and the drill-throughs stay on the same window.
-	const hours = rangeToHours(range);
-	const bucketMs = rangeBucketMs(range);
-	const rShort = rangeShort(range); // "24h" | "7d" | "30d" — for labels + hrefs
-	const rLabel = rangeLabel(range); // "24 hours" | "7 days" | "30 days"
-	const sinceIso = new Date(Date.now() - hours * 3_600_000).toISOString();
-
-	// Four independent reads — one degrading (e.g. gateway warming) must not
-	// blank the others. Each rejection handler re-throws anything that is NOT a
-	// GatewayError so NEXT_REDIRECT from the auth helper is never swallowed.
+async function DashboardData({ range }: { range: TimeRange }) {
+	// EIGHT reads, all for THE SAME window (`range` — one object, one instant), all
+	// through `lib/metrics/fetch.ts`: this page computes no hours, no bucket and no
+	// `since` of its own (DSH-11 §3c, guarded by check-metric-single-source.py).
+	// `null` = the gateway was unreachable for that family; each family degrades
+	// alone and renders `—` plus the warming banner, never a confident zero.
 	const [
 		slo,
 		sloSummary,
-		signatures,
+		timePoints,
+		sig,
 		gw,
 		toolAnalytics,
 		latency,
 		guardrails,
-		timePoints,
 	] = await Promise.all([
-		// `bucket` matches the display bucket this page already renders at, so the
-		// gateway groups server-side instead of shipping every HOUR to the edge.
-		// At range=30d that is 906 rows / 213KB -> ~30-60 rows: the Worker has a
-		// per-request CPU ceiling, and 30d was the first surface to exceed it under
-		// load (Error 1102). Every consumer below is unaffected — the sums are exact
-		// under re-aggregation, `wmean` re-weights identically, and byModel/byProvider
-		// keep their dimensions. The bucketed percentiles are a TRUE quantileMerge,
-		// which is strictly better than the mean-of-hourly-percentiles computed here.
-		gatewayGet<SloRow[]>(
-			`/v1/slo?hours=${hours}&bucket=${Math.max(1, Math.round(bucketMs / 3_600_000))}`,
-		).then(
-			(rows) => ({ rows, warming: false }),
-			(err) => {
-				if (err instanceof GatewayError)
-					return { rows: [] as SloRow[], warming: true };
-				throw err;
-			},
-		),
-		//  #9: the TRUE window-wide p50/p95/p99 (server-side quantileMerge
-		// over the stored per-hour states), for the headline tiles. Null on an
-		// unreachable gateway → the tiles fall back to the weighted-mean below.
-		gatewayGet<SloSummary>(`/v1/slo/summary?hours=${hours}`).then(
-			(s) => s,
-			(err) => {
-				if (err instanceof GatewayError) return null;
-				throw err;
-			},
-		),
-		gatewayGet<{ signatures: SignatureHit[] }>(
-			`/v1/query/signatures?since=${encodeURIComponent(sinceIso)}`,
-		).then(
-			(d) => d.signatures,
-			(err) => {
-				if (err instanceof GatewayError) return [] as SignatureHit[];
-				throw err;
-			},
-		),
-		fetchGatewayStats({ hours }), // null on unreachable
-		gatewayGet<ToolAnalyticsResponse>(
-			`/v1/query/tool-analytics?hours=${hours}`,
-		).then(
-			(d) => d,
-			(err) => {
-				if (err instanceof GatewayError) return null; // gateway unreachable
-				throw err;
-			},
-		),
-		// Honest latency split (§ latency framing): gateway overhead (what WE add)
-		// vs upstream provider vs TTFT. null on unreachable → the tiles show "—".
-		fetchLatencyBreakdown({ hours }),
-		// Pre-flight block rate for the strip — real /v1/guardrails/stats. null on
-		// unreachable → the strip pill shows "—".
-		fetchGuardrailStats({ hours }),
-		// Latency-over-time chart points — the gateway's TRUE per-bucket
-		// quantileMerge (provenance audit P2 #8), NOT a client mean of per-hour
-		// percentiles. [] on unreachable → the chart is empty, tiles unaffected.
-		gatewayGet<SloTimePoint[]>(
-			`/v1/slo/timeseries?hours=${hours}&bucket=${Math.max(1, Math.round(bucketMs / 3_600_000))}`,
-		).then(
-			(p) => p,
-			(err) => {
-				if (err instanceof GatewayError) return [] as SloTimePoint[];
-				throw err;
-			},
-		),
+		fetchSloRows(range),
+		fetchSloSummary(range),
+		fetchSloTimeseries(range),
+		fetchSignaturesFor(range),
+		fetchGatewayStatsFor(range),
+		fetchToolAnalyticsFor(range),
+		fetchLatencyBreakdownFor(range),
+		fetchGuardrailStatsFor(range),
 	]);
 
-	const dash = slo.warming; // gateway unreachable → em-dash the SLO-derived cards
-	//  #4: exclude non-LLM (provider="") rows — tool/child spans land in the
-	// empty-provider bucket. Including them made "Requests" a raw SPAN count that
-	// double-counted tool spans (also shown as "Tool usage") and over-counted
-	// multi-span SDK/agent traces, and diluted the error rate. Every SLO-derived
-	// metric below is now over LLM-request spans, so "Requests" reconciles with the
-	// /traces list it links to (1 LLM span per request in the common case; a true
-	// distinct-trace count via uniqExact(trace_id) is the exact-match follow-up).
-	const rows = slo.rows.filter((r) => r.provider !== "");
-	const totalRequests = rows.reduce((s, r) => s + r.requests, 0);
-	const totalErrors = rows.reduce((s, r) => s + r.errors, 0);
-	const errorPct = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
-	//  #9: headline p50/p95/p99 are the TRUE window quantiles from the server
-	// (quantileMerge over the stored per-hour states), NOT a request-weighted mean
-	// of the per-hour bucket percentiles. A weighted mean of percentiles is a
-	// percentile-of-percentiles and diverges from the real quantile. The wmean is
-	// kept only as the fallback when the summary endpoint is unavailable (gateway
-	// warming), so the tiles degrade to an approximation rather than to blank.
-	const wmean = (pick: (r: SloRow) => number): number =>
-		totalRequests > 0
-			? rows.reduce((s, r) => s + pick(r) * r.requests, 0) / totalRequests
-			: 0;
-	const meanP95 = sloSummary ? sloSummary.p95_ms : wmean((r) => r.p95_ms);
-	// Provenance audit #9: when the summary endpoint is unavailable the ring falls
-	// back to the weighted-mean-of-hourly-p95 (a percentile-of-percentiles). Flag
-	// it `~` so an approximation is never shown as a true window quantile.
-	const usingFallback = !sloSummary;
-	const budget = computeSloBudget(
-		totalRequests,
-		totalErrors,
-		await availabilityTarget(),
-	);
-	// R59: both charts are drawn over the REQUESTED window, not over first-observed …
-	// last-observed. Without this the domain is a property of the data while the heading
-	// above describes the query — and steady traffic all day renders identically to a
-	// single 4am burst, which is the one thing these charts exist to tell apart.
-	// `Date.now()` is safe here: this is a server component, so there is no client
-	// re-render to disagree with.
-	const win = chartWindow(Date.now(), hours, bucketMs);
-	const points = latencyPointsFromTimeseries(timePoints, bucketMs, win);
-	const traffic = buildTrafficPoints(rows, bucketMs, win);
-	// A chart bar → that bucket's traces (gateway list honors since/until).
-	const barHref = (p: { t: number }) =>
-		`/traces?since=${encodeURIComponent(new Date(p.t).toISOString())}&until=${encodeURIComponent(
-			new Date(p.t + bucketMs).toISOString(),
-		)}`;
-	/*
-	 * DSH-08 — the three per-bucket series behind the new sparks. All three come
-	 * from the SAME `traffic` grid the Traffic-over-time chart is drawn on, so a
-	 * spark and the chart above it can never disagree about what a bucket is.
-	 * `buildTrafficPoints` short-circuits to [] on zero rows, so "no traffic" gives
-	 * an empty array here and StatCard renders no spark at all — never a flat line,
-	 * which would claim measured zeros we did not measure.
-	 */
-	const callsSpark = traffic.map((p) => p.requests);
-	const tokensSpark = traffic.map((p) => p.tokens);
-	// `errRateSpark` — an error-RATE-per-bucket series — was computed here and is
-	// DELETED (2026-08-22) with its only consumer, the spark in the KPI row (see
-	// the `kpis` block for why that spark could not be read at the width it had).
-	// A live computation whose result nothing renders is worse than none: it reads
-	// as a series the surface offers, and the next person wires it somewhere by
-	// assuming it was already wanted. Its one real insight is worth keeping in
-	// writing for whoever revives it — it was the error RATE, never the error
-	// COUNT, because a raw count tracks traffic volume, so a busy healthy hour
-	// out-spikes a quiet broken one and the shape says the opposite of the number
-	// beside it.
-	// Traffic as lollipop points — real per-hour request counts (honest zero bars).
-	const trafficLolli = traffic.map((p) => ({
-		label: p.label,
-		value: p.requests,
-	}));
-	const trafficHref = (i: number) => {
-		const p = traffic[i];
-		return p ? barHref(p) : `/traces?range=${rShort}`;
+	const dash = slo === null; // the SLO family is unreachable → em-dash its tiles
+	const rLabel = range.label; // "last 24 hours" · "2026-09-01 14:00 → 17:00 UTC"
+	const href = (path: string, extra?: Record<string, string | undefined>) =>
+		withWindow(path, range, extra);
+
+	// LLM-request rows only (provider !== ""): tool/child spans land in the
+	// empty-provider group and are not LLM calls (registry: `llm_calls`).
+	const rows = (slo ?? []).filter((r) => r.provider !== "");
+	// Headline totals come from /v1/slo/summary — the registry's ONE source for
+	// `llm_calls` / `error_rate` / the quantiles — so this tile and /slo's agree by
+	// construction. The per-bucket rows are the fallback only while the summary
+	// route is unreachable, and then the tile says so.
+	const target = await availabilityTarget();
+	const head = sloHeadline({
+		summary: sloSummary,
+		fallback: {
+			requests: rows.reduce((s, r) => s + r.requests, 0),
+			errors: rows.reduce((s, r) => s + r.errors, 0),
+		},
+		target,
+		unreachable: dash,
+	});
+	const { requests: totalRequests, errors: totalErrors, budget } = head;
+	const usingFallback = head.fromFallback;
+	const meanP95 = sloSummary ? sloSummary.p95_ms : 0;
+
+	// Every series on this page sits on ONE grid — `range`'s buckets.
+	const traffic = sloTrafficSeries(range, rows);
+	const latencyData = sloLatencySeries(range, timePoints ?? []);
+	const trafficChart: ChartData = {
+		...traffic,
+		series: traffic.series.filter(
+			(s) => s.id === "requests" || s.id === "errors",
+		),
 	};
-	// Real gateway share of the end-to-end trip (both p95; flagged ≈). Null when
-	// there is no measured overhead or no window p95 — never a fabricated split.
+	const callsSpark = sparkOf(traffic, "requests");
+	const tokensSpark = sparkOf(traffic, "tokens");
+	const canChartLatency = drawableBuckets(latencyData, "p95") >= 1; // founder 2026-09-04: one bucket of real traffic is data, show it
+
+	// Real gateway share of the end-to-end trip (both p95; flagged ≈).
 	const gwTripPct =
 		latency && latency.overhead_samples > 0 && meanP95 > 0
 			? Math.round((latency.overhead_p95_ms / meanP95) * 100)
@@ -510,18 +384,10 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	const totalInputTokens = rows.reduce((s, r) => s + r.total_input_tokens, 0);
 	const totalOutputTokens = rows.reduce((s, r) => s + r.total_output_tokens, 0);
 
-	// Router signals — real, from the live gateway aggregate (null when unreachable).
-	const cacheHitPct = gw ? gw.cache_hit_rate_pct : null;
-	// Real spend = summed stored per-span cost. 0 (or null) → "—", never a fake $0.
+	// Router signals — null when THAT family is unreachable, never folded to 0.
 	const spend = gw ? gw.total_cost_usd : null;
-	// Pre-flight block rate — real guardrail metric (null when unreachable).
-	// (Circuit-breaker + failover resilience signals live on the Gateway page,
-	// where the full per-provider router health is shown — not duplicated here.)
-	const blockRatePct = guardrails ? guardrails.block_rate_pct : null;
+	const signatures = sig?.signatures ?? [];
 
-	// Traffic by provider/model (top 5 by request volume) — real SLO aggregates.
-	// `errors` is summed too so the request-flow Sankey can split each model into
-	// its honest OK / Error outcome (no new read — same rows).
 	const byModel = new Map<
 		string,
 		{
@@ -555,7 +421,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 		.sort((a, b) => b.your_hits - a.your_hits)
 		.slice(0, 5);
 
-	// Tool analytics — top 5 tools by call volume. null when gateway is unreachable.
 	const toolAnalyticsWarming = toolAnalytics === null;
 	const totalToolCalls = toolAnalytics?.total_calls ?? 0;
 	const topTools = (toolAnalytics?.tools ?? [])
@@ -563,13 +428,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 		.slice(0, 5);
 	const maxToolCalls = topTools[0]?.calls ?? 0;
 
-	/*
-	 * DSH-08 — Spend's chart is a COMPOSITION, not a trend, and that is a data
-	 * fact rather than a design preference: `GatewayStats` carries
-	 * `total_cost_usd` and a per-provider `cost_usd`, and NOTHING in the whole
-	 * dashboard response carries cost over time. A sparkline here would have to be
-	 * invented, so the tile shows the split it can actually substantiate.
-	 */
 	const costSplit = (gw?.providers ?? [])
 		.filter((p) => p.cost_usd > 0)
 		.sort((a, b) => b.cost_usd - a.cost_usd)
@@ -577,71 +435,67 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	const costSplitTotal = costSplit.reduce((sum, p) => sum + p.cost_usd, 0);
 
 	/*
-	 * ── P0.6 THE OPERATIONAL KPI ROW ─────────────────────────────────────────
-	 * Five metrics, ONE surface, the number dominant and quiet context under it.
-	 * Values and hrefs are the SAME reads as before — presentation only.
-	 *
-	 * WHAT REPLACED WHAT. These five used to be a row of mixed controls: two
-	 * filled pills (a black one for error rate, a soft one for block rate) and two
-	 * hand-built horizontal bar-gauges with the figure printed inside the fill.
-	 * Four shapes for four numbers of the same kind, and the black pill was the
-	 * single loudest object above the fold while carrying a value that is usually
-	 * 0.00%. P0.6 names both: "Do NOT use coloured pills as the main KPI treatment"
-	 * and "Avoid oversized black pills."
-	 *
-	 * NO PERIOD-OVER-PERIOD DELTA, AND THAT IS A DATA FACT RATHER THAN AN
-	 * OMISSION. The brief's KPI sketch shows "↓ 0.48% vs 24h". Nothing on this
-	 * page reads a PREVIOUS window: every fetch above is `?hours=${hours}` for the
-	 * current one, so a "vs 24h" figure could only be invented, and P0.20 forbids
-	 * both fabricating data and changing data fetching. What IS available is a
-	 * comparison against the plan's contracted target, and the availability KPI
-	 * carries exactly that — a real delta, against a real threshold. The rest
-	 * The rest carry only their window label.
-	 *
-	 * AND NO SPARK EITHER — REMOVED AFTER LOOKING AT THE RENDER, not after reading
-	 * the JSX. The first cut put the real per-bucket error-rate series in this row
-	 * as a `SparkBars`. Rendered at the width a fifth of a card actually leaves
-	 * (~72px beside the sub-line), a 24-bucket series where 23 buckets sit near 2%
-	 * and one spikes normalises to 23 sub-pixel bars and one tick: on screen it is
-	 * a dotted line, not a shape. An illegible chart is worse than no chart —
-	 * it spends the reader's attention and returns nothing — and P0.6's KPI
-	 * treatment is label / number / delta, with no series in it. The shape still
-	 * exists where it is legible: the Volume surface below, and the full
-	 * Traffic-over-time chart.
+	 * ── THE OPERATIONAL KPI ROW ───────────────────────────────────────────────
+	 * Five metrics, each formatted by the registry's ONE rule for its kind, each
+	 * carrying its sample size where it is a rate (§3d). Zero traffic renders the
+	 * metric's zero copy — never `100.000% ▲ above target` (B-334).
 	 */
+	const avail = head.availability;
+	const errRate = head.errorRate;
+	const blockRate = fmtPercent(guardrails?.block_rate_pct, {
+		n: guardrails ? guardrails.total_evaluations : null,
+		floor: 100,
+	});
+	const cacheHit = fmtPercent(gw?.cache_hit_rate_pct, {
+		n: gw ? gw.total_requests : null,
+		floor: 100,
+	});
+	const sampleNote = (n: number, floor: number, what: string) => (
+		<span className="text-ink-3">
+			n = {fmtCount(n)} · below the {fmtCount(floor)}-{what} floor
+		</span>
+	);
 	const availAhead = budget.availabilityPct >= budget.targetPct;
 	const kpis: {
 		label: string;
 		value: string;
 		href: string;
 		hint?: string;
-		/** Quiet context under the number. Carries the semantic tone when there is one. */
 		sub: ReactNode;
 	}[] = [
 		{
-			label: "Error rate",
-			value: dash ? "—" : `${errorPct.toFixed(2)}%`,
-			href: `/traces?status=error&range=${rShort}`,
-			hint: "Share of LLM requests that failed, over the selected window.",
-			sub: <span className="text-ink-3">last {rLabel}</span>,
+			label: METRICS.block_rate.label,
+			value: guardrails === null || blockRate.noSample ? "—" : blockRate.text,
+			href: href("/guardrails"),
+			hint: hintOf(METRICS.block_rate),
+			sub:
+				guardrails === null ? (
+					<span className="text-ink-3">waiting on the gateway</span>
+				) : blockRate.noSample ? (
+					<span className="text-ink-3">{METRICS.block_rate.zeroCopy}</span>
+				) : blockRate.belowFloor ? (
+					sampleNote(guardrails.total_evaluations, blockRate.floor, "verdict")
+				) : (
+					<span className="text-ink-3">
+						of {fmtCount(guardrails.total_evaluations)} verdicts
+					</span>
+				),
 		},
 		{
-			label: "Block rate",
-			value: blockRatePct === null ? "—" : `${blockRatePct.toFixed(1)}%`,
-			href: "/guardrails",
-			hint: "Share of pre-flight guardrail VERDICTS that blocked (denominator = verdicts, not requests).",
-			sub: <span className="text-ink-3">of guardrail verdicts</span>,
-		},
-		{
-			label: "Availability",
-			value: dash ? "—" : `${budget.availabilityPct.toFixed(3)}%`,
-			href: "/slo",
-			// The one REAL delta on the page: measured availability against the
-			// plan's contracted target. Arrow + words + colour, never colour alone
-			// (P0.19).
+			label: METRICS.availability.label,
+			value: dash || avail.noSample ? "—" : avail.text,
+			href: href("/slo"),
+			hint: hintOf(METRICS.availability),
 			sub: dash ? (
 				<span className="text-ink-3">
 					vs {budget.targetPct.toFixed(1)}% target
+				</span>
+			) : avail.noSample ? (
+				<span className="text-ink-3">{METRICS.availability.zeroCopy}</span>
+			) : avail.belowFloor ? (
+				<span className="text-ink-3">
+					n = {fmtCount(totalRequests)} · below the {fmtCount(avail.floor)}
+					-request floor for a {budget.targetPct.toFixed(1)}% target
 				</span>
 			) : (
 				<span className={availAhead ? "text-ok-ink" : "text-danger-ink"}>
@@ -651,41 +505,64 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			),
 		},
 		{
-			label: "Cache hit",
-			value: cacheHitPct === null ? "—" : `${cacheHitPct.toFixed(1)}%`,
-			href: "/gateway",
-			hint: "Share of gateway requests served from the response cache.",
-			sub: <span className="text-ink-3">gateway cache</span>,
+			label: METRICS.cache_hit_rate.label,
+			value: gw === null || cacheHit.noSample ? "—" : cacheHit.text,
+			href: href("/gateway"),
+			hint: hintOf(METRICS.cache_hit_rate),
+			sub:
+				gw === null ? (
+					<span className="text-ink-3">waiting on the gateway</span>
+				) : cacheHit.noSample ? (
+					<span className="text-ink-3">{METRICS.cache_hit_rate.zeroCopy}</span>
+				) : cacheHit.belowFloor ? (
+					sampleNote(gw.total_requests, cacheHit.floor, "request")
+				) : (
+					<span className="text-ink-3">
+						of {fmtCount(gw.total_requests)} routed requests
+					</span>
+				),
 		},
 		{
-			label: "p95 latency",
-			// `usingFallback` flags a weighted-mean-of-hourly-p95 (a
-			// percentile-of-percentiles) so an approximation is never shown as a
-			// true window quantile.
-			// `meanP95 > 0` GUARDS THE MARKER, and the render is what caught it. On a
-			// zero-traffic tenant the summary endpoint returns nothing, so
-			// `usingFallback` is true and `fmtMs(0)` is an em-dash — and the tile
-			// printed "~—", an approximation marker on the ABSENCE of a value. The
-			// tilde has to mean "this number is approximate"; on no number it is noise
-			// that reads like a rendering fault.
-			value:
-				dash || meanP95 <= 0
-					? "—"
-					: usingFallback
-						? `~${fmtMs(meanP95)}`
-						: fmtMs(meanP95),
-			href: "/slo",
-			hint: "End-to-end p95 over the window — the true server-side quantile, not a mean of hourly percentiles.",
-			sub: <span className="text-ink-3">end to end</span>,
+			label: METRICS.latency_p95.label,
+			value: dash || meanP95 <= 0 ? "—" : fmtDurationMs(meanP95),
+			href: href("/slo"),
+			hint: hintOf(METRICS.latency_p95),
+			sub: dash ? (
+				<span className="text-ink-3">end to end</span>
+			) : usingFallback ? (
+				<span className="text-ink-3">
+					summary unreachable — no window quantile
+				</span>
+			) : totalRequests > 0 && totalRequests < 100 ? (
+				sampleNote(totalRequests, 100, "request")
+			) : (
+				<span className="text-ink-3">
+					end to end · n = {fmtCount(totalRequests)}
+				</span>
+			),
+		},
+		{
+			label: METRICS.error_rate.label,
+			value: dash ? "—" : errRate.noSample ? "—" : errRate.text,
+			href: href("/traces", { status: "error" }),
+			hint: hintOf(METRICS.error_rate),
+			sub: dash ? (
+				<span className="text-ink-3">{rLabel}</span>
+			) : errRate.noSample ? (
+				<span className="text-ink-3">{METRICS.error_rate.zeroCopy}</span>
+			) : errRate.belowFloor ? (
+				<span className="text-ink-3">
+					{fmtFraction(totalErrors, totalRequests)} failed · n below the{" "}
+					{fmtCount(errRate.floor)}-request floor
+				</span>
+			) : (
+				<span className="text-ink-3">
+					{fmtFraction(totalErrors, totalRequests)} failed
+				</span>
+			),
 		},
 	];
 
-	/*
-	 * ── P0.7 THE ACTIVITY SURFACE ────────────────────────────────────────────
-	 * LLM calls · Tokens · Spend read as ONE coherent activity surface with three
-	 * metric groups and hairline separators, not as three unrelated floating
-	 * cards. Same three reads as before.
-	 */
 	const activity: {
 		icon: MetricIconName;
 		label: string;
@@ -697,32 +574,38 @@ async function DashboardData({ range }: { range: string | undefined }) {
 	}[] = [
 		{
 			icon: "llm-calls",
-			label: "LLM calls",
-			value: dash ? "—" : totalRequests.toLocaleString(),
-			href: `/traces?range=${rShort}`,
-			hint: "Model requests — one agent run can make several. Not the trace/conversation count (see Traces).",
+			label: METRICS.llm_calls.label,
+			value: head.llmCalls,
+			href: href("/traces"),
+			hint: hintOf(METRICS.llm_calls),
 			spark: dash ? undefined : callsSpark,
-			sub: dash ? undefined : `per bucket · last ${rLabel}`,
+			sub: dash
+				? undefined
+				: totalRequests === 0
+					? METRICS.llm_calls.zeroCopy
+					: `per ${bucketLabel(range.bucketMs)} bucket · ${rLabel}`,
 		},
 		{
 			icon: "tokens",
-			label: "Tokens",
-			value: dash ? "—" : fmtTokens(totalInputTokens + totalOutputTokens),
-			href: "/slo",
+			label: METRICS.tokens.label,
+			value: dash ? "—" : fmtCompact(totalInputTokens + totalOutputTokens),
+			href: href("/slo"),
+			hint: hintOf(METRICS.tokens),
 			spark: dash ? undefined : tokensSpark,
 			sub: dash ? undefined : "in + out · per bucket",
 		},
 		{
 			icon: "spend",
-			label: "Spend (est.)",
-			value: spend === null || spend === 0 ? "—" : fmtCost(spend),
-			href: "/gateway",
-			// NO SPARK, AND THAT IS THE HONEST ANSWER, not a gap. Nothing in this
-			// page's reads carries cost over time; `GatewayStats` has a window total
-			// and a per-provider split, so the tile shows the split. A sparkline here
-			// would be the first fabricated series on the surface.
+			label: METRICS.spend_est.label,
+			// null = unreachable; 0 with nothing priced = no priced traffic (both `—`,
+			// and the sub-line says which). A measured spend over priced rows renders.
+			value: spend === null || spend === 0 ? "—" : fmtUsd(spend),
+			href: href("/gateway"),
+			hint: hintOf(METRICS.spend_est),
 			sub:
-				costSplit.length > 0 && costSplitTotal > 0 ? (
+				gw === null ? (
+					<span>waiting on the gateway</span>
+				) : costSplit.length > 0 && costSplitTotal > 0 ? (
 					<span className="flex items-center gap-2">
 						<span className="flex h-1 flex-1 overflow-hidden rounded-full bg-surface-2">
 							{costSplit.map((prov, i) => (
@@ -733,7 +616,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 										width: `${(prov.cost_usd / costSplitTotal) * 100}%`,
 										opacity: Math.max(0.3, 0.9 - i * 0.2),
 									}}
-									title={`${prov.provider}: ${fmtCost(prov.cost_usd)}`}
+									title={`${prov.provider}: ${fmtUsd(prov.cost_usd)}`}
 								/>
 							))}
 						</span>
@@ -743,16 +626,14 @@ async function DashboardData({ range }: { range: string | undefined }) {
 								: `${costSplit.length} providers`}
 						</span>
 					</span>
-				) : undefined,
+				) : (
+					<span>no priced traffic in this window</span>
+				),
 		},
 	];
 
-	// Viz data for the request-flow row — derived from the SAME real reads above
-	// (SLO rows, byModel); no extra fetch, no fabricated numbers.
 	const modelHref = (m: string) =>
-		m && m !== "—"
-			? `/traces?model=${encodeURIComponent(m)}&range=${rShort}`
-			: undefined;
+		m && m !== "—" ? href("/traces", { model: m }) : undefined;
 	const flowModels = topModels.slice(0, 4).map((m) => ({
 		id: `${m.provider}::${m.model}`,
 		label: m.model,
@@ -761,19 +642,12 @@ async function DashboardData({ range }: { range: string | undefined }) {
 		href: modelHref(m.model),
 	}));
 
-	// Provider health — top 4 by request volume (presentational, no new fetch).
 	const topProviders = (gw?.providers ?? [])
 		.slice()
 		.sort((a, b) => b.requests - a.requests)
 		.slice(0, 4);
 	const maxProvReq = topProviders[0]?.requests ?? 0;
 
-	/*
-	 * DSH-08 — guardrail verdicts as a composition. The four arcs are the four
-	 * real outcome counts and they sum to `total_evaluations`. Tone is set only on
-	 * the EXCEPTIONS — see the `allowed` segment for why the healthy 95% is
-	 * deliberately neutral.
-	 */
 	const guardrailSegments = guardrails
 		? (
 				[
@@ -795,19 +669,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						value: guardrails.warns,
 						tone: "warn",
 					},
-					{
-						id: "allowed",
-						label: "allowed",
-						value: guardrails.allows,
-						// NO TONE, AND THAT IS THE POINT. This was `tone: "ok"`, which is
-						// defensible on paper — allowed IS the healthy outcome — and wrong
-						// on screen: `allowed` is ~95% of every real window, so the card
-						// rendered as a saturated green ring with three slivers on it. The
-						// loudest object on the surface was the news that nothing happened.
-						// Under "colour is data", the DATUM here is the exception: blocked,
-						// redacted, warned. Allowed takes the neutral chart ramp, so the 5%
-						// that needs attention is the only thing carrying colour.
-					},
+					{ id: "allowed", label: "allowed", value: guardrails.allows },
 				] as const
 			).filter((seg) => seg.value > 0)
 		: [];
@@ -821,7 +683,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 		 * two groups, the grouping the section labels announce was contradicted by
 		 * the layout underneath them.
 		 */
-		<div className="space-y-8">
+		<div className="space-y-5">
 			{/* The page header used to sit here. It moved OUT of this component and
 			    above the Suspense boundary in `DashboardPage` — it depends on no
 			    gateway read, so rendering it here made the page title wait for the
@@ -852,7 +714,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						<Link
 							key={k.label}
 							href={k.href}
-							className="group flex flex-col gap-1.5 border-l border-t border-line px-5 py-4 transition-colors hover:bg-surface-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus-ring"
+							className="group flex flex-col gap-1 border-l border-t border-line px-4 py-3 transition-colors hover:bg-surface-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							<span className="t-metric-label flex items-center gap-1.5">
 								{k.label}
@@ -868,7 +730,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							</span>
 							{/* The number is GRAPHITE (P0.6) — the semantic tone lives in the
 							    sub-line below it, never in the headline figure. */}
-							<span className="t-metric font-mono text-ink">{k.value}</span>
+							<span className="t-metric-sm text-ink">{k.value}</span>
 							<span className="flex min-h-4 items-center text-2xs">
 								{k.sub}
 							</span>
@@ -891,7 +753,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							<Link
 								key={a.label}
 								href={a.href}
-								className="flex flex-col gap-2 border-l border-t border-line px-6 py-5 transition-colors hover:bg-surface-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus-ring"
+								className="flex flex-col gap-1 border-l border-t border-line px-4 py-3 transition-colors hover:bg-surface-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus-ring"
 							>
 								<span className="flex items-center gap-2">
 									<MetricIcon name={a.icon} size={20} />
@@ -908,22 +770,20 @@ async function DashboardData({ range }: { range: string | undefined }) {
 										)}
 									</span>
 								</span>
-								<span className="t-metric font-mono text-ink">{a.value}</span>
-								{a.spark && (
-									/* `max-w-[13rem]` and a taller bar, both set from the render.
-									   `SparkBars` uses `preserveAspectRatio="none"`, so an
-									   unconstrained spark in a third-of-a-card cell stretched 24
-									   two-unit bars across ~380px — each bar ~10px wide with a 5px
-									   gap, which reads as a dashed rule rather than as a series.
-									   Capping the width keeps the bars narrow and the 18px height
-									   gives the shape somewhere to happen. */
-									<SparkBars
-										values={a.spark}
-										height={18}
-										ariaLabel={`${a.label} per bucket over the last ${rLabel}`}
-										className="max-w-[13rem]"
-									/>
-								)}
+								{/* Founder 2026-09-04: the spark sits to the RIGHT of the value, not
+								   under it — the row was taking a third of the board for three numbers.
+								   One line: value left, series right, caption below in 2xs. */}
+								<span className="flex items-end justify-between gap-4">
+									<span className="t-metric-sm text-ink">{a.value}</span>
+									{a.spark && (
+										<SparkBars
+											values={a.spark}
+											height={20}
+											ariaLabel={`${a.label} per bucket over the last ${rLabel}`}
+											className="mb-0.5 w-28 shrink-0"
+										/>
+									)}
+								</span>
 								<span className="min-h-4 text-2xs text-ink-3">{a.sub}</span>
 							</Link>
 						))}
@@ -932,19 +792,20 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			</section>
 
 			{/* ── Section 1 — HEALTH AT A GLANCE ─────────────────────────────────
-			    Traffic over time (PRIMARY, wide) · Error budget (PRIMARY, the one
-			    deliberate dark card) · Where the time goes (secondary).
+			    Traffic over time (PRIMARY, wide) · Where the time goes (centre, founder
+			    2026-09-04) · Error budget (RIGHT — the one deliberate dark card).
 			    P0.4: the three do NOT carry the same visual weight any more. */}
 			<section aria-label="Health at a glance" className="space-y-3">
 				<SectionLabel>Health at a glance</SectionLabel>
 				<div className="grid grid-cols-1 gap-4 lg:grid-cols-12 lg:items-stretch">
 					{/* Traffic over time — real per-bucket request counts. PRIMARY. */}
-					<Card className="flex h-full flex-col p-6 lg:col-span-6">
+					<Card className="flex h-full flex-col p-5 lg:col-span-6">
 						<CardHead
 							icon="traffic"
-							title={`Traffic over time — last ${rLabel} · UTC`}
+							title={`Traffic over time — ${rLabel}${range.kind === "preset" ? " · UTC" : ""}`}
+							meta={`${bucketLabel(range.bucketMs)} buckets`}
 						/>
-						{trafficLolli.length > 0 ? (
+						{traffic.hasData ? (
 							/*
 							 * `flex-col`, and this was a real defect (found by LOOKING at the
 							 * render rather than reading the JSX). The wrapper was
@@ -955,27 +816,15 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							 * tick was present in the DOM and correct.
 							 */
 							<div className="flex flex-1 flex-col justify-center">
-								<Lollipop
-									points={trafficLolli}
-									hrefFor={trafficHref}
-									ariaLabel={`requests per bucket over the last ${rLabel}`}
+								{/* DSH-11: the ONE interactive chart — hover for the exact count
+								    and the bucket's UTC bounds, click a bar for that bucket's
+								    traces, drag to zoom this page to the selection. The shared
+								    TimeRuler is drawn by the chart, inset to its own plot. */}
+								<MetricChart
+									data={trafficChart}
+									label={`requests and errors per ${bucketLabel(range.bucketMs)} bucket, ${rLabel}`}
+									drillPath="/traces"
 								/>
-								{/* ONE time axis, replacing the strided labels this chart used
-								    to draw itself. `win.endMs` is the LAST BUCKET START, so the
-								    axis runs to that bucket's END. Inset to the svg's PAD_L/PAD_R
-								    (34/8 of a 640 viewBox) so ticks land on the slot centres the
-								    bars use. */}
-								<div
-									className="mt-2"
-									style={{ marginLeft: "5.31%", marginRight: "1.25%" }}
-								>
-									<TimeRuler
-										startMs={win.startMs}
-										endMs={win.endMs + bucketMs}
-										ticks={4}
-										mode="absolute"
-									/>
-								</div>
 							</div>
 						) : (
 							<CardEmpty
@@ -990,6 +839,103 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						)}
 					</Card>
 
+					{/* Where the time goes — the honest trip split (real p95 per
+					    component). SECONDARY weight (P0.4): it is a breakdown of the
+					    latency the KPI row already states. */}
+					<Link href="/gateway" className={`${TILE_LINK_CLS} lg:col-span-3`}>
+						<Card quiet className="flex h-full flex-col p-5">
+							<CardHead
+								icon="time"
+								title="Where the time goes"
+								meta="gateway vs upstream"
+							/>
+							{latency && latency.overhead_samples > 0 ? (
+								<div
+									className="flex flex-1 flex-col items-center justify-center"
+									title={
+										gwTripPct !== null
+											? "gateway ≈ N% of the trip is a ratio of two p95s measured over different span populations; percentiles are not additive, so read it as approximate."
+											: undefined
+									}
+								>
+									<ConcentricRings
+										rings={[
+											{
+												value: usingFallback
+													? `~${fmtMs(meanP95)}`
+													: fmtMs(meanP95),
+												label: "end-to-end",
+											},
+											{
+												value: fmtMs(latency.provider_p95_ms),
+												label: "provider",
+											},
+											{
+												value: fmtMs(latency.overhead_p95_ms),
+												label: "gateway",
+											},
+										]}
+										caption={
+											gwTripPct !== null
+												? `p95 · gateway ≈ ${gwTripPct}% of the trip${usingFallback ? " (approx)" : ""}`
+												: "p95 · end-to-end · provider · gateway"
+										}
+									/>
+									{/* Founder 2026-09-04: say the split out loud. The rings imply it; the
+									    reader should not have to subtract. Provider time is the model's and
+									    not ours to change; gateway time is, and its p50 is the honest steady
+									    state — a small n makes the p95 the single cold first request. */}
+									<dl className="mt-3 w-full max-w-[17rem] space-y-1 text-2xs">
+										<div className="flex items-baseline justify-between gap-3">
+											<dt className="text-ink-2">Provider (the model)</dt>
+											<dd className="font-mono tabular-nums text-ink">
+												{fmtMs(latency.provider_p95_ms)}
+												{meanP95 > 0 && (
+													<span className="text-ink-3">
+														{" "}
+														·{" "}
+														{Math.round(
+															(latency.provider_p95_ms / meanP95) * 100,
+														)}
+														%
+													</span>
+												)}
+											</dd>
+										</div>
+										<div className="flex items-baseline justify-between gap-3">
+											<dt className="text-ink-2">Gateway (ours)</dt>
+											<dd className="font-mono tabular-nums text-ink">
+												{fmtMs(latency.overhead_p95_ms)}
+												{gwTripPct !== null && (
+													<span className="text-ink-3"> · {gwTripPct}%</span>
+												)}
+											</dd>
+										</div>
+										<div className="flex items-baseline justify-between gap-3">
+											<dt className="text-ink-3">
+												Gateway, typical request (p50)
+											</dt>
+											<dd className="font-mono tabular-nums text-ink-2">
+												{fmtMs(latency.overhead_p50_ms)}
+											</dd>
+										</div>
+										{latency.overhead_samples < 20 && (
+											<p className="pt-1 text-ink-3">
+												n = {latency.overhead_samples} — at this volume the p95
+												is the slowest single request (usually the first, cold
+												one).
+											</p>
+										)}
+									</dl>
+								</div>
+							) : (
+								<CardEmpty
+									title="No latency split yet"
+									description="Gateway versus provider latency appears here as requests flow."
+								/>
+							)}
+						</Card>
+					</Link>
 					{/*
 					 * P0.10 — ERROR BUDGET. The one deliberately dark card, in BOTH
 					 * themes, because a burn signal should read as an instrument panel
@@ -1015,7 +961,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							<div className="flex items-center gap-2">
 								<MetricIcon name="error-budget" size={20} onInverse />
 								<h2 className="t-card-title text-ink-inverse">
-									Error budget ({rShort})
+									Error budget ({range.short})
 								</h2>
 							</div>
 						</div>
@@ -1054,7 +1000,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							<div className="flex items-center justify-between gap-3">
 								<dt className="text-ink-inverse opacity-60">Availability</dt>
 								<dd className="font-mono tabular-nums text-ink-inverse">
-									{dash ? "—" : `${budget.availabilityPct.toFixed(3)}%`}
+									{dash || avail.noSample ? "—" : avail.text}
 								</dd>
 							</div>
 							<div className="flex items-center justify-between gap-3">
@@ -1075,58 +1021,6 @@ async function DashboardData({ range }: { range: string | undefined }) {
 							</div>
 						</dl>
 					</div>
-
-					{/* Where the time goes — the honest trip split (real p95 per
-					    component). SECONDARY weight (P0.4): it is a breakdown of the
-					    latency the KPI row already states. */}
-					<Link href="/gateway" className={`${TILE_LINK_CLS} lg:col-span-3`}>
-						<Card quiet className="flex h-full flex-col p-6">
-							<CardHead
-								icon="time"
-								title="Where the time goes"
-								meta="gateway vs upstream"
-							/>
-							{latency && latency.overhead_samples > 0 ? (
-								<div
-									className="flex flex-1 flex-col items-center justify-center"
-									title={
-										gwTripPct !== null
-											? "gateway ≈ N% of the trip is a ratio of two p95s measured over different span populations; percentiles are not additive, so read it as approximate."
-											: undefined
-									}
-								>
-									<ConcentricRings
-										rings={[
-											{
-												value: usingFallback
-													? `~${fmtMs(meanP95)}`
-													: fmtMs(meanP95),
-												label: "end-to-end",
-											},
-											{
-												value: fmtMs(latency.provider_p95_ms),
-												label: "provider",
-											},
-											{
-												value: fmtMs(latency.overhead_p95_ms),
-												label: "gateway",
-											},
-										]}
-										caption={
-											gwTripPct !== null
-												? `p95 · gateway ≈ ${gwTripPct}% of the trip${usingFallback ? " (approx)" : ""}`
-												: "p95 · end-to-end · provider · gateway"
-										}
-									/>
-								</div>
-							) : (
-								<CardEmpty
-									title="No latency split yet"
-									description="Gateway versus provider latency appears here as requests flow."
-								/>
-							)}
-						</Card>
-					</Link>
 				</div>
 			</section>
 
@@ -1136,28 +1030,28 @@ async function DashboardData({ range }: { range: string | undefined }) {
 				<div className="grid grid-cols-1 gap-4 lg:grid-cols-12 lg:items-stretch">
 					{/* Latency over time + the full gateway-overhead / provider / TTFT
 					    percentile split — all real. PRIMARY. */}
-					<Card className="flex h-full flex-col p-6 lg:col-span-5">
+					<Card className="flex h-full flex-col p-5 lg:col-span-5">
 						<CardHead
 							icon="latency"
-							title={`Latency over time — last ${rLabel} · UTC`}
+							title={`Latency over time — ${rLabel}${range.kind === "preset" ? " · UTC" : ""}`}
+							meta="true quantiles per bucket"
 						/>
-						{points.length > 0 ? (
-							<>
-								<LatencyTimeline points={points} />
-								{/* preserveAspectRatio="none" means the chart svg stretches
-								    edge to edge, so the ruler needs no inset. */}
-								<TimeRuler
-									startMs={win.startMs}
-									endMs={win.endMs + bucketMs}
-									ticks={4}
-									mode="absolute"
-								/>
-							</>
+						{canChartLatency ? (
+							<MetricChart
+								data={latencyData}
+								label={`p50, p95 and p99 latency per ${bucketLabel(range.bucketMs)} bucket, ${rLabel}`}
+								drillPath="/traces"
+								legend
+							/>
 						) : (
 							<CardEmpty
 								ghost={<GhostFloor />}
-								title="No latency data yet"
-								description="Per-bucket percentiles appear here as requests flow through the gateway."
+								title={
+									timePoints === null
+										? "Waiting on the gateway"
+										: "No latency data yet"
+								}
+								description="Per-bucket percentiles appear here once a bucket in the window carries traffic."
 								action={{ href: "/gateway", label: "Gateway setup" }}
 							/>
 						)}
@@ -1186,7 +1080,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					</Card>
 
 					{/* Request flow — gateway → model → honest OK/Error split. PRIMARY. */}
-					<Card className="flex h-full flex-col p-6 lg:col-span-4">
+					<Card className="flex h-full flex-col p-5 lg:col-span-4">
 						<CardHead
 							icon="request-flow"
 							title="Request flow"
@@ -1209,23 +1103,25 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					</Card>
 
 					{/* Guardrail activity — real block/fail-open verdicts. SECONDARY. */}
-					<Card quiet className="flex h-full flex-col p-6 lg:col-span-3">
+					<Card quiet className="flex h-full flex-col p-5 lg:col-span-3">
 						<CardHead
 							icon="guardrail"
 							title="Guardrail activity"
-							meta={rShort}
+							meta={range.short}
 						/>
 						{guardrails === null || guardrails.total_evaluations === 0 ? (
 							<CardEmpty
-								title="No guardrail activity yet"
+								title={
+									guardrails === null
+										? "Waiting on the gateway"
+										: "No guardrail activity yet"
+								}
 								description="Block and allow verdicts appear here as requests pass the inline guardrails."
 								action={{ href: "/guardrails", label: "Configure guardrails" }}
 							/>
 						) : (
 							<div className="flex flex-1 flex-col justify-center">
-								<div className="t-metric-sm font-mono text-ink">
-									{guardrails.block_rate_pct.toFixed(1)}%
-								</div>
+								<div className="t-metric-sm text-ink">{blockRate.text}</div>
 								<p className="mt-0.5 text-2xs text-ink-3">block rate</p>
 								{/*
 								 * Four counts that are FOUR PARTS OF ONE WHOLE were rendered as
@@ -1252,7 +1148,10 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											l: "evaluations",
 										},
 										{
-											v: `${guardrails.fail_open_rate_pct.toFixed(1)}%`,
+											v: fmtPercent(guardrails.fail_open_rate_pct, {
+												n: guardrails.total_evaluations,
+												floor: 100,
+											}).text,
 											l: "fail-open",
 										},
 										{ v: guardrails.blocks.toLocaleString(), l: "blocked" },
@@ -1344,7 +1243,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 													<td className="px-4 py-3">
 														{m.model && m.model !== "—" ? (
 															<Link
-																href={`/traces?model=${encodeURIComponent(m.model)}&range=${rShort}`}
+																href={href("/traces", { model: m.model })}
 																className="block truncate font-mono text-xs text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 																title={`View ${m.model} traces`}
 															>
@@ -1371,7 +1270,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 														{m.requests.toLocaleString()}
 													</td>
 													<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
-														{fmtTokens(m.tokens)}
+														{fmtCompact(m.tokens)}
 													</td>
 												</tr>
 											))}
@@ -1396,7 +1295,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 					{/* Provider health — top 4 providers by request volume with error rate
 					    and a share bar. Derived inline from fetchGatewayStats (already
 					    fetched); no extra read, no fabricated numbers. */}
-					<Card quiet className="flex h-full flex-col p-6 lg:col-span-4">
+					<Card quiet className="flex h-full flex-col p-5 lg:col-span-4">
 						<CardHead
 							icon="provider"
 							title="Provider health"
@@ -1404,7 +1303,11 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						/>
 						{topProviders.length === 0 ? (
 							<CardEmpty
-								title="No provider traffic yet"
+								title={
+									gw === null
+										? "Waiting on the gateway"
+										: "No provider traffic yet"
+								}
 								description="Per-provider request volume and error rate appear here."
 								action={{
 									href: "/settings/providers",
@@ -1426,7 +1329,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 												{p.provider}
 											</span>
 											<span className="font-mono text-xs tabular-nums text-ink">
-												{fmtTokens(p.requests)}
+												{fmtCount(p.requests)}
 											</span>
 											<span
 												className={`font-mono text-xs tabular-nums ${
@@ -1474,7 +1377,7 @@ async function DashboardData({ range }: { range: string | undefined }) {
 												Signature
 											</th>
 											<th className="t-metric-label px-4 py-2 text-right">
-												Hits ({rShort})
+												Hits ({range.short})
 											</th>
 											<th className="t-metric-label px-4 py-2 text-right">
 												Action
@@ -1489,7 +1392,9 @@ async function DashboardData({ range }: { range: string | undefined }) {
 											>
 												<td className="px-4 py-3">
 													<Link
-														href={`/traces?signature_id=${encodeURIComponent(s.signature_id)}&range=${rShort}`}
+														href={href("/traces", {
+															signature_id: s.signature_id,
+														})}
 														className="rounded font-mono text-xs text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 														title={`View ${s.signature_id} traces`}
 													>
@@ -1514,7 +1419,11 @@ async function DashboardData({ range }: { range: string | undefined }) {
 						) : (
 							<div className="px-6 pb-6">
 								<CardEmpty
-									title="No failure signatures matched yet"
+									title={
+										sig === null
+											? "Waiting on the gateway"
+											: "No failure signatures matched yet"
+									}
 									description="A known agent-failure pattern — a tool-schema violation, definition drift — surfaces here when it is seen in your traces."
 									action={{
 										href: "/signatures",
@@ -1530,13 +1439,13 @@ async function DashboardData({ range }: { range: string | undefined }) {
 			{/* ── Tool usage — the one dashboard surface for agent tool health.
 			    SECONDARY, full width. */}
 			<section aria-label="Tool usage" className="space-y-3">
-				<SectionLabel>Tool usage ({rShort})</SectionLabel>
+				<SectionLabel>Tool usage ({range.short})</SectionLabel>
 				<Card quiet className="overflow-hidden">
 					<div className="px-6 pb-3 pt-5">
 						<CardHead
 							icon="tool-usage"
 							title="Tools called through the gateway"
-							action={{ href: "/traces", label: "View traces" }}
+							action={{ href: href("/traces"), label: "View traces" }}
 						/>
 					</div>
 					{toolAnalyticsWarming ? (
@@ -1661,9 +1570,13 @@ async function NoApiKeysBanner() {
 export default async function DashboardPage({
 	searchParams,
 }: {
-	searchParams: Promise<{ range?: string }>;
+	searchParams: Promise<{ range?: string; since?: string; until?: string }>;
 }) {
-	const { range } = await searchParams;
+	const sp = await searchParams;
+	// ONE window for every read and every href on this page, resolved once from the
+	// shared grammar (DSH-11 §3a). `Date.now()` is taken here so the eight reads
+	// below all ask for the same instant.
+	const range = parseTimeRange(sp, { defaultPreset: "24h", nowMs: Date.now() });
 	return (
 		/*
 		 * P0.15/P0.16/P0.17 — RESPONSIVE PAGE PADDING. `px-2 py-3` put the whole
@@ -1673,7 +1586,7 @@ export default async function DashboardPage({
 		 * The horizontal value stays modest on a phone (P0.17: touch targets and
 		 * chart width matter more there than margin) and opens up on a desktop.
 		 */
-		<div className="space-y-8 px-1 py-2 sm:px-2 sm:py-4 lg:px-3">
+		<div className="space-y-5 px-1 py-2 sm:px-2 sm:py-3 lg:px-3">
 			{/* Page header — OUTSIDE the Suspense boundary on purpose. The range
 			    control sits alone on the right: it is a CONTROL, and it used to be
 			    the fifth item in a row of four metrics, which is what made that row
@@ -1684,13 +1597,18 @@ export default async function DashboardPage({
 			    control is clickable) while the data is still in flight. */}
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div>
-					<h1 className="t-h1">Welcome back</h1>
+					{/* DSH-16: the ONE gradient headline in the app — blue → amber,
+					    large text only (checked at the 3:1 large/UI floor via
+					    accent-warm's own contrast-check.mjs pairs, not the 4.5:1 body
+					    floor `.t-h1`'s plain colour otherwise clears). */}
+					<h1 className="t-h1 heading-gradient-warm">Welcome back</h1>
 					<p className="mt-2 text-sm text-ink-2">
 						Your agent fleet, at a glance.
 					</p>
 				</div>
 				<RangeControl />
 			</header>
+			<WindowNotice range={range} />
 			{/* Outside `DashboardData` on purpose — see NoApiKeysBanner. `null`
 			    fallback: a banner must never render a placeholder. */}
 			<Suspense fallback={null}>

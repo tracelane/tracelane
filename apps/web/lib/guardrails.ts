@@ -12,8 +12,6 @@
  * fabricated — the fail-open rate is a real count, not an estimate.
  */
 
-import { GatewayError, gatewayGet } from "@/lib/gateway";
-
 /** One guardrail rail's health, as returned by `GET /v1/guardrails/stats`. */
 export type GuardrailRailHealth = {
 	rail: string;
@@ -47,31 +45,7 @@ export type GuardrailStats = {
 	rails: GuardrailRailHealth[];
 };
 
-/**
- * Fetch guardrail-engine stats for the authenticated tenant.
- *
- * Returns `null` on any `GatewayError` (gateway unreachable) so the page can show
- * its warming state — distinct from a reachable-but-empty result
- * (`total_evaluations === 0`). Non-`GatewayError` (e.g. the `NEXT_REDIRECT` from
- * `requireGatewayToken`) propagates so the auth redirect is honored.
- *
- * @param opts.hours Look-back window in hours forwarded to the gateway.
- */
-export async function fetchGuardrailStats(opts?: {
-	hours?: number;
-}): Promise<GuardrailStats | null> {
-	const q = new URLSearchParams();
-	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
-	const qs = q.toString();
-	try {
-		return await gatewayGet<GuardrailStats>(
-			`/v1/guardrails/stats${qs ? `?${qs}` : ""}`,
-		);
-	} catch (err) {
-		if (err instanceof GatewayError) return null;
-		throw err;
-	}
-}
+// `fetchGuardrailStats` moved to `lib/metrics/fetch.ts` (DSH-11): one read layer, one window.
 
 /** One verdict-detail row from `GET /v1/guardrails/verdicts`. */
 export type GuardrailVerdict = {
@@ -86,33 +60,4 @@ export type GuardrailVerdict = {
 	fail_open_rails: string[];
 };
 
-/**
- * Fetch the verdict-detail rows behind the decision-mix counts — the honest
- * click-through for "N blocked" (a blocked verdict 403s the request pre-span,
- * so there is no trace to link to; the verdict itself is the detail).
- *
- * Returns `null` on any `GatewayError` so the page shows its warming state.
- */
-export async function fetchGuardrailVerdicts(opts?: {
-	hours?: number;
-	decision?: string;
-	limit?: number;
-	/** Exact ULID lookup — the id the gateway returns in a 403 block body. */
-	correlationId?: string;
-}): Promise<GuardrailVerdict[] | null> {
-	const q = new URLSearchParams();
-	if (opts?.hours !== undefined) q.set("hours", String(opts.hours));
-	if (opts?.decision) q.set("decision", opts.decision);
-	if (opts?.correlationId) q.set("correlation_id", opts.correlationId);
-	if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
-	const qs = q.toString();
-	try {
-		const res = await gatewayGet<{ verdicts: GuardrailVerdict[] }>(
-			`/v1/guardrails/verdicts${qs ? `?${qs}` : ""}`,
-		);
-		return res.verdicts;
-	} catch (err) {
-		if (err instanceof GatewayError) return null;
-		throw err;
-	}
-}
+// `fetchGuardrailVerdicts` moved to `lib/metrics/fetch.ts` (DSH-11): one read layer, one window.

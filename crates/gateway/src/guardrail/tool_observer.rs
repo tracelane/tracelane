@@ -105,11 +105,14 @@ impl ToolObserver {
         out
     }
 
+    // No production caller — used only by tests. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.seen.len()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()

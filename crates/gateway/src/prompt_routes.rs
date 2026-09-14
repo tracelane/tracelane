@@ -259,6 +259,35 @@ async fn require_promotion_write(
     }
 }
 
+/// BILL-01 / ADR-076 A3 velocity breaker gate. Checked AFTER
+/// `require_promotion_write` (an unentitled tenant is refused for that reason
+/// first) and BEFORE any router mutation, same shape as the entitlement gate.
+/// `423 Locked` — the resource exists and the caller may otherwise act on it,
+/// but a human has not yet confirmed the anomaly `billing::velocity_breaker`
+/// flagged (`DELETE /v1/billing/promotion-freeze` clears it).
+///
+/// # Errors
+/// `423` while `tenants.promotion_frozen_at` is set. No error otherwise.
+async fn require_not_promotion_frozen(
+    entitlements: &Option<Arc<EntitlementCache>>,
+    tenant: &TenantId,
+) -> Result<(), WriteError> {
+    let Some(cache) = entitlements else {
+        return Ok(()); // no control plane — nothing to freeze against
+    };
+    let resolved = cache.resolved(*tenant.as_uuid()).await;
+    if resolved.is_promotion_frozen() {
+        return Err((
+            StatusCode::LOCKED,
+            Json(serde_json::json!({
+                "error": "promotion_frozen",
+                "reason": resolved.promotion_frozen_reason,
+            })),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct EnvQuery {
     /// dev | staging | production | canary. Defaults to production.
@@ -371,7 +400,7 @@ async fn tenant_from_auth(headers: &HeaderMap) -> Result<TenantId, (StatusCode, 
     })?;
     let claims = crate::auth::validate_authorization(header_str)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+        .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))?;
     // A13 scope gate on the READ surfaces (`GET /v1/prompts`,
     // `GET /v1/prompts/{name}`, `.../history`). Prompt CONTENT is the tenant's
     // intellectual property; before this an `ingest`-scoped SDK key — the
@@ -478,7 +507,7 @@ async fn actor_from_auth(headers: &HeaderMap) -> Result<(TenantId, String), (Sta
     })?;
     let claims = crate::auth::validate_authorization(header_str)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+        .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))?;
     authorize_write(&claims)?;
     Ok((claims.tenant_id, claims.sub))
 }
@@ -657,6 +686,8 @@ async fn promote_handler(
     // ADR-009 Team+ write gate — BEFORE any parse/route work so an
     // unentitled tenant causes zero routing mutation.
     require_promotion_write(&state.entitlements, &tenant).await?;
+    // BILL-01 A3 velocity breaker — after entitlement, before any mutation.
+    require_not_promotion_frozen(&state.entitlements, &tenant).await?;
     let from_env = parse_env(&body.from_env).map_err(|(s, m)| write_err(s, m))?;
     let to_env = parse_env(&body.to_env).map_err(|(s, m)| write_err(s, m))?;
 
@@ -731,6 +762,8 @@ async fn rollback_handler(
     tracing::Span::current().record("tenant_id", tenant.to_string());
     // ADR-009 Team+ write gate.
     require_promotion_write(&state.entitlements, &tenant).await?;
+    // BILL-01 A3 velocity breaker.
+    require_not_promotion_frozen(&state.entitlements, &tenant).await?;
     let env = parse_env(&body.env).map_err(|(s, m)| write_err(s, m))?;
     let chain_tenant = tenant.clone();
     let decision = state
@@ -949,7 +982,12 @@ async fn start_eval_handler(
     }
     let budget_usd = crate::spend::workspace_budget_usd(state.entitlements.as_ref(), &tenant).await;
     if budget_usd.is_some() {
-        crate::spend::seed_workspace(engine.clickhouse(), &tenant).await;
+        crate::spend::seed_workspace(
+            engine.clickhouse(),
+            &tenant,
+            crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant).await,
+        )
+        .await;
         let who = crate::spend::Subject::Workspace(*tenant.as_uuid());
         if let Some(body) = crate::spend::workspace_refusal(who, budget_usd) {
             return Err(write_err(StatusCode::PAYMENT_REQUIRED, body.to_string()));
@@ -1437,13 +1475,13 @@ mod tests {
         crate::auth::Claims {
             tenant_id: TenantId::from_jwt_claim(uuid::Uuid::nil()),
             sub: "a8-test".into(),
-            exp: u64::MAX,
             auth_method,
             role,
             // These fixtures test the ROLE gate; scope is orthogonal here.
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
             budget_usd_monthly: None,
             rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
         }
     }
 

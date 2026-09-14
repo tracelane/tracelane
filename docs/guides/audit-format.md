@@ -61,15 +61,22 @@ Reference implementation: `row_hash_v2` in
 (`packages/verifier-{rust,typescript,python}`) recompute exactly this.
 
 Every 100 events (`TRACELANE_REKOR_ANCHOR_EVERY`, default `100` —
-`crates/gateway/src/server.rs:93-96`) the Merkle root over all row hashes in the
+`crates/gateway/src/server.rs:132-135`) the Merkle root over all row hashes in the
 batch is computed and signed with Ed25519. **Anchoring that root to a public
 transparency log is best-effort, and off unless configured.** The gateway POSTs
 only when `TRACELANE_REKOR_URL` is set — unset or empty means sign-and-persist
 locally, never an external POST (`crates/gateway/src/audit.rs:1499-1503`) — and
-anchoring additionally needs a mintable per-tenant ECDSA anchor key, which is
-Audit-add-on gated (`audit.rs:1523-1528`). When either is absent, or the log is
-unreachable, the batch stays signed-but-unanchored (`anchor_state = 0x00`) and
-the offline verifier reports it as unanchored rather than failing.
+anchoring additionally needs a mintable per-tenant ECDSA anchor key
+(`audit.rs:2128-2184`, `store.get_or_create_anchor`). **As of the retired
+pricing model this mint was gated on the `f_audit_addon` entitlement**
+(`audit.rs:17`); under the ruled model (spec `BILL-01` §0.2 — "the ledger,
+hash chain, Rekor anchoring and free self-verification are on every tier")
+that gate is being removed so anchoring runs on every tier — a gateway-side
+change owned by a parallel block (B1/B2), not yet verified here; re-check
+`audit.rs:17` and the `get_or_create_anchor` call site before citing this as
+current behavior. When either the URL or the key is absent, or the log is
+unreachable, the batch stays signed-but-unanchored (`anchor_state = 0x00`)
+and the offline verifier reports it as unanchored rather than failing.
 
 The anchoring target is Sigstore Rekor **v2** —
 `log2025-1.rekor.sigstore.dev` (`crates/tracelane-audit-cli/src/main.rs:95`,
@@ -166,33 +173,53 @@ The pack includes:
 
 ## Pricing
 
-| Tier | Audit log retention |
+> **Pricing v3 (founder ruling 2026-09-12, ADR-076):** retention is now two
+> independent windows — an indexed window and a queryable-history window
+> (`specs/BILL-01-metering-and-tiers.md` §0.3) — rather than the single
+> `retention_days` figure the table and code citations below describe.
+> `apps/web/db/seed.mjs` is being migrated to the new columns in a parallel
+> block (expand → migrate → contract; `apps/web/db/schema.ts:146` in spec
+> §2.6); the exact current line numbers below are the pre-migration code and
+> may move once that migration lands — re-verify before citing.
+
+| Tier | Ledger/audit-log retention (ruled) |
 |---|---|
-| Free hosted ($0) | 7 days |
-| Builder ($59) | 30 days |
-| Team ($249) | 90 days |
-| Business ($899) | 180 days |
-| Enterprise (from $2,999) | 365 days |
+| Free ($0) | 30 days queryable |
+| Builder ($29/mo, $24 annual) | 2 years queryable |
+| Team ($229/mo, $190 annual) | 2 years queryable |
+| Business ($799/mo, $665 annual) | 2 years queryable |
+| Enterprise (from $2,499/mo) | 7 years queryable |
 
-Source: `apps/web/db/seed.mjs:60-153`. `retention_days` is a plain integer column,
-set per plan and overridable per workspace
-(`COALESCE(we.retention_days, pe.retention_days)` —
-`crates/gateway/src/entitlement_cache.rs:525`). **There is no multi-year retention
-tier and no year-scale configuration mechanism** — 365 days is the highest value
-configured anywhere in the repo.
+Source: `apps/web/db/plans.v3.json` (`ledger_days` per plan) — the single
+machine-readable source for these figures, cross-checked by
+`scripts/ci/check-pricing-copy-vs-seed.py`. The prior per-plan `retention_days`
+integer column (`crates/gateway/src/entitlement_cache.rs:525`,
+`COALESCE(we.retention_days, pe.retention_days)`) is being replaced by the
+`indexed_window_days` / `queryable_days` / `ledger_days` columns named in
+spec §2.6.
 
-**Audit-log export requires the Audit add-on (+$999/mo) on every tier, Enterprise
-included.** `GET /v1/audit/export` and `GET /v1/audit/summary` check
-`FeatureKey::AuditAddon` before any ClickHouse read
-(`crates/gateway/src/audit_export.rs:827,892`), and `f_audit_addon` defaults to
-FALSE on every plan (`apps/web/db/schema.ts:163`) and is seeded on none — it is a
-per-tenant flag grant, not a plan default (`apps/web/db/seed.mjs:12-16`). Without
-it those endpoints return an entitlement-required error, not a reduced export. No
-base tier carries self-serve export.
+**There is no paid audit product — the Article-12 export ships with the Enterprise plan.** An internal review found
+`/v1/audit/export` does not yet meet the evidence-pack bar
+(no per-record Merkle proof, no completeness attestation), so the export
+does not ship as a paid add-on at any price; 7-year ledger retention folds
+into Enterprise instead. Self-verification
+(`tlane verify` against your own export) is included on every tier. The bulk
+`GET /v1/audit/export` regulatory-export route stays gated ("self-verify free, Article-12 export
+gated" is unchanged by this ruling) —
+today that gate is the `FeatureKey::AuditAddon` check before any ClickHouse
+read (`crates/gateway/src/audit_export.rs:827,892`), which the ruled model
+resolves to true for Enterprise and false elsewhere, not to a purchasable
+flag (`apps/web/db/schema.ts:163`, `apps/web/db/seed.mjs:12-16`). Without it
+those endpoints return an entitlement-required error, not a reduced export.
+No non-Enterprise tier carries self-serve bulk export.
 
-The add-on delivers:
+Included on every tier:
 - Per-tenant Ed25519-signed Merkle roots, with best-effort Sigstore Rekor v2 anchoring on the terms in [Hash chain structure](#hash-chain-structure) above
 - Offline verification by a third party, with no Tracelane account
+
+Enterprise-only:
+- 7-year ledger retention instead of 2
+- The bulk `GET /v1/audit/export` regulatory-export route
 
 Timestamps come from the gateway host's clock, plus the Rekor entry time on batches
 that actually anchored. Tracelane makes **no eIDAS or qualified-timestamp claim** —

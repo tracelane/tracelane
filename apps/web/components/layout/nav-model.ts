@@ -70,7 +70,12 @@ export const NAV_ITEMS: readonly { href: string; label: string }[] =
 export const ACCOUNT_HREF = "/settings/account";
 
 export const ALL_CHROME_ROUTES: readonly string[] = [
-	...sections.flatMap((s) => s.items.map((i) => i.href)),
-	ACCOUNT_HREF,
-	SUPPORT_HREF,
+	...new Set([
+		...sections.flatMap((s) => s.items.map((i) => i.href)),
+		// SET-36: the Settings section is now derived from the one settings list,
+		// so ACCOUNT_HREF arrives through `sections` too; it stays listed so the
+		// export above keeps meaning what it says, and the Set drops the duplicate.
+		ACCOUNT_HREF,
+		SUPPORT_HREF,
+	]),
 ];

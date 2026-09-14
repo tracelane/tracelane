@@ -47,6 +47,9 @@ export async function GET(req: NextRequest): Promise<Response> {
 	const qs = forwardParams(req.nextUrl.searchParams, [
 		"model",
 		"has_error",
+		// OBS-20. Without this the live tail shows a SUPERSET while a user filter is
+		// active — new rows for every user arriving under a chip that says one name.
+		"end_user",
 		"since",
 		"until",
 	]);

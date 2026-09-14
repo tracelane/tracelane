@@ -120,7 +120,14 @@ thread_local! {
 
 /// Enable/disable the loopback bypass on the CURRENT thread (debug builds
 /// only). `providers::smoke_tests` drives this via an RAII guard.
-#[cfg(debug_assertions)]
+///
+/// `#[cfg(all(test, debug_assertions))]`, not just `debug_assertions` — every
+/// caller is itself test-gated the same way (`cargo bench` compiles test
+/// targets in the release-like bench profile, where `debug_assertions` is
+/// off, so a bare `#[cfg(test)]` here would compile a call to a function
+/// that does not exist there and take the Benchmarks job down with E0425;
+/// see the identical note at `providers/openai.rs:870`).
+#[cfg(all(test, debug_assertions))]
 pub(crate) fn set_loopback_bypass_for_tests(on: bool) {
     LOOPBACK_BYPASS_TLS.with(|b| b.set(on));
 }

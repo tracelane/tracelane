@@ -10,6 +10,8 @@
  * viewBox / `h-4 w-4` convention used across the app.
  */
 
+import { SETTINGS_ITEMS } from "@/components/settings/settings-nav-config";
+
 function ActivityIcon() {
 	return (
 		<svg
@@ -286,6 +288,27 @@ function GatewayIcon() {
 	);
 }
 
+function LayoutsIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<rect x="3" y="3" width="18" height="4" rx="1" />
+			<rect x="3" y="11" width="8" height="10" rx="1" />
+			<rect x="13" y="11" width="8" height="5" rx="1" />
+			<rect x="13" y="18" width="8" height="3" rx="1" />
+		</svg>
+	);
+}
+
 function DashboardIcon() {
 	return (
 		<svg
@@ -303,6 +326,29 @@ function DashboardIcon() {
 			<rect x="14" y="3" width="7" height="5" rx="1" />
 			<rect x="14" y="12" width="7" height="9" rx="1" />
 			<rect x="3" y="16" width="7" height="5" rx="1" />
+		</svg>
+	);
+}
+
+/** The conventional "leaves the app" glyph — a box with an arrow escaping its
+ * top-right corner. Used only by `EXTERNAL_LINKS`, so a customer sees before
+ * they click that the destination is a different origin. */
+function ExternalLinkIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+			<polyline points="15 3 21 3 21 9" />
+			<line x1="10" y1="14" x2="21" y2="3" />
 		</svg>
 	);
 }
@@ -327,6 +373,20 @@ export type NavSection = {
  * previously-orphaned pages, and no duplicate hrefs) so a link can never go
  * dead. Items tagged `badge: "V1.1"` route to an honest ComingSoon empty state.
  */
+/** Icons for the Settings group, by href; a page with no entry falls back to KeyIcon. */
+const SETTINGS_ICONS: Partial<Record<string, () => React.JSX.Element>> = {
+	"/settings/api-keys": KeyIcon,
+	"/settings/providers": ServerIcon,
+	"/settings/byok": KeyIcon,
+	"/settings/audit": ShieldIcon,
+	"/settings/alerts": BellIcon,
+	"/settings/evals": ShieldCheckIcon,
+	"/settings/billing": CreditCardIcon,
+	"/settings/team": UsersIcon,
+	"/settings/workspace": BuildingIcon,
+	"/settings/account": UsersIcon,
+};
+
 export const sections: NavSection[] = [
 	// ADR-074 §6 grouping. The SAME NINE hrefs as the previous Observe/Improve/
 	// Operate split — regrouped, never reduced, which is why the R12 after-proof
@@ -334,7 +394,10 @@ export const sections: NavSection[] = [
 	{
 		label: "Observe",
 		items: [
-			{ href: "/dashboard", label: "Dashboard", Icon: DashboardIcon },
+			{ href: "/dashboard", label: "Overview", Icon: DashboardIcon },
+			// DSH-13 custom dashboards — nav entry added after the feature shipped
+			// (same rule as /experiments and /review: add once the page is real).
+			{ href: "/dashboards", label: "Dashboards", Icon: LayoutsIcon },
 			{ href: "/traces", label: "Traces", Icon: ActivityIcon },
 			{ href: "/sessions", label: "Sessions", Icon: SessionsIcon },
 			// EVL-29 review queues. Added only AFTER a real review produced rows
@@ -370,45 +433,68 @@ export const sections: NavSection[] = [
 			// been the dead-entry shape: a nav item leading to a surface that
 			// cannot populate.
 			{ href: "/experiments", label: "Experiments", Icon: BarChartIcon },
-			// ── OUT OF THE NAV, AND THE THREE REASONS ARE NOT THE SAME ────────
+			// OBS-16 (2026-09-06). The form + `POST /api/playground` proxy are
+			// real, so the entry moves in with them — same rule as Experiments
+			// and /review: a nav link only after the page behind it is real.
+			{ href: "/playground", label: "Playground", Icon: GitBranchIcon },
+			// ── OUT OF THE NAV, AND THE REASON IS NOT THE SAME AS ABOVE ───────
 			//
-			// Experiments (EVL-02) IS BUILT and its pages are real — list, detail
-			// and the side-by-side diff. It stays out of the nav until a real run
-			// has produced rows on prod: the S3 serialization point in
-			// `docs/runbook/BUILD_RUNBOOK.md`, which exists so a nav entry never
-			// leads to a surface that cannot populate. Add the entry here once
-			// that has happened; nothing else needs to change.
+			// Experiments (EVL-02) was OUT of this list until 2026-08-24 (`968eb470`),
+			// when Sprint 3 item 9 produced real rows on prod; the entry above is
+			// the result. (This comment said "stays out of the nav" for two weeks
+			// after the entry landed — corrected 2026-09-06.)
+			//
+			// Playground (OBS-16) was OUT of this list until 2026-09-06, when the
+			// form replaced the ComingSoon stub; the entry above is the result.
+			// (This comment called it "genuinely unbuilt" until the same day.)
 			//
 			// Datasets (EVL-04) has a shipped, prod-proven API and NO UI yet —
 			// `app/datasets/page.tsx` is still a ComingSoon stub. It is out of the
 			// nav because there is nothing to navigate TO, not because the feature
 			// is absent.
 			//
-			// Playground is genuinely unbuilt.
-			//
 			// This comment was previously one line calling all three "V1.1
-			// ComingSoon stubs". Two of the three had moved on, and a comment that
-			// misdescribes the code is the §17 defect — here it would have told the
-			// next reader that a finished feature does not exist.
+			// ComingSoon stubs". A comment that misdescribes the code is the §17
+			// defect — here it would have told the next reader that a finished
+			// feature does not exist.
 		],
 	},
 	{
+		// SET-36: DERIVED from the one settings list. This used to be a hand-kept
+		// copy of `SettingsNav`'s tabs that never learned about `/settings/evals`
+		// or `/settings/account` — and since `Sidebar` filters this group out and
+		// renders Settings as one footer link, its only consumer is the chrome
+		// sweep (`nav-model.ts` ALL_CHROME_ROUTES), so the two missing pages were
+		// simply never walked. Icons are kept for the `NavItem` shape; nothing
+		// renders them for this group today.
 		label: "Settings",
-		items: [
-			{ href: "/settings/api-keys", label: "API Keys", Icon: KeyIcon },
-			{ href: "/settings/providers", label: "LLM Providers", Icon: ServerIcon },
-			{ href: "/settings/billing", label: "Billing", Icon: CreditCardIcon },
-			{ href: "/settings/byok", label: "Encryption Keys", Icon: KeyIcon },
-			{
-				href: "/settings/audit",
-				label: "Audit signing key",
-				Icon: ShieldIcon,
-			},
-			{ href: "/settings/alerts", label: "Alerts", Icon: BellIcon },
-			{ href: "/settings/team", label: "Team", Icon: UsersIcon },
-			{ href: "/settings/workspace", label: "Workspace", Icon: BuildingIcon },
-		],
+		items: SETTINGS_ITEMS.map(({ href, label }) => ({
+			href,
+			label,
+			Icon: SETTINGS_ICONS[href] ?? KeyIcon,
+		})),
 	},
+];
+
+export type ExternalNavLink = {
+	href: string;
+	label: string;
+	Icon: () => React.JSX.Element;
+};
+
+/**
+ * DSH-15 — chrome links that leave the app entirely (a different origin), so
+ * they cannot be checked against `app/<href>/page.tsx` the way `sections` is.
+ * Deliberately OUTSIDE `sections`: `nav-config.test.ts`'s dead-link sweep
+ * flattens `sections` and would fail an absolute URL with no local route, and
+ * `no-stranded-routes.test.ts` walks `app/`/`components/` for path LITERALS
+ * starting with `/`, so an `https://` href is invisible to it too — neither
+ * guard needed touching. Rendered by `AccountMenu`, next to Support — the
+ * other help/account affordance — per the founder request 2026-09-06
+ * (`specs/DSH-15-docs-link-in-app-shell.md`).
+ */
+export const EXTERNAL_LINKS: ExternalNavLink[] = [
+	{ href: "https://docs.tracelane.dev", label: "Docs", Icon: ExternalLinkIcon },
 ];
 
 /**
@@ -442,8 +528,8 @@ export const sections: NavSection[] = [
  * never an option: the pair has to work unbranched.
  *
  * `--surface-3` lands one step past the #F1F1F0 the brief sampled for light. That
- * is the cost of the monotonic ordering above, and it is still ~7% off the rail
- * plane — nothing like the ink pill it replaces.
+ * is the cost of the monotonic ordering above, and it is still ~7% away from the
+ * rail plane — nothing like the ink pill it replaces.
  *
  * The active row carries THREE non-colour signals besides the tone —
  * `aria-current="page"`, a heavier weight, and the 2px leading marker `Sidebar`
@@ -453,7 +539,11 @@ export const RAIL_ITEM =
 	"relative flex items-center gap-2.5 rounded-[var(--radius-control)] px-2 py-2 text-sm transition-colors";
 /** Idle rows are secondary ink; primary ink is reserved for the row you are on. */
 export const RAIL_ITEM_IDLE = "text-ink-2 hover:bg-surface-2 hover:text-ink";
-export const RAIL_ITEM_ACTIVE = "bg-surface-3 font-medium text-ink";
+/* DSH-16: the active-row chip moves from a neutral grey (`bg-surface-3`) to the
+   accent's own soft tint — reusing the ONE hue that already means "this is
+   what you're interacting with" rather than adding a second, unrelated grey
+   step. No new hue, no per-group colour. */
+export const RAIL_ITEM_ACTIVE = "bg-action-soft font-medium text-ink";
 /**
  * The fixed icon column. Every label starts at the same x whether its glyph is a
  * 16px `viewBox="0 0 16 16"` outline (AccountMenu) or a 24px one (nav-config), and

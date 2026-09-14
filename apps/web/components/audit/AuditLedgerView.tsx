@@ -788,8 +788,8 @@ function TrustPanel({
 									{verdict.anchors === 1 ? "" : "s"} in this view were skipped
 									because your workspace has no per-workspace signing key to
 									check them against, so their inclusion proofs were neither
-									confirmed nor rejected. A per-workspace key is issued with the
-									Audit add-on.
+									confirmed nor rejected. A per-workspace key is issued on every
+									plan with the first recorded batch.
 								</p>
 							</div>
 						</div>
@@ -1302,9 +1302,10 @@ function TrustPanel({
 										not your own. That detects later tampering, but it cannot be
 										checked independently of us.{" "}
 										<span className="font-medium">
-											Independent verification requires the Audit add-on
+											Independent verification uses your workspace&apos;s own
+											signing key
 										</span>
-										, which issues your workspace its own signing key.
+										, issued on every plan with the first recorded batch.
 									</div>
 								</div>
 							);
@@ -1986,8 +1987,8 @@ export function AuditLedgerView({
 
 			{/* EXPORT / UPSELL — moved directly under the verdict so the "how do I get
 			    the complete ledger" answer is impossible to miss (founder: the download
-			    was buried below a long chain view). Download (paid) or Audit-add-on
-			    upsell (free). */}
+			    was buried below a long chain view). Download (Enterprise) or the
+			    Enterprise upsell (every other plan). */}
 			{canExport ? (
 				<Card className="p-5">
 					<h2 className="text-sm font-semibold text-ink">
@@ -2044,18 +2045,19 @@ export function AuditLedgerView({
 				>
 					<div>
 						<div className="t-card-title text-ink-inverse opacity-60">
-							Audit SKU · $999/mo add-on
+							Article-12 export · Enterprise plan
 						</div>
 						<h2 className="mt-1 text-sm font-semibold text-ink-inverse">
 							Download the complete ledger
 						</h2>
 						<p className="mt-0.5 max-w-2xl text-sm text-ink-inverse opacity-70">
 							Seeing and verifying the first {fmtCount(rows.length)} events of
-							your chain (from genesis) is <strong>free</strong> — that is
-							everything above. The downloadable Article-12 evidence pack — the{" "}
+							your chain (from genesis) is{" "}
+							<strong>included on every plan</strong> — that is everything
+							above. The downloadable Article-12 export — the{" "}
 							<strong>complete</strong> chain as independently-verifiable NDJSON
-							with public-anchor proofs, for regulator hand-off — is the Audit
-							add-on.
+							with public-anchor proofs, for regulator hand-off — is included on
+							the Enterprise plan, with 7-year ledger retention.
 						</p>
 					</div>
 					{/*
@@ -2083,7 +2085,7 @@ export function AuditLedgerView({
 						href="/settings/billing"
 						className="bg-ink-inverse text-surface-inverse hover:opacity-90 inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-sm font-medium focus-visible:outline-ink-inverse"
 					>
-						Add the Audit SKU
+						Enterprise plan
 					</Link>
 				</div>
 			)}

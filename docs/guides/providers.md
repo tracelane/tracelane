@@ -55,9 +55,13 @@ never reach some other provider's key.
 | 302.AI | `302ai` | `https://api.302.ai` | `302AI_BASE_URL` | `302AI_API_KEY` | `302ai/` |
 | Abacus | `abacus` | `https://routellm.abacus.ai` | `ABACUS_BASE_URL` | `ABACUS_API_KEY` | `abacus/` |
 | abliteration.ai | `abliteration-ai` | `https://api.abliteration.ai` | `ABLITERATION_AI_BASE_URL` | `ABLIT_KEY` | `abliteration-ai/` |
+| above.dev | `above` | `https://api.above.dev` | `ABOVE_BASE_URL` | `ABOVE_API_KEY` | `above/` |
+| AgentRouter | `agentrouter` | `https://agentrouter.org` | `AGENTROUTER_BASE_URL` | `AGENTROUTER_API_KEY` | `agentrouter/` |
+| Agnes AI | `agnes` | `https://apihub.agnes-ai.com` | `AGNES_BASE_URL` | `AGNES_API_KEY` | `agnes/` |
 | ai&amp; | `aiand` | `https://api.aiand.com` | `AIAND_BASE_URL` | `AIAND_API_KEY` | `aiand/` |
 | AI-ROUTER | `ai-router` | `https://api.ai-router.dev` | `AI_ROUTER_BASE_URL` | `AI_ROUTER_API_KEY` | `ai-router/` |
 | Ai21 | `ai21` | `https://api.ai21.com` | `AI21_BASE_URL` | `AI21_API_KEY` | `ai21/` · `j2-` · `jamba` |
+| Aixy | `aixy` | `https://api.aixy-gateway.com` | `AIXY_BASE_URL` | `AIXY_API_KEY` | `aixy/` |
 | AKI.IO | `aki-io` | `https://aki.io` | `AKI_IO_BASE_URL` | `AKI_IO_API_KEY` | `aki-io/` |
 | Aleph Alpha | `aleph-alpha` | `https://api.aleph-alpha.com` | `ALEPH_ALPHA_BASE_URL` | `ALEPH_ALPHA_API_KEY` | `luminous` · `aleph-alpha/` |
 | Alibaba | `alibaba` | `https://dashscope-intl.aliyuncs.com/compatible-mode` | `ALIBABA_BASE_URL` | `DASHSCOPE_API_KEY` | `alibaba/` |
@@ -76,6 +80,7 @@ never reach some other provider's key.
 | Baseten | `baseten` | `https://bridge.baseten.co/v1/direct` | `BASETEN_BASE_URL` | `BASETEN_API_KEY` | `baseten/` |
 | Berget.AI | `berget` | `https://api.berget.ai` | `BERGET_BASE_URL` | `BERGET_API_KEY` | `berget/` |
 | Blue Claw | `blueclaw` | `https://openai.blueclaw.network` | `BLUECLAW_BASE_URL` | `BLUECLAW_API_KEY` | `blueclaw/` |
+| Bothub | `bothub` | `https://openai.bothub.ru` | `BOTHUB_BASE_URL` | `BOTHUB_API_KEY` | `bothub/` |
 | Cerebras | `cerebras` | `https://api.cerebras.ai` | `CEREBRAS_BASE_URL` | `CEREBRAS_API_KEY` | `cerebras/` |
 | Charm Hyper | `hyper` | `https://hyper.charm.land` | `HYPER_BASE_URL` | `HYPER_API_KEY` | `hyper/` |
 | Chutes | `chutes` | `https://llm.chutes.ai` | `CHUTES_BASE_URL` | `CHUTES_API_KEY` | `chutes/` |
@@ -96,6 +101,7 @@ never reach some other provider's key.
 | DigitalOcean | `digitalocean` | `https://inference.do-ai.run` | `DIGITALOCEAN_BASE_URL` | `DIGITALOCEAN_ACCESS_TOKEN` | `digitalocean/` |
 | DInference | `dinference` | `https://api.dinference.com` | `DINFERENCE_BASE_URL` | `DINFERENCE_API_KEY` | `dinference/` |
 | EBCloud | `ebcloud` | `https://maas-api.ebcloud.com` | `EBCLOUD_BASE_URL` | `EBCLOUD_API_KEY` | `ebcloud/` |
+| Echo | `echo` | `https://echo.tracerml.ai` | `ECHO_BASE_URL` | `ECHO_API_KEY` | `echo/` |
 | Eden AI | `edenai` | `https://api.edenai.run/v3` | `EDENAI_BASE_URL` | `EDENAI_API_KEY` | `edenai/` |
 | EmpirioLabs AI | `empiriolabs` | `https://api.empiriolabs.ai` | `EMPIRIOLABS_BASE_URL` | `EMPIRIOLABS_API_KEY` | `empiriolabs/` |
 | evroc | `evroc` | `https://models.think.evroc.com` | `EVROC_BASE_URL` | `EVROC_API_KEY` | `evroc/` |
@@ -119,10 +125,12 @@ never reach some other provider's key.
 | Inference | `inference` | `https://inference.net` | `INFERENCE_BASE_URL` | `INFERENCE_API_KEY` | `inference/` |
 | InferX | `inferx` | `https://model.inferx.net/endpoints` | `INFERX_BASE_URL` | `INFERX_API_KEY` | `inferx/` |
 | IO.NET | `io-net` | `https://api.intelligence.io.solutions/api` | `IO_NET_BASE_URL` | `IOINTELLIGENCE_API_KEY` | `io-net/` |
+| IteraCompute | `iteracompute` | `https://api.iteracompute.com` | `ITERACOMPUTE_BASE_URL` | `ITERACOMPUTE_API_KEY` | `iteracompute/` |
 | Jalapeno Cloud | `jalapeno` | `https://api.jalapeno-cloud.ai` | `JALAPENO_BASE_URL` | `JALAPENO_API_KEY` | `jalapeno/` |
 | Jiekou.AI | `jiekou` | `https://api.jiekou.ai/openai` | `JIEKOU_BASE_URL` | `JIEKOU_API_KEY` | `jiekou/` |
 | Kenari | `kenari` | `https://kenari.id` | `KENARI_BASE_URL` | `KENARI_API_KEY` | `kenari/` |
 | Kilo Gateway | `kilo` | `https://api.kilo.ai/api/gateway` | `KILO_BASE_URL` | `KILO_API_KEY` | `kilo/` |
+| klokintegration.se | `klokintegration` | `https://api-gw.klok.ipaas.se/proxy/kloker-key` | `KLOKINTEGRATION_BASE_URL` | `KLOKINTEGRATION_API_KEY` | `klokintegration/` |
 | Kosmik Compute | `kosmik` | `https://api.koscompute.com` | `KOSMIK_BASE_URL` | `KOSMIK_API_KEY` | `kosmik/` |
 | KUAE Cloud Coding Plan | `kuae-cloud-coding-plan` | `https://coding-plan-endpoint.kuaecloud.net` | `KUAE_CLOUD_CODING_PLAN_BASE_URL` | `KUAE_API_KEY` | `kuae-cloud-coding-plan/` |
 | Lambda | `lambda` | `https://api.lambdalabs.com` | `LAMBDA_BASE_URL` | `LAMBDA_API_KEY` | `lambda/` |
@@ -130,6 +138,8 @@ never reach some other provider's key.
 | Lilac | `lilac` | `https://api.getlilac.com` | `LILAC_BASE_URL` | `LILAC_API_KEY` | `lilac/` |
 | Llama | `llama` | `https://api.llama.com/compat` | `LLAMA_BASE_URL` | `LLAMA_API_KEY` | `llama/` |
 | LLM Gateway | `llmgateway` | `https://api.llmgateway.io` | `LLMGATEWAY_BASE_URL` | `LLMGATEWAY_API_KEY` | `llmgateway/` |
+| LLM Gateway | `llmgateway-providers` | `https://api.llmgateway.io` | `LLMGATEWAY_PROVIDERS_BASE_URL` | `LLMGATEWAY_API_KEY` | `llmgateway-providers/` |
+| LLM Tech | `llmtech` | `https://api.llmtech.eu` | `LLMTECH_BASE_URL` | `LLMTECH_API_KEY` | `llmtech/` |
 | LLMTR | `llmtr` | `https://llmtr.com` | `LLMTR_BASE_URL` | `LLMTR_API_KEY` | `llmtr/` |
 | LongCat | `longcat` | `https://api.longcat.chat/openai` | `LONGCAT_BASE_URL` | `LONGCAT_API_KEY` | `longcat/` |
 | LucidQuery | `lucidquery` | `https://api.lucidquery.com` | `LUCIDQUERY_BASE_URL` | `LUCIDQUERY_API_KEY` | `lucidquery/` |
@@ -144,6 +154,7 @@ never reach some other provider's key.
 | Moonshot AI | `moonshot` | `https://api.moonshot.cn` | `MOONSHOT_BASE_URL` | `MOONSHOT_API_KEY` | `moonshot/` |
 | Moonshot AI (China) | `moonshotai-cn` | `https://api.moonshot.cn` | `MOONSHOTAI_CN_BASE_URL` | `MOONSHOT_API_KEY` | `moonshotai-cn/` |
 | Morph | `morph` | `https://api.morphllm.com` | `MORPH_BASE_URL` | `MORPH_API_KEY` | `morph/` |
+| NaN | `nan` | `https://api.nan.builders` | `NAN_BASE_URL` | `NAN_API_KEY` | `nan/` |
 | NanoGPT | `nano-gpt` | `https://nano-gpt.com/api` | `NANO_GPT_BASE_URL` | `NANO_GPT_API_KEY` | `nano-gpt/` |
 | NEAR AI Cloud | `nearai` | `https://cloud-api.near.ai` | `NEARAI_BASE_URL` | `NEARAI_API_KEY` | `nearai/` |
 | Nebius Token Factory | `nebius` | `https://api.tokenfactory.nebius.com` | `NEBIUS_BASE_URL` | `NEBIUS_API_KEY` | `nebius/` |
@@ -157,9 +168,12 @@ never reach some other provider's key.
 | OpenAI | `openai` | `https://api.openai.com` | `OPENAI_BASE_URL` | `OPENAI_API_KEY` | `gpt` · `openai/` · `o1` · `o3` · `text-embedding-` |
 | OpenCode Go | `opencode-go` | `https://opencode.ai/zen/go` | `OPENCODE_GO_BASE_URL` | `OPENCODE_API_KEY` | `opencode-go/` |
 | OpenCode Zen | `opencode` | `https://opencode.ai/zen` | `OPENCODE_BASE_URL` | `OPENCODE_API_KEY` | `opencode/` |
+| OpenReason | `openreason` | `https://api.openreason.app` | `OPENREASON_BASE_URL` | `OPENREASON_API_KEY` | `openreason/` |
 | OpenRouter | `openrouter` | `https://openrouter.ai/api` | `OPENROUTER_BASE_URL` | `OPENROUTER_API_KEY` | `openrouter/` |
+| Opper | `opper` | `https://api.opper.ai/v3/compat` | `OPPER_BASE_URL` | `OPPER_API_KEY` | `opper/` |
 | OrcaRouter | `orcarouter` | `https://api.orcarouter.ai` | `ORCAROUTER_BASE_URL` | `ORCAROUTER_API_KEY` | `orcarouter/` |
 | OVHcloud AI Endpoints | `ovhcloud` | `https://oai.endpoints.kepler.ai.cloud.ovh.net` | `OVHCLOUD_BASE_URL` | `OVHCLOUD_API_KEY` | `ovhcloud/` |
+| Pendra | `pendra` | `https://api.pendra.ai/api` | `PENDRA_BASE_URL` | `PENDRA_API_KEY` | `pendra/` |
 | Perplexity | `perplexity` | `https://api.perplexity.ai` | `PERPLEXITY_BASE_URL` | `PERPLEXITY_API_KEY` | `sonar` · `perplexity/` · `llama-3.1-sonar` |
 | Pioneer | `pioneer` | `https://api.pioneer.ai` | `PIONEER_BASE_URL` | `PIONEER_API_KEY` | `pioneer/` |
 | Poe | `poe` | `https://api.poe.com` | `POE_BASE_URL` | `POE_API_KEY` | `poe/` |
@@ -177,9 +191,12 @@ never reach some other provider's key.
 | Scaleway | `scaleway` | `https://api.scaleway.ai` | `SCALEWAY_BASE_URL` | `SCALEWAY_API_KEY` | `scaleway/` |
 | SCNet Token Plan | `scnet-token-plan` | `https://api.scnet.cn/api/llm` | `SCNET_TOKEN_PLAN_BASE_URL` | `SCNET_API_KEY` | `scnet-token-plan/` |
 | SCX.ai | `scx` | `https://api.scx.ai` | `SCX_BASE_URL` | `SCX_API_KEY` | `scx/` |
+| SCX.ai | `scx-ai` | `https://api.scx.ai` | `SCX_AI_BASE_URL` | `SCX_API_KEY` | `scx-ai/` |
+| SenseNova (China) | `sensenova` | `https://token.sensenova.cn` | `SENSENOVA_BASE_URL` | `SENSENOVA_API_KEY` | `sensenova/` |
 | SiliconFlow | `siliconflow` | `https://api.siliconflow.com` | `SILICONFLOW_BASE_URL` | `SILICONFLOW_API_KEY` | `siliconflow/` |
 | SiliconFlow (China) | `siliconflow-cn` | `https://api.siliconflow.cn` | `SILICONFLOW_CN_BASE_URL` | `SILICONFLOW_CN_API_KEY` | `siliconflow-cn/` |
 | STACKIT | `stackit` | `https://api.openai-compat.model-serving.eu01.onstackit.cloud` | `STACKIT_BASE_URL` | `STACKIT_API_KEY` | `stackit/` |
+| Standard Compute | `standardcompute` | `https://api.stdcmpt.com` | `STANDARDCOMPUTE_BASE_URL` | `STANDARDCOMPUTE_API_KEY` | `standardcompute/` |
 | StepFun (China) | `stepfun` | `https://api.stepfun.com` | `STEPFUN_BASE_URL` | `STEPFUN_API_KEY` | `stepfun/` |
 | StepFun (Global) | `stepfun-ai` | `https://api.stepfun.ai` | `STEPFUN_AI_BASE_URL` | `STEPFUN_API_KEY` | `stepfun-ai/` |
 | StepFun Step Plan (China) | `stepfun-step-plan` | `https://api.stepfun.com/step_plan` | `STEPFUN_STEP_PLAN_BASE_URL` | `STEPFUN_API_KEY` | `stepfun-step-plan/` |
@@ -193,11 +210,16 @@ never reach some other provider's key.
 | The Grid AI | `the-grid-ai` | `https://api.thegrid.ai` | `THE_GRID_AI_BASE_URL` | `THEGRID_API_KEY` | `the-grid-ai/` |
 | Tinfoil | `tinfoil` | `https://inference.tinfoil.sh` | `TINFOIL_BASE_URL` | `TINFOIL_API_KEY` | `tinfoil/` |
 | Together AI | `together` | `https://api.together.xyz` | `TOGETHER_BASE_URL` | `TOGETHER_API_KEY` | `together/` |
+| TokenGo | `tokengo` | `https://api.tokengo.com` | `TOKENGO_BASE_URL` | `TOKENGO_API_KEY` | `tokengo/` |
+| TokenRouter | `tokenrouter` | `https://api.tokenrouter.com` | `TOKENROUTER_BASE_URL` | `TOKENROUTER_API_KEY` | `tokenrouter/` |
 | TrustedRouter | `trustedrouter` | `https://api.trustedrouter.com` | `TRUSTEDROUTER_BASE_URL` | `TRUSTEDROUTER_API_KEY` | `trustedrouter/` |
 | Umans AI | `umans-ai` | `https://api.code.umans.ai` | `UMANS_AI_BASE_URL` | `UMANS_AI_API_KEY` | `umans-ai/` |
 | Umans AI Coding Plan | `umans-ai-coding-plan` | `https://api.code.umans.ai` | `UMANS_AI_CODING_PLAN_BASE_URL` | `UMANS_AI_CODING_PLAN_API_KEY` | `umans-ai-coding-plan/` |
 | UnoRouter | `unorouter` | `https://api.unorouter.com` | `UNOROUTER_BASE_URL` | `UNOROUTER_API_KEY` | `unorouter/` |
 | Upstage | `upstage` | `https://api.upstage.ai` | `UPSTAGE_BASE_URL` | `UPSTAGE_API_KEY` | `solar-` · `upstage/` |
+| Vancine | `vancine` | `https://vancine.com` | `VANCINE_BASE_URL` | `VANCINE_API_KEY` | `vancine/` |
+| Volcengine Ark | `volcengine` | `https://ark.cn-beijing.volces.com/api/v3` | `VOLCENGINE_BASE_URL` | `ARK_API_KEY` | `volcengine/` |
+| Volcengine Ark Coding Plan | `volcengine-coding-plan` | `https://ark.cn-beijing.volces.com/api/coding/v3` | `VOLCENGINE_CODING_PLAN_BASE_URL` | `ARK_CODING_PLAN_API_KEY` | `volcengine-coding-plan/` |
 | Vultr | `vultr` | `https://api.vultrinference.com` | `VULTR_BASE_URL` | `VULTR_API_KEY` | `vultr/` |
 | Wafer | `wafer.ai` | `https://pass.wafer.ai` | `WAFER_AI_BASE_URL` | `WAFER_API_KEY` | `wafer.ai/` |
 | Weights &amp; Biases | `wandb` | `https://api.inference.wandb.ai` | `WANDB_BASE_URL` | `WANDB_API_KEY` | `wandb/` |

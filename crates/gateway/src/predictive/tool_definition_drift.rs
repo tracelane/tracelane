@@ -318,38 +318,38 @@ impl Predictor for ToolDefinitionDrift {
                 )
             });
 
-            if let Some((prev_hash, prev_fields, prev_description, prev_schema)) = prior {
-                if prev_hash != hash {
-                    // A drift escalates from Warn to Block when it takes a
-                    // rug-pull shape: (a) a new sensitive-named field, (b) the
-                    // description drifts to introduce an injection directive, or
-                    // (c) an existing field's constraint is loosened.
-                    let sensitive_field = introduces_sensitive_field(&prev_fields, &fields);
-                    let injected = description_drift_injects(&prev_description, description);
-                    let relaxed = relaxes_existing_field_constraint(&prev_schema, input_schema);
-                    let rug_pull = sensitive_field || injected.is_some() || relaxed.is_some();
-                    tracing::warn!(
-                        target: "tool.definition_drift",
-                        aft_id = AFT_TOOL_DRIFT,
-                        tool = tool_name,
-                        prev_hash = %prev_hash,
-                        curr_hash = %hash,
-                        introduces_sensitive_field = sensitive_field,
-                        description_injection = injected.unwrap_or(""),
-                        relaxes_field = relaxed.as_deref().unwrap_or(""),
-                        "tracelane.tool_definition.drift=true — a declared tool's definition \
-                         changed for this tenant (silent rug-pull shape)",
-                    );
-                    // Block dominates Warn; Warn dominates Allow.
-                    if rug_pull {
-                        decision = Decision::Block {
-                            aft_id: AFT_TOOL_DRIFT,
-                        };
-                    } else if matches!(decision, Decision::Allow) {
-                        decision = Decision::Warn {
-                            aft_id: AFT_TOOL_DRIFT,
-                        };
-                    }
+            if let Some((prev_hash, prev_fields, prev_description, prev_schema)) = prior
+                && prev_hash != hash
+            {
+                // A drift escalates from Warn to Block when it takes a
+                // rug-pull shape: (a) a new sensitive-named field, (b) the
+                // description drifts to introduce an injection directive, or
+                // (c) an existing field's constraint is loosened.
+                let sensitive_field = introduces_sensitive_field(&prev_fields, &fields);
+                let injected = description_drift_injects(&prev_description, description);
+                let relaxed = relaxes_existing_field_constraint(&prev_schema, input_schema);
+                let rug_pull = sensitive_field || injected.is_some() || relaxed.is_some();
+                tracing::warn!(
+                    target: "tool.definition_drift",
+                    aft_id = AFT_TOOL_DRIFT,
+                    tool = tool_name,
+                    prev_hash = %prev_hash,
+                    curr_hash = %hash,
+                    introduces_sensitive_field = sensitive_field,
+                    description_injection = injected.unwrap_or(""),
+                    relaxes_field = relaxed.as_deref().unwrap_or(""),
+                    "tracelane.tool_definition.drift=true — a declared tool's definition \
+                     changed for this tenant (silent rug-pull shape)",
+                );
+                // Block dominates Warn; Warn dominates Allow.
+                if rug_pull {
+                    decision = Decision::Block {
+                        aft_id: AFT_TOOL_DRIFT,
+                    };
+                } else if matches!(decision, Decision::Allow) {
+                    decision = Decision::Warn {
+                        aft_id: AFT_TOOL_DRIFT,
+                    };
                 }
             }
 

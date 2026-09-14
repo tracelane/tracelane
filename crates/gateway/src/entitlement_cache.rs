@@ -83,26 +83,39 @@ const MAX_CAPACITY: u64 = 100_000;
 // ── Metrics (atomic-counter house style, cf. ingest/src/limits.rs) ──────────
 static CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LISTEN_RECONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Requests served a last-known grant past the TTL while a refresh ran off-path.
+pub static STALE_SERVED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIL_OPEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot of the cache metrics, surfaced as `tracelane_entitlement_*` /
-/// `tracelane_listen_reconnect_total` by the metrics scrape.
-pub fn metrics_snapshot() -> EntitlementMetrics {
-    EntitlementMetrics {
-        cache_miss_total: CACHE_MISS_TOTAL.load(Ordering::Relaxed),
-        listen_reconnect_total: LISTEN_RECONNECT_TOTAL.load(Ordering::Relaxed),
-        fail_open_total: FAIL_OPEN_TOTAL.load(Ordering::Relaxed),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EntitlementMetrics {
-    pub cache_miss_total: u64,
-    pub listen_reconnect_total: u64,
-    pub fail_open_total: u64,
-}
+// `metrics_snapshot` / `EntitlementMetrics` (a `(cache_miss_total,
+// listen_reconnect_total, fail_open_total)` reader) were deleted 2026-09-12
+// (B-390) — zero callers anywhere, including tests; no `/metrics` route
+// wires this in yet, despite the doc comment's claim. The three counters
+// themselves (`CACHE_MISS_TOTAL`, `LISTEN_RECONNECT_TOTAL`,
+// `FAIL_OPEN_TOTAL`) are untouched and still incremented at their call
+// sites below.
 
 /// A gated feature flag (the `f_*` columns of `plan_entitlements`).
+///
+/// Found 2026-09-12 (B-390): 15 of these variants are never passed to
+/// `.has()`/`.check()` by any production request path, in two different
+/// ways. `Pr7Trajectory` through `HipaaGcpAddon` (8 variants) are real,
+/// tested entitlement plumbing for features that are simply NOT_BUILT yet
+/// (matches `docs/inventory/README.md`) — nothing calls
+/// `.check(tenant, FeatureKey::PrN...)` because the PR7-12 predictive tiers,
+/// cohort baselines and the HIPAA/GCP add-on don't exist. `AuditSelfVerify`
+/// and `GuardrailR2`..`GuardrailR7` (7 variants) are the opposite case: the
+/// FEATURES are absolutely live, but their entitlement check bypasses this
+/// enum entirely — `rail.rs`'s `RailGate::from_resolved` and
+/// `audit_self_verify.rs` read the resolved struct's `f_guardrail_r*` /
+/// `f_audit_selfverify` fields directly, never through `FeatureKey`.
+/// Left as one `#[allow(dead_code)]` rather than deleted or split apart:
+/// sorting genuinely-unbuilt from checked-a-different-way needs either an
+/// ADR (to drop the `plan_entitlements` columns for the unbuilt half) or a
+/// refactor (to route the guardrail/audit-self-verify half through this
+/// enum too) — neither is a dead-code cleanup, and getting it wrong here
+/// risks entitlement correctness, not just a warning.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FeatureKey {
     Pr7Trajectory,
@@ -112,11 +125,10 @@ pub enum FeatureKey {
     Pr11SloDrift,
     Pr12LanggraphBranch,
     CohortBaselines,
-    HipaaGcpAddon,
     AuditAddon,
     /// Free-tier audit self-verify (ADR-066). Default-TRUE on every plan — lets a
     /// tenant SEE + verify their OWN recent chain in-app. Distinct from the paid
-    /// `AuditAddon` (the $999 Article-12 evidence-pack export). A per-workspace
+    /// `AuditAddon` (the Article-12 export — Enterprise-seeded; the paid SKU is not sold, B-392). A per-workspace
     /// `FALSE` override (deny-overrides-grant) can still switch it off.
     AuditSelfVerify,
     /// B1 Prompt-Promotion WRITE workflow (promote / rollback / observe) —
@@ -151,34 +163,51 @@ pub enum FeatureKey {
     Experiments,
     OnlineEvals,
     AnnotationQueues,
+    /// BILL-01 / ADR-076 — SSO from Team. Reads `ResolvedEntitlements.f_sso`,
+    /// which the resolver derives from `plan_entitlements.f_sso` (Team+)
+    /// overlaid by a `workspace_entitlements.f_sso` override.
+    Sso,
 }
 
-impl FeatureKey {
-    /// The Postgres column name backing this feature.
-    pub fn column(self) -> &'static str {
+// `impl FeatureKey { pub fn column(self) -> &'static str { ... } }` (a
+// `FeatureKey` -> Postgres column-name mapping) was deleted 2026-09-12
+// (B-390) — zero callers anywhere, including tests. The real resolution
+// path (below, the `has`-style match) reads each `f_*` struct field
+// directly by name rather than building a column-name string dynamically;
+// the SQL SELECT lists that name these same columns (`db/mod.rs` and
+// friends) are separate hardcoded literals, not built from this method
+// either. Restorable from git history at
+// `607aaa205d52f2545ab6bf81a76ed524f2747f44` if a dynamic per-flag query
+// is ever built. (SHA: `2d1f164ba924f7c0bc846c06e8400866cbb32ae1`.)
+
+/// BILL-01 / ADR-076 §0.4 — the customer's overflow choice at the spend
+/// ceiling. `AutoAge` (the default) ages the oldest indexed data out early and
+/// keeps it queryable in cold; `AutoOverage` is opt-in and keeps billing past
+/// the ceiling. Never a third state: the Postgres columns are `CHECK`-
+/// constrained to these two strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowMode {
+    AutoAge,
+    AutoOverage,
+}
+
+impl OverflowMode {
+    /// Parse the Postgres `text` value. Anything unrecognised (there should be
+    /// none — the column is `CHECK`-constrained) fails to the SAFE default:
+    /// auto-age never loses data, auto-overage keeps charging silently.
+    #[must_use]
+    pub fn from_column(s: &str) -> Self {
+        match s {
+            "auto_overage" => Self::AutoOverage,
+            _ => Self::AutoAge,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Pr7Trajectory => "f_pr7_trajectory",
-            Self::Pr8ArgDrift => "f_pr8_argdrift",
-            Self::Pr9A2aHandoff => "f_pr9_a2a_handoff",
-            Self::Pr10InlineSlmJudge => "f_pr10_inline_slm_judge",
-            Self::Pr11SloDrift => "f_pr11_slo_drift",
-            Self::Pr12LanggraphBranch => "f_pr12_langgraph_branch",
-            Self::CohortBaselines => "f_cohort_baselines",
-            Self::HipaaGcpAddon => "f_hipaa_gcp_addon",
-            Self::AuditAddon => "f_audit_addon",
-            Self::AuditSelfVerify => "f_audit_selfverify",
-            Self::PromptPromotionWrite => "f_prompt_promotion_write",
-            Self::GuardrailR2 => "f_guardrail_r2",
-            Self::GuardrailR3Pinning => "f_guardrail_r3_pinning",
-            Self::GuardrailR4 => "f_guardrail_r4",
-            Self::GuardrailR5 => "f_guardrail_r5",
-            Self::GuardrailR6 => "f_guardrail_r6",
-            Self::GuardrailR7 => "f_guardrail_r7",
-            Self::Alerts => "f_alerts",
-            Self::Datasets => "f_datasets",
-            Self::Experiments => "f_experiments",
-            Self::OnlineEvals => "f_online_evals",
-            Self::AnnotationQueues => "f_annotation_queues",
+            Self::AutoAge => "auto_age",
+            Self::AutoOverage => "auto_overage",
         }
     }
 }
@@ -195,7 +224,6 @@ pub struct ResolvedEntitlements {
     pub f_pr11_slo_drift: bool,
     pub f_pr12_langgraph_branch: bool,
     pub f_cohort_baselines: bool,
-    pub f_hipaa_gcp_addon: bool,
     pub f_audit_addon: bool,
     /// Free-tier audit self-verify (ADR-066). Default-TRUE on every plan.
     pub f_audit_selfverify: bool,
@@ -208,7 +236,6 @@ pub struct ResolvedEntitlements {
     pub f_guardrail_r5: bool,
     pub f_guardrail_r6: bool,
     pub f_guardrail_r7: bool,
-    pub retention_days: i32,
     /// ADR-048 D2 — full-capture gate (Business + Enterprise base; an active
     /// Audit SKU forces it). The ingest sampler enforces capture via its own
     /// per-tenant cache; this is carried here so the gateway can inspect or
@@ -221,13 +248,53 @@ pub struct ResolvedEntitlements {
     pub f_experiments: bool,
     pub f_online_evals: bool,
     pub f_annotation_queues: bool,
-    /// Monthly included trace quota (deny-overrides-grant from
-    /// `workspace_entitlements` ⊕ `plan_entitlements`). The gateway hard-cap 429
-    /// threshold = `trace_quota_monthly` × `overage_hard_cap_multiplier`.
-    pub trace_quota_monthly: i64,
-    /// Hard-cap multiplier as integer tenths (5.0× → 50, 1.0× → 10) so the
-    /// hot-path decision stays integer-only and this struct keeps deriving `Eq`.
-    pub overage_hard_cap_multiplier_tenths: i32,
+    /// BILL-01 / ADR-076 — SSO from Team. Own field (not routed only through
+    /// `FeatureKey`) because the resolver reads it directly for the pricing
+    /// page + `/v1/billing/usage`'s `plan` block.
+    pub f_sso: bool,
+    // ── BILL-01 / ADR-076 — the six-meter model's per-plan allowances ───────
+    //
+    // `None` on any `*_included` field means CUSTOM (Enterprise only — the
+    // Postgres column is genuinely NULL, never a sentinel zero). `Some(0)` is
+    // a real zero allowance (the fail-closed `deny_all()` state). Bytes, not
+    // GB: the Postgres `numeric(12,3)` GB figure is converted once, here, so
+    // every caller compares against the SAME unit `usage_daily`/`meter_counters`
+    // record in (bytes), never re-deriving GB->bytes at each read site.
+    pub hot_bytes_included: Option<u64>,
+    pub ingest_bytes_included: Option<u64>,
+    pub series_included: Option<i64>,
+    pub scan_units_included: Option<i64>,
+    pub eval_runs_included: Option<i64>,
+    pub indexed_window_days: i32,
+    pub queryable_days: i32,
+    pub ledger_days: i32,
+    /// Free is the only tier capped at 1 seat. Every paid tier resolves `true`
+    /// (ADR-076 §0.3) — plan-level only, no `workspace_entitlements` override
+    /// column exists for this one.
+    pub unlimited_seats: bool,
+    /// Free: no overage, ages out rather than bills. Every paid tier is `true`.
+    pub overage_allowed: bool,
+    pub overflow_mode: OverflowMode,
+    /// Per-tenant requests-per-minute from the DB (replaces
+    /// `RateLimitTier::from_plan_tier_str`). `None` = no limit (Enterprise, and
+    /// the no-control-plane self-host default, B-357).
+    pub rate_limit_rpm: Option<u32>,
+    /// `None` = contract pricing (Enterprise's "from $2,499"), never a customer-
+    /// facing zero.
+    pub price_monthly_usd: Option<i32>,
+    pub price_annual_month_usd: Option<i32>,
+    pub price_from_usd: Option<i32>,
+    pub polar_product_id_month: Option<String>,
+    pub polar_product_id_year: Option<String>,
+    /// A3 velocity breaker (`tenants.promotion_frozen_at/_reason`). While set,
+    /// `prompt_routes` promote/rollback return `423 promotion_frozen` — read
+    /// through this cache rather than a per-request Postgres round trip.
+    pub promotion_frozen_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub promotion_frozen_reason: Option<String>,
+    /// The pricing-rates version this tenant is rated against
+    /// (`tenants.price_version`) — price protection (ADR-076 §0.5). `None`
+    /// means "the current version", read by `billing::rating`.
+    pub price_version: Option<String>,
     /// GWY-43: the workspace-wide monthly USD spend ceiling (`tenants
     /// .budget_usd_monthly`), in integer **micro-USD**. `0` = uncapped.
     ///
@@ -241,9 +308,35 @@ pub struct ResolvedEntitlements {
     /// 15-minute TTL with `LISTEN/NOTIFY` invalidation, never per request
     /// (`CLAUDE.md` §2, gw ↔ PG).
     pub workspace_budget_micro_usd: u64,
+    /// BILL-01 / ADR-076 §0.4 — the customer-set monthly spend ceiling
+    /// (`tenants.spend_ceiling_usd`, opt-in, off by default), in integer
+    /// micro-USD. `None` = no ceiling — the Postgres column is genuinely
+    /// NULL, never a coerced zero (unlike `workspace_budget_micro_usd`
+    /// above, whose `0` sentinel predates this field and already shipped
+    /// that different contract).
+    pub spend_ceiling_micro_usd: Option<u64>,
+    /// BILL-01 / ADR-076 §0.4 — AUTO-AGE's shrunken window
+    /// (`tenants.auto_age_window_days`), set by the daily metering job when
+    /// a ceiling tenant's projected overage would exceed the ceiling at the
+    /// plan's full `indexed_window_days`. `None` until a shrink is needed;
+    /// the job clears it back to `None` once the projection fits again at
+    /// the plan window. **Never read this directly at a window-scoped call
+    /// site — call [`Self::effective_window_days`].**
+    pub auto_age_window_days: Option<i32>,
 }
 
 impl ResolvedEntitlements {
+    /// The window every window-scoped read must use instead of
+    /// `indexed_window_days` directly (spec §0.4): the usage route's
+    /// hot/cold split, `window_breakdown_handler`, and the metering job's
+    /// own tenant→window map all narrow together the moment AUTO-AGE sets
+    /// `auto_age_window_days` — a caller reading `indexed_window_days`
+    /// straight would keep billing/showing the pre-shrink window forever.
+    #[must_use]
+    pub fn effective_window_days(&self) -> i32 {
+        self.auto_age_window_days
+            .unwrap_or(self.indexed_window_days)
+    }
     /// The deny-all default served on a cache miss during a control-plane
     /// outage when no last-known grant exists. Deny-new-features per ADR-035.
     pub fn deny_all() -> Self {
@@ -256,7 +349,6 @@ impl ResolvedEntitlements {
             f_pr11_slo_drift: false,
             f_pr12_langgraph_branch: false,
             f_cohort_baselines: false,
-            f_hipaa_gcp_addon: false,
             f_audit_addon: false,
             // Fail-closed on a control-plane outage with no last-known grant:
             // deny self-verify until the real (default-TRUE) grant resolves.
@@ -268,7 +360,6 @@ impl ResolvedEntitlements {
             f_guardrail_r5: false,
             f_guardrail_r6: false,
             f_guardrail_r7: false,
-            retention_days: 7,
             f_full_capture: false,
             f_alerts: false,
             // fail-CLOSED: no control plane => free tier, never paid.
@@ -276,12 +367,38 @@ impl ResolvedEntitlements {
             f_experiments: false,
             f_online_evals: false,
             f_annotation_queues: false,
-            // Free-plan quota defaults (10K traces, 1.0× hard cap = 429
-            // exactly at the included quota) — fail-restricted, mirrors
-            // plan_entitlements.free_v1.
-            trace_quota_monthly: 10_000,
-            overage_hard_cap_multiplier_tenths: 10,
+            f_sso: false,
+            // Deny-all = zero allowances on every meter, a conservative 30-day
+            // window (ADR-076: "deny = zero allowances, 30-day window"). NOT
+            // `None` (which would mean "custom/unlimited") — this is the
+            // fail-CLOSED floor, never a grant.
+            hot_bytes_included: Some(0),
+            ingest_bytes_included: Some(0),
+            series_included: Some(0),
+            scan_units_included: Some(0),
+            eval_runs_included: Some(0),
+            indexed_window_days: 30,
+            queryable_days: 30,
+            ledger_days: 30,
+            unlimited_seats: false,
+            overage_allowed: false,
+            overflow_mode: OverflowMode::AutoAge,
+            // Fail-restricted: the Free RPM figure, not unlimited.
+            rate_limit_rpm: Some(60),
+            price_monthly_usd: None,
+            price_annual_month_usd: None,
+            price_from_usd: None,
+            polar_product_id_month: None,
+            polar_product_id_year: None,
+            promotion_frozen_at: None,
+            promotion_frozen_reason: None,
+            price_version: None,
             workspace_budget_micro_usd: 0,
+            // Deny-all: no ceiling, no auto-age shrink — the fail-closed
+            // floor is a denial via zero allowances, not a spend-ceiling
+            // state, which does not apply when there is no control plane.
+            spend_ceiling_micro_usd: None,
+            auto_age_window_days: None,
         }
     }
 
@@ -343,7 +460,6 @@ impl ResolvedEntitlements {
             f_pr11_slo_drift: false,
             f_pr12_langgraph_branch: false,
             f_cohort_baselines: false,
-            f_hipaa_gcp_addon: false,
             f_audit_addon: false,
             f_audit_selfverify: true,
             f_prompt_promotion_write: false,
@@ -356,7 +472,6 @@ impl ResolvedEntitlements {
             f_guardrail_r5: true,
             f_guardrail_r6: true,
             f_guardrail_r7: true,
-            retention_days: 7,
             f_full_capture: false,
             f_alerts: false,
             // fail-CLOSED: no control plane => free tier, never paid.
@@ -364,38 +479,56 @@ impl ResolvedEntitlements {
             f_experiments: false,
             f_online_evals: false,
             f_annotation_queues: false,
-            // The point of the grant: no rate-limit tier and no monthly quota
-            // can reject the run. `trace_quota_monthly: 0` is the documented
-            // "unlimited" sentinel — `QuotaTracker::check` early-returns Allow
-            // on 0 (rate_limiter.rs:312), so this short-circuits the quota the
-            // same way the tier short-circuits the limiter.
-            trace_quota_monthly: 0,
-            overage_hard_cap_multiplier_tenths: 10,
+            f_sso: false,
+            // BILL-01: bench = None/unlimited on every meter — the point of the
+            // grant is that no allowance and no rate-limit tier can reject the
+            // run (`rate_limit_rpm: None` on this grant is what confers it —
+            // `admission.rs` reads the field directly, no tier indirection).
+            hot_bytes_included: None,
+            ingest_bytes_included: None,
+            series_included: None,
+            scan_units_included: None,
+            eval_runs_included: None,
+            indexed_window_days: 365,
+            queryable_days: 730,
+            ledger_days: 730,
+            unlimited_seats: true,
+            overage_allowed: false,
+            overflow_mode: OverflowMode::AutoAge,
+            rate_limit_rpm: None,
+            price_monthly_usd: None,
+            price_annual_month_usd: None,
+            price_from_usd: None,
+            polar_product_id_month: None,
+            polar_product_id_year: None,
+            promotion_frozen_at: None,
+            promotion_frozen_reason: None,
+            price_version: None,
             workspace_budget_micro_usd: 0,
+            // Bench measures the gateway's own overhead — no ceiling exists
+            // for a no-control-plane grant, so no auto-age shrink either.
+            spend_ceiling_micro_usd: None,
+            auto_age_window_days: None,
         }
     }
 
     /// Is this the bench grant? Keyed on the reserved `plan_lookup_key`, which
     /// no Polar plan can produce.
+    ///
+    /// BILL-01 / ADR-076 (2026-09-13) orphaned this method's only caller,
+    /// `rate_limit_tier()` — deleted along with the whole `RateLimitTier` type
+    /// in the `rate_limiter.rs` rewrite (bench's uncapped rate limit is now
+    /// conferred structurally by `bench_unlimited()`'s own `rate_limit_rpm:
+    /// None`, not by a branch here). Kept, not deleted: whether bench traffic
+    /// should also be exempted from the six usage meters
+    /// (`crate::billing::meters`) or from the velocity breaker is a real
+    /// question this build did not need to answer — the eight numbered BILL-01
+    /// steps never mention bench — and `is_bench()` is the one-line predicate
+    /// that answer would be built on.
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_bench(&self) -> bool {
         self.plan_lookup_key == "__bench"
-    }
-
-    /// The rate-limit tier this grant confers.
-    ///
-    /// Lives HERE, on the grant, rather than as a branch in the hot path: the
-    /// tier is a property of the entitlement, so `chat_completions_handler` no
-    /// longer mentions bench when resolving limits at all. One auditable site.
-    #[must_use]
-    pub fn rate_limit_tier(&self) -> crate::rate_limiter::RateLimitTier {
-        if self.is_bench() {
-            crate::rate_limiter::RateLimitTier::Bench
-        } else {
-            crate::rate_limiter::RateLimitTier::from_plan_tier_str(
-                self.plan_lookup_key.trim_end_matches("_v1"),
-            )
-        }
     }
 
     /// Project a single feature flag.
@@ -408,7 +541,6 @@ impl ResolvedEntitlements {
             FeatureKey::Pr11SloDrift => self.f_pr11_slo_drift,
             FeatureKey::Pr12LanggraphBranch => self.f_pr12_langgraph_branch,
             FeatureKey::CohortBaselines => self.f_cohort_baselines,
-            FeatureKey::HipaaGcpAddon => self.f_hipaa_gcp_addon,
             FeatureKey::AuditAddon => self.f_audit_addon,
             FeatureKey::AuditSelfVerify => self.f_audit_selfverify,
             FeatureKey::PromptPromotionWrite => self.f_prompt_promotion_write,
@@ -423,20 +555,15 @@ impl ResolvedEntitlements {
             FeatureKey::Experiments => self.f_experiments,
             FeatureKey::OnlineEvals => self.f_online_evals,
             FeatureKey::AnnotationQueues => self.f_annotation_queues,
+            FeatureKey::Sso => self.f_sso,
         }
     }
 
-    /// Derive the gateway monthly-quota config from the resolved
-    /// entitlements. The 429 hard cap = `trace_quota_monthly` × multiplier, both
-    /// sourced from `workspace_entitlements` ⊕ `plan_entitlements` (never the
-    /// hardcoded plan map — that drift was the gap; CLAUDE.md control-
-    /// plane rule). A zero/negative quota (only the OSS self-host path) means
-    /// "no quota enforced".
-    pub fn quota_config(&self) -> crate::rate_limiter::QuotaConfig {
-        crate::rate_limiter::QuotaConfig {
-            trace_quota_monthly: self.trace_quota_monthly.max(0) as u64,
-            hard_cap_tenths: self.overage_hard_cap_multiplier_tenths.max(0) as u32,
-        }
+    /// Is a spend/promotion action currently frozen for this tenant (A3
+    /// velocity breaker)? `prompt_routes` reads this before promote/rollback.
+    #[must_use]
+    pub fn is_promotion_frozen(&self) -> bool {
+        self.promotion_frozen_at.is_some()
     }
 }
 
@@ -463,6 +590,8 @@ pub struct EntitlementCache {
     cache: Cache<Uuid, Arc<Cached>>,
     /// Survives the moka TTL so an outage can fail-open to the last-known grant.
     last_known: Arc<DashMap<Uuid, Arc<ResolvedEntitlements>>>,
+    /// Tenants whose next miss must re-resolve INLINE (an explicit invalidation).
+    forced: Arc<dashmap::DashSet<Uuid>>,
     resolve: ResolveFn,
 }
 
@@ -474,6 +603,7 @@ impl EntitlementCache {
                 .time_to_live(TTL)
                 .build(),
             last_known: Arc::new(DashMap::new()),
+            forced: Arc::new(dashmap::DashSet::new()),
             resolve,
         }
     }
@@ -491,6 +621,23 @@ impl EntitlementCache {
             }
             return Arc::new(cached.resolved.clone());
         }
+        // STALE-WHILE-REVALIDATE (2026-09-04, the p95 investigation). After the
+        // 15-minute TTL the entry is gone from `cache`, but `last_known` still
+        // holds the last successful resolve. Serving it and refreshing OFF-PATH
+        // means a sparse request never waits on the control plane — with the
+        // keepalive off (NEON-COMPUTE-PIN) that wait was a fresh connect plus,
+        // when the compute had suspended, its ~1.2 s resume, and it showed up
+        // as gateway p99 587 ms / max 1.09 s on 2026-09-03. Staleness is bounded
+        // by one refresh: the refresh runs on THIS request, so the next request
+        // sees the fresh grant. A tenant never resolved before still resolves
+        // inline (there is nothing to serve) and fails CLOSED as before.
+        if !self.forced.contains(&tenant)
+            && let Some(last) = self.last_known.get(&tenant)
+        {
+            STALE_SERVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.spawn_refresh(tenant);
+            return last.clone();
+        }
         self.resolve_and_store(tenant).await
     }
 
@@ -501,6 +648,7 @@ impl EntitlementCache {
         match (self.resolve)(tenant).await {
             Ok(resolved) => {
                 let arc = Arc::new(resolved.clone());
+                self.forced.remove(&tenant);
                 self.last_known.insert(tenant, arc.clone());
                 self.cache
                     .insert(
@@ -546,12 +694,20 @@ impl EntitlementCache {
     /// so a concurrent outage still has a fallback.
     pub async fn invalidate(&self, tenant: Uuid) {
         self.cache.invalidate(&tenant).await;
+        // An EXPLICIT invalidation (NOTIFY, a plan change) must force an INLINE
+        // re-resolve — the stale-while-revalidate branch in `resolved` may not
+        // serve the value that was just declared wrong. `last_known` is kept:
+        // it is still the fail-open answer if that re-resolve hits an outage.
+        self.forced.insert(tenant);
     }
 
     /// Evict every workspace — used when a `plan_entitlements` row changes, which
     /// affects all tenants on that plan (the `NOTIFY` payload `ALL` triggers this).
     pub fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        for e in self.last_known.iter() {
+            self.forced.insert(*e.key());
+        }
     }
 
     #[cfg(test)]
@@ -561,10 +717,22 @@ impl EntitlementCache {
 }
 
 /// Build a Postgres-backed resolver closure over a `deadpool` pool (the
-/// `-pooler` endpoint). Computes deny-overrides-grant in SQL: a tenant's
-/// `workspace_entitlements` non-NULL columns overlay the `plan_entitlements`
-/// defaults via `COALESCE`. A tenant with no `workspace_entitlements` row falls
-/// back to the `free_v1` plan defaults (deny-new-features for unseeded tenants).
+/// `-pooler` endpoint).
+///
+/// **ADR-073 fix (B-241).** Starts FROM `tenants` — plan MEMBERSHIP — never
+/// from `workspace_entitlements`, which is the OVERRIDE layer only. The old
+/// query joined `workspace_entitlements JOIN plan_entitlements` and fell back
+/// to a hardcoded `free_v1` for any tenant with no override row — silently
+/// converting "this tenant has no override row" into "this tenant is on the
+/// free plan", which is a different and usually false statement for a paying
+/// tenant. There is now exactly one query and no fallback: a tenant with no
+/// `workspace_entitlements` row still resolves to *their plan's* defaults via
+/// the `LEFT JOIN`; only a MISSING `tenants` ROW (the tenant does not exist at
+/// all) reaches `deny_all()`.
+///
+/// `pe.plan_lookup_key = t.plan::text || '_v1'` mirrors the exact mapping
+/// `apps/web/lib/entitlements.ts`'s `PLAN_TO_LOOKUP_KEY` and the Polar webhook's
+/// `` `${tenant.plan ?? "free"}_v1` `` use — one rule, expressed once here.
 pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
     Arc::new(move |tenant: Uuid| {
         let pool = pool.clone();
@@ -574,9 +742,10 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                 .await
                 .map_err(|e| anyhow::anyhow!("entitlement pool: {e}"))?;
             // Overlay overrides over plan defaults. LEFT JOIN so a tenant with
-            // no override row still resolves to its plan; if the tenant has no
-            // workspace_entitlements row at all the query returns 0 rows and we
-            // fall back to free_v1 below.
+            // no override row still resolves to its plan's defaults — the
+            // ADR-073 fix. `numeric` columns are cast to text: tokio-postgres
+            // has no numeric->f64 conversion, and a NULL (Enterprise "custom")
+            // must survive as a NULL string, never a coerced zero.
             const SQL: &str = "\
                 SELECT pe.plan_lookup_key, \
                   COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory) AS f_pr7_trajectory, \
@@ -586,9 +755,7 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                   COALESCE(we.f_pr11_slo_drift, pe.f_pr11_slo_drift) AS f_pr11_slo_drift, \
                   COALESCE(we.f_pr12_langgraph_branch, pe.f_pr12_langgraph_branch) AS f_pr12_langgraph_branch, \
                   COALESCE(we.f_cohort_baselines, pe.f_cohort_baselines) AS f_cohort_baselines, \
-                  COALESCE(we.f_hipaa_gcp_addon, pe.f_hipaa_gcp_addon) AS f_hipaa_gcp_addon, \
                   COALESCE(we.f_audit_addon, pe.f_audit_addon) AS f_audit_addon, \
-                  COALESCE(we.retention_days, pe.retention_days) AS retention_days, \
                   COALESCE(we.f_guardrail_r2, pe.f_guardrail_r2) AS f_guardrail_r2, \
                   COALESCE(we.f_guardrail_r3_pinning, pe.f_guardrail_r3_pinning) AS f_guardrail_r3_pinning, \
                   COALESCE(we.f_guardrail_r4, pe.f_guardrail_r4) AS f_guardrail_r4, \
@@ -603,33 +770,41 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                   COALESCE(we.f_online_evals, pe.f_online_evals) AS f_online_evals, \
                   COALESCE(we.f_annotation_queues, pe.f_annotation_queues) AS f_annotation_queues, \
                   COALESCE(we.f_audit_selfverify, pe.f_audit_selfverify) AS f_audit_selfverify, \
-                  COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly) AS trace_quota_monthly, \
-                  (COALESCE(we.overage_hard_cap_multiplier, pe.overage_hard_cap_multiplier) * 10)::int \
-                    AS overage_hard_cap_multiplier_tenths, \
-                  t.budget_usd_monthly::text AS workspace_budget_usd_text \
-                FROM workspace_entitlements we \
-                JOIN plan_entitlements pe ON pe.plan_lookup_key = we.plan_lookup_key \
-                LEFT JOIN tenants t ON t.id = we.tenant_id \
-                WHERE we.tenant_id = $1";
-            if let Some(row) = client.query_opt(SQL, &[&tenant]).await? {
-                return Ok(row_to_resolved(&row));
-            }
-            // Unseeded tenant → free plan defaults.
-            const FALLBACK: &str = "\
-                SELECT plan_lookup_key, f_pr7_trajectory, f_pr8_argdrift, \
-                  f_pr9_a2a_handoff, f_pr10_inline_slm_judge, f_pr11_slo_drift, \
-                  f_pr12_langgraph_branch, f_cohort_baselines, f_hipaa_gcp_addon, \
-                  f_audit_addon, retention_days, \
-                  f_guardrail_r2, f_guardrail_r3_pinning, f_guardrail_r4, \
-                  f_guardrail_r5, f_guardrail_r6, f_guardrail_r7, \
-                  f_full_capture, f_prompt_promotion_write, f_alerts, \
-                  f_datasets, f_experiments, f_online_evals, f_annotation_queues, \
-                  f_audit_selfverify, \
-                  trace_quota_monthly, \
-                  (overage_hard_cap_multiplier * 10)::int AS overage_hard_cap_multiplier_tenths \
-                FROM plan_entitlements WHERE plan_lookup_key = 'free_v1'";
-            match client.query_opt(FALLBACK, &[]).await? {
+                  COALESCE(we.f_sso, pe.f_sso) AS f_sso, \
+                  COALESCE(we.hot_gb_included, pe.hot_gb_included)::text AS hot_gb_included_text, \
+                  COALESCE(we.ingest_gb_included, pe.ingest_gb_included)::text AS ingest_gb_included_text, \
+                  COALESCE(we.series_included, pe.series_included) AS series_included, \
+                  COALESCE(we.scan_units_included, pe.scan_units_included) AS scan_units_included, \
+                  COALESCE(we.eval_runs_included, pe.eval_runs_included) AS eval_runs_included, \
+                  COALESCE(we.indexed_window_days, pe.indexed_window_days) AS indexed_window_days, \
+                  COALESCE(we.queryable_days, pe.queryable_days) AS queryable_days, \
+                  COALESCE(we.ledger_days, pe.ledger_days) AS ledger_days, \
+                  pe.unlimited_seats AS unlimited_seats, \
+                  COALESCE(we.overage_allowed, pe.overage_allowed) AS overage_allowed, \
+                  COALESCE(t.overflow_mode, we.overflow_mode, pe.overflow_mode) AS overflow_mode, \
+                  COALESCE(we.rate_limit_rpm, pe.rate_limit_rpm) AS rate_limit_rpm, \
+                  pe.price_monthly_usd AS price_monthly_usd, \
+                  pe.price_annual_month_usd AS price_annual_month_usd, \
+                  pe.price_from_usd AS price_from_usd, \
+                  pe.polar_product_id_month AS polar_product_id_month, \
+                  pe.polar_product_id_year AS polar_product_id_year, \
+                  t.promotion_frozen_at AS promotion_frozen_at, \
+                  t.promotion_frozen_reason AS promotion_frozen_reason, \
+                  t.price_version AS price_version, \
+                  t.budget_usd_monthly::text AS workspace_budget_usd_text, \
+                  t.spend_ceiling_usd::text AS spend_ceiling_usd_text, \
+                  t.auto_age_window_days AS auto_age_window_days, \
+                  t.auto_age_since AS auto_age_since \
+                FROM tenants t \
+                JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
+                LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
+                WHERE t.id = $1 AND t.archived_at IS NULL";
+            match client.query_opt(SQL, &[&tenant]).await? {
                 Some(row) => Ok(row_to_resolved(&row)),
+                // No tenant row at all (unknown / archived tenant) — fail
+                // CLOSED to nothing, ADR-073 §5. This is deliberately NOT the
+                // same as "no workspace_entitlements row", which the LEFT JOIN
+                // above already resolves to the tenant's real plan.
                 None => Ok(ResolvedEntitlements::deny_all()),
             }
         }) as Pin<Box<dyn Future<Output = anyhow::Result<ResolvedEntitlements>> + Send>>
@@ -681,9 +856,7 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         f_pr11_slo_drift: row.get("f_pr11_slo_drift"),
         f_pr12_langgraph_branch: row.get("f_pr12_langgraph_branch"),
         f_cohort_baselines: row.get("f_cohort_baselines"),
-        f_hipaa_gcp_addon: row.get("f_hipaa_gcp_addon"),
         f_audit_addon: row.get("f_audit_addon"),
-        retention_days: row.get("retention_days"),
         f_guardrail_r2: row.get("f_guardrail_r2"),
         f_guardrail_r3_pinning: row.get("f_guardrail_r3_pinning"),
         f_guardrail_r4: row.get("f_guardrail_r4"),
@@ -700,13 +873,40 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         f_online_evals: row.get("f_online_evals"),
         f_annotation_queues: row.get("f_annotation_queues"),
         f_audit_selfverify: row.get("f_audit_selfverify"),
-        trace_quota_monthly: row.get("trace_quota_monthly"),
-        overage_hard_cap_multiplier_tenths: row.get("overage_hard_cap_multiplier_tenths"),
-        // Present ONLY on the primary query. The FALLBACK (an unseeded tenant,
-        // plan defaults only) has no `tenants` join, so this column does not
-        // exist there — and an unseeded tenant has no workspace budget, which is
-        // the same answer. `try_get` by name absorbs both "absent column" and
-        // "NULL" without conflating them with a real zero.
+        f_sso: row.get("f_sso"),
+        // BILL-01 / ADR-076 — numeric(12,3) GB figures arrive cast to text
+        // (tokio-postgres has no native numeric->f64); NULL (Enterprise
+        // "custom") survives as `None`, never a coerced zero. Converted to
+        // BYTES here, once, so every downstream caller compares one unit.
+        hot_bytes_included: numeric_text_to_bytes(row.get("hot_gb_included_text")),
+        ingest_bytes_included: numeric_text_to_bytes(row.get("ingest_gb_included_text")),
+        series_included: row.get("series_included"),
+        scan_units_included: row.get("scan_units_included"),
+        eval_runs_included: row.get("eval_runs_included"),
+        // NOT NULL in practice for every one of the five seeded plan rows
+        // (`apps/web/db/seed.mjs` upserts all five); `Row::get` panics on a
+        // genuine NULL here, which is the correct direction per this file's
+        // own rule (a half-seeded plan row is a deploy-time bug, not a value
+        // to silently paper over).
+        indexed_window_days: row.get("indexed_window_days"),
+        queryable_days: row.get("queryable_days"),
+        ledger_days: row.get("ledger_days"),
+        unlimited_seats: row.get("unlimited_seats"),
+        overage_allowed: row.get("overage_allowed"),
+        overflow_mode: OverflowMode::from_column(row.get::<_, &str>("overflow_mode")),
+        rate_limit_rpm: row
+            .get::<_, Option<i32>>("rate_limit_rpm")
+            .and_then(|v| u32::try_from(v).ok()),
+        price_monthly_usd: row.get("price_monthly_usd"),
+        price_annual_month_usd: row.get("price_annual_month_usd"),
+        price_from_usd: row.get("price_from_usd"),
+        polar_product_id_month: row.get("polar_product_id_month"),
+        polar_product_id_year: row.get("polar_product_id_year"),
+        promotion_frozen_at: row.get("promotion_frozen_at"),
+        promotion_frozen_reason: row.get("promotion_frozen_reason"),
+        price_version: row.get("price_version"),
+        // `try_get` by name absorbs both "absent column" and "NULL" without
+        // conflating them with a real zero.
         //
         // Parse failure is also uncapped: `tenants_budget_nonneg_chk` rejects a
         // negative at write time, and a mis-read that silently refuses every
@@ -718,7 +918,28 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
             .and_then(|t| t.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
             .map_or(0, |v| (v * 1_000_000.0).round() as u64),
+        // `None` on NULL (no ceiling — the default) or an unparseable value,
+        // never a coerced zero: a real `$0` ceiling and "no ceiling" must
+        // stay distinguishable, unlike `workspace_budget_micro_usd` above.
+        spend_ceiling_micro_usd: row
+            .try_get::<_, Option<String>>("spend_ceiling_usd_text")
+            .ok()
+            .flatten()
+            .and_then(|t| t.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| (v * 1_000_000.0).round() as u64),
+        auto_age_window_days: row.get("auto_age_window_days"),
     }
+}
+
+/// Parse a `numeric(12,3)` GB figure read as `::text` and convert to BYTES
+/// (×1e9). `None` on a NULL string (Enterprise "custom") or an unparseable
+/// value — never a coerced zero, which would read as "zero included" rather
+/// than "no cap".
+fn numeric_text_to_bytes(text: Option<String>) -> Option<u64> {
+    text.and_then(|t| t.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|gb| (gb * 1_000_000_000.0).round() as u64)
 }
 
 /// Spawn the long-lived `LISTEN entitlements_changed` task.
@@ -1025,7 +1246,6 @@ mod tests {
             f_pr11_slo_drift: true,
             f_pr12_langgraph_branch: true,
             f_cohort_baselines: true,
-            f_hipaa_gcp_addon: true,
             f_audit_addon: true,
             f_audit_selfverify: true,
             f_prompt_promotion_write: true,
@@ -1035,12 +1255,35 @@ mod tests {
             f_guardrail_r5: true,
             f_guardrail_r6: true,
             f_guardrail_r7: true,
-            retention_days: 365,
             f_full_capture: true,
             f_alerts: true,
-            trace_quota_monthly: 25_000_000,
-            overage_hard_cap_multiplier_tenths: 990,
+            f_sso: true,
+            // Enterprise: every allowance is "custom" — genuinely `None`, not a
+            // large number, matching what a NULL `plan_entitlements` column
+            // resolves to.
+            hot_bytes_included: None,
+            ingest_bytes_included: None,
+            series_included: None,
+            scan_units_included: None,
+            eval_runs_included: None,
+            indexed_window_days: 365,
+            queryable_days: 730,
+            ledger_days: 2555,
+            unlimited_seats: true,
+            overage_allowed: true,
+            overflow_mode: OverflowMode::AutoAge,
+            rate_limit_rpm: None,
+            price_monthly_usd: None,
+            price_annual_month_usd: None,
+            price_from_usd: Some(2499),
+            polar_product_id_month: None,
+            polar_product_id_year: None,
+            promotion_frozen_at: None,
+            promotion_frozen_reason: None,
+            price_version: None,
             workspace_budget_micro_usd: 0,
+            spend_ceiling_micro_usd: None,
+            auto_age_window_days: None,
         }
     }
 
@@ -1137,46 +1380,130 @@ mod tests {
             FeatureKey::Pr7Trajectory,
             FeatureKey::Pr10InlineSlmJudge,
             FeatureKey::AuditAddon,
-            FeatureKey::HipaaGcpAddon,
             FeatureKey::PromptPromotionWrite,
         ] {
             assert!(!d.has(f));
         }
     }
 
-    /// The gateway quota is entitlement-driven — `quota_config` reads the
-    /// resolved `trace_quota_monthly` × multiplier, NOT the hardcoded plan map.
+    /// BILL-01: a NULL `*_gb_included` (Enterprise "custom") must survive as
+    /// `None`, never coerce to a zero — "zero included" and "no cap" are
+    /// opposite claims and this is the ONE place the numeric->bytes
+    /// conversion happens.
     #[test]
-    fn quota_config_derives_from_entitlements_not_hardcoded() {
-        // grant_all() = enterprise (25M, 99.0× → 990 tenths).
+    fn numeric_text_to_bytes_preserves_null_as_none_never_zero() {
+        assert_eq!(numeric_text_to_bytes(None), None, "NULL must stay None");
+        assert_eq!(
+            numeric_text_to_bytes(Some("garbage".to_string())),
+            None,
+            "unparseable must fail open to None, not silently deny at 0"
+        );
+        assert_eq!(
+            numeric_text_to_bytes(Some("5".to_string())),
+            Some(5_000_000_000),
+            "5 GB -> 5e9 bytes"
+        );
+        assert_eq!(
+            numeric_text_to_bytes(Some("0.25".to_string())),
+            Some(250_000_000),
+            "Free's 0.25 GB -> 250 MB, not rounded to 0"
+        );
+    }
+
+    /// `has(Sso)` reads the new `f_sso` field, not a plan-string guess.
+    #[test]
+    fn sso_feature_key_reads_f_sso() {
         let mut e = grant_all();
-        let qc = e.quota_config();
-        assert_eq!(qc.trace_quota_monthly, 25_000_000);
-        assert_eq!(qc.hard_cap_tenths, 990);
+        assert!(e.has(FeatureKey::Sso));
+        e.f_sso = false;
+        assert!(!e.has(FeatureKey::Sso));
+        assert!(!ResolvedEntitlements::deny_all().has(FeatureKey::Sso));
+    }
 
-        // deny_all() = free (10K, 1.0×) → the hard cap is EXACTLY the included
-        // quota: "429 at quota" holds for free with no code change.
-        let d = ResolvedEntitlements::deny_all();
-        assert_eq!(d.quota_config().trace_quota_monthly, 10_000);
-        assert_eq!(
-            d.quota_config().hard_cap_absolute(),
-            10_000,
-            "free 1.0× → 429 exactly at the included quota"
-        );
+    /// A3 velocity breaker: `is_promotion_frozen` is exactly "the two columns
+    /// are set", read through the cache rather than a fresh Postgres round trip.
+    #[test]
+    fn promotion_frozen_reads_the_resolved_timestamp() {
+        let mut e = grant_all();
+        assert!(!e.is_promotion_frozen());
+        e.promotion_frozen_at = Some(chrono::Utc::now());
+        assert!(e.is_promotion_frozen());
+    }
 
-        // The strict "429 at quota" launch policy for a PAID plan is a data lever,
-        // not a code change: a workspace_entitlements override of multiplier→1.0×
-        // (tenths 10) makes the hard cap equal the included quota.
-        e.trace_quota_monthly = 150_000;
-        e.overage_hard_cap_multiplier_tenths = 10;
+    /// ADR-073 / B-241, against a REAL Postgres: a tenant whose `tenants.plan =
+    /// 'builder'` and who carries NO `workspace_entitlements` row must resolve
+    /// `builder_v1` — not `free_v1`. This is the exact shape of the bug ADR-073
+    /// exists to close: the OLD resolver started FROM `workspace_entitlements`
+    /// and fell back to a hardcoded `free_v1` for any tenant with no override
+    /// row, silently downgrading a paying tenant.
+    ///
+    /// Gated on a real Postgres because the resolution logic lives in the SQL
+    /// itself (`t.plan::text || '_v1'` joined against `plan_entitlements`), not
+    /// in `row_to_resolved` — a fake `tokio_postgres::Row` cannot be
+    /// constructed outside a real query, so this is the only way to prove the
+    /// JOIN direction rather than merely describe it.
+    ///
+    /// Run: `POSTGRES_URL=<neon> cargo test -p gateway --bin gateway \
+    ///   entitlement_cache::tests::b241_builder_tenant_with_no_override_resolves_builder_v1 \
+    ///   -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Postgres with the BILL-01 (0040) migration applied; set POSTGRES_URL"]
+    async fn b241_builder_tenant_with_no_override_resolves_builder_v1() {
+        let pool = crate::db::build_pool().await.expect("build_pool");
+        let client = pool.get().await.expect("client");
+        let tenant_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO tenants (id, workos_org_id, plan) VALUES ($1, $2, 'builder'::text::plan)",
+                &[&tenant_id, &format!("org_b241_{tenant_id}")],
+            )
+            .await
+            .expect("insert builder tenant with NO workspace_entitlements row");
+
+        let resolved = pg_resolver(pool)(tenant_id).await.expect("resolve");
         assert_eq!(
-            e.quota_config().hard_cap_absolute(),
-            150_000,
-            "multiplier 1.0× makes the 429 fire exactly at the included quota"
+            resolved.plan_lookup_key, "builder_v1",
+            "a builder-plan tenant with no override row must resolve builder_v1, \
+             never the hardcoded free_v1 fallback (B-241)"
         );
-        // …and 5.0× (tenths 50) gives the ADR-020 grace band.
-        e.overage_hard_cap_multiplier_tenths = 50;
-        assert_eq!(e.quota_config().hard_cap_absolute(), 750_000);
+        assert!(
+            resolved.overage_allowed,
+            "builder_v1 allows overage per the plan defaults, proving the \
+             plan_entitlements JOIN actually ran rather than deny_all()"
+        );
+    }
+
+    /// ADR-073 deny-overrides-grant: Team's plan default for `f_sso` is
+    /// `true`; an explicit `workspace_entitlements.f_sso = false` override
+    /// must beat it. Same real-Postgres gate as the test above.
+    #[tokio::test]
+    #[ignore = "needs a real Postgres with the BILL-01 (0040) migration applied; set POSTGRES_URL"]
+    async fn deny_overrides_grant_on_f_sso() {
+        let pool = crate::db::build_pool().await.expect("build_pool");
+        let client = pool.get().await.expect("client");
+        let tenant_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO tenants (id, workos_org_id, plan) VALUES ($1, $2, 'team'::text::plan)",
+                &[&tenant_id, &format!("org_deny_sso_{tenant_id}")],
+            )
+            .await
+            .expect("insert team tenant");
+        client
+            .execute(
+                "INSERT INTO workspace_entitlements (tenant_id, plan_lookup_key, f_sso) \
+                 VALUES ($1, 'team_v1', false)",
+                &[&tenant_id],
+            )
+            .await
+            .expect("insert workspace override denying SSO");
+
+        let resolved = pg_resolver(pool)(tenant_id).await.expect("resolve");
+        assert_eq!(resolved.plan_lookup_key, "team_v1");
+        assert!(
+            !resolved.f_sso,
+            "an explicit workspace_entitlements FALSE must beat the Team plan default TRUE"
+        );
     }
 
     /// PL-20 #1 — the falsification proof for the entitlements resolver.
@@ -1236,7 +1563,6 @@ mod tests {
             src[from..to].to_string()
         };
         let primary = cut("const SQL: &str");
-        let fallback = cut("const FALLBACK: &str");
 
         // What NAME would Postgres give each selected column? That is the only
         // thing `row.get(name)` can address, and it is NOT "the name appears
@@ -1297,34 +1623,20 @@ mod tests {
         }
 
         let primary_names = output_names(&primary);
-        let fallback_names = output_names(&fallback);
 
         for name in &wanted {
             assert!(
                 primary_names.iter().any(|c| c == name),
-                "`{name}` is not an addressable OUTPUT COLUMN of the PRIMARY query \
+                "`{name}` is not an addressable OUTPUT COLUMN of the query \
                  (it needs `AS {name}`, or to be a bare column reference) — \
                  `row.get(\"{name}\")` will PANIC on a cache miss in production. \
                  Addressable columns are: {primary_names:?}"
             );
         }
 
-        // The fallback deliberately lacks the workspace budget: it has no
-        // `tenants` join, and an unseeded tenant has no workspace budget. That is
-        // the ONE permitted absence, and `try_get` is what makes it safe — so
-        // this asserts the exception is exactly one column wide rather than
-        // letting a second silently join it.
-        let missing: Vec<&&str> = wanted
-            .iter()
-            .filter(|n| !fallback_names.iter().any(|c| c == **n))
-            .collect();
-        assert_eq!(
-            missing,
-            vec![&"workspace_budget_usd_text"],
-            "the FALLBACK query may omit exactly ONE column (the workspace \
-             budget, read with try_get). Anything else listed here is a field \
-             that will panic for every unseeded tenant. Fallback columns: \
-             {fallback_names:?}"
-        );
+        // ADR-073: there is now exactly ONE query (the hardcoded `free_v1`
+        // FALLBACK was the B-241 mechanism this ADR removes). The loop above
+        // — every wanted column addressable in the one remaining query — is
+        // the whole test.
     }
 }

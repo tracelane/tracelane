@@ -20,7 +20,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::post,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
@@ -247,7 +247,8 @@ async fn authenticate_with(
         }
         Err(err) => {
             tracing::warn!(error = %err, "byok auth failed");
-            Err(error(StatusCode::UNAUTHORIZED, "invalid credentials"))
+            let (status, msg) = crate::auth::failure(&err);
+            Err(error(status, msg))
         }
     }
 }

@@ -19,7 +19,13 @@ vi.mock("@/db", () => ({
 		return h.db.db;
 	},
 }));
-vi.mock("@/lib/auth", () => ({ requireSession: vi.fn(async () => h.session) }));
+vi.mock("@/lib/auth", () => ({
+	requireSession: vi.fn(async () => h.session),
+	// B-361: the route calls this after archiving; a mock without it throws
+	// "not a function" and the route's own catch silently swallows that,
+	// which masqueraded as a dropped db call (h.db?.cursor() off by one).
+	invalidateOrgArchivedCache: vi.fn(),
+}));
 
 import { DELETE } from "./route";
 

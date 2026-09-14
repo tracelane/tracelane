@@ -126,23 +126,6 @@ SELECT
 FROM tracelane.spans
 GROUP BY tenant_id, trace_id;
 
--- ── Per-tenant usage counters ────────────────────────────────────────────────
--- Used for billing and rate-limit reporting. SummingMergeTree accumulates deltas.
-CREATE TABLE IF NOT EXISTS tracelane.usage_counters
-(
-    tenant_id     String,
-    bucket_hour   DateTime,              -- truncated to hour
-    provider      String,
-    model         String,
-    input_tokens  Int64,
-    output_tokens Int64,
-    request_count Int64
-)
-ENGINE = SummingMergeTree((input_tokens, output_tokens, request_count))
-PARTITION BY toYYYYMM(bucket_hour)
-ORDER BY (tenant_id, bucket_hour, provider, model)
-TTL toDate(bucket_hour) + INTERVAL 365 DAY
-SETTINGS index_granularity = 8192;
 
 -- ── Audit log (tamper-evident) ───────────────────────────────────────────────
 -- Append-only; hash_chain forms a Merkle chain per tenant.

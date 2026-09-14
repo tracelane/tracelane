@@ -24,6 +24,15 @@ use uuid::Uuid;
 #[path = "../src/db/mod.rs"]
 #[allow(dead_code)]
 mod db;
+// B-383 (a): the KEK ring and the rotate command, for the real-Postgres re-wrap
+// proof below. `byok_rotate` reaches `crate::byok` and `crate::db`, which is why
+// both are mounted here under those exact names.
+#[path = "../src/byok.rs"]
+#[allow(dead_code)]
+mod byok;
+#[path = "../src/byok_rotate.rs"]
+#[allow(dead_code)]
+mod byok_rotate;
 
 fn url() -> Option<String> {
     std::env::var("POSTGRES_TEST_URL").ok()
@@ -395,5 +404,389 @@ async fn evl29_jsonb_columns_reject_a_str_and_accept_a_value() -> Result<()> {
         "annotation_queues_expected_field_chk must refuse an empty reference field"
     );
 
+    Ok(())
+}
+
+// ── B-378: the batched head-advance against a REAL Postgres ────────────────
+//
+// `append_atomic_batch` is the transaction the audit head-writer runs. Three
+// properties, each of which a mock could fake: K events advance the head by
+// exactly K with the chain intact; a redelivered batch of the SAME event ids
+// consumes ZERO seqs; a batch that is half redelivery, half new appends only
+// the new half and chains it from the real head.
+
+fn tenant() -> tracelane_shared::TenantId {
+    tracelane_shared::TenantId::from_jwt_claim(Uuid::new_v4())
+}
+
+fn fake_hash(seq: u64, prev: &[u8; 32]) -> [u8; 32] {
+    // A stand-in for `row_hash_v2` — the test asserts the CHAINING, not the
+    // digest; `write_ch` is the caller's, and this one records what it was
+    // handed.
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&seq.to_be_bytes());
+    h[8..16].copy_from_slice(&prev[..8]);
+    h
+}
+
+#[tokio::test]
+#[ignore]
+async fn b378_batch_advances_the_head_by_k_and_chains() -> Result<()> {
+    let pool = test_pool().await?;
+    let t = tenant();
+    let genesis = [7u8; 32];
+    let ids: Vec<String> = (0..5)
+        .map(|i| format!("evt-{i}-{}", Uuid::new_v4()))
+        .collect();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = std::sync::Arc::clone(&seen);
+    let out = db::audit_chain_state::append_atomic_batch(
+        &pool,
+        &t,
+        genesis,
+        Some(&ids),
+        5,
+        move |first_seq, prev, kept| async move {
+            let mut p = prev;
+            let mut hs = Vec::new();
+            for i in 0..kept.len() {
+                let h = fake_hash(first_seq + i as u64, &p);
+                hs.push(h);
+                p = h;
+            }
+            seen2.lock().unwrap().push((first_seq, prev, kept));
+            Ok(hs)
+        },
+    )
+    .await?
+    .expect("five new events must append");
+    assert_eq!(out.first_seq, 0, "genesis batch starts at seq 0");
+    assert_eq!(out.prev_hash, genesis);
+    assert_eq!(out.kept, vec![0, 1, 2, 3, 4]);
+    assert_eq!(out.row_hashes.len(), 5);
+    // Chained: hash i embeds hash i-1's prefix.
+    for i in 1..5 {
+        assert_eq!(&out.row_hashes[i][8..16], &out.row_hashes[i - 1][..8]);
+    }
+    let rows = db::audit_chain_state::load_all(&pool).await?;
+    let head = rows
+        .iter()
+        .find(|r| r.tenant_id == t)
+        .expect("head row persisted");
+    assert_eq!(head.last_seq, 4, "head advanced to the END of the batch");
+    assert_eq!(head.last_row_hash, out.row_hashes[4]);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "ONE write_ch call for the batch"
+    );
+
+    // Redelivery of the SAME five ids: no seq consumed, write_ch never called.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let calls2 = std::sync::Arc::clone(&calls);
+    let again = db::audit_chain_state::append_atomic_batch(
+        &pool,
+        &t,
+        genesis,
+        Some(&ids),
+        5,
+        move |_, _, kept| async move {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![[0u8; 32]; kept.len()])
+        },
+    )
+    .await?;
+    assert!(again.is_none(), "an all-redelivered batch is a no-op");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let rows = db::audit_chain_state::load_all(&pool).await?;
+    let head = rows.iter().find(|r| r.tenant_id == t).unwrap();
+    assert_eq!(head.last_seq, 4, "redelivery must not move the head");
+
+    // Half redelivered, half new: only the new two append, chained from seq 4.
+    let mixed: Vec<String> = vec![
+        ids[1].clone(),
+        format!("evt-new-a-{}", Uuid::new_v4()),
+        ids[3].clone(),
+        format!("evt-new-b-{}", Uuid::new_v4()),
+    ];
+    let out2 = db::audit_chain_state::append_atomic_batch(
+        &pool,
+        &t,
+        genesis,
+        Some(&mixed),
+        4,
+        |first_seq, prev, kept| async move {
+            let mut p = prev;
+            let mut hs = Vec::new();
+            for i in 0..kept.len() {
+                let h = fake_hash(first_seq + i as u64, &p);
+                hs.push(h);
+                p = h;
+            }
+            Ok(hs)
+        },
+    )
+    .await?
+    .expect("two new events must append");
+    assert_eq!(out2.first_seq, 5);
+    assert_eq!(out2.kept, vec![1, 3], "only the NEW ids, in arrival order");
+    assert_eq!(
+        out2.prev_hash, out.row_hashes[4],
+        "chains from the real head"
+    );
+    let rows = db::audit_chain_state::load_all(&pool).await?;
+    let head = rows.iter().find(|r| r.tenant_id == t).unwrap();
+    assert_eq!(head.last_seq, 6);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn b378_a_short_hash_vector_refuses_to_advance_the_head() -> Result<()> {
+    // write_ch returning fewer hashes than events would advance the head past
+    // rows that were never written. Fail closed: error, no head movement.
+    let pool = test_pool().await?;
+    let t = tenant();
+    let ids: Vec<String> = (0..3)
+        .map(|i| format!("evt-{i}-{}", Uuid::new_v4()))
+        .collect();
+    let err = db::audit_chain_state::append_atomic_batch(
+        &pool,
+        &t,
+        [1u8; 32],
+        Some(&ids),
+        3,
+        |_, _, _| async move { Ok(vec![[9u8; 32]; 2]) },
+    )
+    .await
+    .expect_err("2 hashes for 3 events must be refused");
+    assert!(
+        format!("{err:#}").contains("refusing to advance the head"),
+        "{err:#}"
+    );
+    let rows = db::audit_chain_state::load_all(&pool).await?;
+    assert!(
+        rows.iter().all(|r| r.tenant_id != t),
+        "the rolled-back genesis row must not persist"
+    );
+    Ok(())
+}
+
+// ── B-383 (f): the negative auth cache ────────────────────────────────────
+//
+// An unknown `tlane_` key used to cost one Neon round trip PER ATTEMPT; a scan of
+// random keys was a scan of Postgres. Now a miss is remembered for 30 s: the second
+// probe of the same unknown key answers from the negative cache (the counter moves,
+// the pool is not asked), and a key MINTED after a probe authenticates at once
+// because `create` forgets the negative entry.
+
+#[tokio::test]
+#[ignore]
+async fn b383_negative_cache_absorbs_repeat_misses_and_a_mint_clears_it() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let pool = test_pool().await?;
+    let _ = db::api_keys::init_pepper(&"11".repeat(32));
+    let key_body = format!("probe_before_mint_{}", Uuid::new_v4().simple());
+
+    let first = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    assert!(first.is_none(), "unknown key is unknown");
+    let neg_before = db::api_keys::AUTH_NEGATIVE_HIT_TOTAL.load(Ordering::Relaxed);
+    let second = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    assert!(second.is_none());
+    assert_eq!(
+        db::api_keys::AUTH_NEGATIVE_HIT_TOTAL.load(Ordering::Relaxed),
+        neg_before + 1,
+        "the second probe of an unknown key must be answered by the negative cache"
+    );
+
+    // Mint that exact key now: it must authenticate immediately, not in 30 s.
+    let tenant_id = Uuid::new_v4();
+    db::tenants::create(&pool, tenant_id, "neg-cache-tenant", "free").await?;
+    let material = db::api_keys::KeyMaterial::from_body(&key_body)?;
+    db::api_keys::create(
+        &pool,
+        &tracelane_shared::TenantId::from_jwt_claim(tenant_id),
+        &material,
+        "ci-neg-cache",
+        &key_body[..6],
+        None,
+        &db::api_keys::MintOptions::default(),
+    )
+    .await?;
+    let after_mint = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    assert!(
+        after_mint.is_some(),
+        "a key minted after being probed must authenticate at once (the mint forgets the negative entry)"
+    );
+    Ok(())
+}
+
+/// B-383 (a): a row sealed under KEK 0 is re-wrapped under KEK 1 by
+/// `byok-rotate`, reads back under a ring holding KEK 1, and FAILS under a ring
+/// holding only KEK 0 — the property that makes dropping the old key safe. Also:
+/// dry-run moves nothing; a second execute run finds nothing to do; the audit
+/// key columns move too; a row whose blob changed underneath is left alone.
+#[tokio::test]
+#[ignore]
+async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()> {
+    use base64::Engine as _;
+    use secrecy::{ExposeSecret as _, SecretString};
+    let pool = test_pool().await?;
+    let tenant_id = Uuid::new_v4();
+    let _tenant = db::tenants::create(&pool, tenant_id, "b383-rotate", "free").await?;
+    let tenant = tracelane_shared::TenantId::from_jwt_claim(tenant_id);
+    let k0 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+    let k1 = base64::engine::general_purpose::STANDARD.encode([0x22u8; 32]);
+
+    // Today's process: one legacy key, writing v2.
+    let legacy = byok::ByokMasterKey::from_values(Some(&k0), None, None)?.expect("ring");
+    let secret = SecretString::from("sk-live-provider-key-do-not-use".to_string());
+    let v2 = legacy.encrypt_with_context(&secret, &byok::provider_key_aad(&tenant, "openai"))?;
+    db::provider_keys::upsert(&pool, &tenant, "openai", &v2, "tuse").await?;
+    let audit_secret = SecretString::from("pkcs8-der-b64-do-not-use".to_string());
+    let audit_v2 = legacy.encrypt_with_context(&audit_secret, &byok::audit_key_aad(&tenant))?;
+    let anchor_v2 = legacy.encrypt_with_context(&audit_secret, &byok::anchor_key_aad(&tenant))?;
+    {
+        let c = pool.get().await?;
+        c.execute(
+            "INSERT INTO tenant_audit_keys (tenant_id, encrypted_private_key, public_key_b64, encrypted_anchor_key) \
+             VALUES ($1, $2, '', $3)",
+            &[&tenant_id, &audit_v2, &anchor_v2],
+        )
+        .await?;
+    }
+
+    // The rotated process: both keys, KEK 1 active.
+    let ring = byok::ByokMasterKey::from_values(Some(&k0), Some(&format!("1:{k1}")), Some(1))?
+        .expect("ring");
+    assert_eq!(ring.active_kek(), 1);
+
+    // Dry run: reports, writes nothing.
+    let dry = byok_rotate::rotate(&pool, &ring, true).await?;
+    assert_eq!(
+        dry.tables.iter().map(|t| t.rewrapped).sum::<u64>(),
+        3,
+        "{}",
+        dry.render()
+    );
+    assert_eq!(dry.remaining(), 3);
+    let still_v2 = db::provider_keys::get(&pool, &tenant, "openai")
+        .await?
+        .expect("row");
+    assert_eq!(still_v2.ciphertext_b64, v2, "dry-run must not write");
+
+    // Execute.
+    let run = byok_rotate::rotate(&pool, &ring, false).await?;
+    assert_eq!(run.failed(), 0, "{}", run.render());
+    assert_eq!(run.remaining(), 0, "{}", run.render());
+    assert_eq!(
+        run.tables.iter().map(|t| t.rewrapped).sum::<u64>(),
+        3,
+        "{}",
+        run.render()
+    );
+
+    // The row is now v3 under KEK 1, decrypts under the ring, and NOT under KEK 0 alone.
+    let moved = db::provider_keys::get(&pool, &tenant, "openai")
+        .await?
+        .expect("row");
+    assert_ne!(moved.ciphertext_b64, v2);
+    assert_eq!(
+        byok::ByokMasterKey::kek_id_of(&moved.ciphertext_b64),
+        Some(1)
+    );
+    let aad = byok::provider_key_aad(&tenant, "openai");
+    assert_eq!(
+        ring.decrypt_with_context(&moved.ciphertext_b64, &aad)?
+            .expose_secret(),
+        secret.expose_secret()
+    );
+    let err = legacy
+        .decrypt_with_context(&moved.ciphertext_b64, &aad)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("sealed under KEK 1"), "{err}");
+    // The audit columns moved too, and still open under their own AADs.
+    {
+        let c = pool.get().await?;
+        let row = c
+            .query_one(
+                "SELECT encrypted_private_key, encrypted_anchor_key FROM tenant_audit_keys WHERE tenant_id = $1",
+                &[&tenant_id],
+            )
+            .await?;
+        let pk: String = row.get(0);
+        let ak: String = row.get(1);
+        assert_eq!(byok::ByokMasterKey::kek_id_of(&pk), Some(1));
+        assert_eq!(byok::ByokMasterKey::kek_id_of(&ak), Some(1));
+        assert_eq!(
+            ring.decrypt_with_context(&pk, &byok::audit_key_aad(&tenant))?
+                .expose_secret(),
+            audit_secret.expose_secret()
+        );
+        assert_eq!(
+            ring.decrypt_with_context(&ak, &byok::anchor_key_aad(&tenant))?
+                .expose_secret(),
+            audit_secret.expose_secret()
+        );
+    }
+    // Idempotent: a second run has nothing to do.
+    let again = byok_rotate::rotate(&pool, &ring, false).await?;
+    assert_eq!(
+        again.tables.iter().map(|t| t.rewrapped).sum::<u64>(),
+        0,
+        "{}",
+        again.render()
+    );
+    assert_eq!(again.tables.iter().map(|t| t.current).sum::<u64>(), 3);
+
+    // A blob the ring cannot open is reported, not skipped silently, and does
+    // not stop the other rows.
+    let stranger = byok::ByokMasterKey::from_values(
+        Some(&base64::engine::general_purpose::STANDARD.encode([0x33u8; 32])),
+        None,
+        None,
+    )?
+    .expect("ring");
+    let foreign =
+        stranger.encrypt_with_context(&secret, &byok::provider_key_aad(&tenant, "cohere"))?;
+    db::provider_keys::upsert(&pool, &tenant, "cohere", &foreign, "tuse").await?;
+    let with_foreign = byok_rotate::rotate(&pool, &ring, false).await?;
+    assert_eq!(with_foreign.failed(), 1, "{}", with_foreign.render());
+    assert_eq!(with_foreign.tables[0].unreadable, 1);
+    Ok(())
+}
+
+/// B-386 (a): the single-instance lock. A second session cannot take it while
+/// the first holds it; dropping the holder releases it (session-scoped, so a
+/// crash releases it too — no lease, no stale file).
+#[tokio::test]
+#[ignore]
+async fn b386_singleton_lock_admits_one_holder_and_releases_on_drop() -> Result<()> {
+    let _pool = test_pool().await?;
+    // The lock is per Postgres *server* (hashtext of a constant), so the test
+    // database created by `test_pool` is irrelevant — point at the admin URL.
+    let cfg: tokio_postgres::Config = require_url().parse()?;
+    let first = db::singleton::try_acquire(&cfg).await?;
+    assert!(first.is_some(), "first holder takes the lock");
+    let second = db::singleton::try_acquire(&cfg).await?;
+    assert!(
+        second.is_none(),
+        "a second gateway must be refused while the first holds it"
+    );
+    drop(first);
+    // Release is asynchronous (the session has to close); poll rather than sleep-and-hope.
+    let mut reacquired = None;
+    for _ in 0..50 {
+        if let Some(l) = db::singleton::try_acquire(&cfg).await? {
+            reacquired = Some(l);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        reacquired.is_some(),
+        "dropping the holder must release the lock"
+    );
     Ok(())
 }

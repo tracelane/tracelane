@@ -91,47 +91,20 @@ reason = "dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migrat
 id = "GHSA-5xrq-8626-4rwp"
 reason = "vitest UI server arbitrary file read/exec. REASON CORRECTED 2026-08-24: the previous text said 'patch is vitest 4.1.0 (major)'. OSV's real ranges are [0, 3.2.6) and [4.0.0, 4.1.0); we resolve vitest 2.1.9 (declared ^2.0.0 in 6 packages), so we sit in the FIRST range and the first fixed version on our line is 3.2.6 - still a MAJOR bump (2.x -> 3.x), not the 4.x one claimed. Conclusion unchanged, arithmetic was wrong. Precondition not met either: the advisory requires the vitest UI server to be LISTENING; every invocation here is `vitest run` (no --ui), and it is dev/test tooling never shipped in a product artifact. FOUNDER RULING R126 (2026-08-24): NO BUMP — a 2->3 major across six packages for a dev-only test runner whose exploit precondition we never meet. This ignore is DELIBERATE and its reason is now the true one; if it goes false again, delete or correct it rather than leaving it, because an ignore whose stated reason is false is worse than an unused one."
 
-# ── astro 6.4.8, surfaced by the weekly on-node scan (R118 alert, 2026-08-24) ──
+# ── astro: THREE IGNORES DELETED 2026-09-10, FIXED RATHER THAN SUPPRESSED ─────
 #
-# THREE ADVISORIES, ALL SSR-ONLY, AND WE SHIP A PURELY STATIC SITE. Each one was
-# READ at osv.dev rather than taken from a note, and each says in its own text
-# that a static build is unaffected:
+# `GHSA-4g3v-8h47-v7g6`, `GHSA-f48w-9m4c-m7f5` and `GHSA-7pw4-f3q4-r2p2` were
+# ignored here from 2026-08-24 on an SSR-only-unreachability argument, with
+# "the real fix is astro 6 -> 7 (a major)" written as the thing not taken.
 #
-#   GHSA-4g3v-8h47-v7g6 (5.3) — reflected XSS via unescaped View Transition
-#     animation properties in server-generated CSS
-#     (`runtime/server/transition.ts`). Advisory scopes it to `output: "server"`
-#     and `prerender = false` routes.
-#   GHSA-f48w-9m4c-m7f5 (5.1) — unescaped attribute NAMES in `renderHTMLElement()`
-#     (`runtime/server/render/dom.ts`). Needs an SSR runtime that exposes a global
-#     `HTMLElement` (Deno/Bun/jsdom); in default Node SSR the branch is dead.
-#   GHSA-7pw4-f3q4-r2p2 (2.1) — reflected XSS through `transition:persist` /
-#     `transition:scope` values copied unescaped into server-rendered output by
-#     `generateHydrateScript()`.
+# It was taken. B-373: `apps/site` moved astro 6.4.8 -> 7.3.2, which is past all
+# three fixes (7.1.0 / 7.0.6 / 7.0.4) and past the CRITICAL that forced the
+# issue — `GHSA-26w7-cxv4-gfx2`, RCE through AVIF image optimization, patched in
+# 7.2.8 and never ignorable on the unreachability argument the other three used.
+# The entries are DELETED rather than left: this file's own header calls a dead
+# ignore worse than an unused one, and osv-scanner 2.4.0 reports unused ignores.
 #
-# THE CONDITION THAT MAKES THESE UNREACHABLE, stated so it can be RE-CHECKED
-# rather than believed: `apps/site/astro.config.mjs` declares NO adapter and no
-# `output: "server"`, so Astro defaults to `output: "static"`; `apps/site/dist/`
-# contains no server entry. There is no SSR runtime to reach any of the three
-# code paths.
-#
-# ⚠️  DELETE THESE THREE THE DAY `apps/site` GAINS AN ADAPTER OR `output:
-# "server"`. That single change makes all three live, and this ignore would then
-# be an ignore whose reason has gone false — which this file's own header calls
-# worse than an unused one.
-#
-# The real fix is astro 6 -> 7 (a major). Not taken for a static marketing site
-# against three Medium/Low advisories that cannot execute.
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-4g3v-8h47-v7g6"
-reason = "astro View-Transition CSS XSS. SSR-ONLY: the advisory scopes it to `output: \"server\"` / `prerender = false`. `apps/site` has NO adapter and no `output: \"server\"` (astro.config.mjs), so it builds static and `dist/` has no server entry — the code path cannot run. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.1.0 (major)."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-f48w-9m4c-m7f5"
-reason = "astro `renderHTMLElement()` unescaped attribute names. SSR-ONLY, and doubly unreachable: it needs an SSR runtime exposing a global `HTMLElement` (Deno/Bun/jsdom) — in default Node SSR the branch is dead — plus a component extending native HTMLElement with attacker-controlled spread keys. `apps/site` is a static build with no adapter, so there is no SSR runtime at all. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.0.6 (major)."
-
-# REVIEW: 2026-11-07
-[[IgnoredVulns]]
-id = "GHSA-7pw4-f3q4-r2p2"
-reason = "astro transition-directive reflected XSS via `generateHydrateScript()`. SSR-ONLY — the advisory states static sites do not execute the vulnerable function — and it additionally requires the developer to pass request-derived input straight into a transition directive, which apps/site does not do. `apps/site` is a static build with no adapter. DELETE THIS IGNORE if apps/site ever gains an adapter. Fix is astro 7.0.4 (major)."
+# The unreachability argument itself is still true and still worth having if a
+# future astro advisory needs it: `apps/site/astro.config.ts` declares NO adapter
+# and no `output: "server"`, so it builds static and `dist/` carries no server
+# entry. That fact is now recorded here instead of inside three ignores.

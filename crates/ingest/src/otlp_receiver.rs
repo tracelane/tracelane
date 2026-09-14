@@ -50,8 +50,6 @@ use tower::Service as _;
 use tower_http::trace::TraceLayer;
 use tracing::instrument;
 
-use tracelane_shared::TracelaneSpan;
-
 use crate::auth::{AuthResult, PeerCertDer, record_auth_result, require_spiffe_auth};
 use crate::cardinality::{CardinalityTracker, Classification, record_overflow};
 use crate::disk_guard::{DiskGuard, record_disk_shed};
@@ -59,8 +57,6 @@ use crate::limits::{
     self, IngestLimits, RejectReason, WARNING_ENFORCEMENT_DATE, check_payload_pre_decode,
     check_span_post_decode, record_reject,
 };
-use crate::quota::{QuotaDecision, QuotaNotifier, QuotaTracker, current_period, reset_at_rfc3339};
-use crate::tenant_config::TenantConfigCache;
 use crate::tls::HANDSHAKE_TIMEOUT;
 
 /// ADR-029 reject reason header. Carries a stable enum string the SDK
@@ -87,15 +83,12 @@ struct ReceiverState {
     /// FT-08: disk-pressure flag. `is_shedding()` is a single atomic load on
     /// the hot path; a background task refreshes it.
     disk: DiskGuard,
-    /// ADR-048 D4.1: per-tenant config cache — supplies the ingest quota cap +
-    /// billing contact (shared with the ClickHouse writer, which reads the
-    /// sampling policy from the same cache).
-    tenant_cfg: Arc<TenantConfigCache>,
-    /// ADR-048 D4.2: per-tenant monthly span quota (the SDK/OTLP-direct cost
-    /// backstop).
-    quota: Arc<QuotaTracker>,
-    /// ADR-048 D5: dedup'd quota-breach notifier.
-    notifier: Arc<QuotaNotifier>,
+    // `tenant_cfg` (ADR-048 D4.1) was REMOVED from this struct (BILL-01 /
+    // ADR-076, 2026-09-13) — its one consumer here was the per-tenant span
+    // quota check + 429, both retired outright: "ingest is NEVER blocked by
+    // billing state, on any tier". The ClickHouse writer still holds its own
+    // clone of the SAME cache for the sampling policy; nothing on this
+    // receiver's request path reads it any more.
     /// ADR-067 single-tenant self-host: when `Some`, EVERY decoded span is
     /// attributed to this one operator-configured tenant, overriding both the
     /// SPIFFE peer extension AND the resource-attribute fallback. This is what
@@ -120,18 +113,13 @@ pub async fn run(
     port: u16,
     span_tx: mpsc::Sender<crate::span_envelope::SpanEnvelope>,
     disk: DiskGuard,
-    tenant_cfg: Arc<TenantConfigCache>,
-    quota: Arc<QuotaTracker>,
-    notifier: Arc<QuotaNotifier>,
     single_tenant: Option<tracelane_shared::TenantId>,
+    shutdown: crate::shutdown::Signal,
 ) -> Result<()> {
     let state = ReceiverState {
         span_tx: Arc::new(span_tx),
         cardinality: CardinalityTracker::new(),
         disk,
-        tenant_cfg,
-        quota,
-        notifier,
         single_tenant: single_tenant.clone(),
     };
     let app = build_router(state);
@@ -151,9 +139,14 @@ pub async fn run(
         .await
         .context("failed to bind OTLP receiver port")?;
 
+    // B-377: stop accepting on SIGTERM, finish in-flight requests, then return —
+    // which drops this receiver's `span_tx` and lets the writer drain (main.rs).
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.into_wait())
         .await
-        .context("OTLP receiver error")
+        .context("OTLP receiver error")?;
+    tracing::info!("OTLP HTTP receiver stopped; in-flight requests finished");
+    Ok(())
 }
 
 /// Start the OTLP HTTP receiver in **mTLS** mode.
@@ -167,26 +160,18 @@ pub async fn run(
 /// # Errors
 /// Returns `Err` only on bind failure. Per-connection TLS / handshake
 /// failures are logged and dropped without affecting the loop.
-#[instrument(
-    skip(span_tx, server_config, disk, tenant_cfg, quota, notifier),
-    fields(port)
-)]
+#[instrument(skip(span_tx, server_config, disk, shutdown), fields(port))]
 pub async fn run_mtls(
     port: u16,
     span_tx: mpsc::Sender<crate::span_envelope::SpanEnvelope>,
     server_config: Arc<rustls::ServerConfig>,
     disk: DiskGuard,
-    tenant_cfg: Arc<TenantConfigCache>,
-    quota: Arc<QuotaTracker>,
-    notifier: Arc<QuotaNotifier>,
+    shutdown: crate::shutdown::Signal,
 ) -> Result<()> {
     let state = ReceiverState {
         span_tx: Arc::new(span_tx),
         cardinality: CardinalityTracker::new(),
         disk,
-        tenant_cfg,
-        quota,
-        notifier,
         // mTLS is the hosted, multi-tenant ingest path — tenant comes from the
         // verified SPIFFE peer, never a fixed single tenant (ADR-067's guard
         // refuses to co-enable SPIRE + single-tenant self-host).
@@ -204,6 +189,7 @@ pub async fn run_mtls(
     let http = HttpBuilder::new(TokioExecutor::new());
     let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
+    let mut shutdown = shutdown;
     loop {
         // Acquire BEFORE accept so we apply backpressure at the TCP
         // listener level when at capacity, rather than spawning a task
@@ -216,12 +202,38 @@ pub async fn run_mtls(
             }
         };
 
-        let (tcp, peer_addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
+        // B-377: a hand-rolled accept loop gets no axum graceful shutdown, so the
+        // signal is raced against `accept` here. On shutdown: stop accepting, then
+        // wait — bounded — for every in-flight connection to hand its permit back.
+        let (tcp, peer_addr) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(permit);
+                    tracing::warn!(error = %e, "accept failed; continuing");
+                    continue;
+                }
+            },
+            () = shutdown.wait() => {
                 drop(permit);
-                tracing::warn!(error = %e, "accept failed; continuing");
-                continue;
+                drop(listener);
+                let in_flight = MAX_CONCURRENT_CONNECTIONS - conn_limit.available_permits();
+                tracing::info!(in_flight, "OTLP mTLS receiver stopped accepting; draining");
+                // Every permit back == every connection finished.
+                let drained = tokio::time::timeout(
+                    crate::shutdown::DRAIN_TIMEOUT,
+                    conn_limit.acquire_many(MAX_CONCURRENT_CONNECTIONS as u32),
+                )
+                .await;
+                match drained {
+                    Ok(Ok(_)) => tracing::info!("OTLP mTLS receiver drained"),
+                    Ok(Err(_)) => tracing::warn!("connection semaphore closed during drain"),
+                    Err(_) => tracing::error!(
+                        still_open = MAX_CONCURRENT_CONNECTIONS - conn_limit.available_permits(),
+                        "OTLP mTLS receiver drain timed out — those connections are cut"
+                    ),
+                }
+                return Ok(());
             }
         };
         let acceptor = acceptor.clone();
@@ -565,28 +577,16 @@ async fn traces_handler(
         tracing::Span::current().record("tenant_id", tracing::field::display(t));
     }
 
-    // ADR-048 D4.2/D5: per-tenant ingest quota — the cost backstop for the
-    // SDK/OTLP-direct path (which bypasses the gateway request quota). Resolve
-    // the tenant's monthly span cap from the config cache and HARD-REJECT the
-    // whole batch with a typed 429 once the cap is reached (never a silent drop —
-    // the #81 class). Fire one dedup'd billing-contact email (fire-and-forget;
-    // must not block the 429). `cap == 0` ⇒ unlimited (default until the Postgres
-    // resolver supplies a real per-tenant cap).
-    if let Some(tenant_uuid) = spans.first().map(|s| *s.tenant_id.as_uuid()) {
-        let period = current_period();
-        let cfg = state.tenant_cfg.config_for(tenant_uuid).await;
-        if let QuotaDecision::Exceeded { used, limit } = state.quota.check_and_add(
-            tenant_uuid,
-            spans.len() as u64,
-            cfg.monthly_span_quota,
-            period,
-        ) {
-            state
-                .notifier
-                .notify(tenant_uuid, cfg.billing_email.clone(), used, limit);
-            return quota_exceeded_response(used, limit, period);
-        }
-    }
+    // BILL-01 / ADR-076 §0.4 (2026-09-13): there was a per-tenant monthly span
+    // quota + typed 429 here (ADR-048 D4.2/D5). It is GONE, not merely
+    // relaxed — "ingest is NEVER blocked by billing state, on any tier". A
+    // batch that decodes and passes every ADR-029/030 cap is admitted
+    // unconditionally; overage bills continuously per unit (spec §0.4), it
+    // never rejects a request. `quota_exceeded_hard_rejects_with_429_and_
+    // does_not_dispatch` below is replaced by
+    // `every_batch_is_admitted_regardless_of_prior_volume`, which proves the
+    // POSITIVE: repeated batches for the same tenant keep landing on the
+    // writer channel with no 429 at any volume.
 
     let n_total = spans.len();
     let mut n_dropped = 0usize;
@@ -670,21 +670,10 @@ fn reject_response(
     resp
 }
 
-/// ADR-048 D5 quota-exceeded response: typed `429 Too Many Requests` with the
-/// `{error, limit, used, reset_at, upgrade_url}` body the SDK reacts to. The
-/// `reset_at` is the start of next month; `upgrade_url` is env-overridable.
-fn quota_exceeded_response(used: u64, limit: u64, period: u32) -> Response {
-    let upgrade_url = std::env::var("TRACELANE_UPGRADE_URL")
-        .unwrap_or_else(|_| "https://app.tracelane.dev/settings/billing".into());
-    let body = serde_json::json!({
-        "error": "quota_exceeded",
-        "limit": limit,
-        "used": used,
-        "reset_at": reset_at_rfc3339(period),
-        "upgrade_url": upgrade_url,
-    });
-    (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
-}
+// `quota_exceeded_response` (ADR-048 D5's typed 429) was DELETED outright
+// with the quota it served (BILL-01 / ADR-076 §0.4, 2026-09-13) — "ingest is
+// NEVER blocked by billing state, on any tier". Restorable from git history
+// if a per-tenant ingest cap is ever reintroduced by a founder ruling.
 
 /// FT-08 shed response: `507 Insufficient Storage` with
 /// `Tracelane-Reject-Reason: disk_full` and a structured body. Records the
@@ -805,27 +794,16 @@ mod tests {
         axum::Router,
         tokio::sync::mpsc::Receiver<crate::span_envelope::SpanEnvelope>,
     ) {
-        router_with_disk_and_quota(disk, 0)
+        router_with_disk_single_tenant(disk, None)
     }
 
-    /// Build a router with an explicit disk guard AND a uniform default span
-    /// quota (`0` = unlimited) so the quota 429 path can be driven.
-    fn router_with_disk_and_quota(
-        disk: DiskGuard,
-        default_quota: u64,
-    ) -> (
-        axum::Router,
-        tokio::sync::mpsc::Receiver<crate::span_envelope::SpanEnvelope>,
-    ) {
-        router_with_disk_quota_single_tenant(disk, default_quota, None)
-    }
-
-    /// Build a router with an explicit disk guard, default quota, AND an optional
+    /// Build a router with an explicit disk guard AND an optional
     /// single-tenant self-host override (ADR-067). `Some(t)` stamps every span
-    /// with `t` regardless of peer extension / resource attribute.
-    fn router_with_disk_quota_single_tenant(
+    /// with `t` regardless of peer extension / resource attribute. BILL-01 /
+    /// ADR-076 (2026-09-13) removed the quota/notifier fields this used to
+    /// also build — there is no per-tenant span cap on this path any more.
+    fn router_with_disk_single_tenant(
         disk: DiskGuard,
-        default_quota: u64,
         single_tenant: Option<TenantId>,
     ) -> (
         axum::Router,
@@ -836,28 +814,10 @@ mod tests {
             span_tx: Arc::new(tx),
             cardinality: crate::cardinality::CardinalityTracker::new(),
             disk,
-            tenant_cfg: Arc::new(TenantConfigCache::default_with_quota(default_quota)),
-            quota: Arc::new(QuotaTracker::new()),
-            notifier: Arc::new(QuotaNotifier::new(
-                None,
-                "alerts@tracelane.dev".into(),
-                "https://app.tracelane.dev/settings/billing".into(),
-            )),
             single_tenant,
         };
         let app = build_router(state);
         (app, rx)
-    }
-
-    /// A router with a finite default span quota for the quota tests.
-    fn router_with_quota(
-        default_quota: u64,
-    ) -> (
-        axum::Router,
-        tokio::sync::mpsc::Receiver<crate::span_envelope::SpanEnvelope>,
-    ) {
-        let disk = DiskGuard::new(std::env::temp_dir(), 0);
-        router_with_disk_and_quota(disk, default_quota)
     }
 
     /// FT-08: when the disk guard is shedding, a valid OTLP batch is rejected
@@ -965,66 +925,39 @@ mod tests {
         assert_eq!(span.tenant_id, tenant(), "peer extension must win");
     }
 
-    /// ADR-048 D4.2/D5: once a tenant reaches its monthly span cap, the receiver
-    /// HARD-REJECTS the next batch with a typed 429 `quota_exceeded` and does NOT
-    /// dispatch it — the observable end-state (a real reject AT the cap, not a
-    /// counter increment). The first under-cap batch still flows (200 + dispatch).
+    /// BILL-01 / ADR-076 §0.4 (2026-09-13): REPLACES
+    /// `quota_exceeded_hard_rejects_with_429_and_does_not_dispatch` +
+    /// `quota_cap_zero_never_rejects` — both asserted a 429 that no longer
+    /// exists. "Ingest is NEVER blocked by billing state, on any tier": a
+    /// tenant with a ZERO allowance (there is no allowance concept left on
+    /// this path at all) is still accepted, at ANY volume — a real ceiling
+    /// reached, an exhausted plan, a $0 free tier, all identical here. Fires
+    /// far more batches than any prior "cap" this class used to trip at,
+    /// for the SAME tenant, and every one lands 200 + on the writer channel.
     #[tokio::test]
-    async fn quota_exceeded_hard_rejects_with_429_and_does_not_dispatch() {
-        let (app, mut rx) = router_with_quota(1); // cap = 1 span / month
-        // Peer path (mTLS) — same tenant across both batches so the quota
-        // counter accumulates; profile-independent.
-
-        // First batch (1 span): under cap → 200, span reaches the writer channel.
-        let r1 = app
-            .clone()
-            .oneshot(req_with_peer(sample_protobuf_body(None)))
-            .await
-            .unwrap();
-        assert_eq!(r1.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_ok(), "under-cap span must be dispatched");
-
-        // Second batch: tenant is now AT the cap → 429, nothing dispatched.
-        let r2 = app
-            .oneshot(req_with_peer(sample_protobuf_body(None)))
-            .await
-            .unwrap();
-        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
-        let bytes = to_bytes(r2.into_body(), 2048).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"], "quota_exceeded");
-        assert_eq!(v["limit"], 1);
-        assert_eq!(v["used"], 1);
-        assert!(
-            v["reset_at"].as_str().is_some_and(|s| !s.is_empty()),
-            "429 body must advertise reset_at"
-        );
-        assert!(
-            v["upgrade_url"].as_str().is_some(),
-            "429 body must carry upgrade_url"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "an over-quota batch must NOT reach the writer channel"
-        );
-    }
-
-    /// Unlimited default (cap 0) never 429s — non-regressing on a fresh deploy.
-    #[tokio::test]
-    async fn quota_cap_zero_never_rejects() {
-        let (app, mut rx) = router_with_quota(0);
-        for _ in 0..5 {
-            // Peer path (mTLS) so the cap-0 quota test runs in both profiles.
+    async fn every_batch_is_admitted_regardless_of_prior_volume() {
+        let (app, mut rx) = test_router();
+        // Peer path (mTLS) — same tenant across every batch, profile-independent.
+        // Drained after each send (as the real writer continuously would) so
+        // the assertion is about the ABSENCE of a billing-driven rejection,
+        // not about the unrelated channel-capacity backpressure FT-08 already
+        // covers — 25 batches is 25 test-router() `mpsc::channel(16)` slots'
+        // worth would 503 on capacity alone if left undrained.
+        for _ in 0..25 {
             let r = app
                 .clone()
                 .oneshot(req_with_peer(sample_protobuf_body(None)))
                 .await
                 .unwrap();
-            assert_eq!(r.status(), StatusCode::OK);
-        }
-        // All five dispatched.
-        for _ in 0..5 {
-            assert!(rx.try_recv().is_ok());
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "no batch may ever be rejected for billing/volume reasons"
+            );
+            assert!(
+                rx.try_recv().is_ok(),
+                "every admitted batch's span must reach the writer channel"
+            );
         }
     }
 
@@ -1040,7 +973,7 @@ mod tests {
             Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap(),
         );
         let disk = DiskGuard::new(std::env::temp_dir(), 0);
-        let (app, mut rx) = router_with_disk_quota_single_tenant(disk, 0, Some(fixed.clone()));
+        let (app, mut rx) = router_with_disk_single_tenant(disk, Some(fixed.clone()));
 
         // Body claims a DIFFERENT tenant via the resource attribute; no peer
         // extension is attached (plaintext self-host).

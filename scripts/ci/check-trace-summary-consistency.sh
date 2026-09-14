@@ -46,7 +46,7 @@ if [ "${1:-}" = "--selftest" ]; then
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || {
     echo "CANNOT RUN: docker unavailable — this selftest is UNPROVEN here (exit 3, not a pass)."; exit 3; }
   C="tlane-tsc-selftest-$$"
-  cleanup(){ docker rm -f "$C" >/dev/null 2>&1; }
+  cleanup(){ docker rm -fv "$C" >/dev/null 2>&1; }
   trap cleanup EXIT
   docker run -d --name "$C" clickhouse/clickhouse-server:24.12-alpine >/dev/null 2>&1 || {
     echo "SKIP: could not start a throwaway ClickHouse."; exit 0; }

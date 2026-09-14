@@ -20,7 +20,7 @@ All commands respect these env vars:
 |---|---|---|
 | `TRACELANE_API_KEY` | Tenant API key (`tlane_<base62>`) | required for live commands |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL | `https://gateway.tracelane.dev` |
-| `TRACELANE_TRACE_CONTENT` | Capture full prompt/response payload in spans | `false` |
+| ~~`TRACELANE_TRACE_CONTENT`~~ | **Not implemented — reads are ignored.** No component has ever read this variable. Prompt/response text is never captured by the CLI or the SDKs; the gateway captures it only for tenants an operator allowlists in `tracelane.yaml` | — |
 
 `tlane --help` lists everything; this page is the prose tour.
 

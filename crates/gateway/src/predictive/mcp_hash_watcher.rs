@@ -150,6 +150,10 @@ impl McpHashWatcher {
     /// Retained as the coarse whole-list fingerprint (a caller that only has
     /// names). Per-tool detection does **not** use it — see the module docs for
     /// why a list hash cannot see a definition mutation.
+    ///
+    /// No production caller today — used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn hash_tools(tool_names: &[&str]) -> String {
         use std::collections::BTreeSet;
@@ -243,11 +247,10 @@ impl McpHashWatcher {
         for tool in observed {
             let key: ToolKey = (tenant.to_owned(), server.to_owned(), tool.name.clone());
             match state.tools.get(&key) {
-                Some(baseline) => {
-                    if baseline.def_hash != tool.def_hash {
-                        changes.push((tool.name.clone(), ToolChange::Drifted));
-                    }
+                Some(baseline) if baseline.def_hash != tool.def_hash => {
+                    changes.push((tool.name.clone(), ToolChange::Drifted));
                 }
+                Some(_) => {}
                 None if known_server => changes.push((tool.name.clone(), ToolChange::Added)),
                 None => {}
             }

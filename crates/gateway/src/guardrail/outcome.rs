@@ -265,6 +265,11 @@ impl RailOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum RailError {
     /// Required configuration is missing (treated per fail-mode).
+    ///
+    /// No production rail constructs this today — only dispatcher.rs's own
+    /// mock-rail tests do. Gated (B-390, 2026-09-12) rather than deleted:
+    /// this is real error taxonomy a future rail can return.
+    #[cfg(test)]
     #[error("rail configuration missing: {0}")]
     ConfigMissing(&'static str),
     /// The rail exceeded its per-rail timeout. For a deterministic rail this
@@ -275,6 +280,10 @@ pub enum RailError {
     #[error("rail detector panicked")]
     DetectorPanic,
     /// A dependency (e.g. the pinned-hash store) was unavailable.
+    ///
+    /// No production rail constructs this today — same as `ConfigMissing`
+    /// above. Gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[error("rail dependency unavailable: {0}")]
     DependencyUnavailable(&'static str),
 }
@@ -285,9 +294,11 @@ impl RailError {
     #[must_use]
     pub fn reason_code(&self) -> &'static str {
         match self {
+            #[cfg(test)]
             RailError::ConfigMissing(_) => reason_codes::CONFIG_MISSING,
             RailError::Timeout => reason_codes::RAIL_TIMEOUT,
             RailError::DetectorPanic => reason_codes::DETECTOR_ERROR,
+            #[cfg(test)]
             RailError::DependencyUnavailable(_) => reason_codes::DEPENDENCY_UNAVAILABLE,
         }
     }
@@ -299,10 +310,16 @@ impl RailError {
 /// scan can enumerate them.
 pub mod reason_codes {
     // ── Cross-cutting (dispatcher / §5 RailError) ──────────────────────────
+    // `CONFIG_MISSING`/`DEPENDENCY_UNAVAILABLE` are the reason codes for
+    // `RailError::ConfigMissing`/`::DependencyUnavailable`, both `#[cfg(test)]`
+    // (B-390, 2026-09-12) — no production rail returns those variants. Gated
+    // to match; still exercised by dispatcher.rs/metrics.rs/verdict.rs tests.
+    #[cfg(test)]
     pub const CONFIG_MISSING: &str = "CONFIG_MISSING";
     pub const RAIL_TIMEOUT: &str = "RAIL_TIMEOUT";
     /// A detector errored/panicked on a security rail → fail-closed block.
     pub const DETECTOR_ERROR: &str = "DETECTOR_ERROR";
+    #[cfg(test)]
     pub const DEPENDENCY_UNAVAILABLE: &str = "DEPENDENCY_UNAVAILABLE";
 
     // ── R1 cost / token / loop ─────────────────────────────────────────────
@@ -334,7 +351,11 @@ pub mod reason_codes {
 
     // ── R3 tool/MCP safety ─────────────────────────────────────────────────
     pub const TOOL_SCHEMA_INVALID: &str = "TOOL_SCHEMA_INVALID";
-    pub const TOOL_ARG_POLICY: &str = "TOOL_ARG_POLICY";
+    // `TOOL_ARG_POLICY` (deleted 2026-09-12, B-390) — spec'd in
+    // the original guardrails spec (internal) but no rail emits it; zero
+    // references anywhere, including tests. Restorable from git history at
+    // `607aaa205d52f2545ab6bf81a76ed524f2747f44` when tool-argument-policy
+    // checking is built.
     pub const TOOL_DEF_DRIFT: &str = "TOOL_DEF_DRIFT";
     /// A call to a tool whose definition drifted from its approved pin, under
     /// the opt-in SUSPEND posture — the tool stays suspended until the new
@@ -349,8 +370,9 @@ pub mod reason_codes {
     // ── R5 output format ───────────────────────────────────────────────────
     pub const FORMAT_INVALID_JSON: &str = "FORMAT_INVALID_JSON";
     pub const FORMAT_SCHEMA_FAIL: &str = "FORMAT_SCHEMA_FAIL";
-    pub const FORMAT_REGEX_FAIL: &str = "FORMAT_REGEX_FAIL";
-    pub const FORMAT_REASK_EXHAUSTED: &str = "FORMAT_REASK_EXHAUSTED";
+    // `FORMAT_REGEX_FAIL` and `FORMAT_REASK_EXHAUSTED` (deleted 2026-09-12,
+    // B-390) — same story as `TOOL_ARG_POLICY` above: spec'd, zero emitters,
+    // zero references anywhere. Restorable from the same git SHA.
 
     // ── R6 system-prompt leak ──────────────────────────────────────────────
     pub const SYS_PROMPT_LEAK: &str = "SYS_PROMPT_LEAK";
@@ -363,7 +385,8 @@ pub mod reason_codes {
     pub const INJECTION_DIRECT: &str = "INJECTION_DIRECT";
     pub const INJECTION_INDIRECT_RAG: &str = "INJECTION_INDIRECT_RAG";
     pub const INJECTION_INDIRECT_TOOL_RESULT: &str = "INJECTION_INDIRECT_TOOL_RESULT";
-    pub const INJECTION_PROMPT_EXTRACTION: &str = "INJECTION_PROMPT_EXTRACTION";
+    // `INJECTION_PROMPT_EXTRACTION` (deleted 2026-09-12, B-390) — same story
+    // as `TOOL_ARG_POLICY` above. Restorable from the same git SHA.
 }
 
 #[cfg(test)]

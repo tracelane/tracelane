@@ -2,12 +2,15 @@
 //!
 //! The fat-agent-trace cost class is 1000× a chat trace (a ~2-span chat ≈ 417 B;
 //! a 2 000-span agent trace ≈ 417 KB; a runaway loop can emit far more into a
-//! single trace). A per-*tenant* quota (D4.2) bounds totals, but a single
-//! pathological trace can still blow a batch — so this caps **spans and bytes
-//! per trace**, applied to KEPT spans on **all** tiers, including forced-full
-//! (matrix §4: the ceiling bounds pathological volume even under the Audit-SKU
-//! guarantee). It is the cheap structural backstop the sampler can't provide —
-//! the sampler decides keep/drop per trace; this bounds an accepted trace's size.
+//! single trace). This is the ONLY per-trace/per-tenant volume backstop left on
+//! this path — the per-*tenant* monthly span quota (D4.2) this comment used to
+//! also name is GONE (BILL-01 / ADR-076, 2026-09-13: "ingest is NEVER blocked
+//! by billing state, on any tier"). A single pathological trace can still blow
+//! a batch, so this caps **spans and bytes per trace**, applied to KEPT spans
+//! on **all** tiers, including forced-full (matrix §4: the ceiling bounds
+//! pathological volume even under the Audit-SKU guarantee). It is the cheap
+//! structural backstop the sampler can't provide — the sampler decides
+//! keep/drop per trace; this bounds an accepted trace's size.
 //!
 //! Stateful like the tail sampler's sticky map: a `DashMap<trace_id, accum>`
 //! bounded by [`PerTraceCeiling::prune`] (the ClickHouse writer calls it on the
@@ -56,6 +59,10 @@ struct TraceAccum {
 static CEILING_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot the ceiling-drop counter (for the metrics endpoint / tests).
+///
+/// No production caller today — the metrics endpoint doesn't read this yet.
+/// Used only by tests, hence gated (B-390, 2026-09-12).
+#[cfg(test)]
 pub fn dropped_total() -> u64 {
     CEILING_DROPPED.load(Ordering::Relaxed)
 }

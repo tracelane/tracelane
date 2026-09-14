@@ -6,40 +6,49 @@
 import Logo from "./Logo.astro";
 ---
 
-<footer class="border-t border-border">
-  <div class="container py-14">
-    <div class="grid gap-10 sm:grid-cols-2 lg:grid-cols-[1.5fr_1fr_1fr_1fr] text-sm">
+<footer class="site-footer">
+  <div class="container pt-16 pb-10">
+    <div class="grid gap-12 sm:grid-cols-2 lg:grid-cols-[1.6fr_1fr_1fr_1fr] text-sm">
       <div class="max-w-xs">
-        <p class="text-fg"><Logo size={26} /></p>
-        <p class="mt-4 text-fg-muted leading-relaxed">The flight recorder for AI agents. Open source, Apache 2.0.</p>
+        <p class="text-fg"><Logo size={28} /></p>
+        <p class="mt-5 text-fg-muted leading-relaxed">The flight recorder for AI agents. Open source, Apache 2.0.</p>
+        <div class="mt-6 flex flex-wrap gap-2">
+          <a href="https://app.tracelane.dev/sign-in" class="btn-primary btn-sm">Start free</a>
+          <a href="https://github.com/tracelane" class="btn-secondary btn-sm" rel="me noopener">GitHub</a>
+        </div>
       </div>
       <nav aria-label="Product">
-        <p class="text-xs text-fg-dim mb-4">Product</p>
-        <ul class="space-y-2.5 text-fg-muted">
-          <li><a href="/#what" class="hover:text-fg transition-colors">Product</a></li>
-          <li><a href="/#audit" class="hover:text-fg transition-colors">Audit ledger</a></li>
-          <li><a href="/pricing" class="hover:text-fg transition-colors">Pricing</a></li>
-          <li><a href="https://docs.tracelane.dev" class="hover:text-fg transition-colors" rel="noopener">Docs</a></li>
+        <p class="footer-col-title">product</p>
+        <ul class="space-y-3">
+          <li><a href="/#what" class="footer-link">Product</a></li>
+          <li><a href="/#audit" class="footer-link">Audit ledger</a></li>
+          <li><a href="/pricing" class="footer-link">Pricing</a></li>
+          <li><a href="https://docs.tracelane.dev" class="footer-link" rel="noopener">Docs</a></li>
         </ul>
       </nav>
       <nav aria-label="Resources">
-        <p class="text-xs text-fg-dim mb-4">Resources</p>
-        <ul class="space-y-2.5 text-fg-muted">
-          <li><a href="https://github.com/tracelane" class="hover:text-fg transition-colors" rel="me noopener">GitHub</a></li>
-          <li><a href="/security" class="hover:text-fg transition-colors">Security</a></li>
-          <li><a href="https://newsletter.aitechhive.com" class="hover:text-fg transition-colors" rel="noopener">Working Notes</a></li>
+        <p class="footer-col-title">resources</p>
+        <ul class="space-y-3">
+          {/* /changelog was ORPHANED — reinstated as a live page 2026-09-07 and
+              linked from nowhere on the site until 2026-09-09. It was reachable
+              only by typing the URL, and a crawler reached it only through the
+              sitemap. This is its one entry point. */}
+          <li><a href="/changelog" class="footer-link">Changelog</a></li>
+          <li><a href="https://github.com/tracelane" class="footer-link" rel="me noopener">GitHub</a></li>
+          <li><a href="/security" class="footer-link">Security</a></li>
+          <li><a href="https://newsletter.aitechhive.com" class="footer-link" rel="noopener">Working Notes</a></li>
         </ul>
       </nav>
       <nav aria-label="Legal">
-        <p class="text-xs text-fg-dim mb-4">Legal</p>
-        <ul class="space-y-2.5 text-fg-muted">
-          <li><a href="/privacy" class="hover:text-fg transition-colors">Privacy</a></li>
-          <li><a href="/terms" class="hover:text-fg transition-colors">Terms</a></li>
-          <li class="pt-2"><a href="mailto:support@tracelane.dev" class="hover:text-fg transition-colors">support@tracelane.dev</a></li>
+        <p class="footer-col-title">legal</p>
+        <ul class="space-y-3">
+          <li><a href="/privacy" class="footer-link">Privacy</a></li>
+          <li><a href="/terms" class="footer-link">Terms</a></li>
+          <li class="pt-2"><a href="mailto:support@tracelane.dev" class="footer-link">support@tracelane.dev</a></li>
         </ul>
       </nav>
     </div>
-    <div class="mt-12 pt-6 border-t border-border text-xs text-fg-dim flex flex-col sm:flex-row gap-2 justify-between">
+    <div class="mt-14 pt-6 border-t border-border text-xs text-fg-dim flex flex-col sm:flex-row gap-2 justify-between font-mono">
       <p>© 2026 Tracelane. Apache 2.0 core.</p>
       <p>Open source · Self-host anywhere · Your keys, 0% markup</p>
     </div>

@@ -35,21 +35,42 @@ only names a directory for you to review by hand; nothing is scanned.
 |---|---|---|
 | `HELICONE_API_KEY` | `TRACELANE_API_KEY` | Same role: tenant API key |
 | `HELICONE_BASE_URL` | `TRACELANE_GATEWAY_URL` | Override only for self-host |
-| `HELICONE_PROPERTY_*` | `X-Tracelane-Property-*` header | Per-request custom properties |
-| `HELICONE_USER_ID` | `TRACELANE_USER_ID` | Per-request user attribution |
-| `HELICONE_CACHE_ENABLED` | — | No equivalent: Tracelane has no built-in caching layer in V1 |
+| `HELICONE_USER_ID` | `X-Tracelane-User-Id` header | Per-request end-user attribution |
+| `HELICONE_SESSION_ID` | `X-Conversation-Id` header (`X-Session-Id` accepted) | Groups turns into a session |
+| `HELICONE_PROPERTY_*` | — | **No equivalent.** Tracelane has no custom-property header |
+| `HELICONE_CACHE_ENABLED` | — | Not a per-request switch. Tracelane's response cache is operator-configured, not client-toggled — see below |
 
 ## What you keep
 
 - Existing OpenAI/Anthropic SDK code — no swap required
-- Per-request user attribution via header
-- Custom properties — translated to span attributes
+- Per-request end-user attribution — send `X-Tracelane-User-Id`, or just set
+  OpenAI's own `user` field on the request body and Tracelane reads it. It lands
+  on the span as `user_id`, and the `/sessions` page shows a **User** column you
+  can click through to that person's traces
+- Session grouping — `X-Conversation-Id`
 
 ## What changes
 
 - The base URL: `https://gateway.tracelane.dev/v1` (or your self-host endpoint)
-- Semantic response caching is operator-level, surfaced as the
-  `tracelane_semantic_cache_hit` span attribute
+- **Custom properties have no equivalent.** Helicone's `Helicone-Property-*`
+  headers become arbitrary span dimensions; Tracelane has no such header. The
+  nearest thing is `X-Business-Reference`, a single free-form identifier (a case
+  or transaction id) — one value, not a bag of key/values. If you rely on
+  multiple custom properties, tell us; it is not built
+- **Response caching is operator-configured, not per-request.** Helicone's
+  `Helicone-Cache-Enabled` is a client toggle; Tracelane's cache is set up once
+  by whoever runs the gateway, and a served hit is visible on the span as
+  `tracelane_semantic_cache_hit`. There is no header to turn it on or off per
+  call
+
+<Note>
+  **Send an opaque id, not an email address.** The user id is stored on the span,
+  and PII redaction rewrites anything email-, phone- or card-shaped before it is
+  written — so `alice@acme.com` is stored as `[REDACTED:email]` and the User
+  column reads "redacted" for every such trace. A UUID or a hash of your internal
+  user id is what you want, which is also what OpenAI and Anthropic both ask for
+  on their equivalent fields.
+</Note>
 - Predictive guardrails inline at the gateway. We found no equivalent inline
   guardrail layer documented by Helicone as of 2026-08-26.
 

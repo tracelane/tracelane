@@ -57,15 +57,23 @@ const COST_SQL: &str = "SELECT sum(if(isFinite(JSONExtractFloat(attributes, 'gen
     JSONExtractFloat(attributes, 'gen_ai_usage_cost'), 0.0)) \
     FROM tracelane.spans \
     WHERE tenant_id = ? AND start_time >= now() - toIntervalMinute(?)";
-// quota_pct: traces month-to-date (the rule's window is ignored — quota is monthly).
-// `uniqExact(trace_id)`, NOT `count()` — same defect and same reason as
-// `server::TRACES_THIS_MONTH_SQL` (B-243). A split trace emits >1 partial row in
-// `trace_summaries` that never collapses, so `count()` made the `quota_pct` alert
-// fire EARLY on real agent traffic. Kept numerically identical to the enforcer's
-// figure on purpose: an alert that disagrees with the quota it warns about is
-// worse than no alert.
-const QUOTA_USED_SQL: &str = "SELECT toFloat64(uniqExact(trace_id)) FROM tracelane.trace_summaries \
-    WHERE tenant_id = ? AND start_time >= toStartOfMonth(now())";
+// quota_pct: BILL-01 / ADR-076 (2026-09-13) REDEFINED this as "ingest % of
+// included" — the trace-count reading this comment used to describe
+// (`uniqExact(trace_id)` against the ADR-020 `trace_quota_monthly` column, dropped by 0042) is
+// GONE along with the monthly trace-count hard cap it mirrored: "ingest is
+// NEVER blocked by billing state, on any tier" retired that whole model, and
+// a raw trace count no longer means anything billing-relevant under the
+// six-meter model. The wire NAME `quota_pct` is kept (alert-rule rows and any
+// dashboard already keying on it stay valid); only what it MEASURES changed.
+//
+// `used` sums `meter_counters.value` for `meter = 'ingest_bytes'` THIS
+// CALENDAR MONTH, across BOTH writers (`source` is not filtered — spec §2.1:
+// "ONE meter, both paths write the same row shape") in ONE query. `included`
+// is `ResolvedEntitlements.ingest_bytes_included` from the SAME entitlement
+// cache every other gateway read already uses (`None` = Enterprise custom,
+// which cannot be expressed as a percentage of anything — no alert fires).
+const INGEST_USED_SQL: &str = "SELECT sum(value) FROM tracelane.meter_counters \
+    WHERE tenant_id = ? AND meter = 'ingest_bytes' AND toYYYYMM(day) = toYYYYMM(now())";
 
 /// The error-budget fraction (`1 - availability SLO target`) for a plan lookup
 /// key (ADR-020 SLAs): Team 99% → 0.01, Enterprise 99.95% → 0.0005, everything
@@ -99,6 +107,18 @@ fn plan_key_to_error_budget(key: Option<&str>) -> f64 {
 /// The cost of the TTL is bounded and stated: a newly created or deleted rule
 /// takes effect within this window rather than on the next tick.
 const RULES_CACHE_TTL: Duration = Duration::from_secs(900);
+
+/// The rule-set cache TTL actually used: `TRACELANE_ALERTS_RULES_TTL_SECS` when set
+/// and parseable, else [`RULES_CACHE_TTL`]. Founder, 2026-09-03 (NEON-COMPUTE-PIN):
+/// with zero tenants and zero rules, four Postgres reads an hour is four compute
+/// wakes an hour; prod sets 21600 (6 h). A new rule takes effect within the TTL.
+fn rules_cache_ttl() -> Duration {
+    std::env::var("TRACELANE_ALERTS_RULES_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(RULES_CACHE_TTL, Duration::from_secs)
+}
 
 /// One enabled rule joined to the destination it fires to.
 type RuleWithDest = (AlertRule, super::AlertDestination);
@@ -159,7 +179,7 @@ impl AlertChecker {
     /// fresh cache serves without touching the control plane at all.
     async fn cached_rules(&self) -> anyhow::Result<Vec<RuleWithDest>> {
         if let Some((fetched_at, rules)) = self.rules_cache.read().await.as_ref()
-            && fetched_at.elapsed() < RULES_CACHE_TTL
+            && fetched_at.elapsed() < rules_cache_ttl()
         {
             return Ok(rules.clone());
         }
@@ -368,7 +388,7 @@ impl AlertChecker {
 
         let rows = match self
             .ch
-            .query(SQL)
+            .query(&crate::clickhouse_query::ceiling(SQL))
             .bind(tenant.to_string())
             .fetch_all::<(String, u64, f64, u64)>()
             .await
@@ -420,7 +440,7 @@ impl AlertChecker {
         let window = rule.window_minutes.max(1) as u32;
         match self
             .ch
-            .query(sql)
+            .query(&crate::clickhouse_query::ceiling(sql))
             .bind(rule.tenant_id.to_string())
             .bind(window)
             .fetch_one::<f64>()
@@ -468,65 +488,51 @@ impl AlertChecker {
         plan_key_to_error_budget(key.as_deref())
     }
 
-    /// quota_pct = 100 × (traces month-to-date) / (monthly trace quota). The
-    /// quota comes from the resolved plan/override; a missing/zero quota → None
-    /// (can't compute a percentage against no limit).
+    /// BILL-01 / ADR-076 — `quota_pct` = 100 × (this month's `ingest_bytes`
+    /// used, both writers) / (`ingest_bytes_included` for the plan/override).
+    /// `None` on a read failure, or when the tenant's allowance is `None`
+    /// (Enterprise "custom" — no percentage of an uncapped allowance exists).
+    /// See [`ingest_pct`] for the pure computation this wraps.
     async fn quota_pct(&self, tenant: Uuid) -> Option<f64> {
         let used = match self
             .ch
-            .query(QUOTA_USED_SQL)
+            .query(&crate::clickhouse_query::ceiling(INGEST_USED_SQL))
             .bind(tenant.to_string())
             .fetch_one::<f64>()
             .await
         {
             Ok(v) => v,
             Err(err) => {
-                tracing::warn!(error = %err, "quota used query failed");
+                tracing::warn!(error = %err, "ingest_bytes used query failed");
                 return None;
             }
         };
-        let limit = self.trace_quota(tenant).await?;
-        if limit <= 0.0 {
-            return None;
-        }
-        Some(100.0 * used / limit)
-    }
-
-    /// Resolve the tenant's monthly trace quota (override → plan → free default).
-    async fn trace_quota(&self, tenant: Uuid) -> Option<f64> {
-        let client = self.pool.get().await.ok()?;
-        // Override overlays plan; a tenant with no workspace row → free plan.
-        let row = client
-            .query_opt(
-                "SELECT COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly) \
-                 FROM workspace_entitlements we \
-                 JOIN plan_entitlements pe ON pe.plan_lookup_key = we.plan_lookup_key \
-                 WHERE we.tenant_id = $1",
-                &[&tenant],
-            )
+        let included = self
+            .entitlements
+            .resolved(tenant)
             .await
-            .ok()?;
-        let quota: i64 = match row {
-            Some(r) => r.get(0),
-            None => {
-                let fallback = client
-                    .query_opt(
-                        "SELECT trace_quota_monthly FROM plan_entitlements \
-                         WHERE plan_lookup_key = 'free_v1'",
-                        &[],
-                    )
-                    .await
-                    .ok()??;
-                fallback.get(0)
-            }
-        };
-        Some(quota as f64)
+            .ingest_bytes_included;
+        ingest_pct(used, included)
     }
+}
+
+/// Pure: `used` ÷ `included` × 100, or `None` when there is nothing to divide
+/// by (`included` is `None` — Enterprise custom — or `Some(0)`, which would be
+/// a divide-by-zero rather than a meaningful 0%/∞% reading). Extracted so the
+/// percentage math is assertable on a fixture without a live ClickHouse or
+/// Postgres — the SAME shape `rows_accounted`/`sweep_days` use elsewhere in
+/// this tree for background-job arithmetic.
+fn ingest_pct(used_bytes: f64, included_bytes: Option<u64>) -> Option<f64> {
+    let included = included_bytes? as f64;
+    if included <= 0.0 {
+        return None;
+    }
+    Some(100.0 * used_bytes / included)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RULES_CACHE_TTL, plan_key_to_error_budget};
+    use super::{RULES_CACHE_TTL, ingest_pct, plan_key_to_error_budget};
     use std::time::Duration;
 
     ///  #6: burn is divided by the tenant's PLAN error budget (ADR-020),
@@ -567,6 +573,35 @@ mod tests {
             RULES_CACHE_TTL >= Duration::from_secs(300),
             "below 5 minutes the per-tick Postgres saving stops being worth the code"
         );
+    }
+
+    // ── BILL-01 / ADR-076 — quota_pct's "ingest % of included" (pure, fixture) ─
+
+    #[test]
+    fn ingest_pct_computes_the_plain_percentage() {
+        // Fixture: Free's ruled ingest_gb_included is 1 GB = 1e9 bytes
+        // (apps/web/db/plans.v3.json); half-used reads 50%.
+        assert_eq!(ingest_pct(500_000_000.0, Some(1_000_000_000)), Some(50.0));
+    }
+
+    #[test]
+    fn ingest_pct_over_100_is_reported_not_capped() {
+        // The alert checker's job is to report reality; capping display at
+        // 100% is a UI concern (spec §3), not this function's.
+        let pct = ingest_pct(1_500_000_000.0, Some(1_000_000_000)).unwrap();
+        assert!((pct - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ingest_pct_is_none_for_enterprise_custom_allowance() {
+        // `None` = Enterprise "custom" (a genuinely NULL Postgres column,
+        // never a sentinel zero) — no percentage of an uncapped allowance.
+        assert_eq!(ingest_pct(999_999.0, None), None);
+    }
+
+    #[test]
+    fn ingest_pct_is_none_rather_than_a_divide_by_zero() {
+        assert_eq!(ingest_pct(1.0, Some(0)), None);
     }
 
     #[test]

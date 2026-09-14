@@ -90,6 +90,9 @@ run "doc-index freshness"         python3 scripts/ci/build-doc-index.py --check
 run "spec anchors"                python3 scripts/ci/check-spec-anchors.py
 run "CLAUDE.md volatile anchors"  bash scripts/ci/check-claudemd-volatile-anchors.sh
 run "script exec bits"            python3 scripts/ci/check-script-exec-bits.py
+# B-384: the hooks are the only enforcement on a direct push; a clone that never
+# installed them gets a green gate and an ungated push. Refuse that here, first.
+run "git hooks installed"         python3 scripts/ci/check-hooks-installed.py
 
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAILED" -ne 0 ]; then

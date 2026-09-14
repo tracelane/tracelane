@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, Result, bail};
 use clickhouse::Client as ClickhouseClient;
 use futures::StreamExt as _;
+use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 use tracelane_shared::{ChatRequest, Message, MessageContent, Role, TenantId};
 use uuid::Uuid;
@@ -771,6 +772,15 @@ impl DatasetCaseError {
     /// Stable slug for the response body and for the dashboard's error state,
     /// which renders the gateway's code verbatim so the user has something to act
     /// on. Stable means: changing one of these is a customer-visible break.
+    ///
+    /// No production caller today (found 2026-09-12, B-390) — nothing
+    /// downcasts a `verdict()` error to `DatasetCaseError` and calls this or
+    /// `http_status` below; the doc comment above `DatasetCaseError`
+    /// describes that downcast pattern but it is not implemented anywhere,
+    /// so a case-resolution failure currently surfaces without this 404/422
+    /// mapping. Used only by tests, hence gated rather than deleted — the
+    /// mapping is real design, just unwired.
+    #[cfg(test)]
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
@@ -788,6 +798,7 @@ impl DatasetCaseError {
     /// it" facts — the same code `EVL-04` §4 gives the sibling content-capture
     /// refusals, which are the same shape: nothing is malformed, the data simply
     /// is not there yet.
+    #[cfg(test)]
     #[must_use]
     pub fn http_status(self) -> u16 {
         match self {
@@ -1042,6 +1053,8 @@ pub fn eval_suite_id_for(tenant_id: &TenantId, prompt_name: &str, suite: &str) -
 
 /// The engine.
 pub struct PromptEvalEngine {
+    /// SRE #20: the entitlement cache, so reads run at the tenant's OWN cap tier.
+    entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ch: ClickhouseClient,
     providers: Arc<ProviderRegistry>,
     router: Arc<PromptRouter>,
@@ -1055,6 +1068,27 @@ pub struct PromptEvalEngine {
 }
 
 impl PromptEvalEngine {
+    /// SRE #20 follow-up: every eval-run read goes through here (they were UNCAPPED —
+    /// no settings at all — until the prod query_log proof showed it).
+    async fn capped(&self, sql: &str, tenant: &TenantId) -> String {
+        crate::clickhouse_query::TenantQuery::new(sql, self.tier_for(tenant).await)
+            .sql_with_settings()
+    }
+
+    /// SRE #20: the tenant's own ADR-031 tier (`clickhouse_query::tier_for_tenant`).
+    async fn tier_for(&self, tenant: &TenantId) -> crate::clickhouse_query::PlanTier {
+        crate::clickhouse_query::tier_for_tenant(self.entitlements.as_ref(), tenant).await
+    }
+
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
+    }
+
     pub fn new(
         ch: ClickhouseClient,
         providers: Arc<ProviderRegistry>,
@@ -1062,6 +1096,7 @@ impl PromptEvalEngine {
         nats: Option<Arc<async_nats::Client>>,
     ) -> Self {
         Self {
+            entitlements: None,
             ch,
             providers,
             router,
@@ -1500,7 +1535,7 @@ impl PromptEvalEngine {
         let sql = crate::clickhouse_query::TenantQuery::new(
             "SELECT count() FROM datasets FINAL \
              WHERE tenant_id = ? AND dataset_id = ? AND deleted = 0",
-            crate::clickhouse_query::PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
         let n: u64 = self
@@ -1539,7 +1574,7 @@ impl PromptEvalEngine {
                AND (? = '' OR toString(snapshot_id) = ?) \
              ORDER BY created_at DESC \
              LIMIT 1",
-            crate::clickhouse_query::PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
         let rows = self
@@ -1595,7 +1630,7 @@ impl PromptEvalEngine {
              WHERE tenant_id = ? AND snapshot_id = ? \
              ORDER BY ordinal \
              LIMIT ?",
-            crate::clickhouse_query::PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
         self.ch
@@ -1648,10 +1683,10 @@ impl PromptEvalEngine {
                AND (? = '' OR JSONExtractString(attributes, 'gen_ai_request_model') = ?) \
              ORDER BY start_time DESC \
              LIMIT ?",
-            crate::clickhouse_query::PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let rows = self
+        let mut rows = self
             .ch
             .query(&sql)
             .bind(tenant_id.to_string())
@@ -1663,6 +1698,23 @@ impl PromptEvalEngine {
             .await
             .context("reading case inputs from spans")?;
 
+        // BILL-01 / ADR-076 §2.3 — `JSONExtractRaw` returns
+        // `{"$ref":"blake3:<hex>"}` verbatim when ingest deduplicated a large
+        // `gen_ai_input_messages` value. Without rehydration that value fails
+        // to parse as `Vec<Message>` below and the WHOLE trace is silently
+        // skipped as "does not parse" — deduplicated (i.e. large, real)
+        // prompts would be exactly the ones missing from eval case sourcing.
+        // Fail-open (a read path): a lookup failure leaves the `$ref` text,
+        // which still hits the same graceful skip-and-warn path below.
+        {
+            let mut fields: Vec<&mut String> =
+                rows.iter_mut().map(|r| &mut r.input_messages).collect();
+            if let Err(e) = crate::billing::blobs::rehydrate(&self.ch, tenant_id, &mut fields).await
+            {
+                tracing::warn!(error = %e, "blob rehydration failed for eval case inputs");
+            }
+        }
+
         if rows.is_empty() {
             // Is the workspace recording content AT ALL? If not, no filter the
             // user can type will ever match, and telling them "no traces matched"
@@ -1670,8 +1722,13 @@ impl PromptEvalEngine {
             let recorded: u64 = self
                 .ch
                 .query(
-                    "SELECT count() FROM spans \
+                    &self
+                        .capped(
+                            "SELECT count() FROM spans \
                      WHERE tenant_id = ? AND JSONHas(attributes, 'gen_ai_input_messages')",
+                            tenant_id,
+                        )
+                        .await,
                 )
                 .bind(tenant_id.to_string())
                 .fetch_one()
@@ -1743,10 +1800,13 @@ impl PromptEvalEngine {
             // one conversation, and forcing them under a shared trace id would render
             // as a 200-span tree that never happened.
             Uuid::new_v4(),
+            None,
             model,
-            None,
-            None,
-            None,
+            // This span is Tracelane's OWN call, not a customer request — there is
+            // no caller identity on the other side of it, and inventing one would
+            // put a synthetic agent or end user into the same aggregates real ones
+            // are counted in.
+            &crate::server::CallerIdentity::default(),
             started_at,
             out.input_tokens,
             out.output_tokens,
@@ -1757,7 +1817,6 @@ impl PromptEvalEngine {
                 stream: false,
                 cost_usd: out.cost_usd,
             },
-            None,
             None,
             None,
             None,
@@ -1773,13 +1832,7 @@ impl PromptEvalEngine {
         // `EVL-23` — set on EVERY eval span, both halves, so the split is exact
         // in both directions rather than "judge, or whatever is left over".
         span.attributes.tracelane_eval_role = Some(role.as_str().to_string());
-        let nats = Arc::clone(nats);
-        tokio::spawn(async move {
-            if let Err(e) = crate::otlp_emit::publish_span(&nats, &span).await {
-                crate::otlp_emit::note_span_publish_failed();
-                tracing::warn!(error = %e, "eval case span NATS publish failed");
-            }
-        });
+        crate::otlp_emit::spawn_publish(Arc::clone(nats), span, "eval case");
     }
 }
 
@@ -1812,12 +1865,20 @@ impl PromptEvalEngine {
             crate::server::ProviderKey::Unusable => bail!(
                 "the stored '{provider_id}' key could not be decrypted — rotate it in Settings → LLM Providers"
             ),
+            crate::server::ProviderKey::LookupFailed => {
+                bail!("the key store could not be reached for '{provider_id}' — retry shortly")
+            }
         };
 
         let request = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: model.to_string(),
             messages: case.messages.clone(),
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: Some(false),
@@ -1829,9 +1890,27 @@ impl PromptEvalEngine {
         // R81: wall-clock start, for the span. `Instant` cannot be turned into a
         // timestamp, so the two clocks are taken together rather than derived.
         let span_started_at = chrono::Utc::now();
-        let mut stream =
-            crate::server::dispatch_to_provider(&self.providers, request, &key, model, tenant_id)
-                .await?;
+        let dispatch_result = crate::server::dispatch_to_provider(
+            &self.providers,
+            request,
+            key.expose_secret(),
+            model,
+            tenant_id,
+        )
+        .await;
+        // BILL-01 meter 6 (eval_runs): ONE unit per JUDGE call that reached a
+        // provider (`role == Judge` — the prompt-under-test dispatch is not a
+        // judge run). An errored call still counts; never counted under
+        // `TRACELANE_EVAL_MOCK_PROVIDERS` (a CI mock-provider run is not
+        // billable).
+        if role == EvalSpanRole::Judge
+            && std::env::var("TRACELANE_EVAL_MOCK_PROVIDERS").is_err()
+            && let Some(sink) = crate::billing::meters::global()
+        {
+            sink.record(tenant_id, crate::billing::UsageMeter::EvalRuns, "", 1.0)
+                .await;
+        }
+        let mut stream = dispatch_result?;
 
         let mut out = CaseOutcome::default();
         while let Some(ev) = stream.next().await {
@@ -1852,23 +1931,16 @@ impl PromptEvalEngine {
                     // one. NOT every provider emits `Done` — the failover comment
                     // in `server.rs` names Gemini — so the accumulator above is
                     // the fallback, not the other way round.
-                    if let Some(choice) = response.choices.first() {
-                        if let MessageContent::Text(t) = &choice.message.content {
-                            if !t.is_empty() {
-                                out.output = t.clone();
-                            }
-                        }
+                    if let Some(choice) = response.choices.first()
+                        && let MessageContent::Text(t) = &choice.message.content
+                        && !t.is_empty()
+                    {
+                        out.output = t.clone();
                     }
                     if let Some(u) = response.usage {
                         out.input_tokens = u.input_tokens;
                         out.output_tokens = u.output_tokens;
                     }
-                }
-                ProviderEvent::Error { message, code } => {
-                    bail!(
-                        "provider error{}: {message}",
-                        code.map(|c| format!(" [{c}]")).unwrap_or_default()
-                    );
                 }
                 _ => {}
             }
@@ -2364,18 +2436,19 @@ struct RunPlan {
 
 /// What a completed run produced. Returned by `execute_run` so an experiment can
 /// react to its arm without re-reading ClickHouse for a row it just wrote.
+///
+/// `pass_count`, `fail_count`, `error_count`, `items_written` (deleted
+/// 2026-09-12, B-390) — computed and populated here but never read by
+/// `run_arm`'s only caller (`experiment_routes.rs`, which reads only
+/// `.status`/`.eval_run_id`); the durable copies of these same counts live
+/// in `EvalRunRow` (written via `insert_run` just above in `execute_run`,
+/// and read back separately for the counts anyone actually displays). The
+/// `pass`/`fail`/`err`/`items_written` locals that fed them are untouched —
+/// they still drive `status` and the `EvalRunRow` write.
 #[derive(Debug, Clone, Copy)]
 pub struct RunOutcome {
     pub eval_run_id: Uuid,
     pub status: EvalStatus,
-    pub pass_count: u32,
-    pub fail_count: u32,
-    pub error_count: u32,
-    /// Per-item rows durably written. **`0` with a terminal status means the
-    /// item write FAILED**, and the run is `errored` for that reason — it never
-    /// means "the run had no items", because a run with no cases is refused
-    /// before it starts.
-    pub items_written: u32,
 }
 
 impl PromptEvalEngine {
@@ -2494,13 +2567,12 @@ impl PromptEvalEngine {
                 rubric: JudgeRubric::BuiltIn { name },
                 ..
             } = a
+                && judge::built_in(name).is_none()
             {
-                if judge::built_in(name).is_none() {
-                    bail!(
-                        "unknown built-in judge rubric {name:?} — available: {}",
-                        judge::BUILT_IN_NAMES.join(", ")
-                    );
-                }
+                bail!(
+                    "unknown built-in judge rubric {name:?} — available: {}",
+                    judge::BUILT_IN_NAMES.join(", ")
+                );
             }
         }
         let model = req
@@ -2620,7 +2692,8 @@ impl PromptEvalEngine {
         // pure cost.
         let subject = crate::spend::Subject::Workspace(*tenant_id.as_uuid());
         if budget_usd.is_some() {
-            crate::spend::seed_workspace(&self.ch, &tenant_id).await;
+            crate::spend::seed_workspace(&self.ch, &tenant_id, self.tier_for(&tenant_id).await)
+                .await;
         }
 
         let mut results: Vec<CaseResult> = Vec::with_capacity(cases.len());
@@ -2755,7 +2828,8 @@ impl PromptEvalEngine {
             &results,
         );
         let items_expected = u32::try_from(item_rows.len()).unwrap_or(u32::MAX);
-        let (items_written, item_write_error) = match insert_run_items(&self.ch, &item_rows).await {
+        let (_items_written, item_write_error) = match insert_run_items(&self.ch, &item_rows).await
+        {
             Ok(()) => (items_expected, None),
             Err(e) => {
                 tracing::error!(
@@ -2846,10 +2920,6 @@ impl PromptEvalEngine {
         RunOutcome {
             eval_run_id,
             status,
-            pass_count: u32::try_from(pass).unwrap_or(u32::MAX),
-            fail_count: u32::try_from(fail).unwrap_or(u32::MAX),
-            error_count: u32::try_from(err).unwrap_or(u32::MAX),
-            items_written,
         }
     }
 }
@@ -2983,13 +3053,18 @@ impl PromptEvalEngine {
         let limit = limit.clamp(1, 200);
         self.ch
             .query(
-                "SELECT eval_run_id, prompt_version_id, eval_suite_id, status, \
+                &self
+                    .capped(
+                        "SELECT eval_run_id, prompt_version_id, eval_suite_id, status, \
                         pass_count, fail_count, error_count, duration_ms, \
                         toUnixTimestamp64Milli(started_at) AS started_at_ms \
                  FROM eval_runs FINAL \
                  WHERE tenant_id = ? \
                  ORDER BY started_at DESC \
                  LIMIT ?",
+                        tenant_id,
+                    )
+                    .await,
             )
             .bind(tenant_id.to_string())
             .bind(limit)
@@ -3018,12 +3093,12 @@ impl PromptEvalEngine {
         let rows = self
             .ch
             .query(
-                "SELECT status, pass_count, fail_count, error_count, duration_ms, results_json, \
+                &self.capped("SELECT status, pass_count, fail_count, error_count, duration_ms, results_json, \
                         toUnixTimestamp64Milli(started_at) AS started_at_ms, \
                         toUnixTimestamp64Milli(completed_at) AS completed_at_ms \
                  FROM eval_runs FINAL \
                  WHERE tenant_id = ? AND eval_run_id = ? \
-                 LIMIT 1",
+                 LIMIT 1", tenant_id).await,
             )
             .bind(tenant_id.to_string())
             .bind(eval_run_id)
@@ -3081,10 +3156,16 @@ impl PromptEvalEngine {
         let rows = self
             .ch
             .query(
-                "SELECT tenant_id, eval_run_id, prompt_version_id, eval_suite_id, \
+                // SRE #20 follow-up: a CROSS-TENANT boot sweep — there is no tenant to
+                // resolve, so it runs at the tightest caps: a small table, and fail-open.
+                &crate::clickhouse_query::TenantQuery::new(
+                    "SELECT tenant_id, eval_run_id, prompt_version_id, eval_suite_id, \
                         toUnixTimestamp64Milli(started_at) AS started_at_ms \
                  FROM eval_runs FINAL \
                  WHERE status = 'running' AND started_at < now() - INTERVAL ? SECOND",
+                    crate::clickhouse_query::PlanTier::Free,
+                )
+                .sql_with_settings(),
             )
             .bind(cutoff_secs)
             .fetch_all::<Stale>()
@@ -3340,6 +3421,7 @@ mod tests {
     #[test]
     fn only_one_run_per_prompt_may_be_in_flight() {
         let engine = PromptEvalEngine {
+            entitlements: None,
             ch: clickhouse::Client::default(),
             providers: Arc::new(ProviderRegistry::new().expect("registry")),
             router: Arc::new(PromptRouter::new()),

@@ -43,9 +43,40 @@ const MTOK: f64 = 1_000_000.0;
 fn price_card(model: &str) -> Option<PriceCard> {
     let m = model.to_ascii_lowercase();
 
-    // ── Anthropic Claude ── list prices per Mtok; cache read 0.1×, write 1.25×.
+    // ── Anthropic Claude ── list prices per Mtok, re-verified against
+    // platform.claude.com/docs/en/about-claude/pricing on 2026-09-07 (B-350).
+    // Cache read is 0.1× input (0.025× on Fable / Mythos 5.1); the 5-minute
+    // cache write is 1.25× input. The 1-hour write tier (2× input) is NOT
+    // modelled: the adapter reports one cache-creation counter, so a 1h write
+    // bills at the 5m rate — a documented under-report on that slice only.
     if m.contains("claude") {
+        // Fable 5 / 5.1 and Mythos 5 / 5.1: 10/50. Only the 5.1 generation has
+        // the 0.025× cache read; Fable 5 / Mythos 5 read at the standard 0.1×.
+        if m.contains("fable") || m.contains("mythos") {
+            let cache_read = if m.contains("-5-1") { 0.25 } else { 1.0 };
+            return Some(PriceCard {
+                input_per_mtok: 10.0,
+                output_per_mtok: 50.0,
+                cache_read_per_mtok: cache_read,
+                cache_write_per_mtok: 12.5,
+            });
+        }
         if m.contains("opus") {
+            // Opus 4.5, 4.6, 4.7, 4.8 and 5 are 5/25. Opus 4 and 4.1 (retired
+            // except on Bedrock / Google Cloud) and Claude 3 Opus are 15/75.
+            // Until 2026-09-07 EVERY "opus" priced at 15/75 — 3× over for every
+            // Opus a customer can call today (B-350, found when the models.dev
+            // catalog refresh disagreed with this card; the page settled it).
+            const OPUS_AT_5_25: [&str; 5] =
+                ["opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5"];
+            if OPUS_AT_5_25.iter().any(|v| m.contains(v)) {
+                return Some(PriceCard {
+                    input_per_mtok: 5.0,
+                    output_per_mtok: 25.0,
+                    cache_read_per_mtok: 0.5,
+                    cache_write_per_mtok: 6.25,
+                });
+            }
             return Some(PriceCard {
                 input_per_mtok: 15.0,
                 output_per_mtok: 75.0,
@@ -54,6 +85,16 @@ fn price_card(model: &str) -> Option<PriceCard> {
             });
         }
         if m.contains("haiku") {
+            // Haiku 3.5 (retired except on Bedrock / Google Cloud) is 0.80/4;
+            // Haiku 4.5 is 1/5.
+            if m.contains("haiku-3-5") || m.contains("3-5-haiku") {
+                return Some(PriceCard {
+                    input_per_mtok: 0.8,
+                    output_per_mtok: 4.0,
+                    cache_read_per_mtok: 0.08,
+                    cache_write_per_mtok: 1.0,
+                });
+            }
             return Some(PriceCard {
                 input_per_mtok: 1.0,
                 output_per_mtok: 5.0,
@@ -62,6 +103,18 @@ fn price_card(model: &str) -> Option<PriceCard> {
             });
         }
         if m.contains("sonnet") {
+            // Sonnet 5 is 2/10 — the launch "introductory" price made permanent
+            // (the page says the scheduled 2026-09-01 rise to 3/15 will not
+            // occur). Sonnet 4, 4.5 and 4.6 are 3/15. `sonnet-5` cannot match
+            // `sonnet-4-5` (different substring) — asserted in the tests.
+            if m.contains("sonnet-5") {
+                return Some(PriceCard {
+                    input_per_mtok: 2.0,
+                    output_per_mtok: 10.0,
+                    cache_read_per_mtok: 0.2,
+                    cache_write_per_mtok: 2.5,
+                });
+            }
             return Some(PriceCard {
                 input_per_mtok: 3.0,
                 output_per_mtok: 15.0,
@@ -70,6 +123,52 @@ fn price_card(model: &str) -> Option<PriceCard> {
             });
         }
         return None; // an unrecognised Claude tier — do not guess
+    }
+
+    // ── DeepSeek, first-party API ── list prices per Mtok from
+    // api-docs.deepseek.com/quick_start/pricing, read 2026-09-07 (B-351); in
+    // force since 2026-08-16 16:00 UTC. These are the PEAK rates (Mon–Fri
+    // 01:00–04:00 and 06:00–10:00 UTC). Off-peak is exactly half and is NOT
+    // modelled: a request is priced by model, not by wall clock, and
+    // over-reporting off-peak spend is the direction a budget survives. The
+    // OpenAI-compatible adapter reports `prompt_tokens` (cache hits included)
+    // as input and no cache counters, so input bills at the cache-MISS rate and
+    // the cache tiers are 0.0 — the same no-double-count shape as the OpenAI
+    // cards ($0.014 / Mtok cache-hit is therefore not charged; over-report).
+    //
+    // `deepseek-chat` / `deepseek-reasoner` are the legacy names: since
+    // 2026-07-31 both point at V4-Flash (non-thinking / thinking) and DeepSeek
+    // retires them three months on (api-docs.deepseek.com/updates). Routing
+    // them to the Flash card is exact today and this arm goes when the names do.
+    //
+    // Why hand cards at all: models.dev still carries the PRE-2026-08-16 rates
+    // (0.14 / 0.28) for `deepseek/deepseek-v4-*`, so the generated row is
+    // stale by ~3×; the hand card wins over it by design. Scoped to the
+    // first-party route — a `groq/deepseek-r1-…` or other reseller id falls
+    // through to the catalog, which prices it from that reseller's own row.
+    let (route_prefix, bare) = match m.split_once('/') {
+        Some((p, rest)) => (Some(p), rest),
+        None => (None, m.as_str()),
+    };
+    if matches!(route_prefix, None | Some("deepseek")) && bare.starts_with("deepseek") {
+        if bare.contains("v4-pro") {
+            return Some(PriceCard {
+                input_per_mtok: 1.32,
+                output_per_mtok: 3.96,
+                cache_read_per_mtok: 0.0,
+                cache_write_per_mtok: 0.0,
+            });
+        }
+        if bare.contains("v4-flash") || bare == "deepseek-chat" || bare == "deepseek-reasoner" {
+            return Some(PriceCard {
+                input_per_mtok: 0.44,
+                output_per_mtok: 1.32,
+                cache_read_per_mtok: 0.0,
+                cache_write_per_mtok: 0.0,
+            });
+        }
+        // R1 / V3.x first-party ids are no longer on DeepSeek's price page —
+        // fall through to the catalog rather than guess.
     }
 
     // ── OpenAI ── input includes any cached prefix, so we bill input+output at
@@ -230,7 +329,7 @@ pub fn cost_usd(model: &str, usage: &Usage) -> Option<f64> {
 
 /// ── The generated price table (GWY-42) ──────────────────────────────────────
 ///
-/// `price_card` above is the founder-verified set: 13 cards across 3 vendors,
+/// `price_card` above is the verified set: 19 cards across 4 vendors,
 /// each entered from a provider's own pricing page. It stays FIRST and it WINS.
 /// This table only extends coverage.
 ///
@@ -265,6 +364,10 @@ mod catalog_prices {
     /// exactly ONE provider sells that model id, so a bare `gpt-4o` prices from
     /// its real owner and an ambiguous name gets no fallback rather than a coin
     /// toss between two vendors' rates.
+    // B-386: stays global — this is a memoised parse of a compile-time constant
+    // (`model_prices.tsv`), with no input, no mutation and no test setup; moving
+    // it into `AppState` would thread an argument through `build_gateway_span`'s
+    // sites and the two finalizers to construct the same table.
     pub fn table() -> &'static PriceTable {
         static T: OnceLock<PriceTable> = OnceLock::new();
         T.get_or_init(|| {
@@ -368,12 +471,19 @@ mod tests {
     #[test]
     fn models_that_used_to_be_unpriced_now_price() {
         let u = usage(1_000_000, 1_000_000, None, None);
+        // 2026-09-06: the catalog was regenerated from models.dev (to pick up
+        // `claude-fable-5-1`, the model Claude Code sessions default to — PLT-46)
+        // and models.dev had DROPPED its `deepseek/deepseek-chat` and
+        // `deepseek/deepseek-reasoner` rows, so those two went unpriced (B-351).
+        // 2026-09-07: they price again — from a hand card read off DeepSeek's
+        // own pricing page, not a guess (see `price_card`).
         for m in [
             "gpt-5",
             "gpt-4.1",
             "o3-mini",
-            "deepseek-chat",
             "grok-4.6",
+            "claude-fable-5-1",
+            "deepseek-chat",
             "deepseek-reasoner",
         ] {
             let c = cost_usd(m, &u);
@@ -457,8 +567,144 @@ mod tests {
     fn opus_costs_more_than_sonnet() {
         let opus = cost_usd("claude-opus-4-8", &usage(1000, 1000, None, None)).unwrap();
         let sonnet = cost_usd("claude-sonnet-4-6", &usage(1000, 1000, None, None)).unwrap();
-        assert!(approx(opus, 0.09), "opus got {opus}"); // (15000+75000)/1e6
+        assert!(approx(opus, 0.03), "opus got {opus}"); // (5000+25000)/1e6
         assert!(opus > sonnet);
+    }
+
+    /// B-350. Every Opus a customer can call today (4.5 … 5) is 5/25; only the
+    /// retired Opus 4 / 4.1 and Claude 3 Opus are 15/75. Until 2026-09-07 one
+    /// card priced them all at 15/75, and the models.dev refresh exposed it.
+    /// Prices: platform.claude.com/docs/en/about-claude/pricing, 2026-09-07.
+    #[test]
+    fn opus_price_is_version_aware() {
+        let u = usage(1_000_000, 1_000_000, None, None);
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "anthropic.claude-opus-4-5-20251101-v1:0", // Bedrock id
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+        ] {
+            let c = cost_usd(m, &u).unwrap();
+            assert!(approx(c, 30.0), "`{m}` must price 5/25, got {c}");
+        }
+        for m in [
+            "claude-opus-4-1",
+            "claude-opus-4-20250514",
+            "claude-3-opus-20240229",
+        ] {
+            let c = cost_usd(m, &u).unwrap();
+            assert!(approx(c, 90.0), "`{m}` must price 15/75, got {c}");
+        }
+        // Cache tiers follow the base rate: 0.1× read, 1.25× write.
+        let cached = cost_usd(
+            "claude-opus-4-8",
+            &usage(0, 0, Some(1_000_000), Some(1_000_000)),
+        )
+        .unwrap();
+        assert!(
+            approx(cached, 0.5 + 6.25),
+            "opus 4.8 cache tiers got {cached}"
+        );
+    }
+
+    /// Fable / Mythos 5 and 5.1 are 10/50 with a 12.50 cache write; ONLY the 5.1
+    /// generation reads cache at 0.025× (0.25), Fable 5 reads at 0.1× (1.00).
+    #[test]
+    fn fable_and_mythos_cards_including_the_5_1_cache_read() {
+        let u = usage(1_000_000, 1_000_000, Some(1_000_000), Some(1_000_000));
+        let f51 = cost_usd("claude-fable-5-1", &u).unwrap();
+        assert!(
+            approx(f51, 10.0 + 50.0 + 0.25 + 12.5),
+            "fable 5.1 got {f51}"
+        );
+        let f5 = cost_usd("claude-fable-5", &u).unwrap();
+        assert!(approx(f5, 10.0 + 50.0 + 1.0 + 12.5), "fable 5 got {f5}");
+        let m51 = cost_usd("claude-mythos-5-1", &u).unwrap();
+        assert!(
+            approx(m51, f51),
+            "mythos 5.1 must equal fable 5.1, got {m51}"
+        );
+        // The hand card, not the catalog, answers — so a stale catalog row
+        // cannot move this number.
+        assert!(price_card("claude-fable-5-1").is_some());
+    }
+
+    /// Sonnet 5 is 2/10 (introductory pricing made permanent); Sonnet 4.x is
+    /// 3/15. The `sonnet-5` substring must not capture `sonnet-4-5`.
+    #[test]
+    fn sonnet_5_is_2_10_and_does_not_capture_sonnet_4_5() {
+        let u = usage(1_000_000, 1_000_000, None, None);
+        assert!(approx(cost_usd("claude-sonnet-5", &u).unwrap(), 12.0));
+        assert!(approx(cost_usd("claude-sonnet-4-5", &u).unwrap(), 18.0));
+        assert!(approx(
+            cost_usd("claude-sonnet-4-5-20250929", &u).unwrap(),
+            18.0
+        ));
+        assert!(approx(cost_usd("claude-sonnet-4-6", &u).unwrap(), 18.0));
+        assert!(approx(
+            cost_usd("claude-3-5-sonnet-20241022", &u).unwrap(),
+            18.0
+        ));
+    }
+
+    /// Haiku 3.5 (retired) is 0.80/4; Haiku 4.5 is 1/5.
+    #[test]
+    fn haiku_3_5_is_priced_below_haiku_4_5() {
+        let u = usage(1_000_000, 1_000_000, None, None);
+        assert!(approx(
+            cost_usd("claude-3-5-haiku-20241022", &u).unwrap(),
+            4.8
+        ));
+        assert!(approx(
+            cost_usd("claude-haiku-4-5-20251001", &u).unwrap(),
+            6.0
+        ));
+    }
+
+    /// B-351. DeepSeek first-party ids price at DeepSeek's own PEAK list rates
+    /// (api-docs.deepseek.com/quick_start/pricing, 2026-09-07): V4-Flash
+    /// 0.44/1.32, V4-Pro 1.32/3.96. The legacy `deepseek-chat` /
+    /// `deepseek-reasoner` names point at V4-Flash and price identically. The
+    /// models.dev row for `deepseek/deepseek-v4-flash` still says 0.14/0.28 (the
+    /// pre-2026-08-16 price), which is exactly why the hand card must win.
+    #[test]
+    fn deepseek_first_party_prices_from_deepseeks_own_page_not_the_stale_catalog() {
+        let u = usage(1_000_000, 1_000_000, None, None);
+        for m in [
+            "deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash",
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ] {
+            let c = cost_usd(m, &u).unwrap();
+            assert!(
+                approx(c, 0.44 + 1.32),
+                "`{m}` must price at V4-Flash peak 0.44/1.32, got {c}"
+            );
+        }
+        let pro = cost_usd("deepseek-v4-pro", &u).unwrap();
+        assert!(approx(pro, 1.32 + 3.96), "v4-pro got {pro}");
+        // The stale catalog value must NOT be what answers.
+        assert!(price_card("deepseek-v4-flash").is_some());
+        assert!(!approx(
+            cost_usd("deepseek-v4-flash", &u).unwrap(),
+            0.14 + 0.28
+        ));
+    }
+
+    /// The DeepSeek hand card is scoped to the FIRST-PARTY route. A reseller's
+    /// DeepSeek model (`groq/deepseek-r1-…`, `abacus/…`) is that reseller's price,
+    /// which the catalog carries — the hand card must not shadow it.
+    #[test]
+    fn deepseek_hand_card_does_not_shadow_reseller_routes() {
+        assert!(price_card("groq/deepseek-r1-distill-llama-70b").is_none());
+        assert!(price_card("abacus/deepseek-ai/DeepSeek-V4-Flash").is_none());
+        // A first-party id DeepSeek no longer lists falls through to the catalog
+        // rather than getting a guessed V4 price.
+        assert!(price_card("deepseek-r1").is_none());
     }
 
     #[test]

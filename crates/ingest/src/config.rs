@@ -45,16 +45,13 @@ pub struct IngestConfig {
     /// Per-trace byte ceiling (estimated total span bytes per single trace).
     /// `0` disables. Env: `TRACELANE_MAX_BYTES_PER_TRACE` (default 64 MiB).
     pub max_bytes_per_trace: u64,
-    /// Default per-tenant **monthly span** quota (ADR-048 D4.2), applied
-    /// uniformly until the Postgres resolver supplies real per-tenant caps.
-    /// `0` = unlimited (default — non-regressing). Env:
-    /// `TRACELANE_INGEST_DEFAULT_QUOTA`.
-    pub default_ingest_quota: u64,
-    /// Per-tenant **finite** quota applied while the control-plane resolver is
-    /// FAULTING (review P1-1): keep-all on a blip, but hard-stop a sustained or
-    /// induced fault at this cap instead of running uncapped. Generous default
-    /// (Enterprise base monthly). Env: `TRACELANE_FAULT_QUOTA`.
-    pub fault_quota: u64,
+    // `default_ingest_quota` (ADR-048 D4.2 default monthly span quota) and
+    // `fault_quota` (review P1-1's finite fault-path cap) are BOTH GONE —
+    // ADR-076 §0.4 retired the per-tenant ingest span quota outright ("ingest
+    // is NEVER blocked by billing state, on any tier"). `TRACELANE_INGEST_
+    // DEFAULT_QUOTA` / `TRACELANE_FAULT_QUOTA` are no longer read; an operator
+    // who still sets either now gets a silent no-op, same as any other
+    // retired env var in this tree.
 }
 
 impl IngestConfig {
@@ -97,14 +94,6 @@ impl IngestConfig {
                 .map(|v| v.parse())
                 .unwrap_or(Ok(crate::per_trace_ceiling::DEFAULT_MAX_BYTES_PER_TRACE))
                 .context("TRACELANE_MAX_BYTES_PER_TRACE must be a u64")?,
-            default_ingest_quota: std::env::var("TRACELANE_INGEST_DEFAULT_QUOTA")
-                .map(|v| v.parse())
-                .unwrap_or(Ok(0))
-                .context("TRACELANE_INGEST_DEFAULT_QUOTA must be a u64")?,
-            fault_quota: std::env::var("TRACELANE_FAULT_QUOTA")
-                .map(|v| v.parse())
-                .unwrap_or(Ok(crate::quota::DEFAULT_FAULT_QUOTA))
-                .context("TRACELANE_FAULT_QUOTA must be a u64")?,
         })
     }
 }

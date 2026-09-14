@@ -98,7 +98,8 @@ async fn handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "billing checkout auth failed");
-            return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error(status, msg);
         }
     };
 
@@ -195,7 +196,9 @@ mod tests {
             std::env::remove_var("TRACELANE_CHECKOUT_SUCCESS_URL");
             std::env::remove_var("TRACELANE_CHECKOUT_CANCEL_URL");
         }
-        let state = CheckoutState::from_env(Arc::new(PolarClient::new("polar_pat_fake")));
+        let state = CheckoutState::from_env(Arc::new(PolarClient::new(
+            secrecy::SecretString::from("polar_pat_fake".to_string()),
+        )));
         assert!(state.default_success_url.contains("status=success"));
         assert!(state.default_cancel_url.contains("status=cancelled"));
         unsafe {

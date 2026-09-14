@@ -22,7 +22,9 @@ vi.mock("@/db", () => ({
 import { tenants } from "@/db/schema";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import {
+	PLANS_V3,
 	PLAN_ENTITLEMENTS,
+	type Plan,
 	mergeOverrides,
 	resolveEntitlements,
 } from "./entitlements";
@@ -54,12 +56,12 @@ describe("mergeOverrides (deny-overrides-grant primitive)", () => {
 	it("coerces drizzle numeric strings to numbers for numeric fields", () => {
 		const base = { ...PLAN_ENTITLEMENTS.team };
 		const merged = mergeOverrides(base, {
-			overage_hard_cap_multiplier: "5.0",
-			retention_days: 120,
+			hot_gb_included: "120.5", // Drizzle numeric() columns come back as strings
+			indexed_window_days: 120,
 		});
-		expect(merged.overage_hard_cap_multiplier).toBe(5.0);
-		expect(typeof merged.overage_hard_cap_multiplier).toBe("number");
-		expect(merged.retention_days).toBe(120);
+		expect(merged.hot_gb_included).toBe(120.5);
+		expect(typeof merged.hot_gb_included).toBe("number");
+		expect(merged.indexed_window_days).toBe(120);
 	});
 });
 
@@ -80,8 +82,8 @@ describe("resolveEntitlements", () => {
 		const ent = await resolveEntitlements(null, "free");
 		expect(ent).toEqual(PLAN_ENTITLEMENTS.free);
 		expect(ent.plan).toBe("free");
-		expect(ent.trace_quota_monthly).toBe(10_000);
-		expect(ent.retention_days).toBe(7);
+		expect(ent.ingest_gb_included).toBe(1);
+		expect(ent.indexed_window_days).toBe(3);
 		expect(ent.byok_cmk).toBe(false);
 	});
 
@@ -95,7 +97,8 @@ describe("resolveEntitlements", () => {
 
 		setDb([]);
 		const ent = await resolveEntitlements(null, "free");
-		expect(ent.trace_quota_monthly).toBe(10_000); // not Builder's 150K
+		expect(ent.ingest_gb_included).toBe(1); // not Builder's 25 GB
+		expect(ent.unlimited_seats).toBe(false); // not every-paid-tier's unlimited
 	});
 
 	it("FALLBACK: Postgres error mid-resolution falls back to plan-map default", async () => {
@@ -104,7 +107,7 @@ describe("resolveEntitlements", () => {
 		const ent = await resolveEntitlements("tenant-uuid", "builder");
 		expect(ent.plan).toBe("builder");
 		expect(ent.byok_cmk).toBe(false);
-		expect(ent.seat_cap_max).toBe(1);
+		expect(ent.unlimited_seats).toBe(true); // ADR-076: every paid tier
 	});
 
 	it("DENY-OVERRIDES-GRANT: workspace FALSE overrides a plan-granted TRUE", async () => {
@@ -129,50 +132,74 @@ describe("resolveEntitlements", () => {
 		expect(ent.f_pr7_trajectory).toBe(true);
 	});
 
-	it("applies plan_entitlements numeric seat caps over the map default", async () => {
+	it("applies plan_entitlements six-meter overrides over the map default", async () => {
 		setDb([
-			[{ seatCapMax: 25, retentionDays: 90 }], // plan row
+			[{ unlimitedSeats: true, indexedWindowDays: 120 }], // plan row
 			[], // no workspace override (empty array → undefined first elem)
 		]);
 		const ent = await resolveEntitlements("tenant-uuid", "team");
-		expect(ent.seat_cap_max).toBe(25);
-		expect(ent.retention_days).toBe(90);
+		expect(ent.unlimited_seats).toBe(true);
+		expect(ent.indexed_window_days).toBe(120);
 	});
 });
 
-describe("tier landing matrix — what each plan lands with (billing.md / ADR-020)", () => {
-	// The authoritative per-tier numbers. Drift between this map and
-	// PLAN_ENTITLEMENTS is a bug (billing.md "Seat caps — one source of truth"
-	// + "Drift ... is a bug; ADR-020 lists the authoritative numbers"). This is
-	// the guard that a new signup on any tier "lands properly" — right seat cap,
-	// retention, and quota.
-	const MATRIX = {
-		free: { included: 1, max: 1, retention: 7, quota: 10_000 },
-		builder: { included: 1, max: 1, retention: 30, quota: 150_000 },
-		team: { included: 10, max: 25, retention: 90, quota: 1_000_000 },
-		business: { included: 25, max: 50, retention: 180, quota: 5_000_000 },
-		enterprise: { included: 0, max: 0, retention: 365, quota: 25_000_000 },
-	} as const;
+describe("tier landing matrix — every plan lands EXACTLY on plans.v3.json (ADR-076)", () => {
+	// Compared against PLANS_V3 (the JSON) rather than hand-typed literals — this
+	// is the guard that `buildPlanEntitlements`'s MAPPING is correct, not a pin
+	// on numbers that could silently drift from the single source
+	// (`.claude/rules/reference-tables.md`).
+	const LOOKUP: Record<string, string> = {
+		free: "free_v1",
+		builder: "builder_v1",
+		team: "team_v1",
+		business: "business_v1",
+		enterprise: "enterprise_v1",
+	};
 
-	for (const [plan, exp] of Object.entries(MATRIX)) {
-		it(`${plan}: seat_cap_included=${exp.included}, seat_cap_max=${exp.max} (0=unlimited), retention=${exp.retention}d, quota=${exp.quota}`, () => {
-			const e = PLAN_ENTITLEMENTS[plan as keyof typeof MATRIX];
-			expect(e.seat_cap_included).toBe(exp.included);
-			expect(e.seat_cap_max).toBe(exp.max);
-			expect(e.retention_days).toBe(exp.retention);
-			expect(e.trace_quota_monthly).toBe(exp.quota);
+	for (const plan of Object.keys(LOOKUP)) {
+		it(`${plan}: every ADR-076 field matches its plans.v3.json row exactly`, () => {
+			const row = PLANS_V3.plans[LOOKUP[plan] as string];
+			expect(row).toBeDefined();
+			if (!row) return;
+			const e = PLAN_ENTITLEMENTS[plan as Plan];
+			expect(e.unlimited_seats).toBe(row.unlimited_seats);
+			expect(e.f_sso).toBe(row.f_sso);
+			expect(e.hot_gb_included).toBe(row.hot_gb_included);
+			expect(e.ingest_gb_included).toBe(row.ingest_gb_included);
+			expect(e.series_included).toBe(row.series_included);
+			expect(e.scan_units_included).toBe(row.scan_units_included);
+			expect(e.eval_runs_included).toBe(row.eval_runs_included);
+			expect(e.indexed_window_days).toBe(row.indexed_window_days);
+			expect(e.queryable_days).toBe(row.queryable_days);
+			expect(e.ledger_days).toBe(row.ledger_days);
+			expect(e.cold_archive_days).toBe(row.cold_archive_days);
+			expect(e.overage_allowed).toBe(row.overage_allowed);
+			expect(e.rate_limit_rpm).toBe(row.rate_limit_rpm);
 		});
 	}
 
-	it("seat cap ordering is monotonic non-decreasing across paid tiers; enterprise is the 0=unlimited sentinel", () => {
-		expect(PLAN_ENTITLEMENTS.builder.seat_cap_max).toBeLessThanOrEqual(
-			PLAN_ENTITLEMENTS.team.seat_cap_max,
-		);
-		expect(PLAN_ENTITLEMENTS.team.seat_cap_max).toBeLessThanOrEqual(
-			PLAN_ENTITLEMENTS.business.seat_cap_max,
-		);
-		// Enterprise uses 0 as the unlimited sentinel (NOT a smaller cap than Business).
-		expect(PLAN_ENTITLEMENTS.enterprise.seat_cap_max).toBe(0);
+	it("seats: Free is capped at 1; EVERY paid tier is unlimited (ADR-076, no ladder)", () => {
+		expect(PLAN_ENTITLEMENTS.free.unlimited_seats).toBe(false);
+		for (const plan of ["builder", "team", "business", "enterprise"] as const) {
+			expect(PLAN_ENTITLEMENTS[plan].unlimited_seats).toBe(true);
+		}
+	});
+
+	it("SSO: Team and above only (plans.v3.json f_sso)", () => {
+		expect(PLAN_ENTITLEMENTS.free.f_sso).toBe(false);
+		expect(PLAN_ENTITLEMENTS.builder.f_sso).toBe(false);
+		expect(PLAN_ENTITLEMENTS.team.f_sso).toBe(true);
+		expect(PLAN_ENTITLEMENTS.business.f_sso).toBe(true);
+		expect(PLAN_ENTITLEMENTS.enterprise.f_sso).toBe(true);
+	});
+
+	it("Enterprise allowances are all `null` (custom), never a numeric quota", () => {
+		const ent = PLAN_ENTITLEMENTS.enterprise;
+		expect(ent.hot_gb_included).toBeNull();
+		expect(ent.ingest_gb_included).toBeNull();
+		expect(ent.series_included).toBeNull();
+		expect(ent.scan_units_included).toBeNull();
+		expect(ent.eval_runs_included).toBeNull();
 	});
 });
 
@@ -184,7 +211,7 @@ describe("audit_ledger — one source of truth = f_audit_addon", () => {
 	it("GRANT: a workspace f_audit_addon=TRUE grant enables audit_ledger on any tier", async () => {
 		setDb([
 			[{ fAuditAddon: false }], // plan default: add-on off
-			[{ fAuditAddon: true }], // per-tenant Audit SKU grant (migration 0005)
+			[{ fAuditAddon: true }], // per-tenant f_audit_addon export grant (migration 0005)
 		]);
 		const ent = await resolveEntitlements("tenant-uuid", "builder");
 		expect(ent.audit_ledger).toBe(true);
@@ -293,8 +320,8 @@ describe("full-capture gate (f_full_capture)", () => {
 	});
 
 	it("AUDIT FORCE is NON-OVERRIDABLE: workspace f_full_capture=false + audit grant → still full", async () => {
-		// plan grants full, workspace tries to deny it, but the Audit SKU is
-		// active → the deny is overridden back to TRUE (non-overridable guarantee).
+		// plan grants full, workspace tries to deny it, but the export grant
+		// (f_audit_addon) is active → the deny is overridden back to TRUE (non-overridable guarantee).
 		setDb([
 			[{ fFullCapture: true, fAuditAddon: false }],
 			[{ fFullCapture: false, fAuditAddon: true }],

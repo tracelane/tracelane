@@ -48,7 +48,7 @@
 //! # What it deliberately does NOT do
 //!
 //! It does not add a span attribute. Span size is a load-bearing number in this
-//! product (92.6 B/span is cited as part of the margin moat), and eight more
+//! product, and eight more
 //! fields on every span would grow it several-fold to answer a question that is
 //! only ever asked about the slow tail. If the breakdown later earns a place in
 //! ClickHouse it can be added deliberately, with that cost priced in.
@@ -61,22 +61,55 @@ use std::time::Instant;
 /// [`StageTimer::mark`].
 const MAX_STAGES: usize = 16;
 
-/// Requests slower than this (gateway overhead, not total) get a breakdown.
-/// Default 25 ms — comfortably above the 15 ms p99 budget, so a healthy gateway
-/// never emits.
-fn threshold_us() -> u64 {
-    std::env::var("TRACELANE_STAGE_TRACE_THRESHOLD_US")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(25_000)
+/// The two bounds, read ONCE at boot into `AppState::hotpath` (B-386 b).
+///
+/// Until 2026-09-12 both were read from the environment inside
+/// `emit_if_slow` — on EVERY request, on the hot path this module exists to
+/// measure. A test now constructs one instead of mutating the process env.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Requests slower than this (gateway overhead, not total) get a
+    /// breakdown. Default 25 ms — comfortably above the 15 ms p99 budget, so a
+    /// healthy gateway never emits.
+    pub threshold_us: u64,
+    /// Minimum gap between two emitted breakdown lines, process-wide.
+    pub interval_ms: u64,
 }
 
-/// Minimum gap between two emitted breakdown lines, process-wide.
-fn interval_ms() -> u64 {
-    std::env::var("TRACELANE_STAGE_TRACE_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000)
+impl Config {
+    pub const DEFAULT_THRESHOLD_US: u64 = 25_000;
+    pub const DEFAULT_INTERVAL_MS: u64 = 10_000;
+
+    /// `TRACELANE_STAGE_TRACE_THRESHOLD_US` / `TRACELANE_STAGE_TRACE_INTERVAL_MS`,
+    /// each falling back to its default when unset or unparsable.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        Self {
+            threshold_us: read(
+                "TRACELANE_STAGE_TRACE_THRESHOLD_US",
+                Self::DEFAULT_THRESHOLD_US,
+            ),
+            interval_ms: read(
+                "TRACELANE_STAGE_TRACE_INTERVAL_MS",
+                Self::DEFAULT_INTERVAL_MS,
+            ),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            threshold_us: Self::DEFAULT_THRESHOLD_US,
+            interval_ms: Self::DEFAULT_INTERVAL_MS,
+        }
+    }
 }
 
 /// Count of slow requests since boot. Monotonic; reported on every emitted line
@@ -163,8 +196,8 @@ impl StageTimer {
     ///
     /// The counter is incremented for EVERY slow request, including suppressed
     /// ones — the rate limit governs the log line, never the measurement.
-    pub fn emit_if_slow(&self, overhead_us: u64) -> bool {
-        if overhead_us < threshold_us() {
+    pub fn emit_if_slow(&self, cfg: &Config, overhead_us: u64) -> bool {
+        if overhead_us < cfg.threshold_us {
             return false;
         }
         let nth = SLOW_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -174,7 +207,7 @@ impl StageTimer {
         // only when another thread moved the value between the load and the
         // swap; it re-reads and re-tests rather than assuming its first read.
         let now = mono_ms();
-        let interval = interval_ms();
+        let interval = cfg.interval_ms;
         loop {
             let last = LAST_EMIT_MS.load(Ordering::Relaxed);
             // 0 is the never-emitted sentinel. Without it the first slow request
@@ -263,10 +296,11 @@ mod tests {
     /// instrument off the 86 GB/day path in `.claude/rules/logging.md`.
     #[test]
     fn a_request_under_threshold_never_emits() {
+        let cfg = Config::default();
         let t = StageTimer::new();
-        assert!(!t.emit_if_slow(0), "a 0 us request emitted a line");
+        assert!(!t.emit_if_slow(&cfg, 0), "a 0 us request emitted a line");
         assert!(
-            !t.emit_if_slow(threshold_us() - 1),
+            !t.emit_if_slow(&cfg, cfg.threshold_us - 1),
             "a request just under threshold emitted a line"
         );
     }
@@ -279,10 +313,11 @@ mod tests {
         // the emit path itself; reset it so ordering between tests cannot make
         // this one flaky.
         LAST_EMIT_MS.store(0, Ordering::Relaxed);
+        let cfg = Config::default();
         let mut t = StageTimer::new();
         t.mark("auth");
         assert!(
-            t.emit_if_slow(threshold_us() + 1),
+            t.emit_if_slow(&cfg, cfg.threshold_us + 1),
             "a request over threshold emitted nothing"
         );
     }

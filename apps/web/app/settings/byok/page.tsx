@@ -44,7 +44,7 @@ export default async function ByokPage() {
 				</p>
 				<div className="max-w-2xl rounded-lg border border-action-line bg-action-soft px-4 py-3 text-sm text-action-ink">
 					<span className="font-semibold">
-						Customer-managed encryption is available on Business ($899/mo) and
+						Customer-managed encryption is available on Business ($799/mo) and
 						Enterprise.
 					</span>{" "}
 					<Link

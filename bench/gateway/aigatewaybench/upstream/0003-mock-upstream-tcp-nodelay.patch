@@ -1,0 +1,34 @@
+From 388962197390c09a3434b875ffa98f314d186746 Mon Sep 17 00:00:00 2001
+From: Tracelane <noreply@tracelane.dev>
+Date: Mon, 7 Sep 2026 04:09:17 +0000
+Subject: [PATCH] mock-upstream: set TCP_NODELAY on accepted connections
+
+A streamed response is many small SSE writes; with Nagle on, the last small segment waits
+for the peer's delayed ACK (~40 ms on Linux). Measured through a streaming consumer with
+zero pacing: ~52 ms per request before, ~11 ms after, the consumer unchanged. The
+non-streaming path is one write and never pays it, so without this the overhead panel
+charges every gateway that streams from the mock ~40 ms the others do not pay.
+---
+ crates/mock-upstream/src/main.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/mock-upstream/src/main.rs b/crates/mock-upstream/src/main.rs
+index 5e6a4b5..38ae2b4 100644
+--- a/crates/mock-upstream/src/main.rs
++++ b/crates/mock-upstream/src/main.rs
+@@ -80,6 +80,12 @@ async fn main() {
+     let listener = tokio::net::TcpListener::bind((address, port))
+         .await
+         .expect("mock upstream binds");
++    // TCP_NODELAY: without it a streamed response of many small SSE writes can stall
++    // ~40 ms on the last small segment (Nagle waiting for the peer's delayed ACK) — a
++    // cost the non-streaming path never pays, so it skews any overhead comparison.
++    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp_stream: &mut tokio::net::TcpStream| {
++        let _ = tcp_stream.set_nodelay(true);
++    });
+     axum::serve(listener, app)
+         .await
+         .expect("mock upstream serves");
+-- 
+2.53.0
+

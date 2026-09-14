@@ -9,10 +9,10 @@ classification: PUBLIC
 | Data type | Where it lives | Retention |
 |---|---|---|
 | Spans (hot) | ClickHouse — **EU, Germany** (Hetzner, Falkenstein) | Up to 365 days. Retention is not customer-configurable. |
-| Spans (cold) | Cloudflare R2 — **implemented, not yet active** | n/a today; spans live in ClickHouse |
+| Spans (cold) | **None.** No cold tier exists; an unused R2 batcher was removed on 2026-09-12 | n/a; spans live only in ClickHouse, under the hot retention above |
 | Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Until account deletion |
 | Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
-| Provider API keys | Postgres (envelope-encrypted) | Until revoked |
+| Provider API keys | Postgres (envelope-encrypted) | Within 60 seconds of revocation (a key idle for over a minute may be accepted once more on its next use while the gateway re-checks it) |
 | Prompt/completion text | ClickHouse spans | Same as spans (not captured unless an operator allowlists the workspace`) |
 
 ### Sigstore Rekor — an external dependency, deliberately not a sub-processor

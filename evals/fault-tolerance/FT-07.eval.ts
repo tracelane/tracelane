@@ -37,9 +37,17 @@ describe("FT-07: Dashboard slow ClickHouse query — timeout + partial result", 
 		);
 		// Option 1: the dashboard reads ClickHouse only through the
 		// gateway proxy (tenant resolved gateway-side from the JWT). Real data,
-		// not static fixtures.
-		expect(content).toContain("gatewayGet");
-		expect(content).toContain("/v1/slo");
+		// not static fixtures. Since DSH-11 the page reads through the ONE
+		// windowed read layer, `lib/metrics/fetch.ts`, which is where the
+		// `gatewayGet` call and the `/v1/slo` route now live — so the assertion
+		// follows the seam rather than the page's text.
+		expect(content).toContain('from "@/lib/metrics/fetch"');
+		const fetchLayer = fs.readFileSync(
+			path.join(WEB_APP, "lib/metrics/fetch.ts"),
+			"utf8",
+		);
+		expect(fetchLayer).toContain("gatewayGet");
+		expect(fetchLayer).toContain("/v1/slo");
 	});
 
 	it("dashboard query timeout budget matches perf budget", () => {

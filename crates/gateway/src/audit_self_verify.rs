@@ -8,8 +8,9 @@
 //! exact NDJSON the export would produce, and returns a truthful verdict plus the
 //! chain bytes so the browser can render + independently re-verify.
 //!
-//! This is deliberately distinct from the paid `/v1/audit/export` (the $999
-//! Article-12 evidence pack, `FeatureKey::AuditAddon`): self-verify is
+//! This is deliberately distinct from the Enterprise `/v1/audit/export` (the
+//! Article-12 evidence pack, `FeatureKey::AuditAddon` — the paid SKU is not
+//! sold, B-392): self-verify is
 //! default-granted on every plan (`FeatureKey::AuditSelfVerify`), scope-floored to
 //! the caller's own chain within their retention window, and never produces the
 //! formatted, downloadable compliance deliverable. See ADR-066 for the split.
@@ -19,7 +20,7 @@
 //! The tenant is resolved ONLY from the validated `Authorization` claim
 //! (`Claims::tenant_id`, an internal UUID produced by the org_id→tenant bridge in
 //! `auth`). The request query has NO `tenant_id` / `since` / `until` fields — the
-//! window is derived from the tier's `retention_days`, never from the request. A
+//! window is derived from the tier's `ledger_days`, never from the request. A
 //! raw org_id or a body/param tenant_id therefore CANNOT reach the ClickHouse
 //! read: every read binds `claims.tenant_id` and the reader's SQL is
 //! `WHERE tenant_id = ? ... FINAL`. Enforced structurally + by
@@ -106,6 +107,7 @@ fn self_verify_verdict(
     strip_detected: bool,
     trust_established: bool,
     truncated: bool,
+    anchors_included: u64,
 ) -> &'static str {
     // R53 — THREE verdicts, because two were a lie in one direction.
     //
@@ -132,6 +134,17 @@ fn self_verify_verdict(
     if !trust_established {
         return "indeterminate";
     }
+    // B-381 (2026-09-12): GREEN ALSO REQUIRES AN EXTERNAL WITNESS. `trust_established`
+    // is true for any chain rooted at genesis — and the genesis seed is a per-tenant
+    // DETERMINISTIC value, which means anyone holding the hashing code can produce a
+    // perfectly consistent, perfectly "rooted" ledger from nothing. The independent
+    // review did exactly that in twenty lines of Python and this returned green.
+    // Consistency is not evidence; a publicly-included Rekor anchor is. Without one
+    // the honest verdict is "internally consistent, not yet publicly anchored" —
+    // which is INDETERMINATE (no positive evidence of tampering), never green.
+    if anchors_included == 0 {
+        return "indeterminate";
+    }
     "green"
 }
 
@@ -139,8 +152,8 @@ fn self_verify_verdict(
 const DEFAULT_LIMIT: u32 = 1000;
 /// Hard row cap per call (mirrors the export). The free surface is bounded.
 const MAX_LIMIT: u32 = 50_000;
-/// Retention-window floor used when the resolved `retention_days` is missing or
-/// non-positive (the free-tier floor — ADR-020 `free_v1`).
+/// Retention-window floor used when the resolved `ledger_days` is missing or
+/// non-positive (a floor below Free's 30-day ledger — ADR-076 `free_v1`).
 const RETENTION_FLOOR_DAYS: i64 = 7;
 
 /// Query params — `limit` ONLY. There is intentionally NO `tenant_id`, `since`,
@@ -157,12 +170,15 @@ pub struct SelfVerifyQuery {
 /// The verification window actually used (derived, not request-supplied).
 #[derive(Debug, Clone, Serialize)]
 pub struct SelfVerifyWindow {
-    /// ISO-8601 lower bound = `until - retention_days`.
+    /// ISO-8601 lower bound = `until - ledger_days`.
     pub since: String,
     /// ISO-8601 upper bound = now.
     pub until: String,
-    /// The tier's trace-retention window used to bound the read.
-    pub retention_days: i32,
+    /// The tier's LEDGER retention (`plan_entitlements.ledger_days`, ADR-076:
+    /// 30 d Free, 2 y paid, 7 y Enterprise) used to bound the read. Was the
+    /// ADR-020 `retention_days` (a trace window) until the BILL-01 contract
+    /// step dropped that column.
+    pub ledger_days: i32,
 }
 
 /// The first detected chain break, surfaced so a RED verdict is actionable
@@ -248,7 +264,8 @@ async fn handler(
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "audit self-verify auth failed");
-            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error_response(status, msg);
         }
     };
 
@@ -267,7 +284,7 @@ async fn handler(
     }
     let tenant = claims.tenant_id;
 
-    // 2. Entitlement — resolve the full set (we need `retention_days`) and require
+    // 2. Entitlement — resolve the full set (we need `ledger_days`) and require
     //    the default-TRUE `f_audit_selfverify` grant. Fail CLOSED when there is no
     //    entitlement source (prod always has one alongside this route); a
     //    per-workspace FALSE override (deny-overrides-grant) yields 403.
@@ -291,10 +308,10 @@ async fn handler(
         return self_verify_disabled_response();
     }
 
-    // 3. Window — the caller's OWN chain within their tier's retention window.
+    // 3. Window — the caller's OWN chain within their tier's LEDGER retention.
     //    Derived from entitlements, NEVER from the request (scope floor).
-    let days = if resolved.retention_days > 0 {
-        resolved.retention_days as i64
+    let days = if resolved.ledger_days > 0 {
+        resolved.ledger_days as i64
     } else {
         RETENTION_FLOOR_DAYS
     };
@@ -410,16 +427,19 @@ async fn handler(
         .unwrap_or(report.rows_seen)
         .max(report.rows_seen);
 
-    // 7. Build the truthful verdict (ADR-070 trust root + truncation guard — see
-    //    `self_verify_verdict`). A genesis-rooted unanchored view is still GREEN; a
-    //    windowed view with no anchor, or a response that verified 0 of N rows, RED.
+    // 7. Build the truthful verdict (ADR-070 trust root + truncation guard + B-381
+    //    anchor requirement — see `self_verify_verdict`). GREEN needs a publicly
+    //    included anchor; a consistent-but-unanchored view is INDETERMINATE; a
+    //    windowed view with no root, or a response that verified 0 of N rows, RED.
     let truncated = report.rows_seen == 0 && total_in_window > 0;
+    let unanchored = report.anchors_included == 0;
     let verdict = self_verify_verdict(
         report.hash_chain_valid,
         report.signatures_valid,
         report.strip_detected,
         report.trust_established,
         truncated,
+        report.anchors_included,
     );
     let first_failure = report
         .errors
@@ -439,6 +459,15 @@ async fn handler(
                     "loaded 0 rows but the ledger holds {total_in_window} in this window — response truncated"
                 ),
             })
+        })
+        .or_else(|| {
+            // B-381: say WHY it is not green when the only thing missing is the
+            // public witness — the UI must not show a blank indeterminate card.
+            (verdict == "indeterminate" && unanchored).then(|| SelfVerifyFailure {
+                seq: None,
+                kind: "unanchored".into(),
+                detail: "hash chain is internally consistent but no publicly-included Rekor anchor covers this window yet — a third party cannot verify it offline until one lands".into(),
+            })
         });
 
     let body = SelfVerifyResponse {
@@ -447,7 +476,7 @@ async fn handler(
         window: SelfVerifyWindow {
             since: since.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             until: until.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            retention_days: days as i32,
+            ledger_days: days as i32,
         },
         rows_verified: report.rows_seen,
         total_in_window,
@@ -602,14 +631,14 @@ mod tests {
     }
 
     /// Entitlement cache that resolves EVERY tenant to a fixed `f_audit_selfverify`
-    /// grant + a fixed `retention_days`.
-    fn fixed_entitlement(selfverify: bool, retention_days: i32) -> Arc<EntitlementCache> {
+    /// grant + a fixed `ledger_days`.
+    fn fixed_entitlement(selfverify: bool, ledger_days: i32) -> Arc<EntitlementCache> {
         Arc::new(EntitlementCache::new(Arc::new(
             move |_tenant: uuid::Uuid| {
                 Box::pin(async move {
                     Ok(ResolvedEntitlements {
                         f_audit_selfverify: selfverify,
-                        retention_days,
+                        ledger_days,
                         ..ResolvedEntitlements::deny_all()
                     })
                 })
@@ -801,29 +830,55 @@ mod tests {
                 serde_json::to_string(&offline_core).unwrap(),
                 "server self-verify verdict diverged from the offline OSS verifier"
             );
-            // And it must be GREEN for a healthy chain.
-            assert_eq!(json["verdict"], "green");
+            // The core AGREES byte-for-byte — that is the constraint. The verdict for
+            // this unanchored fixture is `indeterminate` (B-381): the offline CLI says
+            // CHAIN-ONLY / exit 3 for the same bytes, and the server must not say
+            // more than the customer's own verifier would.
+            assert_eq!(json["verdict"], "indeterminate");
+            assert_eq!(server.anchors_included, 0);
         });
     }
 
     // ---- Constraint 3: honest GREEN and RED -----------------------------
+
+    // B-381: a chain that checks out but has NO publicly-included anchor is not green,
+    // however well it is rooted — genesis is a deterministic seed anyone can compute.
+    #[test]
+    fn self_verify_verdict_is_never_green_without_an_included_anchor() {
+        assert_eq!(
+            self_verify_verdict(true, true, false, true, false, 0),
+            "indeterminate",
+            "consistent + rooted + ZERO included anchors must not be green"
+        );
+        assert_eq!(
+            self_verify_verdict(true, true, false, true, false, 1),
+            "green",
+            "one included anchor is what turns it green"
+        );
+        // Positive evidence of tampering still outranks the anchor question.
+        assert_eq!(
+            self_verify_verdict(false, true, false, true, false, 0),
+            "red"
+        );
+        assert_eq!(self_verify_verdict(true, true, true, true, false, 0), "red");
+    }
 
     #[test]
     fn self_verify_verdict_green_only_when_all_hold() {
         // GREEN requires the full conjunction; flipping ANY input to the bad value
         // must yield RED. Negative cases first (.claude/rules/testing.md).
         assert_eq!(
-            self_verify_verdict(false, true, false, true, false),
+            self_verify_verdict(false, true, false, true, false, 1),
             "red",
             "broken hash chain"
         );
         assert_eq!(
-            self_verify_verdict(true, false, false, true, false),
+            self_verify_verdict(true, false, false, true, false, 1),
             "red",
             "signature failure"
         );
         assert_eq!(
-            self_verify_verdict(true, true, true, true, false),
+            self_verify_verdict(true, true, true, true, false, 1),
             "red",
             "strip detected"
         );
@@ -831,43 +886,51 @@ mod tests {
         // to be "red" and is now "indeterminate". Everything checkable passed; the only
         // absent thing is a trust root for this window.
         assert_eq!(
-            self_verify_verdict(true, true, false, false, false),
+            self_verify_verdict(true, true, false, false, false, 1),
             "indeterminate",
             "unrooted window: cannot verify is NOT verification failed"
         );
         // ADR-070's property SURVIVES — it said an unrooted window is never GREEN, and
         // it still is not. Reclassified, not reversed; assert the half that binds.
         assert_ne!(
-            self_verify_verdict(true, true, false, false, false),
+            self_verify_verdict(true, true, false, false, false, 1),
             "green",
             "an unrooted window must never be green (ADR-070)"
         );
         // And a REAL problem inside an unrooted window is still RED — positive evidence
         // outranks the window every time, so `indeterminate` can never mask a defect.
         assert_eq!(
-            self_verify_verdict(false, true, false, false, false),
+            self_verify_verdict(false, true, false, false, false, 1),
             "red",
             "broken chain in an unrooted window is RED, not indeterminate"
         );
         assert_eq!(
-            self_verify_verdict(true, true, true, false, false),
+            self_verify_verdict(true, true, true, false, false, 1),
             "red",
             "strip in an unrooted window is RED, not indeterminate"
         );
         assert_eq!(
-            self_verify_verdict(true, true, false, true, true),
+            self_verify_verdict(true, true, false, true, true, 1),
             "red",
             "truncated: 0 rows verified out of a non-empty ledger"
         );
         assert_eq!(
-            self_verify_verdict(true, true, false, true, false),
+            self_verify_verdict(true, true, false, true, false, 1),
             "green",
             "all invariants hold"
         );
     }
 
+    /// B-381 (2026-09-12). This test used to be `healthy_chain_is_green` and asserted
+    /// `green` on a chain with ZERO anchors — which is precisely the verdict the
+    /// independent review defeated with a twenty-line fabricated ledger. A healthy,
+    /// consistent, UNANCHORED chain is `indeterminate` now, with the reason on the
+    /// wire so the card is not blank; the GREEN branch is proven at the decision
+    /// function (`self_verify_verdict_is_never_green_without_an_included_anchor`)
+    /// because a real included anchor needs a Rekor inclusion proof this mock
+    /// reader does not carry.
     #[test]
-    fn healthy_chain_is_green() {
+    fn healthy_unanchored_chain_is_indeterminate_not_green() {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
@@ -885,9 +948,17 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::OK, "body: {json}");
-            assert_eq!(json["verdict"], "green");
-            assert_eq!(json["hash_chain_valid"], true);
-            assert!(json["first_failure"].is_null());
+            assert_eq!(json["hash_chain_valid"], true, "the chain itself is fine");
+            assert_eq!(json["anchors_included"], 0);
+            assert_eq!(
+                json["verdict"], "indeterminate",
+                "consistent is not verified"
+            );
+            assert_ne!(json["verdict"], "green");
+            assert_eq!(
+                json["first_failure"]["kind"], "unanchored",
+                "the reason must be on the wire, not a blank card: {json}"
+            );
         });
     }
 
@@ -986,10 +1057,11 @@ mod tests {
         });
     }
 
-    /// The anchor-aware path: an unanchored chain still verifies GREEN, and the
-    /// response reports zero resolved anchors (never implies universal anchoring).
+    /// The anchor-aware path: an unanchored chain reports zero resolved / included
+    /// anchors and is therefore INDETERMINATE (B-381) — never green, and never an
+    /// accusation either: `strip_detected` stays false.
     #[test]
-    fn unanchored_chain_is_green_with_zero_resolved_anchors() {
+    fn unanchored_chain_is_indeterminate_with_zero_resolved_anchors() {
         let _g = ENV_LOCK.lock().expect("env lock");
         let _env = DevAuthEnv::enable();
         rt().block_on(async {
@@ -1007,10 +1079,13 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::OK, "body: {json}");
-            assert_eq!(json["verdict"], "green");
+            assert_eq!(json["verdict"], "indeterminate");
             assert_eq!(json["rekor_anchors_resolved"], 0);
             assert_eq!(json["anchors_included"], 0);
-            assert_eq!(json["strip_detected"], false);
+            assert_eq!(
+                json["strip_detected"], false,
+                "unanchored is not an accusation"
+            );
         });
     }
 

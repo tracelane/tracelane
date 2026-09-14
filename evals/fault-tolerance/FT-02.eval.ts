@@ -86,8 +86,15 @@ describe("FT-02: Rate-limit queue — retry within SLO", () => {
 		);
 		expect(fs.existsSync(chaos)).toBe(true);
 		const content = fs.readFileSync(chaos, "utf8");
-		expect(content).toContain("wiremock_429_then_200_succeeds_within_budget");
-		expect(content).toContain("wiremock_persistent_429_exhausts_retry");
-		expect(content).toContain("MockServer");
+		// B-385 2c (2026-09-12): the real handler, the real free-tier bucket —
+		// the request past the allowance is a 429 with Retry-After, from the
+		// booted gateway binary, and the quota/ledger counters are untouched.
+		expect(content).toContain("the_request_past_the_free_tier_allowance_is_429_with_retry_after");
+		expect(content).toContain("Retry-After");
+		const harness = fs.readFileSync(
+			path.resolve(__dirname, "../../crates/gateway/tests/common/mod.rs"),
+			"utf8",
+		);
+		expect(harness).toContain("CARGO_BIN_EXE_gateway");
 	});
 });

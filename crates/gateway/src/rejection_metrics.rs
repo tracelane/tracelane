@@ -1,15 +1,27 @@
-//! Per-tenant gateway rejection counters (rate-limit + monthly-quota 429s).
+//! Per-tenant gateway rejection counters (rate-limit + budget-exceeded 429s).
 //!
 //! Callers: the two 429 branches in [`crate::server`] increment on rejection;
 //! the Gateway-ops read (`/v1/gateway/stats` in [`crate::trace_reads`]) reads
 //! the authenticated tenant's totals.
 //!
-//! Why a counter and not a span: a rate-limit / quota 429 is returned BEFORE any
-//! provider dispatch, so there is no request span to carry the signal. Emitting
-//! one span per rejected request would write telemetry for exactly the load the
-//! limiter is shedding — a DoS amplifier under a flood. Instead each rejection is
-//! a single relaxed `fetch_add` on a per-`(tenant, reason)` atomic (no I/O, no
-//! allocation past the first insert), read on demand by the stats endpoint.
+//! Why a counter and not a span: a rate-limit / budget 429 is returned BEFORE
+//! any provider dispatch, so there is no request span to carry the signal.
+//! Emitting one span per rejected request would write telemetry for exactly
+//! the load the limiter is shedding — a DoS amplifier under a flood. Instead
+//! each rejection is a single relaxed `fetch_add` on a per-`(tenant, reason)`
+//! atomic (no I/O, no allocation past the first insert), read on demand by
+//! the stats endpoint.
+//!
+//! **BILL-01 / ADR-076 (2026-09-13) retired what this counter used to mean.**
+//! It was the MONTHLY TRACE-COUNT hard cap (ADR-020); that concept is
+//! deleted outright — ingest is never blocked by billing state, on any tier.
+//! `record_budget_exceeded` is called from `admission::run`'s
+//! `KeyBudget`/`WorkspaceBudget` steps, so it counts a customer's own opt-in
+//! USD spend-budget 429s (GWY-43), never a quota. The field, method and JSON
+//! wire name (`budget_exceeded_since_start`, `GatewayStatsResponse` in
+//! `trace_reads.rs`; `apps/web/lib/gateway-ops.ts` reads that key) were
+//! renamed together on 2026-09-14 — founder: "no old code logic should
+//! exist" — so no surface names a quota this gateway does not have.
 //!
 //! Semantics — **process-lifetime totals**, reset on restart/redeploy, NOT a
 //! rolling window. The surface labels them "since gateway start" so the number is
@@ -17,7 +29,6 @@
 //! instance per node today; a multi-instance fleet would sum per-instance
 //! counters (documented, not silently wrong).
 
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
@@ -27,12 +38,14 @@ use tracelane_shared::TenantId;
 #[derive(Default)]
 struct TenantRejections {
     rate_limited: AtomicU64,
-    quota_exceeded: AtomicU64,
+    budget_exceeded: AtomicU64,
 }
 
-/// Process-global per-tenant rejection registry.
+/// Per-tenant rejection registry. ONE instance per process, owned by
+/// `AppState` (B-386 b) — not a global.
 ///
-/// `String` key mirrors [`crate::rate_limiter::QuotaTracker`] — it avoids
+/// `String` key mirrors [`crate::spend::SpendTracker`]'s subject keying (and the
+/// retired trace-quota tracker's before it, deleted under ADR-076) — it avoids
 /// depending on `TenantId: Hash + Eq` and keeps the two per-tenant maps keyed
 /// identically.
 pub struct RejectionRegistry {
@@ -40,7 +53,8 @@ pub struct RejectionRegistry {
 }
 
 impl RejectionRegistry {
-    fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             by_tenant: DashMap::new(),
         }
@@ -55,16 +69,17 @@ impl RejectionRegistry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one monthly-quota hard-cap 429 for `tenant`.
-    pub fn record_quota_exceeded(&self, tenant: &TenantId) {
+    /// Record one budget-exceeded 429 for `tenant` — a per-key or workspace
+    /// USD spend budget (GWY-43; BILL-01 A3 daily/weekly ceilings).
+    pub fn record_budget_exceeded(&self, tenant: &TenantId) {
         self.by_tenant
             .entry(tenant.to_string())
             .or_default()
-            .quota_exceeded
+            .budget_exceeded
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `(rate_limited, quota_exceeded)` process-lifetime totals for `tenant`
+    /// `(rate_limited, budget_exceeded)` process-lifetime totals for `tenant`
     /// (`(0, 0)` if the tenant has never been rejected).
     #[must_use]
     pub fn snapshot(&self, tenant: &TenantId) -> (u64, u64) {
@@ -73,19 +88,18 @@ impl RejectionRegistry {
             .map(|e| {
                 (
                     e.rate_limited.load(Ordering::Relaxed),
-                    e.quota_exceeded.load(Ordering::Relaxed),
+                    e.budget_exceeded.load(Ordering::Relaxed),
                 )
             })
             .unwrap_or((0, 0))
     }
 }
 
-/// The process-global registry (lazily initialised on first use).
-#[must_use]
-pub fn registry() -> &'static RejectionRegistry {
-    static R: LazyLock<RejectionRegistry> = LazyLock::new(RejectionRegistry::new);
-    &R
-}
+// `registry()` — the process-global `LazyLock` — was DELETED 2026-09-12 (B-386 b).
+// The one instance now lives on `AppState::rejection_metrics` (constructed in
+// `server::run`, built fresh by `handler_harness::test_state`) and is shared
+// with `trace_reads::TraceReadState` by `Arc`, so the hot path records on the
+// same counters the `/v1/gateway` stats surface reads.
 
 #[cfg(test)]
 mod tests {
@@ -108,7 +122,7 @@ mod tests {
         let t = tenant(0xB2);
         reg.record_rate_limited(&t);
         reg.record_rate_limited(&t);
-        reg.record_quota_exceeded(&t);
+        reg.record_budget_exceeded(&t);
         assert_eq!(reg.snapshot(&t), (2, 1));
     }
 
@@ -118,8 +132,8 @@ mod tests {
         let a = tenant(1);
         let b = tenant(2);
         reg.record_rate_limited(&a);
-        reg.record_quota_exceeded(&b);
-        // Tenant a sees only its own rate-limit; b only its own quota reject.
+        reg.record_budget_exceeded(&b);
+        // Tenant a sees only its own rate-limit; b only its own budget reject.
         assert_eq!(reg.snapshot(&a), (1, 0));
         assert_eq!(reg.snapshot(&b), (0, 1));
     }

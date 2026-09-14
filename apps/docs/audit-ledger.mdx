@@ -18,7 +18,7 @@ gateway) are **full-fidelity in your trace store but not yet in the hash
 chain**; chaining them is on the roadmap.
 
 **What is live.** The SHA-256 hash chain is **appended for every tenant** (the
-chain itself is universal). For **Audit add-on** workspaces, each batch's Merkle
+chain itself is universal). On **every tier**, each batch's Merkle
 root is additionally **Ed25519-signed and best-effort anchored to the public
 Sigstore Rekor v2 log** (`log2025-1.rekor.sigstore.dev`; first production anchor:
 log index `19398597`, 2026-07-13). Anchoring is **per Merkle batch (every 100
@@ -26,14 +26,15 @@ events) — never per-event or per-trace**, and coverage is **not yet universal*
 it grows as each batch closes and anchors. Anchoring is **best-effort** — if the
 public log is unreachable a batch stays signed-locally-but-not-yet-anchored, and
 the hash chain + Ed25519 signature still verify. **eIDAS QTSP timestamping remains
-on the roadmap.** Exporting the ledger for offline verification
-(`/v1/audit/export`, `tlane verify`) requires the **Audit add-on** (fail-closed);
-the hash chain is appended for every tenant, but offline self-verification is an
-Audit-add-on capability.
+on the roadmap.** Self-verification (`tlane verify` against your own export of
+the chain) is included on every tier. The bulk regulatory export
+(`/v1/audit/export`, the Article-12-style evidence package) is an **Enterprise**
+capability (fail-closed on other tiers).
 </Note>
 
-The cryptographic-anchoring layer (Ed25519 + Rekor) is part of the standalone
-**Audit add-on** at $999/mo (Business+ base required).
+The cryptographic-anchoring layer (Ed25519 + Rekor) and self-verification are
+included on every tier. Seven-year ledger retention and the bulk
+`/v1/audit/export` regulatory package are included on Enterprise.
 
 ## How it works
 
@@ -53,7 +54,7 @@ Request arrives at gateway
    length-prefixed; universal, free tier included)
         │
         ▼
-  ── Audit SKU: cryptographic anchoring ──                 ← LIVE (Ed25519 + Rekor, best-effort)
+  ── Cryptographic anchoring (every tier) ──                ← LIVE (Ed25519 + Rekor, best-effort)
   Every N events (default: 100), a batch is assembled:
     Merkle root of the batch
     Ed25519 signature over the root (tenant's audit keypair)
@@ -77,11 +78,12 @@ exits 1 as `INCOMPLETE` rather than passing on a partial result.
 ## Export
 
 <Note>
-`/v1/audit/export` (and `/v1/audit/summary`) require the **Audit add-on**
-entitlement and fail closed (HTTP 403) without it. The hash chain is appended
-for every tenant, but exporting the ledger for offline verification is an
-Audit-add-on capability. For anchored batches the export bundle includes the
-Rekor inclusion proof + signed checkpoint.
+`/v1/audit/export` (and `/v1/audit/summary`) require **Enterprise**
+and fail closed (HTTP 403) without it. The hash chain is appended
+for every tenant, and self-verification (`tlane verify`) is included on every
+tier — only the bulk regulatory export is Enterprise-only. For anchored
+batches the export bundle includes the Rekor inclusion proof + signed
+checkpoint.
 </Note>
 
 The ledger export is an API call. It returns the NDJSON that `tlane verify`
@@ -192,7 +194,7 @@ over — a verifier must re-hash those exact bytes, not a re-serialised copy.
 
 ## Batch header schema
 
-Each Audit-add-on batch carries an anchor record, discriminated from row records
+Each anchored batch carries an anchor record, discriminated from row records
 by `"type":"anchor"` (row records carry no `type`). `rekor` is **absent from the
 JSON object entirely** unless `anchor_state` is `anchored` — the field is
 `skip_serializing_if = "Option::is_none"`

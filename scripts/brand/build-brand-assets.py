@@ -18,21 +18,29 @@ imagemagick on this machine, and adding one to draw a logo is not a trade worth 
 The polygon scanline rasterizer and PNG/ICO writers below are ~150 lines of stdlib and
 are exact for straight-edged geometry, which is all this mark is.
 
-THE MARK. A geometric T monogram, constructed — never auto-traced. It was MEASURED from
-the founder's reference sheet (`brand/reference/brand-sheet-source.png`, the
-`icon-black-mark` cell) by decoding it and extracting per-row dark-pixel runs, then
-rebuilt on a clean 100x100 grid with exact values: stroke 12, counter gap 10, and every
-diagonal at exactly 45 degrees. The source is a raster export with 1-2px jitter on its
-edges; this is the intended geometry behind it.
+THE MARK is the aperture drawn in `apps/site/src/components/Logo.astro` — see THE
+GEOMETRY below. (Until 2026-08-24 this file emitted a geometric T monogram measured
+from a founder reference sheet; that mark, its sheet and the rejected zip are gone from
+the tree since 2026-09-12 and live only in git history — `git log -- brand/`.)
 
-It reads as an "inline" T — two parallel bands tracing the letter, split by a 45-degree
-counter that slices the top right. That split makes it TWO shapes, not one, which is the
-detail an auto-trace would have smoothed away.
+ONE OUTPUT SET, 2026-09-12 (founder: "way too many inconsistent variants ... keep one
+source or one latest version of what's live on homepage"). The manifest in `outputs()`
+emits exactly what a surface consumes, plus a nine-file brand kit under `brand/`. The
+marketing site and the app get the SAME favicon files at the SAME `/brand/*` paths, so
+the tab icon is identical by construction — before this, the site shipped a single
+small-cut SVG that rendered a solid disc at HiDPI while the app's 32px PNG showed the
+rings, and the founder saw two different marks in two tabs.
+
+The lockup PNGs (`brand/png/tracelane-lockup-horizontal-*.png`) and the OG card are the
+one thing this stdlib rasterizer cannot draw — they carry the Inter wordmark — and come
+from `scripts/brand/render-lockup-png.mjs`, which renders the SVG masters this script
+writes. Derived, not a second source.
 
 USAGE
-  build-brand-assets.py             # write brand/ and apps/web/public/brand/
+  build-brand-assets.py             # write brand/, apps/web/public/brand/, apps/site/public/brand/
   build-brand-assets.py --verify    # rebuild in a temp dir and PROVE every output is real
   build-brand-assets.py --selftest  # prove the verifier CATCHES a blank/solid asset
+  build-brand-assets.py --check-refs  # every /brand/* the app AND the site reference exists
 """
 
 from __future__ import annotations
@@ -68,7 +76,6 @@ ROOT = Path(__file__).resolve().parents[2]
 # 16px, and pretending otherwise ships mush. Below SMALL_AT the mark drops to a
 # simplified cut — thicker corners, one solid centre, no rings. Same silhouette,
 # legible where the full cut is not. `_cut_for()` picks; nothing else decides.
-S, G = 12, 10  # retained: the retired T monogram's stroke/counter, cited by docs.
 
 # The mark's own box is 8..92 on BOTH axes — deliberately square, so every square
 # surface (favicon, app icon, PWA tile, avatar) centres it without hand-nudging.
@@ -125,18 +132,19 @@ def _expand_shapes(shapes: list[tuple]) -> list[tuple]:
 # "concentric circles in centre, not circle + dot": a ring plus a filled dot is one
 # circle and a disc; two rings is the thing the word describes.
 MARK_FULL = _expand_shapes(
-    _corners(26, 12)
-    + [("poly", [(8, 44), (25.5, 44), (25.5, 56), (8, 56)])]
-    + [("poly", [(74.5, 44), (92, 44), (92, 56), (74.5, 56)])]
-    + [("ring", 50, 50, 22, 7), ("ring", 50, 50, 8.5, 6)]
+    # A4-6 (2026-09-04): the SLIM mark — corner stroke 12 → 8, span 12 → 7 tall, rings 7/6 → 4/3.5.
+    _corners(22, 8)
+    + [("poly", [(8, 46.5), (25.5, 46.5), (25.5, 53.5), (8, 53.5)])]
+    + [("poly", [(74.5, 46.5), (92, 46.5), (92, 53.5), (74.5, 53.5)])]
+    + [("ring", 50, 50, 22, 4), ("ring", 50, 50, 8.5, 3.5)]
 )
 
 # THE SMALL CUT. Solid centre, so the bars run to ITS edge rather than the ring's.
 MARK_SMALL = _expand_shapes(
-    _corners(30, 14)
-    + [("poly", [(8, 44), (34, 44), (34, 56), (8, 56)])]
-    + [("poly", [(66, 44), (92, 44), (92, 56), (66, 56)])]
-    + [("disc", 50, 50, 16)]
+    _corners(28, 10)
+    + [("poly", [(8, 46), (34, 46), (34, 54), (8, 54)])]
+    + [("poly", [(66, 46), (92, 46), (92, 54), (66, 54)])]
+    + [("disc", 50, 50, 12)]
 )
 
 # Below this rendered pixel size the mark drops to the simplified cut.
@@ -148,7 +156,7 @@ MARK_SMALL = _expand_shapes(
 # that width from the ring geometry itself, and the selftest asserts it CLEARS the
 # floor at SMALL_AT and MISSES it one pixel below. Change this constant and that
 # two-sided assertion is what argues back.
-SMALL_AT = 20
+SMALL_AT = 32  # A4-6 (2026-09-04): the slim rings need 32 px before the inner stroke holds a pixel
 
 # The band width `Logo.astro` ITSELF judged acceptable at that threshold, in device
 # px: its raw inner stroke is 6 units on a 100-unit box drawn at SMALL_AT px with no
@@ -164,7 +172,10 @@ SMALL_AT = 20
 # thinner band at a given nominal size than the UNPADDED component does. Padding and
 # EXPAND nearly cancel (0.9 * 1.143 = 1.029), which is why both land on 20 — but that
 # is a result here, not an assumption, and retuning either one breaks it loudly.
-BAND_FLOOR_PX = 6 * SMALL_AT / 100
+# A4-6: the narrowest band is now the INNER RING STROKE, 3.5 units (was 6) — the floor follows
+# the geometry, not the other way round; the selftest still holds both directions.
+NARROWEST_BAND_UNITS = 3.5
+BAND_FLOOR_PX = NARROWEST_BAND_UNITS * SMALL_AT / 100
 
 
 def _cut_for(size: int) -> list[tuple]:
@@ -190,10 +201,7 @@ def _narrowest_band_px(size: int, pad: float) -> float:
 MARK = MARK_FULL
 
 INK = "#0D0D0D"  # ADR-074 §8: the mark is never coloured.
-SITE_INK = "#15181f"  # apps/site's own --color-fg; see the favicon entry in outputs().
 PAPER = "#FFFFFF"
-
-TAGLINE = "THE FLIGHT RECORDER FOR AI AGENTS"
 # Wordmark face: the app's incumbent, with the ADR-074 target first. SVG text stays
 # text on purpose — outlining it here would fork the wordmark from the product's font.
 FONT_STACK = "Inter, 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif"
@@ -437,42 +445,23 @@ def svg_mark(fill: str, *, small: bool = False) -> str:
     )
 
 
-def svg_lockup(fill: str, *, stacked: bool, tagline: bool) -> str:
-    """Wordmark stays <text>: outlining it would fork the logo from the product font."""
-    if not stacked:
-        w, h = (560, 116) if tagline else (500, 100)
-        mark = _paths(fill, dx=0, dy=(h - 84) / 2, scale=0.84)
-        word = (
-            f'  <text x="112" y="{h / 2 - (8 if tagline else 0)}" font-family="{FONT_STACK}" '
-            f'font-size="66" font-weight="600" letter-spacing="-2.2" fill="{fill}" '
-            'dominant-baseline="central">tracelane</text>'
-        )
-        tag = (
-            f'\n  <text x="115" y="{h / 2 + 34}" font-family="{FONT_STACK}" font-size="15" '
-            f'font-weight="500" letter-spacing="3.4" fill="{fill}" '
-            f'dominant-baseline="central">{TAGLINE}</text>'
-            if tagline
-            else ""
-        )
-    else:
-        w, h = (420, 250) if tagline else (420, 220)
-        mark = _paths(fill, dx=(w - 100) / 2, dy=6, scale=1.0)
-        word = (
-            f'  <text x="{w / 2}" y="152" font-family="{FONT_STACK}" font-size="62" '
-            f'font-weight="600" letter-spacing="-2" fill="{fill}" text-anchor="middle" '
-            'dominant-baseline="central">tracelane</text>'
-        )
-        tag = (
-            f'\n  <text x="{w / 2}" y="196" font-family="{FONT_STACK}" font-size="13.5" '
-            f'font-weight="500" letter-spacing="3.1" fill="{fill}" text-anchor="middle" '
-            f'dominant-baseline="central">{TAGLINE}</text>'
-            if tagline
-            else ""
-        )
+def svg_lockup(fill: str) -> str:
+    """The horizontal lockup — mark + lowercase wordmark. The ONLY lockup.
+
+    Wordmark stays <text>: outlining it would fork the logo from the product font.
+    The stacked and tagline variants were dropped 2026-09-12 — nothing consumed them.
+    """
+    w, h = 500, 100
+    mark = _paths(fill, dx=0, dy=(h - 84) / 2, scale=0.84)
+    word = (
+        f'  <text x="112" y="{h / 2}" font-family="{FONT_STACK}" '
+        f'font-size="66" font-weight="600" letter-spacing="-2.2" fill="{fill}" '
+        'dominant-baseline="central">tracelane</text>'
+    )
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" '
         f'height="{h}" role="img" aria-label="Tracelane — the flight recorder for AI agents">\n'
-        f"  <title>Tracelane</title>\n{mark}\n{word}{tag}\n</svg>\n"
+        f"  <title>Tracelane</title>\n{mark}\n{word}\n</svg>\n"
     )
 
 
@@ -480,198 +469,75 @@ def svg_lockup(fill: str, *, stacked: bool, tagline: bool) -> str:
 # Manifest
 # ─────────────────────────────────────────────────────────────────────────────
 def outputs() -> list[tuple[str, str, dict]]:
-    """(relative path, kind, kwargs). One list so build and verify cannot diverge."""
+    """(relative path, kind, kwargs). One list so build and verify cannot diverge.
+
+    THREE GROUPS, and nothing else: the brand kit a human reaches for, the runtime
+    files each surface's HTML actually references, and the docs portal. Every entry
+    here is either consumed by a `<link>`/manifest/docs.json on a live surface or is
+    one of the nine kit files. `--check-refs` proves the runtime half resolves.
+    """
     o: list[tuple[str, str, dict]] = []
-    # SVG masters
+
+    # ── 1. THE BRAND KIT (brand/) — for decks, press, partner pages. Nine files:
+    # these four SVGs + three PNGs here + two lockup PNGs from render-lockup-png.mjs.
     o.append(("brand/svg/tracelane-mark-black.svg", "svg_mark", {"fill": INK}))
     o.append(("brand/svg/tracelane-mark-white.svg", "svg_mark", {"fill": PAPER}))
-    for stacked in (False, True):
-        for tag in (False, True):
-            for name, fill in (("black", INK), ("white", PAPER)):
-                s = "stacked" if stacked else "horizontal"
-                t = "-tagline" if tag else ""
-                o.append(
-                    (
-                        f"brand/svg/tracelane-lockup-{s}{t}-{name}.svg",
-                        "svg_lockup",
-                        {"fill": fill, "stacked": stacked, "tagline": tag},
-                    )
-                )
-    # Favicons — black mark on white, and white mark on black
-    for size in (512, 256, 128, 64, 48, 32, 16):
-        p = 0.05 if size >= 32 else 0.03
-        o.append(
-            (
-                f"brand/png/favicon-{size}.png",
-                "png",
-                {"size": size, "ink": INK, "bg": PAPER, "shape": "none", "pad": p},
-            )
-        )
-        o.append(
-            (
-                f"brand/png/favicon-{size}-white.png",
-                "png",
-                {"size": size, "ink": PAPER, "bg": INK, "shape": "none", "pad": p},
-            )
-        )
-    # Standalone marks, transparent
-    for size in (1024, 512):
-        o.append(
-            (
-                f"brand/png/icon-black-mark-{size}.png",
-                "png",
-                {"size": size, "ink": INK, "bg": None, "shape": "none", "pad": 0.02},
-            )
-        )
-        o.append(
-            (
-                f"brand/png/icon-white-mark-{size}.png",
-                "png",
-                {"size": size, "ink": PAPER, "bg": None, "shape": "none", "pad": 0.02},
-            )
-        )
-    # Square + circle icons
-    for shape in ("square", "circle"):
-        o.append(
-            (
-                f"brand/png/icon-black-{shape}-1024.png",
-                "png",
-                {"size": 1024, "ink": PAPER, "bg": INK, "shape": shape, "pad": 0.21},
-            )
-        )
-        o.append(
-            (
-                f"brand/png/icon-white-{shape}-1024.png",
-                "png",
-                {"size": 1024, "ink": INK, "bg": PAPER, "shape": shape, "pad": 0.21},
-            )
-        )
-    # Apple touch 180, Android 192 — both polarities
     o.append(
-        (
-            "brand/png/apple-touch-icon-black.png",
-            "png",
-            {"size": 180, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
+        ("brand/svg/tracelane-lockup-horizontal-black.svg", "svg_lockup", {"fill": INK})
     )
     o.append(
         (
-            "brand/png/apple-touch-icon-white.png",
-            "png",
-            {"size": 180, "ink": INK, "bg": PAPER, "shape": "square", "pad": 0.19},
+            "brand/svg/tracelane-lockup-horizontal-white.svg",
+            "svg_lockup",
+            {"fill": PAPER},
         )
     )
-    o.append(
-        (
-            "brand/png/android-icon-black.png",
-            "png",
-            {"size": 192, "ink": PAPER, "bg": INK, "shape": "circle", "pad": 0.22},
+    # Bare mark on transparent, both polarities — the slide / avatar / doc drop-in.
+    for name, ink in (("black", INK), ("white", PAPER)):
+        o.append(
+            (
+                f"brand/png/tracelane-mark-{name}-1024.png",
+                "png",
+                {"size": 1024, "ink": ink, "bg": None, "shape": "none", "pad": 0.02},
+            )
         )
-    )
+    # The app-store / social-avatar tile: white mark on ink, iOS superellipse.
     o.append(
         (
-            "brand/png/android-icon-white.png",
+            "brand/png/tracelane-icon-1024.png",
             "png",
-            {"size": 192, "ink": INK, "bg": PAPER, "shape": "circle", "pad": 0.22},
-        )
-    )
-    # PWA / maskable
-    o.append(
-        (
-            "brand/png/pwa-512.png",
-            "png",
-            {"size": 512, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
-    )
-    o.append(
-        (
-            "brand/png/pwa-192.png",
-            "png",
-            {"size": 192, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
+            {"size": 1024, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.21},
         )
     )
 
-    # ── The APP-FACING copies. Generated here, never hand-copied: a hand-copied asset
-    # is a second source of truth, and that is precisely how the old logo ended up as
-    # SIX divergent inlined SVGs plus two PNGs that no longer matched each other.
-    for size in (512, 256, 128, 64, 48, 32, 16):
+    # ── 2. RUNTIME — what the HTML references, at the paths it references. The app
+    # (`apps/web/app/layout.tsx` + `manifest.ts`) and the marketing site
+    # (`apps/site/src/layouts/Base.astro`) name the SAME files at the SAME `/brand/*`
+    # paths, so both tabs resolve the same bytes and render the same mark. Generated
+    # into each public dir rather than copied: a hand-copied asset is a second source
+    # of truth, and that is precisely how the old logo ended up as six divergent SVGs.
+    favicon_16 = {"size": 16, "ink": INK, "bg": PAPER, "shape": "none", "pad": 0.03}
+    favicon_32 = {"size": 32, "ink": INK, "bg": PAPER, "shape": "none", "pad": 0.05}
+    apple_touch = {"size": 180, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19}
+    for public in ("apps/web/public", "apps/site/public"):
+        o.append((f"{public}/brand/favicon-16.png", "png", favicon_16))
+        o.append((f"{public}/brand/favicon-32.png", "png", favicon_32))
+        o.append((f"{public}/brand/apple-touch-icon.png", "png", apple_touch))
+        o.append((f"{public}/brand/tracelane-mark.svg", "svg_mark", {"fill": INK}))
+    # PWA tiles — the app only; the marketing site has no manifest.
+    for size in (512, 192):
         o.append(
             (
-                f"apps/web/public/brand/favicon-{size}.png",
+                f"apps/web/public/brand/pwa-{size}.png",
                 "png",
-                {
-                    "size": size,
-                    "ink": INK,
-                    "bg": PAPER,
-                    "shape": "none",
-                    "pad": 0.05 if size >= 32 else 0.03,
-                },
+                {"size": size, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
             )
         )
-    o.append(
-        (
-            "apps/web/public/brand/apple-touch-icon.png",
-            "png",
-            {"size": 180, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
-    )
-    o.append(
-        (
-            "apps/web/public/brand/pwa-512.png",
-            "png",
-            {"size": 512, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
-    )
-    o.append(
-        (
-            "apps/web/public/brand/pwa-192.png",
-            "png",
-            {"size": 192, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
-    )
-    o.append(("apps/web/public/brand/tracelane-mark.svg", "svg_mark", {"fill": INK}))
 
-    # Docs portal (Mintlify) — light/dark logo + favicon.
-    o.append(
-        (
-            "apps/docs/logo/light.svg",
-            "svg_lockup",
-            {"fill": INK, "stacked": False, "tagline": False},
-        )
-    )
-    o.append(
-        (
-            "apps/docs/logo/dark.svg",
-            "svg_lockup",
-            {"fill": PAPER, "stacked": False, "tagline": False},
-        )
-    )
+    # ── 3. DOCS PORTAL (Mintlify) — light/dark logo + favicon, at docs.json's paths.
+    o.append(("apps/docs/logo/light.svg", "svg_lockup", {"fill": INK}))
+    o.append(("apps/docs/logo/dark.svg", "svg_lockup", {"fill": PAPER}))
     o.append(("apps/docs/favicon.svg", "svg_mark", {"fill": INK, "small": True}))
-
-    # Marketing site (apps/site). GENERATED HERE, not hand-kept: this file was
-    # hand-authored while `brand/` still emitted the retired T monogram, which is
-    # exactly the second-source-of-truth the module docstring exists to prevent.
-    #
-    # Its ink is the SITE's foreground token (`apps/site/src/styles/global.css:122`),
-    # not the brand INK — deliberately. Each surface draws the mark in its own text
-    # colour (site #15181f · app `--logo-ink` · brand assets #0D0D0D); the founder
-    # asked for one MARK, and unifying the palettes on top of that would be a visible
-    # change to the live site that nobody requested.
-    o.append(
-        ("apps/site/public/favicon.svg", "svg_mark", {"fill": SITE_INK, "small": True})
-    )
-    # The marketing site had NO apple-touch icon, so an iOS "Add to Home Screen"
-    # fell back to a screenshot of the page — the one surface where the mark was
-    # not the icon. Generated in the same polarity as the app's (white mark on the
-    # brand ink, iOS superellipse padding), because a home-screen tile is chrome we
-    # do not control and must read at 60px, not the site's own light canvas.
-    o.append(
-        (
-            "apps/site/public/apple-touch-icon.png",
-            "png",
-            {"size": 180, "ink": PAPER, "bg": INK, "shape": "square", "pad": 0.19},
-        )
-    )
     return o
 
 
@@ -684,7 +550,6 @@ def outputs() -> list[tuple[str, str, dict]]:
 # there is a blank icon on surfaces we never see. The ICO carries 16/32/48/64/128/256, so
 # `_cut_for` puts the simplified cut in the 16 and the full cut in the rest, inside one file.
 ICO_PATHS = (
-    "brand/png/favicon.ico",
     "apps/web/public/favicon.ico",
     "apps/site/public/favicon.ico",
 )
@@ -906,8 +771,18 @@ def verify(dest: Path) -> int:
     return 0
 
 
+# (source file, public dir it is served from). The site is scanned exactly like the
+# app: since 2026-09-12 both reference the same `/brand/*` files, and a site-side 404
+# would be the same invisible failure B-252 was.
+REF_SOURCES = (
+    ("apps/web/app/layout.tsx", "apps/web/public"),
+    ("apps/web/app/manifest.ts", "apps/web/public"),
+    ("apps/site/src/layouts/Base.astro", "apps/site/public"),
+)
+
+
 def check_refs() -> int:
-    """Every /brand/* asset referenced from app metadata must EXIST.
+    """Every /brand/* asset referenced from app OR site metadata must EXIST.
 
     This is B-252's guard. `4088da73` deleted `logo-icon-{light,dark}.png` when the mark
     moved to inline SVG and left three references behind — the apple-touch icon and BOTH
@@ -917,32 +792,35 @@ def check_refs() -> int:
     """
     import re
 
-    refs: dict[str, list[str]] = {}
-    for rel in ("apps/web/app/layout.tsx", "apps/web/app/manifest.ts"):
+    refs: dict[tuple[str, str], list[str]] = {}
+    for rel, public in REF_SOURCES:
         p = ROOT / rel
         if not p.exists():
             continue
-        for m in re.finditer(r'"(/brand/[^"]+)"', p.read_text(encoding="utf-8")):
-            refs.setdefault(m.group(1), []).append(rel)
+        for m in re.finditer(r'"(/brand/[^"?]+)', p.read_text(encoding="utf-8")):
+            refs.setdefault((public, m.group(1)), []).append(rel)
 
     missing = [
-        (u, srcs)
-        for u, srcs in sorted(refs.items())
-        if not (ROOT / "apps/web/public" / u.lstrip("/")).exists()
+        (public, u, srcs)
+        for (public, u), srcs in sorted(refs.items())
+        if not (ROOT / public / u.lstrip("/")).exists()
     ]
     if missing:
         print(f"✗ {len(missing)} icon reference(s) point at files that DO NOT EXIST:")
-        for u, srcs in missing:
-            print(f"    {u}  ← {', '.join(sorted(set(srcs)))}")
+        for public, u, srcs in missing:
+            print(f"    {public}{u}  ← {', '.join(sorted(set(srcs)))}")
         print("  Run: python3 scripts/brand/build-brand-assets.py")
         return 1
-    if not refs:
+    surfaces = {public for public, _ in refs}
+    if len(surfaces) < len({public for _, public in REF_SOURCES}):
         print(
-            "✗ no /brand/* references found — the scan found nothing to check, which is"
+            "✗ a surface has no /brand/* references — the scan found nothing to check"
         )
-        print("  a broken probe, not a clean result.")
+        print(
+            f"  there, which is a broken probe, not a clean result: saw {sorted(surfaces)}"
+        )
         return 1
-    print(f"OK — all {len(refs)} referenced /brand/* asset(s) exist.")
+    print(f"OK — all {len(refs)} referenced /brand/* asset(s) exist on both surfaces.")
     return 0
 
 
@@ -953,14 +831,17 @@ def selftest() -> int:
     # B-252's own falsification: a reference to a file that is not there must be caught.
     import re as _re
 
-    _txt = (ROOT / "apps/web/app/layout.tsx").read_text(encoding="utf-8")
-    _found = _re.findall(r'"(/brand/[^"]+)"', _txt)
     _planted = "/brand/__selftest-does-not-exist.png"
-    if _found and not (ROOT / "apps/web/public" / _planted.lstrip("/")).exists():
-        print(f"  selftest: ref-scan sees {len(_found)} real ref(s) → PROBE ALIVE ✓")
-    else:
-        print("  selftest: ref-scan found nothing to check ✗")
-        ok = False
+    for _rel, _public in REF_SOURCES:
+        _txt = (ROOT / _rel).read_text(encoding="utf-8")
+        _found = _re.findall(r'"(/brand/[^"?]+)', _txt)
+        if _found and not (ROOT / _public / _planted.lstrip("/")).exists():
+            print(
+                f"  selftest: ref-scan sees {len(_found)} ref(s) in {_rel} → PROBE ALIVE ✓"
+            )
+        else:
+            print(f"  selftest: ref-scan found nothing to check in {_rel} ✗")
+            ok = False
     blank = _png(
         64, 64, b"".join(b"\x00" + b"\x00\x00\x00\x00" * 64 for _ in range(64))
     )

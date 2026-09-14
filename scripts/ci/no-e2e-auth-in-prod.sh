@@ -88,9 +88,25 @@ selftest() {
 		printf 'export const bypassActive = false\n' >"$repo/apps/web/lib/e2e-auth.ts"
 		printf 'export const session = null\n' >"$repo/apps/web/lib/session.ts"
 		printf '# notes\n' >"$repo/docs/NOTES.md"
-		git -C "$repo" init -q -b main
-		git -C "$repo" add -A
-		git -C "$repo" -c user.email=selftest@example.invalid -c user.name=selftest \
+		# `env -u GIT_*`: an inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE would
+		# make these three commands act on the CALLER's repository — 2026-09-05 a
+		# commit titled "fixture" that deleted every tracked file landed on an agent
+		# worktree's branch, and the shared config was left `core.bare=true`
+		# (B-345). The toplevel assertion makes that impossible to repeat
+		# silently: the fixture repo must BE the fixture directory, or we stop.
+		env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+			git -C "$repo" init -q -b main
+		local top
+		top="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+			git -C "$repo" rev-parse --show-toplevel)"
+		if [[ "$top" != "$repo" && "$top" != "$(readlink -f "$repo")" ]]; then
+			echo "SELFTEST ABORT: fixture repo resolved to '$top', not '$repo' — refusing to commit into a live repository" >&2
+			exit 97
+		fi
+		env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+			git -C "$repo" add -A
+		env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+			git -C "$repo" -c user.email=selftest@example.invalid -c user.name=selftest \
 			-c commit.gpgsign=false commit -q --no-verify -m fixture
 	}
 

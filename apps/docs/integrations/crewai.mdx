@@ -52,9 +52,11 @@ task was observed emitting three. A five-agent crew can emit hundreds of spans f
 Plan limits are counted in spans on this path.
 <Warning>
   **An OTel span and a gateway call are not the same unit, and they are not counted the
-  same way.** A gateway request (the base-URL swap) is one unit against your monthly trace
-  quota. On this OTel path your app sends **spans**, and one agent run is many spans — the
-  tree above is 11 for a single `invoke()`. Do not read "10K traces/mo" as "10,000 crew runs". Size against **spans per run**, and see [pricing](/pricing).
+  same way.** A gateway request and an OTel span both count as ingest bytes against the
+  SAME meter — there is no separate quota for one path or the other. On this OTel path
+  your app sends **spans**, and one agent run is many spans — the tree above is 11 for a
+  single `invoke()`. Size your ingest estimate against **spans per run**, not runs, and
+  see [pricing](/pricing).
 </Warning>
 
 

@@ -44,6 +44,16 @@ export {
 	type LollipopProps,
 } from "./charts/Lollipop";
 export { Gauge, type GaugeProps } from "./charts/Gauge";
+// DSH-11 — the ONE interactive time-series chart (hover, keyboard, legend, click-through, brush).
+export {
+	TimeSeriesChart,
+	type TimeSeriesChartProps,
+	type ChartBucket,
+	type ChartSeriesInput,
+	type ChartTone,
+	type ChartMark,
+	type ChartValueKind,
+} from "./charts/TimeSeriesChart";
 export {
 	RequestFlow,
 	type RequestFlowModel,

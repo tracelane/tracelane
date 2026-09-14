@@ -15,14 +15,6 @@
 //! bin+lib hybrid pattern used by `crates/gateway` and required by
 //! criterion's bench harness target.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    clippy::needless_return,
-    clippy::collapsible_match,
-    clippy::collapsible_if
-)]
-
 pub mod cardinality;
 // MOVED to `tracelane_shared::otlp` for GWY-41 (see main.rs). Re-exported under the
 // old path so `benches/limits.rs` — `use ingest::limits::…` — compiles unchanged.

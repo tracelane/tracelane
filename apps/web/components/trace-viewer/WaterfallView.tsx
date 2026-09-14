@@ -14,7 +14,7 @@
  */
 
 import { inferSpanKind } from "@/lib/span-kind";
-import { spanStartUs } from "@/lib/trace-summary";
+import { barGeometry, spanStartUs } from "@/lib/trace-summary";
 import type { VisibleRow } from "@/lib/trace-tree";
 import {
 	SPAN_KIND_MARK,
@@ -95,10 +95,10 @@ export function WaterfallView({
 					const kind = inferSpanKind(s.attributes);
 					const isError = s.status_code === 2;
 					const offsetUs = Math.max(0, spanStartUs(s) - startUs);
-					const leftPct = totalUs > 0 ? (offsetUs / totalUs) * 100 : 0;
-					const rawWidth = totalUs > 0 ? (s.duration_us / totalUs) * 100 : 100;
-					// Clamp so a near-zero span is still visible and a bar never overruns.
-					const widthPct = Math.min(Math.max(rawWidth, 0.5), 100 - leftPct);
+					// Shared with SwimlaneView (OBS-49) via `barGeometry` — the SAME
+					// formula, not a second copy, is what makes render parity between
+					// the two views a property of the code rather than an assertion.
+					const { leftPct, widthPct } = barGeometry(s, startUs, totalUs);
 					const selected = s.span_id === selectedId;
 					// Guide rail count capped at 8 (same cap as indent).
 					const guideCount = Math.min(row.depth, 8);

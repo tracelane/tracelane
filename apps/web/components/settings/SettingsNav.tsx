@@ -1,69 +1,99 @@
 "use client";
 
 /**
- * SettingsNav — left-rail tab navigation for the /settings section.
+ * SettingsNav — the navigation for the /settings section (`SET-36`).
  *
- * Uses pathname matching to highlight the active settings tab.
+ * Two renderings of ONE list (`settings-nav-config.ts`):
+ *
+ * - `sm` and up: a left rail of four named groups, in the same small-caps
+ *   vocabulary the sidebar uses for Observe · Prove · Operate
+ *   (`RAIL_GROUP_LABEL` is imported, not copied, so the two cannot drift).
+ * - below `sm`: ONE native `<select>` whose `<optgroup>`s are the same four
+ *   groups. This replaces a horizontal strip of ten tabs that was wider than
+ *   any phone and scrolled in its own track — a native control is the one
+ *   thing a phone renders well without any CSS from us.
+ *
+ * The active page is chosen by longest-prefix match and announced with
+ * `aria-current="page"` on the rail, never by colour alone.
  */
 
+import { RAIL_GROUP_LABEL } from "@/components/layout/nav-config";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { SETTINGS_GROUPS, activeSettingsHref } from "./settings-nav-config";
 
-const TABS = [
-	{ href: "/settings/api-keys", label: "API Keys" },
-	{ href: "/settings/providers", label: "LLM Providers" },
-	{ href: "/settings/billing", label: "Billing" },
-	// CMK / data-at-rest encryption keys — distinct from the LLM provider keys
-	// above. Relabeled from "BYOK Keys" to disambiguate the overloaded term.
-	{ href: "/settings/byok", label: "Encryption Keys" },
-	// Audit signing key + verify/export how-to (page already existed; the nav
-	// entry was missing, leaving it unreachable). Trust cluster, next to keys.
-	{ href: "/settings/audit", label: "Audit" },
-	{ href: "/settings/team", label: "Team" },
-	{ href: "/settings/workspace", label: "Workspace" },
-	// ADR-059: alerting settings (f_alerts gated; page shows honest not-entitled state)
-	{ href: "/settings/alerts", label: "Alerts" },
-	// EVL-28: online evals (f_online_evals gated; same honest not-entitled state).
-	// Next to Alerts because both are "what Tracelane does with your traffic
-	// while you are not watching", and both spend or notify on their own.
-	{ href: "/settings/evals", label: "Online Evals" },
-	{ href: "/settings/account", label: "Account" },
-] as const;
+/*
+ * ACTIVE is `--surface-3`, HOVER is `--surface-hover`, and the pair has to be
+ * read in both themes. Active was `--surface-2` and hover a 50% wash of the
+ * same token: in LIGHT that ordered correctly by accident, but in DARK
+ * `--surface-hover` (#202125) is LIGHTER than `--surface-2` (#1c1d20), so
+ * hovering an inactive tab made it read louder than the tab you are actually
+ * on. `--surface-3` is the declared press/active step and sits above the hover
+ * step in BOTH themes, which is the only way this ordering survives a palette
+ * swap.
+ */
+const ITEM_ACTIVE =
+	"block rounded-md px-3 py-1.5 text-sm font-medium text-ink bg-surface-3 whitespace-nowrap";
+const ITEM_IDLE =
+	"block rounded-md px-3 py-1.5 text-sm text-ink-2 whitespace-nowrap hover:text-ink hover:bg-surface-hover transition-colors";
 
 export function SettingsNav() {
 	const pathname = usePathname();
+	const router = useRouter();
+	const active = activeSettingsHref(pathname);
 
 	return (
-		/*
-		 * P0.17: below `sm` this is a HORIZONTAL strip of seven tabs, which is wider
-		 * than a phone. It scrolls in its own track rather than widening the page —
-		 * `whitespace-nowrap` keeps each label on one line so the strip scrolls
-		 * instead of the labels wrapping to two rows of ragged height.
-		 */
-		<nav className="flex gap-1 shrink-0 overflow-x-auto sm:overflow-x-visible sm:flex-col sm:w-40">
-			{TABS.map(({ href, label }) => (
-				<Link
-					key={href}
-					href={href}
-					className={
-						/*
-						 * ACTIVE is `--surface-3`, HOVER is `--surface-hover`, and the pair
-						 * has to be read in both themes. Active was `--surface-2` and hover
-						 * a 50% wash of the same token: in LIGHT that ordered correctly by
-						 * accident, but in DARK `--surface-hover` (#202125) is LIGHTER than
-						 * `--surface-2` (#1c1d20), so hovering an inactive tab made it read
-						 * louder than the tab you are actually on. `--surface-3` is the
-						 * declared press/active step and sits above the hover step in BOTH
-						 * themes, which is the only way this ordering survives a palette swap.
-						 */
-						pathname.startsWith(href)
-							? "rounded-md px-3 py-2 text-sm font-medium text-ink bg-surface-3 whitespace-nowrap"
-							: "rounded-md px-3 py-2 text-sm text-ink-2 whitespace-nowrap hover:text-ink hover:bg-surface-hover transition-colors"
-					}
+		<>
+			{/* < sm — one control. `value` is controlled so the select follows the
+			    route (a back-button navigation must not leave it on the old page). */}
+			<label className="block sm:hidden">
+				<span className="sr-only">Settings section</span>
+				<select
+					value={active ?? ""}
+					onChange={(e) => router.push(e.target.value)}
+					className="w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink"
 				>
-					{label}
-				</Link>
-			))}
-		</nav>
+					{SETTINGS_GROUPS.map((group) => (
+						<optgroup key={group.label} label={group.label}>
+							{group.items.map((item) => (
+								<option key={item.href} value={item.href}>
+									{item.label}
+								</option>
+							))}
+						</optgroup>
+					))}
+				</select>
+			</label>
+
+			{/* ≥ sm — the grouped rail. `w-44` fits the longest label ("Audit
+			    signing key") on one line; a label that wraps is a design change,
+			    not something to hide with an ellipsis. */}
+			<nav
+				aria-label="Settings"
+				className="hidden shrink-0 sm:flex sm:w-44 sm:flex-col sm:gap-5"
+			>
+				{SETTINGS_GROUPS.map((group) => (
+					<div key={group.label}>
+						<p className={RAIL_GROUP_LABEL}>{group.label}</p>
+						<ul className="flex flex-col gap-0.5">
+							{group.items.map((item) => {
+								const isActive = item.href === active;
+								return (
+									<li key={item.href}>
+										<Link
+											href={item.href}
+											aria-current={isActive ? "page" : undefined}
+											className={isActive ? ITEM_ACTIVE : ITEM_IDLE}
+										>
+											{item.label}
+										</Link>
+									</li>
+								);
+							})}
+						</ul>
+					</div>
+				))}
+			</nav>
+		</>
 	);
 }

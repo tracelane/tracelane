@@ -57,10 +57,12 @@ Tracelane. Five components, one monorepo.
      registry — build it from source.
 ```
 
-> **R2 cold tier is code, not a live path.** `crates/ingest/src/r2_batcher.rs`
-> exists and buffers **NDJSON** (not Parquet), but nothing ever feeds its
-> channel — `crates/ingest/src/main.rs:350` drops the sender. No span has ever
-> been written to R2. It is drawn nowhere above on purpose.
+> **R2 cold tier — REMOVED 2026-09-12.** `crates/ingest/src/r2_batcher.rs`
+> used to exist, buffering NDJSON (not Parquet), but nothing ever fed its
+> channel — it was deleted outright rather than left dormant (zero producers,
+> ever). No span has ever been written to R2. Restorable from git history at
+> `29b22c52c827894a3777bb954bb988b346222405` if cold-tier archival is rebuilt
+> with a real producer. It is drawn nowhere above on purpose.
 
 ---
 
@@ -142,7 +144,7 @@ same label meant different things across doc generations.)
 Each returns `Allow | Warn | Block` with an `aft_id` for marker. A `Block` is
 **recorded, not enforced**, unless the operator sets
 `TRACELANE_PREDICTIVE_ENFORCE=1` — the observe-first default
-(`crates/gateway/src/server.rs:1138-1163`).
+(`crates/gateway/src/server.rs:1177-1202`).
 
 ---
 

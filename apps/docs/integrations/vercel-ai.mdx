@@ -91,12 +91,12 @@ ai.generateText                    (root)
 ## Span volume
 
 <Warning>
-  **An OTel span and a gateway call are not the same unit, and they are not counted the
-  same way.** A gateway request (the base-URL swap below) is one unit against your monthly
-  trace quota. On this path your app sends **spans**, and one agent run is many — the trace
-  above is 6 for a single `generateText`, and each extra step and tool call adds more. Do
-  not read "10K traces/mo" as "10,000 agent runs". Size against **spans per run**, and see
-  [pricing](/pricing).
+  **An OTel span and a gateway call are not the same unit, but they count against the
+  same meter.** A gateway request and an OTel span both count as ingest bytes — there is
+  no separate quota for one path or the other. On this path your app sends **spans**, and
+  one agent run is many — the trace above is 6 for a single `generateText`, and each
+  extra step and tool call adds more. Size your ingest estimate against **spans per
+  run**, not runs, and see [pricing](/pricing).
 </Warning>
 
 ## The alternative: the gateway base URL

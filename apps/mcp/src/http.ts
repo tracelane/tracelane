@@ -9,8 +9,16 @@
  * `<token>` is a Tracelane JWT or an `tlane_…` API key. The token is
  * validated by the gateway's `/v1/auth/whoami` endpoint (proxy pattern
  * — keeps the JWT alg allowlist + JWKS + audience check + peppered
- * HMAC lookup in one place). Tenant ID is bound to the request via
- * `runWithTenant` so tool handlers read it through `getTenantId()`.
+ * HMAC lookup in one place). Tenant ID AND the bearer itself are both bound
+ * to the request via `runWithTenant` (PLT-22): `ClickHouseReader` tool
+ * handlers read the tenant through `getTenantId()`, and — in gateway mode —
+ * `GatewayReader` reads the bearer through `getActiveBearer()` and uses it,
+ * not the process's own `TRACELANE_API_KEY`, for every trace read. Each
+ * request therefore reads gateway data as ITS OWN caller's identity; two
+ * concurrent requests with different bearers never share one. A request
+ * context that somehow carried no bearer would make `GatewayReader` fail
+ * closed rather than fall back to the fixed env key — see
+ * `auth.ts`'s `getActiveBearer` doc comment.
  *
  * No CORS-allow-all. The transport is intended for first-party agents
  * and headless integrations.
@@ -20,6 +28,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { resolveBearerViaGateway, runWithTenant } from "./auth.js";
+import { createReader } from "./reader.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
@@ -66,7 +75,10 @@ function buildServer(): McpServer {
 	const server = instrumentMcpServer(
 		new McpServer({ name: "tracelane", version: MCP_SERVER_VERSION }),
 	);
-	registerTraceTools(server);
+	// PLT-22: CLICKHOUSE_URL set -> self-host ClickHouseReader; unset ->
+	// Cloud GatewayReader, which reads THIS request's own bearer from the
+	// runWithTenant context below (getActiveBearer) — never a fixed key.
+	registerTraceTools(server, createReader());
 	registerEvalTools(server);
 	return server;
 }
@@ -140,9 +152,16 @@ export async function runHttp(): Promise<void> {
 			const mcp = buildServer();
 			await mcp.connect(transport);
 
-			await runWithTenant(tenantId, async () => {
-				await transport.handleRequest(req, res, parsedBody);
-			});
+			// PLT-22: bind THIS request's own bearer alongside its tenant, so
+			// GatewayReader reads gateway data as this caller's identity, never
+			// the process's fixed TRACELANE_API_KEY.
+			await runWithTenant(
+				tenantId,
+				async () => {
+					await transport.handleRequest(req, res, parsedBody);
+				},
+				bearer,
+			);
 		} catch (err) {
 			process.stderr.write(
 				`${JSON.stringify({

@@ -102,6 +102,11 @@ impl TailSampler {
     }
 
     /// Drop the sticky verdict for a single closed trace window (memory bound).
+    ///
+    /// No production caller today — the writer relies on `prune()`'s
+    /// max-age eviction instead of an explicit per-trace forget. Used only by
+    /// tests, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     pub fn forget(&self, trace_id: Uuid) {
         self.forced_keep.remove(&trace_id);
     }

@@ -8,7 +8,7 @@ classification: PUBLIC
 # Audit control mapping — EU AI Act Article 12
 
 **Effective date:** 2026-06-16 (V1 launch). **Coverage:** every
-workspace with the **Audit add-on SKU** (`f_audit_addon = TRUE` in
+workspace on the **Enterprise plan** (the Article-12 export grant, `f_audit_addon = TRUE` in
 `workspace_entitlements`).
 
 > **What this page is — and is not.** This is a **technical control
@@ -30,7 +30,7 @@ verify a ledger export independently.
 > including the free tier) and is independently verifiable today by
 > recomputing the chain offline. **Ed25519 Merkle-root batch signing,
 > Merkle aggregation, and Sigstore Rekor v2 public-transparency
-> anchoring are live in production** for Audit-add-on workspaces:
+> anchoring are live in production** for Enterprise workspaces:
 > each batch's Merkle root is Ed25519-signed and best-effort anchored
 > to the public Sigstore Rekor v2 log
 > ([`log2025-1.rekor.sigstore.dev`](https://log2025-1.rekor.sigstore.dev)),
@@ -60,7 +60,7 @@ tamper-evident ledger**, and it is worth being precise about which:
 
 | Event type | Emitted by | What it records |
 |---|---|---|
-| `chat.completions.request` | `crates/gateway/src/server.rs:1191` | every LLM provider call proxied by the gateway |
+| `chat.completions.request` | `crates/gateway/src/admission.rs:772-791` | every LLM provider call proxied by the gateway |
 | `guardrail.verdict` | `crates/gateway/src/guardrail/recorder.rs:123` | every guardrail-layer decision |
 | `eval.verdict` | `crates/gateway/src/prompt_routes.rs:89` | prompt promotion / rollback decisions |
 
@@ -73,7 +73,7 @@ design**. The gateway hot path performs an **acked** JetStream publish
 *before* it dispatches to the provider (`crates/gateway/src/audit.rs:493`),
 so the event is durably captured before the request is served; a publish
 failure returns `503 audit_unavailable` rather than serving an unrecorded
-request (`server.rs:1201`). The head-advance itself — sequence assignment
+request (`admission.rs:788-790`). The head-advance itself — sequence assignment
 under a per-tenant row lock, the ClickHouse row, the Postgres head, the
 commit — runs **off the request path** in a single head-writer consumer
 (`crates/gateway/src/audit_consumer.rs`), which acks the JetStream
@@ -117,7 +117,7 @@ The `payload` is **metadata by construction — never prompt or response
 content**. For a `chat.completions.request` row it is `model`,
 `warn_aft_id` (the AFT-1 identifier when a guardrail fired, otherwise
 null) and `trace_id`, plus `business_reference` when the caller supplied
-one (`crates/gateway/src/server.rs:1172-1190`). Payloads pass through PII
+one (`crates/gateway/src/admission.rs:773-786`). Payloads pass through PII
 redaction (`crates/policy/src/pii.rs`) and then a structural cap: any
 string **value** longer than 256 characters is replaced by a
 `[content-redacted: len=N, sha256=…]` marker
@@ -135,7 +135,7 @@ queryable but not chained.
 
 ### Article 12(2)(c) — retention floor
 
-The Audit add-on carries a **180-day minimum retention** commitment for ledger
+The Enterprise plan carries a **180-day minimum retention** commitment for ledger
 data. Two properties carry it and both are checkable against a running system:
 no scheduled job deletes ledger data — the retention sweep operates on span
 tables only — and the ledger tables carry no TTL, so no row expires on its own.
@@ -146,7 +146,7 @@ Retention holds because nothing expires ledger rows automatically, not because
 a runtime check refuses a shorter value. A shorter contractual term would be a
 process failure, not one the software currently refuses.
 
-Workspaces without the Audit add-on are **not** covered by this mapping.
+Workspaces without the Enterprise export grant are **not** covered by this mapping.
 There is no per-plan expiry of ledger data to describe: no ledger table
 carries a TTL and the retention sweep operates on span tables only, as
 this document states below. Ledger data is retained indefinitely on every
@@ -204,7 +204,7 @@ same endpoint.
 Authentication is the ordinary bearer credential — a WorkOS JWT or a
 `tlane_…` API key — and the tenant is resolved **only** from the
 validated claim, never from a query parameter or request body. The
-endpoint is gated on the Audit add-on entitlement
+endpoint is gated on the Enterprise export entitlement
 (`FeatureKey::AuditAddon`): an unentitled caller receives
 `403 entitlement_required` and **zero ledger bytes**, and if the
 entitlement source is unavailable the export is refused rather than

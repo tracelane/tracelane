@@ -64,4 +64,7 @@ export type SloTimePoint = {
 	p95_ms: number;
 	p99_ms: number;
 	requests: number;
+	/** Errored requests in the bucket. Optional until the gateway that emits it
+	 *  (DSH-11 / B-332) is deployed; absent → the errors series is a gap. */
+	errors?: number;
 };

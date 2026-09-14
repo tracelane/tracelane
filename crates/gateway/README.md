@@ -15,7 +15,9 @@ Tracelane's Rust gateway — the performance-critical hot path.
 | Module | Purpose |
 |---|---|
 | `main.rs` | Binary entry point — initialise logging, load config, start server |
-| `server.rs` | Axum router — auth middleware, rate limit, predictive layer, provider proxy |
+| `server.rs` | Axum router and boot — config, `AppState`, every route mount, admission layer, `/health` |
+| `server/` | The request path, one file per concern — `chat.rs` (`POST /v1/chat/completions`), `embeddings.rs`, `dispatch.rs` (BYOK key + provider dispatch + retry), `stream.rs` (SSE), `buffered.rs`, `spans.rs`, `errors.rs`, `quota.rs` |
+| `admission.rs` | The ONE admission pipeline every inference route runs — auth → scope → parse → entitlements + rate limit → quota → budgets → predictive → audit publish |
 | `providers/` | Provider adapters (Anthropic, OpenAI, Gemini, Bedrock, Together, …) |
 | `predictive/` | 8-predictor guardrail layer — MCP hash watcher, taint tracker, A2UI, A2A, … |
 | `audit.rs` | SHA-256 hash chain — compute_row_hash(), Rekor anchoring queue |

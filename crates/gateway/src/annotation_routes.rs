@@ -462,9 +462,20 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, (StatusCode, St
             "Authorization must be ASCII".into(),
         )
     })?;
-    crate::auth::validate_authorization(s)
+    let claims = crate::auth::validate_authorization(s)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))
+        .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))?;
+    // B-383 (d), 2026-09-12: this family authenticated and then answered ANY
+    // scope — an `ingest`-only SDK key (the credential that ships in a customer's
+    // container image) could read and write here. Workspace data needs the
+    // `read` scope; a JWT session (legacy full surface) passes as before.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This API key is not scoped to read recorded data. It needs the `read` scope.".into(),
+        ));
+    }
+    Ok(claims)
 }
 
 fn check_trace_id(t: &str) -> Result<(), (StatusCode, String)> {
@@ -1697,7 +1708,11 @@ fn ms_to_iso(ms: i64) -> String {
 /// on a fire-and-forget task, `spans` by ingest — so an OFFSET scan could step
 /// straight over the trace it was looking for, and the reviewer would simply
 /// never be shown it. The cursor is the ordering column itself.
-fn candidate_sql(source: &QueueSource, seek: bool) -> String {
+fn candidate_sql(
+    source: &QueueSource,
+    seek: bool,
+    tier: crate::clickhouse_query::PlanTier,
+) -> String {
     let body = match source {
         // The FIRST queue type: item 11's judge scores. `FINAL` because
         // `online_eval_scores` is a ReplacingMergeTree and a half-merged
@@ -1750,8 +1765,7 @@ fn candidate_sql(source: &QueueSource, seek: bool) -> String {
         // ClickHouse — see `fetch_candidates`.
         QueueSource::NeedsReview => String::new(),
     };
-    crate::clickhouse_query::TenantQuery::new(body, crate::clickhouse_query::PlanTier::Builder)
-        .sql_with_settings()
+    crate::clickhouse_query::TenantQuery::new(body, tier).sql_with_settings()
 }
 
 /// One page of candidates from ClickHouse, before the exclusion subtraction.
@@ -1779,7 +1793,11 @@ async fn fetch_candidates(
             "Trace storage is unavailable, so queue membership cannot be evaluated.",
         )
     })?;
-    let sql = candidate_sql(&filter.source, after_ms.is_some());
+    let sql = candidate_sql(
+        &filter.source,
+        after_ms.is_some(),
+        crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), tenant).await,
+    );
     let mut q = crate::clickhouse_query::ch_client(url)
         .query(&sql)
         .bind(tenant.to_string())
@@ -2545,12 +2563,12 @@ mod tests {
         Claims {
             tenant_id: tenant(),
             sub: "user-a".to_string(),
-            exp: u64::MAX,
             auth_method: crate::auth::AuthMethod::JwtBearer,
             role,
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
             budget_usd_monthly: None,
             rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
         }
     }
 
@@ -2929,8 +2947,8 @@ mod tests {
             },
             QueueSource::TraceError,
         ] {
-            let first = candidate_sql(&src, false);
-            let next = candidate_sql(&src, true);
+            let first = candidate_sql(&src, false, crate::clickhouse_query::PlanTier::Free);
+            let next = candidate_sql(&src, true, crate::clickhouse_query::PlanTier::Free);
             assert!(
                 !first.contains("OFFSET") && !next.contains("OFFSET"),
                 "OFFSET paging reintroduced: {next}"

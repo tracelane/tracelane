@@ -8,6 +8,8 @@ import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
 	decodeWebhookSecret,
+	isActiveStatus,
+	isPastDueStatus,
 	logSafe,
 	resolvePlan,
 	verifySignature,
@@ -164,7 +166,7 @@ describe("decodeWebhookSecret (Polar keying)", () => {
 });
 
 describe("resolvePlan", () => {
-	it("maps each known unprefixed plan key", () => {
+	it("maps each known unprefixed MONTHLY plan key, interval='month'", () => {
 		for (const [key, planEnum] of [
 			["builder_v1", "builder"],
 			["team_v1", "team"],
@@ -176,8 +178,29 @@ describe("resolvePlan", () => {
 					eventType: "subscription.created",
 					lookupKey: key,
 				}),
-			).toEqual({ kind: "plan", planEnum, lookupKey: key });
+			).toEqual({ kind: "plan", planEnum, lookupKey: key, interval: "month" });
 		}
+	});
+
+	it("ADR-076: the _year lookup key maps to the SAME plan, interval='year'", () => {
+		for (const [key, planEnum] of [
+			["builder_v1_year", "builder"],
+			["team_v1_year", "team"],
+			["business_v1_year", "business"],
+		] as const) {
+			expect(
+				resolvePlan({ eventType: "subscription.created", lookupKey: key }),
+			).toEqual({ kind: "plan", planEnum, lookupKey: key, interval: "year" });
+		}
+	});
+
+	it("Enterprise has NO annual product — enterprise_v1_year is unknown", () => {
+		expect(
+			resolvePlan({
+				eventType: "subscription.created",
+				lookupKey: "enterprise_v1_year",
+			}),
+		).toEqual({ kind: "unknown", rawKey: "enterprise_v1_year" });
 	});
 
 	it("canceled/revoked event → free", () => {
@@ -199,6 +222,16 @@ describe("resolvePlan", () => {
 		).toEqual({ kind: "free", lookupKey: "free_v1" });
 	});
 
+	it("ADR-076: unpaid status (dunning exhausted) → free, same as canceled/revoked", () => {
+		expect(
+			resolvePlan({
+				eventType: "subscription.updated",
+				status: "unpaid",
+				lookupKey: "team_v1",
+			}),
+		).toEqual({ kind: "free", lookupKey: "free_v1" });
+	});
+
 	it("unknown / missing key → unknown", () => {
 		expect(
 			resolvePlan({
@@ -212,6 +245,22 @@ describe("resolvePlan", () => {
 				lookupKey: null,
 			}),
 		).toEqual({ kind: "unknown", rawKey: null });
+	});
+});
+
+describe("isActiveStatus / isPastDueStatus", () => {
+	it("active and trialing both read as active", () => {
+		expect(isActiveStatus("active")).toBe(true);
+		expect(isActiveStatus("trialing")).toBe(true);
+		expect(isActiveStatus("past_due")).toBe(false);
+		expect(isActiveStatus(null)).toBe(false);
+		expect(isActiveStatus(undefined)).toBe(false);
+	});
+
+	it("only past_due reads as past-due", () => {
+		expect(isPastDueStatus("past_due")).toBe(true);
+		expect(isPastDueStatus("active")).toBe(false);
+		expect(isPastDueStatus("unpaid")).toBe(false);
 	});
 });
 
@@ -248,5 +297,47 @@ describe("logSafe — log-injection guard", () => {
 
 	it("leaves an ordinary value untouched", () => {
 		expect(logSafe("audit_addon_v1")).toBe("audit_addon_v1");
+	});
+});
+
+// ── B-388: event ordering ────────────────────────────────────────────────────
+import { eventClock, isStale } from "./polar-webhook";
+
+describe("B-388 eventClock", () => {
+	it("prefers Polar's data.modified_at over the envelope timestamp", () => {
+		const d = eventClock(
+			{ modified_at: "2026-09-12T10:00:00Z" },
+			"2026-09-12T11:00:00Z",
+		);
+		expect(d?.toISOString()).toBe("2026-09-12T10:00:00.000Z");
+	});
+	it("falls back to the envelope timestamp", () => {
+		const d = eventClock({}, "2026-09-12T11:00:00Z");
+		expect(d?.toISOString()).toBe("2026-09-12T11:00:00.000Z");
+	});
+	it("returns null when neither parses (the caller then APPLIES)", () => {
+		expect(eventClock({ modified_at: "not a date" }, 12345)).toBeNull();
+		expect(eventClock({}, undefined)).toBeNull();
+	});
+});
+
+describe("B-388 isStale", () => {
+	const t1 = new Date("2026-09-12T10:00:00Z");
+	const t2 = new Date("2026-09-12T10:00:01Z");
+	it("STALE: the stored clock is newer than the event's", () => {
+		expect(isStale(t2, t1)).toBe(true);
+	});
+	it("not stale: equal clocks apply (created + updated in one instant)", () => {
+		expect(isStale(t1, new Date(t1))).toBe(false);
+	});
+	it("not stale: a newer event applies", () => {
+		expect(isStale(t1, t2)).toBe(false);
+	});
+	it("not stale: no stored clock (every tenant before this shipped)", () => {
+		expect(isStale(null, t1)).toBe(false);
+		expect(isStale(undefined, t1)).toBe(false);
+	});
+	it("not stale: an unparsable event clock applies (fail-open for the plan)", () => {
+		expect(isStale(t2, null)).toBe(false);
 	});
 });

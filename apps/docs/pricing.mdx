@@ -1,35 +1,51 @@
 ---
 title: Tracelane pricing and plans
-description: Predictable AI agent reliability at honest prices — capped overage, no per-seat trap, no retention upcharge, Apache 2.0 core, Polar Merchant of Record.
+description: Six usage meters, five tiers, ingest never blocked by billing state. Apache 2.0 core, Polar.sh Merchant of Record.
 classification: PUBLIC
 ---
 
-Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger you can verify offline. Polar.sh Merchant of Record — no per-seat trap, no retention upcharge, capped overage with hard limit. No surprise bills.
+Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident audit ledger included on every tier and verifiable offline. Polar.sh Merchant of Record — no per-seat trap, ingest is never blocked by billing state. No surprise bills.
 
 ## Tiers
 
-| Tier | Price | What's included |
-|---|---|---|
-| **OSS self-host** | $0 forever | 150+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack. |
-| **Free hosted** | $0 | 10K traces/mo, 60 RPM, 1 seat, no commercial use, rule-based PR1+PR2. |
-| **Builder** | $59/mo | 150K traces/mo, 600 RPM, overage $1.20/10K (5× hard cap then 429), predictive PR1+PR2+PR4+PR5 (rule-based), 1 seat, prompt history (read-only). |
-| **Team** | $249/mo | 1M traces/mo, 6K RPM, overage $1.20/10K (5× hard cap then 429), 10 seats included (25 max), predictive PR1+PR2+PR4+PR5 (rule-based) — the same set Builder runs — inline heuristic guardrails incl. the data-governance and quality rails, predictive pre-flight guardrails with tamper-evident promotion record. |
-| **Business** | $899/mo | 5M traces/mo, 60K RPM, 25 seats included (50 max), inline heuristic guardrails incl. the data-governance and quality rails. |
-| **Enterprise** | From $2,999/mo | 25M+ traces custom, uncapped seats, PR1+PR2+PR4+PR5 (rule-based), dedicated tenancy option. |
-| **Audit SKU** | +$999/mo | Tamper-evident agent ledger (Merkle-batched hash chain + Ed25519 per-tenant signing live; anchored batches carry a resolved Sigstore Rekor v2 inclusion proof, best-effort; universal per-run anchoring on the roadmap), plus the complete ledger export in the offline-verifier wire format — verify it yourself with `tlane verify --tenant-pubkey`, no Tracelane involvement. See [Audit Ledger](/audit-ledger) for protocol details. |
+| Tier | Monthly | Annual (per mo) | Rate limit | Seats |
+|---|---|---|---|---|
+| **OSS self-host** | $0 forever | — | — | — |
+| **Free hosted** | $0 | — | 60 RPM | 1 |
+| **Builder** | $29 | $24 | 600 RPM | Unlimited |
+| **Team** | $229 | $190 | 6,000 RPM | Unlimited |
+| **Business** | $799 | $665 | 60,000 RPM | Unlimited |
+| **Enterprise** | from $2,499 | contract | custom | Unlimited |
+
+- **OSS self-host** — 150+ providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack.
+- **Free hosted** — no commercial use, rule-based PR1+PR2.
+- **Builder** — predictive PR1+PR2+PR4+PR5 (rule-based), prompt history (read-only).
+- **Team** — SSO/SAML; predictive PR1+PR2+PR4+PR5 — the same set Builder runs — plus the data-governance and quality rails, and a tamper-evident promotion record.
+- **Business** — SSO/SAML; the data-governance and quality rails.
+- **Enterprise** — SSO/SAML, dedicated tenancy option, custom volume on every meter, 7-year ledger retention and the bulk audit export.
+
+### Included allowances (per month, no rollover)
+
+| Tier | Ingest | Hot window | Series | Query | Cold archive | Eval runs |
+|---|---|---|---|---|---|---|
+| Free | 1 GB | 0.25 GB | 100 | 10 scan-units | 7 days | 50 |
+| Builder | 25 GB | 5 GB | 2,000 | 150 scan-units | complete (2 yr) | 2,000 |
+| Team | 300 GB | 75 GB | 15,000 | 2,000 scan-units | complete (2 yr) | 40,000 |
+| Business | 1.5 TB | 300 GB | 75,000 | 12,000 scan-units | complete (2 yr) | 250,000 |
+| Enterprise | custom | custom | custom | custom | complete (2 yr) | custom |
 
 <Note>
-**One meter for gateway traffic.** Requests through the Tracelane gateway are counted
-once each against a single monthly trace counter — there is no second gateway-call
-budget to track or run out of.
+**Ingest is ONE meter — a gateway call and a raw OTel span both count the
+same way.** Whichever path sends data (the gateway's
+`/v1/chat/completions` proxy, or an OTel exporter pointed at Tracelane), what
+you're billed on is bytes accepted, not a trace count or a separate span
+limit.
 </Note>
 
 <Warning>
-**If you send OpenTelemetry spans, the unit is different — read this before choosing a
-plan.** Pointing an OTel exporter at Tracelane (the
-[framework integrations](/integrations/langchain)) does not go through the gateway, so it
-does not consume the gateway trace counter. It is bounded instead by a **per-tenant
-monthly span limit**, and **one agent run is many spans**.
+**Size by ingest bytes, not by run count.** If you send OpenTelemetry spans
+directly (the [framework integrations](/integrations/langchain)), one agent
+run is many spans, and each span is its own share of ingest bytes.
 
 Measured on 2026-08-31 with the standard community instrumentors:
 
@@ -40,17 +56,19 @@ Measured on 2026-08-31 with the standard community instrumentors:
 | a LlamaIndex `llm.complete()` | **1** |
 | a two-step Vercel AI tool-calling run | **6** |
 
-So **"10K traces/mo" is not "10,000 agent runs"** — on the Free plan, whose span limit
-equals its headline number, a LangGraph agent at 11 spans per run works out to roughly
-**900 runs a month**. A crew-style framework that retries tasks emits more still.
-
-Size against **spans per run**, not runs. If you are unsure, run your agent once against a
-free account and look at the span count on the trace before you commit to a plan.
+A busier framework that retries tasks sends more spans, and more spans is
+more ingest bytes. If you're unsure, run your agent once against a free
+account and check the ingest total on your usage page before committing to a
+plan.
 </Warning>
 
 <Note>
-**Retention.** Stored traces are kept up to a 365-day maximum. Retention is not
-customer-configurable — there is no retention setting in the product.
+**Retention has two windows.** The **indexed window** is how far back queries
+run fast: Free 3 days, Builder 30 days, Team 90 days, Business 180 days,
+Enterprise 365+ days. **Queryable history** is how far back your data stays
+queryable at all, from cold storage: Free 30 days, every paid tier 2 years
+(7 years on Enterprise). Retention is not customer-configurable — there is no
+retention setting in the product.
 </Note>
 
 <Note>
@@ -59,33 +77,114 @@ The [SLO](/slo) dashboard tracks error-budget burn against a default availabilit
 target, and burn-rate alerts are available on paid plans.
 </Note>
 
+## How usage is metered
+
+Six meters, all live on every paid tier — Builder included. Usage above your
+included allowance bills continuously per unit; there is no rollover and no
+hard-cap.
+
+| Meter | Rate | What it measures |
+|---|---|---|
+| Ingest | $0.20 / GB accepted | Bytes accepted through the gateway or via OTLP — one meter, both paths. |
+| Hot indexed window | $16.00/GB-month (0–500) · $8.00 (500–2,000) · $4.50 (2,000–10,000) · $3.00 (10,000+) | Resident GB-month inside your plan's indexed window — priced as **query capacity**, not disk. |
+| Series | $0.008 / series-month | Distinct metric series (provider/model/attribute combinations) tracked this month. |
+| Query compute | $0.15 / scan-unit | ClickHouse bytes scanned to answer your queries; 1 scan-unit = 1 GB scanned. |
+| Cold archive | $0.08 / GB-month | Resident GB-month once data ages past the indexed window, while still inside queryable history. |
+| Evaluations | $0.005 / judge run | Each LLM-judge run against your traces or datasets. |
+
+<Note>
+**Resident GB is the logical size of what you sent, averaged daily across the
+month — not peak, not compressed bytes on disk. The hot window is priced as
+query capacity, not disk.**
+</Note>
+
+<Note>
+**Never metered, and why:** per host or peak host · per seat on any paid tier
+· a separate egress line (egress is priced into ingest and query) · retention
+as a multiplier · OTel attributes reclassified as premium metrics.
+</Note>
+
+**No rollover.** Unused allowance does not carry to next month.
+
+**Incident burst.** Any single day up to 5× your trailing 30-day average is
+billed at included rates, not overage.
+
+**Warnings at 75% and 90%** of any meter, with a month-end projection and a
+"what's using your window" breakdown by project, service, capture state and
+trace shape.
+
+**Spend ceiling — off by default.** Set a monthly ceiling if you want one. At
+the ceiling, AUTO-AGE switches on: the oldest days leave your indexed window
+early and stay queryable in cold storage. Ingest keeps running and nothing is
+lost.
+
+<Note>
+**Ingest is never blocked by billing state, on any tier.** A recorder that
+stops recording because of an invoice is not a recorder.
+</Note>
+
+## Free
+
+One workspace per account, reclaimed after 14 idle days, no card required, no
+overage — Free ages out rather than returning 429s.
+
+## Policies
+
+- **Price protection.** Your rate is held for 12 months from signup.
+- **Dunning.** Failed payments retry at days 1, 5 and 14, then the workspace
+  drops to Free. Data is held 30 days.
+- **Refunds.** 30 days on the base subscription, first billing cycle only.
+  Usage charges are non-refundable.
+- **Enterprise onboarding.** A one-time $5,000 fee covers migration and a
+  named engineer for 30 days.
+- **Prepaid credits.** $5,000 buys $5,750 of usable credit; $20,000 buys
+  $24,000. Credits expire after 12 months.
+
+<Note>
+**Audit ledger.** The tamper-evident ledger, hash chain, Rekor anchoring and
+self-verification are included on every tier. Seven-year ledger retention is
+included on Enterprise.
+</Note>
+
 ## How we compare
 
 | Claim | Tracelane | LangSmith | LangSmith Engine | Langfuse Pro | Braintrust Pro |
 |---|---|---|---|---|---|
-| Price entry paid | $59 Builder | $39/seat Plus | Plus + Engine usage | $199 Pro | $249 Pro |
-| Trace overage | $1.20/10K, 5× hard cap, 429 | $0.50/1K, no cap documented | $0.50/1K + Engine usage | $8/100K, no cap | $3/GB ingest |
-| Retention | up to 365d, no upcharge | 14d base, 9–10× upcharge to 400d | 14d base, 9–10× upcharge to 400d | 90d Core, 3yr Pro | 14d Starter, 30d Pro |
-| Gateway | Rust gateway, BYOK 0% | none (obs only) | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
+| Price entry paid | $29 Builder | $39/seat Plus<!-- pricing-guard: allow $39 competitor-price --> | Plus + Engine usage | $199 Pro<!-- pricing-guard: allow $199 competitor-price --> | $249 Pro<!-- pricing-guard: allow $249 competitor-price --> |
+| Usage metering | Six per-unit meters (ingest/hot/series/query/cold/evals), no rollover, no hard-cap | $0.50/1K, no cap documented<!-- pricing-guard: allow $0.50 competitor-price --> | $0.50/1K + Engine usage<!-- pricing-guard: allow $0.50 competitor-price --> | $8/100K, no cap<!-- pricing-guard: allow $8 competitor-price --> | $3/GB ingest<!-- pricing-guard: allow $3 competitor-price --> |
+| Retention | Indexed 3d–365d+, queryable 30d–2y by tier, no upcharge | 14d base, 9–10× upcharge to 400d | 14d base, 9–10× upcharge to 400d | 90d Core, 3yr Pro | 14d Starter, 30d Pro |
+| Gateway | Rust gateway, BYOK 0% | Partial — lists an "LLM Gateway" to "control agent model calls"; BYOK and self-hosting for it are not documented there [langchain.com/langsmith, 2026-09-07] | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
 | Inline predictive guardrails | yes, inline | no | no (post-failure clustering) | no | no |
 | Auto-rollback on posted metrics | EWMA drift on observations you post; not autonomous | manual prompt promotion | manual prompt promotion | none | none |
-| Tamper-evident audit ledger | $999 SKU, hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap) | no | no | not documented | no |
+| Tamper-evident audit ledger | Included on every tier; hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap); 7-year retention + bulk export on Enterprise | no | no | not documented | no |
 | Self-host license | Apache 2.0 (full stack) | none | Cloud + Enterprise Self-Hosted SKU | MIT (4-DB stack) | hybrid, seats charged |
 | OTel GenAI semconv | canonical wire format | proprietary | proprietary | partial | proprietary |
 | Intervention timing | pre-flight (before model call) | post-failure | post-failure (cluster + draft PR) | post-failure | eval-time |
 
-*Competitive pricing verified May 2026 against each vendor's public pricing page. LangSmith Engine launched May 13, 2026 ([langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview)). See also [vs LangSmith Engine](/comparisons/vs-langsmith-engine). We're wrong? Open an issue at [github.com/tracelane/tracelane](https://github.com/tracelane/tracelane).*
+*Competitive pricing verified May 2026 against each vendor's public pricing page; the
+Gateway row was re-checked 2026-09-07. LangSmith Engine launched May 13, 2026 ([langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview)). See also [vs LangSmith Engine](/comparisons/vs-langsmith-engine) and the [full comparison matrix](/comparisons/index). We're wrong? Open an issue at [github.com/tracelane/tracelane](https://github.com/tracelane/tracelane).*
 
 ## FAQ
 
 <AccordionGroup>
 
-<Accordion title="What happens if I exceed my trace quota?">
-Soft cap at 100% (you get an alert). Overages bill at $1.20 per 10K traces up to 5× your included quota. At 5× we return HTTP 429 + a Slack alert. No surprise bills.
+<Accordion title="What happens if I go over my included allowance?">
+You get a warning at 75% and 90% of any meter, with a month-end projection. Usage above
+your included allowance bills continuously per unit — there is no hard-cap and no 429.
+Any single day up to 5× your trailing 30-day average bills at included rates (incident
+burst), so a one-day spike doesn't turn into overage. An optional spend ceiling (off by
+default) switches on AUTO-AGE at the limit you set: the oldest days leave your indexed
+window early and stay queryable in cold storage, and ingest keeps running. No surprise
+bills.
 </Accordion>
 
 <Accordion title="How many people can use one workspace?">
-Team management is live. Free and Builder are single-seat. Team includes 10 seats (25 maximum), Business includes 25 (50 maximum), and Enterprise is uncapped. Invite by email from **Settings → Team** — invitations are sent through WorkOS, and each invitee is given a `member` or `viewer` role (owner is a separate explicit grant). The cap is enforced when you invite: accepted memberships and pending invitations both consume a seat, and an invite past the cap is refused with a typed `seat_limit_reached` error. Provider keys are BYOK and workspace-scoped, so every seat shares the workspace's keys.
+Team management is live. Seats are **unlimited on every paid tier** — Builder, Team,
+Business and Enterprise all invite without limit. Free is single-seat. Invite by email
+from **Settings → Team** — invitations are sent through WorkOS, and each invitee is given
+a `member` or `viewer` role (owner is a separate explicit grant). On Free, a second invite
+is refused with a typed `seat_limit_reached` error. Provider keys are BYOK and
+workspace-scoped, so every seat shares the workspace's keys.
 </Accordion>
 
 <Accordion title="What inline guardrails run on every request?">
@@ -129,16 +228,16 @@ traffic today.
 Engine clusters production failures after they happen, then drafts PRs and online evaluators in your LangSmith UI. Tracelane sits one step earlier in the agent lifecycle: inline heuristic guardrails at the gateway, tamper-evident promotion record on every deploy, and EWMA drift-based rollback on metrics you post to the observe endpoint (cost, latency, guardrail-fire rate — see [prompt promotion](/prompt-promotion) for what is autonomous and what is not). Engine requires the LangSmith trace surface + LangChain-managed inference keys per LangSmith AI ToS. Tracelane is OTel GenAI semconv-native, BYOK zero markup, Apache 2.0 full stack, self-hostable. See [vs LangSmith Engine](/comparisons/vs-langsmith-engine).
 </Accordion>
 
-<Accordion title="What is the Audit SKU and do I need it?">
-A tamper-evident record of what your agents actually did. Every gateway-proxied request appends a hash-chained audit entry. Entries are batched (100 by default), each batch gets an RFC 6962 Merkle root, and that root is signed with your workspace's own Ed25519 key — the Merkle root is per batch, not per span. Anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis, with universal per-run anchoring on the roadmap.
+<Accordion title="What's included in the audit ledger?">
+A tamper-evident record of what your agents actually did. Every gateway-proxied request appends a hash-chained audit entry. Entries are batched (100 by default), each batch gets an RFC 6962 Merkle root, and that root is signed with your workspace's own Ed25519 key — the Merkle root is per batch, not per span. Anchored batches carry a resolved Sigstore Rekor v2 inclusion proof on a best-effort basis, with universal per-run anchoring on the roadmap. **All of this — the hash chain, Ed25519 signing, Rekor anchoring and offline self-verification — is included on every tier**, not sold as a separate add-on.
 
 **Scope, stated plainly:** only calls proxied through the Tracelane gateway are chained. Spans sent straight from an SDK or an OTLP exporter are stored and queryable, but they are not part of the chain.
 
-The full ledger exports in the offline-verifier wire format, so you or a third party can verify the chain and the signatures independently with `tlane verify --tenant-pubkey` — no Tracelane involvement, no trust in us required. See [Audit Ledger](/audit-ledger).
+Self-verify with `tlane verify --tenant-pubkey` on your own export — no Tracelane involvement, no trust in us required. The bulk regulatory export (`/v1/audit/export`, the Article-12-style evidence package) and 7-year ledger retention are **Enterprise** capabilities. See [Audit Ledger](/audit-ledger).
 </Accordion>
 
 <Accordion title="Is there a free trial for paid tiers?">
-Free hosted (10K traces/mo) is permanently free for non-commercial use. There is no paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+Free hosted (one workspace, reclaimed after 14 idle days, no card required) is permanently free for non-commercial use. There is no paid-tier free trial — the free hosted tier and OSS self-host are the trial.
 </Accordion>
 
 <Accordion title="Can I self-host?">
@@ -149,5 +248,4 @@ Yes. Apache 2.0 full stack on GitHub (`github.com/tracelane/tracelane`). Self-ho
 
 ---
 
-Prices billed via [Polar.sh](https://polar.sh) (Merchant of Record). Early Member rate locked before May 27, 2026. EU VAT, US sales tax, and India GST handled by Polar.sh.
-
+Prices billed via [Polar.sh](https://polar.sh) (Merchant of Record). EU VAT, US sales tax, and India GST handled by Polar.sh.

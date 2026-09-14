@@ -143,6 +143,17 @@ export function Modal({
 			<div
 				className={[
 					"w-full space-y-4 rounded-[var(--radius-card)] border border-line bg-surface p-6 shadow-[var(--shadow-overlay)]",
+					// THE PANEL IS BOUNDED AND SCROLLS ITSELF. Without this, a panel
+					// taller than the viewport is CLIPPED AT THE TOP and that region is
+					// unreachable: the scrim is `flex items-center overflow-y-auto`, and
+					// a centred flex item overflows its container equally in both
+					// directions, so the overflow above the container's top edge has no
+					// scrollable distance (Chromium reports scrollHeight === clientHeight).
+					// Found 2026-09-07 building the EVL-29 "New queue" dialog: a 3-field
+					// rubric on a 900px laptop put the dialog's title and first field
+					// permanently out of reach. `2rem` is the scrim's own `p-4`, so the
+					// panel fits exactly; `dvh` so a mobile URL bar cannot re-create it.
+					"max-h-[calc(100dvh-2rem)] overflow-y-auto",
 					width === "lg" ? "max-w-lg" : "max-w-md",
 				].join(" ")}
 			>

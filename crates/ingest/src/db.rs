@@ -3,7 +3,10 @@
 //!
 //! Ingest is normally Postgres-free (spans flow OTLP/NATS → ClickHouse). This
 //! pool exists only so the `tenant_config` resolver can read each tenant's
-//! sampling policy + ingest quota + billing contact from the Neon control plane.
+//! sampling policy from the Neon control plane. (BILL-01 / ADR-076,
+//! 2026-09-13: the ingest span quota this resolver used to also carry is
+//! retired outright — "ingest is NEVER blocked by billing state, on any
+//! tier" — so there is no quota cap left to read here any more.)
 //! It mirrors `crates/gateway/src/db`: `deadpool-postgres` over `tokio-postgres`
 //! with a rustls TLS connector (Neon mandates TLS; `NoTls` fails the handshake)
 //! and the webpki root set (no filesystem dependency — works in the distroless
@@ -121,4 +124,48 @@ fn host_to_string(host: &tokio_postgres::config::Host) -> Option<String> {
             tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
         }
     }
+}
+
+/// NEON-TO-ZERO 3a (founder, 2026-09-03): close IDLE pooled connections so the
+/// ingest pool cannot hold the managed compute awake by itself. Mirrors
+/// `crates/gateway/src/db/idle_evict.rs`, which carries the rationale;
+/// `TRACELANE_PG_IDLE_EVICT_SECS` (default 120, `0` disables) is the same knob.
+pub fn spawn_idle_evict(pool: DbPool) {
+    let max_idle = match std::env::var("TRACELANE_PG_IDLE_EVICT_SECS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("0") => 0,
+        Some(v) => v.parse::<u64>().unwrap_or(120),
+        None => 120,
+    };
+    if max_idle == 0 {
+        tracing::info!(
+            "Postgres idle-connection eviction DISABLED (TRACELANE_PG_IDLE_EVICT_SECS=0)"
+        );
+        return;
+    }
+    let every = (max_idle / 2).max(15);
+    tracing::info!(
+        max_idle_secs = max_idle,
+        sweep_secs = every,
+        "Postgres idle-connection eviction ON"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(every));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let limit = Duration::from_secs(max_idle);
+        loop {
+            ticker.tick().await;
+            let r = pool.retain(|_, m| m.last_used() < limit);
+            if !r.removed.is_empty() {
+                tracing::debug!(
+                    evicted = r.removed.len(),
+                    retained = r.retained,
+                    "evicted idle Postgres connections"
+                );
+            }
+        }
+    });
 }

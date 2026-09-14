@@ -78,6 +78,35 @@ const FAIL_WARN_INTERVAL_SECS: u64 = 60;
 /// fail-open score (`0.0`). The first fail-open warns immediately, then at most
 /// once per [`FAIL_WARN_INTERVAL_SECS`] (with the cumulative count) so a
 /// misconfigured / undeployed sidecar can never disable PR6 in silence.
+/// How many times the PR6 sidecar has failed open in this process.
+///
+/// S7 (SRE audit 2026-09-04). This counter existed from the start and was only ever
+/// LOGGED. `scripts/ops/tlane-status.sh` therefore grepped the log for the string
+/// `"PromptGuard FAILING OPEN"` — which no code in this tree emits (the message here
+/// says "sidecar UNREACHABLE") — so `log_promptguard_failopen` was pinned to 0, the
+/// watchdog read that zero, and every board printed a green PromptGuard for a sidecar
+/// production does not run. A rename broke a control silently, which is the whole
+/// argument against grepping prose: read the counter.
+#[must_use]
+pub fn fail_opens_total() -> u64 {
+    PROMPT_GUARD_FAIL_OPENS.load(Ordering::Relaxed)
+}
+
+/// Whether the PR6 sidecar is CONFIGURED at all — i.e. whether a client would be built.
+///
+/// S7 follow-up (2026-09-04), and the reason it exists is the whole point of S7. Once
+/// `/health` published `prompt_guard_fail_opens`, the ops board read `0` and printed
+/// **"PromptGuard enforcing"**. On prod `PROMPT_GUARD_URL` is UNSET, so the predictor is
+/// omitted from the stack entirely and the count is trivially zero forever. That is a
+/// second false green of exactly the shape S7 was opened to remove — the fail-open
+/// counter is honest about fail-opens and says NOTHING about whether the thing runs.
+///
+/// **A count of zero is only good news once you know the thing executed.** Publish both.
+#[must_use]
+pub fn is_configured() -> bool {
+    score_url_from(std::env::var("PROMPT_GUARD_URL").ok().as_deref()).is_some()
+}
+
 fn note_fail_open(reason: &str) -> f32 {
     let total = PROMPT_GUARD_FAIL_OPENS.fetch_add(1, Ordering::Relaxed) + 1;
     let now = unix_now_secs();
@@ -166,8 +195,10 @@ fn score_url_from(raw: Option<&str>) -> Option<String> {
 impl PromptGuardClient {
     /// Construct a new client.
     ///
-    /// Reads `PROMPT_GUARD_URL` from the environment; defaults to
-    /// `http://127.0.0.1:8080`.  The request timeout is fixed at 30 ms to
+    /// Reads `PROMPT_GUARD_URL` from the environment. It no longer defaults to
+    /// `http://127.0.0.1:8080` (the gateway's own listener — B-192, fixed in
+    /// `659cd639`): unset means NOT DEPLOYED and the predictor is omitted from the
+    /// stack by `predictive/mod.rs`. The request timeout is fixed at 30 ms to
     /// match the predictive layer p50 budget — if the sidecar is slower than
     /// this the call fails open (see module-level docs).
     ///

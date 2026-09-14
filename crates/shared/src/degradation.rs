@@ -146,6 +146,74 @@ pub enum Degradation {
     /// has a bill-shaped surprise in the other direction, and silence here would
     /// be indistinguishable from "no traffic".
     OnlineEvalBudgetExceeded = 10,
+    /// Ingest dropped a span because its trace passed the per-trace ceiling
+    /// (`TRACELANE_MAX_SPANS_PER_TRACE` / `_BYTES_`). SRE register #54: this was
+    /// the ONE drop path that logged at `debug!` only — counted in
+    /// `per_trace_ceiling` for a `/metrics` nobody scrapes, invisible everywhere
+    /// else. Routing it here gives it the `TRACELANE_DEGRADED` marker the
+    /// watchdog reads and an `open_for_secs` a reader can act on.
+    PerTraceCeilingDrop = 11,
+    /// OBS-48 — a best-effort write on the PUBLIC share read path failed (the
+    /// `view_count` increment or the cosmetic workspace-name read). The page
+    /// still renders; the count is what tells an operator the DB is unhappy
+    /// under an unauthenticated route, which is worth knowing about.
+    TraceShareBestEffortWrite = 12,
+    /// B-378 — the audit head-writer could not COMMIT a batch (Postgres or
+    /// ClickHouse refused), so the events stay unacked in JetStream for
+    /// redelivery. Nothing is lost while the stream has room; what this counts
+    /// is how long the ledger has been falling behind, which the per-batch
+    /// `error!` line that preceded it could not express.
+    AuditAppendFailed = 13,
+    /// B-378 — the audit JetStream backlog (`num_pending + num_ack_pending`)
+    /// crossed the unhealthy threshold, or its reading went stale. The 1 GiB
+    /// stream bound turns a long enough backlog into `503 audit_unavailable` on
+    /// EVERY request; this is the signal that fires before that does.
+    AuditBacklog = 14,
+    /// B-386 — the single-instance advisory lock is NOT held: the connection
+    /// that carried it dropped and re-acquisition has not succeeded, or another
+    /// gateway holds it. While open, every per-process cap (rate limit, quota,
+    /// budgets) may be enforced by more than one process against the same
+    /// control plane — cap × instances.
+    SingletonLockLost = 15,
+    /// BILL-01 / ADR-076 A3 — the velocity breaker tripped: a key's daily
+    /// output-token total exceeded `mean + sigma*stddev` of its own trailing
+    /// window, and the key's tenant had prompt promotion FROZEN
+    /// (`tenants.promotion_frozen_at`). Not a fault — the breaker working —
+    /// but a founder-visible event, not a silent state change: a customer
+    /// mid-rollout whose promote/rollback suddenly 423s needs a reason that
+    /// outlives the single log line the trip itself emits.
+    VelocityBreakerTripped = 16,
+    /// BILL-01 / ADR-076 §2.3 — a `blobs` or `blob_refs` INSERT (ingest's
+    /// content-addressed dedup, riding the same batch as the span flush)
+    /// failed. The span itself still lands (this never blocks capture); what
+    /// is lost is the ability to rehydrate that one attribute value on read,
+    /// and — because the buffer is NOT retried the way the meter sink's is
+    /// (the blob bytes came off a span already about to be flushed once) —
+    /// silence here would look identical to "nothing this large was ever
+    /// sent". `crates/ingest/src/clickhouse_writer.rs`.
+    BlobStoreFailed = 17,
+    /// BILL-01 / ADR-076 — the daily metering job (meters 2-5) failed a
+    /// `GROUP BY` read or the `meter_gauges` write for a run. The gauges for
+    /// that day stay stale (the usage route already reports "—, last
+    /// computed …" for a stale gauge, so customers see it) but nothing else
+    /// signals that the JOB itself is broken, as opposed to merely running
+    /// late. `crates/gateway/src/billing/metering_job.rs`.
+    MeteringJobFailed = 18,
+    /// BILL-01 / ADR-076 — a Polar `/events/ingest` POST for one
+    /// (tenant, meter, day) failed. Retried next run (idempotent on
+    /// `external_id`), so nothing is lost permanently — but until the retry
+    /// lands, that meter-day is simply absent from the customer's Polar
+    /// invoice with no other signal that it was ever computed.
+    /// `crates/gateway/src/billing/metering_job.rs`.
+    PolarMeterEmissionFailed = 19,
+    /// BILL-01 / ADR-076 — a usage-warning email (75%/90% of an included
+    /// allowance) could not be sent because `RESEND_API_KEY` is unset. One
+    /// warning per PROCESS (not per tenant, not per tick — the cause is
+    /// process-wide config, so per-tenant noise would say nothing new): a
+    /// tenant crossing 90% of their plan today looks, from outside, exactly
+    /// like a tenant who was never warned.
+    /// `crates/gateway/src/billing/email.rs`.
+    UsageWarningEmailUnconfigured = 20,
 }
 
 impl Degradation {
@@ -166,6 +234,16 @@ impl Degradation {
             Self::SemanticCacheUnavailable => "semantic_cache_unavailable",
             Self::OnlineEvalJudgeFailed => "online_eval_judge_failed",
             Self::OnlineEvalBudgetExceeded => "online_eval_budget_exceeded",
+            Self::PerTraceCeilingDrop => "per_trace_ceiling_drop",
+            Self::TraceShareBestEffortWrite => "trace_share_best_effort_write",
+            Self::AuditAppendFailed => "audit_append_failed",
+            Self::AuditBacklog => "audit_backlog",
+            Self::SingletonLockLost => "singleton_lock_lost",
+            Self::VelocityBreakerTripped => "velocity_breaker_tripped",
+            Self::BlobStoreFailed => "blob_store_failed",
+            Self::MeteringJobFailed => "metering_job_failed",
+            Self::PolarMeterEmissionFailed => "polar_meter_emission_failed",
+            Self::UsageWarningEmailUnconfigured => "email_unconfigured",
         }
     }
 
@@ -225,6 +303,59 @@ impl Degradation {
                  paused for that workspace. This is the cap WORKING — raise the budget or \
                  lower the sample rate if the coverage is wanted."
             }
+            Self::PerTraceCeilingDrop => {
+                "spans past the per-trace ceiling (TRACELANE_MAX_SPANS_PER_TRACE / \
+                 _BYTES_) are being DROPPED by ingest and the trace is truncated. Either \
+                 a runaway agent loop or a ceiling set too low for a real workload; \
+                 read the count and open_for_secs before raising it."
+            }
+            Self::TraceShareBestEffortWrite => {
+                "a best-effort write on the public share page (view_count or workspace \
+                 name) is failing; the page still renders. Check the control-plane pool."
+            }
+            Self::AuditAppendFailed => {
+                "the audit head-writer cannot commit ledger batches (Postgres or \
+                 ClickHouse refused); events are piling up unacked in JetStream. Requests \
+                 still succeed until the 1 GiB stream bound, then EVERY request 503s. \
+                 Check the control-plane pool and the ClickHouse audit_log insert."
+            }
+            Self::AuditBacklog => {
+                "the audit JetStream backlog is past the unhealthy threshold or its reading \
+                 is stale; the ledger is falling behind the gateway. Read \
+                 /health.audit_backlog and the head-writer's own log."
+            }
+            Self::SingletonLockLost => {
+                "the gateway's single-instance advisory lock is not held — a second gateway \
+                 may be enforcing the same per-process caps against this control plane \
+                 (cap × instances). Check for a duplicate container and the Postgres \
+                 connection that carries the lock."
+            }
+            Self::VelocityBreakerTripped => {
+                "an API key's output-token generation rate tripped the BILL-01 velocity \
+                 breaker; its tenant's prompt promotion is now FROZEN (423 on promote/\
+                 rollback) until a human clears it via DELETE /v1/billing/promotion-freeze. \
+                 tenants.promotion_frozen_reason names the key and the numbers."
+            }
+            Self::BlobStoreFailed => {
+                "a content-addressed blob or reference row failed to write; the span \
+                 itself still landed, but that attribute value cannot be rehydrated on \
+                 read. Check the gateway/ingest ClickHouse INSERT grant on blobs/blob_refs."
+            }
+            Self::MeteringJobFailed => {
+                "the daily metering job (meters 2-5: hot window, series, query, cold) \
+                 failed a read or write this run — those gauges are STALE for at least a \
+                 day. Check the gateway's control-plane pool and ClickHouse reachability."
+            }
+            Self::PolarMeterEmissionFailed => {
+                "a Polar usage event for one (tenant, meter, day) failed to post; it is \
+                 retried next run (idempotent), but until then that meter-day is simply \
+                 absent from the invoice. Check POLAR_ACCESS_TOKEN and Polar reachability."
+            }
+            Self::UsageWarningEmailUnconfigured => {
+                "a usage-warning email (75%/90% of an included allowance) could not be \
+                 sent — RESEND_API_KEY is unset. Customers crossing a threshold are not \
+                 being notified; the in-app usage page still shows it."
+            }
         }
     }
 
@@ -242,13 +373,23 @@ impl Degradation {
             Degradation::SemanticCacheUnavailable,
             Self::OnlineEvalJudgeFailed,
             Self::OnlineEvalBudgetExceeded,
+            Self::PerTraceCeilingDrop,
+            Self::TraceShareBestEffortWrite,
+            Self::AuditAppendFailed,
+            Self::AuditBacklog,
+            Self::SingletonLockLost,
+            Self::VelocityBreakerTripped,
+            Self::BlobStoreFailed,
+            Self::MeteringJobFailed,
+            Self::PolarMeterEmissionFailed,
+            Self::UsageWarningEmailUnconfigured,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 11;
+pub const COUNT: usize = 21;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -278,6 +419,16 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

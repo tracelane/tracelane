@@ -138,6 +138,14 @@ export function EmptyState({
 					aria-hidden="true"
 					className="relative grid h-9 w-9 place-items-center rounded-xl bg-surface-2 text-ink-2"
 				>
+					{/* DSH-16: a very soft amber halo behind the icon, FULL variant only
+					    (never `compact`, which is the in-card "no data yet" tile used ~30
+					    times across the dashboard — one glow per empty PAGE, not one per
+					    empty TILE). `.empty-icon-glow` paints behind this span's own
+					    `bg-surface-2` fill (negative z-index inside the stacking context
+					    `position: relative` establishes here), so it reads as a halo
+					    bleeding out from the chip's edges. */}
+					{!compact && <span aria-hidden="true" className="empty-icon-glow" />}
 					{icon}
 				</span>
 			)}

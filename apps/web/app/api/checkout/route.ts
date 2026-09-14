@@ -1,49 +1,132 @@
 /**
- * POST /api/checkout — start an in-app Polar checkout for a plan upgrade.
+ * POST /api/checkout — start an in-app Polar checkout for a FREE → PAID
+ * upgrade, or a REAL PRICE CHANGE for an existing subscriber (B-140).
  *
- * Mirrors `/api/billing/portal`: authenticates the session, forwards the
- * per-user WorkOS JWT as the Bearer (the gateway resolves the tenant from it —
- * never from the request body), and proxies to the gateway's
- * `POST /v1/billing/checkout`, which calls Polar.sh and returns the hosted
- * checkout URL. We 302-redirect the browser straight to that Polar URL. Stripe
- * direct calls are banned post Phase-2 (`.claude/rules/billing.md`); the
- * dashboard never holds a Polar access token, only the user's JWT.
+ * Authenticates the session, forwards the per-user WorkOS JWT as the Bearer
+ * (the gateway resolves the tenant from it — never from the request body),
+ * and proxies to the gateway's `POST /v1/billing/checkout`, which calls
+ * Polar.sh and returns the hosted checkout URL. We 302-redirect the browser
+ * straight to that Polar URL. Stripe direct calls are banned post Phase-2
+ * (`.claude/rules/billing.md`); the dashboard never holds a Polar access
+ * token, only the user's JWT.
  *
- * The desired tier is selected via `?tier=` (builder | team | business |
- * enterprise) and mapped to the Polar product UUID through deployment env
- * (`POLAR_PRODUCT_ID_<TIER>`). Real product ids stay in config, never in code.
- * A valid tier with no configured product id fails loud (501) rather than
- * starting a broken checkout.
+ * The desired tier is selected via `?tier=` (builder | team | business) and
+ * `?interval=` (month | year, default month) and mapped to the Polar product
+ * UUID by reading `plan_entitlements.polar_product_id_month/year` — NOT an
+ * env var (`POLAR_PRODUCT_ID_<TIER>` is retired: an env-var product map is
+ * exactly the class ADR-076 removes, and it is why annual products could
+ * never be added without a Worker redeploy). A valid tier with no configured
+ * product id for the deployment fails loud (501) rather than starting a
+ * broken checkout.
+ *
+ * Enterprise is sales-led — never a self-serve checkout target (B-134/B-132:
+ * there has never been, and still is not, an Audit-SKU or Enterprise
+ * checkout of any kind; the Audit SKU is not sold at all, spec `BILL-01`
+ * §10.4).
+ *
+ * B-140: a tenant that ALREADY holds an active Polar subscription
+ * (`tenants.polar_subscription_id` set) is sent to the customer portal for
+ * ANY plan change — Polar rejects a second concurrent subscription in the
+ * same group, so a second checkout would just fail at Polar. `/api/checkout`
+ * is reserved for the free → paid transition.
  */
 
+import { db } from "@/db";
+import { planEntitlements, tenants } from "@/db/schema";
 import { requireGatewayToken, requireSession } from "@/lib/auth";
 import { gatewayBaseUrl } from "@/lib/gateway";
+import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
-/** Tier → the env var holding its Polar product UUID. */
-const PRODUCT_ENV: Record<string, string> = {
-	builder: "POLAR_PRODUCT_ID_BUILDER",
-	team: "POLAR_PRODUCT_ID_TEAM",
-	business: "POLAR_PRODUCT_ID_BUSINESS",
-	enterprise: "POLAR_PRODUCT_ID_ENTERPRISE",
+/** Self-serve tiers. Enterprise is sales-led (mailto CTA only, no checkout). */
+const SELF_SERVE_LOOKUP_KEY: Record<string, string> = {
+	builder: "builder_v1",
+	team: "team_v1",
+	business: "business_v1",
 };
+
+async function portalRedirect(
+	origin: string,
+	token: string,
+): Promise<NextResponse> {
+	const base = gatewayBaseUrl();
+	const upstream = await fetch(`${base}/v1/billing/portal`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${token}`,
+		},
+		body: JSON.stringify({}),
+	});
+	if (!upstream.ok) {
+		return NextResponse.json(
+			{ error: "billing portal unavailable" },
+			{ status: upstream.status >= 500 ? 502 : upstream.status },
+		);
+	}
+	const data = (await upstream.json()) as { url: string };
+	let dest: URL;
+	try {
+		dest = new URL(data.url);
+	} catch {
+		return NextResponse.json(
+			{ error: "billing portal unavailable" },
+			{ status: 502 },
+		);
+	}
+	if (dest.hostname !== "polar.sh" && !dest.hostname.endsWith(".polar.sh")) {
+		return NextResponse.json(
+			{ error: "billing portal unavailable" },
+			{ status: 502 },
+		);
+	}
+	return NextResponse.redirect(dest, 302);
+}
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
 	// Auth first: mint the per-user JWT (the gateway derives the tenant from it)
 	// and read the customer email the gateway checkout endpoint requires. Both
 	// redirect (NEXT_REDIRECT) when there is no session — never swallowed.
 	const { token } = await requireGatewayToken();
-	const { email } = await requireSession();
+	const session = await requireSession();
+	const { email } = session;
 
 	const tier = (req.nextUrl.searchParams.get("tier") ?? "").toLowerCase();
-	const envName = PRODUCT_ENV[tier];
-	if (!envName) {
+	const lookupKey = SELF_SERVE_LOOKUP_KEY[tier];
+	if (!lookupKey) {
 		return NextResponse.json({ error: "unknown tier" }, { status: 400 });
 	}
-	const productId = process.env[envName];
+	const interval =
+		req.nextUrl.searchParams.get("interval") === "year" ? "year" : "month";
+
+	// B-140: an existing subscriber changes plans through the Polar customer
+	// portal, never a second checkout.
+	const [tenantRow] = await db
+		.select({ polarSubscriptionId: tenants.polarSubscriptionId })
+		.from(tenants)
+		.where(eq(tenants.workosOrgId, session.tenantId))
+		.limit(1);
+	if (tenantRow?.polarSubscriptionId) {
+		return portalRedirect(req.nextUrl.origin, token);
+	}
+
+	const [planRow] = await db
+		.select({
+			polarProductIdMonth: planEntitlements.polarProductIdMonth,
+			polarProductIdYear: planEntitlements.polarProductIdYear,
+		})
+		.from(planEntitlements)
+		.where(eq(planEntitlements.planLookupKey, lookupKey))
+		.limit(1);
+	const productId =
+		interval === "year"
+			? planRow?.polarProductIdYear
+			: planRow?.polarProductIdMonth;
 	if (!productId) {
-		// Valid tier, but this deployment has no Polar product id for it. Fail
-		// loud instead of POSTing an empty product_id (the gateway 400s anyway).
+		// Valid tier, but this deployment has no Polar product id for it/this
+		// interval yet (`scripts/ops/polar-sync.mjs` has not run, or Enterprise
+		// has no annual product by design). Fail loud instead of POSTing an
+		// empty product_id (the gateway 400s anyway).
 		return NextResponse.json(
 			{ error: "checkout not configured for this tier" },
 			{ status: 501 },

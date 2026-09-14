@@ -5,24 +5,15 @@
 //!
 //! Set `TRACELANE_LOG_FORMAT=json` for structured production logs.
 
-// Many modules contain scaffolded items awaiting wiring in upcoming milestones.
-// Suppress dead_code and unused_imports globally for this binary crate during
-// the active development phase.
-#![allow(
-    dead_code,
-    unused_imports,
-    clippy::needless_return,
-    clippy::collapsible_match,
-    clippy::collapsible_if,
-    clippy::manual_is_multiple_of
-)]
-
 use anyhow::Context as _;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+// B-385: the ONE admission pipeline the three dispatch routes run.
 mod admin_audit;
+mod admission;
 mod alerts;
 mod annotation_routes;
+mod anthropic_messages;
 mod audit;
 mod audit_consumer;
 mod audit_export;
@@ -36,6 +27,7 @@ mod auth;
 mod billing;
 mod byok;
 mod byok_api;
+mod byok_rotate;
 mod circuit_breaker;
 mod clickhouse_query;
 mod dataset_routes;
@@ -43,12 +35,21 @@ mod db;
 mod entitlement_cache;
 mod experiment_routes;
 mod guardrail;
+// B-385 (2c): the in-process handler harness. Test-only by construction, and
+// `debug_assertions`-gated like `providers::smoke_tests` — the loopback SSRF
+// bypass it drives exists only in debug builds (`ssrf_guard.rs` says why a
+// bare `cfg(test)` would break the bench profile).
+#[cfg(all(test, debug_assertions))]
+mod handler_harness;
+mod health_probe;
 mod hotpath;
 mod key_routes;
 mod kill_switch;
+mod metrics;
 mod notification_routes;
 mod otlp_emit;
 mod payment;
+mod preauth_limiter;
 mod predictive;
 mod pricing;
 mod providers;
@@ -63,6 +64,7 @@ mod server;
 mod spend;
 mod ssrf_guard;
 mod tool_analytics;
+mod trace_context;
 mod trace_ingest;
 mod trace_reads;
 mod untrusted_data;
@@ -84,7 +86,22 @@ mod semantic_cache;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // SRE register #45 — the container HEALTHCHECK (`gateway --health-probe`).
+    // Before tracing and before config: a probe must not depend on anything but
+    // the port, and must not emit a log line every 30 s.
+    if std::env::args().nth(1).as_deref() == Some("--health-probe") {
+        let port = std::env::var("TRACELANE_PORT").unwrap_or_else(|_| "8080".into());
+        return health_probe::run(&format!("http://127.0.0.1:{port}/health")).await;
+    }
+
     init_tracing();
+
+    // B-383 (a): `gateway byok-rotate [--dry-run]` — re-wrap every BYOK row under
+    // the active KEK, then exit. Same env, same pool, no listener.
+    if std::env::args().nth(1).as_deref() == Some("byok-rotate") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return byok_rotate::main(&rest).await;
+    }
 
     let config = server::Config::from_env().context("failed to load gateway config")?;
 

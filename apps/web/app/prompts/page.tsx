@@ -49,7 +49,7 @@ async function PromoteGateBanner() {
 		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
 			<span>
 				<span className="font-semibold">
-					🔒 Promoting a version across environments requires Team ($249/mo)
+					🔒 Promoting a version across environments requires Team ($229/mo)
 				</span>{" "}
 				— viewing and authoring versions is free.
 			</span>
@@ -97,7 +97,7 @@ async function PromptListData() {
 	}
 
 	return (
-		<Card className="overflow-x-auto">
+		<Card className="relative overflow-x-auto">
 			<table className="w-full text-sm">
 				<thead className="border-b border-line">
 					<tr>

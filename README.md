@@ -44,6 +44,37 @@ fires on LLM traffic today** — for two different reasons:
 See [`apps/docs/predictive-guardrails.mdx`](apps/docs/predictive-guardrails.mdx) for
 per-rail status.
 
+## How Tracelane compares
+
+| | Tracelane | LiteLLM | Portkey | Langfuse | LangSmith |
+|---|---|---|---|---|---|
+| Measured gateway overhead (p50) | **2 ms** † | partial (Python proxy 14–15 ms, same bench; Rust build not public) | 3–4 ms, same bench run | — (no gateway) | — (no gateway) |
+| Rust hot path | ✓ | — (Python proxy measured; Rust gateway announced, no public build) | — (TypeScript/Node.js) | — (no gateway) | — (no gateway) |
+| BYOK, 0% token markup | ✓ | ✓ | ✓ | — | partial (lists an LLM Gateway; BYOK not documented) |
+| OTel-native ingest | ✓ | partial | partial | ✓ | partial |
+| Multi-agent swimlanes | ✓ | — | — | ✓ | ✓ |
+| Sessions | ✓ (per-user identity on the roadmap) | — | — | ✓ | ✓ |
+| Eval loop (datasets, experiments, online evals, annotation queues, CI gate) | ✓, proven on prod | — | — | ✓ | ✓ |
+| Prompt management + playground | ✓ | — | ✓ | ✓ | ✓ |
+| MCP server for traces | ✓ (`@tracelanedev/mcp` on npm) | — | — | — | — |
+| Claude Code flight recorder | ✓ | — | — | — | — |
+| Tamper-evident ledger, offline-verifiable | ✓ | — | — | — | — |
+| Self-host, single Compose file | ✓ | ✓ | ✓ | ✓ (+ Kubernetes) | partial (Enterprise BYOC) |
+| License | Apache 2.0 | MIT (core) | MIT | MIT | none for OSS; Enterprise self-hosted SKU is proprietary |
+
+✓ = shipped and documented · partial = supported with a real limit · — = not documented on
+the vendor's own page as of 2026-09-07 (not necessarily absent).
+
+**Not yet:** SOC 2 report, configurable data residency, HIPAA/BAA, documented SAML SSO,
+contractual SLA, documented Slack/PagerDuty alert integrations. Stated as limits, not
+discovered as gaps — see the [full matrix](https://docs.tracelane.dev/comparisons) for
+what each competitor has instead.
+
+Full matrix with sources: <https://docs.tracelane.dev/comparisons>
+
+† Benchmark: 2 ms p50 / 4 ms p95 / 5 ms p99 added latency on LiteLLM's AIGatewayBench
+harness (4 vCPU, two runs, capture on) — <https://docs.tracelane.dev/benchmarks>
+
 ## Quick start
 
 **Hosted** (zero infra):
@@ -241,11 +272,6 @@ carries no branch protection and no review history you can inspect — the merge
 the full test suite and the guard selftests run upstream before anything is exported.
 Judge the code and the releases, not the commit graph.
 
-Honest note on SLSA: the repository runs `slsa-framework/slsa-github-generator`, but its
-`final` job is currently failing even on successful releases, so **we do not claim a
-verified SLSA Level 3 attestation**. The provenance you can actually verify today is the
-`attest-build-provenance` one, alongside the Cosign bundle above.
-
 ## Migrating from Helicone
 
 One command rewrites your Helicone base URL and auth headers to Tracelane (config +
@@ -259,7 +285,7 @@ Full guide: [docs.tracelane.dev/migrations/from-helicone](https://docs.tracelane
 
 ## Pricing
 
-OSS self-host is **$0 forever** under Apache 2.0, with no commercial restriction. What it runs is the headless stack — ClickHouse, NATS, gateway and ingest; there is no dashboard container, and the web UI is hosted-only today (see [Self-host](#quick-start) above). Hosted tiers (free / $59 Builder / $249 Team / $899 Business / $2,999+ Enterprise + $999/mo Audit add-on) with capped overage and bundled seats are documented at **[tracelane.dev/pricing](https://tracelane.dev/pricing)**, and the same ladder is published at [docs.tracelane.dev/pricing](https://docs.tracelane.dev/pricing).
+OSS self-host is **$0 forever** under Apache 2.0, with no commercial restriction. What it runs is the headless stack — ClickHouse, NATS, gateway and ingest; there is no dashboard container, and the web UI is hosted-only today (see [Self-host](#quick-start) above). Hosted tiers (free / $29 Builder / $229 Team / $799 Business / $2,499+ Enterprise), metered on six usage dimensions (ingest, hot indexed window, series, query compute, cold archive, evaluations) with unlimited seats on every paid tier, are documented at **[tracelane.dev/pricing](https://tracelane.dev/pricing)**, and the same ladder is published at [docs.tracelane.dev/pricing](https://docs.tracelane.dev/pricing).
 
 ## Community
 

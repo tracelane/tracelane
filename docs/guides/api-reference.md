@@ -280,7 +280,11 @@ always mounted.
 
 ### `GET /v1/audit/export?since=<iso8601>&until=<iso8601>&limit=<u32>`
 
-Requires the **$999/mo Audit add-on** (`f_audit_addon`). Without it: `403
+Requires **Enterprise** (`f_audit_addon`) — the bulk regulatory export is not
+sold as a separate add-on (spec `BILL-01` §10.4: `/v1/audit/export` does not
+yet meet the founder ruling's evidence-pack bar, so it folds into Enterprise
+instead of shipping at a price). Self-verification (`tlane verify`) needs no
+entitlement on any tier. Without Enterprise: `403
 {"error":"entitlement_required","feature":"audit_ledger","message":…,"upgrade_url":…}`.
 If the entitlement cache is unreachable the export fails **closed** with `503` —
 it never serves a paid capability it cannot verify.
@@ -457,8 +461,10 @@ dispatch and records **after** it, then:
 
 - base-plan `subscription.*` events update `tenants` (plan, `polar_customer_id`,
   `polar_subscription_id`) and the `workspace_entitlements.plan_lookup_key`;
-- add-on events (the separate $999 Audit SKU subscription) grant the matching
-  entitlement boolean and **never** touch the base plan;
+- (retired) add-on events from the former paid audit subscription used to grant
+  the matching entitlement boolean without touching the base plan — the SKU
+  is not sold under the ruled model (spec `BILL-01` §10.4); the entitlement
+  is now a plan default (Enterprise only), not a purchase;
 - `canceled` / `revoked` clear them.
 
 Per-plan feature flags are plan defaults and are not set here.
@@ -495,9 +501,9 @@ starts full, so the first burst can be the whole minute's allowance.
 | Tier | RPM | Burst (bucket capacity) |
 |---|---|---|
 | Free | 60 | 60 |
-| Builder ($59/mo) | 600 | 600 |
-| Team ($249/mo) | 6,000 | 6,000 |
-| Business ($899/mo) | 60,000 | 60,000 |
+| Builder ($29/mo) | 600 | 600 |
+| Team ($229/mo) | 6,000 | 6,000 |
+| Business ($799/mo) | 60,000 | 60,000 |
 | Enterprise | uncapped (short-circuits the bucket entirely) | — |
 
 An unrecognised plan string resolves to **Free**, never to a higher tier.
@@ -512,23 +518,18 @@ Throttled:
 header** — read the body field. (The circuit-breaker `503` and the upstream
 `provider_rate_limited` `429` *do* set the header; see [Error shape](#error-shape).)
 
-### Monthly quota — hard cap
+### Monthly trace quota — REMOVED
 
-Separately, each plan has a monthly trace quota with a hard-cap multiplier
-(5× on paid plans). Past `quota × multiplier` the gateway returns:
-
-```json
-{
-  "error": "quota_exceeded",
-  "limit": 750000,
-  "used": 750001,
-  "reset_at": "2026-09-01T00:00:00Z",
-  "upgrade_url": "https://app.tracelane.dev/settings/billing"
-}
-```
-
-The counter is rehydrated from ClickHouse once per tenant per month per process,
-so a restart or blue-green deploy does not forgive accrued usage.
+There is no monthly trace-count hard-cap and no `quota_exceeded` refusal.
+Ingest and proxied calls are metered continuously across six meters and
+billed by usage; **ingest is never blocked by billing state, on any tier**.
+The only budget-shaped refusals are the ones a workspace sets itself — the
+per-key monthly budget (`key_budget_exceeded`, set when the key is minted)
+and the workspace spend ceiling (set on the billing page) — and neither
+blocks ingest, only proxied calls. The `quota_exceeded`
+response an earlier revision of this page described was retired with the
+hard-cap in September 2026; a client that still special-cases it will never
+see it.
 
 ---
 

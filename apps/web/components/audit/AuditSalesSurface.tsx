@@ -2,14 +2,16 @@ import { Card } from "@tracelanedev/ui";
 import Link from "next/link";
 
 /**
- * Shown to tenants WITHOUT the Audit SKU entitlement — the page exists + what it
- * does (a sales surface), never a fake/empty render implying they have it.
+ * Shown to tenants WITHOUT the Article-12 export entitlement (f_audit_addon,
+ * Enterprise) — the page exists + what it does (a sales surface), never a
+ * fake/empty render implying they have it. The paid Article-12 add-on is NOT sold
+ * (BILL-01 §10.4 / B-392): the upsell is the Enterprise plan.
  */
 export function AuditSalesSurface() {
 	return (
 		<Card provenance className="p-6">
 			<div className="t-card-title text-seal-ink">
-				Audit SKU · $999/mo add-on
+				Audit ledger · included on every plan
 			</div>
 			<h2 className="mt-1 text-md font-semibold text-ink">
 				A provable record of every gateway call and guardrail verdict
@@ -61,7 +63,7 @@ export function AuditSalesSurface() {
 					// light, 17.71:1 in dark, label included.
 					className="bg-selected text-selected-on hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-sm font-medium"
 				>
-					Add the Audit SKU
+					Enterprise plan
 				</Link>
 			</div>
 		</Card>

@@ -51,6 +51,10 @@ fn test_tenant() -> TenantId {
 
 fn request_with_tools(model: &str) -> ChatRequest {
     ChatRequest {
+        top_p: None,
+        seed: None,
+        logprobs: None,
+        top_logprobs: None,
         model: model.into(),
         messages: vec![Message {
             role: Role::User,
@@ -72,6 +76,7 @@ fn request_with_tools(model: &str) -> ChatRequest {
                 "required": ["city"]
             }),
         }]),
+        tool_choice: None,
         system: None,
         metadata: None,
     }
@@ -458,4 +463,179 @@ async fn cohere_stream_sends_tools_and_surfaces_tool_calls_and_usage() {
     );
     let (input, output, _cost) = usage_of(&events).expect("stream-end usage surfaces");
     assert_eq!((input, output), (42, 17));
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// B-353 / B-354 — the BUFFERED (non-streaming) assembly.
+//
+// `buffer_provider_stream` itself needs an `AppState`, a NATS handle and a
+// guardrail engine, which is exactly why this half had no coverage and why a
+// 100%-dropped tool call shipped. The two facts it folds out of the stream live
+// in `BufferedToolState`, and the body it builds in
+// `buffered_completion_payload`, so both are driven here from the REAL
+// Anthropic adapter parsing a provider-authentic fixture.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// A text-only Anthropic stream: no `tool_use` block, `stop_reason: end_turn`.
+/// The control for "nothing changed for the 94% of traffic that uses no tools".
+const ANTHROPIC_TEXT_ONLY_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t1\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Sunny.\"}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// The same answer, cut short by the token budget: `stop_reason: max_tokens`.
+const ANTHROPIC_TRUNCATED_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t2\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Sunny and\"}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":128}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Run the real Anthropic adapter over `sse`, fold the events exactly as
+/// `buffer_provider_stream` does, and return the `chat.completion` body a
+/// non-streaming caller would receive.
+async fn buffered_body_for(sse: &'static str) -> serde_json::Value {
+    let _bypass = LoopbackBypassGuard::new();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let stream = AnthropicProvider::for_base_url(server.uri())
+        .expect("provider")
+        .chat(
+            request_with_tools("claude-sonnet-4-6"),
+            "sk-ant-test-do-not-use-in-prod",
+            &test_tenant(),
+        )
+        .await
+        .expect("anthropic chat returns stream");
+
+    let events = collect(stream).await;
+    let mut state = crate::server::BufferedToolState::default();
+    let mut text = String::new();
+    let mut input_tokens = 0u32;
+    let mut output_tokens = 0u32;
+    for ev in &events {
+        if state.absorb(ev) {
+            continue;
+        }
+        match ev {
+            ProviderEvent::StreamChunk { delta } => text.push_str(delta),
+            ProviderEvent::UsageUpdate {
+                input_tokens: i,
+                output_tokens: o,
+                ..
+            } => {
+                if *i > 0 {
+                    input_tokens = *i;
+                }
+                if *o > 0 {
+                    output_tokens = *o;
+                }
+            }
+            _ => {}
+        }
+    }
+    crate::server::buffered_completion_payload(
+        "chatcmpl-fixture",
+        "claude-sonnet-4-6",
+        text,
+        &state,
+        input_tokens,
+        output_tokens,
+    )
+}
+
+/// **THE TEST THAT WOULD HAVE CAUGHT B-353.** A provider-authentic Anthropic
+/// stream carrying a `tool_use` block, buffered the way a non-streaming caller
+/// gets it. Before the fix the assembled body carried content only: the
+/// `ToolCallDelta`s fell through `Ok(_) => {}` and the model's tool intent was
+/// discarded with a 200.
+#[tokio::test]
+async fn a_buffered_tool_use_stream_carries_the_tool_call_in_openai_shape() {
+    let body = buffered_body_for(ANTHROPIC_BEHAVIORAL_SSE).await;
+    let calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("a buffered response must carry the model's tool calls");
+    assert_eq!(calls.len(), 1, "one tool_use block -> one tool call");
+    assert_eq!(calls[0]["id"], "toolu_b067");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    // `arguments` is a JSON *string* on the OpenAI wire — that is what every
+    // SDK's `json.loads(tc.function.arguments)` expects. Asserting the parsed
+    // value as well as the type is what makes this a contract rather than a
+    // spelling check.
+    let raw = calls[0]["function"]["arguments"]
+        .as_str()
+        .expect("arguments must be a STRING, not an object");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(raw).expect("arguments parse as JSON"),
+        serde_json::json!({ "city": "Bangalore" })
+    );
+    // B-354, same response: the SDK tool loop branches on this.
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    // The text half is untouched.
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "The weather is sunny."
+    );
+}
+
+/// **The no-behaviour-change control.** A stream with no tool calls must
+/// produce the body it produced before B-353/B-354 existed — asserted against
+/// the WHOLE body, not a field, so an added key fails the test.
+#[tokio::test]
+async fn a_text_only_buffered_response_is_unchanged() {
+    let body = buffered_body_for(ANTHROPIC_TEXT_ONLY_SSE).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "id": "chatcmpl-fixture",
+            "object": "chat.completion",
+            "model": "claude-sonnet-4-6",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Sunny." },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 3,
+                "total_tokens": 14
+            }
+        }),
+        // B-353 regression pin: the tool-free path must not change bytes.
+        "a tool-free response must be byte-identical to the body it produced before tool-call accumulation was added"
+    );
+}
+
+/// B-354, the mapping that is not derivable from the response's own contents: a
+/// truncated answer carries no tool calls and looks exactly like a complete one
+/// unless the provider's `stop_reason` is read.
+#[tokio::test]
+async fn a_max_tokens_stop_becomes_finish_reason_length() {
+    let body = buffered_body_for(ANTHROPIC_TRUNCATED_SSE).await;
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert!(
+        body["choices"][0]["message"].get("tool_calls").is_none(),
+        "a truncated text answer must not grow a tool_calls key"
+    );
 }

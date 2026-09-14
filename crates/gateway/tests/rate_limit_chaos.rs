@@ -1,160 +1,119 @@
-//! FT-02 chaos test: provider 429 (rate-limit) storm + same-provider retry.
+//! FT-02 chaos test (rebuilt under B-385 2c): a tenant over its per-minute
+//! limit, THROUGH THE REAL GATEWAY.
 //!
-//! Un-skips `evals/fault-tolerance/FT-02`'s integration case. It mirrors the
-//! FT-01 `failover_chaos.rs` shape: rather than booting the full gateway hot
-//! path (axum + Postgres + ClickHouse), it drives the SSRF-guarded reqwest
-//! client against a `wiremock` upstream that injects HTTP 429s, exercising
-//! the same retry shape `server.rs::dispatch_with_retry` runs in production:
+//! Until 2026-09-12 this file drove a bare `reqwest::Client` against a wiremock
+//! that returned 429, and its `ft02_retry_count_is_one` compared a local
+//! constant to itself. The gateway's own limiter — the thing FT-02 is about —
+//! was never in the loop.
 //!
-//!   1. Upstream answers the first request with 429 + `Retry-After`, then a
-//!      200 on the retry → the caller succeeds inside the retry budget.
-//!   2. A persistent-429 upstream exhausts the single A7 retry; the caller
-//!      surfaces the failure (the gateway would return 429 + `Retry-After`).
+//! Now the test boots the real binary (`tests/common`) with no control plane,
+//! which resolves every request to the FREE tier (60 rpm —
+//! `.claude/rules/tenancy.md`: no entitlement cache is the UNPRIVILEGED state),
+//! sends 60 requests that the upstream serves, and asserts that the 61st is a
+//! `429` carrying `Retry-After` and the body the OpenAI-shaped wire always sent
+//! — produced by `crate::admission` inside `chat_completions_handler`, not by a
+//! mock. It also asserts what the 429 did NOT do: reach the provider, or emit a
+//! span.
 //!
-//! Runs with the SSRF loopback bypass (debug-only) because wiremock binds
-//! 127.0.0.1. See `failover_chaos.rs` for the OnceLock rationale.
+//! The in-process twin, which additionally reads the quota counter, the ledger
+//! seq and the per-tenant rejection tally, and covers all three routes, is
+//! `src/handler_harness.rs::a_tenant_over_its_per_minute_limit_gets_429_with_retry_after`.
+//!
+//! Debug builds only: the dev-stub credential and the loopback SSRF bypass the
+//! child process needs both exist only there.
 
 #![cfg(debug_assertions)]
-#![allow(dead_code)]
 
-use std::time::Instant;
+mod common;
 
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "../src/ssrf_guard.rs"]
-#[allow(dead_code)]
-mod ssrf_guard;
+use common::{BEARER, Gateway, chat_ok_body, chat_request};
 
-/// Enable the loopback SSRF bypass for this test binary exactly once.
-///
-/// Set via `OnceLock` and never removed: every test here needs loopback
-/// (wiremock binds 127.0.0.1), the binary is process-isolated, and a
-/// per-test set/remove would race the SSRF guard's `validate_url` read on
-/// the multi-threaded test runtime (see `.claude/rules/testing.md`).
-fn enable_loopback_bypass() {
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| {
-        // SAFETY: runs exactly once, before any test reads the var; the
-        // OnceLock barrier serialises it ahead of all readers. Debug-only
-        // escape hatch — release builds ignore the var entirely.
-        unsafe {
-            std::env::set_var("TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS", "1");
-        }
-    });
+/// The no-control-plane per-minute allowance, as `rate_limiter` (a lib
+/// module, so readable from here) defines it — not a number this file made
+/// up. BILL-01 deleted `RateLimitTier`; this is the same 60 rpm figure,
+/// resolved through the REAL function the gateway itself calls at boot
+/// (`no_control_plane_rate_limit_rpm_from_env`), reading THIS test process's
+/// own environment — which the spawned child inherits, and which sets no
+/// self-host marker, so both resolve to the hosted-but-poolless answer.
+fn free_rpm() -> u32 {
+    gateway::rate_limiter::no_control_plane_rate_limit_rpm_from_env()
+        .expect("no self-host marker is set in this test's env, so this must be Some(60)")
 }
 
-/// Sanity: the A7 retry policy is one same-provider retry on a transient
-/// upstream failure (FT-02 /). The numeric budget reference keeps a
-/// future widening of the retry count visible to this eval.
-#[test]
-fn ft02_retry_count_is_one() {
-    const EXPECTED_SAME_PROVIDER_RETRIES: u32 = 1;
-    assert_eq!(EXPECTED_SAME_PROVIDER_RETRIES, 1);
-}
-
-/// Wiremock-driven rate-limit chaos: first call returns 429 + Retry-After,
-/// the retry returns 200. The retry path stays inside the FT-02 budget.
 #[tokio::test]
-async fn wiremock_429_then_200_succeeds_within_budget() {
-    enable_loopback_bypass();
-
-    let server = MockServer::start().await;
-
-    // First request: 429 with a Retry-After. Subsequent requests: 200.
+async fn the_request_past_the_free_tier_allowance_is_429_with_retry_after() {
+    let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("retry-after", "0")
-                .set_body_string("rate limited"),
-        )
-        .up_to_n_times(1)
-        .mount(&server)
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+        .mount(&upstream)
         .await;
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(b"data: [DONE]\n\n".to_vec(), "text/event-stream"),
-        )
-        .mount(&server)
-        .await;
+    let gw = Gateway::spawn(&upstream.uri()).await;
+    let client = reqwest::Client::new();
+    let allowance = free_rpm();
 
-    let url = server.uri();
-    ssrf_guard::validate_url(&url).await.expect("loopback URL");
-
-    let started = Instant::now();
-    let client = reqwest::Client::builder().build().unwrap();
-
-    // Attempt 1 — must return 429 with a Retry-After header.
-    let first = client
-        .post(&url)
-        .body("{}")
-        .send()
-        .await
-        .expect("first send");
-    assert_eq!(first.status().as_u16(), 429);
-    assert!(
-        first.headers().contains_key("retry-after"),
-        "provider 429 must carry Retry-After for the backoff",
+    // Inside the allowance: every request is served.
+    for i in 0..allowance {
+        let resp = client
+            .post(gw.url("/v1/chat/completions"))
+            .header("authorization", BEARER)
+            .json(&chat_request())
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "request {i} of {allowance} was refused"
+        );
+    }
+    let served = upstream.received_requests().await.expect("requests").len();
+    assert_eq!(
+        served as u32, allowance,
+        "every request inside the allowance reached the provider"
+    );
+    let spans_after_allowance = gw.spans_dropped().await;
+    assert_eq!(
+        spans_after_allowance,
+        u64::from(allowance),
+        "one span per served request"
     );
 
-    // Honour the Retry-After (0s here) before the single A7 retry.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Attempt 2 — must return 200.
-    let second = client
-        .post(&url)
-        .body("{}")
+    // The one past it: refused by the gateway's own limiter.
+    let resp = client
+        .post(gw.url("/v1/chat/completions"))
+        .header("authorization", BEARER)
+        .json(&chat_request())
         .send()
         .await
-        .expect("second send");
-    assert_eq!(second.status().as_u16(), 200);
-
-    // THE BUDGET IS 5s, AND THE WIDENING IS DELIBERATE — it was 1000ms.
-    //
-    // What this asserts is that the A7 retry path adds NO PATHOLOGICAL DELAY: no
-    // multi-second backoff, no hang, no sleep that scales with anything. Two loopback
-    // round trips plus a 50ms sleep is single-digit milliseconds of real work, so any
-    // regression worth catching here is measured in SECONDS, not in the gap between
-    // 900ms and 1100ms.
-    //
-    // At 1000ms it was measuring the BOX, not the code. Observed failing FOUR times on
-    // 2026-08-25 under ordinary gate load — 2.48s once — while the same file passes
-    // 25/25 in 0.27s on an idle machine. A test that goes red because something else
-    // was compiling is a test people re-run rather than read, and it blocked a push
-    // three times.
-    //
-    // 5s still bites: the shipped behaviour is ~250ms here, so a real regression has
-    // 20x of headroom to trip it. Falsifiable by inserting a `sleep(6s)` in the retry
-    // path — the assertion fires. A budget nothing can realistically exceed would be
-    // decoration, and this is not that.
-    let elapsed = started.elapsed();
+        .expect("the gateway answers");
+    assert_eq!(resp.status().as_u16(), 429);
+    let retry_after: u32 = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("a 429 from the gateway carries a numeric Retry-After");
     assert!(
-        elapsed.as_millis() < 5000,
-        "rate-limit retry path exceeded budget: {elapsed:?}",
+        retry_after >= 1,
+        "Retry-After must be at least one second: {retry_after}"
     );
-}
+    let body: serde_json::Value = resp.json().await.expect("JSON 429 body");
+    assert_eq!(body["error"], "rate limit exceeded");
+    assert_eq!(body["retry_after_secs"], retry_after);
 
-/// A persistent 429 upstream exhausts the single retry; both attempts see
-/// 429. The gateway would then surface 429 + Retry-After to the caller
-/// rather than tying up a worker slot on a known-throttled upstream.
-#[tokio::test]
-async fn wiremock_persistent_429_exhausts_retry() {
-    enable_loopback_bypass();
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "10"))
-        .mount(&server)
-        .await;
-
-    let url = server.uri();
-    ssrf_guard::validate_url(&url).await.expect("loopback URL");
-
-    let client = reqwest::Client::builder().build().unwrap();
-    let r1 = client.post(&url).body("{}").send().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let r2 = client.post(&url).body("{}").send().await.unwrap();
-    assert_eq!(r1.status().as_u16(), 429);
-    assert_eq!(r2.status().as_u16(), 429);
+    // What the 429 did NOT do.
+    assert_eq!(
+        upstream.received_requests().await.expect("requests").len(),
+        served,
+        "a throttled request must never reach the provider"
+    );
+    assert_eq!(
+        gw.spans_dropped().await,
+        spans_after_allowance,
+        "a 429 is rejected pre-dispatch and emits no span"
+    );
 }

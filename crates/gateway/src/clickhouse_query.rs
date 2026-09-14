@@ -151,6 +151,14 @@ pub struct TenantQuery {
     /// only attaches the `SETTINGS` block.
     pub sql: String,
     pub caps: ClickHouseResourceCaps,
+    /// BILL-01 / ADR-076 meter 4 — `SETTINGS log_comment = '<tag>'`, read back
+    /// from `system.query_log.log_comment` by the daily metering job to
+    /// attribute `read_bytes` to a tenant (spec §2.1: "every gateway read is
+    /// tagged `tenant_id=<uuid>`"). `None` by default — see
+    /// [`Self::with_log_comment`]; an untagged query is simply excluded from
+    /// meter 4 (spec's own words: "fail-open on the customer's side, counted
+    /// as a defect metric"), never a broken query.
+    pub log_comment: Option<String>,
 }
 
 impl TenantQuery {
@@ -159,7 +167,18 @@ impl TenantQuery {
         Self {
             sql: sql.into(),
             caps: ClickHouseResourceCaps::for_tier(tier),
+            log_comment: None,
         }
+    }
+
+    /// Attach a `log_comment` tag. The convention (spec §2.1): a real tenant
+    /// read is tagged `tenant_id=<uuid>`; the metering job's OWN queries are
+    /// tagged `tracelane-meter`, which the job's `system.query_log` read
+    /// explicitly excludes via `log_comment LIKE 'tenant_id=%'`.
+    #[must_use]
+    pub fn with_log_comment(mut self, tag: impl Into<String>) -> Self {
+        self.log_comment = Some(tag.into());
+        self
     }
 
     /// Return SQL with the SETTINGS block appended. Idempotent — if
@@ -171,11 +190,15 @@ impl TenantQuery {
         // ClickHouse allows multiple SETTINGS sections; later wins.
         // We always append our wrapper's caps last so they cannot be
         // overridden by a query author who attached looser settings.
-        format!(
-            "{body}\n{settings}",
-            body = self.sql.trim_end_matches(';'),
-            settings = self.caps.settings_fragment()
-        )
+        let mut settings = self.caps.settings_fragment();
+        if let Some(tag) = &self.log_comment {
+            // Single-quoted ClickHouse string literal; a literal `'` in a
+            // tag (never true for our own `tenant_id=<uuid>` / fixed-string
+            // tags, but defensive against a future caller) is escaped by
+            // doubling, ClickHouse's own escape convention.
+            settings.push_str(&format!(", log_comment = '{}'", tag.replace('\'', "''")));
+        }
+        format!("{body}\n{settings}", body = self.sql.trim_end_matches(';'),)
     }
 }
 
@@ -193,6 +216,38 @@ impl TenantQuery {
 /// dies with a syntax error at *position 1 ('the')*. It has had ZERO callers
 /// since it was written, so nothing ever ran it — `docs/reference/TRAPS.md` §1
 /// CLASS-1, the same shape `run-postgres-integration.sh` was created to close.
+/// The ADR-031 cap tier for THIS tenant — its own plan, read from the entitlement
+/// cache the hot path already keeps (no Postgres per request). SRE register #20
+/// (2026-09-05): after B-330 made `trace_reads.rs` tier-aware, ~47 other reads still
+/// passed the literal `PlanTier::Builder`, so a Team or Business tenant queried
+/// datasets, experiments, evals, the audit export and the semantic cache under
+/// Builder's caps whatever it paid for. One helper, so every reader resolves the
+/// tier the same way. Fails CLOSED (`.claude/rules/tenancy.md`): no control plane →
+/// `Free`; an unknown plan key → the conservative default `from_plan_key` carries.
+pub async fn tier_for_tenant(
+    entitlements: Option<&std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    tenant_id: &tracelane_shared::TenantId,
+) -> PlanTier {
+    match entitlements {
+        None => PlanTier::Free,
+        Some(cache) => {
+            let resolved = cache.resolved(*tenant_id.as_uuid()).await;
+            PlanTier::from_plan_key(&resolved.plan_lookup_key)
+        }
+    }
+}
+
+/// A CEILING for reads that have no tenant tier to resolve — background sweeps,
+/// cross-tenant boot loads, the alert checker, the audit anchor jobs. SRE #20
+/// follow-up (2026-09-06): `check-ch-reads-capped.py` found two dozen such reads
+/// with NO settings at all. Business caps (60 s / 5 B rows / 8 GiB): a bound where
+/// none existed, wide enough that no legitimate sweep on today's data can trip it,
+/// and NOT Enterprise, whose 32 GiB memory cap exceeds the box and bounds nothing.
+#[must_use]
+pub fn ceiling(sql: &str) -> String {
+    TenantQuery::new(sql, PlanTier::Business).sql_with_settings()
+}
+
 #[cfg(test)]
 pub(crate) fn split_migration_statements(sql: &str) -> Vec<String> {
     let stripped: String = sql
@@ -301,6 +356,32 @@ mod tests {
         assert!(sql.contains("\nSETTINGS"));
     }
 
+    /// BILL-01 / ADR-076 meter 4 (step 5): the rendered SQL carries the
+    /// `log_comment` tag inside the SAME `SETTINGS` clause, so meter 4's
+    /// `system.query_log.log_comment LIKE 'tenant_id=%'` read can attribute
+    /// this query — and a query with no tag attached renders none, which is
+    /// the fail-open-on-the-customer's-side default the spec names.
+    #[test]
+    fn with_log_comment_renders_the_tag_in_the_settings_clause() {
+        let tagged = TenantQuery::new("SELECT 1", PlanTier::Team)
+            .with_log_comment("tenant_id=00000000-0000-0000-0000-000000000001");
+        let sql = tagged.sql_with_settings();
+        assert!(
+            sql.contains("log_comment = 'tenant_id=00000000-0000-0000-0000-000000000001'"),
+            "rendered SQL must carry the log_comment tag: {sql}"
+        );
+        assert!(
+            sql.contains("SETTINGS max_memory_usage"),
+            "caps must still be present"
+        );
+
+        let untagged = TenantQuery::new("SELECT 1", PlanTier::Team).sql_with_settings();
+        assert!(
+            !untagged.contains("log_comment"),
+            "no tag attached must render no log_comment clause"
+        );
+    }
+
     #[test]
     fn tenant_query_strips_trailing_semicolon_before_settings() {
         // ClickHouse rejects a `;` between the query body and a
@@ -311,5 +392,38 @@ mod tests {
         let sql = q.sql_with_settings();
         assert!(!sql.contains("1;"), "trailing semicolon must be stripped");
         assert!(sql.contains("SETTINGS"));
+    }
+
+    /// SRE register #20 (2026-09-05): no reader outside this file passes the literal
+    /// Builder tier any more — every one resolves the tenant's own tier through
+    /// `tier_for_tenant`. Scans the NON-TEST half of each file that used to carry the
+    /// literal (B-330 covered `trace_reads.rs` the same way). The needle is built with
+    /// `concat!` so this test's own source cannot satisfy it.
+    #[test]
+    fn no_reader_passes_the_builder_tier_literal_any_more() {
+        let needle = concat!("PlanTier::", "Builder");
+        let files: [(&str, &str); 10] = [
+            ("audit_export.rs", include_str!("audit_export.rs")),
+            ("dataset_routes.rs", include_str!("dataset_routes.rs")),
+            ("experiment_routes.rs", include_str!("experiment_routes.rs")),
+            ("prompt_eval.rs", include_str!("prompt_eval.rs")),
+            (
+                "online_eval_routes.rs",
+                include_str!("online_eval_routes.rs"),
+            ),
+            ("online_eval.rs", include_str!("online_eval.rs")),
+            ("semantic_cache.rs", include_str!("semantic_cache.rs")),
+            ("spend.rs", include_str!("spend.rs")),
+            ("annotation_routes.rs", include_str!("annotation_routes.rs")),
+            ("tool_analytics.rs", include_str!("tool_analytics.rs")),
+        ];
+        for (name, src) in files {
+            let non_test = src.split("#[cfg(test)]").next().unwrap_or("");
+            assert!(
+                !non_test.contains(needle),
+                "{name} still passes the literal Builder tier outside its tests — use \
+                 tier_for_tenant / the reader's tier_for (SRE #20)"
+            );
+        }
     }
 }

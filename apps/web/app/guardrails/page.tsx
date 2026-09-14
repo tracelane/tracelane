@@ -28,8 +28,16 @@
 
 import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
-import { fetchGuardrailStats } from "@/lib/guardrails";
-import { rangeLabel, rangeToHours } from "@/lib/range";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
+import { fetchGuardrailStatsFor } from "@/lib/metrics/fetch";
+import { fmtCount, fmtDurationMs, fmtPercent } from "@/lib/metrics/format";
+import { hintOf } from "@/lib/metrics/hint";
+import { METRICS } from "@/lib/metrics/registry";
+import {
+	type TimeRange,
+	parseTimeRange,
+	withWindow,
+} from "@/lib/metrics/time-range";
 import {
 	Badge,
 	type BadgeProps,
@@ -53,16 +61,20 @@ const SIDE_HINT =
 export const metadata: Metadata = { title: "Guardrails — Tracelane" };
 export const dynamic = "force-dynamic";
 
-const pct = (v: number): string => `${v.toFixed(1)}%`;
-const ms = (v: number): string => `${v.toLocaleString()} ms`;
+// ONE formatter per kind — the registry's. `ms` used to print `0 ms` on a window
+// with no verdicts, a measurement that never happened (DSH-11 §3.1).
+const ms = fmtDurationMs;
 
-/** Verdict-list href for a decision, preserving the active range. */
-function verdictHref(decision: string, range?: string): string {
-	const q = new URLSearchParams();
-	if (decision) q.set("decision", decision);
-	if (range) q.set("range", range);
-	const s = q.toString();
-	return s ? `/guardrails/verdicts?${s}` : "/guardrails/verdicts";
+/** Verdict-list href for a decision, carrying THIS page's window (preset or custom). */
+function verdictHref(
+	decision: string,
+	range: TimeRange,
+	rail?: string,
+): string {
+	return withWindow("/guardrails/verdicts", range, {
+		decision: decision || undefined,
+		rail: rail || undefined,
+	});
 }
 
 /**
@@ -100,9 +112,9 @@ function SectionLabel({
 	);
 }
 
-async function GuardrailData({ range }: { range?: string }) {
-	const label = rangeLabel(range);
-	const stats = await fetchGuardrailStats({ hours: rangeToHours(range) });
+async function GuardrailData({ range }: { range: TimeRange }) {
+	const label = range.label;
+	const stats = await fetchGuardrailStatsFor(range);
 
 	// Gateway unreachable ≠ zero evaluations — degrade to the warming state.
 	if (stats === null) {
@@ -117,9 +129,19 @@ async function GuardrailData({ range }: { range?: string }) {
 		);
 	}
 
-	const failOpenTone =
-		stats.fail_open_rate_pct > 0 ? "danger" : ("ok" as const);
 	const zero = stats.total_evaluations === 0;
+	// §3d — a rate over fewer verdicts than its floor is neutral and says so; a
+	// window with no verdicts renders the zero copy, never `0.0%`.
+	const n = stats.total_evaluations;
+	const blockRate = fmtPercent(stats.block_rate_pct, { n, floor: 100 });
+	const failOpen = fmtPercent(stats.fail_open_rate_pct, { n, floor: 100 });
+	const failOpenTone =
+		zero || failOpen.belowFloor
+			? "default"
+			: stats.fail_open_rate_pct > 0
+				? "danger"
+				: ("ok" as const);
+	const sample = zero ? undefined : { n, floor: 100 };
 
 	/*
 	 * The four stored outcome counts, in the order they were already rendered.
@@ -203,34 +225,53 @@ async function GuardrailData({ range }: { range?: string }) {
 			<StatGrid title="Evaluation &amp; enforcement" cols={4}>
 				<StatCard
 					icon="traffic"
-					label={`Evaluations (${label})`}
-					value={stats.total_evaluations.toLocaleString()}
-					sub={`${stats.request_side.toLocaleString()} request · ${stats.response_side.toLocaleString()} response · response-side rolling out`}
+					label={METRICS.verdicts.label}
+					value={fmtCount(stats.total_evaluations)}
+					sub={
+						zero
+							? `${METRICS.verdicts.zeroCopy} · ${label}`
+							: `${fmtCount(stats.request_side)} request · ${fmtCount(stats.response_side)} response · ${label}`
+					}
 					hint={SIDE_HINT}
 				/>
 				<StatCard
 					icon="failure-signatures"
-					label="Block rate"
-					value={pct(stats.block_rate_pct)}
-					sub={`${stats.blocks.toLocaleString()} blocked pre-flight`}
+					label={METRICS.block_rate.label}
+					value={zero ? "—" : blockRate.text}
+					sub={
+						zero
+							? METRICS.block_rate.zeroCopy
+							: `${fmtCount(stats.blocks)} blocked pre-flight`
+					}
+					hint={hintOf(METRICS.block_rate)}
+					sample={sample}
 					variant="action"
 				/>
 				<StatCard
 					icon="error-budget"
-					label="Fail-open rate"
-					value={pct(stats.fail_open_rate_pct)}
+					label={METRICS.fail_open_rate.label}
+					value={zero ? "—" : failOpen.text}
 					sub={
-						stats.fail_open_verdicts > 0
-							? `${stats.fail_open_verdicts.toLocaleString()} verdict${stats.fail_open_verdicts === 1 ? "" : "s"} proceeded after a rail errored`
-							: "no rail failed open"
+						zero
+							? METRICS.fail_open_rate.zeroCopy
+							: stats.fail_open_verdicts > 0
+								? `${fmtCount(stats.fail_open_verdicts)} verdict${stats.fail_open_verdicts === 1 ? "" : "s"} proceeded after a rail errored`
+								: "no rail failed open"
 					}
+					hint={hintOf(METRICS.fail_open_rate)}
+					sample={sample}
 					tone={failOpenTone}
 				/>
 				<StatCard
 					icon="latency"
-					label="Inline overhead (p95)"
-					value={ms(stats.p95_ms)}
-					sub={`p50 ${ms(stats.p50_ms)} · p99 ${ms(stats.p99_ms)}`}
+					label={METRICS.guardrail_overhead_p95.label}
+					hint={hintOf(METRICS.guardrail_overhead_p95)}
+					value={zero ? "—" : ms(stats.p95_ms)}
+					sub={
+						zero
+							? METRICS.guardrail_overhead_p95.zeroCopy
+							: `p50 ${ms(stats.p50_ms)} · p99 ${ms(stats.p99_ms)}`
+					}
 				/>
 			</StatGrid>
 
@@ -263,8 +304,8 @@ async function GuardrailData({ range }: { range?: string }) {
 								className="flex flex-col items-start gap-2 bg-surface px-5 py-4 transition-colors hover:bg-surface-hover"
 							>
 								<Badge tone={d.tone}>{d.label}</Badge>
-								<span className="t-metric-sm font-mono text-ink">
-									{d.value.toLocaleString()}
+								<span className="t-metric-sm text-ink">
+									{fmtCount(d.value)}
 								</span>
 							</Link>
 						))}
@@ -288,7 +329,10 @@ async function GuardrailData({ range }: { range?: string }) {
 				>
 					Guardrail rails
 				</SectionLabel>
-				<RailRoster live={stats.rails} range={range} />
+				<RailRoster
+					live={stats.rails}
+					blockedHrefBase={verdictHref("block", range)}
+				/>
 			</section>
 
 			<section className="space-y-3">
@@ -312,9 +356,10 @@ async function GuardrailData({ range }: { range?: string }) {
 export default async function GuardrailsPage({
 	searchParams,
 }: {
-	searchParams: Promise<{ range?: string }>;
+	searchParams: Promise<{ range?: string; since?: string; until?: string }>;
 }) {
-	const { range } = await searchParams;
+	const sp = await searchParams;
+	const range = parseTimeRange(sp, { defaultPreset: "24h", nowMs: Date.now() });
 	return (
 		/* The dashboard's padding ramp, to the utility (verifier, 2026-08-22). This
 		   was `px-2 py-3 sm:px-4 sm:py-4` — a DIFFERENT gutter from the four other
@@ -338,11 +383,12 @@ export default async function GuardrailsPage({
 					<h1 className="t-h1">Guardrails</h1>
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Pre-flight verdicts across your traffic — blocked, redacted or
-						allowed, plus inline overhead. Last {rangeLabel(range)}.
+						allowed, plus inline overhead. {range.label}.
 					</p>
 				</div>
 				<RangeControl />
 			</header>
+			<WindowNotice range={range} />
 			<Suspense
 				fallback={
 					<div className="space-y-8">

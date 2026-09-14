@@ -20,26 +20,68 @@
  * Tool handlers no longer call `getTenantId()` from module scope — the
  * HTTP middleware sets a per-request `currentTenantId` via
  * `runWithTenant(tenant, fn)` and tools read it via `getTenantId()`.
+ *
+ * PLT-22: the SAME per-request context also carries the bearer that
+ * authenticated the request, so `GatewayReader` can read trace data as
+ * THAT caller's identity rather than the process's fixed
+ * `TRACELANE_API_KEY` — see `getActiveBearer()` below. Without this, an
+ * HTTP transport fronting more than one caller would serve every one of
+ * them as the identity of one fixed key: a cross-tenant read, not a
+ * caveat.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
 interface AuthContext {
 	tenantId: string;
+	/** The bearer that authenticated this HTTP request (PLT-22). Always
+	 * present when `runWithTenant` is called from the HTTP transport —
+	 * `http.ts` never enters this context without one, since a request
+	 * with no valid bearer 401s before `runWithTenant` is ever called. It
+	 * is typed optional only so a caller that DOES construct a context
+	 * without one (defensive/test code) fails closed rather than crashing. */
+	bearer?: string;
 }
 
 const als = new AsyncLocalStorage<AuthContext>();
 
 /**
- * Bind a tenant to the current async chain for the duration of `fn`.
- * Used by the HTTP transport's middleware to give each request its own
- * tenant context.
+ * Bind a tenant (and, in HTTP mode, the bearer that authenticated it) to
+ * the current async chain for the duration of `fn`. Used by the HTTP
+ * transport's middleware to give each request its own tenant + bearer
+ * context — never shared across concurrent requests (`AsyncLocalStorage`
+ * isolates each call's chain).
  */
 export async function runWithTenant<T>(
 	tenantId: string,
 	fn: () => Promise<T>,
+	bearer?: string,
 ): Promise<T> {
-	return als.run({ tenantId }, fn);
+	return als.run({ tenantId, bearer }, fn);
+}
+
+/**
+ * The bearer `GatewayReader` should authenticate its gateway reads with.
+ * Three-way, and the third arm is the PLT-22 fix (a cross-tenant read was
+ * previously possible in HTTP mode):
+ *
+ *   - **`undefined`** — no active request context at all. This is Stdio
+ *     mode: `bootstrapStdioTenant` never calls `runWithTenant`, so there is
+ *     nothing bound here for the whole process lifetime. The caller falls
+ *     back to the process's own `TRACELANE_API_KEY` — safe, because Stdio
+ *     is a single-tenant subprocess by construction (one Claude Desktop /
+ *     Cursor instance, one key).
+ *   - **`null`** — an HTTP request context IS active but carries no bearer.
+ *     Should not happen given `http.ts` always passes one, but if it ever
+ *     did, the caller MUST fail closed here, never fall back to the fixed
+ *     env key — that fallback is exactly the cross-tenant read this
+ *     function exists to prevent.
+ *   - **a string** — the HTTP caller's own validated bearer. Use it.
+ */
+export function getActiveBearer(): string | null | undefined {
+	const ctx = als.getStore();
+	if (ctx === undefined) return undefined;
+	return ctx.bearer ?? null;
 }
 
 /**
@@ -139,8 +181,12 @@ const CACHE_MAX_ENTRIES = 4_096;
  *
  * Debug builds (NODE_ENV !== "production") accept loopback so the
  * local dev loop works.
+ *
+ * Exported (PLT-22) so `reader.ts`'s `GatewayReader` validates the same
+ * env var the same way before reading trace data through it — one SSRF
+ * check for both the auth hop and the data hop, never two.
  */
-function validateGatewayUrl(
+export function validateGatewayUrl(
 	raw: string,
 ): { ok: true; url: string } | { ok: false; reason: string } {
 	let parsed: URL;

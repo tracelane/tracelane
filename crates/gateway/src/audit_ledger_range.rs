@@ -72,7 +72,8 @@ async fn handler(State(state): State<ExportState>, headers: HeaderMap) -> Respon
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "audit ledger-range auth failed");
-            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+            let (status, msg) = crate::auth::failure(&err);
+            return error_response(status, msg);
         }
     };
 

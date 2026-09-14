@@ -7,12 +7,13 @@ classification: PUBLIC
 The Tracelane gateway exposes:
 
 - **OpenAI-compatible** `/v1/chat/completions`
+- **Anthropic-compatible** `/v1/messages`
 - **Tenant control plane** `/v1/prompts/*`, `/v1/guardrails/*`, `/v1/audit/*`
 - **Billing** `/v1/billing/*`, `/v1/webhooks/polar`
 - **Auth** `/v1/auth/whoami`, `/v1/webhooks/workos`, `/v1/keys`
 - **Operational** `/health`
 
-All authenticated endpoints accept `Authorization: Bearer <jwt | tlane_*>`.
+All authenticated endpoints accept `Authorization: Bearer <jwt | tlane_*>`. `POST /v1/messages` and `POST /v1/messages/count_tokens` also accept `x-api-key: tlane_*`, because that is what the Anthropic SDKs send; no other endpoint reads that header.
 
 ## Inference
 
@@ -26,8 +27,34 @@ Anthropic (`claude-*`), Google (`gemini-*`), Vertex (`vertex/*`), Bedrock
 translated to their native wire format. Full prefix list:
 [Providers](/providers).
 `POST /v1/embeddings` is a separate endpoint, in the OpenAI Embeddings shape and
-routed by model name the same way. There is no `/v1/messages` or `/v1/rerank` —
-every chat/inference call routes through chat/completions.
+routed by model name the same way. There is no `/v1/rerank`.
+
+### `POST /v1/messages`
+
+The Anthropic Messages shape, so an Anthropic SDK — or Claude Code with
+`ANTHROPIC_BASE_URL` pointed here — works by swapping its base URL. It serves
+Anthropic models only (`claude-*`); any other model is refused `400
+unroutable_model` rather than translated, and the OpenAI-shaped
+`/v1/chat/completions` is the endpoint for every other provider.
+
+Your request body is forwarded to Anthropic as you sent it, with your stored
+Anthropic key (BYOK) and your `anthropic-version` / `anthropic-beta` headers
+attached. The response is relayed back unchanged — streaming SSE included — so
+`thinking` blocks, `tool_use` blocks, `cache_control` and beta features reach your
+SDK exactly as Anthropic emitted them. The exception is a response your workspace's
+own guardrails redact or block, which is the case where enforcement takes
+precedence over relaying bytes.
+
+The same pipeline runs as on `/v1/chat/completions`: entitlements and rate limits,
+the monthly quota, per-key and workspace budgets, detection, the tamper-evident
+ledger append, and request guardrails. Errors are returned in Anthropic's error
+shape (`{"type":"error","error":{...}}`) with an extra `code` field. Cross-provider
+failover is not available on this endpoint.
+
+### `POST /v1/messages/count_tokens`
+
+Anthropic's pre-flight token count, forwarded with your stored key. It is not an
+inference: it emits no span and writes no ledger row.
 
 ## Prompt promotion
 

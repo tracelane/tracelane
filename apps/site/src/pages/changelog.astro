@@ -1,0 +1,999 @@
+---
+/**
+ * /changelog — public progress and changelog page.
+ *
+ * Reinstated 2026-09-07 (founder request), reversing ADR-074 §10's scope
+ * decision to drop the page. See the supersession note added to that ADR.
+ *
+ * ALL COPY LIVES IN:  apps/site/src/data/changelog-data.ts
+ * This file holds no prose of its own — every claim, number and use-sentence
+ * is in the data file so a verifier has exactly one place to read.
+ *
+ * PROGRESSIVE ENHANCEMENT: all 66 entries render server-side, in the DOM
+ * before any JS runs. Filter chips are <a href="#…"> links — clicking updates
+ * the URL hash without JS. The inline script reads the hash and hides entries;
+ * without it the full list is visible and every link still works.
+ *
+ * BANNED STRINGS: the seven strings in scripts/deploy/site.sh:78-85 are
+ * absent from this template. In particular, no npm scope is named here —
+ * see the data file header for the reason.
+ */
+import Base from "../layouts/Base.astro";
+import {
+  ENTRIES,
+  TYPE_LABEL,
+  CADENCE,
+  STATS,
+  NEXT,
+  type EntryType,
+} from "../data/changelog-data.ts";
+
+/* ── Helpers ───────────────────────────────────────────────────────────── */
+
+/* MONTH IS THE FINEST GRANULARITY THIS PAGE SHOWS — founder ruling, 2026-09-09:
+   "just show the weekly or monthly wise data. No need to share day wise data."
+   Entries keep their exact `date` in the data file (it is what orders them and
+   what groups them into months); the day is simply never rendered, and there is
+   no longer a `fmtDate` — a "07 Sep" formatter existing at all is how a day
+   badge comes back. The month heading carries a `<time datetime="2026-09">`, so
+   the page is still machine-readable at the granularity it actually claims.
+
+   The cadence chart above was already monthly, so the whole page now reads at
+   one resolution instead of two. */
+
+/** "2026-09" → "September 2026" */
+function fmtMonth(ym: string): string {
+  return new Intl.DateTimeFormat("en", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(`${ym}-01T00:00:00Z`));
+}
+
+function ordinal(n: number): string {
+  const s = ["th", "st", "nd", "rd"] as const;
+  const v = n % 100;
+  return s[(v - 20) % 10] ?? s[v] ?? s[0] ?? "th";
+}
+
+/* ── Data prep ─────────────────────────────────────────────────────────── */
+
+// Group entries by month. ENTRIES is already newest-first; Map preserves
+// insertion order so monthGroups is also newest-first.
+const byMonth = new Map<string, typeof ENTRIES>();
+for (const e of ENTRIES) {
+  const m = e.date.slice(0, 7);
+  const arr = byMonth.get(m) ?? [];
+  arr.push(e);
+  byMonth.set(m, arr);
+}
+const monthGroups = [...byMonth.entries()];
+
+// Per-type entry counts for the filter chips (rendered at build time)
+const typeCounts: Record<EntryType, number> = {
+  gateway: 0,
+  observability: 0,
+  evals: 0,
+  trust: 0,
+  platform: 0,
+};
+for (const e of ENTRIES) {
+  typeCounts[e.type]++;
+}
+
+/* ── Cadence SVG geometry ──────────────────────────────────────────────── */
+const maxCount = Math.max(...CADENCE.map((c) => c.count));
+const BAR_W = 56;
+const BAR_GAP = 18;
+const MAX_BAR_H = 72;
+const LABEL_H = 22;
+const SVG_W = CADENCE.length * BAR_W + (CADENCE.length - 1) * BAR_GAP;
+const SVG_H = MAX_BAR_H + 10 + LABEL_H;
+const lastCadenceIdx = CADENCE.length - 1;
+
+// Build the axis label: "entries per month · Sep to 7th"
+// The last CADENCE month is the partial one; find its last entry to get the day.
+const lastCadenceMonth = CADENCE[lastCadenceIdx]?.month ?? "";
+const lastEntryInFinalMonth = ENTRIES.find((e) =>
+  e.date.startsWith(lastCadenceMonth),
+);
+const lastDay = lastEntryInFinalMonth
+  ? new Date(`${lastEntryInFinalMonth.date}T00:00:00Z`).getUTCDate()
+  : undefined;
+const lastMonthShort = CADENCE[lastCadenceIdx]?.label ?? "";
+const partialNote = lastDay
+  ? `${lastMonthShort} to ${lastDay}${ordinal(lastDay)}`
+  : lastMonthShort;
+const axisLabel = `entries per month · ${partialNote}`;
+---
+
+<Base
+  title="Changelog — Tracelane"
+  description="Everything Tracelane has shipped since May 2026 — changes across the gateway, observability, evals, trust and platform, with every production proof labelled."
+  canonical="/changelog"
+>
+  {/* ═══════════════════════════════════════════════════════════════ HERO */}
+  <section class="panel cl-hero hero" style="padding-top:clamp(3.5rem,7vw,5.5rem)">
+    <div class="cl-hero-text">
+      <p class="eyebrow">changelog</p>
+      <h1 class="display-lg mt-5">
+        Everything shipped,<br class="hidden sm:block" /> since day one.
+      </h1>
+      <p class="lede mt-5">
+        Five months of continuous shipping — aggregated, sourced and labelled
+        with every production proof on record.
+      </p>
+    </div>
+
+    {/* Stat cards — all five numbers from STATS, source line part of each card */}
+    <div class="cl-stats mt-10 cards-hover reveal">
+      {
+        STATS.map((stat) => (
+          <div class="glass cl-stat-card">
+            <p
+              class="cl-stat-value"
+              aria-label={`${stat.value}${stat.unit ? " " + stat.unit : ""} ${stat.label}`}
+            >
+              <span class="cl-stat-number">{stat.value}</span>
+              {stat.unit && <span class="cl-stat-unit">{stat.unit}</span>}
+            </p>
+            <p class="cl-stat-label">{stat.label}</p>
+            <p class="cl-stat-source">{stat.source}</p>
+          </div>
+        ))
+      }
+    </div>
+
+    {/*
+      Cadence bar — five bars, one per month.
+      The SVG is aria-hidden; a sr-only <table> carries the identical numbers
+      for assistive technology (the pattern used by the benchmark chart on index.astro).
+      `prefers-reduced-motion` suppresses the hover opacity transition via CSS.
+    */}
+    <div class="cl-cadence-wrap mt-10 reveal">
+      <figure class="cl-cadence-fig" aria-hidden="true">
+        <svg
+          viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+          xmlns="http://www.w3.org/2000/svg"
+          role="presentation"
+          aria-hidden="true"
+          style="width:100%;height:auto;max-width:440px;display:block"
+        >
+          {
+            CADENCE.map((bar, i) => {
+              const h = Math.max(
+                4,
+                Math.round((bar.count / maxCount) * MAX_BAR_H),
+              );
+              const x = i * (BAR_W + BAR_GAP);
+              const y = MAX_BAR_H - h;
+              const isCurrent = i === lastCadenceIdx;
+              return (
+                <g
+                  class="cadence-bar-group"
+                  data-month={bar.month}
+                  tabindex="0"
+                  role="button"
+                  aria-label={`${bar.label}: ${bar.count} entries — scroll to this month`}
+                >
+                  <rect
+                    x={x}
+                    y={y}
+                    width={BAR_W}
+                    height={h}
+                    rx="5"
+                    fill={
+                      isCurrent
+                        ? "var(--color-accent-soft)"
+                        : "var(--color-accent)"
+                    }
+                    stroke={isCurrent ? "var(--color-accent)" : "none"}
+                    stroke-width={isCurrent ? 1.5 : 0}
+                    class="cadence-bar"
+                    data-month={bar.month}
+                  />
+                  <text
+                    x={x + BAR_W / 2}
+                    y={y - 4}
+                    text-anchor="middle"
+                    font-size="9"
+                    font-family="var(--font-mono)"
+                    fill="var(--color-fg-subtle)"
+                  >
+                    {bar.count}
+                  </text>
+                  <text
+                    x={x + BAR_W / 2}
+                    y={SVG_H - 3}
+                    text-anchor="middle"
+                    font-size="10"
+                    font-family="var(--font-mono)"
+                    fill="var(--color-fg-subtle)"
+                  >
+                    {bar.label}
+                  </text>
+                </g>
+              );
+            })
+          }
+        </svg>
+      </figure>
+
+      {/* Screen-reader table — same data, accessible form */}
+      <div class="sr-only">
+        <table>
+          <caption>Changelog entries per month</caption>
+          <thead>
+            <tr>
+              <th scope="col">Month</th>
+              <th scope="col">Entries</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              CADENCE.map((bar) => (
+                <tr>
+                  <td>{bar.label} 2026</td>
+                  <td>{bar.count}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+
+      <p class="cl-cadence-label">{axisLabel}</p>
+    </div>
+  </section>
+
+  {/* ═══════════════════════════════════════════════════════ FILTER BAR
+      Sticky below the site nav. Progressive enhancement: these are
+      <a href="#…"> so clicking updates the hash even without JS. */}
+  <div
+    class="cl-filter-bar"
+    role="region"
+    aria-label="Filter changelog entries"
+  >
+    <div class="panel cl-filter-inner">
+      <div class="cl-chips" role="group" aria-label="Filter by type">
+        <a
+          class="cl-chip"
+          href="#"
+          data-type="all"
+          aria-pressed="true"
+        >
+          All
+          <span
+            class="cl-chip-count"
+            aria-label={`${ENTRIES.length} total entries`}
+          >
+            {ENTRIES.length}
+          </span>
+        </a>
+        {
+          (Object.entries(TYPE_LABEL) as [EntryType, string][]).map(
+            ([type, label]) => (
+              <a
+                class="cl-chip"
+                href={`#type=${type}`}
+                data-type={type}
+                aria-pressed="false"
+              >
+                {label}
+                <span
+                  class="cl-chip-count"
+                  aria-label={`${typeCounts[type]} ${label} entries`}
+                >
+                  {typeCounts[type]}
+                </span>
+              </a>
+            ),
+          )
+        }
+      </div>
+      <a
+        class="cl-chip cl-chip--proven"
+        href="#proven=true"
+        data-toggle="proven"
+        aria-pressed="false"
+      >
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 10 10"
+          fill="none"
+          aria-hidden="true"
+        >
+          <path
+            d="M1.5 5L4 7.5L8.5 2.5"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"></path>
+        </svg>
+        Proven on production
+      </a>
+    </div>
+  </div>
+
+  {/* ══════════════════════════════════════════════════════════ TIMELINE */}
+  <section class="cl-timeline-section panel" aria-label="Changelog timeline">
+    {/* Global empty state — shown by JS when no entry matches the active filter */}
+    <div class="cl-global-empty" hidden aria-live="polite">
+      <p class="card-body">
+        No entries match this filter —
+        <a href="#" class="link-accent" data-reset="true">show all</a>.
+      </p>
+    </div>
+
+    {
+      monthGroups.map(([ym, entries]) => (
+        <div class="cl-month-group" id={`month-${ym}`} data-month={ym}>
+          <div class="cl-month-heading">
+            <h2 class="cl-month-title">
+              <time datetime={ym}>{fmtMonth(ym)}</time>
+            </h2>
+            <span
+              class="cl-month-badge"
+              aria-label={`${entries.length} entries`}
+            >
+              {entries.length}
+            </span>
+          </div>
+
+          {/* Per-month empty state — shown by JS when all entries in this month are hidden */}
+          <p class="cl-month-empty card-body" hidden>
+            Nothing under this heading yet — try{" "}
+            <a href="#" class="link-accent" data-reset="true">
+              All
+            </a>
+            .
+          </p>
+
+          {entries.map((entry) => (
+            <article
+              class="cl-entry"
+              data-type={entry.type}
+              data-state={entry.state}
+            >
+              <div class="cl-body-col">
+                <div class="cl-meta">
+                  <span class="cl-type-chip">{TYPE_LABEL[entry.type]}</span>
+                  {entry.state === "proven" && (
+                    <span class="cl-proven" title="Proven on production">
+                      <svg
+                        width="9"
+                        height="9"
+                        viewBox="0 0 9 9"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M1.25 4.5L3.5 6.75L7.75 2.25"
+                          stroke="currentColor"
+                          stroke-width="1.4"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      proven
+                    </span>
+                  )}
+                  {entry.id && <span class="cl-id">{entry.id}</span>}
+                </div>
+                <h3 class="cl-title">{entry.title}</h3>
+                <p class="card-body cl-use">{entry.use}</p>
+                {entry.doc && (
+                  <a
+                    href={`https://docs.tracelane.dev${entry.doc}`}
+                    class="link-accent cl-doc"
+                    rel="noopener"
+                  >
+                    Docs →
+                  </a>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      ))
+    }
+  </section>
+
+  {/* ══════════════════════════════════════════════════════ WHAT'S NEXT */}
+  <section class="band band--dark cl-next-band" aria-labelledby="cl-next-h">
+    <div class="band-inner">
+      <div class="section-head">
+        <p class="eyebrow">what's next</p>
+        <h2 class="display-lg text-fg mt-5" id="cl-next-h">
+          Where we're headed.
+        </h2>
+        <p class="lede mt-5" style="color:var(--color-on-dark-muted)">
+          These are directions, not commitments, and they carry no dates.
+        </p>
+      </div>
+      <div class="mt-12 cl-next-grid cards-hover reveal">
+        {
+          NEXT.map((item) => (
+            <div class="glass cl-next-card">
+              <h3 class="card-title">{item.theme}</h3>
+              <p class="card-body">{item.blurb}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  {/* ════════════════════════════════════════════════════════ PAGE CTA */}
+  <section class="panel cl-page-cta">
+    <div class="cl-cta-links">
+      <a
+        href="https://github.com/tracelane/tracelane/blob/main/CHANGELOG.md"
+        class="btn-secondary"
+        rel="noopener"
+      >
+        The full release notes on GitHub
+      </a>
+      <a href="https://app.tracelane.dev/sign-in" class="btn-primary">
+        Start free <span aria-hidden="true">→</span>
+      </a>
+    </div>
+  </section>
+</Base>
+
+<style>
+  /* ── Stat cards ──────────────────────────────────────────────────────────── */
+  .cl-stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.875rem;
+  }
+  @media (min-width: 640px) {
+    .cl-stats {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  @media (min-width: 1140px) {
+    .cl-stats {
+      grid-template-columns: repeat(5, 1fr);
+    }
+  }
+
+  .cl-stat-card {
+    padding: clamp(1rem, 2.5vw, 1.5rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .cl-stat-value {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: clamp(1.5rem, 1.1rem + 1.5vw, 2.125rem);
+    letter-spacing: var(--tracking-lg);
+    line-height: 1.1;
+    color: var(--color-fg);
+    /* tabular numerals on every figure — CLAUDE.md non-negotiable */
+    font-variant-numeric: tabular-nums;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.25em;
+  }
+
+  .cl-stat-unit {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--color-fg-muted);
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+
+  .cl-stat-label {
+    margin-top: 0.5rem;
+    font-size: var(--text-sm);
+    color: var(--color-fg-muted);
+    line-height: 1.4;
+    flex: 1;
+  }
+
+  .cl-stat-source {
+    margin-top: 0.875rem;
+    padding-top: 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem; /* 11px */
+    color: var(--color-fg-subtle);
+    line-height: 1.45;
+    border-top: 1px solid var(--color-border-subtle);
+  }
+
+  /* ── Cadence bar ─────────────────────────────────────────────────────────── */
+  .cl-cadence-wrap {
+    max-width: 460px;
+  }
+
+  .cl-cadence-fig {
+    display: block;
+  }
+
+  .cadence-bar-group {
+    cursor: pointer;
+    outline: none;
+  }
+
+  .cadence-bar-group:focus-visible > rect,
+  .cadence-bar-group:focus-visible > .cadence-bar {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 3px;
+  }
+
+  .cadence-bar {
+    transition: opacity 0.18s ease;
+  }
+
+  .cadence-bar-group:hover .cadence-bar,
+  .cadence-bar-group:focus-visible .cadence-bar {
+    opacity: 0.75;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .cadence-bar {
+      transition: none;
+    }
+  }
+
+  .cl-cadence-label {
+    margin-top: 0.625rem;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--color-fg-subtle);
+    letter-spacing: 0.03em;
+  }
+
+  /* ── Filter bar ──────────────────────────────────────────────────────────── */
+  .cl-filter-bar {
+    position: sticky;
+    top: 4rem; /* below the 4rem site header */
+    z-index: 20;
+    background: var(--color-bg);
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+
+  .cl-filter-inner {
+    padding-block: 0.75rem;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .cl-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    flex: 1 1 auto;
+  }
+
+  .cl-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-elevated);
+    padding: 0.3em 0.8em 0.32em;
+    font-size: var(--text-sm);
+    font-weight: 500;
+    color: var(--color-fg-muted);
+    text-decoration: none;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background-color 0.15s ease,
+      border-color 0.15s ease,
+      color 0.15s ease;
+    box-shadow: var(--shadow-sm);
+    user-select: none;
+  }
+
+  .cl-chip:hover {
+    color: var(--color-fg);
+    border-color: var(--color-border-strong);
+    background: var(--color-bg-hover);
+  }
+
+  .cl-chip:focus-visible {
+    outline: 2px solid var(--color-fg);
+    outline-offset: 2px;
+  }
+
+  /* Active / pressed state — uses the site's blue accent (--action) */
+  .cl-chip[aria-pressed="true"] {
+    background: var(--color-accent);
+    border-color: var(--color-accent);
+    color: #ffffff;
+    box-shadow: none;
+  }
+
+  .cl-chip-count {
+    font-family: var(--font-mono);
+    font-size: 0.75em;
+    opacity: 0.8;
+  }
+
+  .cl-chip--proven {
+    flex-shrink: 0;
+  }
+
+  .cl-chip--proven[aria-pressed="true"] {
+    background: var(--color-verify);
+    border-color: var(--color-verify);
+    color: #ffffff;
+  }
+
+  /* ── Timeline ────────────────────────────────────────────────────────────── */
+  .cl-timeline-section {
+    padding-top: 0;
+  }
+
+  .cl-global-empty {
+    padding: 4rem 0;
+    text-align: center;
+  }
+
+  .cl-global-empty[hidden],
+  .cl-month-empty[hidden],
+  .cl-entry[hidden] {
+    display: none;
+  }
+
+  .cl-month-group {
+    margin-bottom: 2rem;
+  }
+
+  /* THE MONTH HEADING IS NOW THE ONLY DATE ON THE PAGE, so it has to actually be
+     visible. `top` was `calc(4rem + 3rem)` — nav plus an ESTIMATE of the filter
+     bar — and the estimate was wrong in both directions: measured 2026-09-09 at
+     scrollY 2000, the bar's real bottom is 172px at 390px wide (the chips wrap
+     to three rows) against a heading top of 95px, so **77px of a 48px-tall
+     heading was covered — it was entirely hidden behind the bar on every phone**,
+     and still clipped by 9px at 1280. It read as correct only because each entry
+     used to carry its own "07 Sep".
+     `--cl-stack-top` is published by the script at the foot of this file from the
+     two bars' MEASURED heights, and re-measured whenever they reflow. The
+     `calc()` stays as the no-JS fallback — same value as before, no worse than
+     today if the script never runs. */
+  .cl-month-heading {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    position: sticky;
+    top: var(--cl-stack-top, calc(4rem + 3rem));
+    background: var(--color-bg);
+    padding-block: 0.875rem;
+    border-bottom: 1px solid var(--color-border);
+    z-index: 10;
+  }
+
+  .cl-month-title {
+    font-size: var(--text-xl);
+    font-weight: 500;
+    letter-spacing: var(--tracking-md);
+    color: var(--color-fg);
+  }
+
+  .cl-month-badge {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--color-fg-subtle);
+    background: var(--color-bg-subtle);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 999px;
+    padding: 0.15em 0.6em;
+    letter-spacing: 0.02em;
+  }
+
+  .cl-month-empty {
+    padding-block: 1.25rem;
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* Entry row. ONE COLUMN, at every width. This was `5.25rem 1fr` — a date rail
+     plus the body — until the day badge was dropped (see the granularity note in
+     the front-matter). On a phone that rail was not even a rail: it stacked, so
+     every entry spent its first line on "07 Sep". The `.cl-date-col` and
+     `.cl-date` rules went with it rather than being left to rot as dead
+     selectors that would quietly resurrect the layout. */
+  .cl-entry {
+    padding-block: 1.375rem;
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+
+  .cl-body-col {
+    min-width: 0;
+  }
+
+  .cl-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+  }
+
+  /* Monochrome type chip — colour is data; chrome is monochrome (ADR-074). */
+  .cl-type-chip {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.04em;
+    color: var(--color-fg-subtle);
+    background: var(--color-bg-subtle);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 999px;
+    padding: 0.15em 0.6em;
+    white-space: nowrap;
+  }
+
+  /* Green checkmark — the one use of a non-blue colour on this page,
+     because a production proof is data (it means something happened). */
+  .cl-proven {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.04em;
+    color: var(--color-verify);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .cl-id {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--color-fg-subtle);
+    letter-spacing: 0.03em;
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+
+  .cl-title {
+    font-size: 1rem;
+    font-weight: 500;
+    letter-spacing: var(--tracking-xs);
+    color: var(--color-fg);
+    line-height: 1.35;
+    margin-bottom: 0.35rem;
+  }
+
+  .cl-use {
+    margin-top: 0;
+    font-size: var(--text-sm);
+  }
+
+  .cl-doc {
+    display: inline-block;
+    margin-top: 0.5rem;
+    font-size: var(--text-sm);
+  }
+
+  /* ── What's next ─────────────────────────────────────────────────────────── */
+  .cl-next-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+  @media (min-width: 640px) {
+    .cl-next-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  @media (min-width: 960px) {
+    .cl-next-grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+
+  .cl-next-card {
+    padding: clamp(1.25rem, 2.5vw, 1.75rem);
+  }
+
+  /* ── Page CTA footer ─────────────────────────────────────────────────────── */
+  .cl-page-cta {
+    padding-top: 0;
+  }
+
+  .cl-cta-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    border-top: 1px solid var(--color-border-subtle);
+    padding-top: 2.5rem;
+  }
+</style>
+
+<script is:inline>
+  /**
+   * Changelog filter — vanilla JS, no runtime deps.
+   *
+   * STATE MODEL
+   *   activeType: "all" | EntryType   (default "all")
+   *   provenOnly: boolean              (default false)
+   *
+   * HASH FORMAT — URLSearchParams on the fragment
+   *   #type=gateway               type filter active
+   *   #proven=true                proven-only toggle
+   *   #type=evals&proven=true     both
+   *
+   * PROGRESSIVE ENHANCEMENT
+   *   Without this script: all entries are visible; chips are <a> links
+   *   that update the URL hash (usable but unfiltered).
+   *   With this script: hash changes drive filtering; [hidden] added to
+   *   non-matching entries; per-month and global empty states managed.
+   */
+  (function () {
+    "use strict";
+
+    function parseHash() {
+      var raw = location.hash.slice(1);
+      var params = new URLSearchParams(raw);
+      return {
+        type: params.get("type") || "all",
+        proven: params.get("proven") === "true",
+      };
+    }
+
+    function apply(state) {
+      var entries = document.querySelectorAll(".cl-entry");
+      var anyVisible = false;
+
+      entries.forEach(function (el) {
+        var show = true;
+        if (state.type !== "all" && el.dataset.type !== state.type) {
+          show = false;
+        }
+        if (state.proven && el.dataset.state !== "proven") {
+          show = false;
+        }
+        el.hidden = !show;
+        if (show) anyVisible = true;
+      });
+
+      // Per-month empty states
+      document.querySelectorAll(".cl-month-group").forEach(function (group) {
+        var visible = group.querySelectorAll(".cl-entry:not([hidden])").length;
+        var empty = group.querySelector(".cl-month-empty");
+        if (empty) empty.hidden = visible > 0;
+      });
+
+      // Global empty state
+      var globalEmpty = document.querySelector(".cl-global-empty");
+      if (globalEmpty) globalEmpty.hidden = anyVisible;
+
+      // Chip aria-pressed
+      document
+        .querySelectorAll(".cl-chip[data-type]")
+        .forEach(function (chip) {
+          chip.setAttribute(
+            "aria-pressed",
+            String(chip.dataset.type === state.type),
+          );
+        });
+
+      var provenChip = document.querySelector(
+        ".cl-chip[data-toggle='proven']",
+      );
+      if (provenChip) {
+        provenChip.setAttribute("aria-pressed", String(state.proven));
+      }
+    }
+
+    function pushHash(state) {
+      var params = new URLSearchParams();
+      if (state.type !== "all") params.set("type", state.type);
+      if (state.proven) params.set("proven", "true");
+      var str = params.toString();
+      history.replaceState(
+        null,
+        "",
+        str ? "#" + str : location.pathname + location.search,
+      );
+    }
+
+    var state = parseHash();
+    apply(state);
+
+    // Type chip clicks
+    document
+      .querySelectorAll(".cl-chip[data-type]")
+      .forEach(function (chip) {
+        chip.addEventListener("click", function (e) {
+          e.preventDefault();
+          state.type = chip.dataset.type || "all";
+          pushHash(state);
+          apply(state);
+        });
+      });
+
+    // Proven-only toggle
+    var provenChip = document.querySelector(
+      ".cl-chip[data-toggle='proven']",
+    );
+    if (provenChip) {
+      provenChip.addEventListener("click", function (e) {
+        e.preventDefault();
+        state.proven = !state.proven;
+        pushHash(state);
+        apply(state);
+      });
+    }
+
+    // "Show all" reset links (inside empty states)
+    document.querySelectorAll("[data-reset]").forEach(function (link) {
+      link.addEventListener("click", function (e) {
+        e.preventDefault();
+        state.type = "all";
+        state.proven = false;
+        pushHash(state);
+        apply(state);
+      });
+    });
+
+    // Hash change — back/forward navigation
+    window.addEventListener("hashchange", function () {
+      state = parseHash();
+      apply(state);
+    });
+
+    /* STICKY STACK HEIGHT — see `.cl-month-heading` above. The month heading has
+       to sit below BOTH sticky bars, and their heights are not knowable from
+       CSS: the site header is 4rem, but the filter bar is 51px at 1280 and 118px
+       at 390 because the chips wrap. Measured, not estimated, and re-measured on
+       reflow — a chip added to the bar must not silently re-bury the heading. */
+    (function () {
+      var header = document.querySelector(".site-header");
+      var bar = document.querySelector(".cl-filter-bar");
+      if (!header || !bar) return;
+      function publish() {
+        document.documentElement.style.setProperty(
+          "--cl-stack-top",
+          header.offsetHeight + bar.offsetHeight + "px",
+        );
+      }
+      publish();
+      if ("ResizeObserver" in window) {
+        var ro = new ResizeObserver(publish);
+        ro.observe(bar);
+        ro.observe(header);
+      } else {
+        window.addEventListener("resize", publish, { passive: true });
+      }
+    })();
+
+    // Cadence bars — scroll to month on click / Enter / Space
+    document
+      .querySelectorAll(".cadence-bar-group")
+      .forEach(function (bar) {
+        function scrollToMonth() {
+          var month = bar.dataset.month;
+          if (!month) return;
+          var target = document.getElementById("month-" + month);
+          if (target) {
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        }
+        bar.addEventListener("click", scrollToMonth);
+        bar.addEventListener("keydown", function (e) {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            scrollToMonth();
+          }
+        });
+      });
+  })();
+</script>

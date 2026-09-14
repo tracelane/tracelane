@@ -1,0 +1,143 @@
+# PLT-23 — Tracelane entry for AIGatewayBench (github.com/BerriAI/ai-gateway-bench,
+# pinned commit ff372fc). Derived from ../../../infra/self-host/docker-compose.yml
+# with two changes only:
+#
+#   1. `network_mode: host` on every service, so the gateway can reach the bench's
+#      mock upstream (crates/mock-upstream) without a docker bridge hop, and so the
+#      harness's `mem_sampler.py` can attach to the gateway PID by the same loopback
+#      the load generator uses. Inter-service URLs below point at 127.0.0.1 instead
+#      of docker-compose service names for the same reason. `run.sh` picks the
+#      mock's port from `$MOCK_URL` (default 9000, overridden to 9500 on THIS dev
+#      box) because host networking puts ClickHouse's native TCP port (also 9000)
+#      on the same loopback — 9000 stays ClickHouse's here.
+#   2. `ANTHROPIC_BASE_URL` is pointed at the mock instead of the real Anthropic API,
+#      per CLAUDE.md's `crates/gateway/src/providers/anthropic.rs:50` (the adapter
+#      reads this env var with no other override needed) — this is how a self-host
+#      gateway gets pointed at a zero-latency mock for an apples-to-apples overhead
+#      measurement, exactly as `specs/PLT-23-gateway-overhead-benchmark.md` §2 says.
+#      **Found 2026-09-06, dev run:** a RELEASE-build gateway's own SSRF guard
+#      (`crates/gateway/src/ssrf_guard.rs`) rejects a loopback `ANTHROPIC_BASE_URL`
+#      — the debug-only test bypass is hard-disabled in release, by design. `run.sh`
+#      reports Tracelane as `CANNOT_DETERMINE` on this dev box for exactly that
+#      reason. On a box where `$MOCK_URL` is the box's own PUBLIC IPv4 (a CCX23,
+#      `MOCK_BIND=0.0.0.0`), the resolved address is neither loopback nor RFC1918,
+#      so the guard allows it — every gateway in this comparison, Tracelane
+#      included, is meant to share that ONE `$MOCK_URL` for symmetry.
+#
+# Capture stays ON (NATS + ClickHouse up, TRACELANE_SELF_HOST=1, no
+# TRACELANE_BENCH_MOCK_UPSTREAM) — a gateway that measures fast because it dropped
+# its own product is not the product being measured. Proof 3 in the spec's §7 reads
+# span counts back out of THIS ClickHouse after the scenario runs.
+#
+# Required env (see run.sh): TRACELANE_MASTER_KEY, ANTHROPIC_BASE_URL (defaults to
+# the mock on the host), CLICKHOUSE_PASSWORD (optional, defaults match self-host).
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    network_mode: host
+    environment:
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - tracelane_bench_clickhouse_data:/var/lib/clickhouse
+      - ../../../infra/self-host/clickhouse/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      # NOT mounting 02_slo_alerting.sql: found broken 2026-09-06 running THIS
+      # bench — its `v_slo_stats` view does `countMerge(request_count)` against
+      # `tracelane.slo_hourly_stats`, a table that does not exist in
+      # `schema.sql` at all (grep confirms `request_count` only appears in
+      # `usage_counters`, an unrelated `SummingMergeTree`), so ClickHouse's own
+      # init aborts with `NUMBER_OF_ARGUMENTS_DOESNT_MATCH` and the container
+      # exits — this is a PRE-EXISTING self-host bug (the same script is
+      # unmodified in ../../../infra/self-host/docker-compose.yml), not
+      # something this bench introduced, and out of this task's edit scope.
+      # The overhead scenario needs only `tracelane.spans` (proof 3 in the
+      # spec's §7), which `schema.sql` alone provides. Filed as a finding in
+      # the PLT-23 report; not fixed here.
+      - ../../../infra/self-host/clickhouse/config.xml:/etc/clickhouse-server/config.d/self-host.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password ${CLICKHOUSE_PASSWORD:-tracelane_bench} --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  nats:
+    image: nats:2.10-alpine
+    network_mode: host
+    # Default client port 4222 is free on this box; monitoring on 8222 too.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - tracelane_bench_nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  gateway:
+    build:
+      context: ../../..
+      dockerfile: infra/docker/gateway.Dockerfile
+    network_mode: host
+    environment:
+      TRACELANE_PORT: "8080"
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+      ANTHROPIC_API_KEY: bench
+      ANTHROPIC_BASE_URL: ${GWBENCH_MOCK_URL:-http://127.0.0.1:9100}
+      TRACELANE_MASTER_KEY: "${TRACELANE_MASTER_KEY:?required — run.sh generates one}"
+      TRACELANE_SELF_HOST: "1"
+      TRACELANE_SINGLE_TENANT_ID: ${TRACELANE_SINGLE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+      # Explicit for the record (since F8 on 2026-09-07 self-host defaults to no cap anyway): the
+      # 2026-09-06 CCX23 run resolved to the Free tier's 60 rpm and measured the rate limiter —
+      # 84 × 200, then 429. Every other gateway in the run is unlimited.
+      TRACELANE_SELF_HOST_TIER: enterprise
+      NATS_URL: nats://127.0.0.1:4222
+      CLICKHOUSE_URL: http://127.0.0.1:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  ingest:
+    build:
+      context: ../../..
+      dockerfile: infra/docker/ingest.Dockerfile
+    network_mode: host
+    environment:
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRACELANE_SELF_HOST: "1"
+      TRACELANE_SINGLE_TENANT_ID: ${TRACELANE_SINGLE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+      NATS_URL: nats://127.0.0.1:4222
+      CLICKHOUSE_URL: http://127.0.0.1:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+volumes:
+  tracelane_bench_clickhouse_data:
+    driver: local
+  tracelane_bench_nats_data:
+    driver: local

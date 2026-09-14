@@ -1,0 +1,288 @@
+---
+/**
+ * CompareTable — the compact competitor matrix, homepage section.
+ *
+ * Same 13 rows as README.md's "How Tracelane compares" table and sourced from the
+ * same place: `apps/docs/comparisons/index.mdx` (the full, footnoted matrix). Do not
+ * hand-edit a claim here — change the source doc and copy the cell across. Every
+ * number and every ✓/partial/— reading matches the doc as of 2026-09-07.
+ *
+ * Self-contained: imported once into `index.astro` after `#benchmarks`, no props.
+ */
+
+type Cell = { v: "yes" | "partial" | "no"; label: string };
+
+const yes = (label: string): Cell => ({ v: "yes", label });
+const partial = (label: string): Cell => ({ v: "partial", label });
+const no = (label: string): Cell => ({ v: "no", label });
+
+const rows: { label: string; cells: [Cell, Cell, Cell, Cell, Cell] }[] = [
+  {
+    label: "Measured gateway overhead (p50)",
+    cells: [
+      yes("2 ms †"),
+      partial("Python proxy 14–15 ms, same bench; Rust build not public"),
+      partial("3–4 ms, same bench run"),
+      no("no gateway"),
+      no("no gateway"),
+    ],
+  },
+  {
+    label: "Rust hot path",
+    cells: [yes("yes"), no("Python proxy measured; Rust gateway announced, no public build"), no("TypeScript/Node.js"), no("no gateway"), no("no gateway")],
+  },
+  {
+    label: "BYOK, 0% token markup",
+    cells: [yes("yes"), yes("yes"), yes("yes"), no("—"), partial("lists an LLM Gateway; BYOK not documented")],
+  },
+  {
+    label: "OTel-native ingest",
+    cells: [yes("yes"), partial("partial"), partial("partial"), yes("yes"), partial("partial")],
+  },
+  {
+    label: "Multi-agent swimlanes",
+    cells: [yes("yes"), no("—"), no("—"), yes("yes"), yes("yes")],
+  },
+  {
+    label: "Sessions",
+    cells: [yes("per-user identity on the roadmap"), no("—"), no("—"), yes("yes"), yes("yes")],
+  },
+  {
+    label: "Eval loop — datasets, experiments, online evals, annotation queues, CI gate",
+    cells: [yes("proven on prod"), no("—"), no("—"), yes("yes"), yes("yes")],
+  },
+  {
+    label: "Prompt management + playground",
+    cells: [yes("yes"), no("—"), yes("yes"), yes("yes"), yes("yes")],
+  },
+  {
+    label: "MCP server for traces",
+    cells: [yes("on npm, read-only, tenant-scoped"), no("—"), no("—"), no("—"), no("—")],
+  },
+  {
+    label: "Claude Code flight recorder",
+    cells: [yes("yes"), no("—"), no("—"), no("—"), no("—")],
+  },
+  {
+    label: "Tamper-evident ledger, offline-verifiable",
+    cells: [yes("yes"), no("—"), no("—"), no("—"), no("—")],
+  },
+  {
+    label: "Self-host, single Compose file",
+    cells: [yes("yes"), yes("yes"), yes("yes"), yes("+ Kubernetes"), partial("Enterprise BYOC")],
+  },
+  {
+    label: "License",
+    cells: [
+      yes("Apache 2.0"),
+      partial("MIT (core)"),
+      yes("MIT"),
+      yes("MIT"),
+      no("none for OSS; Enterprise self-hosted SKU is proprietary"),
+    ],
+  },
+];
+
+const glyph: Record<Cell["v"], { char: string; aria: string }> = {
+  yes: { char: "✓", aria: "yes" },
+  partial: { char: "◐", aria: "partial" },
+  no: { char: "—", aria: "not documented" },
+};
+---
+
+<section id="compare" class="panel">
+  <div class="reveal section-head">
+    <p class="eyebrow mb-4">How we compare</p>
+    <h2 class="display-lg text-fg">Thirteen claims, sourced.</h2>
+    <p class="lede">
+      Against each vendor's own docs and pricing pages, fetched 2026-09-07. A dash means we didn't find it documented, not that
+      the vendor lacks it.
+    </p>
+  </div>
+
+  <div class="mt-10 reveal compare-scroll">
+    <table class="compare-table">
+      <caption class="sr-only">Feature comparison: Tracelane, LiteLLM, Portkey, Langfuse, LangSmith</caption>
+      <thead>
+        <tr>
+          <th scope="col"></th>
+          <th scope="col" class="compare-col-tracelane">Tracelane</th>
+          <th scope="col">LiteLLM</th>
+          <th scope="col">Portkey</th>
+          <th scope="col">Langfuse</th>
+          <th scope="col">LangSmith</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr>
+            <th scope="row">{row.label}</th>
+            {row.cells.map((cell, i) => {
+              const trivial = cell.label === "yes" || cell.label === "no" || cell.label === "—";
+              return (
+                <td class={i === 0 ? "compare-col-tracelane" : undefined}>
+                  <span class={`compare-glyph compare-glyph--${cell.v}`} aria-label={glyph[cell.v].aria}>
+                    {glyph[cell.v].char}
+                  </span>
+                  {!trivial && <span class="compare-cell-label">{cell.label}</span>}
+                </td>
+              );
+            })}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="mt-6 text-sm text-fg-dim compare-legend">
+    <span class="compare-glyph compare-glyph--yes" aria-hidden="true">✓</span> shipped and documented
+    &nbsp;·&nbsp;
+    <span class="compare-glyph compare-glyph--partial" aria-hidden="true">◐</span> supported with a real limit
+    &nbsp;·&nbsp;
+    <span class="compare-glyph compare-glyph--no" aria-hidden="true">—</span> not documented on the vendor's own page as of 2026-09-07
+  </p>
+
+  <p class="mt-4 text-sm text-fg-dim">
+    † Benchmark: 2 ms p50 / 4 ms p95 / 5 ms p99 added latency on LiteLLM's own
+    AIGatewayBench harness (4 vCPU, two runs, capture on) —
+    <a href="/benchmarks" class="link-accent">full method and raw CSVs</a>.
+  </p>
+
+  <p class="mt-2 text-sm text-fg-dim">
+    <strong>Not yet:</strong> SOC 2 report, configurable data residency, HIPAA/BAA,
+    documented SAML SSO, contractual SLA, documented Slack/PagerDuty alert integrations.
+  </p>
+
+  <p class="mt-6 flex flex-wrap items-center gap-4">
+    <a href="https://docs.tracelane.dev/comparisons" class="link-accent">Full matrix with sources →</a>
+    <a href="/#benchmarks" class="link-accent">Benchmark method →</a>
+  </p>
+</section>
+
+<style>
+  /* Horizontal scroll lives INSIDE this wrapper — the page body never scrolls
+     sideways. `.panel`'s own inline padding stays put; the table clips at the
+     wrapper edge and the row-label column stays stuck to the left, so a
+     half-visible vendor column reads as "more", not broken.
+     (This comment used to claim a "soft fade" that no rule ever implemented —
+     the sticky label column below is what actually keeps a scrolled cell
+     readable, and it is real.) */
+  .compare-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-elevated);
+    box-shadow: var(--shadow-sm), var(--ring-inset);
+    scroll-snap-type: x proximity;
+  }
+
+  .compare-table {
+    width: 100%;
+    min-width: 44rem;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+
+  .compare-table th,
+  .compare-table td {
+    padding: 0.75rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--color-border-subtle);
+    vertical-align: top;
+    white-space: normal;
+  }
+
+  .compare-table thead th {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.04em;
+    color: var(--color-fg-subtle);
+    font-weight: 500;
+    border-bottom: 1px solid var(--color-border-strong);
+    white-space: nowrap;
+  }
+
+  .compare-table tbody th {
+    font-weight: 500;
+    color: var(--color-fg);
+    max-width: 18rem;
+  }
+
+  .compare-table tbody tr:last-child th,
+  .compare-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  /* Tracelane's own column, highlighted — the reader's eye should land here first. */
+  .compare-col-tracelane {
+    background: color-mix(in oklab, var(--color-accent) 6%, transparent);
+  }
+  thead .compare-col-tracelane {
+    color: var(--color-accent);
+    background: color-mix(in oklab, var(--color-accent) 9%, transparent);
+  }
+
+  .compare-glyph {
+    display: inline-block;
+    width: 1.1rem;
+    text-align: center;
+    font-weight: 600;
+  }
+  .compare-glyph--yes {
+    color: var(--color-verify);
+  }
+  .compare-glyph--partial {
+    color: var(--color-accent);
+  }
+  .compare-glyph--no {
+    color: var(--color-fg-dim);
+  }
+
+  .compare-cell-label {
+    margin-left: 0.5rem;
+    color: var(--color-fg-muted);
+  }
+
+  .compare-legend .compare-glyph {
+    margin-right: 0.15rem;
+  }
+
+  /* MOBILE. The table is NOT narrowed to fit a phone — squeezing six columns
+     into 390px is what produced cells reading one word per line ("Measured /
+     gateway / overhead / (p50)") and vendor text sheared mid-word at the scroll
+     edge. It is WIDENED instead, so every column keeps a readable measure and
+     the reader scrolls sideways through a table that still looks like a table.
+     The row label is pinned so the claim stays on screen while they do — the
+     one thing a scrolled comparison table cannot afford to lose. */
+  @media (max-width: 767px) {
+    .compare-table {
+      /* PX, NOT REM, AND DELIBERATELY. `tokens.css` sets the root to 13.5px for
+         the app's 4px grid, so `1rem` here is 13.5px, not 16 — `58rem` reads as
+         928px and lays out at 783. These two numbers have to add up against the
+         label width below, so they are stated in the unit they are reasoned in.
+         148px label + 5 vendor columns at ~127px. */
+      min-width: 783px;
+    }
+    .compare-table th,
+    .compare-table td {
+      padding: 0.7rem 0.85rem;
+      scroll-snap-align: start;
+    }
+
+    /* Sticky row-label column. `background` is required: without an opaque
+       ground the scrolled cells show THROUGH it. It reuses the card plane so it
+       matches the wrapper, and the hairline stands in for the edge the reader
+       would otherwise lose. */
+    .compare-table tbody th,
+    .compare-table thead th:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      background: var(--color-bg-elevated);
+      box-shadow: 1px 0 0 var(--color-border-subtle);
+      max-width: none;
+      width: 148px;
+    }
+  }
+</style>

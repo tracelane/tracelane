@@ -19,7 +19,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{DeliveryError, METRICS, is_breach};
+use super::{DeliveryError, METRICS};
+// No production caller in this module — routes validate against `METRICS`
+// only; `is_breach` is the evaluator's own comparator, exercised here only
+// by a test asserting the two agree. Used only by tests, hence gated
+// (B-390, 2026-09-12).
+#[cfg(test)]
+use super::is_breach;
 use crate::db::DbPool;
 use crate::entitlement_cache::{EntitlementCache, FeatureKey};
 
@@ -50,6 +56,28 @@ pub fn routes() -> Router<AlertRoutesState> {
         .route("/v1/alerts/test", post(test_fire_handler))
 }
 
+/// `scheme://host/…<last 4>` — recognisable, not reusable (B-383 d).
+pub(crate) fn redact_destination_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("", url),
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let tail: String = url
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if scheme.is_empty() {
+        format!("…{tail}")
+    } else {
+        format!("{scheme}://{host}/…{tail}")
+    }
+}
+
 fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
 }
@@ -69,7 +97,16 @@ async fn gate(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "Authorization must be ASCII"))?;
     let claims = crate::auth::validate_authorization(header_str)
         .await
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "auth failed"))?;
+        .map_err(|e| err(crate::auth::failure_status(&e), "auth failed"))?;
+    // B-383 (d), 2026-09-12: alert rules and destinations are workspace
+    // configuration; a destination URL is bearer-equivalent. An `ingest`-only
+    // key must not reach them — `read` scope for API keys, JWTs as before.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "This API key is not scoped to read recorded data. It needs the `read` scope.",
+        ));
+    }
     let tenant = *claims.tenant_id.as_uuid();
     if !state.entitlements.check(tenant, FeatureKey::Alerts).await {
         return Err(err(
@@ -236,7 +273,12 @@ async fn list_dest_handler(State(state): State<AlertRoutesState>, headers: Heade
                     id: d.id,
                     name: d.name,
                     kind: d.kind,
-                    url: d.url,
+                    // B-383 (d): the full URL is write-only after creation. A
+                    // Slack/Discord/webhook URL IS the credential; the list shows
+                    // enough to recognise it (`scheme://host/…` + last 4), the way
+                    // `/v1/keys` shows a key prefix. The dashboard truncates it
+                    // anyway.
+                    url: redact_destination_url(&d.url),
                 })
                 .collect();
             Json(json!({ "destinations": views })).into_response()
@@ -408,6 +450,21 @@ async fn test_fire_handler(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    /// B-383 (d): a destination URL is bearer-equivalent; the list must show
+    /// enough to recognise it and not enough to reuse it.
+    #[test]
+    fn destination_url_is_redacted_to_scheme_host_and_a_tail() {
+        let r = redact_destination_url("https://hooks.slack.com/services/T000/B000/XXXXsecret");
+        assert_eq!(r, "https://hooks.slack.com/…cret");
+        assert!(!r.contains("T000"), "the path is the secret: {r}");
+        assert_eq!(redact_destination_url("opaque-token-value"), "…alue");
+        assert_eq!(
+            redact_destination_url("https://h.example/a"),
+            "https://h.example/…le/a"
+        );
+    }
+
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

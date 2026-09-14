@@ -1,0 +1,11 @@
+# PLT-23 gateway-overhead comparison — AIGatewayBench harness commit ff372fc
+# date=2026-09-07 host_label=ccx23 run_label=2 nproc=4 mem_gb=15 kernel=6.8.0-138-generic load1m=0.48
+# tracelane_sha=1f3af9ad litellm_python_version=1.100.0
+# mock_url=http://2.28.46.92:9100 mock_bind=0.0.0.0 mock_ttft_ms=0 mock_itl_ms=0
+gateway,status,version,n,p50_ms,p95_ms,p99_ms,peak_rss_mb,notes
+direct,ok,direct-mock,4558,1,2,3,2.355,
+tracelane,ok,1f3af9ad,4474,3,6,8,14.111,capture proof: 4591 rows in tracelane.spans after the run
+litellm-python,ok,1.100.0,3843,15,36,50,323.437,
+portkey,ok,1.15.2,4408,4,7,11,,
+bifrost,ok,unknown,4477,3,4,6,101.478,
+litellm-rust,CANNOT_DETERMINE,,,,,,,no public build — LiteLLM's own harness README builds it from a private branch (/home/ubuntu/repos/litellm/litellm-rust @ litellm_rust_messages_route) on their machine; never skip silently, per spec

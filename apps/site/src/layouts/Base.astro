@@ -29,7 +29,7 @@ const jsonLd = {
       "@id": "https://tracelane.dev/#org",
       name: "Tracelane",
       url: "https://tracelane.dev",
-      logo: "https://tracelane.dev/og-default.png",
+      logo: "https://tracelane.dev/brand/apple-touch-icon.png",
       sameAs: [
         "https://github.com/tracelane",
         "https://x.com/xsanjeevlabs",
@@ -54,9 +54,28 @@ const jsonLd = {
 <!doctype html>
 <html lang="en">
   <head>
+    <script is:inline>
+      /* Dark mode is the shared app tokens' own mechanism — `[data-theme="dark"]`
+         in the shared ui `tokens.css` — not a site-local palette. The
+         app itself flips that attribute from a user setting; the site has no
+         such setting, so it follows the OS/browser preference instead. Runs
+         BEFORE first paint (blocking, in <head>) so there is no flash. */
+      (function () {
+        var KEY = "tracelane-theme";
+        var mq = window.matchMedia("(prefers-color-scheme: dark)");
+        function stored() { try { return localStorage.getItem(KEY); } catch (e) { return null; } }
+        function apply() {
+          var t = stored();
+          document.documentElement.dataset.theme = t === "light" || t === "dark" ? t : (mq.matches ? "dark" : "light");
+        }
+        apply();
+        mq.addEventListener("change", function () { if (!stored()) apply(); });
+      })();
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f5f6f8" />
+    <meta name="theme-color" content="#f5f5f7" />
+    <meta name="color-scheme" content="light dark" />
     <meta name="generator" content={Astro.generator} />
 
     <title>{title}</title>
@@ -80,8 +99,16 @@ const jsonLd = {
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={fullOgImage} />
 
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- THE SAME icon set, in the SAME order, at the SAME paths as the app
+         (`apps/web/app/layout.tsx` → metadata.icons). Both public dirs are written
+         by `scripts/brand/build-brand-assets.py` in one run, so the two tabs resolve
+         identical bytes. Until 2026-09-12 this was a single small-cut `favicon.svg`:
+         at HiDPI Chrome drew it at 32px as a solid disc while the app's 32px PNG
+         showed the rings — two marks in two tabs. `--check-refs` proves these resolve. -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/brand/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/brand/favicon-16.png" />
+    <link rel="icon" type="image/svg+xml" href="/brand/tracelane-mark.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/brand/apple-touch-icon.png" />
 
     {/* Inter Tight is no longer used — the rebuilt system runs ONE sans, like the
         reference. Preloading a face the CSS never asks for is a wasted round trip

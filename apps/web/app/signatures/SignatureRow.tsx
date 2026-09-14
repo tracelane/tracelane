@@ -114,15 +114,22 @@ function Chevron({ open }: { open: boolean }) {
 	);
 }
 
-export function SignatureRow({ sig }: { sig: SignatureHit }) {
+export function SignatureRow({
+	sig,
+	windowQuery,
+}: {
+	sig: SignatureHit;
+	/** `range=30d` or `since=…&until=…` — the page's window, so the traces link matches the counts. */
+	windowQuery: string;
+}) {
 	const [open, setOpen] = useState(false);
 	const detailId = useId();
 	const t = aftFor(sig.signature_id);
 	const name = t?.name ?? sig.signature_id;
 	const sev = severity(sig.action);
-	// range=30d so the destination window matches the 30-day signature aggregate
-	// (the traces list now defaults to 24h, which would show fewer rows than the count).
-	const tracesHref = `/traces?signature_id=${encodeURIComponent(sig.signature_id)}&range=30d`;
+	// The destination window matches the aggregate's (preset or custom), never a
+	// hard-coded 30d that a custom window on the page would silently contradict.
+	const tracesHref = `/traces?signature_id=${encodeURIComponent(sig.signature_id)}&${windowQuery}`;
 	// Does the detail panel have any taxonomy FIELDS above its action footer?
 	// False for an id that does not resolve — see the footer's comment.
 	const hasFields = Boolean(t?.description || t?.detection);

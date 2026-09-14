@@ -9,8 +9,13 @@
 //! (same no-per-request-network discipline as the entitlement cache, ADR-035) —
 //! a background task refreshes the snapshot; the hot path only reads an
 //! `ArcSwap`. Three flag families:
-//!   - `kill.predictive.{trajectory_guard,slm_judge,argdrift}` — disable a
-//!     predictor fleet-wide in seconds, no redeploy.
+//!   - `kill.predictive.<name>` — disable one predictor fleet-wide, where `<name>`
+//!     is the predictor's EXACT `fn name()` string (`pr8-lite-argument-drift`,
+//!     `slm_judge`, `trajectory_guard`, …). Keys are matched verbatim; a key that
+//!     names no registered predictor is reported at boot by
+//!     `PredictiveLayer::with_kill_switch` as an `error!` and is otherwise INERT
+//!     (B-237: `argdrift` was documented for a predictor named
+//!     `pr8-lite-argument-drift`, so the switch could never be armed).
 //!   - `kill.upstream.<provider>` — force a provider's breaker open.
 //!   - `flag.canary.<feature>` — canary cohort selection (§23.5).
 //!
@@ -41,7 +46,13 @@ pub struct KillSwitch {
 
 impl KillSwitch {
     /// A kill-switch with no flags set — every flag resolves to its safe
-    /// default. Used when PostHog is unconfigured (dev) and as the test seed.
+    /// default.
+    ///
+    /// No production caller today (corrected 2026-09-12, B-390 — this used
+    /// to claim "used when PostHog is unconfigured (dev)"; `from_env()`
+    /// handles that case itself via `from_flag_list`, never by calling this).
+    /// Used only as the test seed, hence gated.
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             flags: Arc::new(ArcSwap::from_pointee(HashMap::new())),
@@ -134,6 +145,21 @@ impl KillSwitch {
         self.flags.load().get(key).copied().unwrap_or(default)
     }
 
+    /// Every key currently forced ON, sorted — what the operator actually armed, so a
+    /// consumer can say which of them matched nothing (B-237).
+    #[must_use]
+    pub fn forced_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .flags
+            .load()
+            .iter()
+            .filter(|(_, v)| **v)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// Is predictor `name` killed? Default `false` — predictors are fail-open,
     /// so an unreachable flag service leaves them running.
     pub fn predictive_killed(&self, name: &str) -> bool {
@@ -201,10 +227,14 @@ fn decide_url(host: &str) -> String {
 /// Build the refresh client and clear the SSRF gate, or refuse.
 ///
 /// Factored out of [`KillSwitch::spawn_refresh`] so it is unit-testable
-/// without spawning a task or hitting the network — the same pattern as
-/// `validate_slack_webhook` in `server.rs`. Client construction and the SSRF
-/// gate are deliberately in ONE function so that a test of this function
-/// covers the gate's INVOCATION, not merely its logic.
+/// without spawning a task or hitting the network. (This comment used to cite
+/// `validate_slack_webhook` in `server.rs` as the same pattern; BILL-01 /
+/// ADR-076, 2026-09-13, deleted that function along with the monthly-quota
+/// Slack notification it validated a URL for — the pattern itself, one
+/// function doing both client construction and the SSRF gate, is unchanged
+/// here.) Client construction and the SSRF gate are deliberately in ONE
+/// function so that a test of this function covers the gate's INVOCATION,
+/// not merely its logic.
 ///
 /// Returns `None` (and logs at `error`) when the URL is rejected. The caller
 /// MUST NOT start the refresh loop on `None`: every `kill.*` flag then serves

@@ -28,13 +28,16 @@ export default async function TeamPage() {
 		.where(eq(tenants.workosOrgId, session.tenantId))
 		.limit(1);
 
-	const plan: Plan = (tenantRows[0]?.plan as Plan) ?? "builder";
+	// Fail CLOSED to `free` when the tenant row is unresolvable
+	// (`.claude/rules/tenancy.md`) — an absent row must not read as unlimited.
+	const plan: Plan = (tenantRows[0]?.plan as Plan) ?? "free";
 	// Seat cap comes from the SAME authoritative source the invite route enforces
 	// (`resolveEntitlements`), never a hardcoded map — so the displayed cap can
-	// never drift from what the server actually allows. Entitlements use `0` as
-	// the unlimited sentinel; the component uses `< 0`, so translate at the seam.
+	// never drift from what the server actually allows. ADR-076: seats are
+	// UNLIMITED on every paid tier; only Free is capped, at 1. The component
+	// takes `< 0` as its unlimited sentinel, so translate at the seam.
 	const ent = await resolveEntitlements(tenantRows[0]?.id, plan);
-	const membersMax = ent.seat_cap_max > 0 ? ent.seat_cap_max : -1;
+	const membersMax = ent.unlimited_seats ? -1 : 1;
 
 	return (
 		<div className="space-y-1">

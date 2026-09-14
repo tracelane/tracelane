@@ -29,6 +29,12 @@ export interface DbMock {
 	results: unknown[];
 	/** Index of the next result to be consumed (for assertions). */
 	cursor: () => number;
+	/**
+	 * Every argument list passed to a builder `.set(...)` on any chain, in call
+	 * order — so a test can assert WHAT an update wrote, not only that one ran
+	 * (B-388: the ordering clock must land in the same statement as the plan).
+	 */
+	setCalls: unknown[][];
 }
 
 /**
@@ -41,6 +47,7 @@ export interface DbMock {
 export function makeDbMock(results: unknown[]): DbMock {
 	let i = 0;
 	const cursor = () => i;
+	const setCalls: unknown[][] = [];
 
 	// A single chain object: every builder method returns `this`, and the
 	// object is a thenable that resolves to the next queued result the first
@@ -72,8 +79,12 @@ export function makeDbMock(results: unknown[]): DbMock {
 					};
 				}
 				// Any builder method (from/where/limit/values/returning/set/
-				// orderBy/innerJoin/...) returns the same chain.
-				return (..._args: unknown[]) => proxy;
+				// orderBy/innerJoin/...) returns the same chain. `.set(...)` is
+				// additionally recorded so a test can read what an update wrote.
+				return (...args: unknown[]) => {
+					if (prop === "set") setCalls.push(args);
+					return proxy;
+				};
 			},
 		};
 		const proxy: unknown = new Proxy({}, handler);
@@ -97,5 +108,5 @@ export function makeDbMock(results: unknown[]): DbMock {
 		}),
 	};
 
-	return { db, results, cursor };
+	return { db, results, cursor, setCalls };
 }

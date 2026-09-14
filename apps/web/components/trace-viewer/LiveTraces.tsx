@@ -100,11 +100,15 @@ export function LiveTraces({
 		};
 	}, [live, streamParams]);
 
-	// Status indicator dot color — ok-soft for live (operational status),
-	// danger for error, warn for transitional states.
+	// Status indicator dot colour. `live` was `bg-ok` — the same green the app
+	// uses for "verified"/"healthy" — but this dot means something different:
+	// "actively capturing right now", not "passed a check". DSH-16 gives that
+	// its own hue (the recorder's amber) so the two meanings stop sharing a
+	// colour for two unrelated reasons. Error/transitional states are real
+	// fault states and keep their existing semantic colours.
 	const dotClass =
 		status === "live"
-			? "bg-ok animate-pulse"
+			? "bg-accent-warm animate-pulse"
 			: status === "error"
 				? "bg-danger"
 				: "bg-warn";

@@ -1,9 +1,12 @@
 /**
  * Tests for POST /api/support — the in-product support widget endpoint.
  *
- * Asserts the kind allowlist, message bounds/trim, and that the row is written
- * with the SESSION's WorkOS actor (never a body-supplied identity). db + auth
- * are mocked (off the network / off Postgres).
+ * Asserts the kind allowlist (now four kinds, incl. "feature"), the area
+ * allowlist (14 keys, `@/lib/support-taxonomy` — NOT mocked, since it is a
+ * plain data module with no DB/network dependency), message bounds/trim, and
+ * that the row is written with the SESSION's WorkOS actor (never a
+ * body-supplied identity). db + auth are mocked (off the network / off
+ * Postgres).
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -86,19 +89,55 @@ describe("POST /api/support", () => {
 		await expect(res.json()).resolves.toMatchObject({ ref: "TL-8F3A21C4" });
 	});
 
-	it("records the broad area as a labeled first line", async () => {
+	it("records the broad area as a labeled first line, using the human label — not the raw key", async () => {
 		await POST(req({ kind: "bug", message: "it broke", category: "gateway" }));
 		expect(insertValues).toHaveBeenCalledWith(
-			expect.objectContaining({ message: "[area: gateway]\nit broke" }),
+			expect.objectContaining({
+				message: "[area: Gateway & providers]\nit broke",
+			}),
 		);
 	});
 
-	it("ignores an unknown area rather than storing it", async () => {
+	it("records one of the newly-widened areas with its label", async () => {
 		await POST(
+			req({ kind: "bug", message: "the judge disagreed", category: "evals" }),
+		);
+		expect(insertValues).toHaveBeenCalledWith(
+			expect.objectContaining({
+				message: "[area: Evals, datasets & experiments]\nthe judge disagreed",
+			}),
+		);
+	});
+
+	it("ignores an unknown (invalid) area rather than storing it or rejecting the ticket", async () => {
+		const res = await POST(
 			req({ kind: "bug", message: "it broke", category: "not-a-real-area" }),
 		);
+		// An unrecognised category never blocks the ticket — see CATEGORY_LABELS
+		// in the route.
+		expect(res.status).toBe(201);
 		expect(insertValues).toHaveBeenCalledWith(
 			expect.objectContaining({ message: "it broke" }),
 		);
+	});
+
+	it("accepts the fourth kind, 'feature' (feature request)", async () => {
+		const res = await POST(
+			req({ kind: "feature", message: "please add dark mode" }),
+		);
+		expect(res.status).toBe(201);
+		expect(insertValues).toHaveBeenCalledWith(
+			expect.objectContaining({ kind: "feature" }),
+		);
+	});
+
+	it("still rejects an invalid kind, and names all four valid kinds", async () => {
+		const res = await POST(req({ kind: "spam", message: "x" }));
+		expect(res.status).toBe(400);
+		expect(insert).not.toHaveBeenCalled();
+		await expect(res.json()).resolves.toMatchObject({
+			error: "invalid_kind",
+			expected: "query|feedback|bug|feature",
+		});
 	});
 });

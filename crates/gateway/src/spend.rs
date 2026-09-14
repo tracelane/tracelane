@@ -13,8 +13,9 @@
 //! product claim is added latency. It is not viable, and B-256 (an unexplained
 //! 13× production overhead regression) is open while this ships.
 //!
-//! So this mirrors [`crate::rate_limiter::QuotaTracker`] exactly, including the
-//! part that took a bug to learn. **: an in-memory counter alone is not a
+//! So this mirrors the shape the retired trace-quota tracker had (`QuotaTracker`,
+//! deleted with ADR-076 / BILL-01 — spend budgets are the only counter left),
+//! including the part that took a bug to learn. **: an in-memory counter alone is not a
 //! cap.** The quota counter reset to zero on every process restart, so
 //! a redeploy forgave accrued usage and the hard cap was bypassable by shipping.
 //! The fix, reused here: the counter is *seeded* from a durable ClickHouse total
@@ -109,7 +110,7 @@ pub struct SpendTracker {
     /// `api_keys.id` → the `YYYYMM` its counter was last seeded for. Absent
     /// means never seeded in this process (fresh start / post-deploy); a
     /// different month means the month rolled. Both need a re-seed, and this one
-    /// map expresses both — the same trick `QuotaTracker` uses, and the reason
+    /// map expresses both — the trick the retired `QuotaTracker` used, and the reason
     /// there is no separate month-boundary reset job to forget to run.
     seeded: Arc<DashMap<Subject, u32>>,
 }
@@ -214,6 +215,12 @@ impl SpendTracker {
 
     /// Spend recorded against this key so far this month, USD. For status
     /// surfaces and the 402 body. `0.0` for a key with no recorded spend.
+    ///
+    /// No production caller today — `check()` above (the real 402/budget
+    /// decision path) reads `current_micro` directly rather than through
+    /// this public wrapper. Used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn current_usd(&self, who: Subject) -> f64 {
         from_micro(self.current_micro(who))
@@ -317,7 +324,11 @@ pub fn workspace_refusal(who: Subject, budget_usd: Option<f64>) -> Option<serde_
 /// Seed the workspace counter from the durable ClickHouse total, once per
 /// workspace per month per process. Fail-OPEN — see
 /// [`workspace_budget_usd`] for why that direction is correct for a budget.
-pub async fn seed_workspace(ch: &clickhouse::Client, tenant: &tracelane_shared::TenantId) {
+pub async fn seed_workspace(
+    ch: &clickhouse::Client,
+    tenant: &tracelane_shared::TenantId,
+    tier: crate::clickhouse_query::PlanTier,
+) {
     let who = Subject::Workspace(*tenant.as_uuid());
     let ym = year_month(chrono::Utc::now());
     if !tracker().needs_seed(who, ym) {
@@ -340,7 +351,7 @@ pub async fn seed_workspace(ch: &clickhouse::Client, tenant: &tracelane_shared::
     // do mid-build.
     let sql = crate::clickhouse_query::TenantQuery::new(
         crate::server::WORKSPACE_SPEND_THIS_MONTH_SQL,
-        crate::clickhouse_query::PlanTier::Builder,
+        tier,
     )
     .sql_with_settings();
     let baseline = match ch
@@ -363,13 +374,21 @@ pub async fn seed_workspace(ch: &clickhouse::Client, tenant: &tracelane_shared::
     tracker().seed_if_needed(who, ym, baseline);
 }
 
-/// `YYYYMM` for a UTC instant — the period key both this tracker and
-/// `QuotaTracker` bucket by.
+/// `YYYYMM` for a UTC instant — the monthly period key.
 #[must_use]
 pub fn year_month(now: chrono::DateTime<chrono::Utc>) -> u32 {
     use chrono::Datelike as _;
     now.year() as u32 * 100 + now.month()
 }
+
+// BILL-01 A3 — `BudgetReset` and `window_key` live in `tracelane-shared`, not
+// here, because `db::api_keys` (which needs `BudgetReset`) is compiled a
+// SECOND time as a standalone module by
+// `tests/postgres_tenant_integration.rs` (`#[path = "../src/db/mod.rs"]`) —
+// a separate crate with no access to `gateway::spend`. Re-exported under
+// their original names so every existing `crate::spend::BudgetReset` /
+// `crate::spend::window_key` call site in this crate is unaffected.
+pub use tracelane_shared::spend::{BudgetReset, window_key};
 
 #[cfg(test)]
 mod tests {
@@ -504,6 +523,90 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         assert_eq!(year_month(d), 202_608);
+    }
+
+    fn dt(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn budget_reset_parses_the_three_check_constrained_values() {
+        assert_eq!(BudgetReset::from_column("daily"), BudgetReset::Daily);
+        assert_eq!(BudgetReset::from_column("weekly"), BudgetReset::Weekly);
+        assert_eq!(BudgetReset::from_column("monthly"), BudgetReset::Monthly);
+        // Fail-open to the WIDEST window, never the strictest, on garbage —
+        // a customer's own ceiling, not a security path (CLAUDE.md §10).
+        assert_eq!(BudgetReset::from_column("bogus"), BudgetReset::Monthly);
+        assert_eq!(BudgetReset::from_column(""), BudgetReset::Monthly);
+    }
+
+    #[test]
+    fn window_key_monthly_matches_year_month_exactly() {
+        let d = dt("2026-08-18T04:00:00Z");
+        assert_eq!(window_key(BudgetReset::Monthly, d), year_month(d));
+    }
+
+    #[test]
+    fn window_key_daily_is_yyyymmdd() {
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2026-08-18T23:59:59Z")),
+            20_260_818
+        );
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2026-08-19T00:00:00Z")),
+            20_260_819
+        );
+        // Month boundary — no carry bugs from naive digit concatenation.
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2026-08-31T12:00:00Z")),
+            20_260_831
+        );
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2026-09-01T00:00:01Z")),
+            20_260_901
+        );
+        // Year boundary.
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2026-12-31T23:59:59Z")),
+            20_261_231
+        );
+        assert_eq!(
+            window_key(BudgetReset::Daily, dt("2027-01-01T00:00:00Z")),
+            20_270_101
+        );
+    }
+
+    #[test]
+    fn window_key_weekly_resets_on_the_iso_monday_boundary() {
+        // 2026-08-17 is a Monday (ISO week start); 2026-08-16 is the Sunday
+        // before it, so the two dates must land in DIFFERENT weekly windows
+        // even though they are one day apart — the whole point of ISO-week
+        // cadence over a naive "every 7 days" counter.
+        let sunday = window_key(BudgetReset::Weekly, dt("2026-08-16T23:00:00Z"));
+        let monday = window_key(BudgetReset::Weekly, dt("2026-08-17T00:00:01Z"));
+        assert_ne!(
+            sunday, monday,
+            "the ISO week must roll over at Monday, not at a fixed offset"
+        );
+        // Within the same ISO week, every day shares one key.
+        let tuesday = window_key(BudgetReset::Weekly, dt("2026-08-18T12:00:00Z"));
+        let sunday_end = window_key(BudgetReset::Weekly, dt("2026-08-23T23:59:59Z"));
+        assert_eq!(monday, tuesday);
+        assert_eq!(monday, sunday_end);
+    }
+
+    #[test]
+    fn window_key_weekly_handles_the_iso_year_boundary() {
+        // 2026-12-31 is a Thursday; ISO 8601 puts the year's first week where
+        // the first Thursday falls, so late December can belong to ISO week 1
+        // of the FOLLOWING calendar year — a naive `calendar_year * 100 +
+        // week` (without `iso_week()`) would silently misbucket this.
+        use chrono::Datelike as _;
+        let key = window_key(BudgetReset::Weekly, dt("2026-12-31T12:00:00Z"));
+        let iso = dt("2026-12-31T12:00:00Z").iso_week();
+        assert_eq!(key, iso.year() as u32 * 100 + iso.week());
     }
 
     #[test]

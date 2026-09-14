@@ -37,6 +37,11 @@ pub enum EnforcementMode {
     /// Hard block on a met trifecta (default).
     Block,
     /// Warn + route to a human-approval gate instead of blocking.
+    ///
+    /// No production construction — production always builds `R4Trifecta`
+    /// via `new()` (`Block`, the default), never `with_config`. Used only
+    /// by a test, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     Approve,
 }
 
@@ -46,6 +51,11 @@ pub enum Strictness {
     /// Require untrusted + private-read + exfil (the precise lethal trifecta).
     TwoOfThree,
     /// Conservative: untrusted + exfil is enough (ignore private-read).
+    ///
+    /// No production construction — production always builds `R4Trifecta`
+    /// via `new()` (`TwoOfThree`, the default). Used only by a test, hence
+    /// gated (B-390, 2026-09-12).
+    #[cfg(test)]
     UntrustedPlusExfil,
 }
 
@@ -77,6 +87,9 @@ impl R4Trifecta {
         Self::default()
     }
 
+    // No production caller — `engine.rs` always constructs `R4Trifecta::new()`.
+    // Used only by tests, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn with_config(config: R4Config) -> Self {
         Self { config }
@@ -174,6 +187,7 @@ impl R4Trifecta {
         // Trifecta condition per strictness.
         let met = match self.config.strictness {
             Strictness::TwoOfThree => tainted && private_read,
+            #[cfg(test)]
             Strictness::UntrustedPlusExfil => tainted,
         };
         if !met {
@@ -196,6 +210,7 @@ impl R4Trifecta {
             },
             "strictness": match self.config.strictness {
                 Strictness::TwoOfThree => "two_of_three",
+                #[cfg(test)]
                 Strictness::UntrustedPlusExfil => "untrusted_plus_exfil",
             },
             "unknown_tool_involved": unknown_involved,
@@ -207,6 +222,7 @@ impl R4Trifecta {
             EnforcementMode::Block => RailOutcome::block(reason).with_details(details),
             // Approve mode: warn + (the human-approval gate is wired by the
             // caller off the warn outcome).
+            #[cfg(test)]
             EnforcementMode::Approve => RailOutcome::warn(reason).with_details(details),
         }
     }
@@ -308,10 +324,15 @@ mod tests {
     /// Build a request with the given messages + the three declared tools.
     fn request(messages: Vec<Message>, declare: &[&str]) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages,
             tools: Some(declare.iter().map(|n| tool(n)).collect()),
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

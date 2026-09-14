@@ -24,12 +24,19 @@ permissions:
   contents: read
   id-token: write
 
+# HOSTED-RUNNER NOTE (founder, 2026-09-07 — hosted minutes are billed, "only in
+# extreme case with my approval"). `runs-on` moved to the standard
+# `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` indirection. VERIFIED NO-OP FOR
+# TODAY'S COST: `if: github.repository == 'tracelane/tracelane'` below already
+# gates this job out on the private repo before a runner is even allocated
+# (`gh api .../workflows/sbom.yml/runs` reads conclusion=skipped on every
+# private firing) — consistency/defense-in-depth, not a fix to an active spend.
 jobs:
   generate-sbom:
     # PUBLIC-ONLY: nothing consumes a private SBOM; the public one is the published artifact.
     if: github.repository == 'tracelane/tracelane'
     name: Generate and sign CycloneDX SBOM
-    runs-on: ubuntu-latest
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

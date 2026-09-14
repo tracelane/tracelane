@@ -1,17 +1,21 @@
 /**
- * Unavailable-surface empty state — rendered by `/datasets`, `/experiments` and
- * `/playground`. Tracelane has no feature behind any of those routes: the pages
- * exist only so a direct URL does not 404, and none of them is linked from the
- * nav (`components/layout/nav-config.tsx`).
+ * Unavailable-surface empty state — rendered by `/datasets`. Tracelane has no
+ * feature behind that route: the page exists only so a direct URL does not
+ * 404, and it is not linked from the nav (`components/layout/nav-config.tsx`).
+ *
+ * `/experiments` (EVL-02, 2026-08-24) and `/playground` (OBS-16, 2026-09-06)
+ * both moved off this component once a real feature landed behind them — this
+ * comment named all three for weeks after the first move, which is exactly
+ * the §17 defect (a comment that misdescribes the code it sits next to).
  *
  * It says exactly that, and nothing more. NO fabricated UI, no fake data, no
  * entitlement stub, and no forward-looking promise — the absence of a
  * category-standard surface reads as a gap in five seconds, so we name it
  * instead of hiding it.
  *
- * `description` is still accepted because the three call sites pass one, but it
- * is deliberately NOT rendered: each of those descriptions narrated a surface
- * that does not exist.
+ * `description` is still accepted because the remaining call site passes one,
+ * but it is deliberately NOT rendered: it narrated a surface that does not
+ * exist.
  */
 
 import { EmptyState } from "@tracelanedev/ui";

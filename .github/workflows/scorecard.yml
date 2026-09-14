@@ -30,13 +30,32 @@ name: openssf-scorecard
 # GitHub Security tab (via codeql-action/upload-sarif — works on private),
 # and exits clean. Score is visible per-run in the Actions UI.
 
+# HOSTED-RUNNER OPT-IN (founder, 2026-09-07 — hosted minutes are billed, "only
+# in extreme case with my approval"). `ossf/scorecard-action`'s own docs require
+# it to run on a GitHub-hosted runner (self-hosted is unsupported), so this job
+# CANNOT move to `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` the way the other
+# light workflows did. The `schedule:` trigger is REMOVED (it ran weekly,
+# unattended, on the heaviest of the four already-public-only scanners) and the
+# job's `if:` below now ALSO requires this input — so this workflow no longer
+# runs at all except a deliberately approved dispatch:
+#   gh workflow run openssf-scorecard --ref main -f hosted_runners=approved-by-founder
+# VERIFIED NO-OP FOR TODAY'S PRIVATE COST regardless: the repository condition
+# below already gated this job to the public repo only (confirmed skipped on
+# every private schedule firing) — this is belt-and-suspenders, and its real
+# effect is stopping the WEEKLY PUBLIC scan from running unattended.
 on:
-  schedule:
-    - cron: '23 4 * * 1'
   workflow_dispatch:
+    inputs:
+      hosted_runners:
+        description: >-
+          Run Scorecard (GitHub-hosted only, no self-hosted option)? Founder
+          approval only (2026-09-07). Leave "no" to no-op this workflow.
+        type: choice
+        options:
+          - "no"
+          - "approved-by-founder"
+        default: "no"
 
-# Moved off per-push (2026-06-06 CI cost pass): Scorecard is a slow scan with no
-# per-change merge-gating value. Runs weekly + on demand.
 concurrency:
   group: scorecard-${{ github.ref }}
   cancel-in-progress: true
@@ -45,8 +64,11 @@ permissions: read-all
 
 jobs:
   analysis:
-    # PUBLIC-ONLY: duplicates the public scan, and several checks (Branch-Protection, Code-Review) cannot evaluate on the private repo at all - the API 403s.
-    if: github.repository == 'tracelane/tracelane'
+    # PUBLIC-ONLY, AND NOW ALSO FOUNDER-APPROVED-DISPATCH-ONLY (see header).
+    if: >-
+      github.repository == 'tracelane/tracelane'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.hosted_runners == 'approved-by-founder'
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:

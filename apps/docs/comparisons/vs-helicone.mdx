@@ -18,7 +18,7 @@ and Helicone's `ai-gateway` carries a
 | Gateway language | Rust | Rust |
 | Wire format | OTel GenAI semconv (canonical) | Helicone's own schema; OpenTelemetry support documented as partial |
 | Predictive guardrails | Inline heuristic guardrails | — |
-| Tamper-evident audit ledger | $999 add-on SKU (tamper-evident hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap) | — |
+| Tamper-evident audit ledger | Included on every tier (hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap); 7-year retention + bulk export on Enterprise | — |
 | Auto-rollback on objective metrics | EWMA drift on metrics you post; not autonomous | — |
 | Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
 | Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |

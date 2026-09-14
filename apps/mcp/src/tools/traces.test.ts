@@ -93,7 +93,10 @@ const fakeServer = {
 	},
 };
 
-// Import after mocks are in place.
+// Import after mocks are in place. `ClickHouseReader` imports the same
+// `../db.js` / `../auth.js` modules mocked above, so it reads through the
+// fakes exactly like the pre-PLT-22 inline SQL did.
+import { ClickHouseReader } from "../reader.js";
 import { registerTraceTools } from "./traces.js";
 
 beforeEach(() => {
@@ -103,7 +106,7 @@ beforeEach(() => {
 	nextRows = [];
 	fakeClient.query.mockClear();
 	// biome-ignore lint/suspicious/noExplicitAny: structural fake.
-	registerTraceTools(fakeServer as any);
+	registerTraceTools(fakeServer as any, new ClickHouseReader());
 });
 
 afterEach(() => {
@@ -440,5 +443,42 @@ describe("replay_trace (newly implemented)", () => {
 		expect(JSON.stringify(out)).not.toContain('"stub"');
 		expect(out.span_count).toBe(0);
 		expect(out.error).toContain("not found");
+	});
+});
+
+describe("ClickHouse mode never calls the gateway (PLT-22 proof 4)", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("list_traces makes no HTTP request when CLICKHOUSE_URL is set (ClickHouseReader)", async () => {
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+		nextRows = [];
+
+		await callTool("list_traces", { limit: 5 });
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+		// And the read still went through the (mocked) ClickHouse client, so
+		// this isn't passing merely because nothing ran.
+		expect(fakeClient.query).toHaveBeenCalledTimes(1);
+	});
+
+	it("every tool in this suite makes zero HTTP requests", async () => {
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+		nextRows = [];
+
+		for (const name of registered.keys()) {
+			await registered.get(name)?.handler({
+				limit: 5,
+				trace_id: "t1",
+				span_id: "s1",
+				query: "boom",
+				include_tool_calls: true,
+			});
+		}
+
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 });

@@ -6,25 +6,63 @@
 
 Read-only MCP server exposing Tracelane trace data to any MCP-compatible client — Claude Desktop, Claude Code, Cursor, or any agent using the Model Context Protocol.
 
-> **Not on npm yet — `npx @tracelanedev/mcp` still 404s, including in the config
-> blocks below.** The package is wired into the release workflow and becomes
-> installable when the next signed release tag carries it. Releases are bundled —
-> one tag covering everything that has moved, never a tag cut for a single package
-> ([VERSIONING.md, "Release cadence"](../../VERSIONING.md#release-cadence--one-tag-everything-that-moved))
-> — so treat every `npx` line here as the *post-publish* form and use the
-> [from-source](#self-hosting) path today. The same run submits `apps/mcp/server.json`
-> to the MCP registry; the name it will be listed under is
-> `io.github.tracelane/tracelane-mcp`.
->
-> **It reads ClickHouse directly**, not through the gateway, so it needs ClickHouse
-> credentials and runs against a self-hosted or local Tracelane stack — not against a
-> hosted Cloud workspace.
+> **On npm since 2026-09-07:** `npx @tracelanedev/mcp` installs `@tracelanedev/mcp@0.3.0`; the
+> config blocks below work as written. From-source is still documented under [self-hosting](#self-hosting).
+> The same run submits `apps/mcp/server.json` to the MCP registry; the name it will be listed under is `io.github.tracelane/tracelane-mcp`.
+
+**Default mode reads through the gateway** — the same tenant-scoped `/v1/*` routes the
+dashboard uses — with just `TRACELANE_API_KEY` and `TRACELANE_GATEWAY_URL`. That is the
+Cloud-tenant path (PLT-22) and needs no ClickHouse credentials. Set `CLICKHOUSE_URL` to
+switch to self-host mode, reading ClickHouse directly instead — see
+[Self-hosting](#self-hosting).
 
 ## Quick start
 
-### Claude Desktop
+### Cloud (Tracelane-hosted tenant)
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS),
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows), or `.mcp.json` at your
+project root for Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "tracelane": {
+      "command": "npx",
+      "args": ["@tracelanedev/mcp"],
+      "env": {
+        "TRACELANE_API_KEY": "tlane_YOUR_KEY",
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+      }
+    }
+  }
+}
+```
+
+No `CLICKHOUSE_URL` — its absence is what selects gateway mode. Every read goes through
+the gateway's existing tenant-scoped routes, so a key from another tenant, or one lacking
+the `read` scope, gets a clear tool error rather than an empty result.
+
+### Until it is on npm
+
+Swap the two launch keys for a path into your clone — every `env` key is unchanged:
+
+```json
+"command": "node",
+"args": ["/path/to/tracelane/apps/mcp/dist/index.js"]
+```
+
+Build it first with `pnpm install && pnpm --filter @tracelanedev/mcp build`.
+
+The Streamable HTTP transport ships in this package (`TRACELANE_MCP_TRANSPORT=http`,
+see [Transports](#transports)) — run it yourself. There is **no hosted endpoint**:
+`https://mcp.tracelane.dev` does not resolve, so a `url`-style client entry has
+nothing to connect to.
+
+### Self-host (ClickHouse)
+
+Set `CLICKHOUSE_URL` to read ClickHouse directly instead of the gateway — for a
+self-hosted or local Tracelane stack:
 
 ```json
 {
@@ -44,35 +82,19 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
-### Claude Code
-
-The same block in `.mcp.json` at the project root.
-
-### Until it is on npm
-
-Swap the two launch keys for a path into your clone — every `env` key is unchanged:
-
-```json
-"command": "node",
-"args": ["/path/to/tracelane/apps/mcp/dist/index.js"]
-```
-
-Build it first with `pnpm install && pnpm --filter @tracelanedev/mcp build`.
-
-The Streamable HTTP transport ships in this package (`TRACELANE_MCP_TRANSPORT=http`,
-see [Transports](#transports)) — run it yourself. There is **no hosted endpoint**:
-`https://mcp.tracelane.dev` does not resolve, so a `url`-style client entry has
-nothing to connect to.
+`TRACELANE_GATEWAY_URL` is still needed in self-host mode — it is where
+`TRACELANE_API_KEY` is validated (`/v1/auth/whoami`) even though trace reads go to
+ClickHouse instead.
 
 ## Tools
 
 | Tool | Description |
 |---|---|
-| `list_traces` | List recent traces for the tenant. Params: `limit` (default 20), `since` (ISO timestamp), `model` (filter by model name) |
+| `list_traces` | List recent traces for the tenant. Params: `limit` (default 20), `model_filter`, `has_error` |
 | `get_trace` | Get all spans for a trace. Params: `trace_id` |
-| `get_span` | Get full details for a span including all LLM GenAI attributes. Params: `span_id` |
-| `search_traces` | Full-text search across trace root names and metadata. Params: `query`, `limit` |
-| `explain_guardrail_block` | Human-readable explanation of why a request was blocked or warned. Params: `span_id` |
+| `get_span` | Get full details for a span including all LLM GenAI attributes. Params: `span_id`, `trace_id` — **required in Cloud (gateway) mode** (no span-by-id gateway route; the span is picked out of the trace's span list), optional in self-host mode |
+| `search_traces` | Free-text search across span names and attributes. Params: `query` (gateway mode requires ≥4 chars), `model_filter?`, `has_error?`, `limit`. Gateway mode returns content-filtered trace summaries; self-host mode returns per-span match detail (`matched_spans`, `first_match_*`) |
+| `explain_guardrail_block` | Human-readable explanation of a guardrail signal. Self-host mode: `trace_id` + `span_id` (a detection-layer AFT flag on a recorded span). Gateway mode: EITHER `correlation_id` (from a block's 403 body, for a request blocked pre-flight with no trace) OR `trace_id` + `span_id` (same AFT-flag case, still available since spans carry the flag either way) |
 | `list_evals` | List every pain-point + fault-tolerance eval id and count, read from the manifest bundled at build time from `evals/`. Params: none |
 | `get_eval_result` | Read a specific eval's assertions. Needs a repo checkout for the source; says so when there is none. Params: `eval_id` |
 | `replay_trace` | Return a recorded trace as-is (ordered spans with LLM/tool attributes) for offline step-through. **Read-only — it does not re-execute any model or tool.** Params: `trace_id`, `include_tool_calls?` |
@@ -103,10 +125,11 @@ Once connected, you can ask Claude:
 ## Security invariants
 
 - **Read-only.** No write tools are registered — the tool surface is the eight listed above, all of which only read.
-- **Tenant isolation.** Every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound, never string-interpolated).
-- **`tenant_id` is never a tool parameter.** Stdio resolves it once at startup from `TRACELANE_API_KEY` via the gateway and refuses to start if the key is rejected; HTTP resolves it per request from the bearer token and binds it through `AsyncLocalStorage`.
+- **Tenant isolation.** Gateway mode: every read is a tenant-scoped gateway route (`crates/gateway/src/trace_reads.rs`) — the tenant comes from the bearer's claims server-side, this server never sends or sees a tenant id. Self-host mode: every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound, never string-interpolated).
+- **`tenant_id` is never a tool parameter** in either mode. Stdio resolves it once at startup from `TRACELANE_API_KEY` via the gateway and refuses to start if the key is rejected; HTTP resolves it per request from the bearer token and binds it through `AsyncLocalStorage`.
+- **A non-2xx gateway response is a tool error, never an empty result.** A revoked or wrong-tenant key, a key missing the `read` scope, or another tenant's trace id all read back as `isError: true` carrying the gateway's own status and message — not `[]`.
 - **No eval id reaches the filesystem.** `get_eval_result` looks the id up in the bundled manifest and uses the manifest's path, so a traversal string cannot name a file.
-- **`TRACELANE_GATEWAY_URL` is SSRF-checked** before any bearer is sent to it: https-only outside development, tracelane.dev hosts only, private/CGNAT/IMDS ranges refused.
+- **`TRACELANE_GATEWAY_URL` is SSRF-checked** before any bearer is sent to it, in both modes: https-only outside development, tracelane.dev hosts only, private/CGNAT/IMDS ranges refused.
 
 **Known gap — span content is returned verbatim.** There is no redaction pass over
 span attributes and no untrusted-content sentinel around user text. Do not point this

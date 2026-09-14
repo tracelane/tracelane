@@ -31,7 +31,17 @@ function isBareRoute(pathname: string): boolean {
 	return (
 		pathname === "/onboarding" ||
 		pathname.startsWith("/sign-in") ||
-		pathname.startsWith("/auth")
+		pathname.startsWith("/auth") ||
+		// OBS-48 `/s/[token]` is the UNAUTHENTICATED public share page
+		// (`app/s/[token]/page.tsx` — "no requireSession, no withAuth, no
+		// user JWT anywhere in this file") and builds its own complete
+		// header/footer chrome. Without this the full authenticated
+		// Sidebar+TopBar (Dashboard/Settings/Account nav, Ask Tara,
+		// notifications — all session-requiring) wrapped around it too,
+		// showing an anonymous visitor the internal app chrome and
+		// double-rendering the page's own header. Found by the qaA
+		// render-proof sweep.
+		pathname.startsWith("/s/")
 	);
 }
 
@@ -80,7 +90,7 @@ export function AppShell({
 					 * for it. Vertical padding is `py-6` so the first card clears the sticky
 					 * bar rather than touching it.
 					 */}
-					<main className="app-canvas min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8 xl:px-10">
+					<main className="app-canvas min-w-0 flex-1 px-4 py-4 sm:px-6 lg:px-8 xl:px-10">
 						{children}
 					</main>
 				</div>

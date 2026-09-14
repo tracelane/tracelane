@@ -39,23 +39,45 @@
  *    hand-rolled tables that primitive exists to replace.
  */
 
-import type { SloModelRow, SloTimePoint } from "@/app/slo/types";
+import type { SloModelRow } from "@/app/slo/types";
 import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { MetricChart } from "@/components/metrics/MetricChart";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { PLAN_TO_LOOKUP_KEY, type Plan } from "@/lib/entitlements";
-import { GatewayError, gatewayGet } from "@/lib/gateway";
-import { fetchLatencyBreakdown, overheadByModelKey } from "@/lib/latency";
-import { rangeBucketMs, rangeLabel, rangeToHours } from "@/lib/range";
+import { overheadByModelKey } from "@/lib/latency";
+import {
+	fetchLatencyBreakdownFor,
+	fetchSloModels,
+	fetchSloSummary,
+	fetchSloTimeseries,
+} from "@/lib/metrics/fetch";
+import {
+	fmtCompact,
+	fmtCount,
+	fmtDurationMs,
+	fmtFraction,
+	fmtPercent,
+	fmtRatio,
+} from "@/lib/metrics/format";
+import { hintOf } from "@/lib/metrics/hint";
+import { METRICS } from "@/lib/metrics/registry";
+import { drawableBuckets, sloLatencySeries } from "@/lib/metrics/series";
+import { sloHeadline } from "@/lib/metrics/tiles";
+import {
+	type TimeRange,
+	bucketLabel,
+	parseTimeRange,
+} from "@/lib/metrics/time-range";
 import {
 	Badge,
 	type BadgeProps,
 	Card,
 	EmptyState,
 	Gauge,
-	LatencyTimeline,
 	MetricIcon,
 	type MetricIconName,
 	Skeleton,
@@ -65,7 +87,6 @@ import {
 	THead,
 	TR,
 	Table,
-	TimeRuler,
 	cn,
 } from "@tracelanedev/ui";
 import { eq } from "drizzle-orm";
@@ -76,26 +97,16 @@ import {
 	SLO_TARGET_AVAILABILITY,
 	type SloBudget,
 	availabilityTargetForPlanKey,
-	computeSloBudget,
 } from "./budget";
-import { chartWindow, latencyPointsFromTimeseries } from "./latency";
 
 export const metadata: Metadata = { title: "SLOs — Tracelane" };
 
-function formatDuration(ms: number): string {
-	if (ms < 1000) return `${ms.toFixed(0)}ms`;
-	return `${(ms / 1000).toFixed(2)}s`;
-}
-
-function formatTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-	return String(n);
-}
-
-function formatBurnRate(x: number): string {
-	return Number.isFinite(x) ? `${x.toFixed(2)}×` : "∞×";
-}
+// ONE formatter per kind — the registry's (`lib/metrics/format.ts`). The page's
+// own `formatDuration` printed `0ms` where the dashboard printed `—` for the same
+// absence (DSH-11 §3.1); both now go through `fmtDurationMs`.
+const formatDuration = fmtDurationMs;
+const formatTokens = fmtCompact;
+const formatBurnRate = fmtRatio;
 
 function formatBudgetRemaining(pct: number): string {
 	if (!Number.isFinite(pct)) return "over budget";
@@ -236,7 +247,7 @@ function MetricStrip({
 						</span>
 						<span className="mt-auto flex flex-col gap-1.5 pt-2">
 							{/* GRAPHITE, always (P0.6). The tone lives in the sub-line. */}
-							<span className="t-metric font-mono text-ink">{k.value}</span>
+							<span className="t-metric text-ink">{k.value}</span>
 							<span className="flex min-h-4 items-center text-2xs">
 								{k.sub}
 							</span>
@@ -457,6 +468,17 @@ function SloTable({
 							</TH>
 							<TH numeric>Input tokens</TH>
 							<TH numeric>Output tokens</TH>
+							{/* Founder 2026-09-04: the percentiles beside each other invite a
+							    like-for-like speed reading, and that reading is wrong — an LLM
+							    call's wall time is dominated by how many tokens it DECODES. A
+							    model asked for 4 tokens will beat one asked for 37 whatever its
+							    raw speed. This column is the missing denominator. */}
+							<TH
+								numeric
+								title="Median output tokens per request (total output tokens ÷ requests). Latency scales with output length, so compare p50 only between rows with a similar figure here — a short answer is not a fast model."
+							>
+								Out tok/req
+							</TH>
 						</TR>
 					</THead>
 					<TBody>
@@ -469,8 +491,11 @@ function SloTable({
 							return (
 								<TR key={key}>
 									<TD className="min-w-[11rem]">
+										{/* The empty-provider group is tool/child spans. It is NOT an LLM
+										    call and is excluded from every headline above (registry rule:
+										    provider ≠ ''), so the row says what it is rather than "—". */}
 										<div className="font-medium text-xs text-ink">
-											{s.provider || "—"}
+											{s.provider || "non-LLM spans"}
 										</div>
 										<div className="font-mono text-xs text-ink-2">
 											{s.model || "—"}
@@ -488,9 +513,9 @@ function SloTable({
 											/>
 										</div>
 									</TD>
-									<TD numeric>{s.requests.toLocaleString()}</TD>
+									<TD numeric>{fmtCount(s.requests)}</TD>
 									<TD numeric className={errorRateBand(errorPct).ink}>
-										{errorPct.toFixed(2)}%
+										{fmtPercent(errorPct, { n: s.requests, floor: 100 }).text}
 									</TD>
 									<TD numeric muted>
 										{formatDuration(s.p50_ms)}
@@ -513,6 +538,13 @@ function SloTable({
 									</TD>
 									<TD numeric muted>
 										{formatTokens(s.total_output_tokens)}
+									</TD>
+									<TD numeric muted>
+										{s.requests > 0
+											? Math.round(
+													s.total_output_tokens / s.requests,
+												).toLocaleString("en-US")
+											: "—"}
 									</TD>
 								</TR>
 							);
@@ -552,55 +584,34 @@ async function availabilityTarget(): Promise<number> {
 	}
 }
 
-async function SloData({ range }: { range?: string }) {
-	const hours = rangeToHours(range);
-	const label = rangeLabel(range);
-	const bucketMs = rangeBucketMs(range);
-	const bucketHours = Math.max(1, Math.round(bucketMs / 3_600_000));
-	let modelRows: SloModelRow[];
-	let timePoints: SloTimePoint[];
-	try {
-		// Gateway-proxied reads (Option 1) — the gateway owns the
-		// slo_hourly_stats queries and resolves the tenant from the forwarded token.
-		// Table = per-(provider,model) TRUE merged quantiles; chart = per-bucket
-		// TRUE merged quantiles — NOT client-side means of per-hour percentiles
-		// (provenance audit P2 #8).
-		[modelRows, timePoints] = await Promise.all([
-			gatewayGet<SloModelRow[]>(`/v1/slo/models?hours=${hours}`),
-			gatewayGet<SloTimePoint[]>(
-				`/v1/slo/timeseries?hours=${hours}&bucket=${bucketHours}`,
-			),
-		]);
-	} catch (err) {
+async function SloData({ range }: { range: TimeRange }) {
+	const label = range.label;
+	// Four reads for ONE window, in flight together — the latency breakdown used to
+	// wait sequentially behind the other two (inventory finding). All through
+	// `lib/metrics/fetch.ts`; this page computes no hours and no bucket.
+	const [modelRows, timePoints, sloSummary, latency] = await Promise.all([
+		fetchSloModels(range),
+		fetchSloTimeseries(range),
+		fetchSloSummary(range),
+		fetchLatencyBreakdownFor(range),
+	]);
+	if (modelRows === null) {
 		// Gateway unreachable → warming banner + empty table, not the error card.
-		// Re-throw anything else (incl. NEXT_REDIRECT from the auth helper).
-		if (err instanceof GatewayError) {
-			return (
-				<div className="space-y-3">
-					<WarmingBanner />
-					<SectionLabel>By provider &amp; model</SectionLabel>
-					<SloTable modelRows={[]} overheadByModel={new Map()} />
-				</div>
-			);
-		}
-		throw err;
+		return (
+			<div className="space-y-3">
+				<WarmingBanner />
+				<SectionLabel>By provider &amp; model</SectionLabel>
+				<SloTable modelRows={[]} overheadByModel={new Map()} />
+			</div>
+		);
 	}
+	const overheadByModel = overheadByModelKey(latency);
 
-	// Per-(provider, model) gateway overhead for the table's "our slice" column
-	// (§ latency framing). Best-effort: an unreachable gateway → empty map → "—".
-	const overheadByModel = overheadByModelKey(
-		await fetchLatencyBreakdown({ hours }),
-	);
-
-	// Headline totals over LLM-request rows only (provider!==""), MATCHING the
-	// dashboard (dashboard/page.tsx:176). The empty-provider bucket is tool/child
-	// spans; including it double-counted requests and diluted the error rate, so
-	// the SLO "LLM calls"/"Error rate" tiles reconcile with the identically-named
-	// dashboard KPIs (same slo_hourly_stats source). The per-provider table below
-	// still renders all rows. (Provenance audit P1 — cross-page parity.)
+	// Headline totals: /v1/slo/summary is the registry's ONE source for `llm_calls`
+	// and `error_rate`, so this page and /dashboard agree by construction. The
+	// per-model rows (provider !== "" — tool/child spans are not LLM calls) are the
+	// fallback only while the summary route is unreachable.
 	const llmRows = modelRows.filter((r) => r.provider !== "");
-	const totalRequests = llmRows.reduce((s, r) => s + r.requests, 0);
-	const totalErrors = llmRows.reduce((s, r) => s + r.errors, 0);
 	const totalInputTokens = llmRows.reduce(
 		(s, r) => s + r.total_input_tokens,
 		0,
@@ -609,28 +620,23 @@ async function SloData({ range }: { range?: string }) {
 		(s, r) => s + r.total_output_tokens,
 		0,
 	);
-	const overallErrorPct =
-		totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
-	// Chart points are the gateway's TRUE per-bucket quantiles — just format the
-	// UTC label + rename fields (no client re-aggregation).
-	// R59: the REQUESTED window, so "— last {range}" above is true. See
-	// app/slo/latency.ts ChartWindow for why a data-derived domain was the defect.
-	const win = chartWindow(Date.now(), hours, bucketMs);
-	const latencyPoints = latencyPointsFromTimeseries(timePoints, bucketMs, win);
-	const budget = computeSloBudget(
-		totalRequests,
-		totalErrors,
-		await availabilityTarget(),
-	);
+	const target = await availabilityTarget();
+	const head = sloHeadline({
+		summary: sloSummary,
+		fallback: {
+			requests: llmRows.reduce((s, r) => s + r.requests, 0),
+			errors: llmRows.reduce((s, r) => s + r.errors, 0),
+		},
+		target,
+		unreachable: false,
+	});
+	const { requests: totalRequests, errors: totalErrors, budget } = head;
+	const overallErrorPct = budget.errorRatePct;
+	const latencyData = sloLatencySeries(range, timePoints ?? []);
 
-	// MIRRORS `LatencyTimeline`'s OWN GUARD (`points.length < 2 || drawable < 2`).
-	// The chart refuses to draw below two measured buckets and says so in one grey
-	// line — which used to leave that sentence and a full absolute TimeRuler for a
-	// chart that is not there, sitting in a card sized for one. When it cannot
-	// draw, the card shows an empty state instead; the primitive keeps its own
-	// guard as defence in depth.
-	const drawableBuckets = latencyPoints.filter((p) => p.p95 != null).length;
-	const canChart = latencyPoints.length >= 2 && drawableBuckets >= 2;
+	// A chart needs two measured buckets; below that the card shows its empty
+	// state rather than an axis over nothing.
+	const canChart = drawableBuckets(latencyData, "p95") >= 2;
 
 	// An empty window is not a healthy one. `computeSloBudget` returns a full,
 	// untouched budget at zero traffic (100% available, 0× burn) — correct
@@ -638,6 +644,10 @@ async function SloData({ range }: { range?: string }) {
 	// no requests in it reads as a measurement. The numbers are untouched; only
 	// the state WORDS step aside for the honest one.
 	const noTraffic = totalRequests === 0;
+	// §3d — precision the sample cannot support is not rendered, and a target is
+	// only judged once the sample could resolve it.
+	const avail = head.availability;
+	const errRate = head.errorRate;
 	const health = BURN_HEALTH[budget.tone];
 	const errBand = errorRateBand(overallErrorPct);
 	// Bar for the budget-remaining cell, sized from the percentage the cell is
@@ -650,16 +660,22 @@ async function SloData({ range }: { range?: string }) {
 	const budgetKpis: Kpi[] = [
 		{
 			icon: "error-budget",
-			label: "SLO target (your plan)",
+			label: METRICS.slo_target.label,
 			value: `${budget.targetPct.toFixed(1)}%`,
 			sub: <span className="text-ink-3">contracted availability</span>,
 		},
 		{
 			icon: "time",
-			label: `Availability (${label})`,
-			value: `${budget.availabilityPct.toFixed(3)}%`,
+			label: METRICS.availability.label,
+			value: avail.noSample ? "—" : avail.text,
+			hint: hintOf(METRICS.availability),
 			sub: noTraffic ? (
-				<span className="text-ink-3">no traffic in window</span>
+				<span className="text-ink-3">{METRICS.availability.zeroCopy}</span>
+			) : avail.belowFloor ? (
+				<span className="text-ink-3">
+					n = {fmtCount(totalRequests)} · below the {fmtCount(avail.floor)}
+					-request floor for a {budget.targetPct.toFixed(1)}% target
+				</span>
 			) : (
 				<span className={BAND_INK[budget.tone]}>
 					{AVAILABILITY_BAND[budget.tone]}
@@ -668,8 +684,12 @@ async function SloData({ range }: { range?: string }) {
 		},
 		{
 			icon: "error-budget",
-			label: "Error budget remaining",
-			value: formatBudgetRemaining(budget.budgetRemainingPct),
+			label: METRICS.budget_remaining.label,
+			hint: hintOf(METRICS.budget_remaining),
+			value:
+				noTraffic || avail.belowFloor
+					? "—"
+					: formatBudgetRemaining(budget.budgetRemainingPct),
 			sub: (
 				<span
 					aria-hidden="true"
@@ -687,28 +707,41 @@ async function SloData({ range }: { range?: string }) {
 	const volumeKpis: Kpi[] = [
 		{
 			icon: "llm-calls",
-			label: `LLM calls (${label})`,
-			value: totalRequests.toLocaleString(),
-			hint: "Model requests — one agent run can make several. Not the trace/conversation count (see Traces).",
+			label: METRICS.llm_calls.label,
+			value: head.llmCalls,
+			hint: hintOf(METRICS.llm_calls),
+			sub: (
+				<span className="text-ink-3">
+					{noTraffic ? METRICS.llm_calls.zeroCopy : label}
+				</span>
+			),
 		},
 		{
 			icon: "failure-signatures",
-			label: "Error rate",
-			value: `${overallErrorPct.toFixed(2)}%`,
+			label: METRICS.error_rate.label,
+			value: errRate.noSample ? "—" : errRate.text,
+			hint: hintOf(METRICS.error_rate),
 			sub: noTraffic ? (
-				<span className="text-ink-3">no traffic in window</span>
+				<span className="text-ink-3">{METRICS.error_rate.zeroCopy}</span>
+			) : errRate.belowFloor ? (
+				<span className="text-ink-3">
+					{fmtFraction(totalErrors, totalRequests)} failed · n below the{" "}
+					{fmtCount(errRate.floor)}-request floor
+				</span>
 			) : (
 				<span className={errBand.ink}>{errBand.text}</span>
 			),
 		},
 		{
 			icon: "tokens",
-			label: "Input tokens",
+			label: METRICS.tokens_input.label,
+			hint: hintOf(METRICS.tokens_input),
 			value: formatTokens(totalInputTokens),
 		},
 		{
 			icon: "tokens",
-			label: "Output tokens",
+			label: METRICS.tokens_output.label,
+			hint: hintOf(METRICS.tokens_output),
 			value: formatTokens(totalOutputTokens),
 		},
 	];
@@ -730,7 +763,7 @@ async function SloData({ range }: { range?: string }) {
 				<div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
 					<div className="min-w-0">
 						<h2 className="text-sm font-semibold text-ink">
-							Error budget — last {label} vs a {budget.targetPct.toFixed(1)}%
+							Error budget — {label} vs a {budget.targetPct.toFixed(1)}%
 							availability target
 						</h2>
 						<p className="mt-0.5 text-xs text-ink-3">
@@ -741,6 +774,13 @@ async function SloData({ range }: { range?: string }) {
 					</div>
 					{noTraffic ? (
 						<Badge tone="neutral">No traffic</Badge>
+					) : avail.belowFloor ? (
+						<Badge
+							tone="neutral"
+							title={`n = ${totalRequests} — below the ${avail.floor}-request floor a ${budget.targetPct.toFixed(1)}% target needs`}
+						>
+							Small sample
+						</Badge>
 					) : (
 						<Badge tone={health.tone} title={health.title}>
 							{health.label}
@@ -879,22 +919,16 @@ async function SloData({ range }: { range?: string }) {
 				<Card className="flex flex-col p-6">
 					<CardHead
 						icon="latency"
-						title={`Latency over time — last ${label} · UTC`}
-						meta="true quantiles per bucket"
+						title={`Latency over time — ${label}${range.kind === "preset" ? " · UTC" : ""}`}
+						meta={`true quantiles per ${bucketLabel(range.bucketMs)} bucket`}
 					/>
 					{canChart ? (
-						<>
-							<LatencyTimeline points={latencyPoints} />
-							{/* ADR-074 §7 — the one time axis. `preserveAspectRatio="none"`
-							    means the chart svg stretches edge to edge, so the ruler
-							    needs no inset. */}
-							<TimeRuler
-								startMs={win.startMs}
-								endMs={win.endMs + bucketMs}
-								ticks={4}
-								mode="absolute"
-							/>
-						</>
+						<MetricChart
+							data={latencyData}
+							label={`p50, p95 and p99 latency per ${bucketLabel(range.bucketMs)} bucket, ${label}`}
+							drillPath="/traces"
+							legend
+						/>
 					) : (
 						<SloEmpty
 							// The chart it replaces is `h-44` plus a ruler — ~200px — so the
@@ -902,7 +936,11 @@ async function SloData({ range }: { range?: string }) {
 							// the comb has a floor to sit on that is clear of the copy.
 							className="min-h-56 justify-center"
 							ghost={<GhostFloor />}
-							title="No latency data yet"
+							title={
+								timePoints === null
+									? "Waiting on the gateway"
+									: "No latency data yet"
+							}
 							description="Per-bucket p50, p95 and p99 appear here once at least two buckets in the window carry traffic."
 							action={{ href: "/gateway", label: "Gateway setup" }}
 						/>
@@ -912,7 +950,7 @@ async function SloData({ range }: { range?: string }) {
 
 			<section aria-label="By provider and model" className="space-y-3">
 				<SectionLabel
-					action={<span className="text-2xs text-ink-3">last {label}</span>}
+					action={<span className="text-2xs text-ink-3">{label}</span>}
 				>
 					By provider &amp; model
 				</SectionLabel>
@@ -928,9 +966,10 @@ export const dynamic = "force-dynamic";
 export default async function SloPage({
 	searchParams,
 }: {
-	searchParams: Promise<{ range?: string }>;
+	searchParams: Promise<{ range?: string; since?: string; until?: string }>;
 }) {
-	const { range } = await searchParams;
+	const sp = await searchParams;
+	const range = parseTimeRange(sp, { defaultPreset: "24h", nowMs: Date.now() });
 	return (
 		/* Page padding ramps with the viewport, matching the dashboard: a pinned
 		   `px-2` gutter put the whole surface ~7px from the edge of the content
@@ -945,11 +984,12 @@ export default async function SloPage({
 					<h1 className="t-h1">SLOs</h1>
 					<p className="mt-2 text-sm text-ink-2">
 						Error budget, latency percentiles, and error rates by provider/model
-						— last {rangeLabel(range)}
+						— {range.label}
 					</p>
 				</div>
 				<RangeControl />
 			</header>
+			<WindowNotice range={range} />
 			<Suspense
 				fallback={
 					<div className="space-y-8">

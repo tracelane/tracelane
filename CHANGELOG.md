@@ -13,6 +13,14 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+**Pricing v3 — six usage meters, five tiers.** Billing moves from a trace-count quota to
+six continuous per-unit meters (ingest, hot indexed window, series, query compute, cold
+archive, evaluations), each with its own included allowance and no rollover. Ingest is
+never blocked by billing state on any tier. Seats are unlimited on every paid tier. See
+[tracelane.dev/pricing](https://tracelane.dev/pricing) for current rates.
+
 ### Added
 
 **Framework integrations — LangChain, LangGraph, LlamaIndex, CrewAI and the Vercel AI
@@ -269,9 +277,10 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
   (base URL + auth headers) as a reviewable diff; `tlane import-helicone` reads
   existing projects, traces, and prompt versions. Historical trace-data import is
   **(roadmap)**.
-- **Supply-chain trust** — Cosign keyless signatures, CycloneDX SBOMs, SLSA Build
-  Level 3 provenance, OSV-Scanner + Grype + Syft scanning, and OIDC Trusted
-  Publishing on every release artifact.
+- **Supply-chain trust** — Cosign keyless signatures, CycloneDX SBOMs, GitHub
+  build-provenance attestations (`attest-build-provenance`, SLSA provenance
+  format), OSV-Scanner + Grype + Syft scanning, and OIDC Trusted Publishing on
+  every release artifact.
 
 ### Changed
 

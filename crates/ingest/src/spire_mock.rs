@@ -85,7 +85,6 @@ impl SpiffeWorkloadApi for MockService {
 pub struct MockSpireHandle {
     pub socket_path: PathBuf,
     _shutdown: oneshot::Sender<()>,
-    pub join: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn the mock server on a Unix Domain Socket inside `dir`. Returns
@@ -100,7 +99,10 @@ pub async fn spawn_mock_spire(dir: &Path, material: MockSpireMaterial) -> MockSp
     let (tx, rx) = oneshot::channel::<()>();
     let svc = SpiffeWorkloadApiServer::new(MockService { material });
 
-    let join = tokio::spawn(async move {
+    // Handle deliberately not kept: dropping a `JoinHandle` in tokio detaches
+    // rather than aborts, and the task's own lifetime is governed by the
+    // `_shutdown` oneshot below, not by anyone awaiting this handle.
+    tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(svc)
             .serve_with_incoming_shutdown(stream, async {
@@ -112,6 +114,5 @@ pub async fn spawn_mock_spire(dir: &Path, material: MockSpireMaterial) -> MockSp
     MockSpireHandle {
         socket_path,
         _shutdown: tx,
-        join,
     }
 }

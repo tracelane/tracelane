@@ -125,15 +125,16 @@ export default async function AuditKeyPage() {
 						Your batches are signed with Tracelane&apos;s operator key, so the
 						ledger is tamper-evident — but a third party cannot verify it
 						without trusting us. A per-workspace signing key, which is what
-						makes independent verification possible, is issued with the Audit
-						add-on.
+						makes independent verification possible, is issued on every plan
+						with your first recorded batch.
 					</p>
 				</Card>
 			)}
 
 			{/* How-to — written from the ADR-066 entitlement split, not marketing:
 			    self-verify is default-granted on EVERY plan; only the Article-12
-			    evidence-pack export is the $999 Audit add-on. The chain is
+			    export is entitlement-gated (f_audit_addon — seeded TRUE on Enterprise
+			    only; the paid Article-12 add-on is NOT sold, spec BILL-01 §10.4 / B-392). The chain is
 			    per-workspace (never per-trace) and tamper-evident (the chain
 			    proves whether a record was altered). Every capability named below is built + live. */}
 			<Card className="space-y-4 p-5">
@@ -195,13 +196,13 @@ export default async function AuditKeyPage() {
 						</span>
 						<span>
 							<span className="font-medium text-ink">
-								Export the Article-12 evidence pack — paid ($999/mo Audit
-								add-on).
+								Export the complete Article-12 ledger — Enterprise plan (7-year
+								retention).
 							</span>{" "}
 							For a formatted, downloadable compliance deliverable (EU AI Act
-							Article 12), enable the Audit add-on and the export appears on the
-							Audit page. Self-verify (steps 1–2) stays free — only this filed
-							export is the paid part.
+							Article 12), the export appears on the Audit page on the
+							Enterprise plan. Self-verify (steps 1–2) is included on every plan
+							— only this filed export is Enterprise-only.
 						</span>
 					</li>
 				</ol>
@@ -213,8 +214,8 @@ export default async function AuditKeyPage() {
 					chain unbroken). Hand your auditor the signing key above out-of-band;
 					they reproduce the same green with{" "}
 					<code className="font-mono text-ink">tlane verify</code> on their own
-					machine. If they need a filed compliance pack, export it via the Audit
-					add-on.
+					machine. If they need a filed compliance pack, export it from the
+					Audit page (Enterprise plan).
 				</div>
 
 				<Link

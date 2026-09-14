@@ -1,0 +1,19 @@
+# PLT-23 — LiteLLM Python proxy config for the OpenAI-route overhead scenario.
+# The api_base placeholder below is substituted by run.sh (sed) with the
+# effective $MOCK_URL —
+# `http://127.0.0.1:9500` on this dev box, a CCX23 public IPv4 for the
+# publishable run (Tracelane's own SSRF guard rejects a loopback/RFC1918
+# ANTHROPIC_BASE_URL in release builds, so every gateway shares one
+# non-loopback MOCK_URL for symmetry — see run.sh's header comment).
+# Verified working 2026-09-06:
+#   litellm --config configs/litellm-python.config.yaml --port 8102
+# Client sends model="mock" to LiteLLM's own OpenAI-compatible
+# `/v1/chat/completions`; litellm_params.model tells litellm which upstream SDK
+# call to make (openai/*, pointed at the mock via api_base), independent of the
+# public model_name.
+model_list:
+  - model_name: mock
+    litellm_params:
+      model: openai/mock
+      api_base: __MOCK_URL__/v1
+      api_key: dummy

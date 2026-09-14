@@ -1,6 +1,6 @@
 {
 	"name": "@tracelanedev/mcp",
-	"version": "0.2.4",
+	"version": "0.3.0",
 	"description": "Tracelane MCP server — read-only, tenant-scoped trace access",
 	"mcpName": "io.github.tracelane/tracelane-mcp",
 	"repository": {

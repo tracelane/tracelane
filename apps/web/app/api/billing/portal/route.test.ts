@@ -79,8 +79,38 @@ describe("POST /api/billing/portal", () => {
 		});
 		const res = await POST();
 		expect(res.status).toBe(401);
-		expect(JSON.stringify(await res.json())).not.toContain(
-			"unauthorized detail",
-		);
+		const body = await res.json();
+		expect(JSON.stringify(body)).not.toContain("unauthorized detail");
+		// A 401 is not one of the three refusals the button can explain, so no
+		// reason is attached — the button falls back to its status-based copy.
+		expect(body.reason).toBeUndefined();
 	});
+
+	// Founder, 2026-09-14: "Manage billing throws 'billing portal unavailable'".
+	// The gateway's 403 (not the workspace owner) and 409 (no Polar customer yet)
+	// are NOT portal failures; the proxy tags them so the button can say what is
+	// actually going on. The reason is derived from the STATUS ONLY — the body is
+	// still never read, because a Polar error body can echo a request id.
+	it.each([
+		[403, 403, "owner_required"],
+		[409, 409, "no_billing_account"],
+		[503, 502, "not_configured"],
+	] as const)(
+		"tags an upstream %i as %i with reason %s, still without the body",
+		async (upstreamStatus, expectedStatus, expectedReason) => {
+			fetchMock.mockResolvedValue({
+				ok: false,
+				status: upstreamStatus,
+				json: async () => ({ error: "UPSTREAM_DETAIL_MUST_NOT_LEAK" }),
+			});
+			const res = await POST();
+			expect(res.status).toBe(expectedStatus);
+			const body = (await res.json()) as { error: string; reason?: string };
+			expect(body.error).toBe("billing portal unavailable");
+			expect(body.reason).toBe(expectedReason);
+			expect(JSON.stringify(body)).not.toContain(
+				"UPSTREAM_DETAIL_MUST_NOT_LEAK",
+			);
+		},
+	);
 });

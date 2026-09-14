@@ -43,7 +43,10 @@ pub enum GuardrailFeature {
 }
 
 impl GuardrailFeature {
-    /// All gated features (the non-free-default rails). Used by [`RailGate::all`].
+    /// All gated features (the non-free-default rails). Used by [`RailGate::all`],
+    /// which itself has no production caller (see its doc). Used only by
+    /// tests, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     pub const ALL: [GuardrailFeature; 6] = [
         GuardrailFeature::R2SecretsPii,
         GuardrailFeature::R3DefinitionPinning,
@@ -70,7 +73,13 @@ impl RailGate {
         Self { granted: 0 }
     }
 
-    /// Everything granted — Enterprise / tests.
+    /// Everything granted.
+    ///
+    /// No production caller today (corrected 2026-09-12, B-390 — this used
+    /// to also say "Enterprise"; `resolve()` below computes an Enterprise
+    /// tenant's real gate from entitlements rather than calling this).
+    /// Used only by tests, hence gated.
+    #[cfg(test)]
     #[must_use]
     pub fn all() -> Self {
         let mut g = Self::free_defaults_only();

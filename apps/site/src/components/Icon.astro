@@ -1,0 +1,52 @@
+---
+/* One inline SVG icon set for the whole site — 24-unit grid, 1.5px stroke,
+   round caps/joins, no fills, a subtle accent dot in --action (opt-out via
+   dot={false}). Replaces every ad-hoc <svg> icon in index.astro. */
+export interface Props {
+  name:
+    | "agent" | "gateway" | "provider"
+    | "drift" | "check" | "tool"
+    | "record" | "replay" | "prove"
+    | "sun" | "moon";
+  size?: number;
+  dot?: boolean;
+  class?: string;
+}
+const { name, size = 24, dot = true, class: klass = "" } = Astro.props;
+
+const paths: Record<string, string> = {
+  agent: "M8 8V6a4 4 0 0 1 8 0v2 M3.5 8h17a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-17a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z M8 13h.01 M16 13h.01",
+  gateway: "M12 3a9 9 0 1 0 9 9 M12 3v6l4 2",
+  provider: "M4 18l6-11 6 11M8.2 14h3.6 M18 6.6a2.1 2.1 0 1 0 0-4.2 2.1 2.1 0 0 0 0 4.2Z",
+  drift: "M3 12h4l3 8 4-16 3 8h4",
+  check: "M4.5 4.5h15v15h-15Z M8.5 12l2.3 2.3L15.8 9",
+  tool: "M12 2.5l3.1 6.2 6.4 1-4.6 4.5 1.1 6.3-5.9-3.2-5.9 3.2 1.1-6.3-4.6-4.5 6.4-1Z",
+  record: "M4 5.5h16v13H4Z M4 9.5h16",
+  replay: "M20.5 12a8.5 8.5 0 1 1-2.5-6",
+  prove: "M4 12.5l5 5L20 6",
+  sun: "M12 4V2 M12 22v-2 M4 12H2 M22 12h-2 M5.6 5.6L4.2 4.2 M19.8 19.8l-1.4-1.4 M5.6 18.4l-1.4 1.4 M19.8 4.2l-1.4 1.4 M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z",
+  moon: "M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z",
+};
+
+const dots: Partial<Record<string, [number, number]>> = {
+  gateway: [12, 12],
+  provider: [18, 6.6],
+  record: [4.6, 3.2],
+};
+const d = dots[name];
+---
+<svg
+  class:list={["ic", klass]}
+  width={size}
+  height={size}
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.5"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  aria-hidden="true"
+>
+  <path d={paths[name]} />
+  {dot && d && <circle cx={d[0]} cy={d[1]} r="1.4" fill="var(--color-accent)" stroke="none" />}
+</svg>

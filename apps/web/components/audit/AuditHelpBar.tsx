@@ -66,10 +66,10 @@ export function AuditHelpBar({ exportEntitled }: { exportEntitled: boolean }) {
 				) : (
 					<Link
 						href="/settings/billing"
-						title="Auditor-formatted Compliance & Evidence Handbook — included with the $999/mo Audit add-on"
+						title="Auditor-formatted Compliance & Evidence Handbook — included on the Enterprise plan"
 						className={lockedCls}
 					>
-						🔒 Compliance Handbook · Audit SKU
+						🔒 Compliance Handbook · Enterprise
 					</Link>
 				)}
 			</div>

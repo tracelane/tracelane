@@ -75,6 +75,59 @@ _CREATE_TABLE = re.compile(
 )
 
 
+# `infra/dev/clickhouse/schema.sql` is the BASE CONTRACT — the DDL a fresh install gets
+# through `/docker-entrypoint-initdb.d`. Its columns are the ones every environment is
+# supposed to have, which makes them the honest thing to require of a target.
+CH_SCHEMA = ROOT / "infra/dev/clickhouse/schema.sql"
+
+
+def _columns_of(sql: str) -> dict[str, list[str]]:
+    """`{table: [column, ...]}` from CREATE TABLE blocks, by paren depth.
+
+    Depth, not a line regex, because a column's TYPE carries its own parens —
+    `DateTime64(6, 'UTC')`, `Nullable(String)`, `Array(String)`. A regex that ignored
+    them would either stop at the first `)` (truncating the table) or run past the last
+    one (swallowing the ENGINE clause and reporting `ORDER` as a column).
+    """
+    out: dict[str, list[str]] = {}
+    for m in _CREATE_TABLE.finditer(sql):
+        table = m.group(1)
+        i = sql.find("(", m.end())
+        if i == -1:
+            continue
+        depth, j = 0, i
+        while j < len(sql):
+            if sql[j] == "(":
+                depth += 1
+            elif sql[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        body, cols, d = sql[i + 1 : j], [], 0
+        for raw in body.split("\n"):
+            line = raw.split("--", 1)[0].strip()
+            if d == 0 and line:
+                c = re.match(r"^`?(\w+)`?\s+\S", line)
+                # Skip table-level clauses that share the column position.
+                if c and c.group(1).upper() not in {
+                    "INDEX",
+                    "PRIMARY",
+                    "ORDER",
+                    "PARTITION",
+                    "TTL",
+                    "SETTINGS",
+                    "ENGINE",
+                    "CONSTRAINT",
+                    "PROJECTION",
+                }:
+                    cols.append(c.group(1))
+            d += raw.count("(") - raw.count(")")
+        if cols:
+            out.setdefault(table, cols)
+    return out
+
+
 def expected() -> dict:
     """What the code requires of its databases. Pure — reads the tree, nothing else."""
     if not ENTITLEMENTS.is_file():
@@ -138,10 +191,34 @@ def expected() -> dict:
         )
         raise SystemExit(2)
 
+    # COLUMNS, not just tables (B-369). The table check cannot see a column that never
+    # landed, and one did not: migration 04 adds eight MATERIALIZED columns to `spans`
+    # and PROD HAS NONE OF THEM, while migrations 13 and 16 — both later — were applied.
+    # Read from prod `system.columns` on 2026-09-10, not inferred.
+    #
+    # The requirement is `schema.sql`'s columns, NOT every column every migration ever
+    # added, and that boundary is deliberate for the same reason the table check uses an
+    # intersection: migration-only columns are known drift with zero readers, and a guard
+    # that fires on a condition the deployer will not act on is a guard that gets switched
+    # off. schema.sql is what a FRESH install gets, so every environment owes it.
+    ch_cols: dict[str, list[str]] = {}
+    if CH_SCHEMA.is_file():
+        for t, c in _columns_of(CH_SCHEMA.read_text(encoding="utf-8")).items():
+            if t in referenced:
+                ch_cols[t] = c
+    if not ch_cols:
+        print(
+            "✗ CANNOT DETERMINE — no columns parsed from "
+            f"{CH_SCHEMA}; an empty column requirement would certify anything.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     return {
         "postgres_columns": cols,
         "postgres_tables": ["plan_entitlements", "workspace_entitlements"],
         "clickhouse_tables": dict(sorted(tables.items())),
+        "clickhouse_columns": {k: sorted(v) for k, v in sorted(ch_cols.items())},
     }
 
 
@@ -187,6 +264,37 @@ def compare(want: dict, have: dict) -> int:
                 f"      infra/dev/clickhouse/migrations/{f}"
             )
 
+    # B-369 — COLUMNS. `have_ch_cols` absent means the target was asked for tables only
+    # (an older deploy script). That is CANNOT DETERMINE, not a pass: an unread column
+    # set is not a clean one, and silently skipping it is how migration 04 went unapplied
+    # for months without any control noticing.
+    want_ch_cols = want.get("clickhouse_columns") or {}
+    if want_ch_cols:
+        have_ch_cols = have.get("clickhouse_columns")
+        if have_ch_cols is None:
+            print(
+                "✗ CANNOT DETERMINE — the target reported TABLES but no clickhouse_columns.\n"
+                "  The deploy script must send `system.columns` too; see scripts/deploy/gateway.sh.\n"
+                "  An unread column set is not a clean one (CLAUDE.md §1)."
+            )
+            return 2
+        for tbl, cols in want_ch_cols.items():
+            # A table already reported missing above is not also a column complaint —
+            # that would print the same defect twice and bury the actionable line.
+            if tbl not in have_ch_set:
+                continue
+            present = set(have_ch_cols.get(tbl, []))
+            missing = [c for c in cols if c not in present]
+            if missing:
+                problems.append(
+                    f"  CLICKHOUSE {tbl}: missing column(s) {', '.join(missing)}\n"
+                    f"    `infra/dev/clickhouse/schema.sql` declares them, so a FRESH install\n"
+                    f"    has them and this target does not. That is un-journaled migration\n"
+                    f"    drift — the B-369 class, where migration 04's eight columns were\n"
+                    f"    never applied to prod while 13 and 16 were.\n"
+                    f"    apply BY HAND:  ALTER TABLE tracelane.{tbl} ADD COLUMN ..."
+                )
+
     if problems:
         print("✗ THE TARGET DOES NOT HAVE THE SCHEMA THIS BINARY READS:\n")
         print("\n\n".join(problems))
@@ -197,8 +305,16 @@ def compare(want: dict, have: dict) -> int:
         return 1
 
     print(
-        f"OK — target has all {len(want['postgres_columns'])} entitlement column(s) "
-        f"and all {len(want['clickhouse_tables'])} ClickHouse table(s) the code reads."
+        f"OK — target has all {len(want['postgres_columns'])} entitlement column(s), "
+        f"all {len(want['clickhouse_tables'])} ClickHouse table(s) the code reads, and "
+        f"every column `schema.sql` declares for "
+        f"{len(want.get('clickhouse_columns') or {})} of them."
+    )
+    print(
+        "  NOTE: the column check covers what `schema.sql` declares — the base contract a\n"
+        "  fresh install gets. Columns added ONLY by a migration file are deliberately out\n"
+        "  of scope; they are known drift with no readers, and requiring them would refuse\n"
+        "  a healthy prod."
     )
     return 0
 
@@ -277,6 +393,56 @@ def selftest() -> int:
     else:
         print(f"  ✗ db-qualified parse wrong: {got}")
         fails += 1
+
+    # ── B-369: the COLUMN check, proven to BLOCK ───────────────────────────────
+    _base_want = {
+        "postgres_columns": ["f_x"],
+        "postgres_tables": ["plan_entitlements"],
+        "clickhouse_tables": {"spans": "schema.sql"},
+        "clickhouse_columns": {"spans": ["tenant_id", "api_key_id", "cost_usd"]},
+    }
+    case(
+        "a MISSING clickhouse COLUMN refuses (the migration-04 class)",
+        _base_want,
+        {
+            "postgres_columns": {"plan_entitlements": ["f_x"]},
+            "clickhouse_tables": ["spans"],
+            # `cost_usd` absent — exactly the shape of migration 04's unapplied columns.
+            "clickhouse_columns": {"spans": ["tenant_id", "api_key_id"]},
+        },
+        1,
+    )
+    case(
+        "all columns present PASSES",
+        _base_want,
+        {
+            "postgres_columns": {"plan_entitlements": ["f_x"]},
+            "clickhouse_tables": ["spans"],
+            "clickhouse_columns": {
+                "spans": ["tenant_id", "api_key_id", "cost_usd", "extra_ok"]
+            },
+        },
+        0,
+    )
+    case(
+        "a target reporting TABLES but NO columns is rc=2, never a pass",
+        _base_want,
+        {
+            "postgres_columns": {"plan_entitlements": ["f_x"]},
+            "clickhouse_tables": ["spans"],
+        },
+        2,
+    )
+    case(
+        "a missing TABLE is reported once, not also as N missing columns",
+        _base_want,
+        {
+            "postgres_columns": {"plan_entitlements": ["f_x"]},
+            "clickhouse_tables": [],
+            "clickhouse_columns": {},
+        },
+        1,
+    )
 
     # And the pure half must actually parse the real tree, or the guard certifies nothing.
     try:

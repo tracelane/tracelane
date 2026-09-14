@@ -16,7 +16,7 @@ restricting how you deploy it. We wanted a licence our own customers could
 adopt without a legal review.
 
 **Rust gateway, not Go.** Low p95 overhead with full tracing on is a
-hot-path budget (measured figures publish with the Reliability Benchmark v1.0).
+hot-path budget — measured at 2 ms p50 / 4 ms p95 / 5 ms p99 added latency on a 4 vCPU host with capture on ([benchmarks](/benchmarks)).
 Rust's zero-allocation request flow and tokio's runtime get us there without
 exotic tuning.
 

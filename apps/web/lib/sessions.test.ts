@@ -23,7 +23,15 @@ vi.mock("@/lib/auth", () => ({
 	})),
 }));
 
-import { fetchSessionTraces, fetchSessions } from "./sessions";
+import { fetchSessionsFor } from "@/lib/metrics/fetch";
+import { fetchSessionTraces } from "./sessions";
+
+// The list window every read is asked for — the shared grammar (DSH-11).
+const WIN = {
+	sinceMs: Date.parse("2026-06-01T00:00:00Z"),
+	untilMs: Date.parse("2026-07-01T00:00:00Z"),
+	bucketMs: 3_600_000,
+};
 
 // Fake session data scoped to each tenant (keyed by Bearer token).
 const STORE = {
@@ -130,6 +138,15 @@ beforeEach(() => {
 		const tracesMatch = /\/v1\/sessions\/([^/]+)\/traces/.exec(url);
 		if (tracesMatch !== null) {
 			const sid = decodeURIComponent(tracesMatch[1] ?? "");
+			// A sentinel id forcing a real upstream failure (B-335d) — distinct from
+			// "no such session" (404), which the store lookup below covers.
+			if (sid === "sess-upstream-502") {
+				return {
+					ok: false,
+					status: 502,
+					json: async () => ({ error: "bad_gateway" }),
+				} as Response;
+			}
 			const sessionData = store.traces[sid as keyof typeof store.traces];
 			if (sessionData === undefined) {
 				return {
@@ -154,11 +171,11 @@ beforeEach(() => {
 	});
 });
 
-describe("fetchSessions — per-user JWT tenant isolation", () => {
+describe("fetchSessionsFor — per-user JWT tenant isolation", () => {
 	it("ignores GATEWAY_BEARER_TOKEN and forwards the per-user JWT, not the static operator token", async () => {
 		vi.stubEnv("GATEWAY_BEARER_TOKEN", "static-operator-POISON");
 		try {
-			await fetchSessions({ days: 30 });
+			await fetchSessionsFor(WIN);
 			expect(bearerOf()).toBe("Bearer jwt-tenant-a");
 			expect(bearerOf()).not.toContain("POISON");
 		} finally {
@@ -168,26 +185,26 @@ describe("fetchSessions — per-user JWT tenant isolation", () => {
 
 	it("returns ONLY tenant A's sessions — never tenant B's", async () => {
 		h.token = "jwt-tenant-a";
-		const sessions = await fetchSessions({ days: 30 });
+		const sessions = await fetchSessionsFor(WIN);
 		expect(sessions).toHaveLength(1);
-		expect(sessions[0]?.session_id).toBe("sess-A-001");
-		const serialized = JSON.stringify(sessions);
+		expect(sessions?.[0]?.session_id).toBe("sess-A-001");
+		const serialized = JSON.stringify(sessions ?? []);
 		expect(serialized).not.toContain("sess-001");
 		expect(serialized).not.toContain("claude-3-5-haiku");
 	});
 
 	it("returns ONLY tenant B's sessions under tenant B's JWT", async () => {
 		h.token = "jwt-tenant-b";
-		const sessions = await fetchSessions({ days: 30 });
-		expect(sessions[0]?.session_id).toBe("sess-001");
-		const serialized = JSON.stringify(sessions);
+		const sessions = await fetchSessionsFor(WIN);
+		expect(sessions?.[0]?.session_id).toBe("sess-001");
+		const serialized = JSON.stringify(sessions ?? []);
 		expect(serialized).not.toContain("sess-A-001");
 		expect(serialized).not.toContain("gpt-4o-mini");
 	});
 
-	it("returns [] on a gateway non-2xx (best-effort empty state, not a crash)", async () => {
+	it("returns null on a gateway non-2xx — unreachable, never an empty list (B-334)", async () => {
 		h.token = "unknown-tenant-xyz" as StoreKey;
-		expect(await fetchSessions({ days: 30 })).toEqual([]);
+		expect(await fetchSessionsFor(WIN)).toBeNull();
 	});
 
 	it("propagates NEXT_REDIRECT rather than swallowing it", async () => {
@@ -195,14 +212,16 @@ describe("fetchSessions — per-user JWT tenant isolation", () => {
 		vi.mocked(requireGatewayToken).mockRejectedValueOnce(
 			new Error("NEXT_REDIRECT"),
 		);
-		await expect(fetchSessions({ days: 30 })).rejects.toThrow("NEXT_REDIRECT");
+		await expect(fetchSessionsFor(WIN)).rejects.toThrow("NEXT_REDIRECT");
 	});
 
-	it("forwards days and limit as query params", async () => {
-		await fetchSessions({ days: 7, limit: 20 });
+	it("forwards the window as since/until (RFC3339) plus limit — never days=", async () => {
+		await fetchSessionsFor(WIN, { limit: 20 });
 		const calledUrl = fetchMock.mock.calls[0]?.[0] as string | undefined;
-		expect(calledUrl).toContain("days=7");
+		expect(calledUrl).toContain("since=2026-06-01T00%3A00%3A00.000Z");
+		expect(calledUrl).toContain("until=2026-07-01T00%3A00%3A00.000Z");
 		expect(calledUrl).toContain("limit=20");
+		expect(calledUrl).not.toContain("days=");
 	});
 });
 
@@ -225,9 +244,18 @@ describe("fetchSessionTraces — per-user JWT tenant isolation", () => {
 		expect(result).toBeNull();
 	});
 
-	it("returns null on a gateway non-2xx (all GatewayErrors yield null)", async () => {
+	it("throws (never null) on a non-404 GatewayError — a 401 is a real failure, not 'not found'", async () => {
 		h.token = "unknown-tenant-xyz" as StoreKey;
-		expect(await fetchSessionTraces("sess-A-001")).toBeNull();
+		await expect(fetchSessionTraces("sess-A-001")).rejects.toMatchObject({
+			status: 401,
+		});
+	});
+
+	it("throws on a 502 upstream failure — must not read as 'not found' (B-335d)", async () => {
+		h.token = "jwt-tenant-a";
+		await expect(fetchSessionTraces("sess-upstream-502")).rejects.toMatchObject(
+			{ status: 502 },
+		);
 	});
 
 	it("forwards the per-user JWT as Bearer", async () => {

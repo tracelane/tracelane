@@ -3,39 +3,96 @@
  * PricingTable — the price ladder, rendered by BOTH the homepage `#pricing` anchor and
  * the `/pricing` route.
  *
- * ONE SOURCE, TWO SURFACES. `/pricing` did not exist before 2026-08-16 — it 404'd live
- * while ADR-074 §10 listed it as must-have scope, and every "pricing" link on the site
- * was a homepage anchor. The obvious fix (write a pricing page) would have created a
- * SECOND copy of the ladder, and a price that appears in two places drifts: this repo
- * already keeps `apps/docs/pricing.mdx`, `docs/product/SETTINGS.md` and the billing rules
- * in a documented parallel-update set for exactly that reason.
+ * ONE SOURCE, TWO SURFACES — and now a THIRD source underneath both: every price,
+ * allowance and window figure is read straight from `apps/web/db/plans.v3.json`
+ * (`../../lib/plans.ts`), never typed here. `scripts/ci/check-pricing-copy-vs-seed.py`
+ * enforces it. ADR-076 (2026-09-12 founder ruling) replaced the old trace-count /
+ * seat-ladder model with six usage meters and unlimited seats on every paid tier —
+ * this component is the site half of that migration (`specs/BILL-01-metering-and-tiers.md`
+ * §8 `#site-pricing`).
  *
- * So the markup below is the homepage section, moved VERBATIM — not rewritten, not
- * "improved". No number, claim, SLA, quota or disclaimer changed in the extraction. Any
- * price change now edits one file and both surfaces move together.
+ * OSS self-host is the one card NOT driven by the JSON: it is not sold through
+ * Polar at all (`.claude/rules/billing.md`) and the ruled model does not touch it.
  *
- * Copy locks apply here as everywhere: "tamper-evident", never "tamper-proof"; the
- * regulatory language stays exactly as reviewed.
+ * Copy locks apply here as everywhere: "tamper-evident", never "tamper-proof";
+ * no promotional-percentage or price-markdown language anywhere (spec §0.1) —
+ * annual is a second REAL price, never a reduced monthly one.
  */
+import { LADDER, formatDays, formatGb, formatPrice, plan } from "../lib/plans";
+
 interface Props {
 	/** Heading level. The homepage renders this as a SECTION (h2); /pricing is a PAGE
-	 *  and must lead with an h1 — a page with no h1 is an accessibility and SEO defect,
-	 *  and this one shipped exactly that way, because the markup was lifted verbatim
-	 *  from a section and nothing re-examined the heading level on the way. */
+	 *  and must lead with an h1. */
 	as?: "h1" | "h2";
 }
 const { as: Heading = "h2" } = Astro.props;
+const signIn = "https://app.tracelane.dev/sign-in";
+const selfHost = "https://docs.tracelane.dev/self-hosting";
+const talk = "mailto:sales@tracelane.dev?subject=Tracelane%20Enterprise";
+
+const TILE_CLASS: Record<string, string> = {
+	free_v1: "tile-teal",
+	builder_v1: "tile-bronze",
+	team_v1: "tile-forest",
+	business_v1: "tile-wine",
+	enterprise_v1: "tile-indigo",
+};
+
+const rows = LADDER.map((key) => {
+	const row = plan(key);
+	return {
+		key,
+		row,
+		priceMonth: formatPrice(row, "month"),
+		priceYear:
+			row.price_annual_month_usd !== null ? formatPrice(row, "year") : null,
+	};
+});
+
+const meters = [
+	{
+		label: "Ingest",
+		rate: "$0.20 / GB accepted",
+		body: "Every span you send, gateway or OTLP — one meter.",
+	},
+	{
+		label: "Hot indexed window",
+		rate: "from $16.00 / resident GB-month",
+		body: "Resident GB is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. The hot window is priced as query capacity, not disk.",
+	},
+	{
+		label: "Series",
+		rate: "$0.008 / series-month",
+		body: "Distinct metric series you emit, counted once per month.",
+	},
+	{
+		label: "Query compute",
+		rate: "$0.15 / scan-unit",
+		body: "1 scan-unit = 1 GB scanned to answer your queries.",
+	},
+	{
+		label: "Cold archive",
+		rate: "$0.08 / GB-month",
+		body: "Everything past your indexed window, kept queryable for two years.",
+	},
+	{
+		label: "Evaluations",
+		rate: "$0.005 / judge run",
+		body: "Each automated judge run scored against your traces.",
+	},
+];
 ---
 
   {/* ===== Pricing ===== */}
-  <section id="pricing" class="panel">
-    <div class="reveal max-w-2xl">
-      <Heading class="text-3xl sm:text-4xl text-fg">Pricing.</Heading>
-      <p class="mt-4 text-lg text-fg-muted">Open core. Self-host free forever. Hosted tiers start at $0.</p>
+  <section id="pricing" class="panel" style={Heading === "h1" ? "padding-top:clamp(3rem,7vw,5.5rem)" : undefined}>
+    <div class="reveal section-head">
+      <p class="eyebrow mb-4">Pricing</p>
+      <Heading class="display-lg text-fg">Pricing.</Heading>
+      <p class="lede">Six meters, priced the same way on every paid tier. Self-host free forever.</p>
     </div>
 
-    <div class="mt-14 grid gap-5 sm:grid-cols-2 md:grid-cols-3 reveal-group cards-hover">
-      <article class="glass p-6">
+    <div class="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3 reveal-group cards-hover">
+      <article class="glass tier">
         <div class="mesh-tile tile-graphite">
           <h3 class="t-name">OSS self-host</h3>
           <div>
@@ -43,106 +100,73 @@ const { as: Heading = "h2" } = Astro.props;
             <p class="t-meta">Apache 2.0 · forever</p>
           </div>
         </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
+        <ul class="tier-list">
           <li>Full Rust gateway · 150+ providers — 6 native adapters plus any OpenAI-compatible endpoint</li>
           <li>ClickHouse + R2 storage</li>
           <li>Tamper-evident audit ledger</li>
           <li>Community Discord support</li>
         </ul>
+        <div class="tier-cta"><a href={selfHost} class="btn-secondary btn-block" rel="noopener">Self-hosting guide</a></div>
       </article>
 
-      <article class="glass p-6">
-        <div class="mesh-tile tile-teal">
-          <h3 class="t-name">Free hosted</h3>
-          <div>
-            <p class="t-price">$0</p>
-            <p class="t-meta">10K traces / mo</p>
+      {rows.map(({ key, row, priceMonth }) => (
+        <article class={`glass tier ${key === "team_v1" ? "rec-card relative" : ""}`}>
+          {key === "team_v1" && <p class="rec-tag">recommended</p>}
+          <div class={`mesh-tile ${TILE_CLASS[key]}`}>
+            <h3 class="t-name">{row.name}</h3>
+            <div>
+              <p class="t-price">{priceMonth.fromLabel && "from "}{priceMonth.amount}{priceMonth.suffix && <span class="t-per">{priceMonth.suffix}</span>}</p>
+              <p class="t-meta">
+                {formatDays(row.indexed_window_days, key === "enterprise_v1")} indexed ·{" "}
+                {formatGb(row.hot_gb_included)} hot ·{" "}
+                {row.unlimited_seats ? "unlimited seats" : "1 seat"}
+              </p>
+            </div>
           </div>
-        </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>Single workspace, 1 seat</li>
-          <li>60 RPM</li>
-          <li>Pre-flight policy checks</li>
-          <li>No credit card · no commercial use</li>
-        </ul>
-      </article>
-
-      <article class="glass p-6">
-        <div class="mesh-tile tile-bronze">
-          <h3 class="t-name">Builder</h3>
-          <div>
-            <p class="t-price">$59<span class="t-per">/mo</span></p>
-            <p class="t-meta">150K traces / mo · 1 seat</p>
+          <ul class="tier-list">
+            <li>{formatGb(row.ingest_gb_included)} ingest / mo</li>
+            <li>{row.rate_limit_rpm === null ? "Uncapped RPM" : `${row.rate_limit_rpm.toLocaleString("en-US")} RPM`}</li>
+            {row.f_sso && <li>WorkOS SSO</li>}
+            {key === "enterprise_v1" && <li>7-year ledger retention (included)</li>}
+            {key === "free_v1" && <li>No credit card · ages out after 14 idle days, never a 429</li>}
+          </ul>
+          <div class={`tier-cta ${key === "team_v1" ? "on-dark" : ""}`}>
+            {key === "enterprise_v1" ? (
+              <a href={talk} class="btn-secondary btn-block">Talk to us</a>
+            ) : key === "team_v1" ? (
+              <a href={signIn} class="btn-primary btn-block">Start free <span aria-hidden="true">→</span></a>
+            ) : (
+              <a href={signIn} class="btn-secondary btn-block">Start free</a>
+            )}
           </div>
-        </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>600 RPM</li>
-          <li>Guardrail verdict history (read-only)</li>
-          <li>Audit ledger + offline verify</li>
-          <li>Email support · 24h</li>
-        </ul>
-      </article>
-
-      <article class="rec-card glass p-6 relative">
-        <p class="absolute -top-3 left-6 px-2 text-xs font-mono text-pop lowercase" style="background:var(--color-bg-elevated)">recommended</p>
-        <div class="mesh-tile tile-forest">
-          <h3 class="t-name">Team</h3>
-          <div>
-            <p class="t-price">$249<span class="t-per">/mo</span></p>
-            <p class="t-meta">1M traces / mo · 10 seats</p>
-          </div>
-        </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>Pre-flight guardrail rails + tamper-evident promotion record</li>
-          <li>WorkOS SSO · 99% SLA</li>
-          <li>Slack support · 8h</li>
-        </ul>
-      </article>
-
-      <article class="glass p-6">
-        <div class="mesh-tile tile-wine">
-          <h3 class="t-name">Business</h3>
-          <div>
-            <p class="t-price">$899<span class="t-per">/mo</span></p>
-            <p class="t-meta">5M traces / mo · 25 seats</p>
-          </div>
-        </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>Priority support</li>
-          <li>Inline heuristic guardrails (ML ensemble on the roadmap) · 99.9% SLA</li>
-          <li>WorkOS SSO</li>
-          <li>Dedicated Slack · 4h</li>
-        </ul>
-      </article>
-
-      <article class="glass p-6">
-        <div class="mesh-tile tile-indigo">
-          <h3 class="t-name">Enterprise</h3>
-          <div>
-            <p class="t-price">$2,999+<span class="t-per">/mo</span></p>
-            <p class="t-meta">25M+ traces · custom</p>
-          </div>
-        </div>
-        <ul class="mt-6 space-y-2 text-sm text-fg-muted">
-          <li>Custom seats</li>
-          <li>Region pinning (EU; US / IN on the roadmap)</li>
-          <li>BYOK + CMK self-service</li>
-          <li>1h SLA · dedicated CSM</li>
-        </ul>
-      </article>
+        </article>
+      ))}
     </div>
 
-    <div class="mt-10 glass p-6">
-      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h3 class="font-medium text-fg">Tamper-evident agent ledger</h3>
-          <p class="mt-2 text-sm text-fg-muted leading-relaxed">
-            $999/mo add-on. SHA-256 hash chain + Ed25519-signed Merkle root, an Article 12 documentation pack, and an audit ledger kept for its full lifetime (no expiry clock). Tracelane enforces no per-tenant storage region today, signs no BAA, and makes no regulatory-conformance claim — the assessment remains yours. EU AI Act Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">details</a>).
-          </p>
-        </div>
-        <p class="font-mono text-2xl text-fg shrink-0">+$999<span class="text-base text-fg-muted">/mo</span></p>
+    <div id="site-pricing" class="mt-10 reveal">
+      <p class="card-title mb-4 text-center">How the six meters work</p>
+      <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {meters.map((m) => (
+          <div class="glass p-5">
+            <p class="card-index">{m.label}</p>
+            <p class="text-fg font-semibold text-sm mt-1">{m.rate}</p>
+            <p class="card-body text-sm mt-1">{m.body}</p>
+          </div>
+        ))}
       </div>
     </div>
 
-    <p class="mt-10 text-center text-sm text-fg-subtle">Trace retention is the same on every plan: traces are kept up to 365 days. Metered in traces, not spans — one gateway call is one trace, and overage is $1.20 per 10K traces above your monthly quota. Need more seats than your plan includes? <a href="mailto:support@tracelane.dev?subject=Additional%20seats" class="underline decoration-fg-subtle hover:decoration-fg transition-colors">Talk to us</a>.</p>
+    <div class="mt-5 glass addon reveal">
+      <div>
+        <p class="card-index">on every tier</p>
+        <h3 class="card-title">Tamper-evident agent ledger</h3>
+        <p class="card-body text-sm">
+          The hash chain, Ed25519-signed Merkle root, Rekor anchoring and self-verification are included on every tier — free and paid alike. Seven-year retention on Enterprise. Tracelane enforces no per-tenant storage region today, signs no BAA, and makes no regulatory-conformance claim — the assessment remains yours. EU AI Act Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>).
+        </p>
+      </div>
+    </div>
+
+    <p class="mt-10 text-center text-sm text-fg-subtle max-w-3xl mx-auto" style="text-wrap:pretty">
+      "Resident GB" is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. No rollover of unused allowance. Price held 12 months from signup. Never metered: per host or peak host, per seat on any paid tier, a separate egress line, retention as a multiplier, or OTel attributes reclassified as premium metrics. Free ages out after 14 idle days — it never returns a 429, and ingest is never blocked by billing state on any tier.
+    </p>
   </section>

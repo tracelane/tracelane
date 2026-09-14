@@ -10,7 +10,7 @@ self-hosted deployments you supply the 32-byte envelope master key
 **public-key fingerprint** for audit and labeling. Tracelane holds the
 ciphertext and decrypts it in-memory only at request dispatch.
 
-Available on **Business $899/mo and above** (read-only key list on Team $249+).
+Available on **Business $799/mo and above** (read-only key list on Team $229+).
 
 ## How envelope encryption works
 
@@ -99,6 +99,7 @@ previous one `rotating`. No ciphertext is re-encrypted and no key is
 automatically revoked — provider-key ciphertext stays sealed under the
 deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
 
+No ciphertext is re-encrypted and no key is automatically revoked — revocation of provider-key access takes effect within 60 seconds (a key idle for over a minute may be accepted once more on its next use while the gateway re-checks it).
 ## Audit trail
 
 CMK register and remove operations are recorded against the tenant in the

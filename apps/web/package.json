@@ -23,9 +23,10 @@
 		"@tracelanedev/ui": "workspace:*",
 		"@workos-inc/authkit-nextjs": "^4.0.1",
 		"drizzle-orm": "^0.45.2",
-		"next": "15.5.21",
+		"next": "15.5.24",
 		"react": "19.0.0",
-		"react-dom": "19.0.0"
+		"react-dom": "19.0.0",
+		"zod": "^3.23.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.0",
@@ -33,11 +34,14 @@
 		"@opennextjs/cloudflare": "1.19.11",
 		"@playwright/test": "^1.49.1",
 		"@tailwindcss/postcss": "^4.0.0",
+		"@testing-library/jest-dom": "^6.5.0",
+		"@testing-library/react": "^16.0.0",
 		"@types/node": "^22.0.0",
 		"@types/react": "19.0.0",
 		"@types/react-dom": "19.0.0",
 		"babel-plugin-react-compiler": "1.0.0",
 		"drizzle-kit": "^0.30.0",
+		"jsdom": "^25.0.0",
 		"knip": "^6.29.0",
 		"tailwindcss": "^4.0.0",
 		"typescript": "^5.5.0",

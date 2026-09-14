@@ -5,8 +5,14 @@
 //! Cache writes are wait-free via `ArcSwap`.
 //!
 //! WorkOS JWKS URL: `https://api.workos.com/sso/jwks/{client_id}`
-//! Override with `WORKOS_JWKS_URL`. Tests inject keys via
-//! `set_cache_for_testing`.
+//! Override with `WORKOS_JWKS_URL`.
+//!
+//! `set_cache_for_testing`/`clear_cache_for_testing` (a test-key-injection
+//! seam this doc used to point readers at) were deleted 2026-09-12 (B-390) —
+//! `grep -rn set_cache_for_testing crates/` outside this file returned zero
+//! hits; nothing calls them, in `auth::mod::tests` or anywhere else.
+//! Restorable from git history at `d0d2d6dbf0d5a1432bfdffba50dd511b49197b1d`
+//! if a test needs to inject JWKS keys directly again.
 
 use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwap;
@@ -63,6 +69,11 @@ impl JwksCache {
     }
 }
 
+// B-386: stays global (for now) — the JWKS cache is read by `validate_jwt`, which
+// has no state handle; converting it means threading an auth context through
+// `validate_authorization`'s ~25 callers across every route family, which is
+// disproportionate for the pass that moved the tier, hotpath, failover and the
+// two metric registries. Listed in the B-386 report as deferred, not done.
 static CACHE: std::sync::OnceLock<Arc<ArcSwap<Option<Arc<JwksCache>>>>> =
     std::sync::OnceLock::new();
 
@@ -70,19 +81,9 @@ fn cache() -> &'static Arc<ArcSwap<Option<Arc<JwksCache>>>> {
     CACHE.get_or_init(|| Arc::new(ArcSwap::from_pointee(None)))
 }
 
-/// Inject a `JwksCache` into the global cache. Test-only seam — the
-/// `validate_jwt` path then sees these keys instead of fetching from
-/// WorkOS. Used by the integration tests in `auth::mod::tests`.
-#[doc(hidden)]
-pub fn set_cache_for_testing(value: Arc<JwksCache>) {
-    cache().store(Arc::new(Some(value)));
-}
-
-/// Clear the JWKS cache. Test-only.
-#[doc(hidden)]
-pub fn clear_cache_for_testing() {
-    cache().store(Arc::new(None));
-}
+// `set_cache_for_testing` / `clear_cache_for_testing` (a test-key-injection
+// seam) were deleted 2026-09-12 (B-390) — zero callers anywhere in the tree.
+// See the module doc above for the restore SHA.
 
 /// Singleflight lock for the stale-refresh path (mythos round-2 B4).
 /// At TTL expiry under high RPS, N concurrent requests would each
@@ -102,20 +103,20 @@ fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
 /// the body is not valid JSON, or any JWK lacks a `kid` claim.
 pub async fn get_cached() -> Result<Arc<JwksCache>> {
     let current = cache().load();
-    if let Some(ref cached) = **current {
-        if cached.is_fresh() {
-            return Ok(Arc::clone(cached));
-        }
+    if let Some(ref cached) = **current
+        && cached.is_fresh()
+    {
+        return Ok(Arc::clone(cached));
     }
 
     // B4: singleflight — only one task does the refresh per stale window.
     let _guard = refresh_lock().lock().await;
     // Re-check: another task may have refreshed while we were waiting.
     let current = cache().load();
-    if let Some(ref cached) = **current {
-        if cached.is_fresh() {
-            return Ok(Arc::clone(cached));
-        }
+    if let Some(ref cached) = **current
+        && cached.is_fresh()
+    {
+        return Ok(Arc::clone(cached));
     }
 
     let fresh = fetch_from_workos().await?;
@@ -154,13 +155,13 @@ pub async fn get_cached_with_refresh_on_miss(kid: &str) -> Result<Arc<JwksCache>
     // parking_lot::Mutex doesn't poison — consistent with audit.rs.
     {
         let mut guard = last_on_miss_refresh().lock();
-        if let Some(last) = *guard {
-            if last.elapsed() < ON_MISS_REFRESH_COOLDOWN {
-                // Cooled-down — just return the cache. The caller's
-                // lookup will fail and surface a 401 to the client.
-                // Better one 401 than DoS-storming WorkOS.
-                return Ok(cache);
-            }
+        if let Some(last) = *guard
+            && last.elapsed() < ON_MISS_REFRESH_COOLDOWN
+        {
+            // Cooled-down — just return the cache. The caller's
+            // lookup will fail and surface a 401 to the client.
+            // Better one 401 than DoS-storming WorkOS.
+            return Ok(cache);
         }
         *guard = Some(Instant::now());
     }

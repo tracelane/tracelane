@@ -30,6 +30,15 @@ export interface TraceSummary {
 	models: string[];
 	/** Distinct resolved providers, in first-seen order. */
 	providers: string[];
+	/**
+	 * OBS-20: distinct end-user ids across the trace, in first-seen order.
+	 *
+	 * An ARRAY rather than a single value, for the same reason `models` is one:
+	 * a trace can legitimately carry more than one span, and asserting a single
+	 * end user would silently pick whichever span happened to be first. In
+	 * practice a gateway-proxied trace is one span and this has 0 or 1 entries.
+	 */
+	endUsers: string[];
 }
 
 /** Start of a span in microseconds — precise column first, ISO fallback. */
@@ -39,6 +48,30 @@ export function spanStartUs(s: Span): number {
 	}
 	const ms = Date.parse(s.start_time);
 	return Number.isFinite(ms) ? ms * 1000 : 0;
+}
+
+/**
+ * A span's bar geometry as a percentage of the trace window — the ONE formula
+ * both {@link WaterfallView} and `SwimlaneView` (OBS-49) resolve their bars
+ * against, so "render parity" between the two views is a property of sharing
+ * this function rather than something asserted after the fact on two separate
+ * implementations that could drift.
+ *
+ * `leftPct` is clamped to 0 (a span starting before the window, which should
+ * not happen but must never render off-screen). `widthPct` has a 0.5% floor so
+ * a near-zero-duration span is still visible, and is capped so a bar never
+ * overruns the right edge of the track.
+ */
+export function barGeometry(
+	span: Span,
+	startUs: number,
+	totalUs: number,
+): { leftPct: number; widthPct: number } {
+	const offsetUs = Math.max(0, spanStartUs(span) - startUs);
+	const leftPct = totalUs > 0 ? (offsetUs / totalUs) * 100 : 0;
+	const rawWidth = totalUs > 0 ? (span.duration_us / totalUs) * 100 : 100;
+	const widthPct = Math.min(Math.max(rawWidth, 0.5), 100 - leftPct);
+	return { leftPct, widthPct };
 }
 
 /** [min start, max end] of the span set in microseconds (end = start + duration). */
@@ -78,6 +111,7 @@ export function computeTraceSummary(spans: Span[]): TraceSummary {
 	let costSeen = false;
 	const models: string[] = [];
 	const providers: string[] = [];
+	const endUsers: string[] = [];
 
 	for (const s of spans) {
 		if (s.status_code === 2) errorCount++;
@@ -101,6 +135,7 @@ export function computeTraceSummary(spans: Span[]): TraceSummary {
 		}
 		if (g.model && !models.includes(g.model)) models.push(g.model);
 		if (g.system && !providers.includes(g.system)) providers.push(g.system);
+		if (g.endUser && !endUsers.includes(g.endUser)) endUsers.push(g.endUser);
 	}
 
 	return {
@@ -116,5 +151,6 @@ export function computeTraceSummary(spans: Span[]): TraceSummary {
 		cost: costSeen ? costSum : undefined,
 		models,
 		providers,
+		endUsers,
 	};
 }

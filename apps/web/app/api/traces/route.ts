@@ -39,6 +39,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 		"has_error",
 		"min_latency_ms",
 		"signature_id",
+		// OBS-20. Absent until 2026-09-10: any client of THIS route got an
+		// unfiltered list while the page itself (a Server Component using gatewayGet)
+		// filtered correctly — so the two disagreed silently.
+		"end_user",
 		"cursor",
 		"since",
 		"until",

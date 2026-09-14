@@ -14,23 +14,33 @@
 //! NOTIFY listener (migration 14) calls [`TenantConfigCache::invalidate`] as an
 //! optimisation when wired.
 //!
+//! **BILL-01 / ADR-076 (2026-09-13): the per-tenant `monthly_span_quota` field
+//! and the OTLP-receiver 429 it fed are BOTH GONE.** "Ingest is NEVER blocked
+//! by billing state, on any tier" (spec §0.4) — the SDK/OTLP-direct cost
+//! backstop this cache used to carry alongside the sampling policy is retired
+//! outright, not replaced. `TenantConfig` now carries only the policy + the
+//! billing contact (kept for the step-8 usage-warning emails, which are a
+//! notification, never a block).
+//!
 //! **Two distinct fail directions (do not conflate):**
 //! - A **never-seen / no-row tenant** (the resolver *succeeds* but finds no
 //!   config) resolves to the cheaper [`SamplingPolicy::Tail`] — a non-entitled
 //!   tenant must not get unbounded Full.
 //! - A **resolver FAULT** (pool/query error — a control-plane blip) resolves to
 //!   [`TenantConfig::fault_keep_all`] = **Full, keep every span** regardless of
-//!   the tail rate (bounded by the per-trace ceiling), so a DB outage never
-//!   silently drops benign spans (the #81 class). Founder-decided (data-safe over
-//!   COGS-safe on a fault); a sustained outage trades elevated cost for zero loss.
-//!   This is paired with the startup fail-open in `db.rs` (a PG blip at boot does
-//!   not stop ingest; the resolver auto-recovers when PG returns).
+//!   the tail rate (bounded by the per-trace ceiling — never by a quota, which
+//!   no longer exists), so a DB outage never silently drops benign spans (the
+//!   #81 class). Founder-decided (data-safe over COGS-safe on a fault); a
+//!   sustained outage trades elevated cost for zero loss. This is paired with
+//!   the startup fail-open in `db.rs` (a PG blip at boot does not stop ingest;
+//!   the resolver auto-recovers when PG returns).
 //!
 //! ## The production resolver (Postgres)
 //!
 //! [`TenantConfigCache::default_tail`] resolves every tenant to `Tail`; it is
-//! correct when no control plane is wired. The production resolver queries the
-//! Neon control plane and computes the ADR-048 precedence (highest wins):
+//! correct when no control plane is wired, and is what `main.rs` actually
+//! calls on that path. The production resolver queries the Neon control plane
+//! and computes the ADR-048 precedence (highest wins):
 //!
 //! 1. **Audit SKU active** (`f_audit_addon`) → `Full`, forced (a tamper-evident
 //!    record of every action cannot tail-drop spans; non-overridable — matrix §4).
@@ -44,24 +54,26 @@
 //! migration 09 — reliably present), NOT the Drizzle-only `tenants.audit_enabled`
 //! column (which the SQL migrations never create — referencing it would fail at
 //! runtime; the recurring SQL↔Drizzle drift). SQL (resolved by `tenant_id`,
-//! never request body) — also yields the ingest quota cap and billing email:
+//! never request body):
 //! ```sql
-//! SELECT t.sampling_policy, t.force_tail, t.billing_email,
+//! SELECT t.sampling_policy, t.force_tail,
 //!        COALESCE(we.f_full_capture, pe.f_full_capture, FALSE) AS f_full_capture,
-//!        COALESCE(we.f_audit_addon,  pe.f_audit_addon,  FALSE) AS f_audit_addon,
-//!        (COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly, 0)
-//!         * COALESCE(we.overage_hard_cap_multiplier, pe.overage_hard_cap_multiplier, 1.0))::BIGINT
-//!          AS quota_cap
+//!        COALESCE(we.f_audit_addon,  pe.f_audit_addon,  FALSE) AS f_audit_addon
 //! FROM tenants t
 //! LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id
 //! LEFT JOIN plan_entitlements      pe ON pe.plan_lookup_key = we.plan_lookup_key
 //! WHERE t.id = $1
 //! ```
 //! [`pg_tenant_config_resolver`] runs exactly this, maps the row → [`PolicyInputs`]
-//! (→ [`resolve_policy`]) + `monthly_span_quota` (the cap, in spans) +
-//! `billing_email`. A *no-row* result → Tail (cheap); a *query fault* →
+//! (→ [`resolve_policy`]). A *no-row* result → Tail (cheap); a *query fault* →
 //! [`TenantConfig::fault_keep_all`] (keep-all). [`spawn_listen_task`] keeps the
 //! cache fresh via LISTEN/NOTIFY.
+//!
+//! BILL-01 step 8's usage-warning emails read `tenants.billing_email` from the
+//! GATEWAY's own Postgres pool (`crates/gateway/src/billing/email.rs`), not
+//! from this cache — this is a separate process with a separate control-plane
+//! connection, so there was never a reason to plumb the contact through here
+//! only to leave it unread; `TenantConfig` carries no billing_email field.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -75,20 +87,16 @@ use uuid::Uuid;
 use crate::db::DbPool;
 use crate::tail_sampler::SamplingPolicy;
 
-/// Resolved per-tenant ingest config. Carries the sampling policy + the ingest
-/// quota cap + billing contact; the design reserves room for `retention_days`
-/// (the TTL task shares this one cache).
+/// Resolved per-tenant ingest config. Carries the sampling policy; the design
+/// reserves room for `retention_days` (the TTL task shares this one cache).
+///
+/// **No quota field.** ADR-076 §0.4 retired the per-tenant monthly span quota
+/// and the OTLP-receiver 429 it fed outright — "ingest is NEVER blocked by
+/// billing state, on any tier." A fault or a real overage both resolve
+/// through [`SamplingPolicy`] alone now; there is nothing left here to cap.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TenantConfig {
     pub policy: SamplingPolicy,
-    /// Monthly ingest **span** quota — the hard cap = `trace_quota_monthly ×
-    /// overage_hard_cap_multiplier` (5× paid, 99× Enterprise; ADR-048 D5).
-    /// `0` = unlimited (the default until the Postgres resolver supplies a real
-    /// per-tenant cap — non-regressing on a fresh deploy).
-    pub monthly_span_quota: u64,
-    /// Tenant billing contact for the quota-breach email (ADR-048 D5). `None`
-    /// until the Postgres resolver populates it.
-    pub billing_email: Option<String>,
 }
 
 impl TenantConfig {
@@ -97,20 +105,17 @@ impl TenantConfig {
     /// unknown-tenant no-row (both of which return [`TenantConfig::default`] =
     /// Tail). A control-plane blip must NOT silently drop benign spans (the #81
     /// class), so a fault keeps **every** span (Full) regardless of the tail
-    /// rate, still bounded by the per-trace ceiling, with a **finite**
-    /// `fault_quota` cap (review P1-1) so a sustained/induced fault hard-stops
-    /// rather than running uncapped. Trade-off (founder-accepted): a sustained
-    /// outage keeps everything at elevated cost up to that cap. This
+    /// rate, bounded ONLY by the per-trace ceiling — there is no quota to cap
+    /// it further any more (ADR-076 retired the span-quota backstop this used
+    /// to also carry, review P1-1's `fault_quota`). Trade-off
+    /// (founder-accepted): a sustained outage keeps everything at Full. This
     /// deliberately reverses the design's original "fail-safe to the cheaper
     /// policy" for the fault path; a planned Tail (entitlement says so) is
     /// unaffected and still cheap.
-    pub fn fault_keep_all(fault_quota: u64) -> Self {
+    #[must_use]
+    pub fn fault_keep_all() -> Self {
         Self {
             policy: SamplingPolicy::Full,
-            // FINITE (review P1-1): generous for a brief blip, but a sustained or
-            // induced fault hard-stops at the cap instead of running uncapped.
-            monthly_span_quota: fault_quota,
-            billing_email: None,
         }
     }
 }
@@ -140,7 +145,7 @@ pub fn resolve_policy(i: PolicyInputs) -> SamplingPolicy {
     if i.audit_active {
         // Non-overridable: the audit completeness guarantee beats the
         // kill-switch (a runaway audited tenant is bounded by the per-trace
-        // ceiling + quota 429, never by silently dropping audited spans).
+        // ceiling, never by silently dropping audited spans).
         return SamplingPolicy::Full;
     }
     if i.force_tail {
@@ -180,27 +185,18 @@ impl TenantConfigCache {
         }
     }
 
-    /// A cache that resolves every tenant to `Tail` with an unlimited quota —
-    /// correct when no control plane (Postgres) is wired. Non-regressing: with
-    /// the writer's tail rate at 100 this keeps every span (the post-#81
-    /// behaviour) and the unlimited quota rejects nothing; the Postgres resolver
-    /// turns the ADR-048 levers on.
+    /// A cache that resolves every tenant to `Tail` — correct when no control
+    /// plane (Postgres) is wired. Non-regressing: with the writer's tail rate
+    /// at 100 this keeps every span (the post-#81 behaviour); the Postgres
+    /// resolver turns the ADR-048 levers on. This is `main.rs`'s actual
+    /// no-Postgres fallback now (ADR-076 deleted the `default_with_quota`
+    /// wrapper this used to be an alias for), not only a test helper.
     pub fn default_tail() -> Self {
-        Self::default_with_quota(0)
-    }
-
-    /// Like [`default_tail`](Self::default_tail) but with a uniform default span
-    /// quota (`0` = unlimited) applied to every tenant — a global anti-abuse
-    /// backstop on the direct OTLP path until the Postgres resolver supplies real
-    /// per-tenant caps.
-    pub fn default_with_quota(default_quota: u64) -> Self {
         Self::new(
             Arc::new(move |_| {
                 Box::pin(async move {
                     TenantConfig {
                         policy: SamplingPolicy::Tail,
-                        monthly_span_quota: default_quota,
-                        billing_email: None,
                     }
                 })
             }),
@@ -212,10 +208,10 @@ impl TenantConfigCache {
     /// TTL). The resolver is responsible for fail-safe (Tail) on error, so this
     /// never surfaces an error to the hot path.
     async fn resolve_into_cache(&self, tenant: Uuid) -> TenantConfig {
-        if let Some(e) = self.entries.get(&tenant) {
-            if e.fetched_at.elapsed() < self.ttl {
-                return e.cfg.clone();
-            }
+        if let Some(e) = self.entries.get(&tenant)
+            && e.fetched_at.elapsed() < self.ttl
+        {
+            return e.cfg.clone();
         }
         let cfg = (self.resolver)(tenant).await;
         self.entries.insert(
@@ -233,12 +229,6 @@ impl TenantConfigCache {
         self.resolve_into_cache(tenant).await.policy
     }
 
-    /// Resolve a tenant's full config — quota cap + billing email (OTLP receiver
-    /// quota path).
-    pub async fn config_for(&self, tenant: Uuid) -> TenantConfig {
-        self.resolve_into_cache(tenant).await
-    }
-
     /// Drop a tenant's cached config — the LISTEN/NOTIFY invalidation hook
     /// (`tenant_config_changed`, migration 14). The next `policy_for` re-resolves.
     pub fn invalidate(&self, tenant: Uuid) {
@@ -253,12 +243,12 @@ impl TenantConfigCache {
 }
 
 /// Production resolver: read each tenant's config from the Neon control plane.
-/// Computes the ADR-048 policy precedence ([`resolve_policy`]) + the ingest quota
-/// cap (`trace_quota_monthly × overage_hard_cap_multiplier`, in spans) + billing
-/// email. Two fail directions: an unknown tenant (query OK, no row) → cheap
-/// `Tail`; a pool/query **fault** → [`TenantConfig::fault_keep_all`] (Full,
-/// keep-all) with the finite `fault_quota` cap. The hot path never sees an error.
-pub fn pg_tenant_config_resolver(pool: DbPool, fault_quota: u64) -> ResolveFn {
+/// Computes the ADR-048 policy precedence ([`resolve_policy`]) + the billing
+/// email (BILL-01 step 8). Two fail directions: an unknown tenant (query OK,
+/// no row) → cheap `Tail`; a pool/query **fault** →
+/// [`TenantConfig::fault_keep_all`] (Full, keep-all — no quota cap any more,
+/// ADR-076). The hot path never sees an error.
+pub fn pg_tenant_config_resolver(pool: DbPool) -> ResolveFn {
     Arc::new(move |tenant: Uuid| {
         let pool = pool.clone();
         Box::pin(async move {
@@ -276,12 +266,12 @@ pub fn pg_tenant_config_resolver(pool: DbPool, fault_quota: u64) -> ResolveFn {
                         tracelane_shared::degradation::Degradation::TenantConfigFault,
                     );
                     tracing::warn!(
-                        %tenant, error = %e, fault_quota,
+                        %tenant, error = %e,
                         "tenant config resolve FAULTED — keep-all (Full) so a control-plane blip \
                          never drops benign spans (#81 class); bounded by the per-trace ceiling \
-                         + the finite fault quota"
+                         (ADR-076: no quota cap exists any more)"
                     );
-                    TenantConfig::fault_keep_all(fault_quota)
+                    TenantConfig::fault_keep_all()
                 }
             }
         })
@@ -289,11 +279,9 @@ pub fn pg_tenant_config_resolver(pool: DbPool, fault_quota: u64) -> ResolveFn {
 }
 
 const RESOLVE_SQL: &str = "\
-    SELECT t.sampling_policy, t.force_tail, t.billing_email, \
+    SELECT t.sampling_policy, t.force_tail, \
       COALESCE(we.f_full_capture, pe.f_full_capture, FALSE), \
-      COALESCE(we.f_audit_addon, pe.f_audit_addon, FALSE), \
-      (COALESCE(we.trace_quota_monthly, pe.trace_quota_monthly, 0) \
-       * COALESCE(we.overage_hard_cap_multiplier, pe.overage_hard_cap_multiplier, 1.0))::BIGINT \
+      COALESCE(we.f_audit_addon, pe.f_audit_addon, FALSE) \
     FROM tenants t \
     LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
     LEFT JOIN plan_entitlements pe ON pe.plan_lookup_key = we.plan_lookup_key \
@@ -307,10 +295,8 @@ async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig
     };
     let sampling_policy: String = row.get(0);
     let force_tail: bool = row.get(1);
-    let billing_email: Option<String> = row.get(2);
-    let f_full_capture: bool = row.get(3);
-    let f_audit_addon: bool = row.get(4);
-    let quota_cap: i64 = row.get(5);
+    let f_full_capture: bool = row.get(2);
+    let f_audit_addon: bool = row.get(3);
 
     let policy = resolve_policy(PolicyInputs {
         wants_full: sampling_policy.eq_ignore_ascii_case("full"),
@@ -318,11 +304,7 @@ async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig
         audit_active: f_audit_addon,
         force_tail,
     });
-    Ok(TenantConfig {
-        policy,
-        monthly_span_quota: quota_cap.max(0) as u64,
-        billing_email,
-    })
+    Ok(TenantConfig { policy })
 }
 
 /// Spawn the long-lived LISTEN task that evicts cache entries on control-plane
@@ -546,7 +528,6 @@ mod tests {
     fn full() -> TenantConfig {
         TenantConfig {
             policy: SamplingPolicy::Full,
-            ..Default::default()
         }
     }
 
@@ -582,8 +563,7 @@ mod tests {
             )
             .expect("pool config is valid; connecting is what must fail");
 
-        let fault_quota = 4_242;
-        let resolver = pg_tenant_config_resolver(pool, fault_quota);
+        let resolver = pg_tenant_config_resolver(pool);
 
         let before = count(Degradation::TenantConfigFault);
         let cfg_out = resolver(uuid::Uuid::from_u128(0xB187)).await;
@@ -660,22 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn fault_keep_all_is_full_with_finite_quota_distinct_from_default_tail() {
+    fn fault_keep_all_is_full_distinct_from_default_tail() {
         // A runtime resolver FAULT keeps every span (Full) regardless of the
         // tail rate — a control-plane blip must not drop benign spans (#81
-        // class) — but with a FINITE quota (review P1-1) so a sustained/induced
-        // fault hard-stops, not uncapped. An unknown-tenant/no-row resolution is
-        // NOT a fault and stays the cheaper Tail default.
-        let fault = TenantConfig::fault_keep_all(25_000_000);
+        // class) — bounded only by the per-trace ceiling now (ADR-076 retired
+        // the quota cap this used to also carry). An unknown-tenant/no-row
+        // resolution is NOT a fault and stays the cheaper Tail default.
+        let fault = TenantConfig::fault_keep_all();
         assert_eq!(fault.policy, SamplingPolicy::Full);
-        assert_eq!(
-            fault.monthly_span_quota, 25_000_000,
-            "fault quota is FINITE (P1-1), not unlimited"
-        );
-        assert_ne!(
-            fault.monthly_span_quota, 0,
-            "a fault must NOT be uncapped/unlimited"
-        );
         assert_eq!(
             TenantConfig::default().policy,
             SamplingPolicy::Tail,

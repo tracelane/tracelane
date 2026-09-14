@@ -311,7 +311,10 @@ describe("rendered /guardrails roster — a Free tenant sees no false lock", () 
 	// No live verdicts = the state a fresh/Free workspace is in, which is exactly
 	// when `locked = gated && !live` decides whether to show the upsell badge.
 	const html = renderToStaticMarkup(
-		createElement(RailRoster, { live: [], range: "24h" }),
+		createElement(RailRoster, {
+			live: [],
+			blockedHrefBase: "/guardrails/verdicts?decision=block&range=24h",
+		}),
 	);
 	/** The markup for one rail row, from its id label back to the row start. */
 	const rowOf = (id: string): string => {

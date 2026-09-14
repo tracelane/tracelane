@@ -98,7 +98,29 @@ export interface StatCardProps {
 	 * Values are normalised internally; pass raw numbers.
 	 */
 	spark?: readonly number[];
+	/**
+	 * Small-sample rendering (DSH-11 §3d). `n` is the sample the rate was measured
+	 * over; `floor` the smallest sample that can resolve its target. Below the
+	 * floor the CALLER passes a neutral tone and this renders
+	 * `n = 70 · below the 1,000-request floor` under the value, so precision the
+	 * sample cannot support is never shown without its caveat.
+	 */
+	sample?: { n: number; floor: number; fraction?: string };
 	className?: string;
+	/**
+	 * Where the value block sits when the card is TALLER than its content.
+	 *
+	 * `"baseline"` (default) pushes it to the bottom with `mt-auto`, which is what
+	 * makes a ROW of KPI tiles share one baseline — a tile without a `sub` would
+	 * otherwise float its number halfway up beside a neighbour that has one.
+	 *
+	 * `"top"` opts out, for a card whose height is set by something OTHER than its
+	 * own content: a DSH-13 dashboard stat tile placed beside a 480px chart
+	 * stretches to that chart's height, and `mt-auto` then stranded the number at
+	 * the bottom of a mostly-empty card (founder screenshot, 2026-09-07). Nothing
+	 * shares a baseline with it, so there is no baseline to keep.
+	 */
+	valueAlign?: "baseline" | "top";
 }
 
 /** Tone → VALUE colour. `default` is primary ink: the reading is the point. */
@@ -140,7 +162,9 @@ export function StatCard({
 	interactive,
 	delta,
 	spark,
+	sample,
 	className,
+	valueAlign = "baseline",
 }: StatCardProps) {
 	const isDefault = variant === "default";
 	// ONE surface class for every variant — see the header. `.stat-tile` supplies
@@ -156,10 +180,10 @@ export function StatCard({
 				// transparent-bordered inverse tile has no edge of any kind and dissolves
 				// into the canvas behind it. In light theme `--line` on a near-black fill
 				// is a 1px step the ground already almost matches, so it costs nothing.
-				"stat-tile bg-surface-inverse p-5"
+				"stat-tile relative bg-surface-inverse p-5"
 			: variant === "action"
-				? "stat-tile border-action-line bg-action-soft p-5"
-				: "stat-tile p-5";
+				? "stat-tile relative border-action-line bg-action-soft p-5"
+				: "stat-tile relative p-5";
 	// `.t-metric-label` already paints `--ink-2`, so `default` and `action` pass
 	// NOTHING here and inherit the one definition of what a metric label is. Only
 	// the dark card needs its own tone.
@@ -275,7 +299,7 @@ export function StatCard({
 					)}
 				</p>
 			</div>
-			<div className="mt-auto">
+			<div className={valueAlign === "top" ? undefined : "mt-auto"}>
 				<div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
 					<p className={cn("t-metric", valueCls)}>{value}</p>
 					{/* Borderless inline delta (P0.6) — no fill, no border, no radius.
@@ -319,12 +343,30 @@ export function StatCard({
 				    THE COMMENT LIVED INSIDE `{spark && ( … )}` and broke the parse: the
 				    right-hand side of `&&` is ONE expression, so a JSX comment beside the
 				    element is a syntax error, not a comment. It is hoisted here. */}
+				{/* Founder 2026-09-04: a spark sits to the RIGHT of the value row, not
+				    under it, so a tile with a series is no taller than one without.
+				    Absolutely positioned inside the tile's bottom-right so the value row
+				    keeps its baseline grid with its neighbours. */}
 				{spark && (
 					<SparkBars
 						values={spark}
 						inverse={variant === "inverse"}
-						className="mt-2"
+						height={22}
+						className="pointer-events-none absolute right-5 bottom-5 w-28"
 					/>
+				)}
+				{sample && (
+					<p
+						className={cn("mt-1 font-mono text-2xs", subCls)}
+						style={{ fontVariantNumeric: "tabular-nums" }}
+						data-sample-floor={sample.floor}
+					>
+						n = {sample.n.toLocaleString("en-US")}
+						{sample.n < sample.floor
+							? ` · below the ${sample.floor.toLocaleString("en-US")}-sample floor`
+							: ""}
+						{sample.fraction ? ` · ${sample.fraction}` : ""}
+					</p>
 				)}
 				{/* Reserved line: keeps every tile in a row the same height even when
 				    only some have a sub-line, without forcing callers to pass an empty

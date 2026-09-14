@@ -198,6 +198,60 @@ def all_docs() -> list[str]:
     ]
 
 
+# Founder ruling 2026-09-03 §4: docs/archive/ is never read as current truth. A
+# CANONICAL doc — tracked, not itself under docs/archive/, and not a HISTORICAL
+# stub left at a retired path (CLAUDE.md §19) — that links or path-references
+# docs/archive/... as a LIVE citation is the same shape as B-279/§17: a reader
+# following the link is sent to superseded material believing it is current.
+#
+# Whitelisted by PATH, not by content: docs/INDEX.md and
+# the archive's own index file index the archive BY DESIGN — every reference
+# there is deliberate, not a citation mistake.
+ARCHIVE_REF_RE = re.compile(r"docs/archive/[\w./-]+")
+# Joined at runtime on purpose: the public-export guard refuses a `docs/archive/<name>.md`
+# token in shipped source (and ruff re-joins adjacent literals, so `+` it is).
+ARCHIVE_REF_WHITELIST = {"docs/INDEX.md", "docs/archive/" + "ARCHIVE_INDEX.md"}
+# Matches the machine header check-archive-headers.py requires — a canonical-side
+# doc carrying this in its own first lines is itself a retirement stub (CLAUDE.md
+# §19's worked example), not a live doc making a live citation.
+HISTORICAL_STUB_RE = re.compile(r"tracelane:status:\s*HISTORICAL")
+
+
+def canonical_docs() -> list[str]:
+    """Tracked docs NOT under docs/archive/ and not themselves a HISTORICAL stub."""
+    out = []
+    for p in all_docs():
+        if p in ARCHIVE_REF_WHITELIST:
+            continue
+        if p.startswith("docs/archive/"):
+            continue
+        head = "\n".join(
+            (ROOT / p).read_text(encoding="utf-8", errors="replace").splitlines()[:5]
+        )
+        if HISTORICAL_STUB_RE.search(head):
+            continue
+        out.append(p)
+    return out
+
+
+def check_archive_citations(docs: list[str]) -> list[tuple[str, int, str]]:
+    """Every canonical doc that path-references docs/archive/... as a LIVE
+    reference, unannotated. Annotated (same line says "historical"/"archived",
+    or the link carries a `(historical)`/`archived` marker) is fine — the
+    citation is then clearly to superseded material, not presented as truth."""
+    bad: list[tuple[str, int, str]] = []
+    for p in docs:
+        text = (ROOT / p).read_text(encoding="utf-8", errors="replace")
+        for i, line in enumerate(text.split("\n"), 1):
+            if not ARCHIVE_REF_RE.search(line):
+                continue
+            low = line.lower()
+            if "historical" in low or "archived" in low:
+                continue
+            bad.append((p, i, line.strip()[:160]))
+    return bad
+
+
 def rust_cli_flags() -> set[str]:
     """Flags of the Rust verifier, read from its clap-derive struct fields."""
     src = ROOT / "crates" / "tracelane-audit-cli" / "src" / "main.rs"
@@ -296,6 +350,21 @@ def report(docs: list[str]) -> int:
                 )
                 print(f"    -> registered: {' '.join(sorted(known)) or '(none)'}\n")
 
+    archive_hits = check_archive_citations(canonical_docs())
+    if archive_hits:
+        problems += len(archive_hits)
+        print(
+            f"ARCHIVE CITATION — {len(archive_hits)} canonical doc line(s) cite "
+            "docs/archive/ as a live reference:"
+        )
+        for p, i, line in archive_hits:
+            print(f"    {p}:{i}  {line}")
+        print(
+            "    -> archive is not citable as current truth — cite the canonical "
+            "doc or code, or annotate the line 'historical'/'archived' if the "
+            "citation is deliberate\n"
+        )
+
     if problems:
         print(f"FAIL — {problems} cross-document conflict(s).")
         return 1
@@ -343,6 +412,40 @@ def selftest() -> int:
             print(f"  FAIL: false positive on agreeing docs: {conflicts}")
             return 1
         print("  OK: no false positive")
+
+    print("selftest: an UNANNOTATED docs/archive/ citation must FAIL ...")
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "a.md").write_text(
+            "See docs/archive/old-spec-1.md for the retention table.\n",
+            encoding="utf-8",
+        )
+        real_root = ROOT
+        ROOT = Path(td)
+        try:
+            hits = check_archive_citations(["a.md"])
+        finally:
+            ROOT = real_root
+        if not hits:
+            print("  FAIL: unannotated docs/archive/ citation was NOT caught")
+            return 1
+        print(f"  OK: caught {hits}")
+
+    print("selftest: an ANNOTATED docs/archive/ citation must PASS ...")
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "a.md").write_text(
+            "See docs/archive/old-spec-1.md (historical) for how retention used to work.\n",
+            encoding="utf-8",
+        )
+        real_root = ROOT
+        ROOT = Path(td)
+        try:
+            hits = check_archive_citations(["a.md"])
+        finally:
+            ROOT = real_root
+        if hits:
+            print(f"  FAIL: annotated citation was wrongly flagged: {hits}")
+            return 1
+        print("  OK: annotated citation not flagged")
 
     print(
         "selftest PASSED — the gate blocks a real contradiction and stays quiet otherwise."

@@ -17,6 +17,7 @@
 
 import type { Span } from "@/components/trace-viewer/types";
 
+import { isRedactedEndUser } from "@/lib/end-user";
 import { countToolCallSpans, detectToolLoop } from "@/lib/tool-loop";
 import { computeTraceSummary } from "@/lib/trace-summary";
 import { Badge, StatCard, fmtDur } from "@tracelanedev/ui";
@@ -146,6 +147,32 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 						</span>
 					}
 				/>
+
+				{/* OBS-20 — "who initiated this". Rendered only when the caller sent
+				    one: an always-present tile reading "—" on every trace would
+				    train the reader to ignore it, and the sessions page carries
+				    the "how do I send this" hint instead. `[REDACTED:email]` is
+				    surfaced as an explained value rather than blanked, because a
+				    working privacy control must not read as a broken feature. */}
+				{s.endUsers.length > 0 && (
+					<StatCard
+						label={s.endUsers.length > 1 ? "Users" : "User"}
+						value={
+							<span
+								className="text-sm font-semibold leading-snug"
+								title={
+									s.endUsers.some(isRedactedEndUser)
+										? "An email address was sent as the user id and was removed by PII redaction before storage. Send an opaque id (a UUID or hash) instead."
+										: undefined
+								}
+							>
+								{s.endUsers
+									.map((u) => (isRedactedEndUser(u) ? "redacted" : u))
+									.join(", ")}
+							</span>
+						}
+					/>
+				)}
 
 				{s.providers.length > 0 && (
 					<StatCard

@@ -136,7 +136,15 @@ def strip_test_modules(src: str) -> str:
             continue
         # Only treat it as a module/block if what sits between is short — a `#[cfg(test)]`
         # on a single `fn` is fine to blank too, but we must not run away to a distant `{`.
-        if "}" in src[m.end() : brace] or (brace - m.end()) > 200:
+        # A `;` between the attribute and the brace means the attribute sat on a
+        # STATEMENT (`#[cfg(test)] use …;`), not on a block — the brace found is the
+        # next item's (2026-09-03: `fn main() {` in crates/ingest/src/main.rs, which
+        # blanked the whole process setup and reported a wired task as unwired).
+        if (
+            "}" in src[m.end() : brace]
+            or ";" in src[m.end() : brace]
+            or (brace - m.end()) > 200
+        ):
             continue
         depth, i, n = 0, brace, len(src)
         while i < n:

@@ -3,54 +3,54 @@
 /* ─────────────────────────────────────────────────────────────────────────────
    tracelane.dev — marketing surface.
 
-   REBUILT FROM SCRATCH 2026-08-24 on founder instruction ("drop all and then
-   build a fresh"). The previous system — a warm-grey "Instrument" palette layered
-   over glassmorphism, mesh gradients, aurora washes and six tinted pricing tiles —
-   is GONE. Nothing below is inherited from it.
+   RE-UNIFIED 2026-09-04, founder ruling (overrides the 2026-09-03 "site keeps
+   its warm palette" ruling): the site now shares ONE palette with the app —
+   the shared ui `tokens.css`, currently ADR-074 Amendment 4
+   "Cupertino" (Apple light ground, floating white cards, one blue accent,
+   iOS-depth dark). The site's own `tokens.site.css` (2026-09-03 fork) is
+   DELETED — see `git log -p -- apps/site/src/styles/tokens.site.css` for its
+   short life. This pass is PRESENTATION + copy density; no price, date,
+   citation, link or copy lock moved — `tests/site.test.ts` still asserts the
+   ladder and the copy locks, and now reads its token expectations from
+   `packages/ui/src/styles/tokens.css` instead of a site-local fork.
 
-   The TYPE SCALE, RADII, SPACING and LAYOUT below are cursor.com's, measured out
-   of Cursor's own shipped stylesheet (`/marketing-static/_next/static/chunks/
-   1255v9fszg0ay.css`) on 2026-08-24 and annotated with the Cursor custom property
-   each came from. Those are unchanged.
+   WHAT IS KEPT:
+     · ONE sans (Inter) + ONE mono (JetBrains Mono), self-hosted, no third-party
+       font request (the CSP has no font-src for one) — the app itself ships
+       Geist, but the brief keeps the site's existing self-hosted faces.
+     · The lowercase wordmark and the aperture mark (`Logo.astro`, untouched).
+     · The 16px marketing density override (ADR-074 §2) — `tokens.css` sets the
+       app's 13px body for its own 4px grid; averaging the two is how the app
+       ends up unusable, so marketing re-asserts 16px explicitly.
+     · The Cursor container steps (1140 / 1380) and bottom-stacked sections.
 
-   THE COLOUR IS NOT CURSOR'S ANY MORE — RE-TONED 2026-08-27 on founder
-   instruction, against a reference canvas: a COOL slate/pearl neutral family in
-   place of Cursor's warm stone, with one warm copper accent. Colour only; not one
-   font, layout rule, number or string moved. The Cursor property names left in the
-   COLOUR block below are the ROLE each token still plays, not a claim that the hex
-   was read from Cursor — the hexes there are ours.
+   WHAT CHANGED:
+     1. PALETTE. Every `--color-*` role below is now a var() alias onto the
+        shared tokens (`--bg`, `--surface`, `--ink*`, `--line*`, `--action*`,
+        `--ok`, `--danger`) instead of a site-pinned hex. One accent — the
+        app's blue — used only for the CTA and data marks; chrome is
+        monochrome. The "dark band" section keeps a fixed near-black ground
+        (matching the app's own dark `--bg`) regardless of the viewer's colour
+        scheme, since it is a deliberate contrast moment, not a theme switch.
+        `prefers-color-scheme: dark` now works site-wide because it is the
+        SAME mechanism that already drives the app — no separate dark-mode
+        code was added here.
+     2. VERY LOW TEXT. Sections were cut to a headline + one line; the hero is
+        an animated, interactive request-flow diagram (CSS + vanilla JS, no
+        libraries) instead of a paragraph; features are icon chips; "how it
+        works" is three numbered steps.
+     3. A REAL PRICING LADDER. Tier cards share one anatomy (name · price · meta ·
+        rule · checklist · CTA); the recommended tier is inverted to ink.
 
-   THE THREE THINGS THAT MAKE IT READ THE WAY IT DOES, in order of how much they
-   matter:
-     1. A cool off-white canvas (#f5f6f8) with cards only a hair darker (#eef0f4).
-        The contrast between a card and the page is ~2%. Nothing floats, nothing
-        glows, nothing has a drop shadow — surfaces are distinguished by tone alone.
-     2. 4px radii on panels and cards, pill radii on buttons. Small radius + large
-        panel is the signature; the old system's 2rem panel radius is the single
-        biggest thing that made it NOT look like this.
-     3. An understated hero. Cursor's h1 ships at 1.625rem — smaller than their own
-        section headings, which run 3.25rem→4.5rem. The framed product stage carries
-        the page, not the headline.
-
-   `@tracelanedev/ui/styles/tokens.css` is still imported: it is the app's token
-   file, `tests/site.test.ts` asserts its ink/line/ok hexes reach the artifact, and
-   the app + docs portal read from it. The site's ROLE tokens below no longer alias
-   onto it — this surface is deliberately its own skin now — but the import stays so
-   the shared definitions ship and that gate keeps meaning something.
+   Radii: 16px on cards (matching the app's Cupertino `--radius-card`), 10px on
+   controls/wells, pill on buttons.
    ───────────────────────────────────────────────────────────────────────────── */
 @import "@tracelanedev/ui/styles/tokens.css";
 
 @theme {
   /* ============================================================
-     TYPE SCALE — Cursor's, verbatim.
-     Their names map onto Tailwind's like this:
-       text-xl  = --text-md     (1.375rem)
-       text-2xl = --text-md-lg  (1.625rem)  ← their h1
-       text-3xl = --text-lg     (2.25rem)
-       text-4xl = --text-xl     (3.25rem)
-       text-5xl = --text-2xl    (4.5rem)
-     So `text-3xl sm:text-4xl` on a section heading lands exactly on Cursor's
-     own `type-lg` → `type-xl` step.
+     TYPE SCALE — Tailwind names kept so existing utilities resolve.
+     Display sizes are fluid and set on the .display-* classes below.
      ============================================================ */
   --text-xs: 0.75rem;
   --text-sm: 0.875rem;
@@ -62,100 +62,99 @@
   --text-4xl: 3.25rem;
   --text-5xl: 4.5rem;
 
-  /* Tracking, per size (Cursor --tracking-*). Negative and small: the scale is
-     tightened as it grows, never loosened. */
   --tracking-xs: 0.01em;
   --tracking-sm: 0.01em;
-  --tracking-base: 0.005em;
-  --tracking-md: -0.005em;
-  --tracking-md-lg: -0.0125em;
-  --tracking-lg: -0.02em;
-  --tracking-xl: -0.025em;
-  --tracking-2xl: -0.03em;
+  --tracking-base: 0.002em;
+  --tracking-md: -0.008em;
+  --tracking-md-lg: -0.015em;
+  --tracking-lg: -0.024em;
+  --tracking-xl: -0.03em;
+  --tracking-2xl: -0.035em;
 
   /* ============================================================
-     RADIUS — Cursor --radius-*. The 4px card is the signature.
+     RADIUS — matches the app's Cupertino radii (A4: 16px cards, 10px controls).
      ============================================================ */
-  --radius-2xs: 2px;
-  --radius-xs: 4px;
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 0.5rem;
-  --radius-xl: 0.75rem;
-  --radius-2xl: 1rem;
-  --radius-panel: 4px; /* was 2rem — see header note (3) */
+  --radius-2xs: 4px;
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-2xl: 26px;
+  --radius-panel: 16px;
 
   /* ============================================================
-     FONTS — self-hosted only, no third-party request (the CSP has no
-     font-src for one). Cursor ships "CursorGothic" + "Berkeley Mono",
-     neither of which is licensable here; Inter and JetBrains Mono are the
-     nearest neutral grotesk / neutral mono we already have on disk.
-     ONE sans, like Cursor — Inter Tight is no longer used for display.
+     FONTS — self-hosted only. The app ships Geist; the site keeps its own
+     self-hosted Inter + JetBrains Mono rather than adding a font request.
      ============================================================ */
   --font-sans: "Inter", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
   --font-display: var(--font-sans);
   --font-mono: "JetBrainsMono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* ============================================================
-     COLOUR — OURS, 2026-08-27. A cool slate/pearl neutral ramp, six steps from
-     canvas to sunken, each ~2% apart so surfaces separate by tone alone. The
-     Cursor property names are kept as the ROLE LABEL for each step (this is the
-     card tone, this is the well tone) — the hexes are not Cursor's.
-       --color-theme-bg        #f5f6f8
-       --color-theme-fg        #15181f
-       --color-theme-card-hex  #eef0f4
-       --color-theme-card-01   #e9ecf1   (hover, light)
-       --color-theme-card-02   #e4e7ee   (stage / well)
-       --color-theme-card-03   #dde1e9   (secondary button, active)
-       --color-theme-card-04   #d5dae4   (secondary button hover)
-       --color-theme-accent    #d9542b
-       text-sec  = fg 60%   text-mid = fg 50%   text-tertiary = fg 40%
-       border-02 = fg 10%   border-02-5 = fg 20%   fg-05 = fg 5%
+     COLOUR — every role is a var() ALIAS onto the shared app tokens
+     (the shared ui `tokens.css`, imported above). No hex is
+     pinned here; a palette swap happens in ONE file and this one follows.
+     Monochrome chrome, one blue accent (--action) for the CTA and data only.
      ============================================================ */
-  --color-bg: #f5f6f8;
-  --color-bg-elevated: #eef0f4; /* card */
-  --color-bg-hover: #e9ecf1;
-  --color-bg-subtle: #e4e7ee; /* stage / well */
-  --color-bg-sunken: #dde1e9;
-  --color-bg-sunken-2: #d5dae4;
+  --color-bg: var(--bg);
+  --color-bg-elevated: var(--surface); /* card plane — white */
+  --color-bg-hover: var(--surface-hover);
+  --color-bg-subtle: var(--surface-2); /* stage / well */
+  --color-bg-sunken: var(--surface-2);
+  --color-bg-sunken-2: var(--surface-3);
 
-  --color-fg: #15181f;
-  --color-fg-muted: color-mix(in oklab, #15181f 60%, transparent); /* text-sec */
-  --color-fg-subtle: color-mix(in oklab, #15181f 60%, transparent);
-  --color-fg-dim: color-mix(in oklab, #15181f 40%, transparent); /* text-tertiary */
+  --color-fg: var(--ink);
+  --color-fg-2: var(--ink-2);
+  --color-fg-muted: var(--ink-2);
+  --color-fg-subtle: var(--ink-3);
+  --color-fg-dim: color-mix(in oklab, var(--ink-3) 75%, transparent);
 
-  --color-border: color-mix(in oklab, #15181f 10%, transparent); /* border-02 */
-  --color-border-subtle: color-mix(in oklab, #15181f 5%, transparent);
-  --color-border-strong: color-mix(in oklab, #15181f 20%, transparent); /* border-02-5 */
+  --color-border: var(--line);
+  --color-border-subtle: color-mix(in oklab, var(--line) 65%, transparent);
+  --color-border-strong: var(--line-2);
 
-  /* The one warm thing on a cool page. A copper, not a safety orange: against a
-     slate canvas the vivid #f54e00 this replaced read as a warning, and the
-     reference sits in the copper/terracotta range. Used for links, the badge dot,
-     the scroll rail and the feature glyphs — nowhere structural. */
-  --color-accent: #d9542b;
-  --color-accent-2: #b8431f;
-  --color-accent-ink: #d9542b;
-  --color-pop: #d9542b;
+  --color-accent: var(--action);
+  --color-accent-2: var(--action-ink);
+  --color-accent-ink: var(--action-ink);
+  --color-pop: var(--action);
+  --color-accent-soft: var(--action-soft);
 
-  /* Proof signal. Desaturated and pulled COOL so they sit in the same family as
-     the canvas — a generic #22c55e reads as a different site. */
-  --color-verify: #0f7f60;
-  --color-alarm: #c9314f;
+  --color-verify: var(--ok);
+  --color-alarm: var(--danger);
 
-  /* Dark stage — used for the terminal frames. A cool near-black, not Cursor's
-     warm #14120b, so the dark panels belong to the same page as the light ones. */
-  --color-panel-dark: #0d1015; /* --color-theme-bg, dark */
-  --color-panel-dark-card: #151922; /* --color-theme-card-hex, dark */
-  --color-on-dark: #e7eaf0; /* --color-theme-fg, dark */
-  --color-on-dark-muted: color-mix(in oklab, #e7eaf0 60%, transparent);
+  /* Dark band + dark frames — a deliberate, fixed near-black contrast moment,
+     independent of the viewer's colour scheme (mirrors the app's own dark
+     `--bg`/`--surface` values rather than tracking the light/dark switch). */
+  --color-panel-dark: #000000;
+  --color-panel-dark-card: #1c1c1e;
+  --color-on-dark: #f5f5f7;
+  --color-on-dark-muted: color-mix(in oklab, #f5f5f7 62%, transparent);
+  --color-on-dark-dim: color-mix(in oklab, #f5f5f7 42%, transparent);
 
-  /* Rhythm. Cursor: --v = 1rem*1.4 (vertical), --g = 10rem/16 (grid gutter). */
   --spacing-v: 1.4rem;
   --spacing-g: 0.625rem;
 
-  /* Motion. Two curves and three durations, named once. */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+/* Elevation — cool-tinted shadows, anchored on the shared --ink token so they
+   track the palette. Kept outside @theme so they are not turned into
+   utilities nobody asked for. */
+:root {
+  --shadow-sm:
+    0 1px 1px color-mix(in oklab, var(--ink) 4%, transparent),
+    0 1px 3px color-mix(in oklab, var(--ink) 5%, transparent);
+  --shadow-md:
+    0 1px 2px color-mix(in oklab, var(--ink) 5%, transparent),
+    0 6px 16px -6px color-mix(in oklab, var(--ink) 12%, transparent),
+    0 18px 40px -18px color-mix(in oklab, var(--ink) 16%, transparent);
+  --shadow-lg:
+    0 1px 2px color-mix(in oklab, var(--ink) 6%, transparent),
+    0 12px 28px -10px color-mix(in oklab, var(--ink) 18%, transparent),
+    0 40px 80px -32px color-mix(in oklab, var(--ink) 28%, transparent);
+  --ring-inset: inset 0 1px 0 color-mix(in oklab, #ffffff 70%, transparent);
 }
 
 /* ── Self-hosted faces ─────────────────────────────────────────────────────── */
@@ -183,42 +182,42 @@
     scroll-behavior: smooth;
     scroll-padding-top: 5.5rem;
     -webkit-text-size-adjust: 100%;
+    /* The hero bloom and the dark band's gradients extend past the viewport by
+       design; `clip` keeps the document from growing a horizontal scroll while
+       creating no scroll container of its own. */
+    overflow-x: clip;
   }
 
   /* MARKETING DENSITY, 16px. `tokens.css` sets `body { font-size: 12.5px }` for
      the app's 4px grid; ADR-074 §2 is explicit that averaging the two densities
-     is how the app ends up unusable. This override is the whole reason this
-     block exists, and `tests/site.test.ts` asserts the 16px reached the
-     artifact. */
+     is how the app ends up unusable. `tests/site.test.ts` asserts the 16px
+     reached the artifact. */
   body {
     font-size: 16px;
     background: var(--color-bg);
     color: var(--color-fg);
     font-family: var(--font-sans);
-    line-height: 1.5;
+    line-height: 1.55;
     letter-spacing: var(--tracking-base);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    font-feature-settings: "cv05" 1, "ss03" 1;
+    font-feature-settings: "cv05" 1, "ss03" 1, "cv11" 1;
+    overflow-x: clip;
   }
 
-  /* Headings: normal weight, tightened tracking, snug leading. Cursor sets
-     font-weight NORMAL on every display size — the size does the work, not the
-     weight, and a 3.25rem bold heading is the other thing that stops a page
-     reading like this one. */
   h1,
   h2,
   h3,
   h4 {
     font-family: var(--font-display);
-    font-weight: 400;
-    line-height: 1.15;
+    font-weight: 500;
+    line-height: 1.1;
     letter-spacing: var(--tracking-lg);
     text-wrap: balance;
   }
   h3,
   h4 {
-    line-height: 1.25;
+    line-height: 1.3;
     letter-spacing: var(--tracking-md);
   }
 
@@ -235,167 +234,282 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   LAYOUT
-   Cursor's container steps: 420 / 660 / 900 / 1140 / 1380 / 1470, gutter 1.25rem.
+   DISPLAY TYPE — fluid, one family, stepped.
    ═══════════════════════════════════════════════════════════════════════════ */
-.container {
+.display-xl {
+  font-size: clamp(2.5rem, 1.4rem + 4.6vw, 4.25rem);
+  line-height: 1.02;
+  letter-spacing: var(--tracking-2xl);
+  font-weight: 500;
+}
+.display-lg {
+  font-size: clamp(2rem, 1.3rem + 2.6vw, 3rem);
+  line-height: 1.08;
+  letter-spacing: var(--tracking-xl);
+  font-weight: 500;
+}
+.display-md {
+  font-size: clamp(1.75rem, 1.3rem + 1.6vw, 2.375rem);
+  line-height: 1.12;
+  letter-spacing: var(--tracking-lg);
+  font-weight: 500;
+}
+.lede {
+  font-size: clamp(1.0625rem, 1rem + 0.35vw, 1.25rem);
+  line-height: 1.6;
+  color: var(--color-fg-muted);
+  text-wrap: pretty;
+  max-width: 40rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LAYOUT
+   ═══════════════════════════════════════════════════════════════════════════ */
+.container,
+.panel,
+.site-bar,
+.hero-panel,
+.hero-container,
+.band-inner {
   width: 100%;
   margin-inline: auto;
-  padding-inline: 1.25rem;
+  padding-inline: clamp(1.25rem, 3vw, 2rem);
   max-width: 1140px;
 }
 @media (min-width: 1380px) {
-  .container {
-    max-width: 1380px;
-  }
-}
-@media (min-width: 1470px) {
-  .container {
-    max-width: 1470px;
+  .container,
+  .panel,
+  .site-bar,
+  .hero-panel,
+  .hero-container,
+  .band-inner {
+    max-width: 1280px;
   }
 }
 
 .container-prose {
   width: 100%;
   margin-inline: auto;
-  padding-inline: 1.25rem;
-  max-width: 720px;
+  padding-inline: clamp(1.25rem, 3vw, 2rem);
+  max-width: 760px;
 }
 
-/* A section. Cursor's `.section` is padding-block-end: v6 (8.4rem) with no top
-   padding — sections stack bottom-to-bottom, which is why the page reads as one
-   continuous column rather than a stack of bands. */
+/* A section. Sections stack bottom-to-bottom so the page reads as one column. */
 .panel {
-  width: 100%;
-  margin-inline: auto;
-  padding-inline: 1.25rem;
-  max-width: 1140px;
-  padding-block-end: calc(var(--spacing-v) * 5);
-}
-@media (min-width: 1380px) {
-  .panel {
-    max-width: 1380px;
-  }
-}
-@media (min-width: 1470px) {
-  .panel {
-    max-width: 1470px;
-  }
-}
-@media (min-width: 900px) {
-  .panel {
-    padding-block-end: calc(var(--spacing-v) * 6);
-  }
+  padding-block-end: clamp(5rem, 9vw, 8.5rem);
 }
 
-/* `panel-wash` / `panel-dark` / `panel-rail` are carried over as NAMES because
-   /security, /pricing and /terms use them. Under the new system a "wash" is a
-   one-step tone change, not a gradient. */
-.panel-wash {
+/* A full-bleed band. Children use .band-inner for the column. */
+.band {
+  width: 100%;
+  margin-block-end: clamp(5rem, 9vw, 8.5rem);
+  padding-block: clamp(4.5rem, 8vw, 7.5rem);
+}
+.band--dark {
+  position: relative;
+  /* ONE accent, one bloom — monochrome chrome, blue only (was two hues). */
+  background: var(--color-panel-dark);
+  color: var(--color-on-dark);
+  isolation: isolate;
+}
+.band--dark::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(color-mix(in oklab, var(--color-on-dark) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in oklab, var(--color-on-dark) 5%, transparent) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(80% 80% at 50% 40%, #000 30%, transparent 100%);
+  -webkit-mask-image: radial-gradient(80% 80% at 50% 40%, #000 30%, transparent 100%);
+}
+.band--dark .eyebrow {
+  color: var(--color-on-dark-muted);
+}
+.band--dark .glass {
+  background: color-mix(in oklab, var(--color-on-dark) 4%, var(--color-panel-dark-card));
+  border-color: color-mix(in oklab, var(--color-on-dark) 10%, transparent);
+  box-shadow: none;
+}
+.band--dark .cards-hover > *:hover {
+  background: color-mix(in oklab, var(--color-on-dark) 7%, var(--color-panel-dark-card));
+  border-color: color-mix(in oklab, var(--color-on-dark) 16%, transparent);
+  transform: none;
+  box-shadow: none;
+}
+.band--dark .text-fg {
+  color: var(--color-on-dark);
+}
+.band--dark .text-fg-muted {
+  color: var(--color-on-dark-muted);
+}
+.band--dark .text-fg-dim {
+  color: var(--color-on-dark-dim);
+}
+/* Card anatomy on dark — the class selectors below outrank the utility
+   overrides above, so they need their own on-dark rule. */
+.band--dark .card-title {
+  color: var(--color-on-dark);
+}
+.band--dark .card-body {
+  color: var(--color-on-dark-muted);
+}
+.band--dark .glass {
+  box-shadow: none;
+}
+
+/* Legacy names carried for /security, /pricing, /terms. */
+.panel-wash,
+.panel-dark,
+.mesh,
+.mesh-aurora {
   background: transparent;
 }
 .panel-rail {
   padding-block: calc(var(--spacing-v) * 1.5);
 }
-.panel-dark {
-  background: transparent;
+
+/* Section head — eyebrow + title + lede, one rhythm everywhere. */
+.section-head {
+  max-width: 44rem;
+}
+.section-head > .lede {
+  margin-top: 1.1rem;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   SURFACES — card and stage
+   SURFACES — card, well, frame
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* `.glass` keeps its name (six files reference it) and loses everything that
-   made it glass. It is now Cursor's `.card`: flat card tone, 4px radius, a
-   1px border at 2.5% ink, no blur, no shadow. */
+/* `.glass` keeps its name (six files reference it). It is the card plane:
+   white, hairline border, soft layered shadow, an inner top highlight. */
 .glass {
+  position: relative;
   background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-xs);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 .cards-hover > * {
   transition:
-    background-color 0.18s var(--ease-out),
-    border-color 0.18s var(--ease-out);
+    transform 0.25s var(--ease-out),
+    box-shadow 0.25s var(--ease-out),
+    border-color 0.25s var(--ease-out),
+    background-color 0.25s var(--ease-out);
 }
 .cards-hover > *:hover {
-  background: var(--color-bg-hover);
-  border-color: var(--color-border);
+  transform: translateY(-2px);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-md), var(--ring-inset);
 }
 
-/* THE STAGE — the framed showcase panel from cursor.com.
-   A wide, barely-tinted well (#e4e7ee) at 4px radius, with the product frame
-   inset on top of it. This is the "background + frames" the founder pointed at:
-   the well is a TONE, and the frame inside it is a window. */
+/* Card anatomy helpers. */
+.card-index {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  color: var(--color-accent);
+}
+.card-title {
+  margin-top: 0.85rem;
+  font-size: 1.125rem;
+  font-weight: 500;
+  letter-spacing: var(--tracking-md);
+  color: var(--color-fg);
+}
+.card-body {
+  margin-top: 0.6rem;
+  color: var(--color-fg-muted);
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+.card-rule {
+  height: 1px;
+  background: var(--color-border-subtle);
+  margin-block: 1.25rem;
+}
+
+/* THE STAGE — a tinted well with the product frame inset. */
 .stage-well {
+  position: relative;
   background: var(--color-bg-subtle);
-  border-radius: var(--radius-xs);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-panel);
   padding: clamp(0.75rem, 2.5vw, 2.25rem);
   overflow: hidden;
 }
 
-/* Two of Cursor's stages sit on a soft painted backdrop rather than a flat
-   tone. This is that register done as a soft mesh — the founder's reference
-   canvas (2026-08-27): a cool pearl grey top-left, a slate-periwinkle body,
-   and ONE warm bloom held to the top-right corner. Four stops, no imagery, no
-   licensed asset. The warm bloom is the only saturated thing on the page that
-   is not the accent, and it is deliberately weak — a mesh that competes with
-   the product frame sitting on top of it is decoration, not a backdrop. */
+/* The scenic well: monochrome surface tones, one faint blue bloom (chrome
+   stays monochrome; the accent appears once, for data). */
 .stage-well--scenic {
   background:
-    radial-gradient(90% 70% at 6% 0%, #f3f5f8 0%, transparent 60%),
-    radial-gradient(66% 92% at 100% 20%, #ecd9cd 0%, transparent 58%),
-    radial-gradient(78% 70% at 100% 82%, #e7dee1 0%, transparent 60%),
-    radial-gradient(120% 110% at 28% 104%, #ccd5e6 0%, transparent 62%),
-    linear-gradient(155deg, #eceff4 0%, #dfe4ee 46%, #d7dce8 100%);
+    radial-gradient(90% 70% at 6% 0%, var(--color-bg-elevated) 0%, transparent 60%),
+    radial-gradient(78% 70% at 100% 82%, var(--color-bg-subtle) 0%, transparent 60%),
+    linear-gradient(155deg, var(--color-bg-subtle) 0%, var(--color-bg-sunken) 46%, var(--color-bg-sunken-2) 100%);
+}
+.stage-well--scenic::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(color-mix(in oklab, var(--color-fg) 4%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in oklab, var(--color-fg) 4%, transparent) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: linear-gradient(180deg, #000 0%, transparent 70%);
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, transparent 70%);
+}
+.stage-well--scenic > * {
+  position: relative;
+  z-index: 1;
 }
 
 .stage-well--dark {
   background:
     radial-gradient(110% 90% at 10% 0%, #1b2029 0%, transparent 60%),
     linear-gradient(180deg, #141821 0%, #0d1015 100%);
+  border-color: color-mix(in oklab, var(--color-on-dark) 8%, transparent);
 }
 
-/* THE WINDOW FRAME — a macOS-chrome panel. Title bar with three lights, a
-   centred title, then the body. Cursor's frames are pale, borderless-feeling
-   and sit on the well with one soft shadow that reads as depth, not glow. */
+/* THE WINDOW FRAME */
 .frame {
   background: var(--color-bg-elevated);
-  border: 1px solid color-mix(in oklab, #15181f 8%, transparent);
+  border: 1px solid color-mix(in oklab, var(--color-fg) 10%, transparent);
   border-radius: var(--radius-md);
   overflow: hidden;
-  box-shadow:
-    0 1px 2px color-mix(in oklab, #15181f 6%, transparent),
-    0 12px 32px -12px color-mix(in oklab, #15181f 22%, transparent);
+  box-shadow: var(--shadow-lg);
 }
 
 .frame-bar {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  background: color-mix(in oklab, #15181f 3%, var(--color-bg-elevated));
-  border-bottom: 1px solid color-mix(in oklab, #15181f 7%, transparent);
+  padding: 0.55rem 0.85rem;
+  background: color-mix(in oklab, var(--color-fg) 2.5%, var(--color-bg-elevated));
+  border-bottom: 1px solid color-mix(in oklab, var(--color-fg) 7%, transparent);
   position: relative;
-  min-height: 2.25rem;
+  min-height: 2.35rem;
 }
 .frame-lights {
   display: inline-flex;
-  gap: 0.375rem;
+  gap: 0.4rem;
 }
 .frame-lights i {
-  width: 0.625rem;
-  height: 0.625rem;
+  width: 0.6rem;
+  height: 0.6rem;
   border-radius: 999px;
-  background: color-mix(in oklab, #15181f 16%, transparent);
+  background: color-mix(in oklab, var(--color-fg) 14%, transparent);
 }
 .frame-title {
   position: absolute;
   inset-inline: 0;
   text-align: center;
-  font-size: 0.75rem;
-  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--color-fg-dim);
   pointer-events: none;
 }
 .frame-action {
@@ -405,27 +519,28 @@
   z-index: 1;
 }
 .frame-body {
-  padding: 1rem 1.1rem 1.15rem;
+  padding: 1.05rem 1.2rem 1.2rem;
 }
 
-/* Dark variant — used for the two terminal frames. */
 .frame--dark {
   background: var(--color-panel-dark-card);
-  border-color: color-mix(in oklab, #e7eaf0 10%, transparent);
+  border-color: color-mix(in oklab, var(--color-on-dark) 12%, transparent);
   color: var(--color-on-dark);
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--color-on-dark) 6%, transparent) inset,
+    var(--shadow-lg);
 }
 .frame--dark .frame-bar {
-  background: color-mix(in oklab, #e7eaf0 4%, var(--color-panel-dark-card));
-  border-bottom-color: color-mix(in oklab, #e7eaf0 8%, transparent);
+  background: color-mix(in oklab, var(--color-on-dark) 4%, var(--color-panel-dark-card));
+  border-bottom-color: color-mix(in oklab, var(--color-on-dark) 8%, transparent);
 }
 .frame--dark .frame-lights i {
-  background: color-mix(in oklab, #e7eaf0 20%, transparent);
+  background: color-mix(in oklab, var(--color-on-dark) 18%, transparent);
 }
 .frame--dark .frame-title {
-  color: var(--color-on-dark-muted);
+  color: var(--color-on-dark-dim);
 }
 
-/* Media frame — the chrome wraps a video or image edge-to-edge. */
 .frame--media .frame-body {
   padding: 0;
   line-height: 0;
@@ -437,9 +552,7 @@
   height: auto;
 }
 
-/* The OVERLAP. Cursor's stages layer a second, smaller window over the first,
-   offset down-right. Below 900px they stack — an overlap on a phone is just
-   two things you cannot read. */
+/* The overlap stack (migration stage). */
 .frame-stack {
   position: relative;
 }
@@ -455,41 +568,34 @@
     margin-top: 0;
     z-index: 2;
   }
-  /* Room for the overlap to land in — and it must land on EMPTY space, not on
-     the frame beneath it. The first pass sized the overlap at 62% and the
-     `tlane migrate helicone` comment ran underneath it, so the reader lost the
-     end of two lines. An overlap that hides content is a layout bug wearing a
-     style's clothes. */
   .frame-stack > .frame:first-child .frame-body {
     padding-bottom: 5.5rem;
   }
-  /* Only a stage that CARRIES an overlap needs the extra well below it. Applied
-     to every well it just read as an unbalanced bottom margin. */
   .stage-well:has(.frame-stack) {
     padding-bottom: clamp(2rem, 4.5vw, 3.75rem);
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   TERMINAL — used inside .frame--dark. Real command output only.
+   TERMINAL — inside .frame--dark. Real command output only.
    ═══════════════════════════════════════════════════════════════════════════ */
 .term {
   font-family: var(--font-mono);
   font-size: 0.8125rem;
-  line-height: 1.65;
+  line-height: 1.7;
   color: var(--color-on-dark);
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
 }
 .term .c {
-  color: color-mix(in oklab, #e7eaf0 45%, transparent);
+  color: color-mix(in oklab, var(--color-on-dark) 42%, transparent);
 }
 .term .p {
   color: var(--color-accent);
 }
 .term .ok {
-  color: #34c39a;
+  color: var(--color-verify);
 }
 .caret {
   display: inline-block;
@@ -504,11 +610,7 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   BUTTONS — Cursor's .btn family, measured.
-     primary   : solid ink, bg-coloured text, pill
-     secondary : card-03 fill, hairline border, pill
-     ghost     : transparent, 20% border, pill
-     text/tert : accent-coloured, no chrome
+   BUTTONS
    ═══════════════════════════════════════════════════════════════════════════ */
 .btn-primary,
 .btn-secondary,
@@ -516,39 +618,64 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 0.4em;
+  gap: 0.45em;
   border-radius: 999px;
   font-size: var(--text-base);
-  font-weight: 400;
+  font-weight: 500;
   line-height: 1;
-  padding: 0.78em 1.35em 0.8em;
+  padding: 0.8em 1.35em 0.82em;
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
+  letter-spacing: -0.005em;
   transition:
-    background-color 0.16s var(--ease-out),
-    border-color 0.16s var(--ease-out),
-    color 0.16s var(--ease-out);
+    background-color 0.18s var(--ease-out),
+    border-color 0.18s var(--ease-out),
+    color 0.18s var(--ease-out),
+    transform 0.18s var(--ease-out),
+    box-shadow 0.18s var(--ease-out);
+}
+.btn-primary > [aria-hidden] {
+  transition: transform 0.18s var(--ease-out);
+}
+.btn-primary:hover > [aria-hidden] {
+  transform: translateX(2px);
 }
 
 .btn-primary {
-  background: var(--color-fg);
-  border: 1px solid var(--color-fg);
-  color: var(--color-bg);
+  /* Always a dark-ink pill with white text — fixed, not theme-relative
+     (var(--color-fg) flips to near-white in dark mode and broke this). */
+  background: linear-gradient(180deg, #2a2f39 0%, var(--color-panel-dark-card) 100%);
+  border: 1px solid var(--color-panel-dark-card);
+  color: #ffffff;
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, #ffffff 14%, transparent),
+    0 1px 2px color-mix(in oklab, var(--color-fg) 20%, transparent),
+    0 6px 14px -6px color-mix(in oklab, var(--color-fg) 40%, transparent);
 }
 .btn-primary:hover {
-  background: #2b303a; /* --color-theme-fg-02 */
-  border-color: #2b303a;
-  color: var(--color-bg);
+  background: linear-gradient(180deg, #343a46 0%, #1c2028 100%);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, #ffffff 16%, transparent),
+    0 2px 4px color-mix(in oklab, var(--color-fg) 20%, transparent),
+    0 10px 20px -8px color-mix(in oklab, var(--color-fg) 45%, transparent);
+}
+.btn-primary:active {
+  transform: translateY(0);
 }
 
 .btn-secondary {
-  background: var(--color-bg-sunken);
-  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   color: var(--color-fg);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 .btn-secondary:hover {
-  background: var(--color-bg-sunken-2);
+  background: var(--color-bg-hover);
+  border-color: color-mix(in oklab, var(--color-fg) 28%, transparent);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md), var(--ring-inset);
 }
 
 .btn-ghost {
@@ -560,74 +687,127 @@
   background: var(--color-bg-elevated);
 }
 
+/* On-dark variants. */
+.band--dark .btn-secondary,
+.on-dark .btn-secondary {
+  background: color-mix(in oklab, var(--color-on-dark) 6%, transparent);
+  border-color: color-mix(in oklab, var(--color-on-dark) 18%, transparent);
+  color: var(--color-on-dark);
+  box-shadow: none;
+}
+.band--dark .btn-secondary:hover,
+.on-dark .btn-secondary:hover {
+  background: color-mix(in oklab, var(--color-on-dark) 10%, transparent);
+  border-color: color-mix(in oklab, var(--color-on-dark) 30%, transparent);
+}
+.on-dark .btn-primary {
+  background: #ffffff;
+  border-color: #ffffff;
+  /* Fixed dark ink, not theme-relative — this button is always white
+     regardless of page theme (it sits on a permanently-dark surface), so its
+     text must stay dark too. var(--color-fg) broke this in dark mode. */
+  color: #1d1d1f;
+  box-shadow: 0 8px 20px -8px color-mix(in oklab, #000 60%, transparent);
+}
+.on-dark .btn-primary:hover {
+  background: #f1f3f7;
+}
+
 .btn-sm {
   font-size: var(--text-sm);
-  padding: 0.45em 0.9em 0.46em;
+  padding: 0.5em 0.95em 0.52em;
 }
-/* THE HEADER CTA IS A THUMB TARGET ON A PHONE. At the desktop padding it renders
-   25px tall — over WCAG 2.5.8's 24px floor by one pixel, and well under the 44px
-   both Apple and Android ask for. It is the single most important control on the
-   page, so below the `sm` breakpoint it gets height instead of scaling with type.
-
-   THE VALUE IS SET FROM A MEASUREMENT, NOT FROM ARITHMETIC. The first attempt used
-   `0.75em` and I reported "25px -> 38px" — a number I had calculated from the font
-   size and never checked. The live site measured **32px**. Both figures were wrong
-   in the same direction, which is the point: a padding in `em` interacts with
-   line-height and the pill radius, so the only honest way to hit a pixel target is
-   to render it and read it back. 1.25em measures 43px at 320-430px, which is
-   the platform guidance, and fits inside the 64px bar with room to spare. */
+/* THE HEADER CTA IS A THUMB TARGET ON A PHONE (WCAG 2.5.8 / platform 44px).
+   1.25em measured 43px at 320-430px on the previous system; kept. */
 @media (max-width: 639px) {
   .btn-sm {
     padding: 1.25em 1.05em 1.26em;
   }
 }
+.btn-block {
+  width: 100%;
+}
 
-/* The accent inline link Cursor uses to close a feature block. */
 .link-accent {
-  color: var(--color-accent);
+  color: var(--color-accent-ink);
   text-decoration: none;
+  font-weight: 500;
   transition: color 0.16s var(--ease-out);
 }
 .link-accent:hover {
-  color: color-mix(in oklab, var(--color-accent) 75%, transparent);
+  color: var(--color-accent);
+}
+.band--dark .link-accent {
+  color: var(--color-accent);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    SMALL PARTS
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Eyebrow / kicker — Cursor's `type-sm` label above a heading. */
+/* Eyebrow — mono, copper tick, small caps feel via tracking (text stays as
+   authored; no transform, so the lowercase copy lock is preserved). */
 .eyebrow {
-  font-size: var(--text-sm);
-  letter-spacing: var(--tracking-sm);
-  color: var(--color-fg-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+  color: var(--color-fg-subtle);
+}
+.eyebrow::before {
+  content: "";
+  width: 1.25rem;
+  height: 1px;
+  background: var(--color-accent);
+  flex: none;
+}
+.eyebrow.eyebrow--center {
+  justify-content: center;
 }
 
 .badge {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.55rem;
   border-radius: 999px;
   border: 1px solid var(--color-border);
   background: var(--color-bg-elevated);
-  padding: 0.35rem 0.8rem;
+  padding: 0.4rem 0.9rem 0.4rem 0.7rem;
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-sm);
-  color: var(--color-fg-muted);
+  letter-spacing: 0.02em;
+  color: var(--color-fg-subtle);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 .badge .dot {
-  width: 0.4rem;
-  height: 0.4rem;
+  width: 0.45rem;
+  height: 0.45rem;
   border-radius: 999px;
   background: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
 }
 
-/* `grad-text` keeps its name; the gradient is gone. Emphasis is now the accent,
-   which is how Cursor marks a word — one colour, no ramp. */
 .grad-text {
   color: var(--color-accent);
 }
-
+/* DSH-16 (2026-09-07): the ONE gradient headline this pass adds to the site —
+   blue -> amber, applied ONLY to the audit section's "Provably." (index.astro).
+   A NEW class rather than repointing `.grad-text` itself: that class has TWO
+   call sites (the hero's "flight recorder" AND "Provably."), and the brief's
+   assumption that it had one was wrong (verified against index.astro before
+   building — DSH-16 spec §4). Giving the gradient to both would put it on the
+   single most prominent line on the whole page as well as the trust claim,
+   which is more colour than "a little personality" asks for; this keeps the
+   hero's existing flat accent untouched. */
+.grad-text-warm {
+  background-image: linear-gradient(90deg, var(--action) 0%, var(--accent-warm) 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
 .text-verify {
   color: var(--color-verify);
 }
@@ -635,49 +815,183 @@
   color: var(--color-accent);
 }
 
-/* Provider tiles — Cursor's logo garden. A flat card, tall, name centred. */
+/* Fact strip under the hero CTAs — mono, hairline separators. All items are
+   claims the page already carries elsewhere. */
+.fact-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  color: var(--color-fg-dim);
+}
+.fact-strip > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.fact-strip > span::before {
+  content: "";
+  width: 0.3rem;
+  height: 0.3rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+  opacity: 0.8;
+}
+
+/* Hero backdrop — a faint hairline grid fading out, and one warm bloom. */
+.hero {
+  position: relative;
+}
+.hero::before {
+  content: "";
+  position: absolute;
+  inset: -4rem 0 0 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(color-mix(in oklab, var(--color-fg) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in oklab, var(--color-fg) 5%, transparent) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(70% 55% at 50% 0%, #000 0%, transparent 100%);
+  -webkit-mask-image: radial-gradient(70% 55% at 50% 0%, #000 0%, transparent 100%);
+}
+/* B-Icons/glow pass (2026-09-04): the blue radial bloom behind the hero
+   was removed — the hero ground is now the flat token ground plus the
+   barely-there grid above. */
+
+/* Provider strip — one bordered rail, cells separated by hairlines. */
+.provider-rail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+}
+@media (min-width: 660px) {
+  .provider-rail {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (min-width: 900px) {
+  .provider-rail {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+}
+.provider-rail .tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 4.5rem;
+  padding: 1rem 0.5rem;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--color-fg-subtle);
+  text-align: center;
+  border-right: 1px solid var(--color-border-subtle);
+  border-bottom: 1px solid var(--color-border-subtle);
+  transition:
+    color 0.18s var(--ease-out),
+    background-color 0.18s var(--ease-out);
+}
+.provider-rail .tile:hover {
+  color: var(--color-fg);
+  background: var(--color-bg-hover);
+}
+.provider-rail .tile:last-child {
+  color: var(--color-accent-ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+}
+/* Legacy tile grid (any other page naming it). */
 .tile-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.625rem;
 }
-@media (min-width: 660px) {
-  .tile-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-}
-@media (min-width: 900px) {
-  .tile-grid {
-    grid-template-columns: repeat(8, minmax(0, 1fr));
-  }
-}
-.tile {
+.tile-grid .tile {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 5.5rem;
-  padding: 1rem 0.5rem;
+  min-height: 5rem;
   background: var(--color-bg-elevated);
-  border-radius: var(--radius-xs);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
   font-size: var(--text-sm);
-  color: color-mix(in oklab, #15181f 75%, transparent);
-  text-align: center;
-  transition: background-color 0.18s var(--ease-out);
 }
-.tile:hover {
-  background: var(--color-bg-hover);
+
+/* Ledger chain — a DIAGRAM of the mechanism the copy describes (events hash-
+   chained, a Merkle root signed). Labels only; no hash values, no counts. */
+.chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 0.75rem;
+  margin-top: 2rem;
+}
+.chain-node {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid color-mix(in oklab, var(--color-on-dark) 14%, transparent);
+  border-radius: var(--radius-xs);
+  background: color-mix(in oklab, var(--color-on-dark) 4%, var(--color-panel-dark-card));
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.02em;
+  color: var(--color-on-dark-muted);
+  min-width: 5.25rem;
+}
+.chain-node b {
+  font-weight: 500;
+  color: var(--color-on-dark);
+}
+.chain-node--root {
+  border-color: color-mix(in oklab, var(--color-accent) 55%, transparent);
+  background: color-mix(in oklab, var(--color-accent) 12%, var(--color-panel-dark-card));
+}
+.chain-node--root b {
+  color: var(--color-accent);
+}
+.chain-link {
+  flex: none;
+  width: 1.25rem;
+  height: 1px;
+  background: color-mix(in oklab, var(--color-on-dark) 22%, transparent);
+  position: relative;
+}
+.chain-link::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: -2.5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--color-accent);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    PRICING — /pricing and the homepage anchor share PricingTable.astro.
-   The six tinted "mesh tiles" are retired; a tier header is now type alone.
-   The tile-* class names are kept so the component needs no edit.
+   Class names kept; the anatomy is name · price · meta · rule · list · CTA.
    ═══════════════════════════════════════════════════════════════════════════ */
-.mesh-tile {
+.tier {
   display: flex;
   flex-direction: column;
-  gap: 0.85rem;
-  padding-bottom: 1.1rem;
+  padding: 1.6rem 1.6rem 1.5rem;
+}
+.tier .mesh-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding-bottom: 1.25rem;
   border-bottom: 1px solid var(--color-border-subtle);
 }
 .tile-graphite,
@@ -689,68 +1003,236 @@
   background: transparent;
 }
 .t-name {
-  font-size: var(--text-sm);
-  letter-spacing: var(--tracking-sm);
-  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  color: var(--color-fg-subtle);
 }
 .t-price {
-  font-size: var(--text-3xl);
-  letter-spacing: var(--tracking-lg);
+  font-size: clamp(2.25rem, 1.8rem + 1.5vw, 2.75rem);
+  letter-spacing: var(--tracking-xl);
+  font-weight: 500;
   color: var(--color-fg);
-  line-height: 1.05;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
 }
 .t-per {
   font-size: var(--text-base);
+  font-weight: 400;
+  letter-spacing: 0;
   color: var(--color-fg-muted);
+  margin-left: 0.15rem;
 }
 .t-meta {
-  margin-top: 0.4rem;
+  margin-top: 0.55rem;
   font-size: var(--text-sm);
   color: var(--color-fg-muted);
 }
-/* The recommended tier is marked by its border, not by a fill. */
-.rec-card {
-  border-color: var(--color-border-strong);
+.tier-list {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+  flex: 1;
 }
-
-/* `mesh` / `mesh-aurora` are referenced by /security and the old audit band.
-   They are now inert — kept as no-ops so no page loses a class it names. */
-.mesh,
-.mesh-aurora {
-  background: transparent;
+.tier-list li {
+  display: flex;
+  gap: 0.65rem;
+  align-items: flex-start;
+  line-height: 1.5;
+}
+.tier-list li::before {
+  content: "";
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.15rem;
+  border-radius: 999px;
+  background:
+    /* stroke colour is a literal duplicate of --action's light-theme hex — a
+       data: URI cannot read a CSS var(); see tokens.css's --action. */
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%230071e3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-7'/%3E%3C/svg%3E")
+    center / 0.7rem no-repeat,
+    var(--color-accent-soft);
+}
+.tier-cta {
+  margin-top: 1.5rem;
+}
+/* The recommended tier is inverted to ink — fixed, not theme-relative, for
+   the same reason as .btn-primary above. */
+.rec-card {
+  background: linear-gradient(180deg, #1a1e26 0%, var(--color-panel-dark-card) 100%);
+  border-color: var(--color-panel-dark-card);
+  color: var(--color-on-dark);
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, #ffffff 10%, transparent),
+    var(--shadow-lg);
+}
+.rec-card .t-name {
+  color: var(--color-accent);
+}
+.rec-card .t-price,
+.rec-card .text-fg {
+  color: #ffffff;
+}
+.rec-card .t-per,
+.rec-card .t-meta,
+.rec-card .tier-list {
+  color: var(--color-on-dark-muted);
+}
+.rec-card .mesh-tile {
+  border-bottom-color: color-mix(in oklab, var(--color-on-dark) 12%, transparent);
+}
+.rec-card .tier-list li::before {
+  background-color: color-mix(in oklab, var(--color-accent) 24%, transparent);
+}
+.cards-hover > .rec-card:hover {
+  border-color: var(--color-panel-dark-card);
+  background: linear-gradient(180deg, #1e2330 0%, var(--color-panel-dark-card) 100%);
+}
+.rec-tag {
+  position: absolute;
+  top: -0.8rem;
+  left: 1.5rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  box-shadow: 0 4px 12px -4px color-mix(in oklab, var(--color-accent) 60%, transparent);
+}
+.addon {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.6rem;
+  background:
+    radial-gradient(60% 100% at 100% 0%, var(--color-accent-soft) 0%, transparent 60%),
+    var(--color-bg-elevated);
+}
+@media (min-width: 640px) {
+  .addon {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 2rem;
+  }
+}
+.addon-price {
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 1.5rem + 1vw, 2.25rem);
+  font-weight: 500;
+  letter-spacing: var(--tracking-xl);
+  color: var(--color-fg);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.addon-price .t-per {
+  font-size: var(--text-base);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    HEADER / FOOTER CHROME
    ═══════════════════════════════════════════════════════════════════════════ */
 .site-header {
-  background: color-mix(in srgb, var(--color-bg) 88%, transparent);
-  backdrop-filter: saturate(1.1) blur(10px);
-  -webkit-backdrop-filter: saturate(1.1) blur(10px);
+  background: color-mix(in srgb, var(--color-bg) 78%, transparent);
+  backdrop-filter: saturate(1.4) blur(14px);
+  -webkit-backdrop-filter: saturate(1.4) blur(14px);
   border-bottom: 1px solid transparent;
-  transition: border-color 0.2s var(--ease-out);
+  transition:
+    border-color 0.2s var(--ease-out),
+    box-shadow 0.2s var(--ease-out);
 }
 .site-header.scrolled {
   border-bottom-color: var(--color-border-subtle);
+  box-shadow: 0 1px 0 color-mix(in oklab, #ffffff 60%, transparent) inset, var(--shadow-sm);
 }
-.site-bar {
-  width: 100%;
-  margin-inline: auto;
-  padding-inline: 1.25rem;
-  max-width: 1140px;
+/* Theme toggle — fixed 2rem square so light/dark never reflows the bar. */
+.theme-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-bg-elevated);
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  transition: color 0.16s var(--ease-out), background-color 0.16s var(--ease-out), border-color 0.16s var(--ease-out);
 }
-@media (min-width: 1380px) {
-  .site-bar {
-    max-width: 1380px;
-  }
+.theme-toggle:hover {
+  color: var(--color-fg);
+  border-color: var(--color-border-strong);
 }
-@media (min-width: 1470px) {
-  .site-bar {
-    max-width: 1470px;
-  }
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.theme-toggle-icon {
+  position: absolute;
+}
+.theme-toggle-icon--moon {
+  display: none;
+}
+[data-theme="dark"] .theme-toggle-icon--sun {
+  display: none;
+}
+[data-theme="dark"] .theme-toggle-icon--moon {
+  display: block;
+}
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.4rem 0.7rem;
+  border-radius: 999px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--color-fg-muted);
+  text-decoration: none;
+  transition:
+    color 0.16s var(--ease-out),
+    background-color 0.16s var(--ease-out);
+}
+.nav-link:hover {
+  color: var(--color-fg);
+  background: color-mix(in oklab, var(--color-fg) 5%, transparent);
+}
+.nav-link .ext {
+  font-size: 0.7em;
+  opacity: 0.7;
 }
 .logo-mark {
   display: block;
+}
+
+.site-footer {
+  border-top: 1px solid var(--color-border);
+  /* Was a hardcoded light hex at the gradient end — invisible in light mode,
+     but a wrong-theme light strip once dark mode could apply. */
+  background: linear-gradient(180deg, var(--color-bg) 0%, var(--color-bg-subtle) 100%);
+}
+.footer-col-title {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+  color: var(--color-fg-dim);
+  margin-bottom: 1rem;
+}
+.footer-link {
+  color: var(--color-fg-muted);
+  text-decoration: none;
+  transition: color 0.16s var(--ease-out);
+}
+.footer-link:hover {
+  color: var(--color-fg);
 }
 
 .skip-link {
@@ -776,21 +1258,20 @@
   width: 100%;
   transform: scaleX(0);
   transform-origin: 0 50%;
-  background: var(--color-accent);
+  background: linear-gradient(90deg, var(--color-accent), var(--color-accent));
   z-index: 60;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   MOTION — one entrance, used everywhere. Cursor's page barely moves; a fade
-   with 8px of lift is the whole vocabulary.
+   MOTION — one entrance, used everywhere.
    ═══════════════════════════════════════════════════════════════════════════ */
 .reveal,
 .reveal-group > * {
   opacity: 0;
-  transform: translateY(8px);
+  transform: translateY(10px);
   transition:
-    opacity 0.5s var(--ease-out),
-    transform 0.5s var(--ease-out);
+    opacity 0.6s var(--ease-out),
+    transform 0.6s var(--ease-out);
 }
 .reveal.in,
 .reveal-group.in > * {
@@ -798,35 +1279,181 @@
   transform: none;
 }
 .reveal-group.in > *:nth-child(2) {
-  transition-delay: 0.06s;
+  transition-delay: 0.07s;
 }
 .reveal-group.in > *:nth-child(3) {
-  transition-delay: 0.12s;
+  transition-delay: 0.14s;
 }
 .reveal-group.in > *:nth-child(4) {
-  transition-delay: 0.18s;
+  transition-delay: 0.21s;
 }
 .reveal-group.in > *:nth-child(5) {
-  transition-delay: 0.24s;
+  transition-delay: 0.28s;
 }
 .reveal-group.in > *:nth-child(6) {
-  transition-delay: 0.3s;
+  transition-delay: 0.35s;
+}
+/* Hover transitions must not be overridden by the reveal transition once in. */
+.cards-hover.in > * {
+  transition:
+    transform 0.25s var(--ease-out),
+    box-shadow 0.25s var(--ease-out),
+    border-color 0.25s var(--ease-out),
+    background-color 0.25s var(--ease-out),
+    opacity 0.6s var(--ease-out);
 }
 
 .hero-rise,
 .headline-in {
-  animation: rise 0.6s var(--ease-out) both;
+  animation: rise 0.7s var(--ease-out) both;
   animation-delay: var(--d, 0s);
 }
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(12px);
   }
   to {
     opacity: 1;
     transform: none;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HERO REQUEST-FLOW DIAGRAM — the animated/interactive hero visual. CSS +
+   vanilla JS only (index.astro's inline script), no libraries. A pulse
+   travels each connector on a loop; hovering/focusing a node highlights it
+   and swaps the readout line below (JS-driven, no invented numbers — only
+   the qualitative state each step is already claimed to do elsewhere).
+   ═══════════════════════════════════════════════════════════════════════════ */
+.hero-flow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0.5rem 0.25rem 1.1rem;
+}
+.flow-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  flex: none;
+  width: 5.75rem;
+  padding: 0.9rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  transition:
+    border-color 0.2s var(--ease-out),
+    box-shadow 0.2s var(--ease-out),
+    color 0.2s var(--ease-out),
+    transform 0.2s var(--ease-out);
+}
+.flow-node-glyph {
+  display: flex;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.flow-node-glyph svg {
+  width: 100%;
+  height: 100%;
+}
+.flow-node.is-active,
+.flow-node:focus-visible {
+  border-color: var(--color-accent);
+  color: var(--color-fg);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md), 0 0 0 3px var(--color-accent-soft);
+}
+.flow-line {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 1.5rem;
+  height: 1px;
+  background: var(--color-border-strong);
+}
+.flow-pulse {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-top: -0.2rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
+  animation: flow-pulse 2.4s var(--ease-in-out) infinite;
+  animation-delay: var(--delay, 0s);
+}
+@keyframes flow-pulse {
+  0% {
+    left: 0;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    left: calc(100% - 0.4rem);
+    opacity: 0;
+  }
+}
+.hero-flow-readout {
+  min-height: 1.2rem;
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+  text-align: center;
+}
+
+/* Icon chips — the "why it fails" row. One line, one icon, no card body. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.65rem 1.1rem 0.65rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  font-size: var(--text-sm);
+  color: var(--color-fg);
+}
+.chip-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 999px;
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  flex: none;
+}
+.chip-glyph svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+/* The 3-step "how it works" — a numbered index on the existing card anatomy. */
+.step-card {
+  position: relative;
+}
+.step-num {
+  position: absolute;
+  top: 1.4rem;
+  right: 1.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-fg-dim);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -842,29 +1469,176 @@
     animation: none !important;
     transition: none !important;
   }
-  .caret {
+  .caret,
+  .flow-pulse {
     animation: none;
+  }
+  .flow-pulse {
+    left: 50%;
+    opacity: 1;
+  }
+  .cards-hover > *:hover {
+    transform: none;
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   FAQ — <details> as a Cursor list row: hairline separators, no card chrome.
+   BENCHMARK CHART — grouped horizontal bars, one row per gateway, three bars
+   (p50/p95/p99) per row. Pure CSS width percentages computed at build time
+   in index.astro's frontmatter (`benchPct`) — no chart library, no runtime
+   JS. The visual chart is `aria-hidden`; a `.sr-only` <table> right below it
+   carries the same numbers for assistive tech, and each bar's track also
+   carries its own `aria-label` so the numbers survive even if a reader
+   reaches into the hidden chart directly.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.bench-chart {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  overflow: hidden;
+}
+.bench-row {
+  padding: 1.1rem 1.25rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.bench-row:last-child {
+  border-bottom: 0;
+}
+.bench-row--highlight {
+  position: relative;
+  background: color-mix(in oklab, var(--color-accent) 6%, transparent);
+}
+.bench-row--highlight::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 3px;
+  background: var(--color-accent);
+}
+.bench-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.bench-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+  color: var(--color-fg);
+}
+.bench-tag {
+  border-radius: 999px;
+  background: var(--color-accent-soft);
+  padding: 0.15rem 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  color: var(--color-accent);
+}
+.bench-version {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-fg-dim);
+}
+.bench-bars {
+  margin-top: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.bench-bar-line {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(0, 1fr) 3.4rem;
+  align-items: center;
+  gap: 0.65rem;
+}
+.bench-bar-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-fg-dim);
+}
+.bench-bar-track {
+  height: 0.55rem;
+  border-radius: 999px;
+  background: var(--color-bg-subtle);
+  overflow: hidden;
+}
+.bench-bar-fill {
+  height: 100%;
+  min-width: 3px;
+  border-radius: inherit;
+  background: var(--color-fg-subtle);
+}
+.bench-row--highlight .bench-bar-fill {
+  background: var(--color-accent);
+}
+.bench-bar-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-fg-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.bench-run1 {
+  margin-top: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--color-fg-dim);
+}
+.bench-not-measured {
+  margin-top: 0.65rem;
+  font-size: var(--text-sm);
+  color: var(--color-fg-dim);
+}
+.bench-rss-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+}
+.bench-rss-row b {
+  font-weight: 500;
+  color: var(--color-fg);
+}
+.bench-footnotes {
+  line-height: 1.6;
+}
+.bench-repro {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-subtle);
+  padding: 0.55em 0.9em;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-fg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FAQ — <details> as hairline rows.
    ═══════════════════════════════════════════════════════════════════════════ */
 .faq-row {
-  border-top: 1px solid var(--color-border-subtle);
+  border-top: 1px solid var(--color-border);
 }
 .faq-row:last-child {
-  border-bottom: 1px solid var(--color-border-subtle);
+  border-bottom: 1px solid var(--color-border);
 }
 .faq-row > summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 1.5rem;
-  padding: 1.15rem 0;
+  padding: 1.25rem 0;
   cursor: pointer;
   list-style: none;
   font-size: var(--text-lg);
+  font-weight: 500;
   letter-spacing: var(--tracking-md);
   transition: color 0.16s var(--ease-out);
 }
@@ -872,19 +1646,36 @@
   display: none;
 }
 .faq-row > summary:hover {
-  color: var(--color-accent);
+  color: var(--color-accent-ink);
 }
 .faq-row > summary .sign {
-  color: var(--color-fg-dim);
-  transition: transform 0.2s var(--ease-out);
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-strong);
+  font-size: 1rem;
+  font-weight: 400;
+  color: var(--color-fg-muted);
+  transition:
+    transform 0.25s var(--ease-out),
+    background-color 0.2s var(--ease-out),
+    color 0.2s var(--ease-out),
+    border-color 0.2s var(--ease-out);
 }
 .faq-row[open] > summary .sign {
   transform: rotate(45deg);
+  background: var(--color-fg);
+  border-color: var(--color-fg);
+  color: var(--color-bg);
 }
 .faq-row > p {
-  padding-bottom: 1.25rem;
+  padding-bottom: 1.5rem;
   max-width: 68ch;
+  animation: rise 0.35s var(--ease-out) both;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -895,42 +1686,71 @@
   border-radius: 999px;
   border: 1px solid var(--color-border-strong);
   background: var(--color-bg-elevated);
-  padding: 0.78em 1.25em 0.8em;
+  padding: 0.8em 1.25em 0.82em;
   font-size: var(--text-base);
   color: var(--color-fg);
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  transition:
+    border-color 0.16s var(--ease-out),
+    box-shadow 0.16s var(--ease-out);
 }
 .field::placeholder {
   color: var(--color-fg-dim);
 }
 .field:focus {
-  outline: 2px solid var(--color-fg);
-  outline-offset: 0.15ch;
+  outline: none;
+  border-color: var(--color-fg);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-fg) 8%, transparent);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   LEGACY CLASS NAMES still referenced by /security, /privacy, /terms, /404 and
-   PricingTable. Redefined in the new language rather than deleted, because a
-   page losing a class it names renders unstyled — not "slightly different".
+   PROSE PAGES — /security, /privacy, /terms.
    ═══════════════════════════════════════════════════════════════════════════ */
-.hero-panel,
-.hero-container {
-  width: 100%;
-  margin-inline: auto;
-  padding-inline: 1.25rem;
-  max-width: 1140px;
+.prose-page h2 {
+  margin-top: 3.5rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--color-border);
+  font-size: clamp(1.375rem, 1.2rem + 0.6vw, 1.625rem);
+  font-weight: 500;
+  letter-spacing: var(--tracking-md-lg);
 }
-@media (min-width: 1380px) {
-  .hero-panel,
-  .hero-container {
-    max-width: 1380px;
-  }
+.prose-page ul {
+  margin-top: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
 }
-@media (min-width: 1470px) {
-  .hero-panel,
-  .hero-container {
-    max-width: 1470px;
-  }
+.prose-page ul > li {
+  position: relative;
+  padding-left: 1.5rem;
+  color: var(--color-fg-muted);
+  line-height: 1.6;
+  text-wrap: pretty;
 }
+.prose-page ul > li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.8em;
+  width: 0.75rem;
+  height: 1px;
+  background: var(--color-accent);
+}
+.prose-page p {
+  text-wrap: pretty;
+}
+.prose-page code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.4em;
+  border-radius: var(--radius-2xs);
+  background: color-mix(in oklab, var(--color-fg) 5%, transparent);
+  color: var(--color-fg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LEGACY CLASS NAMES still referenced by /404 and old markup.
+   ═══════════════════════════════════════════════════════════════════════════ */
 .hero-cols {
   display: grid;
   gap: 2rem;
@@ -940,22 +1760,26 @@
 }
 
 .feat-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent-soft);
   color: var(--color-accent);
-  margin-bottom: 1rem;
-  height: 1.5rem;
-  display: flex;
-  align-items: flex-end;
+  margin-bottom: 1.1rem;
 }
 .glyph-replay,
 .glyph-prove {
-  width: 1.35rem;
-  height: 1.35rem;
+  width: 1.2rem;
+  height: 1.2rem;
 }
 .glyph-eq {
   display: inline-flex;
   align-items: flex-end;
   gap: 2px;
-  height: 1.1rem;
+  height: 1rem;
 }
 .glyph-eq i {
   width: 3px;
@@ -976,7 +1800,6 @@
   height: 50%;
 }
 
-/* The old hero video stage. /404 and the legacy markup reference these. */
 .stage-wrap,
 .stage {
   position: relative;
@@ -994,19 +1817,37 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: color-mix(in oklab, #15181f 8%, transparent);
+  background: linear-gradient(180deg, transparent 40%, color-mix(in oklab, var(--color-fg) 22%, transparent) 100%);
   border: 0;
   cursor: pointer;
+  transition: background-color 0.2s var(--ease-out);
 }
 .play {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 4rem;
-  height: 4rem;
+  width: 4.25rem;
+  height: 4.25rem;
   border-radius: 999px;
-  background: var(--color-fg);
-  color: var(--color-bg);
+  background: color-mix(in srgb, #ffffff 92%, transparent);
+  color: var(--color-fg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow:
+    0 0 0 8px color-mix(in srgb, #ffffff 25%, transparent),
+    var(--shadow-lg);
+  transition:
+    transform 0.25s var(--ease-out),
+    box-shadow 0.25s var(--ease-out);
+}
+.stage-overlay:hover .play {
+  transform: scale(1.06);
+  box-shadow:
+    0 0 0 12px color-mix(in srgb, #ffffff 30%, transparent),
+    var(--shadow-lg);
+}
+.play svg {
+  margin-left: 3px;
 }
 .stat-float {
   margin-top: 1rem;
@@ -1020,8 +1861,6 @@
   color: var(--color-fg-muted);
 }
 
-/* The provider marquee is replaced by the tile grid on the homepage; the class
-   stays a plain inline row so any other page naming it still reads. */
 .marquee {
   overflow: hidden;
 }

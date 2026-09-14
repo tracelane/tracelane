@@ -11,15 +11,10 @@ live access to your production traces during debugging.
 **Read-only by design.** The server can never modify traces, change configuration,
 or access another tenant's data.
 
-<Warning>
-**Not on npm, and not available on Tracelane Cloud.** `@tracelanedev/mcp` is not
-published to the registry — it is wired into the release workflow but no release tag has
-carried it yet — so `npx @tracelanedev/mcp` returns a 404. It becomes installable on the
-next bundled release. The server also reads
-spans straight out of ClickHouse instead of proxying the gateway, so it needs
-ClickHouse credentials: it runs against a self-hosted or local Tracelane stack, not
-against a hosted Cloud workspace.
-</Warning>
+By default the server reads through the gateway — the same tenant-scoped `/v1/*` routes
+the dashboard uses — with just an API key and the gateway URL, no ClickHouse credentials.
+Set `CLICKHOUSE_URL` to read ClickHouse directly instead, for a self-hosted or local
+Tracelane stack.
 
 ## Run it
 
@@ -30,15 +25,13 @@ git clone https://github.com/tracelane/tracelane && cd tracelane
 pnpm install && pnpm --filter @tracelanedev/mcp build
 ```
 
-Then start it against your own stack. ClickHouse credentials are what it reads traces
-with; the gateway URL is used only to validate your `tlane_*` key:
+Then start it against your Tracelane Cloud workspace. The gateway URL validates
+`TRACELANE_API_KEY` and — with no `CLICKHOUSE_URL` set — is also where every trace read
+goes:
 
 ```bash
-CLICKHOUSE_URL=http://localhost:8123 \
-CLICKHOUSE_USER=default \
-CLICKHOUSE_PASSWORD=... \
 TRACELANE_API_KEY=tlane_... \
-TRACELANE_GATEWAY_URL=http://localhost:8080 \
+TRACELANE_GATEWAY_URL=https://gateway.tracelane.dev \
 node apps/mcp/dist/index.js
 ```
 
@@ -54,11 +47,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
       "command": "node",
       "args": ["/path/to/tracelane/apps/mcp/dist/index.js"],
       "env": {
-        "CLICKHOUSE_URL": "http://localhost:8123",
-        "CLICKHOUSE_USER": "default",
-        "CLICKHOUSE_PASSWORD": "...",
         "TRACELANE_API_KEY": "tlane_...",
-        "TRACELANE_GATEWAY_URL": "http://localhost:8080"
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
       }
     }
   }
@@ -70,6 +60,28 @@ Restart Claude Desktop. You should see "tracelane" in the MCP tools list.
 ## Configure Claude Code
 
 Add to `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "tracelane": {
+      "command": "node",
+      "args": ["/path/to/tracelane/apps/mcp/dist/index.js"],
+      "env": {
+        "TRACELANE_API_KEY": "tlane_...",
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
+      }
+    }
+  }
+}
+```
+
+## Self-host (ClickHouse) instead
+
+Set `CLICKHOUSE_URL` to read ClickHouse directly rather than through the gateway — for a
+self-hosted or local Tracelane stack. `TRACELANE_GATEWAY_URL` is still needed; it is where
+`TRACELANE_API_KEY` is validated (`/v1/auth/whoami`) even though trace reads go to
+ClickHouse instead:
 
 ```json
 {
@@ -116,8 +128,12 @@ annotations, token counts, and latency breakdown.
 ### `get_span`
 
 ```typescript
-mcp.tracelane.get_span({ span_id: "uuid" })
+mcp.tracelane.get_span({ trace_id: "uuid", span_id: "uuid" })
 ```
+
+`trace_id` is **required** when reading through the gateway (Cloud mode) — there is no
+span-by-id gateway route, so the span is located via the trace's span list. Self-host
+(ClickHouse) mode accepts `span_id` alone.
 
 Returns: single span with all attributes and predictive verdict detail. Input and
 output content appears only if an operator has enabled content capture for the
@@ -128,17 +144,25 @@ workspace (see [Security](/security)); it is off by default.
 ```typescript
 mcp.tracelane.search_traces({
   query: "tool_call browserbase stuck-loop",
-  since: "24h",
-  limit: 10,
+  model_filter: "claude-sonnet-4-6",  // optional
+  has_error: true,                     // optional
+  limit: 10,                           // optional, 1-50, default 10
 })
 ```
 
-Free-text search across span names and OTel attribute values.
+Free-text search across span names and attribute JSON. Gateway mode rejects a query
+shorter than 4 characters. There is no time-window filter on this tool today.
 
 ### `explain_guardrail_block`
 
 ```typescript
-mcp.tracelane.explain_guardrail_block({ span_id: "uuid" })
+// Self-host (ClickHouse) mode — a detection-layer (AFT) flag on a recorded span:
+mcp.tracelane.explain_guardrail_block({ trace_id: "uuid", span_id: "uuid" })
+
+// Gateway (Cloud) mode also accepts a correlation_id — the id from a guardrail
+// block's 403 response body, for a request blocked pre-flight (no trace exists
+// for it, since the request never dispatched):
+mcp.tracelane.explain_guardrail_block({ correlation_id: "01ABC..." })
 ```
 
 Returns a structured explanation: which AFT rule fired, the evidence, the
@@ -163,10 +187,11 @@ Resolution: review span 7–9 for unintended data exfiltration.
 ### `list_evals`
 
 ```typescript
-mcp.tracelane.list_evals({ suite: "fault-tolerance" })
+mcp.tracelane.list_evals()
 ```
 
-Returns the eval scoreboard — the 20 conformance evals with current status.
+Takes no parameters — it always returns the full bundled eval manifest (id, suite, and
+count for every pain-point and fault-tolerance eval), not a suite-filtered subset.
 
 ### `get_eval_result`
 
@@ -205,9 +230,11 @@ node apps/mcp/dist/index.js
 
 ## Auth
 
-**V1:** `TRACELANE_API_KEY` env var — the `tlane_*` key is hashed and looked up
-against the Postgres `api_keys` table. The resulting `tenant_id` scopes all
-ClickHouse queries.
+**V1:** `TRACELANE_API_KEY` env var — the `tlane_*` key is validated against the
+gateway's `/v1/auth/whoami`. In gateway (Cloud) mode the key also authenticates every
+subsequent trace read; the gateway resolves `tenant_id` from the key's claims and scopes
+every route to it server-side. In self-host mode, the resolved `tenant_id` scopes every
+ClickHouse query this server issues.
 
 **V2:** OAuth 2.1 PKCE — `tenant_id` extracted from the JWT claim only, never
 from tool arguments.
@@ -215,8 +242,9 @@ from tool arguments.
 ## Security invariants
 
 - Read-only: no write tools are exposed — enforced at the `@modelcontextprotocol/sdk` handler level.
-- Every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound).
-- `tenant_id` from env/JWT only — MCP tool arguments cannot override it.
+- Gateway mode: every read is a tenant-scoped gateway route; this server never sends or sees a tenant id. Self-host mode: every ClickHouse query includes `WHERE tenant_id = {tenantId: String}` (parameter-bound).
+- `tenant_id` from env/JWT only — MCP tool arguments cannot override it in either mode.
+- A non-2xx gateway response is a tool error, never an empty result — a revoked key, a key missing the `read` scope, or another tenant's trace id all surface the gateway's own status and message.
 - No raw SQL in tool arguments — all filters are parsed into typed query parameters.
 
 ## Related

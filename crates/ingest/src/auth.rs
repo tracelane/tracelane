@@ -72,7 +72,17 @@ pub struct PeerCertDer(pub Bytes);
 #[derive(Debug, Clone)]
 pub struct SpiffeIdentity {
     pub tenant_id: TenantId,
+    // No production reader today — `require_spiffe_auth` inserts the whole
+    // struct into request extensions, but nothing downstream pulls
+    // `Extension<SpiffeIdentity>` back out and reads these two fields; only
+    // `tenant_id` is separately extracted (as its own extension). Used only
+    // by tests, hence gated (B-390, 2026-09-12) rather than deleted — they
+    // are load-bearing for the moment a downstream handler needs the raw
+    // SPIFFE URI or SVID expiry, and deleting them would silently lose that
+    // capability rather than just hide the warning.
+    #[cfg(test)]
     pub spiffe_uri: String,
+    #[cfg(test)]
     pub expires_at: DateTime<Utc>,
 }
 
@@ -276,10 +286,10 @@ pub fn verify_spiffe_svid_at(
     // MUST have KeyUsage::digital_signature. Without these checks, a
     // CA-issued intermediate cert whose SAN happens to contain the right
     // SPIFFE URI would authenticate as a workload.
-    if let Ok(Some(bc)) = cert.basic_constraints() {
-        if bc.value.ca {
-            return Err(SpiffeAuthError::LeafIsCa);
-        }
+    if let Ok(Some(bc)) = cert.basic_constraints()
+        && bc.value.ca
+    {
+        return Err(SpiffeAuthError::LeafIsCa);
     }
     let key_usage = cert
         .key_usage()
@@ -329,7 +339,9 @@ pub fn verify_spiffe_svid_at(
 
     Ok(SpiffeIdentity {
         tenant_id,
+        #[cfg(test)]
         spiffe_uri: spiffe_uri.to_string(),
+        #[cfg(test)]
         expires_at: not_after,
     })
 }

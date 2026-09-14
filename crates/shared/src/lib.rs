@@ -12,23 +12,33 @@
 //!   rather than in `ingest` because `GWY-41` gave OTLP a SECOND entry point
 //!   (the gateway's authenticated `POST /v1/traces`) and two entry points must
 //!   not mean two decoders. `ingest` re-exports both under their old paths.
+//! - `jetstream_limits` — the one place a JetStream stream/consumer limit is made TRUE
+//!   on an EXISTING stream. `get_or_create_*` never re-applies config, so without it a
+//!   bound added in source reaches fresh deployments only (SRE register #50 / #29).
 //! - `aft` — the AFT failure-signature id shape (ADR-056 H1), needed by the
 //!   decoder above and by ingest's federation writer.
 
 pub mod aft;
 pub mod api_scope;
 pub mod degradation;
+/// BILL-01 / ADR-076 step 2 — the Resend plain-text email sender, extracted
+/// from ingest's (now-deleted) `QuotaNotifier` so the gateway's usage-warning
+/// emails (step 8) reuse ONE implementation rather than a second copy.
+pub mod email;
+pub mod jetstream_limits;
 pub mod listen_dsn;
 pub mod model;
+pub mod nats_connect;
 pub mod otlp;
 pub mod redact;
 pub mod self_host;
 pub mod span;
+pub mod spend;
 pub mod tenant;
 
 pub use model::{
     ChatRequest, ChatResponse, Choice, ContentPart, ImageUrl, Message, MessageContent,
-    RequestMetadata, Role, Tool, ToolCall, Usage,
+    RequestMetadata, Role, Tool, ToolCall, ToolChoice, Usage,
 };
 pub use span::{Intervention, SpanAttributes, SpanStatus, SpanStatusCode, TracelaneSpan};
 pub use tenant::TenantId;

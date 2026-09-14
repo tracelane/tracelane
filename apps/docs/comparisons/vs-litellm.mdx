@@ -16,7 +16,7 @@ Tracelane is a Rust gateway with Trusted Publishing OIDC, Cosign keyless signing
 | Supply-chain posture | Cosign keyless + attested build provenance + OSV-Scanner + Grype + Syft | PyPI install with transitive dependency surface |
 | Token model | Trusted Publishing OIDC (no long-lived registry tokens) | Registry token model per project policy |
 | Vuln scanning | OSV-Scanner + Grype + Syft | Not documented |
-| Gateway overhead | Low — no interpreter on the hot path (measured figures publish with the Reliability Benchmark v1.0) | Python interpreter on the hot path |
+| Gateway overhead | Low — no interpreter on the hot path: **2 ms p50 / 4 ms p95 / 5 ms p99 added**, measured with LiteLLM's own AIGatewayBench harness (4 vCPU, two runs, capture on) — see [benchmarks](/benchmarks) | Python interpreter on the hot path |
 | BYOK key custody | Envelope encryption, AAD bound to (tenant_id, provider_id) | Keys commonly supplied via proxy config / environment |
 | Audit ledger | Tamper-evident hash chain + Merkle + Ed25519 per-tenant signing (live); best-effort Rekor v2 inclusion proof on anchored batches (universal anchoring on the roadmap) | Not documented |
 | Inline guardrails | Heuristic rails at the gateway (R1–R8), verdicts written to the ledger | Guardrail hook framework with third-party integrations; no ledgered verdict |

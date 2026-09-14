@@ -94,7 +94,12 @@ const PAIRS = [
 	// 1:1 contrast: --accent and --surface-inverse are BOTH ink after ADR-074, so the
 	// error-budget burn rate rendered #0d0d0d on #0d0d0d in light theme — invisible.
 	// A contrast checker that never looks at a surface cannot report anything about it.
-	["ink-inverse", "surface-inverse", 4.5, "value/text ON the inverse (dark) card"],
+	[
+		"ink-inverse",
+		"surface-inverse",
+		4.5,
+		"value/text ON the inverse (dark) card",
+	],
 	// `selected-on`, NOT `ink-inverse`. The first version of this line asserted
 	// ink-inverse and failed at 1.00:1 in dark — correctly, because in dark BOTH resolve
 	// to the same value (#f0f3f7 then; #f5f5f5 under the P0 palette). But the app never
@@ -148,8 +153,37 @@ const PAIRS = [
 	// contrast with the paper behind it, so that is what is asserted. If a second
 	// series is ever made load-bearing, this pair is the wrong control for it and
 	// the token needs deepening — say so then rather than editing this line.
-	["chart-secondary", "chart-primary", 3.0, "second series vs first (adjacent marks)"],
+	[
+		"chart-secondary",
+		"chart-primary",
+		3.0,
+		"second series vs first (adjacent marks)",
+	],
 	["chart-grid", "surface", 1.0, "gridline on a card (decorative)"],
+
+	// ── ADDED 2026-09-07 (DSH-16) — the categorical palette + the recorder's
+	// amber. `--chart-1`/`--chart-4` are aliases onto `--chart-primary`/
+	// `--accent-warm` and are covered by those pairs already; `--chart-2`
+	// (violet) and `--chart-3` (teal) are the two genuinely new hexes.
+	["chart-2", "surface", 3.0, "categorical series 2 (violet) on a card (UI)"],
+	["chart-2", "bg", 3.0, "categorical series 2 (violet) on the canvas (UI)"],
+	["chart-3", "surface", 3.0, "categorical series 3 (teal) on a card (UI)"],
+	["chart-3", "bg", 3.0, "categorical series 3 (teal) on the canvas (UI)"],
+
+	// The recorder's amber. `--accent-warm` is a graphic mark (dot/glow), never
+	// small text, so 3:1; `--accent-warm-ink` is the text tone that pairs with
+	// it (badge/label copy), so 4.5:1 — the same dual-tone split every other
+	// status colour in this file already uses.
+	["accent-warm", "surface", 3.0, "recorder mark on a card (UI)"],
+	["accent-warm", "bg", 3.0, "recorder mark on the canvas (UI)"],
+	["accent-warm-ink", "surface", 4.5, "recorder-light text on a card"],
+	["accent-warm-ink", "bg", 4.5, "recorder-light text on the canvas"],
+	[
+		"accent-warm-ink",
+		"accent-warm-soft",
+		4.5,
+		"recorder-light chip text on its soft fill",
+	],
 ];
 
 // ── argv ────────────────────────────────────────────────────────────────────
@@ -178,20 +212,27 @@ if (SELFTEST) {
 	const good = ratio("#0d0d0d", "#ffffff"); // 19.44:1
 	let ok = true;
 	if (bad >= 4.5) {
-		console.log(`  selftest: low-contrast pair scored ${bad.toFixed(2)} — NOT caught ✗`);
+		console.log(
+			`  selftest: low-contrast pair scored ${bad.toFixed(2)} — NOT caught ✗`,
+		);
 		ok = false;
 	} else {
 		console.log(`  selftest: low-contrast pair ${bad.toFixed(2)}:1 → CAUGHT ✓`);
 	}
 	if (good < 4.5) {
-		console.log(`  selftest: high-contrast pair wrongly failed ✗`);
+		console.log("  selftest: high-contrast pair wrongly failed ✗");
 		ok = false;
 	} else {
-		console.log(`  selftest: high-contrast pair ${good.toFixed(2)}:1 → PASSES ✓`);
+		console.log(
+			`  selftest: high-contrast pair ${good.toFixed(2)}:1 → PASSES ✓`,
+		);
 	}
 	// And prove BOTH theme blocks actually parse — the bug this script shipped with
 	// was a dark selector that never existed, so it measured light twice and threw.
-	for (const [label, header] of [["light", ":root {"], ["dark", '[data-theme="dark"],']]) {
+	for (const [label, header] of [
+		["light", ":root {"],
+		["dark", '[data-theme="dark"],'],
+	]) {
 		const v = vars(header);
 		const n = Object.keys(v).length;
 		if (n < 20) {
@@ -212,7 +253,7 @@ if (SELFTEST) {
 				`  selftest: unknown token --${bogus} is absent → the missing-token branch is reachable ✓`,
 			);
 		} else {
-			console.log(`  selftest: could not plant an unknown token ✗`);
+			console.log("  selftest: could not plant an unknown token ✗");
 			ok = false;
 		}
 	}

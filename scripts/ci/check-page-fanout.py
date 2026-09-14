@@ -17,12 +17,47 @@ Fan-out is a design decision, not an addition. Past the budget the correct move
 is ONE aggregate endpoint served on-node (where each call costs 0.9ms), not an
 Nth parallel call from the edge.
 
-Exit 1 on violation. `--selftest` plants violations and asserts they are caught.
+SUSPENSE FORM (B-343, 2026-09-05): `Promise.all([...])` is not
+the only way to fire N concurrent gateway calls from one render. `apps/web/app/
+dashboards/[id]/page.tsx` renders each dashboard tile as its own `<Suspense>`
+boundary wrapping an `async` server component that calls a gateway fetcher —
+React streams those concurrently, so a 12-tile dashboard is 12 concurrent
+gateway calls the `Promise.all` scan reports as ZERO. That is the
+`guard-filetype-blindspot` class: green because unmeasured, not because safe.
+
+THE RULE for the Suspense form (documented here because there is no fixed
+literal to grep, unlike `Promise.all([...])`):
+  1. Find a `<Suspense>` boundary whose direct child is a component defined in
+     the same file as `async function Name(...)`.
+  2. That component counts as a concurrent gateway call IF its body calls a
+     known fetcher — the same `GATEWAY_CALLS` list used for the `Promise.all`
+     scan, plus `fetchTileData` (`@/lib/metrics/tiles`), plus anything
+     imported from `@/lib/metrics/fetch` or `@/lib/gateway`.
+  3. A Suspense-wrapped fetching component rendered inside a `.map(...)` call
+     fires once PER ITEM — the count is the length of a runtime array, which
+     this static guard cannot know. So the default is **N = unbounded**,
+     which always exceeds the budget and fails the file.
+  4. The ONE way to earn a finite count instead of unbounded: a concurrency
+     limiter — `makeLimiter(N)` (`apps/web/lib/metrics/tile-support.ts`) —
+     assigned to a variable that is VISIBLY referenced inside the `.map(...)`
+     body (passed as a prop, called directly). The reported count is then the
+     limiter's own cap, exactly like the pinned `Promise.all` allowlist below
+     — a real ceiling enforced in code, not an unmeasured guess. No limiter
+     variable in scope of the map body means no credit — the guard does not
+     chase a limiter through prop-drilling or a second module.
+  `dashboards/[id]/page.tsx` passes rule 4: `makeLimiter(8)` at page.tsx:74 is
+  assigned to `run` and `run` is threaded into every mapped `<TileContainer>`,
+  so the file is allowlisted below at the true, code-enforced number: 8 — not
+  the 0 the old scan reported, and not an unbounded guess either.
+
+Exit 1 on violation. `--selftest` plants violations (including an unbounded
+mapped Suspense fan-out with no limiter) and asserts they are caught.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import tempfile
@@ -46,6 +81,20 @@ GATEWAY_CALLS = [
     "fetchGatewayStats",
     "fetchLatencyBreakdown",
     "fetchGuardrailStats",
+    # `apps/web/lib/metrics/fetch.ts` (DSH-11) — every windowed read, by name.
+    "fetchSloRows",
+    "fetchSloSummary",
+    "fetchSloModels",
+    "fetchSloTimeseries",
+    "fetchGatewayStatsFor",
+    "fetchCostBreakdownFor",
+    "fetchLatencyBreakdownFor",
+    "fetchToolAnalyticsFor",
+    "fetchGuardrailStatsFor",
+    "fetchGuardrailVerdictsFor",
+    "fetchSignaturesFor",
+    "fetchTraceCountFor",
+    "fetchSessionsFor",
 ]
 CALL_RE = re.compile(r"\b(" + "|".join(GATEWAY_CALLS) + r")\s*[<(]")
 
@@ -62,7 +111,26 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
             "/v1/dashboard aggregate endpoint. Do NOT raise this number."
         ),
     ),
+    "apps/web/app/dashboards/[id]/page.tsx": (
+        8,
+        (
+            "B-343: per-tile Suspense fan-out (up to 12 tiles), bounded by "
+            "makeLimiter(8) at page.tsx:74 — `run` is threaded into every "
+            "mapped <TileContainer>, so at most 8 tile fetches are ever "
+            "in flight regardless of tile count. The pinned number IS the "
+            "limiter's own cap, not a guess. Raise this only if the limiter's "
+            "own argument changes; the guard's Suspense-form detector reads "
+            "that argument, so the two cannot drift silently."
+        ),
+    ),
 }
+
+# The fetcher import surfaces the Suspense-form detector looks for, beyond the
+# named GATEWAY_CALLS list (B-343 rule 2).
+SUSPENSE_FETCHER_MODULES = ("@/lib/metrics/fetch", "@/lib/gateway")
+SUSPENSE_EXTRA_FETCHERS = ("fetchTileData",)
+
+LIMITER_CALL_RE = re.compile(r"\bmakeLimiter\s*\(\s*(\d+)\s*\)")
 
 
 def find_concurrent_blocks(src: str) -> list[tuple[int, str]]:
@@ -83,12 +151,127 @@ def find_concurrent_blocks(src: str) -> list[tuple[int, str]]:
     return out
 
 
-def scan_file(path: Path) -> tuple[int, int]:
-    """Return (max concurrent gateway calls, line of the worst block)."""
+def _balanced(src: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Return the index of the char CLOSING the bracket opened at open_idx."""
+    depth = 0
+    for j in range(open_idx, len(src)):
+        if src[j] == open_ch:
+            depth += 1
+        elif src[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(src) - 1
+
+
+def _function_bodies(src: str) -> dict[str, str]:
+    """Map `async function Name(` definitions to their `{ ... }` body text.
+
+    The params are balanced first (`params_end`), THEN the body's opening `{`
+    is sought — a destructured/typed TS param like `{ id }: { id: string }`
+    contains braces of its own, and finding the first bare `{` after the name
+    (without skipping past the parameter list) grabs a param brace instead of
+    the function body, desyncing every brace match after it.
+    """
+    out: dict[str, str] = {}
+    for m in re.finditer(r"\basync function\s+([A-Za-z0-9_]+)\s*\(", src):
+        params_open = m.end() - 1  # at the '('
+        params_end = _balanced(src, params_open, "(", ")")
+        brace = src.find("{", params_end + 1)
+        if brace == -1:
+            continue
+        end = _balanced(src, brace, "{", "}")
+        out[m.group(1)] = src[brace : end + 1]
+    return out
+
+
+def _fetcher_names(src: str) -> set[str]:
+    """Fetcher identifiers this file could call: GATEWAY_CALLS + fetchTileData +
+    anything imported from the two Suspense-form fetcher modules (rule 2)."""
+    names = set(GATEWAY_CALLS) | set(SUSPENSE_EXTRA_FETCHERS)
+    for mod in SUSPENSE_FETCHER_MODULES:
+        for m in re.finditer(
+            r'import\s*\{([^}]*)\}\s*from\s*["\']' + re.escape(mod) + r'["\']', src
+        ):
+            for raw in m.group(1).split(","):
+                name = raw.split(" as ")[-1].strip()
+                if name:
+                    names.add(name)
+    return names
+
+
+def find_suspense_map_fanout(src: str) -> list[tuple[int, str, float]]:
+    """Suspense-form fan-out (B-343): a `<Suspense>` wrapping an async fetching
+    component, rendered inside a `.map(...)` callback. See the module docstring
+    for the numbered rule this implements. Returns (line, component, count)
+    where count is an int (a visibly-applied `makeLimiter(N)` cap) or
+    `math.inf` (mapped, fetching, and NO limiter in scope — unbounded)."""
+    fetchers = _fetcher_names(src)
+    bodies = _function_bodies(src)
+
+    def calls_fetcher(body: str) -> bool:
+        # `\s*[<(]` mirrors CALL_RE: a TS generic call reads `gatewayGet<T>(...)`,
+        # so the name is followed by `<`, not directly by `(`.
+        return any(
+            re.search(r"\b" + re.escape(fn) + r"\s*[<(]", body) for fn in fetchers
+        )
+
+    # Pre-index every `const X = makeLimiter(N)` so a map body's limiter usage
+    # can be resolved back to its numeric cap (rule 4).
+    limiter_caps: list[tuple[int, str, int]] = []  # (pos, var_name, cap)
+    for lm in LIMITER_CALL_RE.finditer(src):
+        assign = re.search(
+            r"(?:const|let)\s+([A-Za-z0-9_]+)\s*=\s*" + re.escape(lm.group(0)), src
+        )
+        if assign:
+            limiter_caps.append((lm.start(), assign.group(1), int(lm.group(1))))
+
+    out: list[tuple[int, str, float]] = []
+    for mm in re.finditer(r"\.map\s*\(", src):
+        open_idx = mm.end() - 1
+        close_idx = _balanced(src, open_idx, "(", ")")
+        map_body = src[open_idx : close_idx + 1]
+        if "<Suspense" not in map_body:
+            continue
+
+        fetching_comp = None
+        for comp in re.findall(r"<([A-Z][A-Za-z0-9_]*)\b", map_body):
+            body = bodies.get(comp)
+            if body and calls_fetcher(body):
+                fetching_comp = comp
+                break
+        if fetching_comp is None:
+            continue  # a Suspense in a .map that renders no fetching component
+
+        # Rule 4: a limiter defined before this .map AND referenced inside its
+        # body earns the pinned cap instead of "unbounded".
+        cap: float = math.inf
+        for pos, var, n in limiter_caps:
+            if pos < mm.start() and re.search(r"\b" + re.escape(var) + r"\b", map_body):
+                cap = n
+                break
+
+        line = src.count("\n", 0, mm.start()) + 1
+        out.append((line, fetching_comp, cap))
+    return out
+
+
+def scan_file(path: Path) -> tuple[float, int]:
+    """Return (max concurrent gateway calls, line of the worst block).
+
+    "Max" ranges over BOTH fan-out forms this file can contain: literal
+    `Promise.all([...])` blocks and per-tile `<Suspense>` fan-out (B-343). The
+    count is `float` because the Suspense form can report `math.inf`
+    (unbounded, mapped, no limiter) — always the worst possible reading.
+    """
     src = path.read_text(encoding="utf-8", errors="replace")
-    worst, worst_line = 0, 0
+    worst: float = 0
+    worst_line = 0
     for line, body in find_concurrent_blocks(src):
         n = len(CALL_RE.findall(body))
+        if n > worst:
+            worst, worst_line = n, line
+    for line, _name, n in find_suspense_map_fanout(src):
         if n > worst:
             worst, worst_line = n, line
     return worst, worst_line
@@ -104,9 +287,13 @@ def iter_sources(roots: list[Path]):
             yield p
 
 
+def _fmt_n(n: float) -> str:
+    return "unbounded" if n == math.inf else str(int(n))
+
+
 def run(roots: list[Path], repo: Path, quiet: bool = False) -> list[str]:
     failures: list[str] = []
-    findings: list[tuple[str, int, int]] = []
+    findings: list[tuple[str, float, int]] = []
     for p in iter_sources(roots):
         n, line = scan_file(p)
         if n == 0:
@@ -119,20 +306,32 @@ def run(roots: list[Path], repo: Path, quiet: bool = False) -> list[str]:
             allowed = pinned[0]
             if n > allowed:
                 failures.append(
-                    f"{rel}:{line} — {n} concurrent gateway calls, allowlisted at "
-                    f"EXACTLY {allowed}. The allowlist is a ratchet: it records a "
-                    f"known offender, it does not license growth. Collapse these "
-                    f"into one aggregate endpoint."
+                    f"{rel}:{line} — {_fmt_n(n)} concurrent gateway calls, "
+                    f"allowlisted at EXACTLY {allowed}. The allowlist is a "
+                    f"ratchet: it records a known offender, it does not license "
+                    f"growth. Collapse these into one aggregate endpoint."
                 )
             continue
 
-        if n > DEFAULT_BUDGET:
+        if n == math.inf:
             failures.append(
-                f"{rel}:{line} — {n} concurrent gateway calls exceeds the budget "
-                f"of {DEFAULT_BUDGET}. Promise.all resolves at the SLOWEST member, "
-                f"so this samples the wide-area tail {n} times per render. Serve "
-                f"it from ONE aggregate endpoint instead of adding a parallel "
-                f"call. See runbooks/RCA-dashboard-fanout-tail-latency.md."
+                f"{rel}:{line} — UNBOUNDED concurrent gateway fan-out: a "
+                f"<Suspense> boundary renders an async component that calls a "
+                f"gateway fetcher inside a `.map(...)`, with no `makeLimiter(N)` "
+                f"visibly bounding it. The count scales with a runtime array's "
+                f"length, so every item added widens the tail-latency sample by "
+                f"one. Bound it with a limiter (see "
+                f"apps/web/lib/metrics/tile-support.ts `makeLimiter`) or collapse "
+                f"it into one aggregate endpoint."
+            )
+        elif n > DEFAULT_BUDGET:
+            failures.append(
+                f"{rel}:{line} — {_fmt_n(n)} concurrent gateway calls exceeds "
+                f"the budget of {DEFAULT_BUDGET}. Promise.all resolves at the "
+                f"SLOWEST member, so this samples the wide-area tail {_fmt_n(n)} "
+                f"times per render. Serve it from ONE aggregate endpoint instead "
+                f"of adding a parallel call. See "
+                f"runbooks/RCA-dashboard-fanout-tail-latency.md."
             )
 
     if not quiet and findings:
@@ -141,7 +340,7 @@ def run(roots: list[Path], repo: Path, quiet: bool = False) -> list[str]:
             pin = ALLOWLIST.get(rel)
             tag = f"  (allowlisted at {pin[0]})" if pin else ""
             flag = "  <-- OVER BUDGET" if (not pin and n > DEFAULT_BUDGET) else ""
-            print(f"    {n:>2}  {rel}:{line}{tag}{flag}")
+            print(f"    {_fmt_n(n):>9}  {rel}:{line}{tag}{flag}")
     return failures
 
 
@@ -232,6 +431,64 @@ def selftest() -> int:
             ok = False
         if "seq.tsx" in joined:
             print("SELFTEST FAIL: flagged sequential awaits (not concurrent fan-out)")
+            ok = False
+
+        # B-343: Suspense-form fan-out. A component fetching under <Suspense>
+        # inside a `.map(...)` with NO limiter must be UNBOUNDED and REFUSED —
+        # the defect the guard was blind to (12 tiles reported as 0 calls).
+        (root / "susp_bad").mkdir(parents=True)
+        (root / "susp_bad" / "page.tsx").write_text(
+            "async function Tile({ id }: { id: string }) {\n"
+            "  const data = await gatewayGet<T>(`/v1/x${id}`);\n"
+            "  return <div>{data}</div>;\n"
+            "}\n\n"
+            "export default function Page({ tiles }: { tiles: Item[] }) {\n"
+            "  return (\n"
+            "    <div>\n"
+            "      {tiles.map((t) => (\n"
+            "        <Suspense key={t.id} fallback={<Skeleton />}>\n"
+            "          <Tile id={t.id} />\n"
+            "        </Suspense>\n"
+            "      ))}\n"
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+        # The same shape, but a `makeLimiter(N)` is defined and visibly threaded
+        # into the mapped component — must earn the pinned cap, not "unbounded",
+        # and (at 4, under the default budget of 5) must PASS.
+        (root / "susp_good").mkdir(parents=True)
+        (root / "susp_good" / "page.tsx").write_text(
+            "const run = makeLimiter(4);\n\n"
+            "async function Tile({ id, run }: { id: string; run: Limiter }) {\n"
+            "  return run(() => gatewayGet<T>(`/v1/x${id}`));\n"
+            "}\n\n"
+            "export default function Page({ tiles }: { tiles: Item[] }) {\n"
+            "  return (\n"
+            "    <div>\n"
+            "      {tiles.map((t) => (\n"
+            "        <Suspense key={t.id} fallback={<Skeleton />}>\n"
+            "          <Tile id={t.id} run={run} />\n"
+            "        </Suspense>\n"
+            "      ))}\n"
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+
+        susp_fails = run([root / "susp_bad", root / "susp_good"], Path(td), quiet=True)
+        susp_joined = " ".join(susp_fails)
+        if not any("susp_bad/page.tsx" in f and "UNBOUNDED" in f for f in susp_fails):
+            print(
+                "SELFTEST FAIL: did not catch the unbounded mapped Suspense "
+                "fan-out (no limiter)"
+            )
+            ok = False
+        if "susp_good/page.tsx" in susp_joined:
+            print(
+                "SELFTEST FAIL: flagged a mapped Suspense fan-out that a "
+                "visibly-applied makeLimiter(4) bounds under budget"
+            )
             ok = False
 
         # The ratchet: an allowlisted file that grows must still fail.

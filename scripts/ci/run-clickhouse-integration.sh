@@ -54,20 +54,35 @@ esac
 
 CONTAINER=tlane-ch-integration-$$
 STARTED_CONTAINER=0
-cleanup() { [ "$STARTED_CONTAINER" = 1 ] && docker rm -f "$CONTAINER" >/dev/null 2>&1; return 0; }
+cleanup() { [ "$STARTED_CONTAINER" = 1 ] && docker rm -fv "$CONTAINER" >/dev/null 2>&1; return 0; }
 trap cleanup EXIT
 
+# Return codes: 1 = no usable docker on this box (a SKIP, exit 0 below, as before);
+# 2 = docker is here but ClickHouse did NOT come up (a LOUD failure, exit 3 below).
+# 2026-09-06 (block 6): five `tlane-ch-integration-*` containers sat in state
+# `created` — host port 18123 was still held, `docker run` failed with "driver failed
+# programming external connectivity", this function returned 1, the caller printed
+# SKIP and exited 0, and the meta-gate's selftest read that 0 as "the suite PASSED
+# with B-272 reintroduced". Two full gates went red for a cause the output never
+# named. A start failure with docker PRESENT is not a skip.
 start_throwaway_clickhouse() {
   command -v docker >/dev/null 2>&1 || return 1
   docker info >/dev/null 2>&1 || return 1
   local port=18123
+  # Stale throwaways from a run that died mid-window hold the port; they are ours.
+  docker ps -a --filter 'name=tlane-ch-integration-' --format '{{.Names}}' 2>/dev/null \
+    | xargs -r docker rm -fv >/dev/null 2>&1 || true
   # 24.12 is the version the migration-18 type traps were verified against
   # (`Nullable(LowCardinality(String))` is illegal there, and the DateTime64
   # millis-vs-micros behaviour was MEASURED on 24.12.6.70). Pinning it means this
   # runner tests the server prod actually runs, not whatever `latest` became.
-  docker run -d --name "$CONTAINER" \
+  if ! docker run -d --name "$CONTAINER" \
     -e CLICKHOUSE_SKIP_USER_SETUP=1 \
-    -p "${port}:8123" clickhouse/clickhouse-server:24.12-alpine >/dev/null 2>&1 || return 1
+    -p "${port}:8123" clickhouse/clickhouse-server:24.12-alpine >/dev/null 2>&1; then
+    docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true   # `run` creates before it fails to start
+    echo "ERROR: docker is present but the throwaway ClickHouse did not START — host port ${port} held? (ss -ltnp | grep ${port})" >&2
+    return 2
+  fi
   STARTED_CONTAINER=1
   # POLL A REAL QUERY, not `/ping`. The postgres runner learned the same lesson
   # the expensive way: an entrypoint that reports ready mid-initialisation
@@ -82,7 +97,8 @@ start_throwaway_clickhouse() {
     fi
     sleep 1
   done
-  return 1
+  echo "ERROR: the throwaway ClickHouse started but never answered SELECT 1 within 90 s (docker logs $CONTAINER)." >&2
+  return 2
 }
 
 if [ "${1:-}" = "--selftest" ]; then
@@ -148,7 +164,12 @@ assert old in s, "mutation target absent"
 open(p, "w").write(s.replace(old, new, 1))
 PY
   echo "SELFTEST: unqualified the dataset_id WHERE (B-272's exact shape). Expecting RED."
-  if bash "$0" >/dev/null 2>&1; then
+  bash "$0" >/dev/null 2>&1; _rc=$?
+  if [ "$_rc" -eq 3 ]; then
+    echo "SELFTEST CANNOT DETERMINE — ClickHouse did not come up, so the mutated suite never ran (runner exit 3). Fix docker / host port 18123 first; this is NOT a passing selftest." >&2
+    exit 1
+  fi
+  if [ "$_rc" -eq 0 ]; then
     echo "SELFTEST FAILED — the suite passed with B-272 reintroduced. This runner proves nothing."
     exit 1
   fi
@@ -157,16 +178,30 @@ PY
 fi
 
 if [ -z "${CLICKHOUSE_TEST_URL:-}" ]; then
-  if ! start_throwaway_clickhouse; then
+  start_throwaway_clickhouse; _st=$?
+  if [ "$_st" -eq 1 ]; then
     echo "SKIP: no CLICKHOUSE_TEST_URL and no usable docker — this guard CANNOT RUN here."
     echo "      That is a real gap, not a pass."
     exit 0
+  elif [ "$_st" -ne 0 ]; then
+    echo "CANNOT DETERMINE: docker is present but ClickHouse did not come up — the round-trip suite did NOT run. Exit 3, never 0." >&2
+    exit 3
   fi
 fi
 
 RC=0
 # The in-crate round trip: the REAL ClickHouseDatasetStore, the REAL ItemWriteRow.
 cargo test -p gateway --bin gateway clickhouse_roundtrip -- --ignored --nocapture || RC=1
+# B-383 (c) / B-387: the retention sweep's enforce DELETE against every content
+# table on the checked-in schema — the projection-vs-lightweight-delete refusal
+# (Code 344) is only visible to a server.
+cargo test -p gateway --bin gateway retention_sweep::tests::enforce_delete_is_accepted -- --ignored || RC=1
+# B-393 (BILL-01): blob rehydration against a real server. The lookup compares
+# `hex(hash)` (UPPERCASE on the server) to a bound string — a case mismatch
+# matches zero rows and is invisible to every unit test, because the miss is
+# the SQL's semantics, not the Rust's. This test existed and was `#[ignore]`d
+# but nothing ran it; prod found the defect first.
+cargo test -p gateway --bin gateway billing::blobs::tests::rehydrate_against_a_real_clickhouse -- --ignored || RC=1
 # The previously-uncalled migration-03 parity test. Mirrors column shapes rather
 # than driving the persisters, so it is a weaker check — run for coverage, not
 # for confidence.

@@ -1,12 +1,15 @@
 "use client";
 
 /**
- * TopBar — the thin strip beside the sidebar (ADR-074 §6). It keeps ONLY three
- * things: environment context, Cmd+K, and notifications. Everything that used to
- * live on the 11-item horizontal bar now lives in the sidebar.
+ * TopBar — the thin strip beside the sidebar (ADR-074 §6). It keeps ONLY four
+ * things: environment context, Cmd+K, notifications, and (OBS-40) Ask Tara.
+ * Everything that used to live on the 11-item horizontal bar now lives in the
+ * sidebar.
  *
  * NO TOP NAVIGATION. Navigation is the rail's job; this bar carries no
- * destinations, and adding one here would re-create the horizontal bar §6 deleted.
+ * destinations — Ask Tara is a Q&A surface over data the rail already links
+ * to, not a new destination, so it does not re-create the horizontal bar §6
+ * deleted.
  *
  * CMD+K IS FIRST-CLASS, NOT A NICETY (§6) — it is what keeps the sidebar at nine
  * items, so it is rendered as a real, labelled, always-visible control with its
@@ -34,6 +37,7 @@
  */
 
 import { NotificationBell } from "@/components/notifications/NotificationBell";
+import { TaraPanel } from "@/components/tara/TaraPanel";
 import type { ReactNode } from "react";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -92,6 +96,9 @@ export function TopBar({ orgSlot }: { orgSlot?: ReactNode }) {
 
 			<div className="ml-auto flex items-center gap-2">
 				{orgSlot}
+				{/* OBS-40 — "Ask Tara", the observability assistant. Self-contained
+				 * button + panel, same shape as NotificationBell beside it. */}
+				<TaraPanel />
 				<NotificationBell />
 				<ThemeToggle compact />
 			</div>

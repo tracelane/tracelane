@@ -18,5 +18,5 @@ pub use r3_tool_safety::{R3Pinning, R3Schema};
 pub use r4_trifecta::R4Trifecta;
 pub use r5_format::R5Format;
 pub use r6_sysprompt_leak::R6SysPromptLeak;
-pub use r7_topic_competitor::{R7Config, R7TopicCompetitor};
+pub use r7_topic_competitor::R7TopicCompetitor;
 pub use r8_injection::R8Injection;

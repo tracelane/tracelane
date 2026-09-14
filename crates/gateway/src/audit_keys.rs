@@ -12,10 +12,23 @@
 //! for the active tenant before submitting a Merkle root.
 //!
 //! Entitlement gate (ENFORCED): MINTING a new per-tenant keypair requires
-//! the Audit SKU entitlement (`f_audit_addon`) — checked in `get_or_create` via the
-//! `EntitlementCache`. An existing keypair is always honoured; a non-entitled tenant
-//! falls back to the global `TRACELANE_REKOR_SIGNING_KEY`. (CLAUDE.md: per-feature
-//! grants in `workspace_entitlements`, not the plan-tier path, are the mechanism.)
+//! `FeatureKey::AuditSelfVerify` (`f_audit_selfverify`) — checked in `get_or_create`
+//! via the `EntitlementCache`. An existing keypair is always honoured; a
+//! non-entitled tenant falls back to the global `TRACELANE_REKOR_SIGNING_KEY`.
+//! (CLAUDE.md: per-feature grants in `workspace_entitlements`, not the
+//! plan-tier path, are the mechanism.)
+//!
+//! **BILL-01 / ADR-076 §10.11 (2026-09-13):** this used to gate on
+//! `FeatureKey::AuditAddon` (`f_audit_addon`, the Enterprise-seeded Article-12
+//! evidence-pack export — NOT sold, spec §10.4/B-392), which meant the
+//! tenant identity a batch is anchored under existed only for Enterprise. The
+//! founder ruling states "the ledger, hash chain, Rekor anchoring and free
+//! self-verification are on EVERY tier" — moving the mint gate to
+//! `AuditSelfVerify` (default-TRUE on every plan, still deny-overridable per
+//! workspace, ADR-066 §6) makes that literally true. `/v1/audit/export` and
+//! `/v1/audit/summary` (`audit_export.rs`) stay gated on `AuditAddon` — the
+//! paid SKU precondition is unrelated to whether a batch gets ANCHORED at
+//! all, and ADR-066's export gate changes only by an explicit founder ruling.
 
 use std::sync::Arc;
 
@@ -37,7 +50,10 @@ use tracelane_shared::TenantId;
 /// The private key bytes are held in a `SecretString` to ensure they are
 /// zeroed on drop and never appear in logs or tracing output.
 pub struct TenantAuditKeypair {
-    pub tenant_id: TenantId,
+    // `pub tenant_id: TenantId` (deleted 2026-09-12, B-390) — never read
+    // anywhere; every caller already knows the tenant it asked
+    // `TenantAuditKeyStore` to look up or create this keypair for, so the
+    // struct's own copy was redundant.
     /// PKCS#8 DER private key, wrapped in SecretString.
     private_key_der: SecretString,
     /// Cached parsed keypair for signing — avoids re-parsing on every call.
@@ -49,7 +65,7 @@ impl TenantAuditKeypair {
     ///
     /// The generated keypair is ready to sign but not yet persisted.
     /// Call [`TenantAuditKeyStore::store`] to persist it.
-    pub fn generate(tenant_id: TenantId) -> Result<Self> {
+    pub fn generate(_tenant_id: TenantId) -> Result<Self> {
         let rng = rand::SystemRandom::new();
         let pkcs8_bytes = signature::Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| anyhow::anyhow!("Ed25519 keypair generation failed"))?;
@@ -60,7 +76,6 @@ impl TenantAuditKeypair {
         let key_pair =
             parsed.map_err(|e| anyhow::anyhow!("Ed25519 keypair parse after generate: {e:?}"))?;
         Ok(Self {
-            tenant_id,
             private_key_der,
             key_pair: Arc::new(key_pair),
         })
@@ -96,7 +111,8 @@ const P256_SPKI_PREFIX: [u8; 26] = [
 /// the verifier with `WithED25519ph`). NEVER used for the local attestation; the
 /// Ed25519 key remains the sole local-attestation signer (ADR-057).
 pub struct TenantAnchorKeypair {
-    pub tenant_id: TenantId,
+    // `pub tenant_id: TenantId` (deleted 2026-09-12, B-390) — never read
+    // anywhere, same reasoning as `TenantAuditKeypair` above.
     /// PKCS#8 DER private key, base64, wrapped in `SecretString` (zeroed on drop).
     private_key_der: SecretString,
     /// Parsed ECDSA keypair — avoids re-parsing on every sign.
@@ -119,7 +135,7 @@ impl TenantAnchorKeypair {
     }
 
     /// Parse an anchor keypair from raw PKCS#8 DER bytes.
-    fn from_pkcs8_der(tenant_id: TenantId, der: &[u8]) -> Result<Self> {
+    fn from_pkcs8_der(_tenant_id: TenantId, der: &[u8]) -> Result<Self> {
         let rng = rand::SystemRandom::new();
         let key_pair = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -128,7 +144,6 @@ impl TenantAnchorKeypair {
         )
         .map_err(|e| anyhow::anyhow!("parse ECDSA anchor keypair: {e:?}"))?;
         Ok(Self {
-            tenant_id,
             private_key_der: SecretString::from(B64.encode(der)),
             key_pair: Arc::new(key_pair),
         })
@@ -168,16 +183,17 @@ impl TenantAnchorKeypair {
 pub struct TenantAuditKeyStore {
     pool: Pool,
     byok: Arc<ByokMasterKey>,
-    /// Entitlement cache used to gate MINTING a new per-tenant keypair on the
-    /// `AuditAddon` (`f_audit_addon`) feature. `None` (e.g. Postgres-less dev)
-    /// is permissive, matching the pre-gate behaviour.
+    /// Entitlement cache used to gate MINTING a new per-tenant keypair on
+    /// `AuditSelfVerify` (`f_audit_selfverify`) — default-TRUE on every plan
+    /// (BILL-01 / ADR-076 §10.11). `None` (e.g. Postgres-less dev) is
+    /// permissive, matching the pre-gate behaviour.
     entitlements: Option<Arc<EntitlementCache>>,
 }
 
 impl TenantAuditKeyStore {
     /// Create a new key store backed by the given Postgres pool and BYOK master
-    /// key. `entitlements` gates minting a new per-tenant keypair on the Audit
-    /// SKU (`f_audit_addon`) — CLAUDE.md requires per-feature grants, not the
+    /// key. `entitlements` gates minting a new per-tenant keypair on
+    /// `AuditSelfVerify` — CLAUDE.md requires per-feature grants, not the
     /// plan-tier path, to be the entitlement mechanism. Pass `None` only where
     /// no entitlement cache exists.
     pub fn new(
@@ -375,21 +391,23 @@ impl TenantAuditKeyStore {
             return Ok(keypair);
         }
 
-        // No key yet → about to MINT the per-tenant Ed25519 keypair, the Audit-SKU
-        // artifact. Gate minting on `f_audit_addon` so it is not given away for
-        // free (a tenant that already has a key, above, is always honoured). When
-        // not entitled we error; the caller (`RekorClient::submit_for_tenant`)
-        // falls back to the global signing key. No cache wired → permissive.
-        if let Some(ents) = self.entitlements.as_ref() {
-            if !ents
-                .check(*tenant_id.as_uuid(), FeatureKey::AuditAddon)
+        // No key yet → about to MINT the per-tenant Ed25519 keypair. BILL-01 /
+        // ADR-076 §10.11: gate minting on `AuditSelfVerify` (default-TRUE on
+        // every plan, still deny-overridable per workspace), not the paid
+        // `AuditAddon` — anchoring is on every tier by the founder ruling; only
+        // `/v1/audit/export` stays behind the paid SKU (a tenant that already
+        // has a key, above, is always honoured). When not entitled we error;
+        // the caller (`RekorClient::submit_for_tenant`) falls back to the
+        // global signing key. No cache wired → permissive.
+        if let Some(ents) = self.entitlements.as_ref()
+            && !ents
+                .check(*tenant_id.as_uuid(), FeatureKey::AuditSelfVerify)
                 .await
-            {
-                anyhow::bail!(
-                    "tenant not entitled to a per-tenant audit keypair (f_audit_addon); \
-                     caller falls back to the global signing key"
-                );
-            }
+        {
+            anyhow::bail!(
+                "tenant not entitled to a per-tenant audit keypair (f_audit_selfverify); \
+                 caller falls back to the global signing key"
+            );
         }
 
         // Generate and persist a new keypair.
@@ -461,8 +479,10 @@ impl TenantAuditKeyStore {
     /// Precondition: the tenant's `tenant_audit_keys` row already exists — the
     /// Ed25519 [`get_or_create`](Self::get_or_create) creates it, and the anchor
     /// flow always mints the Ed25519 key first. Minting the anchor key is gated on
-    /// the same Audit-SKU entitlement (`f_audit_addon`); an existing anchor key is
-    /// always honoured.
+    /// the same `AuditSelfVerify` entitlement (`f_audit_selfverify`) as the
+    /// Ed25519 mint — see [`get_or_create`](Self::get_or_create)'s doc for why
+    /// this moved off the paid `AuditAddon`; an existing anchor key is always
+    /// honoured.
     ///
     /// Concurrency (pattern): two racing anchors may both try to mint — the
     /// conditional `UPDATE ... WHERE encrypted_anchor_key IS NULL` lets only the
@@ -489,14 +509,15 @@ impl TenantAuditKeyStore {
             return self.decrypt_and_parse_anchor(tenant_id.clone(), &encrypted);
         }
 
-        // No anchor key yet → MINT (Audit-SKU gated, same as the Ed25519 mint).
-        if let Some(ents) = self.entitlements.as_ref() {
-            if !ents
-                .check(*tenant_id.as_uuid(), FeatureKey::AuditAddon)
+        // No anchor key yet → MINT (AuditSelfVerify-gated, same as the Ed25519 mint).
+        if let Some(ents) = self.entitlements.as_ref()
+            && !ents
+                .check(*tenant_id.as_uuid(), FeatureKey::AuditSelfVerify)
                 .await
-            {
-                anyhow::bail!("tenant not entitled to a per-tenant anchor keypair (f_audit_addon)");
-            }
+        {
+            anyhow::bail!(
+                "tenant not entitled to a per-tenant anchor keypair (f_audit_selfverify)"
+            );
         }
 
         let keypair = TenantAnchorKeypair::generate(tenant_id.clone())?;
@@ -580,7 +601,6 @@ impl TenantAuditKeyStore {
         let key_pair =
             parsed.map_err(|e| anyhow::anyhow!("parse tenant Ed25519 keypair: {e:?}"))?;
         Ok(TenantAuditKeypair {
-            tenant_id,
             private_key_der,
             key_pair: Arc::new(key_pair),
         })
@@ -688,9 +708,9 @@ mod tests {
             .unwrap();
         }
 
-        // entitlements: None => the Audit-SKU gate is permissive, so both racers reach
-        // the mint. Two INDEPENDENT stores so nothing in-process serializes them; only
-        // Postgres does.
+        // entitlements: None => the AuditSelfVerify gate is permissive, so both
+        // racers reach the mint. Two INDEPENDENT stores so nothing in-process
+        // serializes them; only Postgres does.
         let byok = Arc::new(byok);
         let a = TenantAuditKeyStore::new(pool.clone(), Arc::clone(&byok), None);
         let b = TenantAuditKeyStore::new(pool.clone(), Arc::clone(&byok), None);

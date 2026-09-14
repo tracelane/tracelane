@@ -75,7 +75,11 @@ describe("GC-001: Anthropic SSE streaming correctness", () => {
 			),
 			"utf8",
 		);
-		expect(src).toContain("extended_thinking");
+		// B-390 (2026-09-12): the never-constructed `ExtendedThinkingConfig`
+		// request struct was deleted; extended thinking is enabled by the beta
+		// header and the SSE parser handles `thinking_delta` — assert THOSE.
+		expect(src).toContain("interleaved-thinking-2025-05-14");
+		expect(src).toContain("thinking_delta");
 	});
 
 	it.skip("Anthropic SSE integration: stream delivers content_block_delta events (Week 8)", async () => {

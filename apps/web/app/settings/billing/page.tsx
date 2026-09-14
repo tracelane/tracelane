@@ -1,62 +1,25 @@
 /**
- * /settings/billing — plan and billing management page.
- *
- * Shows current plan, audit status, in-app upgrade actions (POST /api/checkout
- * → Polar-hosted checkout), and opens the Polar-hosted billing portal for
- * payment method / invoice / plan changes. Server component.
+ * /settings/billing — the usage board (spec `BILL-01-metering-and-tiers.md`
+ * §8 `#usage` + `#plan-change`). Server component: reads the tenant row once
+ * and hands the client `<UsageBoard>` just enough to make its ONE gateway
+ * call (spec §2.5b) — everything else (percentages, badges, the breakdown,
+ * the ceiling write) happens client-side or on-demand.
  */
 
-import { BillingPortalButton } from "@/components/settings/BillingPortalButton";
-import { PlansLink } from "@/components/settings/PlansLink";
-import { buildCard } from "@/components/settings/plan-catalog";
+import { PlanCard, PlanHeader } from "@/components/billing/PlanCard";
+import { UsageBoard } from "@/components/billing/UsageBoard";
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
-import { requireSession } from "@/lib/auth";
-import { type Plan, resolveEntitlements } from "@/lib/entitlements";
-import { Badge } from "@tracelanedev/ui";
+import { canAdmin, requireSession } from "@/lib/auth";
+import type { Plan } from "@/lib/entitlements";
 import { eq } from "drizzle-orm";
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 
 export const metadata: Metadata = { title: "Billing — Settings" };
 
-// "list price" suffix: the actual charge comes from Polar (the real billing
-// source); this label is informational and must not imply a confirmed charge.
-const PLAN_LABEL: Record<string, string> = {
-	free: "Free hosted — $0",
-	builder: "Builder — $59/mo list price",
-	team: "Team — $249/mo list price",
-	business: "Business — $899/mo list price",
-	enterprise: "Enterprise",
-};
-
-// The per-plan bullet list was static prose and had drifted: it sold Builder as
-// "Full-fidelity traces (90-day hot)" while the entitlement map gives Builder
-// `retention_days: 30` and `f_full_capture: false`. It is now derived from the
-// SAME catalog the /plans ladder uses (`components/settings/plan-catalog.ts`),
-// off the RESOLVED entitlements — so the limits shown are this workspace's real
-// limits, overrides included, and a plan change cannot leave the copy behind.
-
-/**
- * Self-serve upgrade targets per current plan (Enterprise is sales-led — no
- * self-serve checkout). Each target renders a form that POSTs to `/api/checkout`,
- * which 302-redirects to the Polar-hosted checkout. That route fails loud (501)
- * until the deployment sets `POLAR_PRODUCT_ID_<TIER>` for the tier — so the
- * funnel is wired-but-dark pre-launch, never a silently-broken checkout.
- */
-const UPGRADE_TARGETS: Record<string, string[]> = {
-	free: ["builder", "team", "business"],
-	builder: ["team", "business"],
-	team: ["business"],
-	business: [],
-	enterprise: [],
-};
-
-const TIER_NAME: Record<string, string> = {
-	builder: "Builder",
-	team: "Team",
-	business: "Business",
-};
+// Reads the session cookie + Postgres at request time — never prerender.
+export const dynamic = "force-dynamic";
 
 async function getTenantBilling(workosOrgId: string) {
 	const rows = await db
@@ -64,16 +27,15 @@ async function getTenantBilling(workosOrgId: string) {
 			id: tenants.id,
 			plan: tenants.plan,
 			polarCustomerId: tenants.polarCustomerId,
+			billingInterval: tenants.billingInterval,
+			spendCeilingUsd: tenants.spendCeilingUsd,
+			overflowMode: tenants.overflowMode,
 		})
 		.from(tenants)
 		.where(eq(tenants.workosOrgId, workosOrgId))
 		.limit(1);
-
 	return rows[0] ?? null;
 }
-
-// Reads the session cookie + Postgres at request time — never prerender.
-export const dynamic = "force-dynamic";
 
 export default async function BillingPage() {
 	const session = await requireSession();
@@ -81,138 +43,33 @@ export default async function BillingPage() {
 
 	if (!billing) redirect("/onboarding");
 
-	const plan = billing.plan;
-	// Resolve entitlements ONCE — drives both the audit add-on badge and the seat
-	// bullet, so both reflect per-workspace overrides (deny-overrides-grant: a
-	// workspace_entitlements row may cap seats lower or grant the add-on). NOT the
-	// dead legacy tenants.auditEnabled column (the invisible entitlement-gated UI bug class).
-	const ent = await resolveEntitlements(billing.id, plan as Plan);
-	const auditAddonActive = ent.audit_ledger;
-	const card = buildCard(plan as Plan, ent);
-	const features = [
-		card.traces,
-		card.seats,
-		card.retention,
-		card.overage,
-		...card.features,
-	];
-	const hasBillingAccount = !!billing.polarCustomerId;
-	const upgradeTargets = UPGRADE_TARGETS[plan] ?? [];
+	const plan = billing.plan as Plan;
+	const ceilingUsd = billing.spendCeilingUsd
+		? Number(billing.spendCeilingUsd)
+		: null;
+	const overflowMode =
+		(billing.overflowMode as "auto_age" | "auto_overage" | null) ?? "auto_age";
+
+	const billingInterval =
+		plan === "free"
+			? null
+			: ((billing.billingInterval as "month" | "year" | null) ?? "month");
 
 	return (
 		<div className="space-y-6">
-			<div>
-				<h2 className="text-sm font-semibold text-ink">Current plan</h2>
-				{/* B-178: this said "take effect immediately via Polar webhook".
-				    Two different answers were being collapsed into one. The webhook
-				    writes the plan straight away and THIS page reads Postgres
-				    directly, so the dashboard is immediate — but the gateway serves
-				    entitlements from a cache whose TTL is the real bound on
-				    enforcement (15 minutes, and that is the bound now that the
-				    control-plane LISTEN is off by default). Saying "immediately"
-				    was true of the record and false of the thing customers care
-				    about, which is when their new limits actually apply. */}
-				<p className="text-xs text-ink-2 mt-0.5">
-					Plan changes are recorded here immediately. New limits apply to API
-					traffic within 15 minutes.
-				</p>
-			</div>
-
-			<div className="rounded-lg border border-line p-5 space-y-4">
-				<div className="flex items-center justify-between">
-					<div>
-						<p className="text-base font-semibold text-ink">
-							{PLAN_LABEL[plan] ?? plan}
-						</p>
-						{auditAddonActive && (
-							<Badge tone="seal" className="mt-1">
-								Audit add-on active
-							</Badge>
-						)}
-					</div>
-					{hasBillingAccount ? (
-						<BillingPortalButton />
-					) : (
-						<span className="text-xs text-ink-3">
-							No billing account yet — upgrade to add payment method.
-						</span>
-					)}
-				</div>
-
-				<ul className="space-y-1.5">
-					{features.map((f) => (
-						<li key={f} className="flex items-center gap-2 text-xs text-ink-2">
-							<svg
-								viewBox="0 0 16 16"
-								fill="none"
-								stroke="currentColor"
-								strokeWidth={2}
-								className="h-3.5 w-3.5 shrink-0 text-ink-2"
-								aria-hidden="true"
-							>
-								<polyline points="3 8 6 11 13 4" />
-							</svg>
-							{f}
-						</li>
-					))}
-				</ul>
-			</div>
-
-			<div className="rounded-lg border border-line p-5 space-y-3">
-				<h3 className="text-sm font-medium text-ink">Upgrade your plan</h3>
-				<p className="text-xs text-ink-2">
-					Builder → Team unlocks prompt authoring and promotion. Team → Business
-					adds BYOK and a higher trace allowance. Business → Enterprise adds
-					25M+ traces, unlimited seats, SSO, and a dedicated support SLA. The
-					tamper-evident audit ledger is a separate $999/mo add-on — it is not
-					bundled into any plan.
-				</p>
-				{upgradeTargets.length > 0 && (
-					<div className="flex flex-wrap gap-2 pt-1">
-						{upgradeTargets.map((tier) => (
-							// Native form POST → /api/checkout returns a 302 to the
-							// Polar-hosted checkout, which the browser follows. No client JS.
-							<form
-								key={tier}
-								action={`/api/checkout?tier=${tier}`}
-								method="post"
-							>
-								<button
-									type="submit"
-									className="px-3 py-1.5 rounded text-xs bg-action text-action-on hover:bg-action/90 transition-colors"
-								>
-									Upgrade to {TIER_NAME[tier] ?? tier}
-								</button>
-							</form>
-						))}
-						{/* Enterprise is sales-led — a contact CTA, never a checkout
-						    button (that route 501s without a Polar Enterprise product). */}
-						{plan !== "enterprise" && (
-							<a
-								href="mailto:sales@tracelane.dev?subject=Tracelane%20Enterprise"
-								className="rounded border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
-							>
-								Contact us — Enterprise
-							</a>
-						)}
-					</div>
-				)}
-				{/* When there are no self-serve upgrades left (Business), still offer
-				    the Enterprise contact path. */}
-				{upgradeTargets.length === 0 && plan !== "enterprise" && (
-					<a
-						href="mailto:sales@tracelane.dev?subject=Tracelane%20Enterprise"
-						className="inline-block rounded border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
-					>
-						Contact us — Enterprise
-					</a>
-				)}
-				{/* SET-15: the plan comparison is IN the product now (/plans), derived
-				    from the entitlement map. It used to be an external link to the
-				    marketing homepage's #pricing section, which took the customer out
-				    of the dashboard to read figures no code check binds. */}
-				<PlansLink className="mt-1 inline-block text-xs text-ink-2 underline underline-offset-2 transition-colors hover:text-ink" />
-			</div>
+			{/* The current tier FIRST — the one fact every visitor to this page
+			    wants before any meter (founder, 2026-09-14). */}
+			<PlanHeader plan={plan} billingInterval={billingInterval} />
+			<UsageBoard
+				plan={plan}
+				canManage={canAdmin(session.role)}
+				initialCeilingUsd={ceilingUsd}
+				initialOverflowMode={overflowMode}
+			/>
+			<PlanCard
+				plan={plan}
+				hasBillingAccount={billing.polarCustomerId !== null}
+			/>
 		</div>
 	);
 }

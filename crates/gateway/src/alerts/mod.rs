@@ -65,7 +65,12 @@ pub struct AlertRule {
 #[derive(Debug, Clone)]
 pub struct AlertDestination {
     pub id: Uuid,
-    pub tenant_id: Uuid,
+    // `tenant_id` (deleted 2026-09-12, B-390) — never read after construction
+    // anywhere in the tree; every caller already scoped its query by tenant
+    // (`WHERE tenant_id = $2` etc.), so the returned row's own copy was
+    // redundant. The SQL SELECT lists still name the column (unchanged) —
+    // only the struct field and its three positional `r.get(N)` /
+    // `row.get(N)` assignments were removed.
     pub name: String,
     pub kind: String,
     pub url: String,
@@ -117,7 +122,6 @@ fn row_to_rule_and_dest(row: &tokio_postgres::Row) -> (AlertRule, AlertDestinati
         },
         AlertDestination {
             id: row.get(9),
-            tenant_id: row.get(10),
             name: row.get(11),
             kind: row.get(12),
             url: row.get(13),
@@ -242,7 +246,6 @@ pub async fn list_destinations(pool: &DbPool, tenant: Uuid) -> Result<Vec<AlertD
         .iter()
         .map(|r| AlertDestination {
             id: r.get(0),
-            tenant_id: r.get(1),
             name: r.get(2),
             kind: r.get(3),
             url: r.get(4),
@@ -267,7 +270,6 @@ pub async fn get_destination(
         .context("SELECT alert_destination failed")?;
     Ok(row.map(|r| AlertDestination {
         id: r.get(0),
-        tenant_id: r.get(1),
         name: r.get(2),
         kind: r.get(3),
         url: r.get(4),

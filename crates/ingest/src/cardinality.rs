@@ -20,10 +20,14 @@
 //! ## Persistence (V1 deviation from prompt — see ADR-030)
 //!
 //! V1 launch ships the in-memory tracker only. The Postgres
-//! migration `10_workspace_attr_cardinality.sql` exists; the
-//! `flush_to_postgres` / `hydrate_from_postgres` methods are present
-//! and unit-tested in isolation but **not wired into `main.rs`**.
-//! V1.1 turns them on once ingest carries a Postgres pool.
+//! migration `10_workspace_attr_cardinality.sql` exists; `flush_to_postgres`
+//! is present, `#[cfg(test)]`-gated (B-390, 2026-09-12 — it had no production
+//! caller), and unit-tested in isolation but **not wired into `main.rs`**.
+//! Its read-side counterpart `hydrate_from_postgres`, and the rotation
+//! scheduler `run_daily_rotation`, had zero callers anywhere including tests
+//! and were deleted the same day — restorable from git history at
+//! `29b22c52c827894a3777bb954bb988b346222405`. V1.1 turns this back on once
+//! ingest carries a Postgres pool.
 
 use std::collections::hash_map::RandomState;
 use std::sync::Mutex;
@@ -37,14 +41,6 @@ use uuid::Uuid;
 /// HLL++ precision parameter. p=14 yields ~16 KB sketch and ~0.81%
 /// relative error at 95% confidence (per hyperloglogplus crate docs).
 pub const HLL_PRECISION: u8 = 14;
-
-/// Per-tier max unique attribute keys per workspace per rolling 30-day window.
-///
-/// MOVED to `tracelane_shared::otlp::limits` for GWY-41 — `IngestLimits::default()`
-/// needs it and `IngestLimits` moved to `shared`. It is a *limit*, so the limits
-/// module is its right home; re-exported here so this module's call sites and the
-/// ADR-030 docs that name `cardinality::DEFAULT_MAX_ATTR_CARDINALITY` still resolve.
-pub use tracelane_shared::otlp::limits::DEFAULT_MAX_ATTR_CARDINALITY;
 
 /// Counter for `tracelane_attr_overflow_total{workspace_id_bucket}`.
 /// One AtomicU64 per of the 64 bucket ids (the same buckets ADR-029
@@ -74,6 +70,12 @@ pub fn record_overflow(bucket: u8) {
 }
 
 /// Snapshot all 64 overflow bucket counters.
+///
+/// No production caller today — nothing exports this counter yet (the
+/// `metrics_server` doesn't reach it). Used only by tests; gated accordingly
+/// rather than deleted, since `record_overflow` above IS live and this is its
+/// only observation point.
+#[cfg(test)]
 pub fn overflow_metric_snapshot() -> [u64; 64] {
     let mut out = [0u64; 64];
     for (i, slot) in out.iter_mut().enumerate() {
@@ -105,12 +107,23 @@ struct WorkspaceState {
     estimate: u64,
     /// Date stamp on the current daily sub-window. Used by
     /// [`CardinalityTracker::rotate_window`] to detect a midnight
-    /// boundary cross.
+    /// boundary cross. `rotate_window` is `#[cfg(test)]`-gated (B-390,
+    /// 2026-09-12 — no production caller), so this field is read only
+    /// under `cfg(test)` too; gated the same way rather than deleted,
+    /// since it is not merely written, it is genuinely part of the
+    /// (currently test-only) rotation feature.
+    #[cfg(test)]
     window_day: chrono::NaiveDate,
 }
 
 impl WorkspaceState {
     fn new(now: DateTime<Utc>) -> Self {
+        // `window_day` is `#[cfg(test)]`-only (see the field's doc comment);
+        // outside `cfg(test)` this parameter would otherwise go unused.
+        #[cfg(test)]
+        let window_day = now.date_naive();
+        #[cfg(not(test))]
+        let _ = now;
         Self {
             // `HyperLogLogPlus::new(p, build_hasher)` returns Result;
             // p=14 is in-range so unwrap is safe (the only error is
@@ -118,7 +131,8 @@ impl WorkspaceState {
             sketch: HyperLogLogPlus::new(HLL_PRECISION, RandomState::new())
                 .expect("HLL p=14 is in range"),
             estimate: 0,
-            window_day: now.date_naive(),
+            #[cfg(test)]
+            window_day,
         }
     }
 }
@@ -191,6 +205,9 @@ impl CardinalityTracker {
 
     /// Return the current estimated unique-key count for a workspace
     /// (forced refresh — does not use the cached value).
+    ///
+    /// No production caller today — used only by tests, hence gated.
+    #[cfg(test)]
     pub fn estimate(&self, workspace_id: Uuid) -> u64 {
         let Some(entry) = self.inner.get(&workspace_id) else {
             return 0;
@@ -213,46 +230,32 @@ impl CardinalityTracker {
     /// the next call no-ops until midnight. V1.1 wires
     /// [`Self::flush_to_postgres`] before this and archives the
     /// previous-day sketch.
+    ///
+    /// No production caller today (`run_daily_rotation`, the intended V1.1
+    /// caller, was deleted 2026-09-12 B-390 for having zero callers of its
+    /// own) — used only by tests, hence gated.
+    #[cfg(test)]
     pub fn rotate_window(&self, now: DateTime<Utc>) {
         let today = now.date_naive();
         for entry in self.inner.iter() {
-            if let Ok(mut state) = entry.value().lock() {
-                if state.window_day != today {
-                    state.window_day = today;
-                    tracing::info!(
-                        workspace_id = %entry.key(),
-                        new_day = %today,
-                        "cardinality window rotated"
-                    );
-                }
+            if let Ok(mut state) = entry.value().lock()
+                && state.window_day != today
+            {
+                state.window_day = today;
+                tracing::info!(
+                    workspace_id = %entry.key(),
+                    new_day = %today,
+                    "cardinality window rotated"
+                );
             }
         }
     }
 
-    /// Spawn-friendly daily rotation. Spawns a `tokio::time::interval`
-    /// that fires every hour and calls [`Self::rotate_window`]. Hourly
-    /// (not daily) so a clock drift / startup skew doesn't skip a
-    /// rotation entirely.
-    ///
-    /// Returns a future that never resolves under normal operation;
-    /// fold into `tokio::try_join!` in `main.rs` (V1: NOT wired;
-    /// V1.1: wired alongside the Postgres flush).
-    pub async fn run_daily_rotation(self) -> anyhow::Result<()> {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-        // First tick fires immediately; skip it so we don't rotate at
-        // startup when there's nothing to rotate.
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            self.rotate_window(Utc::now());
-        }
-    }
-
-    /// Number of workspaces being tracked (helper for tests +
-    /// observability dashboards).
-    pub fn workspace_count(&self) -> usize {
-        self.inner.len()
-    }
+    // `run_daily_rotation` (the intended `try_join!` arm for `rotate_window`)
+    // and `workspace_count` were deleted 2026-09-12 (B-390) — zero callers
+    // anywhere in the tree, including tests. Restorable from git history at
+    // `29b22c52c827894a3777bb954bb988b346222405` (the commit before this
+    // session's B-390 cleanup) if V1.1 wires per-tenant rotation.
 
     // ---------------- Persistence (V1: defined, not wired) ----------------
 
@@ -266,6 +269,12 @@ impl CardinalityTracker {
     /// serde derive or use a manual encode/decode (the on-disk format
     /// is just the 2^p register bytes + the precision byte). Tracked
     /// internally for the V1.1 wire-up patch.
+    ///
+    /// No production caller today — used only by tests, hence gated.
+    /// `hydrate_from_postgres`, its read-side counterpart, was deleted
+    /// 2026-09-12 (B-390) for having zero callers anywhere, including tests;
+    /// restorable from git history at `29b22c52c827894a3777bb954bb988b346222405`.
+    #[cfg(test)]
     pub async fn flush_to_postgres<P>(&self, _pool: P) -> anyhow::Result<usize> {
         // Intentionally a no-op stub. Returning Ok(0) so the eventual
         // V1.1 caller can log "flushed N workspaces" without ambiguity.
@@ -273,21 +282,11 @@ impl CardinalityTracker {
             "CardinalityTracker::flush_to_postgres is V1.1 — wire when ingest carries a PG pool"
         )
     }
-
-    /// V1.1 placeholder: read every row of
-    /// `workspace_attr_cardinality` from the last 30 days and rebuild
-    /// the in-memory tracker. Unwired in V1.
-    pub async fn hydrate_from_postgres<P>(_pool: P) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "CardinalityTracker::hydrate_from_postgres is V1.1 — wire when ingest carries a PG pool"
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn observation_below_cap_returns_accepted() {

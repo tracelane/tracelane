@@ -1,0 +1,55 @@
+---
+title: Ask Tara
+description: A text-and-voice assistant that answers questions about your own traces, sessions, cost and guardrail history — read-only, and itself a traced call on your own provider key.
+classification: PUBLIC
+---
+
+Tara is the observability assistant built into the Tracelane dashboard. Ask it a
+question about your own data — "what did my last session cost?", "which traces after
+3pm had errors?" — in plain language, by typing or by voice, and it answers by reading
+through the same tenant-scoped routes the dashboard itself uses.
+
+## What it does
+
+- **Answers only from your own data.** Every number, trace id or model name in an
+  answer comes from a live read against your tenant's traces, sessions, cost breakdown,
+  latency/error summary, or guardrail history — never from anything Tara "remembers."
+  When it cannot find something, it says so instead of guessing.
+- **Cites its sources.** Answers carry citation chips linking straight to the traces
+  they were built from.
+- **Is itself a traced call.** Asking Tara a question sends a request through your own
+  gateway on your own connected provider key, exactly like any other chat completion —
+  so the question and answer are captured, and you can open the conversation's own
+  trace from the panel.
+
+## What it does not do
+
+- **Read-only.** Tara cannot change, delete, annotate, or configure anything. It has no
+  tools that write.
+- **Not a general-purpose chatbot.** Its tool set is a fixed list of read routes over
+  your trace, session, cost, latency and guardrail data — it does not answer questions
+  unrelated to your Tracelane data, and it will not always have an answer to every
+  question about your data either (a narrow enough or unusual-enough question may
+  return "I could not find that in your traces").
+- **No server-side voice.** Speech-to-text and text-to-speech both run in your browser
+  using the Web Speech API — no audio is ever uploaded to Tracelane or to any
+  third-party speech vendor.
+
+## Voice support
+
+**Tara's voice.** When you press *Read aloud*, Tara prefers a natural female English voice
+from the ones your browser and operating system provide (for example Aria or Jenny on Edge,
+Google UK or US English Female on Chrome, Samantha on macOS and iOS). Voices are supplied by
+your device, not by Tracelane, so on a machine with no such voice installed the browser's
+default is used.
+
+The microphone button uses your browser's built-in `SpeechRecognition` API, and "read
+aloud" uses its built-in speech synthesis. Both are currently available in **Chrome and
+Edge**. In a browser without support, the microphone button is hidden with a tooltip
+explaining why — typing always works everywhere.
+
+## Where it lives
+
+Open it from the **Ask Tara** button in the dashboard's top bar. It needs at least one
+connected LLM provider key (**Settings → LLM providers**) — without one, the panel
+tells you so and links you to add one, without making a request.

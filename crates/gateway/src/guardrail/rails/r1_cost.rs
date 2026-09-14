@@ -208,6 +208,9 @@ impl R1Cost {
         Self::default()
     }
 
+    // No production caller — `default_rails()` always constructs `R1Cost::new()`.
+    // Used only by tests overriding the config, hence gated (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn with_config(config: R1Config) -> Self {
         Self { config }
@@ -226,35 +229,33 @@ impl R1Cost {
         // Detect the response side by the presence of the response buffer
         // (`usage` may be absent mid-stream before the first usage update).
         if ctx.response_buf.is_some() {
-            if let (Some(usage), Some(max)) = (ctx.usage, self.config.max_output_tokens) {
-                if usage.output_tokens > max {
-                    return RailOutcome::block(reason_codes::OUTPUT_TOKEN_CAP).with_details(
-                        serde_json::json!({ "output_tokens": usage.output_tokens, "max": max }),
-                    );
-                }
+            if let (Some(usage), Some(max)) = (ctx.usage, self.config.max_output_tokens)
+                && usage.output_tokens > max
+            {
+                return RailOutcome::block(reason_codes::OUTPUT_TOKEN_CAP).with_details(
+                    serde_json::json!({ "output_tokens": usage.output_tokens, "max": max }),
+                );
             }
             return RailOutcome::not_applicable();
         }
 
         // ── Request-side: input cap ────────────────────────────────────────
-        if let Some(max) = self.config.max_input_tokens {
-            if ctx.est_input_tokens > max {
-                return RailOutcome::block(reason_codes::INPUT_TOKEN_CAP).with_details(
-                    serde_json::json!({ "est_input_tokens": ctx.est_input_tokens, "max": max }),
-                );
-            }
+        if let Some(max) = self.config.max_input_tokens
+            && ctx.est_input_tokens > max
+        {
+            return RailOutcome::block(reason_codes::INPUT_TOKEN_CAP).with_details(
+                serde_json::json!({ "est_input_tokens": ctx.est_input_tokens, "max": max }),
+            );
         }
 
         // ── Loop cap (calls in the rolling window) ─────────────────────────
-        if let Some(max) = self.config.max_calls_per_window {
-            if ctx.session.calls_in_window >= max {
-                return RailOutcome::block(reason_codes::LOOP_CAP).with_details(
-                    serde_json::json!({
-                        "calls_in_window": ctx.session.calls_in_window,
-                        "max": max,
-                    }),
-                );
-            }
+        if let Some(max) = self.config.max_calls_per_window
+            && ctx.session.calls_in_window >= max
+        {
+            return RailOutcome::block(reason_codes::LOOP_CAP).with_details(serde_json::json!({
+                "calls_in_window": ctx.session.calls_in_window,
+                "max": max,
+            }));
         }
 
         // ── Step cap (GWY-23) ──────────────────────────────────────────────
@@ -390,6 +391,10 @@ mod tests {
 
     fn req() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages: vec![Message {
@@ -399,6 +404,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -609,10 +615,15 @@ mod tests {
 
     fn req_with(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".to_string(),
             system: None,
             messages,
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

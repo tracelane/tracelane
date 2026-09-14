@@ -67,13 +67,13 @@ impl Predictor for CaptchaPreemptor {
         }
 
         // Check page content for CAPTCHA signatures
-        if let Some(html) = req.get("page_content").and_then(|v| v.as_str()) {
-            if CAPTCHA_PAGE_SIGNATURES.iter().any(|p| html.contains(p)) {
-                tracing::warn!("CAPTCHA page signature detected");
-                return Decision::Warn {
-                    aft_id: "AFT-A2UI-CAPTCHA-001",
-                };
-            }
+        if let Some(html) = req.get("page_content").and_then(|v| v.as_str())
+            && CAPTCHA_PAGE_SIGNATURES.iter().any(|p| html.contains(p))
+        {
+            tracing::warn!("CAPTCHA page signature detected");
+            return Decision::Warn {
+                aft_id: "AFT-A2UI-CAPTCHA-001",
+            };
         }
 
         Decision::Allow

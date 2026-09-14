@@ -1,9 +1,12 @@
 /**
  * Tests for POST /api/settings/team/invite — server-side seat enforcement.
  *
- * Focus: an invite that would push the org past its `seat_cap_max` MUST be
- * rejected with 403 even on a direct POST (the UI disables the button, but
- * the server is the real gate). Seats consumed = accepted memberships + PENDING
+ * ADR-076 (2026-09-12 ruling): seats are UNLIMITED on every paid tier — the
+ * only surviving cap is Free's single seat. Focus: an invite that would push
+ * a Free org past its one seat MUST be rejected with 403 even on a direct
+ * POST (the UI disables the button, but the server is the real gate); a paid
+ * tenant (`unlimited_seats: true`) is never capped, however many members or
+ * pending invitations exist. Seats consumed = accepted memberships + PENDING
  * invitations. Negative cases first per `.claude/rules/testing.md`. tenant_id
  * derives from the session org id.
  */
@@ -16,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
 	db: null as DbMock | null,
 	session: { tenantId: "org_SESSION", userId: "user_1", email: "a@b.co" },
-	seatCapMax: 0,
+	unlimitedSeats: true,
 }));
 
 vi.mock("@/db", () => ({
@@ -30,15 +33,15 @@ vi.mock("@/lib/auth", () => ({
 	requireSession: vi.fn(async () => h.session),
 }));
 
-// Drive seat_cap_max directly so the seat-gate logic is the unit under test;
-// the resolver itself is covered in lib/entitlements.test.ts.
+// Drive unlimited_seats directly so the seat-gate logic is the unit under
+// test; the resolver itself is covered in lib/entitlements.test.ts.
 vi.mock("@/lib/entitlements", async (orig) => {
 	const actual = (await orig()) as Record<string, unknown>;
 	return {
 		...actual,
 		resolveEntitlements: vi.fn(async () => ({
 			...PLAN_ENTITLEMENTS.team,
-			seat_cap_max: h.seatCapMax,
+			unlimited_seats: h.unlimitedSeats,
 		})),
 	};
 });
@@ -162,69 +165,56 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 		expect(res.status).toBe(422);
 	});
 
-	it("REJECT: at the seat cap → 403, and the invite POST never runs", async () => {
-		h.seatCapMax = 10;
-		const spy = stubWorkos({ members: 10, pending: 0 });
+	it("REJECT: Free (unlimited_seats=false) already at its 1 seat → 403", async () => {
+		h.unlimitedSeats = false;
+		const spy = stubWorkos({ members: 1, pending: 0 });
 		const res = await POST(req({ email: "new@member.co" }));
 		expect(res.status).toBe(403);
 		const json = (await res.json()) as { error: string; seat_cap_max: number };
 		expect(json.error).toBe("seat_limit_reached");
-		expect(json.seat_cap_max).toBe(10);
+		expect(json.seat_cap_max).toBe(1);
 		// Only the two count GETs ran; the invitation POST was never dispatched.
 		expect(spy.mock.calls.every((c) => methodOf(c) !== "POST")).toBe(true);
 	});
 
-	it("REJECT: PENDING invitations push over the cap → 403 (fix #4)", async () => {
-		// 8 accepted + 2 pending = 10 = cap → the next invite is blocked, even
-		// though only 8 seats are 'accepted'. Regression for the double-count gap.
-		h.seatCapMax = 10;
-		const spy = stubWorkos({ members: 8, pending: 2 });
+	it("REJECT: Free with a PENDING invite already at the cap → 403 (fix #4)", async () => {
+		// 0 accepted (besides the owner) + 1 pending = 1 = cap → the next invite
+		// is blocked, even though nobody has ACCEPTED yet. Regression for the
+		// double-count gap.
+		h.unlimitedSeats = false;
+		const spy = stubWorkos({ members: 1, pending: 1 });
 		const res = await POST(req({ email: "new@member.co" }));
 		expect(res.status).toBe(403);
 		expect(spy.mock.calls.every((c) => methodOf(c) !== "POST")).toBe(true);
-	});
-
-	it("REJECT: over the cap (race / stale UI) → 403", async () => {
-		h.seatCapMax = 10;
-		stubWorkos({ members: 12, pending: 0 });
-		const res = await POST(req({ email: "new@member.co" }));
-		expect(res.status).toBe(403);
 	});
 
 	it("REJECT: a membership lookup fails → 502 (fail closed on the owner gate)", async () => {
 		// The owner-gate's membership lookup runs before the seat count, so a
 		// WorkOS failure fails closed there first (also 502, different code).
-		h.seatCapMax = 10;
-		stubWorkos({ members: 3, pending: 0, membersOk: false });
+		h.unlimitedSeats = false;
+		stubWorkos({ members: 1, pending: 0, membersOk: false });
 		const res = await POST(req({ email: "new@member.co" }));
 		expect(res.status).toBe(502);
 		const json = (await res.json()) as { error: string };
 		expect(json.error).toBe("could not verify caller role");
 	});
 
-	it("HAPPY: under the cap → forwards the invite to WorkOS, 201", async () => {
-		h.seatCapMax = 10;
-		const spy = stubWorkos({ members: 3, pending: 0 });
+	// Free is genuinely single-user: the inviting owner is ALWAYS a member, so
+	// they always occupy the one seat before the invite is even considered.
+	// There is no "happy path" invite on Free — spec: "Free is advertising
+	// only: ONE workspace per account" — this is that constraint proven, not a
+	// gap. `stubWorkos` always includes the caller as the first entry, so
+	// `members: 0` still reports one real member (the caller).
+	it("Free NEVER has a successful invite — the owner alone already fills the one seat", async () => {
+		h.unlimitedSeats = false;
+		const spy = stubWorkos({ members: 0, pending: 0 });
 		const res = await POST(req({ email: "New@Member.co" }));
-		expect(res.status).toBe(201);
-		const json = (await res.json()) as { invitationId: string };
-		expect(json.invitationId).toBe("invitation_123");
-		// The invite carries the SESSION org id, never anything from the body,
-		// and the email is normalised to lowercase.
-		const inviteCall = spy.mock.calls.find(
-			(c) =>
-				(c[0] as string).includes("/invitations") && methodOf(c) === "POST",
-		);
-		const body = JSON.parse((inviteCall?.[1] as { body: string }).body) as {
-			organization_id: string;
-			email: string;
-		};
-		expect(body.organization_id).toBe("org_SESSION");
-		expect(body.email).toBe("new@member.co");
+		expect(res.status).toBe(403);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "POST")).toBe(true);
 	});
 
-	it("HAPPY: unlimited (seat_cap_max=0, Enterprise) enforces NO seat cap", async () => {
-		h.seatCapMax = 0;
+	it("HAPPY: unlimited_seats=true (every paid tier) enforces NO seat cap", async () => {
+		h.unlimitedSeats = true;
 		const spy = stubWorkos({ members: 999, pending: 999 });
 		const res = await POST(req({ email: "x@y.co" }));
 		// The point of unlimited: 999 members + 999 pending must still succeed.
@@ -236,7 +226,7 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 	});
 
 	it("REJECT: address already has a pending invite → 409 already_invited", async () => {
-		h.seatCapMax = 10;
+		h.unlimitedSeats = true;
 		stubWorkos({ members: 1, pending: 0, pendingEmail: "dupe@member.co" });
 		const res = await POST(req({ email: "dupe@member.co" }));
 		expect(res.status).toBe(409);
@@ -245,14 +235,14 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 	});
 
 	it("REJECT: duplicate check is case/whitespace-insensitive", async () => {
-		h.seatCapMax = 10;
+		h.unlimitedSeats = true;
 		stubWorkos({ members: 1, pending: 0, pendingEmail: "dupe@member.co" });
 		const res = await POST(req({ email: "  DUPE@Member.CO  " }));
 		expect(res.status).toBe(409);
 	});
 
 	it("REJECT: a malformed address is rejected before any WorkOS call", async () => {
-		h.seatCapMax = 10;
+		h.unlimitedSeats = true;
 		const spy = stubWorkos({ members: 1, pending: 0 });
 		const res = await POST(req({ email: "not-an-email" }));
 		expect(res.status).toBe(422);
@@ -260,7 +250,7 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 	});
 
 	it("REJECT: caller is not an owner → 403 role_forbidden (owner-gate)", async () => {
-		h.seatCapMax = 10;
+		h.unlimitedSeats = true;
 		// Session user is present but as a plain member → owner-gate denies.
 		vi.stubGlobal(
 			"fetch",
@@ -283,7 +273,7 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 	});
 
 	it("REJECT: invalid role → 422 (before any WorkOS call)", async () => {
-		h.seatCapMax = 10;
+		h.unlimitedSeats = true;
 		const spy = stubWorkos({ members: 3, pending: 0 });
 		const res = await POST(req({ email: "new@member.co", role: "owner" }));
 		expect(res.status).toBe(422);

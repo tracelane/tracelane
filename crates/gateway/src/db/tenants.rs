@@ -85,6 +85,12 @@ fn row_to_tenant(r: &tokio_postgres::Row) -> Tenant {
 
 /// Insert a new tenant. `workos_org_id` is required (NOT NULL); `plan` is the
 /// plan enum value as a string (e.g. "free").
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs`
+/// (a separate crate, invisible to this crate's own `dead_code` analysis) —
+/// production provisioning goes through `create_or_get_by_workos_org` below.
+/// Allow justified the same way as `db::apply_migrations` (B-390, 2026-09-12).
+#[allow(dead_code)]
 pub async fn create(
     pool: &Pool,
     tenant_id: Uuid,
@@ -159,6 +165,13 @@ pub async fn get(pool: &Pool, tenant_id: &TenantId) -> Result<Option<Tenant>> {
 
 /// Update the Polar ids after a successful Polar customer + subscription
 /// create. Idempotent.
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs`
+/// (a separate crate, invisible to this crate's own `dead_code` analysis) —
+/// the real Polar webhook handler is TypeScript, at
+/// `apps/web/app/api/webhooks/polar/route.ts`, not this Rust function.
+/// Allow justified the same way as `db::apply_migrations` (B-390, 2026-09-12).
+#[allow(dead_code)]
 pub async fn set_polar_ids(
     pool: &Pool,
     tenant_id: &TenantId,
@@ -178,8 +191,17 @@ pub async fn set_polar_ids(
     Ok(())
 }
 
-/// Reverse map: `polar_customer_id` -> `Tenant`. Used by the Polar webhook
-/// handler to flip plan tier when `subscription.updated` fires.
+/// Reverse map: `polar_customer_id` -> `Tenant`.
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs`
+/// (a separate crate, invisible to this crate's own `dead_code` analysis).
+/// Corrected 2026-09-12 (B-390): this doc used to claim "Used by the Polar
+/// webhook handler to flip plan tier when `subscription.updated` fires" —
+/// false; the real handler is TypeScript
+/// (`apps/web/app/api/webhooks/polar/route.ts`), same finding as
+/// `set_polar_ids` above and the already-deleted `set_plan_tier`
+/// (see the note further down this file).
+#[allow(dead_code)]
 pub async fn get_by_polar_customer(pool: &Pool, polar_customer_id: &str) -> Result<Option<Tenant>> {
     let client = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
     let sql = format!(

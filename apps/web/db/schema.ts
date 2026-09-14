@@ -16,6 +16,7 @@ import {
 	boolean,
 	check,
 	customType,
+	date,
 	doublePrecision,
 	index,
 	inet,
@@ -67,6 +68,13 @@ export const tenants = pgTable(
 		stripeCustomerId: text("stripe_customer_id"),
 		polarCustomerId: text("polar_customer_id"),
 		polarSubscriptionId: text("polar_subscription_id"),
+		// B-388 (migration 0039): Polar's `modified_at` of the LAST subscription
+		// event applied to this tenant. The webhook refuses an event whose clock
+		// is older — a retried `updated` after a `canceled` cannot re-activate the
+		// plan. NULL until the first event after this shipped.
+		polarSubscriptionModifiedAt: timestamp("polar_subscription_modified_at", {
+			withTimezone: true,
+		}),
 		// Fresh/unbilled signups are 'free' until the Polar webhook (or a manual
 		// grant) elevates them. Previously 'builder', which gave new signups
 		// Builder entitlements (150K traces) for free.
@@ -114,6 +122,38 @@ export const tenants = pgTable(
 		// reads it), but `drizzle-kit push` never dropped the column, so it
 		// persists. Keeping it here is the honest, non-destructive reconcile.
 		name: text("name"),
+		// ── ADR-076 / BILL-01, migration 0040 ──────────────────────────────
+		// Customer-set monthly spend ceiling (opt-in, OFF by default per spec
+		// §0.4). NULL = no ceiling — ingest is never blocked either way.
+		spendCeilingUsd: numeric("spend_ceiling_usd", { precision: 12, scale: 2 }),
+		// What happens AT the ceiling: 'auto_age' (default — oldest data leaves
+		// the indexed window early, stays queryable in cold, nothing lost) or
+		// 'auto_overage' (opt-in continuous billing past the ceiling). NULL on a
+		// tenant row means "use the plan's overflow_mode default".
+		overflowMode: text("overflow_mode"),
+		// 'month' | 'year'. Set by the webhook from the subscription's own
+		// lookup_key suffix (`_year`), never guessed.
+		billingInterval: text("billing_interval"),
+		// signup + billing_policy.price_protection_months, set on the FIRST paid
+		// subscription.created/.active event. NULL = never had a paid sub.
+		priceProtectedUntil: timestamp("price_protected_until", {
+			withTimezone: true,
+		}),
+		// Set on subscription.past_due; cleared on the next .active. Plan is
+		// UNCHANGED while dunning — ingest is never gated on billing state.
+		dunningStartedAt: timestamp("dunning_started_at", { withTimezone: true }),
+		// Set when a churned/unpaid subscription drops the tenant to free: now +
+		// billing_policy.dunning_data_hold_days. The purge path refuses before
+		// this date.
+		dataHoldUntil: timestamp("data_hold_until", { withTimezone: true }),
+		// A3 velocity breaker (token generation >2σ above a rolling 7-day
+		// average): prompt promotion is frozen while these are set; a human
+		// clears them.
+		promotionFrozenAt: timestamp("promotion_frozen_at", { withTimezone: true }),
+		promotionFrozenReason: text("promotion_frozen_reason"),
+		// The `pricing_rates.price_version` this tenant is pinned to (12-month
+		// price protection). NULL = tracks the current version.
+		priceVersion: text("price_version"),
 	},
 	(t) => [
 		uniqueIndex("tenants_workos_org_id_idx").on(t.workosOrgId),
@@ -138,27 +178,10 @@ export type Tenant = typeof tenants.$inferSelect;
 
 export const planEntitlements = pgTable("plan_entitlements", {
 	planLookupKey: text("plan_lookup_key").primaryKey(),
-	seatCapIncluded: integer("seat_cap_included").notNull().default(1),
-	seatCapMax: integer("seat_cap_max").notNull().default(1),
-	retentionDays: integer("retention_days").notNull().default(7),
-	traceQuotaMonthly: bigint("trace_quota_monthly", { mode: "number" })
-		.notNull()
-		.default(10000),
-	gatewayQuotaMonthly: bigint("gateway_quota_monthly", { mode: "number" })
-		.notNull()
-		.default(10000),
-	overageHardCapMultiplier: numeric("overage_hard_cap_multiplier", {
-		precision: 4,
-		scale: 1,
-	})
-		.notNull()
-		.default("1.0"),
-	overagePricePer10kUsd: numeric("overage_price_per_10k_usd", {
-		precision: 6,
-		scale: 2,
-	})
-		.notNull()
-		.default("0.00"),
+	// The ADR-020 columns (seat caps, retention_days, trace/gateway quotas, the
+	// overage multiplier + per-10K price, f_hipaa_gcp_addon) were DROPPED by
+	// migration 0042 (BILL-01 contract step, 2026-09-14). The ruled model's
+	// numbers are the ADR-076 block below.
 	fPr7Trajectory: boolean("f_pr7_trajectory").notNull().default(false),
 	fPr8Argdrift: boolean("f_pr8_argdrift").notNull().default(false),
 	fPr9A2aHandoff: boolean("f_pr9_a2a_handoff").notNull().default(false),
@@ -170,13 +193,6 @@ export const planEntitlements = pgTable("plan_entitlements", {
 		.notNull()
 		.default(false),
 	fCohortBaselines: boolean("f_cohort_baselines").notNull().default(false),
-	// NOT A SHIPPED ENTITLEMENT. There is no HIPAA BAA and no GCP deployment —
-	// nothing in this repo ever sets this flag TRUE: `seed.mjs` does not seed
-	// `hipaa_gcp_addon_v1`, and the Polar webhook explicitly refuses to auto-wire
-	// the grant (`app/api/webhooks/polar/route.ts` handleAddOnChange). The column
-	// exists in Neon, so it stays here for Drizzle parity; removing it is a
-	// hand-written migration, not an edit to this file.
-	fHipaaGcpAddon: boolean("f_hipaa_gcp_addon").notNull().default(false),
 	fAuditAddon: boolean("f_audit_addon").notNull().default(false),
 	// ADR-048 D2: full-capture gate. Business + Enterprise base = TRUE; others
 	// FALSE. Audit-SKU-active forces full regardless (resolved in entitlements).
@@ -219,8 +235,9 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	// it is deliberately not a Builder default.
 	fOnlineEvals: boolean("f_online_evals").notNull().default(false),
 	// EVL-29 annotation / review queues over the OBS-18 trace_annotations store.
-	// Team+ = TRUE (seeded) — a review queue is a multi-seat workflow, and
-	// Builder is a one-seat plan (seat_cap_max = 1).
+	// Team+ = TRUE (seeded) — a review queue is a multi-person workflow: the
+	// eval loop's boundary (EVL-29), not a seat rule (ADR-076: seats are
+	// unlimited on every paid tier).
 	fAnnotationQueues: boolean("f_annotation_queues").notNull().default(false),
 	// Inline guardrail V1 rails (infra migration 12 → reconciled into Drizzle in
 	// they were prod-only, hand-applied). Gated rails default OFF for
@@ -238,6 +255,37 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	// tenant SEEs + verifies their OWN recent chain in-app. Distinct from the
 	// paid fAuditAddon (Article-12 evidence-pack export).
 	fAuditSelfverify: boolean("f_audit_selfverify").notNull().default(true),
+	// ── ADR-076 / BILL-01, migration 0040 — the six-meter ruled model ─────────
+	// EXPAND phase of expand→migrate→contract: every column below is ADDED
+	// alongside the retired seat-cap/trace-quota/overage columns above, which
+	// stay until a later migration drops them (once no deployed binary reads
+	// them). `apps/web/db/plans.v3.json` is the single source these mirror —
+	// never re-type these numbers anywhere else (`.claude/rules/reference-tables.md`).
+	priceMonthlyUsd: integer("price_monthly_usd"), // NULL = contract (Enterprise)
+	priceAnnualMonthUsd: integer("price_annual_month_usd"), // NULL = no annual product
+	priceFromUsd: integer("price_from_usd"), // Enterprise "from $2,499"
+	hotGbIncluded: numeric("hot_gb_included", { precision: 12, scale: 3 }), // NULL = custom
+	ingestGbIncluded: numeric("ingest_gb_included", { precision: 12, scale: 3 }),
+	seriesIncluded: bigint("series_included", { mode: "number" }),
+	scanUnitsIncluded: bigint("scan_units_included", { mode: "number" }),
+	evalRunsIncluded: bigint("eval_runs_included", { mode: "number" }),
+	indexedWindowDays: integer("indexed_window_days"),
+	queryableDays: integer("queryable_days"),
+	ledgerDays: integer("ledger_days"),
+	coldArchiveDays: integer("cold_archive_days"), // NULL = complete (whole queryable history)
+	unlimitedSeats: boolean("unlimited_seats").notNull().default(false),
+	fSso: boolean("f_sso").notNull().default(false),
+	overageAllowed: boolean("overage_allowed").notNull().default(false), // Free: no overage, ages out
+	overflowMode: text("overflow_mode").notNull().default("auto_age"),
+	// The Polar product ids for this plan, written by scripts/ops/polar-sync.mjs
+	// (idempotent on lookup_key). The checkout route reads THESE, not a
+	// POLAR_PRODUCT_ID_<TIER> env var.
+	polarProductIdMonth: text("polar_product_id_month"),
+	polarProductIdYear: text("polar_product_id_year"),
+	// Per-tenant requests-per-minute, read from the DB rather than a tier-string
+	// compare. NULL = no limit (Enterprise; also the no-control-plane self-host
+	// default, B-357).
+	rateLimitRpm: integer("rate_limit_rpm"),
 	createdAt: timestamp("created_at", { withTimezone: true })
 		.defaultNow()
 		.notNull(),
@@ -257,20 +305,8 @@ export const workspaceEntitlements = pgTable(
 		planLookupKey: text("plan_lookup_key")
 			.notNull()
 			.references(() => planEntitlements.planLookupKey),
-		// All nullable: NULL == inherit from plan_entitlements.
-		seatCapIncluded: integer("seat_cap_included"),
-		seatCapMax: integer("seat_cap_max"),
-		retentionDays: integer("retention_days"),
-		traceQuotaMonthly: bigint("trace_quota_monthly", { mode: "number" }),
-		gatewayQuotaMonthly: bigint("gateway_quota_monthly", { mode: "number" }),
-		overageHardCapMultiplier: numeric("overage_hard_cap_multiplier", {
-			precision: 4,
-			scale: 1,
-		}),
-		overagePricePer10kUsd: numeric("overage_price_per_10k_usd", {
-			precision: 6,
-			scale: 2,
-		}),
+		// All nullable: NULL == inherit from plan_entitlements. (The ADR-020
+		// override columns were dropped by migration 0042 — see plan_entitlements.)
 		fPr7Trajectory: boolean("f_pr7_trajectory"),
 		fPr8Argdrift: boolean("f_pr8_argdrift"),
 		fPr9A2aHandoff: boolean("f_pr9_a2a_handoff"),
@@ -278,7 +314,6 @@ export const workspaceEntitlements = pgTable(
 		fPr11SloDrift: boolean("f_pr11_slo_drift"),
 		fPr12LanggraphBranch: boolean("f_pr12_langgraph_branch"),
 		fCohortBaselines: boolean("f_cohort_baselines"),
-		fHipaaGcpAddon: boolean("f_hipaa_gcp_addon"),
 		fAuditAddon: boolean("f_audit_addon"),
 		// ADR-048 D2: per-tenant full-capture override (NULL = inherit plan).
 		fFullCapture: boolean("f_full_capture"),
@@ -308,6 +343,24 @@ export const workspaceEntitlements = pgTable(
 		// ADR-066: per-tenant audit self-verify override (NULL = inherit plan;
 		// FALSE switches off the default-TRUE free grant, deny-overrides-grant).
 		fAuditSelfverify: boolean("f_audit_selfverify"),
+		// ── ADR-076 / BILL-01, migration 0040 — nullable overrides, same columns
+		// as plan_entitlements above. NULL = inherit; deny-overrides-grant on the
+		// booleans (a workspace FALSE beats a plan TRUE).
+		hotGbIncluded: numeric("hot_gb_included", { precision: 12, scale: 3 }),
+		ingestGbIncluded: numeric("ingest_gb_included", {
+			precision: 12,
+			scale: 3,
+		}),
+		seriesIncluded: bigint("series_included", { mode: "number" }),
+		scanUnitsIncluded: bigint("scan_units_included", { mode: "number" }),
+		evalRunsIncluded: bigint("eval_runs_included", { mode: "number" }),
+		indexedWindowDays: integer("indexed_window_days"),
+		queryableDays: integer("queryable_days"),
+		ledgerDays: integer("ledger_days"),
+		fSso: boolean("f_sso"),
+		overageAllowed: boolean("overage_allowed"),
+		rateLimitRpm: integer("rate_limit_rpm"),
+		overflowMode: text("overflow_mode"),
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.defaultNow()
 			.notNull(),
@@ -487,6 +540,10 @@ export const apiKeys = pgTable(
 		// `api_keys_rate_limit_rpm_positive_chk` rejects 0: a key that can never
 		// be used is a foot-gun, and `revokedAt` already switches a key off.
 		rateLimitRpm: integer("rate_limit_rpm"),
+		// ── A3 (BILL-01 / ADR-076, migration 0040) — per-key budget cadence + a
+		// velocity breaker on top of the existing monthly `budgetUsdMonthly`.
+		budgetReset: text("budget_reset").notNull().default("monthly"),
+		velocityBreaker: boolean("velocity_breaker").notNull().default(false),
 	},
 	(t) => [
 		index("api_keys_tenant_id_idx").on(t.tenantId),
@@ -1087,3 +1144,229 @@ export const onlineEvalPolicies = pgTable(
 );
 
 export type OnlineEvalPolicy = typeof onlineEvalPolicies.$inferSelect;
+
+// ── DSH-13 — Custom dashboards ────────────────────────────────────────────────
+//
+// A dashboard is a saved *question*, never a saved *answer*. No tile stores
+// a query, a window, or a number: the window comes from the URL, the number
+// from the gateway at render time. `metric_id` is validated against the
+// registry at write time (web); at read time an unknown id renders
+// "This tile's metric no longer exists — remove it" (registry drift).
+
+export const dashboards = pgTable(
+	"dashboards",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		/** WorkOS user id (email) of the creator — display only. */
+		createdBy: text("created_by").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [index("dashboards_tenant_id_idx").on(t.tenantId)],
+);
+
+export type Dashboard = typeof dashboards.$inferSelect;
+
+export const dashboardTiles = pgTable(
+	"dashboard_tiles",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		dashboardId: uuid("dashboard_id")
+			.notNull()
+			.references(() => dashboards.id, { onDelete: "cascade" }),
+		/** 0-based display order within the dashboard. */
+		position: integer("position").notNull().default(0),
+		/** Column span on the 12-column grid: 4 (1/3), 6 (half), or 12 (full). */
+		width: integer("width").notNull().default(6),
+		/** Free-text title shown above the tile. 60 chars max (validated by the API). */
+		title: text("title").notNull().default(""),
+		/** Registry metric id — validated against METRICS at write time. */
+		metricId: text("metric_id").notNull(),
+		/**
+		 * Visualization shape: `stat`, `series`, `breakdown`, or `divider`.
+		 * `divider` (DSH-13 §9, 2026-09-07) is a pure-layout tile — no metric, no
+		 * fetch — that forces every tile placed after it onto a new grid row. A
+		 * divider row is pinned by `dashboard_tiles_divider_shape_chk` to
+		 * `width = 12` and `metric_id = '__divider__'` (the reserved sentinel,
+		 * `DIVIDER_METRIC_ID` in `lib/metrics/tile-support.ts` — deliberately not
+		 * a METRICS registry key).
+		 */
+		shape: text("shape").notNull().default("stat"),
+		/** For `breakdown` tiles: the grouping dimension (`model`, `provider`, etc.). */
+		dimension: text("dimension"),
+		/** Optional filter dimension (e.g. `model`). */
+		filterDimension: text("filter_dimension"),
+		/** Optional filter value (e.g. `claude-haiku-4-5`). */
+		filterValue: text("filter_value"),
+		/**
+		 * Tile height class: `compact` | `regular` | `tall`. Chart pixel height
+		 * (220/320/480, `CHART_HEIGHT_PX` in `lib/metrics/tile-support.ts`) for
+		 * series/breakdown; a smaller min-height (`STAT_MIN_HEIGHT_PX`) for stat.
+		 * Added 2026-09-07 (founder report: a narrow tile made a chart invisible
+		 * — the missing half of that bug was a chart pinned to 140px regardless
+		 * of width). Default `regular` so every pre-existing row keeps rendering.
+		 */
+		height: text("height").notNull().default("regular"),
+	},
+	(t) => [
+		index("dashboard_tiles_dashboard_id_idx").on(t.dashboardId),
+		// B-342: two concurrent adds computed the same max(position)+1 and both succeeded.
+		uniqueIndex("dashboard_tiles_dashboard_position_uniq").on(
+			t.dashboardId,
+			t.position,
+		),
+		check("dashboard_tiles_width_chk", sql`${t.width} IN (4, 6, 12)`),
+		check(
+			"dashboard_tiles_shape_chk",
+			sql`${t.shape} IN ('stat', 'series', 'breakdown', 'divider')`,
+		),
+		check(
+			"dashboard_tiles_dimension_chk",
+			sql`${t.dimension} IS NULL OR ${t.dimension} IN ('model', 'provider', 'api_key', 'status', 'operation', 'decision', 'rail')`,
+		),
+		check(
+			"dashboard_tiles_height_chk",
+			sql`${t.height} IN ('compact', 'regular', 'tall')`,
+		),
+		// DSH-13 §9 (migration 0038): a divider tile can only ever be full-width
+		// and carry the reserved sentinel metric_id — enforced at the DB layer so
+		// an application bug can never write an inconsistent divider row.
+		check(
+			"dashboard_tiles_divider_shape_chk",
+			sql`${t.shape} <> 'divider' OR (${t.width} = 12 AND ${t.metricId} = '__divider__')`,
+		),
+	],
+);
+
+export type DashboardTile = typeof dashboardTiles.$inferSelect;
+
+// ── OBS-48 — Shareable verified trace link ────────────────────────────────────
+//
+// One row per minted share link. `token_hash` is the sha256 of the 256-bit
+// random token; the RAW token is returned to the owner exactly once (at mint
+// time, in the gateway's `POST` response) and never stored — the same "we
+// cannot show it again" shape as `api_keys.lookup_hash`.
+//
+// WRITTEN BY THE GATEWAY (Rust, via its own deadpool Postgres pool), not by
+// this app's Drizzle client — this table follows the `audit_chain_state` /
+// `tenant_audit_keys` precedent: declared here as the canonical schema even
+// though the runtime writer is `crates/gateway`. Un-journaled migration 0036
+// must land on Neon BEFORE the gateway that reads/writes it deploys (TRAPS §9).
+//
+// `revoked_at` is a soft marker, not a delete: `DELETE /v1/traces/{id}/shares/{id}`
+// sets it rather than removing the row, so `view_count` and the mint history
+// survive a revoke.
+export const traceShares = pgTable(
+	"trace_shares",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		// ClickHouse trace id (hex/UUID-shaped text, not a Postgres FK — spans
+		// live in ClickHouse, never Postgres).
+		traceId: text("trace_id").notNull(),
+		// sha256(token), raw bytes. The token itself is never stored.
+		tokenHash: bytea("token_hash").notNull(),
+		// WorkOS claim `sub` of the minting user.
+		createdBy: text("created_by").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+		// NULL = active. Non-NULL = revoked (soft; see table doc above).
+		revokedAt: timestamp("revoked_at", { withTimezone: true }),
+		viewCount: bigint("view_count", { mode: "number" }).notNull().default(0),
+	},
+	(t) => [
+		// The owner-facing list (`GET /v1/traces/{id}/shares`) and the mint
+		// route's 10-active-links cap both filter on this pair.
+		index("trace_shares_tenant_trace_idx").on(t.tenantId, t.traceId),
+		uniqueIndex("trace_shares_token_hash_idx").on(t.tokenHash),
+	],
+);
+
+export type TraceShare = typeof traceShares.$inferSelect;
+
+// ── ADR-076 / BILL-01 — reference tables ──────────────────────────────────────
+// Founder, 2026-09-13: "try not to hardcode prices, limits, config values and
+// have them on reference tables". Rates and policy numbers are DATA, seeded
+// from `apps/web/db/plans.v3.json` by `seed.mjs`, read by the gateway on its
+// entitlement-cache refresh cadence (never per request), by this app, by
+// `scripts/ops/polar-sync.mjs`, and by the copy guard. See
+// `.claude/rules/reference-tables.md`.
+
+/**
+ * A rated band for one meter at one price version. `price_version` is how
+ * price protection works: a tenant pins the version current at signup for 12
+ * months (`tenants.priceVersion`); a new ruling INSERTS a new version and
+ * flips `is_current` — nobody's pinned rows move.
+ */
+export const pricingRates = pgTable(
+	"pricing_rates",
+	{
+		priceVersion: text("price_version").notNull(),
+		// ingest_gb | hot_gb_month | series | scan_units | cold_gb_month | eval_runs
+		meter: text("meter").notNull(),
+		bandLo: numeric("band_lo", { precision: 14, scale: 3 })
+			.notNull()
+			.default("0"),
+		bandHi: numeric("band_hi", { precision: 14, scale: 3 }), // NULL = open (unbounded top band)
+		usdPerUnit: numeric("usd_per_unit", { precision: 12, scale: 4 }).notNull(),
+		unit: text("unit").notNull(), // GB | GB-month | series-month | scan-unit | run
+		isCurrent: boolean("is_current").notNull().default(false),
+		effectiveFrom: date("effective_from").notNull().defaultNow(),
+	},
+	(t) => [primaryKey({ columns: [t.priceVersion, t.meter, t.bandLo] })],
+);
+
+export type PricingRate = typeof pricingRates.$inferSelect;
+
+/**
+ * One row per named policy knob: burst multiple, warning thresholds, dunning
+ * schedule, refund window, etc. `value` is `jsonb` because the shapes vary
+ * (a single number, a list of days, a list of tiers).
+ */
+export const billingPolicy = pgTable("billing_policy", {
+	key: text("key").primaryKey(),
+	value: jsonb("value").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true })
+		.defaultNow()
+		.notNull(),
+});
+
+export type BillingPolicyRow = typeof billingPolicy.$inferSelect;
+
+/**
+ * Idempotency for the 75%/90%/100% usage-warning emails: one email per
+ * (tenant, meter, calendar month, threshold), so a re-computed daily gauge
+ * cannot re-send the same warning.
+ */
+export const meterWarnings = pgTable(
+	"meter_warnings",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		meter: text("meter").notNull(),
+		/** First day of the calendar month this warning covers. */
+		period: date("period").notNull(),
+		threshold: integer("threshold").notNull(),
+		sentAt: timestamp("sent_at", { withTimezone: true }).defaultNow().notNull(),
+	},
+	(t) => [
+		primaryKey({
+			columns: [t.tenantId, t.meter, t.period, t.threshold],
+		}),
+	],
+);
+
+export type MeterWarning = typeof meterWarnings.$inferSelect;

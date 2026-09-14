@@ -12,8 +12,19 @@
 
 import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
-import { fetchGuardrailVerdicts } from "@/lib/guardrails";
-import { rangeLabel, rangeToHours } from "@/lib/range";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
+import type { GuardrailStats } from "@/lib/guardrails";
+import {
+	fetchGuardrailStatsFor,
+	fetchGuardrailVerdictsFor,
+} from "@/lib/metrics/fetch";
+import { fmtCount } from "@/lib/metrics/format";
+import {
+	type TimeRange,
+	parseTimeRange,
+	withWindow,
+} from "@/lib/metrics/time-range";
+import { MAX_VERDICT_LIMIT, clampVerdictLimit } from "@/lib/verdict-limit";
 import {
 	Button,
 	Card,
@@ -39,32 +50,73 @@ const DECISIONS = [
 	{ value: "allow", label: "Allowed" },
 ] as const;
 
-/** Decision filter — server-driven links (preserve the active range). */
-function decisionHref(sp: SP, v: string): string {
-	const q = new URLSearchParams();
-	if (v) q.set("decision", v);
-	if (sp.range) q.set("range", sp.range);
-	if (sp.correlation_id) q.set("correlation_id", sp.correlation_id);
-	const s = q.toString();
-	return s ? `/guardrails/verdicts?${s}` : "/guardrails/verdicts";
+/** Decision filter — server-driven links carrying THIS page's window (preset or custom). */
+function decisionHref(sp: SP, range: TimeRange, v: string): string {
+	return withWindow("/guardrails/verdicts", range, {
+		decision: v || undefined,
+		correlation_id: sp.correlation_id,
+	});
 }
 
-/** Gateway caps the verdict look-back at 720h (MAX_GUARDRAIL_HOURS). */
-const LOOKUP_HOURS = 720;
+/** An id lookup ignores the range chip: the widest window the gateway serves (720 h). */
+const LOOKUP_MS = 720 * 3_600_000;
 
-async function VerdictsData({ sp }: { sp: SP }) {
+/** A `?limit=` link carrying THIS page's window + decision filter (B-335b). */
+function limitHref(sp: SP, range: TimeRange, limit: number): string {
+	return withWindow("/guardrails/verdicts", range, {
+		decision: sp.decision,
+		limit: String(limit),
+	});
+}
+
+/** The summary's exact verdict count for this window, scoped to the active
+ * decision filter — the same aggregate `/guardrails` shows, so "N of M" reads
+ * against a real total rather than the capped list re-counting itself. `null`
+ * when the stats read is unreachable (never fabricated as 0). */
+function windowVerdictTotal(
+	stats: GuardrailStats | null,
+	decision: string | undefined,
+): number | null {
+	if (stats === null) return null;
+	switch (decision) {
+		case "block":
+			return stats.blocks;
+		case "redact":
+			return stats.redacts;
+		case "warn":
+			return stats.warns;
+		case "allow":
+			return stats.allows;
+		default:
+			return stats.total_evaluations;
+	}
+}
+
+async function VerdictsData({ sp, range }: { sp: SP; range: TimeRange }) {
 	const lookup = sp.correlation_id?.trim() || undefined;
+	// `?limit=` only applies to the default (non-lookup) list — an id lookup
+	// always wants the one matching row, wherever it falls, and stays at its
+	// existing fixed page size.
+	const limit = clampVerdictLimit(sp.limit);
 	// An id lookup ignores the range chip and the decision filter: you paste the
 	// id from a 403 and you want THAT verdict, wherever it falls in the window.
-	const verdicts = await fetchGuardrailVerdicts(
-		lookup
-			? { hours: LOOKUP_HOURS, correlationId: lookup, limit: 100 }
-			: {
-					hours: rangeToHours(sp.range),
-					decision: sp.decision,
-					limit: 100,
-				},
-	);
+	// The window's exact verdict total (for "Showing N of M") only applies to
+	// the default list — a lookup's "M" would mean something else entirely.
+	const [verdicts, stats] = await Promise.all([
+		fetchGuardrailVerdictsFor(
+			lookup
+				? {
+						sinceMs: range.untilMs - LOOKUP_MS,
+						untilMs: range.untilMs,
+						bucketMs: range.bucketMs,
+					}
+				: range,
+			lookup
+				? { correlationId: lookup, limit: 100 }
+				: { decision: sp.decision, rail: sp.rail, limit },
+		),
+		lookup ? Promise.resolve(null) : fetchGuardrailStatsFor(range),
+	]);
 
 	// Defence in depth: if the gateway is older than this filter it will IGNORE
 	// `correlation_id` and return the recent list, which we'd otherwise render as
@@ -96,7 +148,7 @@ async function VerdictsData({ sp }: { sp: SP }) {
 				description={`Nothing matched ${lookup} in the last 30 days (the verdict look-back window). Check the id from the 403 response body, or clear the search.`}
 				action={
 					<Link
-						href={decisionHref({ ...sp, correlation_id: undefined }, "")}
+						href={decisionHref({ ...sp, correlation_id: undefined }, range, "")}
 						className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 					>
 						Clear search
@@ -112,14 +164,14 @@ async function VerdictsData({ sp }: { sp: SP }) {
 			<EmptyState
 				title={
 					filtered
-						? `No ${sp.decision} verdicts in the last ${rangeLabel(sp.range)}`
-						: `No verdicts in the last ${rangeLabel(sp.range)}`
+						? `No ${sp.decision} verdicts — ${range.label}`
+						: `No verdicts — ${range.label}`
 				}
 				description="Every request through the gateway is evaluated pre-flight; verdicts land here as traffic flows. Try widening the range or clearing the decision filter."
 				action={
 					filtered ? (
 						<Link
-							href={decisionHref({ ...sp, decision: undefined }, "")}
+							href={decisionHref({ ...sp, decision: undefined }, range, "")}
 							className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 						>
 							Clear filter
@@ -130,13 +182,54 @@ async function VerdictsData({ sp }: { sp: SP }) {
 		);
 	}
 
+	// The window's exact verdict total, scoped to the active decision filter —
+	// `null` when the stats read failed (never shown as a fabricated 0). Absent
+	// entirely in lookup mode: an id lookup's "M" would mean something else.
+	// B-335a: with a rail filter the summary's per-decision total is NOT the
+	// denominator (it counts every rail), so "N of M" is withheld rather than wrong.
+	const windowTotal =
+		lookup || sp.rail ? null : windowVerdictTotal(stats, sp.decision);
 	return (
-		// `quiet` — flat. A full-width table is a surface the reader scans, not an
-		// object floating in front of the page; the card shadow under a 100%-wide
-		// panel reads as a seam. Same call the rail roster makes one click away.
-		<Card quiet className="overflow-hidden p-0">
-			<VerdictTable verdicts={rows} />
-		</Card>
+		<>
+			{!lookup && (
+				<p className="mb-3 text-xs text-ink-2">
+					Showing{" "}
+					<span className="tabular-nums font-medium text-ink">
+						{fmtCount(rows.length)}
+					</span>
+					{windowTotal !== null && (
+						<>
+							{" "}
+							of{" "}
+							<span className="tabular-nums font-medium text-ink">
+								{fmtCount(windowTotal)}
+							</span>
+						</>
+					)}{" "}
+					verdicts in this window.
+					{windowTotal !== null && windowTotal > rows.length && (
+						<>
+							{" "}
+							Narrow the window to see the rest, or{" "}
+							<Link
+								href={limitHref(sp, range, MAX_VERDICT_LIMIT)}
+								className="font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+							>
+								show up to {MAX_VERDICT_LIMIT}
+							</Link>
+							.
+						</>
+					)}
+				</p>
+			)}
+			{/* `quiet` — flat. A full-width table is a surface the reader scans, not
+			    an object floating in front of the page; the card shadow under a
+			    100%-wide panel reads as a seam. Same call the rail roster makes one
+			    click away. */}
+			<Card quiet className="overflow-hidden p-0">
+				<VerdictTable verdicts={rows} />
+			</Card>
+		</>
 	);
 }
 
@@ -147,6 +240,7 @@ export default async function GuardrailVerdictsPage({
 }) {
 	const sp = await searchParams;
 	const active = sp.decision ?? "";
+	const range = parseTimeRange(sp, { defaultPreset: "24h", nowMs: Date.now() });
 	return (
 		/* The dashboard's padding ramp, to the utility (verifier, 2026-08-22). This
 		   was `px-2 py-3 sm:px-4 sm:py-4`, a different gutter from the four pages
@@ -180,6 +274,7 @@ export default async function GuardrailVerdictsPage({
 				</div>
 				<RangeControl />
 			</header>
+			<WindowNotice range={range} />
 
 			{/* ONE filter row: the decision segments on the left, the correlation-ID
 			    lookup on the right. They were two stacked rows plus the range control,
@@ -195,7 +290,7 @@ export default async function GuardrailVerdictsPage({
 					label="Verdict decision"
 					value={active}
 					options={DECISIONS}
-					hrefFor={(v) => decisionHref(sp, v)}
+					hrefFor={(v) => decisionHref(sp, range, v)}
 				/>
 				<form method="get" className="flex flex-wrap items-center gap-2">
 					{sp.decision && (
@@ -220,6 +315,7 @@ export default async function GuardrailVerdictsPage({
 						<Link
 							href={decisionHref(
 								{ ...sp, correlation_id: undefined },
+								range,
 								sp.decision ?? "",
 							)}
 							className="text-xs text-ink-2 underline underline-offset-2 hover:text-ink"
@@ -243,7 +339,7 @@ export default async function GuardrailVerdictsPage({
 					</div>
 				}
 			>
-				<VerdictsData sp={sp} />
+				<VerdictsData sp={sp} range={range} />
 			</Suspense>
 		</div>
 	);

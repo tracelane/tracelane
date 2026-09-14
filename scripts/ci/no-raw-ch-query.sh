@@ -90,16 +90,41 @@ scan_tree() {
             crates/ingest/src/clickhouse_writer.rs) continue ;;
             */tests/*|*/test*) continue ;;
             # ── V1.1 sweep allow-list (ADR-031 §"V1 wiring scope") ───────
-            # The three pre-existing audit-ledger / prompt-history read
-            # paths predate ADR-031 and read from internally-bounded row
-            # sets (audit log, prompt history) rather than user-driven
-            # dashboard queries. Refactoring them to TenantQuery is V1.1
-            # sweep work — tracked in CHANGELOG and ADR-031. Each file
-            # has its own "ADR-031 V1.1 sweep" TODO comment near the .query
-            # call so the next maintainer sees the upgrade plan.
+            # The two pre-existing audit-chain / prompt-history read paths
+            # predate ADR-031 and read from internally-bounded row sets
+            # (chain-head re-derivation, prompt history) rather than
+            # user-driven dashboard queries. Refactoring them to TenantQuery
+            # is V1.1 sweep work — tracked in CHANGELOG and ADR-031. Each
+            # file has its own "ADR-031 V1.1 sweep" TODO comment near the
+            # .query call so the next maintainer sees the upgrade plan.
+            # (`audit_export.rs` left this list 2026-09-05 — see its own
+            # COMPLIANT entry below.)
             crates/gateway/src/audit.rs) continue ;;
-            crates/gateway/src/audit_export.rs) continue ;;
             crates/gateway/src/prompt_history.rs) continue ;;
+            # Audit export / summary / self-verify / ledger-range reads.
+            # COMPLIANT, NOT EXEMPT — since 2026-09-05 (SRE register #28).
+            #
+            # This file sat in the V1.1 block above for three months while a
+            # comment INSIDE it said the export "routes through TenantQuery so
+            # the export command inherits the tier-derived caps". It did not:
+            # zero of its reads were capped, so `/v1/audit/export`,
+            # `/v1/audit/self-verify` and `/v1/audit/ledger-range` — all
+            # authenticated, all customer-reachable — could scan a tenant's whole
+            # ledger with no execution-time or row ceiling. A comment asserting a
+            # control the code does not implement, and an exemption that made the
+            # guard agree with the comment instead of with the code.
+            #
+            # Every read now goes through `ClickHouseExportReader::capped`, which
+            # is `TenantQuery::new(sql, PlanTier::Builder).sql_with_settings()`.
+            # VERIFY THE CLAIM RATHER THAN TRUSTING THIS COMMENT — the two
+            # numbers below differ by exactly the THREE `.query(` calls in the
+            # `#[cfg(test)]` gate1 harness (CREATE DATABASE, the migration loop,
+            # and a count), which are test setup against a throwaway container:
+            #   grep -c '\.query(' crates/gateway/src/audit_export.rs        # 14
+            #   grep -c 'Self::capped(' crates/gateway/src/audit_export.rs   # 11
+            # If the first ever exceeds the second by more than three, this
+            # entry is a lie and the file is silently uncapped again.
+            crates/gateway/src/audit_export.rs) continue ;;
             # ClickHouseEvalGate: single-row tenant-scoped PK lookup against
             # eval_runs, internally bounded like prompt_history. V1.1 sweep
             # routes it through TenantQuery for consistency (ADR-031).
@@ -233,25 +258,49 @@ scan_tree() {
             #   grep -c '\.query(' crates/gateway/src/spend.rs           # 1
             #   grep -c 'TenantQuery::new(' crates/gateway/src/spend.rs   # 1
             crates/gateway/src/spend.rs) continue ;;
+            # Tool analytics (`/v1/query/tool-analytics`). COMPLIANT, NOT EXEMPT —
+            # since 2026-09-05 (SRE register #28, the first B-225 file closed). It
+            # was the B-225 file the row itself said to fix first: an authenticated
+            # customer-reachable read scanning `spans FINAL` over up to 90 days
+            # with no ceiling. The one SELECT now executes `capped_sql()`, which is
+            # `TenantQuery::new(SQL, PlanTier::Builder).sql_with_settings()`.
+            #   grep -c '\.query(' crates/gateway/src/tool_analytics.rs       # 1
+            #   grep -c 'TenantQuery::new(' crates/gateway/src/tool_analytics.rs # 1
+            crates/gateway/src/tool_analytics.rs) continue ;;
             # ── SURFACED 2026-08-13 by widening the trigger; DECLARED, not silent ──
-            # These six became visible only when the trigger stopped requiring a
+            # These became visible only when the trigger stopped requiring a
             # direct `use clickhouse::` import. Each was checked rather than waved
-            # through: **all six DO filter on `tenant_id`, so there is no isolation
+            # through: **all DO filter on `tenant_id`, so there is no isolation
             # leak.** What none of them has is the ADR-031 resource cap — zero use
-            # `TenantQuery`, and five carry no `SETTINGS` / `max_execution_time` at
+            # `TenantQuery`, and most carry no `SETTINGS` / `max_execution_time` at
             # all, so an expensive query on an authenticated read route is unbounded.
             #
             # That is a COST/availability gap, not a tenancy gap, and closing it
-            # means refactoring six query paths — real work, tracked as **B-225**,
+            # means refactoring the query paths — real work, tracked as **B-225**,
             # not something to smuggle into a guard change. Exempted here WITH the
             # reason and the row so the debt is visible instead of invisible; the
-            # row is what removes these lines.
+            # row is what removes these lines. Was six files; `tool_analytics.rs`
+            # closed 2026-09-05 (above). FIVE remain.
+            #
+            # `server.rs` → `server/quota.rs` on 2026-09-12 (B-385 §2d split the
+            # file by concern): the SAME three reads — the monthly trace count and
+            # the key / workspace spend baselines — moved with the quota code, and
+            # nothing about them changed. A path rename of an existing entry, not
+            # a new exemption; the B-225 row still owns closing it.
             crates/gateway/src/alerts/checker.rs) continue ;;
             crates/gateway/src/billing/usage.rs) continue ;;
             crates/gateway/src/guardrail/engine.rs) continue ;;
-            crates/gateway/src/server.rs) continue ;;
-            crates/gateway/src/tool_analytics.rs) continue ;;
+            crates/gateway/src/server/quota.rs) continue ;;
             crates/gateway/src/retention_sweep.rs) continue ;;
+            # BILL-01 (2026-09-14): the daily metering job — six cross-tenant
+            # `GROUP BY tenant_id` reads, the weekly blob GC mutation and the
+            # boot-catch-up probe. EVERY read here goes through the file's own
+            # `capped()` → `TenantQuery::new(.., PlanTier::Enterprise)` so the
+            # ADR-031 caps are on every call site — asserted per call by
+            # `check-ch-reads-capped.py`, which is the stronger guard and passes.
+            # This file-level entry exists only because this guard's trigger is
+            # "uses the clickhouse crate + calls .query" and cannot see the wrapper.
+            crates/gateway/src/billing/metering_job.rs) continue ;;
         esac
         # TRIGGER WIDENED 2026-08-13. It was `^use clickhouse::` + `.query`, and
         # that combination is only how a file looks when it constructs the client

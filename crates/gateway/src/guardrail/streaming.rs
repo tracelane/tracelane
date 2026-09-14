@@ -138,6 +138,10 @@ impl ResponseGuard {
     }
 
     /// Whether a block already terminated this stream.
+    ///
+    /// No production caller today — used only by tests, hence gated
+    /// (B-390, 2026-09-12).
+    #[cfg(test)]
     #[must_use]
     pub fn is_blocked(&self) -> bool {
         self.blocked

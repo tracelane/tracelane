@@ -87,10 +87,10 @@ pub fn reason_from_body(body: &str) -> Option<String> {
     let err = v.get("error")?;
     if let Some(details) = err.get("details").and_then(|d| d.as_array()) {
         for d in details {
-            if let Some(r) = d.get("reason").and_then(|r| r.as_str()) {
-                if let Some(safe) = safe_reason(r) {
-                    return Some(safe);
-                }
+            if let Some(r) = d.get("reason").and_then(|r| r.as_str())
+                && let Some(safe) = safe_reason(r)
+            {
+                return Some(safe);
             }
         }
     }
@@ -127,6 +127,21 @@ impl ProviderHttpError {
     #[must_use]
     pub fn is_rate_limited(&self) -> bool {
         self.status == 429
+    }
+
+    /// True when the status is an UPSTREAM fault — the class ADR-036 actually names
+    /// as a breaker trip input ("timeouts, 429s, 5xx").
+    ///
+    /// SRE audit finding 38, 2026-09-04. A 401/403/404/400 blames the CALLER's key,
+    /// model or body, not the provider's health — and `CircuitBreaker` is keyed
+    /// `(provider, region)` with **no tenant dimension** (`circuit_breaker.rs`
+    /// `DashMap<(String, String), _>`, region hardcoded `"default"` at both call
+    /// sites, one instance per process). So counting one tenant's dead BYOK key as a
+    /// provider fault trips the breaker for EVERY tenant on that provider. The
+    /// breaker was fed `provider_result.is_ok()`, which is true of any error at all.
+    #[must_use]
+    pub fn is_upstream_fault(&self) -> bool {
+        self.status >= 500 || self.is_rate_limited()
     }
 
     /// True when the upstream says the model does not exist (404). Distinct from
@@ -355,17 +370,79 @@ pub use bedrock::BedrockProvider;
 pub use cohere::CohereProvider;
 pub use google::GoogleProvider;
 pub use openai::{
-    // GWY-26: the OpenAI embeddings wire shapes, owned by the adapter that
-    // speaks that format (see the block at the end of `openai.rs`).
-    EmbeddingData,
+    // GWY-26: the OpenAI embeddings wire shape the handler consumes, owned by
+    // the adapter that speaks that format (see the block at the end of
+    // `openai.rs`). The response-side shapes stay in `openai.rs`; nothing
+    // outside it names them.
     EmbeddingsRequest,
-    EmbeddingsResponse,
-    EmbeddingsUsage,
     OpenAiProvider,
 };
 pub use vertex::VertexProvider;
 
 use tracelane_shared::{ChatRequest, ChatResponse, TenantId};
+
+/// Why the model stopped, in the OpenAI `finish_reason` vocabulary.
+///
+/// # B-354
+///
+/// The gateway used to hardcode `"stop"` at every site that emits a
+/// `finish_reason`, so a client running the standard OpenAI tool loop — keep
+/// calling while `finish_reason == "tool_calls"` — could not run it through the
+/// gateway at all, and a truncated answer was indistinguishable from a complete
+/// one. Providers all report this; nothing carried it across the seam.
+///
+/// It is an enum rather than a `String` so the value on the wire can only ever
+/// be one of OpenAI's four, whatever a provider spells its own stop reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+}
+
+impl FinishReason {
+    /// The OpenAI wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ContentFilter => "content_filter",
+        }
+    }
+
+    /// Anthropic's `message_delta.delta.stop_reason`.
+    ///
+    /// `None` for a value we do not recognise — an unknown stop reason falls
+    /// back to the derived default rather than being forwarded as a word no
+    /// OpenAI client knows.
+    #[must_use]
+    pub fn from_anthropic_stop_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "tool_use" => Some(Self::ToolCalls),
+            "max_tokens" => Some(Self::Length),
+            "end_turn" | "stop_sequence" => Some(Self::Stop),
+            "refusal" => Some(Self::ContentFilter),
+            _ => None,
+        }
+    }
+
+    /// An OpenAI-family provider's own `choices[].finish_reason`, passed
+    /// through. `function_call` is the pre-2023 spelling of `tool_calls` and
+    /// some compatible hosts still emit it.
+    #[must_use]
+    pub fn from_openai_finish_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "stop" => Some(Self::Stop),
+            "length" => Some(Self::Length),
+            "tool_calls" | "function_call" => Some(Self::ToolCalls),
+            "content_filter" => Some(Self::ContentFilter),
+            _ => None,
+        }
+    }
+}
 
 /// A streaming response event from a provider adapter.
 #[derive(Debug)]
@@ -379,8 +456,15 @@ pub enum ProviderEvent {
         name: Option<String>,
         input_delta: String,
     },
-    /// Incremental thinking/reasoning token (Anthropic extended thinking, etc.)
-    ThinkingDelta { delta: String },
+    /// Incremental thinking/reasoning token (Anthropic extended thinking,
+    /// Gemini thoughts). Parsed by two adapters and, today, FORWARDED BY NO
+    /// CONSUMER — the OpenAI wire has no standard field for it and the recorder
+    /// does not capture reasoning text. Filed as B-392 (2026-09-12); the field
+    /// stays so the adapters keep parsing what a consumer will need.
+    ThinkingDelta {
+        #[allow(dead_code)]
+        delta: String,
+    },
     /// Token usage update
     UsageUpdate {
         input_tokens: u32,
@@ -393,35 +477,33 @@ pub enum ProviderEvent {
         /// model→price table. Threaded to the span as `gen_ai.usage.cost`.
         cost_usd: Option<f64>,
     },
+    /// The provider's own stop reason, normalised (B-354). Emitted at most
+    /// once per stream, before the stream ends. Consumers that do not care
+    /// fall through their `_ => {}` arm, which is why this is a new variant
+    /// rather than a field bolted onto `UsageUpdate`.
+    Finish { reason: FinishReason },
+    /// `OBS-53`. Per-chunk token logprobs, OpenAI-compatible wire only.
+    ///
+    /// **A new variant is SILENTLY DROPPED by every existing consumer**, and
+    /// that is not the reassurance the `Finish` comment above makes it sound
+    /// like: all twelve match sites on this enum carry a catch-all, so the
+    /// compiler will NOT point at the places that need wiring. B-353 shipped
+    /// exactly that way (`server.rs`, `ToolCallAccumulator`'s doc). The two
+    /// consumers that matter were therefore wired BY HAND: the SSE loop and the
+    /// buffered fold, both in `server.rs`. If you add a third stream consumer,
+    /// nothing will remind you.
+    LogprobsDelta { logprobs: Vec<f64> },
     /// Final non-streaming response (used for non-streaming calls)
     Done { response: ChatResponse },
-    /// Provider-level error
-    Error {
-        message: String,
-        code: Option<String>,
-    },
 }
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + Send>>;
 
-/// All provider adapters implement this trait.
-/// RPITIT is used instead of `async_trait` in the hot path.
-pub trait ProviderAdapter: Send + Sync {
-    /// Provider identifier (e.g. "anthropic", "openai")
-    fn provider_id(&self) -> &'static str;
-
-    /// Send a chat request and return a stream of events.
-    /// `tenant_id` is threaded through for `tracing::instrument` fields.
-    fn chat(
-        &self,
-        request: ChatRequest,
-        api_key: &str,
-        tenant_id: &TenantId,
-    ) -> impl Future<Output = Result<ProviderStream>> + Send;
-}
-
-/// Future alias so the trait object can be stored.
-use std::future::Future;
+// B-390 (2026-09-12): the `ProviderAdapter` trait that used to sit here was
+// DELETED — no adapter implemented it and no caller was generic over it; the
+// registry dispatches by concrete type (`server::dispatch_to_provider`). It was
+// the "Provider trait ✅ Done" row of the archived V1 launch status, which
+// described an intention the code never took up.
 
 /// Registry of provider adapters: **6 native + every row in `providers.tsv`**.
 ///
@@ -522,7 +604,7 @@ impl ProviderRegistry {
     /// Used as the `provider_id` column in `provider_keys` so BYOK
     /// ciphertext is bound to a stable family token regardless of the
     /// specific model variant. Mirrors the match arms in
-    /// `api_key_env_var` — keep both in sync.
+    /// `env_var_for_provider_id` — keep both in sync.
     /// The SINGLE canonical model→provider map. Returns `None` for an unmatched
     /// model —: it MUST NOT default to a provider. Defaulting would fetch
     /// that provider's key for a model the caller never meant (credential
@@ -532,8 +614,8 @@ impl ProviderRegistry {
     pub fn provider_id_for_model(model: &str) -> Option<&'static str> {
         // GWY-39: operator-defined `tracelane.yaml` aliases are consulted FIRST
         // and by EXACT NAME. Placing them here — inside the ONE canonical map —
-        // is what makes every delegate (`api_key_env_var`,
-        // `provider_name_from_model`, `dispatch_to_provider`) honour an alias
+        // is what makes every delegate (`provider_name_from_model`,
+        // `dispatch_to_provider`, and through it `env_var_for_provider_id`) honour an alias
         // without any of them growing a second lookup.
         //
         // Cost when no `tracelane.yaml` exists (every deployment today): one
@@ -588,18 +670,6 @@ impl ProviderRegistry {
     #[must_use]
     pub fn openai_compatible(&self, provider_id: &str) -> Option<&OpenAiProvider> {
         self.compat(provider_id)
-    }
-
-    /// Resolve the env-var name to read a provider API key from (legacy
-    /// single-tenant env fallback).
-    ///
-    /// DELEGATES to the single canonical `provider_id_for_model` table,
-    /// then maps provider_id → env var. NO model-prefix matching lives here — that
-    /// was the drift surface (the Groq family dispatched to Groq but resolved
-    /// `ANTHROPIC_API_KEY` here). Enforced by
-    /// `scripts/ci/check-provider-mapping-single-source.py`.
-    pub fn api_key_env_var(model: &str) -> Option<&'static str> {
-        Self::provider_id_for_model(model).map(Self::env_var_for_provider_id)
     }
 
     /// Provider-id → API-key env-var name.
@@ -669,6 +739,14 @@ impl MockProvider {
 mod model_routing_consistency_tests {
     use super::ProviderRegistry;
 
+    /// The two id-keyed hops the hot path takes, fused for these tests. B-390
+    /// deleted the production model-keyed wrapper (nothing called it); the tests
+    /// below assert the composed answer, which is what a caller would observe.
+    fn api_key_env_var(model: &str) -> Option<&'static str> {
+        ProviderRegistry::provider_id_for_model(model)
+            .map(ProviderRegistry::env_var_for_provider_id)
+    }
+
     /// Regression: the dispatch match in `server.rs` routes
     /// `llama*` / `qwen* `/ `gemma*` to `registry.groq`, but the BYOK
     /// key-lookup functions used to default them to `anthropic` /
@@ -737,7 +815,7 @@ mod model_routing_consistency_tests {
                 "provider_id_for_model({m}) must be groq (dispatch routes it to registry.groq)"
             );
             assert_eq!(
-                ProviderRegistry::api_key_env_var(m),
+                api_key_env_var(m),
                 Some("GROQ_API_KEY"),
                 "api_key_env_var({m}) must be GROQ_API_KEY (was defaulting to ANTHROPIC_API_KEY)"
             );
@@ -753,10 +831,7 @@ mod model_routing_consistency_tests {
             ProviderRegistry::provider_id_for_model(m),
             Some("perplexity")
         );
-        assert_eq!(
-            ProviderRegistry::api_key_env_var(m),
-            Some("PERPLEXITY_API_KEY")
-        );
+        assert_eq!(api_key_env_var(m), Some("PERPLEXITY_API_KEY"));
     }
 
     /// Spot-check that the two key-lookup functions stay in lockstep on the
@@ -772,7 +847,7 @@ mod model_routing_consistency_tests {
         ];
         for (model, pid, env) in cases {
             assert_eq!(ProviderRegistry::provider_id_for_model(model), Some(pid));
-            assert_eq!(ProviderRegistry::api_key_env_var(model), Some(env));
+            assert_eq!(api_key_env_var(model), Some(env));
         }
     }
 
@@ -799,7 +874,7 @@ mod model_routing_consistency_tests {
                 Some(pid),
                 "{model} must route to {pid}, not the anthropic default"
             );
-            assert_eq!(ProviderRegistry::api_key_env_var(model), Some(env));
+            assert_eq!(api_key_env_var(model), Some(env));
         }
     }
 
@@ -823,7 +898,7 @@ mod model_routing_consistency_tests {
                 "{model:?} must be unroutable (None), never a default provider"
             );
             assert_eq!(
-                ProviderRegistry::api_key_env_var(model),
+                api_key_env_var(model),
                 None,
                 "{model:?} must resolve NO key env (never ANTHROPIC_API_KEY)"
             );
@@ -898,7 +973,7 @@ mod model_routing_consistency_tests {
                 Some(*pid),
                 "{model} must route to provider {pid}"
             );
-            let env = ProviderRegistry::api_key_env_var(model);
+            let env = api_key_env_var(model);
             assert!(env.is_some(), "{model} ({pid}) resolved NO key env");
         }
 
@@ -913,7 +988,7 @@ mod model_routing_consistency_tests {
                 if a_pid == b_pid {
                     continue;
                 }
-                let b_env = ProviderRegistry::api_key_env_var(b_model).unwrap();
+                let b_env = api_key_env_var(b_model).unwrap();
                 pairs += 1;
                 if a_env.is_empty() || b_env.is_empty() {
                     continue; // ollama carries no key — nothing to leak
@@ -942,7 +1017,7 @@ mod model_routing_consistency_tests {
                 None,
                 "{m:?} must be unroutable (fail closed)"
             );
-            assert_eq!(ProviderRegistry::api_key_env_var(m), None);
+            assert_eq!(api_key_env_var(m), None);
         }
     }
 }

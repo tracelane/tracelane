@@ -35,9 +35,34 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # (file, function) pairs that run per request / per span.
 HOT_PATHS = [
-    ("crates/gateway/src/server.rs", "chat_completions_handler"),
-    ("crates/gateway/src/server.rs", "embeddings_handler"),
-    ("crates/gateway/src/server.rs", "spawn_span_publish"),
+    # B-385 — the ONE admission pipeline every dispatch route runs first. `admit`
+    # is the auth step; `run` is every step after it. Listing both because the
+    # per-request path is split across them, and a guard that reads one half
+    # is blind to the other.
+    ("crates/gateway/src/admission.rs", "admit"),
+    ("crates/gateway/src/admission.rs", "run"),
+    # B-385 §2d (2026-09-12) split `server.rs` by concern; each per-request fn is
+    # listed under the file it lives in now. `server.rs` itself keeps only boot,
+    # `/health` and `/v1/auth/whoami`, none of which is per-request inference.
+    ("crates/gateway/src/server/chat.rs", "chat_completions_handler"),
+    ("crates/gateway/src/server/embeddings.rs", "embeddings_handler"),
+    ("crates/gateway/src/server/spans.rs", "spawn_span_publish"),
+    # The two response assemblies and the SSE finalizer run once per request too;
+    # they were reached only through the handler before the split and this guard
+    # reads NAMED bodies, so listing them is what keeps the coverage it had.
+    ("crates/gateway/src/server/stream.rs", "provider_stream_to_sse"),
+    ("crates/gateway/src/server/stream.rs", "run"),
+    ("crates/gateway/src/server/buffered.rs", "buffer_provider_stream"),
+    ("crates/gateway/src/server/dispatch.rs", "dispatch_to_provider"),
+    ("crates/gateway/src/server/dispatch.rs", "resolve_provider_key"),
+    # GWY-47 — the Anthropic Messages wire is a third per-request inference path.
+    # `messages_admitted` is where the post-admission pipeline actually lives; the
+    # handler above it is a four-line admission wrapper, and listing only the
+    # wrapper would have made this guard blind to the whole route.
+    ("crates/gateway/src/anthropic_messages.rs", "messages_handler"),
+    ("crates/gateway/src/anthropic_messages.rs", "messages_admitted"),
+    ("crates/gateway/src/anthropic_messages.rs", "count_tokens_with_claims"),
+    ("crates/gateway/src/anthropic_messages.rs", "finish_span"),
     ("crates/ingest/src/clickhouse_writer.rs", "flush"),
 ]
 
@@ -45,7 +70,7 @@ HOT_PATHS = [
 # Each entry must carry the reason; the reason is the control, not the entry.
 ALLOWLIST = {
     (
-        "crates/gateway/src/server.rs",
+        "crates/gateway/src/server/chat.rs",
         "chat_completions_handler",
         "tracelane.failover.cross_provider.activated=true",
     ): (
@@ -61,7 +86,14 @@ RE_INFO = re.compile(r"\binfo!\s*\(")
 
 def extract_fn(src: str, fn: str) -> tuple[str, int] | None:
     """Body of `fn` by brace matching. Returns (body, start_line) or None."""
-    m = re.search(rf"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn\s+{re.escape(fn)}\s*[(<]", src)
+    # `pub(crate)` / `pub(super)` as well as bare `pub`. The narrower pattern read
+    # `pub\s+` only, so making an already-listed handler `pub(crate)` made this guard
+    # report NOT FOUND — which is the right direction (loud, not silently green) but
+    # is still the guard breaking on a visibility change rather than on a defect.
+    m = re.search(
+        rf"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+{re.escape(fn)}\s*[(<]",
+        src,
+    )
     if not m:
         return None
     i = src.index("{", m.start())
@@ -133,6 +165,14 @@ def selftest() -> int:
     )
     assert not scan(outside, "f.rs", "h"), "selftest: only the named fn is in scope"
     print("✓ selftest: info! outside the named fn is ignored (scoped)")
+
+    # A `pub(crate)` handler must still be FOUND — the regex that read only `pub\s+`
+    # reported NOT FOUND on one, so the guard broke on a visibility change.
+    for vis in ("", "pub ", "pub(crate) ", "pub(super) "):
+        dirty_vis = f'{vis}async fn h() {{\n    tracing::info!("per request");\n}}\n'
+        hits = scan(dirty_vis, "f.rs", "h")
+        assert len(hits) == 1 and "per-request fn" in hits[0], f"{vis!r}: got {hits}"
+    print("✓ selftest: pub / pub(crate) / pub(super) handlers are all still scanned")
 
     # A missing hot-path fn must be LOUD, not silently green.
     hits = scan("fn unrelated() {}\n", "f.rs", "gone")

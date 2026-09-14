@@ -209,9 +209,20 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, (StatusCode, St
             "Authorization must be ASCII".to_string(),
         )
     })?;
-    crate::auth::validate_authorization(s)
+    let claims = crate::auth::validate_authorization(s)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))
+        .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))?;
+    // B-383 (d), 2026-09-12: this family authenticated and then answered ANY
+    // scope — an `ingest`-only SDK key (the credential that ships in a customer's
+    // container image) could read and write here. Workspace data needs the
+    // `read` scope; a JWT session (legacy full surface) passes as before.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This API key is not scoped to read recorded data. It needs the `read` scope.".into(),
+        ));
+    }
+    Ok(claims)
 }
 
 #[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]

@@ -33,6 +33,7 @@ import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { gatewayBaseUrl } from "@/lib/gateway";
 import { causeLine } from "@/lib/redact-cause";
+import { sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
 // Reads the DB + gateway at request time — never prerender / cache.
@@ -64,16 +65,45 @@ function reason(err: unknown): string {
 	return "error";
 }
 
-/** Real Neon read — the exact first read every `@/db` authenticated page does. */
-async function checkNeon(): Promise<CheckResult> {
+/** Real Neon read — the exact first read every `@/db` authenticated page does.
+ *
+ * Also returns the compute's Postgres UPTIME (NEON-TO-ZERO 3b, founder 2026-09-03):
+ * `pg_postmaster_start_time()` resets when the Neon compute resumes from suspend,
+ * so a small uptime at the hourly canary is evidence the compute was Idle between
+ * wakes, and an uptime that keeps growing hour over hour is a PIN — the canary
+ * pages on that. One extra scalar on a query this route already pays for. */
+async function checkNeon(): Promise<{
+	result: CheckResult;
+	uptimeSecs: number | null;
+}> {
 	try {
 		// Parameterised Drizzle query (no raw SQL); existence probe, returns no
 		// tenant data. Mirrors the `select … from tenants` that broke in.
 		await db.select({ id: tenants.id }).from(tenants).limit(1);
-		return "ok";
+		let uptimeSecs: number | null = null;
+		try {
+			const rows = await db.execute(
+				sql`select extract(epoch from now() - pg_postmaster_start_time())::int as uptime_secs`,
+			);
+			const v = (rows as unknown as { rows?: Array<{ uptime_secs?: unknown }> })
+				.rows?.[0]?.uptime_secs;
+			uptimeSecs =
+				typeof v === "number"
+					? v
+					: typeof v === "string"
+						? Number.parseInt(v, 10)
+						: null;
+			if (uptimeSecs !== null && !Number.isFinite(uptimeSecs))
+				uptimeSecs = null;
+		} catch (err) {
+			// The uptime is a sentinel input, not a health verdict: its absence is
+			// reported as null, never as a failed data tier.
+			logCause("neon_uptime", err);
+		}
+		return { result: "ok", uptimeSecs };
 	} catch (err) {
 		logCause("neon", err);
-		return `fail: ${reason(err)}`;
+		return { result: `fail: ${reason(err)}`, uptimeSecs: null };
 	}
 }
 
@@ -103,9 +133,22 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 		return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 	}
 
-	const [neon, gateway] = await Promise.all([checkNeon(), checkGateway()]);
-	const checks = { neon, gateway };
-	const ok = neon === "ok" && gateway === "ok";
+	// `?neon=skip` — the 15-minute watchdog passes this so its probe does not wake the
+	// Neon compute four times an hour (founder, 2026-09-03: NEON-COMPUTE-PIN; cost wins
+	// with zero users). The hourly canary still probes Neon for real. A skipped leg is
+	// reported as "skipped", never as "ok", so a reader cannot mistake it for a pass.
+	const skipNeon = new URL(req.url).searchParams.get("neon") === "skip";
+	const [neonProbe, gateway] = await Promise.all([
+		skipNeon
+			? Promise.resolve({ result: "skipped" as const, uptimeSecs: null })
+			: checkNeon(),
+		checkGateway(),
+	]);
+	const neon = neonProbe.result;
+	// `neon_uptime_secs` is null when the leg was skipped or the scalar could not
+	// be read — a reader must treat null as CANNOT DETERMINE, not as zero.
+	const checks = { neon, gateway, neon_uptime_secs: neonProbe.uptimeSecs };
+	const ok = (neon === "ok" || neon === "skipped") && gateway === "ok";
 
 	// 503 on any failure so a plain HTTP-status monitor fires — the check ASSERTS
 	// the data path, it does not merely confirm the route responds.

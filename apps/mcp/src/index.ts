@@ -14,10 +14,8 @@
  * where `tenant_id` comes from the bearer token (HTTP) or the trusted
  * subprocess env block (Stdio), never from tool arguments.
  *
- * NOT ON NPM YET: `npx @tracelanedev/mcp` 404s today, so every `npx` form below
- * is the POST-PUBLISH shape. Until a signed release tag carries this package,
- * substitute `node <repo>/apps/mcp/dist/index.js`. Releases are bundled — one tag
- * covering everything that moved — see VERSIONING.md "Release cadence".
+ * Published on npm as `@tracelanedev/mcp` (first release 0.3.0, 2026-09-07); the
+ * `npx` forms below install it. From source: `node <repo>/apps/mcp/dist/index.js`.
  *
  * Transport selection (A2):
  *
@@ -41,6 +39,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { bootstrapStdioTenant } from "./auth.js";
 import { runHttp } from "./http.js";
+import { createReader } from "./reader.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
@@ -50,13 +49,19 @@ async function runStdio(): Promise<void> {
 	// L3 sweep 2026-07-03: resolve TRACELANE_API_KEY -> tenant via the
 	// gateway BEFORE serving (the documented stdio auth path; fail-closed
 	// on a rejected key). No key -> TRACELANE_TENANT_ID fallback as before.
+	// PLT-22: this ALSO validates the same key GatewayReader reads with,
+	// when CLICKHOUSE_URL is unset (Cloud/gateway mode).
 	await bootstrapStdioTenant();
+
+	// PLT-22: CLICKHOUSE_URL set -> self-host ClickHouseReader; unset ->
+	// Cloud GatewayReader. No new env var — see reader.ts.
+	const reader = createReader();
 
 	// Wrap so every tool invocation emits OTel MCP semconv v1.39 attributes.
 	const server = instrumentMcpServer(
 		new McpServer({ name: "tracelane", version: MCP_SERVER_VERSION }),
 	);
-	registerTraceTools(server);
+	registerTraceTools(server, reader);
 	registerEvalTools(server);
 
 	const transport = new StdioServerTransport();

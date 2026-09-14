@@ -1,6 +1,6 @@
 /**
  * POST /api/support — persist an in-product support message from the dashboard
- * "Reach out" widget (Question / Feedback / Bug).
+ * "Reach out" widget (Question / Feedback / Bug / Feature request).
  *
  * `requireSession()` supplies the actor (WorkOS user + org) — never a body
  * field, so a request can't spoof who it's from. The row is written directly
@@ -11,9 +11,10 @@
 import { db } from "@/db";
 import { supportRequests } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
+import { SUPPORT_AREAS, SUPPORT_KINDS } from "@/lib/support-taxonomy";
 import { NextResponse } from "next/server";
 
-const KINDS = new Set(["query", "feedback", "bug"]);
+const KINDS = new Set<string>(SUPPORT_KINDS.map((k) => k.key));
 const MAX_MESSAGE = 5000;
 
 /**
@@ -21,16 +22,17 @@ const MAX_MESSAGE = 5000;
  * "Bug". Stored as a labeled first line of `message` — `support_requests` has no
  * `category` column and this needs no migration; promote it to its own column if
  * we ever want to aggregate on it.
+ *
+ * Keyed by the stable `key` (what the client sends); the value is the human
+ * LABEL, because a support inbox reading "[area: gateway]" made the operator
+ * decode the key by hand. An unrecognised category is not an error — the
+ * ticket still matters without one — so it is silently dropped rather than
+ * rejecting the whole request (widened founder, 2026-09-07: 7 → 14 areas,
+ * same soft-drop behaviour, same allowlist source as the client dropdown).
  */
-const CATEGORIES = new Set([
-	"gateway",
-	"traces",
-	"guardrails",
-	"audit",
-	"billing",
-	"account",
-	"other",
-]);
+const CATEGORY_LABELS = new Map<string, string>(
+	SUPPORT_AREAS.map((a) => [a.key, a.label]),
+);
 
 /**
  * Human ticket reference derived from the row's UUID primary key — no extra
@@ -57,7 +59,10 @@ export async function POST(req: Request) {
 
 	if (typeof kind !== "string" || !KINDS.has(kind)) {
 		return NextResponse.json(
-			{ error: "invalid_kind", expected: "query|feedback|bug" },
+			{
+				error: "invalid_kind",
+				expected: SUPPORT_KINDS.map((k) => k.key).join("|"),
+			},
 			{ status: 400 },
 		);
 	}
@@ -69,9 +74,10 @@ export async function POST(req: Request) {
 		);
 	}
 
-	const area =
-		typeof category === "string" && CATEGORIES.has(category) ? category : null;
-	const stored = area ? `[area: ${area}]\n${text}` : text;
+	// The human label, not the raw key — see CATEGORY_LABELS above.
+	const areaLabel =
+		typeof category === "string" ? CATEGORY_LABELS.get(category) : undefined;
+	const stored = areaLabel ? `[area: ${areaLabel}]\n${text}` : text;
 
 	const [row] = await db
 		.insert(supportRequests)

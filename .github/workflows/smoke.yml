@@ -8,6 +8,16 @@ name: E2E Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      hosted_runners:
+        description: >-
+          Run this GitHub-hosted smoke job? Founder approval only (2026-09-07).
+          Leave "no" for a normal manual trigger that intentionally no-ops.
+        type: choice
+        options:
+          - "no"
+          - "approved-by-founder"
+        default: "no"
   pull_request:
     branches: [main]
     # Allowlist (not paths-ignore) because this is a TARGETED integration test,
@@ -33,8 +43,21 @@ permissions:
 jobs:
   smoke:
     name: Integration smoke (ingest -> ClickHouse)
+    # HOSTED-RUNNER OPT-IN (founder, 2026-09-07 — hosted minutes are billed,
+    # "only in extreme case with my approval"). This job CANNOT move to
+    # `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` (tl-node-1): `e2e-smoke.sh` runs
+    # `docker compose up clickhouse nats`, which binds the SAME host ports
+    # (8123/4222) prod uses on that box — identical to why `live-eval-gate` in
+    # ci.yml stays off the self-hosted node. So it stays `ubuntu-latest` and
+    # instead requires the same dispatch approval as ci.yml's three hosted jobs.
+    # This also retires the `pull_request`-label path in practice: a labelled PR
+    # has no `inputs` context, so the condition below is always false for it —
+    # the run will report `skipped`, same as the 10-of-10 history this file
+    # already notes, just for a different reason now.
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'smoke')
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.hosted_runners == 'approved-by-founder'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

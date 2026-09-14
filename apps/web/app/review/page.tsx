@@ -21,6 +21,25 @@
  * "the loop closes by construction" is only true if the field cannot be absent.
  * So this page must not offer a create button it knows will fail.
  *
+ * ## The "New queue" affordance (added 2026-09-07 — a founder finding, not new scope)
+ *
+ * `specs/EVL-29-golden-case-authoring-queues.md:400` specified this control —
+ * "**Create queue** disables at 50 with…" — back when this page was first built
+ * (2026-08-29), and its own §8 wireframe drew `[ + New queue ]` in the header. It
+ * shipped read-only: `POST /v1/annotation-queues` existed end to end at the
+ * gateway and the Next.js proxy, and nothing in `apps/web` ever called it — the
+ * only way to create a queue was `curl`. `NewQueueDialog` (rendered from BOTH the
+ * header, always, and the empty state's primary action) closes that gap. It is
+ * disabled — never hidden — whenever this page already knows the create would
+ * fail: no datasets (R222), the dataset read itself failing (so the target
+ * cannot be verified), or the workspace already at `max_queues` (`crates/gateway/
+ * src/annotation_routes.rs:644`, `MAX_QUEUES = 50` today, read from the list
+ * response rather than hard-coded here).
+ *
+ * Per-row **Archive** / **Un-archive** (`QueueRow`) closes the matching gap on
+ * `PATCH /v1/annotation-queues/{id}` — see that file's header for why archiving,
+ * not a full edit form, is what shipped.
+ *
  * ## Not in the nav yet, on purpose
  *
  * The `BUILD_RUNBOOK.md` S3 rule that `/experiments` records: the nav entry
@@ -30,11 +49,16 @@
  */
 
 import type { AnnotationQueue } from "@/app/api/annotation-queues/shared";
-import { formatDateTimeUtc } from "@/lib/format-date";
+import {
+	type DatasetOption,
+	NewQueueDialog,
+} from "@/components/review/NewQueueDialog";
+import { QueueRow } from "@/components/review/QueueRow";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
 import { EmptyState } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
+import type { ReactNode } from "react";
 
 export const metadata: Metadata = { title: "Review queues — Tracelane" };
 
@@ -89,6 +113,36 @@ function sourceLabel(q: AnnotationQueue): string {
 	}
 }
 
+/**
+ * The single place that decides why "New queue" is disabled, or that it is not.
+ * `datasets === null` means the dataset READ failed — treated as "cannot verify
+ * a target exists" rather than "there are none", which is the more honest
+ * refusal (R222 requires a REAL target, and an unconfirmed one is not that).
+ */
+function createDisabledReason(
+	datasets: DatasetListResponse | null,
+	atCap: boolean,
+	maxQueues: number,
+): ReactNode | null {
+	if (datasets === null) {
+		return "We couldn't confirm your datasets — reload and try again.";
+	}
+	if (datasets.datasets.length === 0) {
+		return (
+			<>
+				A queue writes into a dataset, and every review lands in it — so a queue
+				cannot exist without one. Creating a dataset is not in the app yet; the
+				API accepts one today at <code>POST /v1/datasets</code>. This button
+				turns on as soon as you have one.
+			</>
+		);
+	}
+	if (atCap) {
+		return `You have ${maxQueues} active queues (the maximum). Archive one to create another.`;
+	}
+	return null;
+}
+
 export default async function ReviewQueuesPage() {
 	const load = await loadQueues();
 
@@ -109,10 +163,22 @@ export default async function ReviewQueuesPage() {
 		);
 	}
 
+	// Loaded once for every entitled branch below — the header's "New queue"
+	// affordance needs to know the tenant's datasets whether or not the queue
+	// list itself loaded.
+	const datasetsResp = await loadDatasets();
+	const datasetOptions: DatasetOption[] = datasetsResp?.datasets ?? [];
+
 	if (load.kind === "failed") {
 		return (
-			<main className="p-8">
-				<h1 className="text-2xl font-semibold">Review queues</h1>
+			<main className="p-8 space-y-6">
+				<div className="flex items-center justify-between gap-3">
+					<h1 className="text-2xl font-semibold">Review queues</h1>
+					<NewQueueDialog
+						datasets={datasetOptions}
+						disabledReason={createDisabledReason(datasetsResp, false, 0)}
+					/>
+				</div>
 				<EmptyState
 					title="We could not load your review queues"
 					description="This is a problem reading them, not an empty list — your queues are unaffected. Retry in a moment."
@@ -121,16 +187,26 @@ export default async function ReviewQueuesPage() {
 		);
 	}
 
-	const { queues } = load.data;
+	const { queues, max_queues } = load.data;
 
 	if (queues.length === 0) {
-		const datasets = await loadDatasets();
 		// `null` = the dataset read FAILED. Treating that as "no datasets" would
 		// tell the user to create something they may already have.
-		const hasDatasets = datasets ? datasets.datasets.length > 0 : true;
+		const hasDatasets = datasetsResp ? datasetsResp.datasets.length > 0 : true;
+		const disabledReason = createDisabledReason(
+			datasetsResp,
+			false,
+			max_queues,
+		);
 		return (
-			<main className="p-8">
-				<h1 className="text-2xl font-semibold">Review queues</h1>
+			<main className="p-8 space-y-6">
+				<div className="flex items-center justify-between gap-3">
+					<h1 className="text-2xl font-semibold">Review queues</h1>
+					<NewQueueDialog
+						datasets={datasetOptions}
+						disabledReason={disabledReason}
+					/>
+				</div>
 				<EmptyState
 					title={
 						hasDatasets ? "No review queues yet" : "You need a dataset first"
@@ -140,14 +216,31 @@ export default async function ReviewQueuesPage() {
 							? "A queue is a saved filter over your traces — for example, every trace the online-eval judge scored below 0.5. A reviewer works the queue, answers your rubric, and each answer becomes a graded case in a dataset."
 							: "Every review queue writes into a target dataset, and that target is required — it is what makes the review loop close. Create a dataset, then come back."
 					}
+					action={
+						<NewQueueDialog
+							datasets={datasetOptions}
+							disabledReason={disabledReason}
+							label="Create queue"
+							size="lg"
+						/>
+					}
 				/>
 			</main>
 		);
 	}
 
+	const atCap = queues.length >= max_queues;
+	const disabledReason = createDisabledReason(datasetsResp, atCap, max_queues);
+
 	return (
 		<main className="p-8 space-y-6">
-			<h1 className="text-2xl font-semibold">Review queues</h1>
+			<div className="flex items-center justify-between gap-3">
+				<h1 className="text-2xl font-semibold">Review queues</h1>
+				<NewQueueDialog
+					datasets={datasetOptions}
+					disabledReason={disabledReason}
+				/>
+			</div>
 			<div className="overflow-x-auto">
 				<table className="w-full text-sm">
 					<thead>
@@ -157,27 +250,12 @@ export default async function ReviewQueuesPage() {
 							<th className="py-2 pr-4">Window</th>
 							<th className="py-2 pr-4">Reference field</th>
 							<th className="py-2 pr-4">Created</th>
+							<th className="py-2 pr-4">Actions</th>
 						</tr>
 					</thead>
 					<tbody>
 						{queues.map((q) => (
-							<tr key={q.id} className="border-b last:border-0">
-								<td className="py-2 pr-4">
-									{q.archived_at ? (
-										<span className="opacity-60">{q.name} (archived)</span>
-									) : (
-										<Link className="underline" href={`/review/${q.id}`}>
-											{q.name}
-										</Link>
-									)}
-								</td>
-								<td className="py-2 pr-4">{sourceLabel(q)}</td>
-								<td className="py-2 pr-4">{q.filter.window_hours}h</td>
-								<td className="py-2 pr-4">
-									<code>{q.expected_output_field}</code>
-								</td>
-								<td className="py-2 pr-4">{formatDateTimeUtc(q.created_at)}</td>
-							</tr>
+							<QueueRow key={q.id} queue={q} sourceLabel={sourceLabel(q)} />
 						))}
 					</tbody>
 				</table>

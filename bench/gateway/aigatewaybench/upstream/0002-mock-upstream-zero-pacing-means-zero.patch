@@ -1,0 +1,102 @@
+From a66526d6f0c40e3c4c8b5d9216c1c9ded837c0b8 Mon Sep 17 00:00:00 2001
+From: Tracelane <noreply@tracelane.dev>
+Date: Mon, 7 Sep 2026 03:42:02 +0000
+Subject: [PATCH] =?UTF-8?q?mock-upstream:=20zero=20pacing=20means=20zero?=
+ =?UTF-8?q?=20=E2=80=94=20skip=20tokio::time::sleep=20when=20MOCK=5FTTFT?=
+ =?UTF-8?q?=5FMS=20/=20MOCK=5FITL=5FMS=20are=200?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With both knobs at 0 the streaming path still took ~50 ms for 40 chunks: each
+tokio::time::sleep(Duration::ZERO) waits for the runtime's ~1 ms timer tick, so a
+'zero injected latency' overhead run charged every streaming gateway ~1.25 ms per
+chunk that the non-streaming path never pays. Guard the sleeps; configured pacing
+is unchanged (defaults still 20 ms TTFT + 5 ms ITL).
+---
+ crates/mock-upstream/src/main.rs | 28 +++++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/crates/mock-upstream/src/main.rs b/crates/mock-upstream/src/main.rs
+index 584a063..5e6a4b5 100644
+--- a/crates/mock-upstream/src/main.rs
++++ b/crates/mock-upstream/src/main.rs
+@@ -185,7 +185,9 @@ fn anthropic_stream(
+         {
+             return;
+         }
+-        tokio::time::sleep(config.ttft).await;
++        if !config.ttft.is_zero() {
++            tokio::time::sleep(config.ttft).await;
++        }
+         if tool_call {
+             let start = json!({
+                 "type": "content_block_start",
+@@ -205,7 +207,9 @@ fn anthropic_stream(
+                 return;
+             }
+             for fragment in TOOL_FRAGMENTS {
+-                tokio::time::sleep(config.itl).await;
++                if !config.itl.is_zero() {
++                    tokio::time::sleep(config.itl).await;
++                }
+                 let delta = json!({
+                     "type": "content_block_delta",
+                     "index": 0,
+@@ -247,7 +251,9 @@ fn anthropic_stream(
+                 return;
+             }
+             for _ in 0..config.output_tokens {
+-                tokio::time::sleep(config.itl).await;
++                if !config.itl.is_zero() {
++                    tokio::time::sleep(config.itl).await;
++                }
+                 let delta = json!({
+                     "type": "content_block_delta",
+                     "index": 0,
+@@ -309,7 +315,9 @@ async fn messages(State(config): State<MockConfig>, Json(body): Json<Value>) ->
+             .body(Body::from_stream(anthropic_stream(config, tool_call)))
+             .expect("stream response builds");
+     }
+-    tokio::time::sleep(config.ttft).await;
++    if !config.ttft.is_zero() {
++            tokio::time::sleep(config.ttft).await;
++        }
+     Json(anthropic_body(&config, tool_call)).into_response()
+ }
+ 
+@@ -338,7 +346,9 @@ fn openai_body(config: &MockConfig) -> Value {
+ fn openai_stream(config: MockConfig) -> ReceiverStream<Result<Bytes, Infallible>> {
+     let (sender, receiver) = mpsc::channel(16);
+     tokio::spawn(async move {
+-        tokio::time::sleep(config.ttft).await;
++        if !config.ttft.is_zero() {
++            tokio::time::sleep(config.ttft).await;
++        }
+         if sender
+             .send(Ok(Bytes::from(format!(
+                 "data: {}\n\n",
+@@ -361,7 +371,9 @@ fn openai_stream(config: MockConfig) -> ReceiverStream<Result<Bytes, Infallible>
+             return;
+         }
+         for _ in 0..config.output_tokens {
+-            tokio::time::sleep(config.itl).await;
++            if !config.itl.is_zero() {
++                    tokio::time::sleep(config.itl).await;
++                }
+             let payload = json!({
+                 "id": "chatcmpl-gwbench",
+                 "object": "chat.completion.chunk",
+@@ -422,6 +434,8 @@ async fn chat_completions(State(config): State<MockConfig>, Json(body): Json<Val
+             .body(Body::from_stream(openai_stream(config)))
+             .expect("stream response builds");
+     }
+-    tokio::time::sleep(config.ttft).await;
++    if !config.ttft.is_zero() {
++            tokio::time::sleep(config.ttft).await;
++        }
+     Json(openai_body(&config)).into_response()
+ }
+-- 
+2.53.0
+

@@ -22,6 +22,19 @@
  * only place either behaviour existed, so an open account menu could be closed
  * only by clicking `Account` again. `useDismiss` supplies both, and is shared
  * with `NotificationBell`, which had the same hole.
+ *
+ * **Corrected 2026-09-07 (founder): the submenu now opens UPWARD.** `Account`
+ * sits at the very bottom of the sidebar footer, and the submenu used to render
+ * BELOW it in normal document flow — on a short viewport (or with the docs link
+ * added by DSH-15 lengthening the list) that grows off the bottom of the screen
+ * with no way to reach the lower items. The `<details>` element is now the
+ * positioning context (`relative`) and the item list is an absolutely
+ * positioned floating card anchored `bottom-full` — the same "floating card over
+ * the page" material `NotificationBell`'s panel uses (`--surface` /
+ * `--radius-card` / `--shadow-overlay`), rather than being the transparent
+ * in-flow block it was. Same items, same top-to-bottom order, same icons; the
+ * collapsed rail keeps the identical width it already had (`inset-x-0`), so it
+ * is never wider than the rail and never clipped.
  */
 
 import { useDismiss } from "@/lib/use-dismiss";
@@ -30,6 +43,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 import {
+	EXTERNAL_LINKS,
 	RAIL_ICON,
 	RAIL_ITEM,
 	RAIL_ITEM_ACTIVE,
@@ -101,11 +115,12 @@ export function AccountMenu({ collapsed = false }: { collapsed?: boolean }) {
 
 			<details
 				ref={detailsRef}
-				className="group"
+				className="group relative"
 				onToggle={(e) => setMenuOpen(e.currentTarget.open)}
 			>
 				<summary
 					title={collapsed ? "Account" : undefined}
+					aria-expanded={menuOpen}
 					className={cn(
 						RAIL_ITEM,
 						RAIL_ITEM_IDLE,
@@ -130,7 +145,19 @@ export function AccountMenu({ collapsed = false }: { collapsed?: boolean }) {
 					</span>
 					{!collapsed && <span>Account</span>}
 				</summary>
-				<div className="mt-0.5 flex flex-col gap-0.5 pl-1">
+				{/*
+				 * Opens UPWARD, `bottom-full` — `Account` sits at the bottom of the
+				 * sidebar, so growing downward (the old behaviour) ran the list off
+				 * the viewport. `inset-x-0` matches the exact width of the `<details>`
+				 * itself, so the rail (`w-14`, collapsed) and the expanded sidebar
+				 * (`w-60`) each get a popover no wider than themselves — never
+				 * clipped left or right. It is a floating CARD (`--surface` +
+				 * `--radius-card` + `--shadow-overlay`), the same material
+				 * `NotificationBell`'s panel uses, not the transparent in-flow block
+				 * this was before: a popover claiming to float above the rail needs
+				 * to look like it does.
+				 */}
+				<div className="absolute inset-x-0 bottom-full z-50 mb-1 flex flex-col gap-0.5 rounded-[var(--radius-card)] border border-line bg-surface p-1 shadow-[var(--shadow-overlay)]">
 					{/*
 					 * `title` when collapsed, exactly as every other rail row does it.
 					 * WITHOUT IT THESE TWO LINKS HAVE NO ACCESSIBLE NAME AT ALL on the
@@ -154,6 +181,28 @@ export function AccountMenu({ collapsed = false }: { collapsed?: boolean }) {
 						<span className={RAIL_ICON} />
 						{!collapsed && <span>Support</span>}
 					</Link>
+					{/* DSH-15: the app's public docs, next to Support — the other
+					    help affordance in this menu. A different origin, so a plain
+					    `<a>` (not `next/link`) with `target="_blank"` and the
+					    `noopener noreferrer` pair (no `window.opener` handed to the
+					    destination, no referrer leak), same as `AccountMenu`'s other
+					    non-app link below. Uses the icon slot (unlike Support/Sign
+					    out) so the outbound-link glyph is visible before the click. */}
+					{EXTERNAL_LINKS.map(({ href, label, Icon }) => (
+						<a
+							key={href}
+							href={href}
+							target="_blank"
+							rel="noopener noreferrer"
+							title={collapsed ? label : undefined}
+							className={cn(RAIL_ITEM, RAIL_ITEM_IDLE)}
+						>
+							<span className={RAIL_ICON}>
+								<Icon />
+							</span>
+							{!collapsed && <span>{label}</span>}
+						</a>
+					))}
 					<a
 						href="/sign-out"
 						title={collapsed ? "Sign out" : undefined}

@@ -47,7 +47,7 @@ esac
 
 CONTAINER=tlane-pg-integration-$$
 STARTED_CONTAINER=0
-cleanup() { [ "$STARTED_CONTAINER" = 1 ] && docker rm -f "$CONTAINER" >/dev/null 2>&1; return 0; }
+cleanup() { [ "$STARTED_CONTAINER" = 1 ] && docker rm -fv "$CONTAINER" >/dev/null 2>&1; return 0; }
 trap cleanup EXIT
 
 start_throwaway_postgres() {
@@ -161,6 +161,12 @@ if [ "${1:-}" = "--selftest" ]; then
   fi
   TARGET="$WT/crates/gateway/src/db/api_keys.rs"
   [ -f "$TARGET" ] || { echo "SELFTEST BROKEN: $TARGET absent in the worktree"; exit 1; }
+  # The real tree's file, fingerprinted BEFORE the mutation. The property asserted
+  # below is "the falsification did not touch the developer's file", which is a
+  # before/after comparison — NOT "the developer's file matches HEAD": that older
+  # form refused whenever api_keys.rs carried an honest uncommitted edit (B-383 f,
+  # 2026-09-12) and called the guard BROKEN when it was the tree that was busy.
+  REAL_BEFORE="$(sha256sum "$REPO_ROOT/crates/gateway/src/db/api_keys.rs" | cut -d' ' -f1)"
 
   OLD='const BUDGET_NUMERIC_CAST: &str = "::text::numeric";'
   NEW='const BUDGET_NUMERIC_CAST: &str = "::numeric";'
@@ -176,8 +182,9 @@ PY
   # THE PROPERTY THAT MAKES R121 REAL, asserted rather than assumed: the developer's
   # own tree is untouched by everything above. If this ever stops holding, the fix
   # has silently reverted to the thing it replaced.
-  if ! git_clean -C "$REPO_ROOT" diff --quiet -- crates/gateway/src/db/api_keys.rs; then
-    echo "SELFTEST BROKEN: the REAL tree's api_keys.rs is dirty — the falsification must never touch it"
+  REAL_AFTER="$(sha256sum "$REPO_ROOT/crates/gateway/src/db/api_keys.rs" | cut -d' ' -f1)"
+  if [ "$REAL_BEFORE" != "$REAL_AFTER" ]; then
+    echo "SELFTEST BROKEN: the REAL tree's api_keys.rs CHANGED during the falsification — it must never be touched"
     exit 1
   fi
   echo "SELFTEST: falsifying in an isolated worktree ($WT). The real tree is NOT touched."
@@ -227,5 +234,10 @@ for f in apps/web/db/migrations/*.sql; do
     || true   # base-DB migration is best-effort; the fresh-DB tests do their own
 done
 
-cargo test -p gateway --test postgres_tenant_integration -- --ignored
-exit $?
+RC=0
+cargo test -p gateway --test postgres_tenant_integration -- --ignored || RC=1
+# B-394 (BILL-01): the ceiling write binds an `Option<f64>` into `numeric(12,2)`.
+# Only a real server can refuse that bind (`error serializing parameter 1`) — it
+# answered 503 on every prod call, `null` included, with the full gate green.
+cargo test -p gateway --bin gateway billing::usage::tests::set_ceiling_sql -- --ignored || RC=1
+exit $RC

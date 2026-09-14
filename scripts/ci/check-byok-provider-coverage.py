@@ -15,7 +15,7 @@ looks complete on its own — which is exactly the shape that rots silently.
 
 ## The four sources, after GWY-42
 
-The 163 OpenAI-compatible providers now live in `crates/gateway/providers.tsv`
+The 185 OpenAI-compatible providers now live in `crates/gateway/providers.tsv`
 and resolve through `providers::catalog`. Only the SIX native adapters
 (anthropic, google, vertex, bedrock, azure, cohere) are still hand-written arms,
 so the lists this guard compares are:

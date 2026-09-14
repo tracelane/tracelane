@@ -51,8 +51,8 @@ Content-Type: application/json
   "override_reason": "why you are promoting without an eval run"
 }
 
-# Team plan ($249/mo) required for promote.
-# Builder plan ($59/mo) can author versions — promote is gated.
+# Team plan ($229/mo) required for promote.
+# Builder plan ($29/mo) can author versions — promote is gated.
 #
 # \`override_reason\` is shown rather than \`eval_run_id\` because eval runs
 # are not produced yet: passing an \`eval_run_id\` returns 409 today. The

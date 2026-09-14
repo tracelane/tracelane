@@ -26,7 +26,41 @@ export type SessionSummary = {
 	cost_usd: number;
 	total_tokens: number;
 	model: string;
+	/**
+	 * PLT-46: the `gen_ai.agent.name` of the session's most recent span (e.g.
+	 * `"claude-code"`), empty string when no span carried one. Optional
+	 * because the gateway is gaining this column separately (Rust,
+	 * `trace_reads.rs`'s session SELECT) — a dashboard build must not assume
+	 * it has already deployed. Absent or `""` both mean "no agent name";
+	 * `apps/web/components/sessions/SessionRow.tsx`'s `SessionRow` renders
+	 * nothing for either, and only shows the chip when the value is a
+	 * non-empty string.
+	 */
+	agent_name?: string;
+	/**
+	 * OBS-20: the customer's own END USER — who initiated this conversation.
+	 *
+	 * Optional for the same deploy-ordering reason as `agent_name` above: the
+	 * gateway gains this column in its own release, and a dashboard build must
+	 * not assume it has already shipped.
+	 *
+	 * THREE values, and they are NOT interchangeable:
+	 *   - absent or `""` — nobody sent one. Expected for any tenant that has not
+	 *     instrumented it, including a correctly deployed one.
+	 *   - a real id — render it.
+	 *   - the literal `"[REDACTED:email]"` — the customer sent an email address
+	 *     and ingest's PII redaction removed it before storage. Rendering this
+	 *     raw, or as blank, both read as a bug; `SessionRow` renders an explained
+	 *     "redacted" chip instead.
+	 */
+	end_user?: string;
 };
+
+// OBS-20: `REDACTED_END_USER` lives in `@/lib/end-user` — a module with no
+// imports — because render-tested components need it and this file reaches
+// authkit. Re-exported here so callers that already import from `lib/sessions`
+// need not know that.
+export { REDACTED_END_USER } from "@/lib/end-user";
 
 /** A single trace row within a session, returned by `GET /v1/sessions/:id/traces`. */
 export type SessionTraceRow = {
@@ -40,60 +74,25 @@ export type SessionTraceRow = {
 	model: string;
 };
 
-/**
- * Fetch recent sessions for the authenticated tenant.
- *
- * Routes through the per-user JWT (`gatewayGet`). A `GatewayError` yields `[]`
- * so the page renders its empty state rather than crashing. Any
- * non-`GatewayError` — notably the `NEXT_REDIRECT` thrown by
- * `requireGatewayToken` for an unauthenticated / org-less session — is
- * re-thrown, never swallowed (`lib/auth.ts` contract).
- *
- * @param opts.days  Look-back window in days forwarded to the gateway.
- * @param opts.limit Max sessions returned (forwarded to the gateway).
- */
-export async function fetchSessions(opts?: {
-	days?: number;
-	limit?: number;
-	/** RFC3339 lower bound (overrides `days`) — from the range control. */
-	since?: string;
-	/** Sort column: turns | cost | tokens | duration | (default) last-activity. */
-	sort?: string;
-	/** Sort direction: asc | desc. */
-	order?: string;
-	/** Status filter: error | ok. */
-	status?: string;
-	/** Response-model filter (exact). */
-	model?: string;
-}): Promise<SessionSummary[]> {
-	const q = new URLSearchParams();
-	if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
-	if (opts?.days !== undefined) q.set("days", String(opts.days));
-	if (opts?.since) q.set("since", opts.since);
-	if (opts?.sort) q.set("sort", opts.sort);
-	if (opts?.order) q.set("order", opts.order);
-	if (opts?.status) q.set("status", opts.status);
-	if (opts?.model) q.set("model", opts.model);
-	const qs = q.toString();
-	try {
-		const res = await gatewayGet<{ sessions: SessionSummary[] }>(
-			`/v1/sessions${qs ? `?${qs}` : ""}`,
-		);
-		return res.sessions;
-	} catch (err) {
-		if (err instanceof GatewayError) return [];
-		throw err;
-	}
-}
+// `fetchSessions` (a `days=`/`since=` reader) lived here until DSH-11; the list
+// now reads through `lib/metrics/fetch.ts::fetchSessionsFor` with the shared
+// window, and its tenant-isolation tests moved with it.
 
 /**
  * Fetch the ordered trace list for a single session.
  *
- * Routes through the per-user JWT (`gatewayGet`). Returns `null` on any
- * `GatewayError` (including 404) — the page renders its not-found state. The
- * gateway returns the SAME 404 for "session missing" and "not this tenant's",
- * so existence never leaks across tenants. Any non-`GatewayError` (e.g.
- * `NEXT_REDIRECT`) propagates so the auth redirect is honored.
+ * Routes through the per-user JWT (`gatewayGet`). Returns `null` ONLY on a
+ * **404** `GatewayError` — the page's `notFound()` is consistent with the
+ * gateway's own choice to return the SAME 404 for "session missing" and "not
+ * this tenant's", so existence never leaks across tenants.
+ *
+ * Any OTHER `GatewayError` (502 upstream failure, 401, a timeout collapsed to
+ * 503 — see `gatewayGet`) re-throws rather than folding into `null`: a real
+ * outage is not "this session does not exist", and letting it read as a 404
+ * would tell the caller "not found" for a fact it never actually observed
+ * (B-335d). It propagates to the nearest error boundary instead. A
+ * non-`GatewayError` (e.g. `NEXT_REDIRECT`) also propagates so the auth
+ * redirect is honored.
  *
  * @param sessionId  Raw session identifier. URL-encoded internally before use
  *                   in the gateway path.
@@ -106,7 +105,7 @@ export async function fetchSessionTraces(
 			`/v1/sessions/${encodeURIComponent(sessionId)}/traces`,
 		);
 	} catch (err) {
-		if (err instanceof GatewayError) return null;
+		if (err instanceof GatewayError && err.status === 404) return null;
 		throw err;
 	}
 }

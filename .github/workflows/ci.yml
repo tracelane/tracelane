@@ -22,15 +22,33 @@ name: CI
 # dispatch to a self-hosted runner instead (private repo + a free box), set repo
 # variable CI_RUNNER (e.g. =tl-node-1) — no YAML edit for the light jobs.
 #
+# B-382 (2026-09-12/13): CI_RUNNER is now `tl-wsl-1` — the founder's WSL box, a
+# user-level systemd unit (`~/.config/systemd/user/actions-runner.service`), no
+# prod secret on it, $0. Until 2026-09-12 the runner was the prod node itself,
+# which ran third-party `build.rs` as root with the docker socket beside the BYOK
+# master key and the API-key pepper; that runner is retired. A dedicated Hetzner
+# box (`tl-ci-1`, cx43) ran push-time CI for ~12 h on 2026-09-12 and was deleted
+# the same night on the founder's cost ruling — GitHub billed $0 for Actions in
+# September (gross $6.38, all inside the free 2,000 min), so a paid CI box saved
+# nothing. `infra/ci/tl-ci-1-bootstrap.sh` is kept for the always-on option.
+# B-384 (2026-09-12): with a runner that is not prod, the root jobs run on a
+# private PUSH again (see `changes` / `secret-scan`).
+#
 # PER-JOB ROUTING — CORRECTED 2026-08-10 by observation. The previous text here
 # claimed the heavy cargo/stack jobs were "HARDCODED `ubuntu-latest` and never hit
 # the runner". THAT WAS FALSE, and run 31369123020 proved it: with
 # `CI_RUNNER=tl-node-1`, Rust (fmt·clippy·test), Ingest release-profile guard and
 # Span publish → JetStream ALL ran on tl-node-1 and passed.
 #
-# `grep -n 'runs-on:'` is the authority: 10 of 14 jobs use the
-# `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` indirection. Only FOUR are hardcoded
-# `ubuntu-latest` — repo guards, live-eval-gate, bench, behavioral-tier-ran.
+# `grep -n 'runs-on:'` is the authority: 12 of 14 jobs use the
+# `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` indirection (`repo guards` and
+# `behavioral-tier-ran.yml` moved onto it 2026-08-17 / B-269 — this paragraph used
+# to list them as hardcoded, which was the same stale-doc shape TRAPS §1 warns
+# about). Only THREE are hardcoded `ubuntu-latest` today — `api-key-mint-postgres`,
+# `live-eval-gate`, `bench` — and since 2026-09-07 (founder ruling: hosted minutes
+# are billed, "only in extreme case with my approval") all three ALSO require
+# `workflow_dispatch` with `inputs.hosted_runners == 'approved-by-founder'`, so a
+# plain push/PR/schedule run never reaches any of them. See each job's own comment.
 #
 # The saturation hazard is real but is ALREADY MITIGATED, which is why the cold
 # build no longer takes the box down: the runner's systemd unit is cgroup-capped at
@@ -44,23 +62,31 @@ name: CI
 # Tiers (apply whenever this workflow actually runs):
 #   • FAST tier (fmt·clippy·unit-test, web, python, grep guards, secret-scan):
 #     on push-to-main + every PR-to-main. Path-scoped by the `changes` job.
-#   • FULL/BEHAVIORAL tier (eval-suite, span-publish-integration, live-eval-gate,
-#     bench): on PR-to-main (gates the merge) + post-merge main push + WEEKLY +
-#     manual dispatch. NOT on feature-branch pushes.
+#   • FULL/BEHAVIORAL tier, SELF-HOSTED HALF (eval-suite, span-publish-integration):
+#     on PR-to-main (gates the merge) + post-merge main push + WEEKLY + manual
+#     dispatch. NOT on feature-branch pushes.
+#   • FULL/BEHAVIORAL tier, HOSTED HALF (live-eval-gate, bench) — CORRECTED
+#     2026-09-07: NEITHER runs on PR, push, or the weekly cron any more. Both
+#     require `workflow_dispatch` with `inputs.hosted_runners ==
+#     'approved-by-founder'` (see the HOSTED-RUNNER OPT-IN comment below) — a
+#     founder ruling on hosted-minute cost, not a paths/live_stack change. This
+#     paragraph previously said "WEEKLY + manual dispatch", true before that
+#     date and not true now — the same stale-doc shape TRAPS §1 warns about.
 #   • Feature-branch pushes do NOT trigger CI — the per-push gate there is local
 #     `scripts/verify-all.sh` (mirrors every infra-free check). Opening the PR to
 #     main is what runs the behavioral net.
-#   • WEEKLY (cron) + workflow_dispatch run the FULL suite regardless of paths
-#     (the `changes` job fail-safes to run-all on non-push/PR events) — the
-#     scheduled safety net for a path-gate miss.
+#   • WEEKLY (cron) + workflow_dispatch run the SELF-HOSTED-HALF FULL suite
+#     regardless of paths (the `changes` job fail-safes to run-all on non-push/PR
+#     events) — the scheduled safety net for a path-gate miss. The hosted half
+#     (live-eval-gate, bench) is EXCLUDED from that net now; there is no
+#     unattended perf/live-stack coverage until someone dispatches it approved.
 #
-# BUDGET: on GitHub-hosted Linux (the CI_RUNNER default), a full+behavioral run
-# (live-eval-gate + bench + cold builds) is ~50-90 billed min. A DAILY such run
-# alone would exceed the 2,000 free private-repo min/month — so the scheduled net
-# is WEEKLY, not nightly. Weekly (~4×) + hot-path-PR behavioral + fast-tier push
-# stays well under 2,000 → ~$0. For a true nightly net at $0, run `bash
-# ci/run-ci.sh` on-node via cron (free, off GitHub's budget). Self-hosted
-# runners (CI_RUNNER=self-hosted) don't consume billed minutes at all.
+# BUDGET: on GitHub-hosted Linux (the CI_RUNNER default), the self-hosted-half
+# full+behavioral run + cold builds is well within the 2,000 free private-repo
+# min/month at weekly cadence. live-eval-gate + bench no longer run unattended at
+# all (see above), so they no longer figure in this budget — every minute they
+# cost is now a minute someone explicitly asked for and approved. Self-hosted
+# runners (CI_RUNNER=tl-node-1) don't consume billed minutes at all.
 #
 # Portable fallback (no CI provider at all): `bash ci/run-ci.sh` runs the SAME
 # gateway→NATS→ingest→ClickHouse live-eval on any Docker host (proven on-node
@@ -74,9 +100,36 @@ on:
     # so without it a PR marked ready would never get its first real run — the
     # draft guard below would have been a one-way door.
     types: [opened, synchronize, reopened, ready_for_review]
-  schedule:
-    - cron: "0 3 * * 0" # weekly, Sun 03:00 UTC — full + behavioral, all paths (budget: not daily)
-  workflow_dispatch: {} # manual full run (use to validate the runner end-to-end)
+  # The weekly Sunday cron was REMOVED 2026-09-13: the runner is a laptop that is
+  # off at 03:00 UTC, so a scheduled run queues for 24 h and fails unread. The
+  # FULL local gate runs before every push instead; dispatch this workflow by
+  # hand when a drift check is wanted.
+  # HOSTED-RUNNER OPT-IN (founder, 2026-09-07 — "ensure to only use in extreme case
+  # with my approval"). GitHub-hosted runners on THIS account are billed; the
+  # self-hosted `tl-node-1` box (via `${{ vars.CI_RUNNER || 'ubuntu-latest' }}`) is
+  # free. Three jobs below cannot move to tl-node-1 (api-key-mint-postgres needs a
+  # `services:` container and must never point a throwaway Postgres at the prod
+  # node; live-eval-gate and bench spin up stack/compile load the founder does not
+  # want sharing prod's box) — those three now ALSO require this input to be
+  # exactly `approved-by-founder`, checked at the job's own `if:`. Default is `no`,
+  # so a plain `gh workflow run CI --ref main` or the weekly cron runs ZERO hosted
+  # jobs; every other job here is unaffected (already self-hosted-first via
+  # CI_RUNNER). To actually run the hosted three:
+  #   gh workflow run CI --ref main -f hosted_runners=approved-by-founder
+  # `check-hosted-runner-optin.py` fails CI if a future hardcoded-hosted job is
+  # added without this same gate.
+  workflow_dispatch:
+    inputs:
+      hosted_runners:
+        description: >-
+          Run the 3 GitHub-hosted jobs (api-key-mint-postgres, live-eval-gate,
+          bench)? These are BILLED minutes on this account — founder approval
+          only (2026-09-07). Leave "no" for a normal manual full run.
+        type: choice
+        options:
+          - "no"
+          - "approved-by-founder"
+        default: "no"
 
 # Superseded runs are CANCELLED. Re-enabled 2026-07-31 after the precondition it
 # was disabled for stopped holding.
@@ -161,9 +214,16 @@ jobs:
     # A run where everything skipped now reads CANNOT DETERMINE, not GREEN
     # (scripts/ops/ci-status.sh) — a draft PR is honestly unverified. Mark it
     # ready for review to get a verdict.
-    if: >-
-      (github.repository == 'tracelane/tracelane' || github.event_name != 'push')
-      && github.event.pull_request.draft != true
+    # B-384 (2026-09-12) ran the substantive jobs on a private PUSH for one day.
+    # REVERSED 2026-09-13 (founder: "trim whatever is redundant"): the runner is
+    # the founder's own laptop, the pre-push hook has ALREADY run the FULL local
+    # gate on these exact bytes, and CI then rebuilt the same tree a second time
+    # on the same machine (3 separate Rust builds, ~45-60 min) for a verdict no
+    # deploy record ever consulted. A push now runs only the structural jobs
+    # (`guards`, `secret-scan`, ~3 min); the full suite is `workflow_dispatch`
+    # (and PRs). `ci-status.sh` reads a push run as CANNOT DETERMINE, which is
+    # honest — the deploy scripts take the verdict from the FULL stamp instead.
+    if: github.event.pull_request.draft != true && github.event_name != 'push'
     name: Detect changed areas
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     outputs:
@@ -234,7 +294,7 @@ jobs:
               apps/*|packages/sdk-typescript/*|packages/verifier-typescript/*|packages/cli/*|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|biome.json|tsconfig*|*.ts|*.tsx|*.jsx) web=true;;
             esac
             case "$f" in
-              evals/*|ml/*|packages/sdk-python/*|packages/verifier-python/*|*.py|pyproject.toml|ruff.toml) python=true;;
+              evals/*|ml/*|packages/sdk-python/*|packages/verifier-python/*|scripts/ci/requirements/*|*.py|pyproject.toml|ruff.toml) python=true;;
             esac
           done <<< "$files"
 
@@ -297,11 +357,16 @@ jobs:
       # because the runner runs one job at a time. **If a second runner is ever
       # added (B-202 option (a), currently declined), this must become per-runner
       # or it will serialize jobs that were meant to be parallel.**
+      #
+      # PER-RUNNER PATH (2026-09-13): the runner's own `.env` may set
+      # `CI_CARGO_TARGET_DIR`; the `/opt/...` default is the bootstrap-script
+      # layout. `tl-wsl-1` runs as an unprivileged user with no sudo, so it
+      # cannot create anything under `/opt` and sets it to a dir in its home.
       - name: Persistent cargo target dir (self-hosted only)
         if: vars.CI_RUNNER != ''
         run: |
           set -euo pipefail
-          TARGET_DIR=/opt/actions-runner/cargo-target
+          TARGET_DIR="${CI_CARGO_TARGET_DIR:-/opt/actions-runner/cargo-target}"
           FLOOR_KB=$((40 * 1024 * 1024))   # 40 GiB floor on /
           avail=$(df --output=avail / | tail -1 | tr -d ' ')
           echo "disk avail=${avail} KB · floor=${FLOOR_KB} KB · target=${TARGET_DIR}"
@@ -326,7 +391,15 @@ jobs:
   api-key-mint-postgres:
     name: API-key mint (real Postgres)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # HOSTED-RUNNER OPT-IN (founder, 2026-09-07). This job cannot move to the
+    # self-hosted box (see the `runs-on` comment below), so it is billed minutes
+    # and now requires EXPLICIT dispatch approval on top of the rust-changed
+    # condition — a plain push/PR/schedule run never reaches this job at all.
+    #   gh workflow run CI --ref main -f hosted_runners=approved-by-founder
+    if: >-
+      needs.changes.outputs.rust == 'true'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.hosted_runners == 'approved-by-founder'
     # HOSTED on purpose: this needs a `services:` container, and the self-hosted
     # runner shares a box with production. Never point a throwaway Postgres at
     # tl-node-1.
@@ -463,7 +536,7 @@ jobs:
         if: vars.CI_RUNNER != ''
         run: |
           set -euo pipefail
-          TARGET_DIR=/opt/actions-runner/cargo-target
+          TARGET_DIR="${CI_CARGO_TARGET_DIR:-/opt/actions-runner/cargo-target}"
           FLOOR_KB=$((40 * 1024 * 1024))
           avail=$(df --output=avail / | tail -1 | tr -d ' ')
           echo "disk avail=${avail} KB · floor=${FLOOR_KB} KB · target=${TARGET_DIR}"
@@ -520,6 +593,33 @@ jobs:
       - name: pytest
         run: pytest
 
+  python-frameworks:
+    name: Python SDK · real framework attach (B-314)
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    timeout-minutes: 30
+    # B-314: the SDK suite mocks every framework, so four adapters that never
+    # attached stayed green. This job installs the REAL frameworks — hash-pinned
+    # at the exact versions each adapter was run against on 2026-08-31 — and
+    # runs ONE file that imports them at module top: a missing framework is a
+    # collection ImportError, never a skip (B-169). The file is named so the
+    # default `pytest` walk in the `python` job cannot collect it.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c  # v5.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/ci/requirements/python-frameworks.txt
+      - name: Install the real frameworks (hash-pinned) and the SDK
+        run: |
+          pip install --require-hashes -r scripts/ci/requirements/python-frameworks.txt
+          pip install -e packages/sdk-python/
+      - name: Attach to real framework objects
+        run: pytest -p no:cacheprovider -q packages/sdk-python/tests_frameworks/real_attach_check.py
+
   guards:
     # PRIVATE-MINUTE POLICY: on PUBLIC this always runs. On PRIVATE it runs
     # only for pull_request / schedule / workflow_dispatch, NOT push — a private
@@ -572,8 +672,10 @@ jobs:
     #
     # The other three hardcoded jobs STAY hosted, deliberately: `api-key-mint-postgres`
     # needs a `services:` container and must never point a throwaway Postgres at the
-    # production node; `live-eval-gate` and `bench` run on schedule/dispatch only and
-    # were never part of this failure.
+    # production node; `live-eval-gate` and `bench` need Docker/stack load the founder
+    # does not want on the prod box. All three were never part of this failure — they
+    # ran (and now, since 2026-09-07, run only) on an approved `workflow_dispatch`,
+    # never on the private push path this fix is about.
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -593,6 +695,10 @@ jobs:
       - name: ClickHouse query cap-wrapper guard (ADR-031)
         if: ${{ !cancelled() }}
         run: ./scripts/ci/no-raw-ch-query.sh
+
+      - name: ClickHouse reads capped at the CALL SITE (ADR-031, SRE #20)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-ch-reads-capped.py
 
       - name: Gateway-URL fallback guard (no silent localhost → CF 1003)
         if: ${{ !cancelled() }}
@@ -625,6 +731,20 @@ jobs:
       - name: Docs site guard (nav 404s · missing logo · MDX parse · dead links)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-docs-site.py
+
+      - name: Pricing-copy vs seed guard — selftest (prove it blocks)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-pricing-copy-vs-seed.py --selftest
+
+      # BILL-01 / ADR-076: every price/allowance/rate/policy figure in customer-facing
+      # copy (apps/docs, apps/site, README, docs/guides, packages/*/README,
+      # CHANGELOG.public.md) must agree with apps/web/db/plans.v3.json — the single
+      # machine-readable source. 173 rows across the tree still carried the retired
+      # $59/$249/$899/$2,999 ladder and the $1.20-per-10K overage model at the time
+      # this guard was written.
+      - name: Pricing-copy vs seed guard (no retired figures, no banned words)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-pricing-copy-vs-seed.py
 
       - name: Provider mapping single-source guard
         if: ${{ !cancelled() }}
@@ -702,6 +822,42 @@ jobs:
       - name: Workflow job-graph guard (no dangling `needs:`)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-workflow-job-graph.py
+
+      - name: Hosted-runner opt-in guard — selftest (prove it blocks AND passes)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-hosted-runner-optin.py --selftest
+
+      # Founder ruling 2026-09-07: hosted GitHub Actions runners are billed on this
+      # account, approved "only in extreme case with my approval". Every hosted
+      # `runs-on` must carry `inputs.hosted_runners == 'approved-by-founder'` on its
+      # own `if:` (schedule excluded too), or the stronger `github.repository ==
+      # 'tracelane/tracelane'`.
+      - name: Hosted-runner opt-in guard (no hosted job fires without approval)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-hosted-runner-optin.py
+
+      - name: Unreachable write routes — selftest (prove it blocks AND passes)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-unreachable-write-routes.py --selftest
+
+      # Founder-found 2026-09-07: the annotation-queue CREATE route existed end to
+      # end (gateway + web proxy) with no caller anywhere in the UI — reachable
+      # only by curl. The L16 Playwright gate asserts a button DOES something and
+      # cannot see a button never built.
+      - name: Unreachable write routes (every mutating API route has a UI caller)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-unreachable-write-routes.py
+
+      - name: GWY-48 span sites — selftest (prove it blocks AND passes)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-request-config-span-sites.py --selftest
+
+      # GWY-48: request configuration must reach all FOUR span sites. The streaming
+      # one is the risk — it needed a new function parameter, so a refactor that
+      # drops it compiles clean and every unit test still passes.
+      - name: GWY-48 span sites (request config reaches all four)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-request-config-span-sites.py
 
       - name: Hot-path logging guard — selftest
         if: ${{ !cancelled() }}
@@ -801,11 +957,18 @@ jobs:
     # A run where everything skipped now reads CANNOT DETERMINE, not GREEN
     # (scripts/ops/ci-status.sh) — a draft PR is honestly unverified. Mark it
     # ready for review to get a verdict.
-    if: >-
-      (github.repository == 'tracelane/tracelane' || github.event_name != 'push')
-      && github.event.pull_request.draft != true
+    # B-384 (2026-09-12): runs on a private push too — see `changes` above.
+    if: github.event.pull_request.draft != true
     name: Secret + supply-chain scan (fast)
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    env:
+      # This job runs `pnpm audit` directly (not through scripts/verify-all.sh's
+      # run_advisory), so the var has no local effect on THIS step today — it is
+      # set here for the same reason nightly-full-gate.yml sets it: CI is a
+      # controlled, always-networked environment, so the audit should behave as
+      # a real blocking check here, matching the nightly's strict posture rather
+      # than a dev box's WARN-on-failure default.
+      TRACELANE_GATE_STRICT_NETWORK: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # gitleaks runs FIRST, on the pristine checkout (no node_modules/target
@@ -864,28 +1027,27 @@ jobs:
     needs: changes
     # Auto-run whenever the perf-sensitive surface (gateway/ingest/shared/policy)
     # changed — no manual 'hot-path' label needed (the label gate meant bench
-    # almost never ran). On nightly/dispatch the `changes` job fail-safes to
-    # all-true, so the perf budgets are enforced every night regardless of paths.
-    # The dedicated self-hosted box also yields STABLE criterion numbers (vs the
-    # noisy shared GitHub runners), which is what makes `bench:budgets` meaningful.
+    # almost never ran). The dedicated self-hosted box's HEAVY cargo/stack build
+    # still runs off it (see `runs-on` below), which also yields STABLE criterion
+    # numbers (vs the noisy shared GitHub runners) — what makes `bench:budgets`
+    # meaningful.
     #
-    # Bench is the ~20-min long pole. Run it exactly where the-class perf
-    # gate is needed — a PR-to-main touching the hot path (`live_stack`, which the
-    # `changes` filter sets for crates/gateway|ingest|shared|policy) + the WEEKLY
-    # cron + manual dispatch — but NOT on the post-merge main `push` (redundant
-    # with the PR run that already gated the merge). `!= push` keeps it off the
-    # main-push event while `live_stack` keeps it on hot-path PRs.
-    # NOTE: a DIRECT-to-main hot-path push (no PR) therefore skips bench until the
-    # weekly cron — route hot-path changes through a PR to get the bench gate.
-    # 2026-08-10: OFF pull_request too. A release-profile benchmark has no business
-    # on an intermediate push — 441 min in August, the single largest job.
-    # TRADE, stated plainly: a hot-path PR no longer gets the perf gate before
-    # merge; a regression is caught by the WEEKLY cron instead. When a PR needs the
-    # gate, run it deliberately: gh workflow run CI --ref <branch>.
+    # HOSTED-RUNNER OPT-IN, CORRECTED 2026-09-07 (founder: hosted GitHub Actions
+    # runners are billed, "only in extreme case with my approval"). This job used
+    # to fire on `schedule` OR `workflow_dispatch` — the WEEKLY cron alone ran it,
+    # billed, with nobody watching. Schedule participation is REMOVED and dispatch
+    # now requires the same explicit opt-in as the other two hosted jobs, so:
+    #   * a plain push, PR, or the weekly cron runs bench ZERO times;
+    #   * `gh workflow run CI --ref <branch> -f hosted_runners=approved-by-founder`
+    #     is the ONLY way to run it — read the Benchmarks job, not the PR tick.
+    # TRADE, stated plainly: there is no more unattended perf net at all (weekly or
+    # otherwise) — a hot-path change gets the B-066 perf gate only when someone
+    # deliberately asks for it and approves the spend in the same command.
     if: >-
       needs.changes.outputs.live_stack == 'true'
-      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest  # HEAVY (cargo/stack): OFF the prod node (per-job routing; ubuntu-latest is billing-gated - the founder's separate concern)
+      && github.event_name == 'workflow_dispatch'
+      && inputs.hosted_runners == 'approved-by-founder'
+    runs-on: ubuntu-latest  # HEAVY (cargo/stack): OFF the prod node; billed, dispatch-gated above
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install Rust toolchain

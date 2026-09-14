@@ -6,8 +6,10 @@
  * through to the gateway `/v1/traces` params — each reaches the WHERE clause.
  */
 
+import { classifyTraceFetchError, noMatchCopy } from "@/app/traces/empty-state";
 import { EmptyTraces } from "@/components/empty-states/EmptyTraces";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { FilterBar } from "@/components/trace-viewer/FilterBar";
 import { LiveTraces } from "@/components/trace-viewer/LiveTraces";
 import {
@@ -24,8 +26,15 @@ import {
 	gatewayGet,
 	gatewayGetOrNull,
 } from "@/lib/gateway";
+import { fetchTraceCountFor } from "@/lib/metrics/fetch";
+import {
+	type TimeRange,
+	parseOptionalTimeRange,
+	windowParams,
+} from "@/lib/metrics/time-range";
 import {
 	EmptyState,
+	ErrorState,
 	LedgerSeqChip,
 	SegmentedControl,
 	Skeleton,
@@ -96,7 +105,10 @@ const PAGE_PARAMS = [
 	"until",
 	"min_latency_ms",
 	"signature_id",
+	"q",
 	"failover",
+	// OBS-20 — "show me this person's traces".
+	"end_user",
 	"sort",
 	"order",
 	"group",
@@ -125,44 +137,48 @@ function pageHref(
 	return s ? `/traces?${s}` : "/traces";
 }
 
+// The list's window comes from the shared grammar — `parseOptionalTimeRange`
+// (`range=all` is the one explicit "no bound" opt-out; a since/until pair wins over
+// a preset). Resolved ONCE per request in `TracesPage` so the list, the count, the
+// group table and the live stream all ask for the same instant. It lives in
+// lib/metrics because a Next page module may export only route fields.
+
 /**
- * RFC3339 lower-bound for a range preset, or null for "all time".
- *
- * No range param defaults to the last hour so the list loads fast (the founder
- * ask — "All time" over the whole tenant is slow). The explicit "All time"
- * option passes `range=all` (or legacy `""`) to opt out and scan everything.
+ * B-379 (2026-09-12): the gateway's list, count and groups queries ALWAYS carry a
+ * window — a request with no `since` gets the gateway's 7-day default. "All
+ * time" on this page must therefore be SENT, not implied: 365 days back, the
+ * schema's retention backstop (`spans` TTL), so "all" means everything retained
+ * rather than a silent week. One place, so the list, the count, the groups and
+ * the live feed keep asking for the same instant.
  */
-function rangeSince(range: string | undefined): string | null {
-	const r = range ?? "1h";
-	const now = Date.now();
-	const ms =
-		r === "1h"
-			? 3_600_000
-			: r === "24h"
-				? 86_400_000
-				: r === "7d"
-					? 604_800_000
-					: r === "30d"
-						? 2_592_000_000
-						: 0; // "all" / "" / unknown → no lower bound (all time)
-	return ms ? new Date(now - ms).toISOString() : null;
+const ALL_TIME_LOOKBACK_MS = 365 * 24 * 60 * 60 * 1000;
+function setWindow(q: URLSearchParams, w: TimeRange | null): void {
+	if (w) {
+		for (const [k, v] of windowParams(w)) q.set(k, v);
+		return;
+	}
+	q.set("since", new Date(Date.now() - ALL_TIME_LOOKBACK_MS).toISOString());
 }
 
-/** Build the gateway `/v1/traces` query from the URL filters. */
-function buildQuery(sp: SP): string {
+/** Build the gateway `/v1/traces` query from the URL filters + the window. */
+function buildQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	q.set("limit", String(parseSize(sp)));
 	if (sp.model) q.set("model", sp.model);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
+	if (sp.end_user) q.set("end_user", sp.end_user);
+	// OBS-01. Forwarded verbatim — the gateway is the ONE place the 4-char
+	// minimum is enforced (`trace_reads.rs::validate_search_term`); a term the
+	// FilterBar wouldn't have submitted itself (a hand-typed `?q=abc`) still
+	// reaches the gateway and comes back as its real 400, not a silent drop.
+	if (sp.q) q.set("q", sp.q);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.status === "error") q.set("has_error", "true");
 	else if (sp.status === "ok") q.set("has_error", "false");
 	// A raw since/until window (e.g. a dashboard chart-click) wins over the range
 	// preset; the gateway validates both as RFC3339 and rejects malformed input.
-	const since = sp.since ?? rangeSince(sp.range);
-	if (since) q.set("since", since);
-	if (sp.until) q.set("until", sp.until);
+	setWindow(q, w);
 	if (sp.sort) q.set("sort", sp.sort);
 	if (sp.order) q.set("order", sp.order);
 	if (sp.cursor) q.set("cursor", sp.cursor);
@@ -190,8 +206,13 @@ function buildExportBase(sp: SP): string {
 	if (sp.status) q.set("status", sp.status);
 	if (sp.model) q.set("model", sp.model);
 	if (sp.range) q.set("range", sp.range);
+	// A custom window survives into the export (it used to be dropped, so the CSV
+	// covered a different period than the list it was exported from).
+	if (sp.since) q.set("since", sp.since);
+	if (sp.until) q.set("until", sp.until);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
+	if (sp.end_user) q.set("end_user", sp.end_user);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.sort) q.set("sort", sp.sort);
 	if (sp.order) q.set("order", sp.order);
@@ -199,18 +220,17 @@ function buildExportBase(sp: SP): string {
 }
 
 /** Gateway `/v1/traces/groups` query — the grouping dimension + the same filters. */
-function buildGroupQuery(sp: SP): string {
+function buildGroupQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	if (sp.group) q.set("by", sp.group);
 	if (sp.model) q.set("model", sp.model);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
+	if (sp.end_user) q.set("end_user", sp.end_user);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.status === "error") q.set("has_error", "true");
 	else if (sp.status === "ok") q.set("has_error", "false");
-	const since = sp.since ?? rangeSince(sp.range);
-	if (since) q.set("since", since);
-	if (sp.until) q.set("until", sp.until);
+	setWindow(q, w);
 	return q.toString();
 }
 
@@ -220,17 +240,16 @@ function buildGroupQuery(sp: SP): string {
  * no `cursor` (live always shows the newest). Keeps the live feed in lock-step
  * with the filtered list.
  */
-function buildStreamParams(sp: SP): string {
+function buildStreamParams(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	if (sp.model) q.set("model", sp.model);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
+	if (sp.end_user) q.set("end_user", sp.end_user);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.status === "error") q.set("has_error", "true");
 	else if (sp.status === "ok") q.set("has_error", "false");
-	const since = sp.since ?? rangeSince(sp.range);
-	if (since) q.set("since", since);
-	if (sp.until) q.set("until", sp.until);
+	setWindow(q, w);
 	return q.toString();
 }
 
@@ -321,7 +340,11 @@ function PaginationBar({
 	);
 }
 
-async function TracesData({ query, sp }: { query: string; sp: SP }) {
+async function TracesData({
+	query,
+	sp,
+	w,
+}: { query: string; sp: SP; w: TimeRange | null }) {
 	const gatewayUrl = gatewayBaseUrl();
 
 	let traces: TraceSummary[];
@@ -334,9 +357,32 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 		traces = data.traces;
 		nextCursor = data.next_cursor ?? null;
 	} catch (err) {
-		// Gateway unreachable ≠ zero rows: degrade to the warming empty-state.
-		// Re-throw anything else (incl. NEXT_REDIRECT from the auth helper).
 		if (err instanceof GatewayError) {
+			// OBS-01. Classification is a pure, unit-tested function
+			// (`empty-state.ts`) — a 4xx is a REJECTED request, not an
+			// unreachable gateway, most commonly `?q=` forced below the 4-char
+			// minimum (`trace_reads.rs::validate_search_term`). "error ≠ empty"
+			// (CLAUDE.md §1): rendering the warming banner for a validation
+			// failure would tell the user their gateway is down when it
+			// answered them perfectly correctly.
+			const failure = classifyTraceFetchError(err);
+			if (failure.kind === "rejected") {
+				return (
+					<ErrorState
+						title="Search error"
+						description={failure.message}
+						action={
+							<Link
+								href={pageHref(sp, { q: undefined, cursor: undefined })}
+								className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+							>
+								Clear search
+							</Link>
+						}
+					/>
+				);
+			}
+			// Gateway unreachable / 5xx ≠ zero rows: degrade to the warming empty-state.
 			return (
 				<>
 					<WarmingBanner />
@@ -344,6 +390,7 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 				</>
 			);
 		}
+		// Re-throw anything else (incl. NEXT_REDIRECT from the auth helper).
 		throw err;
 	}
 
@@ -377,21 +424,32 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 				sp.since ||
 				sp.until ||
 				sp.min_latency_ms ||
-				sp.signature_id,
+				sp.signature_id ||
+				sp.q ||
+				sp.end_user,
 		);
 		const allTime = sp.range === "all" || sp.range === "";
 		const windowPill = Boolean(sp.range) && !allTime;
 		if (contentFilter || windowPill) {
+			// OBS-01. Copy selection is a pure, unit-tested function
+			// (`empty-state.ts`) — a SEARCH returning zero rows names the term
+			// as the thing to change, distinct from "no data matches these
+			// filters" (spec §2, proof #3).
+			const copy = noMatchCopy(sp.q);
 			return (
 				<EmptyState
-					title="No traces match these filters"
-					description="Try widening the time range or clearing the model filter."
+					title={copy.title}
+					description={copy.description}
 					action={
 						<Link
-							href="/traces"
+							href={
+								sp.q
+									? pageHref(sp, { q: undefined, cursor: undefined })
+									: "/traces"
+							}
 							className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 						>
-							Clear filters
+							{sp.q ? "Clear search" : "Clear filters"}
 						</Link>
 					}
 				/>
@@ -416,15 +474,10 @@ async function TracesData({ query, sp }: { query: string; sp: SP }) {
 		return <EmptyTraces gatewayUrl={gatewayUrl} />;
 	}
 
-	// Best-effort tenant total matching the filters, for the "50 of N" footer.
-	// A failure just omits the total (never fails the list render).
-	let total: number | null = null;
-	try {
-		const c = await gatewayGet<{ total: number }>(`/v1/traces/count?${query}`);
-		total = typeof c.total === "number" ? c.total : null;
-	} catch {
-		total = null;
-	}
+	// Best-effort tenant total matching the filters, for the "N of M" footer —
+	// the SAME window as the list (lib/metrics), never a second computation. An
+	// unreachable count omits the total; it never fails the list render.
+	const total = await fetchTraceCountFor(w, new URLSearchParams(query));
 
 	return (
 		<>
@@ -473,14 +526,18 @@ export default async function TracesPage({
 	searchParams: Promise<SP>;
 }) {
 	const sp = await searchParams;
-	const query = buildQuery(sp);
+	const w = parseOptionalTimeRange(sp, {
+		defaultPreset: "1h",
+		nowMs: Date.now(),
+	});
+	const query = buildQuery(sp, w);
 	const exportBase = buildExportBase(sp);
 	const exportPrefix = exportBase ? `${exportBase}&` : "";
 	const groupBy =
 		sp.group && VALID_GROUPS.includes(sp.group as (typeof VALID_GROUPS)[number])
 			? sp.group
 			: null;
-	const groupQuery = buildGroupQuery(sp);
+	const groupQuery = buildGroupQuery(sp, w);
 
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
@@ -539,6 +596,7 @@ export default async function TracesPage({
 				</div>
 			)}
 
+			{w && <WindowNotice range={w} />}
 			{groupBy ? (
 				<Suspense
 					key={groupQuery}
@@ -553,7 +611,7 @@ export default async function TracesPage({
 					<GroupData by={groupBy} query={groupQuery} />
 				</Suspense>
 			) : (
-				<LiveTraces streamParams={buildStreamParams(sp)}>
+				<LiveTraces streamParams={buildStreamParams(sp, w)}>
 					<Suspense
 						key={query}
 						fallback={
@@ -564,7 +622,7 @@ export default async function TracesPage({
 							</div>
 						}
 					>
-						<TracesData query={query} sp={sp} />
+						<TracesData query={query} sp={sp} w={w} />
 					</Suspense>
 				</LiveTraces>
 			)}

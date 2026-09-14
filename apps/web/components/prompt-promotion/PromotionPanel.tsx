@@ -6,8 +6,8 @@
  * Calls POST /api/prompts/:name/promote (Next.js route → gateway proxy with
  * per-user JWT). The gateway enforces entitlements:
  *
- *   - Builder $59  → 403 with { error, feature, message, upgrade_url }
- *   - Team $249+   → 200/201 (decision: promoted / blocked_by_eval /
+ *   - Builder $29  → 403 with { error, feature, message, upgrade_url }
+ *   - Team $229+   → 200/201 (decision: promoted / blocked_by_eval /
  *                    blocked_by_policy / manual_override)
  *   - Eval gate blocked → 409
  *
@@ -113,7 +113,7 @@ export function PromotionPanel({
 				setStatus("upgrade_required");
 				setUpgradeUrl(body.upgrade_url ?? "/#pricing");
 				setErrorMsg(
-					body.message ?? "Team plan ($249/mo) required to promote prompts.",
+					body.message ?? "Team plan ($229/mo) required to promote prompts.",
 				);
 				return;
 			}

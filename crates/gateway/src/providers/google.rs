@@ -141,11 +141,11 @@ pub(super) fn build_gemini_stream(
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(events) = parse_gemini_sse(data) {
-                        for event in events {
-                            yield event;
-                        }
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(events) = parse_gemini_sse(data)
+                {
+                    for event in events {
+                        yield event;
                     }
                 }
             }
@@ -172,20 +172,20 @@ fn parse_gemini_sse(data: &str) -> Result<Vec<ProviderEvent>> {
         let mut fc_index = 0usize;
         for part in arr {
             // Thought signature (Gemini reasoning trace)
-            if let Some(thought) = part.get("thought").and_then(|t| t.as_str()) {
-                if !thought.is_empty() {
-                    events.push(ProviderEvent::ThinkingDelta {
-                        delta: thought.to_owned(),
-                    });
-                }
+            if let Some(thought) = part.get("thought").and_then(|t| t.as_str())
+                && !thought.is_empty()
+            {
+                events.push(ProviderEvent::ThinkingDelta {
+                    delta: thought.to_owned(),
+                });
             }
             // Text part
-            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                if !text.is_empty() {
-                    events.push(ProviderEvent::StreamChunk {
-                        delta: text.to_owned(),
-                    });
-                }
+            if let Some(text) = part.get("text").and_then(|t| t.as_str())
+                && !text.is_empty()
+            {
+                events.push(ProviderEvent::StreamChunk {
+                    delta: text.to_owned(),
+                });
             }
             // Function call part
             if let Some(fc) = part.get("functionCall") {
@@ -274,6 +274,11 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// GWY-48. Forwarded so a parameter the span RECORDS is a parameter the
+    /// provider actually RECEIVED. `skip_serializing_if`, so a request that did
+    /// not send it serialises byte-identically to before this field existed.
+    #[serde(rename = "topP", skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 impl GeminiRequest {
@@ -362,14 +367,20 @@ impl GeminiRequest {
             }]
         });
 
-        let generation_config = if req.max_tokens.is_some() || req.temperature.is_some() {
-            Some(GeminiGenerationConfig {
-                max_output_tokens: req.max_tokens,
-                temperature: req.temperature,
-            })
-        } else {
-            None
-        };
+        // GWY-48: `|| req.top_p.is_some()` is NOT optional. Adding the struct
+        // field without widening this condition means a request carrying only
+        // `top_p` builds no `generationConfig` at all and the value is dropped —
+        // with the field visibly present and the type-check passing.
+        let generation_config =
+            if req.max_tokens.is_some() || req.temperature.is_some() || req.top_p.is_some() {
+                Some(GeminiGenerationConfig {
+                    max_output_tokens: req.max_tokens,
+                    temperature: req.temperature,
+                    top_p: req.top_p,
+                })
+            } else {
+                None
+            };
 
         Ok(Self {
             contents,
@@ -388,6 +399,10 @@ mod tests {
     #[test]
     fn translates_system_to_system_instruction() {
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "gemini-3.1-pro".into(),
             messages: vec![
                 Message {
@@ -404,6 +419,7 @@ mod tests {
                 },
             ],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,
@@ -419,6 +435,10 @@ mod tests {
     #[test]
     fn assistant_maps_to_model_role() {
         let req = ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "gemini-3.1-flash".into(),
             messages: vec![
                 Message {
@@ -435,6 +455,7 @@ mod tests {
                 },
             ],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: None,
             stream: None,

@@ -13,14 +13,11 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::pin::Pin;
 use tracing::instrument;
 
-use tracelane_shared::{
-    ChatResponse, Choice, Message, MessageContent, Role, TenantId, ToolCall, Usage,
-};
+use tracelane_shared::{MessageContent, Role, TenantId, ToolChoice};
 
-use crate::providers::{ProviderEvent, ProviderStream};
+use crate::providers::{FinishReason, ProviderEvent, ProviderStream};
 use tracelane_shared::ChatRequest;
 
 /// OpenAI Chat Completions API adapter.
@@ -34,21 +31,11 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// A14: constructors are now fallible — `.expect()` on `reqwest`
-    /// client build moved to a `?` propagated up through
-    /// `ProviderRegistry::new()`. The build error is theoretical with
-    /// rustls today but ruled-out by .claude/rules/rust.md regardless.
-    pub fn openai() -> anyhow::Result<Self> {
-        Ok(Self {
-            client: crate::ssrf_guard::safe_client_builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .context("build OpenAI reqwest client")?,
-            base_url: std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com".into()),
-            provider_id: "openai",
-        })
-    }
+    // `openai()` (a dedicated constructor reading `OPENAI_BASE_URL`, defaulting
+    // to `https://api.openai.com`) was deleted 2026-09-12 (B-390) — zero
+    // callers anywhere; `providers/mod.rs`'s def-driven catalog constructs
+    // every OpenAI-compatible provider, including plain OpenAI, through
+    // `compatible()` below instead.
 
     /// For OpenAI-compatible providers that share the same request shape.
     pub fn compatible(
@@ -148,8 +135,10 @@ fn build_openai_stream(
                     if data == "[DONE]" {
                         return;
                     }
-                    if let Ok(Some(event)) = parse_openai_sse(data) {
-                        yield event;
+                    if let Ok(events) = parse_openai_sse(data) {
+                        for event in events {
+                            yield event;
+                        }
                     }
                 }
             }
@@ -157,7 +146,32 @@ fn build_openai_stream(
     }
 }
 
-fn parse_openai_sse(data: &str) -> Result<Option<ProviderEvent>> {
+/// Parse one OpenAI SSE frame into zero or more provider events.
+///
+/// # OBS-53 — why this returns a `Vec` and not an `Option`
+///
+/// It used to return `Result<Option<ProviderEvent>>` — at most ONE event per
+/// frame — and the `finish_reason` arm at the bottom survived that only because
+/// *OpenAI sends `finish_reason` on its own chunk with an empty delta*, as the
+/// comment there still explains.
+///
+/// **Logprobs have no such luck.** OpenAI puts `choices[0].logprobs` on the SAME
+/// chunk as `choices[0].delta.content`. Under the old return type a logprobs
+/// check placed after the content check would be unreachable for every real
+/// chunk, and one placed before it would drop the token — so "add a logprobs
+/// arm" produces a control that never fires, which is the CLAUDE.md §1 class.
+///
+/// `parse_anthropic_sse_event` already returns a `Vec` for exactly this reason
+/// (one `message_delta` carries usage AND a stop reason), so this is the repo's
+/// own precedent rather than a new shape.
+///
+/// **The precedence between content / tool-call / finish is DELIBERATELY
+/// UNCHANGED.** At most one of those three is still emitted per frame, in the
+/// same order, so the known limitation recorded at the `finish_reason` arm
+/// (a compat host that bundles the reason onto the last content chunk loses it)
+/// is neither fixed nor worsened here. Widening that is a behaviour change to
+/// existing streams and does not belong in an observability block.
+fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
 
     // Usage chunk (stream_options.include_usage = true)
@@ -167,49 +181,89 @@ fn parse_openai_sse(data: &str) -> Result<Option<ProviderEvent>> {
         // Wire-reported cost: OpenRouter (and some OpenAI-compatible
         // hosts) attach `usage.cost` in USD. Absent → None, never computed.
         let cost_usd = usage.get("cost").and_then(|c| c.as_f64());
-        return Ok(Some(ProviderEvent::UsageUpdate {
+        return Ok(vec![ProviderEvent::UsageUpdate {
             input_tokens: input,
             output_tokens: output,
             cache_read: None,
             cache_creation: None,
             cost_usd,
-        }));
+        }]);
+    }
+
+    // OBS-53. Collected BEFORE the content/tool/finish decision below and
+    // carried alongside whichever of those wins, because this frame can
+    // legitimately be both a token and its logprob. Absent ⇒ nothing pushed, so
+    // a stream from a client that did not ask for logprobs is byte-identical to
+    // before this existed.
+    let mut events: Vec<ProviderEvent> = Vec::new();
+    if let Some(entries) = v["choices"][0]["logprobs"]["content"].as_array() {
+        let logprobs: Vec<f64> = entries
+            .iter()
+            .filter_map(|e| e["logprob"].as_f64())
+            // A logprob is <= 0 and finite. A provider that sends `null`, a
+            // string, or -inf for a zero-probability token would otherwise
+            // poison a mean; filtering here keeps `token_count` honest, because
+            // the count is of tokens actually SUMMARISED, not of tokens seen.
+            .filter(|l| l.is_finite())
+            .collect();
+        if !logprobs.is_empty() {
+            events.push(ProviderEvent::LogprobsDelta { logprobs });
+        }
     }
 
     let delta = &v["choices"][0]["delta"];
     if delta.is_null() {
-        return Ok(None);
+        return Ok(events);
     }
 
     // Text delta
-    if let Some(text) = delta["content"].as_str() {
-        if !text.is_empty() {
-            return Ok(Some(ProviderEvent::StreamChunk {
-                delta: text.to_owned(),
-            }));
-        }
+    if let Some(text) = delta["content"].as_str()
+        && !text.is_empty()
+    {
+        events.push(ProviderEvent::StreamChunk {
+            delta: text.to_owned(),
+        });
+        return Ok(events);
     }
 
     // Tool call delta
-    if let Some(tool_calls) = delta["tool_calls"].as_array() {
-        if let Some(tc) = tool_calls.first() {
-            let index = tc["index"].as_u64().unwrap_or(0) as usize;
-            let id = tc["id"].as_str().map(str::to_owned);
-            let name = tc["function"]["name"].as_str().map(str::to_owned);
-            let input_delta = tc["function"]["arguments"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
-            return Ok(Some(ProviderEvent::ToolCallDelta {
-                index,
-                id,
-                name,
-                input_delta,
-            }));
-        }
+    if let Some(tool_calls) = delta["tool_calls"].as_array()
+        && let Some(tc) = tool_calls.first()
+    {
+        let index = tc["index"].as_u64().unwrap_or(0) as usize;
+        let id = tc["id"].as_str().map(str::to_owned);
+        let name = tc["function"]["name"].as_str().map(str::to_owned);
+        let input_delta = tc["function"]["arguments"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        events.push(ProviderEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            input_delta,
+        });
+        return Ok(events);
     }
 
-    Ok(None)
+    // B-354: the provider's own stop reason, passed through.
+    //
+    // Checked LAST, and that is the honest limit of this parser's single-event
+    // return: OpenAI itself sends `finish_reason` on its own chunk with an
+    // EMPTY delta, so this is reached for every real OpenAI stream. A
+    // compatible host that bundles the reason onto the last CONTENT chunk
+    // loses it here — the content event wins, because dropping a token is
+    // worse than dropping a reason the buffered path can still derive from the
+    // presence of tool calls.
+    if let Some(reason) = v["choices"][0]["finish_reason"]
+        .as_str()
+        .and_then(FinishReason::from_openai_finish_reason)
+    {
+        events.push(ProviderEvent::Finish { reason });
+        return Ok(events);
+    }
+
+    Ok(events)
 }
 
 // ── OpenAI request/response types ────────────────────────────────────────────
@@ -227,12 +281,33 @@ pub(super) struct OpenAiRequest {
     messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
+    /// B-355. Forwarded VERBATIM: the internal `ToolChoice` serialises back to
+    /// the exact OpenAI wire form, so there is no translation to get wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
     stream: bool,
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// GWY-48. Forwarded because a parameter we RECORD on the span and then
+    /// throw away is the quiet dishonesty this repo keeps paying for. Every one
+    /// is `skip_serializing_if`, so a request that did not send it serialises
+    /// byte-identically to before these fields existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    /// GWY-48. This is the ONLY wire with a seed concept, which is why only this
+    /// adapter carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    /// OBS-53. Never injected by the gateway — present only when the CLIENT
+    /// asked, because it changes the response body and this gateway is
+    /// byte-compatible by contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,12 +403,17 @@ impl OpenAiRequest {
             model: req.model,
             messages,
             tools,
+            tool_choice: req.tool_choice,
             stream: req.stream.unwrap_or(true),
             stream_options: StreamOptions {
                 include_usage: true,
             },
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            top_p: req.top_p,
+            seed: req.seed,
+            logprobs: req.logprobs,
+            top_logprobs: req.top_logprobs,
         }
     }
 }
@@ -345,6 +425,10 @@ mod tests {
 
     fn simple_request() -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "gpt-5.5".into(),
             messages: vec![Message {
                 role: Role::User,
@@ -353,6 +437,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: Some(100),
             temperature: None,
             stream: Some(true),
@@ -388,6 +473,156 @@ mod tests {
             "cache_control must be stripped before reaching OpenAI"
         );
         assert_eq!(blocks[0].get("type"), Some(&json!("text")));
+    }
+
+    // ── B-355: tool_choice, forwarded verbatim ──────────────────────────────
+
+    /// The OpenAI-family adapters need no translation — the internal
+    /// `ToolChoice` serialises back to the exact wire form the caller sent, so
+    /// a round trip through the gateway is a no-op.
+    #[test]
+    fn tool_choice_is_forwarded_verbatim() {
+        use tracelane_shared::ToolChoice;
+        for (choice, want) in [
+            (ToolChoice::Auto, serde_json::json!("auto")),
+            (ToolChoice::None, serde_json::json!("none")),
+            (ToolChoice::Required, serde_json::json!("required")),
+            (
+                ToolChoice::Function {
+                    name: "get_weather".into(),
+                },
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "get_weather" }
+                }),
+            ),
+        ] {
+            let mut req = simple_request();
+            req.tool_choice = Some(choice.clone());
+            let wire = serde_json::to_value(OpenAiRequest::from_universal(req)).expect("serialize");
+            assert_eq!(wire["tool_choice"], want, "for {choice:?}");
+        }
+    }
+
+    /// The control: no `tool_choice` on the way in, no key on the way out.
+    #[test]
+    fn a_request_without_tool_choice_sends_no_key() {
+        let wire =
+            serde_json::to_value(OpenAiRequest::from_universal(simple_request())).expect("ser");
+        assert!(
+            wire.get("tool_choice").is_none(),
+            "an absent tool_choice must not reach the wire: {wire}"
+        );
+    }
+
+    // ── B-354: the provider's own finish_reason ─────────────────────────────
+
+    /// OpenAI sends `finish_reason` on its OWN chunk with an empty delta. Before
+    /// B-354 that chunk parsed to `None` and the reason was lost.
+    #[test]
+    fn the_terminal_chunks_finish_reason_is_parsed() {
+        for (wire, want) in [
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+            // The pre-2023 spelling some compatible hosts still emit.
+            ("function_call", FinishReason::ToolCalls),
+            ("content_filter", FinishReason::ContentFilter),
+        ] {
+            let data =
+                format!(r#"{{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{wire}"}}]}}"#);
+            match parse_openai_sse(&data).expect("parses").as_slice() {
+                [ProviderEvent::Finish { reason }] => assert_eq!(*reason, want, "for {wire}"),
+                other => panic!("expected a Finish event for {wire}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A reason we do not recognise is DROPPED, not forwarded — an OpenAI
+    /// client cannot act on a word that is not in its vocabulary, and the
+    /// buffered path can still derive `tool_calls` from the response contents.
+    #[test]
+    fn an_unrecognised_finish_reason_yields_no_event() {
+        let data = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"invented"}]}"#;
+        assert!(
+            parse_openai_sse(data).expect("parses").is_empty(),
+            "an unknown finish_reason must not reach the wire"
+        );
+    }
+
+    /// **OBS-53's whole reason for changing this function's return type.** OpenAI
+    /// puts `logprobs` on the SAME chunk as the content token. Under the old
+    /// `Option` return, whichever check came first won and the other fact was
+    /// lost; this asserts BOTH survive, and that the content event is still
+    /// there — the property a naive "add an arm" would have broken.
+    #[test]
+    fn an_openai_chunk_with_content_and_logprobs_still_yields_the_content_event() {
+        let data = r#"{"choices":[{"index":0,"delta":{"content":"hi"},
+            "logprobs":{"content":[{"token":"hi","logprob":-0.25}]},
+            "finish_reason":null}]}"#;
+        let events = parse_openai_sse(data).expect("parses");
+        assert_eq!(events.len(), 2, "got {events:?}");
+        match events.as_slice() {
+            [
+                ProviderEvent::LogprobsDelta { logprobs },
+                ProviderEvent::StreamChunk { delta },
+            ] => {
+                assert_eq!(delta, "hi", "the token must NOT be dropped");
+                assert_eq!(logprobs, &vec![-0.25]);
+            }
+            other => panic!("expected logprobs + content, got {other:?}"),
+        }
+    }
+
+    /// A chunk with no logprobs is byte-identical in behaviour to before OBS-53:
+    /// exactly one event, and it is the content.
+    #[test]
+    fn a_chunk_without_logprobs_yields_exactly_one_event() {
+        let data = r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
+        assert_eq!(parse_openai_sse(data).expect("parses").len(), 1);
+    }
+
+    /// A non-finite logprob is dropped rather than allowed to poison a mean —
+    /// and if that leaves nothing, no event is emitted at all.
+    #[test]
+    fn a_non_finite_logprob_is_dropped_not_summarised() {
+        let data = r#"{"choices":[{"index":0,"delta":{"content":"hi"},
+            "logprobs":{"content":[{"token":"hi","logprob":null}]}}]}"#;
+        let events = parse_openai_sse(data).expect("parses");
+        assert_eq!(events.len(), 1, "only the content event: {events:?}");
+    }
+
+    /// GWY-48: the four new wire fields reach the OpenAI body, and a request that
+    /// sent none of them serialises without any of the keys.
+    #[test]
+    fn the_openai_body_forwards_top_p_seed_and_logprobs_only_when_sent() {
+        let bare = OpenAiRequest::from_universal(simple_request());
+        let json = serde_json::to_string(&bare).expect("serialises");
+        for k in ["top_p", "seed", "logprobs", "top_logprobs"] {
+            assert!(!json.contains(k), "`{k}` must be absent: {json}");
+        }
+
+        let mut req = simple_request();
+        req.top_p = Some(0.9);
+        req.seed = Some(7);
+        req.logprobs = Some(true);
+        req.top_logprobs = Some(3);
+        let json = serde_json::to_string(&OpenAiRequest::from_universal(req)).expect("serialises");
+        assert!(json.contains(r#""top_p":0.9"#), "{json}");
+        assert!(json.contains(r#""seed":7"#), "{json}");
+        assert!(json.contains(r#""logprobs":true"#), "{json}");
+        assert!(json.contains(r#""top_logprobs":3"#), "{json}");
+    }
+
+    /// The control: a content chunk still parses as content, unchanged. The
+    /// finish_reason check is LAST for exactly this reason.
+    #[test]
+    fn a_content_chunk_is_still_a_content_chunk() {
+        let data = r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        match parse_openai_sse(data).expect("parses").as_slice() {
+            [ProviderEvent::StreamChunk { delta }] => assert_eq!(delta, "hi"),
+            other => panic!("expected a content chunk, got {other:?}"),
+        }
     }
 
     #[test]

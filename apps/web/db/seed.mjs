@@ -47,6 +47,8 @@
 
 import { neon } from "@neondatabase/serverless";
 
+import { readFileSync } from "node:fs";
+
 const url = process.env.DATABASE_URL;
 if (!url) {
 	console.error("[seed] DATABASE_URL is not set");
@@ -54,9 +56,12 @@ if (!url) {
 }
 const sql = neon(url);
 
-// [key, seat_incl, seat_max(0=unlimited), retention_days, trace_quota,
-// gateway_quota, overage_hard_cap_multiplier, overage_price_per_10k_usd,
+// [key,
 // f_full_capture (Business+Enterprise=true),
+//   (the ADR-020 positional values that used to sit between `key` and this —
+//   seat caps, retention_days, trace/gateway quotas, the overage multiplier and
+//   per-10K price — were DROPPED with migration 0042, BILL-01 contract step;
+//   every ruled number is in ./plans.v3.json, keyed, never positional),
 // f_prompt_promotion_write (Team+=true, ADR-009),
 // f_audit_addon (Enterprise only),
 // then the four Sprint 3 eval-loop flags (migration 0030): f_datasets
@@ -74,13 +79,6 @@ const sql = neon(url);
 const PLANS = [
 	[
 		"free_v1",
-		1,
-		1,
-		7,
-		10000,
-		10000,
-		"1.0",
-		"0.00",
 		false,
 		false,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
@@ -99,13 +97,6 @@ const PLANS = [
 	],
 	[
 		"builder_v1",
-		1,
-		1,
-		30,
-		150000,
-		150000,
-		"5.0",
-		"1.20",
 		false,
 		false,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
@@ -124,13 +115,6 @@ const PLANS = [
 	],
 	[
 		"team_v1",
-		10,
-		25,
-		90,
-		1000000,
-		1000000,
-		"5.0",
-		"1.20",
 		false, // f_full_capture
 		true, // f_prompt_promotion_write
 		// ADR-064 amended (founder 2026-07-14): ALL 9 rails at Team+ — gr2 + gr4
@@ -151,13 +135,6 @@ const PLANS = [
 	],
 	[
 		"business_v1",
-		25,
-		50,
-		180,
-		5000000,
-		5000000,
-		"5.0",
-		"1.20",
 		true,
 		true,
 		false, // f_audit_addon (see enterprise_v1 for why it sits here)
@@ -176,13 +153,6 @@ const PLANS = [
 	],
 	[
 		"enterprise_v1",
-		0,
-		0,
-		365,
-		25000000,
-		25000000,
-		"99.0",
-		"1.00",
 		true,
 		true,
 		true, // f_audit_addon — ENTERPRISE ONLY (founder ruling 2026-08-14). The six
@@ -205,13 +175,6 @@ const PLANS = [
 
 for (const [
 	key,
-	si,
-	sm,
-	rd,
-	tq,
-	gq,
-	cap,
-	ov,
 	fc,
 	ppw,
 	aa,
@@ -228,25 +191,16 @@ for (const [
 ] of PLANS) {
 	await sql`
 		insert into plan_entitlements (
-			plan_lookup_key, seat_cap_included, seat_cap_max, retention_days,
-			trace_quota_monthly, gateway_quota_monthly,
-			overage_hard_cap_multiplier, overage_price_per_10k_usd, f_full_capture,
+			plan_lookup_key, f_full_capture,
 			f_prompt_promotion_write,
 			f_audit_addon,
 			f_datasets, f_experiments, f_online_evals, f_annotation_queues,
 			f_guardrail_r2, f_guardrail_r3_pinning, f_guardrail_r4,
 			f_guardrail_r5, f_guardrail_r6, f_guardrail_r7
-		) values (${key}, ${si}, ${sm}, ${rd}, ${tq}, ${gq}, ${cap}, ${ov}, ${fc}, ${ppw},
+		) values (${key}, ${fc}, ${ppw},
 			${aa}, ${ds}, ${exp}, ${oe}, ${aq},
 			${gr2}, ${gr3p}, ${gr4}, ${gr5}, ${gr6}, ${gr7})
 		on conflict (plan_lookup_key) do update set
-			seat_cap_included = excluded.seat_cap_included,
-			seat_cap_max = excluded.seat_cap_max,
-			retention_days = excluded.retention_days,
-			trace_quota_monthly = excluded.trace_quota_monthly,
-			gateway_quota_monthly = excluded.gateway_quota_monthly,
-			overage_hard_cap_multiplier = excluded.overage_hard_cap_multiplier,
-			overage_price_per_10k_usd = excluded.overage_price_per_10k_usd,
 			f_full_capture = excluded.f_full_capture,
 			f_prompt_promotion_write = excluded.f_prompt_promotion_write,
 			f_datasets = excluded.f_datasets,
@@ -263,10 +217,105 @@ for (const [
 			updated_at = now()`;
 }
 
+// ── BILL-01 / ADR-076 (founder ruling 2026-09-12): pricing v3 ─────────────────────────
+// The six-meter allowances, windows, seats and prices live in ./plans.v3.json — keyed by
+// lookup key, NOT positional, so the guardrail drift test's `p.slice(-6)` over PLANS above
+// is untouched. That JSON is the ONE source `scripts/ci/check-pricing-copy-vs-seed.py`
+// compares every public figure against. Columns: migration 0040 (un-journaled, applied
+// to Neon BEFORE the gateway that reads them deploys). The ADR-020 columns this seed used
+// to upsert (seat caps, trace quotas, overage multiplier) were DROPPED by migration 0042
+// (2026-09-14, the contract step) — nothing writes or reads them any more.
+const v3 = JSON.parse(
+	readFileSync(new URL("./plans.v3.json", import.meta.url), "utf8"),
+);
+for (const [key, p] of Object.entries(v3.plans)) {
+	await sql`
+		update plan_entitlements set
+			price_monthly_usd = ${p.price_monthly_usd},
+			price_annual_month_usd = ${p.price_annual_month_usd},
+			price_from_usd = ${p.price_from_usd},
+			hot_gb_included = ${p.hot_gb_included},
+			ingest_gb_included = ${p.ingest_gb_included},
+			series_included = ${p.series_included},
+			scan_units_included = ${p.scan_units_included},
+			eval_runs_included = ${p.eval_runs_included},
+			indexed_window_days = ${p.indexed_window_days},
+			queryable_days = ${p.queryable_days},
+			ledger_days = ${p.ledger_days},
+			cold_archive_days = ${p.cold_archive_days},
+			unlimited_seats = ${p.unlimited_seats},
+			f_sso = ${p.f_sso},
+			overage_allowed = ${p.overage_allowed},
+			rate_limit_rpm = ${p.rate_limit_rpm},
+			updated_at = now()
+		where plan_lookup_key = ${key}`;
+}
+console.log(
+	`[seed] pricing v3: updated ${Object.keys(v3.plans).length} plan rows from plans.v3.json`,
+);
+
+// Reference tables (founder 2026-09-13: no hardcoded prices / limits / config — tables).
+// pricing_rates: one row per (meter, band); billing_policy: one row per policy key.
+const m = v3.meters;
+const rateRows = [
+	["ingest_gb", 0, null, m.ingest_usd_per_gb, "GB"],
+	...m.hot_window_usd_per_gb_month_ladder.map(([lo, hi, usd]) => [
+		"hot_gb_month",
+		lo,
+		hi,
+		usd,
+		"GB-month",
+	]),
+	["series", 0, null, m.series_usd_per_series_month, "series-month"],
+	["scan_units", 0, null, m.query_usd_per_scan_unit, "scan-unit"],
+	["cold_gb_month", 0, null, m.cold_usd_per_gb_month, "GB-month"],
+	["eval_runs", 0, null, m.eval_usd_per_judge_run, "run"],
+];
+for (const [meter, lo, hi, usd, unit] of rateRows) {
+	await sql`
+		insert into pricing_rates (price_version, meter, band_lo, band_hi, usd_per_unit, unit, is_current)
+		values ('v3', ${meter}, ${lo}, ${hi}, ${usd}, ${unit}, true)
+		on conflict (price_version, meter, band_lo) do update set
+			band_hi = excluded.band_hi, usd_per_unit = excluded.usd_per_unit,
+			unit = excluded.unit, is_current = true`;
+}
+const pol = v3.policy;
+const policyRows = {
+	burst_multiple: pol.burst_multiple_of_trailing_30d_avg,
+	// The gateway reads the two thresholds as SEPARATE scalar keys (rating.rs Policy);
+	// the array form stays for the web app. Bare JSON scalars — a quoted string would
+	// cast to "\"75\"" and fall back to the default silently.
+	warn_pct_1: pol.warning_thresholds_pct[0],
+	warn_pct_2: pol.warning_thresholds_pct[1],
+	warn_pct: pol.warning_thresholds_pct,
+	velocity_sigma: pol.velocity_sigma,
+	velocity_window_days: pol.velocity_window_days,
+	velocity_interval_secs: pol.velocity_interval_secs,
+	rollover: pol.rollover,
+	price_protection_months: pol.price_protection_months,
+	free_idle_reclaim_days: pol.free_idle_reclaim_days,
+	dunning_retry_days: pol.dunning_retry_days,
+	dunning_data_hold_days: pol.dunning_data_hold_days,
+	refund_days_base_first_cycle: pol.refund_days_base_first_cycle,
+	enterprise_onboarding_fee_usd: pol.enterprise_onboarding_fee_usd,
+	prepaid_credits: pol.prepaid_credits,
+	prepaid_expiry_months: pol.prepaid_expiry_months,
+	never_metered: m.never_metered,
+	audit_sku: pol.audit_sku,
+};
+for (const [key, value] of Object.entries(policyRows)) {
+	await sql`
+		insert into billing_policy (key, value) values (${key}, ${JSON.stringify(value)}::jsonb)
+		on conflict (key) do update set value = excluded.value, updated_at = now()`;
+}
+console.log(
+	`[seed] pricing v3: ${rateRows.length} pricing_rates rows + ${Object.keys(policyRows).length} billing_policy rows`,
+);
+
 const rows = await sql`
-	select plan_lookup_key, seat_cap_included, seat_cap_max, retention_days,
-	 trace_quota_monthly, gateway_quota_monthly,
-	 overage_hard_cap_multiplier, overage_price_per_10k_usd
+	select plan_lookup_key, price_monthly_usd, price_annual_month_usd, hot_gb_included,
+	 ingest_gb_included, series_included, scan_units_included, eval_runs_included,
+	 indexed_window_days, queryable_days, ledger_days, unlimited_seats, f_sso, rate_limit_rpm
 	from plan_entitlements order by plan_lookup_key`;
 console.log(
 	`[seed] upserted ${PLANS.length} plan rows. plan_entitlements now:`,

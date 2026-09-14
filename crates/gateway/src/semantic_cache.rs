@@ -58,6 +58,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use clickhouse::Client as ClickhouseClient;
+use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 use tracelane_shared::{ChatRequest, MessageContent, TenantId};
 use uuid::Uuid;
@@ -157,6 +158,52 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
             params.update(serde_json::to_string(t).unwrap_or_default().as_bytes());
         }
     }
+    // B-355: same reasoning as `tools` above — the same question asked with
+    // `tool_choice: "required"` and with `"none"` is a different question, and
+    // sharing one cache entry between them would serve an answer that ignores
+    // the caller's instruction. Absent → nothing hashed, so every existing key
+    // is unchanged.
+    if let Some(tc) = &req.tool_choice {
+        params.update(serde_json::to_string(tc).unwrap_or_default().as_bytes());
+    }
+    // GWY-48: `top_p` and `seed` are sampling parameters in exactly the sense
+    // `RequestKey::params_hash`'s own doc comment means — "two requests whose
+    // sampling parameters differ are not interchangeable however alike their
+    // text reads". Landing them on `ChatRequest` WITHOUT landing them here would
+    // make two requests differing only in `top_p` collide on one cache entry and
+    // serve the second caller the first caller's answer. That is B-355's defect
+    // reintroduced under a new field name, which is why `model.rs` says so at
+    // the field and why this is the same commit.
+    //
+    // OBS-53's `logprobs`/`top_logprobs` are hashed for a DIFFERENT reason, and
+    // it is the stronger one: they change the SHAPE OF THE RESPONSE BODY. A
+    // cached answer stored for a caller who did not ask for logprobs has no
+    // `logprobs` object in it, so replaying it to a caller who did would silently
+    // drop a field that caller's client is parsing. Not in the spec; found
+    // building it.
+    //
+    // Each is length-tagged and only hashed when PRESENT, so every key written
+    // before this change is byte-identical after it — the cache is not flushed by
+    // a deploy. The tag is what keeps a `top_p` of 0.5 from colliding with a
+    // `system` prompt that happens to carry the same four bytes; the pre-existing
+    // fields have no tag and are left exactly as they are (changing them WOULD
+    // flush the cache, for a weakness this feature does not introduce).
+    if let Some(tp) = req.top_p {
+        params.update(b"top_p=");
+        params.update(&tp.to_le_bytes());
+    }
+    if let Some(seed) = req.seed {
+        params.update(b"seed=");
+        params.update(&seed.to_le_bytes());
+    }
+    if let Some(lp) = req.logprobs {
+        params.update(b"logprobs=");
+        params.update(&[u8::from(lp)]);
+    }
+    if let Some(tlp) = req.top_logprobs {
+        params.update(b"top_logprobs=");
+        params.update(&[tlp]);
+    }
     if let Some(sys) = &req.system {
         params.update(sys.as_bytes());
     }
@@ -188,6 +235,8 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
 
 /// The cache.
 pub struct SemanticCache {
+    /// SRE #20: the entitlement cache, so cache reads run at the tenant's OWN cap tier.
+    entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ch: ClickhouseClient,
     providers: Arc<ProviderRegistry>,
     cfg: SemanticCacheConfig,
@@ -242,6 +291,20 @@ pub struct SemanticCache {
 const NO_EMBEDDER_TTL_SECS: u64 = 3600;
 
 impl SemanticCache {
+    /// SRE #20: the tenant's own ADR-031 tier (`clickhouse_query::tier_for_tenant`).
+    async fn tier_for(&self, tenant: &TenantId) -> crate::clickhouse_query::PlanTier {
+        crate::clickhouse_query::tier_for_tenant(self.entitlements.as_ref(), tenant).await
+    }
+
+    #[must_use]
+    pub fn with_entitlements(
+        mut self,
+        entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    ) -> Self {
+        self.entitlements = entitlements;
+        self
+    }
+
     #[must_use]
     pub fn new(
         ch: ClickhouseClient,
@@ -250,6 +313,7 @@ impl SemanticCache {
     ) -> Self {
         let ttl = std::time::Duration::from_secs(u64::from(cfg.ttl_hours()) * 3600);
         Self {
+            entitlements: None,
             ch,
             providers,
             cfg,
@@ -273,10 +337,8 @@ impl SemanticCache {
         }
     }
 
-    #[must_use]
-    pub fn config(&self) -> &SemanticCacheConfig {
-        &self.cfg
-    }
+    // `config(&self) -> &SemanticCacheConfig` (a plain field accessor) was
+    // deleted 2026-09-12 (B-390) — zero callers anywhere, including tests.
 }
 
 impl SemanticCache {
@@ -319,9 +381,12 @@ impl SemanticCache {
         let embedding = match self.embed(tenant_id, &key.embed_text).await {
             Ok(v) => v,
             Err(e) => {
-                tracelane_shared::degradation::note(
-                    tracelane_shared::degradation::Degradation::SemanticCacheUnavailable,
-                );
+                // B-347: no credential is configuration, not a degradation.
+                if !embed_failure_is_configuration(&self.no_embedder, tenant_id).await {
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::SemanticCacheUnavailable,
+                    );
+                }
                 tracing::debug!(error = %format!("{e:#}"), "semantic cache: embedding unavailable");
                 return None;
             }
@@ -353,7 +418,7 @@ impl SemanticCache {
                AND embedding_dims = ? \
              ORDER BY created_at DESC \
              LIMIT ?",
-            crate::clickhouse_query::PlanTier::Builder,
+            self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
 
@@ -438,7 +503,7 @@ impl SemanticCache {
                         dimensions: Some(self.cfg.embedding_dimensions()),
                         user: None,
                     },
-                    &key,
+                    key.expose_secret(),
                     tenant_id,
                 )
                 .await
@@ -471,6 +536,41 @@ impl SemanticCache {
     }
 }
 
+/// B-347 (2026-09-05). `embed()` fails for two reasons that must NOT be counted the
+/// same way: a tenant with NO embedding-capable credential (a stable fact of its
+/// configuration — prod is 94% Anthropic, which has no embeddings API) and an
+/// embedder that actually ERRORED (a fault). `embed()` records the first in the
+/// negative cache before returning, so "the tenant is in `no_embedder`" is exactly
+/// "this was configuration". Counting configuration as `SemanticCacheUnavailable`
+/// kept `degraded_open = 1` on prod for every container's whole life — one note at
+/// the first miss after boot — and the watchdog signature carried `degraded=1`
+/// from 2026-09-04 on, which is the shape that teaches a reader to ignore the
+/// channel. Only a fault is a degradation.
+pub(crate) async fn embed_failure_is_configuration(
+    no_embedder: &moka::future::Cache<TenantId, ()>,
+    tenant_id: &TenantId,
+) -> bool {
+    no_embedder.get(tenant_id).await.is_some()
+}
+
+/// B-359 (2026-09-07). Whether a buffered completion may enter the cache, by its
+/// OpenAI-wire `finish_reason`.
+///
+/// Only `"stop"` qualifies. `"length"` is a truncated answer — an artefact of the
+/// first caller's `max_tokens` that a later caller with a different limit would
+/// receive as if complete. `"tool_calls"` is a side-effecting instruction whose
+/// arguments were derived from the FIRST prompt's text: the semantic tier would
+/// serve `get_weather(city="Paris")` to "weather in Berlin", which is similar
+/// enough to hit. `"content_filter"` never reaches the store (the guardrail
+/// branches return before it). Anything unrecognised is refused — fail-closed,
+/// because a cache that guesses at an uninterpretable stop reason is worse than
+/// a miss (§10: this is the correctness side of the cache, not its
+/// fault-tolerance side).
+#[must_use]
+pub fn is_cacheable_finish_reason(finish_reason: &str) -> bool {
+    finish_reason == "stop"
+}
+
 impl SemanticCache {
     /// Record an answer for reuse. Fire-and-forget: a store failure must never
     /// affect the response the customer already received.
@@ -482,9 +582,13 @@ impl SemanticCache {
     ///   `String` dropped — so there is nothing to store without changing the
     ///   enforce-before-yield guard seam. Replaying a buffered body as SSE would
     ///   also fabricate timing the recorder never saw.
-    /// - **Tool calls.** A `tool_calls` response is a side-effecting
-    ///   instruction; serving a remembered one is a replay, not a saving. Only
-    ///   `finish_reason == "stop"` is stored.
+    /// - **Tool calls and truncated answers.** A `tool_calls` response is a
+    ///   side-effecting instruction; serving a remembered one is a replay, not
+    ///   a saving. A `length`-truncated answer is an artefact of the FIRST
+    ///   caller's `max_tokens`, not an answer. Only `finish_reason == "stop"`
+    ///   is stored — enforced by [`is_cacheable_finish_reason`] at the store
+    ///   call site (B-359, 2026-09-07; until then this sentence was true only
+    ///   because the reason was a hardcoded literal, see B-354).
     /// - **Over-size bodies**, so one pathological response cannot dominate the
     ///   scan every subsequent lookup pays for.
     #[allow(clippy::too_many_arguments)]
@@ -548,9 +652,12 @@ impl SemanticCache {
         let embedding = match self.embed(tenant_id, &key.embed_text).await {
             Ok(v) => v,
             Err(_) => {
-                tracelane_shared::degradation::note(
-                    tracelane_shared::degradation::Degradation::SemanticCacheUnavailable,
-                );
+                // B-347: no credential is configuration, not a degradation.
+                if !embed_failure_is_configuration(&self.no_embedder, tenant_id).await {
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::SemanticCacheUnavailable,
+                    );
+                }
                 return;
             }
         };
@@ -704,10 +811,31 @@ mod clickhouse_roundtrip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-359. Only a complete text answer is remembered; a truncated one, a
+    /// tool call, a filtered one and an unknown reason are all refused.
+    #[test]
+    fn only_a_stop_finish_reason_is_cacheable() {
+        assert!(is_cacheable_finish_reason("stop"));
+        for r in [
+            "length",
+            "tool_calls",
+            "content_filter",
+            "",
+            "STOP",
+            "unknown",
+        ] {
+            assert!(!is_cacheable_finish_reason(r), "`{r}` must not be cached");
+        }
+    }
     use tracelane_shared::{Message, Role};
 
     fn req(model: &str, text: &str, temp: Option<f32>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: model.into(),
             messages: vec![Message {
                 role: Role::User,
@@ -716,6 +844,7 @@ mod tests {
                 tool_calls: None,
             }],
             tools: None,
+            tool_choice: None,
             max_tokens: None,
             temperature: temp,
             stream: None,
@@ -756,6 +885,87 @@ mod tests {
         );
     }
 
+    /// **GWY-48 — THE CACHE-POISONING PROOF.** Two requests differing only in
+    /// `top_p` must NOT share a cache entry. Without the `top_p` arm in
+    /// `request_key` this test fails, and the failure mode in production is that
+    /// the second caller is served the first caller's answer — the exact defect
+    /// B-355 already fixed once for `tool_choice`.
+    #[test]
+    fn params_hash_changes_when_only_top_p_changes() {
+        let mut a = req("m", "hello", Some(0.5));
+        let mut b = req("m", "hello", Some(0.5));
+        a.top_p = Some(0.1);
+        b.top_p = Some(0.9);
+        assert_ne!(
+            request_key(&a).params_hash,
+            request_key(&b).params_hash,
+            "top_p must partition the cache"
+        );
+    }
+
+    /// Same class: a `seed` is a request for a DIFFERENT sampling trajectory, so
+    /// two seeds are two questions.
+    #[test]
+    fn params_hash_changes_when_only_seed_changes() {
+        let mut a = req("m", "hello", None);
+        let mut b = req("m", "hello", None);
+        a.seed = Some(1);
+        b.seed = Some(2);
+        assert_ne!(request_key(&a).params_hash, request_key(&b).params_hash);
+    }
+
+    /// **OBS-53, and NOT in the spec — found while building.** `logprobs` changes
+    /// the SHAPE OF THE RESPONSE BODY. A stored answer from a caller who did not
+    /// ask for logprobs carries no `logprobs` object, so replaying it to a caller
+    /// who did would silently drop a field that caller's client is parsing.
+    #[test]
+    fn params_hash_changes_when_only_logprobs_changes() {
+        let mut a = req("m", "hello", None);
+        let mut b = req("m", "hello", None);
+        a.logprobs = Some(true);
+        b.logprobs = Some(false);
+        assert_ne!(request_key(&a).params_hash, request_key(&b).params_hash);
+
+        let mut c = req("m", "hello", None);
+        let mut d = req("m", "hello", None);
+        c.logprobs = Some(true);
+        c.top_logprobs = Some(3);
+        d.logprobs = Some(true);
+        d.top_logprobs = Some(5);
+        assert_ne!(request_key(&c).params_hash, request_key(&d).params_hash);
+    }
+
+    /// **THE CACHE IS NOT FLUSHED BY THIS DEPLOY.** Each new field is hashed only
+    /// when PRESENT, so a request that sends none of them produces the same
+    /// `params_hash` it did before GWY-48 — which is why the four arms are
+    /// `if let Some(..)` rather than `unwrap_or(default)` like `max_tokens`
+    /// above. Pinned against a literal so a later "tidy-up" that makes them
+    /// unconditional fails here rather than silently discarding every warm entry.
+    #[test]
+    fn a_request_sending_none_of_the_new_fields_keeps_its_pre_gwy48_params_hash() {
+        let mut with_fields = req("m", "hello", Some(0.5));
+        with_fields.top_p = None;
+        with_fields.seed = None;
+        with_fields.logprobs = None;
+        with_fields.top_logprobs = None;
+        assert_eq!(
+            request_key(&req("m", "hello", Some(0.5))).params_hash,
+            request_key(&with_fields).params_hash
+        );
+        // The literal: blake3 over model ‖ max_tokens(0) ‖ temperature(0.5), the
+        // pre-GWY-48 input for this request. If this changes, existing cache
+        // entries were orphaned.
+        let mut h = blake3::Hasher::new();
+        h.update(b"m");
+        h.update(&0u32.to_le_bytes());
+        h.update(&0.5f32.to_le_bytes());
+        assert_eq!(
+            request_key(&req("m", "hello", Some(0.5))).params_hash,
+            h.finalize().to_hex().to_string(),
+            "a warm cache entry written before GWY-48 must still be reachable"
+        );
+    }
+
     /// A different MODEL must never share a cache entry, even for byte-identical
     /// text — the answers are not interchangeable.
     #[test]
@@ -773,5 +983,28 @@ mod tests {
         let user_text = request_key(&r).embed_text;
         r.messages[0].role = Role::Assistant;
         assert_ne!(user_text, request_key(&r).embed_text);
+    }
+
+    /// B-347: a tenant remembered in the negative cache (no embedding-capable
+    /// credential) is CONFIGURATION — the caller must not note a degradation;
+    /// a tenant absent from it errored for real and must.
+    #[tokio::test]
+    async fn b347_no_credential_is_configuration_not_a_degradation() {
+        let cache: moka::future::Cache<TenantId, ()> = moka::future::Cache::builder().build();
+        let configured_out = TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid"),
+        );
+        let faulted = TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid"),
+        );
+        cache.insert(configured_out.clone(), ()).await;
+        assert!(
+            embed_failure_is_configuration(&cache, &configured_out).await,
+            "a tenant in the negative cache failed for lack of a credential — no degradation"
+        );
+        assert!(
+            !embed_failure_is_configuration(&cache, &faulted).await,
+            "a tenant NOT in the negative cache errored for real — that IS a degradation"
+        );
     }
 }

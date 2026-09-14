@@ -85,6 +85,21 @@ Or render it in the terminal, using a trace id from that list:
 tlane trace <traceId> --format timeline   # ASCII waterfall
 ```
 
+### Optional — join the trace your app already has
+
+If your app runs OpenTelemetry with HTTP instrumentation (`opentelemetry-instrumentation-httpx` or
+`-requests` in Python, `@opentelemetry/instrumentation-http` / `-fetch` in Node), every request it
+sends to the gateway already carries a W3C `traceparent` header. The gateway reads it: the
+`gen_ai.chat` span it records takes **your** trace id and is parented to **your** calling span.
+
+What that gives you: one span, correctly parented. If you also send your own spans to Tracelane
+(see the framework integrations), the gateway span appears under your LLM span in the same trace.
+If you do not, Tracelane shows the gateway span as the root of a trace that carries your trace id,
+so you can look it up by the id your own tooling printed.
+
+A malformed header is ignored, never an error — the request proceeds and the span gets a fresh
+trace id with no parent. `tracestate` is not read; nothing is propagated onward to the provider.
+
 ## Optional — group turns into a session
 
 A multi-turn conversation is several traces sharing one id. Send it as the
@@ -111,6 +126,40 @@ client.chat.completions.create(
 ```
 
 </CodeGroup>
+
+## Optional — say who initiated the call
+
+A session tells you *these turns belong together*. It does not tell you **who**.
+Send an end-user id and the `/sessions` list gains a **User** column you can
+click through to every trace from that person.
+
+Three ways in, first one wins:
+
+| What you send | Where |
+|---|---|
+| `x-tracelane-user-id` header (`x-user-id` is an alias) | any route |
+| OpenAI's own top-level `user` field (or `safety_identifier`) | request body — **no code change if you already set it** |
+| Anthropic's `metadata.user_id` | request body, on `/v1/messages` |
+| The `user.id` span attribute | OTLP — `enduser.id` and `langfuse.user.id` also accepted |
+
+```typescript
+await client.chat.completions.create({
+  model: "claude-sonnet-4-6",
+  messages: [{ role: "user", content: "Hello" }],
+  user: "u_4471", // ← already OpenAI-standard; Tracelane just records it
+});
+```
+
+<Warning>
+  **Send an opaque id — a UUID or a hash — not an email address or a phone
+  number.** The value is stored on the span, and PII redaction rewrites anything
+  email-, phone- or card-shaped before it is written. `alice@acme.com` is stored
+  as `[REDACTED:email]`, and the User column shows "redacted" rather than the
+  address. OpenAI and Anthropic ask the same of their equivalent fields.
+</Warning>
+
+Ids longer than 256 characters are dropped rather than truncated — a shortened
+id is a *wrong* id — and the request itself always succeeds either way.
 
 If you use the SDK, `withSession(id, fn)` (TypeScript) and `use_session(id)`
 (Python) set that header for every call in the scope — see

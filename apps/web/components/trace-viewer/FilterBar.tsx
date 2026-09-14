@@ -3,12 +3,22 @@
 import { nextFilterParams } from "@/app/traces/filter-params";
 import { Button, SegmentedControl, cn } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // Only the dimensions the gateway /v1/traces endpoint genuinely filters on are
 // rendered here — no dead chips. status→has_error, model, time→since, latency→
-// min_latency_ms, signature_id (the §2 read-path dims). provider / cost
+// min_latency_ms, signature_id, q (the §2 read-path dims). provider / cost
 // thresholds are V1.1 (need a write-path MV change — not cleanly read-path).
+
+/**
+ * OBS-01. Tied to the gateway's own `ngrambf_v1(4, …)` skip index, not a UI
+ * preference — `crates/gateway/src/trace_reads.rs` `MIN_SEARCH_TERM` /
+ * `validate_search_term`. A shorter term is REJECTED there (400), never
+ * silently scanned, so the client-side gate here exists only to avoid firing
+ * a request that is guaranteed to 400 — the gateway stays the one place the
+ * rule is enforced.
+ */
+const MIN_SEARCH_TERM = 4;
 const STATUS = [
 	{ value: "", label: "All" },
 	{ value: "ok", label: "OK" },
@@ -89,6 +99,10 @@ export function FilterBar() {
 	const [model, setModel] = useState(sp.get("model") ?? "");
 	const [latency, setLatency] = useState(sp.get("min_latency_ms") ?? "");
 	const [signature, setSignature] = useState(sp.get("signature_id") ?? "");
+	// OBS-20: URL-derived, not local state — nothing in this bar SETS it.
+	const endUser = sp.get("end_user") ?? "";
+	const [q, setQ] = useState(sp.get("q") ?? "");
+	const searchRef = useRef<HTMLInputElement>(null);
 
 	const setParam = useCallback(
 		(key: string, value: string) => {
@@ -128,6 +142,66 @@ export function FilterBar() {
 		return () => clearTimeout(id);
 	}, [signature, setParam, sp]);
 
+	// `q` does NOT debounce-as-typed like model/latency/signature above — it
+	// submits on Enter only (OBS-01 §2). Firing a request per keystroke below
+	// the 4-char minimum would just accumulate 400s from the gateway; explicit
+	// submit is also what lets "type `/`, type a term, press Enter" read as one
+	// deliberate action rather than a moving-target debounce.
+	//
+	// Still resync FROM the URL when it changes out from under us (Clear all,
+	// the browser back button, a bare `?q=` typed by hand) — otherwise the box
+	// would show stale text after either.
+	useEffect(() => {
+		setQ(sp.get("q") ?? "");
+	}, [sp]);
+
+	// `/` focuses the search box, unless focus is already inside a form control
+	// (typing a literal `/` into the model filter must not get hijacked).
+	useEffect(() => {
+		function onKeyDown(e: KeyboardEvent) {
+			if (e.key !== "/") return;
+			const el = document.activeElement as HTMLElement | null;
+			const tag = el?.tagName;
+			if (
+				tag === "INPUT" ||
+				tag === "TEXTAREA" ||
+				tag === "SELECT" ||
+				el?.isContentEditable
+			) {
+				return;
+			}
+			e.preventDefault();
+			searchRef.current?.focus();
+		}
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, []);
+
+	const qTrimmed = q.trim();
+	const qTooShort = qTrimmed.length > 0 && qTrimmed.length < MIN_SEARCH_TERM;
+
+	function submitSearch() {
+		if (qTrimmed.length === 0) {
+			setParam("q", "");
+			return;
+		}
+		// Below the minimum: the hint is already visible: refuse to submit
+		// rather than fire a request the gateway will 400 anyway.
+		if (qTooShort) return;
+		setParam("q", qTrimmed);
+	}
+
+	function handleSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+		if (e.key === "Enter") {
+			e.preventDefault();
+			submitSearch();
+		} else if (e.key === "Escape") {
+			setQ("");
+			setParam("q", "");
+			e.currentTarget.blur();
+		}
+	}
+
 	// The default 1h range isn't a "custom" filter — only a non-default range
 	// counts toward showing "Clear all".
 	const active = Boolean(
@@ -136,6 +210,8 @@ export function FilterBar() {
 			model ||
 			latency ||
 			signature ||
+			sp.get("q") ||
+			endUser ||
 			group,
 	);
 
@@ -144,6 +220,28 @@ export function FilterBar() {
 
 	return (
 		<div className="mb-4 flex flex-wrap items-center gap-2">
+			{/* OBS-01 full-text search — span name + attributes, ngram-indexed on the
+			    gateway (`crates/gateway/src/trace_reads.rs:1849`). Submits on Enter,
+			    not on every keystroke (see the `q` effect above); Esc clears. */}
+			<div className="flex flex-col">
+				<input
+					ref={searchRef}
+					type="search"
+					value={q}
+					onChange={(e) => setQ(e.target.value)}
+					onKeyDown={handleSearchKeyDown}
+					placeholder="search span names and attributes… (/)"
+					aria-label="Search span names and attributes"
+					title="Substring match. Case-sensitive, except a plain lowercase term also matches raw case. Minimum 4 characters."
+					className={cn(inputCls, "w-64")}
+				/>
+				{qTooShort && (
+					<span className="mt-0.5 text-2xs text-ink-3">
+						4 characters minimum
+					</span>
+				)}
+			</div>
+
 			{/* Status */}
 			<SegmentedControl
 				label="Trace status"
@@ -220,6 +318,17 @@ export function FilterBar() {
 				/>
 			)}
 
+			{/* OBS-20 — chip only, never an input. You reach this filter by clicking
+			    a user on /sessions or on a trace, not by typing an opaque id from
+			    memory; an empty text box inviting you to guess one would be a
+			    dead chip. Clearable like every other. */}
+			{endUser && (
+				<FilterChip
+					label={`user: ${endUser.length > 16 ? `${endUser.slice(0, 16)}…` : endUser}`}
+					onRemove={() => setParam("end_user", "")}
+				/>
+			)}
+
 			{active && (
 				<Button
 					variant="ghost"
@@ -228,6 +337,7 @@ export function FilterBar() {
 						setModel("");
 						setLatency("");
 						setSignature("");
+						setQ("");
 						router.replace(pathname);
 					}}
 				>

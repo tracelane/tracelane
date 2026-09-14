@@ -1,6 +1,10 @@
 import type { Span } from "@/components/trace-viewer/types";
 import { describe, expect, it } from "vitest";
-import { computeTraceSummary, traceTimeBounds } from "./trace-summary";
+import {
+	barGeometry,
+	computeTraceSummary,
+	traceTimeBounds,
+} from "./trace-summary";
 
 function span(p: Partial<Span> & { span_id: string }): Span {
 	return {
@@ -75,5 +79,44 @@ describe("computeTraceSummary", () => {
 		expect(startUs).toBe(1_000_000);
 		expect(endUs).toBe(3_500_000);
 		expect(s.totalDurationUs).toBe(2_500_000);
+	});
+});
+
+describe("barGeometry — the ONE formula WaterfallView and SwimlaneView (OBS-49) share", () => {
+	it("positions a span at its true fraction of the trace window", () => {
+		const s = span({
+			span_id: "a",
+			start_time_us: 1_350_000, // 350ms into a window starting at 1_000_000
+			duration_us: 700_000, // 50% of a 1_400_000us window
+		});
+		const { leftPct, widthPct } = barGeometry(s, 1_000_000, 1_400_000);
+		expect(leftPct).toBeCloseTo(25);
+		expect(widthPct).toBeCloseTo(50);
+	});
+
+	it("floors width at 0.5% so a near-zero-duration span stays visible", () => {
+		const s = span({ span_id: "z", start_time_us: 1_000_000, duration_us: 1 });
+		const { widthPct } = barGeometry(s, 1_000_000, 1_400_000);
+		expect(widthPct).toBe(0.5);
+	});
+
+	it("never lets a bar overrun the right edge of the track", () => {
+		const s = span({
+			span_id: "late",
+			start_time_us: 1_390_000, // 99.3% in
+			duration_us: 1_000_000, // would overrun without the cap
+		});
+		const { leftPct, widthPct } = barGeometry(s, 1_000_000, 1_400_000);
+		expect(leftPct + widthPct).toBeLessThanOrEqual(100);
+	});
+
+	it("clamps a span starting before the window to the origin, never negative", () => {
+		const s = span({
+			span_id: "early",
+			start_time_us: 500_000,
+			duration_us: 200_000,
+		});
+		const { leftPct } = barGeometry(s, 1_000_000, 1_400_000);
+		expect(leftPct).toBe(0);
 	});
 });

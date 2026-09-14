@@ -150,13 +150,23 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, ApiError> {
             "Authorization must be ASCII",
         )
     })?;
-    crate::auth::validate_authorization(s).await.map_err(|e| {
+    let claims = crate::auth::validate_authorization(s).await.map_err(|e| {
         err(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
+            crate::auth::failure_status(&e),
+            crate::auth::failure_code(&e),
             format!("auth failed: {e}"),
         )
-    })
+    })?;
+    // B-383 (d), 2026-09-12: scores and policies are workspace data — the `read`
+    // scope, never an `ingest`-only key. A JWT session passes as before.
+    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "This API key is not scoped to read recorded data. It needs the `read` scope.",
+        ));
+    }
+    Ok(claims)
 }
 
 /// The `f_online_evals` gate. Applies to READS as well as writes.
@@ -651,7 +661,8 @@ async fn scores_handler(
               WHERE tenant_id = ? AND scored_at >= now() - toIntervalHour(?) {trace_filter} \
               ORDER BY scored_at DESC LIMIT ?"
         ),
-        crate::clickhouse_query::PlanTier::Builder,
+        crate::clickhouse_query::tier_for_tenant(Some(&state.entitlements), &claims.tenant_id)
+            .await,
     )
     .sql_with_settings();
 
@@ -739,6 +750,15 @@ struct SummaryResponse {
     judge_cost_usd: Option<f64>,
     /// The policy's monthly ceiling — `null` with no policy.
     judge_budget_usd_monthly: Option<f64>,
+    /// B-299: whether THIS workspace's content is captured at all. `false` means
+    /// the judge never receives a request body from this workspace, whatever the
+    /// policy says — `admission` refuses on the same predicate storage uses.
+    /// This is the read-back surface for that refusal: a policy with
+    /// `enabled: true` and `content_capture: false` scores nothing, by design.
+    content_capture: bool,
+    /// Process-wide count of admissions refused on the capture policy since the
+    /// gateway started (all workspaces — the counter is not per tenant).
+    admissions_refused_capture_off: u64,
 }
 
 #[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
@@ -784,7 +804,8 @@ async fn summary_handler(
                 sum(cost_usd) AS judge_cost_usd \
            FROM online_eval_scores FINAL \
           WHERE tenant_id = ? AND scored_at >= now() - toIntervalHour(?)",
-        crate::clickhouse_query::PlanTier::Builder,
+        crate::clickhouse_query::tier_for_tenant(Some(&state.entitlements), &claims.tenant_id)
+            .await,
     )
     .sql_with_settings();
     let s = ch
@@ -850,7 +871,8 @@ async fn summary_handler(
             AND JSONExtractString(attributes, 'tracelane_eval_run_id') = '' \
             AND NOT JSONHas(attributes, 'tracelane_semantic_cache_hit') \
             AND start_time >= now() - toIntervalHour(?)",
-        crate::clickhouse_query::PlanTier::Builder,
+        crate::clickhouse_query::tier_for_tenant(Some(&state.entitlements), &claims.tenant_id)
+            .await,
     )
     .sql_with_settings();
     let e = ch
@@ -868,7 +890,10 @@ async fn summary_handler(
             )
         })?;
 
+    let content_capture = crate::server::config::content_capture_enabled(&claims.tenant_id);
     Ok(Json(SummaryResponse {
+        content_capture,
+        admissions_refused_capture_off: crate::online_eval::skipped_capture_off(),
         window_hours: hours,
         configured_sample_rate: configured,
         enabled,

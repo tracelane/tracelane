@@ -15,10 +15,13 @@
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { ChainStatusChip } from "@/components/trace-viewer/ChainStatusChip";
 import { CopyButton } from "@/components/trace-viewer/CopyButton";
+import { ShareDialog } from "@/components/trace-viewer/ShareDialog";
 import { TraceDetailView } from "@/components/trace-viewer/TraceDetailView";
 import { TraceFlagPanel } from "@/components/trace-viewer/TraceFlagPanel";
 import type { Span } from "@/components/trace-viewer/types";
 import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
+import { fetchSignaturesFor } from "@/lib/metrics/fetch";
+import { parseTimeRange } from "@/lib/metrics/time-range";
 import { EmptyState, Skeleton } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -86,18 +89,18 @@ async function SpanData({ traceId }: { traceId: string }) {
 	// than an absent one.
 	let hitCounts: Record<string, number> | undefined;
 	try {
-		const sinceIso = new Date(Date.now() - 30 * 86_400_000).toISOString();
-		const data = await gatewayGet<{
-			signatures: { signature_id: string; your_hits: number }[];
-		}>(`/v1/query/signatures?since=${encodeURIComponent(sinceIso)}`);
-		hitCounts = Object.fromEntries(
-			(data.signatures ?? []).map(
-				(s: { signature_id: string; your_hits: number }) => [
-					s.signature_id,
-					s.your_hits,
-				],
-			),
+		// The badge's window is the signatures page's default (30 d), through the
+		// shared layer — never a second `Date.now() − 30 days` here.
+		const sigWindow = parseTimeRange(
+			{ range: "30d" },
+			{ defaultPreset: "30d", nowMs: Date.now() },
 		);
+		const data = await fetchSignaturesFor(sigWindow);
+		hitCounts = data
+			? Object.fromEntries(
+					data.signatures.map((s) => [s.signature_id, s.your_hits]),
+				)
+			: undefined;
 	} catch {
 		hitCounts = undefined;
 	}
@@ -113,7 +116,7 @@ export default async function TraceDetailPage({ params }: Props) {
 
 	return (
 		<div className="p-6">
-			<div className="mb-6 flex items-center gap-3">
+			<div className="mb-6 flex flex-wrap items-center gap-x-3 gap-y-2">
 				<Link
 					href="/traces"
 					className="shrink-0 text-sm text-ink-2 transition-colors hover:text-ink"
@@ -124,7 +127,13 @@ export default async function TraceDetailPage({ params }: Props) {
 				<h1 className="min-w-0 flex-1 truncate font-mono text-xl font-semibold text-ink">
 					{traceId}
 				</h1>
-				<div className="flex shrink-0 items-center gap-1.5">
+				{/* flex-wrap on the row (above) lets this action cluster drop to its
+				    own line on a narrow viewport instead of forcing horizontal
+				    scroll — six shrink-0 actions (ledger chip, 2 copy buttons,
+				    Compare, Flag, Share) never fit beside a full-width trace id
+				    under ~640px. Found by the qaA render-proof sweep, mobile
+				    (390px) viewport, both themes. */}
+				<div className="flex w-full flex-wrap items-center gap-1.5 sm:w-auto">
 					{/* ChainStatusChip is async (server fetch). Suspense fallback is a
 					    placeholder skeleton — sized to match the chip — so the header
 					    layout does not reflow when the ledger status resolves. */}
@@ -153,6 +162,10 @@ export default async function TraceDetailPage({ params }: Props) {
 					<Suspense fallback={<Skeleton className="h-7 w-28 rounded-md" />}>
 						<TraceFlagPanel traceId={traceId} />
 					</Suspense>
+					{/* OBS-48. Client component (mint/list/revoke state) — no server
+					    fetch needed to render the button itself, so no Suspense
+					    boundary; the active-links list loads only once the panel opens. */}
+					<ShareDialog traceId={traceId} />
 				</div>
 			</div>
 			<Suspense

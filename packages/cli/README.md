@@ -99,7 +99,7 @@ tlane prompt diff my-prompt --from-env staging --to-env production
 tlane prompt list my-prompt [--limit 100]
 ```
 
-**Available on:** Team $249+ for full promote/rollback workflow. Builder $59 can list and show (read-only).
+**Available on:** Team $229+ for full promote/rollback workflow. Builder $29 can list and show (read-only).
 
 ### `tlane export`
 

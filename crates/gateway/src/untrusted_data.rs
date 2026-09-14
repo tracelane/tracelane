@@ -127,7 +127,7 @@ fn wrap_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracelane_shared::{ImageUrl, Tool, ToolCall};
+    use tracelane_shared::{ImageUrl, ToolCall};
 
     fn user_text(s: &str) -> Message {
         Message {
@@ -158,11 +158,16 @@ mod tests {
 
     fn request_with(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
             model: "claude-sonnet-4-6".into(),
             messages,
             max_tokens: None,
             temperature: None,
             tools: None,
+            tool_choice: None,
             stream: None,
             system: None,
             metadata: None,

@@ -25,6 +25,8 @@ from typing import Any
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 
+from tracelane.instrumentations._attach import attach
+
 _tracer = trace.get_tracer("tracelane.langgraph", "0.1.0")
 
 
@@ -50,8 +52,6 @@ def instrument_langgraph(graph: Any) -> None:
 
 
 def _patch_invoke(graph: Any, graph_name: str) -> None:
-    if not hasattr(graph, "invoke"):
-        return
     original = graph.invoke
 
     def _patched_invoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
@@ -78,12 +78,13 @@ def _patch_invoke(graph: Any, graph_name: str) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    graph.invoke = _patched_invoke
+    # B-314: `attach`, not assignment — idempotent (a second instrument_langgraph()
+    # does not double-wrap and double-count) and it RAISES if the framework renamed
+    # the method, where the old `if not hasattr: return` was a silent capture gap.
+    attach(graph, "invoke", lambda _original: _patched_invoke)
 
 
 def _patch_ainvoke(graph: Any, graph_name: str) -> None:
-    if not hasattr(graph, "ainvoke"):
-        return
     original = graph.ainvoke
 
     async def _patched_ainvoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
@@ -110,13 +111,14 @@ def _patch_ainvoke(graph: Any, graph_name: str) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    graph.ainvoke = _patched_ainvoke
+    # B-314: `attach`, not assignment — idempotent (a second instrument_langgraph()
+    # does not double-wrap and double-count) and it RAISES if the framework renamed
+    # the method, where the old `if not hasattr: return` was a silent capture gap.
+    attach(graph, "ainvoke", lambda _original: _patched_ainvoke)
 
 
 def _patch_stream(graph: Any, graph_name: str) -> None:
     """Wrap stream() to emit a span per chunk for stuck-loop detection."""
-    if not hasattr(graph, "stream"):
-        return
     original = graph.stream
 
     def _patched_stream(input: Any, config: Any = None, **kwargs: Any) -> Any:
@@ -146,7 +148,10 @@ def _patch_stream(graph: Any, graph_name: str) -> None:
                 span.set_status(StatusCode.ERROR, str(exc))
                 raise
 
-    graph.stream = _patched_stream
+    # B-314: `attach`, not assignment — idempotent (a second instrument_langgraph()
+    # does not double-wrap and double-count) and it RAISES if the framework renamed
+    # the method, where the old `if not hasattr: return` was a silent capture gap.
+    attach(graph, "stream", lambda _original: _patched_stream)
 
 
 def _record_result(span: Any, result: Any) -> None:

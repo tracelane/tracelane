@@ -75,26 +75,47 @@ export async function setupE2EDb(): Promise<E2EDatabase | null> {
 	await db.insert(schema.planEntitlements).values([
 		{
 			planLookupKey: "free_v1",
-			seatCapIncluded: 1,
-			seatCapMax: 1,
-			retentionDays: 7,
-			traceQuotaMonthly: 10_000,
-			gatewayQuotaMonthly: 10_000,
-			overageHardCapMultiplier: "1.0",
-			overagePricePer10kUsd: "0.00",
 			fFullCapture: false,
+			// ADR-076 / BILL-01 six-meter columns — mirrors plans.v3.json free_v1.
+			indexedWindowDays: 3,
+			queryableDays: 30,
+			ledgerDays: 30,
+			coldArchiveDays: 7,
+			hotGbIncluded: "0.25",
+			ingestGbIncluded: "1",
+			seriesIncluded: 100,
+			scanUnitsIncluded: 10,
+			evalRunsIncluded: 50,
+			unlimitedSeats: false,
+			fSso: false,
+			overageAllowed: false,
 		},
 		{
 			planLookupKey: "team_v1",
-			seatCapIncluded: 10,
-			seatCapMax: 25,
-			retentionDays: 90,
-			traceQuotaMonthly: 1_000_000,
-			gatewayQuotaMonthly: 1_000_000,
-			overageHardCapMultiplier: "5.0",
-			overagePricePer10kUsd: "1.20",
 			fFullCapture: false,
 			fPromptPromotionWrite: true,
+			// Team+ = TRUE in the real seed (`db/seed.mjs`) for both flags — omitting
+			// them here left every `f_online_evals` / `f_annotation_queues` DB check
+			// resolving FALSE under the E2E bypass (the schema's NOT NULL DEFAULT
+			// FALSE wins over the `PLAN_ENTITLEMENTS.team` static default of TRUE),
+			// so /settings/evals rendered its upsell for a plan that should see the
+			// manager. `f_annotation_queues` is gateway-resolved, not DB-resolved, so
+			// this fixes only the field this file's DB check can actually reach.
+			fOnlineEvals: true,
+			fAnnotationQueues: true,
+			// ADR-076 / BILL-01 six-meter columns — mirrors plans.v3.json team_v1.
+			indexedWindowDays: 90,
+			queryableDays: 730,
+			ledgerDays: 730,
+			coldArchiveDays: null,
+			hotGbIncluded: "75",
+			ingestGbIncluded: "300",
+			seriesIncluded: 15000,
+			scanUnitsIncluded: 2000,
+			evalRunsIncluded: 40000,
+			unlimitedSeats: true,
+			fSso: true,
+			overageAllowed: true,
 		},
 	]);
 	await pg.query(

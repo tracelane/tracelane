@@ -26,6 +26,7 @@ pub mod workos_webhook;
 use std::sync::OnceLock;
 
 use anyhow::{Context as _, Result, bail};
+use axum::http::StatusCode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -76,8 +77,6 @@ pub struct Claims {
     pub tenant_id: TenantId,
     /// Subject (user ID or service account ID from WorkOS)
     pub sub: String,
-    /// Expiry timestamp (Unix seconds since epoch)
-    pub exp: u64,
     /// Authentication method that produced these claims.
     pub auth_method: AuthMethod,
     /// Org membership role, read from the WorkOS session JWT `role` claim
@@ -110,6 +109,14 @@ pub struct Claims {
     /// GWY-43 — this key's requests-per-minute override. `None` means "use the
     /// tenant's plan tier", which is what every key did before GWY-43.
     pub rate_limit_rpm: Option<u32>,
+    /// BILL-01 A3 — this key's per-key budget cadence, resolved in the same
+    /// SELECT that authenticated it (the `api_keys.budget_reset` column,
+    /// default `'monthly'`). Every non-API-key credential carries `Monthly` —
+    /// there is no per-key budget to reset on a JWT / self-host / SPIFFE
+    /// principal, so the field is inert there rather than `Option`-wrapped;
+    /// `admission::run`'s `KeyBudget` step reads it only when a key budget is
+    /// actually being enforced.
+    pub budget_reset: crate::spend::BudgetReset,
 }
 
 impl Claims {
@@ -319,6 +326,11 @@ pub enum AuthMethod {
     /// looked like it would regress self-host. They are different principals.
     SelfHostMasterKey,
     /// mTLS SPIFFE SVID (ingest workers only).
+    // Never minted by THIS binary — ingest's SPIFFE/mTLS path authenticates in
+    // `crates/ingest`. Kept as a principal the role predicates are tested against
+    // (PL-9b: an mTLS service identity is never an admin), so a future gateway
+    // route that accepts an SVID inherits a denial that already has a test.
+    #[allow(dead_code)]
     Mtls,
 }
 
@@ -342,6 +354,8 @@ struct SelfHostAuth {
     master_key: Option<SecretString>,
 }
 
+// B-386: stays global — a boot-time mode switch that never changes, read by
+// `validate_authorization`, which has no state handle.
 static SELF_HOST_AUTH: OnceLock<SelfHostAuth> = OnceLock::new();
 
 /// Install single-tenant self-host auth. Called exactly once at startup; a
@@ -376,7 +390,6 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
     Ok(Claims {
         tenant_id: sh.tenant_id.clone(),
         sub: "self-host".to_string(),
-        exp: u64::MAX,
         // PL-9b: its OWN principal, not `ApiKey`. This is the operator.
         auth_method: AuthMethod::SelfHostMasterKey,
         role: None,
@@ -384,6 +397,9 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
         // GWY-43: no budget and no per-key rate override on this credential.
         budget_usd_monthly: None,
         rate_limit_rpm: None,
+        // BILL-01 A3: no per-key budget on this credential either; `Monthly`
+        // is inert here (see the field doc) rather than meaningful.
+        budget_reset: crate::spend::BudgetReset::Monthly,
     })
 }
 
@@ -414,6 +430,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Debug, Deserialize)]
 struct WorkOsClaims {
     sub: String,
+    /// The token's expiry. `jsonwebtoken` enforces it during decode, before
+    /// this struct exists, and nothing downstream reads it again — kept so the
+    /// struct mirrors the claim set the issuer signs (wire contract).
+    #[allow(dead_code)]
     exp: u64,
     #[serde(
         default,
@@ -427,6 +447,89 @@ struct WorkOsClaims {
     /// `viewer`). Absent on service tokens and pre-role-config JWTs.
     #[serde(default)]
     role: Option<String>,
+}
+
+/// B-391 (c): the credential could not be CHECKED — as distinct from checked
+/// and found wrong.
+///
+/// Before this, a Postgres/Neon outage with a cold auth cache surfaced as
+/// **401 "invalid or expired credentials"** (`api_key.rs` bailed with a string,
+/// every handler mapped every `Err` to 401). A customer reading that rotates a
+/// perfectly good key; a watchdog reading it sees "auth failures", not "the
+/// control plane is down". The two are different facts and get different
+/// status codes: **503 `auth_unavailable`** for this error anywhere in the
+/// chain, 401 for everything else. Fail-CLOSED either way (§10) — the request
+/// is refused; only the reason is honest now.
+///
+/// Sources that produce it: the API-key Postgres lookup (`api_key.rs`), a JWKS
+/// that cannot be fetched on a cold cache (`validate_jwt`), and the
+/// `org_id → tenant` bridge's Postgres lookup (`org_tenant_cache.rs`). A key
+/// that is simply not found, a JWT whose `kid` is unknown after a successful
+/// refresh, or an org with no tenant are all still 401.
+///
+/// `Display` is the STATIC client-safe sentence, deliberately: several route
+/// families answer `format!("auth failed: {e}")`, and the Postgres error text
+/// must not ride into a client body through that. The cause lives in `detail`
+/// (Debug only) and is logged at the site that produced it.
+#[derive(Debug, thiserror::Error)]
+#[error("authentication temporarily unavailable — retry")]
+pub struct AuthStoreUnavailable {
+    /// The underlying cause, for logs. Never rendered by `Display`.
+    pub detail: String,
+}
+
+impl AuthStoreUnavailable {
+    /// Build one, logging the cause ONCE here so no handler has to.
+    pub fn new(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        tracing::error!(detail = %detail, "auth store unavailable");
+        Self { detail }
+    }
+}
+
+/// True when [`AuthStoreUnavailable`] sits anywhere in the error's context
+/// chain — `.context(..)` wrappers must not hide it.
+#[must_use]
+pub fn is_store_unavailable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<AuthStoreUnavailable>().is_some())
+}
+
+/// The status for a failed [`validate_authorization`]. ONE place, so the 28
+/// route families that authenticate cannot disagree about what an outage
+/// looks like: 503 when the store was unreachable, 401 otherwise.
+#[must_use]
+pub fn failure_status(err: &anyhow::Error) -> StatusCode {
+    if is_store_unavailable(err) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::UNAUTHORIZED
+    }
+}
+
+/// The status and the client-facing message, for sites that answer a static
+/// sentence rather than the error's own text.
+#[must_use]
+pub fn failure(err: &anyhow::Error) -> (StatusCode, &'static str) {
+    if is_store_unavailable(err) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication temporarily unavailable — retry",
+        )
+    } else {
+        (StatusCode::UNAUTHORIZED, "invalid or expired credentials")
+    }
+}
+
+/// Machine-readable reason token for the JSON `error` field, paired with
+/// [`failure`].
+#[must_use]
+pub fn failure_code(err: &anyhow::Error) -> &'static str {
+    if is_store_unavailable(err) {
+        "auth_unavailable"
+    } else {
+        "unauthorized"
+    }
 }
 
 /// Validate an `Authorization` header value (Bearer JWT or `tlane_` API key).
@@ -500,9 +603,11 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
     // 2. Load JWKS and find the matching key. A12: on cache miss, force
     //    one rate-limited refresh in case WorkOS just rotated its key —
     //    otherwise a fresh `kid` 401s every JWT for up to CACHE_TTL.
+    // B-391 (c): a JWKS that cannot be fetched on a cold cache is an OUTAGE of
+    // the store we check credentials against, not a bad credential.
     let jwks_cache = jwks::get_cached_with_refresh_on_miss(&kid)
         .await
-        .context("JWKS unavailable")?;
+        .map_err(|e| AuthStoreUnavailable::new(format!("JWKS: {e:#}")))?;
     let decoding_key = jwks_cache
         .lookup(&kid)
         .ok_or_else(|| anyhow::anyhow!("no JWKS entry for kid={kid}"))?;
@@ -515,7 +620,6 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
     Ok(Claims {
         tenant_id,
         sub: claims.sub,
-        exp: claims.exp,
         auth_method: AuthMethod::JwtBearer,
         role,
         // A JWT is governed by Role, not by scopes — see the field's invariant.
@@ -523,6 +627,8 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
         // GWY-43: no budget and no per-key rate override on this credential.
         budget_usd_monthly: None,
         rate_limit_rpm: None,
+        // BILL-01 A3: a JWT carries no per-key budget cadence either.
+        budget_reset: crate::spend::BudgetReset::Monthly,
     })
 }
 
@@ -684,7 +790,6 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
     Claims {
         tenant_id,
         sub: "dev-stub".into(),
-        exp: u64::MAX,
         auth_method,
         // Dev tenant = full access, stated EXPLICITLY (PL-9). It used to be
         // `None`, i.e. full access by falling through the grandfather — the
@@ -696,6 +801,7 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
         // GWY-43: no budget and no per-key rate override on this credential.
         budget_usd_monthly: None,
         rate_limit_rpm: None,
+        budget_reset: crate::spend::BudgetReset::Monthly,
     }
 }
 
@@ -706,6 +812,50 @@ mod tests {
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().unwrap()
+    }
+
+    // ── B-391 (c): an auth-store outage is 503, a bad credential is 401, and
+    // the distinction survives `.context()` wrapping and the moka `Arc` hop. ──
+
+    #[test]
+    fn store_outage_is_503_and_a_bad_credential_is_401() {
+        let outage: anyhow::Error = AuthStoreUnavailable {
+            detail: "connection refused".into(),
+        }
+        .into();
+        assert_eq!(failure_status(&outage), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failure_code(&outage), "auth_unavailable");
+        let (st, msg) = failure(&outage);
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("temporarily unavailable"));
+
+        let bad = anyhow::anyhow!("API key not found or revoked");
+        assert_eq!(failure_status(&bad), StatusCode::UNAUTHORIZED);
+        assert_eq!(failure_code(&bad), "unauthorized");
+        assert_eq!(failure(&bad).1, "invalid or expired credentials");
+    }
+
+    #[test]
+    fn store_outage_survives_context_wrapping() {
+        let wrapped = anyhow::Error::from(AuthStoreUnavailable {
+            detail: "pool timeout".into(),
+        })
+        .context("api key lookup")
+        .context("validate_authorization");
+        assert!(is_store_unavailable(&wrapped));
+        assert_eq!(failure_status(&wrapped), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn store_outage_display_never_carries_the_cause() {
+        // Several route families answer `format!("auth failed: {e}")`; the
+        // Postgres error text must not ride into a client body through that.
+        let e = AuthStoreUnavailable {
+            detail: "FATAL: password authentication failed for user neondb_owner".into(),
+        };
+        let shown = e.to_string();
+        assert!(!shown.contains("neondb_owner"), "{shown}");
+        assert!(!shown.contains("password"), "{shown}");
     }
 
     #[test]
@@ -1008,13 +1158,13 @@ mod tests {
         Claims {
             tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).unwrap()),
             sub: "u".into(),
-            exp: u64::MAX,
             auth_method: AuthMethod::JwtBearer,
             role,
             key_scope: scope::KeyScope::LegacyFullSurface,
             // GWY-43: no budget and no per-key rate override on this credential.
             budget_usd_monthly: None,
             rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
         }
     }
 
@@ -1054,13 +1204,13 @@ mod tests {
             let claims = Claims {
                 tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).unwrap()),
                 sub: "u".into(),
-                exp: u64::MAX,
                 auth_method: AuthMethod::JwtBearer,
                 role: role_from_claim(raw),
                 key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
                 // GWY-43: no budget and no per-key rate override on this credential.
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
+                budget_reset: crate::spend::BudgetReset::Monthly,
             };
             assert_eq!(claims.role, None, "{raw:?} must not resolve to a role");
             assert!(
@@ -1082,13 +1232,13 @@ mod tests {
         let admin = Claims {
             tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).unwrap()),
             sub: "u".into(),
-            exp: u64::MAX,
             auth_method: AuthMethod::JwtBearer,
             role: role_from_claim(Some("admin")),
             key_scope: crate::auth::scope::KeyScope::LegacyFullSurface,
             // GWY-43: no budget and no per-key rate override on this credential.
             budget_usd_monthly: None,
             rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
         };
         assert_eq!(admin.role, Some(Role::Owner));
         assert!(admin.can_admin() && admin.can_mint_keys() && admin.is_verified_owner());
