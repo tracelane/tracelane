@@ -13,6 +13,7 @@
  * `DEFAULT_VERDICT_LIMIT`. */
 export const DEFAULT_VERDICT_LIMIT = 100;
 
+// pricing-guard: allow "hard cap" — a query page-size cap, not billing
 /** The gateway's hard cap on `?limit=` for `GET /v1/guardrails/verdicts`
  * (`MAX_VERDICT_LIMIT`, trace_reads.rs). Never request or link past this. */
 export const MAX_VERDICT_LIMIT = 500;

@@ -967,6 +967,12 @@ if command -v python3 >/dev/null 2>&1; then
     # teaches everyone to ignore it) and that planted drift is actually detected.
     area ALWAYS
     run "claim anchors hold"           python3 scripts/ci/check-claim-anchors.py
+    # The generated data model (docs/reference/DATA_MODEL.md) must equal what the
+    # schemas say — the control for orphan tables, dead columns and doc drift
+    # (founder, 2026-09-14: "wire it with the next Rust block, falsification-
+    # proven"). Its --selftest plants staleness and proves --check sees it; the
+    # guard meta-gate runs that selftest because this line names the script.
+    run "data model (generated) current" python3 scripts/ci/build-data-model.py --check
     area DOCS RUST WEB
     run "doc cross-doc consistency"    python3 scripts/ci/check-doc-consistency.py
     area DOCS

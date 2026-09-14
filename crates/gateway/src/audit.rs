@@ -14,7 +14,7 @@
 //!   [`audit_keys::TenantAuditKeyStore`]. Each tenant's Merkle root is
 //!   signed by a tenant-scoped key; cross-tenant signing-key compromise
 //!   surface is bounded by `TenantAuditKeyStore` access (minting is
-//!   gated on the Audit SKU entitlement `f_audit_addon`).
+//!   gated on the Enterprise audit-export entitlement `f_audit_addon`).
 //!   Non-entitled tenants and dev fall back to the global
 //!   `TRACELANE_REKOR_SIGNING_KEY`.
 //! - **C5**: Ed25519 PKCS#8 bytes wrapped in `secrecy::SecretBox` so

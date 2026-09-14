@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwap;
 use clickhouse::Client as ClickhouseClient;
 use uuid::Uuid;
@@ -39,6 +39,16 @@ use uuid::Uuid;
 use tracelane_shared::TenantId;
 
 use crate::auto_rollback::{PromptMetrics, RollbackDecision, RollbackEngine, RollbackMode};
+
+/// A refusal the CALLER caused — a version id that is not one of this tenant's
+/// registered versions — as opposed to a fault inside the router. The write
+/// handlers map it to 400 and everything else to 500 (`prompt_routes.rs`
+/// `router_err`). `B-398`, founder 2026-09-14: promote answered 500 on an
+/// unknown `to_version_id`, on a path a customer touches. Typed rather than
+/// string-matched so the mapping cannot drift when a message is reworded.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ClientFault(pub String);
 
 /// Deployment environment for a routed prompt version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1338,7 +1348,10 @@ impl PromptRouter {
         // of A's choosing and `GET /v1/prompts/<name>?env=production` returned
         // B's prompt text. Fails CLOSED — see `tenant_owns_version`.
         if !self.tenant_owns_version(&tenant_id, to_version_id) {
-            bail!("prompt version {to_version_id} is not a registered version for this tenant");
+            return Err(ClientFault(format!(
+                "prompt version {to_version_id} is not a registered version for this tenant"
+            ))
+            .into());
         }
         // Eval-gate check.
         let decision_kind = match (eval_run_id, self.require_eval_gate) {
@@ -1469,7 +1482,10 @@ impl PromptRouter {
         // of A's choosing and `GET /v1/prompts/<name>?env=production` returned
         // B's prompt text. Fails CLOSED — see `tenant_owns_version`.
         if !self.tenant_owns_version(&tenant_id, to_version_id) {
-            bail!("prompt version {to_version_id} is not a registered version for this tenant");
+            return Err(ClientFault(format!(
+                "prompt version {to_version_id} is not a registered version for this tenant"
+            ))
+            .into());
         }
         let key_to: RoutingKey = (tenant_id.clone(), prompt_name.to_string(), to_env);
         let from_version_id = self.routing.load().get(&key_to).copied();
@@ -1523,7 +1539,10 @@ impl PromptRouter {
         metrics: &PromptMetrics,
     ) -> Result<()> {
         if !self.tenant_owns_version(tenant_id, prompt_version_id) {
-            bail!("prompt version {prompt_version_id} is not a registered version for this tenant");
+            return Err(ClientFault(format!(
+                "prompt version {prompt_version_id} is not a registered version for this tenant"
+            ))
+            .into());
         }
         self.rollback_engine
             .observe(tenant_id.clone(), prompt_version_id, metrics)

@@ -1,4 +1,4 @@
-//! Audit-data retention floor for the Audit add-on SKU (ADR-034).
+//! Audit-data retention floor for the Enterprise audit-export entitlement (ADR-034).
 //!
 //! EU AI Act Article 12(2)(c) requires a minimum 6-month retention
 //! for high-risk-AI-system logs. The Enterprise export contract promises
@@ -35,10 +35,10 @@ pub const AUDIT_ADDON_MIN_RETENTION_DAYS: i32 = 180;
 /// # Panics
 ///
 /// Panics if `contractual_override` is `Some(n)` with `n <
-/// AUDIT_ADDON_MIN_RETENTION_DAYS` on an Audit-add-on workspace. The
+/// AUDIT_ADDON_MIN_RETENTION_DAYS` on an audit-export workspace. The
 /// override is structurally intended for "longer than the floor" use
 /// cases only. A future caller wanting a *shorter* retention must
-/// either (a) not be on the Audit add-on, or (b) get an explicit ADR
+/// either (a) not hold the export entitlement, or (b) get an explicit ADR
 /// amendment.
 #[cfg(test)]
 pub fn resolve_audit_retention(
@@ -52,7 +52,7 @@ pub fn resolve_audit_retention(
                 override_days >= AUDIT_ADDON_MIN_RETENTION_DAYS,
                 "contractual_override ({override_days}) cannot be shorter than \
                  AUDIT_ADDON_MIN_RETENTION_DAYS ({AUDIT_ADDON_MIN_RETENTION_DAYS}) \
-                 for an Audit-add-on workspace"
+                 for an audit-export workspace"
             );
         }
         return override_days;

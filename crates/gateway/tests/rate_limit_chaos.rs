@@ -56,6 +56,7 @@ async fn the_request_past_the_free_tier_allowance_is_429_with_retry_after() {
     let allowance = free_rpm();
 
     // Inside the allowance: every request is served.
+    let burst = std::time::Instant::now();
     for i in 0..allowance {
         let resp = client
             .post(gw.url("/v1/chat/completions"))
@@ -82,15 +83,41 @@ async fn the_request_past_the_free_tier_allowance_is_429_with_retry_after() {
         "one span per served request"
     );
 
-    // The one past it: refused by the gateway's own limiter.
-    let resp = client
-        .post(gw.url("/v1/chat/completions"))
-        .header("authorization", BEARER)
-        .json(&chat_request())
-        .send()
-        .await
-        .expect("the gateway answers");
-    assert_eq!(resp.status().as_u16(), 429);
+    // The one past it: refused by the gateway's own limiter. That limiter is a
+    // token bucket refilling at `allowance` per MINUTE — one token a second on
+    // Free — so every whole second the burst above took has put one token back.
+    // On a loaded gate box the sequential burst measured over a second and the
+    // 61st request was SERVED (2026-09-14: one red gate in three, nothing in
+    // the limiter had changed). The property under test is "past the allowance
+    // → 429 with Retry-After, never the provider", not "this box is fast": allow
+    // exactly the refill the clock permits, and require the 429 inside it.
+    let refilled = u32::try_from(burst.elapsed().as_secs()).unwrap_or(u32::MAX) + 1;
+    let mut refused = None;
+    let mut extra_served = 0u32;
+    for _ in 0..=refilled {
+        let r = client
+            .post(gw.url("/v1/chat/completions"))
+            .header("authorization", BEARER)
+            .json(&chat_request())
+            .send()
+            .await
+            .expect("the gateway answers");
+        if r.status().as_u16() == 429 {
+            refused = Some(r);
+            break;
+        }
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "a non-429 past the allowance must be a refill-served 200"
+        );
+        extra_served += 1;
+    }
+    let resp = refused.unwrap_or_else(|| {
+        panic!("no 429 within {refilled} refill-tolerant request(s) past the allowance")
+    });
+    let served = served + extra_served as usize;
+    let spans_after_allowance = spans_after_allowance + u64::from(extra_served);
     let retry_after: u32 = resp
         .headers()
         .get("retry-after")

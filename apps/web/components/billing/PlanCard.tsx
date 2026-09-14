@@ -95,19 +95,22 @@ export function PlanHeader({
 								</button>
 							</form>
 						)}
-						{idx > 0 && plan !== "free" && LADDER[idx - 1] && (
-							<form
-								action={`/api/checkout?tier=${LADDER[idx - 1]}&interval=${billingInterval ?? "month"}`}
-								method="post"
-							>
-								<button
-									type="submit"
-									className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
+						{idx > 0 &&
+							plan !== "free" &&
+							plan !== "enterprise" &&
+							LADDER[idx - 1] && (
+								<form
+									action={`/api/checkout?tier=${LADDER[idx - 1]}&interval=${billingInterval ?? "month"}`}
+									method="post"
 								>
-									Downgrade to {buildCard(LADDER[idx - 1] as Plan).name}
-								</button>
-							</form>
-						)}
+									<button
+										type="submit"
+										className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
+									>
+										Downgrade to {buildCard(LADDER[idx - 1] as Plan).name}
+									</button>
+								</form>
+							)}
 						{plan === "business" && (
 							<a
 								href="mailto:sales@tracelane.dev?subject=Tracelane%20Enterprise"

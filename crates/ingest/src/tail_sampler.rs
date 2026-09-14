@@ -33,7 +33,7 @@ pub enum SampleDecision {
 /// caller from the tenant-config cache. `Full` keeps every span; `Tail` runs the
 /// sticky error/intervention + rate-sample logic. The policy is resolved
 /// server-side from entitlement — a `Full` here means the tenant is entitled
-/// (Business/Enterprise) or has the Audit SKU forcing it; a non-entitled tenant
+/// (Business/Enterprise) or has the audit-export entitlement forcing it; a non-entitled tenant
 /// always resolves to `Tail` (fail-safe to the cheaper policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SamplingPolicy {

@@ -21,6 +21,7 @@
  * drizzle migration 0005. One source of truth: a tenant either has the
  * f_audit_addon grant (page renders AND export succeeds) or has neither.
  *
+ * // pricing-guard: allow "Audit SKU" — stating it is NOT sold
  * **ADR-076 (2026-09-12 ruling): the Audit SKU is NOT SOLD** — spec
  * `BILL-01` §10.4 found `/v1/audit/export` is not yet a complete offline
  * evidence package (no per-record Merkle proof, no completeness attestation
@@ -147,6 +148,7 @@ export interface Entitlements {
 	cold_archive_days: number | null;
 	// Free has no overage — it ages out, never bills past the allowance. Every
 	// paid tier bills continuously per unit past its included allowance
+	// pricing-guard: allow "hard cap" — stating there is none
 	// (no rollover, no hard cap — "ingest is never blocked by billing state").
 	overage_allowed: boolean;
 	overflow_mode: "auto_age" | "auto_overage";
@@ -277,6 +279,7 @@ function buildPlanEntitlements(plan: Plan): Entitlements {
 		prompt_promotion_read: true,
 		prompt_promotion_write: legacy.prompt_promotion_write,
 		byok_cmk: legacy.byok_cmk,
+		// pricing-guard: allow "Audit SKU" — stating it is NOT sold
 		// ADR-076: the Audit SKU is not sold — see the module doc. Never TRUE by
 		// plan default, on any tier including Enterprise.
 		audit_ledger: false,

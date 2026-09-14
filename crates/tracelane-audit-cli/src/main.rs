@@ -309,7 +309,7 @@ fn fetch_audit_range(args: &VerifyArgs) -> Result<PathBuf> {
     // It previously pointed at a route that has never existed —
     // so every online verify 404'd. The tenant is derived from the validated
     // credential, so `--workspace` is not a query parameter; it is kept only to
-    // label the report. The endpoint is gated on the Audit add-on and returns 403
+    // label the report. The endpoint is gated on the Enterprise export entitlement and returns 403
     // `entitlement_required` without it.
     let _ = workspace;
     let url = format!(

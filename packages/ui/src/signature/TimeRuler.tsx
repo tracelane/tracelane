@@ -359,7 +359,7 @@ export function TimeRuler({
  * NOT PLACED ANYWHERE YET, AND THAT IS DELIBERATE — 2026-08-16. No gateway endpoint
  * returns a tenant-scope seq range: `/v1/traces/{id}/chain` gives ONE per-trace seq,
  * `/v1/audit/summary` aggregates min/max on `event_time` not `seq` and is gated on the
- * PAID Audit add-on (2 entitlement rows fleet-wide, B-249), and `/v1/audit/self-verify`
+ * Enterprise export entitlement (2 entitlement rows fleet-wide, B-249), and `/v1/audit/self-verify`
  * loads the OLDEST rows (`ORDER BY seq ASC LIMIT ?`) so a range derived from it
  * understates and freezes as the ledger grows. Rendering this chip from any of those
  * would put a confident number on screen that the data does not support — the shape

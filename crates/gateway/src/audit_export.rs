@@ -33,7 +33,7 @@
 //!
 //! ## Entitlement gate (/ ADR-009 / ADR-025)
 //!
-//! The tamper-evident export is a **paid** capability — the $999/mo Audit
+//! The tamper-evident export is an ENTERPRISE capability — the audit-export
 //! SKU (`FeatureKey::AuditAddon`). After the tenant is resolved from the
 //! validated claim (the org_id→tenant seam lives in `auth`), the handler
 //! checks `entitlement_cache.check(tenant, AuditAddon)` (plan defaults
@@ -1040,7 +1040,7 @@ async fn handler(
             {
                 tracing::info!(
                     tenant_id = %claims.tenant_id,
-                    "audit export denied — tenant lacks the Audit SKU entitlement"
+                    "audit export denied — tenant lacks the audit-export entitlement"
                 );
                 return entitlement_required_response();
             }
@@ -1197,7 +1197,7 @@ fn entitlement_required_response() -> Response {
         Json(serde_json::json!({
             "error": "entitlement_required",
             "feature": "audit_ledger",
-            "message": "The tamper-evident audit ledger export requires the Audit add-on.",
+            "message": "The tamper-evident audit ledger export is included with the Enterprise plan.",
             "upgrade_url": "https://app.tracelane.dev/settings/billing",
         })),
     )
@@ -1794,7 +1794,7 @@ mod tests {
         }
 
         // The "curl the paywall" attack: an authenticated tlane_ key
-        // WITHOUT the Audit SKU must get 403 + ZERO ledger bytes, not the export.
+        // WITHOUT the export entitlement must get 403 + ZERO ledger bytes, not the export.
         #[test]
         fn tlane_key_without_audit_entitlement_gets_403_and_zero_ledger_bytes() {
             let _g = ENV_LOCK.lock().expect("env lock");
@@ -1817,7 +1817,7 @@ mod tests {
             });
         }
 
-        // A key WITH the Audit SKU gets the export bytes.
+        // A key WITH the export entitlement gets the export bytes.
         #[test]
         fn tlane_key_with_audit_entitlement_gets_the_export() {
             let _g = ENV_LOCK.lock().expect("env lock");

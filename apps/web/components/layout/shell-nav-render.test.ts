@@ -2,7 +2,7 @@
  * R12 AFTER-PROOF — the hard gate on the sidebar migration.
  *
  * Founder ruling R12: after the shell phase, every destination in the BEFORE-inventory
- * (`docs/internal/R12_BEFORE_INVENTORY.md`) must be proven still reachable and still
+ * the R12 before-inventory (internal) must be proven still reachable and still
  * rendering, or deliberately struck with a reason. **Nothing may be left stranded.**
  * A previous navigation migration dropped 8 metrics/columns; this is the control that
  * exists so this one cannot.

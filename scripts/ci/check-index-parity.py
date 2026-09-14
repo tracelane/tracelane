@@ -98,7 +98,10 @@ def stores() -> list[tuple[Path, Path, str]]:
     only when present — CI has no `~/.claude`, and a guard that fails for being
     unable to see is the fail-open defect in reverse."""
     out: list[tuple[Path, Path, str]] = []
-    mem = Path.home() / ".claude/projects/-home-sanjeev-work-tracelane-private/memory"
+    # Claude Code names a project dir after the repo path with `/` → `-`; derive it
+    # rather than hardcoding one machine's layout into a file the public export ships.
+    slug = "-" + str(ROOT.resolve()).strip("/").replace("/", "-")
+    mem = Path.home() / ".claude" / "projects" / slug / "memory"
     if mem.is_dir():
         out.append((mem / "MEMORY.md", mem, "memory"))
     specs = ROOT / "specs"

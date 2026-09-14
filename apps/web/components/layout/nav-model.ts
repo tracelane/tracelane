@@ -65,7 +65,7 @@ export const NAV_ITEMS: readonly { href: string; label: string }[] =
  * `SettingsNav.tsx`, but it is absent from `nav-config.tsx`, so until 2026-08-15 it
  * fell outside this array and therefore outside the sweep — a live surface nothing
  * checked. Found by the R12 before-inventory
- * (`docs/internal/R12_BEFORE_INVENTORY.md`), not by a failure.
+ * the R12 before-inventory (internal), not by a failure.
  */
 export const ACCOUNT_HREF = "/settings/account";
 

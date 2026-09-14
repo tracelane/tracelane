@@ -293,7 +293,7 @@ SETTINGS index_granularity = 8192;
 -- gen_ai.memory.validity_window_start: ISO-8601 (when memory record becomes valid)
 -- gen_ai.memory.validity_window_end:   ISO-8601 (when memory record expires)
 --
--- See: docs/archive/ADR-001-otel-gen-ai-semconv-docsadr-copy.md
+-- See: ADR-001 (OTel gen-ai semantic conventions; the decision record is internal)
 
 -- ── V2 reserved: gen_ai.guardrail.decision event ────────────────────────────
 -- Proposed to open-telemetry/semantic-conventions. Tracelane is the reference impl.
@@ -328,7 +328,7 @@ SETTINGS index_granularity = 8192;
 -- gen_ai.retrieval.collection:        string (vector store collection / index name)
 --
 -- Enables: recall@k tracking, empty-result detection, slow-retrieval SLO alerts.
--- See: docs/archive/ADR-001-otel-gen-ai-semconv-docsadr-copy.md
+-- See: ADR-001 (OTel gen-ai semantic conventions; the decision record is internal)
 
 -- ── V2 reserved: gen_ai.tool_cost.* attributes ───────────────────────────────
 -- Per-tool-call cost forecasting and budget enforcement for agentic workflows.
@@ -343,7 +343,7 @@ SETTINGS index_granularity = 8192;
 -- gen_ai.tool_cost.currency:           ISO-4217 currency code (default: USD)
 --
 -- Enables: per-agent cost attribution, budget guardrails, cost anomaly detection.
--- See: docs/archive/ADR-001-otel-gen-ai-semconv-docsadr-copy.md
+-- See: ADR-001 (OTel gen-ai semantic conventions; the decision record is internal)
 
 -- ── federation_signals: cross-customer failure-signature substrate ───────────
 -- The anonymized aggregate for opt-in federated detection across tenants,

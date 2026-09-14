@@ -6,7 +6,7 @@
  * the JWT (never the body) and enforces entitlements:
  *
  *   - Team+ (prompt_promotion_write): 200/201 → promoted / blocked decision
- *   - Builder ($59): 403 with `{ error, feature, message, upgrade_url }`
+ *   - Builder: 403 with `{ error, feature, message, upgrade_url }`
  *   - Eval gate blocked: 409
  *
  * All responses (including the entitlement 403 and eval-gate 409) are

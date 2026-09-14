@@ -187,6 +187,22 @@ fn validate_prompt_name(name: &str) -> Result<(), (StatusCode, String)> {
 /// readable `error` code), matching the gate + hard-cap 429 style.
 type WriteError = (StatusCode, Json<serde_json::Value>);
 
+/// `B-398`: a router refusal the CALLER caused (`ClientFault` — an id that is
+/// not theirs) is a 400; only a genuine router fault stays 500. Before this,
+/// every `promote()` / `rollback` error was 500, including "not a registered
+/// version for this tenant", on a path a customer touches.
+fn router_err(e: anyhow::Error) -> WriteError {
+    let status = if e
+        .downcast_ref::<crate::prompt_router::ClientFault>()
+        .is_some()
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    write_err(status, e.to_string())
+}
+
 fn write_err(status: StatusCode, msg: impl Into<String>) -> WriteError {
     let msg = msg.into();
     // Some callers hand us a fully-formed JSON OBJECT as a string —
@@ -732,7 +748,7 @@ async fn promote_handler(
                 .await
         }
     }
-    .map_err(|e| write_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(router_err)?;
 
     // Decision kind -> HTTP status:
     //   Promoted / ManualOverride -> 200 (the swap happened)
@@ -777,7 +793,7 @@ async fn rollback_handler(
             Some(actor.as_str()),
         )
         .await
-        .map_err(|e| write_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(router_err)?;
     // Wedge item 3: chain the rollback decision as a signed eval.verdict.
     chain_eval_verdict(&state.audit_chain, chain_tenant, &actor, &decision).await;
     Ok(Json(decision.into()))
@@ -856,7 +872,7 @@ async fn observe_handler(
         .router
         .observe_and_maybe_rollback(tenant, &name, env, body.prompt_version_id, &metrics)
         .await
-        .map_err(|e| write_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(router_err)?;
 
     // Wedge item 3: an AUTOMATED production flip is chained exactly like a
     // manual one, attributed to the system (no human actor). Only fires when a
@@ -1323,6 +1339,30 @@ mod tests {
             assert!(
                 matches!(read, Err((StatusCode::NOT_FOUND, _))),
                 "403'd promote must leave no routing pointer"
+            );
+        });
+    }
+
+    // B-398 (founder, 2026-09-14: "promote answering 500 on an unknown version
+    // id is a 400, and it sits on a path a customer touches"). A `to_version_id`
+    // that is not a registered version for THIS tenant is the caller's fault —
+    // 400, never 500 — and the production pointer must not flip.
+    #[test]
+    fn promote_unknown_version_id_is_400_not_500_and_flips_nothing() {
+        let _g = ENV_LOCK.lock().expect("env lock");
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let (state, _seeded) = seeded_state(Some(fixed_entitlement(true))).await;
+            let err = call_promote(&state, Uuid::from_u128(0xDEAD_BEEF))
+                .await
+                .expect_err("an unknown version id must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "body: {}", err.1.0);
+            let body = err.1.0.to_string();
+            assert!(body.contains("not a registered version"), "body: {body}");
+            let read = call_get_active(&state).await;
+            assert!(
+                matches!(read, Err((StatusCode::NOT_FOUND, _))),
+                "a refused promote must leave no routing pointer"
             );
         });
     }

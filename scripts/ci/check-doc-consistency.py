@@ -416,7 +416,7 @@ def selftest() -> int:
     print("selftest: an UNANNOTATED docs/archive/ citation must FAIL ...")
     with tempfile.TemporaryDirectory() as td:
         Path(td, "a.md").write_text(
-            "See docs/archive/old-spec-1.md for the retention table.\n",
+            "See docs/archive/" + "old-spec-1.md for the retention table.\n",
             encoding="utf-8",
         )
         real_root = ROOT
@@ -433,7 +433,8 @@ def selftest() -> int:
     print("selftest: an ANNOTATED docs/archive/ citation must PASS ...")
     with tempfile.TemporaryDirectory() as td:
         Path(td, "a.md").write_text(
-            "See docs/archive/old-spec-1.md (historical) for how retention used to work.\n",
+            "See docs/archive/"
+            + "old-spec-1.md (historical) for how retention used to work.\n",
             encoding="utf-8",
         )
         real_root = ROOT

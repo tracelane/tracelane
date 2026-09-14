@@ -12,6 +12,7 @@
  *   5. Dispatch subscription.* → BASE plan events update tenants (plan,
  *      polar_customer_id, polar_subscription_id) + upsert
  *      workspace_entitlements.plan_lookup_key (plan membership only).
+ * // pricing-guard: allow "Audit SKU" — stating it is NOT sold
  *      ADD-ON events: none are handled since 2026-09-14 — the Audit SKU is not
  *      sold (B-392); a stray `audit_addon_v1` event is an unknown-key no-op and
  *      NEVER touches the base plan

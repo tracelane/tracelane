@@ -82,6 +82,26 @@ SCAN_GLOBS = [
     "crates/*/README.md",
 ]
 
+# Shipped SOURCE — docstrings, comments and API strings that a customer (a 403
+# body) or a public contributor (the mirror) reads. Scanned for RETIRED figures
+# and phrases ONLY, check (b): the $-token allow-list (a) would flag every `$1`
+# bind and every example figure, and the banned-word check (c) every "discount"
+# inside a webhook handler. Added 2026-09-14 after the verifier found
+# "the $999/mo Audit" in `audit_export.rs`, "requires the Audit add-on" in a
+# customer-facing 403 body, and "Builder ($59)" in a route docstring on the
+# public mirror — with this guard green, because none of them was a doc.
+SOURCE_SKIP_FIGURES = {"hard cap"}
+
+SOURCE_GLOBS = [
+    "crates/*/src/**/*.rs",
+    "packages/*/src/**/*.ts",
+    "packages/*/src/**/*.tsx",
+    "apps/web/app/**/*.ts",
+    "apps/web/lib/**/*.ts",
+    "apps/web/db/**/*.mjs",
+    "apps/mcp/src/**/*.ts",
+]
+
 # A leading digit group of 1-3, then optional COMPLETE thousands groups, so a
 # trailing sentence comma ("$2,499, custom") is never slurped into the token.
 DOLLAR_RE = re.compile(r"\$\d{1,3}(?:,\d{3})*(?:\.\d+)?")
@@ -229,18 +249,19 @@ def strip_allow_comments(line: str) -> tuple[str, set[str]]:
     return line, excused
 
 
-def iter_files(root: Path) -> list[Path]:
+def iter_files(root: Path) -> list[tuple[Path, bool]]:
     seen: set[Path] = set()
-    files: list[Path] = []
-    for pattern in SCAN_GLOBS:
-        for p in sorted(root.glob(pattern)):
-            # Test fixtures are not a customer surface (`online-evals-render.test.tsx`
-            # renders a "$0.0001" cost to assert a formatter, not to price anything).
-            if is_test_file(p):
-                continue
-            if p.is_file() and p not in seen:
-                seen.add(p)
-                files.append(p)
+    files: list[tuple[Path, bool]] = []
+    for retired_only, globs in ((False, SCAN_GLOBS), (True, SOURCE_GLOBS)):
+        for pattern in globs:
+            for p in sorted(root.glob(pattern)):
+                # Test fixtures are not a customer surface (`online-evals-render.test.tsx`
+                # renders a "$0.0001" cost to assert a formatter, not to price anything).
+                if is_test_file(p):
+                    continue
+                if p.is_file() and p not in seen:
+                    seen.add(p)
+                    files.append((p, retired_only))
     return files
 
 
@@ -254,7 +275,9 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 COMMENT_IN_FENCE_RE = re.compile(r"^\s*(# |// |-- )")
 
 
-def scan_file(path: Path, allowed_prices: set[str]) -> list[str]:
+def scan_file(
+    path: Path, allowed_prices: set[str], retired_only: bool = False
+) -> list[str]:
     hits: list[str] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -280,8 +303,8 @@ def scan_file(path: Path, allowed_prices: set[str]) -> list[str]:
             _, prev_excused = strip_allow_comments(lines[i - 2])
             excused |= prev_excused
 
-        # (a) any $<number> token not in the allowed price set.
-        for m in DOLLAR_RE.finditer(raw):
+        # (a) any $<number> token not in the allowed price set — docs only.
+        for m in [] if retired_only else DOLLAR_RE.finditer(raw):
             tok = m.group(0)
             if tok in allowed_prices or tok in excused:
                 continue
@@ -289,6 +312,12 @@ def scan_file(path: Path, allowed_prices: set[str]) -> list[str]:
 
         # (b) retired figures, anywhere, regardless of $ shape.
         for fig in RETIRED_FIGURES:
+            # In SOURCE, "hard cap" is ordinary engineering English (a payload
+            # size, a page size, a breaker ceiling) — eight honest uses on the
+            # first run. The retired BILLING hard-cap is caught by its other
+            # tokens (`quota`, `hard_cap_multiplier`) and by the docs scan.
+            if retired_only and fig in SOURCE_SKIP_FIGURES:
+                continue
             # Word-bounded, not substring: `25M` sat inside an SVG path
             # (`v11.25M12 9v3.75`) in `EmptyTraces.tsx` and read as the retired
             # 25M-trace allowance. A `$`-prefixed figure keeps its own left edge.
@@ -298,7 +327,7 @@ def scan_file(path: Path, allowed_prices: set[str]) -> list[str]:
         # (c) banned words — never excusable by an allow-comment; there is no
         # legitimate reason to write "discount" / "% off" / "save 20%" about
         # Tracelane pricing anywhere in scope.
-        for pat in BANNED_WORD_PATTERNS:
+        for pat in [] if retired_only else BANNED_WORD_PATTERNS:
             if pat.search(raw):
                 hits.append(f"{path}:{i}: banned word matching {pat.pattern!r}")
     return hits
@@ -309,8 +338,8 @@ def run(root: Path) -> list[str]:
     allowed_prices = load_allowed_prices(seed)
     load_allowed_allowances(seed)  # derived; see docstring
     hits: list[str] = []
-    for f in iter_files(root):
-        hits.extend(scan_file(f, allowed_prices))
+    for f, retired_only in iter_files(root):
+        hits.extend(scan_file(f, allowed_prices, retired_only=retired_only))
     return hits
 
 
@@ -347,8 +376,18 @@ SELFTEST_FILES = {
     "retired_sku_in_fenced_comment.mdx": (
         "```bash\n# Pull your ledger (requires the Audit add-on)\ncurl ...\n```\n"
     ),
+    # A retired PRICE in a fenced comment — the SECURITY.md shape ("`$999/mo`
+    # SKU") had it sat inside a code block. Founder, 2026-09-14: confirm the
+    # selftest plants a case inside a fence, since that is where this one hid.
+    "retired_price_in_fenced_comment.mdx": (
+        "```bash\n# the ledger is a $999/mo SKU\ntlane verify --offline\n```\n"
+    ),
     # Code inside the fence (a SQL bind param, a JSON figure) must stay green.
     "code_in_fence.mdx": "```sql\nSELECT $1, $2 FROM t WHERE usd = 4999\n```\n",
+    # SHIPPED SOURCE (retired-only scan): a retired price in a Rust docstring
+    # blocks; a bare number and a `$1` bind in code do not.
+    "retired_price_in_source.rs": "//! The export is a paid capability — the $999/mo Audit SKU.\n",
+    "bare_numbers_in_source.rs": "let timeout_secs = 59; // $1 is a bind, 4999 a figure\n",
     "allowed_sku_history.mdx": (
         '<!-- pricing-guard: allow "Audit add-on" historical -->\n'
         "2026-06: the Audit add-on shipped its verifier.\n"
@@ -378,7 +417,9 @@ def selftest() -> int:
         allowed_prices = load_allowed_prices(seed)
         results: dict[str, list[str]] = {}
         for name in SELFTEST_FILES:
-            results[name] = scan_file(docs_dir / name, allowed_prices)
+            results[name] = scan_file(
+                docs_dir / name, allowed_prices, retired_only=name.endswith(".rs")
+            )
 
         expectations = {
             "clean.mdx": False,
@@ -388,6 +429,9 @@ def selftest() -> int:
             "unlisted_price.mdx": True,
             "retired_sku.mdx": True,
             "retired_sku_in_fenced_comment.mdx": True,
+            "retired_price_in_fenced_comment.mdx": True,
+            "retired_price_in_source.rs": True,
+            "bare_numbers_in_source.rs": False,
             "code_in_fence.mdx": False,
             "allowed_sku_history.mdx": False,
             "allowed_with_comment.mdx": False,
@@ -430,7 +474,7 @@ def selftest() -> int:
         )
         # Scope, not just scanning: the widened globs must SELECT the tsx and the
         # svg, and must NOT select the test fixture.
-        picked = {p.name for p in iter_files(fake)}
+        picked = {p.name for p, _ in iter_files(fake)}
         for must, name in (
             (True, "RetiredPrice.tsx"),
             (True, "flow.svg"),

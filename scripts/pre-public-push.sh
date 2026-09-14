@@ -578,10 +578,10 @@ fi
 
 # 2. Leakage backstop — strategy / internal-doc / economics phrases that must never
 #    appear anywhere in a public tree.
-scan "internal-trackers" 'BLOCKERS\.md|FOUNDER_ACTIONS|TRACELANE_(BRD|TRD)|Sanjeevlabs/tracelane-private' "$ROOT"
+scan "internal-trackers" 'BLOCKERS\.md|FOUNDER_ACTIONS|TRACELANE_(BRD|TRD)|Sanjeevlabs/tracelane-private|tracelane-private|-home-sanjeev-|/tmp/claude-' "$ROOT"
 scan "strategy/economics" 'acquirer |moat |reservation price|gross margin|AI-tourist' "$ROOT"
 # Private-doc references (private spec/tracker names + internal trackers) must not ship. README.md is public, excluded.
-scan "private-doc-refs" 'GUARDRAILS_V1_SPEC|Design_System_Spec|SAMPLING_MECHANISM_DESIGN|Database_Schema|INFRA_CHANGES|PROGRESS\.md|SECURITY_FINDINGS|V1_LAUNCH_STATUS|TRACELANE_FEATURE_CHECKLIST|BUILD_SPEC|BUILD_CHEATSHEET|Test_Plan|docs/(product/specs|internal|trackers|archive)/[A-Za-z_]+\.(md|ya?ml)' "$ROOT"
+scan "private-doc-refs" 'GUARDRAILS_V1_SPEC|Design_System_Spec|SAMPLING_MECHANISM_DESIGN|Database_Schema|INFRA_CHANGES|PROGRESS\.md|SECURITY_FINDINGS|V1_LAUNCH_STATUS|TRACELANE_FEATURE_CHECKLIST|BUILD_SPEC|BUILD_CHEATSHEET|Test_Plan|(^|[^/])docs/(product/specs|internal|trackers|archive)/[A-Za-z0-9_.-]+\.(md|ya?ml)' "$ROOT"
 
 # NOTE: secret scanning is handled by gitleaks + trufflehog in CI (with an allowlist
 # for the synthetic redaction/PII test vectors, e.g. AWS's own AKIAIOSFODNN7EXAMPLE and

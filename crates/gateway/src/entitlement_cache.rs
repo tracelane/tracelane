@@ -237,7 +237,7 @@ pub struct ResolvedEntitlements {
     pub f_guardrail_r6: bool,
     pub f_guardrail_r7: bool,
     /// ADR-048 D2 — full-capture gate (Business + Enterprise base; an active
-    /// Audit SKU forces it). The ingest sampler enforces capture via its own
+    /// audit-export entitlement forces it). The ingest sampler enforces capture via its own
     /// per-tenant cache; this is carried here so the gateway can inspect or
     /// stamp the resolved grant on the request path.
     pub f_full_capture: bool,

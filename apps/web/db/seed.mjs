@@ -25,6 +25,7 @@
  *
  * EXCEPTION — `f_full_capture` IS a plan-level default, like the seat caps:
  * Business + Enterprise = TRUE, every other tier FALSE. It is seeded here so a
+ * // pricing-guard: allow "Audit SKU" — the seed normalises the retired flag
  * re-seed normalises it; an active Audit SKU
  * still forces it TRUE per-tenant on top (resolved in lib/entitlements.ts).
  *

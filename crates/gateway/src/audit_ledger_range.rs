@@ -7,7 +7,7 @@
 //!   carries no ledger field — so a per-row chip meant one gateway call per row,
 //!   which is the fan-out that cost 6s on `/dashboard`.
 //! * `/v1/audit/summary` has the right shape but aggregates `min/max(event_time)`,
-//!   not `seq`, and is gated on the PAID Audit add-on — B-249 measured **two**
+//!   not `seq`, and is gated on the Enterprise export entitlement — B-249 measured **two**
 //!   `workspace_entitlements` rows fleet-wide, so the chip would be blank for
 //!   almost every workspace.
 //! * `/v1/audit/self-verify` is free-tier and its NDJSON carries per-row `seq`, but

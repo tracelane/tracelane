@@ -2066,6 +2066,7 @@ pub struct SessionListFilters {
 /// clocks that every subquery sees (ClickHouse propagates `WITH` into subqueries —
 /// `enable_global_with_statement`, on by default). Before this the window was
 /// optional and, when absent, "last 50 traces" read the tenant's entire history
+/// pricing-guard: allow "1M traces" — a measured row count, not an allowance
 /// (measured: 1,000,576 rows / 72 MB on 1M traces) and hit `max_rows_to_read` at
 /// ~50M — it FAILED, not slowed. Two `?` here, then the tenant, then the filters.
 const WINDOW_WITH: &str = "WITH fromUnixTimestamp64Micro(?) AS w_since, \

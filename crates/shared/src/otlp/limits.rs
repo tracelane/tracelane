@@ -467,6 +467,7 @@ mod tests {
     fn post_decode_flags_warning_band_when_span_exceeds_half() {
         // One attribute carrying ~600 KiB of value — span's encoded_len
         // will exceed 512 KiB (the warning threshold) but stay under
+        // pricing-guard: allow "hard cap" — OTLP payload size, not billing
         // 1 MiB (the hard cap).
         let payload = "x".repeat(600 * 1024 - 100); // a bit under 600KiB to leave room for varint overhead
         // But this also exceeds max_attribute_value_bytes (32 KiB), so it
@@ -480,6 +481,7 @@ mod tests {
             max_attr_key_cardinality: DEFAULT_MAX_ATTR_CARDINALITY,
         };
         let span = span_with_attrs(vec![make_attr("rrweb.dom", &payload)]);
+        // pricing-guard: allow "hard cap" — OTLP payload size, not billing
         let ok = check_span_post_decode(&span, &lax).expect("under hard cap");
         assert!(
             ok.in_warning_band,

@@ -746,6 +746,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-pricing-copy-vs-seed.py
 
+      - name: Data-model generator — selftest (deterministic; planted staleness is detected)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/build-data-model.py --selftest
+
+      # docs/reference/DATA_MODEL.md is GENERATED from schema.ts + schema.sql +
+      # plans.v3.json. A stale committed copy is the doc-drift / dead-column class
+      # BILL-01 paid for; this fails the build until it is regenerated.
+      - name: Data-model generator — committed model is current
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/build-data-model.py --check
+
       - name: Provider mapping single-source guard
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-provider-mapping-single-source.py

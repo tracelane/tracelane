@@ -21,6 +21,7 @@
  *
  * Enterprise is sales-led — never a self-serve checkout target (B-134/B-132:
  * there has never been, and still is not, an Audit-SKU or Enterprise
+ * // pricing-guard: allow "Audit SKU" — stating it is NOT sold
  * checkout of any kind; the Audit SKU is not sold at all, spec `BILL-01`
  * §10.4).
  *

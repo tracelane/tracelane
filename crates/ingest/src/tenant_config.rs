@@ -42,7 +42,7 @@
 //! calls on that path. The production resolver queries the Neon control plane
 //! and computes the ADR-048 precedence (highest wins):
 //!
-//! 1. **Audit SKU active** (`f_audit_addon`) → `Full`, forced (a tamper-evident
+//! 1. **Audit-export entitlement active** (`f_audit_addon`, Enterprise) → `Full`, forced (a tamper-evident
 //!    record of every action cannot tail-drop spans; non-overridable — matrix §4).
 //! 2. **`force_tail` kill-switch** (ADR-048 D4.4) → `Tail` (bounds a runaway
 //!    tenant without a deploy; does NOT override the audit guarantee above).
@@ -128,7 +128,7 @@ pub struct PolicyInputs {
     pub wants_full: bool,
     /// `f_full_capture` resolved (plan default ∪ workspace override).
     pub full_capture_entitled: bool,
-    /// Audit SKU active — resolved from `f_audit_addon` (the entitlements
+    /// Audit-export entitlement active — resolved from `f_audit_addon` (the entitlements
     /// mirror; the ingest resolver does not read the Drizzle-only
     /// `tenants.audit_enabled`, which the SQL migrations never create).
     pub audit_active: bool,
