@@ -46,6 +46,13 @@ export type MeterRateKey =
 export interface GatewayUsageResponse {
 	/** Calendar month this response covers, e.g. "2026-09". */
 	month: string;
+	/**
+	 * B-410: the Polar billing cycle the figures are rated over, when the
+	 * tenant has a paid subscription (ISO timestamps). Absent/null = the
+	 * calendar month above. The invoice is Polar's; this makes the page agree with it.
+	 */
+	period_start?: string | null;
+	period_end?: string | null;
 	computed_at: string;
 	/** False when the rate card itself could not be loaded — distinct from a meter simply having no data yet. */
 	rates_available: boolean;

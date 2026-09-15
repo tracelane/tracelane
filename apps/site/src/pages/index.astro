@@ -392,7 +392,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
         </div>
         <div class="glass p-6">
           <p class="card-index">hipaa</p>
-          <p class="card-body text-sm">No signed BAA today — PII redaction inline and provider keys envelope-encrypted, so healthcare pilots can start without PHI in the trace store.</p>
+          <p class="card-body text-sm">No signed BAA today, so do not route PHI through the hosted gateway. Prompt and response text is not stored unless we enable capture for your workspace. Inline redaction (Team and above) masks structured identifiers only — card numbers, SSNs, emails, E.164 phone numbers and secret-shaped strings — never names, addresses or free-text clinical detail. Provider keys are envelope-encrypted.</p>
         </div>
       </div>
     </div>
@@ -403,7 +403,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
     <div class="grid gap-10 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:gap-16 lg:items-center reveal">
       <div>
         <p class="eyebrow mb-4">Migration</p>
-        <h2 class="display-md text-fg">Moving off a tool that got acquired or breached?</h2>
+        <h2 class="display-md text-fg">Moving off a tool that changed hands or changed its terms?</h2>
         <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
           One command rewrites your config. Nothing leaves your infrastructure.
         </p>
@@ -459,7 +459,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       </div>
       <div class="glass p-6">
         <p class="card-index">vuln scanning</p>
-        <p class="card-body text-sm">OSV-Scanner + Grype + Syft on every commit.</p>
+        <p class="card-body text-sm">gitleaks, cargo-deny and a critical-level dependency audit on every push; OSV-Scanner and Grype nightly and a Syft SBOM weekly on the public repository.</p>
       </div>
       <div class="glass p-6">
         <p class="card-index">pre-flight policy</p>
@@ -491,7 +491,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
         <details class="faq-row">
           <summary class="text-fg">How is it different from Helicone, LangSmith or Langfuse?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one Rust binary. Helicone, Langfuse and LangSmith are observability-first — you bring your own gateway and guardrails. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's gateway is GPL-3.0 (corporate-procurement-hostile), Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. The audit ledger is hash-chained and Ed25519-signed — no competitor in this category offers cryptographic audit-log integrity at the trace level.</p>
+          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one Rust binary. Helicone, Langfuse and LangSmith are observability-first — you bring your own gateway and guardrails. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's gateway is GPL-3.0, Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. The audit ledger is hash-chained and Ed25519-signed — we are not aware of another product in this category that offers cryptographic audit-log integrity at the trace level.</p>
         </details>
 
         <details class="faq-row">

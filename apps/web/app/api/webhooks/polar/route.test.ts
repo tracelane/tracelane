@@ -241,6 +241,55 @@ describe("POST /api/webhooks/polar", () => {
 		expect(setArg?.dataHoldUntil).toBeUndefined();
 	});
 
+	it("B-410: the subscription cycle (current_period_start/end) lands on the tenant", async () => {
+		setDb([
+			[], // dedup select
+			[{ id: "ten_1", priceProtectedUntil: new Date("2020-01-01T00:00:00Z") }],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					current_period_start: "2026-09-14T10:00:00Z",
+					current_period_end: "2026-10-14T10:00:00Z",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			currentPeriodStart?: unknown;
+			currentPeriodEnd?: unknown;
+		};
+		expect(setArg?.currentPeriodStart).toEqual(
+			new Date("2026-09-14T10:00:00Z"),
+		);
+		expect(setArg?.currentPeriodEnd).toEqual(new Date("2026-10-14T10:00:00Z"));
+	});
+
+	it("B-410: a malformed or absent cycle is never written as a bogus date", async () => {
+		setDb([
+			[],
+			[{ id: "ten_1", priceProtectedUntil: new Date("2020-01-01T00:00:00Z") }],
+			[],
+			[],
+			[],
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					current_period_start: "not a date",
+					current_period_end: 42,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect("currentPeriodStart" in setArg).toBe(false);
+		expect("currentPeriodEnd" in setArg).toBe(false);
+	});
+
 	it("ADR-076: an annual (_year) lookup key sets billing_interval='year'", async () => {
 		setDb([
 			[], // dedup select

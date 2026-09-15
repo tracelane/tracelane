@@ -240,4 +240,8 @@ cargo test -p gateway --test postgres_tenant_integration -- --ignored || RC=1
 # Only a real server can refuse that bind (`error serializing parameter 1`) — it
 # answered 503 on every prod call, `null` included, with the full gate green.
 cargo test -p gateway --bin gateway billing::usage::tests::set_ceiling_sql -- --ignored || RC=1
+# B-418 / verifier R1 (2026-09-15): the boot schema check's REFUSAL had only ever been
+# falsified by hand. Against a real information_schema: complete → Ok(n), one dropped
+# column → Missing([that column]), no tables → Unavailable.
+cargo test -p gateway --bin gateway entitlement_cache::boot_schema_check_tests::verify_schema_refuses -- --ignored || RC=1
 exit $RC

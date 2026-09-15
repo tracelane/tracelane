@@ -147,7 +147,7 @@ export function UsageBoard({
 	if (state === "empty" || !data) {
 		return (
 			<EmptyState
-				title="No usage yet this month — send a trace and it appears here within a minute."
+				title="No usage yet — send a trace and it appears here within a minute."
 				icon={
 					<svg
 						width="20"
@@ -205,7 +205,24 @@ export function UsageBoard({
 	});
 
 	const cold = data.meters.cold;
-	const coldCaption = cold.used == null ? "—" : formatGbUnit(cold.used);
+	// BILL-01 A5: cold now carries an included allowance on paid tiers, so it
+	// gets the same used / included caption and warning bar as the other meters.
+	const coldPct = pctOf(cold.used, cold.included);
+	const coldLevel = warnLevel(cold.used, cold.included, data.warn_pct);
+	const coldCaption =
+		cold.used == null
+			? "—"
+			: cold.included == null
+				? formatGbUnit(cold.used)
+				: formatMeterCaption({
+						used: cold.used,
+						included: cold.included,
+						unit: cold.unit,
+						usedFormat: formatGbAdaptive,
+					});
+	const periodLabel = data.period_start
+		? "Usage this billing period"
+		: "Usage this month";
 
 	// Worst-offending meter (for the banner), only among allowance-bearing meters.
 	const worst = tiles.reduce<(typeof tiles)[number] | null>((acc, t) => {
@@ -217,7 +234,7 @@ export function UsageBoard({
 	return (
 		<div className="space-y-5">
 			<div className="flex flex-wrap items-center justify-between gap-2">
-				<h2 className="t-h1">Usage this month</h2>
+				<h2 className="t-h1">{periodLabel}</h2>
 				<span className="text-2xs text-ink-3">
 					last computed {formatDateTimeUtc(data.computed_at)} · daily projection
 				</span>
@@ -237,8 +254,8 @@ export function UsageBoard({
 				<MeterTile
 					label={METER_LABEL.cold}
 					caption={coldCaption}
-					pct={null}
-					level="ok"
+					pct={coldPct}
+					level={coldLevel}
 					projection={
 						cold.projection_month_end == null
 							? "— not enough data yet"

@@ -221,6 +221,7 @@ def load_allowed_allowances(seed: dict) -> set[str]:
             "queryable_days",
             "ledger_days",
             "cold_archive_days",
+            "cold_gb_included",
             "rate_limit_rpm",
         ):
             v = plan.get(key)

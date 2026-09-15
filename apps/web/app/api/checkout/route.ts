@@ -35,6 +35,7 @@
 import { db } from "@/db";
 import { planEntitlements, tenants } from "@/db/schema";
 import { requireGatewayToken, requireSession } from "@/lib/auth";
+import { PLANS_V3 } from "@/lib/entitlements";
 import { gatewayBaseUrl } from "@/lib/gateway";
 import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -99,6 +100,18 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	}
 	const interval =
 		req.nextUrl.searchParams.get("interval") === "year" ? "year" : "month";
+	if (interval === "year" && !PLANS_V3.policy.annual_available) {
+		// B14: a yearly Polar product grants its meter credits ONCE per year
+		// (B-411); nothing annual is sold until the founder rules the shape.
+		// Refused here, before any Neon read, with the reason from the table.
+		return NextResponse.json(
+			{
+				error: "annual billing is not available yet",
+				reason: "annual_unavailable",
+			},
+			{ status: 400 },
+		);
+	}
 
 	// B-140: an existing subscriber changes plans through the Polar customer
 	// portal, never a second checkout.

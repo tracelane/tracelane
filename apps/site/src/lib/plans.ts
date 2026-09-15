@@ -59,6 +59,7 @@ export interface PlanRow {
 	queryable_days: number;
 	ledger_days: number;
 	cold_archive_days: number | null;
+	cold_gb_included: number | null;
 	unlimited_seats: boolean;
 	f_sso: boolean;
 	overage_allowed: boolean;

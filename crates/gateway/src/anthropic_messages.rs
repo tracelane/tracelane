@@ -2421,6 +2421,8 @@ mod tests {
     /// recorded nothing on the route Claude Code sessions use.
     #[tokio::test]
     async fn a_client_that_hangs_up_mid_stream_is_recorded_as_cancelled() {
+        // Process-global drop counter: serialised with the two stream.rs readers.
+        let _serial = crate::server::DROP_COUNTER_TEST_LOCK.lock().await;
         use futures::StreamExt as _;
         let _bypass = LoopbackBypassGuard::new();
         let server = sse_mock().await;

@@ -262,6 +262,9 @@ pub struct ResolvedEntitlements {
     // record in (bytes), never re-deriving GB->bytes at each read site.
     pub hot_bytes_included: Option<u64>,
     pub ingest_bytes_included: Option<u64>,
+    /// BILL-01 A5: included cold-archive bytes per period (24x monthly ingest on
+    /// paid tiers). `None` = no allowance (Free) or custom (Enterprise).
+    pub cold_bytes_included: Option<u64>,
     pub series_included: Option<i64>,
     pub scan_units_included: Option<i64>,
     pub eval_runs_included: Option<i64>,
@@ -290,6 +293,10 @@ pub struct ResolvedEntitlements {
     /// `prompt_routes` promote/rollback return `423 promotion_frozen` — read
     /// through this cache rather than a per-request Postgres round trip.
     pub promotion_frozen_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// B-410: the Polar subscription cycle `[start, end)` from the webhook. The
+    /// usage route rates over it so the dashboard agrees with the invoice;
+    /// `None` = no paid cycle known -> calendar month.
+    pub billing_period: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     pub promotion_frozen_reason: Option<String>,
     /// The pricing-rates version this tenant is rated against
     /// (`tenants.price_version`) — price protection (ADR-076 §0.5). `None`
@@ -374,6 +381,7 @@ impl ResolvedEntitlements {
             // fail-CLOSED floor, never a grant.
             hot_bytes_included: Some(0),
             ingest_bytes_included: Some(0),
+            cold_bytes_included: None,
             series_included: Some(0),
             scan_units_included: Some(0),
             eval_runs_included: Some(0),
@@ -391,6 +399,7 @@ impl ResolvedEntitlements {
             polar_product_id_month: None,
             polar_product_id_year: None,
             promotion_frozen_at: None,
+            billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
             workspace_budget_micro_usd: 0,
@@ -486,6 +495,7 @@ impl ResolvedEntitlements {
             // `admission.rs` reads the field directly, no tier indirection).
             hot_bytes_included: None,
             ingest_bytes_included: None,
+            cold_bytes_included: None,
             series_included: None,
             scan_units_included: None,
             eval_runs_included: None,
@@ -502,6 +512,7 @@ impl ResolvedEntitlements {
             polar_product_id_month: None,
             polar_product_id_year: None,
             promotion_frozen_at: None,
+            billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
             workspace_budget_micro_usd: 0,
@@ -730,23 +741,10 @@ impl EntitlementCache {
 /// the `LEFT JOIN`; only a MISSING `tenants` ROW (the tenant does not exist at
 /// all) reaches `deny_all()`.
 ///
-/// `pe.plan_lookup_key = t.plan::text || '_v1'` mirrors the exact mapping
-/// `apps/web/lib/entitlements.ts`'s `PLAN_TO_LOOKUP_KEY` and the Polar webhook's
-/// `` `${tenant.plan ?? "free"}_v1` `` use — one rule, expressed once here.
-pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
-    Arc::new(move |tenant: Uuid| {
-        let pool = pool.clone();
-        Box::pin(async move {
-            let client = pool
-                .get()
-                .await
-                .map_err(|e| anyhow::anyhow!("entitlement pool: {e}"))?;
-            // Overlay overrides over plan defaults. LEFT JOIN so a tenant with
-            // no override row still resolves to its plan's defaults — the
-            // ADR-073 fix. `numeric` columns are cast to text: tokio-postgres
-            // has no numeric->f64 conversion, and a NULL (Enterprise "custom")
-            // must survive as a NULL string, never a coerced zero.
-            const SQL: &str = "\
+/// The ONE entitlement query. Module-level so the boot schema check
+/// (`verify_schema`) parses the same text the resolver runs — no second list
+/// of columns to drift (founder, 2026-09-14, B6 audit item B).
+pub(crate) const SQL: &str = "\
                 SELECT pe.plan_lookup_key, \
                   COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory) AS f_pr7_trajectory, \
                   COALESCE(we.f_pr8_argdrift, pe.f_pr8_argdrift) AS f_pr8_argdrift, \
@@ -773,6 +771,7 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                   COALESCE(we.f_sso, pe.f_sso) AS f_sso, \
                   COALESCE(we.hot_gb_included, pe.hot_gb_included)::text AS hot_gb_included_text, \
                   COALESCE(we.ingest_gb_included, pe.ingest_gb_included)::text AS ingest_gb_included_text, \
+                  COALESCE(we.cold_gb_included, pe.cold_gb_included)::text AS cold_gb_included_text, \
                   COALESCE(we.series_included, pe.series_included) AS series_included, \
                   COALESCE(we.scan_units_included, pe.scan_units_included) AS scan_units_included, \
                   COALESCE(we.eval_runs_included, pe.eval_runs_included) AS eval_runs_included, \
@@ -791,6 +790,8 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                   t.promotion_frozen_at AS promotion_frozen_at, \
                   t.promotion_frozen_reason AS promotion_frozen_reason, \
                   t.price_version AS price_version, \
+                  t.current_period_start AS current_period_start, \
+                  t.current_period_end AS current_period_end, \
                   t.budget_usd_monthly::text AS workspace_budget_usd_text, \
                   t.spend_ceiling_usd::text AS spend_ceiling_usd_text, \
                   t.auto_age_window_days AS auto_age_window_days, \
@@ -799,6 +800,23 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                 JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
                 LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
                 WHERE t.id = $1 AND t.archived_at IS NULL";
+
+/// `pe.plan_lookup_key = t.plan::text || '_v1'` mirrors the exact mapping
+/// `apps/web/lib/entitlements.ts`'s `PLAN_TO_LOOKUP_KEY` and the Polar webhook's
+/// `` `${tenant.plan ?? "free"}_v1` `` use — one rule, expressed once here.
+pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
+    Arc::new(move |tenant: Uuid| {
+        let pool = pool.clone();
+        Box::pin(async move {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| anyhow::anyhow!("entitlement pool: {e}"))?;
+            // Overlay overrides over plan defaults. LEFT JOIN so a tenant with
+            // no override row still resolves to its plan's defaults — the
+            // ADR-073 fix. `numeric` columns are cast to text: tokio-postgres
+            // has no numeric->f64 conversion, and a NULL (Enterprise "custom")
+            // must survive as a NULL string, never a coerced zero.
             match client.query_opt(SQL, &[&tenant]).await? {
                 Some(row) => Ok(row_to_resolved(&row)),
                 // No tenant row at all (unknown / archived tenant) — fail
@@ -880,6 +898,7 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         // BYTES here, once, so every downstream caller compares one unit.
         hot_bytes_included: numeric_text_to_bytes(row.get("hot_gb_included_text")),
         ingest_bytes_included: numeric_text_to_bytes(row.get("ingest_gb_included_text")),
+        cold_bytes_included: numeric_text_to_bytes(row.get("cold_gb_included_text")),
         series_included: row.get("series_included"),
         scan_units_included: row.get("scan_units_included"),
         eval_runs_included: row.get("eval_runs_included"),
@@ -903,6 +922,11 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         polar_product_id_month: row.get("polar_product_id_month"),
         polar_product_id_year: row.get("polar_product_id_year"),
         promotion_frozen_at: row.get("promotion_frozen_at"),
+        billing_period: {
+            let start: Option<chrono::DateTime<chrono::Utc>> = row.get("current_period_start");
+            let end: Option<chrono::DateTime<chrono::Utc>> = row.get("current_period_end");
+            start.zip(end)
+        },
         promotion_frozen_reason: row.get("promotion_frozen_reason"),
         price_version: row.get("price_version"),
         // `try_get` by name absorbs both "absent column" and "NULL" without
@@ -1263,6 +1287,7 @@ mod tests {
             // resolves to.
             hot_bytes_included: None,
             ingest_bytes_included: None,
+            cold_bytes_included: None,
             series_included: None,
             scan_units_included: None,
             eval_runs_included: None,
@@ -1279,6 +1304,7 @@ mod tests {
             polar_product_id_month: None,
             polar_product_id_year: None,
             promotion_frozen_at: None,
+            billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
             workspace_budget_micro_usd: 0,
@@ -1638,5 +1664,252 @@ mod tests {
         // FALLBACK was the B-241 mechanism this ADR removes). The loop above
         // — every wanted column addressable in the one remaining query — is
         // the whole test.
+    }
+}
+
+// ── Boot schema check (founder, 2026-09-14, B6 audit item B) ────────────────
+//
+// Nothing applies migrations at prod boot (`apply_migrations` is test-only) and
+// every migration since 0009 is hand-applied, so a binary that reads a column
+// the target database does not yet have is one `docker compose up` away. The
+// deploy script's pre-flight (`check-deploy-schema.py`) covers the scripted
+// path; this covers the manual one, permanently: the gateway REFUSES to boot
+// when a definite answer says a column is missing.
+
+/// Why the boot check did not pass.
+#[derive(Debug)]
+pub enum SchemaCheck {
+    /// The database answered and these `table.column` pairs are absent — refuse to boot.
+    Missing(Vec<String>),
+    /// The check could not run (pool / query error) — the caller boots on the
+    /// cache's own fail-open path and says so; a restart loop during a
+    /// control-plane blip is the worse outcome.
+    Unavailable(String),
+}
+
+/// Every `(table, column)` the entitlement query reads, parsed from `SQL`
+/// itself. Aliases: `pe` plan_entitlements · `we` workspace_entitlements · `t` tenants.
+pub fn selected_columns() -> Vec<(&'static str, String)> {
+    let re = regex::Regex::new(r"\b(pe|we|t)\.([a-z_][a-z0-9_]*)").expect("static regex");
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for cap in re.captures_iter(SQL) {
+        let table = match &cap[1] {
+            "pe" => "plan_entitlements",
+            "we" => "workspace_entitlements",
+            _ => "tenants",
+        };
+        let col = cap[2].to_string();
+        if !out.iter().any(|(t, c)| *t == table && *c == col) {
+            out.push((table, col));
+        }
+    }
+    out
+}
+
+/// Pure: which selected columns are not in `present` (`(table, column)` pairs).
+pub fn missing_columns(
+    selected: &[(&'static str, String)],
+    present: &[(String, String)],
+) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|(t, c)| !present.iter().any(|(pt, pc)| pt == t && pc == c))
+        .map(|(t, c)| format!("{t}.{c}"))
+        .collect()
+}
+
+/// Ask `information_schema.columns` for the three tables and compare with what
+/// `SQL` reads. `Ok(n)` = every one of the `n` selected columns exists.
+pub async fn verify_schema(pool: &crate::db::DbPool) -> Result<usize, SchemaCheck> {
+    let selected = selected_columns();
+    let tables: Vec<&str> = vec!["plan_entitlements", "workspace_entitlements", "tenants"];
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| SchemaCheck::Unavailable(format!("pool: {e}")))?;
+    let rows = client
+        .query(
+            "SELECT table_name::text, column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = ANY($1)",
+            &[&tables],
+        )
+        .await
+        .map_err(|e| SchemaCheck::Unavailable(format!("information_schema query: {e}")))?;
+    let present: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    if present.is_empty() {
+        // An empty answer is "cannot see", never "nothing is wrong" (CLAUDE.md §14).
+        return Err(SchemaCheck::Unavailable(
+            "information_schema returned no columns for the control-plane tables".into(),
+        ));
+    }
+    let missing = missing_columns(&selected, &present);
+    if missing.is_empty() {
+        Ok(selected.len())
+    } else {
+        Err(SchemaCheck::Missing(missing))
+    }
+}
+
+#[cfg(test)]
+mod boot_schema_check_tests {
+    use super::*;
+
+    #[test]
+    fn every_alias_in_the_query_maps_to_a_real_table_and_the_list_is_deduplicated() {
+        let cols = selected_columns();
+        assert!(
+            cols.len() > 30,
+            "the query names dozens of columns, got {}",
+            cols.len()
+        );
+        for pair in [
+            ("plan_entitlements", "hot_gb_included"),
+            ("workspace_entitlements", "ingest_gb_included"),
+            ("tenants", "spend_ceiling_usd"),
+            ("tenants", "plan"),
+            ("workspace_entitlements", "tenant_id"),
+        ] {
+            assert!(
+                cols.iter().any(|(t, c)| (*t, c.as_str()) == pair),
+                "missing {pair:?}"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            cols.iter().all(|p| seen.insert(p.clone())),
+            "duplicates in the list"
+        );
+    }
+
+    #[test]
+    fn a_column_the_database_lacks_is_named_and_a_complete_database_passes() {
+        let selected = selected_columns();
+        let mut present: Vec<(String, String)> = selected
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), c.clone()))
+            .collect();
+        assert!(missing_columns(&selected, &present).is_empty());
+        // Falsify: drop exactly the column migration 0043 will add, plus one more.
+        present.retain(|(t, c)| !(t == "plan_entitlements" && c == "hot_gb_included"));
+        present.retain(|(t, c)| !(t == "tenants" && c == "spend_ceiling_usd"));
+        let missing = missing_columns(&selected, &present);
+        assert_eq!(
+            missing,
+            vec![
+                "plan_entitlements.hot_gb_included".to_string(),
+                "tenants.spend_ceiling_usd".to_string()
+            ]
+        );
+    }
+
+    /// A pool onto a FRESH database on the integration server — the three
+    /// control-plane tables are built from `selected_columns()` itself (every
+    /// column `text`; only presence matters to `information_schema`), so this
+    /// test needs no migration and cannot disturb any other test's database.
+    async fn fresh_pool(url: &str, ddl: &[String]) -> crate::db::DbPool {
+        let (admin, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the integration Postgres");
+        let handle = tokio::spawn(conn);
+        let db = format!("tlane_schema_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .batch_execute(&format!("CREATE DATABASE {db}"))
+            .await
+            .expect("CREATE DATABASE (the integration role needs createdb)");
+        drop(admin);
+        let _ = handle.await;
+
+        let pg_cfg: tokio_postgres::Config = url.parse().expect("parse POSTGRES_TEST_URL");
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = pg_cfg.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        });
+        cfg.port = pg_cfg.get_ports().first().copied();
+        cfg.user = pg_cfg.get_user().map(str::to_owned);
+        cfg.password = pg_cfg
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).to_string());
+        cfg.dbname = Some(db);
+        let pool = cfg
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .expect("create pool");
+        let client = pool.get().await.expect("pool.get");
+        for stmt in ddl {
+            client.batch_execute(stmt).await.expect("ddl");
+        }
+        pool
+    }
+
+    /// The boot refusal, observed against a REAL `information_schema` rather
+    /// than a hand-built `present` list: a complete database passes with the
+    /// full column count, dropping ONE column the SELECT names fails with
+    /// exactly that column, and a database with none of the tables is
+    /// `Unavailable` (the fail-open branch) — never a silent pass. Until
+    /// 2026-09-15 the refusal had been falsified once by hand on a probe
+    /// Postgres and never by anything a gate runs (verifier residual R1).
+    /// `#[ignore]`d by default; `scripts/ci/run-postgres-integration.sh` runs it.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn verify_schema_refuses_a_missing_column_against_a_real_information_schema() {
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let selected = selected_columns();
+        let mut by_table: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (t, c) in &selected {
+            by_table.entry(t).or_default().push(c.clone());
+        }
+        let ddl: Vec<String> = by_table
+            .iter()
+            .map(|(t, cols)| {
+                let body = cols
+                    .iter()
+                    .map(|c| format!("{c} text"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("CREATE TABLE {t} ({body})")
+            })
+            .collect();
+
+        // 1. Complete → Ok(n), n = every column the SELECT names.
+        let pool = fresh_pool(&url, &ddl).await;
+        assert_eq!(verify_schema(&pool).await.unwrap(), selected.len());
+
+        // 2. Drop exactly one named column → Missing names exactly it.
+        let client = pool.get().await.unwrap();
+        client
+            .batch_execute("ALTER TABLE tenants DROP COLUMN current_period_end")
+            .await
+            .unwrap();
+        drop(client);
+        match verify_schema(&pool).await {
+            Err(SchemaCheck::Missing(cols)) => {
+                assert_eq!(cols, vec!["tenants.current_period_end".to_string()]);
+            }
+            other => panic!("expected Missing([tenants.current_period_end]), got {other:?}"),
+        }
+
+        // 3. Restore it → Ok again (the check is about presence, not history).
+        let client = pool.get().await.unwrap();
+        client
+            .batch_execute("ALTER TABLE tenants ADD COLUMN current_period_end text")
+            .await
+            .unwrap();
+        drop(client);
+        assert_eq!(verify_schema(&pool).await.unwrap(), selected.len());
+
+        // 4. No tables at all → Unavailable, the documented fail-OPEN branch
+        //    (an empty information_schema answer is "cannot see", CLAUDE.md §14).
+        let empty = fresh_pool(&url, &[]).await;
+        match verify_schema(&empty).await {
+            Err(SchemaCheck::Unavailable(_)) => {}
+            other => panic!("expected Unavailable on an empty schema, got {other:?}"),
+        }
     }
 }

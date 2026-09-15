@@ -42,6 +42,7 @@ vi.mock("@/db", () => ({
 	},
 }));
 
+import { PLANS_V3 } from "@/lib/entitlements";
 import { POST } from "./route";
 
 const fetchMock = vi.fn();
@@ -171,24 +172,46 @@ describe("POST /api/checkout", () => {
 		expect(body).not.toHaveProperty("tenantId");
 	});
 
-	it("reads the ANNUAL product id when ?interval=year", async () => {
-		setDb([
-			[{ polarSubscriptionId: null }],
-			[
-				{
-					polarProductIdMonth: "polar_prod_team_month",
-					polarProductIdYear: "polar_prod_team_year",
-				},
-			],
-		]);
-		fetchMock.mockResolvedValue({
-			ok: true,
-			status: 200,
-			json: async () => ({ url: "https://polar.sh/checkout/xyz" }),
+	it("B14: ?interval=year is REFUSED (400, annual_unavailable) while plans.v3.json says annual is not for sale — before any DB read or gateway call", async () => {
+		// A yearly Polar product grants its meter credits once per YEAR (B-411);
+		// until the founder rules the annual shape nothing annual is sold. The
+		// shipped reference table carries the switch OFF.
+		expect(PLANS_V3.policy.annual_available).toBe(false);
+		setDb([[{ polarSubscriptionId: null }]]);
+		const res = await POST(req("team", "year"));
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "annual billing is not available yet",
+			reason: "annual_unavailable",
 		});
-		await POST(req("team", "year"));
-		const body = sentBody();
-		expect(body.product_id).toBe("polar_prod_team_year");
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("reads the ANNUAL product id when ?interval=year and the switch is ON", async () => {
+		const spy = vi
+			.spyOn(PLANS_V3.policy, "annual_available", "get")
+			.mockReturnValue(true);
+		try {
+			setDb([
+				[{ polarSubscriptionId: null }],
+				[
+					{
+						polarProductIdMonth: "polar_prod_team_month",
+						polarProductIdYear: "polar_prod_team_year",
+					},
+				],
+			]);
+			fetchMock.mockResolvedValue({
+				ok: true,
+				status: 200,
+				json: async () => ({ url: "https://polar.sh/checkout/xyz" }),
+			});
+			await POST(req("team", "year"));
+			const body = sentBody();
+			expect(body.product_id).toBe("polar_prod_team_year");
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("B-140: a tenant with an ACTIVE subscription is sent to the customer portal, never a second checkout", async () => {

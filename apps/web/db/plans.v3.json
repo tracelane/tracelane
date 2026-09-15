@@ -1,5 +1,5 @@
 {
-  "_comment": "BILL-01 / ADR-076 \u2014 the founder's 2026-09-12 pricing ruling, verbatim (specs/BILL-01-metering-and-tiers.md \u00a70). THE single source for every public price, allowance, window and seat figure: seed.mjs upserts these into plan_entitlements, and scripts/ci/check-pricing-copy-vs-seed.py refuses any docs/site/README figure that disagrees. Rates are market-anchored and never adjusted for cost; null = custom/contract (Enterprise).",
+  "_comment": "BILL-01 / ADR-076 — the founder's 2026-09-12 pricing ruling, verbatim (specs/BILL-01-metering-and-tiers.md §0). THE single source for every public price, allowance, window and seat figure: seed.mjs upserts these into plan_entitlements, and scripts/ci/check-pricing-copy-vs-seed.py refuses any docs/site/README figure that disagrees. Rates are market-anchored and never adjusted for cost; null = custom/contract (Enterprise). AMENDMENT A5 (founder, 2026-09-14): ingest allowances re-derived as 4x the hot window's steady-state fill (hot_gb x 30 / indexed_window_days) — Builder 20, Team 100, Business 200 GB; every paid tier gets cold_gb_included = 24x its monthly ingest (two years of included ingest), meter 5 bills only beyond it, mean-daily basis like meter 2; backfill is billed, no exemption. Applied to ALL workspaces immediately (no real customers).",
   "meters": {
     "ingest_usd_per_gb": 0.2,
     "hot_window_usd_per_gb_month_ladder": [
@@ -37,6 +37,8 @@
     ]
   },
   "policy": {
+    "annual_available": false,
+    "annual_available_reason": "Annual billing is not offered yet (2026-09-15): the billing provider grants included allowances once per subscription cycle, so a yearly product would grant one month of allowance per year. While false, polar-sync archives the yearly products and clears their ids, the app hides the annual action and the checkout refuses interval=year. Flip to true only together with the decided annual shape.",
     "burst_multiple_of_trailing_30d_avg": 5,
     "warning_thresholds_pct": [
       75,
@@ -66,7 +68,7 @@
     "prepaid_expiry_months": 12,
     "audit_sku": {
       "sold": false,
-      "reason": "specs/BILL-01 \u00a710.4 \u2014 /v1/audit/export is not yet a complete offline evidence pack (B-392); 7-year ledger retention folds into Enterprise"
+      "reason": "specs/BILL-01 §10.4 — /v1/audit/export is not yet a complete offline evidence pack (B-392); 7-year ledger retention folds into Enterprise"
     },
     "velocity_sigma": 2,
     "velocity_window_days": 7,
@@ -90,7 +92,8 @@
       "unlimited_seats": false,
       "f_sso": false,
       "overage_allowed": false,
-      "rate_limit_rpm": 60
+      "rate_limit_rpm": 60,
+      "cold_gb_included": null
     },
     "builder_v1": {
       "name": "Builder",
@@ -98,7 +101,7 @@
       "price_annual_month_usd": 24,
       "price_from_usd": null,
       "hot_gb_included": 5,
-      "ingest_gb_included": 25,
+      "ingest_gb_included": 20,
       "series_included": 2000,
       "scan_units_included": 150,
       "eval_runs_included": 2000,
@@ -109,7 +112,8 @@
       "unlimited_seats": true,
       "f_sso": false,
       "overage_allowed": true,
-      "rate_limit_rpm": 600
+      "rate_limit_rpm": 600,
+      "cold_gb_included": 480
     },
     "team_v1": {
       "name": "Team",
@@ -117,7 +121,7 @@
       "price_annual_month_usd": 190,
       "price_from_usd": null,
       "hot_gb_included": 75,
-      "ingest_gb_included": 300,
+      "ingest_gb_included": 100,
       "series_included": 15000,
       "scan_units_included": 2000,
       "eval_runs_included": 40000,
@@ -128,7 +132,8 @@
       "unlimited_seats": true,
       "f_sso": true,
       "overage_allowed": true,
-      "rate_limit_rpm": 6000
+      "rate_limit_rpm": 6000,
+      "cold_gb_included": 2400
     },
     "business_v1": {
       "name": "Business",
@@ -136,7 +141,7 @@
       "price_annual_month_usd": 665,
       "price_from_usd": null,
       "hot_gb_included": 300,
-      "ingest_gb_included": 1500,
+      "ingest_gb_included": 200,
       "series_included": 75000,
       "scan_units_included": 12000,
       "eval_runs_included": 250000,
@@ -147,7 +152,8 @@
       "unlimited_seats": true,
       "f_sso": true,
       "overage_allowed": true,
-      "rate_limit_rpm": 60000
+      "rate_limit_rpm": 60000,
+      "cold_gb_included": 4800
     },
     "enterprise_v1": {
       "name": "Enterprise",
@@ -166,7 +172,8 @@
       "unlimited_seats": true,
       "f_sso": true,
       "overage_allowed": true,
-      "rate_limit_rpm": null
+      "rate_limit_rpm": null,
+      "cold_gb_included": null
     }
   }
 }

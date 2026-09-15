@@ -152,11 +152,15 @@ export function buildCard(plan: Plan): PlanCard {
 			value: formatCountOrCustom(row.eval_runs_included),
 		},
 		{
+			// BILL-01 A5: paid tiers carry an included cold-archive allowance
+			// (24x monthly ingest); Free keeps a 7-day cold window; Enterprise custom.
 			label: "Cold archive",
 			value:
-				row.cold_archive_days === null
-					? "complete"
-					: formatDays(row.cold_archive_days),
+				row.cold_gb_included !== null && row.cold_gb_included !== undefined
+					? `${formatGb(row.cold_gb_included)}·mo included`
+					: row.cold_archive_days === null
+						? "custom"
+						: formatDays(row.cold_archive_days),
 		},
 		{ label: "Ledger retention", value: formatDays(row.ledger_days) },
 		{ label: "Seats", value: row.unlimited_seats ? "Unlimited" : "1" },
@@ -167,8 +171,14 @@ export function buildCard(plan: Plan): PlanCard {
 		plan,
 		name: row.name,
 		priceMonth: formatPrice(row, "month"),
+		// B14 (2026-09-15): annual is not for sale until the founder rules its
+		// shape — `policy.annual_available` in plans.v3.json is the ONE switch;
+		// a null priceYear hides "Switch to annual" (PlanHeader) and the checkout
+		// refuses `interval=year` on the same flag.
 		priceYear:
-			row.price_annual_month_usd !== null ? formatPrice(row, "year") : null,
+			PLANS_V3.policy.annual_available && row.price_annual_month_usd !== null
+				? formatPrice(row, "year")
+				: null,
 		note:
 			plan === "free"
 				? "advertising only — one workspace, no card"
@@ -190,7 +200,6 @@ export function buildLadder(): PlanCard[] {
  */
 export const LADDER_FOOTNOTES: readonly string[] = [
 	"No rollover of unused allowance.",
-	"Price held 12 months from signup.",
 	"Free ages out after 14 idle days — never returns a 429.",
 ];
 

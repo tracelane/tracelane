@@ -289,6 +289,13 @@ function addMonths(d: Date, months: number): Date {
 	return out;
 }
 
+/** A Polar ISO-8601 timestamp field, or null when absent / not a string / unparsable. */
+function parseIsoDate(v: unknown): Date | null {
+	if (typeof v !== "string") return null;
+	const d = new Date(v);
+	return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function addDays(d: Date, days: number): Date {
 	return new Date(d.getTime() + days * 24 * 60 * 60 * 1000);
 }
@@ -375,6 +382,18 @@ async function handleSubscriptionChange(
 	const extra: Record<string, unknown> = {};
 
 	if (interval) extra.billingInterval = interval;
+	// B-410: the subscription cycle, straight from the payload. The dashboard
+	// rates usage over this window so it agrees with the invoice; a drop to
+	// Free clears it and the usage route falls back to the calendar month.
+	const periodStart = parseIsoDate(data.current_period_start);
+	const periodEnd = parseIsoDate(data.current_period_end);
+	if (planValue === "free") {
+		extra.currentPeriodStart = null;
+		extra.currentPeriodEnd = null;
+	} else if (periodStart && periodEnd) {
+		extra.currentPeriodStart = periodStart;
+		extra.currentPeriodEnd = periodEnd;
+	}
 
 	// Dunning: past_due starts the clock; any active status clears it. Plan is
 	// UNCHANGED either way — `resolvePlan` never resolves `past_due` to `free`,

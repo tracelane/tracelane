@@ -267,9 +267,14 @@ def _falsify_deny_ban() -> int:
             "deny",
             "--manifest-path",
             str(fixture / "Cargo.toml"),
-            "check",
+            # `--config` is a GLOBAL option in cargo-deny ≥ 0.18 (`cargo deny --config
+            # <path> check bans`); after `check` it is "unexpected argument". This
+            # selftest had never executed on the gate box until 2026-09-15 (B-419:
+            # cargo-deny was not installed, so it SKIPPED), which is how the stale
+            # ordering survived.
             "--config",
             str(pathlib.Path(__file__).parents[2] / "deny.toml"),
+            "check",
             "bans",
         ],
         capture_output=True,

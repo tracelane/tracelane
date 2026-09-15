@@ -29,10 +29,10 @@ Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident aud
 | Tier | Ingest | Hot window | Series | Query | Cold archive | Eval runs |
 |---|---|---|---|---|---|---|
 | Free | 1 GB | 0.25 GB | 100 | 10 scan-units | 7 days | 50 |
-| Builder | 25 GB | 5 GB | 2,000 | 150 scan-units | complete (2 yr) | 2,000 |
-| Team | 300 GB | 75 GB | 15,000 | 2,000 scan-units | complete (2 yr) | 40,000 |
-| Business | 1.5 TB | 300 GB | 75,000 | 12,000 scan-units | complete (2 yr) | 250,000 |
-| Enterprise | custom | custom | custom | custom | complete (2 yr) | custom |
+| Builder | 20 GB | 5 GB | 2,000 | 150 scan-units | 480 GB-mo included (2 yr queryable) | 2,000 |
+| Team | 100 GB | 75 GB | 15,000 | 2,000 scan-units | 2,400 GB-mo included (2 yr queryable) | 40,000 |
+| Business | 200 GB | 300 GB | 75,000 | 12,000 scan-units | 4,800 GB-mo included (2 yr queryable) | 250,000 |
+| Enterprise | custom | custom | custom | custom | custom (2 yr queryable) | custom |
 
 <Note>
 **Ingest is ONE meter — a gateway call and a raw OTel span both count the
@@ -89,7 +89,7 @@ hard-cap.
 | Hot indexed window | $16.00/GB-month (0–500) · $8.00 (500–2,000) · $4.50 (2,000–10,000) · $3.00 (10,000+) | Resident GB-month inside your plan's indexed window — priced as **query capacity**, not disk. |
 | Series | $0.008 / series-month | Distinct metric series (provider/model/attribute combinations) tracked this month. |
 | Query compute | $0.15 / scan-unit | ClickHouse bytes scanned to answer your queries; 1 scan-unit = 1 GB scanned. |
-| Cold archive | $0.08 / GB-month | Resident GB-month once data ages past the indexed window, while still inside queryable history. |
+| Cold archive | $0.08 / GB-month | Resident GB-month once data ages past the indexed window, while still inside queryable history — measured as the mean daily cold GB over the month, the same basis as the hot window. Every paid tier includes 24× its monthly ingest allowance in cold (two years of included ingest); the meter bills only beyond that. History you import counts toward cold from the day it lands. |
 | Evaluations | $0.005 / judge run | Each LLM-judge run against your traces or datasets. |
 
 <Note>
@@ -130,7 +130,6 @@ overage — Free ages out rather than returning 429s.
 
 ## Policies
 
-- **Price protection.** Your rate is held for 12 months from signup.
 - **Dunning.** Failed payments retry at days 1, 5 and 14, then the workspace
   drops to Free. Data is held 30 days.
 - **Refunds.** 30 days on the base subscription, first billing cycle only.

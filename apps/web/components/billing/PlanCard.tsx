@@ -68,7 +68,8 @@ export function PlanHeader({
 					<div className="flex flex-wrap gap-2">
 						{plan !== "free" &&
 							plan !== "enterprise" &&
-							billingInterval !== "year" && (
+							billingInterval !== "year" &&
+							card.priceYear && (
 								<form
 									action={`/api/checkout?tier=${plan}&interval=year`}
 									method="post"

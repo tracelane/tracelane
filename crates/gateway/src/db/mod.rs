@@ -401,6 +401,12 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         include_str!(
             "../../../../apps/web/db/migrations/0042_bill01_contract_drop_adr020_columns.sql"
         ),
+        // BILL-01 A5 + B-410: cold_gb_included on both entitlement tables, the Polar
+        // cycle on tenants. Nullable adds; applied BY HAND on prod BEFORE the
+        // gateway that reads them (its boot check refuses otherwise).
+        include_str!(
+            "../../../../apps/web/db/migrations/0043_bill01_cold_allowance_and_billing_period.sql"
+        ),
     ];
     for migration in MIGRATIONS {
         client

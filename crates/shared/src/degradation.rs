@@ -214,6 +214,10 @@ pub enum Degradation {
     /// like a tenant who was never warned.
     /// `crates/gateway/src/billing/email.rs`.
     UsageWarningEmailUnconfigured = 20,
+    /// The daily metering job found a day without its marker row inside the
+    /// lookback and recomputed it as of that day (founder, 2026-09-14, D). One
+    /// WARN per occurrence; the count says how often 04:10 UTC is being missed.
+    MeteringGaugeGapBackfilled = 21,
 }
 
 impl Degradation {
@@ -244,6 +248,7 @@ impl Degradation {
             Self::MeteringJobFailed => "metering_job_failed",
             Self::PolarMeterEmissionFailed => "polar_meter_emission_failed",
             Self::UsageWarningEmailUnconfigured => "email_unconfigured",
+            Self::MeteringGaugeGapBackfilled => "metering_gauge_gap_backfilled",
         }
     }
 
@@ -356,6 +361,12 @@ impl Degradation {
                  sent — RESEND_API_KEY is unset. Customers crossing a threshold are not \
                  being notified; the in-app usage page still shows it."
             }
+            Self::MeteringGaugeGapBackfilled => {
+                "the daily metering job found a day without its own marker row inside \
+                 the 7-day lookback and recomputed that day as of itself (spans carry \
+                 ingested_at) — nothing was lost, but 04:10 UTC was MISSED at least once. \
+                 A repeating count means the job is not running when it should."
+            }
         }
     }
 
@@ -383,13 +394,14 @@ impl Degradation {
             Self::MeteringJobFailed,
             Self::PolarMeterEmissionFailed,
             Self::UsageWarningEmailUnconfigured,
+            Self::MeteringGaugeGapBackfilled,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 21;
+pub const COUNT: usize = 22;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -419,6 +431,7 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

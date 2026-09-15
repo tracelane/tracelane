@@ -54,6 +54,9 @@ export interface PlansV3Meters {
 	never_metered: string[];
 }
 export interface PlansV3Policy {
+	/** B14: no annual product is sold until the founder rules its shape. */
+	annual_available: boolean;
+	annual_available_reason: string;
 	burst_multiple_of_trailing_30d_avg: number;
 	warning_thresholds_pct: number[];
 	rollover: boolean;
@@ -81,6 +84,7 @@ export interface PlansV3PlanRow {
 	queryable_days: number;
 	ledger_days: number;
 	cold_archive_days: number | null;
+	cold_gb_included: number | null;
 	unlimited_seats: boolean;
 	f_sso: boolean;
 	overage_allowed: boolean;

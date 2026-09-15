@@ -100,6 +100,8 @@ pub(crate) use spans::{
     CallerIdentity, CapturedInput, GatewayTiming, RequestConfig, SpanUsageMeta, build_gateway_span,
     record_key_spend, spawn_span_publish,
 };
+#[allow(unused_imports)]
+pub(crate) use stream::DROP_COUNTER_TEST_LOCK;
 pub(crate) use stream::STREAMS_FINALIZED_ON_DROP;
 
 /// Gateway configuration loaded from environment variables.
@@ -437,6 +439,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // artifact must not be given away). Built only when Postgres is configured;
     // the resolver uses the pooled (`-pooler`) connection and the LISTEN task
     // opens its own direct connection for NOTIFY-driven invalidation (TTL fallback).
+    // BOOT SCHEMA CHECK (founder, 2026-09-14, B6 audit item B). Refuse to start
+    // when the control plane lacks a column the entitlement query names: the
+    // deploy script's pre-flight covers the scripted path, this covers a hand
+    // `docker compose up` against a database still one hand-applied migration
+    // behind (0043 makes it three). Fail-CLOSED on a definite "absent"; a check
+    // that cannot run (Neon unreachable at boot) is fail-OPEN with a loud WARN,
+    // because a restart loop during a control-plane blip is the worse outcome
+    // and the cache already tolerates that state.
+    if let Some(pool) = pg.as_ref() {
+        match crate::entitlement_cache::verify_schema(pool).await {
+            Ok(checked) => {
+                tracing::info!(columns = checked, "control-plane schema check passed");
+            }
+            Err(crate::entitlement_cache::SchemaCheck::Missing(missing)) => {
+                tracing::error!(
+                    ?missing,
+                    "control-plane schema is BEHIND this binary — refusing to boot"
+                );
+                anyhow::bail!(
+                    "boot refused: the control plane lacks columns this binary reads: \
+                     {missing:?} — apply the pending migration by hand first"
+                );
+            }
+            Err(crate::entitlement_cache::SchemaCheck::Unavailable(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "control-plane schema check could not run — booting on the cache's fail-open path"
+                );
+            }
+        }
+    }
     let entitlements = pg.as_ref().map(|pool| {
         let cache = crate::entitlement_cache::EntitlementCache::new(
             crate::entitlement_cache::pg_resolver(pool.clone()),

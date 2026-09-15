@@ -161,6 +161,10 @@ struct PlanView {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageResponse {
     month: String,
+    /// B-410: the billing cycle the figures are rated over (RFC 3339), when a
+    /// paid subscription cycle is known; `None` = the calendar month above.
+    period_start: Option<String>,
+    period_end: Option<String>,
     computed_at: String,
     meters: UsageMeters,
     projected_overage_usd: Option<f64>,
@@ -367,6 +371,46 @@ fn month_progress() -> (f64, f64) {
     (day, days_in_month)
 }
 
+/// B-410 (founder, 2026-09-14): rate over the Polar billing cycle when the
+/// tenant has one, else the calendar month. Returns `(elapsed_days,
+/// total_days)` — elapsed counts today as a day, exactly as `month_progress`.
+fn period_progress(
+    resolved: Option<&crate::entitlement_cache::ResolvedEntitlements>,
+) -> (f64, f64) {
+    match resolved.and_then(|r| r.billing_period) {
+        Some((start, end)) if end > start => {
+            let now = chrono::Utc::now();
+            let total = ((end - start).num_seconds() as f64 / 86_400.0).max(1.0);
+            let elapsed = ((now - start).num_seconds() as f64 / 86_400.0).floor() + 1.0;
+            (elapsed.clamp(1.0, total), total)
+        }
+        _ => month_progress(),
+    }
+}
+
+/// The first day the period-to-date sums cover: the cycle start's UTC date, or
+/// the first of the month.
+fn period_since(
+    resolved: Option<&crate::entitlement_cache::ResolvedEntitlements>,
+) -> chrono::NaiveDate {
+    use chrono::Datelike as _;
+    let today = chrono::Utc::now().date_naive();
+    match resolved.and_then(|r| r.billing_period) {
+        Some((start, end)) if end > start && start.date_naive() <= today => start.date_naive(),
+        _ => today.with_day(1).unwrap_or(today),
+    }
+}
+
+/// The two RFC 3339 strings the response carries for B-410 (`None` = calendar month).
+fn period_fields(
+    resolved: Option<&crate::entitlement_cache::ResolvedEntitlements>,
+) -> (Option<String>, Option<String>) {
+    match resolved.and_then(|r| r.billing_period) {
+        Some((start, end)) => (Some(start.to_rfc3339()), Some(end.to_rfc3339())),
+        None => (None, None),
+    }
+}
+
 fn projection(used: f64, elapsed: f64, days_in_month: f64) -> Option<f64> {
     if elapsed < 1.0 {
         return None;
@@ -377,6 +421,8 @@ fn projection(used: f64, elapsed: f64, days_in_month: f64) -> Option<f64> {
 /// Rate one COUNTER meter (ingest / evals) whose real data lives in
 /// `meter_counters`. `daily` is only populated for the burst-exempt meters
 /// (ingest); it is empty for evals (§0.4 burst applies to meters 1 and 4 only).
+// One parameter per input the view is built from; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn view_from_counter(
     card: &crate::billing::RateCard,
     rated_meter: RatedMeter,
@@ -385,8 +431,9 @@ fn view_from_counter(
     daily: &[f64],
     unit: &'static str,
     overage_allowed: bool,
+    progress: (f64, f64),
 ) -> MeterView {
-    let (elapsed, days_in_month) = month_progress();
+    let (elapsed, days_in_month) = progress;
     let burst_exempt = if daily.is_empty() {
         0.0
     } else {
@@ -450,13 +497,20 @@ async fn usage_handler(
     let tier =
         crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant_id).await;
     let ch = crate::clickhouse_query::ch_client(url);
+    // B-410: everything below is period-to-date over the Polar cycle when the
+    // tenant has one (so the page agrees with the invoice), else month-to-date.
+    let since = period_since(resolved.as_deref());
+    let progress = period_progress(resolved.as_deref());
+    let period = period_fields(resolved.as_deref());
 
     // ONE query: this month's COUNTER totals (ingest_bytes, eval_runs), by meter.
     let counters_sql = crate::clickhouse_query::TenantQuery::new(
-        "SELECT meter, sum(value) AS total FROM tracelane.meter_counters \
-         WHERE tenant_id = ? AND meter IN ('ingest_bytes', 'eval_runs') \
-           AND toYYYYMM(day) = toYYYYMM(now()) \
-         GROUP BY meter",
+        format!(
+            "SELECT meter, sum(value) AS total FROM tracelane.meter_counters \
+             WHERE tenant_id = ? AND meter IN ('ingest_bytes', 'eval_runs') \
+               AND day >= toDate('{since}') AND day <= today() \
+             GROUP BY meter"
+        ),
         tier,
     )
     .with_log_comment(format!("tenant_id={tenant_id}"))
@@ -482,10 +536,12 @@ async fn usage_handler(
     // ONE query: this month's per-day ingest_bytes, for the burst exemption
     // (§0.4 applies to meters 1 and 4; meter 4 has no producer in this build).
     let daily_sql = crate::clickhouse_query::TenantQuery::new(
-        "SELECT toString(day) AS day, sum(value) AS value FROM tracelane.meter_counters \
-         WHERE tenant_id = ? AND meter = 'ingest_bytes' \
-           AND toYYYYMM(day) = toYYYYMM(now()) \
-         GROUP BY day ORDER BY day",
+        format!(
+            "SELECT toString(day) AS day, sum(value) AS value FROM tracelane.meter_counters \
+             WHERE tenant_id = ? AND meter = 'ingest_bytes' \
+               AND day >= toDate('{since}') AND day <= today() \
+             GROUP BY day ORDER BY day"
+        ),
         tier,
     )
     .with_log_comment(format!("tenant_id={tenant_id}"))
@@ -504,12 +560,14 @@ async fn usage_handler(
     // handler apply the RIGHT aggregation per meter (mean / max / sum —
     // spec step 7) instead of collapsing to a single point before it can.
     let gauges_sql = crate::clickhouse_query::TenantQuery::new(
-        "SELECT meter, toString(day) AS day, argMax(value, computed_at) AS value, \
-                toString(max(computed_at)) AS computed_at \
-         FROM tracelane.meter_gauges \
-         WHERE tenant_id = ? AND toYYYYMM(day) = toYYYYMM(now()) \
-         GROUP BY meter, day \
-         ORDER BY day",
+        format!(
+            "SELECT meter, toString(day) AS day, argMax(value, computed_at) AS value, \
+                    toString(max(computed_at)) AS computed_at \
+             FROM tracelane.meter_gauges \
+             WHERE tenant_id = ? AND day >= toDate('{since}') AND day <= today() \
+             GROUP BY meter, day \
+             ORDER BY day"
+        ),
         tier,
     )
     .with_log_comment(format!("tenant_id={tenant_id}"))
@@ -545,6 +603,10 @@ async fn usage_handler(
         .as_ref()
         .and_then(|e| e.eval_runs_included)
         .map(|v| v as f64);
+    let cold_included_gb = resolved
+        .as_ref()
+        .and_then(|e| e.cold_bytes_included)
+        .map(|b| b as f64 / 1e9);
 
     let ingest_view = view_from_counter(
         &card,
@@ -554,6 +616,7 @@ async fn usage_handler(
         &ingest_daily.iter().map(|b| b / 1e9).collect::<Vec<_>>(),
         "GB",
         overage_allowed,
+        progress,
     );
     let evals_view = view_from_counter(
         &card,
@@ -563,6 +626,7 @@ async fn usage_handler(
         &[],
         "run",
         overage_allowed,
+        progress,
     );
     // Meter 2 (hot): `used` = TODAY (the latest day's resident bytes — spec
     // §3 "resident GB today"); the GB-month projection = mean(daily) ×
@@ -577,7 +641,7 @@ async fn usage_handler(
     } else {
         let values: Vec<f64> = hot_daily_rows.iter().map(|g| g.value).collect();
         let today_gb = values.last().copied().unwrap_or(0.0) / 1e9;
-        let (_, days_in_month) = month_progress();
+        let (_, days_in_month) = progress;
         let gb_month_projection = mean(&values) / 1e9 * days_in_month;
         let rated = rating::rate(
             &card,
@@ -614,7 +678,7 @@ async fn usage_handler(
         MeterView::unavailable("series")
     } else {
         let values: Vec<f64> = series_daily_rows.iter().map(|g| g.value).collect();
-        let (elapsed, days_in_month) = month_progress();
+        let (elapsed, days_in_month) = progress;
         let max_val = max_of(&values);
         let rated = rating::rate(&card, RatedMeter::Series, max_val, series_included, 0.0);
         MeterView {
@@ -644,7 +708,7 @@ async fn usage_handler(
         MeterView::unavailable("scan-unit")
     } else {
         let values: Vec<f64> = scan_daily_rows.iter().map(|g| g.value).collect();
-        let (elapsed, days_in_month) = month_progress();
+        let (elapsed, days_in_month) = progress;
         let used_units = sum_of(&values) / 1e9;
         let rated = rating::rate(&card, RatedMeter::ScanUnits, used_units, scan_included, 0.0);
         MeterView {
@@ -675,12 +739,27 @@ async fn usage_handler(
     } else {
         let values: Vec<f64> = cold_daily_rows.iter().map(|g| g.value).collect();
         let mean_gb = mean(&values) / 1e9;
+        // BILL-01 A5: the allowance is 24x monthly ingest on paid tiers; meter 5
+        // bills only beyond it, on this mean-daily basis (same as meter 2).
+        let rated = rating::rate(
+            &card,
+            RatedMeter::ColdGbMonth,
+            mean_gb,
+            cold_included_gb,
+            0.0,
+        );
         MeterView {
             used: Some(mean_gb),
-            included: None,
+            included: cold_included_gb,
             burst_exempt: 0.0,
-            overage_units: 0.0,
-            overage_usd: if card.available { Some(0.0) } else { None },
+            overage_units: rated.overage_units,
+            overage_usd: if overage_allowed && card.available {
+                Some(rated.overage_usd)
+            } else if card.available {
+                Some(0.0)
+            } else {
+                None
+            },
             projection_month_end: Some(mean_gb),
             last_computed_at: cold_daily_rows.last().map(|g| g.computed_at.clone()),
             unit: "GB-month",
@@ -714,6 +793,8 @@ async fn usage_handler(
 
     let resp = UsageResponse {
         month: chrono::Utc::now().format("%Y-%m").to_string(),
+        period_start: period.0.clone(),
+        period_end: period.1.clone(),
         computed_at: chrono::Utc::now().to_rfc3339(),
         meters: UsageMeters {
             ingest: ingest_view,
@@ -764,8 +845,11 @@ async fn usage_handler(
 fn unavailable_response(
     resolved: Option<&crate::entitlement_cache::ResolvedEntitlements>,
 ) -> UsageResponse {
+    let period = period_fields(resolved);
     UsageResponse {
         month: chrono::Utc::now().format("%Y-%m").to_string(),
+        period_start: period.0.clone(),
+        period_end: period.1.clone(),
         computed_at: chrono::Utc::now().to_rfc3339(),
         meters: UsageMeters {
             ingest: MeterView::unavailable("GB"),
@@ -1146,6 +1230,28 @@ mod tests {
     }
 
     #[test]
+    fn period_progress_rates_over_the_polar_cycle_when_one_is_known() {
+        let mut r = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        let now = chrono::Utc::now();
+        r.billing_period = Some((
+            now - chrono::Duration::days(10),
+            now + chrono::Duration::days(20),
+        ));
+        let (elapsed, total) = period_progress(Some(&r));
+        assert!((29.9..=30.1).contains(&total), "total {total}");
+        assert!((10.9..=11.1).contains(&elapsed), "elapsed {elapsed}");
+        assert_eq!(
+            period_since(Some(&r)),
+            (now - chrono::Duration::days(10)).date_naive()
+        );
+        // No cycle -> the calendar month, exactly as before B-410.
+        r.billing_period = None;
+        assert_eq!(period_progress(Some(&r)), month_progress());
+        let (a, b) = period_fields(Some(&r));
+        assert!(a.is_none() && b.is_none());
+    }
+
+    #[test]
     fn month_progress_is_within_bounds() {
         let (elapsed, days) = month_progress();
         assert!((1.0..=31.0).contains(&elapsed));
@@ -1294,6 +1400,8 @@ mod tests {
                 "meters",
                 "month",
                 "overflow_mode",
+                "period_end",
+                "period_start",
                 "plan",
                 "projected_overage_usd",
                 "rate_card_version",

@@ -1721,12 +1721,19 @@ if [[ -n "${_stamp_file#/}" ]] && git rev-parse --git-dir >/dev/null 2>&1; then
         fi
     fi
 
-    printf '%s %s %s %s\n' \
+    _stamp_line="$(printf '%s %s %s %s' \
         "$overall" \
         "$_stamp_hash" \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        "$_stamp_scope" \
-        > "$_stamp_file" 2>/dev/null || true
+        "$_stamp_scope")"
+    printf '%s\n' "$_stamp_line" > "$_stamp_file" 2>/dev/null || true
+    # B-416 (verifier, 2026-09-15): `.verify-stamp` is ONE overwritable line, so the FULL
+    # green run that authorised a deploy is destroyed by the next docs commit's scoped
+    # run — the gate provenance of a deploy became unrecoverable about two minutes after
+    # it happened. The decision file stays exactly as it is (the checker reads only it);
+    # every stamp is ALSO appended here, gitignored, so "which run authorised this
+    # deploy?" has a durable answer: `grep <tree-hash> .verify-stamp.history`.
+    printf '%s\n' "$_stamp_line" >> "${_stamp_file}.history" 2>/dev/null || true
 fi
 
 exit "$overall"

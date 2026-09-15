@@ -164,6 +164,21 @@ struct StreamFinalizer {
 pub(crate) static STREAMS_FINALIZED_ON_DROP: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Tests that read `STREAMS_FINALIZED_ON_DROP` before/after hold this for the
+/// whole test — the same shape as `chat.rs`'s `CANCEL_COUNTER` (2026-09-12).
+/// Deliberately NOT `#[cfg(test)]` (nor its re-export in `server.rs`): three
+/// source-reading checks cut `server.rs` at its FIRST `#[cfg(test)]` marker
+/// (`check-read-route-smoke-coverage.py`, the embeddings route test, the NATS
+/// retry test), and a gated re-export near the top made all three see an
+/// empty file (gate 5, 2026-09-15).
+/// the counter is process-global, so with `RUST_TEST_THREADS > 1` one test's
+/// drop lands between another's `before` read and its assertion. Observed
+/// 2026-09-15 (gate 4): `completed_stream_finalizes_once_not_twice` read 2
+/// where it expected 1 on Rust that had passed the previous gate unchanged.
+#[allow(dead_code)] // held only by tests; a const Mutex costs nothing in the binary
+pub(crate) static DROP_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 impl StreamFinalizer {
     /// Normal completion: the loop ended. Runs finalization now, once.
     fn finish(mut self) {
@@ -1037,6 +1052,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn client_cancel_mid_stream_still_meters_and_finalizes() {
         use futures::StreamExt as _;
+        let _serial = DROP_COUNTER_TEST_LOCK.lock().await;
         let sink = test_sink();
         let before_drops = STREAMS_FINALIZED_ON_DROP.load(std::sync::atomic::Ordering::Relaxed);
         let before_no_nats = tracelane_shared::degradation::count(
@@ -1116,6 +1132,7 @@ pub(crate) mod tests {
     /// finalizes exactly ONCE — `finish()` must not leave `Drop` a second run.
     #[tokio::test]
     async fn completed_stream_finalizes_once_not_twice() {
+        let _serial = DROP_COUNTER_TEST_LOCK.lock().await;
         let before_drops = STREAMS_FINALIZED_ON_DROP.load(std::sync::atomic::Ordering::Relaxed);
         let (n, _) = meter_records_for(vec![chunk("hi"), done_event(50)]).await;
         assert_eq!(n, 1, "one completion, one meter record");

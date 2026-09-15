@@ -134,6 +134,15 @@ export const tenants = pgTable(
 		// 'month' | 'year'. Set by the webhook from the subscription's own
 		// lookup_key suffix (`_year`), never guessed.
 		billingInterval: text("billing_interval"),
+		// B-410 (2026-09-14): the Polar subscription's current cycle, written by the
+		// webhook from `current_period_start/end`. The dashboard rates usage over
+		// THIS window so it agrees with the invoice (Polar credits and bills per
+		// cycle), not with the calendar month. NULL = no paid cycle known -> the
+		// usage route falls back to the calendar month. Migration 0043.
+		currentPeriodStart: timestamp("current_period_start", {
+			withTimezone: true,
+		}),
+		currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
 		// signup + billing_policy.price_protection_months, set on the FIRST paid
 		// subscription.created/.active event. NULL = never had a paid sub.
 		priceProtectedUntil: timestamp("price_protected_until", {
@@ -273,6 +282,10 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	queryableDays: integer("queryable_days"),
 	ledgerDays: integer("ledger_days"),
 	coldArchiveDays: integer("cold_archive_days"), // NULL = complete (whole queryable history)
+	// BILL-01 A5 (2026-09-14): included cold-archive GB-month per calendar month =
+	// 24 x ingest_gb_included on paid tiers; meter 5 bills only beyond it.
+	// NULL = no allowance (Free) or custom (Enterprise). Migration 0043.
+	coldGbIncluded: numeric("cold_gb_included", { precision: 12, scale: 3 }),
 	unlimitedSeats: boolean("unlimited_seats").notNull().default(false),
 	fSso: boolean("f_sso").notNull().default(false),
 	overageAllowed: boolean("overage_allowed").notNull().default(false), // Free: no overage, ages out
@@ -357,6 +370,7 @@ export const workspaceEntitlements = pgTable(
 		indexedWindowDays: integer("indexed_window_days"),
 		queryableDays: integer("queryable_days"),
 		ledgerDays: integer("ledger_days"),
+		coldGbIncluded: numeric("cold_gb_included", { precision: 12, scale: 3 }),
 		fSso: boolean("f_sso"),
 		overageAllowed: boolean("overage_allowed"),
 		rateLimitRpm: integer("rate_limit_rpm"),

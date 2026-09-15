@@ -309,11 +309,31 @@ fn meter_query(sql: String) -> String {
         .sql_with_settings()
 }
 
+/// `now()` for the live run, or the END of a past day for a backfill — the
+/// stock meters (hot, cold, series) are recomputed AS OF that day using the
+/// rows that existed then (`spans.ingested_at`), never approximated from
+/// today's table (founder, 2026-09-14, B6 audit item D).
+fn now_expr(as_of: Option<NaiveDate>) -> String {
+    match as_of {
+        None => "now()".to_string(),
+        Some(d) => format!("toDateTime('{d} 23:59:59', 'UTC')"),
+    }
+}
+
+/// The `ingested_at` bound that makes an as-of recomputation exact; empty live.
+fn ingested_filter(as_of: Option<NaiveDate>, alias: &str) -> String {
+    match as_of {
+        None => String::new(),
+        Some(_) => format!(" AND {alias}ingested_at <= {}", now_expr(as_of)),
+    }
+}
+
 /// Meter 2: `hot_resident_bytes` — `sum(span_bytes)` per tenant over rows
 /// inside THAT tenant's indexed window. ONE query via the `windows` join.
 async fn query_hot_resident_bytes(
     ch: &clickhouse::Client,
     metas: &[TenantMeta],
+    as_of: Option<NaiveDate>,
 ) -> anyhow::Result<HashMap<String, f64>> {
     let sql = meter_query(format!(
         "WITH windows AS ( \
@@ -323,9 +343,11 @@ async fn query_hot_resident_bytes(
          SELECT s.tenant_id AS tenant_id, sum(s.span_bytes) AS value \
          FROM tracelane.spans AS s \
          INNER JOIN windows AS w ON s.tenant_id = w.tenant_id \
-         WHERE s.start_time >= now() - toIntervalDay(w.indexed_window_days) \
+         WHERE s.start_time >= {now} - toIntervalDay(w.indexed_window_days){ingested} \
          GROUP BY s.tenant_id",
-        lit = windows_literal(metas)
+        lit = windows_literal(metas),
+        now = now_expr(as_of),
+        ingested = ingested_filter(as_of, "s.")
     ));
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
@@ -337,15 +359,20 @@ async fn query_hot_resident_bytes(
 /// this build's edit scope beyond calling the rehydration helper, so the two
 /// literal strings are duplicated rather than shared — same reasoning as
 /// `days_since_epoch` above).
-async fn query_series(ch: &clickhouse::Client) -> anyhow::Result<HashMap<String, f64>> {
+async fn query_series(
+    ch: &clickhouse::Client,
+    as_of: Option<NaiveDate>,
+) -> anyhow::Result<HashMap<String, f64>> {
     const MODEL_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name'))";
     const PROVIDER_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider'))";
     let sql = meter_query(format!(
         "SELECT tenant_id AS tenant_id, \
             toFloat64(uniqExact(name, {MODEL_EXPR}, {PROVIDER_EXPR}, JSONExtractString(attributes, 'tracelane_api_key_id'))) AS value \
          FROM tracelane.spans \
-         WHERE toYYYYMM(start_time) = toYYYYMM(now()) \
-         GROUP BY tenant_id"
+         WHERE toYYYYMM(start_time) = toYYYYMM({now}){ingested} \
+         GROUP BY tenant_id",
+        now = now_expr(as_of),
+        ingested = ingested_filter(as_of, "")
     ));
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
@@ -356,17 +383,17 @@ async fn query_series(ch: &clickhouse::Client) -> anyhow::Result<HashMap<String,
 /// metering job's OWN queries (tagged `tracelane-meter`, never
 /// `tenant_id=<uuid>`) are excluded by construction — the `LIKE` filter only
 /// matches the tenant-tag shape.
-async fn query_scan_bytes_yesterday(
+async fn query_scan_bytes_for_day(
     ch: &clickhouse::Client,
+    day: NaiveDate,
 ) -> anyhow::Result<HashMap<String, f64>> {
-    let sql = meter_query(
+    let sql = meter_query(format!(
         "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, sum(read_bytes) AS value \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
-           AND event_date = yesterday() \
+           AND event_date = toDate('{day}') \
          GROUP BY tenant_id"
-            .to_string(),
-    );
+    ));
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
 }
@@ -377,6 +404,7 @@ async fn query_scan_bytes_yesterday(
 async fn query_cold_bytes(
     ch: &clickhouse::Client,
     metas: &[TenantMeta],
+    as_of: Option<NaiveDate>,
 ) -> anyhow::Result<HashMap<String, f64>> {
     let sql = meter_query(format!(
         "WITH windows AS ( \
@@ -387,10 +415,12 @@ async fn query_cold_bytes(
          SELECT s.tenant_id AS tenant_id, sum(s.span_bytes) AS value \
          FROM tracelane.spans AS s \
          INNER JOIN windows AS w ON s.tenant_id = w.tenant_id \
-         WHERE s.start_time < now() - toIntervalDay(w.indexed_window_days) \
-           AND s.start_time >= now() - toIntervalDay(w.queryable_days) \
+         WHERE s.start_time < {now} - toIntervalDay(w.indexed_window_days) \
+           AND s.start_time >= {now} - toIntervalDay(w.queryable_days){ingested} \
          GROUP BY s.tenant_id",
-        lit = windows_literal(metas)
+        lit = windows_literal(metas),
+        now = now_expr(as_of),
+        ingested = ingested_filter(as_of, "s.")
     ));
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
@@ -413,11 +443,12 @@ struct DailyTenantValueRow {
 async fn query_trailing_daily_meter_counter(
     ch: &clickhouse::Client,
     meter: &str,
+    until_excl: NaiveDate,
 ) -> anyhow::Result<HashMap<String, Vec<f64>>> {
     let sql = meter_query(format!(
         "SELECT tenant_id AS tenant_id, toString(day) AS day, sum(value) AS value \
          FROM tracelane.meter_counters \
-         WHERE meter = '{meter}' AND day >= today() - 31 AND day < today() \
+         WHERE meter = '{meter}' AND day >= toDate('{until_excl}') - 31 AND day < toDate('{until_excl}') \
          GROUP BY tenant_id, day ORDER BY tenant_id, day"
     ));
     let rows: Vec<DailyTenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
@@ -432,16 +463,16 @@ async fn query_trailing_daily_meter_counter(
 /// `scan_bytes` analogue of [`query_trailing_daily_meter_counter`].
 async fn query_trailing_daily_scan_bytes(
     ch: &clickhouse::Client,
+    until_excl: NaiveDate,
 ) -> anyhow::Result<HashMap<String, Vec<f64>>> {
-    let sql = meter_query(
+    let sql = meter_query(format!(
         "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, \
             toString(event_date) AS day, sum(read_bytes) AS value \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
-           AND event_date >= today() - 31 AND event_date < today() \
+           AND event_date >= toDate('{until_excl}') - 31 AND event_date < toDate('{until_excl}') \
          GROUP BY tenant_id, day ORDER BY tenant_id, day"
-            .to_string(),
-    );
+    ));
     let rows: Vec<DailyTenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     let mut out: HashMap<String, Vec<f64>> = HashMap::new();
     for r in rows {
@@ -957,6 +988,94 @@ async fn apply_auto_age(
 /// excludes that meter from this run's gauges/emissions/emails rather than
 /// aborting the whole run (a `system.query_log` hiccup must not also blank
 /// out `hot_resident_bytes`, which reads a different table).
+/// How far back a missed day is recomputed. Seven days covers a weekend
+/// outage with margin; beyond that the trailing-30-day burst window the
+/// ingest event needs is itself partial, and a month-old gap is an incident,
+/// not a backfill.
+const GAP_LOOKBACK_DAYS: i64 = 7;
+
+#[derive(serde::Deserialize, clickhouse::Row)]
+struct DayRow {
+    day: String,
+}
+
+/// Days in `[since, until)` that carry the job's marker row — i.e. days the
+/// job completed.
+async fn query_completed_days(
+    ch: &clickhouse::Client,
+    since: NaiveDate,
+    until_excl: NaiveDate,
+) -> anyhow::Result<std::collections::HashSet<NaiveDate>> {
+    let sql = meter_query(format!(
+        "SELECT toString(day) AS day FROM tracelane.meter_gauges \
+         WHERE tenant_id = '{JOB_MARKER_TENANT}' \
+           AND day >= toDate('{since}') AND day < toDate('{until_excl}') \
+         GROUP BY day"
+    ));
+    let rows: Vec<DayRow> = ch.query(&capped(&sql)).fetch_all().await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.day.parse::<NaiveDate>().ok())
+        .collect())
+}
+
+/// Recompute and write every missed day in the lookback, oldest first, and
+/// emit its Polar events. Returns how many days were backfilled.
+async fn backfill_missed_days(
+    ch: &clickhouse::Client,
+    metas: &[TenantMeta],
+    today: NaiveDate,
+    card: &RateCard,
+    polar: Option<&PolarClient>,
+) -> anyhow::Result<usize> {
+    let since = today - chrono::Duration::days(GAP_LOOKBACK_DAYS);
+    let done = query_completed_days(ch, since, today).await?;
+    let mut n = 0usize;
+    for offset in (1..=GAP_LOOKBACK_DAYS).rev() {
+        let day = today - chrono::Duration::days(offset);
+        if done.contains(&day) {
+            continue;
+        }
+        let prev = day - chrono::Duration::days(1);
+        let hot = query_hot_resident_bytes(ch, metas, Some(day)).await?;
+        let series = query_series(ch, Some(day)).await?;
+        let scan = query_scan_bytes_for_day(ch, prev).await?;
+        let cold = query_cold_bytes(ch, metas, Some(day)).await?;
+        write_gauges(ch, day, prev, &hot, &series, &scan, &cold).await?;
+        if let Some(polar) = polar {
+            let ingest_trailing =
+                query_trailing_daily_meter_counter(ch, "ingest_bytes", day).await?;
+            let scan_trailing = query_trailing_daily_scan_bytes(ch, day).await?;
+            let eval_trailing = query_trailing_daily_meter_counter(ch, "eval_runs", day).await?;
+            let dim = days_in_month(day);
+            for meta in metas {
+                let Some(customer_id) = meta.polar_customer_id.as_deref() else {
+                    continue;
+                };
+                let key = meta.tenant_id.to_string();
+                let events = tenant_polar_events(
+                    card.policy.burst_multiple,
+                    dim,
+                    hot.get(&key).copied(),
+                    series.get(&key).copied(),
+                    cold.get(&key).copied(),
+                    eval_trailing.get(&key).and_then(|d| d.last().copied()),
+                    ingest_trailing.get(&key).map(Vec::as_slice),
+                    scan_trailing.get(&key).map(Vec::as_slice),
+                );
+                if !events.is_empty() {
+                    // Keyed on `prev`, exactly as the live run keys on
+                    // yesterday, so a re-run never double-emits a day.
+                    emit_polar_events(polar, customer_id, prev, &events).await;
+                }
+            }
+        }
+        tracing::warn!(%day, "metering job: missed day recomputed as of that day and written");
+        n += 1;
+    }
+    Ok(n)
+}
+
 pub async fn run_once(
     pool: &DbPool,
     ch_url: &str,
@@ -989,17 +1108,23 @@ pub async fn run_once(
         };
     }
 
-    let hot = try_query!(query_hot_resident_bytes(&ch, &metas), "hot_resident_bytes");
-    let series = try_query!(query_series(&ch), "series");
-    let scan = try_query!(query_scan_bytes_yesterday(&ch), "scan_bytes");
-    let cold = try_query!(query_cold_bytes(&ch, &metas), "cold_bytes");
+    let hot = try_query!(
+        query_hot_resident_bytes(&ch, &metas, None),
+        "hot_resident_bytes"
+    );
+    let series = try_query!(query_series(&ch, None), "series");
+    let scan = try_query!(query_scan_bytes_for_day(&ch, yesterday), "scan_bytes");
+    let cold = try_query!(query_cold_bytes(&ch, &metas, None), "cold_bytes");
     let ingest_trailing = try_query!(
-        query_trailing_daily_meter_counter(&ch, "ingest_bytes"),
+        query_trailing_daily_meter_counter(&ch, "ingest_bytes", today),
         "ingest_bytes_trailing"
     );
-    let scan_trailing = try_query!(query_trailing_daily_scan_bytes(&ch), "scan_bytes_trailing");
+    let scan_trailing = try_query!(
+        query_trailing_daily_scan_bytes(&ch, today),
+        "scan_bytes_trailing"
+    );
     let eval_yesterday = try_query!(
-        query_trailing_daily_meter_counter(&ch, "eval_runs"),
+        query_trailing_daily_meter_counter(&ch, "eval_runs", today),
         "eval_runs_trailing"
     );
     // Calendar-month-to-date sums (`day >= toStartOfMonth(today())`) — the
@@ -1022,6 +1147,31 @@ pub async fn run_once(
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::MeteringJobFailed,
         );
+    }
+    // Founder, 2026-09-14 (B6 audit item D): an outage spanning 04:10 used to
+    // lose a day's revenue silently — a missed sample is absent (never zero)
+    // in the dashboard's mean, and its Polar events were never emitted. Every
+    // day in the lookback without the job's marker row is recomputed AS OF
+    // that day and written under it, its Polar events emitted under that
+    // day's idempotency key, and the gap is WARNED once through the
+    // degradation counter the watchdog reads.
+    match backfill_missed_days(&ch, &metas, today, card, polar).await {
+        Ok(0) => {}
+        Ok(n) => {
+            tracing::warn!(
+                days = n,
+                "metering job: backfilled {n} missed day(s) from ClickHouse"
+            );
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::MeteringGaugeGapBackfilled,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "metering job: gap backfill failed for this run");
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::MeteringJobFailed,
+            );
+        }
     }
 
     for meta in &metas {
@@ -1085,6 +1235,11 @@ pub async fn run_once(
                         meter: "query",
                         used: gb(scan_month_val.unwrap_or(0.0)),
                         included: resolved.scan_units_included.map(|v| v as f64),
+                    },
+                    crate::billing::email::MeterUsage {
+                        meter: "cold",
+                        used: gb(cold_bytes.unwrap_or(0.0)),
+                        included: resolved.cold_bytes_included.map(|b| b as f64 / 1e9),
                     },
                     crate::billing::email::MeterUsage {
                         meter: "evals",

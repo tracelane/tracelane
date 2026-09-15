@@ -73,7 +73,7 @@ const meters = [
 	{
 		label: "Cold archive",
 		rate: "$0.08 / GB-month",
-		body: "Everything past your indexed window, kept queryable for two years.",
+		body: `Everything past your indexed window, kept queryable for two years. Metered, not unlimited: every paid plan includes a cold allowance of 24× its monthly ingest (${formatGb(plan("builder_v1").cold_gb_included)}-month on Builder, ${formatGb(plan("team_v1").cold_gb_included)}-month on Team, ${formatGb(plan("business_v1").cold_gb_included)}-month on Business); the rate above applies beyond it.`,
 	},
 	{
 		label: "Evaluations",
@@ -167,6 +167,6 @@ const meters = [
     </div>
 
     <p class="mt-10 text-center text-sm text-fg-subtle max-w-3xl mx-auto" style="text-wrap:pretty">
-      "Resident GB" is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. No rollover of unused allowance. Price held 12 months from signup. Never metered: per host or peak host, per seat on any paid tier, a separate egress line, retention as a multiplier, or OTel attributes reclassified as premium metrics. Free ages out after 14 idle days — it never returns a 429, and ingest is never blocked by billing state on any tier.
+      "Resident GB" is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. No rollover of unused allowance. Never metered: per host or peak host, per seat on any paid tier, a separate egress line, retention as a multiplier, or OTel attributes reclassified as premium metrics. Free ages out after 14 idle days — it never returns a 429, and ingest is never blocked by billing state on any tier.
     </p>
   </section>
