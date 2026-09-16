@@ -51,7 +51,7 @@ docker compose -f infra/dev/docker-compose.yml up -d
 # to Drizzle — an incomplete control plane fails at runtime, not here.
 #
 # READ THIS BEFORE YOU ASSUME THE SCHEMA IS COMPLETE. `drizzle-kit migrate` applies
-# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 43
+# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 44
 # .sql files on disk; 0009+ are hand-written Neon migrations applied out-of-band and
 # deliberately un-journaled, so this command gives you 9 of 39. That is enough for the
 # gateway to boot and for most local work, and it is NOT the production schema.

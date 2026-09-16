@@ -57,6 +57,21 @@ export const planEnum = pgEnum("plan", [
 	"enterprise",
 ]);
 
+/** BILL-02: the annual pair's last-seen state, written by the webhook only. */
+export type AnnualPairHalfJson = {
+	id: string;
+	plan: string;
+	status: string;
+	period_start?: string | null;
+	period_end?: string | null;
+};
+export type AnnualPairJson = {
+	base?: AnnualPairHalfJson | null;
+	usage?: AnnualPairHalfJson | null;
+	/** null when the pair is healthy; else the refusal reason (P2/P3/P4/P6). */
+	alert?: string | null;
+};
+
 export const tenants = pgTable(
 	"tenants",
 	{
@@ -143,6 +158,17 @@ export const tenants = pgTable(
 			withTimezone: true,
 		}),
 		currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
+		// BILL-02 (B14 → (c), 2026-09-16): an ANNUAL tenant holds TWO Polar
+		// subscriptions — the yearly base (no meters) and the $0 monthly usage
+		// (meters + monthly credits). The webhook writes the ids as their events
+		// arrive; `resolvePair` serves the tier only when both are active on the
+		// same plan. `current_period_*` above is the USAGE cycle for such tenants.
+		// Migration 0044.
+		polarBaseSubscriptionId: text("polar_base_subscription_id"),
+		polarUsageSubscriptionId: text("polar_usage_subscription_id"),
+		// The resolver's INPUT, verbatim (`AnnualPair` in lib/polar-webhook.ts):
+		// the last-seen state of each half + the alert the last resolution raised.
+		annualPair: jsonb("annual_pair").$type<AnnualPairJson>(),
 		// signup + billing_policy.price_protection_months, set on the FIRST paid
 		// subscription.created/.active event. NULL = never had a paid sub.
 		priceProtectedUntil: timestamp("price_protected_until", {
@@ -294,7 +320,12 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	// (idempotent on lookup_key). The checkout route reads THESE, not a
 	// POLAR_PRODUCT_ID_<TIER> env var.
 	polarProductIdMonth: text("polar_product_id_month"),
+	// Retired by BILL-02 (a yearly product with meters grants credits once a
+	// YEAR — B-411); stays NULL until a contract migration drops it.
 	polarProductIdYear: text("polar_product_id_year"),
+	// BILL-02: the two products an annual tenant subscribes to. Migration 0044.
+	polarProductIdBaseYear: text("polar_product_id_base_year"),
+	polarProductIdUsageMonth: text("polar_product_id_usage_month"),
 	// Per-tenant requests-per-minute, read from the DB rather than a tier-string
 	// compare. NULL = no limit (Enterprise; also the no-control-plane self-host
 	// default, B-357).

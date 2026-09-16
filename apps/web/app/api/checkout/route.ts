@@ -116,25 +116,33 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	// B-140: an existing subscriber changes plans through the Polar customer
 	// portal, never a second checkout.
 	const [tenantRow] = await db
-		.select({ polarSubscriptionId: tenants.polarSubscriptionId })
+		.select({
+			polarSubscriptionId: tenants.polarSubscriptionId,
+			polarBaseSubscriptionId: tenants.polarBaseSubscriptionId,
+		})
 		.from(tenants)
 		.where(eq(tenants.workosOrgId, session.tenantId))
 		.limit(1);
-	if (tenantRow?.polarSubscriptionId) {
+	if (tenantRow?.polarSubscriptionId || tenantRow?.polarBaseSubscriptionId) {
 		return portalRedirect(req.nextUrl.origin, token);
 	}
 
+	// BILL-02 (B14 → option (c)): an annual plan is bought as its yearly BASE
+	// product; the $0 monthly USAGE subscription is created on the same Polar
+	// customer by the reconciler once the base's webhook lands (spec §2.5).
+	// The retired one-object `_year` product (credits once a YEAR, B-411) is
+	// never read here again.
 	const [planRow] = await db
 		.select({
 			polarProductIdMonth: planEntitlements.polarProductIdMonth,
-			polarProductIdYear: planEntitlements.polarProductIdYear,
+			polarProductIdBaseYear: planEntitlements.polarProductIdBaseYear,
 		})
 		.from(planEntitlements)
 		.where(eq(planEntitlements.planLookupKey, lookupKey))
 		.limit(1);
 	const productId =
 		interval === "year"
-			? planRow?.polarProductIdYear
+			? planRow?.polarProductIdBaseYear
 			: planRow?.polarProductIdMonth;
 	if (!productId) {
 		// Valid tier, but this deployment has no Polar product id for it/this

@@ -10,6 +10,20 @@ to a past event — deletion, insertion, reorder, or modification — breaks the
 recomputed hash, and anyone holding an export can detect it without trusting
 Tracelane.
 
+**What the guarantee rests on, stated plainly.** Every tier gets its own Ed25519
+signing keypair, minted on the tenant's first anchored batch. That key is generated
+and held by Tracelane (envelope-encrypted at rest), so the signature proves a batch
+has not been altered by anyone *other than* Tracelane; it cannot, by itself, stop
+Tracelane from re-signing a rewritten chain. What stops that is the public Sigstore
+Rekor anchor: an anchored batch's Merkle root sits in an append-only public log with
+a timestamp nobody can backdate, so rewriting history would leave the old root on the
+record. **Against a third party, the chain plus the signature is the guarantee on
+every batch; against Tracelane itself, the guarantee is the Rekor anchor, and it
+covers only the batches that are anchored.** Keys you hold yourself (a KMS key we can
+sign with but never read) are on the roadmap for Enterprise; universal per-batch
+anchoring, which would extend the against-us guarantee to the whole chain, is the
+nearer fix and is on the roadmap for every tier.
+
 <Note>
 **What the chain covers.** The chain records **every gateway-proxied call and
 guardrail verdict**. Spans captured via the OTLP/SDK path (self-host

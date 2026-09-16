@@ -25,13 +25,47 @@ import { Badge } from "@tracelanedev/ui";
  * Name, price for the interval actually billed, the interval badge, and the
  * plan-change actions. Server component; every figure is `plans.v3.json`.
  */
+/** BILL-02: what the page knows about an ANNUAL tenant's two subscriptions. */
+export type AnnualHeaderState = {
+	/** the yearly base's `current_period_end` — "paid through …" */
+	basePeriodEnd: string | null;
+	/** null when the pair is healthy; else the resolver's refusal reason */
+	alert: string | null;
+};
+
+/** Customer wording for each refusal (spec §4). Keys are the resolver's. */
+const ANNUAL_ALERT_COPY: Record<string, { title: string; body: string }> = {
+	annual_pair_usage_missing: {
+		title: "Your annual base is paid — usage billing is still being set up.",
+		body: "This workspace is on the Free plan until it completes, usually within a day. Nothing you sent is lost.",
+	},
+	annual_pair_base_lapsed: {
+		title: "Your annual base has lapsed.",
+		body: "This workspace is on the Free plan; usage billing stops at the end of its current cycle. Renew the annual base to restore the plan.",
+	},
+	annual_pair_mismatch: {
+		title: "Your annual subscriptions do not match.",
+		body: "This workspace is on the Free plan until support reconciles them. Email support@tracelane.dev with your workspace name.",
+	},
+};
+
+function paidThrough(iso: string | null): string | null {
+	if (!iso) return null;
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return null;
+	return d.toISOString().slice(0, 10);
+}
+
 export function PlanHeader({
 	plan,
 	billingInterval,
+	annual = null,
 }: {
 	plan: Plan;
 	/** null on Free (no billing account yet). */
 	billingInterval: "month" | "year" | null;
+	/** BILL-02: present iff the tenant holds (or held) an annual pair. */
+	annual?: AnnualHeaderState | null;
 }) {
 	const card = buildCard(plan);
 	const idx = LADDER.indexOf(plan);
@@ -39,6 +73,8 @@ export function PlanHeader({
 		billingInterval === "year" && card.priceYear
 			? card.priceYear
 			: card.priceMonth;
+	const alertCopy = annual?.alert ? ANNUAL_ALERT_COPY[annual.alert] : null;
+	const through = paidThrough(annual?.basePeriodEnd ?? null);
 
 	return (
 		<div className="space-y-4">
@@ -59,7 +95,12 @@ export function PlanHeader({
 								{price.suffix}
 							</span>
 						</p>
-						{billingInterval ? (
+						{billingInterval === "year" && annual && !annual.alert ? (
+							<Badge tone="neutral">
+								annual{through ? ` · paid through ${through}` : ""} · usage
+								billed monthly
+							</Badge>
+						) : billingInterval ? (
 							<Badge tone="neutral">billed {billingInterval}ly</Badge>
 						) : (
 							<Badge tone="neutral">no billing account yet</Badge>
@@ -122,6 +163,15 @@ export function PlanHeader({
 						)}
 					</div>
 				</div>
+				{alertCopy && (
+					<output
+						className="mt-3 block rounded border border-line bg-surface p-3 text-xs"
+						data-testid="annual-pair-alert"
+					>
+						<p className="font-medium text-ink">{alertCopy.title}</p>
+						<p className="mt-1 text-ink-2">{alertCopy.body}</p>
+					</output>
+				)}
 				{plan !== "free" && plan !== "enterprise" && (
 					<p className="mt-2 text-2xs text-ink-3">
 						Upgrade prorates immediately. Downgrade takes effect at your next

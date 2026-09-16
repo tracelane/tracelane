@@ -76,7 +76,9 @@ FAMILIES: list[dict] = [
     {
         "name": "provider-count",
         "code": "crates/gateway/src/providers/mod.rs provider_id_for_model",
-        "pat": re.compile(r"(\d{2})\+?\s*(?:LLM\s*)?providers", re.IGNORECASE),
+        # \d{2,3}: the count passed 100 on 2026-09-16 (191 routable); a two-digit
+        # capture read "191" as "91" and reported a phantom conflict.
+        "pat": re.compile(r"(\d{2,3})\+?\s*(?:LLM\s*)?providers", re.IGNORECASE),
         "key": lambda _m: "provider-count",
     },
     {

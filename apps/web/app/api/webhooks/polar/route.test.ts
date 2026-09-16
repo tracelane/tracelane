@@ -290,12 +290,10 @@ describe("POST /api/webhooks/polar", () => {
 		expect("currentPeriodEnd" in setArg).toBe(false);
 	});
 
-	it("ADR-076: an annual (_year) lookup key sets billing_interval='year'", async () => {
+	it("BILL-02: the retired one-object `_year` key is acked with NO plan change", async () => {
 		setDb([
 			[], // dedup select
 			[{ id: "ten_1", priceProtectedUntil: new Date("2020-01-01T00:00:00Z") }],
-			[], // update tenants
-			[], // upsert workspace_entitlements
 			[], // record webhook_events
 		]);
 		const res = await POST(
@@ -309,8 +307,187 @@ describe("POST /api/webhooks/polar", () => {
 			),
 		);
 		expect(res.status).toBe(200);
-		const setArg = h.db?.setCalls[0]?.[0] as { billingInterval?: string };
-		expect(setArg?.billingInterval).toBe("year");
+		expect(h.db?.setCalls.length ?? 0).toBe(0);
+	});
+
+	// ── BILL-02 (founder ruling B14 → option (c)): the annual PAIR ──────────
+	const baseEvent = (over: Record<string, unknown> = {}) =>
+		subEvent({
+			id: "sub_base",
+			current_period_start: "2026-09-14T00:00:00Z",
+			current_period_end: "2027-09-14T00:00:00Z",
+			product: {
+				organization_id: ORG,
+				metadata: { lookup_key: "team_v1_base_year" },
+			},
+			...over,
+		});
+	const usageEvent = (over: Record<string, unknown> = {}) =>
+		subEvent({
+			id: "sub_usage",
+			current_period_start: "2026-09-14T00:00:00Z",
+			current_period_end: "2026-10-14T00:00:00Z",
+			product: {
+				organization_id: ORG,
+				metadata: { lookup_key: "team_v1_usage_month" },
+			},
+			...over,
+		});
+	const tenantRow = (annualPair: unknown, plan: string | null = null) => [
+		{
+			id: "ten_1",
+			plan,
+			priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+			annualPair,
+		},
+	];
+	const pairDb = (row: unknown[], extraReads: unknown[] = []) =>
+		setDb([[], row, ...extraReads, [], [], []]); // dedup, tenant, (policy reads), update, upsert, record
+
+	it("BILL-02 P2: the BASE arrives first (usage not yet created) → plan FREE, interval year, alert usage_missing, both ids as known", async () => {
+		pairDb(tenantRow(null));
+		const res = await POST(makeReq(baseEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("free");
+		expect(setArg.billingInterval).toBe("year");
+		expect(setArg.polarBaseSubscriptionId).toBe("sub_base");
+		expect(setArg.polarUsageSubscriptionId).toBeNull();
+		expect(setArg.polarSubscriptionId).toBeNull();
+		expect((setArg.annualPair as { alert: string }).alert).toBe(
+			"annual_pair_usage_missing",
+		);
+		expect(setArg.currentPeriodStart).toBeNull();
+	});
+
+	it("BILL-02 P1: the USAGE half arrives for a tenant holding an active base → the tier, interval year, the USAGE cycle as the period, alert null", async () => {
+		pairDb(
+			tenantRow({
+				base: {
+					id: "sub_base",
+					plan: "team",
+					status: "active",
+					period_end: "2027-09-14T00:00:00Z",
+				},
+				alert: "annual_pair_usage_missing",
+			}),
+			[[{ value: 12 }], [{ priceVersion: "v3" }]], // price protection reads (first paid)
+		);
+		const res = await POST(makeReq(usageEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("team");
+		expect(setArg.billingInterval).toBe("year");
+		expect(setArg.currentPeriodStart).toEqual(new Date("2026-09-14T00:00:00Z"));
+		expect(setArg.currentPeriodEnd).toEqual(new Date("2026-10-14T00:00:00Z"));
+		expect(setArg.polarBaseSubscriptionId).toBe("sub_base");
+		expect(setArg.polarUsageSubscriptionId).toBe("sub_usage");
+		expect((setArg.annualPair as { alert: unknown }).alert).toBeNull();
+		// ONE update statement carries plan + period + ids + pair (B-388's guard).
+		expect(h.db?.setCalls.length).toBe(1);
+	});
+
+	it("BILL-02 P3: the BASE is canceled while usage is active → plan FREE, alert base_lapsed (a $0 usage subscription alone is the tier for free)", async () => {
+		pairDb(
+			tenantRow(
+				{
+					base: { id: "sub_base", plan: "team", status: "active" },
+					usage: {
+						id: "sub_usage",
+						plan: "team",
+						status: "active",
+						period_start: "2026-09-14T00:00:00Z",
+						period_end: "2026-10-14T00:00:00Z",
+					},
+					alert: null,
+				},
+				"team",
+			),
+			[[{ value: 30 }]], // dunning_data_hold_days (drop from a paid plan)
+		);
+		const res = await POST(
+			makeReq(baseEvent({ status: "canceled", type: "subscription.canceled" })),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("free");
+		expect((setArg.annualPair as { alert: string }).alert).toBe(
+			"annual_pair_base_lapsed",
+		);
+		expect(setArg.currentPeriodStart).toBeNull();
+	});
+
+	it("BILL-02 P4: the USAGE half arrives on a different plan than the base → plan FREE, alert mismatch", async () => {
+		pairDb(
+			tenantRow({
+				base: { id: "sub_base", plan: "team", status: "active" },
+			}),
+		);
+		const res = await POST(
+			makeReq(
+				usageEvent({
+					product: {
+						organization_id: ORG,
+						metadata: { lookup_key: "builder_v1_usage_month" },
+					},
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("free");
+		expect((setArg.annualPair as { alert: string }).alert).toBe(
+			"annual_pair_mismatch",
+		);
+	});
+
+	it("BILL-02 P6: a MONTHLY subscription arrives for a tenant that holds a pair → plan FREE, alert mismatch, the pair kept as evidence", async () => {
+		pairDb(
+			tenantRow(
+				{
+					base: { id: "sub_base", plan: "team", status: "active" },
+					usage: { id: "sub_usage", plan: "team", status: "active" },
+				},
+				"team",
+			),
+			[[{ value: 30 }]],
+		);
+		const res = await POST(makeReq(subEvent({ id: "sub_monthly" })));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("free");
+		expect((setArg.annualPair as { alert: string; base: unknown }).alert).toBe(
+			"annual_pair_mismatch",
+		);
+		expect((setArg.annualPair as { base: { id: string } }).base.id).toBe(
+			"sub_base",
+		);
+	});
+
+	it("BILL-02 P5: the base renewal goes past_due while usage is active → the tier is KEPT and dunning starts, never a refusal", async () => {
+		pairDb(
+			tenantRow(
+				{
+					base: { id: "sub_base", plan: "team", status: "active" },
+					usage: {
+						id: "sub_usage",
+						plan: "team",
+						status: "active",
+						period_start: "2026-09-14T00:00:00Z",
+						period_end: "2026-10-14T00:00:00Z",
+					},
+				},
+				"team",
+			),
+		);
+		const res = await POST(
+			makeReq(baseEvent({ status: "past_due", type: "subscription.updated" })),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("team");
+		expect(setArg.dunningStartedAt).toBeInstanceOf(Date);
+		expect((setArg.annualPair as { alert: unknown }).alert).toBeNull();
 	});
 
 	// B-388. HMAC + idempotency stop the SAME delivery twice; they say nothing

@@ -48,6 +48,7 @@ import {
 	webhookEvents,
 	workspaceEntitlements,
 } from "@/db/schema";
+import type { AnnualPairJson } from "@/db/schema";
 import {
 	sendDroppedToFreeEmail,
 	sendDunningStartedEmail,
@@ -55,6 +56,7 @@ import {
 } from "@/lib/email";
 import {
 	type BillingInterval,
+	type PairHalf,
 	type PlanResolution,
 	decodeWebhookSecret,
 	eventClock,
@@ -62,6 +64,8 @@ import {
 	isPastDueStatus,
 	isStale,
 	logSafe,
+	planForLookupKey,
+	resolvePair,
 	resolvePlan,
 	verifySignature,
 } from "@/lib/polar-webhook";
@@ -368,6 +372,31 @@ async function handleSubscriptionChange(
 		return;
 	}
 
+	// ── BILL-02 (founder ruling B14 → option (c)): an ANNUAL tenant holds TWO
+	// Polar subscriptions. Any event for a `_base_year` / `_usage_month` key —
+	// and a MONTHLY key arriving for a tenant that already holds a pair (P6) —
+	// goes through the pair resolver, which serves the tier only when both
+	// halves are held on the same plan and REFUSES every half-state to Free
+	// with a named alert (spec §2.4). It never calls Polar: the other half's
+	// last-seen state is in `tenants.annual_pair`.
+	const keyed = planForLookupKey(lookupKey);
+	const half = keyed?.half ?? null;
+	const heldPair = tenant.annualPair ?? null;
+	const holdsPair = !!(heldPair?.base || heldPair?.usage);
+	if (half === "base" || half === "usage" || (holdsPair && half === "single")) {
+		await applyPairEvent({
+			tenant,
+			subId,
+			customerId,
+			status,
+			half: half as "base" | "usage" | "single",
+			keyedPlan: keyed?.plan ?? null,
+			data,
+			eventAt,
+		});
+		return;
+	}
+
 	// `free` is now a valid tenants.plan value, so cancellation sets it
 	// explicitly (was previously left stale because the enum had no `free`).
 	const planValue = resolution.kind === "free" ? "free" : resolution.planEnum;
@@ -477,6 +506,141 @@ async function handleSubscriptionChange(
 }
 
 /**
+ * BILL-02 §2.4 — merge one half's event into the stored pair, resolve, and
+ * write the WHOLE billing state in ONE statement (B-388's ordering guard
+ * holds: plan + clock + period + ids + alert land together or not at all).
+ */
+async function applyPairEvent(args: {
+	tenant: NonNullable<Awaited<ReturnType<typeof correlateTenant>>>;
+	subId: string | null;
+	customerId: string | null;
+	status: string | null;
+	half: "base" | "usage" | "single";
+	keyedPlan: string | null;
+	data: Record<string, unknown>;
+	eventAt: Date | null;
+}): Promise<void> {
+	const { tenant, subId, customerId, status, half, keyedPlan, data, eventAt } =
+		args;
+	const now = new Date();
+	const pair: AnnualPairJson = { ...(tenant.annualPair ?? {}) };
+
+	let alert: string | null = null;
+	let planValue: "free" | "builder" | "team" | "business" | "enterprise";
+	let periodStart: Date | null = null;
+	let periodEnd: Date | null = null;
+	let pastDue = false;
+
+	if (half === "single") {
+		// P6: a monthly subscription for a tenant that holds an annual pair —
+		// two live shapes for one tenant is never valid. Refuse, keep the pair as
+		// evidence; repair is a support action, never automatic.
+		alert = "annual_pair_mismatch";
+		planValue = "free";
+	} else {
+		const incoming: PairHalf = {
+			id: subId ?? pair[half]?.id ?? "",
+			plan: keyedPlan ?? pair[half]?.plan ?? "",
+			status: status ?? "",
+			period_start:
+				typeof data.current_period_start === "string"
+					? data.current_period_start
+					: (pair[half]?.period_start ?? null),
+			period_end:
+				typeof data.current_period_end === "string"
+					? data.current_period_end
+					: (pair[half]?.period_end ?? null),
+		};
+		pair[half] = incoming;
+		const res = resolvePair(pair);
+		if (res.kind === "annual") {
+			planValue = res.planEnum;
+			periodStart = parseIsoDate(res.periodStart);
+			periodEnd = parseIsoDate(res.periodEnd);
+			pastDue = res.pastDue === true;
+		} else if (res.kind === "refuse") {
+			alert = res.reason;
+			planValue = "free";
+		} else {
+			// neither half held: the ordinary drop to Free
+			planValue = "free";
+		}
+	}
+	pair.alert = alert;
+
+	const extra: Record<string, unknown> = {};
+	if (planValue === "free") {
+		extra.currentPeriodStart = null;
+		extra.currentPeriodEnd = null;
+	} else {
+		extra.currentPeriodStart = periodStart;
+		extra.currentPeriodEnd = periodEnd;
+	}
+	extra.dunningStartedAt = pastDue ? (tenant.dunningStartedAt ?? now) : null;
+	if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
+		const holdDays = await readPolicyNumber("dunning_data_hold_days");
+		if (holdDays !== null) extra.dataHoldUntil = addDays(now, holdDays);
+	}
+	if (planValue !== "free" && !tenant.priceProtectedUntil) {
+		const months = await readPolicyNumber("price_protection_months");
+		const version = await readCurrentPriceVersion();
+		if (months !== null) extra.priceProtectedUntil = addMonths(now, months);
+		if (version) extra.priceVersion = version;
+	}
+
+	await db
+		.update(tenants)
+		.set({
+			plan: planValue,
+			billingInterval: "year",
+			...(customerId ? { polarCustomerId: customerId } : {}),
+			// An annual tenant never has a "single" subscription id.
+			polarSubscriptionId: null,
+			polarBaseSubscriptionId: pair.base?.id ?? null,
+			polarUsageSubscriptionId: pair.usage?.id ?? null,
+			annualPair: pair,
+			...(eventAt ? { polarSubscriptionModifiedAt: eventAt } : {}),
+			...extra,
+			updatedAt: now,
+		})
+		.where(eq(tenants.id, tenant.id));
+
+	const lookupKey = planValue === "free" ? "free_v1" : `${planValue}_v1`;
+	await db
+		.insert(workspaceEntitlements)
+		.values({ tenantId: tenant.id, planLookupKey: lookupKey })
+		.onConflictDoUpdate({
+			target: workspaceEntitlements.tenantId,
+			set: { planLookupKey: lookupKey, updatedAt: new Date() },
+		});
+
+	if (alert) {
+		console.warn(
+			"[polar-webhook] BILL-02 annual pair REFUSED — plan set to free:",
+			logSafe(alert),
+			"tenant",
+			logSafe(tenant.id),
+			"half",
+			logSafe(half),
+		);
+	}
+
+	if (tenant.billingEmail) {
+		if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
+			await sendDroppedToFreeEmail(tenant.billingEmail, {
+				previousPlan: tenant.plan,
+				dataHoldUntil: (extra.dataHoldUntil as Date | undefined) ?? now,
+			});
+		} else if (tenant.plan && tenant.plan !== planValue) {
+			await sendPlanChangedEmail(tenant.billingEmail, {
+				fromPlan: tenant.plan,
+				toPlan: planValue,
+			});
+		}
+	}
+}
+
+/**
  * Correlate the tenant for a subscription/add-on event. The gateway sets the
  * Polar customer `external_id` to the internal tenant UUID
  * (crates/gateway/src/billing/polar_client.rs); fall back to an existing
@@ -492,6 +656,7 @@ async function correlateTenant(data: Record<string, unknown>): Promise<{
 	priceProtectedUntil: Date | null;
 	billingEmail: string | null;
 	dunningStartedAt: Date | null;
+	annualPair: AnnualPairJson | null;
 } | null> {
 	const customerId =
 		typeof data.customer_id === "string" ? data.customer_id : null;
@@ -512,6 +677,7 @@ async function correlateTenant(data: Record<string, unknown>): Promise<{
 			priceProtectedUntil: tenants.priceProtectedUntil,
 			billingEmail: tenants.billingEmail,
 			dunningStartedAt: tenants.dunningStartedAt,
+			annualPair: tenants.annualPair,
 		})
 		.from(tenants)
 		.where(

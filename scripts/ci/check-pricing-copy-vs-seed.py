@@ -149,6 +149,10 @@ RETIRED_FIGURES = [
     "Audit add-on",
     "audit add-on",
     "Audit-add-on",
+    # The same SKU under its product name — `security.astro` said "ships with the
+    # Tamper-Evident Agent Ledger add-on" through two green gates (2026-09-16).
+    "Ledger add-on",
+    "ledger add-on",
     "5× hard cap",
     "hard cap",
 ]

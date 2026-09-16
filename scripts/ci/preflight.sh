@@ -88,6 +88,10 @@ run "doc freshness (cited code)"  python3 scripts/ci/check-doc-freshness.py
 run "doc classification"          python3 scripts/ci/check-doc-classification.py
 run "doc-index freshness"         python3 scripts/ci/build-doc-index.py --check
 run "spec anchors"                python3 scripts/ci/check-spec-anchors.py
+# 2026-09-16: the generated data model is 1 s to check and cost TWO 25-minute gates in
+# one day (a spec edited after regenerating moved a finding's line number). Cheap
+# checks that can refuse belong here, not only in the gate (R140).
+run "data model (generated) current" python3 scripts/ci/build-data-model.py --check
 run "CLAUDE.md volatile anchors"  bash scripts/ci/check-claudemd-volatile-anchors.sh
 run "script exec bits"            python3 scripts/ci/check-script-exec-bits.py
 # B-384: the hooks are the only enforcement on a direct push; a clone that never

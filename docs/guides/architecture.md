@@ -21,7 +21,7 @@ Tracelane. Five components, one monorepo.
         │  • Detection layer (observe-first; MCP / agent-tool payloads)│
         │  • Inline guardrail rails (8, request + response side)        │
         │  • Audit publish (v2 SHA-256 chain, PII pre-redacted)        │
-        │  • Dispatch to 150+ providers (prefix-routed, fail-closed)    │
+        │  • Dispatch to 191 providers (prefix-routed, fail-closed)    │
         │  • 1 same-provider retry; cross-provider failover is opt-in  │
         │  • OTLP emit → NATS JetStream (NATS_URL required at boot)    │
         └────────────┬─────────────────────────┬──────────────────────┘

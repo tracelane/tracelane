@@ -1,6 +1,6 @@
 //! Per-upstream circuit breakers (ADR-036, TRD §23.2).
 //!
-//! The gateway routes 150+ providers, and each one is an independent failure
+//! The gateway routes 191 providers, and each one is an independent failure
 //! domain. Without a breaker, one hung or erroring upstream (regional outage,
 //! 429 storm) ties up gateway worker slots and degrades *all* tenants — a
 //! common-mode failure across unrelated traffic. This breaker bulkheads each

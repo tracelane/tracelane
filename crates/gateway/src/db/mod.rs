@@ -407,6 +407,10 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         include_str!(
             "../../../../apps/web/db/migrations/0043_bill01_cold_allowance_and_billing_period.sql"
         ),
+        // BILL-02 (B14 → (c)): the annual pair's subscription ids + base period on
+        // tenants, the two product ids on plan_entitlements. Nullable adds; the
+        // gateway reads none of them (test-database applier only).
+        include_str!("../../../../apps/web/db/migrations/0044_bill02_annual_two_subscriptions.sql"),
     ];
     for migration in MIGRATIONS {
         client

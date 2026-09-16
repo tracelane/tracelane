@@ -193,11 +193,11 @@ describe("POST /api/checkout", () => {
 			.mockReturnValue(true);
 		try {
 			setDb([
-				[{ polarSubscriptionId: null }],
+				[{ polarSubscriptionId: null, polarBaseSubscriptionId: null }],
 				[
 					{
 						polarProductIdMonth: "polar_prod_team_month",
-						polarProductIdYear: "polar_prod_team_year",
+						polarProductIdBaseYear: "polar_prod_team_base_year",
 					},
 				],
 			]);
@@ -208,7 +208,8 @@ describe("POST /api/checkout", () => {
 			});
 			await POST(req("team", "year"));
 			const body = sentBody();
-			expect(body.product_id).toBe("polar_prod_team_year");
+			// BILL-02: annual is bought as the yearly BASE product.
+			expect(body.product_id).toBe("polar_prod_team_base_year");
 		} finally {
 			spy.mockRestore();
 		}

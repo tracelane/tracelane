@@ -18,7 +18,7 @@ and Helicone's `ai-gateway` carries a
 | Gateway language | Rust | Rust |
 | Wire format | OTel GenAI semconv (canonical) | Helicone's own schema; OpenTelemetry support documented as partial |
 | Predictive guardrails | Inline heuristic guardrails | — |
-| Tamper-evident audit ledger | Included on every tier (hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap); 7-year retention + bulk export on Enterprise | — |
+| Tamper-evident audit ledger | Included on every tier (hash chain + a per-tenant Ed25519 key on every tier — generated and held by Tracelane, so the signature proves integrity against third parties and the public Rekor anchor is what proves it against us; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap); 7-year retention + bulk export on Enterprise | — |
 | Auto-rollback on objective metrics | EWMA drift on metrics you post; not autonomous | — |
 | Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
 | Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |
@@ -50,7 +50,7 @@ You do not have to take that on trust. Our `deny.toml` sets a license allowlist 
 </Accordion>
 
 <Accordion title="Is Tracelane feature-equivalent to Helicone?">
-Tracelane covers 150+ providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline (**self-host writes and hashes the chain to ClickHouse; chain resumption ACROSS a gateway restart needs the Postgres control plane, so continuous multi-restart chains are Cloud today**), inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
+Tracelane covers 191 providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline (**self-host writes and hashes the chain to ClickHouse; chain resumption ACROSS a gateway restart needs the Postgres control plane, so continuous multi-restart chains are Cloud today**), inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
 </Accordion>
 
 <Accordion title="What happens to my historical Helicone data?">

@@ -28,6 +28,7 @@ async function getTenantBilling(workosOrgId: string) {
 			plan: tenants.plan,
 			polarCustomerId: tenants.polarCustomerId,
 			billingInterval: tenants.billingInterval,
+			annualPair: tenants.annualPair,
 			spendCeilingUsd: tenants.spendCeilingUsd,
 			overflowMode: tenants.overflowMode,
 		})
@@ -50,16 +51,31 @@ export default async function BillingPage() {
 	const overflowMode =
 		(billing.overflowMode as "auto_age" | "auto_overage" | null) ?? "auto_age";
 
+	// BILL-02: a refused annual pair sits on Free WITH `billing_interval = year`
+	// and an alert — the header must show the banner even though the plan reads
+	// free, so the interval is read whenever a pair exists, not only when paid.
+	const pair = billing.annualPair ?? null;
+	const hasPair = !!(pair?.base || pair?.usage);
 	const billingInterval =
-		plan === "free"
+		plan === "free" && !hasPair
 			? null
 			: ((billing.billingInterval as "month" | "year" | null) ?? "month");
+	const annual = hasPair
+		? {
+				basePeriodEnd: pair?.base?.period_end ?? null,
+				alert: pair?.alert ?? null,
+			}
+		: null;
 
 	return (
 		<div className="space-y-6">
 			{/* The current tier FIRST — the one fact every visitor to this page
 			    wants before any meter (founder, 2026-09-14). */}
-			<PlanHeader plan={plan} billingInterval={billingInterval} />
+			<PlanHeader
+				plan={plan}
+				billingInterval={billingInterval}
+				annual={annual}
+			/>
 			<UsageBoard
 				plan={plan}
 				canManage={canAdmin(session.role)}

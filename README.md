@@ -171,7 +171,7 @@ Agent / SDK
     ▼
 ┌─────────────────────────────────────┐
 │  Rust Gateway (Axum + tokio)        │
-│  - BYOK routing to 150+ providers    │
+│  - BYOK routing to 191 providers    │
 │  - Inline heuristic guardrails      │
 │  - OTLP span emit                   │
 └────────────────┬────────────────────┘

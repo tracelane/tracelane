@@ -39,7 +39,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 |---|---|---|---|---|---|---|---|---|---|
 | Hot-path runtime | Rust <sup>[T1]</sup> | Python proxy (the build measured in [/benchmarks](/benchmarks)); a "Rust core" is announced on GitHub with no public build as of 2026-09-07 <sup>[1]</sup> <sup>[6]</sup> | TypeScript/Node.js <sup>[2]</sup> | Go <sup>[3]</sup> | Not documented <sup>[4]</sup> | N/A — no gateway | N/A — no self-hostable gateway runtime documented <sup>[5]</sup> | N/A — no gateway | N/A — no gateway |
 | Measured gateway overhead (p50) | **2 ms** — AIGatewayBench, CCX23, 2026-09-07 <sup>[T2]</sup> | Python proxy: 14–15 ms p50, same bench run <sup>[T2]</sup>; the announced Rust gateway has no public build, and its self-reported "8 ms P95 at 1k RPS" is not independently measured <sup>[6]</sup> | 3–4 ms p50, same bench run <sup>[T2]</sup> | 2 ms p50, same bench run <sup>[T2]</sup> | Not published <sup>[4]</sup> | — | — | — | — |
-| Providers supported | 150+ <sup>[T3]</sup> | 140+ upstream vendors / ~1,892 models (its own count) <sup>[7]</sup> | Claims 1,600+ LLMs <sup>[8]</sup>; source code lists ~75 provider modules <sup>[9]</sup> — see "Portkey's provider count" below | 23+ upstream vendors (its own count) <sup>[3]</sup> | Multiple — count not documented <sup>[4]</sup> | — | — | — | — |
+| Providers supported | 191 <sup>[T3]</sup> | 140+ upstream vendors / ~1,892 models (its own count) <sup>[7]</sup> | Claims 1,600+ LLMs <sup>[8]</sup>; source code lists ~75 provider modules <sup>[9]</sup> — see "Portkey's provider count" below | 23+ upstream vendors (its own count) <sup>[3]</sup> | Multiple — count not documented <sup>[4]</sup> | — | — | — | — |
 | BYOK, 0% token markup | Yes <sup>[T3]</sup> | Yes — per-key `api_key` in config <sup>[10]</sup> | Yes — virtual keys with your own provider keys <sup>[8]</sup> | Yes — virtual keys <sup>[3]</sup> | Yes — routes through your keys <sup>[4]</sup> | — | Partial — lists an "LLM Gateway" to "control agent model calls"; BYOK not documented on that page <sup>[5]</sup> | — | — |
 | Response caching | Exact-match caching in production. Embedding-similarity caching is built but not active on the hosted product — 94% of production traffic is Anthropic, which has no embeddings API <sup>[T4]</sup> | Yes — exact + semantic, 8+ backends <sup>[11]</sup> | Yes — simple + semantic <sup>[12]</sup> | Yes — semantic caching <sup>[3]</sup> | Partial — caching listed as a feature; exact vs. semantic not documented <sup>[4]</sup> | No | No | No | No |
 | Rate limits + budgets per key | Yes — per-key RPM, overage 429 + alert <sup>[T3]</sup> | Yes — per key/team/user RPM + TPM <sup>[10]</sup> | Yes — hourly/daily/per-minute on requests or tokens <sup>[12]</sup> | Yes — budget management <sup>[3]</sup> | Yes — rate limiting feature <sup>[4]</sup> | No | No | No | No |
@@ -79,7 +79,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 
 | Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
 |---|---|---|---|---|---|---|---|---|---|
-| Tamper-evident / hash-chained audit ledger | Yes — Merkle-batched hash chain + Ed25519 per-tenant signing, included on every tier <sup>[T21]</sup> | No | No | No | No | No | No | No | No |
+| Tamper-evident / hash-chained audit ledger | Yes — Merkle-batched hash chain + per-tenant Ed25519 signing (keys held by Tracelane; the Rekor anchor is the part we cannot forge), included on every tier <sup>[T21]</sup> | No | No | No | No | No | No | No | No |
 | Third-party verifiable offline | Yes — Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; `tlane verify --tenant-pubkey` needs no call back to us <sup>[T21]</sup> | No | No | No | No | No | No | No | No |
 | Self-host in one binary / Compose | Yes — single-node Docker Compose, ClickHouse-backed <sup>[T3]</sup> | Yes — Docker Compose <sup>[1]</sup> | Yes — `npx @portkey-ai/gateway` or Docker <sup>[2]</sup> | Yes — Docker/self-host <sup>[3]</sup> | Partial — Enterprise tier only <sup>[4]</sup> | Yes — Docker Compose + Kubernetes <sup>[14]</sup> | Partial — Enterprise BYOC/self-hosted SKU <sup>[5]</sup> | Partial — Enterprise on-premise <sup>[15]</sup> | Yes — Docker, Kubernetes <sup>[16]</sup> |
 | Open-source license | Apache 2.0 <sup>[T3]</sup> | MIT <sup>[1]</sup> | MIT <sup>[2]</sup> | Apache 2.0 <sup>[3]</sup> | Not confirmed | MIT <sup>[14]</sup> | None for OSS; Enterprise self-hosted SKU is proprietary <sup>[5]</sup> | Not confirmed | ELv2 (not Apache/MIT) <sup>[16]</sup> |
@@ -99,8 +99,8 @@ should be one number. We're not asserting which is "the" real count; we're repor
 the vendor's own marketing disagrees with itself. Read their repository yourself before
 treating any of the three as ground truth: `github.com/portkey-ai/gateway/tree/main/src/providers`.
 
-For our own "150+ providers" claim: it is deliberately conservative against
-`crates/gateway/providers.tsv`, the actual provider adapter table in the repo — count it
+For our own "191 providers" claim: it is the count of `crates/gateway/providers.tsv`
+rows (185) plus the 6 native adapters, held to that file by a guard in CI — count it
 yourself.
 
 ## Honest gaps
@@ -136,7 +136,7 @@ None of these are silent gaps — every one is stated as a limit in a public Tra
 
 - **[T1]** `crates/gateway/src/admission.rs` + `crates/gateway/src/server/chat.rs` — the Rust gateway hot path
 - **[T2]** [`/benchmarks`](/benchmarks) — AIGatewayBench CCX23, 2026-09-07: Tracelane 2/4/5 ms, Portkey 3–4/5–7/8–9 ms, Bifrost 2/2/3 ms, LiteLLM Python 14–15/34–36/47–52 ms
-- **[T3]** [`/pricing`](/pricing) — 150+ providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
+- **[T3]** [`/pricing`](/pricing) — 191 providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
 - **[T4]** feature `GWY-24` — exact-match caching built and proven; the semantic tier is built but has never run in production (0 rows), because 94% of production traffic is Anthropic, which has no embeddings API
 - **[T5]** `crates/gateway/src/guardrail/rails/` (`r1_cost.rs` … `r8_injection.rs`) + [`/pricing`](/pricing) FAQ ("What inline guardrails run on every request?") for the free-vs-Team+ split
 - **[T6]** the feature inventory; `crates/gateway/src/providers/mod.rs` — model→provider routing fails closed to `unroutable_model`

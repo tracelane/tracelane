@@ -142,24 +142,44 @@ export type PlanEnum = "builder" | "team" | "business" | "enterprise";
 export type BillingInterval = "month" | "year";
 
 /**
- * Polar product `metadata.lookup_key` → (plan enum, lookup key, interval).
- * ADR-076: monthly and annual are SEPARATE Polar products (Polar's own rule —
- * one product per pricing model), so each paid tier carries TWO lookup keys:
- * `<plan>_v1` (monthly) and `<plan>_v1_year` (annual). Both map to the same
- * plan; the interval is read off which key actually arrived.
+ * Which Polar subscription a lookup key names. `single` = the ordinary monthly
+ * plan (one subscription). `base` / `usage` = the two halves of an ANNUAL plan
+ * (BILL-02, founder ruling B14 → option (c), 2026-09-16): a yearly BASE product
+ * with no meters and a $0 monthly USAGE product carrying the meters and the
+ * monthly credits. A yearly product WITH meters grants credits once a YEAR
+ * (B-411), which is why the one-object `<plan>_v1_year` keys are gone from
+ * this table: an event for one is `unknown` — acked, no plan change.
  */
-const PLAN_KEYS: Record<string, { plan: PlanEnum; interval: BillingInterval }> =
-	{
-		builder_v1: { plan: "builder", interval: "month" },
-		builder_v1_year: { plan: "builder", interval: "year" },
-		team_v1: { plan: "team", interval: "month" },
-		team_v1_year: { plan: "team", interval: "year" },
-		business_v1: { plan: "business", interval: "month" },
-		business_v1_year: { plan: "business", interval: "year" },
-		// Enterprise has no self-serve annual product (custom contract) — monthly
-		// key only.
-		enterprise_v1: { plan: "enterprise", interval: "month" },
-	};
+export type SubscriptionHalf = "single" | "base" | "usage";
+
+/**
+ * Polar product `metadata.lookup_key` → (plan enum, interval, half).
+ * ADR-076: monthly and annual are SEPARATE Polar products (Polar's own rule —
+ * one product per pricing model). Each paid tier carries THREE keys:
+ * `<plan>_v1` (monthly, single), `<plan>_v1_base_year` (annual base) and
+ * `<plan>_v1_usage_month` (annual usage). All map to the same plan.
+ */
+const PLAN_KEYS: Record<
+	string,
+	{ plan: PlanEnum; interval: BillingInterval; half: SubscriptionHalf }
+> = {
+	builder_v1: { plan: "builder", interval: "month", half: "single" },
+	builder_v1_base_year: { plan: "builder", interval: "year", half: "base" },
+	builder_v1_usage_month: { plan: "builder", interval: "year", half: "usage" },
+	team_v1: { plan: "team", interval: "month", half: "single" },
+	team_v1_base_year: { plan: "team", interval: "year", half: "base" },
+	team_v1_usage_month: { plan: "team", interval: "year", half: "usage" },
+	business_v1: { plan: "business", interval: "month", half: "single" },
+	business_v1_base_year: { plan: "business", interval: "year", half: "base" },
+	business_v1_usage_month: {
+		plan: "business",
+		interval: "year",
+		half: "usage",
+	},
+	// Enterprise has no self-serve annual product (custom contract) — monthly
+	// key only.
+	enterprise_v1: { plan: "enterprise", interval: "month", half: "single" },
+};
 
 export type PlanResolution =
 	| {
@@ -167,6 +187,7 @@ export type PlanResolution =
 			planEnum: PlanEnum;
 			lookupKey: string;
 			interval: BillingInterval;
+			half: SubscriptionHalf;
 	  }
 	| { kind: "free"; lookupKey: "free_v1" }
 	| { kind: "unknown"; rawKey: string | null };
@@ -201,9 +222,125 @@ export function resolvePlan(opts: {
 			planEnum: mapped.plan,
 			lookupKey: key as string,
 			interval: mapped.interval,
+			half: mapped.half,
 		};
 	}
 	return { kind: "unknown", rawKey: key };
+}
+
+/** The (plan, interval, half) a lookup key names, or null for an unknown key —
+ *  used by the webhook to place a CANCEL event (which `resolvePlan` resolves to
+ *  `free` without a half) on the right half of the pair. */
+export function planForLookupKey(key: string | null | undefined): {
+	plan: PlanEnum;
+	interval: BillingInterval;
+	half: SubscriptionHalf;
+} | null {
+	return key ? (PLAN_KEYS[key] ?? null) : null;
+}
+
+// ── BILL-02: the annual PAIR resolver (spec §2.4, P1–P7) ─────────────────
+
+/** The last-seen state of one half of an annual pair (stored verbatim in
+ *  `tenants.annual_pair`, written by the webhook only). */
+export type PairHalf = {
+	id: string;
+	plan: string;
+	status: string;
+	period_start?: string | null;
+	period_end?: string | null;
+};
+
+export type PairResolution =
+	| {
+			kind: "annual";
+			planEnum: PlanEnum;
+			/** the USAGE subscription's cycle — credits and invoices follow it */
+			periodStart: string | null;
+			periodEnd: string | null;
+			/** the base subscription's cycle end — "paid through …" */
+			basePeriodEnd: string | null;
+			/** P5: the base renewal is in dunning; the tier is kept, the clock runs */
+			pastDue?: true;
+	  }
+	| {
+			kind: "refuse";
+			reason:
+				| "annual_pair_usage_missing"
+				| "annual_pair_base_lapsed"
+				| "annual_pair_mismatch";
+			/** the plan the healthy pair WOULD serve (null on a mismatch) */
+			planEnum: PlanEnum | null;
+	  }
+	| { kind: "none" };
+
+const PLAN_ENUMS: ReadonlySet<string> = new Set([
+	"builder",
+	"team",
+	"business",
+	"enterprise",
+]);
+
+/** A half counts as "held" while it is paying or in dunning — never after a
+ *  cancellation, revocation or `unpaid` (Polar's own end states). */
+function halfHeld(h: PairHalf | null | undefined): boolean {
+	return !!h && (isActiveStatus(h.status) || isPastDueStatus(h.status));
+}
+
+/**
+ * Resolve an annual tenant's entitlement from BOTH halves. The ONLY state that
+ * serves the tier is P1 (both held, same plan) — and P5, its dunning variant.
+ * Every other combination REFUSES: the caller writes `plan = free` with the
+ * reason as the alert, the billing page shows it, the reconciler repairs what
+ * can be repaired (P2 creates the usage half, P3 cancels it) and reports what
+ * cannot (P4). `none` = neither half held → the caller's ordinary
+ * drop-to-free path. Pure; the falsification IS the test suite.
+ */
+export function resolvePair(pair: {
+	base?: PairHalf | null;
+	usage?: PairHalf | null;
+}): PairResolution {
+	const base = pair.base ?? null;
+	const usage = pair.usage ?? null;
+	const baseHeld = halfHeld(base);
+	const usageHeld = halfHeld(usage);
+
+	if (!baseHeld && !usageHeld) return { kind: "none" };
+	if (baseHeld && !usageHeld) {
+		return {
+			kind: "refuse",
+			reason: "annual_pair_usage_missing",
+			planEnum: PLAN_ENUMS.has(base?.plan ?? "")
+				? (base?.plan as PlanEnum)
+				: null,
+		};
+	}
+	if (!baseHeld && usageHeld) {
+		return {
+			kind: "refuse",
+			reason: "annual_pair_base_lapsed",
+			planEnum: PLAN_ENUMS.has(usage?.plan ?? "")
+				? (usage?.plan as PlanEnum)
+				: null,
+		};
+	}
+	// Both held.
+	const b = base as PairHalf;
+	const u = usage as PairHalf;
+	if (b.plan !== u.plan || !PLAN_ENUMS.has(b.plan)) {
+		return { kind: "refuse", reason: "annual_pair_mismatch", planEnum: null };
+	}
+	const out: PairResolution = {
+		kind: "annual",
+		planEnum: b.plan as PlanEnum,
+		periodStart: u.period_start ?? null,
+		periodEnd: u.period_end ?? null,
+		basePeriodEnd: b.period_end ?? null,
+	};
+	if (isPastDueStatus(b.status) || isPastDueStatus(u.status)) {
+		return { ...out, pastDue: true };
+	}
+	return out;
 }
 
 /** True on any Polar subscription status meaning "currently paying, healthy". */

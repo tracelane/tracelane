@@ -32,7 +32,7 @@ const providers = [
   "Llama",
   "Bedrock",
   "Groq",
-  "150+ providers",
+  "191 providers",
 ];
 
 /**
@@ -127,7 +127,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       <div class="mt-8 fact-strip hero-rise" style="--d:0.22s" aria-label="At a glance">
         <span>sha-256 hash chain</span>
         <span>ed25519-signed merkle root</span>
-        <span>150+ providers</span>
+        <span>191 providers</span>
         <span>one rust binary</span>
       </div>
     </div>
@@ -146,7 +146,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
           <span class="flow-node-label">Gateway</span>
         </button>
         <div class="flow-line"><span class="flow-pulse" style="--delay:0.9s"></span></div>
-        <button class="flow-node" type="button" data-state="Routed to any of 150+ providers, one wire format.">
+        <button class="flow-node" type="button" data-state="Routed to any of 191 providers, one wire format.">
           <span class="flow-node-glyph" aria-hidden="true"><Icon name="provider" /></span>
           <span class="flow-node-label">Provider</span>
         </button>
@@ -174,7 +174,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
   {/* ===== Provider rail ===== */}
   <section class="panel">
-    <h2 class="eyebrow eyebrow--center w-full mb-6">150+ providers, one canonical wire format</h2>
+    <h2 class="eyebrow eyebrow--center w-full mb-6">191 providers, one canonical wire format</h2>
     <div class="provider-rail reveal">
       {providers.map((p) => <div class="tile">{p}</div>)}
     </div>
@@ -496,7 +496,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
         <details class="faq-row">
           <summary class="text-fg">What about LangSmith Engine?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">LangSmith Engine (May 13, 2026) clusters production failures after they happen and drafts pull requests to fix them; Tracelane's pre-flight policy checks flag failure modes at the gateway. Engine is locked to the LangSmith trace surface and LangChain-managed inference keys per LangChain's terms of service; Tracelane is neutral OTel ingest with 0% BYOK markup across 150+ providers. Different layer of the agent reliability stack.</p>
+          <p class="text-fg-muted leading-relaxed">LangSmith Engine (May 13, 2026) clusters production failures after they happen and drafts pull requests to fix them; Tracelane's pre-flight policy checks flag failure modes at the gateway. Engine is locked to the LangSmith trace surface and LangChain-managed inference keys per LangChain's terms of service; Tracelane is neutral OTel ingest with 0% BYOK markup across 191 providers. Different layer of the agent reliability stack.</p>
         </details>
 
         <details class="faq-row">
@@ -506,7 +506,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
         <details class="faq-row">
           <summary class="text-fg">Which providers are supported?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">150+ providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus OpenAI and any OpenAI-compatible endpoint, including Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI, and Mistral. One canonical wire format across all of them.</p>
+          <p class="text-fg-muted leading-relaxed">191 providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus OpenAI and any OpenAI-compatible endpoint, including Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI, and Mistral. One canonical wire format across all of them.</p>
         </details>
 
         <details class="faq-row">

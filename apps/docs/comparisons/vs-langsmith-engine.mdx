@@ -16,7 +16,9 @@ For LangSmith's current capabilities, pricing and terms, read
 
 Tracelane is a **flight recorder for AI agents**: full-fidelity capture of every model
 call, plus a tamper-evident ledger that a third party can verify offline, without
-access to our systems and without trusting us.
+access to our systems — and, for every batch anchored in the public Sigstore Rekor
+log, without trusting us either (anchoring is best-effort and not yet universal; see
+[the ledger page](/audit-ledger) for exactly what rests on what).
 
 ## What Tracelane ships
 
@@ -49,7 +51,7 @@ on the roadmap and is not shipped.
 
 ### BYOK at 0% markup
 
-Bring your own provider keys across 150+ providers. Keys are stored with envelope
+Bring your own provider keys across 191 providers. Keys are stored with envelope
 encryption, with the AAD bound to `(tenant_id, provider_id)`. We add no markup to your
 provider spend.
 

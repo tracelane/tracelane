@@ -7,10 +7,12 @@
 import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+	type PairHalf,
 	decodeWebhookSecret,
 	isActiveStatus,
 	isPastDueStatus,
 	logSafe,
+	resolvePair,
 	resolvePlan,
 	verifySignature,
 } from "./polar-webhook";
@@ -178,20 +180,56 @@ describe("resolvePlan", () => {
 					eventType: "subscription.created",
 					lookupKey: key,
 				}),
-			).toEqual({ kind: "plan", planEnum, lookupKey: key, interval: "month" });
+			).toEqual({
+				kind: "plan",
+				planEnum,
+				lookupKey: key,
+				interval: "month",
+				half: "single",
+			});
 		}
 	});
 
-	it("ADR-076: the _year lookup key maps to the SAME plan, interval='year'", () => {
-		for (const [key, planEnum] of [
-			["builder_v1_year", "builder"],
-			["team_v1_year", "team"],
-			["business_v1_year", "business"],
+	it("BILL-02: the _base_year and _usage_month keys map to the SAME plan, interval='year', each naming its HALF", () => {
+		for (const [plan, planEnum] of [
+			["builder_v1", "builder"],
+			["team_v1", "team"],
+			["business_v1", "business"],
 		] as const) {
 			expect(
-				resolvePlan({ eventType: "subscription.created", lookupKey: key }),
-			).toEqual({ kind: "plan", planEnum, lookupKey: key, interval: "year" });
+				resolvePlan({
+					eventType: "subscription.created",
+					lookupKey: `${plan}_base_year`,
+				}),
+			).toEqual({
+				kind: "plan",
+				planEnum,
+				lookupKey: `${plan}_base_year`,
+				interval: "year",
+				half: "base",
+			});
+			expect(
+				resolvePlan({
+					eventType: "subscription.created",
+					lookupKey: `${plan}_usage_month`,
+				}),
+			).toEqual({
+				kind: "plan",
+				planEnum,
+				lookupKey: `${plan}_usage_month`,
+				interval: "year",
+				half: "usage",
+			});
 		}
+	});
+
+	it("the retired one-object `_year` key (credits once a YEAR, B-411) is UNKNOWN — acked, no plan change", () => {
+		expect(
+			resolvePlan({
+				eventType: "subscription.created",
+				lookupKey: "builder_v1_year",
+			}),
+		).toEqual({ kind: "unknown", rawKey: "builder_v1_year" });
 	});
 
 	it("Enterprise has NO annual product — enterprise_v1_year is unknown", () => {
@@ -245,6 +283,100 @@ describe("resolvePlan", () => {
 				lookupKey: null,
 			}),
 		).toEqual({ kind: "unknown", rawKey: null });
+	});
+});
+
+describe("resolvePair — BILL-02 §2.4, every half-state REFUSES (falsification is the test)", () => {
+	const base = (over: Partial<PairHalf> = {}): PairHalf => ({
+		id: "sub_base",
+		plan: "team",
+		status: "active",
+		period_start: null,
+		period_end: "2027-09-14T00:00:00Z",
+		...over,
+	});
+	const usage = (over: Partial<PairHalf> = {}): PairHalf => ({
+		id: "sub_usage",
+		plan: "team",
+		status: "active",
+		period_start: "2026-09-14T00:00:00Z",
+		period_end: "2026-10-14T00:00:00Z",
+		...over,
+	});
+
+	it("P1: base ACTIVE + usage ACTIVE on the same plan → the tier, interval year, the USAGE cycle as the period", () => {
+		expect(resolvePair({ base: base(), usage: usage() })).toEqual({
+			kind: "annual",
+			planEnum: "team",
+			periodStart: "2026-09-14T00:00:00Z",
+			periodEnd: "2026-10-14T00:00:00Z",
+			basePeriodEnd: "2027-09-14T00:00:00Z",
+		});
+	});
+
+	it("P2: base ACTIVE + usage MISSING (never created) → REFUSED to free, alert usage_missing", () => {
+		expect(resolvePair({ base: base(), usage: null })).toEqual({
+			kind: "refuse",
+			reason: "annual_pair_usage_missing",
+			planEnum: "team",
+		});
+	});
+
+	it("P2: base ACTIVE + usage CANCELED → REFUSED, alert usage_missing", () => {
+		expect(
+			resolvePair({ base: base(), usage: usage({ status: "canceled" }) }),
+		).toMatchObject({ kind: "refuse", reason: "annual_pair_usage_missing" });
+	});
+
+	it("P3: base LAPSED (canceled / revoked / unpaid) + usage ACTIVE → REFUSED, alert base_lapsed", () => {
+		for (const status of ["canceled", "revoked", "unpaid"]) {
+			expect(
+				resolvePair({ base: base({ status }), usage: usage() }),
+			).toMatchObject({ kind: "refuse", reason: "annual_pair_base_lapsed" });
+		}
+	});
+
+	it("P4: base plan ≠ usage plan → REFUSED, alert mismatch, NO repair hint", () => {
+		expect(
+			resolvePair({
+				base: base({ plan: "team" }),
+				usage: usage({ plan: "builder" }),
+			}),
+		).toEqual({
+			kind: "refuse",
+			reason: "annual_pair_mismatch",
+			planEnum: null,
+		});
+	});
+
+	it("P5: base PAST_DUE (renewal failed) + usage ACTIVE → the tier is KEPT and dunning is flagged, never a refusal (ingest is never gated on billing state)", () => {
+		expect(
+			resolvePair({ base: base({ status: "past_due" }), usage: usage() }),
+		).toEqual({
+			kind: "annual",
+			planEnum: "team",
+			periodStart: "2026-09-14T00:00:00Z",
+			periodEnd: "2026-10-14T00:00:00Z",
+			basePeriodEnd: "2027-09-14T00:00:00Z",
+			pastDue: true,
+		});
+	});
+
+	it("neither half active → `none` (the caller's ordinary drop-to-free path)", () => {
+		expect(
+			resolvePair({
+				base: base({ status: "canceled" }),
+				usage: usage({ status: "canceled" }),
+			}),
+		).toEqual({ kind: "none" });
+		expect(resolvePair({ base: null, usage: null })).toEqual({ kind: "none" });
+	});
+
+	it("usage ACTIVE + base MISSING (never existed) → REFUSED base_lapsed: a $0 usage subscription alone is the tier for free", () => {
+		expect(resolvePair({ base: null, usage: usage() })).toMatchObject({
+			kind: "refuse",
+			reason: "annual_pair_base_lapsed",
+		});
 	});
 });
 

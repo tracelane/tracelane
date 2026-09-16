@@ -246,7 +246,7 @@ Stated plainly, because several committed documents in this repository still ove
 | ClickHouse tiered storage | No `storage_policy` or `TTL … TO DISK` anywhere under `infra/` — retention tiers are not backed by a warm/cold tier |
 | Performance budgets (§6) | **Targets, not measurements.** `bench/gateway/RESULTS.md` is explicitly UNPOPULATED; `bench/predictive/RESULTS.md` is empty. Do not quote these as achieved numbers |
 | Eval suite as a merge gate | The gate runs with **mock providers**, so behavioral assertions **SKIP**. Only the separate live-stack job exercises real behaviour, and it currently runs one suite |
-| Provider coverage | **150+ providers.** Routable = every row of `crates/gateway/providers.tsv` + 6 native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived, never written down — `scripts/ci/check-provider-count.py` computes it and fails any file that disagrees |
+| Provider coverage | **191 providers.** Routable = every row of `crates/gateway/providers.tsv` + 6 native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived, never written down — `scripts/ci/check-provider-count.py` computes it and fails any file that disagrees |
 
 ---
 

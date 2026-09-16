@@ -1,7 +1,11 @@
 //! Per-tenant Ed25519 signing keypair management for the tamper-evident audit ledger.
 //!
-//! Each tenant (Enterprise tier) can have a dedicated Ed25519 keypair for signing
-//! Rekor Merkle-root anchors. Keypairs are generated on first use, PKCS#8-encoded,
+//! Each tenant — on EVERY tier since ADR-076 §10.11 (2026-09-13; this line said
+//! "Enterprise tier" until 2026-09-16 and misled a copy correction) — gets a
+//! dedicated Ed25519 keypair for signing Rekor Merkle-root anchors, minted on
+//! first use. The key is generated and held HERE, envelope-encrypted: it proves
+//! integrity against third parties; the public Rekor anchor is what proves it
+//! against the operator. Keypairs are generated on first use, PKCS#8-encoded,
 //! envelope-encrypted with the workspace BYOK master key, and persisted in the
 //! `tenant_audit_keys` Postgres table.
 //!
