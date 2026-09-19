@@ -17,11 +17,11 @@ Tracelane is a drop-in proxy on the **OpenAI wire format**. You reach every
 provider — Anthropic, Bedrock, Google, 150+ in all — through
 `POST /v1/chat/completions`, choosing the upstream with a **model prefix**.
 
-> **Use an OpenAI-compatible client, not a provider-native SDK.** The gateway
-> mounts exactly one completion route. There is no `/v1/messages`, and auth is
-> read from the `authorization` header — an Anthropic-native client would POST
-> to `/v1/messages` with `x-api-key` and get a 404. Keep the Anthropic *models*;
-> swap the *client*.
+> **Choose the client for the wire format you use.** The OpenAI-compatible
+> surface is `POST /v1/chat/completions`. The gateway also mounts Anthropic-native
+> `POST /v1/messages` and `POST /v1/messages/count_tokens`; those routes accept
+> `x-api-key` as well as `authorization`. See the
+> [API reference](./api-reference.md) for the endpoint-specific contract.
 
 ### Python
 
