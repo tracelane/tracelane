@@ -23,10 +23,9 @@ import Base from "../layouts/Base.astro";
 
     <h2 class="text-fg">Vulnerability management</h2>
     <ul class="text-fg-muted">
-      <li>gitleaks, cargo-deny and a critical-level dependency audit on every push; OSV-Scanner and Grype nightly and a Syft SBOM weekly on the public repository.</li>
-      <li>gitleaks on every commit to block secret leaks.</li>
+      <li>gitleaks on CI pushes; cargo-deny, cargo-audit, OSV-Scanner and Grype nightly. A CycloneDX SBOM is generated weekly with Anchore sbom-action.</li>
       <li>GitHub Security Advisories enabled for coordinated disclosure.</li>
-      <li>cargo-deny enforces the dependency and license allow-list on every build.</li>
+      <li>cargo-deny checks the dependency and license allow-list in the nightly security workflow.</li>
     </ul>
 
     <h2 class="text-fg">Transport + isolation</h2>
