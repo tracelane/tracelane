@@ -115,7 +115,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       </h1>
 
       <p class="mt-6 lede hero-rise" style="--d:0.12s">
-        Every call, traced. Every trace, provable.
+        Gateway-proxied calls and guardrail verdicts are hash-chained; externally ingested spans remain in the trace store but are not yet chained, and Rekor anchoring is best-effort. Metadata and timing are captured by default. Prompt and response content is opt-in per tenant and fails closed.
       </p>
 
       <div class="mt-9 flex flex-wrap items-center gap-3 hero-rise" style="--d:0.18s">
@@ -141,12 +141,12 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
           <span class="flow-node-label">Agent</span>
         </button>
         <div class="flow-line"><span class="flow-pulse" style="--delay:0s"></span></div>
-        <button class="flow-node flow-node--gw" type="button" data-state="Recorded in full fidelity — your keys, 0% markup.">
+        <button class="flow-node flow-node--gw" type="button" data-state="Metadata and timing captured by default; prompt and response content is opt-in per tenant and fails closed.">
           <span class="flow-node-glyph" aria-hidden="true"><Icon name="gateway" /></span>
           <span class="flow-node-label">Gateway</span>
         </button>
         <div class="flow-line"><span class="flow-pulse" style="--delay:0.9s"></span></div>
-        <button class="flow-node" type="button" data-state="Routed to any of 191 providers, one wire format.">
+        <button class="flow-node" type="button" data-state="Routed to any of 191 providers through one outward-facing API surface.">
           <span class="flow-node-glyph" aria-hidden="true"><Icon name="provider" /></span>
           <span class="flow-node-label">Provider</span>
         </button>
@@ -174,7 +174,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
   {/* ===== Provider rail ===== */}
   <section class="panel">
-    <h2 class="eyebrow eyebrow--center w-full mb-6">191 providers, one canonical wire format</h2>
+    <h2 class="eyebrow eyebrow--center w-full mb-6">191 providers, one outward-facing API surface</h2>
     <div class="provider-rail reveal">
       {providers.map((p) => <div class="tile">{p}</div>)}
     </div>
@@ -214,7 +214,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
         <span class="step-num" aria-hidden="true">1</span>
         <div class="feat-glyph" aria-hidden="true"><Icon name="record" size={20} /></div>
         <h3 class="card-title">Record</h3>
-        <p class="card-body">Every call, full fidelity, your keys.</p>
+        <p class="card-body">Metadata and timing by default. Content capture is opt-in per tenant and fails closed.</p>
       </article>
       <article class="glass p-7 step-card">
         <span class="step-num" aria-hidden="true">2</span>
@@ -226,7 +226,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
         <span class="step-num" aria-hidden="true">3</span>
         <div class="feat-glyph" aria-hidden="true"><Icon name="prove" size={20} dot={false} /></div>
         <h3 class="card-title">Prove</h3>
-        <p class="card-body">Hash-chained, signed, verifiable offline.</p>
+        <p class="card-body">Gateway calls and guardrail verdicts are chained; Rekor anchoring is best-effort.</p>
       </article>
     </div>
   </section>
@@ -349,7 +349,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
           <p class="eyebrow mb-4">The audit ledger</p>
           <h2 class="display-lg text-fg">Every run. On the record. <span class="grad-text-warm">Provably.</span></h2>
           <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
-            SHA-256 hash-chained, Ed25519-signed — verify any trace offline.
+            Gateway calls and guardrail verdicts are SHA-256 hash-chained and Ed25519-signed. Exported chains can be verified offline; Rekor anchoring is best-effort.
           </p>
           <p class="mt-6"><a href="/security" class="link-accent">Full security posture →</a></p>
 
@@ -371,8 +371,8 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
               <span class="frame-title">tlane — verify</span>
             </div>
             <div class="frame-body">
-<pre class="term"><code><span class="c"># verify any trace offline — no trust in us required</span>
-<span class="p">$</span> tlane verify &lt;trace-id&gt;
+<pre class="term"><code><span class="c"># verify an exported gateway audit chain offline</span>
+<span class="p">$</span> tlane verify audit.ndjson
 <span class="ok">✓</span> signature valid (Ed25519, Merkle root)
 <span class="ok">✓</span> hash chain unbroken (SHA-256)
 <span class="ok">✓</span> tamper-evident: yes <span class="caret">&nbsp;</span></code></pre>
@@ -384,7 +384,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       <div class="mt-12 grid gap-4 md:grid-cols-3 text-sm reveal-group cards-hover">
         <div class="glass p-6">
           <p class="card-index">eu ai act</p>
-          <p class="card-body text-sm">Article 12 export pack — full audit trail for high-risk AI systems. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>); the ledger is available today.</p>
+          <p class="card-body text-sm">The tamper-evident ledger records gateway calls and guardrail verdicts. Tracelane makes no regulatory-conformance claim. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>).</p>
         </div>
         <div class="glass p-6">
           <p class="card-index">india dpdp</p>
@@ -393,48 +393,6 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
         <div class="glass p-6">
           <p class="card-index">hipaa</p>
           <p class="card-body text-sm">No signed BAA today, so do not route PHI through the hosted gateway. Prompt and response text is not stored unless we enable capture for your workspace. Inline redaction (Team and above) masks structured identifiers only — card numbers, SSNs, emails, E.164 phone numbers and secret-shaped strings — never names, addresses or free-text clinical detail. Provider keys are envelope-encrypted.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  {/* ===== Migration — copy left, two overlapping frames right ===== */}
-  <section id="migrate" class="panel">
-    <div class="grid gap-10 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:gap-16 lg:items-center reveal">
-      <div>
-        <p class="eyebrow mb-4">Migration</p>
-        <h2 class="display-md text-fg">Moving off a tool that changed hands or changed its terms?</h2>
-        <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
-          One command rewrites your config. Nothing leaves your infrastructure.
-        </p>
-      </div>
-
-      <div class="stage-well stage-well--scenic">
-        <div class="frame-stack">
-          <div class="frame frame--dark">
-            <div class="frame-bar">
-              <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="frame-title">tlane — migrate helicone</span>
-            </div>
-            <div class="frame-body">
-<pre class="term"><code><span class="c"># rewrites HELICONE_* env vars, base URLs and custom</span>
-<span class="c"># headers across your source tree — printed as a diff,</span>
-<span class="c"># dry-run by default</span>
-<span class="p">$</span> tlane migrate helicone</code></pre>
-            </div>
-          </div>
-
-          <div class="frame frame-over">
-            <div class="frame-bar">
-              <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="frame-title">tlane — import-litellm</span>
-            </div>
-            <div class="frame-body">
-<pre class="term" style="color:var(--color-fg)"><code><span class="c" style="color:var(--color-fg-dim)"># reads litellm_config.yaml, emits the</span>
-<span class="c" style="color:var(--color-fg-dim)"># equivalent Tracelane config</span>
-<span class="p">$</span> tlane import-litellm</code></pre>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -459,7 +417,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       </div>
       <div class="glass p-6">
         <p class="card-index">vuln scanning</p>
-        <p class="card-body text-sm">gitleaks, cargo-deny and a critical-level dependency audit on every push; OSV-Scanner and Grype nightly and a Syft SBOM weekly on the public repository.</p>
+        <p class="card-body text-sm">gitleaks on CI pushes; cargo-deny, cargo-audit, OSV-Scanner and Grype nightly. A CycloneDX SBOM is generated weekly with Anchore sbom-action.</p>
       </div>
       <div class="glass p-6">
         <p class="card-index">pre-flight policy</p>
@@ -486,12 +444,12 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       <div class="reveal">
         <details class="faq-row">
           <summary class="text-fg">What is Tracelane?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">An open-source (Apache 2.0) flight recorder for AI agents: a universal Rust LLM gateway, full-fidelity OpenTelemetry observability, and a tamper-evident audit ledger. Each event is SHA-256 hash-chained and the Merkle root is Ed25519-signed every 100 events, so any trace can be verified offline.</p>
+          <p class="text-fg-muted leading-relaxed">An open-source (Apache 2.0) flight recorder for AI agents: a universal Rust LLM gateway, OpenTelemetry metadata and timing by default, opt-in per-tenant prompt and response capture, and a tamper-evident audit ledger. Gateway-proxied calls and guardrail verdicts are SHA-256 hash-chained, with Ed25519-signed Merkle batches and best-effort Rekor anchoring; externally ingested spans remain in the trace store but are not yet chained.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">How is it different from Helicone, LangSmith or Langfuse?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one Rust binary. Helicone, Langfuse and LangSmith are observability-first — you bring your own gateway and guardrails. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's gateway is GPL-3.0, Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. The audit ledger is hash-chained and Ed25519-signed — we are not aware of another product in this category that offers cryptographic audit-log integrity at the trace level.</p>
+          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one Rust binary. Helicone, Langfuse and LangSmith are observability-first — you bring your own gateway and guardrails. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's gateway is GPL-3.0, Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. The gateway audit ledger is hash-chained and Ed25519-signed — we are not aware of another product in this category that offers cryptographic audit-log integrity for gateway calls and guardrail verdicts.</p>
         </details>
 
         <details class="faq-row">
@@ -506,12 +464,12 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
         <details class="faq-row">
           <summary class="text-fg">Which providers are supported?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">191 providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus OpenAI and any OpenAI-compatible endpoint, including Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI, and Mistral. One canonical wire format across all of them.</p>
+          <p class="text-fg-muted leading-relaxed">191 providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus OpenAI and any OpenAI-compatible endpoint, including Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI, and Mistral. One outward-facing API surface across both adapter kinds.</p>
         </details>
 
         <details class="faq-row">
-          <summary class="text-fg">Does Tracelane support EU AI Act Article 12?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">The Tamper-Evident Agent Ledger (SHA-256 hash chain, Ed25519-signed Merkle root, Rekor anchoring, self-verification) is included on every tier, free and paid — no add-on to buy. The Article 12 evidence export and seven-year ledger retention are included on Enterprise. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim. EU AI Act Annex III obligations were originally scheduled for Aug 2, 2026; the Digital Omnibus political agreement (May 7, 2026) provisionally deferred enforcement to Dec 2, 2027, pending formal adoption (<a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>). The ledger ships now so regulated buyers can build audit history before binding enforcement.</p>
+          <summary class="text-fg">What does the audit ledger cover?<span class="sign" aria-hidden="true">+</span></summary>
+          <p class="text-fg-muted leading-relaxed">The ledger hash-chains gateway-proxied calls and guardrail verdicts. Merkle batches are Ed25519-signed, and Rekor anchoring is best-effort rather than universal. Externally ingested spans follow their ingest path and are not covered by the same gateway-call guarantee. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim.</p>
         </details>
 
         <details class="faq-row">

@@ -45,11 +45,11 @@ const rows: { label: string; cells: [Cell, Cell, Cell, Cell, Cell] }[] = [
   },
   {
     label: "Sessions",
-    cells: [yes("per-user identity on the roadmap"), no("—"), no("—"), yes("yes"), yes("yes")],
+    cells: [partial("per-user identity on the roadmap"), no("—"), no("—"), yes("yes"), yes("yes")],
   },
   {
     label: "Eval loop — datasets, experiments, online evals, annotation queues, CI gate",
-    cells: [yes("proven on prod"), no("—"), no("—"), yes("yes"), yes("yes")],
+    cells: [yes("yes"), no("—"), no("—"), yes("yes"), yes("yes")],
   },
   {
     label: "Prompt management + playground",
@@ -57,7 +57,7 @@ const rows: { label: string; cells: [Cell, Cell, Cell, Cell, Cell] }[] = [
   },
   {
     label: "MCP server for traces",
-    cells: [yes("on npm, read-only, tenant-scoped"), no("—"), no("—"), no("—"), no("—")],
+    cells: [yes("published as @tracelanedev/mcp; read-only, tenant-scoped"), no("—"), no("—"), no("—"), no("—")],
   },
   {
     label: "Claude Code flight recorder",
@@ -145,7 +145,7 @@ const glyph: Record<Cell["v"], { char: string; aria: string }> = {
   <p class="mt-4 text-sm text-fg-dim">
     † Benchmark: 2 ms p50 / 4 ms p95 / 5 ms p99 added latency on LiteLLM's own
     AIGatewayBench harness (4 vCPU, two runs, capture on) —
-    <a href="/benchmarks" class="link-accent">full method and raw CSVs</a>.
+    <a href="https://docs.tracelane.dev/benchmarks" class="link-accent">full method and raw CSVs</a>.
   </p>
 
   <p class="mt-2 text-sm text-fg-dim">
