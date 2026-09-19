@@ -1,0 +1,1068 @@
+openapi: 3.1.0
+info:
+  title: Tracelane v1 HTTP API
+  version: 1.0.0
+  description: |-
+    Public HTTP routes mounted by the Rust gateway.
+    TODO: Request and response JSON shapes are intentionally not guessed; each operation
+    links to its handler anchor until its concrete serde type is documented.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+paths:
+  # Source: crates/gateway/src/server.rs:996
+  /v1/auth/whoami:
+    get:
+      operationId: get_v1_auth_whoami
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:996; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:997
+  /v1/chat/completions:
+    post:
+      operationId: post_v1_chat_completions
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:997; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:1001
+  /v1/embeddings:
+    post:
+      operationId: post_v1_embeddings
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:1001; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:1013
+  /v1/messages:
+    post:
+      operationId: post_v1_messages
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:1013; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:1017
+  /v1/messages/count_tokens:
+    post:
+      operationId: post_v1_messages_count_tokens
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:1017; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:1036
+  /v1/traces:
+    post:
+      operationId: post_v1_traces
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:1036; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    get:
+      operationId: get_v1_traces
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3985; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/portal.rs:89
+  /v1/billing/portal:
+    post:
+      operationId: post_v1_billing_portal
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/portal.rs:89; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/checkout.rs:84
+  /v1/billing/checkout:
+    post:
+      operationId: post_v1_billing_checkout
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/checkout.rs:84; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/usage.rs:1190
+  /v1/billing/usage:
+    get:
+      operationId: get_v1_billing_usage
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/usage.rs:1190; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/usage.rs:1192
+  /v1/billing/window-breakdown:
+    get:
+      operationId: get_v1_billing_window_breakdown
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/usage.rs:1192; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/usage.rs:1195
+  /v1/billing/ceiling:
+    put:
+      operationId: put_v1_billing_ceiling
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/usage.rs:1195; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/billing/usage.rs:1197
+  /v1/billing/promotion-freeze:
+    delete:
+      operationId: delete_v1_billing_promotion_freeze
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/billing/usage.rs:1197; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/server.rs:1093
+  /v1/webhooks/workos:
+    post:
+      operationId: post_v1_webhooks_workos
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/server.rs:1093; no shape or status is asserted here."
+      security: []
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/audit_pubkey.rs:81
+  /v1/audit/pubkey:
+    get:
+      operationId: get_v1_audit_pubkey
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/audit_pubkey.rs:81; no shape or status is asserted here."
+      security: []
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/audit_export.rs:910
+  /v1/audit/export:
+    get:
+      operationId: get_v1_audit_export
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/audit_export.rs:910; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/audit_export.rs:911
+  /v1/audit/summary:
+    get:
+      operationId: get_v1_audit_summary
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/audit_export.rs:911; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/audit_ledger_range.rs:62
+  /v1/audit/ledger-range:
+    get:
+      operationId: get_v1_audit_ledger_range
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/audit_ledger_range.rs:62; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/audit_self_verify.rs:248
+  /v1/audit/self-verify:
+    get:
+      operationId: get_v1_audit_self_verify
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/audit_self_verify.rs:248; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3986
+  /v1/traces/count:
+    get:
+      operationId: get_v1_traces_count
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3986; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3987
+  /v1/traces/export:
+    get:
+      operationId: get_v1_traces_export
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3987; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3988
+  /v1/traces/groups:
+    get:
+      operationId: get_v1_traces_groups
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3988; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3992
+  /v1/traces/compare:
+    get:
+      operationId: get_v1_traces_compare
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3992; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3993
+  /v1/traces/{trace_id}/spans:
+    get:
+      operationId: get_v1_traces__trace_id__spans
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3993; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3994
+  /v1/traces/{trace_id}/chain:
+    get:
+      operationId: get_v1_traces__trace_id__chain
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3994; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3995
+  /v1/slo:
+    get:
+      operationId: get_v1_slo
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3995; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3996
+  /v1/slo/summary:
+    get:
+      operationId: get_v1_slo_summary
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3996; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3997
+  /v1/slo/models:
+    get:
+      operationId: get_v1_slo_models
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3997; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3998
+  /v1/slo/timeseries:
+    get:
+      operationId: get_v1_slo_timeseries
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3998; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:3999
+  /v1/gateway/stats:
+    get:
+      operationId: get_v1_gateway_stats
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:3999; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4000
+  /v1/costs:
+    get:
+      operationId: get_v1_costs
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4000; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4001
+  /v1/metrics/breakdown:
+    get:
+      operationId: get_v1_metrics_breakdown
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4001; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4003
+  /v1/query/latency-breakdown:
+    get:
+      operationId: get_v1_query_latency_breakdown
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4003; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4006
+  /v1/guardrails/stats:
+    get:
+      operationId: get_v1_guardrails_stats
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4006; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4007
+  /v1/guardrails/verdicts:
+    get:
+      operationId: get_v1_guardrails_verdicts
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4007; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4008
+  /v1/query/signatures:
+    get:
+      operationId: get_v1_query_signatures
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4008; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4009
+  /v1/sessions:
+    get:
+      operationId: get_v1_sessions
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4009; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_reads.rs:4012
+  /v1/sessions/{session_id}/traces:
+    get:
+      operationId: get_v1_sessions__session_id__traces
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_reads.rs:4012; no shape or status is asserted here."
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_share.rs:594
+  /v1/traces/{trace_id}/share:
+    post:
+      operationId: post_v1_traces__trace_id__share
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_share.rs:594; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_share.rs:595
+  /v1/traces/{trace_id}/shares:
+    get:
+      operationId: get_v1_traces__trace_id__shares
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_share.rs:595; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_share.rs:597
+  /v1/traces/{trace_id}/shares/{id}:
+    delete:
+      operationId: delete_v1_traces__trace_id__shares__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_share.rs:597; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/trace_share.rs:601
+  /v1/share/{token}:
+    get:
+      operationId: get_v1_share__token
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/trace_share.rs:601; no shape or status is asserted here."
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      security: []
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/tool_analytics.rs:39
+  /v1/query/tool-analytics:
+    get:
+      operationId: get_v1_query_tool_analytics
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/tool_analytics.rs:39; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1673
+  /v1/datasets:
+    get:
+      operationId: get_v1_datasets
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1673; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_datasets
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1673; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1674
+  /v1/datasets/{id}:
+    get:
+      operationId: get_v1_datasets__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1674; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    delete:
+      operationId: delete_v1_datasets__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1674; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1675
+  /v1/datasets/{id}/items:
+    get:
+      operationId: get_v1_datasets__id__items
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1675; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_datasets__id__items
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1675; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1677
+  /v1/datasets/{id}/items/{item_id}:
+    patch:
+      operationId: patch_v1_datasets__id__items__item_id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1677; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    delete:
+      operationId: delete_v1_datasets__id__items__item_id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1677; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1681
+  /v1/datasets/{id}/snapshots:
+    post:
+      operationId: post_v1_datasets__id__snapshots
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1681; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    get:
+      operationId: get_v1_datasets__id__snapshots
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1681; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1684
+  /v1/datasets/{id}/export:
+    get:
+      operationId: get_v1_datasets__id__export
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1684; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/dataset_routes.rs:1686
+  /v1/datasets/{id}/import:
+    post:
+      operationId: post_v1_datasets__id__import
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/dataset_routes.rs:1686; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/byok_api/provider_keys_api.rs:54
+  /v1/byok/provider-keys:
+    post:
+      operationId: post_v1_byok_provider_keys
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/byok_api/provider_keys_api.rs:54; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    get:
+      operationId: get_v1_byok_provider_keys
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/byok_api/provider_keys_api.rs:54; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/byok_api/provider_keys_api.rs:56
+  /v1/byok/provider-keys/{provider_id}:
+    delete:
+      operationId: delete_v1_byok_provider_keys__provider_id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/byok_api/provider_keys_api.rs:56; no shape or status is asserted here."
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/guardrail/tool_pins_api.rs:87
+  /v1/guardrails/tool-pins:
+    post:
+      operationId: post_v1_guardrails_tool_pins
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/guardrail/tool_pins_api.rs:87; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    get:
+      operationId: get_v1_guardrails_tool_pins
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/guardrail/tool_pins_api.rs:87; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/guardrail/tool_pins_api.rs:88
+  /v1/guardrails/observed-tools:
+    get:
+      operationId: get_v1_guardrails_observed_tools
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/guardrail/tool_pins_api.rs:88; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/guardrail/tool_pins_api.rs:89
+  /v1/guardrails/tool-pins/approve:
+    post:
+      operationId: post_v1_guardrails_tool_pins_approve
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/guardrail/tool_pins_api.rs:89; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/guardrail/tool_pins_api.rs:91
+  /v1/guardrails/tool-pins/{tool_name}:
+    delete:
+      operationId: delete_v1_guardrails_tool_pins__tool_name
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/guardrail/tool_pins_api.rs:91; no shape or status is asserted here."
+      parameters:
+        - name: tool_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/key_routes.rs:159
+  /v1/keys:
+    post:
+      operationId: post_v1_keys
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/key_routes.rs:159; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/annotation_routes.rs:407
+  /v1/traces/{trace_id}/annotations:
+    get:
+      operationId: get_v1_traces__trace_id__annotations
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:407; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_traces__trace_id__annotations
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:407; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    delete:
+      operationId: delete_v1_traces__trace_id__annotations
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:407; no shape or status is asserted here."
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/annotation_routes.rs:416
+  /v1/annotation-queues:
+    get:
+      operationId: get_v1_annotation_queues
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:416; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_annotation_queues
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:416; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/annotation_routes.rs:420
+  /v1/annotation-queues/{queue_id}:
+    patch:
+      operationId: patch_v1_annotation_queues__queue_id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:420; no shape or status is asserted here."
+      parameters:
+        - name: queue_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/annotation_routes.rs:424
+  /v1/annotation-queues/{queue_id}/items:
+    get:
+      operationId: get_v1_annotation_queues__queue_id__items
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:424; no shape or status is asserted here."
+      parameters:
+        - name: queue_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/annotation_routes.rs:428
+  /v1/annotation-queues/{queue_id}/reviews:
+    post:
+      operationId: post_v1_annotation_queues__queue_id__reviews
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/annotation_routes.rs:428; no shape or status is asserted here."
+      parameters:
+        - name: queue_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/notification_routes.rs:197
+  /v1/notifications:
+    get:
+      operationId: get_v1_notifications
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/notification_routes.rs:197; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/notification_routes.rs:198
+  /v1/notifications/{id}/read:
+    post:
+      operationId: post_v1_notifications__id__read
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/notification_routes.rs:198; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/experiment_routes.rs:1579
+  /v1/experiments:
+    get:
+      operationId: get_v1_experiments
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/experiment_routes.rs:1579; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_experiments
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/experiment_routes.rs:1579; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/experiment_routes.rs:1582
+  /v1/experiments/{id}:
+    get:
+      operationId: get_v1_experiments__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/experiment_routes.rs:1582; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/experiment_routes.rs:1583
+  /v1/experiments/{id}/compare:
+    get:
+      operationId: get_v1_experiments__id__compare
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/experiment_routes.rs:1583; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/experiment_routes.rs:1588
+  /v1/evals/{eval_run_id}/items:
+    get:
+      operationId: get_v1_evals__eval_run_id__items
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/experiment_routes.rs:1588; no shape or status is asserted here."
+      parameters:
+        - name: eval_run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:117
+  /v1/prompts:
+    get:
+      operationId: get_v1_prompts
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:117; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:119
+  /v1/prompts/{name}:
+    get:
+      operationId: get_v1_prompts__name
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:119; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    delete:
+      operationId: delete_v1_prompts__name
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:119; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:122
+  /v1/prompts/{name}/versions:
+    post:
+      operationId: post_v1_prompts__name__versions
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:122; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:123
+  /v1/prompts/{name}/history:
+    get:
+      operationId: get_v1_prompts__name__history
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:123; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:124
+  /v1/prompts/{name}/promote:
+    post:
+      operationId: post_v1_prompts__name__promote
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:124; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:125
+  /v1/prompts/{name}/rollback:
+    post:
+      operationId: post_v1_prompts__name__rollback
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:125; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:126
+  /v1/prompts/{name}/observe:
+    post:
+      operationId: post_v1_prompts__name__observe
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:126; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:130
+  /v1/prompts/{name}/evals:
+    post:
+      operationId: post_v1_prompts__name__evals
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:130; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    get:
+      operationId: get_v1_prompts__name__evals
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:130; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/prompt_routes.rs:133
+  /v1/prompts/{name}/evals/{run_id}:
+    get:
+      operationId: get_v1_prompts__name__evals__run_id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/prompt_routes.rs:133; no shape or status is asserted here."
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/alerts/routes.rs:41
+  /v1/alerts/rules:
+    get:
+      operationId: get_v1_alerts_rules
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:41; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_alerts_rules
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:41; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/alerts/routes.rs:45
+  /v1/alerts/rules/{id}:
+    delete:
+      operationId: delete_v1_alerts_rules__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:45; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/alerts/routes.rs:49
+  /v1/alerts/destinations:
+    get:
+      operationId: get_v1_alerts_destinations
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:49; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_alerts_destinations
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:49; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/alerts/routes.rs:53
+  /v1/alerts/destinations/{id}:
+    delete:
+      operationId: delete_v1_alerts_destinations__id
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:53; no shape or status is asserted here."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/alerts/routes.rs:56
+  /v1/alerts/test:
+    post:
+      operationId: post_v1_alerts_test
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/alerts/routes.rs:56; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/online_eval_routes.rs:114
+  /v1/online-evals/policy:
+    get:
+      operationId: get_v1_online_evals_policy
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/online_eval_routes.rs:114; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    post:
+      operationId: post_v1_online_evals_policy
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/online_eval_routes.rs:114; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+    delete:
+      operationId: delete_v1_online_evals_policy
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/online_eval_routes.rs:114; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/online_eval_routes.rs:119
+  /v1/online-evals/scores:
+    get:
+      operationId: get_v1_online_evals_scores
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/online_eval_routes.rs:119; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+  # Source: crates/gateway/src/online_eval_routes.rs:120
+  /v1/online-evals/summary:
+    get:
+      operationId: get_v1_online_evals_summary
+      description: "TODO: derive the wire schema and explicit status codes from crates/gateway/src/online_eval_routes.rs:120; no shape or status is asserted here."
+      responses:
+        default:
+          description: "TODO: Handler response not yet represented; see source anchor above."
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "JWT or tlane API key"
