@@ -879,6 +879,37 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-hot-path-logging.py
 
+      - name: Degradation-count assertions guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-degradation-count-assertions.py --selftest
+
+      # A test asserts `count(kind) > before` on the process-global counter, never an
+      # exact delta — four red gates on that one shape before it became a guard.
+      - name: Degradation-count assertions (no exact delta on a shared counter)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-degradation-count-assertions.py
+
+      - name: Silent DB fallbacks guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-silent-db-fallbacks.py --selftest
+
+      # B-424/425/426: a fail-open fallback on a database result in the billing or
+      # entitlement paths must log at the site — silence hid three defects for two days.
+      - name: Silent DB fallbacks (billing / entitlement paths log at the site)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-silent-db-fallbacks.py
+
+      - name: No secret fields in read responses guard — selftest
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-no-secret-fields-in-read-responses.py --selftest
+
+      # B-430: a vendor's LIST body carried a signing secret inline and it reached a
+      # transcript. None of OUR read/list shapes may advertise one — a one-time reveal
+      # at mint says so at the site (`// secret-field-ok: …`).
+      - name: No secret fields in read responses (Serialize structs + route literals)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-no-secret-fields-in-read-responses.py
+
       - name: R2 endpoint jurisdiction guard — selftest
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-r2-endpoint-jurisdiction.py --selftest

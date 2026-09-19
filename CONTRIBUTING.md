@@ -47,13 +47,13 @@ docker compose -f infra/dev/docker-compose.yml up -d
 
 # Apply Postgres migrations
 # Drizzle is canonical for the control plane (apps/web/db/schema.ts). Applying the
-# three legacy .sql files below would give you 3 of 17, and the schema has since moved
-# to Drizzle — an incomplete control plane fails at runtime, not here.
+# 17 legacy .sql files under infra/dev/postgres/migrations/ would give you the pre-Drizzle
+# schema, and the schema has since moved to Drizzle — an incomplete control plane fails at runtime, not here.
 #
 # READ THIS BEFORE YOU ASSUME THE SCHEMA IS COMPLETE. `drizzle-kit migrate` applies
-# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 44
+# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 45
 # .sql files on disk; 0009+ are hand-written Neon migrations applied out-of-band and
-# deliberately un-journaled, so this command gives you 9 of 39. That is enough for the
+# deliberately un-journaled, so this command gives you 9 of 45. That is enough for the
 # gateway to boot and for most local work, and it is NOT the production schema.
 pnpm --filter @tracelanedev/web exec drizzle-kit migrate
 
@@ -111,7 +111,7 @@ cargo run -p ingest
 # Next.js dashboard (port 3000)
 pnpm dev
 
-# TypeScript MCP server (port 3001)
+# TypeScript MCP server (stdio by default; TRACELANE_MCP_TRANSPORT=http listens on 8081)
 pnpm dev:mcp
 ```
 
@@ -119,7 +119,7 @@ Verify the stack is up:
 
 ```bash
 curl http://localhost:8080/health   # gateway
-curl http://localhost:3000/api/health  # dashboard
+curl http://localhost:3000/api/healthz  # dashboard
 ```
 
 ## Running tests
@@ -213,7 +213,7 @@ Open a GitHub issue using the feature request template. Before doing so:
 
 ### Conventions (non-negotiable)
 
-- No `unwrap()` or `expect()` outside `#[cfg(test)]` — Clippy enforces this
+- No `unwrap()` or `expect()` outside `#[cfg(test)]` — a review rule (`.claude/rules/rust.md`); clippy runs `-D warnings` but no `unwrap_used` lint is configured
 - `tracing::instrument` on every new public async fn with `tenant_id` as a default field
 - Every new ClickHouse query must have `WHERE tenant_id = ?` — CI rejects queries without it
 - `tenant_id` comes from the JWT claim, never the request body

@@ -40,6 +40,10 @@ pub mod metering_job;
 /// (singular — the legacy Polar `TokensProcessed`/`AuditAnchors` recorder,
 /// unchanged): two systems billing two different things, not a rename.
 pub mod meters;
+/// B-410 / B-420 — the ONE rule for which window a usage figure is rated
+/// over: the tenant's stored Polar cycle when it governs the instant, else
+/// the UTC calendar month. The usage route and the metering job both ask it.
+pub mod period;
 pub mod polar_client;
 pub mod portal;
 /// BILL-01 / ADR-076 — the pure rating engine (bands, burst exemption) plus

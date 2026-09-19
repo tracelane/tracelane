@@ -174,6 +174,11 @@ export function UsageBoard({
 		? savedCeiling.mode
 		: (data.overflow_mode ?? initialOverflowMode);
 
+	// B-410: the gateway rates over the tenant's Polar cycle when one governs
+	// (`period_start` set) and over the calendar month otherwise — the copy
+	// names whichever window the numbers were actually rated over.
+	const hasCycle = Boolean(data.period_start);
+	const periodEndLabel = hasCycle ? "period end" : "month end";
 	const tiles = METER_KEYS.filter((k) => k !== "cold").map((key) => {
 		const block = data.meters[key];
 		const pct = pctOf(block.used, block.included);
@@ -190,7 +195,7 @@ export function UsageBoard({
 		const projection =
 			block.projection_month_end == null
 				? "— not enough data yet"
-				: `→ ${formatUsed(block.projection_month_end)}${block.unit ? ` ${block.unit}` : ""} by month end`;
+				: `→ ${formatUsed(block.projection_month_end)}${block.unit ? ` ${block.unit}` : ""} by ${periodEndLabel}`;
 		return {
 			key,
 			label: METER_LABEL[key],
@@ -220,7 +225,7 @@ export function UsageBoard({
 						unit: cold.unit,
 						usedFormat: formatGbAdaptive,
 					});
-	const periodLabel = data.period_start
+	const periodLabel = hasCycle
 		? "Usage this billing period"
 		: "Usage this month";
 
@@ -259,7 +264,7 @@ export function UsageBoard({
 					projection={
 						cold.projection_month_end == null
 							? "— not enough data yet"
-							: `→ ${formatGbUnit(cold.projection_month_end)} by month end`
+							: `→ ${formatGbUnit(cold.projection_month_end)} by ${periodEndLabel}`
 					}
 					extra={
 						cold.overage_usd != null
@@ -300,12 +305,13 @@ export function UsageBoard({
 			)}
 
 			{/* Only rendered when the gateway reports the ceiling ACTUALLY fired
-			    this month. `agedOutDays` is computed ONLY from two real gateway
+			    this period. `agedOutDays` is computed ONLY from two real gateway
 			    numbers — never invented when `auto_age_window_days` is null. */}
 			{data.ceiling_reached && (
 				<CeilingResolvedBanner
 					overflowMode={data.overflow_mode}
 					agedOutDays={agedOutDays(data)}
+					periodNoun={hasCycle ? "billing period" : "month"}
 					onReview={() => setShowCeiling(true)}
 				/>
 			)}

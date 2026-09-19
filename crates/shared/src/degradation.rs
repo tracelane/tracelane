@@ -218,6 +218,16 @@ pub enum Degradation {
     /// lookback and recomputed it as of that day (founder, 2026-09-14, D). One
     /// WARN per occurrence; the count says how often 04:10 UTC is being missed.
     MeteringGaugeGapBackfilled = 21,
+    /// B-427 — `GET /v1/audit/export` could not read the chain rows or the anchor
+    /// records it was about to ship. Until 2026-09-19 a failed anchor read shipped
+    /// the evidence pack with ZERO anchor lines and no log (`unwrap_or_default()`),
+    /// and a failed page read mid-stream ended the NDJSON CLEANLY — a document that
+    /// looks complete and, against the operator, proves nothing (DH-11: the Rekor
+    /// anchor is the only guarantee a customer holds against us). The export now
+    /// fails CLOSED — 500 before the body starts, an ABORTED transfer once it has —
+    /// and this counts how often the wedge's export could not be produced.
+    /// `crates/gateway/src/audit_export.rs`.
+    AuditExportIncomplete = 22,
 }
 
 impl Degradation {
@@ -249,6 +259,7 @@ impl Degradation {
             Self::PolarMeterEmissionFailed => "polar_meter_emission_failed",
             Self::UsageWarningEmailUnconfigured => "email_unconfigured",
             Self::MeteringGaugeGapBackfilled => "metering_gauge_gap_backfilled",
+            Self::AuditExportIncomplete => "audit_export_incomplete",
         }
     }
 
@@ -367,6 +378,13 @@ impl Degradation {
                  ingested_at) — nothing was lost, but 04:10 UTC was MISSED at least once. \
                  A repeating count means the job is not running when it should."
             }
+            Self::AuditExportIncomplete => {
+                "an audit evidence-pack export could not read its chain rows or anchor \
+                 records and was REFUSED (500) or ABORTED mid-transfer rather than shipped \
+                 short. The customer got an error, not a pack missing its anchors. Check \
+                 ClickHouse reachability and the gateway user's grants on audit_log / \
+                 audit_anchor_records."
+            }
         }
     }
 
@@ -395,13 +413,14 @@ impl Degradation {
             Self::PolarMeterEmissionFailed,
             Self::UsageWarningEmailUnconfigured,
             Self::MeteringGaugeGapBackfilled,
+            Self::AuditExportIncomplete,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 22;
+pub const COUNT: usize = 23;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -417,7 +436,19 @@ struct Slot {
     first_seen: AtomicU64,
     last_seen: AtomicU64,
     last_warn: AtomicU64,
+    /// When the CURRENT episode opened (the first note after a resolve). `NEVER` until
+    /// the first note. B-437.
+    opened_at: AtomicU64,
+    /// When the condition was last declared over. `NEVER` until the first resolve.
+    resolved_at: AtomicU64,
+    /// Ordering of the last note vs the last resolve, from the process-wide [`SEQ`]
+    /// — wall-clock seconds cannot order a note and a resolve inside the same second.
+    note_seq: AtomicU64,
+    resolve_seq: AtomicU64,
 }
+
+/// Monotonic ticket for note/resolve ordering (B-437). Never wraps in practice.
+static SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl Slot {
     const fn new() -> Self {
@@ -426,11 +457,21 @@ impl Slot {
             first_seen: AtomicU64::new(NEVER),
             last_seen: AtomicU64::new(0),
             last_warn: AtomicU64::new(NEVER),
+            opened_at: AtomicU64::new(NEVER),
+            resolved_at: AtomicU64::new(NEVER),
+            note_seq: AtomicU64::new(0),
+            resolve_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Open = has fired, and the last occurrence came AFTER the last resolve.
+    fn is_open(&self) -> bool {
+        self.note_seq.load(Ordering::Relaxed) > self.resolve_seq.load(Ordering::Relaxed)
     }
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),
@@ -464,7 +505,16 @@ pub struct Stat {
     pub first_seen: Option<u64>,
     /// Unix seconds of the most recent occurrence, or `None` if never.
     pub last_seen: Option<u64>,
-    /// `last_seen - first_seen`. The TRAPS §16 question: how long has this been open?
+    /// B-437: is the condition STILL open — noted at least once and not [`resolve`]d
+    /// since its last occurrence. Until 2026-09-19 a kind that had fired once read as
+    /// open until the process restarted (`singleton_lock_lost` sat "open" on the
+    /// status page for 33 h while the lock was held), which teaches readers to ignore
+    /// the page — the B-419 class.
+    pub open: bool,
+    /// Unix seconds of the last [`resolve`], or `None` if never resolved.
+    pub resolved_at: Option<u64>,
+    /// Seconds the condition has been open in its CURRENT episode (now − the note that
+    /// opened it), or `None` when it is not open. The TRAPS §16 question.
     pub open_for_secs: Option<u64>,
 }
 
@@ -482,11 +532,21 @@ pub fn note(kind: Degradation) -> u64 {
     let count = slot.count.fetch_add(1, Ordering::Relaxed) + 1;
     let now = unix_now_secs();
 
+    // B-437: a note that arrives while the kind is NOT open (never fired, or resolved
+    // since its last occurrence) opens a new episode — that is the instant
+    // `open_for_secs` counts from, not the first occurrence in the process lifetime.
+    // Read BEFORE first_seen/last_seen move, or the first note reads as already open.
+    let was_open = slot.is_open();
     // Only the first occurrence sets first_seen; `NEVER` is the "unset" marker.
     let _ = slot
         .first_seen
         .compare_exchange(NEVER, now, Ordering::Relaxed, Ordering::Relaxed);
+    if !was_open {
+        slot.opened_at.store(now, Ordering::Relaxed);
+    }
     slot.last_seen.store(now, Ordering::Relaxed);
+    slot.note_seq
+        .store(SEQ.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
 
     let last = slot.last_warn.load(Ordering::Relaxed);
     let due = last == NEVER || now.saturating_sub(last) >= WARN_INTERVAL_SECS;
@@ -498,11 +558,11 @@ pub fn note(kind: Degradation) -> u64 {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        let first = slot.first_seen.load(Ordering::Relaxed);
-        let open_for = if first == NEVER {
+        let opened = slot.opened_at.load(Ordering::Relaxed);
+        let open_for = if opened == NEVER {
             0
         } else {
-            now.saturating_sub(first)
+            now.saturating_sub(opened)
         };
         tracing::warn!(
             marker = "TRACELANE_DEGRADED",
@@ -516,7 +576,64 @@ pub fn note(kind: Degradation) -> u64 {
     count
 }
 
+/// B-437 — declare a degradation OVER: the condition it counts has provably ended (the
+/// singleton lock was re-acquired, the metering job completed a run with no failure,
+/// the audit backlog drained, an export succeeded). Returns `true` when the kind WAS
+/// open and is now closed — that transition emits ONE `warn!` carrying the stable
+/// `TRACELANE_RECOVERED` marker and how long the episode lasted (`logging.md`: *leave
+/// it → one WARN*). Idempotent: resolving a kind that is not open records nothing and
+/// logs nothing, so a caller may resolve on every healthy tick.
+///
+/// The count is NEVER reset — `count` stays the process-lifetime tally — only the
+/// open/closed state moves. A later [`note`] re-opens the kind with a fresh
+/// `opened_at`.
+///
+/// # Errors
+/// None — infallible by construction, for the same reason as [`note`].
+pub fn resolve(kind: Degradation) -> bool {
+    let slot = &SLOTS[kind as usize];
+    if !slot.is_open() {
+        return false;
+    }
+    let now = unix_now_secs();
+    let opened = slot.opened_at.load(Ordering::Relaxed);
+    slot.resolved_at.store(now, Ordering::Relaxed);
+    slot.resolve_seq
+        .store(SEQ.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    let lasted = if opened == NEVER {
+        0
+    } else {
+        now.saturating_sub(opened)
+    };
+    tracing::warn!(
+        marker = "TRACELANE_RECOVERED",
+        kind = kind.as_str(),
+        count = slot.count.load(Ordering::Relaxed),
+        lasted_secs = lasted,
+        "RECOVERED: the condition behind this degradation ended"
+    );
+    true
+}
+
+/// Is `kind` currently open? (B-437; see [`resolve`].)
+#[must_use]
+pub fn is_open(kind: Degradation) -> bool {
+    SLOTS[kind as usize].is_open()
+}
+
 /// Current count for one kind, without recording anything. For tests and diagnostics.
+///
+/// **Test contract — the counter is process-global and monotonic.** Every test in a
+/// binary shares one slot per kind, and tests run in parallel, so a test may only
+/// assert that ITS occurrence landed (`count(kind) > before`), never an exact delta
+/// (`== before + 1`, `after - before == 2`): any other test that drives the same kind
+/// through its own path lands between the two reads. Four red gates said so before
+/// it became a guard — `health_publishes_prompt_guard_fail_opens` (2026-09-06),
+/// `spawn_publish_with_no_runtime…` (CI 34686533037), then the ceiling and FT-05 tests
+/// together (2026-09-16). "Exactly N" belongs on a test-owned observable (the value
+/// `note` returns, an in-flight figure, a loop bound), and a site that must stay exact
+/// writes its reason on an `exact-delta-ok:` line for
+/// `scripts/ci/check-degradation-count-assertions.py`.
 #[must_use]
 pub fn count(kind: Degradation) -> u64 {
     SLOTS[kind as usize].count.load(Ordering::Relaxed)
@@ -535,16 +652,30 @@ pub fn snapshot() -> Vec<Stat> {
             let slot = &SLOTS[kind as usize];
             let first = slot.first_seen.load(Ordering::Relaxed);
             let last = slot.last_seen.load(Ordering::Relaxed);
-            let (first_seen, last_seen, open_for_secs) = if first == NEVER {
-                (None, None, None)
+            let resolved = slot.resolved_at.load(Ordering::Relaxed);
+            let opened = slot.opened_at.load(Ordering::Relaxed);
+            let open = slot.is_open();
+            let (first_seen, last_seen) = if first == NEVER {
+                (None, None)
             } else {
-                (Some(first), Some(last), Some(last.saturating_sub(first)))
+                (Some(first), Some(last))
+            };
+            let open_for_secs = if open && opened != NEVER {
+                Some(unix_now_secs().saturating_sub(opened))
+            } else {
+                None
             };
             Stat {
                 kind: kind.as_str(),
                 count: slot.count.load(Ordering::Relaxed),
                 first_seen,
                 last_seen,
+                open,
+                resolved_at: if resolved == NEVER {
+                    None
+                } else {
+                    Some(resolved)
+                },
                 open_for_secs,
             }
         })
@@ -575,16 +706,21 @@ mod tests {
 
         let returned = note(Degradation::MeterFlushFailed);
 
+        // exact-delta-ok: this is the unit test of `note` itself, and it is the ONLY
+        // noter of MeterFlushFailed and PredictorError in the shared test binary
+        // (`grep -n 'note(Degradation::' crates/shared/src`); exactness is the property.
         assert_eq!(
             count(Degradation::MeterFlushFailed),
             before + 1,
             "note() must advance the counter for its own kind"
         );
+        // exact-delta-ok: same single-noter argument as the assertion above.
         assert_eq!(
             returned,
             before + 1,
             "note() must return the new cumulative count"
         );
+        // exact-delta-ok: same single-noter argument as the assertion above.
         assert_eq!(
             count(Degradation::PredictorError),
             other_before,
@@ -627,6 +763,63 @@ mod tests {
             stat.open_for_secs.is_some(),
             "open_for_secs is the TRAPS §16 question — how long has this been open"
         );
+    }
+
+    /// B-437: a kind that fired and was RESOLVED is not open; a new note re-opens it
+    /// with a fresh episode; resolving a closed kind is a silent no-op. Uses a kind no
+    /// other test in this binary drives (`TraceShareBestEffortWrite`), and `>`
+    /// comparisons on the process-global count (B-423).
+    #[test]
+    fn resolve_closes_an_open_kind_and_a_new_note_reopens_it() {
+        let kind = Degradation::TraceShareBestEffortWrite;
+        let before = count(kind);
+        note(kind);
+        assert!(is_open(kind), "a noted kind is open");
+        let stat = snapshot()
+            .into_iter()
+            .find(|s| s.kind == kind.as_str())
+            .unwrap();
+        assert!(stat.open && stat.open_for_secs.is_some());
+
+        assert!(
+            resolve(kind),
+            "resolving an open kind reports the transition"
+        );
+        assert!(!is_open(kind), "a resolved kind is not open");
+        let stat = snapshot()
+            .into_iter()
+            .find(|s| s.kind == kind.as_str())
+            .unwrap();
+        assert!(!stat.open, "snapshot must say closed");
+        assert!(
+            stat.open_for_secs.is_none(),
+            "nothing is open, so no duration"
+        );
+        assert!(stat.resolved_at.is_some());
+        assert!(
+            stat.count > before,
+            "the count is history and is never reset"
+        );
+
+        assert!(!resolve(kind), "resolving a closed kind is a no-op");
+
+        note(kind);
+        assert!(is_open(kind), "a note after a resolve re-opens the kind");
+        let stat = snapshot()
+            .into_iter()
+            .find(|s| s.kind == kind.as_str())
+            .unwrap();
+        assert!(stat.open, "the new episode is open");
+    }
+
+    #[test]
+    fn a_kind_that_never_fired_is_not_open_and_cannot_be_resolved() {
+        // `PerTraceCeilingDrop` is an ingest-side kind; nothing in this binary notes it.
+        let kind = Degradation::PerTraceCeilingDrop;
+        if count(kind) == 0 {
+            assert!(!is_open(kind));
+            assert!(!resolve(kind));
+        }
     }
 
     #[test]

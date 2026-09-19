@@ -44,6 +44,26 @@ describe("PlanHeader — annual pair (BILL-02)", () => {
 		},
 	);
 
+	it("B-431: a cancel at period end says when the plan ENDS and that it is kept until then; nothing scheduled → no note", () => {
+		const html = render({
+			plan: "builder",
+			billingInterval: "month",
+			subscriptionEndsAt: "2026-10-19T09:08:42.465Z",
+		});
+		expect(html).toContain("Cancels on 2026-10-19");
+		expect(html).toContain("you keep Builder until then");
+		expect(html).toContain('data-testid="subscription-ends-note"');
+		const none = render({ plan: "builder", billingInterval: "month" });
+		expect(none).not.toContain("subscription-ends-note");
+		// Free never renders a scheduled end (there is no plan to keep).
+		const free = render({
+			plan: "free",
+			billingInterval: null,
+			subscriptionEndsAt: "2026-10-19T09:08:42.465Z",
+		});
+		expect(free).not.toContain("subscription-ends-note");
+	});
+
 	it("a monthly tenant is unchanged: 'billed monthly', no annual badge, no banner", () => {
 		const html = render({ plan: "team", billingInterval: "month" });
 		expect(html).toContain("billed monthly");

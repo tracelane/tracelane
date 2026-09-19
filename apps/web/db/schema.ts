@@ -65,11 +65,27 @@ export type AnnualPairHalfJson = {
 	period_start?: string | null;
 	period_end?: string | null;
 };
+/**
+ * O4 (2026-09-19): the webhook's SYNCHRONOUS pairing attempt for a P2 tenant.
+ * `attempting` is the atomic claim one delivery takes before calling Polar (a
+ * concurrent delivery of the same base's `active`/`updated` sees it and does
+ * not create a SECOND usage subscription); `created` / `existing` carry the
+ * usage id; `failed` carries Polar's reason and lets the next base event retry.
+ * NEVER an input to the resolver — the tenant stays `free` until the usage
+ * half's own event arrives.
+ */
+export type AnnualPairPairingJson = {
+	attempted_at: string;
+	result: "attempting" | "created" | "existing" | "failed";
+	usage_subscription_id?: string | null;
+	reason?: string | null;
+};
 export type AnnualPairJson = {
 	base?: AnnualPairHalfJson | null;
 	usage?: AnnualPairHalfJson | null;
 	/** null when the pair is healthy; else the refusal reason (P2/P3/P4/P6). */
 	alert?: string | null;
+	pairing?: AnnualPairPairingJson | null;
 };
 
 export const tenants = pgTable(
@@ -181,6 +197,12 @@ export const tenants = pgTable(
 		// billing_policy.dunning_data_hold_days. The purge path refuses before
 		// this date.
 		dataHoldUntil: timestamp("data_hold_until", { withTimezone: true }),
+		// B-431 (migration 0045): Polar `ends_at` while `cancel_at_period_end` is set
+		// on the live subscription — the plan stays until this instant; NULL when no
+		// end is scheduled. `subscription.revoked` is what actually ends the plan.
+		subscriptionEndsAt: timestamp("subscription_ends_at", {
+			withTimezone: true,
+		}),
 		// A3 velocity breaker (token generation >2σ above a rolling 7-day
 		// average): prompt promotion is frozen while these are set; a human
 		// clears them.
@@ -1402,7 +1424,7 @@ export const meterWarnings = pgTable(
 			.notNull()
 			.references(() => tenants.id, { onDelete: "cascade" }),
 		meter: text("meter").notNull(),
-		/** First day of the calendar month this warning covers. */
+		/** First day of the BILLING PERIOD this warning covers (the tenant's Polar cycle start when one is stored, else the 1st of the calendar month — B-410/B-420, 2026-09-19). */
 		period: date("period").notNull(),
 		threshold: integer("threshold").notNull(),
 		sentAt: timestamp("sent_at", { withTimezone: true }).defaultNow().notNull(),

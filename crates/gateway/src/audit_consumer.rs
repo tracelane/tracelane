@@ -244,6 +244,12 @@ async fn run_once(audit_chain: &Arc<AuditChain>, client: &async_nats::Client) ->
                             tracelane_shared::degradation::note(
                                 tracelane_shared::degradation::Degradation::AuditBacklog,
                             );
+                        } else {
+                            // B-437: a healthy reading ends the episode (no-op when
+                            // none is open).
+                            tracelane_shared::degradation::resolve(
+                                tracelane_shared::degradation::Degradation::AuditBacklog,
+                            );
                         }
                     }
                     Err(e) => {

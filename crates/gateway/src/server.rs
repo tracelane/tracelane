@@ -1750,15 +1750,35 @@ pub(crate) fn health_body(
     spans_dropped: u64,
     audit_backfill_failures: u64,
 ) -> serde_json::Value {
-    let degraded: Vec<serde_json::Value> = tracelane_shared::degradation::snapshot()
-        .into_iter()
-        .filter(|st| st.count > 0)
+    // B-437 (2026-09-19): `degraded` lists kinds that are OPEN — noted and not
+    // resolved since. A kind that fired and whose condition provably ended (the
+    // singleton lock re-acquired, a clean metering run, a drained backlog) moves to
+    // `degraded_history` with its count and `resolved_at`, so the four lock losses
+    // stay visible without reading as "open for 33 hours" on the status page. The
+    // history entries carry `resolved_kind`, not `kind`, on purpose: the watchdog's
+    // `grep -o '"kind":"…"'` must keep seeing only the open ones.
+    let snap = tracelane_shared::degradation::snapshot();
+    let degraded: Vec<serde_json::Value> = snap
+        .iter()
+        .filter(|st| st.open)
         .map(|st| {
             serde_json::json!({
                 "kind": st.kind,
                 "count": st.count,
                 "open_for_secs": st.open_for_secs,
                 "last_seen": st.last_seen,
+            })
+        })
+        .collect();
+    let degraded_history: Vec<serde_json::Value> = snap
+        .iter()
+        .filter(|st| st.count > 0 && !st.open)
+        .map(|st| {
+            serde_json::json!({
+                "resolved_kind": st.kind,
+                "count": st.count,
+                "last_seen": st.last_seen,
+                "resolved_at": st.resolved_at,
             })
         })
         .collect();
@@ -1795,6 +1815,7 @@ pub(crate) fn health_body(
         // happening, and for how long".
         "degraded_open": degraded.len(),
         "degraded": degraded,
+        "degraded_history": degraded_history,
         // B-378 (2026-09-12): the audit JetStream backlog, read from
         // `consumer.info()` every 10 s by the head-writer. Before this nothing
         // read the queue depth at all, and the first symptom of a lagging
@@ -2129,6 +2150,44 @@ mod tests {
     /// Uses a real `note()` because the counters are process-global statics: the
     /// point is that the same call every fail-open path already makes is what
     /// surfaces here, with no second bookkeeping to forget.
+    /// B-437: a RESOLVED kind leaves `degraded` (so `degraded_open` no longer counts
+    /// it) and appears in `degraded_history` under `resolved_kind` — the watchdog's
+    /// `"kind":` grep must not see it. Uses a kind nothing else in this binary
+    /// resolves (`TraceShareBestEffortWrite`).
+    #[test]
+    fn health_moves_a_resolved_degradation_to_history() {
+        use tracelane_shared::degradation::{Degradation, note, resolve};
+        note(Degradation::TraceShareBestEffortWrite);
+        let open = health_body(true, 0, 0);
+        assert!(
+            open["degraded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["kind"] == "trace_share_best_effort_write"),
+            "noted → listed as open"
+        );
+        resolve(Degradation::TraceShareBestEffortWrite);
+        let after = health_body(true, 0, 0);
+        assert!(
+            !after["degraded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["kind"] == "trace_share_best_effort_write"),
+            "resolved → no longer open"
+        );
+        let hist = after["degraded_history"].as_array().expect("history array");
+        let entry = hist
+            .iter()
+            .find(|d| d["resolved_kind"] == "trace_share_best_effort_write")
+            .expect("resolved kind is in history");
+        assert!(entry["count"].as_u64().unwrap() >= 1);
+        assert!(entry["resolved_at"].is_number());
+        // The wire contract the status page greps: no history entry carries `kind`.
+        assert!(hist.iter().all(|d| d.get("kind").is_none()));
+    }
+
     #[test]
     fn health_publishes_open_degradations() {
         use tracelane_shared::degradation::{Degradation, note};
@@ -2469,9 +2528,11 @@ mod tests {
         let after = tracelane_shared::degradation::count(
             tracelane_shared::degradation::Degradation::SpanPublishFailed,
         );
-        assert_eq!(
-            after - before,
-            2,
+        // `>= left`, not `== 2`: the counter is process-global and other publish
+        // tests in this binary land on it concurrently. "Two losses" is `left == 2`
+        // above; this only shows the loop's notes reached the counter.
+        assert!(
+            after - before >= left as u64,
             "two unacked publishes must be two counted losses"
         );
         // And the real drain path with nothing in flight and no client returns promptly.

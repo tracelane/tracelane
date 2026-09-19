@@ -8,7 +8,7 @@ Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident aud
 
 ## Tiers
 
-| Tier | Monthly | Annual (per mo) | Rate limit | Seats |
+| Tier | Monthly | Annual (per mo)\* | Rate limit | Seats |
 |---|---|---|---|---|
 | **OSS self-host** | $0 forever | — | — | — |
 | **Free hosted** | $0 | — | 60 RPM | 1 |
@@ -17,12 +17,22 @@ Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident aud
 | **Business** | $799 | $665 | 60,000 RPM | Unlimited |
 | **Enterprise** | from $2,499 | contract | custom | Unlimited |
 
+\* Annual billing is **not yet available** — the monthly plans are what you can buy today. The annual prices are published so they are known in advance; checkout offers monthly only until annual opens.
+
 - **OSS self-host** — 191 providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack.
-- **Free hosted** — no commercial use, rule-based PR1+PR2.
+- **Free hosted** — no commercial use; the same rule-based predictive layer every tier runs (PR1/PR2/PR4/PR5).
 - **Builder** — predictive PR1+PR2+PR4+PR5 (rule-based), prompt history (read-only).
 - **Team** — SSO/SAML; predictive PR1+PR2+PR4+PR5 — the same set Builder runs — plus the data-governance and quality rails, and a tamper-evident promotion record.
 - **Business** — SSO/SAML; the data-governance and quality rails.
 - **Enterprise** — SSO/SAML, dedicated tenancy option, custom volume on every meter, 7-year ledger retention and the bulk audit export.
+
+### How annual billing works
+
+Not yet available — this is how it will work once it opens. An annual plan is billed as two Polar subscriptions on one customer: the **annual base**,
+paid up front for the year, and a **$0 monthly usage subscription** that carries the plan's
+monthly allowances and bills any overage in arrears each month. In the Polar-hosted billing
+portal they appear as two subscriptions; on your Tracelane billing page they are one plan.
+Change or cancel the plan from the Tracelane billing page, not from either subscription alone.
 
 ### Included allowances (per month, no rollover)
 
@@ -67,7 +77,7 @@ plan.
 run fast: Free 3 days, Builder 30 days, Team 90 days, Business 180 days,
 Enterprise 365+ days. **Queryable history** is how far back your data stays
 queryable at all, from cold storage: Free 30 days, every paid tier 2 years
-(7 years on Enterprise). Retention is not customer-configurable — there is no
+(Enterprise keeps the audit **ledger** for 7 years; queryable history stays 2 years). Retention is not customer-configurable — there is no
 retention setting in the product.
 </Note>
 
@@ -125,8 +135,8 @@ stops recording because of an invoice is not a recorder.
 
 ## Free
 
-One workspace per account, reclaimed after 14 idle days, no card required, no
-overage — Free ages out rather than returning 429s.
+One workspace per account, no card required, no overage — Free ages out rather
+than returning 429s.
 
 ## Policies
 
@@ -236,7 +246,7 @@ Self-verify with `tlane verify --tenant-pubkey` on your own export — no Tracel
 </Accordion>
 
 <Accordion title="Is there a free trial for paid tiers?">
-Free hosted (one workspace, reclaimed after 14 idle days, no card required) is permanently free for non-commercial use. There is no paid-tier free trial — the free hosted tier and OSS self-host are the trial.
+Free hosted (one workspace, no card required) is permanently free for non-commercial use. There is no paid-tier free trial — the free hosted tier and OSS self-host are the trial.
 </Accordion>
 
 <Accordion title="Can I self-host?">

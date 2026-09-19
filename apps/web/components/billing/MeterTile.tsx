@@ -24,7 +24,7 @@ export interface MeterTileProps {
 	/** 0-999, or `null` when there is no allowance to compare against (custom/Enterprise). */
 	pct: number | null;
 	level: WarnLevel;
-	/** "→ 268 GB by month end" — or a partial/unknown message. */
+	/** "→ 268 GB by period end" (or "by month end" with no Polar cycle) — or a partial/unknown message. */
 	projection: string;
 	/** Cold's "$0.08 so far" secondary line (accrued spend, not a rate); omitted elsewhere. */
 	extra?: string;

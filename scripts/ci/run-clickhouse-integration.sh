@@ -202,6 +202,15 @@ cargo test -p gateway --bin gateway retention_sweep::tests::enforce_delete_is_ac
 # the SQL's semantics, not the Rust's. This test existed and was `#[ignore]`d
 # but nothing ran it; prod found the defect first.
 cargo test -p gateway --bin gateway billing::blobs::tests::rehydrate_against_a_real_clickhouse -- --ignored || RC=1
+# B-424 / B-425 (BILL-01, found on prod 2026-09-16): every read the metering job
+# makes, and the two period reads the usage page renders from, against a real
+# server. A SELECT alias shadowing a same-named column (`toString(day) AS day
+# … WHERE day >= …`) is NO_COMMON_TYPE on the server and nothing else; a
+# UInt64 aggregate decoded into an f64 field is a denormal on the server and
+# nothing else. Both failed on every run since BILL-01 deployed and no unit
+# test could see either.
+cargo test -p gateway --bin gateway billing::metering_job::tests::meter_reads_run_against_a_real_clickhouse -- --ignored || RC=1
+cargo test -p gateway --bin gateway billing::usage::tests::period_reads_run_against_a_real_clickhouse -- --ignored || RC=1
 # The previously-uncalled migration-03 parity test. Mirrors column shapes rather
 # than driving the persisters, so it is a weaker check — run for coverage, not
 # for confidence.

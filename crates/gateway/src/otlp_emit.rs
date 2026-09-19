@@ -611,7 +611,14 @@ mod shutdown_drain_tests {
             span_publish_tests::test_span("11111111-1111-4111-8111-111111111111"),
             "ceiling test",
         );
-        assert_eq!(count(Degradation::SpanPublishFailed), before + 1);
+        // `>`, not `== before + 1`: the counter is process-global and any test in
+        // this binary that publishes to a dead NATS lands on it concurrently (gate
+        // 15, 2026-09-16, read +2). "Counted" is `>`; "refused, not spawned" is the
+        // in-flight figure below, which is test-owned under DRAIN_LOCK.
+        assert!(
+            count(Degradation::SpanPublishFailed) > before,
+            "a publish refused above the ceiling must land on the loss counter"
+        );
         assert_eq!(
             in_flight(),
             MAX_IN_FLIGHT,

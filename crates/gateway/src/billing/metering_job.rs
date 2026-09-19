@@ -23,16 +23,35 @@
 //! read a single point — today's resident bytes, yesterday's scan total —
 //! not a day-by-day series). This job therefore issues two FURTHER queries
 //! (`query_trailing_daily_meter_counters`, `query_trailing_daily_scan_bytes`)
-//! to build those arrays, plus three CALENDAR-MONTH-TO-DATE queries
-//! (`query_month_to_date_meter_counter` ×2, `query_month_to_date_scan_bytes`)
+//! to build those arrays, plus three PERIOD-TO-DATE queries
+//! (`query_period_to_date_meter_counter` ×2, `query_period_to_date_scan_bytes`)
 //! feeding the usage-warning emails and the AUTO-AGE ceiling projection
-//! below — the SAME `day >= toStartOfMonth(today())` boundary `GET
-//! /v1/billing/usage` bills from, not the trailing window. Filed here rather
-//! than silently exceeding the stated "4 queries" without saying so: the
-//! real count is 9 ClickHouse reads + 1 batched write per run, all still
-//! `GROUP BY tenant_id`, never a per-tenant loop — the property the budget
-//! exists to protect (no N+1) is intact even though the literal query count
-//! is not 4.
+//! below — the SAME window `GET /v1/billing/usage` bills from, not the
+//! trailing window. Filed here rather than silently exceeding the stated "4
+//! queries" without saying so: the real count is 9 ClickHouse reads + 1
+//! batched write per run, all still `GROUP BY tenant_id`, never a per-tenant
+//! loop — the property the budget exists to protect (no N+1) is intact even
+//! though the literal query count is not 4.
+//!
+//! # The billing period (B-410 / B-420, founder ruling 2026-09-19)
+//!
+//! Every window-to-date figure this job computes — the `series` gauge, the
+//! three period-to-date sums, the GB-month share each daily gauge event
+//! carries, the usage-warning dedup key — is anchored on the tenant's OWN
+//! Polar cycle (`tenants.current_period_start/end`, carried on
+//! [`TenantMeta`] from the same Postgres read), falling back to the UTC
+//! calendar month only for a tenant with no governing cycle. The rule lives
+//! in [`crate::billing::period`] and is the same one `GET /v1/billing/usage`
+//! reads with, so the page, the emails, AUTO-AGE and the invoice agree.
+//! Per-tenant boundaries stay ONE query per meter: the `(tenant_id,
+//! period_start)` pairs ride into the SQL as an `arrayJoin` literal
+//! ([`periods_literal`]) joined on `tenant_id`, exactly as the hot/cold
+//! window join already does — never a per-tenant loop (B-256 class).
+//! `series` is a GAUGE Polar aggregates with `max` over the cycle
+//! (`scripts/ops/polar-sync.mjs`), so the value emitted each day must be the
+//! distinct count SINCE THAT TENANT'S CYCLE STARTED; a calendar-month count
+//! read on a mid-month cycle was the max of two partial months, which
+//! under-counts the union (B-420).
 //!
 //! # AUTO-AGE (spec §0.4)
 //!
@@ -115,18 +134,6 @@ fn days_since_epoch(date: NaiveDate) -> u16 {
     u16::try_from((date - epoch).num_days().max(0)).unwrap_or(u16::MAX)
 }
 
-/// Days in the calendar month containing `date`.
-fn days_in_month(date: NaiveDate) -> u32 {
-    let (y, m) = if date.month() == 12 {
-        (date.year() + 1, 1)
-    } else {
-        (date.year(), date.month() + 1)
-    };
-    NaiveDate::from_ymd_opt(y, m, 1)
-        .and_then(|d| d.pred_opt())
-        .map_or(30, |d| d.day())
-}
-
 /// Seconds from `now` until the next occurrence of `hour:minute` UTC — today
 /// if that time has not yet passed, else tomorrow. Never zero or negative
 /// (a `tokio::time::sleep(0)` fires immediately, which would busy-loop a
@@ -204,8 +211,13 @@ fn gb(bytes: f64) -> f64 {
 
 /// A gauge event's per-day share of a GB-MONTH figure (spec: "today's
 /// resident bytes ÷ 1e9 ÷ days-in-month, so the cycle SUM is the GB-month").
-fn gb_month_share(bytes_today: f64, days_in_month: u32) -> f64 {
-    gb(bytes_today) / f64::from(days_in_month.max(1))
+/// `days_in_period` is the tenant's OWN billing period's length
+/// ([`crate::billing::period::BillingPeriod::total_days`]) — a 30-day cycle
+/// straddling a 31-day month divides by 30 on every one of its days, so the
+/// cycle sum is exactly the mean; dividing by each calendar month's length
+/// summed to 16/30 + 14/31 ≠ 1 for a steady tenant (B-410).
+fn gb_month_share(bytes_today: f64, days_in_period: u32) -> f64 {
+    gb(bytes_today) / f64::from(days_in_period.max(1))
 }
 
 // ── Tenant metadata (ONE Postgres query) ────────────────────────────────────
@@ -221,9 +233,38 @@ struct TenantMeta {
     /// re-evaluates it (via [`Self::effective_window_days`]) and either
     /// confirms it, narrows it further, widens it back, or clears it.
     auto_age_window_days: Option<i32>,
+    /// B-410 / B-420 — `tenants.current_period_start/end`, the Polar cycle
+    /// the webhook stored. `None` = no paid cycle known. Read through
+    /// [`Self::period_at`], never directly: a stored cycle that does not
+    /// contain the instant (stale, or not started) must not anchor anything.
+    billing_period: Option<crate::billing::period::Cycle>,
 }
 
 impl TenantMeta {
+    /// The window this tenant's figures are rated over at `at` — its stored
+    /// Polar cycle when that governs the instant, else the UTC calendar month
+    /// (`crate::billing::period`, the SAME rule `GET /v1/billing/usage` uses).
+    fn period_at(&self, at: chrono::DateTime<Utc>) -> crate::billing::period::BillingPeriod {
+        crate::billing::period::billing_period(self.billing_period, at)
+    }
+
+    /// One WARN per tenant per run when a stored cycle was ignored — it has
+    /// ended without the renewal webhook landing, or has not started. The
+    /// figures fall back to the calendar month (the usage page does the
+    /// same), and the line is what tells an operator the webhook is missing.
+    fn warn_if_cycle_ignored(&self, period: &crate::billing::period::BillingPeriod) {
+        if period.ignored_cycle(self.billing_period)
+            && let Some((start, end)) = self.billing_period
+        {
+            tracing::warn!(
+                tenant_id = %self.tenant_id,
+                cycle_start = %start.to_rfc3339(),
+                cycle_end = %end.to_rfc3339(),
+                "metering job: stored Polar cycle does not contain now — rated over the calendar month; renewal webhook missing?"
+            );
+        }
+    }
+
     /// The window every window-scoped read in THIS job must use instead of
     /// `indexed_window_days` directly — mirrors
     /// `entitlement_cache::ResolvedEntitlements::effective_window_days`
@@ -242,7 +283,8 @@ const TENANT_META_SQL: &str = "\
     SELECT t.id, \
       COALESCE(we.indexed_window_days, pe.indexed_window_days, 3)::int AS indexed_window_days, \
       COALESCE(we.queryable_days, pe.queryable_days, 730)::int AS queryable_days, \
-      t.polar_customer_id, t.billing_email, t.auto_age_window_days \
+      t.polar_customer_id, t.billing_email, t.auto_age_window_days, \
+      t.current_period_start, t.current_period_end \
     FROM tenants t \
     JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
     LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
@@ -263,6 +305,11 @@ async fn fetch_tenant_meta(pool: &DbPool) -> anyhow::Result<Vec<TenantMeta>> {
             polar_customer_id: r.get(3),
             billing_email: r.get(4),
             auto_age_window_days: r.get(5),
+            billing_period: {
+                let start: Option<chrono::DateTime<Utc>> = r.get(6);
+                let end: Option<chrono::DateTime<Utc>> = r.get(7);
+                start.zip(end)
+            },
         })
         .collect())
 }
@@ -293,6 +340,54 @@ fn windows_literal(metas: &[TenantMeta]) -> String {
         })
         .collect();
     format!("[{}]", tuples.join(","))
+}
+
+/// Render `metas` as a ClickHouse literal array of `(tenant_id, period_start)`
+/// tuples — the `arrayJoin` every period-to-date read joins against, so
+/// per-tenant cycle boundaries cost ONE query per meter, never a per-tenant
+/// loop (B-410 / B-420). `period_start` is the first UTC day of the window
+/// governing `at` for THAT tenant ([`TenantMeta::period_at`]): its Polar
+/// cycle, or the calendar month.
+///
+/// Injection surface: none. `tenant_id` is a `Uuid` — typed by tokio-postgres
+/// off OUR OWN `tenants.id` column, so its `Display` is the fixed
+/// hex-and-hyphen shape by construction, never customer input — and the date
+/// is a `NaiveDate` whose `Display` is `YYYY-MM-DD`. The same argument
+/// [`windows_literal`] makes; a value that could be anything else cannot
+/// reach this function's parameter type.
+fn periods_literal(metas: &[TenantMeta], at: chrono::DateTime<Utc>) -> String {
+    let tuples: Vec<String> = metas
+        .iter()
+        .map(|m| format!("('{}','{}')", m.tenant_id, m.period_at(at).start))
+        .collect();
+    format!("[{}]", tuples.join(","))
+}
+
+/// The `WITH periods AS (…)` prefix shared by the period-anchored reads:
+/// `(tenant_id String, period_start Date)` from [`periods_literal`]'s output.
+fn periods_cte(periods_lit: &str) -> String {
+    format!(
+        "WITH periods AS ( \
+            SELECT tupleElement(t,1) AS tenant_id, toDate(tupleElement(t,2)) AS period_start \
+            FROM (SELECT arrayJoin({periods_lit}) AS t) \
+         ) "
+    )
+}
+
+/// The instant a read is made "as of": `now` for the live run, or the last
+/// second of a past day for a backfill — the same boundary [`now_expr`]
+/// renders into the SQL, so the period the literal is built from and the
+/// as-of bound the query applies agree to the second.
+fn instant_for(as_of: Option<NaiveDate>) -> chrono::DateTime<Utc> {
+    match as_of {
+        None => Utc::now(),
+        Some(d) => chrono::DateTime::from_naive_utc_and_offset(
+            d.and_time(
+                chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap_or(chrono::NaiveTime::MIN),
+            ),
+            Utc,
+        ),
+    }
 }
 
 // ── The four gauge queries (spec: meters 2-5) ───────────────────────────────
@@ -340,7 +435,7 @@ async fn query_hot_resident_bytes(
             SELECT tupleElement(t,1) AS tenant_id, tupleElement(t,2) AS indexed_window_days \
             FROM (SELECT arrayJoin({lit}) AS t) \
          ) \
-         SELECT s.tenant_id AS tenant_id, sum(s.span_bytes) AS value \
+         SELECT s.tenant_id AS tenant_id, toFloat64(sum(s.span_bytes)) AS value \
          FROM tracelane.spans AS s \
          INNER JOIN windows AS w ON s.tenant_id = w.tenant_id \
          WHERE s.start_time >= {now} - toIntervalDay(w.indexed_window_days){ingested} \
@@ -353,27 +448,47 @@ async fn query_hot_resident_bytes(
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
 }
 
-/// Meter 3: `series` — distinct `(name, model, provider, api_key_id)` this
-/// calendar month. `MV_MODEL_EXPR`/`MV_PROVIDER_EXPR` mirror
+/// The series SQL, pure so its boundary text is unit-testable: distinct
+/// `(name, model, provider, api_key_id)` per tenant from THAT tenant's
+/// `period_start` (the `periods` join) up to the as-of instant. Was
+/// `toYYYYMM(start_time) = toYYYYMM(now)` — the calendar month for every
+/// tenant — until B-420. `MODEL_EXPR`/`PROVIDER_EXPR` mirror
 /// `trace_reads.rs`'s SLO-view expressions verbatim (that file is outside
 /// this build's edit scope beyond calling the rehydration helper, so the two
 /// literal strings are duplicated rather than shared — same reasoning as
-/// `days_since_epoch` above).
-async fn query_series(
-    ch: &clickhouse::Client,
-    as_of: Option<NaiveDate>,
-) -> anyhow::Result<HashMap<String, f64>> {
+/// `days_since_epoch` above). Unqualified `attributes` / `name` resolve to
+/// `spans` — `periods` carries neither column.
+fn series_sql(periods_lit: &str, as_of: Option<NaiveDate>) -> String {
     const MODEL_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name'))";
     const PROVIDER_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider'))";
-    let sql = meter_query(format!(
-        "SELECT tenant_id AS tenant_id, \
+    meter_query(format!(
+        "{cte}\
+         SELECT s.tenant_id AS tenant_id, \
             toFloat64(uniqExact(name, {MODEL_EXPR}, {PROVIDER_EXPR}, JSONExtractString(attributes, 'tracelane_api_key_id'))) AS value \
-         FROM tracelane.spans \
-         WHERE toYYYYMM(start_time) = toYYYYMM({now}){ingested} \
-         GROUP BY tenant_id",
+         FROM tracelane.spans AS s \
+         INNER JOIN periods AS p ON s.tenant_id = p.tenant_id \
+         WHERE s.start_time >= toDateTime(p.period_start, 'UTC') AND s.start_time <= {now}{ingested} \
+         GROUP BY s.tenant_id",
+        cte = periods_cte(periods_lit),
         now = now_expr(as_of),
-        ingested = ingested_filter(as_of, "")
-    ));
+        ingested = ingested_filter(as_of, "s.")
+    ))
+}
+
+/// Meter 3: `series` — distinct `(name, model, provider, api_key_id)` since
+/// each tenant's OWN billing period started (B-420): its Polar cycle, or the
+/// calendar month when none governs. ONE query via the `periods` join.
+///
+/// This is the value Polar takes `max` over the cycle of
+/// (`scripts/ops/polar-sync.mjs`), so anchoring it on the cycle is what
+/// makes that max equal the true union — a calendar-month count on a
+/// mid-month cycle was the max of two partial months.
+async fn query_series(
+    ch: &clickhouse::Client,
+    metas: &[TenantMeta],
+    as_of: Option<NaiveDate>,
+) -> anyhow::Result<HashMap<String, f64>> {
+    let sql = series_sql(&periods_literal(metas, instant_for(as_of)), as_of);
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
 }
@@ -388,7 +503,7 @@ async fn query_scan_bytes_for_day(
     day: NaiveDate,
 ) -> anyhow::Result<HashMap<String, f64>> {
     let sql = meter_query(format!(
-        "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, sum(read_bytes) AS value \
+        "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, toFloat64(sum(read_bytes)) AS value \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
            AND event_date = toDate('{day}') \
@@ -412,7 +527,7 @@ async fn query_cold_bytes(
                    tupleElement(t,3) AS queryable_days \
             FROM (SELECT arrayJoin({lit}) AS t) \
          ) \
-         SELECT s.tenant_id AS tenant_id, sum(s.span_bytes) AS value \
+         SELECT s.tenant_id AS tenant_id, toFloat64(sum(s.span_bytes)) AS value \
          FROM tracelane.spans AS s \
          INNER JOIN windows AS w ON s.tenant_id = w.tenant_id \
          WHERE s.start_time < {now} - toIntervalDay(w.indexed_window_days) \
@@ -432,6 +547,21 @@ struct DailyTenantValueRow {
     // Unread — see `SpanRow`'s / `DailyRow`'s own comment on this exact
     // shape in `usage.rs`: `clickhouse::Row` decodes RowBinary POSITIONALLY,
     // so removing this field would desync the 3-column SELECT (B-274 class).
+    //
+    // Two rules every SELECT feeding this (or `TenantValueRow`) follows,
+    // both learned from prod on 2026-09-16 and both invisible to a unit test:
+    // - B-424: the string projection is `AS day_iso`, never `AS day` — a
+    //   SELECT alias shadows a same-named column across the WHOLE query in
+    //   ClickHouse, so `WHERE day >= toDate(…)` compared String with Date
+    //   (`NO_COMMON_TYPE`, code 386) and every trailing read + the gap
+    //   backfill failed on every run since BILL-01 shipped.
+    // - B-425: an integer aggregate is wrapped `toFloat64(…)` before it lands
+    //   in `value: f64` — `sum(span_bytes)` is UInt64 on the wire, and
+    //   RowBinary decoded its 8 bytes AS an f64, so hot / cold / scan gauges
+    //   were written as denormals (`1.47526e-318` for 298,596 bytes) and
+    //   emitted to Polar as ~0. `series` was right only because it already
+    //   said `toFloat64(uniqExact(…))`.
+    // `meter_reads_run_against_a_real_clickhouse` holds both.
     #[allow(dead_code)]
     day: String,
     value: f64,
@@ -446,7 +576,7 @@ async fn query_trailing_daily_meter_counter(
     until_excl: NaiveDate,
 ) -> anyhow::Result<HashMap<String, Vec<f64>>> {
     let sql = meter_query(format!(
-        "SELECT tenant_id AS tenant_id, toString(day) AS day, sum(value) AS value \
+        "SELECT tenant_id AS tenant_id, toString(day) AS day_iso, sum(value) AS value \
          FROM tracelane.meter_counters \
          WHERE meter = '{meter}' AND day >= toDate('{until_excl}') - 31 AND day < toDate('{until_excl}') \
          GROUP BY tenant_id, day ORDER BY tenant_id, day"
@@ -467,11 +597,11 @@ async fn query_trailing_daily_scan_bytes(
 ) -> anyhow::Result<HashMap<String, Vec<f64>>> {
     let sql = meter_query(format!(
         "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, \
-            toString(event_date) AS day, sum(read_bytes) AS value \
+            toString(event_date) AS day_iso, toFloat64(sum(read_bytes)) AS value \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
            AND event_date >= toDate('{until_excl}') - 31 AND event_date < toDate('{until_excl}') \
-         GROUP BY tenant_id, day ORDER BY tenant_id, day"
+         GROUP BY tenant_id, event_date ORDER BY tenant_id, event_date"
     ));
     let rows: Vec<DailyTenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     let mut out: HashMap<String, Vec<f64>> = HashMap::new();
@@ -570,12 +700,20 @@ struct PolarEvent {
 /// Build this tenant's Polar events for `period` from what the job just
 /// computed. Pure (no I/O) so the per-meter arithmetic — burst netting,
 /// GB-month sharing — is independently testable.
+///
+/// `days_in_period` is THIS tenant's billing period length (its Polar cycle,
+/// or the calendar month — B-410); `series_period` is the distinct-series
+/// count since that period started, and the caller passes `None` when the
+/// reading is not cycle-true (a stale stored cycle): `series` is `max`-
+/// aggregated over the cycle on Polar's side, so a too-high reading would
+/// stick on the invoice, whereas a skipped day costs nothing — the next
+/// cycle-true reading is the max anyway.
 #[allow(clippy::too_many_arguments)]
 fn tenant_polar_events(
     burst_multiple: f64,
-    days_in_month_val: u32,
+    days_in_period: u32,
     hot_bytes_today: Option<f64>,
-    series_month: Option<f64>,
+    series_period: Option<f64>,
     cold_bytes_today: Option<f64>,
     eval_runs_yesterday: Option<f64>,
     ingest_trailing_daily: Option<&[f64]>,
@@ -594,10 +732,10 @@ fn tenant_polar_events(
     if let Some(bytes) = hot_bytes_today {
         events.push(PolarEvent {
             name: "hot_gb_month",
-            value: gb_month_share(bytes, days_in_month_val),
+            value: gb_month_share(bytes, days_in_period),
         });
     }
-    if let Some(v) = series_month {
+    if let Some(v) = series_period {
         events.push(PolarEvent {
             name: "series",
             value: v,
@@ -615,7 +753,7 @@ fn tenant_polar_events(
     if let Some(bytes) = cold_bytes_today {
         events.push(PolarEvent {
             name: "cold_gb_month",
-            value: gb_month_share(bytes, days_in_month_val),
+            value: gb_month_share(bytes, days_in_period),
         });
     }
     if let Some(v) = eval_runs_yesterday {
@@ -696,39 +834,72 @@ async fn emit_polar_events(
 // back, or clears the shrink entirely, the moment usage drops enough to fit
 // at the full plan window again.
 
-/// Calendar-month-to-date total for one `meter_counters` meter, per tenant —
-/// `day >= toStartOfMonth(today())`, the SAME boundary `GET
-/// /v1/billing/usage` bills from (replaces the rolling-31-day approximation
-/// the usage-warning email path used before this fix; see its call site in
+/// The period-to-date counter SQL, pure for the boundary-text test: `sum` of
+/// one `meter_counters` meter per tenant over `[period_start, day]`, each
+/// tenant's own `period_start` from the `periods` join. Was `day >=
+/// toStartOfMonth(today())` — the calendar month for everyone — until B-410.
+/// `c.day` is qualified on purpose: a SELECT alias shadows a same-named
+/// column across the whole query on the server (B-424), and the `tenant_id`
+/// alias here must not be read where `p.tenant_id` is meant.
+fn period_counter_sql(meter: &str, periods_lit: &str, day: NaiveDate) -> String {
+    meter_query(format!(
+        "{cte}\
+         SELECT c.tenant_id AS tenant_id, sum(c.value) AS value \
+         FROM tracelane.meter_counters AS c \
+         INNER JOIN periods AS p ON c.tenant_id = p.tenant_id \
+         WHERE c.meter = '{meter}' AND c.day >= p.period_start AND c.day <= toDate('{day}') \
+         GROUP BY c.tenant_id",
+        cte = periods_cte(periods_lit),
+    ))
+}
+
+/// Period-to-date total for one `meter_counters` meter, per tenant, at `at`
+/// — each tenant's Polar cycle (or calendar month) start, the SAME window
+/// `GET /v1/billing/usage` bills from (this replaced the rolling-31-day
+/// approximation the usage-warning email path used before BILL-01's fix, and
+/// B-410 replaced the calendar month with the cycle; see its call site in
 /// [`run_once`]). ONE query, `GROUP BY tenant_id` — no per-tenant loop.
-async fn query_month_to_date_meter_counter(
+async fn query_period_to_date_meter_counter(
     ch: &clickhouse::Client,
     meter: &str,
+    metas: &[TenantMeta],
+    at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<HashMap<String, f64>> {
-    let sql = meter_query(format!(
-        "SELECT tenant_id AS tenant_id, sum(value) AS value \
-         FROM tracelane.meter_counters \
-         WHERE meter = '{meter}' AND day >= toStartOfMonth(today()) \
-         GROUP BY tenant_id"
-    ));
+    let sql = period_counter_sql(meter, &periods_literal(metas, at), at.date_naive());
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
 }
 
-/// Calendar-month-to-date `system.query_log.read_bytes`, per tenant — the
-/// `scan_bytes` analogue of [`query_month_to_date_meter_counter`], same
-/// `toStartOfMonth(today())` boundary.
-async fn query_month_to_date_scan_bytes(
+/// The period-to-date scan SQL, pure for the boundary-text test — the
+/// `system.query_log.read_bytes` analogue of [`period_counter_sql`]. The
+/// tenant is parsed out of `log_comment` in a subquery so the join is on a
+/// plain column; the job's own reads (tagged `tracelane-meter`) never match
+/// the `tenant_id=%` shape, so they are excluded by construction.
+fn period_scan_sql(periods_lit: &str, day: NaiveDate) -> String {
+    meter_query(format!(
+        "{cte}\
+         SELECT ql.tenant_id AS tenant_id, toFloat64(sum(ql.read_bytes)) AS value \
+         FROM ( \
+            SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, event_date, read_bytes \
+            FROM system.query_log \
+            WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
+         ) AS ql \
+         INNER JOIN periods AS p ON ql.tenant_id = p.tenant_id \
+         WHERE ql.event_date >= p.period_start AND ql.event_date <= toDate('{day}') \
+         GROUP BY ql.tenant_id",
+        cte = periods_cte(periods_lit),
+    ))
+}
+
+/// Period-to-date `system.query_log.read_bytes`, per tenant, at `at` — the
+/// `scan_bytes` analogue of [`query_period_to_date_meter_counter`], same
+/// per-tenant boundary.
+async fn query_period_to_date_scan_bytes(
     ch: &clickhouse::Client,
+    metas: &[TenantMeta],
+    at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<HashMap<String, f64>> {
-    let sql = meter_query(
-        "SELECT replaceOne(log_comment, 'tenant_id=', '') AS tenant_id, sum(read_bytes) AS value \
-         FROM system.query_log \
-         WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
-           AND event_date >= toStartOfMonth(today()) \
-         GROUP BY tenant_id"
-            .to_string(),
-    );
+    let sql = period_scan_sql(&periods_literal(metas, at), at.date_naive());
     let rows: Vec<TenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
     Ok(rows.into_iter().map(|r| (r.tenant_id, r.value)).collect())
 }
@@ -772,9 +943,10 @@ fn find_auto_age_window(
     Some(lo)
 }
 
-/// Project this tenant's month-to-date overage USD across all six meters
-/// (the SAME [`rating::rate`] `GET /v1/billing/usage` rates with) and, if it
-/// would exceed a configured ceiling under `overflow_mode = AutoAge`,
+/// Rate this tenant's period-to-date overage USD across all six meters
+/// (the SAME [`rating::rate`] `GET /v1/billing/usage` rates with, over the
+/// SAME window — the tenant's Polar cycle, or the calendar month, B-410) and,
+/// if it would exceed a configured ceiling under `overflow_mode = AutoAge`,
 /// narrow `auto_age_window_days` to the largest window that fits — or widen
 /// it back / clear it once usage no longer needs the shrink.
 ///
@@ -792,16 +964,20 @@ fn find_auto_age_window(
 /// either (it hardcodes `overage_usd: Some(0.0)`) — mirroring that here
 /// rather than inventing a second, disagreeing cold-billing model.
 ///
-/// Not calendar-month-exact for the burst-exempt meters (ingest/scan): this
-/// does not re-derive a per-day burst exemption over the whole month, unlike
+/// Not burst-exact for the burst-exempt meters (ingest/scan): this does not
+/// re-derive a per-day burst exemption over the whole period, unlike
 /// `GET /v1/billing/usage`. Same reasoning as the usage-warning email path
 /// right below this function's caller: this is a CONTROL that narrows a
-/// window, never a bill, and treating the full raw calendar-month sum as
-/// billable is the conservative (safe) direction — it can only trigger
-/// AUTO-AGE a little earlier than the exact figure would, never later.
+/// window, never a bill, and treating the full raw period sum as billable
+/// is the conservative (safe) direction — it can only trigger AUTO-AGE a
+/// little earlier than the exact figure would, never later.
 ///
-/// `ingest_month`/`series_month`/`scan_month`/`eval_month` are read from the
-/// SAME global, `GROUP BY tenant_id` per-run maps the usage-warning email
+/// No days-elapsed / days-total arithmetic happens here: the figures are
+/// rated as accrued so far, not projected to period end, exactly as the
+/// usage page's `overage_usd` (and therefore its `ceiling_reached`) is.
+///
+/// `ingest_period`/`series_period`/`scan_period`/`eval_period` are read from
+/// the SAME global, `GROUP BY tenant_id` per-run maps the usage-warning email
 /// path (right below) also consumes — not a per-tenant query. The only
 /// figure genuinely specific to this tenant's own arithmetic is
 /// `hot_bytes_at_current_window`, which the job already computed globally
@@ -820,10 +996,10 @@ async fn apply_auto_age(
     resolved: &crate::entitlement_cache::ResolvedEntitlements,
     entitlements: &EntitlementCache,
     hot_bytes_at_current_window: Option<f64>,
-    series_month: Option<f64>,
-    ingest_month: Option<f64>,
-    scan_month: Option<f64>,
-    eval_month: Option<f64>,
+    series_period: Option<f64>,
+    ingest_period: Option<f64>,
+    scan_period: Option<f64>,
+    eval_period: Option<f64>,
 ) {
     use crate::billing::rating::{self, RatedMeter};
     use crate::entitlement_cache::OverflowMode;
@@ -859,7 +1035,7 @@ async fn apply_auto_age(
         let fixed_overage_usd = rating::rate(
             card,
             RatedMeter::IngestGb,
-            gb(ingest_month.unwrap_or(0.0)),
+            gb(ingest_period.unwrap_or(0.0)),
             ingest_included_gb,
             0.0,
         )
@@ -867,7 +1043,7 @@ async fn apply_auto_age(
             + rating::rate(
                 card,
                 RatedMeter::Series,
-                series_month.unwrap_or(0.0),
+                series_period.unwrap_or(0.0),
                 series_included,
                 0.0,
             )
@@ -875,7 +1051,7 @@ async fn apply_auto_age(
             + rating::rate(
                 card,
                 RatedMeter::ScanUnits,
-                gb(scan_month.unwrap_or(0.0)),
+                gb(scan_period.unwrap_or(0.0)),
                 scan_included,
                 0.0,
             )
@@ -883,7 +1059,7 @@ async fn apply_auto_age(
             + rating::rate(
                 card,
                 RatedMeter::EvalRuns,
-                eval_month.unwrap_or(0.0),
+                eval_period.unwrap_or(0.0),
                 eval_included,
                 0.0,
             )
@@ -999,6 +1175,30 @@ struct DayRow {
     day: String,
 }
 
+/// Did the job COMPLETE on `day`? The job writes one MARKER gauge per run under
+/// the reserved tenant id `__metering_job__` (`JOB_MARKER_TENANT`, `write_gauges`),
+/// so this filters on a tenant_id like every other read of `tracelane.*` and asks
+/// the exact question rather than "does any tenant happen to have a gauge row".
+///
+/// `day = toDate(?)` with the ISO string — NOT the `u16` the WRITER binds: RowBinary
+/// accepts days-since-epoch for a `Date` column on INSERT, but in a WHERE clause
+/// `Date = UInt16` is ILLEGAL_TYPE_OF_ARGUMENT (43) on the server (B-426).
+/// `meter_reads_run_against_a_real_clickhouse` holds it.
+///
+/// # Errors
+/// The ClickHouse error; the boot caller fails OPEN on it and says so.
+async fn job_completed_on(ch: &clickhouse::Client, day: NaiveDate) -> anyhow::Result<bool> {
+    let n: u64 = ch
+        .query(&capped(
+            "SELECT count() FROM tracelane.meter_gauges \
+             WHERE tenant_id = '__metering_job__' AND meter = 'job_completed' AND day = toDate(?)",
+        ))
+        .bind(day.to_string())
+        .fetch_one()
+        .await?;
+    Ok(n > 0)
+}
+
 /// Days in `[since, until)` that carry the job's marker row — i.e. days the
 /// job completed.
 async fn query_completed_days(
@@ -1007,7 +1207,7 @@ async fn query_completed_days(
     until_excl: NaiveDate,
 ) -> anyhow::Result<std::collections::HashSet<NaiveDate>> {
     let sql = meter_query(format!(
-        "SELECT toString(day) AS day FROM tracelane.meter_gauges \
+        "SELECT toString(day) AS day_iso FROM tracelane.meter_gauges \
          WHERE tenant_id = '{JOB_MARKER_TENANT}' \
            AND day >= toDate('{since}') AND day < toDate('{until_excl}') \
          GROUP BY day"
@@ -1038,7 +1238,7 @@ async fn backfill_missed_days(
         }
         let prev = day - chrono::Duration::days(1);
         let hot = query_hot_resident_bytes(ch, metas, Some(day)).await?;
-        let series = query_series(ch, Some(day)).await?;
+        let series = query_series(ch, metas, Some(day)).await?;
         let scan = query_scan_bytes_for_day(ch, prev).await?;
         let cold = query_cold_bytes(ch, metas, Some(day)).await?;
         write_gauges(ch, day, prev, &hot, &series, &scan, &cold).await?;
@@ -1047,17 +1247,28 @@ async fn backfill_missed_days(
                 query_trailing_daily_meter_counter(ch, "ingest_bytes", day).await?;
             let scan_trailing = query_trailing_daily_scan_bytes(ch, day).await?;
             let eval_trailing = query_trailing_daily_meter_counter(ch, "eval_runs", day).await?;
-            let dim = days_in_month(day);
+            let at = instant_for(Some(day));
             for meta in metas {
                 let Some(customer_id) = meta.polar_customer_id.as_deref() else {
                     continue;
                 };
                 let key = meta.tenant_id.to_string();
+                // A day outside the tenant's CURRENT cycle (before it began,
+                // or a stale cycle) was rated over its calendar month; that
+                // reading must not reach Polar's `max` — see
+                // `tenant_polar_events`. No warn here: a backfilled day
+                // predating the cycle is expected, not a missing webhook.
+                let period = meta.period_at(at);
+                let series_for_polar = if period.ignored_cycle(meta.billing_period) {
+                    None
+                } else {
+                    series.get(&key).copied()
+                };
                 let events = tenant_polar_events(
                     card.policy.burst_multiple,
-                    dim,
+                    period.total_days(),
                     hot.get(&key).copied(),
-                    series.get(&key).copied(),
+                    series_for_polar,
                     cold.get(&key).copied(),
                     eval_trailing.get(&key).and_then(|d| d.last().copied()),
                     ingest_trailing.get(&key).map(Vec::as_slice),
@@ -1076,6 +1287,20 @@ async fn backfill_missed_days(
     Ok(n)
 }
 
+/// B-437: a scheduled run that returned `Ok` AND noted no new failure / gap backfill
+/// ends those two episodes on `/health` — `run_once` counts its own sub-failures
+/// through `try_query!`, so "returned Ok" alone is not "clean"; the counters are.
+/// Idempotent (resolve is a no-op when nothing is open).
+fn resolve_after_clean_run(failed_before: u64, gaps_before: u64) {
+    use tracelane_shared::degradation::{Degradation, count, resolve};
+    if count(Degradation::MeteringJobFailed) == failed_before {
+        resolve(Degradation::MeteringJobFailed);
+    }
+    if count(Degradation::MeteringGaugeGapBackfilled) == gaps_before {
+        resolve(Degradation::MeteringGaugeGapBackfilled);
+    }
+}
+
 pub async fn run_once(
     pool: &DbPool,
     ch_url: &str,
@@ -1089,9 +1314,12 @@ pub async fn run_once(
         return Ok(());
     }
     let ch = crate::clickhouse_query::ch_client(ch_url.to_string());
-    let today = Utc::now().date_naive();
+    // ONE instant for the whole run: every period literal below is built from
+    // it, so the series read, the three period-to-date sums and each tenant's
+    // GB-month share all agree on which cycle governs.
+    let now = Utc::now();
+    let today = now.date_naive();
     let yesterday = today - chrono::Duration::days(1);
-    let dim = days_in_month(today);
 
     macro_rules! try_query {
         ($fut:expr, $name:literal) => {
@@ -1112,7 +1340,7 @@ pub async fn run_once(
         query_hot_resident_bytes(&ch, &metas, None),
         "hot_resident_bytes"
     );
-    let series = try_query!(query_series(&ch, None), "series");
+    let series = try_query!(query_series(&ch, &metas, None), "series");
     let scan = try_query!(query_scan_bytes_for_day(&ch, yesterday), "scan_bytes");
     let cold = try_query!(query_cold_bytes(&ch, &metas, None), "cold_bytes");
     let ingest_trailing = try_query!(
@@ -1127,20 +1355,24 @@ pub async fn run_once(
         query_trailing_daily_meter_counter(&ch, "eval_runs", today),
         "eval_runs_trailing"
     );
-    // Calendar-month-to-date sums (`day >= toStartOfMonth(today())`) — the
-    // SAME boundary `GET /v1/billing/usage` bills from. Feeds BOTH the
-    // usage-warning email check below (replacing its old rolling-31-day
-    // approximation) and the AUTO-AGE ceiling projection, so the two never
-    // disagree with each other or with the usage page.
-    let ingest_month = try_query!(
-        query_month_to_date_meter_counter(&ch, "ingest_bytes"),
-        "ingest_bytes_month"
+    // Period-to-date sums over each tenant's OWN billing period (its Polar
+    // cycle, else the calendar month — B-410) — the SAME window `GET
+    // /v1/billing/usage` bills from. Feeds BOTH the usage-warning email check
+    // below (replacing its old rolling-31-day approximation) and the AUTO-AGE
+    // ceiling rating, so the two never disagree with each other, with the
+    // usage page, or with the invoice.
+    let ingest_period = try_query!(
+        query_period_to_date_meter_counter(&ch, "ingest_bytes", &metas, now),
+        "ingest_bytes_period"
     );
-    let eval_month = try_query!(
-        query_month_to_date_meter_counter(&ch, "eval_runs"),
-        "eval_runs_month"
+    let eval_period = try_query!(
+        query_period_to_date_meter_counter(&ch, "eval_runs", &metas, now),
+        "eval_runs_period"
     );
-    let scan_month = try_query!(query_month_to_date_scan_bytes(&ch), "scan_bytes_month");
+    let scan_period = try_query!(
+        query_period_to_date_scan_bytes(&ch, &metas, now),
+        "scan_bytes_period"
+    );
 
     if let Err(e) = write_gauges(&ch, today, yesterday, &hot, &series, &scan, &cold).await {
         tracing::warn!(error = %e, "metering job: meter_gauges write failed for this run");
@@ -1184,11 +1416,25 @@ pub async fn run_once(
         let cold_bytes = cold.get(&key).copied();
         let eval_val = eval_daily.and_then(|d| d.last().copied());
 
+        // This tenant's billing period at the run's instant (B-410): its
+        // stored Polar cycle when that governs, else the calendar month —
+        // and ONE warn per run when a stored cycle had to be ignored.
+        let period = meta.period_at(now);
+        meta.warn_if_cycle_ignored(&period);
+        // `series` is max-aggregated on Polar's side; a calendar-month
+        // reading under a stale cycle must not reach it (see
+        // `tenant_polar_events`).
+        let series_for_polar = if period.ignored_cycle(meta.billing_period) {
+            None
+        } else {
+            series_val
+        };
+
         let events = tenant_polar_events(
             card.policy.burst_multiple,
-            dim,
+            period.total_days(),
             hot_bytes,
-            series_val,
+            series_for_polar,
             cold_bytes,
             eval_val,
             ingest_daily,
@@ -1200,25 +1446,25 @@ pub async fn run_once(
             emit_polar_events(polar, customer_id, yesterday, &events).await;
         }
 
-        let ingest_month_val = ingest_month.get(&key).copied();
-        let scan_month_val = scan_month.get(&key).copied();
-        let eval_month_val = eval_month.get(&key).copied();
+        let ingest_period_val = ingest_period.get(&key).copied();
+        let scan_period_val = scan_period.get(&key).copied();
+        let eval_period_val = eval_period.get(&key).copied();
 
         if let Some(ents) = entitlements {
             let resolved = ents.resolved(meta.tenant_id).await;
 
             if let Some(resend) = resend {
-                // Exact calendar-month sum (`day >= toStartOfMonth(today())`)
-                // — the SAME number `GET /v1/billing/usage` bills from, not
-                // the rolling-31-day approximation this used before (that
-                // window can both over- and under-count relative to the
-                // calendar month, and disagreeing with the number the usage
-                // page shows is exactly the class of bug a WARNING about
-                // that number must not have).
+                // Exact period-to-date sum over the tenant's billing period —
+                // the SAME number `GET /v1/billing/usage` bills from, not the
+                // rolling-31-day approximation this used before BILL-01's
+                // fix and not the calendar month it used before B-410 (a
+                // window that disagrees with the number the usage page shows
+                // is exactly the class of bug a WARNING about that number
+                // must not have).
                 let usages = [
                     crate::billing::email::MeterUsage {
                         meter: "ingest",
-                        used: gb(ingest_month_val.unwrap_or(0.0)),
+                        used: gb(ingest_period_val.unwrap_or(0.0)),
                         included: resolved.ingest_bytes_included.map(|b| b as f64 / 1e9),
                     },
                     crate::billing::email::MeterUsage {
@@ -1233,7 +1479,7 @@ pub async fn run_once(
                     },
                     crate::billing::email::MeterUsage {
                         meter: "query",
-                        used: gb(scan_month_val.unwrap_or(0.0)),
+                        used: gb(scan_period_val.unwrap_or(0.0)),
                         included: resolved.scan_units_included.map(|v| v as f64),
                     },
                     crate::billing::email::MeterUsage {
@@ -1243,11 +1489,13 @@ pub async fn run_once(
                     },
                     crate::billing::email::MeterUsage {
                         meter: "evals",
-                        used: eval_month_val.unwrap_or(0.0),
+                        used: eval_period_val.unwrap_or(0.0),
                         included: resolved.eval_runs_included.map(|v| v as f64),
                     },
                 ];
-                let period = today.with_day(1).unwrap_or(today);
+                // The dedup key (`meter_warnings.period`) is the billing
+                // period's first day — a new Polar cycle re-arms the 75% /
+                // 90% warnings, exactly as a new month did before B-410.
                 crate::billing::email::send_usage_warnings_for_tenant(
                     pool,
                     &resend.http,
@@ -1255,7 +1503,7 @@ pub async fn run_once(
                     &resend.from,
                     meta.tenant_id,
                     meta.billing_email.as_deref(),
-                    period,
+                    period.start,
                     &card.policy.warn_pct,
                     &usages,
                 )
@@ -1270,9 +1518,9 @@ pub async fn run_once(
                 ents,
                 hot_bytes,
                 series_val,
-                ingest_month_val,
-                scan_month_val,
-                eval_month_val,
+                ingest_period_val,
+                scan_period_val,
+                eval_period_val,
             )
             .await;
         }
@@ -1320,22 +1568,21 @@ pub fn spawn(
     tokio::spawn(async move {
         // Boot catch-up: run immediately if today has no gauges at all.
         let ch = crate::clickhouse_query::ch_client(ch_url.clone());
-        let today_u16 = days_since_epoch(Utc::now().date_naive());
-        // The job writes one MARKER gauge per run under the reserved tenant id
-        // `__metering_job__` (`JOB_MARKER_TENANT`, `write_gauges`), so this probe
-        // filters on a tenant_id like every other read of `tracelane.*` and asks the
-        // exact question — "did the job COMPLETE today?" — rather than "does any
-        // tenant happen to have a gauge row".
-        let has_today: bool = ch
-            .query(&capped(
-                "SELECT count() FROM tracelane.meter_gauges \
-                 WHERE tenant_id = '__metering_job__' AND meter = 'job_completed' AND day = ?",
-            ))
-            .bind(today_u16)
-            .fetch_one::<u64>()
-            .await
-            .map(|n| n > 0)
-            .unwrap_or(true); // fail-open: assume present, don't hammer on a read failure
+        // Fail-OPEN on a probe failure (assume present, don't hammer) — but LOUDLY:
+        // this probe compared `Date = UInt16` and failed with ILLEGAL_TYPE_OF_ARGUMENT
+        // on every boot since BILL-01 shipped, and `unwrap_or(true)` with no line
+        // meant the catch-up simply never ran (B-426, found on prod 2026-09-16 when a
+        // deploy was expected to trigger it).
+        let has_today = match job_completed_on(&ch, Utc::now().date_naive()).await {
+            Ok(present) => present,
+            Err(e) => {
+                tracing::warn!(error = %e, "metering job: boot catch-up probe failed — assuming today is present");
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::MeteringJobFailed,
+                );
+                true
+            }
+        };
         if !has_today
             && let Err(e) = run_once(
                 &pool,
@@ -1355,7 +1602,13 @@ pub fn spawn(
         loop {
             let secs = secs_until_next_daily(Utc::now(), DAILY_HOUR, DAILY_MINUTE);
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            if let Err(e) = run_once(
+            let failed_before = tracelane_shared::degradation::count(
+                tracelane_shared::degradation::Degradation::MeteringJobFailed,
+            );
+            let gaps_before = tracelane_shared::degradation::count(
+                tracelane_shared::degradation::Degradation::MeteringGaugeGapBackfilled,
+            );
+            match run_once(
                 &pool,
                 &ch_url,
                 &card.load(),
@@ -1365,10 +1618,13 @@ pub fn spawn(
             )
             .await
             {
-                tracing::warn!(error = %e, "metering job: scheduled run failed; retried next tick");
-                tracelane_shared::degradation::note(
-                    tracelane_shared::degradation::Degradation::MeteringJobFailed,
-                );
+                Ok(()) => resolve_after_clean_run(failed_before, gaps_before),
+                Err(e) => {
+                    tracing::warn!(error = %e, "metering job: scheduled run failed; retried next tick");
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::MeteringJobFailed,
+                    );
+                }
             }
         }
     });
@@ -1395,27 +1651,8 @@ mod tests {
         )
     }
 
-    // ── days_in_month ──────────────────────────────────────────────────
-
-    #[test]
-    fn days_in_month_handles_the_calendar_and_december_rollover() {
-        assert_eq!(
-            days_in_month(NaiveDate::from_ymd_opt(2026, 2, 15).unwrap()),
-            28
-        );
-        assert_eq!(
-            days_in_month(NaiveDate::from_ymd_opt(2024, 2, 15).unwrap()),
-            29
-        ); // leap
-        assert_eq!(
-            days_in_month(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()),
-            30
-        );
-        assert_eq!(
-            days_in_month(NaiveDate::from_ymd_opt(2026, 12, 25).unwrap()),
-            31
-        );
-    }
+    // (`days_in_month` moved to `billing::period::calendar_month` with B-410;
+    // its calendar / December / leap-year cases are pinned there.)
 
     // ── scheduling ─────────────────────────────────────────────────────
 
@@ -1607,7 +1844,15 @@ mod tests {
             polar_customer_id: None,
             billing_email: None,
             auto_age_window_days: None,
+            billing_period: None,
         }
+    }
+
+    fn cycle(start: (i32, u32, u32), end: (i32, u32, u32)) -> crate::billing::period::Cycle {
+        (
+            dt(start.0, start.1, start.2, 0, 0),
+            dt(end.0, end.1, end.2, 0, 0),
+        )
     }
 
     #[test]
@@ -1640,6 +1885,136 @@ mod tests {
     fn effective_window_days_falls_back_to_the_plan_window_when_not_aged() {
         let m = meta(Uuid::from_u128(1), 30, 730);
         assert_eq!(m.effective_window_days(), 30);
+    }
+
+    /// B-410: a 30-day cycle straddling a 31-day month divides every day by
+    /// 30, so the cycle sum is exactly the mean — dividing by each calendar
+    /// month's own length summed to 16/30 + 14/31 ≠ 1 for a steady tenant.
+    #[test]
+    fn gb_month_share_divides_by_the_tenants_own_period_length() {
+        let bytes_per_day = 1e9;
+        let period = crate::billing::period::billing_period(
+            Some(cycle((2026, 9, 14), (2026, 10, 14))),
+            dt(2026, 10, 3, 4, 10),
+        );
+        assert_eq!(period.total_days(), 30);
+        let sum: f64 = (0..30)
+            .map(|_| gb_month_share(bytes_per_day, period.total_days()))
+            .sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "cycle sum {sum} must be 1 GB-month"
+        );
+    }
+
+    // ── B-410 / B-420: per-tenant period boundaries in ONE query ───────
+
+    #[test]
+    fn periods_literal_renders_each_tenants_cycle_start_or_the_first_of_the_month() {
+        let mut on_cycle = meta(Uuid::from_u128(1), 30, 730);
+        on_cycle.billing_period = Some(cycle((2026, 9, 15), (2026, 10, 15)));
+        let no_cycle = meta(Uuid::from_u128(2), 3, 30);
+        let mut stale = meta(Uuid::from_u128(3), 30, 730);
+        stale.billing_period = Some(cycle((2026, 7, 15), (2026, 8, 15)));
+        let lit = periods_literal(&[on_cycle, no_cycle, stale], dt(2026, 10, 3, 4, 10));
+        assert_eq!(
+            lit,
+            format!(
+                "[('{}','2026-09-15'),('{}','2026-10-01'),('{}','2026-10-01')]",
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                Uuid::from_u128(3)
+            ),
+            "the 15th-anchored cycle keeps its start across the month boundary; \
+             no cycle and a stale cycle both fall back to the 1st"
+        );
+    }
+
+    #[test]
+    fn series_sql_is_anchored_on_each_tenants_own_period_start() {
+        let mut m = meta(Uuid::from_u128(1), 30, 730);
+        m.billing_period = Some(cycle((2026, 9, 15), (2026, 10, 15)));
+        let lit = periods_literal(std::slice::from_ref(&m), dt(2026, 10, 3, 4, 10));
+        let sql = series_sql(&lit, None);
+        assert!(
+            !sql.contains("toYYYYMM"),
+            "the calendar-month anchor B-420 replaced must be gone: {sql}"
+        );
+        assert!(
+            sql.contains("'2026-09-15'"),
+            "the cycle start rides in: {sql}"
+        );
+        assert!(sql.contains("INNER JOIN periods AS p ON s.tenant_id = p.tenant_id"));
+        assert!(sql.contains("s.start_time >= toDateTime(p.period_start, 'UTC')"));
+        assert!(
+            sql.contains("s.start_time <= now()"),
+            "live run bounds at now(): {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY s.tenant_id"),
+            "still ONE query per meter: {sql}"
+        );
+        assert!(sql.contains("log_comment = 'tracelane-meter'"));
+        // The as-of form keeps its end-of-day and ingested_at bounds.
+        let as_of = series_sql(&lit, NaiveDate::from_ymd_opt(2026, 10, 3));
+        assert!(as_of.contains("s.start_time <= toDateTime('2026-10-03 23:59:59', 'UTC')"));
+        assert!(as_of.contains("s.ingested_at <= toDateTime('2026-10-03 23:59:59', 'UTC')"));
+    }
+
+    #[test]
+    fn period_counter_and_scan_sql_bound_each_tenant_by_its_own_period_start() {
+        let lit = "[('t1','2026-09-15')]";
+        let day = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let counter = period_counter_sql("ingest_bytes", lit, day);
+        assert!(!counter.contains("toStartOfMonth"), "{counter}");
+        assert!(counter.contains("c.meter = 'ingest_bytes'"));
+        assert!(counter.contains("c.day >= p.period_start AND c.day <= toDate('2026-10-03')"));
+        assert!(counter.contains("INNER JOIN periods AS p ON c.tenant_id = p.tenant_id"));
+        assert!(counter.contains("GROUP BY c.tenant_id"));
+        let scan = period_scan_sql(lit, day);
+        assert!(!scan.contains("toStartOfMonth"), "{scan}");
+        assert!(scan.contains("log_comment LIKE 'tenant_id=%'"));
+        assert!(
+            scan.contains(
+                "ql.event_date >= p.period_start AND ql.event_date <= toDate('2026-10-03')"
+            )
+        );
+        assert!(scan.contains("GROUP BY ql.tenant_id"));
+        // Both carry the meter tag, so neither can count itself as a tenant read.
+        assert!(counter.contains("log_comment = 'tracelane-meter'"));
+        assert!(scan.contains("log_comment = 'tracelane-meter'"));
+    }
+
+    #[test]
+    fn a_stale_cycle_is_rated_over_the_calendar_month_and_flagged() {
+        let mut m = meta(Uuid::from_u128(1), 30, 730);
+        m.billing_period = Some(cycle((2026, 7, 15), (2026, 8, 15)));
+        let period = m.period_at(dt(2026, 10, 3, 4, 10));
+        assert_eq!(
+            period.source,
+            crate::billing::period::PeriodSource::CalendarMonth
+        );
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert!(
+            period.ignored_cycle(m.billing_period),
+            "the run must warn, and skip series to Polar"
+        );
+        // A tenant with no cycle at all is NOT flagged — there is nothing to be stale.
+        let plain = meta(Uuid::from_u128(2), 3, 30);
+        assert!(
+            !plain
+                .period_at(dt(2026, 10, 3, 4, 10))
+                .ignored_cycle(plain.billing_period)
+        );
+    }
+
+    #[test]
+    fn instant_for_a_backfilled_day_is_that_days_last_second() {
+        let d = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        assert_eq!(
+            instant_for(Some(d)),
+            dt(2026, 10, 3, 23, 59) + chrono::Duration::seconds(59)
+        );
     }
 
     // ── SQL shape assertions (mirrors this repo's convention of testing the
@@ -1686,5 +2061,366 @@ mod tests {
         assert!(sql.contains("tracelane.blobs"));
         assert!(sql.contains("tracelane.blob_refs"));
         assert!(sql.contains("NOT IN"));
+    }
+
+    /// B-424 + B-425, against a REAL ClickHouse — neither defect is visible to
+    /// a unit test, because both are the SQL's semantics on the server:
+    ///
+    /// - B-424: `toString(day) AS day … WHERE day >= toDate(…)` — the alias
+    ///   shadowed the Date column and the server answered `NO_COMMON_TYPE`
+    ///   (386) on every run since BILL-01 shipped; the trailing reads and the
+    ///   gap backfill never once succeeded on prod.
+    /// - B-425: `sum(span_bytes)` is UInt64 on the wire and was decoded INTO an
+    ///   f64 field, so a 298,596-byte hot window was written to `meter_gauges`
+    ///   as `1.47526e-318` and emitted to Polar as ~0.
+    ///
+    /// Every read the job makes runs here against the checked-in schema with
+    /// ONE span row of known size, and the value read back must be the bytes
+    /// the row carries — a denormal, an error, or an empty map all fail.
+    /// `#[ignore]`d by default; `scripts/ci/run-clickhouse-integration.sh` runs it.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn meter_reads_run_against_a_real_clickhouse() {
+        let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let root = clickhouse::Client::default().with_url(&url);
+        root.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let ch = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database("tracelane");
+        for sql in [
+            include_str!("../../../../infra/dev/clickhouse/schema.sql"),
+            include_str!(
+                "../../../../infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql"
+            ),
+        ] {
+            for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+                let _ = ch.query(&stmt).execute().await;
+            }
+        }
+        for t in ["spans", "meter_counters", "meter_gauges"] {
+            let n: u64 = ch
+                .query(
+                    "SELECT count() FROM system.tables WHERE database = 'tracelane' AND name = ?",
+                )
+                .bind(t)
+                .fetch_one()
+                .await
+                .expect("system.tables read");
+            assert_eq!(
+                n, 1,
+                "`{t}` was not created — every read below would pass on nothing"
+            );
+        }
+
+        let tenant = Uuid::new_v4();
+        let tid = tenant.to_string();
+        let today = Utc::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+
+        // ONE span, one hour old, so it is inside any window ≥ 1 day. Its size
+        // is whatever the schema's `span_bytes` DEFAULT computes — read back
+        // below rather than assumed, and it is an INTEGER number of bytes.
+        ch.query(
+            "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) \
+             VALUES (?, 'b424-trace', 'b424-span', 'b424 fixture', now64(6) - INTERVAL 1 HOUR, now64(6) - INTERVAL 1 HOUR, '{}')",
+        )
+        .bind(&tid)
+        .execute()
+        .await
+        .expect("insert span");
+        let span_bytes: u64 = ch
+            .query("SELECT toUInt64(sum(span_bytes)) FROM tracelane.spans WHERE tenant_id = ?")
+            .bind(&tid)
+            .fetch_one()
+            .await
+            .expect("read span_bytes back");
+        assert!(
+            span_bytes >= 96,
+            "the fixture span must have a size: {span_bytes}"
+        );
+
+        // Two counter rows and one completion marker under YESTERDAY, as the
+        // ingest path and a completed run would have left them.
+        ch.query(
+            "INSERT INTO tracelane.meter_counters (tenant_id, day, meter, value) VALUES \
+             (?, toDate(?), 'ingest_bytes', 5), (?, toDate(?), 'ingest_bytes', 7), \
+             (?, toDate(?), 'eval_runs', 1)",
+        )
+        .bind(&tid)
+        .bind(yesterday.to_string())
+        .bind(&tid)
+        .bind(yesterday.to_string())
+        .bind(&tid)
+        .bind(yesterday.to_string())
+        .execute()
+        .await
+        .expect("insert counters");
+        ch.query(
+            "INSERT INTO tracelane.meter_gauges (tenant_id, day, meter, value) VALUES (?, toDate(?), ?, 1)",
+        )
+        .bind(JOB_MARKER_TENANT)
+        .bind(yesterday.to_string())
+        .bind(JOB_MARKER_METER)
+        .execute()
+        .await
+        .expect("insert marker");
+
+        let metas = vec![meta(tenant, 30, 730)];
+
+        // B-425: the three byte meters read back as the integer they are.
+        let hot = query_hot_resident_bytes(&ch, &metas, None)
+            .await
+            .expect("hot_resident_bytes query must run");
+        assert_eq!(
+            hot.get(&tid).copied(),
+            Some(span_bytes as f64),
+            "hot_resident_bytes must be the span's bytes as a REAL f64, not its UInt64 \
+             bits decoded as one (B-425): {hot:?}"
+        );
+        let cold = query_cold_bytes(&ch, &metas, None)
+            .await
+            .expect("cold_bytes query must run");
+        assert_eq!(
+            cold.get(&tid).copied().unwrap_or(0.0),
+            0.0,
+            "a one-hour-old span is inside the window, so cold is 0 — an empty map, \
+             never a denormal"
+        );
+        // `scan_bytes` reads `system.query_log`, which needs a query carrying the
+        // tenant comment to have FINISHED and been flushed. Run one, flush, read.
+        ch.query(
+            "SELECT count() FROM tracelane.spans WHERE tenant_id = ? SETTINGS log_comment = ?",
+        )
+        .bind(&tid)
+        .bind(format!("tenant_id={tid}"))
+        .fetch_one::<u64>()
+        .await
+        .expect("tagged read");
+        root.query("SYSTEM FLUSH LOGS")
+            .execute()
+            .await
+            .expect("flush query_log");
+        let scan = query_scan_bytes_for_day(&ch, today)
+            .await
+            .expect("scan_bytes query must run");
+        let scanned = scan
+            .get(&tid)
+            .copied()
+            .expect("the tagged read must be in query_log");
+        assert!(
+            scanned >= 1.0 && scanned.fract() == 0.0 && scanned < 1e12,
+            "scan_bytes must be a whole number of bytes, not UInt64 bits as f64: {scanned}"
+        );
+        // B-410: the period-to-date scan read joins the per-tenant `periods`
+        // literal; a tenant with no cycle rates over the calendar month, which
+        // contains today's tagged read.
+        let scan_period = query_period_to_date_scan_bytes(&ch, &metas, Utc::now())
+            .await
+            .expect("period-to-date scan query must run");
+        assert_eq!(scan_period.get(&tid).copied(), Some(scanned));
+        // …and the series read runs with the same join (this tenant's one
+        // fixture span is one series, started an hour ago — inside any window).
+        let series = query_series(&ch, &metas, None)
+            .await
+            .expect("series query must run");
+        assert_eq!(series.get(&tid).copied(), Some(1.0), "{series:?}");
+        let ingest_period =
+            query_period_to_date_meter_counter(&ch, "ingest_bytes", &metas, Utc::now())
+                .await
+                .expect("period-to-date counter query must run");
+        assert_eq!(
+            ingest_period.get(&tid).copied(),
+            if yesterday.month() == today.month() {
+                Some(12.0)
+            } else {
+                None
+            },
+            "yesterday's 5 + 7 count when yesterday is in this calendar month: {ingest_period:?}"
+        );
+
+        // B-424: the trailing reads and the gap-backfill read run at all, and
+        // the per-day series is the SUM of that day's counter rows.
+        let trailing = query_trailing_daily_meter_counter(&ch, "ingest_bytes", today)
+            .await
+            .expect("trailing ingest read must run (B-424: NO_COMMON_TYPE until fixed)");
+        assert_eq!(trailing.get(&tid), Some(&vec![12.0]), "{trailing:?}");
+        let evals = query_trailing_daily_meter_counter(&ch, "eval_runs", today)
+            .await
+            .expect("trailing eval read must run");
+        assert_eq!(evals.get(&tid), Some(&vec![1.0]));
+        let scan_trailing =
+            query_trailing_daily_scan_bytes(&ch, today.succ_opt().expect("tomorrow"))
+                .await
+                .expect("trailing scan read must run");
+        assert_eq!(scan_trailing.get(&tid), Some(&vec![scanned]));
+        let done = query_completed_days(&ch, yesterday, today)
+            .await
+            .expect("completed-days read must run (B-424: NO_COMMON_TYPE until fixed)");
+        assert!(
+            done.contains(&yesterday),
+            "the marker day must read back: {done:?}"
+        );
+        // B-426: the boot catch-up probe must RUN (it compared Date = UInt16 and
+        // failed on every boot) and answer both ways.
+        assert!(
+            job_completed_on(&ch, yesterday)
+                .await
+                .expect("boot probe must run (B-426: ILLEGAL_TYPE_OF_ARGUMENT until fixed)"),
+            "yesterday carries the marker"
+        );
+        // A day no run ever marks (this test's own `write_gauges` below marks
+        // TODAY, and a re-run against the same server must still pass).
+        let never = NaiveDate::from_ymd_opt(2000, 1, 1).expect("date");
+        assert!(
+            !job_completed_on(&ch, never)
+                .await
+                .expect("boot probe must run"),
+            "an unmarked day answers false"
+        );
+
+        // And the writer round-trips a real f64 through `meter_gauges` — the
+        // value the usage route will render, not a denormal.
+        let mut hot_map = HashMap::new();
+        hot_map.insert(tid.clone(), span_bytes as f64);
+        let empty = HashMap::new();
+        write_gauges(&ch, today, yesterday, &hot_map, &empty, &empty, &empty)
+            .await
+            .expect("write_gauges");
+        let written: f64 = ch
+            .query(
+                "SELECT argMax(value, computed_at) FROM tracelane.meter_gauges \
+                 WHERE tenant_id = ? AND meter = 'hot_resident_bytes' AND day = toDate(?)",
+            )
+            .bind(&tid)
+            .bind(today.to_string())
+            .fetch_one()
+            .await
+            .expect("read gauge back");
+        assert_eq!(written, span_bytes as f64);
+    }
+
+    /// B-410 + B-420, against a REAL ClickHouse — the period anchoring of the
+    /// series meter and the period-to-date counters is SQL semantics on the
+    /// server, which no unit test can see (the three prod defects of
+    /// 2026-09-16 were all of that class).
+    ///
+    /// Two tenants, identical data: three distinct series on the 10th and
+    /// 20th of one month and the 3rd of the next, and ingest counters of 1,
+    /// 2 and 4 on the same days. One tenant holds a Polar cycle running
+    /// 15th → 15th; the other has no cycle. Read AS OF the 5th of the second
+    /// month:
+    /// - the cycle tenant's series count is the UNION over its cycle — the
+    ///   20th and the 3rd, so 2 — and the 10th (the previous cycle) is out;
+    ///   its ingest period-to-date is 2 + 4 = 6;
+    /// - the calendar tenant falls back to that day's calendar month: 1
+    ///   series (the 3rd) and 4 bytes.
+    /// The calendar-month SQL this replaces answered 1 and nothing for the
+    /// cycle tenant — a mid-month cycle spanning two partial months is exactly
+    /// the shape Polar's `max` over the cycle then under-counted (B-420).
+    ///
+    /// Named with the `meter_reads_run_against_a_real_clickhouse` prefix on
+    /// purpose: `scripts/ci/run-clickhouse-integration.sh` selects that name
+    /// and cargo's filter is a substring match, so the runner picks this up
+    /// without a script change.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn meter_reads_run_against_a_real_clickhouse_for_a_mid_month_cycle() {
+        let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let root = clickhouse::Client::default().with_url(&url);
+        root.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let ch = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database("tracelane");
+        for sql in [
+            include_str!("../../../../infra/dev/clickhouse/schema.sql"),
+            include_str!(
+                "../../../../infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql"
+            ),
+        ] {
+            for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+                let _ = ch.query(&stmt).execute().await;
+            }
+        }
+
+        let cycle_tenant = Uuid::new_v4();
+        let calendar_tenant = Uuid::new_v4();
+        let cycle_tid = cycle_tenant.to_string();
+        let calendar_tid = calendar_tenant.to_string();
+        // Fixed dates, well in the past, so the as-of read is deterministic.
+        let days = ["2026-07-10", "2026-07-20", "2026-08-03"];
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 5).expect("date");
+        for tid in [&cycle_tid, &calendar_tid] {
+            for (i, day) in days.iter().enumerate() {
+                // One DISTINCT series per day (a different `name`), ingested the
+                // moment it started so the as-of `ingested_at` bound keeps it.
+                ch.query(
+                    "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes, ingested_at) \
+                     VALUES (?, ?, ?, ?, toDateTime64(?, 6, 'UTC'), toDateTime64(?, 6, 'UTC'), '{}', toDateTime64(?, 3, 'UTC'))",
+                )
+                .bind(tid)
+                .bind(format!("b420-trace-{i}"))
+                .bind(format!("b420-span-{i}"))
+                .bind(format!("b420 series {i}"))
+                .bind(format!("{day} 12:00:00"))
+                .bind(format!("{day} 12:00:01"))
+                .bind(format!("{day} 12:00:01"))
+                .execute()
+                .await
+                .expect("insert span");
+                ch.query(
+                    "INSERT INTO tracelane.meter_counters (tenant_id, day, meter, value) \
+                     VALUES (?, toDate(?), 'ingest_bytes', ?)",
+                )
+                .bind(tid)
+                .bind(*day)
+                .bind(f64::from(1u32 << i)) // 1, 2, 4 — every subset sums differently
+                .execute()
+                .await
+                .expect("insert counter");
+            }
+        }
+
+        let mut on_cycle = meta(cycle_tenant, 30, 730);
+        on_cycle.billing_period = Some(cycle((2026, 7, 15), (2026, 8, 15)));
+        let metas = vec![on_cycle, meta(calendar_tenant, 30, 730)];
+        let at = dt(2026, 8, 5, 12, 0);
+
+        let series = query_series(&ch, &metas, Some(as_of))
+            .await
+            .expect("series query must run");
+        assert_eq!(
+            series.get(&cycle_tid).copied(),
+            Some(2.0),
+            "cycle 07-15 → 08-15 read on 08-05: the 20th and the 3rd, never the 10th: {series:?}"
+        );
+        assert_eq!(
+            series.get(&calendar_tid).copied(),
+            Some(1.0),
+            "no cycle -> August's calendar month: the 3rd only: {series:?}"
+        );
+
+        let ingest = query_period_to_date_meter_counter(&ch, "ingest_bytes", &metas, at)
+            .await
+            .expect("period-to-date counter query must run");
+        assert_eq!(
+            ingest.get(&cycle_tid).copied(),
+            Some(6.0),
+            "cycle tenant: 2 (the 20th) + 4 (the 3rd), never the 10th's 1: {ingest:?}"
+        );
+        assert_eq!(
+            ingest.get(&calendar_tid).copied(),
+            Some(4.0),
+            "calendar tenant: August only: {ingest:?}"
+        );
     }
 }

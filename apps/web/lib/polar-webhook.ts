@@ -35,7 +35,18 @@ const MAX_V1_SIGS = 8;
  * newline in the env var; a real Polar secret carries no surrounding whitespace.
  */
 export function decodeWebhookSecret(raw: string): Buffer {
-	return Buffer.from(raw.trim(), "utf-8");
+	const secret = raw.trim();
+	// TWO secret shapes, TWO keys (B7 stage 1, 2026-09-16, observed against the
+	// sandbox): an endpoint created in the DASHBOARD carries a `polar_whs_…`
+	// secret and Polar signs with the raw UTF-8 bytes of the whole string (the
+	// transform above); an endpoint created through the API carries a Standard
+	// Webhooks `whsec_<base64>` secret and Polar signs with the DECODED bytes.
+	// Before this branch, an API-created endpoint 401'd every delivery — silently,
+	// forever, with the plan flips they carried.
+	if (secret.startsWith("whsec_")) {
+		return Buffer.from(secret.slice("whsec_".length), "base64");
+	}
+	return Buffer.from(secret, "utf-8");
 }
 
 /**
@@ -195,14 +206,25 @@ export type PlanResolution =
 // `unpaid` is a Polar SUBSCRIPTION STATUS (past the retry schedule, benefits
 // revoked on Polar's side) — ADR-076 drops the tenant to Free on it exactly
 // like canceled/revoked, with data held (`billing_policy.dunning_data_hold_days`).
-const CANCEL_EVENTS = /canceled|revoked/;
+//
+// B-431 (B7 stage 2 on PROD, 2026-09-19): the decision is made on Polar's
+// STATUS, plus the one event that means "access ended now". It used to be
+// `/canceled|revoked/` tested against the EVENT NAME, which matched
+// `subscription.canceled` — Polar sends that when the customer cancels AT
+// PERIOD END and the subscription is STILL `active` until `ends_at` — and
+// `subscription.UNcanceled` (the word contains "canceled"), so a customer who
+// cancelled lost the month they had paid for at once, and one who changed their
+// mind stayed on Free. `subscription.revoked` is the event where access ends.
+const REVOKE_EVENT = /\.revoked$/;
 const CANCEL_STATUSES = new Set(["canceled", "revoked", "unpaid"]);
 
 /**
- * Resolve the target plan from a subscription event. Canceled/revoked/unpaid
- * → free. A known `lookup_key` → that plan + its interval. Anything else →
- * unknown (caller acks 200 so Polar stops retrying, and logs it; add-on keys
- * are logged loudly).
+ * Resolve the target plan from a subscription event. A `canceled` / `revoked`
+ * / `unpaid` STATUS, or the `.revoked` event → free. A known `lookup_key` →
+ * that plan + its interval (including a `.canceled` event whose status is
+ * still `active` — the plan runs to `ends_at`). Anything else → unknown
+ * (caller acks 200 so Polar stops retrying, and logs it; add-on keys are
+ * logged loudly).
  */
 export function resolvePlan(opts: {
 	eventType: string;
@@ -210,7 +232,7 @@ export function resolvePlan(opts: {
 	lookupKey?: string | null;
 }): PlanResolution {
 	const canceled =
-		CANCEL_EVENTS.test(opts.eventType) ||
+		REVOKE_EVENT.test(opts.eventType) ||
 		(opts.status != null && CANCEL_STATUSES.has(opts.status));
 	if (canceled) return { kind: "free", lookupKey: "free_v1" };
 
@@ -341,6 +363,66 @@ export function resolvePair(pair: {
 		return { ...out, pastDue: true };
 	}
 	return out;
+}
+
+/** Polar `Subscription` as listed by `GET /v1/subscriptions/?customer_id=` — the
+ *  fields the pair machinery reads (the reconciler and the webhook's
+ *  before-create check). */
+export type PolarLiveSubscription = {
+	id: string;
+	status: string;
+	customer_id: string;
+	product_id: string;
+	current_period_start?: string | null;
+	current_period_end?: string | null;
+	modified_at?: string | null;
+	product?: { metadata?: Record<string, unknown> } | null;
+};
+
+/**
+ * Newest HELD subscription per half from a customer's live Polar list — the
+ * resolver's view of Polar (moved here from the reconciler 2026-09-19 so the
+ * webhook's synchronous pairing checks for an existing usage half through the
+ * SAME classification, never a second one). A half is held while it is
+ * paying or in dunning (`halfHeld`); two held of one kind is a `duplicate`
+ * and the caller stops — a human untangles duplicates.
+ */
+export function classifyLive(subs: PolarLiveSubscription[]): {
+	base: PairHalf | null;
+	usage: PairHalf | null;
+	single: PairHalf | null;
+	duplicates: string[];
+} {
+	const out: Record<SubscriptionHalf, PairHalf[]> = {
+		base: [],
+		usage: [],
+		single: [],
+	};
+	for (const sub of subs) {
+		const k = sub.product?.metadata?.lookup_key;
+		const keyed = planForLookupKey(typeof k === "string" ? k : null);
+		if (!keyed) continue;
+		const half: PairHalf = {
+			id: sub.id,
+			plan: keyed.plan,
+			status: sub.status,
+			period_start: sub.current_period_start ?? null,
+			period_end: sub.current_period_end ?? null,
+		};
+		if (!halfHeld(half)) continue;
+		out[keyed.half].push(half);
+	}
+	const duplicates: string[] = [];
+	for (const k of ["base", "usage", "single"] as const) {
+		if (out[k].length > 1) duplicates.push(k);
+	}
+	const pick = (xs: PairHalf[]) => (xs.length === 1 ? (xs[0] ?? null) : null);
+	return {
+		base: pick(out.base),
+		usage: pick(out.usage),
+		single: pick(out.single),
+		duplicates,
+	};
 }
 
 /** True on any Polar subscription status meaning "currently paying, healthy". */

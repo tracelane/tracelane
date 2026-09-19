@@ -48,4 +48,15 @@
 	// REQUIRED secrets: NEXT_PUBLIC_GATEWAY_URL, NEXT_PUBLIC_WORKOS_REDIRECT_URI,
 	// DATABASE_URL, WORKOS_API_KEY/CLIENT_ID/REDIRECT_URI/COOKIE_*, POLAR_*,
 	// TRACELANE_APIKEY_PEPPER (see `wrangler secret list`).
+	// POLAR_WORKER_TOKEN (BILL-02 O4, optional but RECOMMENDED): a Polar
+	// organization access token with EXACTLY `customers:write` +
+	// `customer_sessions:write` + `subscriptions:write` (docs.polar.sh/openapi.json
+	// 2026-04: the payment-methods read, the customer session that sets the
+	// default card through the PORTAL API — B-435: the org-token customer PATCH
+	// ignores that field — the subscriptions list and the usage-subscription POST). Minted by the founder in the Polar dashboard —
+	// there is no API for organization tokens — then
+	// `wrangler secret put POLAR_WORKER_TOKEN`. Unset → the webhook logs one line
+	// and the annual usage half is created by `scripts/ops/polar-reconcile-annual.ts`
+	// instead (the P2 half-state lasts until someone runs it). `POLAR_SANDBOX=1`
+	// points those calls at sandbox-api.polar.sh (never on prod).
 }

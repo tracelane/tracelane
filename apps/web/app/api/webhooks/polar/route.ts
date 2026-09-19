@@ -35,29 +35,53 @@
  *     `free` and, only when it was PREVIOUSLY paid, set
  *     `data_hold_until = now + billing_policy.dunning_data_hold_days`.
  *
+ * ── BILL-02 O4 (founder ruling 2026-09-19): SYNCHRONOUS pairing ──
+ *   A base `_base_year` event whose pair resolves P2 (usage half missing) and
+ *   whose status is active runs the pairing step (`lib/polar-pair.ts`, the
+ *   reconciler's own calls) BEFORE responding — when `POLAR_WORKER_TOKEN`
+ *   is set (scopes `customers:write` + `customer_sessions:write` +
+ *   `subscriptions:write`; sandbox host when
+ *   `POLAR_SANDBOX=1`). The resolver stays the ONLY grantor: on success the
+ *   usage id is recorded but the tenant stays `free` until the usage half's
+ *   own event arrives. Failure never 5xxes to Polar; the tenant stays P2 with
+ *   the alert and the reconciler retries on its cadence. Bounded by ONE
+ *   deadline for all Polar calls, `billing_policy.annual_pairing_deadline_ms`
+ *   (Polar's delivery timeout is 10 s). Token unset → today's behaviour, one
+ *   log line. An atomic claim in `annual_pair.pairing` stops two in-flight
+ *   deliveries of the same base (`created` / `active` / `updated` land seconds
+ *   apart) from creating TWO usage subscriptions.
+ *
  * E2E is gated on the founder: register the webhook in the Polar dashboard and
- * set POLAR_WEBHOOK_SECRET + POLAR_EXPECTED_ORGANIZATION_ID (+ POLAR_ACCESS_TOKEN)
- * in Vercel.
+ * set POLAR_WEBHOOK_SECRET + POLAR_EXPECTED_ORGANIZATION_ID (+ POLAR_WORKER_TOKEN
+ * for synchronous pairing) with `wrangler secret put`.
  */
 
 import { db } from "@/db";
 import {
 	billingPolicy,
+	planEntitlements,
 	pricingRates,
 	tenants,
 	webhookEvents,
 	workspaceEntitlements,
 } from "@/db/schema";
-import type { AnnualPairJson } from "@/db/schema";
+import type { AnnualPairJson, AnnualPairPairingJson } from "@/db/schema";
 import {
 	sendDroppedToFreeEmail,
 	sendDunningStartedEmail,
 	sendPlanChangedEmail,
 } from "@/lib/email";
 import {
+	makePolarClient,
+	pairUsageSubscription,
+	polarApiBase,
+} from "@/lib/polar-pair";
+import {
 	type BillingInterval,
 	type PairHalf,
 	type PlanResolution,
+	type PolarLiveSubscription,
+	classifyLive,
 	decodeWebhookSecret,
 	eventClock,
 	isActiveStatus,
@@ -69,7 +93,7 @@ import {
 	resolvePlan,
 	verifySignature,
 } from "@/lib/polar-webhook";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -436,11 +460,24 @@ async function handleSubscriptionChange(
 	// Drop-to-Free from a previously PAID plan: hold the data per
 	// `billing_policy.dunning_data_hold_days`, read from the table — never a
 	// literal (`.claude/rules/reference-tables.md`). Re-cancelling an
-	// already-Free tenant does not re-arm the hold clock.
+	// already-Free tenant does not re-arm the hold clock. B-431: a PAID plan
+	// clears any hold left by an earlier lapse — a re-subscribed tenant is not
+	// a lapsed one.
 	if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
 		const holdDays = await readPolicyNumber("dunning_data_hold_days");
 		if (holdDays !== null) extra.dataHoldUntil = addDays(now, holdDays);
+	} else if (planValue !== "free") {
+		extra.dataHoldUntil = null;
 	}
+
+	// B-431: a cancel AT PERIOD END keeps the plan and records when it ends
+	// (Polar `ends_at`, present while `cancel_at_period_end` is true); an
+	// uncancel, a plan change or any other active event clears it. On a drop to
+	// Free there is nothing scheduled any more.
+	extra.subscriptionEndsAt =
+		planValue !== "free" && data.cancel_at_period_end === true
+			? parseIsoDate(data.ends_at)
+			: null;
 
 	// First paid activation: price protection pins BOTH the expiry and the
 	// rate version, both read from the DB, never a literal. Gated on
@@ -526,6 +563,8 @@ async function applyPairEvent(args: {
 	const pair: AnnualPairJson = { ...(tenant.annualPair ?? {}) };
 
 	let alert: string | null = null;
+	/** P2 only: the plan the healthy pair WOULD serve — picks the usage product. */
+	let usageMissingPlan: string | null = null;
 	let planValue: "free" | "builder" | "team" | "business" | "enterprise";
 	let periodStart: Date | null = null;
 	let periodEnd: Date | null = null;
@@ -561,12 +600,33 @@ async function applyPairEvent(args: {
 		} else if (res.kind === "refuse") {
 			alert = res.reason;
 			planValue = "free";
+			if (res.reason === "annual_pair_usage_missing") {
+				usageMissingPlan = res.planEnum ?? null;
+			}
 		} else {
 			// neither half held: the ordinary drop to Free
 			planValue = "free";
 		}
 	}
 	pair.alert = alert;
+
+	// ── O4: P2 on the BASE's active event → claim the synchronous pairing
+	// BEFORE the state write, so the write below carries the LIVE marker (ours,
+	// or a concurrent delivery's) and never clobbers it. Polar is called only
+	// AFTER the P2 truth is written (act on recorded state, then record the
+	// act — `.claude/rules/logging.md`).
+	const claim =
+		half === "base" &&
+		alert === "annual_pair_usage_missing" &&
+		isActiveStatus(status) &&
+		customerId
+			? await claimSynchronousPairing({
+					tenant,
+					pair,
+					plan: usageMissingPlan,
+					now,
+				})
+			: null;
 
 	const extra: Record<string, unknown> = {};
 	if (planValue === "free") {
@@ -625,6 +685,10 @@ async function applyPairEvent(args: {
 		);
 	}
 
+	if (claim?.claimed && customerId) {
+		await runSynchronousPairing({ tenant, claim, customerId });
+	}
+
 	if (tenant.billingEmail) {
 		if (planValue === "free" && tenant.plan && tenant.plan !== "free") {
 			await sendDroppedToFreeEmail(tenant.billingEmail, {
@@ -637,6 +701,287 @@ async function applyPairEvent(args: {
 				toPlan: planValue,
 			});
 		}
+	}
+}
+
+// ── O4: synchronous pairing (BILL-02 §2.5, founder ruling 2026-09-19) ───────
+
+type PairingClaim =
+	| { claimed: false }
+	| {
+			claimed: true;
+			token: string;
+			usageProductId: string;
+			deadlineMs: number;
+			attemptedAt: string;
+	  };
+
+/** `plan_entitlements.polar_product_id_usage_month` for `<plan>_v1` — the SAME
+ *  source the reconciler and polar-sync use; never an env-var product map. */
+async function readUsageProductId(plan: string): Promise<string | null> {
+	const [row] = await db
+		.select({
+			polarProductIdUsageMonth: planEntitlements.polarProductIdUsageMonth,
+		})
+		.from(planEntitlements)
+		.where(eq(planEntitlements.planLookupKey, `${plan}_v1`))
+		.limit(1);
+	return row?.polarProductIdUsageMonth ?? null;
+}
+
+/** `annual_pair || {"pairing": …}` — a MERGE on the live row, never a wholesale
+ *  write, so a concurrent delivery's halves are not clobbered. */
+function mergePairing(marker: AnnualPairPairingJson) {
+	return sql`coalesce(${tenants.annualPair}, '{}'::jsonb) || ${JSON.stringify({ pairing: marker })}::jsonb`;
+}
+
+/**
+ * Phase 1, BEFORE the P2 state write: decide whether THIS delivery pairs.
+ * Off when the token is unset (today's behaviour, one log line), when an
+ * attempt is already recorded (created / existing / attempting), when the
+ * plan has no usage product, or when the deadline policy row is missing. Then
+ * an ATOMIC claim: `UPDATE … SET annual_pair.pairing = attempting WHERE
+ * pairing IS NULL OR pairing.result = 'failed' RETURNING id` — two in-flight
+ * deliveries of the same base cannot both win, and the loser re-reads the
+ * live marker so its own state write carries it instead of clobbering it.
+ * Mutates `pair.pairing` to whatever the row now holds.
+ */
+async function claimSynchronousPairing(args: {
+	tenant: { id: string };
+	pair: AnnualPairJson;
+	plan: string | null;
+	now: Date;
+}): Promise<PairingClaim> {
+	const { tenant, pair, plan, now } = args;
+	const token = process.env.POLAR_WORKER_TOKEN?.trim();
+	if (!token) {
+		console.info(
+			"[polar-webhook] BILL-02 P2: synchronous pairing is OFF — POLAR_WORKER_TOKEN unset; the reconciler pairs on its cadence. tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	const prior = pair.pairing ?? null;
+	if (prior && (prior.result === "created" || prior.result === "existing")) {
+		// A recorded outcome is never repeated — no reads, no Polar call.
+		console.info(
+			"[polar-webhook] BILL-02 P2: pairing already",
+			logSafe(prior.result),
+			"at",
+			logSafe(prior.attempted_at),
+			"— not repeated. tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	if (!plan) {
+		console.error(
+			"[polar-webhook] BILL-02 P2: the base's plan is not a known tier — cannot pick a usage product; synchronous pairing skipped. tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	const usageProductId = await readUsageProductId(plan);
+	if (!usageProductId) {
+		console.error(
+			"[polar-webhook] BILL-02 P2: plan_entitlements has no polar_product_id_usage_month for",
+			logSafe(plan),
+			"— synchronous pairing skipped (polar-sync not run?). tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	const deadlineMs = await readPolicyNumber("annual_pairing_deadline_ms");
+	if (deadlineMs === null || deadlineMs <= 0) {
+		// Reference-tables rule: no literal deadline baked in. A missing policy
+		// row fails toward TODAY's behaviour (the reconciler), loudly.
+		console.error(
+			"[polar-webhook] BILL-02 P2: billing_policy.annual_pairing_deadline_ms missing — synchronous pairing skipped (seed not run?). tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	// A claim is re-takeable when it FAILED, or when it is a STALE `attempting`
+	// (security review M1, 2026-09-19): the Worker can die — or its closing
+	// record write can throw — between the claim and the terminal marker, and
+	// without this an `attempting` marker would wedge the tenant forever (the
+	// reconciler reads pair state, not `pairing`). Stale = older than ten
+	// deadlines, which is why this waits for the deadline read above.
+	const staleAttempt =
+		prior?.result === "attempting" &&
+		Number.isFinite(Date.parse(prior.attempted_at)) &&
+		now.getTime() - Date.parse(prior.attempted_at) > deadlineMs * 10;
+	if (prior?.result === "attempting" && !staleAttempt) {
+		console.info(
+			"[polar-webhook] BILL-02 P2: another delivery is pairing right now (claim from",
+			logSafe(prior.attempted_at),
+			") — not repeated. tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	if (staleAttempt) {
+		console.warn(
+			"[polar-webhook] BILL-02 P2: a stale `attempting` pairing claim from",
+			logSafe(prior?.attempted_at ?? null),
+			"is being re-taken (the earlier invocation never recorded an outcome). tenant",
+			logSafe(tenant.id),
+		);
+	}
+	const attemptedAt = now.toISOString();
+	const marker: AnnualPairPairingJson = {
+		attempted_at: attemptedAt,
+		result: "attempting",
+	};
+	// The WHERE is the atomic claim: NULL, `failed`, or an `attempting` marker
+	// older than the stale bound (the same rule as `staleAttempt`, evaluated on
+	// the LIVE row so two deliveries cannot both re-take a stale claim).
+	const staleBefore = new Date(now.getTime() - deadlineMs * 10).toISOString();
+	const won = await db
+		.update(tenants)
+		.set({ annualPair: mergePairing(marker), updatedAt: now })
+		.where(
+			and(
+				eq(tenants.id, tenant.id),
+				sql`((${tenants.annualPair} -> 'pairing') IS NULL OR (${tenants.annualPair} -> 'pairing' ->> 'result') = 'failed' OR ((${tenants.annualPair} -> 'pairing' ->> 'result') = 'attempting' AND (${tenants.annualPair} -> 'pairing' ->> 'attempted_at') < ${staleBefore}))`,
+			),
+		)
+		.returning({ id: tenants.id });
+	if (!Array.isArray(won) || won.length === 0) {
+		const [live] = await db
+			.select({ annualPair: tenants.annualPair })
+			.from(tenants)
+			.where(eq(tenants.id, tenant.id))
+			.limit(1);
+		pair.pairing = live?.annualPair?.pairing ?? prior;
+		console.info(
+			"[polar-webhook] BILL-02 P2: another delivery holds the pairing claim — not repeated. tenant",
+			logSafe(tenant.id),
+		);
+		return { claimed: false };
+	}
+	pair.pairing = marker;
+	return { claimed: true, token, usageProductId, deadlineMs, attemptedAt };
+}
+
+/**
+ * Phase 2, AFTER the P2 state write: ONE deadline for every Polar call; the
+ * live list first (`classifyLive`, the reconciler's own check — a held usage
+ * half already on the customer is recorded as `existing`, never created
+ * twice); then the shared three-call step. Every outcome is recorded by MERGE
+ * and never touches `plan` — the resolver grants when the usage half's own
+ * event arrives. Never throws: a failure is P2 + alert + a logged reason, and
+ * Polar gets its 200.
+ */
+async function runSynchronousPairing(args: {
+	tenant: { id: string };
+	claim: Extract<PairingClaim, { claimed: true }>;
+	customerId: string;
+}): Promise<void> {
+	const { tenant, claim, customerId } = args;
+	const signal = AbortSignal.timeout(claim.deadlineMs);
+	const polar = makePolarClient({
+		token: claim.token,
+		apiBase: polarApiBase(process.env.POLAR_SANDBOX === "1"),
+		signal,
+		userAgent: "tracelane-polar-webhook/1",
+	});
+	let record: AnnualPairPairingJson;
+	let usageId: string | null = null;
+	try {
+		const listed = (await polar.get(
+			`/v1/subscriptions/?customer_id=${encodeURIComponent(customerId)}&limit=100`,
+		)) as { items?: PolarLiveSubscription[] } | null;
+		const live = classifyLive(listed?.items ?? []);
+		if (live.duplicates.length > 0) {
+			record = {
+				attempted_at: claim.attemptedAt,
+				result: "failed",
+				reason: `duplicate held half on Polar: ${live.duplicates.join(",")}`,
+			};
+		} else if (live.usage) {
+			usageId = live.usage.id;
+			record = {
+				attempted_at: claim.attemptedAt,
+				result: "existing",
+				usage_subscription_id: usageId,
+			};
+		} else {
+			const paired = await pairUsageSubscription({
+				polar,
+				customerId,
+				usageProductId: claim.usageProductId,
+				apply: true,
+			});
+			if (paired.ok && paired.applied) {
+				usageId = paired.usageSubscriptionId;
+				record = {
+					attempted_at: claim.attemptedAt,
+					result: "created",
+					usage_subscription_id: usageId,
+				};
+				if (!paired.defaultPaymentMethodId) {
+					console.warn(
+						"[polar-webhook] BILL-02 P2: usage subscription created with NO card on file — its first non-zero invoice will go past_due (B7 O5). tenant",
+						logSafe(tenant.id),
+					);
+				}
+			} else {
+				record = {
+					attempted_at: claim.attemptedAt,
+					result: "failed",
+					reason: paired.ok ? "not applied" : paired.reason,
+				};
+			}
+		}
+	} catch (err) {
+		// The list call failed or the deadline fired before it answered.
+		record = {
+			attempted_at: claim.attemptedAt,
+			result: "failed",
+			reason: err instanceof Error ? err.message : String(err),
+		};
+	}
+	if (record.result === "failed") {
+		console.error(
+			"[polar-webhook] BILL-02 P2: synchronous pairing FAILED — tenant stays free with the alert; the reconciler retries on its cadence. tenant",
+			logSafe(tenant.id),
+			"reason",
+			logSafe(record.reason ?? null),
+		);
+	} else {
+		console.info(
+			"[polar-webhook] BILL-02 P2: usage half",
+			logSafe(record.result),
+			logSafe(usageId),
+			"— the tenant stays free until the usage half's own event arrives. tenant",
+			logSafe(tenant.id),
+		);
+	}
+	try {
+		await db
+			.update(tenants)
+			.set({
+				annualPair: mergePairing(record),
+				...(usageId ? { polarUsageSubscriptionId: usageId } : {}),
+				updatedAt: new Date(),
+			})
+			.where(eq(tenants.id, tenant.id));
+	} catch (err) {
+		// "Never throws" holds here too (security review M1): a failed record
+		// write leaves the `attempting` marker, which the stale-claim rule in
+		// `claimSynchronousPairing` re-takes on the next base event; Polar still
+		// gets its 200 and the event is recorded, so it is not redelivered into
+		// the same fault. Loud, not fatal.
+		console.error(
+			"[polar-webhook] BILL-02 P2: could not RECORD the pairing outcome",
+			logSafe(record.result),
+			logSafe(usageId),
+			"— the marker stays `attempting` and is re-taken as stale on the next base event. tenant",
+			logSafe(tenant.id),
+			"error",
+			logSafe(err instanceof Error ? err.message : String(err)),
+		);
 	}
 }
 

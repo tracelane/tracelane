@@ -29,6 +29,7 @@ async function getTenantBilling(workosOrgId: string) {
 			polarCustomerId: tenants.polarCustomerId,
 			billingInterval: tenants.billingInterval,
 			annualPair: tenants.annualPair,
+			subscriptionEndsAt: tenants.subscriptionEndsAt,
 			spendCeilingUsd: tenants.spendCeilingUsd,
 			overflowMode: tenants.overflowMode,
 		})
@@ -75,6 +76,11 @@ export default async function BillingPage() {
 				plan={plan}
 				billingInterval={billingInterval}
 				annual={annual}
+				subscriptionEndsAt={
+					billing.subscriptionEndsAt
+						? billing.subscriptionEndsAt.toISOString()
+						: null
+				}
 			/>
 			<UsageBoard
 				plan={plan}
@@ -83,6 +89,7 @@ export default async function BillingPage() {
 				initialOverflowMode={overflowMode}
 			/>
 			<PlanCard
+				annualPair={billingInterval === "year" && annual !== null}
 				plan={plan}
 				hasBillingAccount={billing.polarCustomerId !== null}
 			/>

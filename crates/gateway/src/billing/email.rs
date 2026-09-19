@@ -1,11 +1,14 @@
 //! BILL-01 / ADR-076 step 8 — usage-warning emails.
 //!
-//! After the daily metering job computes each meter's month-to-date `used`
+//! After the daily metering job computes each meter's period-to-date `used`
 //! figure, this module checks it against the tenant's `included` allowance
 //! (from the entitlement cache) and sends ONE email per (tenant, meter,
-//! month, threshold) the FIRST time `used/included` crosses a
+//! period, threshold) the FIRST time `used/included` crosses a
 //! `billing_policy.warn_pct` threshold (75%, 90% — spec §0.4). Deduplication
 //! is the `meter_warnings` INSERT's row count — never a read-then-write.
+//! `period` is the billing period's first UTC day — the tenant's Polar cycle
+//! start when one governs, else the first of the calendar month (B-410,
+//! `crate::billing::period`) — so a new cycle re-arms the warnings.
 //!
 //! Sending itself goes through `tracelane_shared::email::send_plain_text`
 //! (the sender moved out of ingest's now-deleted `QuotaNotifier`, BILL-01
@@ -20,7 +23,7 @@ use uuid::Uuid;
 
 use crate::db::DbPool;
 
-/// One meter's month-to-date usage, ready for the threshold check.
+/// One meter's period-to-date usage, ready for the threshold check.
 /// `meter` is the `meter_warnings.meter` value — short, stable, and
 /// independent of the six billed-meter names `rating::RatedMeter` uses,
 /// because a warning is about an ALLOWANCE crossing, not a rated dollar

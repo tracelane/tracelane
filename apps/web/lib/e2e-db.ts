@@ -122,6 +122,17 @@ export async function setupE2EDb(): Promise<E2EDatabase | null> {
 		'insert into "tenants" ("id", "workos_org_id", "plan") values ($1, $2, $3)',
 		[E2E_INTERNAL_TENANT_ID, E2E_TEST_TENANT_ID, "team"],
 	);
+	// B-427 render proof: `TRACELANE_E2E_AUDIT_ADDON=1` grants the fixture tenant
+	// the Enterprise ledger export (`f_audit_addon` workspace override) so /audit
+	// renders the LedgerData path — the one that reads `/v1/audit/export` and
+	// must show a FAILED read as a failed read, never as "no audit events yet".
+	// Same dev-only seam as the rest of this file; a prod build never reaches it.
+	if (process.env.TRACELANE_E2E_AUDIT_ADDON === "1") {
+		await pg.query(
+			'insert into "workspace_entitlements" ("tenant_id", "plan_lookup_key", "f_audit_addon") values ($1, $2, true)',
+			[E2E_INTERNAL_TENANT_ID, "team_v1"],
+		);
+	}
 
 	holder[GLOBAL_KEY] = db;
 	return db;

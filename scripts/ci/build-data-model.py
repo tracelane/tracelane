@@ -227,6 +227,59 @@ def parse_clickhouse(text: str) -> dict[str, dict]:
 
 
 # ── 4. readers / writers ───────────────────────────────────────────────────────
+def strip_test_modules(t: str) -> str:
+    """Remove every `#[cfg(test)] mod name { ... }` block (balanced braces; string,
+    char and comment bodies skipped) so only production code is scanned."""
+    out: list[str] = []
+    i = 0
+    marker = "#[cfg(test)]"
+    while True:
+        j = t.find(marker, i)
+        if j < 0:
+            out.append(t[i:])
+            break
+        k = j + len(marker)
+        # Skip whitespace and further attributes (`#[allow(...)]`) to the item.
+        m = re.match(
+            r"(?:\s*#\[[^\]]*\])*\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{", t[k:]
+        )
+        if not m:
+            out.append(t[i:k])
+            i = k
+            continue
+        depth = 1
+        pos = k + m.end()
+        n = len(t)
+        while pos < n and depth > 0:
+            c = t[pos]
+            if c == "/" and t.startswith("//", pos):
+                nl = t.find("\n", pos)
+                pos = n if nl < 0 else nl
+                continue
+            if c == "r" and re.match(r'r#*"', t[pos:]):
+                hashes = len(t[pos + 1 :].split('"', 1)[0])
+                end = t.find('"' + "#" * hashes, pos + 2 + hashes)
+                pos = n if end < 0 else end + 1 + hashes
+                continue
+            if c == '"':
+                pos += 1
+                while pos < n and t[pos] != '"':
+                    pos += 2 if t[pos] == "\\" else 1
+                pos += 1
+                continue
+            if c == "'" and re.match(r"'(?:\\.|[^\\'])'", t[pos:]):
+                pos += len(re.match(r"'(?:\\.|[^\\'])'", t[pos:]).group(0))
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            pos += 1
+        out.append(t[i:j])
+        i = pos
+    return "".join(out)
+
+
 def scan_usage(
     pg_vars: dict[str, str], pg_tables: set[str], ch_tables: set[str]
 ) -> dict[str, dict[str, set[str]]]:
@@ -265,6 +318,14 @@ def scan_usage(
     for p in (ROOT / "crates").rglob("*.rs"):
         rel = str(p.relative_to(ROOT))
         t = p.read_text(encoding="utf-8", errors="ignore")
+        # Production code only: a `#[cfg(test)] mod … { … }` block is removed
+        # before scanning. A test that plants a fixture row (`INSERT INTO
+        # tracelane.spans` in the metering job's real-ClickHouse test, B-424) is
+        # not a writer of that table — reporting it as one would contradict
+        # "ingest is the sole span writer". Whole-module removal, NOT a cut at the
+        # first marker: `trace_reads.rs` and `audit.rs` carry a cfg(test) item
+        # near the top, and a cut there erased every production read below it.
+        t = strip_test_modules(t)
         for m in re.finditer(
             r"\b(FROM|JOIN)\s+(?:tracelane\.)?([a-z_][a-z0-9_]*)\b", t
         ):

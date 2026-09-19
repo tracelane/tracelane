@@ -53,6 +53,8 @@
       14
     ],
     "dunning_data_hold_days": 30,
+    "annual_pairing_deadline_ms": 6000,
+    "annual_pairing_deadline_ms_reason": "BILL-02 O4: ONE deadline for every Polar call the webhook makes while pairing an annual tenant's usage subscription synchronously (list, payment-methods, PATCH default, POST). Polar's webhook delivery timeout is 10 s (docs.polar.sh/integrate/webhooks/delivery, read 2026-09-19); the observed pairing takes ~3 s. Past the deadline the tenant stays P2 with the alert and the reconciler repairs later — never a 5xx to Polar.",
     "refund_days_base_first_cycle": 30,
     "enterprise_onboarding_fee_usd": 5000,
     "prepaid_credits": [

@@ -299,6 +299,9 @@ const policyRows = {
 	free_idle_reclaim_days: pol.free_idle_reclaim_days,
 	dunning_retry_days: pol.dunning_retry_days,
 	dunning_data_hold_days: pol.dunning_data_hold_days,
+	// BILL-02 O4: the webhook's synchronous-pairing deadline (ms). Missing row →
+	// pairing is skipped loudly and the reconciler repairs; never a literal.
+	annual_pairing_deadline_ms: pol.annual_pairing_deadline_ms,
 	refund_days_base_first_cycle: pol.refund_days_base_first_cycle,
 	enterprise_onboarding_fee_usd: pol.enterprise_onboarding_fee_usd,
 	prepaid_credits: pol.prepaid_credits,

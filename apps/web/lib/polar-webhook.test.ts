@@ -128,6 +128,15 @@ describe("verifySignature", () => {
 });
 
 describe("decodeWebhookSecret (Polar keying)", () => {
+	it("a Standard-Webhooks `whsec_<base64>` secret (API-created endpoint) is base64-DECODED; `polar_whs_` stays raw bytes", () => {
+		const raw = Buffer.from("0123456789abcdef0123456789abcdef", "utf-8");
+		const whsec = `whsec_${raw.toString("base64")}`;
+		expect(decodeWebhookSecret(whsec).equals(raw)).toBe(true);
+		expect(decodeWebhookSecret(`${whsec}\n`).equals(raw)).toBe(true);
+		const dash = "polar_whs_abcXYZ";
+		expect(decodeWebhookSecret(dash).toString("utf-8")).toBe(dash);
+	});
+
 	// Clearly-marked fake secret; shaped like Polar's `polar_whs_…` but bogus.
 	const RAW = "polar_whs_unit_test_do_not_use_in_prod";
 
@@ -241,13 +250,25 @@ describe("resolvePlan", () => {
 		).toEqual({ kind: "unknown", rawKey: "enterprise_v1_year" });
 	});
 
-	it("canceled/revoked event → free", () => {
+	// B-431: this test used to assert that `subscription.canceled` → free. That was
+	// the defect (Polar's status in that event is still `active` until `ends_at`);
+	// the assertion was the false claim written down. `.revoked` is the event that
+	// ends access.
+	it("revoked event → free; a canceled event whose status is still active keeps the plan (B-431)", () => {
 		expect(
 			resolvePlan({
-				eventType: "subscription.canceled",
+				eventType: "subscription.revoked",
+				status: "canceled",
 				lookupKey: "team_v1",
 			}),
 		).toEqual({ kind: "free", lookupKey: "free_v1" });
+		expect(
+			resolvePlan({
+				eventType: "subscription.canceled",
+				status: "active",
+				lookupKey: "team_v1",
+			}).kind,
+		).toBe("plan");
 	});
 
 	it("canceled status → free even on an update event", () => {

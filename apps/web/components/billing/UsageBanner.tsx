@@ -90,11 +90,14 @@ export function WarnBanner({
 export function CeilingResolvedBanner({
 	overflowMode,
 	agedOutDays,
+	periodNoun = "month",
 	onReview,
 }: {
 	overflowMode: "auto_age" | "auto_overage";
 	/** `plan.indexed_window_days - auto_age_window_days`, only when both are known numbers. */
 	agedOutDays?: number;
+	/** B-410: "billing period" when the gateway rated over a Polar cycle (`period_start` set), else "month". */
+	periodNoun?: "billing period" | "month";
 	onReview: () => void;
 }) {
 	const explanation =
@@ -106,7 +109,7 @@ export function CeilingResolvedBanner({
 	return (
 		<div className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-card)] border border-line bg-surface-2 px-4 py-3">
 			<p className="text-sm font-medium text-ink-2">
-				Ceiling reached this month — {explanation}{" "}
+				Ceiling reached this {periodNoun} — {explanation}{" "}
 				{/* Review note: NEUTRAL, never `ok` (green) — a ceiling event is not a win. */}
 				{overflowMode === "auto_age" && (
 					<Badge tone="neutral">Nothing was lost</Badge>

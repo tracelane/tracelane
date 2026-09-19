@@ -208,7 +208,7 @@ fn hash_token(token: &str) -> Vec<u8> {
 #[derive(Debug, Clone, Serialize)]
 pub struct ShareMintResult {
     pub id: String,
-    pub token: String,
+    pub token: String, // secret-field-ok: one-time reveal at mint; list row has no token (B-430)
     pub url: String,
     /// RFC3339.
     pub expires_at: String,

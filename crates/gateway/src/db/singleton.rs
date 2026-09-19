@@ -193,6 +193,11 @@ pub async fn hold(mut lock: SingletonLock) {
             match try_acquire(&cfg).await {
                 Ok(Some(next)) => {
                     tracing::warn!("singleton lock: re-acquired");
+                    // B-437: the lock is held again — the degradation is OVER, and
+                    // `/health` must say so instead of "open" until restart.
+                    tracelane_shared::degradation::resolve(
+                        tracelane_shared::degradation::Degradation::SingletonLockLost,
+                    );
                     lock = next;
                     break;
                 }

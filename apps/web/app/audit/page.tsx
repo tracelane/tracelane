@@ -237,17 +237,31 @@ async function LedgerData({
 				}
 				throw err;
 			}),
-		// Required export. GatewayError → null (show empty state); other errors propagate.
+		// Required export. A GatewayError is kept WITH ITS STATUS: a 5xx is the
+		// gateway REFUSING the export (B-427 — it now fails closed when the chain
+		// rows or anchor records cannot be read) and must render as a failed read,
+		// never as "no audit events yet". Other errors propagate.
 		gatewayGetText(
 			`/v1/audit/export?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}&limit=1000`,
-		).catch((err: unknown): null => {
-			if (err instanceof GatewayError) return null;
+		).catch((err: unknown): GatewayError => {
+			if (err instanceof GatewayError) return err;
 			throw err;
 		}),
 	]);
 	const { summary, unreachable: summaryUnreachable } = summaryOutcome;
 
-	if (ndjsonOrNull === null) {
+	if (ndjsonOrNull instanceof GatewayError) {
+		if (ndjsonOrNull.status >= 500) {
+			// B-427: the export was refused because a read behind it failed. Nothing
+			// is shown rather than a partial ledger — a chain with its anchors
+			// missing looks complete and proves nothing. Say so; do not say "empty".
+			return (
+				<EmptyState
+					title="The audit ledger could not be read"
+					description={`The gateway refused the export (HTTP ${ndjsonOrNull.status}) rather than return an incomplete ledger. Nothing you recorded is lost — reload to retry, and contact support if it persists.`}
+				/>
+			);
+		}
 		return (
 			<>
 				<WarmingBanner />

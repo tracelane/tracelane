@@ -579,11 +579,32 @@ impl AuditChain {
             // A `try` lock, never a blocking one — losing the race means the other process
             // is already doing it, which is the outcome we wanted anyway. The transaction
             // exists ONLY to scope the lock; nothing is written through it.
-            let Ok(mut claim_client) = pool.get().await else {
-                continue;
+            // B-428 (2026-09-19): every failure on the way to the claim used to read
+            // as "another process holds it" and skip the tenant SILENTLY — the
+            // fail-closed direction, which is right, but a Postgres that refuses the
+            // pool, the transaction or the probe on every sweep would leave every
+            // aged batch un-anchored forever with no line saying why. The direction
+            // stays; the silence goes. Counted under `AuditAgeSweepSkipped`, the
+            // kind that already means "the sweep could not do its job for a tenant".
+            let mut claim_client = match pool.get().await {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!(tenant_id = %tenant_id, error = %err, "audit age-sweep: could not get a Postgres connection for the claim — skipping this tenant this sweep");
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+                    );
+                    continue;
+                }
             };
-            let Ok(claim_tx) = claim_client.transaction().await else {
-                continue;
+            let claim_tx = match claim_client.transaction().await {
+                Ok(tx) => tx,
+                Err(err) => {
+                    tracing::warn!(tenant_id = %tenant_id, error = %err, "audit age-sweep: could not open the claim transaction — skipping this tenant this sweep");
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+                    );
+                    continue;
+                }
             };
             let claimed = claim_tx
                 .query_one(
@@ -592,7 +613,15 @@ impl AuditChain {
                 )
                 .await
                 .map(|r| r.get::<_, bool>(0))
-                .unwrap_or(false);
+                .unwrap_or_else(|err| {
+                    // A probe ERROR is not "held" — it is "cannot tell", and the
+                    // only safe reading of that is to not anchor this tenant now.
+                    tracing::warn!(tenant_id = %tenant_id, error = %err, "audit age-sweep: advisory-lock probe FAILED — treating as not claimed (cannot tell), skipping this tenant this sweep");
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+                    );
+                    false
+                });
             if !claimed {
                 continue; // another process is flushing this tenant right now
             }
@@ -2323,6 +2352,11 @@ mod tests {
             after = count(Degradation::AuditBackfillFailed);
         }
 
+        // exact-delta-ok: the coverage claim below needs exactness. All three
+        // AuditBackfillFailed noters sit in `anchor_task`'s backfill arms, and this
+        // is the only test in the binary that calls `anchor_task` with failing writes
+        // (`grep -n 'anchor_task(' crates/gateway/src/audit.rs`) — if this ever reads
+        // 3 or 4 under a parallel run, look for a second caller before the arms.
         assert_eq!(
             after - before,
             2,

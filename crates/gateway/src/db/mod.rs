@@ -411,6 +411,7 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         // tenants, the two product ids on plan_entitlements. Nullable adds; the
         // gateway reads none of them (test-database applier only).
         include_str!("../../../../apps/web/db/migrations/0044_bill02_annual_two_subscriptions.sql"),
+        include_str!("../../../../apps/web/db/migrations/0045_b431_subscription_ends_at.sql"),
     ];
     for migration in MIGRATIONS {
         client

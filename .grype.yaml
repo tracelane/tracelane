@@ -42,6 +42,11 @@ ignore:
   # REVIEW: 2026-11-07
   - package:
       name: vitest
+  # @vitest/mocker — GHSA-82fw-gwwq-j7x9 (2026-09-08), the redirect-mock path traversal; same
+  # precondition (a Vite dev server / browser mode) we never run. Mirrors osv-scanner.toml. B-434.
+  # REVIEW: 2026-11-07
+  - package:
+      name: "@vitest/mocker"
   # brace-expansion 2.1.4 — the one residual of the 2026-07-30 bump pass (postcss,
   # valibot and the brace-expansion 5.x copy were all raised to fixed versions, not
   # ignored). 2.1.4 carries the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH),

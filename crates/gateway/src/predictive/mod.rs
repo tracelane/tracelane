@@ -442,8 +442,9 @@ mod tests {
     /// while the system was blind. A degradation with no counter cannot be distinguished
     /// from healthy operation by any signal we own.
     ///
-    /// Delta, not absolute: the registry is process-global and other tests in this
-    /// binary touch the same kind.
+    /// Delta, not absolute — and `>`, not `== before + 1`: the registry is
+    /// process-global and other tests in this binary drive the same kind through
+    /// their own panicking predictors concurrently (gate 15, 2026-09-16, read +2).
     #[test]
     fn ft05_fail_open_advances_the_degradation_counter() {
         use tracelane_shared::degradation::{Degradation, count};
@@ -459,9 +460,8 @@ mod tests {
         };
         assert_eq!(layer.evaluate(&ctx), Decision::Allow);
 
-        assert_eq!(
-            count(Degradation::PredictorError),
-            before + 1,
+        assert!(
+            count(Degradation::PredictorError) > before,
             "a predictor that panicked and failed OPEN must advance the degradation \
              counter — otherwise detection being offline looks exactly like detection \
              finding nothing"

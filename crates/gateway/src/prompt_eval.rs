@@ -1719,6 +1719,10 @@ impl PromptEvalEngine {
             // Is the workspace recording content AT ALL? If not, no filter the
             // user can type will ever match, and telling them "no traces matched"
             // sends them to tune a filter that cannot work.
+            // B-429 (2026-09-19): this count DECIDES which message the user gets.
+            // A failed read used to `unwrap_or(0)` and tell them "this workspace
+            // records no prompt content" — sending them to enable a setting that is
+            // already on. A read we could not make is an error, not a zero.
             let recorded: u64 = self
                 .ch
                 .query(
@@ -1733,7 +1737,7 @@ impl PromptEvalEngine {
                 .bind(tenant_id.to_string())
                 .fetch_one()
                 .await
-                .unwrap_or(0);
+                .context("could not count content-bearing spans for this workspace")?;
             if recorded == 0 {
                 bail!(
                     "this workspace records no prompt content, so no trace can be replayed as a \

@@ -128,7 +128,7 @@ struct CreateKeyResponse {
     /// RFC3339 UTC. `null` on a fresh key (matches the list `lastUsedAt`).
     last_used_at: Option<String>,
     created_at: String,
-    raw_key: String,
+    raw_key: String, // secret-field-ok: one-time reveal at mint; DB keeps only hashes (B-430)
     /// A13. `null` only for a pre-A13 key; every newly minted key is explicit.
     scope: Option<Vec<String>>,
     /// A13. RFC3339 UTC, `null` = never expires.

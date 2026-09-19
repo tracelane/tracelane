@@ -37,7 +37,10 @@ export type AnnualHeaderState = {
 const ANNUAL_ALERT_COPY: Record<string, { title: string; body: string }> = {
 	annual_pair_usage_missing: {
 		title: "Your annual base is paid — usage billing is still being set up.",
-		body: "This workspace is on the Free plan until it completes, usually within a day. Nothing you sent is lost.",
+		// O4: with synchronous pairing this is seconds; without a Worker token it
+		// waits for the reconciler. Neither is a promise we can make, so the copy
+		// names the usual case and the point at which to ask for help.
+		body: "This workspace is on the Free plan until it completes — usually within a few seconds. If this message is still here after a day, email support@tracelane.dev with your workspace name. Nothing you sent is lost.",
 	},
 	annual_pair_base_lapsed: {
 		title: "Your annual base has lapsed.",
@@ -60,12 +63,16 @@ export function PlanHeader({
 	plan,
 	billingInterval,
 	annual = null,
+	subscriptionEndsAt = null,
 }: {
 	plan: Plan;
 	/** null on Free (no billing account yet). */
 	billingInterval: "month" | "year" | null;
 	/** BILL-02: present iff the tenant holds (or held) an annual pair. */
 	annual?: AnnualHeaderState | null;
+	/** B-431: `tenants.subscription_ends_at` — the customer cancelled at period
+	 *  end; the plan runs until this instant. ISO string or null. */
+	subscriptionEndsAt?: string | null;
 }) {
 	const card = buildCard(plan);
 	const idx = LADDER.indexOf(plan);
@@ -75,6 +82,7 @@ export function PlanHeader({
 			: card.priceMonth;
 	const alertCopy = annual?.alert ? ANNUAL_ALERT_COPY[annual.alert] : null;
 	const through = paidThrough(annual?.basePeriodEnd ?? null);
+	const endsOn = plan !== "free" ? paidThrough(subscriptionEndsAt) : null;
 
 	return (
 		<div className="space-y-4">
@@ -163,6 +171,20 @@ export function PlanHeader({
 						)}
 					</div>
 				</div>
+				{endsOn && (
+					// B-431: a cancel at period end is NOT a lapse. Say when it ends and
+					// that the plan runs until then — the state Polar itself reports.
+					<output
+						className="mt-3 block rounded-lg border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-warn-ink"
+						data-testid="subscription-ends-note"
+					>
+						<span className="font-semibold">
+							Cancels on {endsOn} — you keep {card.name} until then.
+						</span>{" "}
+						Changed your mind? Resume it from the billing portal below before
+						that date.
+					</output>
+				)}
 				{alertCopy && (
 					<output
 						className="mt-3 block rounded border border-line bg-surface p-3 text-xs"
@@ -194,9 +216,12 @@ export function PlanHeader({
 export function PlanCard({
 	plan,
 	hasBillingAccount,
+	annualPair = false,
 }: {
 	plan: Plan;
 	hasBillingAccount: boolean;
+	/** O3: the tenant holds an annual pair, so the portal shows TWO subscriptions. */
+	annualPair?: boolean;
 }) {
 	const card = buildCard(plan);
 
@@ -223,6 +248,21 @@ export function PlanCard({
 								Payment method, invoices and plan cancellation live in the
 								Polar-hosted billing portal.
 							</p>
+							{annualPair ? (
+								// O3 (founder, 2026-09-19): Polar's portal renders an annual
+								// plan as TWO subscriptions — say so here so nobody is
+								// surprised. Both objects are one plan on our side.
+								<p
+									className="mt-1 mb-3 text-xs text-ink-2"
+									data-testid="annual-portal-note"
+								>
+									An annual plan shows there as two subscriptions: the annual
+									base, paid up front, and a $0 monthly usage subscription that
+									carries your allowances and any overage. Together they are one
+									plan — change or cancel it from this page, not from either
+									subscription alone.
+								</p>
+							) : null}
 							<BillingPortalButton />
 						</>
 					) : (

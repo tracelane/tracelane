@@ -724,6 +724,25 @@ if [[ -f scripts/hooks/protect-audit-fail-closed.sh ]]; then
         skip "audit-fail-closed guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
     fi
 fi
+# B-430 (founder ruling 2026-09-19, "rotated is not closed"): a webhook signing secret
+# reached a transcript through a vendor LIST response printed raw (`curl … | head -c
+# 600`). The hook refuses the raw-print shapes at the tool call; `vendor-read.py` is
+# the sanctioned read, redacting every secret-shaped key and known prefix at the
+# boundary. Both selftests plant the exact B-430 shape and prove it never prints.
+if [[ -f scripts/hooks/protect-vendor-secret-output.sh ]]; then
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "vendor-secret-output guard selftest" "guard not exported to the public repo"
+    else
+        skip "vendor-secret-output guard selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
+fi
+if [[ -f scripts/ops/vendor-read.py ]]; then
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "vendor-read redaction selftest" "guard not exported to the public repo"
+    else
+        skip "vendor-read redaction selftest" "redundant at push — meta-gate (FULL) selftests this script directly"
+    fi
+fi
 # A deferred item must be able to come back. The `Review:` convention was referenced
 # in and read by nothing, so five rows were deferred with no trigger
 # one of them said so in its own text. Prints when a review comes due; blocks only once
@@ -1089,6 +1108,25 @@ if command -v python3 >/dev/null 2>&1; then
     # entitlement_cache was cured of. Prose did not stop it; this does.
     area RUST
     run "hot-path cache TTL"           python3 scripts/ci/check-hot-path-cache-ttl.py
+    # Four red gates on ONE shape (2026-09-06, 09-14, and two in gate 15 on 09-16): a
+    # test asserting `count(kind) == before + 1` on the process-global degradation
+    # counter while a parallel test drove the same kind. Each was fixed at the instance;
+    # this holds the class — a test may assert `> before`, never an exact delta.
+    area RUST
+    run "degradation-count assertions" python3 scripts/ci/check-degradation-count-assertions.py
+    # B-424/425/426 (2026-09-16): three metering defects hid for two days inside SILENT
+    # fallbacks on database results (`unwrap_or_default()` with no line, `unwrap_or(true)`
+    # with no line) and were found by reading /health, not by any gate. A fail-open
+    # fallback on a ClickHouse/Postgres result in the billing or entitlement paths must
+    # warn!/error!/note at the site. Falsified on the pre-fix bytes at both real sites.
+    area RUST
+    run "silent db fallbacks (billing)"  python3 scripts/ci/check-silent-db-fallbacks.py
+    # B-430 (2026-09-19): the other half of "rotated is not closed" — none of OUR read
+    # or list paths may return a secret-shaped field. Every Serialize struct in the
+    # gateway and every route.ts object literal is scanned; a one-time reveal at mint
+    # says so at the site (`// secret-field-ok: …`). Two real sites carry that today.
+    area RUST WEB
+    run "no secret fields in read responses" python3 scripts/ci/check-no-secret-fields-in-read-responses.py
     area ALWAYS
     run "r2 endpoint jurisdiction"     python3 scripts/ci/check-r2-endpoint-jurisdiction.py
     area DOCS
@@ -1285,6 +1323,23 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
         run "migration-drift selftest"     python3 scripts/ci/audit-migration-drift.py --selftest
     else
         skip "migration-drift selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+    fi
+    # B-421 (2026-09-19). Two more guards, SELFTEST ONLY here — the live halves need
+    # credentials and run elsewhere, deliberately:
+    #   · check-db-drift.py — BOTH databases, BOTH directions (declared-but-missing and
+    #     live-but-undeclared), one command; the ops command is
+    #       DATABASE_URL=… CLICKHOUSE_URL=… python3 scripts/ops/check-db-drift.py
+    #     (or --neon-catalog/--clickhouse-catalog with dumps from --catalog-sql).
+    #   · check-seed-vs-neon.py — the seed-before-deploy refusal; its live half runs in
+    #     scripts/deploy/gateway.sh and web.sh, through the node's credential path.
+    # What runs here proves each one BLOCKS on planted drift; neither touches a database.
+    area WEB INFRA
+    if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+        skip "db-drift (both DBs) selftest" "guard not exported to the public repo"
+        run "seed-vs-neon selftest"        python3 scripts/ci/check-seed-vs-neon.py --selftest
+    else
+        skip "db-drift (both DBs) selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+        skip "seed-vs-neon selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
     fi
     # No UI/API reads of dead/legacy entitlement columns (tenants.auditEnabled) —
     # the "invisible entitlement-gated UI" class (internal incident review).

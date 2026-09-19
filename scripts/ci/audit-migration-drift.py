@@ -153,6 +153,19 @@ RE_ADD_COLUMN = re.compile(
     rf"[^;]{{0,200}}?ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?{IDENT}",
     re.IGNORECASE,
 )
+# B-421: one match per ALTER TABLE statement (bounded by `;`), then every ADD/DROP
+# COLUMN inside it. RE_ADD_COLUMN / RE_DROP_COLUMN above are kept for their documented
+# B-338 history but the walker below is what parse_sql_events uses.
+RE_ALTER_STMT = re.compile(
+    rf"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?{IDENT}([^;]*)",
+    re.IGNORECASE,
+)
+RE_ADD_COLUMN_ANY = re.compile(
+    rf"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?{IDENT}", re.IGNORECASE
+)
+RE_DROP_COLUMN_ANY = re.compile(
+    rf"\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?{IDENT}", re.IGNORECASE
+)
 RE_CREATE_INDEX = re.compile(
     rf"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?{IDENT}",
     re.IGNORECASE,
@@ -192,17 +205,33 @@ def parse_sql_events(raw: str, rel: str) -> list[tuple]:
     events: list[tuple] = []
     for m in RE_CREATE_TABLE.finditer(raw):
         events.append((m.start(), rel, "create", "table", m.group(1).lower(), ""))
-    for m in RE_ADD_COLUMN.finditer(raw):
-        events.append(
-            (
-                m.start(),
-                rel,
-                "create",
-                "column",
-                m.group(1).lower(),
-                m.group(2).lower(),
+    # B-421: EVERY `ADD COLUMN` in a statement, not the first. `RE_ADD_COLUMN` anchors
+    # each match on its own `ALTER TABLE`, so a multi-column ALTER (0040: 42 columns in a
+    # few statements) yielded one column per statement. Walk the statement instead.
+    for m in RE_ALTER_STMT.finditer(raw):
+        table, body = m.group(1).lower(), m.group(2)
+        for c in RE_ADD_COLUMN_ANY.finditer(body):
+            events.append(
+                (
+                    m.start() + c.start(),
+                    rel,
+                    "create",
+                    "column",
+                    table,
+                    c.group(1).lower(),
+                )
             )
-        )
+        for c in RE_DROP_COLUMN_ANY.finditer(body):
+            events.append(
+                (
+                    m.start() + c.start(),
+                    rel,
+                    "drop",
+                    "column",
+                    table,
+                    c.group(1).lower(),
+                )
+            )
     for m in RE_CREATE_INDEX.finditer(raw):
         events.append((m.start(), rel, "create", "index", m.group(1).lower(), ""))
     for m in RE_CREATE_TRIGGER.finditer(raw):
@@ -215,11 +244,6 @@ def parse_sql_events(raw: str, rel: str) -> list[tuple]:
         events.append(
             (m.start(), rel, "drop", m.group(1).lower(), m.group(2).lower(), "")
         )
-    for m in RE_DROP_COLUMN.finditer(raw):
-        events.append(
-            (m.start(), rel, "drop", "column", m.group(1).lower(), m.group(2).lower())
-        )
-
     return events
 
 
@@ -384,6 +408,21 @@ def selftest() -> int:
         e[2] == "drop" and e[3] == "column" and (e[4], e[5]) == ("t", "v") for e in ev
     ), f"B-338b drop parsed: {ev}"
     print("✓ selftest: DROP COLUMN is parsed and cancels the earlier ADD (B-338b)")
+    # B-421 (2026-09-19): a MULTI-column ALTER declares EVERY column, not the first.
+    # 0040 adds 42 columns in a handful of statements and 0042 drops 17 in two; the
+    # parser saw 5 and 2, so 37 declared columns were invisible to the missing check
+    # and 15 dropped ones would have stayed "declared" forever.
+    ev = parse_sql_events(
+        "ALTER TABLE t ADD COLUMN IF NOT EXISTS a integer, ADD COLUMN b text, "
+        "ADD COLUMN IF NOT EXISTS c numeric(12, 4); "
+        "ALTER TABLE t DROP COLUMN IF EXISTS b, DROP COLUMN IF EXISTS c;",
+        "z.sql",
+    )
+    adds = {e[5] for e in ev if e[2] == "create" and e[3] == "column"}
+    drops = {e[5] for e in ev if e[2] == "drop" and e[3] == "column"}
+    assert adds == {"a", "b", "c"}, f"B-421 multi-ADD: {adds}"
+    assert drops == {"b", "c"}, f"B-421 multi-DROP: {drops}"
+    print("✓ selftest: EVERY ADD/DROP COLUMN in a multi-column ALTER is parsed (B-421)")
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)

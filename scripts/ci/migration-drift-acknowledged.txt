@@ -1,9 +1,17 @@
-# Accepted absences for scripts/ci/audit-migration-drift.py
+# Accepted absences for scripts/ci/audit-migration-drift.py AND scripts/ops/check-db-drift.py
 #
 # Format:  kind|name|column|REASON
 # A line with an empty REASON is REFUSED, not honoured — an override without a record
 # is not a control. `PENDING <YYYY-MM-DD>` expires on that date and the gate
 # fires again, so a deferral cannot quietly become permanent.
+#
+# `kind` (B-421, 2026-09-19): `<db>:<direction>:<object>` — db `pg` | `ch`, direction
+# `missing` (declared in git, absent live) | `extra` (live, declared nowhere), object
+# `table` | `view` | `column` | `index` | `trigger` | `function` | `constraint` | `type`.
+# A bare `<object>` (every line written before 2026-09-19) means `pg:missing:<object>`.
+# For `column` the name is the TABLE and the third field the column; for a ClickHouse
+# `index` the name is `table.index` (skip indexes are per-table). Both tools read this
+# file; audit-migration-drift.py ignores the namespaced kinds it does not understand.
 #
 # WHY MOST OF THIS FILE EXISTS — established against the live Frankfurt catalog
 # 2026-08-09 (293 objects). There are TWO migration trees and they target TWO
@@ -18,9 +26,13 @@
 # Drizzle uses `<table>_<col>_idx`. A rename is INVISIBLE to this tool by construction,
 # so each one is recorded here by hand with the live object it maps to. Every mapping
 # below was checked against the live catalog, not inferred from the name.
+# (check-db-drift.py reads ONLY the canonical apps/web tree, so the infra/dev lines
+# below are idle for it — they stay for audit-migration-drift.py, which reads both.)
 
 # ── Drizzle-vs-Postgres default naming ───────────────────────────────────────────
 constraint|users_tenant_id_tenants_id_fk||RENAME live as `users_tenant_id_fkey` (Postgres default FK name) — verified in live catalog 2026-08-09
+pg:missing:constraint|users_email_unique||RENAME live as `users_email_key` (Postgres default UNIQUE name) — verified on prod Neon 2026-09-19 by the first live check-db-drift.py run: `UNIQUE (email)` is present under the default name, same class as the FK above
+pg:missing:constraint|users_workos_user_id_unique||RENAME live as `users_workos_user_id_key` (Postgres default UNIQUE name) — verified on prod Neon 2026-09-19, same run; `UNIQUE (workos_user_id)` present
 
 # ── infra/dev tree: describes the DEV compose Postgres, never applied to prod ─────
 # Each maps to a live Drizzle-named equivalent, or to a table prod never had.
@@ -33,30 +45,28 @@ index|idx_provider_keys_tenant||RENAME live as `provider_keys_tenant_idx`
 index|idx_workspace_entitlements_plan||RENAME live as `workspace_entitlements_plan_idx`
 index|tenant_audit_keys_tenant_idx||RENAME live as `tenant_audit_keys_one_per_tenant` (prod enforces one key per tenant as a UNIQUE index)
 index|idx_tenants_stripe_customer||DEV-ONLY tree, and Stripe-era: billing moved to Polar (ADR-020/052). The `tenants.stripe_customer_id` COLUMN still exists live; no index, and nothing queries by it.
-index|tenants_polar_customer_id_idx||DEV-ONLY tree. `tenants.polar_customer_id` exists live with NO index — a seq scan over 17 rows in the Polar webhook lookup. Harmless at this size; revisit past ~10k tenants.
+# `index|tenants_polar_customer_id_idx` was acknowledged here as "exists live with NO
+# index" — DELETED 2026-09-19 (B-421): apps/web/db/migrations/0024 §3 CREATES that index
+# (`APPLIED to Neon Frankfurt 2026-08-12`, one transaction), so the reason was false and
+# the ack was idle. If the index is in fact absent, the next live run says so, loudly.
 table|workspace_attr_cardinality||DEV-ONLY tree and UNWIRED — crates/ingest/src/cardinality.rs:258 states the writer is "Unwired in V1". No live reader anywhere in crates/ or apps/web.
 index|idx_workspace_attr_cardinality_updated||same as above — index on a table prod never created
 
-# ── REAL DRIFT, deliberately deferred by the founder ─────────────────────────────
-#  residue. infra/dev/postgres/migrations/14_full_capture_sampling.sql was
-# hand-applied to prod: its COLUMNS landed, these three objects did not. Consequence
-# while absent: ingest's tenant-config LISTEN has nothing publishing on the channel,
-# which is precisely the three-week silent fault record.
-# apps/web/db/migrations/0024_a13_scoped_keys_and_b188_residue.sql fixes all three and
-# is drafted but UNAPPLIED (commit 7cd363fc).
-constraint|tenants_sampling_policy_chk||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
-function|notify_tenant_config_changed||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
-trigger|trg_tenants_config_notify||PENDING 2026-09-09 — B-188 residue; migration 0024 drafted, awaiting founder apply
-
-# ── A13 scoped keys — migration drafted, deliberately UNAPPLIED ──────────────────
-# apps/web/db/migrations/0024 also carries A13. It lands before the gateway that reads
-# these columns deploys (S2 ordering, RECONCILED_BUILD_MAP.md:135).
-column|api_keys|scope|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
-column|api_keys|expires_at|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
-column|api_keys|budget_usd_monthly|PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
-constraint|api_keys_budget_nonneg_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
-constraint|api_keys_scope_not_empty_chk||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
-index|api_keys_expires_at_idx||PENDING 2026-09-09 — A13, migration 0024 drafted and unapplied
+# ── B-188 residue + A13 — NINE `PENDING 2026-09-09` ACKS DELETED 2026-09-19 (B-421) ───
+#
+# They covered the three migration-14 residue objects (`tenants_sampling_policy_chk`,
+# `notify_tenant_config_changed`, `trg_tenants_config_notify`) and the six A13 objects
+# (`api_keys.scope` / `expires_at` / `budget_usd_monthly`, `api_keys_budget_nonneg_chk`,
+# `api_keys_scope_not_empty_chk`, `api_keys_expires_at_idx`), every one with the reason
+# "migration 0024 drafted and unapplied". That reason stopped being true on 2026-08-12:
+# `apps/web/db/migrations/0024_a13_scoped_keys_and_b188_residue.sql` records at its head
+# `APPLIED to Neon Frankfurt 2026-08-12`, all nine objects sit in ONE BEGIN/COMMIT, and the
+# A13 half is PROVEN ON PROD (the A13 prod proof, 6/6: the gateway reads
+# `api_keys.scope` on every request). They expired on 2026-09-09 and printed nine ACK
+# ERRORs on every deploy since, suppressing nothing. Deleted rather than re-dated: a stale
+# acknowledgement silences the detector about the NEXT real absence at that name
+# (see the GWY-27 note below). If any of the nine is in fact absent, the next live run of
+# either tool reports it as unacknowledged — loud, which is the correct failure direction.
 
 # ── GWY-27 model aliases: an ENTIRE MIGRATION prod has never run (2026-08-23) ──
 #
@@ -80,25 +90,21 @@ index|api_keys_expires_at_idx||PENDING 2026-09-09 — A13, migration 0024 drafte
 # something that no longer exists, so the next real instance at that name reads as
 # already-known.
 
-# ── THE SIX CLICKHOUSE ORPHANS ARE **NOT** ACKNOWLEDGED HERE, AND THAT IS NOT AN OMISSION ──
+# ── CLICKHOUSE — read by check-db-drift.py ONLY (audit-migration-drift.py is Postgres-only) ──
 #
-# `audit-migration-drift.py` is POSTGRES-ONLY — it reads `information_schema`. The six
-# ClickHouse tables that the repo declares and prod lacks (`slo_alerts`, `slo_minute_stats`,
-# `token_economics`, `ttft_stats`, `audit_log_rmt`, `trace_summaries_v2`) are outside its
-# scope and it never reports them, so there is nothing here to silence.
-#
-# They are also not reported by `scripts/ci/check-deploy-schema.py`, for a DIFFERENT and
-# deliberate reason: that guard requires only tables that are BOTH declared by a migration
-# AND referenced by gateway code. All six are orphans — verified 2026-08-23, none appears
-# in any `FROM`/`INSERT` in `crates/`. The narrowing exists because the guard's first shape
-# required every declared table and consequently REFUSED A HEALTHY PROD over exactly these
-# six; a guard that fires on a condition the deployer cannot act on is one that gets
-# switched off.
-#
-# RECORDED HERE ANYWAY so a future reader does not conclude they were missed. The
-# discriminating check, for the one that looked alarming: the SLO surface reads
-# `slo_hourly_stats` and `v_slo_stats`, and BOTH ARE PRESENT on prod — `slo_alerts` and
-# `slo_minute_stats` are declared and read by nothing. A seventh table named in an earlier
-# sweep, `guardrail_verdicts_timeonly`, is declared only in `infra/prod/partition-cutover.sql`
-# — an operational cutover script, not a migration — so it was never expected on prod.
-
+# Until 2026-09-19 this section said the six ClickHouse orphans were "NOT acknowledged
+# here, and that is not an omission", because no tool read ClickHouse. check-db-drift.py
+# now does, replaying schema.sql + migrations/ in order WITH renames and exchanges, so
+# three of the six are no longer "declared" at all: `slo_minute_stats` is dropped by
+# migration 12, `audit_log_rmt` is renamed to `audit_log` by 11, `trace_summaries_v2` is
+# renamed to `trace_summaries` by 15 — the earlier sweep saw the CREATE and not the
+# RENAME. The three that ARE still declared and were verified absent on prod 2026-08-23
+# are below, deferred with an expiry: the founder decides apply-or-delete (the R103 shape
+# — a migration prod never ran and no code reads is a lie in the list).
+# Rollback copies the migrations themselves say to drop BY HAND after verification:
+ch:missing:table|trace_summaries_old||migration 15's rollback copy — DROPPED on prod 2026-08-17 20:29 UTC on founder instruction (B-243 follow-up); its absence is the intended end state
+# `audit_log_pre_rmt` (migration 11's rollback copy) is deliberately NOT acknowledged:
+# B-247 records it still holds 1,399 rows on prod, so it is expected PRESENT.
+# `spans_v2` (migration 22's rollback copy, 2026-09-12) is NOT acknowledged either — no
+# record says it was dropped; if the live run reports it missing, that is the record.
+# 2026-09-19 (B17, founder ruling): the three PENDING ClickHouse tables (slo_alerts, token_economics, ttft_stats) were DROPPED from the declared tree by migration 26 rather than applied — their acks are gone with them, not re-dated.

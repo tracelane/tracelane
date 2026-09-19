@@ -984,7 +984,7 @@ async fn summary_handler(
     {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
-            tracing::error!(error = %err, "audit summary failed");
+            tracing::error!(tenant_id = %claims.tenant_id, error = %err, "audit summary failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "summary failed")
         }
     }
@@ -1065,9 +1065,25 @@ async fn handler(
     // 4. Build the NDJSON body. `?limit=N` → a single capped page (the in-browser
     //    RENDER fetch — LedgerData caps at 1000 so the dashboard never loads a
     //    million rows). No limit → the COMPLETE ledger, UNCAPPED, seq-paginated in
-    //    bounded memory (the download / compliance path). A page-read error ends the
-    //    stream (partial NDJSON) — never a silent green: the verifier catches a short
-    //    chain via its strict consecutive-seq walk.
+    //    bounded memory (the download / compliance path).
+    //
+    //    THE EXPORT FAILS CLOSED — B-427, founder ruling 2026-09-19. This is the
+    //    evidence product: a pack that looks complete and is not is worse than no
+    //    pack. Until this fix a failed anchor read shipped the capped export with
+    //    ZERO anchor lines and no log (`unwrap_or_default()`), and a failed page
+    //    read on the uncapped path ended the stream CLEANLY (`.ok()?`) — the comment
+    //    here claimed "the verifier catches a short chain via its strict
+    //    consecutive-seq walk", which is true of a GAP and false of a TRUNCATION:
+    //    rows 0..=999 of a 5,000-row ledger verify perfectly as a shorter chain, and
+    //    a pack with no anchors verifies CHAIN-ONLY, which against the operator
+    //    proves nothing (DH-11). So: before the body starts, any read error is a
+    //    500 with the reason logged. Once the body has started (200 is on the
+    //    wire), the only honest move left is to ABORT the transfer — the stream
+    //    yields an `Err`, hyper drops the connection without the terminating chunk,
+    //    and every client (curl, the audit CLI's ureq, a browser) sees an incomplete
+    //    transfer rather than a short file. Both paths count
+    //    `AuditExportIncomplete` so `/health` shows it, which is how the last three
+    //    silent fallbacks were found.
     let tenant = claims.tenant_id.clone();
     let body = if let Some(n) = q.limit {
         let limit = n.clamp(1, MAX_LIMIT);
@@ -1078,24 +1094,34 @@ async fn handler(
         {
             Ok(r) => r,
             Err(err) => {
-                tracing::error!(error = %err, "audit_log read_range failed");
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "export failed");
+                return refuse_export(&claims.tenant_id, "audit_log read_range failed", &err);
             }
         };
-        let anchors = state
+        let anchors = match state
             .reader
             .read_anchor_records(&claims.tenant_id, since, until, limit)
             .await
-            .unwrap_or_default();
+        {
+            Ok(a) => a,
+            Err(err) => {
+                return refuse_export(&claims.tenant_id, "audit_anchor_records read failed", &err);
+            }
+        };
+        // B-437: both reads succeeded — an earlier refusal's episode is over.
+        tracelane_shared::degradation::resolve(
+            tracelane_shared::degradation::Degradation::AuditExportIncomplete,
+        );
         let row_lines = rows.into_iter().map(|r| serde_json::to_string(&r));
         let anchor_lines = anchors.into_iter().map(|a| serde_json::to_string(&a));
-        let lines = row_lines.chain(anchor_lines).map(|res| match res {
-            Ok(json) => Ok::<_, std::convert::Infallible>(format!("{json}\n").into_bytes()),
-            Err(_) => Ok(Vec::new()),
+        let lines = row_lines.chain(anchor_lines).map(|res| {
+            res.map(|json| format!("{json}\n").into_bytes())
+                .map_err(anyhow::Error::from)
         });
         Body::from_stream(stream::iter(lines).map(|r| r.map(bytes::Bytes::from)))
     } else {
         const PAGE: u32 = MAX_LIMIT;
+        // Each unfold yields `Ok(page)` or, ONCE, `Err(reason)` and then stops —
+        // the `Err` is the item that aborts the transfer below.
         let row_reader = state.reader.clone();
         let row_tenant = tenant.clone();
         let rows_stream = stream::unfold(Some(None::<u64>), move |cursor| {
@@ -1103,10 +1129,16 @@ async fn handler(
             let tenant = row_tenant.clone();
             async move {
                 let after = cursor?; // outer None → stop paging
-                let page = reader
+                let page = match reader
                     .read_range_page(&tenant, since, until, after, PAGE)
                     .await
-                    .ok()?;
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let err = abort_export(&tenant, "audit_log page read failed", err);
+                        return Some((Err(err), None));
+                    }
+                };
                 if page.is_empty() {
                     return None;
                 }
@@ -1115,10 +1147,17 @@ async fn handler(
                 } else {
                     page.last().map(|r| Some(r.seq))
                 };
-                Some((page, next))
+                Some((Ok(page), next))
             }
         })
-        .flat_map(|page| stream::iter(page.into_iter().map(|r| serde_json::to_string(&r))));
+        .flat_map(|page| match page {
+            Ok(rows) => stream::iter(
+                rows.into_iter()
+                    .map(|r| serde_json::to_string(&r).map_err(anyhow::Error::from))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(err) => stream::iter(vec![Err(err)]),
+        });
 
         let anchor_reader = state.reader.clone();
         let anchor_tenant = tenant.clone();
@@ -1127,12 +1166,17 @@ async fn handler(
             let tenant = anchor_tenant.clone();
             async move {
                 let after = cursor?;
-                // Best-effort: an anchor-read error ends the anchor stream, but the
-                // chain rows already streamed (the chain verifies without anchors).
-                let page = reader
+                let page = match reader
                     .read_anchor_page(&tenant, since, until, after, PAGE)
                     .await
-                    .ok()?;
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let err =
+                            abort_export(&tenant, "audit_anchor_records page read failed", err);
+                        return Some((Err(err), None));
+                    }
+                };
                 if page.is_empty() {
                     return None;
                 }
@@ -1141,15 +1185,26 @@ async fn handler(
                 } else {
                     page.last().map(|a| Some(a.batch_start_seq))
                 };
-                Some((page, next))
+                Some((Ok(page), next))
             }
         })
-        .flat_map(|page| stream::iter(page.into_iter().map(|a| serde_json::to_string(&a))));
-
-        let lines = rows_stream.chain(anchors_stream).map(|res| match res {
-            Ok(json) => Ok::<_, std::convert::Infallible>(format!("{json}\n").into_bytes()),
-            Err(_) => Ok(Vec::new()),
+        .flat_map(|page| match page {
+            Ok(anchors) => stream::iter(
+                anchors
+                    .into_iter()
+                    .map(|a| serde_json::to_string(&a).map_err(anyhow::Error::from))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(err) => stream::iter(vec![Err(err)]),
         });
+
+        // An `Err` item ends the body abnormally — hyper never writes the
+        // terminating chunk, so the client's read fails instead of returning a
+        // short pack. Rows stream first; a row failure therefore also skips the
+        // anchors, which is correct: there is nothing to anchor a pack we refused.
+        let lines = rows_stream
+            .chain(anchors_stream)
+            .map(|res| res.map(|json| format!("{json}\n").into_bytes()));
         Body::from_stream(lines.map(|r| r.map(bytes::Bytes::from)))
     };
 
@@ -1167,6 +1222,28 @@ async fn handler(
         .unwrap_or_else(|_| {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
         })
+}
+
+/// B-427: refuse an export whose read failed BEFORE the body started — logged with
+/// the tenant so the line is actionable, counted so `/health` shows it, 500 so the
+/// customer gets an error rather than a pack missing what failed.
+fn refuse_export(tenant_id: &TenantId, what: &'static str, err: &anyhow::Error) -> Response {
+    tracing::error!(tenant_id = %tenant_id, error = %err, "audit export REFUSED: {what}");
+    tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::AuditExportIncomplete,
+    );
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "export failed")
+}
+
+/// B-427: the body has started (200 already sent); log, count, and hand back the
+/// error that the stream yields to ABORT the transfer. Same signal as
+/// [`refuse_export`], different mechanism — the status line cannot change any more.
+fn abort_export(tenant_id: &TenantId, what: &'static str, err: anyhow::Error) -> anyhow::Error {
+    tracing::error!(tenant_id = %tenant_id, error = %err, "audit export ABORTED mid-stream: {what}");
+    tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::AuditExportIncomplete,
+    );
+    err.context(what)
 }
 
 fn parse_iso(s: &Option<String>) -> Option<DateTime<Utc>> {
@@ -1696,16 +1773,28 @@ mod tests {
     // end-state, not that middleware exists.
     #[cfg(debug_assertions)]
     mod entitlement_gate {
-        use super::super::{ExportQuery, ExportState, handler};
+        use super::super::{
+            AnchorExportRecord, AuditExportReader, ExportQuery, ExportRow, ExportState, handler,
+        };
         use super::{MockExportReader, fixture_row};
         use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
+        use anyhow::Result;
         use axum::extract::{Query, State};
         use axum::http::{HeaderMap, StatusCode};
+        use chrono::{DateTime, Utc};
         use std::pin::Pin;
         use std::sync::Arc;
+        use tracelane_shared::TenantId;
 
         // Env is process-global; serialize these tests + the dev-stub env twiddle.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Poison-tolerant: one failing test must not turn every other test in
+        /// this module into a `PoisonError` panic that hides its own verdict
+        /// (the B-427 RED run showed seven failures for one real cause).
+        fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
 
         fn rt() -> tokio::runtime::Runtime {
             tokio::runtime::Runtime::new().unwrap()
@@ -1797,7 +1886,7 @@ mod tests {
         // WITHOUT the export entitlement must get 403 + ZERO ledger bytes, not the export.
         #[test]
         fn tlane_key_without_audit_entitlement_gets_403_and_zero_ledger_bytes() {
-            let _g = ENV_LOCK.lock().expect("env lock");
+            let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
                 let (status, body) = call_export(Some(fixed_entitlement(false))).await;
@@ -1820,7 +1909,7 @@ mod tests {
         // A key WITH the export entitlement gets the export bytes.
         #[test]
         fn tlane_key_with_audit_entitlement_gets_the_export() {
-            let _g = ENV_LOCK.lock().expect("env lock");
+            let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
                 let (status, body) = call_export(Some(fixed_entitlement(true))).await;
@@ -1839,7 +1928,7 @@ mod tests {
         // Fail closed: no entitlement source (no Postgres) → refuse, zero bytes.
         #[test]
         fn missing_entitlement_cache_fails_closed_503_zero_bytes() {
-            let _g = ENV_LOCK.lock().expect("env lock");
+            let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
                 let (status, body) = call_export(None).await;
@@ -1847,6 +1936,265 @@ mod tests {
                 assert!(
                     !body.contains("claude-sonnet-4-6"),
                     "fail-closed leaked ledger payload: {body}"
+                );
+            });
+        }
+
+        // ───────────────────────────────────────────────────────────────────
+        // B-427 (founder, 2026-09-19): the evidence pack FAILS CLOSED. Until this
+        // fix a failed anchor read shipped the pack with ZERO anchor lines and no
+        // log, and a failed page read mid-stream ended the NDJSON cleanly — a
+        // document that looks complete and, against the operator, proves nothing.
+        // Every test below PLANTS the failure in the reader and proves the customer
+        // gets an error, never a short pack.
+        // ───────────────────────────────────────────────────────────────────
+
+        /// Which reader call is planted to fail.
+        #[derive(Clone, Copy)]
+        enum Plant {
+            AnchorRecords,
+            RowPage,
+            AnchorPage,
+        }
+
+        /// A reader whose chain rows are fine and whose ONE planted call fails —
+        /// the shape of a ClickHouse grant missing on `audit_anchor_records`, or a
+        /// transient error on page N of a large ledger.
+        struct PlantedFailureReader {
+            rows: Vec<ExportRow>,
+            plant: Plant,
+        }
+
+        #[async_trait::async_trait]
+        impl AuditExportReader for PlantedFailureReader {
+            async fn read_range(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _limit: u32,
+            ) -> Result<Vec<ExportRow>> {
+                Ok(self.rows.clone())
+            }
+            async fn read_anchor_records(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _limit: u32,
+            ) -> Result<Vec<AnchorExportRecord>> {
+                match self.plant {
+                    Plant::AnchorRecords => {
+                        anyhow::bail!("planted: audit_anchor_records read failed")
+                    }
+                    _ => Ok(Vec::new()),
+                }
+            }
+            async fn read_range_page(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _after_seq: Option<u64>,
+                _limit: u32,
+            ) -> Result<Vec<ExportRow>> {
+                match self.plant {
+                    Plant::RowPage => anyhow::bail!("planted: audit_log page read failed"),
+                    _ => Ok(self.rows.clone()),
+                }
+            }
+            async fn read_anchor_page(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _after: Option<u64>,
+                _limit: u32,
+            ) -> Result<Vec<AnchorExportRecord>> {
+                match self.plant {
+                    Plant::AnchorPage => {
+                        anyhow::bail!("planted: audit_anchor_records page read failed")
+                    }
+                    _ => Ok(Vec::new()),
+                }
+            }
+        }
+
+        fn planted_state(plant: Plant) -> ExportState {
+            ExportState {
+                reader: Arc::new(PlantedFailureReader {
+                    rows: vec![fixture_row(0), fixture_row(1)],
+                    plant,
+                }),
+                entitlements: Some(fixed_entitlement(true)),
+            }
+        }
+
+        fn entitled_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                "Bearer tlane_b073gateconftestkey0123456789"
+                    .parse()
+                    .unwrap(),
+            );
+            headers
+        }
+
+        /// The in-browser RENDER fetch (`?limit=N`): nothing has been sent yet, so
+        /// a failed anchor read is a 500 — the same refusal the row read gets —
+        /// and never a 200 with the anchors quietly missing.
+        #[test]
+        fn b427_a_failed_anchor_read_refuses_the_capped_export_instead_of_shipping_it_short() {
+            use tracelane_shared::degradation::{self, Degradation};
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                let before = degradation::count(Degradation::AuditExportIncomplete);
+                let query = ExportQuery {
+                    since: None,
+                    until: None,
+                    limit: Some(10),
+                };
+                let resp = handler(
+                    State(planted_state(Plant::AnchorRecords)),
+                    Query(query),
+                    entitled_headers(),
+                )
+                .await;
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+                assert!(
+                    !body.contains("row_hash"),
+                    "a refused export must ship ZERO ledger bytes: {body}"
+                );
+                // The counter is what makes this visible on /health, which is how
+                // B-424..426 were found. `>` not `+1`: the counter is process-global
+                // (B-423).
+                assert!(
+                    degradation::count(Degradation::AuditExportIncomplete) > before,
+                    "the refusal must be counted"
+                );
+            });
+        }
+
+        /// The DOWNLOAD path (no limit) has already sent `200` when a page read
+        /// fails. The only honest move left is to ABORT the transfer: the body
+        /// stream yields an error, so no client — curl, ureq in the audit CLI, a
+        /// browser — can mistake the bytes so far for a complete pack.
+        fn assert_uncapped_export_aborts(plant: Plant) {
+            use tracelane_shared::degradation::{self, Degradation};
+            let before = degradation::count(Degradation::AuditExportIncomplete);
+            let query = ExportQuery {
+                since: None,
+                until: None,
+                limit: None,
+            };
+            rt().block_on(async {
+                let resp = handler(
+                    State(planted_state(plant)),
+                    Query(query),
+                    entitled_headers(),
+                )
+                .await;
+                // 200 is already on the wire by the time page N fails — the status
+                // cannot change; the transfer's COMPLETION is what carries the verdict.
+                assert_eq!(resp.status(), StatusCode::OK);
+                let read = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+                assert!(
+                    read.is_err(),
+                    "the body must END IN AN ERROR, not a clean short pack: {read:?}"
+                );
+                assert!(
+                    degradation::count(Degradation::AuditExportIncomplete) > before,
+                    "the abort must be counted"
+                );
+            });
+        }
+
+        #[test]
+        fn b427_a_failed_row_page_aborts_the_uncapped_export() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            assert_uncapped_export_aborts(Plant::RowPage);
+        }
+
+        #[test]
+        fn b427_a_failed_anchor_page_aborts_the_uncapped_export() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            assert_uncapped_export_aborts(Plant::AnchorPage);
+        }
+
+        /// The same abort observed THROUGH A REAL SOCKET, the way the audit CLI's
+        /// `ureq` fetch and a customer's `curl -o pack.ndjson` see it: a served
+        /// export whose anchor page fails must reach the client as an INCOMPLETE
+        /// transfer (a chunked body with no terminating chunk → a read error), and
+        /// the control — the same server with a healthy reader — must complete.
+        /// Without the control this test could pass on any broken server.
+        #[test]
+        fn b427_an_aborted_export_reaches_a_real_client_as_an_incomplete_transfer() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                async fn serve(state: ExportState) -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let app = super::super::routes().with_state(state);
+                    tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    format!("http://{addr}/v1/audit/export")
+                }
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let auth = "Bearer tlane_b073gateconftestkey0123456789";
+
+                // Control: a healthy reader streams a complete pack.
+                let healthy = ExportState {
+                    reader: Arc::new(MockExportReader {
+                        rows: vec![fixture_row(0), fixture_row(1)],
+                    }),
+                    entitlements: Some(fixed_entitlement(true)),
+                };
+                let url = serve(healthy).await;
+                let resp = client
+                    .get(&url)
+                    .header("authorization", auth)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let body = resp
+                    .bytes()
+                    .await
+                    .expect("the control export must complete");
+                assert!(
+                    String::from_utf8_lossy(&body).contains("row_hash"),
+                    "control export carried no rows"
+                );
+
+                // Planted: the anchor page fails after the rows were sent. Two
+                // outcomes are honest and BOTH are errors on the client: hyper may
+                // drop the connection before the head is flushed (the mock fails
+                // within the same poll — `send()` itself fails, `IncompleteMessage`),
+                // or after it (a `200` whose body read fails). What must never
+                // happen is an `Ok` body.
+                let url = serve(planted_state(Plant::AnchorPage)).await;
+                let read: std::result::Result<bytes::Bytes, reqwest::Error> =
+                    match client.get(&url).header("authorization", auth).send().await {
+                        Ok(resp) => {
+                            assert_eq!(resp.status(), 200, "the status was already sent");
+                            resp.bytes().await
+                        }
+                        Err(e) => Err(e),
+                    };
+                assert!(
+                    read.is_err(),
+                    "a real client must see an INCOMPLETE transfer, not a short pack: {read:?}"
                 );
             });
         }

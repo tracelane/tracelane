@@ -217,6 +217,157 @@ describe("POST /api/webhooks/polar", () => {
 		expect(setArg?.dataHoldUntil).toBeInstanceOf(Date);
 	});
 
+	// ── B-431 (B7 stage 2 on PROD, 2026-09-19) ────────────────────────────────
+	// Polar: `subscription.canceled` = the customer cancelled AT PERIOD END; the
+	// subscription is STILL `active` until `ends_at`. We dropped them to Free at
+	// once (and `subscription.uncanceled` kept them there).
+	it("B-431: subscription.canceled with status active (cancel_at_period_end) KEEPS the plan and records subscription_ends_at", async () => {
+		setDb([
+			[], // dedup select
+			[
+				{
+					id: "ten_1",
+					plan: "team",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					type: "subscription.canceled",
+					status: "active",
+					cancel_at_period_end: true,
+					ends_at: "2026-10-19T09:08:42.465805Z",
+					current_period_start: "2026-09-19T09:08:42.465805Z",
+					current_period_end: "2026-10-19T09:08:42.465805Z",
+					modified_at: "2026-09-19T09:11:41Z",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			polarSubscriptionId?: string | null;
+			subscriptionEndsAt?: Date | null;
+			dataHoldUntil?: unknown;
+		};
+		expect(setArg?.plan).toBe("team");
+		expect(setArg?.polarSubscriptionId).toBe("sub_1");
+		expect(setArg?.subscriptionEndsAt?.toISOString()).toBe(
+			"2026-10-19T09:08:42.465Z",
+		);
+		expect(setArg?.dataHoldUntil).toBeNull();
+	});
+
+	it("B-431: subscription.uncanceled (status active) keeps the plan and CLEARS the scheduled end", async () => {
+		setDb([
+			[],
+			[
+				{
+					id: "ten_1",
+					plan: "team",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[],
+			[],
+			[],
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					type: "subscription.uncanceled",
+					status: "active",
+					cancel_at_period_end: false,
+					ends_at: null,
+					modified_at: "2026-09-19T09:12:44Z",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			subscriptionEndsAt?: Date | null;
+		};
+		expect(setArg?.plan).toBe("team");
+		expect(setArg?.subscriptionEndsAt).toBeNull();
+	});
+
+	it("B-431: subscription.revoked (status canceled) is what ends the plan — free, data held, nothing scheduled", async () => {
+		setDb([
+			[],
+			[
+				{
+					id: "ten_1",
+					plan: "team",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+				},
+			],
+			[{ value: 30 }], // billing_policy.dunning_data_hold_days
+			[],
+			[],
+			[],
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					type: "subscription.revoked",
+					status: "canceled",
+					cancel_at_period_end: false,
+					ends_at: "2026-09-19T09:13:10Z",
+					ended_at: "2026-09-19T09:13:10Z",
+					modified_at: "2026-09-19T09:13:10Z",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			subscriptionEndsAt?: Date | null;
+			dataHoldUntil?: Date;
+		};
+		expect(setArg?.plan).toBe("free");
+		expect(setArg?.subscriptionEndsAt).toBeNull();
+		expect(setArg?.dataHoldUntil).toBeInstanceOf(Date);
+	});
+
+	it("B-431: a paid activation after a lapse CLEARS the data-hold clock left by the lapse", async () => {
+		setDb([
+			[],
+			[
+				{
+					id: "ten_1",
+					plan: "free",
+					priceProtectedUntil: new Date("2020-01-01T00:00:00Z"),
+					dataHoldUntil: new Date("2026-10-19T00:00:00Z"),
+				},
+			],
+			[],
+			[],
+			[],
+		]);
+		const res = await POST(
+			makeReq(
+				subEvent({
+					type: "subscription.active",
+					status: "active",
+					modified_at: "2026-09-19T09:14:08Z",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as {
+			plan?: string;
+			dataHoldUntil?: unknown;
+		};
+		expect(setArg?.plan).toBe("team");
+		expect(setArg?.dataHoldUntil).toBeNull();
+	});
+
 	it("re-cancelling an already-free tenant does not re-arm the data-hold clock", async () => {
 		setDb([
 			[], // dedup select
@@ -666,5 +817,467 @@ describe("POST /api/webhooks/polar", () => {
 		expect(res.status).toBe(200);
 		// Only dedup + record ran -- the tenants table was never queried.
 		expect(m.cursor()).toBe(2);
+	});
+
+	// ── O4 (founder ruling 2026-09-19): SYNCHRONOUS pairing inside the webhook ──
+	//
+	// The half-state P2 (base paid, usage not yet created) was observed for 51 s
+	// in sandbox stage 1 and "the reconciler's cadence" in prod. With a Polar
+	// token on the Worker the webhook creates the usage subscription BEFORE
+	// responding. The resolver stays the ONLY thing that grants: even on success
+	// the tenant is written `free` until the usage half's OWN event arrives.
+	describe("BILL-02 O4: synchronous pairing on the base's active event", () => {
+		const SAVED_TOKEN = process.env.POLAR_WORKER_TOKEN;
+		const SAVED_SANDBOX = process.env.POLAR_SANDBOX;
+		type FetchCall = {
+			method: string;
+			url: string;
+			body?: unknown;
+			bearer?: string;
+		};
+
+		afterEach(() => {
+			if (SAVED_TOKEN === undefined)
+				Reflect.deleteProperty(process.env, "POLAR_WORKER_TOKEN");
+			else process.env.POLAR_WORKER_TOKEN = SAVED_TOKEN;
+			if (SAVED_SANDBOX === undefined)
+				Reflect.deleteProperty(process.env, "POLAR_SANDBOX");
+			else process.env.POLAR_SANDBOX = SAVED_SANDBOX;
+			vi.unstubAllGlobals();
+		});
+
+		/** A fake Polar reached through global fetch — the Worker has no client injection. */
+		function fakePolar(opts: {
+			liveSubs?: unknown[];
+			cards?: unknown[];
+			postStatus?: number;
+			postBody?: string;
+			hang?: boolean;
+		}) {
+			const calls: FetchCall[] = [];
+			const fetchImpl = vi.fn(
+				async (url: string | URL | Request, init?: RequestInit) => {
+					const u = String(url);
+					const method = init?.method ?? "GET";
+					calls.push({
+						method,
+						url: u,
+						body: init?.body ? JSON.parse(String(init.body)) : undefined,
+					});
+					if (opts.hang) {
+						return new Promise<Response>((_resolve, reject) => {
+							init?.signal?.addEventListener("abort", () =>
+								reject(init.signal?.reason ?? new Error("aborted")),
+							);
+						});
+					}
+					const path = new URL(u).pathname + new URL(u).search;
+					if (method === "GET" && path.startsWith("/v1/subscriptions/")) {
+						return new Response(
+							JSON.stringify({ items: opts.liveSubs ?? [] }),
+							{
+								status: 200,
+							},
+						);
+					}
+					if (method === "GET" && /\/payment-methods$/.test(path)) {
+						return new Response(
+							JSON.stringify({
+								items: opts.cards ?? [{ id: "pm_card_1", type: "card" }],
+							}),
+							{ status: 200 },
+						);
+					}
+					if (method === "POST" && path === "/v1/customer-sessions/") {
+						return new Response(
+							JSON.stringify({ token: "polar_cst_test_session" }),
+							{ status: 201 },
+						);
+					}
+					if (method === "PATCH") {
+						// B-435: the portal PATCH must carry the SESSION token, never the
+						// organisation token — recorded so the test can assert it.
+						const auth = String(
+							(init?.headers as Record<string, string> | undefined)
+								?.authorization ?? "",
+						);
+						const last = calls[calls.length - 1];
+						if (last) last.bearer = auth.replace(/^Bearer /, "");
+						return new Response(
+							JSON.stringify({ default_payment_method_id: "pm_card_1" }),
+							{ status: 200 },
+						);
+					}
+					if (method === "POST" && path === "/v1/subscriptions/") {
+						return new Response(
+							opts.postBody ??
+								JSON.stringify({ id: "sub_usage_new", status: "active" }),
+							{ status: opts.postStatus ?? 201 },
+						);
+					}
+					return new Response("unexpected", { status: 500 });
+				},
+			);
+			vi.stubGlobal("fetch", fetchImpl);
+			return { calls, fetchImpl };
+		}
+
+		/** The bound params inside a drizzle `sql` template (the record/claim writes
+		 *  merge jsonb): a primitive interpolated into the tag stays a primitive chunk
+		 *  and is bound as a parameter when rendered; a `Param` object carries `.value`. */
+		function sqlParams(v: unknown): unknown[] {
+			const chunks = (v as { queryChunks?: unknown[] })?.queryChunks ?? [];
+			return chunks.flatMap((c) => {
+				if (typeof c === "string") return [c];
+				if (c && typeof c === "object" && c.constructor?.name === "Param")
+					return [(c as { value: unknown }).value];
+				return [];
+			});
+		}
+		function pairingOf(
+			setArg: Record<string, unknown>,
+		): Record<string, unknown> {
+			const ap = setArg.annualPair as unknown;
+			if (ap && typeof ap === "object" && !("queryChunks" in ap)) {
+				return ((ap as { pairing?: Record<string, unknown> }).pairing ??
+					{}) as Record<string, unknown>;
+			}
+			const json = sqlParams(ap).find((p) => typeof p === "string") as string;
+			return (JSON.parse(json) as { pairing: Record<string, unknown> }).pairing;
+		}
+
+		const liveBase = {
+			id: "sub_base",
+			status: "active",
+			customer_id: "cust_1",
+			product_id: "prod_team_base_year",
+			product: { metadata: { lookup_key: "team_v1_base_year" } },
+		};
+		const liveUsage = {
+			id: "sub_usage_existing",
+			status: "active",
+			customer_id: "cust_1",
+			product_id: "prod_team_usage",
+			current_period_start: "2026-09-14T00:00:00Z",
+			current_period_end: "2026-10-14T00:00:00Z",
+			product: { metadata: { lookup_key: "team_v1_usage_month" } },
+		};
+
+		/** dedup · tenant · usage product id · deadline · claim (won) · P2 write · ws upsert · record · webhook_events */
+		const pairingDb = (row: unknown[], deadlineMs = 6000) =>
+			setDb([
+				[],
+				row,
+				[{ polarProductIdUsageMonth: "prod_team_usage" }],
+				[{ value: deadlineMs }],
+				[{ id: "ten_1" }],
+				[],
+				[],
+				[],
+				[],
+			]);
+
+		it("FALSIFICATION (token UNSET): the planted half-state is REFUSED to free with the alert — never the tier — and no Polar call is made; one line says pairing is off", async () => {
+			Reflect.deleteProperty(process.env, "POLAR_WORKER_TOKEN");
+			const { fetchImpl } = fakePolar({});
+			const info = vi.spyOn(console, "info").mockImplementation(() => {});
+			pairDb(tenantRow(null));
+			const res = await POST(makeReq(baseEvent()));
+			expect(res.status).toBe(200);
+			expect(h.db?.setCalls.length).toBe(1);
+			const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+			expect(setArg.plan).toBe("free");
+			expect((setArg.annualPair as { alert: string }).alert).toBe(
+				"annual_pair_usage_missing",
+			);
+			expect(setArg.polarUsageSubscriptionId).toBeNull();
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(
+				info.mock.calls.some((c) => c.join(" ").includes("POLAR_WORKER_TOKEN")),
+			).toBe(true);
+		});
+
+		it("FALSIFICATION (token SET, Polar refuses the POST with 422): still free + alert, 200 to Polar, the reason logged with the tenant id, the attempt recorded as failed", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { calls } = fakePolar({
+				liveSubs: [liveBase],
+				postStatus: 422,
+				postBody: '{"detail":"customer has no payment method"}',
+			});
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			pairingDb(tenantRow(null));
+			const res = await POST(makeReq(baseEvent()));
+			expect(res.status).toBe(200);
+			// claim · P2 state · record
+			expect(h.db?.setCalls.length).toBe(3);
+			const p2 = h.db?.setCalls[1]?.[0] as Record<string, unknown>;
+			expect(p2.plan).toBe("free");
+			expect((p2.annualPair as { alert: string }).alert).toBe(
+				"annual_pair_usage_missing",
+			);
+			expect(calls.map((c) => c.method)).toEqual([
+				"GET",
+				"GET",
+				"POST",
+				"PATCH",
+				"POST",
+			]);
+			const record = h.db?.setCalls[2]?.[0] as Record<string, unknown>;
+			expect(record.polarUsageSubscriptionId).toBeUndefined();
+			const pairing = pairingOf(record);
+			expect(pairing.result).toBe("failed");
+			expect(String(pairing.reason)).toContain("422");
+			expect(
+				error.mock.calls.some(
+					(c) => c.join(" ").includes("ten_1") && c.join(" ").includes("422"),
+				),
+			).toBe(true);
+		});
+
+		it("happy path: PATCH default card BEFORE POST usage (asserted order), the right product for the plan on the same customer, the usage id stored, plan STILL free until the usage event", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { calls } = fakePolar({ liveSubs: [liveBase] });
+			pairingDb(tenantRow(null));
+			const res = await POST(makeReq(baseEvent()));
+			expect(res.status).toBe(200);
+			expect(calls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([
+				["GET", "/v1/subscriptions/"],
+				["GET", "/v1/customers/cust_1/payment-methods"],
+				["POST", "/v1/customer-sessions/"],
+				["PATCH", "/v1/customer-portal/customers/me"],
+				["POST", "/v1/subscriptions/"],
+			]);
+			expect(
+				calls.every((c) => c.url.startsWith("https://api.polar.sh/")),
+			).toBe(true);
+			expect(calls[2]?.body).toEqual({ customer_id: "cust_1" });
+			// B-435: the default card is set THROUGH THE PORTAL, as the customer.
+			expect(calls[3]?.body).toEqual({
+				default_payment_method_id: "pm_card_1",
+			});
+			expect(calls[3]?.bearer).toBe("polar_cst_test_session");
+			expect(calls[4]?.body).toEqual({
+				product_id: "prod_team_usage",
+				customer_id: "cust_1",
+			});
+			const p2 = h.db?.setCalls[1]?.[0] as Record<string, unknown>;
+			expect(p2.plan).toBe("free"); // NOT the tier on our own say-so
+			expect(p2.polarUsageSubscriptionId).toBeNull();
+			const record = h.db?.setCalls[2]?.[0] as Record<string, unknown>;
+			expect(record.polarUsageSubscriptionId).toBe("sub_usage_new");
+			expect(record.plan).toBeUndefined(); // the record never touches the plan
+			const pairing = pairingOf(record);
+			expect(pairing.result).toBe("created");
+			expect(pairing.usage_subscription_id).toBe("sub_usage_new");
+
+			// …then the usage half's OWN `active` event arrives → P1 through the resolver.
+			pairDb(
+				tenantRow({
+					base: {
+						id: "sub_base",
+						plan: "team",
+						status: "active",
+						period_end: "2027-09-14T00:00:00Z",
+					},
+					alert: "annual_pair_usage_missing",
+					pairing: {
+						attempted_at: "2026-09-19T00:00:00Z",
+						result: "created",
+						usage_subscription_id: "sub_usage_new",
+					},
+				}),
+				[[{ value: 12 }], [{ priceVersion: "v3" }]],
+			);
+			const res2 = await POST(makeReq(usageEvent({ id: "sub_usage_new" })));
+			expect(res2.status).toBe(200);
+			const p1 = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+			expect(p1.plan).toBe("team");
+			expect(p1.billingInterval).toBe("year");
+			expect(p1.currentPeriodStart).toEqual(new Date("2026-09-14T00:00:00Z"));
+			expect(p1.currentPeriodEnd).toEqual(new Date("2026-10-14T00:00:00Z"));
+			expect(p1.polarUsageSubscriptionId).toBe("sub_usage_new");
+			expect((p1.annualPair as { alert: unknown }).alert).toBeNull();
+		});
+
+		it("replay (the base's `active` / `updated` after `created`): Polar already lists a held usage half → NO second POST, the existing id is stored", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { calls } = fakePolar({ liveSubs: [liveBase, liveUsage] });
+			// No pairing marker on the row (the reconciler, or a lost record write)
+			// — the LIVE check is what stops the duplicate.
+			pairingDb(
+				tenantRow({
+					base: { id: "sub_base", plan: "team", status: "active" },
+					alert: "annual_pair_usage_missing",
+				}),
+			);
+			const res = await POST(
+				makeReq(baseEvent({ type: "subscription.active" })),
+			);
+			expect(res.status).toBe(200);
+			expect(calls.map((c) => c.method)).toEqual(["GET"]);
+			const record = h.db?.setCalls[2]?.[0] as Record<string, unknown>;
+			expect(record.polarUsageSubscriptionId).toBe("sub_usage_existing");
+			expect(pairingOf(record).result).toBe("existing");
+		});
+
+		it("M1 (security review 2026-09-19): a STALE `attempting` claim (older than 10× the deadline) is re-taken and pairs; a FRESH one is not", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const stale = new Date(Date.now() - 6000 * 10 - 60_000).toISOString();
+			const { calls } = fakePolar({ liveSubs: [liveBase] });
+			pairingDb(
+				tenantRow({
+					base: { id: "sub_base", plan: "team", status: "active" },
+					alert: "annual_pair_usage_missing",
+					pairing: { attempted_at: stale, result: "attempting" },
+				}),
+			);
+			const res = await POST(
+				makeReq(baseEvent({ type: "subscription.updated" })),
+			);
+			expect(res.status).toBe(200);
+			expect(calls.map((c) => c.method)).toEqual([
+				"GET",
+				"GET",
+				"POST",
+				"PATCH",
+				"POST",
+			]);
+			const record = h.db?.setCalls[2]?.[0] as Record<string, unknown>;
+			expect(pairingOf(record).result).toBe("created");
+
+			// Fresh: another delivery is pairing right now → no claim, no Polar.
+			const fresh = new Date(Date.now() - 1000).toISOString();
+			const b = fakePolar({ liveSubs: [liveBase] });
+			setDb([
+				[],
+				tenantRow({
+					base: { id: "sub_base", plan: "team", status: "active" },
+					alert: "annual_pair_usage_missing",
+					pairing: { attempted_at: fresh, result: "attempting" },
+				}),
+				[{ polarProductIdUsageMonth: "prod_team_usage" }],
+				[{ value: 6000 }],
+				[],
+				[],
+				[],
+			]);
+			const res2 = await POST(
+				makeReq(baseEvent({ type: "subscription.updated" })),
+			);
+			expect(res2.status).toBe(200);
+			expect(b.fetchImpl).not.toHaveBeenCalled();
+			expect(h.db?.setCalls.length).toBe(1);
+		});
+
+		it("replay with the attempt already RECORDED on the row → zero Polar calls and no claim", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { fetchImpl } = fakePolar({ liveSubs: [liveBase, liveUsage] });
+			// dedup · tenant · P2 write · ws upsert · webhook_events — no claim, no record
+			setDb([
+				[],
+				tenantRow({
+					base: { id: "sub_base", plan: "team", status: "active" },
+					alert: "annual_pair_usage_missing",
+					pairing: {
+						attempted_at: "2026-09-19T00:00:00Z",
+						result: "created",
+						usage_subscription_id: "sub_usage_new",
+					},
+				}),
+				[],
+				[],
+				[],
+			]);
+			const res = await POST(
+				makeReq(baseEvent({ type: "subscription.updated" })),
+			);
+			expect(res.status).toBe(200);
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(h.db?.setCalls.length).toBe(1);
+			const p2 = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+			expect(p2.plan).toBe("free");
+			expect(pairingOf(p2).result).toBe("created"); // the marker survives the write
+		});
+
+		it("two deliveries in flight: the claim is LOST → no Polar call, and the P2 write carries the OTHER invocation's live marker instead of clobbering it", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { fetchImpl } = fakePolar({ liveSubs: [liveBase] });
+			setDb([
+				[], // dedup
+				tenantRow(null), // read BEFORE the other invocation claimed
+				[{ polarProductIdUsageMonth: "prod_team_usage" }],
+				[{ value: 6000 }],
+				[], // claim → 0 rows: someone else holds it
+				[
+					{
+						annualPair: {
+							base: { id: "sub_base", plan: "team", status: "active" },
+							pairing: {
+								attempted_at: "2026-09-19T00:00:01Z",
+								result: "attempting",
+							},
+						},
+					},
+				], // re-read the live marker
+				[], // P2 write
+				[], // ws upsert
+				[], // webhook_events
+			]);
+			const res = await POST(
+				makeReq(baseEvent({ type: "subscription.active" })),
+			);
+			expect(res.status).toBe(200);
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(h.db?.setCalls.length).toBe(2); // claim attempt + P2 write, no record
+			const p2 = h.db?.setCalls[1]?.[0] as Record<string, unknown>;
+			expect(pairingOf(p2).result).toBe("attempting");
+		});
+
+		it("timeout: Polar never answers → the webhook still returns 200 within the deadline, the tenant stays P2, the attempt is recorded as failed", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			fakePolar({ hang: true });
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			pairingDb(tenantRow(null), 50); // billing_policy.annual_pairing_deadline_ms = 50
+			const started = Date.now();
+			const res = await POST(makeReq(baseEvent()));
+			expect(res.status).toBe(200);
+			expect(Date.now() - started).toBeLessThan(2_000);
+			const p2 = h.db?.setCalls[1]?.[0] as Record<string, unknown>;
+			expect(p2.plan).toBe("free");
+			const record = h.db?.setCalls[2]?.[0] as Record<string, unknown>;
+			expect(pairingOf(record).result).toBe("failed");
+			expect(error).toHaveBeenCalled();
+		});
+
+		it("POLAR_SANDBOX=1 routes every call to sandbox-api.polar.sh — the reconciler's --sandbox rule", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			process.env.POLAR_SANDBOX = "1";
+			const { calls } = fakePolar({ liveSubs: [liveBase] });
+			pairingDb(tenantRow(null));
+			await POST(makeReq(baseEvent()));
+			expect(calls.length).toBe(5);
+			expect(
+				calls.every((c) => c.url.startsWith("https://sandbox-api.polar.sh/")),
+			).toBe(true);
+		});
+
+		it("the usage product id is unconfigured for the plan (seed not run) → no claim, no Polar call, P2 as today, logged", async () => {
+			process.env.POLAR_WORKER_TOKEN = "polar_oat_worker_test";
+			const { fetchImpl } = fakePolar({ liveSubs: [liveBase] });
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			setDb([
+				[],
+				tenantRow(null),
+				[{ polarProductIdUsageMonth: null }],
+				[], // P2 write
+				[], // ws upsert
+				[], // webhook_events
+			]);
+			const res = await POST(makeReq(baseEvent()));
+			expect(res.status).toBe(200);
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(h.db?.setCalls.length).toBe(1);
+			expect(error).toHaveBeenCalled();
+		});
 	});
 });

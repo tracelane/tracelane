@@ -91,6 +91,18 @@ reason = "dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migrat
 id = "GHSA-5xrq-8626-4rwp"
 reason = "vitest UI server arbitrary file read/exec. REASON CORRECTED 2026-08-24: the previous text said 'patch is vitest 4.1.0 (major)'. OSV's real ranges are [0, 3.2.6) and [4.0.0, 4.1.0); we resolve vitest 2.1.9 (declared ^2.0.0 in 6 packages), so we sit in the FIRST range and the first fixed version on our line is 3.2.6 - still a MAJOR bump (2.x -> 3.x), not the 4.x one claimed. Conclusion unchanged, arithmetic was wrong. Precondition not met either: the advisory requires the vitest UI server to be LISTENING; every invocation here is `vitest run` (no --ui), and it is dev/test tooling never shipped in a product artifact. FOUNDER RULING R126 (2026-08-24): NO BUMP — a 2->3 major across six packages for a dev-only test runner whose exploit precondition we never meet. This ignore is DELIBERATE and its reason is now the true one; if it goes false again, delete or correct it rather than leaving it, because an ignore whose stated reason is false is worse than an unused one."
 
+# vitest 2026-09-08 advisory (CVE-2026-84373): path traversal via a redirect mock, reachable ONLY
+# through the unauthenticated `mockerPlugin`/`interceptorPlugin` of a Vite DEV SERVER or vitest
+# browser mode — `grep -rn "browser:\|@vitest/browser\|mockerPlugin"` over the tree is empty, and
+# every invocation is `vitest run` (no dev server, no --ui, no browser). Same class and the same
+# founder ruling as GHSA-5xrq above (R126: no 2->4 major for a dev-only runner whose precondition
+# we never meet). Fix version is 4.1.11 — the VITEST-MAJOR item. B-434, 2026-09-19. Mirrored in
+# .grype.yaml (`@vitest/mocker`; `vitest` was already there by package).
+# REVIEW: 2026-11-07
+[[IgnoredVulns]]
+id = "GHSA-82fw-gwwq-j7x9"
+reason = "vitest/@vitest/mocker 2.1.9 redirect-mock path traversal: needs a Vite dev server or vitest browser mode; we run `vitest run` only, never shipped. Fix is 4.1.11 (major) — VITEST-MAJOR. Founder R126 class."
+
 # ── astro: THREE IGNORES DELETED 2026-09-10, FIXED RATHER THAN SUPPRESSED ─────
 #
 # `GHSA-4g3v-8h47-v7g6`, `GHSA-f48w-9m4c-m7f5` and `GHSA-7pw4-f3q4-r2p2` were
