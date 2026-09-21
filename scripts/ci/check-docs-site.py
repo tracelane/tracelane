@@ -193,6 +193,16 @@ def check(docs: Path) -> list[str]:
                 hits.append(
                     f"MDX     {rel}:{lineno}: bare '<' breaks the MDX parse → page 404s: {snippet}"
                 )
+            # B-534 (2026-09-21): MDX has no HTML comments. `<!-- pricing-guard: allow … -->`
+            # sat in three .mdx files for a week and Mintlify's deploy of the first
+            # promotion that CHANGED one of them failed with "Unexpected character `!`
+            # before name … to create a comment in MDX, use {/* text */}" — the whole
+            # deployment, every corrected page with it. Mintlify re-parses only changed
+            # files, so the comments passed as long as those files stayed untouched.
+            if "<!--" in line:
+                hits.append(
+                    f"MDX-COMMENT {rel}:{lineno}: HTML comment `<!--` in an .mdx file — MDX has none; use {{/* … */}} (Mintlify refuses the whole deployment)"
+                )
         for target in BODY_LINK.findall(text):
             slug = target.lstrip("/")
             if slug and slug not in known:
@@ -204,6 +214,10 @@ SELFTEST_CASES = {
     "NAV": ("docs.json", lambda s: s.replace('"index"', '"index", "ghost-page"')),
     "ASSET": ("docs.json", lambda s: s.replace('"/favicon.svg"', '"/nope.svg"')),
     "MDX": ("index.mdx", lambda s: s + "\nGateway overhead is <5ms p99.\n"),
+    "MDX-COMMENT": (
+        "index.mdx",
+        lambda s: s + "\nfoo <!-- pricing-guard: allow $5 x --> bar\n",
+    ),
     "LINK": ("index.mdx", lambda s: s + "\nSee the [ghost](/nowhere-at-all).\n"),
     # Re-adds the exact nav entry that made /changelog 404 on the live site.
     "EXPORT": (

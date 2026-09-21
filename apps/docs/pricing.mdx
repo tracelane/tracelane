@@ -159,8 +159,8 @@ included on Enterprise.
 
 | Claim | Tracelane | LangSmith | LangSmith Engine | Langfuse Pro | Braintrust Pro |
 |---|---|---|---|---|---|
-| Price entry paid | $29 Builder | $39/seat Plus<!-- pricing-guard: allow $39 competitor-price --> | Plus + Engine usage | $199 Pro<!-- pricing-guard: allow $199 competitor-price --> | $249 Pro<!-- pricing-guard: allow $249 competitor-price --> |
-| Usage metering | Six per-unit meters (ingest/hot/series/query/cold/evals), no rollover, no hard-cap | $0.50/1K, no cap documented<!-- pricing-guard: allow $0.50 competitor-price --> | $0.50/1K + Engine usage<!-- pricing-guard: allow $0.50 competitor-price --> | $8/100K, no cap<!-- pricing-guard: allow $8 competitor-price --> | $3/GB ingest<!-- pricing-guard: allow $3 competitor-price --> |
+| Price entry paid | $29 Builder | $39/seat Plus{/* pricing-guard: allow $39 competitor-price */} | Plus + Engine usage | $199 Pro{/* pricing-guard: allow $199 competitor-price */} | $249 Pro{/* pricing-guard: allow $249 competitor-price */} |
+| Usage metering | Six per-unit meters (ingest/hot/series/query/cold/evals), no rollover, no hard-cap | $0.50/1K, no cap documented{/* pricing-guard: allow $0.50 competitor-price */} | $0.50/1K + Engine usage{/* pricing-guard: allow $0.50 competitor-price */} | $8/100K, no cap{/* pricing-guard: allow $8 competitor-price */} | $3/GB ingest{/* pricing-guard: allow $3 competitor-price */} |
 | Retention | Indexed 3d–365d+, queryable 30d–2y by tier, no upcharge | 14d base, 9–10× upcharge to 400d | 14d base, 9–10× upcharge to 400d | 90d Core, 3yr Pro | 14d Starter, 30d Pro |
 | Gateway | Rust gateway, BYOK 0% | Partial — lists an "LLM Gateway" to "control agent model calls"; BYOK and self-hosting for it are not documented there [langchain.com/langsmith, 2026-09-07] | LLM Gateway (LangSmith-managed inference per ToS) | none (obs only) | none (eval only) |
 | Inline predictive guardrails | yes, inline | no | no (post-failure clustering) | no | no |
