@@ -69,6 +69,14 @@
 						"pages": ["cli", "mcp-server", "api-reference"]
 					},
 					{
+						"group": "Audit & compliance",
+						"pages": [
+							"audit/conformance-statement",
+							"audit/verifier-cli",
+							"compliance/eu-ai-act-article-12"
+						]
+					},
+					{
 						"group": "Operations",
 						"pages": ["self-hosting", "security", "troubleshooting"]
 					},
