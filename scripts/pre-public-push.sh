@@ -207,6 +207,45 @@ if [ "${1:-}" = "--selftest" ]; then
     fi
     rm -f "$md_bullet"
 
+    # 11. COMPLETENESS (ADR-077 Part III R5, B-450). The homepage shipped "Every trace,
+    # provable." because no rule covered completeness vocabulary — integrity is shipped,
+    # completeness is not (spans fail open and count their drops; OTLP traces are not in
+    # the chain). Plant each shape the founder named and prove each BLOCKS under its own
+    # label; then plant the TRUE, scoped sentences the rule must leave alone and prove
+    # they do NOT block — a rule that bans a true claim is the mirror of publishing a
+    # false one (this file's own "compliance evidence pack" lesson).
+    comp_planted="$ROOT/docs/guides/_nsa_selftest_completeness.md"
+    comp_fail=0
+    while IFS= read -r comp_phrase; do
+        printf '<!-- tracelane:classification: PUBLIC -->\n# probe\n\n%s\n' "$comp_phrase" > "$comp_planted"
+        if run_gate | grep -q 'BLOCKED \[completeness\]'; then :; else
+            echo "  ✗ completeness phrase NOT caught: $comp_phrase"; comp_fail=$((comp_fail+1))
+        fi
+    done <<'PHRASES'
+Every call, traced. Every trace, provable.
+Every call, full fidelity, your keys.
+Every span is captured and hash-chained.
+All traces are recorded, nothing is dropped.
+We never lose a call.
+A complete record of every agent run.
+Lossless capture at the gateway.
+PHRASES
+    [ "$comp_fail" -eq 0 ] && echo "  ✓ every planted completeness phrase is caught under [completeness] (7 shapes)"
+    st_fail=$((st_fail+comp_fail))
+    # The negative control: TRUE sentences already on public surfaces, all must pass.
+    printf '<!-- tracelane:classification: PUBLIC -->\n# probe\n\n%s\n%s\n%s\n%s\n%s\n' \
+        'Every request through the Tracelane gateway is appended to the ledger.' \
+        'Every event is chained by SHA-256 to the event before it.' \
+        'absent = the complete ledger, uncapped' \
+        'Auto-age moves the oldest days to cold early; nothing is lost.' \
+        'Every gateway call, recorded. Every record, verifiable.' > "$comp_planted"
+    if run_gate | grep -q 'BLOCKED \[completeness\]'; then
+        echo "  ✗ the completeness rule fired on a TRUE, scoped sentence — it bans accurate copy"; st_fail=$((st_fail+1))
+    else
+        echo "  ✓ true, scoped sentences (gateway-scoped every, ledger events, uncapped export, auto-age) are not flagged"
+    fi
+    rm -f "$comp_planted"
+
     [ "$st_fail" -eq 0 ] && { echo "never-say-again selftest PASSED."; exit 0; }
     echo "never-say-again selftest FAILED — $st_fail case(s)."; exit 1
 fi

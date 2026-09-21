@@ -46,7 +46,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 | Guardrails on the hot path | Yes — **R1–R8**, deterministic rule-based rails inline at the gateway (cost/budget, secrets+PII redaction, tool pinning, lethal-trifecta, format, system-prompt-leak, topic/competitor, prompt-injection); every verdict is written to the audit ledger. R1/R3/R4/R8 free on every deployment incl. OSS self-host; R2/R5/R6/R7 (data-governance + quality) on Team and above <sup>[T5]</sup> | Yes — PII masking, prompt-injection detection, secret detection <sup>[1]</sup> | Yes — "50+ AI Guardrails" <sup>[2]</sup> | Partial — enterprise only, custom plugin <sup>[3]</sup> | Not documented <sup>[4]</sup> | No | No | No | No |
 | Failover / routing | Partial — model→provider map fails closed (400 `unroutable_model`, no silent default); multi-key routing built <sup>[T6]</sup> | Yes — fallback chains, context-window fallback, cooldown <sup>[13]</sup> | Yes — automatic fallbacks, circuit breaker <sup>[2]</sup> | Yes — automatic failover, load balancing <sup>[3]</sup> | Not documented <sup>[4]</sup> | No | No | No | No |
 | OpenAI-compatible endpoint | Yes — `/v1/chat/completions` <sup>[T1]</sup> | Yes <sup>[1]</sup> | Yes <sup>[2]</sup> | Yes <sup>[3]</sup> | Yes <sup>[4]</sup> | — | Partial — gateway is managed <sup>[5]</sup> | — | — |
-| Anthropic-native `/v1/messages` | Yes — `GWY-47`, proven on production with a real Claude Code session <sup>[T7]</sup> | Partial — routes Anthropic models, but via OpenAI-shaped format <sup>[10]</sup> | Not documented <sup>[2]</sup> | Not documented <sup>[3]</sup> | Yes — direct integration listed <sup>[4]</sup> | — | — | — | — |
+| Anthropic-native `/v1/messages` | Yes — proven on production with a real Claude Code session <sup>[T7]</sup> | Partial — routes Anthropic models, but via OpenAI-shaped format <sup>[10]</sup> | Not documented <sup>[2]</sup> | Not documented <sup>[3]</sup> | Yes — direct integration listed <sup>[4]</sup> | — | — | — | — |
 
 ## Observability
 
@@ -55,14 +55,14 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 | OTel-native ingest (OTLP) | Yes — the OTLP decode path preserves `parent_span_id` by design <sup>[T8]</sup> | Partial — emits OTel spans for guardrail violations <sup>[1]</sup>; native ingest not confirmed | Partial — OTel emission, not primary ingest <sup>[8]</sup> | Partial — Prometheus + distributed tracing <sup>[3]</sup> | Not documented <sup>[4]</sup> | Yes — OTel-native, primary wire format <sup>[14]</sup> | Partial — proprietary format primary <sup>[5]</sup> | Partial — proprietary format primary <sup>[15]</sup> | Yes — native OTel <sup>[16]</sup> |
 | Full-fidelity capture (no default sampling) | Yes — no default sampling; capture on in the published benchmark <sup>[T2]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — all LLM and non-LLM calls <sup>[14]</sup> | Yes — "full visibility" <sup>[5]</sup> | Not documented | Not documented |
 | Trace tree + tool spans | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — traces include tool calls <sup>[14]</sup> | Yes — step-by-step agent view <sup>[5]</sup> | Yes — tracing with spans <sup>[15]</sup> | Yes — every step incl. tool calls <sup>[16]</sup> |
-| Sessions / threads | Yes — `OBS-19` (`/sessions`, `gen_ai.conversation.id`); per-user identity within a session is on the roadmap <sup>[T10]</sup> | Not documented | Not documented | Not documented | Yes — sessions listed <sup>[4]</sup> | Yes — multi-turn sessions <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — "Loop thread" <sup>[15]</sup> | Not documented |
-| Multi-agent swimlanes / agent graph | Yes — `OBS-49` <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — agent graphs <sup>[14]</sup> | Yes — agent step view <sup>[5]</sup> | Not documented | Not documented |
-| Full-text trace search | Yes — `OBS-01` <sup>[T9]</sup> | Not documented | Not documented | Not documented | Partial — HQL query language <sup>[4]</sup> | Not documented <sup>[14]</sup> | Yes — production monitoring + search <sup>[5]</sup> | Not documented | Not documented |
+| Sessions / threads | Yes — `/sessions`, keyed on `gen_ai.conversation.id`; per-user identity within a session is on the roadmap <sup>[T10]</sup> | Not documented | Not documented | Not documented | Yes — sessions listed <sup>[4]</sup> | Yes — multi-turn sessions <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — "Loop thread" <sup>[15]</sup> | Not documented |
+| Multi-agent swimlanes / agent graph | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — agent graphs <sup>[14]</sup> | Yes — agent step view <sup>[5]</sup> | Not documented | Not documented |
+| Full-text trace search | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Partial — HQL query language <sup>[4]</sup> | Not documented <sup>[14]</sup> | Yes — production monitoring + search <sup>[5]</sup> | Not documented | Not documented |
 | Cost per request / model | Yes <sup>[T11]</sup> | Yes — per key/team/user tracking <sup>[1]</sup> | Yes — usage analytics <sup>[2]</sup> | Yes — budget management <sup>[3]</sup> | Not documented | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Not documented |
-| In-app AI assistant over your traces | Yes — `OBS-40` ("Ask Tara"), a natural-language query surface over your own traces, deployed to production <sup>[T12]</sup> | No | No | No | No | Not documented | Not documented | Not documented | Not documented |
-| MCP server for trace access | Yes — `PLT-22`, `@tracelanedev/mcp` (published on npm, `0.3.0`), read-only and tenant-scoped: it reads through the gateway's own `/v1/*` routes with the caller's own bearer token <sup>[T13]</sup> | No | No | Yes — MCP for external tool integration <sup>[3]</sup> | No | No | No | No | No |
-| Claude Code / coding-agent integration | Yes — two paths: `PLT-46` (an OTLP flight recorder that decodes Claude Code's native span shape) and `GWY-47` (an Anthropic-native `/v1/messages` proxy), both proven on production with real Claude Code sessions <sup>[T14]</sup> | Not documented — routing Claude models is not a coding-agent integration | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
-| Shareable trace links | Yes — `OBS-48`, a public `/s/<token>` page carrying the audit-ledger badge <sup>[T15]</sup> | No | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
+| In-app AI assistant over your traces | Yes — "Ask Tara", a natural-language query surface over your own traces, deployed to production <sup>[T12]</sup> | No | No | No | No | Not documented | Not documented | Not documented | Not documented |
+| MCP server for trace access | Yes — `@tracelanedev/mcp` (published on npm, `0.3.0`), read-only and tenant-scoped: it reads through the gateway's own `/v1/*` routes with the caller's own bearer token <sup>[T13]</sup> | No | No | Yes — MCP for external tool integration <sup>[3]</sup> | No | No | No | No | No |
+| Claude Code / coding-agent integration | Yes — two paths: an OTLP flight recorder that decodes Claude Code's native span shape, and an Anthropic-native `/v1/messages` proxy, both proven on production with real Claude Code sessions <sup>[T14]</sup> | Not documented — routing Claude models is not a coding-agent integration | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
+| Shareable trace links | Yes — a public `/s/<token>` page carrying the audit-ledger badge <sup>[T15]</sup> | No | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
 
 ## Evals
 
@@ -70,10 +70,10 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 |---|---|---|---|---|---|---|---|---|---|
 | Datasets | Yes — proven on production <sup>[T16]</sup> | No | Not documented | No | Yes — listed <sup>[4]</sup> | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes <sup>[16]</sup> |
 | Experiments | Yes — proven on production <sup>[T16]</sup> | No | Not documented | No | Not documented | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes <sup>[16]</sup> |
-| LLM-as-judge online evals with sampling | Yes — `EVL-28`, 11.11% sampling against a 10% configured rate, proven on production <sup>[T17]</sup> | No | Not documented | No | Not documented | Yes — LLM-as-judge evaluators <sup>[14]</sup> | Yes — online evaluations <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes — LLM-as-judge <sup>[16]</sup> |
-| Annotation / review queues | Yes — `EVL-29`, proven on production <sup>[T18]</sup> | No | Not documented | No | Not documented | Yes — annotation queues <sup>[14]</sup> | Yes — annotation queues <sup>[5]</sup> | Not documented | Yes — human review <sup>[16]</sup> |
-| CI eval gate (GitHub Action / CLI) | Yes — `EVL-30`, `@tracelanedev/cli` (published on npm, `0.3.0`), proven on production <sup>[T19]</sup> | No | No | No | No | Partial — webhooks + GitHub Actions for alerts <sup>[14]</sup> | Not documented | Not documented | Not documented |
-| Prompt management + playground | Yes — `EVL-03` + `OBS-01` <sup>[T20]</sup> | No | Yes — prompt templates across tiers <sup>[12]</sup> | Not documented | Yes — prompts listed as a feature <sup>[4]</sup> | Yes — versioning + deployment without code changes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — playground <sup>[15]</sup> | Yes — Prompt IDE <sup>[16]</sup> |
+| LLM-as-judge online evals with sampling | Yes — 11.11% sampling against a 10% configured rate, proven on production <sup>[T17]</sup> | No | Not documented | No | Not documented | Yes — LLM-as-judge evaluators <sup>[14]</sup> | Yes — online evaluations <sup>[5]</sup> | Yes <sup>[15]</sup> | Yes — LLM-as-judge <sup>[16]</sup> |
+| Annotation / review queues | Yes — proven on production <sup>[T18]</sup> | No | Not documented | No | Not documented | Yes — annotation queues <sup>[14]</sup> | Yes — annotation queues <sup>[5]</sup> | Not documented | Yes — human review <sup>[16]</sup> |
+| CI eval gate (GitHub Action / CLI) | Yes — `@tracelanedev/cli` (published on npm, `0.3.0`), proven on production <sup>[T19]</sup> | No | No | No | No | Partial — webhooks + GitHub Actions for alerts <sup>[14]</sup> | Not documented | Not documented | Not documented |
+| Prompt management + playground | Yes <sup>[T20]</sup> | No | Yes — prompt templates across tiers <sup>[12]</sup> | Not documented | Yes — prompts listed as a feature <sup>[4]</sup> | Yes — versioning + deployment without code changes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — playground <sup>[15]</sup> | Yes — Prompt IDE <sup>[16]</sup> |
 
 ## Trust
 
@@ -137,23 +137,23 @@ None of these are silent gaps — every one is stated as a limit in a public Tra
 - **[T1]** `crates/gateway/src/admission.rs` + `crates/gateway/src/server/chat.rs` — the Rust gateway hot path
 - **[T2]** [`/benchmarks`](/benchmarks) — AIGatewayBench CCX23, 2026-09-07: Tracelane 2/4/5 ms, Portkey 3–4/5–7/8–9 ms, Bifrost 2/2/3 ms, LiteLLM Python 14–15/34–36/47–52 ms
 - **[T3]** [`/pricing`](/pricing) — 191 providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
-- **[T4]** feature `GWY-24` — exact-match caching built and proven; the semantic tier is built but has never run in production (0 rows), because 94% of production traffic is Anthropic, which has no embeddings API
+- **[T4]** exact-match caching built and proven; the semantic tier is built but has never run in production (0 rows), because 94% of production traffic is Anthropic, which has no embeddings API
 - **[T5]** `crates/gateway/src/guardrail/rails/` (`r1_cost.rs` … `r8_injection.rs`) + [`/pricing`](/pricing) FAQ ("What inline guardrails run on every request?") for the free-vs-Team+ split
 - **[T6]** the feature inventory; `crates/gateway/src/providers/mod.rs` — model→provider routing fails closed to `unroutable_model`
-- **[T7]** feature `GWY-47` — Anthropic-native `POST /v1/messages`, deployed and proven on production 2026-09-06 with a real Claude Code session (3 proxied spans, tokens and cost present)
+- **[T7]** Anthropic-native `POST /v1/messages`, deployed and proven on production 2026-09-06 with a real Claude Code session (3 proxied spans, tokens and cost present)
 - **[T8]** `crates/shared/src/otlp/decode.rs` — the `parent_span_id must survive` comment and the OTLP decode path
-- **[T9]** feature `OBS-49` (multi-agent swimlanes) and `OBS-01` (full-text trace search) rows, both shipped and deployed 2026-09-06
-- **[T10]** feature `OBS-19` — `/v1/sessions` and `/v1/sessions/{id}/traces` handlers in `crates/gateway/src/server.rs`
+- **[T9]** multi-agent swimlanes and full-text trace search, both shipped and deployed 2026-09-06
+- **[T10]** `/v1/sessions` and `/v1/sessions/{id}/traces` handlers in `crates/gateway/src/server.rs`
 - **[T11]** the feature inventory — cost-per-request tracking, built
-- **[T12]** feature `OBS-40` — "Ask Tara," the in-app natural-language query surface, shipped and deployed 2026-09-06; distinct from the MCP server (`PLT-22`, below)
-- **[T13]** feature `PLT-22` — `apps/mcp/src/reader.ts`, `GatewayReader` reads `/v1/*` with the caller's own bearer, tenant isolation proven against production ClickHouse; `@tracelanedev/mcp@0.3.0` published to npm 2026-09-07, confirmed by `npm view @tracelanedev/mcp version`
-- **[T14]** feature `PLT-46` (Claude Code flight recorder, OTLP decoder aliases + cost backfill, deployed and proven 2026-09-06) and `GWY-47` row (Anthropic-native proxy, see [T7])
-- **[T15]** feature `OBS-48` — public `/s/<token>` page, built and deployed 2026-09-06; the per-IP rate limiter defect found in the first prod proof (`B-352`) was fixed and re-proven
+- **[T12]** "Ask Tara," the in-app natural-language query surface, shipped and deployed 2026-09-06; distinct from the MCP server (below)
+- **[T13]** `apps/mcp/src/reader.ts`, `GatewayReader` reads `/v1/*` with the caller's own bearer, tenant isolation proven against production ClickHouse; `@tracelanedev/mcp@0.3.0` published to npm 2026-09-07, confirmed by `npm view @tracelanedev/mcp version`
+- **[T14]** the Claude Code flight recorder (OTLP decoder aliases + cost backfill, deployed and proven 2026-09-06) and the Anthropic-native proxy (see [T7])
+- **[T15]** the public `/s/<token>` page, built and deployed 2026-09-06; a per-IP rate-limiter defect found in the first production proof was fixed and re-proven
 - **[T16]** the feature inventory — Sprint 3 items 8 (datasets) and 9 (experiments), proven on production
-- **[T17]** feature `EVL-28` — online evals with sampling, proven on production 2026-08-29, achieved 11.11% against a configured 10% rate
-- **[T18]** feature `EVL-29` — annotation queues, proven on production 2026-08-29
-- **[T19]** feature `EVL-30` — the CI eval gate and `@tracelanedev/cli`, proven on production 2026-08-30; `@tracelanedev/cli@0.3.0` published to npm 2026-09-07
-- **[T20]** the feature inventory `EVL-03` + `OBS-01` rows — prompt management, playground and trace search, shipped 2026-09-06
+- **[T17]** online evals with sampling, proven on production 2026-08-29, achieved 11.11% against a configured 10% rate
+- **[T18]** annotation queues, proven on production 2026-08-29
+- **[T19]** the CI eval gate and `@tracelanedev/cli`, proven on production 2026-08-30; `@tracelanedev/cli@0.3.0` published to npm 2026-09-07
+- **[T20]** prompt management, playground and trace search, shipped 2026-09-06
 - **[T21]** [`/pricing`](/pricing) audit-ledger description and [`/audit-ledger`](/audit-ledger) — Merkle-batched hash chain, Ed25519 per-tenant signing (live), best-effort Sigstore Rekor v2 inclusion proof on anchored batches
 - **[T22]** [`/pricing`](/pricing) — no SOC 2 / ISO 27001 mentioned, no SLA clause; single-region, 365-day maximum retention, not configurable
 

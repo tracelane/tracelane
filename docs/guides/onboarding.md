@@ -41,13 +41,14 @@ export TRACELANE_GATEWAY_URL="https://gateway.tracelane.dev"
 
 Then send your first request — see [Quickstart](quickstart.md).
 
-### 4. (Optional) Upgrade to Pro / Enterprise
+### 4. (Optional) Upgrade to a paid plan
 
 In the dashboard: **Settings → Billing → Manage**. We open a
 Polar-hosted customer-portal session (`POST /v1/billing/portal`) where
 you upgrade the plan, add payment method, and view invoices. Plan
-changes are recorded within seconds via Polar webhook → Postgres
-`tenants.set_plan_tier`, and the dashboard reflects them straight away.
+changes are recorded within seconds via the Polar webhook, which is the only
+writer of `tenants.plan` (`apps/web/app/api/webhooks/polar/route.ts`), and the
+dashboard reflects them straight away.
 **Your new limits apply to API traffic within 15 minutes** — the gateway
 serves entitlements from a cache rather than reading the control plane on
 every request, and that cache TTL is the bound.
@@ -82,7 +83,10 @@ This starts Postgres + ClickHouse + NATS + Grafana on local ports.
 ```
 
 The other ClickHouse migrations (audit_log, traces, spans) auto-apply
-from `infra/dev/clickhouse/schema.sql` at container init.
+from `infra/dev/clickhouse/schema.sql` at container init. With a Postgres URL set, the
+audit ledger is canonical in Postgres (`audit_log_rows`, `audit_anchor_records`, migration
+`0047`) and ClickHouse `audit_log` is its read copy; without Postgres the chain lives in
+ClickHouse alone.
 
 ### 3. Configure secrets
 
@@ -92,6 +96,7 @@ config file by design — secrets live in your secrets store).
 | Variable | Required | Purpose |
 |---|---|---|
 | `TRACELANE_PORT` | no (default 8080) | Listen port |
+| `NATS_URL` | **yes** — the gateway refuses to boot without it | `nats://host:4222`, the span bus to ingest. To run deliberately without span capture, set `TRACELANE_ALLOW_NO_CAPTURE=1` instead |
 | `POSTGRES_URL` | for production | `postgres://user:pass@host:5432/tracelane` |
 | `CLICKHOUSE_URL` | for production | `http://host:8123` |
 | `WORKOS_CLIENT_ID` | for production | WorkOS Connect client id |
@@ -104,13 +109,14 @@ config file by design — secrets live in your secrets store).
 | `POLAR_EXPECTED_ORGANIZATION_ID` | for billing webhook | pins the Polar org the webhook secret was issued for |
 | `TRACELANE_BILLING_RETURN_URL` | optional | default `https://app.tracelane.dev/billing` |
 | `TRACELANE_REKOR_SIGNING_KEY` | for audit anchoring | PKCS#8 DER base64 Ed25519 key |
+| `TRACELANE_REKOR_URL` | for audit anchoring | Transparency-log endpoint. Unset or empty, anchor batches are signed and persisted locally and never posted — the signing key alone anchors nothing |
 | `TRACELANE_REKOR_ANCHOR_EVERY` | optional | default 100 events per anchor batch |
 | `TRACELANE_DEV_AUTH` | optional | set to `0` to disable dev auth fallback in debug builds |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | optional | `http://localhost:4318` for span emit — OTLP **HTTP**. `:4317` is the gRPC port and Tracelane does not serve it |
 
 Routes mount conditionally:
 
-- `/v1/audit/export` — only with `CLICKHOUSE_URL`
+- `/v1/audit/export` — only with `CLICKHOUSE_URL`; reads the canonical Postgres ledger when `POSTGRES_URL` is also set, else ClickHouse
 - `/v1/billing/portal` — only with `POLAR_ACCESS_TOKEN`
 - `/api/webhooks/polar` — served by the DASHBOARD app (`apps/web`), not the gateway; only with `POLAR_WEBHOOK_SECRET`
 - `/v1/webhooks/workos` — only with `WORKOS_WEBHOOK_SECRET`
@@ -143,13 +149,19 @@ Tracelane bills through **Polar.sh** (Polar handles Stripe under the
 hood; we never call the Stripe API directly). In the Polar dashboard:
 
 1. Create the base-plan **Products** and set each product's
-   `metadata.lookup_key` (unprefixed) — the gateway maps plans by
-   `lookup_key`, so you can rename products without a redeploy. Monthly and
-   annual are separate Polar products:
-   - `builder_v1` ($29) / `builder_v1_year` ($24/mo billed annually)
-   - `team_v1` ($229) / `team_v1_year` ($190/mo billed annually)
-   - `business_v1` ($799) / `business_v1_year` ($665/mo billed annually)
+   `metadata.lookup_key` (unprefixed) — the webhook handler maps plans by
+   `lookup_key` (`apps/web/lib/polar-webhook.ts`), so you can rename products
+   without a redeploy. Create the monthly products only:
+   - `builder_v1` ($29)
+   - `team_v1` ($229)
+   - `business_v1` ($799)
    - `enterprise_v1` (from $2,499, custom)
+
+   Annual billing is not offered today: the checkout refuses a yearly interval
+   (`apps/web/app/api/checkout/route.ts`) and the dashboard hides the annual
+   action. Do not create `<plan>_v1_year` products — that key is no longer
+   recognised, and a webhook event carrying it is acknowledged with no plan
+   change.
 
    The `$0 OSS self-host` and `$0 hosted free` tiers have no Polar
    product — they're the default for unbilled tenants. Seats are unlimited
@@ -163,9 +175,9 @@ hood; we never call the Stripe API directly). In the Polar dashboard:
    - `cold_gb_month` — $0.08/GB-month
    - `eval_runs` — $0.005/judge run
 
-   (Five plans × monthly+annual = ten base products, plus six meters. There
-   is no paid audit product — `/v1/audit/export` does not yet meet the founder
-   ruling's evidence-pack bar (spec `BILL-01` §10.4), so 7-year ledger
+   (Four base products — one per paid plan — plus six meters. There
+   is no paid audit product — `/v1/audit/export` does not yet meet the
+   evidence-pack bar we hold a paid audit product to, so 7-year ledger
    retention folds into Enterprise instead of shipping as a paid SKU.)
 3. Create a **Webhook** (Standard Webhooks spec) at
    `$YOUR_DASHBOARD/api/webhooks/polar` — the dashboard origin, NOT the gateway; the
@@ -203,8 +215,10 @@ pnpm eval:run --suite=all
 ```
 
 20 conformance evals — 10 fault-tolerance chaos scenarios, 7 gateway-correctness,
-and one each for ingest-schema, PII-redaction and prompt-injection. CI fails on any regression. Marketing claims on the public site auto-disable when
-the corresponding eval flips red on `main`.
+and one each for ingest-schema, PII-redaction and prompt-injection. CI runs the
+suite against mock providers (`TRACELANE_EVAL_MOCK_PROVIDERS` in
+`.github/workflows/ci.yml`); behavioural assertions that need a live stack are
+skipped there, so a green mock run is not a behavioural verdict.
 
 ---
 
@@ -215,7 +229,8 @@ Before flipping a tenant to a paid plan:
 - [ ] WorkOS Connect configured + tested (sign-up → tenant + user rows)
 - [ ] Polar Products + Meters + Webhook configured
 - [ ] `POLAR_WEBHOOK_SECRET` rotated + `POLAR_ACCESS_TOKEN` issued (org access token, least privilege)
-- [ ] Audit anchoring keypair generated + `TRACELANE_REKOR_SIGNING_KEY` set
+- [ ] `NATS_URL` set and reachable (the gateway refuses to boot without it)
+- [ ] Audit anchoring keypair generated + `TRACELANE_REKOR_SIGNING_KEY` set, and `TRACELANE_REKOR_URL` set if batches are to be anchored (unset, they are signed locally and never anchored)
 - [ ] `CLICKHOUSE_URL` pointing at production cluster (not dev compose)
 - [ ] `POSTGRES_URL` pointing at Neon production branch
 - [ ] OpenSSF Scorecard ≥ 9.0 on the public repo

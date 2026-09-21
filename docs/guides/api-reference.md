@@ -98,9 +98,19 @@ JWKS, peppered HMAC API-key lookup). Always mounted.
 
 ### `POST /v1/chat/completions`
 
-Always mounted. OpenAI-compatible, and it is the **only** completion route —
-there is no `/v1/messages` or other provider-native surface. Auth is read from
-the `authorization` header only; `x-api-key` is not consulted.
+Always mounted. OpenAI-compatible. Auth is read from the `authorization`
+header (`Bearer tlane_…`); `x-api-key` is not consulted on this route.
+
+*Corrected 2026-09-21 — this paragraph said this was the only completion route
+and that no `/v1/messages` existed; that stopped being true on 2026-09-06.*
+
+### `POST /v1/messages` and `POST /v1/messages/count_tokens`
+
+Anthropic-native routes (Messages API wire format), always mounted. Requests
+route to Anthropic only. These two routes accept **either** `x-api-key:
+tlane_…` **or** `Authorization: Bearer tlane_…`, because that is what an
+Anthropic SDK sends. Keep the client you have; point its base URL at the
+gateway.
 
 Routes to the right upstream provider based on the `model` prefix:
 
@@ -276,14 +286,16 @@ Feed a drift observation for the active version. **Write** — Team-tier gated.
 ## Audit
 
 **Mounted when `CLICKHOUSE_URL` is set** — except `/v1/audit/pubkey`, which is
-always mounted.
+always mounted. With a Postgres control plane, export, self-verify and ledger-range read
+the **canonical** Postgres ledger and never fall back to the ClickHouse copy; without one
+they read ClickHouse, which is then the chain's only home.
 
 ### `GET /v1/audit/export?since=<iso8601>&until=<iso8601>&limit=<u32>`
 
 Requires **Enterprise** (`f_audit_addon`) — the bulk regulatory export is not
-sold as a separate add-on (spec `BILL-01` §10.4: `/v1/audit/export` does not
-yet meet the founder ruling's evidence-pack bar, so it folds into Enterprise
-instead of shipping at a price). Self-verification (`tlane verify`) needs no
+sold as a separate add-on: `/v1/audit/export` does not yet meet the
+evidence-pack bar we hold a paid audit product to, so it folds into Enterprise
+instead of shipping at a price. Self-verification (`tlane verify`) needs no
 entitlement on any tier. Without Enterprise: `403
 {"error":"entitlement_required","feature":"audit_ledger","message":…,"upgrade_url":…}`.
 If the entitlement cache is unreachable the export fails **closed** with `503` —
@@ -463,7 +475,7 @@ dispatch and records **after** it, then:
   `polar_subscription_id`) and the `workspace_entitlements.plan_lookup_key`;
 - (retired) add-on events from the former paid audit subscription used to grant
   the matching entitlement boolean without touching the base plan — the SKU
-  is not sold under the ruled model (spec `BILL-01` §10.4); the entitlement
+  is not sold under the current pricing model; the entitlement
   is now a plan default (Enterprise only), not a purchase;
 - `canceled` / `revoked` clear them.
 

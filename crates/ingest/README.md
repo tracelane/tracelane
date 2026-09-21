@@ -8,11 +8,12 @@ Tracelane's Rust ingest workers — span processing pipeline.
 - Consume spans from NATS JetStream (emitted by the gateway)
 - Parse and validate against OpenInference + OTel GenAI semconv
 - Apply tail-sampling policy when enabled. NOTE: full-fidelity capture is the shipped default — a recorder that drops clean spans is not a recorder
-- Batch-write to ClickHouse (hot tier, 365-day retention) — the sole span writer,
-  and the sole tier: there is no cold-tier archival to object storage. A cold-tier
-  R2 batcher existed in this crate through 2026-09-12 and was deleted —
-  it had zero producers wired to it and was never reachable by any span. If
-  cold-tier archival is ever rebuilt, it will be built with a real producer.
+- Batch-write to ClickHouse — the sole span writer, and it writes one table,
+  `tracelane.spans`. Cold archival, where configured, is a ClickHouse storage
+  policy that moves aged parts to an object-storage volume (the tiering section
+  of migration 24 in `infra/dev/clickhouse/migrations/`) — not a second writer,
+  and not this crate's R2 batcher, which was deleted on 2026-09-12 with zero
+  producers wired to it.
 
 ## Key modules
 
@@ -33,8 +34,12 @@ Tracelane's Rust ingest workers — span processing pipeline.
 
 ## Fault tolerance
 
-- FT-03: ClickHouse downtime → NATS buffers, zero data loss
-- FT-04: R2 outage → degrade to hot-tier-only, alert fires within 60s. **Moot as
-  of B-390 (2026-09-12):** there was never an R2 write path for this to degrade
-  from — the cold tier is deleted, not merely outage-tolerant.
+- FT-03: ClickHouse downtime → NATS JetStream buffers up to the stream's byte and
+  age limits (set in `nats_consumer.rs`); beyond them the oldest spans are
+  discarded and the gap is counted (`/health.spans_stream` on the gateway,
+  `tracelane.capture_gaps` in ClickHouse)
+- FT-04: R2 outage → degrade to hot-tier-only, alert fires within 60s. **Moot for
+  this crate since 2026-09-12:** ingest never had an R2 write path to degrade
+  from — its R2 batcher is deleted. Cold archival is a ClickHouse storage policy
+  (see Responsibility above), not an ingest concern.
 - FT-08: Disk full → reject new writes, reads continue, alert fires

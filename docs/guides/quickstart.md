@@ -17,11 +17,11 @@ Tracelane is a drop-in proxy on the **OpenAI wire format**. You reach every
 provider — Anthropic, Bedrock, Google, 150+ in all — through
 `POST /v1/chat/completions`, choosing the upstream with a **model prefix**.
 
-> **Use an OpenAI-compatible client, not a provider-native SDK.** The gateway
-> mounts exactly one completion route. There is no `/v1/messages`, and auth is
-> read from the `authorization` header — an Anthropic-native client would POST
-> to `/v1/messages` with `x-api-key` and get a 404. Keep the Anthropic *models*;
-> swap the *client*.
+> **Choose the client for the wire format you use.** The OpenAI-compatible
+> surface is `POST /v1/chat/completions`. The gateway also mounts Anthropic-native
+> `POST /v1/messages` and `POST /v1/messages/count_tokens`; those routes accept
+> `x-api-key` as well as `authorization`. See the
+> [API reference](./api-reference.md) for the endpoint-specific contract.
 
 ### Python
 
@@ -133,20 +133,23 @@ today:
   payload, so a trace can be tied to its ledger row. Rekor entry ids appear on
   batches that actually anchored.
 
-> **What a gateway-proxied span does *not* carry: your prompt and completion
-> text.** The gateway records the model, tokens, cost, timings, status and
-> guardrail verdicts — not the message bodies. The audit-ledger payload is
-> likewise metadata (model, trace id, warn id, optional business reference),
-> PII-redacted. Message bodies (`gen_ai.input_messages` /
-> `gen_ai.output_messages`) reach ClickHouse only from **OTLP spans your own SDK
-> emits**. Separately, `f_full_capture` — the entitlement that forces the
-> full-capture sampling policy — is **false on Free, Builder and Team**
-> (`apps/web/db/seed.mjs`); it is granted on Business and Enterprise, and the
-> The Enterprise export grant forces full capture on any plan.
+> **By default a gateway-proxied span does *not* carry your prompt and
+> completion text.** The gateway records the model, tokens, cost, timings,
+> status and guardrail verdicts — not the message bodies. The audit-ledger
+> payload is likewise metadata (model, trace id, warn id, optional business
+> reference), PII-redacted. Content capture is off unless an operator turns it
+> on for a named workspace with a `trace_content:` block in `tracelane.yaml`
+> (`crates/gateway/src/config.rs`); for an allowlisted workspace the message
+> bodies (`gen_ai.input_messages` / `gen_ai.output_messages`) are stored on
+> gateway spans too. Otherwise they reach ClickHouse only from **OTLP spans
+> your own SDK emits**. Separately, `f_full_capture` — the entitlement that
+> forces the full-capture sampling policy — is **false on Free, Builder and
+> Team** (`apps/web/db/seed.mjs`); it is granted on Business and Enterprise,
+> and the Enterprise export grant forces full capture on any plan.
 
 ---
 
-## 4. Verify your audit log offline (Audit-SKU)
+## 4. Verify your audit log offline
 
 ```bash
 npm install -g @tracelanedev/cli

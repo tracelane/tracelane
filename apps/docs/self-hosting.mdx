@@ -5,7 +5,7 @@ classification: PUBLIC
 ---
 
 Tracelane is fully self-hostable. The same binary that powers
-`gateway.tracelane.dev` runs on a $6/mo Hetzner VPS <!-- pricing-guard: allow $6 infra-cost-not-a-plan-price --> or a
+`gateway.tracelane.dev` runs on a six-dollar-a-month Hetzner VPS or a
 hardened production Docker Compose stack.
 
 ## Prerequisites
@@ -13,9 +13,9 @@ hardened production Docker Compose stack.
 | Dependency | Version | Purpose |
 |---|---|---|
 | Rust toolchain | 1.88+ (MSRV; this repo pins 1.95 via `rust-toolchain.toml`) | Build gateway + ingest |
-| Node.js | 20+ | Dashboard + MCP server |
+| Node.js | 20+ | Dashboard + MCP server (multi-tenant topology) |
 | pnpm | 9.15.0 (pinned in `package.json`) | Node package manager |
-| Postgres | 17+ (Neon-compatible) | Tenant metadata, API keys, billing |
+| Postgres | 17+ (Neon-compatible) | Tenant metadata, API keys, billing — **multi-tenant topology only**; the single-tenant compose runs without it and refuses to start if it is configured |
 | ClickHouse | 24.12+ | Span hot tier (365-day TTL) |
 | NATS | 2.10+ with JetStream | Ingest queue |
 
@@ -23,7 +23,7 @@ hardened production Docker Compose stack.
 
 <Warning>
 This section brings up a **local development** stack. It is not a production
-topology — see [Production — Docker Compose](#production--docker-compose) below.
+topology — see [Production — two topologies](#production--two-topologies) below.
 </Warning>
 
 The fastest path to a running stack:
@@ -50,29 +50,65 @@ pnpm --filter @tracelanedev/web dev
 
 The gateway listens on `:8080`, dashboard on `:3000`.
 
-## Production — Docker Compose
+## Production — two topologies
 
-The production stack is the same compose model as dev, hardened: ClickHouse +
-NATS/JetStream + gateway + ingest behind a TLS-terminating reverse proxy.
-Postgres is external (Neon or RDS); the dashboard runs on Vercel/Cloudflare.
-Start from `infra/self-host/` and `infra/docker/` — the compose files that ship
-with this repo. (Tracelane Cloud's own production compose is not published.)
+Pick one. They cannot be mixed: single-tenant self-host mode refuses to start if
+a Postgres, WorkOS or SPIRE setting is present in the environment
+(`crates/shared/src/self_host.rs`, `MULTI_TENANT_SIGNAL_ENVS`).
+
+### A. Single-tenant self-host — the shipped compose
+
+`infra/self-host/docker-compose.yml` runs ClickHouse + NATS/JetStream + gateway +
+ingest on one box, built from source, as **one workspace with no control plane**:
+no Postgres, no WorkOS, no Polar, and no dashboard service. Every request
+authenticates with the bearer token `TRACELANE_MASTER_KEY`, and every span is
+stamped with `TRACELANE_SINGLE_TENANT_ID`. Provider keys are read from the
+environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY` — set at
+least one).
 
 ```bash
 # On your host, from the repo root of your deployment checkout:
-docker compose -f infra/self-host/docker-compose.yml up -d
+cp infra/self-host/.env.example infra/self-host/.env   # set TRACELANE_MASTER_KEY + a provider key
+docker compose -f infra/self-host/docker-compose.yml up -d --build
 ```
+
+| Variable | Where it is set | Description |
+|---|---|---|
+| `TRACELANE_SELF_HOST` | the compose file (`"1"`) | Opts the gateway and ingest into single-tenant mode. Both refuse to start if `POSTGRES_URL`, `PGHOST`, `WORKOS_CLIENT_ID` or `TRACELANE_SPIRE_SOCKET` is also set. |
+| `TRACELANE_SINGLE_TENANT_ID` | `.env` (default `00000000-0000-0000-0000-000000000001`) | The one workspace id every request authenticates as and every span is stamped with. |
+| `TRACELANE_MASTER_KEY` | `.env` — **required**, `openssl rand -base64 32` | The bearer token your clients send (`Authorization: Bearer <key>`). The compose refuses to start without it. |
+| `NATS_URL`, `CLICKHOUSE_URL` | the compose file | Span bus and storage. In this topology the audit ledger lives in ClickHouse `audit_log`. |
+| `TRACELANE_REKOR_SIGNING_KEY` | `.env` (optional) | See [Generate audit signing key](#generate-audit-signing-key). |
+
+Put a TLS-terminating reverse proxy in front of `:8080`. A self-hosted gateway
+with no control plane has no per-minute request cap
+(`crates/gateway/src/rate_limiter.rs`) — cap it at your reverse proxy if you
+need one.
+
+### B. Multi-tenant — running the hosted topology yourself
+
+The hosted topology adds a Postgres control plane (tenants, API keys,
+entitlements, billing and the canonical audit ledger), WorkOS for identity, Polar
+for billing, and the Next.js dashboard. This repo ships no production compose
+file for it: `infra/dev/docker-compose.yml` brings up the backing services for
+development, and `infra/docker/` holds the gateway and ingest Dockerfiles.
+Postgres is external (Neon or RDS); the dashboard runs on Vercel/Cloudflare; the
+gateway and ingest sit behind a TLS-terminating reverse proxy. (Tracelane
+Cloud's own production compose is not published.)
 
 Images are built on-node from source. A published Helm chart and
 signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 
-## Environment variables
+## Environment variables — multi-tenant topology
+
+The tables below are for topology B. Topology A's variables are in its table
+above; do not add these to a single-tenant deployment.
 
 ### Required (production)
 
 | Variable | Description |
 |---|---|
-| `POSTGRES_URL` | `postgres://user:pass@host:5432/tracelane` — read by the **gateway and ingest** (`PGHOST` + friends also work). Leave it unset and the gateway boots with no control plane: API-key validation falls back to the dev stub. |
+| `POSTGRES_URL` | `postgres://user:pass@host:5432/tracelane` — read by the **gateway and ingest** (`PGHOST` + friends also work). A release build refuses every API key without it (`crates/gateway/src/auth/api_key.rs`). Never set it alongside `TRACELANE_SELF_HOST=1`. |
 | `DATABASE_URL` | The same connection string, read by the **Next.js dashboard** (Drizzle/Neon) and `db/seed.mjs`. Set both — they are separate variables, not aliases. |
 | `CLICKHOUSE_URL` | `http://host:8123` |
 | `NATS_URL` | `nats://host:4222` |
@@ -92,7 +128,6 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TRACELANE_SELF_HOST_TIER` | `enterprise` (no cap) | Optional per-minute request cap for a self-hosted gateway (`free` 60 rpm, `builder` 600, `team` 6,000, `business` 60,000, `enterprise` = no cap). Read only in self-host mode. Left unset, a self-hosted gateway has no per-minute cap — you own the compute. Set it to cap your own box. |
 | `TRACELANE_PORT` | `8080` | Gateway listen port |
 | `TRACELANE_REKOR_URL` | — (unset) | Transparency-log endpoint for audit anchoring. Unset or empty ⇒ batches are signed and persisted locally only, with no outbound POST. There is no default log. |
 | `TRACELANE_REKOR_ANCHOR_EVERY` | `100` | Audit events per Rekor anchor batch |
@@ -103,18 +138,21 @@ signed Chainguard/Wolfi image registry are on the roadmap — not yet shipped.
 | `NEXT_PUBLIC_GATEWAY_URL` | `http://localhost:8080` | Gateway URL shown in dashboard |
 
 <Note>
-There are no cold-tier storage variables to set. Cold-tier span archival to
-object storage (R2/S3) is not part of the product — spans live in ClickHouse
-only.
+There are no cold-tier storage variables for the gateway or ingest to read.
+Cold archival is a ClickHouse storage policy (an object-storage volume that aged
+parts move to), configured in ClickHouse itself — the hosted service runs one;
+a self-host without it keeps spans on the ClickHouse disk.
 </Note>
 
 ## Apply migrations
 
 ```bash
-# Postgres — tenant metadata, API keys, CMK keys, billing
+# Postgres — tenant metadata, API keys, CMK keys, billing, and the CANONICAL audit
+# ledger (audit_log_rows, audit_anchor_records) when the gateway has a Postgres URL
 ./scripts/apply-migration-pg.sh
 
-# ClickHouse — spans, trace_summaries, audit_log (auto-applied by Docker Compose
+# ClickHouse — spans, trace_summaries, audit_log (the ledger's read copy — or its only
+# home when you run without Postgres) (auto-applied by Docker Compose
 # from infra/dev/clickhouse/schema.sql at container init).
 # Non-compose install — apply schema + migrations directly:
 clickhouse-client < infra/dev/clickhouse/schema.sql
@@ -146,15 +184,16 @@ Tracelane bills through [Polar.sh](https://polar.sh) (Merchant of Record);
 there is no direct Stripe integration.
 
 1. Create **Products** with these `lookup_key` values (set on each
-   product's `product_metadata`) — monthly and annual are separate Polar
-   products:
+   product's `product_metadata`) — one monthly base product per paid plan.
+   Annual billing is not offered yet; when it is, it is a separate base-plus-usage
+   pair per plan, described on the pricing page.
 
-   | lookup_key (monthly / annual) | Plan | Monthly | Annual (per mo) |
-   |---|---|---|---|
-   | `builder_v1` / `builder_v1_year` | Builder | $29/mo | $24/mo |
-   | `team_v1` / `team_v1_year` | Team | $229/mo | $190/mo |
-   | `business_v1` / `business_v1_year` | Business | $799/mo | $665/mo |
-   | `enterprise_v1` | Enterprise | from $2,499/mo (custom) | contract |
+   | lookup_key | Plan | Monthly |
+   |---|---|---|
+   | `builder_v1` | Builder | $29/mo |
+   | `team_v1` | Team | $229/mo |
+   | `business_v1` | Business | $799/mo |
+   | `enterprise_v1` | Enterprise | from $2,499/mo (custom) |
 
 2. Create six **Meters** with `event_name`:
    - `ingest_gb`, `hot_gb_month`, `series`, `scan_units`, `cold_gb_month`, `eval_runs`
@@ -185,10 +224,24 @@ openssl pkcs8 -topk8 -nocrypt -in rekor-signing.pem -outform DER | base64 -w 0
 # Paste the output into TRACELANE_REKOR_SIGNING_KEY
 ```
 
+<Warning>
+`openssl` writes PKCS#8 **v1** (seed only). Gateway builds before 2026-09-21
+accept only the **v2** form and refuse to boot on a v1 key with
+`invalid Ed25519 PKCS#8 key: KeyRejected("VersionNotSupported")`. On such a
+build, generate the key from the repository instead — it prints a v2 key:
+
+```bash
+cargo test -p gateway --bin gateway print_signing_key -- --ignored --nocapture
+```
+</Warning>
+
 Store `rekor-signing.pem` in your secrets manager. Losing it means you cannot
 anchor new audit batches — existing anchors remain verifiable.
 
 ## Verify the stack
+
+In topology A the bearer token is your `TRACELANE_MASTER_KEY`, not a `tlane_…`
+key — there is no dashboard to mint one.
 
 ```bash
 # Gateway health
@@ -208,18 +261,26 @@ curl "http://localhost:8080/v1/audit/export?since=$(date -u +%Y-%m-%dT%H:%M:%SZ 
 
 ## Production checklist
 
-Before accepting production traffic:
+Before accepting production traffic, in either topology:
 
-- [ ] `TRACELANE_BYOK_MASTER_KEY` set and rotated (32 random bytes, stored in secrets manager)
-- [ ] `TRACELANE_REKOR_SIGNING_KEY` generated and stored
-- [ ] WorkOS webhook verified (send a test event, confirm tenant is provisioned)
-- [ ] Polar products + meters + webhook configured and verified
-- [ ] ClickHouse pointing at production cluster (not dev compose)
-- [ ] Postgres pointing at production branch (Neon or RDS)
+- [ ] `TRACELANE_REKOR_SIGNING_KEY` generated and stored; `TRACELANE_REKOR_URL` set if batches are to be anchored (unset, they are signed locally and never anchored)
+- [ ] ClickHouse pointing at production storage (not dev compose)
 - [ ] TLS termination at reverse proxy (Caddy, Nginx, or Cloudflare Tunnel)
-- [ ] Confirm `POSTGRES_URL` is set — a release build has **no** auth fallback and refuses every API key without it
 - [ ] OSV-Scanner + Grype clean on deployed commit
 - [ ] Conformance suites green: `pnpm --filter @tracelanedev/audit-verifier test`
+
+Single-tenant self-host (topology A):
+
+- [ ] `TRACELANE_MASTER_KEY` set (32 random bytes, stored in secrets manager) — it is the bearer token every client sends
+- [ ] No `POSTGRES_URL` / `PGHOST` / `WORKOS_CLIENT_ID` / `TRACELANE_SPIRE_SOCKET` in the environment — the gateway and ingest refuse to start with one
+
+Multi-tenant (topology B):
+
+- [ ] `TRACELANE_BYOK_MASTER_KEY` set and rotated (32 random bytes, stored in secrets manager)
+- [ ] Confirm `POSTGRES_URL` is set — a release build has **no** auth fallback and refuses every API key without it
+- [ ] Postgres pointing at production branch (Neon or RDS)
+- [ ] WorkOS webhook verified (send a test event, confirm tenant is provisioned)
+- [ ] Polar products + meters + webhook configured and verified
 
 ## Upgrading
 

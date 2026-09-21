@@ -87,7 +87,7 @@ tracelane-audit verify
   --workspace <uuid>           Workspace UUID (tenant_id on every audit row)
   --from <iso8601>             Lower bound (inclusive)
   --to <iso8601>               Upper bound (exclusive)
-  [--api-url <url>]            Default: https://api.tracelane.dev
+  [--api-url <url>]            Default: https://gateway.tracelane.dev (builds before 2026-09-21 default to api.tracelane.dev, which does not resolve — pass the flag)
   [--read-key <key>]           Or set TRACELANE_AUDIT_READ_KEY env var
   [--file <path>]              Offline: verify a local NDJSON instead of HTTP fetch
   [--tenant-pubkey <pubkey>]   Workspace Ed25519 pubkey — the anchor TRUST ROOT.

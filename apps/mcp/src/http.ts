@@ -28,7 +28,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { resolveBearerViaGateway, runWithTenant } from "./auth.js";
-import { createReader } from "./reader.js";
+import { GatewayReader } from "./reader.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
@@ -75,10 +75,17 @@ function buildServer(): McpServer {
 	const server = instrumentMcpServer(
 		new McpServer({ name: "tracelane", version: MCP_SERVER_VERSION }),
 	);
-	// PLT-22: CLICKHOUSE_URL set -> self-host ClickHouseReader; unset ->
-	// Cloud GatewayReader, which reads THIS request's own bearer from the
-	// runWithTenant context below (getActiveBearer) — never a fixed key.
-	registerTraceTools(server, createReader());
+	// B-473 (REV-3, 2026-09-21): the HTTP transport is GATEWAY-BACKED, ALWAYS —
+	// never `createReader()`. Every read goes through the gateway's tenant-scoped
+	// `/v1/*` routes as THIS request's own bearer (runWithTenant → getActiveBearer),
+	// which is the only place an API key's `read` scope is enforced
+	// (`crates/gateway/src/trace_reads.rs`, the A13 seam). `createReader()` picked
+	// `ClickHouseReader` whenever `CLICKHOUSE_URL` was set — direct SQL, tenant-
+	// filtered, NO scope check — so an ingest-only key could read its tenant's
+	// recorded traces through an HTTP deployment. Direct ClickHouse remains the
+	// STDIO transport's self-host mode (`index.ts`: one operator, one process,
+	// their own database).
+	registerTraceTools(server, new GatewayReader());
 	registerEvalTools(server);
 	return server;
 }
@@ -93,7 +100,32 @@ function buildServer(): McpServer {
  *   4. Each new request spins up a fresh transport (stateless mode); a
  *      future revision can flip to stateful + session IDs for streaming.
  */
+/**
+ * B-473: refuse to start the HTTP transport when `CLICKHOUSE_URL` is set. Pure
+ * over the env so it is unit-tested without binding a port. Fail-CLOSED on a
+ * security path (CLAUDE.md §10): silently ignoring the variable would leave an
+ * operator believing their self-host HTTP deployment reads the database it
+ * configured, and a future edit that reintroduces `createReader()` here would
+ * reopen the hole without a refusal — this check refuses BEFORE that could
+ * matter.
+ */
+export function assertHttpTransportIsGatewayBacked(
+	env: NodeJS.ProcessEnv = process.env,
+): void {
+	if (env.CLICKHOUSE_URL) {
+		throw new Error(
+			"refusing to start the HTTP transport with CLICKHOUSE_URL set: the HTTP " +
+				"server serves many callers' bearers, and only the gateway enforces an " +
+				"API key's `read` scope — a direct ClickHouse reader would let an " +
+				"ingest-only key read its tenant's traces (B-473). Unset CLICKHOUSE_URL " +
+				"and set TRACELANE_GATEWAY_URL; direct ClickHouse reads are the stdio " +
+				"transport's self-host mode.",
+		);
+	}
+}
+
 export async function runHttp(): Promise<void> {
+	assertHttpTransportIsGatewayBacked();
 	const port =
 		Number.parseInt(process.env.TRACELANE_MCP_PORT ?? "", 10) || DEFAULT_PORT;
 

@@ -12,8 +12,10 @@ operators self-hosting Tracelane.
 1. Visit [app.tracelane.dev/sign-in](https://app.tracelane.dev/sign-in) — the same
    route handles first-time sign-up and returning sign-in.
 2. Sign in with WorkOS Connect (Google / Microsoft / SAML).
-3. The first sign-in for a domain creates a tenant; subsequent users on the
-   same domain join it.
+3. Your first sign-in creates a personal workspace (named
+   `<your-email-local-part>'s workspace`). Teammates join by invitation only —
+   a workspace owner invites them from Settings → Team — never automatically
+   by email domain.
 4. Pick a plan (Builder $29 / Team $229 / Business $799 / Enterprise from $2,499).
 5. Generate a tenant API key (`tlane_<base62>`). Copy it once — we hash + store.
 6. Drop it in your env as `TRACELANE_API_KEY`.
@@ -31,9 +33,13 @@ Eight steps to running Tracelane on your own infra.
 <Steps>
 
 <Step title="Reserve infra">
-  - Postgres 17 (Neon, RDS, or self-hosted) — tenant + user metadata
-  - ClickHouse 24+ — span/audit storage. There is no cold tier: spans live in
-    ClickHouse only, and no object storage (R2/S3) is required.
+  - Postgres 17 (Neon, RDS, or self-hosted) — tenant + user metadata and the canonical audit ledger
+  - ClickHouse 24+ — span storage and the ledger's read copy (its only home if you skip Postgres). A cold archive
+    (the hot→cold move of aged span parts to S3-compatible object storage) is
+    optional for a self-host: without it, spans stay on the ClickHouse disk.
+    The hosted service tiers spans to Cloudflare R2 and meters it as
+    `cold_gb_month`. The tiering `ALTER`s and the storage-policy precondition
+    are documented in `infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql`.
   - L4 GPU pool — optional, only for the roadmap SLM-judge inference tier; not required at V1
   - Outbound network to Sigstore Rekor (`rekor.sigstore.dev`) — for best-effort, opt-in Rekor v2 anchoring of audit batches; universal per-run anchoring is on the roadmap
 </Step>
@@ -43,19 +49,28 @@ Eight steps to running Tracelane on your own infra.
   - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_WEBHOOK_SECRET` — auth
   - `TRACELANE_BYOK_MASTER_KEY` — provider-key envelope encryption (32 bytes, base64-encoded; AES-256-GCM via `ring`)
   - `TRACELANE_APIKEY_PEPPER` — API-key hashing pepper (release builds refuse to boot without it)
-  - `CLICKHOUSE_URL`, `POSTGRES_URL` — datastore endpoints. (There is no cold
-    tier; no `TRACELANE_R2_*` variables exist to set.)
+  - `CLICKHOUSE_URL`, `POSTGRES_URL` — datastore endpoints. (The gateway and
+    ingest read no object-storage variables; the optional cold archive is
+    configured on the ClickHouse server itself — an S3 disk plus the
+    `hot_cold` storage policy — not through the gateway's environment.)
 </Step>
 
 <Step title="Apply migrations">
-  Drizzle is canonical for the control-plane Postgres schema. Apply it before
-  starting the gateway:
+  Drizzle is canonical for the control-plane Postgres schema, but its journal
+  (`apps/web/db/migrations/meta/_journal.json`) covers only migrations
+  `0000`–`0008`, so `drizzle-kit migrate` would apply those nine and stop.
+  Apply every SQL file in `apps/web/db/migrations/` in order with `psql`
+  before starting the gateway:
 
   ```bash
-  pnpm --filter @tracelanedev/web exec drizzle-kit migrate
+  for m in apps/web/db/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+    psql "$POSTGRES_URL" -v ON_ERROR_STOP=1 -f "$m"
+  done
   ```
 
-  The gateway does **not** apply migrations at boot.
+  `scripts/apply-migration-pg.sh` runs the same loop against a fresh database
+  and checks that the core tables exist afterwards. The gateway does **not**
+  apply migrations at boot.
 </Step>
 
 <Step title="Configure WorkOS Connect">
@@ -68,17 +83,21 @@ Eight steps to running Tracelane on your own infra.
 </Step>
 
 <Step title="Configure Polar">
-  Tracelane v3 pricing requires five base plans (monthly + annual = ten Polar
-  products) plus six usage meters. Create each product in the
-  [Polar.sh](https://polar.sh) dashboard, with the `lookup_key` set on each
-  product's `product_metadata`:
+  Tracelane v3 pricing requires four monthly base products plus six usage
+  meters. Create each product in the [Polar.sh](https://polar.sh) dashboard,
+  with the `lookup_key` set on each product's `product_metadata`:
 
-  | Product | `lookup_key` (monthly / annual) | Monthly | Annual (per mo) |
-  |---|---|---|---|
-  | Builder plan | `builder_v1` / `builder_v1_year` | $29/mo | $24/mo |
-  | Team plan | `team_v1` / `team_v1_year` | $229/mo | $190/mo |
-  | Business plan | `business_v1` / `business_v1_year` | $799/mo | $665/mo |
-  | Enterprise plan | `enterprise_v1` | from $2,499/mo (custom) | contract |
+  | Product | `lookup_key` | Monthly |
+  |---|---|---|
+  | Builder plan | `builder_v1` | $29/mo |
+  | Team plan | `team_v1` | $229/mo |
+  | Business plan | `business_v1` | $799/mo |
+  | Enterprise plan | `enterprise_v1` | from $2,499/mo (custom) |
+
+  Annual billing is not offered yet: the checkout refuses a yearly interval and
+  the app hides the annual action. Do not create `<plan>_v1_year` products — the
+  webhook handler treats that lookup key as unknown and changes no plan
+  (`apps/web/lib/polar-webhook.ts`).
 
   Seats are unlimited on every paid tier — Free is capped at one seat, and
   there is no per-seat product to create.
@@ -90,8 +109,8 @@ Eight steps to running Tracelane on your own infra.
   - Configure the Polar-hosted customer portal — branding, allowed actions
   - Set `POLAR_ACCESS_TOKEN` (organization access token), `POLAR_WEBHOOK_SECRET`, and `POLAR_EXPECTED_ORGANIZATION_ID` in your env
 
-  for the rationale behind unlimited seats and the six usage meters. Retention
-  is tier-specific: the indexed window runs 3/30/90/180/365+ days by tier, and
+  See the [pricing page](/pricing) for the plans, the unlimited seats and the six
+  usage meters. Retention is tier-specific: the indexed window runs 3/30/90/180/365+ days by tier, and
   queryable history is 30 days on Free and 2 years on every paid tier.
 </Step>
 
@@ -110,8 +129,8 @@ Eight steps to running Tracelane on your own infra.
   pnpm --filter @tracelanedev/web start
   ```
   The dashboard is a Next.js app. The MCP server is a separate Node process — run it
-  from source (`node apps/mcp/dist/index.js`) for local-only use; `npx @tracelanedev/mcp`
-  returns a 404 until a release tag publishes the package.
+  from source (`node apps/mcp/dist/index.js`) for local-only use, or run the published
+  package with `npx @tracelanedev/mcp` (on npm since 2026-09-07).
 </Step>
 
 <Step title="Production checklist">

@@ -126,7 +126,7 @@ conversation id — it is still a trace, just not part of a conversation.
 Billing is measured across **six usage meters** — ingest, hot indexed window,
 series, query compute, cold archive and evaluations — not a single trace
 count. Each plan includes a monthly allowance on every meter (Builder, for
-example, includes 25 GB of ingest); usage above the included allowance bills
+example, includes 20 GB of ingest); usage above the included allowance bills
 continuously per unit, with no rollover. **Ingest is never blocked by billing
 state** — sending traces never stops because of usage or an unpaid invoice.
 See [Pricing](/pricing) for the exact per-tier numbers (they are the source of
@@ -147,4 +147,4 @@ in Polar, not by this page — always reconcile any usage number against
 - [Quickstart](/quickstart) — send your first traced call
 - [Pricing](/pricing) — the six usage meters, included allowances and windows
 - [Architecture](/architecture) — how traces are captured and stored
-- [Audit ledger](/audit-ledger) — how each event is made provable
+- [Audit ledger](/audit-ledger) — how each ledger event is made verifiable

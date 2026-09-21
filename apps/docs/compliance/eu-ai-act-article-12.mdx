@@ -52,7 +52,7 @@ does, mapped to the topic of each Article 12 paragraph.
 
 | Shipped capability — what you may cite as evidence |
 |---|
-| The Enterprise plan carries a **180-day minimum retention** commitment for ledger data. That commitment is contractual rather than programmatically enforced: no ledger table carries a TTL and no scheduled job deletes ledger rows, so ledger data is retained indefinitely on every plan today. Two properties carry the six-month requirement and both are checkable against a running system: (1) **no scheduled job deletes ledger data** — the retention sweep operates on span tables only and never on the ledger; (2) **the ledger tables carry no TTL**, so no row expires on its own. Contractual retention above the floor is supported; a value below it is refused. Today that floor is **operational and contractual rather than programmatically enforced** — retention is bounded by the absence of any automatic expiry, not by a runtime check. **What we do not claim, because the limit matters more than the reassurance:** we do not assert that no ledger row has ever been removed by an operator, nor that the database can enumerate every such operation — ClickHouse records `ALTER … DELETE` in a live view that does not cover `TRUNCATE`, `DROP PARTITION`, or rename-based migrations. This row therefore describes a retention **mechanism**, not an invariant we cannot falsify. Where a storage-engine migration has moved a prior chain aside, those rows are **retained and remain queryable**, so the earlier chain stays re-derivable across the change. |
+| The Enterprise plan carries a **180-day minimum retention** commitment for ledger data. That commitment is contractual rather than programmatically enforced: no ledger table carries a TTL and no scheduled job deletes ledger rows, so ledger data is retained indefinitely on every plan today. Two properties carry the six-month requirement and both are checkable against a running system: (1) **no scheduled job deletes ledger data** — the retention sweep operates on span tables only and never on the ledger; (2) **the ledger tables carry no TTL**, so no row expires on its own. Contractual retention above the floor is supported. That floor is **operational and contractual rather than programmatically enforced** — retention is bounded by the absence of any automatic expiry, not by a runtime check, and a shorter contractual term would be a process failure, not one the software refuses. **Which store this describes:** the canonical ledger — chain rows and per-batch anchor records — lives in the Postgres control plane (`crates/gateway/src/db/ledger.rs`), the rows written in the same transaction that advances the chain head; export and verification read that store and never fall back to a copy. The ClickHouse `audit_log` table is a **derived read copy** for the dashboards, written after commit and rebuilt from the canonical store at boot — its mutation history describes the copy, not the ledger. **What we do not claim, because the limit matters more than the reassurance:** we do not assert that no ledger row has ever been removed by an operator with database access, nor that the software can enumerate every such operation beyond the database provider's own logs. What protects the ledger against loss of its store is an hourly archive of the canonical rows and anchor bundles to object storage, each file count-checked against the store before upload — a stated recovery point of **≤ 1 hour**. This row therefore describes a retention **mechanism**, not an invariant we cannot falsify. |
 
 ### 12(3)(a) — log conformity with established procedures
 
@@ -76,7 +76,7 @@ does, mapped to the topic of each Article 12 paragraph.
 
 | Shipped capability — what you may cite as evidence |
 |---|
-| Per-row authorisation is enforced at the gateway: every ClickHouse query filters on the caller's tenant, and a CI guard blocks any new query that omits the filter. Ledger integrity in V1 is **per-tenant** — each workspace has its own sequence and its own Ed25519 keypair, so a workspace's chain is verifiable end to end independently of any other. Integrity guarantees that span across workspaces are on the roadmap. |
+| Per-row authorisation is enforced at the gateway: every ClickHouse query filters on the caller's tenant (a CI guard blocks any new query that omits the filter), and every export or verification read of the Postgres ledger is keyed on the caller's tenant. Ledger integrity in V1 is **per-tenant** — each workspace has its own sequence and its own Ed25519 keypair, so a workspace's chain is verifiable end to end independently of any other. Integrity guarantees that span across workspaces are on the roadmap. |
 
 ## Field mapping table (verifier output → Article 12 topic)
 
@@ -123,7 +123,7 @@ cargo build --release -p tracelane-audit
 # 2. Export the ledger range under audit (deployer-side, any Bearer
 #    credential the workspace already uses).
 curl -H "authorization: Bearer $TRACELANE_TOKEN" \
-  'https://api.tracelane.dev/v1/audit/export?since=2026-05-01T00:00:00Z&until=2026-05-26T00:00:00Z' \
+  'https://gateway.tracelane.dev/v1/audit/export?since=2026-05-01T00:00:00Z&until=2026-05-26T00:00:00Z' \
   -o ledger.ndjson
 
 # 3. Verify it offline. Nothing here contacts Tracelane.

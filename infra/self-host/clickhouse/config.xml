@@ -1,8 +1,19 @@
-<!-- ClickHouse memory limits for self-host on ≤2 GB RAM VPS.
-     These settings cap total memory use to ~512 MB so ClickHouse
-     co-exists with the gateway and OS on a budget instance. -->
+<!-- ClickHouse memory limits for a small self-host box (a 2 GB VPS upwards).
+     Sized so ClickHouse co-exists with the gateway, ingest and the OS.
+
+     2026-09-21: this file capped the server at an ABSOLUTE 512 MB. ClickHouse 24.12
+     counts its whole resident set against that cap (caches, merge buffers, jemalloc
+     retention), and on a table of ~20,000 rows its RSS sat at 550-740 MiB — so once a
+     burst pushed it over, EVERY query, including `SELECT count()`, was refused with
+     `Code: 241 MEMORY_LIMIT_EXCEEDED` and stayed refused: a self-host ClickHouse that
+     never recovers from its first busy minute (found reproducing the self-host bench's
+     half-capture). The cap is now a RATIO of the box's RAM (half of it: 1 GB on a 2 GB
+     VPS, more on a bigger box) with the mark cache pinned small, which is the shape
+     ClickHouse itself recommends for small hosts. -->
 <clickhouse>
-    <max_server_memory_usage>536870912</max_server_memory_usage>    <!-- 512 MB (server-level) -->
+    <max_server_memory_usage>0</max_server_memory_usage>                       <!-- 0 = use the ratio below -->
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>134217728</mark_cache_size>                                  <!-- 128 MB (default 5 GB) -->
     <max_concurrent_queries>20</max_concurrent_queries>
     <max_connections>100</max_connections>
 

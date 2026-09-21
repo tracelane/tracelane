@@ -61,22 +61,20 @@ Reference implementation: `row_hash_v2` in
 (`packages/verifier-{rust,typescript,python}`) recompute exactly this.
 
 Every 100 events (`TRACELANE_REKOR_ANCHOR_EVERY`, default `100` —
-`crates/gateway/src/server.rs:132-135`) the Merkle root over all row hashes in the
+`crates/gateway/src/server.rs:163-166`) the Merkle root over all row hashes in the
 batch is computed and signed with Ed25519. **Anchoring that root to a public
 transparency log is best-effort, and off unless configured.** The gateway POSTs
 only when `TRACELANE_REKOR_URL` is set — unset or empty means sign-and-persist
-locally, never an external POST (`crates/gateway/src/audit.rs:1499-1503`) — and
-anchoring additionally needs a mintable per-tenant ECDSA anchor key
-(`audit.rs:2128-2184`, `store.get_or_create_anchor`). **As of the retired
-pricing model this mint was gated on the `f_audit_addon` entitlement**
-(`audit.rs:17`); under the ruled model (spec `BILL-01` §0.2 — "the ledger,
-hash chain, Rekor anchoring and free self-verification are on every tier")
-that gate is being removed so anchoring runs on every tier — a gateway-side
-change owned by a parallel block (B1/B2), not yet verified here; re-check
-`audit.rs:17` and the `get_or_create_anchor` call site before citing this as
-current behavior. When either the URL or the key is absent, or the log is
-unreachable, the batch stays signed-but-unanchored (`anchor_state = 0x00`)
-and the offline verifier reports it as unanchored rather than failing.
+locally, never an external POST (`crates/gateway/src/audit.rs:2598-2603`) — and
+anchoring additionally needs a per-tenant ECDSA anchor key
+(`audit.rs:2623-2679`, `store.get_or_create_anchor`). Minting that key is gated
+on the `f_audit_selfverify` entitlement
+(`crates/gateway/src/audit_keys.rs:398-415,486-524`), which defaults to true on
+every plan and can be denied per workspace (`apps/web/db/schema.ts:315,412`),
+so anchoring runs on every tier. When either the URL or the key is absent, or
+the log is unreachable, the batch stays signed-but-unanchored
+(`anchor_state = 0x00`) and the offline verifier reports it as unanchored
+rather than failing.
 
 The anchoring target is Sigstore Rekor **v2** —
 `log2025-1.rekor.sigstore.dev` (`crates/tracelane-audit-cli/src/main.rs:95`,
@@ -89,34 +87,46 @@ there.
 
 ## Audit event schema
 
+One exported row, as `GET /v1/audit/export` writes it (`ExportRow`,
+`crates/gateway/src/audit_export.rs:89-104`):
+
 ```json
 {
+  "format": "v2.1",
   "tenant_id": "string (UUID)",
   "seq": "uint64 (monotonic per tenant)",
   "event_time": "ISO-8601 timestamp (microsecond precision, UTC)",
-  "event_type": "request | intervention | export | key_rotation | policy_change",
-  "actor": "string (JWT sub claim — never from request body)",
-  "payload": {
-    "trace_id": "string (UUID, present for request/intervention events)",
-    "span_id": "string (UUID, present for intervention events)",
-    "provider": "string (e.g. openai, anthropic)",
-    "model": "string (model ID)",
-    "input_tokens": "uint32",
-    "output_tokens": "uint32",
-    "aft_ids": ["string"],
-    "intervention": "none | warn | block",
-    "latency_ms": "float"
-  },
+  "event_type": "chat.completions.request | embeddings.request | messages.request | guardrail.verdict | eval.verdict",
+  "actor": "string (the JWT sub claim, or apikey:<id> for an API key — never from the request body)",
+  "payload": "string (the canonical JSON the row hash covers, verbatim — not a nested object)",
   "prev_hash": "string (SHA-256 hex of previous row; for seq=0 the genesis seed above, never empty)",
   "row_hash": "string (SHA-256 hex of this row)",
-  "rekor_entry_id": "string (Rekor v2 entry ID — OPTIONAL: the key is omitted entirely, not null, on any batch that did not anchor)"
+  "rekor_entry_id": "string (the Rekor v2 log index of the entry that anchored this row's batch — OPTIONAL: the key is omitted entirely, not null, on any batch that did not anchor)"
 }
 ```
 
+`format` is always `v2.1` for new exports (`audit_export.rs:81`): `payload` is
+the stored canonical-JSON **string**, the exact `row_hash` preimage, so a
+verifier hashes it byte-for-byte and never re-serialises it. `actor` is the
+authenticated principal (`crates/gateway/src/admission.rs:757-762`;
+`crates/gateway/src/auth/api_key.rs:58,109-112` for the `apikey:` form). What
+the payload string contains depends on `event_type`:
+
+| `event_type` | Written by | Payload keys |
+|---|---|---|
+| `chat.completions.request` | `POST /v1/chat/completions` admission (`admission.rs:825,851-864`) | `model`, `warn_aft_id`, `trace_id` |
+| `embeddings.request` | `POST /v1/embeddings` admission (`admission.rs:901,923-933`) | `model`, `input_count`, `trace_id` |
+| `messages.request` | `POST /v1/messages` admission (`crates/gateway/src/anthropic_messages.rs:936,979-990`) | `model`, `warn_aft_id`, `stream`, `trace_id` |
+| `guardrail.verdict` | the guardrail recorder (`crates/gateway/src/guardrail/recorder.rs:103-109`) | the serialised guardrail verdict |
+| `eval.verdict` | a prompt promotion or rollback (`crates/gateway/src/prompt_routes.rs:94-107`) | `prompt`, `promotion_id`, `from_env`, `to_env`, `to_version_id`, `decision`, `eval_run_id` |
+
+The three `*.request` payloads gain a `business_reference` key only when the
+request supplied one (`admission.rs:754-756`).
+
 `rekor_entry_id` is `skip_serializing_if = "Option::is_none"`
-(`crates/gateway/src/audit_export.rs:98`), so its **absence** is the normal
+(`crates/gateway/src/audit_export.rs:102`), so its **absence** is the normal
 unanchored case — a verifier must treat a missing key as "not anchored", not as a
-malformed row (test: `export_row_skips_rekor_when_none`, `audit_export.rs:1142`).
+malformed row (test: `export_row_skips_rekor_when_none`, `audit_export.rs:1601`).
 
 ---
 
@@ -154,33 +164,32 @@ signed-but-unanchored, which is a reported state, not a failure.
 
 ## EU AI Act Article 12 export
 
-Generate a compliance evidence pack:
+Generate the documentation pack:
 
 ```bash
 tlane export --pack eu-ai-act-art12 --output-dir ./compliance-pack/
 ```
 
-The pack includes:
-1. `art12-01-audit-chain.md` — hash chain summary and Rekor entry UUIDs
-2. `art12-02-ai-disclosure.md` — AI system disclosure statement
-3. `art12-03-model-registry.json` — registry of all AI models used
-4. `art12-04-data-processing.md` — data sources, retention, PII handling
-5. `art12-05-guardrail-evidence.md` — predictive guardrail implementation evidence
-6. `art12-06-rekor-transparency.md` — Sigstore Rekor entries
+The pack is a set of documentation templates the CLI writes locally
+(`packages/cli/src/commands/export.ts:48-90`). It reads no ledger and contacts
+no server, so it accompanies your exported ledger rather than containing it.
+Files:
+1. `art12-01-audit-chain.md` — a description of the hash chain and anchoring mechanism (`export.ts:241-291`)
+2. `art12-02-ai-disclosure.md` — the AI disclosure statement, copied from `AI_DISCLOSURE.md` when the command runs inside a checkout of this repository and marked `missing` in the manifest otherwise (`export.ts:292-314,512-526`)
+3. `art12-03-model-registry.json` — a fixed example model registry, not the models your tenant used (`export.ts:315-369`)
+4. `art12-04-data-processing.md` — a data-processing record template: data sources, retention, PII handling (`export.ts:370-407`)
+5. `art12-05-guardrail-evidence.md` — a description of the guardrail implementation (`export.ts:408-443`)
+6. `art12-06-rekor-transparency.md` — a description of the Rekor anchoring mechanism; it lists no entries (`export.ts:444-497`)
 7. `manifest.json` — machine-readable pack manifest
 
 ---
 
 ## Pricing
 
-> **Pricing v3 (founder ruling 2026-09-12, ADR-076):** retention is now two
-> independent windows — an indexed window and a queryable-history window
-> (`specs/BILL-01-metering-and-tiers.md` §0.3) — rather than the single
-> `retention_days` figure the table and code citations below describe.
-> `apps/web/db/seed.mjs` is being migrated to the new columns in a parallel
-> block (expand → migrate → contract; `apps/web/db/schema.ts:146` in spec
-> §2.6); the exact current line numbers below are the pre-migration code and
-> may move once that migration lands — re-verify before citing.
+> Retention is per plan and has three windows — an indexed window, a
+> queryable-history window and a ledger window (`indexed_window_days`,
+> `queryable_days`, `ledger_days`; `apps/web/db/schema.ts:330-332`) — sourced
+> from `apps/web/db/plans.v3.json`. See [pricing](https://docs.tracelane.dev/pricing).
 
 | Tier | Ledger/audit-log retention (ruled) |
 |---|---|
@@ -192,26 +201,23 @@ The pack includes:
 
 Source: `apps/web/db/plans.v3.json` (`ledger_days` per plan) — the single
 machine-readable source for these figures, cross-checked by
-`scripts/ci/check-pricing-copy-vs-seed.py`. The prior per-plan `retention_days`
-integer column (`crates/gateway/src/entitlement_cache.rs:525`,
-`COALESCE(we.retention_days, pe.retention_days)`) is being replaced by the
-`indexed_window_days` / `queryable_days` / `ledger_days` columns named in
-spec §2.6.
+`scripts/ci/check-pricing-copy-vs-seed.py`. The gateway reads the per-plan
+`indexed_window_days` / `queryable_days` / `ledger_days` columns
+(`crates/gateway/src/entitlement_cache.rs:778-780`).
 
-**There is no paid audit product — the Article-12 export ships with the Enterprise plan.** An internal review found
-`/v1/audit/export` does not yet meet the evidence-pack bar
-(no per-record Merkle proof, no completeness attestation), so the export
-does not ship as a paid add-on at any price; 7-year ledger retention folds
-into Enterprise instead. Self-verification
-(`tlane verify` against your own export) is included on every tier. The bulk
-`GET /v1/audit/export` regulatory-export route stays gated ("self-verify free, Article-12 export
-gated" is unchanged by this ruling) —
-today that gate is the `FeatureKey::AuditAddon` check before any ClickHouse
-read (`crates/gateway/src/audit_export.rs:827,892`), which the ruled model
-resolves to true for Enterprise and false elsewhere, not to a purchasable
-flag (`apps/web/db/schema.ts:163`, `apps/web/db/seed.mjs:12-16`). Without it
-those endpoints return an entitlement-required error, not a reduced export.
-No non-Enterprise tier carries self-serve bulk export.
+**There is no paid audit product.** The `tlane export --pack` templates above
+are not plan-gated — the command takes no credential
+(`packages/cli/src/commands/export.ts:548-590`); the bulk `GET /v1/audit/export`
+route is Enterprise-only. `/v1/audit/export` is not sold as an evidence pack at
+any price (it carries no per-record Merkle proof and no completeness
+attestation); 7-year ledger retention is part of Enterprise instead.
+Self-verification (`tlane verify` against your own export) is included on every
+tier. The gate on `GET /v1/audit/export` is the `FeatureKey::AuditAddon` check
+before any ledger read (`crates/gateway/src/audit_export.rs:1144,1224`);
+`f_audit_addon` is seeded true for Enterprise and false elsewhere and is not a
+purchasable flag (`apps/web/db/schema.ts:254`, `apps/web/db/seed.mjs:67,159`).
+Without it those endpoints return an entitlement-required error, not a reduced
+export. No non-Enterprise tier carries self-serve bulk export.
 
 Included on every tier:
 - Per-tenant Ed25519-signed Merkle roots, with best-effort Sigstore Rekor v2 anchoring on the terms in [Hash chain structure](#hash-chain-structure) above
@@ -235,4 +241,5 @@ there is no QTSP integration.
   `#[deprecated]`** (`audit.rs:148,156,173`) — "vulnerable to field-boundary attacks". Do not
   implement against them.
 - `packages/cli/src/commands/export.ts` — `tlane export --pack eu-ai-act-art12`
-- `infra/dev/clickhouse/schema.sql` — `tracelane.audit_log` table
+- `apps/web/db/migrations/0047_adr078_ledger_canonical_pg.sql` — `audit_log_rows` / `audit_anchor_records`, the canonical ledger when Postgres is configured (`apps/web/db/schema.ts` is the Drizzle source)
+- `infra/dev/clickhouse/schema.sql` — `tracelane.audit_log` table: the ledger's ClickHouse copy, or its only home on a no-Postgres self-host

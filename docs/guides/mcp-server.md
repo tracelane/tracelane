@@ -8,27 +8,9 @@ It is read-only and tenant-scoped.
 
 ---
 
-> **Not on npm — every `npx` line on this page returns a 404 today.**
-> `@tracelanedev/mcp` is not on the registry. The package is wired into the release
-> workflow and becomes installable when the next signed release tag carries it;
-> releases are bundled, so that is the next tag covering everything that has moved,
-> not a tag cut for this package alone. **Until then the only way to run it is from a
-> clone** — see [Run it today](#run-it-today). The `npx` forms below are what to use
-> *after* it is published; they are documented now so the configuration is ready, not
-> because they work.
+## Install
 
-## Run it today (from a clone)
-
-```bash
-pnpm install
-pnpm --filter @tracelanedev/mcp build
-node apps/mcp/dist/index.js
-```
-
-Use `node /abs/path/to/apps/mcp/dist/index.js` as the `command` in any client config
-below, with no `args`, in place of the `npx` form.
-
-## Installation (once published — not yet available)
+`@tracelanedev/mcp` is published on npm (`0.3.0`, 2026-09-07):
 
 ```bash
 npx @tracelanedev/mcp
@@ -37,6 +19,14 @@ npx @tracelanedev/mcp
 Or install globally:
 ```bash
 npm install -g @tracelanedev/mcp
+```
+
+From a clone (local development):
+
+```bash
+pnpm install
+pnpm --filter @tracelanedev/mcp build
+node apps/mcp/dist/index.js
 ```
 
 ---
@@ -53,7 +43,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "args": ["@tracelanedev/mcp"],
       "env": {
         "TRACELANE_API_KEY": "tlane_your-key-here",
-        "TRACELANE_GATEWAY_URL": "https://api.tracelane.dev"
+        "TRACELANE_GATEWAY_URL": "https://gateway.tracelane.dev"
       }
     }
   }
@@ -63,6 +53,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ---
 
 ## Available tools
+
+Eight tools ship (`apps/mcp/src/tools/traces.ts`, `apps/mcp/src/tools/evals.ts`):
+`list_traces`, `get_trace`, `get_span`, `search_traces`, `replay_trace`,
+`explain_guardrail_block`, `list_evals`, `get_eval_result`. The three below are
+described in full; the reference for every tool is the
+[MCP server page](https://docs.tracelane.dev/mcp-server).
 
 ### `search_traces`
 
@@ -128,7 +124,8 @@ The MCP server is read-only. It cannot:
 - Access other tenants' data
 
 All requests are scoped to the tenant identified by `TRACELANE_API_KEY`. The key
-is validated against a JWT claim — never accepted from request body.
+is validated by the gateway (`/v1/auth/whoami`) and the tenant comes from that
+answer — never from a tool argument or request body.
 
 ---
 
@@ -139,7 +136,7 @@ If running Tracelane self-hosted, set `TRACELANE_GATEWAY_URL` to your gateway UR
 ```bash
 TRACELANE_API_KEY=tlane_your-key \
 TRACELANE_GATEWAY_URL=http://localhost:8080 \
-node apps/mcp/dist/index.js        # `npx @tracelanedev/mcp` once published
+npx @tracelanedev/mcp
 ```
 
 ---

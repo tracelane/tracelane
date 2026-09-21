@@ -60,12 +60,14 @@ included on every tier. Seven-year ledger retention and the bulk
 Request arrives at gateway
         │
         ▼
-  Audit event written to ClickHouse (hot tier)
-        │
-        ▼
   Event appended to the per-tenant SHA-256 hash chain     ← LIVE
   (each row hash binds the prior hash; domain-separated,
    length-prefixed; universal, free tier included)
+        │
+        ▼
+  Row and chain head committed to the CANONICAL ledger    ← LIVE (Postgres, one transaction)
+  → copied to ClickHouse for the dashboards: a derived copy,
+    rebuilt from the canonical store at boot if it falls behind
         │
         ▼
   ── Cryptographic anchoring (every tier) ──                ← LIVE (Ed25519 + Rekor, best-effort)
@@ -78,8 +80,12 @@ Request arrives at gateway
   → Rekor returns an entry_id (globally timestamped, immutable)
         │
         ▼
-  entry_id written back to ClickHouse batch record
+  entry_id written back to the canonical batch record (Postgres), then to the ClickHouse copy
 ```
+
+Export, self-verify and ledger-range read the **canonical** store; they never fall back
+to the ClickHouse copy, so a verifier is never handed a partial ledger dressed as a whole
+one. A self-hosted gateway run **without** Postgres keeps its chain in ClickHouse alone.
 
 The result: the hash chain is self-verifying. Given any NDJSON export,
 `tlane verify` recomputes the chain and returns exit 0 (no gaps, no mutations)
@@ -234,9 +240,12 @@ above and follows the same rule.
 
 The per-tenant Ed25519 audit keypair is live. Fetch the public key from
 `GET /v1/audit/pubkey` (or **Settings → Audit**) — it is the trust root the
-verifier uses to accept anchors. The private key is stored encrypted under your
-CMK when BYOK is enabled. Rotate it from **Settings → BYOK Keys** — the old key
-remains valid for verifying historical exports; only new batches use the new key.
+verifier uses to accept anchors. The private key is generated and held by
+Tracelane, envelope-encrypted at rest under a server-held master key
+(`crates/gateway/src/audit_keys.rs`); it is not encrypted under a
+customer-managed key, and rotation of the audit signing key is not yet
+offered. Keys you hold yourself are on the roadmap for Enterprise, as stated
+at the top of this page.
 
 ```bash
 # Fetch your current audit public key

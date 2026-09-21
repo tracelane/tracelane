@@ -12,8 +12,8 @@ Read it before any non-trivial task.
 
 ## 1. What this is
 
-Tracelane is **the flight recorder for AI agents**: full-fidelity capture of every LLM,
-tool, and agent call through a Rust gateway, with a tamper-evident audit ledger that can be
+Tracelane is **the flight recorder for AI agents**: full-fidelity capture of the LLM,
+tool and agent calls routed through its Rust gateway, with a tamper-evident audit ledger that can be
 verified offline by a third party. Blocking is **deliberately observe-first** — stopping an
 agent is destructive, and a false-positive block is worse than the failure it prevents.
 
@@ -83,7 +83,7 @@ Every edge carries its invariant. Dotted boxes are **not built**.
    ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
      R2 cold tier      ml/ ONNX models        ee/ license zone
    │ batcher DELETED   3 predictors are     │ DOES NOT EXIST         │
-     2026-09-12 B-390  unconditional stubs    (whole tree Apache-2.0)
+     2026-09-12        unconditional stubs    (whole tree Apache-2.0)
    └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 

@@ -12,7 +12,7 @@ Read-only MCP server exposing Tracelane trace data to any MCP-compatible client 
 
 **Default mode reads through the gateway** — the same tenant-scoped `/v1/*` routes the
 dashboard uses — with just `TRACELANE_API_KEY` and `TRACELANE_GATEWAY_URL`. That is the
-Cloud-tenant path (PLT-22) and needs no ClickHouse credentials. Set `CLICKHOUSE_URL` to
+Cloud-tenant path and needs no ClickHouse credentials. Set `CLICKHOUSE_URL` to
 switch to self-host mode, reading ClickHouse directly instead — see
 [Self-hosting](#self-hosting).
 

@@ -17,7 +17,7 @@
 Tracelane sits between your AI agents and your LLM providers. You get:
 
 - **BYOK proxy** — point agents at `https://gateway.tracelane.dev`, pass your own API key. 0% markup.
-- **Full-fidelity traces** — every LLM call, tool invocation, agent step, and retry captured as OTel spans using the GenAI semantic conventions. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
+- **Full-fidelity traces** — LLM calls, tool invocations, agent steps and retries captured as OTel spans using the GenAI semantic conventions, at full fidelity for everything routed through the gateway. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
 - **Tamper-evident audit ledger** — every recorded event is hash-chained per tenant and batch-anchored to a public transparency log. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us. That is the part you can hand to an auditor.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
 - **Cross-language ledger conformance** — the audit verifier is implemented three times, in Rust, Python and TypeScript, and all three are held to **one shared corpus of 8 conformance vectors** that includes deliberately-forged and boundary-numeric cases. **10 Rust + 14 Python + 19 TypeScript** conformance tests run in CI, plus a round-trip job asserting the three implementations agree. That is the suite behind "a third party can verify offline" — you can run it in this clone.
@@ -119,7 +119,8 @@ via `POST /v1/keys` needs a Postgres control plane, which self-host does not run
 
 **The tamper-evident audit ledger DOES run in self-host, with one limit worth knowing
 before you rely on it.** Events are hashed into the chain and persisted to ClickHouse
-`audit_log` — measured on a clean stack, four chat requests produce eight linked rows
+`audit_log` (the hosted product keeps the canonical ledger in Postgres and copies it to
+ClickHouse; a self-host without Postgres has only the ClickHouse chain) — measured on a clean stack, four chat requests produce eight linked rows
 with zero chain breaks. **What self-host does not have is chain resumption across a
 gateway restart.** The head is recovered from the Postgres control plane, which
 self-host does not run, so on restart the sequence begins again at genesis and you get

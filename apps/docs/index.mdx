@@ -7,8 +7,8 @@ classification: PUBLIC
 **The flight recorder for AI agents.**
 
 Tracelane is a Rust gateway and ClickHouse-backed observability tier that
-captures every LLM and tool call at full fidelity, with a tamper-evident audit
-ledger that makes each run provable. Its sharpest edge is **MCP and agent-tool
+captures the LLM calls routed through it at full fidelity — no default sampling — with a tamper-evident audit
+ledger that makes each gateway call verifiable. Its sharpest edge is **MCP and agent-tool
 safety**: it surfaces tool-definition-drift, rug-pull substitution, and
 hallucinated tool-call arguments as first-class signals (drift and rug-pull compare
 against a definition you approved in one click from the tools Tracelane has

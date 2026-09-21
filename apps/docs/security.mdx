@@ -8,12 +8,12 @@ classification: PUBLIC
 
 | Data type | Where it lives | Retention |
 |---|---|---|
-| Spans (hot) | ClickHouse — **EU, Germany** (Hetzner, Falkenstein) | Up to 365 days. Retention is not customer-configurable. |
-| Spans (cold) | **None.** No cold tier exists; an unused R2 batcher was removed on 2026-09-12 | n/a; spans live only in ClickHouse, under the hot retention above |
+| Spans (hot) | ClickHouse — **EU, Germany** (Hetzner, Falkenstein) | Parts stay on the hot volume for up to 365 days, then move to the cold volume below. The per-plan **indexed window** (Free 3 d, Builder 30 d, Team 90 d, Business 180 d, Enterprise 365 d) is the dashboard's fast-query boundary, not a deletion. Retention is not customer-configurable. |
+| Spans (cold) | ClickHouse cold volume on **Cloudflare R2 — EU jurisdiction** (`storage_policy = 'hot_cold'`) | Parts older than 365 days are moved here and stay queryable. **Queryable history** is Free 30 days, every paid tier 730 days: a per-plan sweep (enforced on Tracelane Cloud) deletes rows past that window, and the table's own TTL hard-deletes at 730 days. |
 | Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Until account deletion |
-| Audit log | ClickHouse (tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in) | Kept for the ledger's lifetime (no TTL) |
+| Audit log | **Neon Postgres — EU, Germany (Frankfurt)** holds the canonical chain rows and anchor records; ClickHouse (EU, Germany) holds a derived copy for the dashboards. Export and verification read the canonical store. Tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in | Kept for the ledger's lifetime (no TTL) |
 | Provider API keys | Postgres (envelope-encrypted) | Within 60 seconds of revocation (a key idle for over a minute may be accepted once more on its next use while the gateway re-checks it) |
-| Prompt/completion text | ClickHouse spans | Same as spans (not captured unless an operator allowlists the workspace`) |
+| Prompt/completion text | ClickHouse spans | Same as spans (not captured unless an operator allowlists the workspace). Completion bodies are also held by the response cache for up to 7 days — see [Prompt content](#prompt-content) |
 
 ### Sigstore Rekor — an external dependency, deliberately not a sub-processor
 
@@ -32,17 +32,15 @@ appears as a dependency rather than as a sub-processor.
 That reasoning is recorded so it is not re-litigated each time the list is reviewed. It
 would be revisited if the anchored content ever stopped being a bare hash.
 
+**Cloudflare R2 is a storage location, not a bare-hash dependency.** Aged span parts
+are moved to a ClickHouse cold volume backed by Cloudflare R2 (EU jurisdiction), so
+Cloudflare holds customer span data and is a sub-processor for it on Tracelane Cloud.
+
 **Region selection is not offered.** Tracelane Cloud runs a single deployment: neither
 the span schema nor the control-plane schema carries a region dimension, so a tenant
 cannot be pinned to a region and no per-region isolation is claimed. If you need to
 control the jurisdiction your data sits in, [self-host](/self-hosting) — you choose
 where ClickHouse and Postgres run.
-
-<Note>
-**Current behavior:** hot spans carry a **365-day** storage backstop today, and
-per-plan trimming (7–365 days by tier) is rolling out — so until it ships, data may
-be retained **up to 365 days** regardless of plan.
-</Note>
 
 There is no self-serve erasure endpoint. Per-subject erasure requests are handled
 manually via support. Deleting a tenant in Postgres cascades that tenant's control-plane
@@ -76,7 +74,9 @@ Provider keys **never** appear in:
 
 ## Transport
 
-- **TLS 1.3 minimum** on all external traffic. TLS 1.2 rejected.
+- **TLS 1.3** on the edge→origin hop: the origin accepts nothing lower. The
+  public edge (`gateway.tracelane.dev`, `app.tracelane.dev`) negotiates
+  **TLS 1.2 or later** — a TLS 1.2 client is accepted there.
 - **mTLS on the OTLP ingest receiver** — SDK and collector connections to ingest
   are mutually authenticated against SPIFFE identities. The gateway publishes
   spans to ingest over NATS on the internal network, which is not mTLS.
@@ -106,10 +106,11 @@ User-supplied span content (prompt/completion text) is wrapped in
 
 ### Prompt content
 
-**Prompt and completion text is not captured for your workspace.** The gateway
-records the *shape* of a run — model, provider, token counts, latency, cost,
-status, tool-call structure — and not the message bodies. The first-party SDKs do
-not send message bodies either.
+**Prompt and completion text is not captured into your workspace's traces.** The
+gateway records the *shape* of a run — model, provider, token counts, latency,
+cost, status, tool-call structure — and not the message bodies. The first-party
+SDKs do not send message bodies either. The response cache, described below, is
+the one place completion bodies are retained.
 
 Capture is not merely absent, it is **off unless an operator turns it on for a
 named workspace.** A self-hosted deployment can enable it with a `trace_content:`
@@ -118,8 +119,21 @@ maximum field size; with no such block, capture is off for everyone. On Tracelan
 Cloud no customer workspace is on that list, and a CI guard fails the build if one
 is added.
 
-The one path by which prompt text can reach us is your **own** OpenTelemetry
-instrumentation: if you emit the `gen_ai.input.messages` /
+**The response cache retains completion bodies, and it is on for every workspace
+on Tracelane Cloud.** For a non-streaming `POST /v1/chat/completions` request the
+gateway keeps the provider's completion body in process memory, keyed by a hash of
+the request, for up to 7 days, so a byte-identical repeat is served without a
+provider call. If your workspace holds a key for a provider with an embeddings
+API, the gateway also sends the request's message text to **your own** embedding
+provider and writes the completion body plus that embedding — not the message
+text — to a ClickHouse `semantic_cache` table with a 7-day TTL. A workspace whose
+only provider key has no embeddings API (Anthropic, for example) gets the
+in-memory tier alone, which empties on every gateway restart. There is no
+per-workspace or per-request opt-out today. `POST /v1/messages` and streaming
+requests are never cached. See `crates/gateway/src/semantic_cache.rs`.
+
+The one path by which prompt text can reach your **stored traces** is your own
+OpenTelemetry instrumentation: if you emit the `gen_ai.input.messages` /
 `gen_ai.output.messages` semantic-convention attributes to `POST /v1/traces`, we
 store what you send. That is under your control, in your instrumentation.
 
