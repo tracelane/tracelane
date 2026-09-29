@@ -108,7 +108,7 @@ describe("auditTrustState", () => {
 				}),
 			],
 			[
-				"a4037bef — anchored in Rekor",
+				"0e57f1c7 — anchored in Rekor",
 				auditTrustState({
 					anchorRecordCount: 161,
 					anchoredCount: 161,

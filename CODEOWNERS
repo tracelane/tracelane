@@ -2,7 +2,7 @@
 # These owners are automatically requested for review on PRs.
 # Format: <pattern> <owner> [<owner>...]
 
-# Default: founder reviews everything
+# Default: the maintainers review everything
 * @sanjeevlabs
 
 # Rust components — gateway is hot-path, security-critical
@@ -14,7 +14,7 @@
 # ML models — trajectory guard and SLM judge
 /ml/                   @sanjeevlabs
 
-# Eval suite — merge gate, never modified by eval-runner subagent
+# Eval suite and conformance vectors
 /evals/                @sanjeevlabs
 
 # Security-critical: auth, crypto, tenant isolation
@@ -27,7 +27,7 @@
 # Public spec files (CC0)
 /spec/                 @sanjeevlabs
 
-# Decisions and docs
+# Documentation
 /docs/                 @sanjeevlabs
 
 # Infrastructure

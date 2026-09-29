@@ -10,7 +10,7 @@
 # build/dev artifact trees from the scan. Cargo and npm dependency CVEs are
 # still covered by cargo-audit / cargo-deny / pnpm-audit / OSV-Scanner.
 #
-# ⚠️ SCHEMA NOTE (fixed 2026-07-06): each ignore rule below is a
+# ⚠️ SCHEMA NOTE: each ignore rule below is a
 # PACKAGE-ONLY matcher — do NOT add `vulnerability: "*"`. Grype treats the
 # `vulnerability` field as a LITERAL vuln-id comparison, so `"*"` matches a vuln
 # *named* "*" (i.e. nothing), silently disabling the rule (grype loads the
@@ -19,7 +19,7 @@
 # this file with `--config .grype.yaml` (v0.112 does not auto-discover it).
 
 ignore:
-  # SRE-40 (2026-09-22): glibc 2.43-r11 in the gateway/ingest runtime base —
+  # glibc 2.43-r11 in the gateway/ingest runtime base —
   # CVE-2026-19499, `strfmon`/`strfmon_l` right-justified width-padding overflow. NVD:
   # "no network-facing application impact is known"; no fixed package is published
   # (grype fix versions: none). A Rust binary never calls strfmon — ring/aws-lc/tokio
@@ -50,14 +50,12 @@ ignore:
   # REVIEW: 2026-11-07
   - package:
       name: vitest
-  # @vitest/mocker — GHSA-82fw-gwwq-j7x9 (2026-09-08), the redirect-mock path traversal; same
-  # precondition (a Vite dev server / browser mode) we never run. Mirrors osv-scanner.toml. B-434.
+  # @vitest/mocker — GHSA-82fw-gwwq-j7x9, the redirect-mock path traversal; same
+  # precondition (a Vite dev server / browser mode) we never run. Mirrors osv-scanner.toml.
   # REVIEW: 2026-11-07
   - package:
       name: "@vitest/mocker"
-  # brace-expansion 2.1.4 — the one residual of the 2026-07-30 bump pass (postcss,
-  # valibot and the brace-expansion 5.x copy were all raised to fixed versions, not
-  # ignored). 2.1.4 carries the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH),
+  # brace-expansion 2.1.4 carries the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH),
   # but the GHSA range is a flat `<= 5.0.7` — not branch-aware — so it keeps matching
   # every 2.x maintenance release. Cannot raise to 5.x: minimatch@8.0.7 consumes the
   # callable default export that 5.x replaced with a named one. Build-only chain
@@ -65,31 +63,23 @@ ignore:
   # This rule names the ADVISORY as well as the package (unlike the package-only rules
   # above) so any OTHER brace-expansion advisory still fires. The genuinely vulnerable
   # 2.1.2 cannot return: pnpm overrides floor the 2.x line at >=2.1.4 and the >=3 line
-  # at >=5.0.8. Mirrors osv-scanner.toml.
+  # at >=5.0.8.
   #
-  # ⚠️ 2026-09-10 — THE "not branch-aware" PREMISE ABOVE IS NO LONGER TRUE, and the
-  # package.json half of this mirror is GONE. GitHub has since re-cut the advisory into
-  # per-branch ranges (`>=4.0.0 <5.0.8`, `>=3.0.0 <3.0.3`, `>=2.0.0 <2.1.3`, `<1.1.17`),
-  # read from `gh api /advisories/GHSA-mh99-v99m-4gvg`. Our resolved copies are 2.1.4 and
-  # 5.0.9, both above their branch's fix — so `pnpm audit` with ignoreGhsas EMPTIED no
-  # longer reports it at all (measured), and the entry was deleted from package.json as a
-  # mute that muted nothing. THIS rule is kept only because Grype carries its own
-  # vulnerability DB and may still hold the flat range; delete it the first time a Grype
-  # run reports it as unused. Do not re-add the package.json entry.
+  # GitHub's advisory database now carries per-branch ranges, and both resolved copies
+  # (2.1.4, 5.0.9) are above their branch's fix, so `pnpm audit` no longer reports it.
+  # This rule stays only because Grype carries its own vulnerability DB and may still
+  # hold the flat range; delete it the first time a Grype run reports it as unused.
   # REVIEW: 2026-11-07
   - vulnerability: GHSA-mh99-v99m-4gvg
     package:
       name: brace-expansion
-  # ── ADDED 2026-08-09 (founder-ruled). These three were ALREADY accepted in
-  # osv-scanner.toml and were MISSING here, so Grype re-flagged advisories OSV had
-  # passed. Two suppression lists for one decision, drifted — same class as
-  # (BYOK routable-vs-storable) and the 6-way alert-metric list.
+  # ── The three below mirror osv-scanner.toml: one decision, two scanners' lists.
 
   # opentelemetry_sdk 0.27.1 — SUPPRESSED, not fixed.
   # Reason it does not apply: it is not a dependency we chose. `cargo tree --invert`
   # shows it arrives ONLY via opentelemetry-proto (the OTLP protobuf decoder in
   # crates/ingest). We consume prost-generated structs; no SDK entry point is ever
-  # called. Verified 2026-08-09 that `default-features = false` on opentelemetry-proto
+  # called. `default-features = false` on opentelemetry-proto
   # compiles clean but does NOT drop the crate — the sdk is required by the `trace`
   # feature. The only real fix is opentelemetry-proto 0.27 -> ~0.32, a five-minor jump
   # on the decoder in the ingest hot path, to patch code we never execute.
@@ -103,7 +93,7 @@ ignore:
   # Reason it does not apply: purely transitive (via the MCP SDK), patched only in the
   # 2.x MAJOR. Forcing a major on a transitive dep we do not control, in an app whose
   # tests would not catch a runtime break, is a worse risk than the moderate itself.
-  # UNBLOCKING CONDITION (founder, 2026-08-09): revisit when apps/mcp has real test
+  # UNBLOCKING CONDITION: revisit when apps/mcp has real test
   # coverage — until then a forced major is unverifiable.
   # REVIEW: 2026-11-07
   - vulnerability: GHSA-frvp-7c67-39w9

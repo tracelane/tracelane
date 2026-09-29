@@ -9,8 +9,8 @@ The gateway's ``PromptGuardClient`` (see
 every incoming LLM request.  The sidecar is designed to be co-located with the
 gateway process on the same host (no TLS, localhost-only by default).
 
-Throughput: ≥1 000 req/sec on a single Hetzner CCX13 CPU core.
-Latency:    <30 ms p50 on the same hardware.
+Throughput and latency are not published as measurements; benchmark on your
+own hardware before sizing a deployment.
 
 Usage::
 

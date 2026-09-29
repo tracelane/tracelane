@@ -2739,7 +2739,7 @@ mod tests {
         // The parser's own floor is 1024 bytes — small enough to force
         // truncation with a short fixture string.
         let parsed = crate::server::config::parse(
-            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 1024\n",
+            "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n  max_field_bytes: 1024\n",
         )
         .expect("a well-formed trace_content block must parse");
         let cfg = parsed.trace_content().expect("block present");
@@ -2799,7 +2799,7 @@ mod tests {
     #[test]
     fn captured_output_from_config_keeps_tool_calls_when_text_is_empty() {
         let parsed = crate::server::config::parse(
-            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n",
+            "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n",
         )
         .expect("parses");
         let cfg = parsed.trace_content().expect("block present");

@@ -117,12 +117,13 @@ pytest packages/sdk-python/
 
 # Eval orchestrator
 pytest evals/
-
-# Full eval suite — CI runs it with MOCK providers; behavioural assertions need a live stack
-pnpm eval:run --suite=all
 ```
 
-CI runs `pnpm eval:run --suite=all` with `TRACELANE_EVAL_MOCK_PROVIDERS=true`, so every behavioural assertion SKIPS there; the live-stack eval job is opt-in (`workflow_dispatch`). A red eval is acted on rather than automatically refused. Never disable an eval — mark it flaky in the suite and fix within 48 hours.
+The TypeScript eval suites under `evals/` (`pnpm eval:run`) run in the maintainers' CI;
+they report, and no required status check blocks a merge on them. Several of them read artifacts that are not published in this repository, so here
+they are reference material and the `evals` package's `test` script says so rather than
+pretending to pass. The audit-ledger conformance vectors in `evals/audit-ledger/` are
+self-contained and are exercised by the verifier round-trip CI job.
 
 ## Linting and formatting
 
@@ -144,7 +145,6 @@ Run before any hot-path change (gateway, ingest, predictive layer):
 ```bash
 pnpm bench:gateway
 pnpm bench:ingest
-pnpm bench:gateway
 ```
 
 The benchmark job is NOT on the PR path — it runs only on manual dispatch. The budgets it measures against:

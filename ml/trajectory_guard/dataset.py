@@ -1,7 +1,8 @@
 """
 Trace pair dataset for Trajectory Guard training.
 
-Reads from eval_corpus/trace_pairs.dvc (DVC-versioned dataset).
+Reads an NDJSON trace-pair dataset. The maintainers' labelled corpus is not
+distributed with this repository; supply your own in the format below.
 Each sample is a pair of traces: (normal, failure_or_normal) with a label.
 
 Dataset format (NDJSON, each line):
@@ -93,7 +94,8 @@ class TracePairDataset(Dataset):
         path = Path(ndjson_path)
         if not path.exists():
             raise FileNotFoundError(
-                f"Dataset not found: {path}\nRun: dvc pull eval_corpus/trace_pairs.dvc"
+                f"Dataset not found: {path}\n"
+                "The training corpus is not distributed with this repository."
             )
 
         with path.open() as f:

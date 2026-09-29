@@ -19,10 +19,9 @@
 -- retention (Enterprise) — a fail-safe BACKSTOP, not the per-plan window". The
 -- window that actually governs is the entitlement-driven sweep
 -- (`crates/gateway/src/retention_sweep.rs`): Free 7 / Builder 30 / Team 90 /
--- Business 180 / Enterprise 365 days. The ONE tenant with content capture on
--- (`a4037bef`) is `free_v1`, so its governing window is SEVEN DAYS — and on prod
--- today **10,225 of its spans are already past that window, 406 of them carrying
--- content**. Nothing has deleted them only because the sweep runs `dryrun`.
+-- Business 180 / Enterprise 365 days. A Free workspace's governing window is
+-- therefore SEVEN DAYS, whatever this table's own TTL says, and rows older than
+-- that are removed only when the sweep runs in delete mode rather than `dryrun`.
 --
 -- So a queue could list a trace whose content the sweep would already have
 -- removed, and the reviewer would meet a dead end at submit. Copying at

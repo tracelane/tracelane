@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # scripts/security-scan.sh
 #
-# PRIMARY security-scan gate — runs LOCALLY (WSL/dev box). GitHub Actions is
-# NOT relied upon: .github/workflows/security-scan.yml mirrors THIS script for
-# whenever hosted CI happens to be available, never the other way around
-# (founder directive 2026-07-23 after the Actions-billing outage silently
-# disabled all scheduled scanning).
-#
-# Scheduled leg: scripts/ops/tlane-secscan.sh runs weekly on tl-node-1
-# (systemd timer) scanning the RUNNING container images + the public repo's
-# lockfiles, alerting via the watchdog's Gmail SMTP path.
+# Local security-scan gate: runs every dependency / supply-chain scanner the
+# nightly .github/workflows/security-scan.yml runs, with the same config files
+# (deny.toml, .cargo/audit.toml, osv-scanner.toml, .grype.yaml),
+# so a contributor can reproduce the scheduled scan before pushing.
 #
 # Usage: scripts/security-scan.sh          (from anywhere; cds to repo root)
 # Exit:  0 iff every scanner is clean at its threshold.

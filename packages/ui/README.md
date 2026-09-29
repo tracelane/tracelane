@@ -45,7 +45,7 @@ reference families by name only and do not load anything.**
 ## Verify
 
 - `pnpm --filter @tracelanedev/ui contrast:check` — WCAG ≥4.5:1 text / ≥3:1 UI, both themes.
-  Run by `scripts/verify-all.sh`; its `--selftest` proves it goes red on a low-contrast pair.
+  Its `--selftest` proves it goes red on a low-contrast pair.
 - `pnpm --filter @tracelanedev/ui typecheck` · `pnpm --filter @tracelanedev/ui lint`.
 
 ## Preview

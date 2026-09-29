@@ -2187,14 +2187,14 @@ failover:
     /// the failure that would matter.
     #[test]
     fn the_allowlist_excludes_a_tenant_it_does_not_name() {
-        let cfg = parse("trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n")
+        let cfg = parse("trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n")
             .expect("parses")
             .trace_content()
             .expect("block present")
             .clone();
 
         let named = tracelane_shared::TenantId::from_jwt_claim(
-            uuid::Uuid::parse_str("a4037bef-e786-44e3-bfb6-88c93ba9d381").expect("uuid"),
+            uuid::Uuid::parse_str("0e57f1c7-0000-4000-8000-00000000c0de").expect("uuid"),
         );
         let other = tracelane_shared::TenantId::from_jwt_claim(
             uuid::Uuid::parse_str("32ccef57-0000-0000-0000-000000000000").expect("uuid"),
@@ -2215,14 +2215,14 @@ failover:
     fn gwy53_capture_decision_is_allowlist_or_workspace_and_fails_closed_without_a_cache() {
         use crate::db::workspace_capture::WorkspaceCapture;
         let cfg = parse(
-            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 2048\n",
+            "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n  max_field_bytes: 2048\n",
         )
         .expect("parses")
         .trace_content()
         .expect("block present")
         .clone();
         let listed = tracelane_shared::TenantId::from_jwt_claim(
-            uuid::Uuid::parse_str("a4037bef-e786-44e3-bfb6-88c93ba9d381").expect("uuid"),
+            uuid::Uuid::parse_str("0e57f1c7-0000-4000-8000-00000000c0de").expect("uuid"),
         );
         let customer = tracelane_shared::TenantId::from_jwt_claim(
             uuid::Uuid::parse_str("32ccef57-0000-0000-0000-000000000000").expect("uuid"),
@@ -2270,7 +2270,7 @@ failover:
     #[test]
     fn trace_content_block_parses_and_refuses_every_ambiguity() {
         let ok = parse(
-            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 65536\n",
+            "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n  max_field_bytes: 65536\n",
         )
         .expect("a well-formed trace_content block must parse");
         let tc = ok.trace_content().expect("block present");
@@ -2297,7 +2297,7 @@ failover:
         // max_field_bytes defaults rather than failing — it is a tuning knob, not
         // a safety one.
         assert_eq!(
-            parse("trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n")
+            parse("trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n")
                 .expect("parses without max_field_bytes")
                 .trace_content()
                 .expect("present")
@@ -2318,25 +2318,25 @@ failover:
                  day someone REMOVES a tenant expecting it to take effect",
             ),
             (
-                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381,\n",
+                "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de,\n",
                 "a trailing comma leaves an empty entry — refuse rather than guess",
             ),
             (
-                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381,                  a4037bef-e786-44e3-bfb6-88c93ba9d381\n",
+                "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de,                  0e57f1c7-0000-4000-8000-00000000c0de\n",
                 "a duplicated tenant is a copy-paste error worth surfacing",
             ),
             (
-                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 8\n",
+                "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n  max_field_bytes: 8\n",
                 "below 1 KiB every realistic prompt truncates to nothing, producing \
                  unusable eval cases while appearing to work",
             ),
             (
-                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n                   max_field_bytes: 99999999\n",
+                "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n                   max_field_bytes: 99999999\n",
                 "above 1 MiB the span can exceed the NATS payload limit and be dropped \
                  WHOLE — losing the trace, not just the text",
             ),
             (
-                "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  bogus: 1\n",
+                "trace_content:\n  tenants: 0e57f1c7-0000-4000-8000-00000000c0de\n  bogus: 1\n",
                 "an unknown key inside the block must refuse — the strict-subset parser \
                  is the thing that makes a typo loud",
             ),

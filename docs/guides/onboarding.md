@@ -207,17 +207,12 @@ You should see NDJSON audit rows. If the time range is empty, hit
 
 ### 8. Wire your evals
 
-Run the V1 eval suite locally:
-
-```bash
-pnpm eval:run --suite=all
-```
-
-20 conformance evals — 10 fault-tolerance chaos scenarios, 7 gateway-correctness,
-and one each for ingest-schema, PII-redaction and prompt-injection. CI runs the
-suite against mock providers (`TRACELANE_EVAL_MOCK_PROVIDERS` in
-`.github/workflows/ci.yml`); behavioural assertions that need a live stack are
-skipped there, so a green mock run is not a behavioural verdict.
+The repository's `evals/` directory holds 20 conformance evals — 10 fault-tolerance
+chaos scenarios, 7 gateway-correctness, and one each for ingest-schema, PII-redaction
+and prompt-injection. Several of them read artifacts that are not published in the
+public repository, so `pnpm eval:run` will not pass from a public clone; read them as
+reference, and see [eval gates](https://docs.tracelane.dev/eval-gates) for gating
+your own prompts and models.
 
 ---
 

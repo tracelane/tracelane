@@ -13,7 +13,7 @@ attacker-influenced input.**
 
 `check-build-script-network-deps.py` already catches that shape — but it shells out to
 `cargo metadata`, so it needs a Rust toolchain and it fails CLOSED (exit 2) without one.
-**`tl-node-1`, the self-hosted runner every working CI job routes to, has no cargo**
+**The self-hosted runner every working CI job routes to has no cargo**
 (`command -v cargo` returns nothing), and the GitHub-hosted runners have not provisioned
 since 2026-08-17 (`GH-ACTIONS-BILLING`). Putting a fail-closed cargo dependency into the
 one CI job that currently runs would turn it permanently red, which is worse than no

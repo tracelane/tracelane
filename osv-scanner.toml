@@ -8,24 +8,11 @@
 # not ignored. npm moderates are below the pnpm-audit --audit-level=high gate
 # and tracked internally.
 #
-# ── ON `# REVIEW:` DATES — READ BEFORE TRUSTING ONE ─────────────────────────
-# Every remaining entry carries the SAME bulk-stamped `# REVIEW: 2026-11-07`.
-# An identical date on every row carries NO PER-ENTRY INFORMATION: it records
-# when someone stamped the file, not when anyone re-read THIS justification.
-# That is the same defect as a file-level "last verified" stamp standing in for
-# a row-level re-read. Two entries were found on 2026-08-24 whose REASON had
-# gone false while the entry still fired and therefore still looked healthy
-# (@hono/node-server — fixed on our own 1.x line all along, now bumped and the
-# ignore deleted; and vitest — right conclusion, wrong version arithmetic, text
-# corrected below). AN IGNORE WHOSE REASON HAS GONE FALSE IS WORSE THAN AN
-# UNUSED ONE: it is a decision nobody will re-open. No guard checks this; it is
-# a human re-read, and the date above will not tell you when one last happened.
-#
-# 19 dead ignores were deleted 2026-08-24 (osv-scanner 2.4.0 reported each as
-# unused): 4 whose package is gone, 10 bumped past the fix, 4 alias-redundant
-# with the GHSA half already listed, and @hono/node-server once bumped.
+# Every entry carries a `# REVIEW:` date, enforced by
+# scripts/ci/check-suppression-reviews.py. A date says when the entry must next be
+# re-read; it does not prove the reason still holds. An ignore whose stated reason has
+# gone false is worse than an unused one — correct or delete it.
 
-# new advisories surfaced 2026-07-06; all dev-tooling or transitive-below-concern -
 # vite: dev/test tooling (vitest), never shipped in any product artifact; tied to the vitest-major migration.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
@@ -79,44 +66,24 @@ reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, C
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "transitive via async-nats 0.42; the NATS URL is operator-controlled, CRL-parse path unreachable. Mirrors .cargo/audit.toml; real fix is the async-nats >=0.47 upgrade."
 
-# vite: dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migration. Tracked in .
+# vite: dev/test tooling (vitest), not shipped; tied to the vitest-major migration.
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-4w7w-66w2-5vf9"
-reason = "dev/test tooling (vitest), not shipped; tied to the vitest 2->4 migration. Tracked in ."
+reason = "dev/test tooling (vitest), not shipped; tied to the vitest-major migration."
 
-# vitest: file-read only when `vitest --ui` is running — we never run the UI (only `vitest run`). Patch is vitest 4.1.0 (major). Tracked in .
+# vitest: file-read only when the `vitest --ui` server is listening — we never run the UI (only `vitest run`).
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-5xrq-8626-4rwp"
-reason = "vitest UI server arbitrary file read/exec. REASON CORRECTED 2026-08-24: the previous text said 'patch is vitest 4.1.0 (major)'. OSV's real ranges are [0, 3.2.6) and [4.0.0, 4.1.0); we resolve vitest 2.1.9 (declared ^2.0.0 in 6 packages), so we sit in the FIRST range and the first fixed version on our line is 3.2.6 - still a MAJOR bump (2.x -> 3.x), not the 4.x one claimed. Conclusion unchanged, arithmetic was wrong. Precondition not met either: the advisory requires the vitest UI server to be LISTENING; every invocation here is `vitest run` (no --ui), and it is dev/test tooling never shipped in a product artifact. FOUNDER RULING R126 (2026-08-24): NO BUMP — a 2->3 major across six packages for a dev-only test runner whose exploit precondition we never meet. This ignore is DELIBERATE and its reason is now the true one; if it goes false again, delete or correct it rather than leaving it, because an ignore whose stated reason is false is worse than an unused one."
+reason = "vitest UI server arbitrary file read/exec. Requires the vitest UI server to be LISTENING; every invocation here is `vitest run` (no --ui), and vitest is dev/test tooling never shipped in a product artifact. OSV's affected ranges are [0, 3.2.6) and [4.0.0, 4.1.0); we resolve vitest 2.1.9, so the fix is a 2.x -> 3.x major across six packages, deliberately not taken for a precondition we never meet."
 
-# vitest 2026-09-08 advisory (CVE-2026-84373): path traversal via a redirect mock, reachable ONLY
-# through the unauthenticated `mockerPlugin`/`interceptorPlugin` of a Vite DEV SERVER or vitest
-# browser mode — `grep -rn "browser:\|@vitest/browser\|mockerPlugin"` over the tree is empty, and
-# every invocation is `vitest run` (no dev server, no --ui, no browser). Same class and the same
-# founder ruling as GHSA-5xrq above (R126: no 2->4 major for a dev-only runner whose precondition
-# we never meet). Fix version is 4.1.11 — the VITEST-MAJOR item. B-434, 2026-09-19. Mirrored in
-# .grype.yaml (`@vitest/mocker`; `vitest` was already there by package).
+# vitest advisory (CVE-2026-84373): path traversal via a redirect mock, reachable ONLY
+# through the unauthenticated `mockerPlugin`/`interceptorPlugin` of a Vite DEV SERVER or
+# vitest browser mode. Neither is used anywhere in the tree; every invocation is
+# `vitest run`. Same class as GHSA-5xrq above. Fix version is 4.1.11 (a major).
+# Mirrored in .grype.yaml (`@vitest/mocker`; `vitest` was already there by package).
 # REVIEW: 2026-11-07
 [[IgnoredVulns]]
 id = "GHSA-82fw-gwwq-j7x9"
-reason = "vitest/@vitest/mocker 2.1.9 redirect-mock path traversal: needs a Vite dev server or vitest browser mode; we run `vitest run` only, never shipped. Fix is 4.1.11 (major) — VITEST-MAJOR. Founder R126 class."
-
-# ── astro: THREE IGNORES DELETED 2026-09-10, FIXED RATHER THAN SUPPRESSED ─────
-#
-# `GHSA-4g3v-8h47-v7g6`, `GHSA-f48w-9m4c-m7f5` and `GHSA-7pw4-f3q4-r2p2` were
-# ignored here from 2026-08-24 on an SSR-only-unreachability argument, with
-# "the real fix is astro 6 -> 7 (a major)" written as the thing not taken.
-#
-# It was taken. B-373: `apps/site` moved astro 6.4.8 -> 7.3.2, which is past all
-# three fixes (7.1.0 / 7.0.6 / 7.0.4) and past the CRITICAL that forced the
-# issue — `GHSA-26w7-cxv4-gfx2`, RCE through AVIF image optimization, patched in
-# 7.2.8 and never ignorable on the unreachability argument the other three used.
-# The entries are DELETED rather than left: this file's own header calls a dead
-# ignore worse than an unused one, and osv-scanner 2.4.0 reports unused ignores.
-#
-# The unreachability argument itself is still true and still worth having if a
-# future astro advisory needs it: `apps/site/astro.config.ts` declares NO adapter
-# and no `output: "server"`, so it builds static and `dist/` carries no server
-# entry. That fact is now recorded here instead of inside three ignores.
+reason = "vitest/@vitest/mocker 2.1.9 redirect-mock path traversal: needs a Vite dev server or vitest browser mode; we run `vitest run` only, never shipped. Fix is 4.1.11 (major); same class as GHSA-5xrq."

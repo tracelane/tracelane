@@ -4,9 +4,9 @@
 #
 # What this does:
 #   1. Checks Docker + Docker Compose are available
-#   2. Downloads docker-compose.yml + .env.example to ./tracelane/
+#   2. Downloads docker-compose.yml, .env.example and the ClickHouse files to ./tracelane/
 #   3. Generates TRACELANE_MASTER_KEY and CLICKHOUSE_PASSWORD
-#   4. Starts the stack
+#   4. Pulls the published gateway + ingest images (ghcr.io) and starts the stack
 #   5. Prints the endpoint URL
 
 set -euo pipefail
@@ -54,6 +54,10 @@ curl -fsSL "$GITHUB_RAW/docker-compose.yml"          -o "$INSTALL_DIR/docker-com
 curl -fsSL "$GITHUB_RAW/.env.example"                -o "$INSTALL_DIR/.env.example"
 curl -fsSL "$GITHUB_RAW/clickhouse/config.xml"       -o "$INSTALL_DIR/clickhouse/config.xml"
 curl -fsSL "$GITHUB_RAW/clickhouse/schema.sql"       -o "$INSTALL_DIR/clickhouse/schema.sql"
+# docker-compose.yml bind-mounts this file too; a missing bind-mount source makes
+# Docker create an empty DIRECTORY at that path, which the ClickHouse init step
+# cannot execute.
+curl -fsSL "$GITHUB_RAW/clickhouse/02_slo_alerting.sql" -o "$INSTALL_DIR/clickhouse/02_slo_alerting.sql"
 
 if [[ ! -f "$INSTALL_DIR/.env" ]]; then
     cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"

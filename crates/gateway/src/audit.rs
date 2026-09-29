@@ -2459,7 +2459,7 @@ async fn anchor_task(
 /// R32 — a batch older than this anchors regardless of size. **Founder-ruled 24 h**, and
 /// the value is not arbitrary: it is the largest that still makes the customer-facing
 /// statement true, and the smallest that costs the busiest tenant nothing. At the
-/// measured 381 events/day, `a4037bef`'s 100-event threshold fires every ~6.3 h, so a
+/// measured 381 events/day, a demo tenant's 100-event threshold fires every ~6.3 h, so a
 /// 24 h timer never wins and its metered-anchor count is unchanged (+0/day). A 1 h value
 /// would flush it hourly — ~24 anchors/day against 3.8 today, a 6× cost for no benefit.
 /// A 7 d value would leave a new customer un-attested for a week, which is the same
@@ -3228,7 +3228,7 @@ mod tests {
             rekor,
             None,
             Some(ch),
-            TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            TenantId::from_jwt_claim("0e57f1c7-0000-4000-8000-00000000c0de".parse().unwrap()),
             vec![[9u8; 32]],
             1,
             1,

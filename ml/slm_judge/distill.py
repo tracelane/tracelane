@@ -62,7 +62,8 @@ class JudgeDataset(Dataset):
         if not p.exists():
             raise FileNotFoundError(
                 f"Judge labels dataset not found: {p}\n"
-                "Generate labels with: python label_with_teachers.py"
+                "The teacher-labelled dataset is not distributed with this "
+                "repository; supply your own NDJSON of teacher labels."
             )
         with p.open() as f:
             for line in f:

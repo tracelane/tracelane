@@ -225,10 +225,10 @@ mod tests {
         // The prod outage's shape: pgbouncer keeps the server connection — and
         // the session lock on it — after the client leaves.
         assert!(tracelane_shared::listen_dsn::host_cannot_deliver_notify(
-            "ep-spring-bread-asrn0mea-pooler.c-4.eu-central-1.aws.neon.tech"
+            "ep-example-host-000000-pooler.c-4.eu-central-1.aws.neon.tech"
         ));
         assert!(!tracelane_shared::listen_dsn::host_cannot_deliver_notify(
-            "ep-spring-bread-asrn0mea.c-4.eu-central-1.aws.neon.tech"
+            "ep-example-host-000000.c-4.eu-central-1.aws.neon.tech"
         ));
     }
 

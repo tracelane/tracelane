@@ -211,6 +211,11 @@ ClickHouse              Cloudflare
 | `spec/aft-1/` | Markdown | Agent Failure Taxonomy — 13 published failure modes |
 | `infra/dev/` | YAML/SQL | Docker Compose + ClickHouse schema |
 
+The tracelane.dev marketing site is hosted separately and is not part of this
+repository: its source is mostly deployment configuration for the hosted service
+(edge worker bindings, the sign-up form backend, production security headers), which
+nobody building, self-hosting or verifying Tracelane needs.
+
 ## Development
 
 ```bash
@@ -228,8 +233,9 @@ cargo run -p gateway
 # Run ingest
 cargo run -p ingest
 
-# Run eval suite (reports; no required status check blocks a merge on it)
-pnpm eval:run --suite=all
+# Run the tests
+cargo test --workspace --all-features
+pnpm test
 ```
 
 ## Migrating from LiteLLM

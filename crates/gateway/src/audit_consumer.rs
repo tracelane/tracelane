@@ -33,7 +33,7 @@ const CONSUMER: &str = "tracelane-audit-head-writer";
 
 /// Byte ceiling on the audit stream — 1 GiB.
 ///
-/// SRE register #50 (2026-09-04, fixed 2026-09-05): every JetStream stream on tl-node-1
+/// SRE register #50 (2026-09-04, fixed 2026-09-05): every JetStream stream on the production node
 /// was byte-UNBOUNDED (`max_bytes: -1`, read from `jsz`), on the one un-replicated volume
 /// that also holds ClickHouse and the ledger. The audit stream is a WORK QUEUE that drains
 /// to zero on every ack (prod: `messages: 0`), so this bound binds only during a

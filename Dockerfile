@@ -7,19 +7,9 @@
 #          binary would fail to load. Use glibc-dynamic, not static.
 #
 # This is the recipe `.github/workflows/release-container.yml` publishes to GHCR.
-# It deliberately mirrors `infra/docker/gateway.Dockerfile` (the one that builds
-# the running production gateway) step for step. It previously did NOT, and the
-# release job failed 5/5 — never once producing an image — on four independent
-# defects, each masked by the one before it:
-#   1. `COPY crates/mcp-rs/…` for a crate that exists in no branch of either repo
-#      and is not a workspace member  ->  "not found" before anything compiled;
-#   2. no `USER root`, so the nonroot Wolfi user cannot mkdir under WORKDIR
-#      ->  "mkdir: can't create directory 'crates/shared/src': Permission denied";
-#   3. no cmake, which aws-lc-rs / ring need to compile their C;
-#   4. a partial workspace copy (no packages/verifier-rust) and no
-#      apps/web/db/migrations, which the gateway `include_str!`s at compile time.
-# Keep the two files in step: a second, divergent build definition for the same
-# binary is what let this rot unnoticed.
+# It mirrors `infra/docker/gateway.Dockerfile` (the docker-compose build) step for
+# step; keep the two in step — a second, divergent build definition for the same
+# binary is how one of them rots unnoticed.
 FROM cgr.dev/chainguard/rust:latest-dev@sha256:812b1f7bad6a00a1ea4dae924eb9a3621402d6912b37de1d0847d77555282a42 AS builder
 USER root
 # aws-lc-rs / ring (via rustls + jsonwebtoken's aws_lc_rs feature) compile C -> cmake.

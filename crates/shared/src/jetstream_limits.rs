@@ -1,7 +1,7 @@
 //! JetStream stream limits that are ENFORCED on an existing stream, not merely declared.
 //!
 //! WHY — SRE audit register #50 (2026-09-04), fixed 2026-09-05. Every JetStream stream on
-//! tl-node-1 was byte-UNBOUNDED (`max_bytes: -1` on `TRACELANE_SPANS`, `TRACELANE_AUDIT`
+//! the production node was byte-UNBOUNDED (`max_bytes: -1` on `TRACELANE_SPANS`, `TRACELANE_AUDIT`
 //! and `TRACELANE_SPANS_DLQ`, read from `jsz` on the node), on the one un-replicated
 //! volume that also holds ClickHouse and the audit ledger. An ingest stall would have
 //! filled the disk before anything bounded it, and ENOSPC takes ClickHouse and the ledger

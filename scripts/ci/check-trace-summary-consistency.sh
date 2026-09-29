@@ -12,7 +12,7 @@
 # CH client is configurable (default = the prod node's docker exec, matching how
 # the demo is seeded/fixed). Override with CLICKHOUSE_CMD for a local/other CH:
 #   CLICKHOUSE_CMD='clickhouse-client -q' scripts/ci/check-trace-summary-consistency.sh
-#   NODE=tl-node-1 scripts/ci/check-trace-summary-consistency.sh   # via ssh+docker
+#   NODE=<ssh host> scripts/ci/check-trace-summary-consistency.sh   # via ssh+docker
 #
 # Exit 0 iff spans↔summaries are fully consistent (0 missing, 0 orphan).
 set -uo pipefail
@@ -112,8 +112,8 @@ run() { # <sql> -> the query result (one line)
   if [ -n "${CLICKHOUSE_CMD:-}" ]; then
     eval "$CLICKHOUSE_CMD \"\$sql\""
   else
-    local node="${NODE:-tl-node-1}"
-    ssh -o ConnectTimeout=15 -i "${SSH_KEY:-$HOME/.ssh/hetzner}" "$node" \
+    local node="${NODE:?set NODE=<ssh host running ClickHouse>, or CLICKHOUSE_CMD}"
+    ssh -o ConnectTimeout=15 -i "${SSH_KEY:-$HOME/.ssh/id_ed25519}" "$node" \
       "docker exec tracelane-clickhouse-1 clickhouse-client -q \"$sql\"" 2>/dev/null
   fi
 }

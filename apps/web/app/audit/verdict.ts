@@ -159,7 +159,7 @@ export function isAlarm(v: AuditVerdict): boolean {
  * never an alarm either.
  *
  * WHY THIS BUCKET EXISTS (R53). Measured on production 2026-08-15: at
- * `/v1/audit/self-verify?limit=10` the coverage filter dropped all 161 of a4037bef's
+ * `/v1/audit/self-verify?limit=10` the coverage filter dropped all 161 of a demo tenant's
  * anchors, `trust_established` went false, and the product told the operator their
  * fully intact ledger FAILED verification. Our own product accusing a customer's
  * ledger is worse than any false green we have found, because a customer acting on it

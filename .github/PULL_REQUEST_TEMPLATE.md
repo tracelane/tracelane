@@ -19,7 +19,7 @@
 - [ ] `pnpm lint` passes (Biome)
 - [ ] `pnpm typecheck` passes
 - [ ] `ruff check .` + `ruff format --check .` pass
-- [ ] `pnpm eval:run --suite=all` is green (merge gate)
+- [ ] `pnpm test`, `cargo test --workspace --all-features` and `pytest` pass
 - [ ] Every new public async fn has `#[tracing::instrument]` with `tenant_id` field
 - [ ] New ClickHouse queries include `WHERE tenant_id = ?` (CI grep enforces this)
 - [ ] No secrets added (pre-commit + Gitleaks CI enforce this)

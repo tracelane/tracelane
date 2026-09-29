@@ -203,9 +203,8 @@ Stated plainly, so nothing here is read as delivered:
 - The eval suite's merge gate runs with mock providers, so behavioural assertions are skipped
   there; only the live-stack job exercises real behaviour.
 - **Provider coverage:** 191 providers — every row of `crates/gateway/providers.tsv` plus 6
-  native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived,
-  never written down: `scripts/ci/check-provider-count.py` computes it and fails any file that
-  disagrees.
+  native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived
+  from those two sources, never maintained by hand.
 
 ---
 
@@ -326,12 +325,13 @@ cargo fmt --check && cargo clippy --workspace -- -D warnings
 ruff check . && ruff format --check .
 
 pnpm test && cargo test --workspace --all-features && pytest
-pnpm eval:run --suite=all      # valid suites: all, ft, gc, is, pp, pir, pi
 ```
 
-`scripts/verify-all.sh` runs the full local gate (fmt, clippy
-`--all-targets`, `cargo test --all-features`, cargo-deny/audit/machete, the guard scripts,
-biome, typecheck, vitest, knip, `pnpm audit`, gitleaks, ruff, pytest).
+The `guards` job in `.github/workflows/ci.yml` runs the structural guard scripts under
+`scripts/ci/`; each one is a plain script you can run locally. `scripts/security-scan.sh`
+runs the dependency and supply-chain scanners (cargo-deny/audit/machete, `pnpm audit`,
+osv-scanner, grype, and a no-openssl check). The TypeScript eval suites under `evals/` are reference
+material in this repository (several read artifacts that are not published here).
 
 ---
 

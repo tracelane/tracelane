@@ -1,7 +1,6 @@
 # Tracelane self-host — single-node deployment for $5–$10 VPS
 #
 # Minimum requirements: 2 vCPU, 2 GB RAM, 40 GB disk
-# Tested on: Hetzner CX21, Fly.io shared-cpu-2x, DigitalOcean Droplet 2GB
 #
 # Usage:
 #   1. Copy .env.example to .env and fill in your API keys

@@ -121,7 +121,7 @@ fn self_verify_verdict(
     // Everything checkable PASSED and the only thing missing is a trust root for this
     // window — because `anchors_fully_covered` removed every anchor whose covered seqs
     // fall outside it. Measured on prod 2026-08-15: at `?limit=10` all 161 of
-    // a4037bef's anchors were dropped and this returned RED for a fully intact ledger.
+    // a demo tenant's anchors were dropped and this returned RED for a fully intact ledger.
     //
     // That is CLAUDE.md §14 read in reverse. The rule says "I cannot see" is never
     // "nothing is wrong"; its converse binds just as hard — "I cannot see" is never

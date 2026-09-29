@@ -1549,7 +1549,7 @@ mod route_tests {
     /// The three cancel tests read and assert on ONE process-wide counter
     /// (`REQUESTS_CANCELLED_IN_DISPATCH`). Run in parallel — CI's 8 threads,
     /// not the 2 the local gate uses — one test's cancellation lands between
-    /// another's `before` read and its assertion (`tl-ci-1`'s first run,
+    /// another's `before` read and its assertion (the CI runner's first run,
     /// 2026-09-12: `a_request_that_completes…` read 1 where it expected 0).
     /// One lock, held for the whole test.
     static CANCEL_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

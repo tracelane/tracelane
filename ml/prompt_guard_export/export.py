@@ -15,9 +15,10 @@ failure (see ``crates/gateway/src/predictive/prompt_guard.rs`` once
 the inference wiring lands).
 
 License note: Llama Prompt Guard 2 is distributed under the Llama
-Community License. Verify terms at https://www.llama.com/llama3/license/
-before V1 ship — we document the dependency separately in
-``LICENSE-PROMPT-GUARD-2.md`` (founder to add).
+Community License, and so is the INT8 file this script derives from it.
+Review the terms at https://www.llama.com/llama3/license/ before
+redistributing the exported file. The weights are not included in this
+repository; run this script to produce them.
 """
 
 from __future__ import annotations

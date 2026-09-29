@@ -5,9 +5,8 @@
 #          Wolfi rust image targets glibc); chainguard/static has NO libc and the
 #          binary would fail to load. Use glibc-dynamic, not static.
 #
-# Bases are tag-referenced. Pin to the digest from the first node build
-# (`docker images --digests`) and re-pin on each base bump — cgr.dev free
-# `:latest` digests are GC'd over time, so we pin the digest we actually ran.
+# Bases are digest-pinned; re-pin on each base bump (cgr.dev free `:latest`
+# digests are garbage-collected over time).
 FROM cgr.dev/chainguard/rust:latest-dev@sha256:812b1f7bad6a00a1ea4dae924eb9a3621402d6912b37de1d0847d77555282a42 AS builder
 USER root
 # aws-lc-rs / ring (via rustls + jsonwebtoken's aws_lc_rs feature) compile C → cmake.
@@ -20,8 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY packages/verifier-rust/ packages/verifier-rust/
 # The gateway embeds the authoritative Drizzle migrations at compile time
-# (crates/gateway/src/db include_str!("../../../../apps/web/db/migrations/*.sql");
-# the old infra/dev/postgres/migrations set was deleted per ADR-040/),
+# (crates/gateway/src/db include_str!("../../../../apps/web/db/migrations/*.sql"),
 # so they must be present in the build context at the same relative path.
 COPY apps/web/db/migrations/ apps/web/db/migrations/
 # Reviewed identity classifier, embedded at compile time.
@@ -43,18 +41,9 @@ LABEL org.opencontainers.image.title="Tracelane Gateway" \
       org.opencontainers.image.source="https://github.com/tracelane/tracelane"
 
 # ── DEPLOY PROVENANCE ────────────────────────────────────────────────────────────
-# Set ONLY by scripts/deploy/gateway.sh. Any other build — an ad-hoc
-# `docker compose build`, a manual `docker build` — leaves these EMPTY, and that
-# empty value is the signal.
-#
-# Earned 2026-08-10: a hand-rolled `tar -cf - crates/gateway crates/shared` push
-# rebuilt the gateway without the deploy script, so prod ran for hours on an image
-# with none of its own verification behind it — no source-marker, no /health proof,
-# no audit-live-proof, no rollback tag. The existing DEPLOYED_SHA.txt marker did not
-# catch it, because it is a file NEXT TO the source rather than a property of the
-# running image: it kept claiming a two-day-old sha for a freshly built container.
-# The only thing that surfaced it was a security scanner failing for an unrelated
-# reason. Ask the ARTIFACT, not the directory it was built from.
+# Set only by the maintainers' deploy tooling. Any other build — `docker compose
+# build`, a manual `docker build` — leaves these EMPTY, and that empty value is the
+# signal: ask the running ARTIFACT how it was built, not the directory beside it.
 ARG TRACELANE_DEPLOY_SHA=""
 ARG TRACELANE_DEPLOY_VIA=""
 LABEL org.tracelane.deploy.sha="$TRACELANE_DEPLOY_SHA" \

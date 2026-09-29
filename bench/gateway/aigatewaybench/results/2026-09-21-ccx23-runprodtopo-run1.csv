@@ -1,7 +1,7 @@
 # PLT-23 gateway-overhead comparison — AIGatewayBench harness commit ff372fc
 # date=2026-09-21 host_label=ccx23 run_label=prodtopo-run1 nproc=4 mem_gb=15 kernel=6.8.0-138-generic load1m=0.79
 # tracelane_sha=e286a6f9 litellm_python_version=1.102.0
-# mock_url=http://167.233.25.249:9100 mock_bind=0.0.0.0 mock_ttft_ms=0 mock_itl_ms=0
+# mock_url=http://<bench-host>:9100 mock_bind=0.0.0.0 mock_ttft_ms=0 mock_itl_ms=0
 # nats_conf=nats-sync-100ms.conf only=direct,tracelane tracelane_topology=prod-control-plane
 gateway,status,version,n,p50_ms,p95_ms,p99_ms,peak_rss_mb,notes
 direct,ok,direct-mock,4554,1,1,2,2.376,

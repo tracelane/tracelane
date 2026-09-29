@@ -487,7 +487,7 @@ mod tests {
     // WHAT THIS IS: a regression gate with a real measured figure, on whatever
     // machine runs the test suite.
     // WHAT THIS IS NOT: the ADR-014 production-equivalent benchmark. That still
-    // requires a Hetzner CCX13 run, which cannot happen on tl-node-1 today (no
+    // requires a Hetzner CCX13 run, which cannot happen on the self-hosted runner today (no
     // cargo on the node, and a full Rust compile saturates it). The public copy
     // therefore stays hedged — `apps/docs/predictive-guardrails.mdx` still says
     // "an engineering target, not yet measured on production-equivalent

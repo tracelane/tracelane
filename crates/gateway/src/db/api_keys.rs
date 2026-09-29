@@ -874,7 +874,7 @@ pub fn argon2id_verify(phc: &str, key_body: &str) -> Result<bool> {
 /// (m=19456, t=2, p=1 — measured on this box: min 28.9 / median 35.3 / max 45.4 ms),
 /// and it ran inline on the async task. The gateway is a bare `#[tokio::main]`, so it
 /// gets one worker per core — **FOUR on prod**, confirmed from `/proc/<pid>/task` on
-/// tl-node-1 (4x `tokio-rt-worker`, and ZERO blocking-pool threads, which is its own
+/// the production node (4x `tokio-rt-worker`, and ZERO blocking-pool threads, which is its own
 /// evidence that `spawn_blocking` was unused). An inline verify therefore parks a
 /// QUARTER of the runtime for ~35 ms, including whatever else lives in this process —
 /// the audit head-writer consumer among it.

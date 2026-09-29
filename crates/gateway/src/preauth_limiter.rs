@@ -30,7 +30,7 @@
 //!
 //! **Precondition, stated (security review M-2, 2026-09-12):** `cf-connecting-ip`
 //! is only trustworthy because the origin accepts :443 from Cloudflare's edge
-//! ranges alone (Hetzner firewall `tl-fw`, `infra/prod/docker-compose.yml`) and
+//! ranges alone (the host firewall, the production compose file) and
 //! Cloudflare overwrites the header with the true client address. On a
 //! deployment whose origin is reachable directly, a client can send a fresh
 //! `cf-connecting-ip` per request and this throttle keys on whatever it says —

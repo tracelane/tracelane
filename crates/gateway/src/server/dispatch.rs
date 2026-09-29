@@ -930,7 +930,7 @@ mod tests {
         // (b) …and the span we now build for it is a real, renderable error span rather
         //     than an empty shell. `aft_id: None` selects build_error_span.
         let span = build_error_span(
-            &TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            &TenantId::from_jwt_claim("0e57f1c7-0000-4000-8000-00000000c0de".parse().unwrap()),
             Uuid::new_v4(),
             None,
             "claude-haiku-4-5",
@@ -971,7 +971,7 @@ mod tests {
         // (c) And the mapped case still carries its signature, so (a) cannot be
         //     satisfied by deleting the AFT feature.
         let poisoned = build_error_span(
-            &TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
+            &TenantId::from_jwt_claim("0e57f1c7-0000-4000-8000-00000000c0de".parse().unwrap()),
             Uuid::new_v4(),
             None,
             "claude-haiku-4-5",
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     fn the_terminal_error_span_carries_the_attempt_ledger() {
         let tenant =
-            TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap());
+            TenantId::from_jwt_claim("0e57f1c7-0000-4000-8000-00000000c0de".parse().unwrap());
         let ledger = vec![
             DispatchAttempt {
                 attempt: 0,

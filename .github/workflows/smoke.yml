@@ -45,7 +45,7 @@ jobs:
     name: Integration smoke (ingest -> ClickHouse)
     # HOSTED-RUNNER OPT-IN (founder, 2026-09-07 — hosted minutes are billed,
     # "only in extreme case with my approval"). This job CANNOT move to
-    # `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` (tl-node-1): `e2e-smoke.sh` runs
+    # `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` (the self-hosted runner): `e2e-smoke.sh` runs
     # `docker compose up clickhouse nats`, which binds the SAME host ports
     # (8123/4222) prod uses on that box — identical to why `live-eval-gate` in
     # ci.yml stays off the self-hosted node. So it stays `ubuntu-latest` and
