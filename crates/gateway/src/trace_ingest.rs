@@ -3,9 +3,11 @@
 //! ## Why this route exists
 //!
 //! Until this route, **a Tracelane Cloud customer could not produce a multi-span
-//! trace at all.** The gateway emits one root span per request with
-//! `parent_span_id: None` (`server.rs`, `build_gateway_span`), and ingest's OTLP
-//! receiver is reachable only over SPIFFE mTLS inside the Docker network. So the
+//! trace at all.** The gateway emitted one root span per request with
+//! `parent_span_id: None` (since B-311 / ADR-075 it honours an inbound `traceparent`,
+//! so a gateway span can now be a CHILD — `server/spans.rs`, `build_gateway_span`),
+//! and ingest's OTLP receiver is reachable only over SPIFFE mTLS inside the Docker
+//! network. So the
 //! waterfall, `OBS-10` trace compare and the transcript spine were all built and
 //! structurally unreachable: nothing could create the input they render. B-208
 //! measured the consequence — 2,400 traces over 13 days, `max(span_count) = 1` —
@@ -270,7 +272,13 @@ pub async fn ingest_traces_handler(
     if let crate::rate_limiter::RateLimitDecision::Throttle { retry_after_secs } =
         state.rate_limiter.check(&tenant_id, rpm)
     {
-        state.rejection_metrics.record_rate_limited(&tenant_id);
+        // RI-05 slice 3 follow-up (2026-09-20): the aggregate span for the OTLP route too.
+        state.rejection_metrics.record_admission_refusal(
+            &tenant_id,
+            claims.api_key_id(),
+            crate::rejection_metrics::RejectionReason::RateLimited,
+            chrono::Utc::now(),
+        );
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({
@@ -421,7 +429,7 @@ pub async fn ingest_traces_handler(
     // All-or-nothing at the size gate. Publishing half a batch and then returning
     // 413 for the rest would leave the customer's trace permanently truncated
     // with no way to tell which half landed.
-    let mut payloads: Vec<(String, Vec<u8>)> = Vec::with_capacity(batch.spans.len());
+    let mut payloads: Vec<(String, Vec<u8>, String)> = Vec::with_capacity(batch.spans.len());
     for span in &batch.spans {
         let payload = match serde_json::to_vec(span) {
             Ok(p) => p,
@@ -443,19 +451,23 @@ pub async fn ingest_traces_handler(
                 Some(&tenant_id),
             );
         }
-        payloads.push((crate::otlp_emit::span_subject(span), payload));
+        payloads.push((
+            crate::otlp_emit::span_subject(span),
+            payload,
+            crate::otlp_emit::msg_id_for(span),
+        ));
     }
 
-    // ── 8. Publish. The subject carries the tenant; ingest re-binds from it ──
+    // ── 8. Publish — ACKED (RI-07 / B-443). The subject carries the tenant; ingest
+    // re-binds from it. Until 2026-09-19 this was a CORE `nats.publish`, which returns
+    // Ok when the bytes are enqueued in THIS process — so the 200 below said "durable"
+    // about a span the server might never have seen (the B-376 class, fixed for the
+    // gateway's own spans on 09-12 and not here). Now every span goes through the same
+    // acked JetStream publish with a `Nats-Msg-Id`, and the 200 means JetStream accepted
+    // every one; anything else is a 503 the stock exporter retries, and the ids make
+    // that retry land once.
     let n_total = payloads.len();
-    let mut n_rejected = 0usize;
-    for (subject, payload) in payloads {
-        if let Err(err) = nats.publish(subject, payload.into()).await {
-            crate::otlp_emit::note_span_publish_failed();
-            tracing::warn!(error = %err, "trace ingest: span publish failed");
-            n_rejected += 1;
-        }
-    }
+    let n_rejected = publish_batch(&nats, payloads).await;
 
     if n_rejected > 0 {
         // OTLP's partial-success shape, matching what ingest's own receiver
@@ -484,9 +496,106 @@ pub async fn ingest_traces_handler(
     resp
 }
 
+/// RI-07: publish every payload (fast — the client hands bytes to the server or errors),
+/// then await ALL acks under ONE `ACK_TIMEOUT`. Returns how many spans were NOT durably
+/// accepted: publish errors, negative acks, and acks not received in time — each counted
+/// on `SpanPublishFailed` exactly as B-376 counts the gateway's own. Bounded at
+/// `ACK_TIMEOUT` for the whole batch, never `N × ACK_TIMEOUT`.
+async fn publish_batch(
+    nats: &async_nats::Client,
+    payloads: Vec<(String, Vec<u8>, String)>,
+) -> usize {
+    let mut acks = Vec::with_capacity(payloads.len());
+    let mut n_rejected = 0usize;
+    for (subject, payload, msg_id) in payloads {
+        match crate::otlp_emit::publish_span_bytes(nats, subject, payload, msg_id).await {
+            Ok(ack) => acks.push(std::future::IntoFuture::into_future(ack)),
+            Err(err) => {
+                crate::otlp_emit::note_span_publish_failed();
+                tracing::warn!(error = %err, "trace ingest: span publish failed");
+                n_rejected += 1;
+            }
+        }
+    }
+    let n_acks = acks.len();
+    match tokio::time::timeout(
+        crate::otlp_emit::ACK_TIMEOUT,
+        futures::future::join_all(acks),
+    )
+    .await
+    {
+        Ok(results) => {
+            for r in results {
+                if let Err(err) = r {
+                    crate::otlp_emit::note_span_publish_failed();
+                    tracing::warn!(error = %err, "trace ingest: span publish not acked");
+                    n_rejected += 1;
+                }
+            }
+        }
+        Err(_) => {
+            // Every un-acked span in the batch counts as rejected; the exporter retries
+            // the batch and the `Nats-Msg-Id`s dedup the ones that did land.
+            for _ in 0..n_acks {
+                crate::otlp_emit::note_span_publish_failed();
+            }
+            tracing::warn!(
+                spans = n_acks,
+                "trace ingest: JetStream acks timed out for the batch"
+            );
+            n_rejected += n_acks;
+        }
+    }
+    n_rejected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RI-07 §7 row 3, against a REAL nats-server (check-nats-auth.sh): the route's
+    /// publish loop decides 200/503 on ACKS, not enqueues. A stream that REFUSES at
+    /// capacity (`DiscardPolicy::New`, `max_messages` 2) accepts 2 of 5 payloads; the
+    /// other 3 come back rejected, inside one `ACK_TIMEOUT`. A core publish would have
+    /// reported 0 rejected — every enqueue "succeeds".
+    #[tokio::test]
+    #[ignore = "needs NATS_TEST_URL_OPS — run scripts/ci/check-nats-auth.sh"]
+    async fn ri07_publish_batch_rejects_what_jetstream_refused() {
+        let ops_url = std::env::var("NATS_TEST_URL_OPS").expect("NATS_TEST_URL_OPS");
+        let nc = tracelane_shared::nats_connect::NatsConnect::from_url(&ops_url);
+        let client = nc.options().connect(&nc.url).await.expect("ops connects");
+        let js = async_nats::jetstream::new(client.clone());
+        let name = format!("RI07B_{}", uuid::Uuid::new_v4().simple());
+        let subject = format!("tracelane.ri07test.{}.t", name.to_lowercase());
+        let mut stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("tracelane.ri07test.{}.>", name.to_lowercase())],
+                max_messages: 2,
+                discard: async_nats::jetstream::stream::DiscardPolicy::New,
+                ..Default::default()
+            })
+            .await
+            .expect("refusing stream");
+        let payloads: Vec<(String, Vec<u8>, String)> = (0..5)
+            .map(|i| {
+                (
+                    subject.clone(),
+                    format!("{{\"i\":{i}}}").into_bytes(),
+                    format!("t:tr:{i}"),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let rejected = publish_batch(&client, payloads).await;
+        assert!(started.elapsed() < crate::otlp_emit::ACK_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(
+            rejected, 3,
+            "5 published, the stream holds 2, so 3 were refused"
+        );
+        assert_eq!(stream.info().await.expect("info").state.messages, 2);
+        let _ = js.delete_stream(&name).await;
+    }
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

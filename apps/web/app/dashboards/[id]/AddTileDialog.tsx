@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * AddTileDialog — two compact, inline client forms: "Add tile" (a metric +
@@ -23,6 +24,7 @@
  * customer sees the choice before committing to it, not just its label.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { allMetrics } from "@/lib/metrics/registry";
 import {
 	CHART_HEIGHT_PX,
@@ -128,7 +130,7 @@ export function AddTileDialog({ dashboardId }: Props) {
 		setAdding(true);
 		setError(null);
 		try {
-			const res = await fetch(`/api/dashboards/${dashboardId}/tiles`, {
+			const res = await apiFetchRaw(`/api/dashboards/${dashboardId}/tiles`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -162,7 +164,7 @@ export function AddTileDialog({ dashboardId }: Props) {
 		setAddingDivider(true);
 		setDividerError(null);
 		try {
-			const res = await fetch(`/api/dashboards/${dashboardId}/tiles`, {
+			const res = await apiFetchRaw(`/api/dashboards/${dashboardId}/tiles`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -189,20 +191,22 @@ export function AddTileDialog({ dashboardId }: Props) {
 	if (mode === "closed") {
 		return (
 			<div className="flex flex-wrap items-center gap-2">
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => setMode("metric")}
 					className="inline-flex items-center gap-2 rounded-[var(--radius-control)] border border-dashed border-line px-4 py-2 text-sm text-ink-3 transition-colors hover:border-line-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				>
 					<span aria-hidden="true">+</span> Add tile
-				</button>
-				<button
+				</Button>
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => setMode("divider")}
 					className="inline-flex items-center gap-2 rounded-[var(--radius-control)] border border-dashed border-line px-4 py-2 text-sm text-ink-3 transition-colors hover:border-line-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				>
 					<span aria-hidden="true">+</span> Add section divider
-				</button>
+				</Button>
 			</div>
 		);
 	}
@@ -216,13 +220,14 @@ export function AddTileDialog({ dashboardId }: Props) {
 				>
 					<div className="flex items-center justify-between">
 						<p className="t-metric-label">Add a section divider</p>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setMode("closed")}
 							className="text-xs text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring"
 						>
 							Cancel
-						</button>
+						</Button>
 					</div>
 					<p className="text-xs text-ink-3">
 						A full-width strip that starts a new row — every tile added after it
@@ -259,13 +264,14 @@ export function AddTileDialog({ dashboardId }: Props) {
 						<p className="text-xs text-danger-ink">{dividerError}</p>
 					)}
 					<div className="flex justify-end">
-						<button
+						<Button
+							variant="bare"
 							type="submit"
 							disabled={addingDivider}
 							className="rounded-[var(--radius-control)] bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							{addingDivider ? "Adding…" : "Add divider"}
-						</button>
+						</Button>
 					</div>
 				</form>
 			</div>
@@ -281,13 +287,14 @@ export function AddTileDialog({ dashboardId }: Props) {
 			<form onSubmit={handleAdd} className="flex flex-col gap-4">
 				<div className="flex items-center justify-between">
 					<p className="t-metric-label">Add a tile</p>
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => setMode("closed")}
 						className="text-xs text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring"
 					>
 						Cancel
-					</button>
+					</Button>
 				</div>
 
 				<div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -445,13 +452,14 @@ export function AddTileDialog({ dashboardId }: Props) {
 				{error && <p className="text-xs text-danger-ink">{error}</p>}
 
 				<div className="flex justify-end">
-					<button
+					<Button
+						variant="bare"
 						type="submit"
 						disabled={adding}
 						className="rounded-[var(--radius-control)] bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						{adding ? "Adding…" : "Add tile"}
-					</button>
+					</Button>
 				</div>
 			</form>
 		</div>

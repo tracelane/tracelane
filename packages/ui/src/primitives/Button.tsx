@@ -1,3 +1,4 @@
+"use client";
 import { type VariantProps, cva } from "class-variance-authority";
 import { type ButtonHTMLAttributes, forwardRef } from "react";
 import { cn } from "../lib/cn";
@@ -44,18 +45,14 @@ import { cn } from "../lib/cn";
  * reason. A list saying only `transform` transitions nothing and the press would
  * have snapped anyway, silently, while looking correct in the diff.
  *
- * RADIUS: `rounded-md` (6px), and it stays there. tokens.css now splits the
- * radius in two — `--radius-card` 18px for cards/tiles/panels, `--radius-control`
- * 8px for buttons/inputs/chips — and a button at the CARD radius is what makes a
- * surface read as a wireframe of rounded rectangles rather than as a sheet with
- * controls on it. 6px is the small end of the control band and keeps a button
- * visibly tighter than the 18px card behind it.
+ * Controls use the shared control radius and minimum hit target.
  */
 const button = cva(
-	"inline-flex items-center justify-center gap-2 rounded-md font-medium whitespace-nowrap transition-[color,background-color,border-color,opacity,scale] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50",
+	"ui-button inline-flex items-center justify-center gap-2 rounded-control font-medium whitespace-nowrap transition-[color,background-color,border-color,opacity,scale] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50",
 	{
 		variants: {
 			variant: {
+				bare: "",
 				/*
 				 * SOLID INK PRIMARY — and the token is `--selected`, NOT
 				 * `--surface-inverse`. THE BUG THIS FIXES (P0.4/P0.12, 2026-08-22):
@@ -103,10 +100,17 @@ export interface ButtonProps
 		VariantProps<typeof button> {}
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-	({ className, variant, size, ...props }, ref) => (
+	({ className, variant, size, type, ...props }, ref) => (
 		<button
 			ref={ref}
-			className={cn(button({ variant, size }), className)}
+			type={type ?? (variant === "bare" ? "button" : undefined)}
+			data-variant={variant}
+			className={cn(
+				variant === "bare"
+					? "ui-button focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:pointer-events-none disabled:opacity-50"
+					: button({ variant, size }),
+				className,
+			)}
 			{...props}
 		/>
 	),

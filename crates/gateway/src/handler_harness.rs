@@ -114,6 +114,9 @@ pub(crate) fn test_state_with_chain(
         rate_card: Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::billing::RateCard::unavailable(),
         )),
+        zdr: Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::zdr::ZdrCapabilities::unavailable(),
+        )),
     }
 }
 
@@ -206,6 +209,341 @@ mod tests {
     use crate::server::{chat_completions_handler, embeddings_handler};
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
+
+    // ── GWY-49 — zero-data-retention routing, spec §7 rows 3–4 ──────────────
+    //
+    // The whole feature is one decision (`zdr::ZdrCapabilities::eligible`) sitting in
+    // front of dispatch. These drive the REAL handler and count what the mock provider
+    // received — a refused request must reach it ZERO times.
+
+    fn with_zdr_caps(state: &AppState, rows: &[(&str, &str)]) {
+        state
+            .zdr
+            .store(Arc::new(crate::zdr::ZdrCapabilities::from_rows(
+                rows.iter()
+                    .map(|(p, z)| ((*p).to_string(), (*z).to_string())),
+            )));
+    }
+
+    fn authed_with_trace_and_zdr(trace_id: uuid::Uuid, value: &str) -> HeaderMap {
+        let mut h = authed_with_trace(trace_id);
+        h.insert(
+            "x-tracelane-zdr",
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+        h
+    }
+
+    /// Row 4: the model's provider is `none` → 400 `zdr_unsatisfiable`, the provider
+    /// receives NOTHING, and the error span names the reason. Fail-closed, observed.
+    #[tokio::test]
+    async fn zdr_required_on_a_none_provider_is_refused_before_any_byte_leaves() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        with_zdr_caps(&state, &[("ollama", "none")]);
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(trace_id, "required"),
+            Json(
+                json!({"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "zdr_unsatisfiable");
+        assert_eq!(body["provider"], "ollama");
+        assert_eq!(
+            server.received_requests().await.expect("recorded").len(),
+            0,
+            "a refused ZDR request must never reach the provider"
+        );
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1, "the refusal leaves exactly one error span");
+        assert_eq!(
+            spans[0].status.code,
+            tracelane_shared::SpanStatusCode::Error
+        );
+        assert_eq!(
+            spans[0].status.message.as_deref(),
+            Some("zdr_unsatisfiable")
+        );
+        // The REFUSAL span carries the constraint and the EMPTY eligible set, so an
+        // auditor filtering `tracelane_zdr_required = true` sees refusals too.
+        assert_eq!(spans[0].attributes.tracelane_zdr_required, Some(true));
+        assert_eq!(
+            spans[0]
+                .attributes
+                .tracelane_zdr_eligible_providers
+                .as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            body["eligible_provider_count"], 0,
+            "no provider is `default` in this table, and the body says so"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no provider in this gateway's capability table")),
+            "with zero eligible providers the advice must not point at a choice that does not exist: {body}"
+        );
+    }
+
+    /// Row 3 — the router PRUNES: the primary is `none`, the customer opted into
+    /// cross-provider failover, and the chain's candidate is `default` → the candidate
+    /// serves the request as if asked for; the primary is a `zdr_ineligible` skip in the
+    /// attempt ledger; `failover_from` names it; the eligible set is the candidate alone.
+    #[tokio::test]
+    async fn zdr_required_prunes_a_none_primary_to_the_eligible_failover_candidate() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        // openai → ollama chain. `gpt-4o` routes to openai (the ineligible primary);
+        // the candidate `ollama/llama3` routes to the mock. Leaked: `AppState.failover`
+        // is `&'static`, exactly as the boot path installs it.
+        let chain: &'static crate::server::config::FailoverConfig =
+            Box::leak(Box::new(crate::server::config::FailoverConfig::for_test(
+                vec![
+                    crate::server::config::FailoverHop {
+                        provider_id: "openai".into(),
+                        model: "gpt-4o".into(),
+                    },
+                    crate::server::config::FailoverHop {
+                        provider_id: "ollama".into(),
+                        model: "ollama/llama3".into(),
+                    },
+                ],
+                0,
+                0,
+            )));
+        state.failover = Some(chain);
+        with_zdr_caps(&state, &[("openai", "none"), ("ollama", "default")]);
+        let trace_id = uuid::Uuid::new_v4();
+        let mut headers = authed_with_trace_and_zdr(trace_id, "required");
+        headers.insert(
+            "x-tracelane-failover",
+            axum::http::HeaderValue::from_static("cross-provider"),
+        );
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            headers,
+            Json(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{:?}", body_json(resp).await);
+        assert_eq!(
+            server.received_requests().await.expect("recorded").len(),
+            1,
+            "exactly one dispatch, to the eligible candidate"
+        );
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1);
+        let a = &spans[0].attributes;
+        assert_eq!(a.tracelane_zdr_required, Some(true));
+        assert_eq!(
+            a.tracelane_zdr_eligible_providers.as_deref(),
+            Some(&["ollama".to_string()][..]),
+            "the pruned set: the primary is NOT in it"
+        );
+        assert_eq!(
+            a.tracelane_failover_from.as_deref(),
+            Some("openai"),
+            "the swap is on the span, never silent"
+        );
+        let ledger = a
+            .tracelane_dispatch_attempts
+            .as_deref()
+            .expect("a pruned primary makes the ledger worth recording");
+        assert_eq!(ledger.len(), 2, "one skip, one dispatch: {ledger:?}");
+        assert_eq!(ledger[0].outcome, "skipped");
+        assert_eq!(ledger[0].provider, "openai");
+        assert_eq!(ledger[0].model, "gpt-4o");
+        assert_eq!(ledger[0].reason.as_deref(), Some("zdr_ineligible"));
+        assert_eq!(ledger[1].outcome, "ok");
+        assert_eq!(ledger[1].provider, "ollama");
+    }
+
+    /// The prune needs BOTH headers: without the failover opt-in an ineligible primary
+    /// is refused even when an eligible candidate exists — Tracelane never sends to a
+    /// provider the customer did not name.
+    #[tokio::test]
+    async fn zdr_required_without_failover_opt_in_never_swaps_the_provider() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        let chain: &'static crate::server::config::FailoverConfig =
+            Box::leak(Box::new(crate::server::config::FailoverConfig::for_test(
+                vec![crate::server::config::FailoverHop {
+                    provider_id: "ollama".into(),
+                    model: "ollama/llama3".into(),
+                }],
+                0,
+                0,
+            )));
+        state.failover = Some(chain);
+        with_zdr_caps(&state, &[("openai", "none"), ("ollama", "default")]);
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(uuid::Uuid::new_v4(), "required"),
+            Json(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "zdr_unsatisfiable");
+        assert_eq!(
+            body["eligible_provider_count"], 1,
+            "ollama IS default — but not named"
+        );
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 0);
+    }
+
+    /// `/v1/embeddings` — the same refusal, its own span (this route does not use
+    /// `RequestConfig`), the mock untouched.
+    #[tokio::test]
+    async fn zdr_required_on_embeddings_refuses_a_none_provider_with_the_constraint_on_the_span() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        with_zdr_caps(&state, &[("ollama", "none")]);
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = embeddings_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(trace_id, "required"),
+            Json(json!({ "model": "ollama/nomic-embed-text", "input": "x" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "zdr_unsatisfiable");
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 0);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].status.message.as_deref(),
+            Some("zdr_unsatisfiable")
+        );
+        assert_eq!(spans[0].attributes.tracelane_zdr_required, Some(true));
+        assert_eq!(
+            spans[0]
+                .attributes
+                .tracelane_zdr_eligible_providers
+                .as_deref(),
+            Some(&[][..])
+        );
+    }
+
+    /// `/v1/messages` — the refusal in the ANTHROPIC error shape (a Claude SDK cannot
+    /// read an OpenAI body), before BYOK, with the constraint on the error span.
+    #[tokio::test]
+    async fn zdr_required_on_v1_messages_refuses_in_the_anthropic_error_shape() {
+        let _bypass = LoopbackBypassGuard::new();
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        with_zdr_caps(&state, &[("anthropic", "none")]);
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = crate::anthropic_messages::messages_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(trace_id, "required"),
+            axum::body::Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"x"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "zdr_unsatisfiable");
+        assert_eq!(body["error"]["provider"], "anthropic");
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].status.message.as_deref(),
+            Some("zdr_unsatisfiable")
+        );
+        assert_eq!(spans[0].attributes.tracelane_zdr_required, Some(true));
+        assert_eq!(
+            spans[0]
+                .attributes
+                .tracelane_zdr_eligible_providers
+                .as_deref(),
+            Some(&[][..])
+        );
+    }
+
+    /// Row 3 (the half a single provider can show): the provider is `default` → the
+    /// request dispatches, and the span records the constraint and the eligible set.
+    #[tokio::test]
+    async fn zdr_required_on_a_default_provider_dispatches_and_marks_the_span() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        with_zdr_caps(&state, &[("ollama", "default")]);
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(trace_id, "required"),
+            Json(
+                json!({"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{:?}", body_json(resp).await);
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 1);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].attributes.tracelane_zdr_required, Some(true));
+        assert_eq!(
+            spans[0]
+                .attributes
+                .tracelane_zdr_eligible_providers
+                .as_deref(),
+            Some(&["ollama".to_string()][..])
+        );
+    }
+
+    /// An unreadable constraint is refused BEFORE routing — never guessed at.
+    #[tokio::test]
+    async fn a_garbage_zdr_header_is_refused_with_its_own_code() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        with_zdr_caps(&state, &[("ollama", "default")]);
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace_and_zdr(uuid::Uuid::new_v4(), "please"),
+            Json(
+                json!({"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "invalid_zdr_constraint");
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 0);
+    }
+
+    /// No header → today's behaviour exactly, even with an empty (fail-closed) table.
+    #[tokio::test]
+    async fn without_the_header_zdr_changes_nothing() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace(trace_id),
+            Json(
+                json!({"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{:?}", body_json(resp).await);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans[0].attributes.tracelane_zdr_required, None);
+        assert_eq!(spans[0].attributes.tracelane_zdr_eligible_providers, None);
+    }
 
     // ── B-385 (2b): PARSE BEFORE CHARGE, as a behaviour, on every route ──
     //
@@ -376,6 +714,119 @@ mod tests {
         );
     }
 
+    /// RI-05 slice 2 (M1) — the spec's own proof (§7 row 2): a provider
+    /// forced to 429 once then succeed leaves a TWO-element dispatch ledger
+    /// on the served request's span, `[0]` carrying the 429's status and a
+    /// classified reason, `[1]` the clean success — and no element anywhere
+    /// leaks the upstream body, even when that body is planted with a
+    /// credential-shaped string.
+    #[tokio::test]
+    async fn a_429_then_200_leaves_a_two_element_dispatch_ledger_with_no_body_leak() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        // A body shaped like a leaked credential — proves the ledger never
+        // reads it, not merely that this test forgot to check.
+        const PLANTED: &str = "sk-live-PLANTED-CREDENTIAL-9911-do-not-leak";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string(format!(r#"{{"error":{{"message":"{PLANTED}"}}}}"#)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+            .mount(&server)
+            .await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        let trace_id = uuid::Uuid::new_v4();
+
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace(trace_id),
+            Json(json!({
+                "model": "ollama/llama3",
+                "messages": [{"role": "user", "content": "rate limit me then succeed"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{:?}", body_json(resp).await);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("mock recorded requests")
+                .len(),
+            2,
+            "exactly one retry: the 429 attempt and the 200 attempt"
+        );
+
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1, "one request, one span");
+        let attempts = spans[0]
+            .attributes
+            .tracelane_dispatch_attempts
+            .as_ref()
+            .expect("a retried request must carry the dispatch ledger");
+        assert_eq!(attempts.len(), 2, "one element per attempt made");
+        assert_eq!(attempts[0].status, Some(429));
+        assert!(
+            attempts[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r == "provider_rate_limited"
+                    || r.bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')),
+            "reason must be the five-class label or an `[A-Z0-9_]` upstream token, got {:?}",
+            attempts[0].reason
+        );
+        assert_eq!(attempts[1].outcome, "ok");
+        assert_eq!(attempts[1].status, None);
+
+        // THE PROOF: the planted credential-shaped body text must not reach
+        // the span by ANY path — serialize the whole span, not just the
+        // ledger field, so a leak into some OTHER attribute would also fail.
+        let span_json = serde_json::to_string(&spans[0]).expect("span serializes");
+        assert!(
+            !span_json.contains(PLANTED),
+            "the upstream error body leaked into the span: {span_json}"
+        );
+    }
+
+    /// RI-05 slice 2 (M1) — the other half of the write rule: a clean single
+    /// attempt (no retry, no failover) leaves the ledger field ABSENT, not an
+    /// empty array. This is what lets a read path tell "verified clean" apart
+    /// from "built before RI-05 existed".
+    #[tokio::test]
+    async fn a_clean_single_attempt_leaves_the_dispatch_ledger_absent() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        let trace_id = uuid::Uuid::new_v4();
+
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace(trace_id),
+            Json(json!({
+                "model": "ollama/llama3",
+                "messages": [{"role": "user", "content": "just answer"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{:?}", body_json(resp).await);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(spans.len(), 1);
+        assert!(
+            spans[0].attributes.tracelane_dispatch_attempts.is_none(),
+            "a clean single attempt must leave the field ABSENT, not Some(vec![one ok])"
+        );
+    }
+
     /// FT-02 half: a persistent 503 exhausts the single retry, the caller gets
     /// the typed 502, ONE error span is recorded and the breaker is fed ONE
     /// failure.
@@ -535,5 +986,616 @@ mod tests {
                 .is_some_and(|r| r.is_empty()),
             "an unrecorded request must never reach the provider"
         );
+    }
+    #[tokio::test]
+    async fn kya_chat_and_embeddings_record_bounded_names_and_classified_clients() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"list", "model":"ollama/nomic-embed-text",
+                "data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],
+                "usage":{"prompt_tokens":2,"total_tokens":2}
+            })))
+            .mount(&server)
+            .await;
+        for embeddings in [false, true] {
+            let trace = uuid::Uuid::new_v4();
+            let state = test_state(registry_pointing_ollama_at(server.uri()));
+            let mut headers = authed_with_trace(trace);
+            headers.insert("x-tracelane-agent-name", "KYA-Proof".parse().unwrap());
+            headers.insert(
+                "user-agent",
+                "codex_exec/0.155.1 private-machine-metadata"
+                    .parse()
+                    .unwrap(),
+            );
+            let response = if embeddings {
+                embeddings_handler(
+                    State(state),
+                    headers,
+                    Json(json!({"model":"ollama/nomic-embed-text","input":"hello"})),
+                )
+                .await
+            } else {
+                chat_completions_handler(State(state),headers,Json(json!({"model":"ollama/llama3","messages":[{"role":"user","content":"hello"}]}))).await
+            };
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{:?}",
+                body_json(response).await
+            );
+            let spans = crate::otlp_emit::test_sink::for_trace(trace);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(
+                spans[0].attributes.gen_ai_agent_name.as_deref(),
+                Some("kya-proof")
+            );
+            assert_eq!(
+                spans[0].attributes.tracelane_client_name.as_deref(),
+                Some("codex")
+            );
+            assert_eq!(
+                spans[0].attributes.tracelane_agent_name_source.as_deref(),
+                Some("header")
+            );
+            let wire = serde_json::to_string(&spans[0]).unwrap();
+            assert!(!wire.contains("private-machine-metadata"));
+            assert!(!wire.contains("codex_exec/"));
+        }
+    }
+
+    // ── GWY-27 — per-workspace model aliases, spec §7 rows 1–2 ──────────────────
+    //
+    // Drive the REAL handlers with an entitlement cache whose resolved set carries the
+    // workspace's aliases — the only way the hot path ever sees them.
+
+    fn entitlements_with_aliases(
+        pairs: &[(&str, &str)],
+    ) -> Arc<crate::entitlement_cache::EntitlementCache> {
+        let aliases: std::collections::BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(a, t)| ((*a).to_string(), (*t).to_string()))
+            .collect();
+        let aliases = Arc::new(aliases);
+        Arc::new(crate::entitlement_cache::EntitlementCache::new(Arc::new(
+            move |_tenant: uuid::Uuid| {
+                let aliases = Arc::clone(&aliases);
+                Box::pin(async move {
+                    Ok(crate::entitlement_cache::ResolvedEntitlements {
+                        model_aliases: aliases,
+                        ..crate::entitlement_cache::ResolvedEntitlements::deny_all()
+                    })
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = anyhow::Result<
+                                        crate::entitlement_cache::ResolvedEntitlements,
+                                    >,
+                                > + Send,
+                        >,
+                    >
+            },
+        )))
+    }
+
+    async fn last_upstream_model(server: &MockServer) -> serde_json::Value {
+        let received = server.received_requests().await.expect("recorded");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&received.last().expect("one request").body)
+                .expect("upstream body is JSON");
+        sent["model"].clone()
+    }
+
+    /// Row 1: `model: "fast"` reaches the provider as the TARGET (byte-identical to a
+    /// direct call for it), and the span records the caller's alias with the
+    /// substitution named — so a trace shows both names and why they differ.
+    /// An upstream that answers the way the OpenAI-compatible adapter actually talks
+    /// to providers — SSE (it always streams upstream, `providers/openai.rs`) — with
+    /// the `model` claim in the frame. A plain JSON body carries no frame, so the
+    /// span's served model (and therefore any substitution) would be unobservable.
+    async fn chat_sse_mock(served_model: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let frame = json!({
+            "id": "chatcmpl-harness", "object": "chat.completion.chunk", "model": served_model,
+            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn gwy27_a_tenant_alias_routes_to_its_target_and_the_span_says_so() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_sse_mock("llama3").await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        state.entitlements = Some(entitlements_with_aliases(&[("fast", "ollama/llama3")]));
+
+        // The control: what a direct call for the target sends upstream.
+        let direct = chat_completions_handler(
+            State(state.clone()),
+            authed(),
+            Json(
+                json!({"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        let want = last_upstream_model(&server).await;
+
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            authed_with_trace(trace_id),
+            Json(json!({"model": "fast", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a workspace alias must make its name routable"
+        );
+        let got = last_upstream_model(&server).await;
+        assert_eq!(
+            got, want,
+            "the provider must be asked for the TARGET, exactly as a direct call"
+        );
+        assert_ne!(
+            got,
+            json!("fast"),
+            "the alias itself must never leave the gateway"
+        );
+
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        let span = spans.first().expect("the aliased request emits a span");
+        assert_eq!(
+            span.attributes.gen_ai_request_model.as_deref(),
+            Some("fast"),
+            "the span records what the CALLER sent"
+        );
+        assert_eq!(
+            span.attributes.gen_ai_response_model.as_deref(),
+            Some("llama3"),
+            "the provider's own claim — the resolved model, observed"
+        );
+        assert_eq!(
+            span.attributes.tracelane_model_substitution.as_deref(),
+            Some("alias"),
+            "and names why the served model differs"
+        );
+    }
+
+    /// Row 2: an alias whose target no longer routes fails CLOSED — `400
+    /// unroutable_model`, zero bytes to any provider, no default target.
+    #[tokio::test]
+    async fn gwy27_an_alias_to_an_unroutable_target_fails_closed() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_ok_mock().await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        state.entitlements = Some(entitlements_with_aliases(&[(
+            "fast",
+            "no-such-provider-model-xyz",
+        )]));
+        let resp = chat_completions_handler(
+            State(state),
+            authed(),
+            Json(json!({"model": "fast", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "unroutable_model");
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 0);
+    }
+
+    /// The embeddings route honours the same alias map (spec §2).
+    #[tokio::test]
+    async fn gwy27_embeddings_resolve_a_tenant_alias() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }],
+                "model": "nomic-embed-text",
+                "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        state.entitlements = Some(entitlements_with_aliases(&[(
+            "embed",
+            "ollama/nomic-embed-text",
+        )]));
+        let direct = embeddings_handler(
+            State(state.clone()),
+            authed(),
+            Json(json!({"model": "ollama/nomic-embed-text", "input": "x"})),
+        )
+        .await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        let want = last_upstream_model(&server).await;
+        let resp = embeddings_handler(
+            State(state),
+            authed(),
+            Json(json!({"model": "embed", "input": "x"})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(last_upstream_model(&server).await, want);
+    }
+
+    // ── GWY-52 — workspace failover, spec §7 rows 1–3 ───────────────────────────
+
+    fn entitlements_with_failover(
+        enabled: bool,
+        models: &[&str],
+    ) -> Arc<crate::entitlement_cache::EntitlementCache> {
+        let models: Arc<Vec<String>> = Arc::new(models.iter().map(|m| (*m).to_string()).collect());
+        Arc::new(crate::entitlement_cache::EntitlementCache::new(Arc::new(
+            move |_tenant: uuid::Uuid| {
+                let models = Arc::clone(&models);
+                Box::pin(async move {
+                    Ok(crate::entitlement_cache::ResolvedEntitlements {
+                        failover_enabled: enabled,
+                        failover_models: models,
+                        ..crate::entitlement_cache::ResolvedEntitlements::deny_all()
+                    })
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = anyhow::Result<
+                                        crate::entitlement_cache::ResolvedEntitlements,
+                                    >,
+                                > + Send,
+                        >,
+                    >
+            },
+        )))
+    }
+
+    /// Primary `groq/…` answers 500; the workspace's chain names ONLY
+    /// `nebius/…` — absent from the operator chain, so a hop there proves the
+    /// workspace chain was used.
+    async fn failing_openai_and_ok_ollama() -> (MockServer, MockServer, AppState) {
+        let bad = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+            .mount(&bad)
+            .await;
+        let good = chat_ok_mock().await;
+        let mut reg = ProviderRegistry::new().expect("provider registry");
+        reg.set_compat_base_url_for_test("nebius", good.uri())
+            .expect("nebius adapter for the serving mock");
+        reg.set_compat_base_url_for_test("groq", bad.uri())
+            .expect("groq adapter for the failing mock");
+        // The primary must actually DISPATCH (a missing key is refused before any hop,
+        // which is not a provider error), and a hop needs the tenant's own key too (the
+        // loop skips a keyless candidate as `no_byok_key`, by design). Seed the decrypted
+        // key cache — the first thing `resolve_provider_key` reads — for two providers
+        // no other handler test uses, so no test sees them through the shared dev tenant.
+        for provider in ["groq", "nebius"] {
+            crate::db::provider_keys::cache_decrypted(
+                &dev_tenant(),
+                provider,
+                Arc::new(secrecy::SecretString::from(format!(
+                    "unit-test-{provider}-key-not-real"
+                ))),
+            );
+        }
+        (bad, good, test_state(reg))
+    }
+
+    fn gpt4o() -> Json<serde_json::Value> {
+        Json(
+            json!({"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+    }
+
+    /// Row 1: workspace ON + its own chain, NO header → the fallback serves; the span
+    /// names the primary it left.
+    #[tokio::test]
+    async fn gwy52_workspace_failover_serves_from_its_own_chain_without_a_header() {
+        let _bypass = LoopbackBypassGuard::new();
+        let (_bad, good, mut state) = failing_openai_and_ok_ollama().await;
+        state.entitlements = Some(entitlements_with_failover(
+            true,
+            &["nebius/meta-llama-3.1-8b"],
+        ));
+        let trace_id = uuid::Uuid::new_v4();
+        let resp =
+            chat_completions_handler(State(state), authed_with_trace(trace_id), gpt4o()).await;
+        let status = resp.status();
+        assert_eq!(status, StatusCode::OK, "{:?}", body_json(resp).await);
+        assert_eq!(good.received_requests().await.expect("recorded").len(), 1);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        assert_eq!(
+            spans
+                .first()
+                .and_then(|s| s.attributes.tracelane_failover_from.as_deref()),
+            Some("groq")
+        );
+    }
+
+    /// Row 2: a per-request `off` beats the workspace default — no hop.
+    #[tokio::test]
+    async fn gwy52_header_off_beats_the_workspace_default() {
+        let _bypass = LoopbackBypassGuard::new();
+        let (bad, good, mut state) = failing_openai_and_ok_ollama().await;
+        state.entitlements = Some(entitlements_with_failover(
+            true,
+            &["nebius/meta-llama-3.1-8b"],
+        ));
+        let mut headers = authed();
+        headers.insert(
+            "x-tracelane-failover",
+            axum::http::HeaderValue::from_static("off"),
+        );
+        let resp = chat_completions_handler(State(state), headers, gpt4o()).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            !bad.received_requests().await.expect("recorded").is_empty(),
+            "the primary must have been TRIED — otherwise 'no hop' proves nothing"
+        );
+        assert_eq!(good.received_requests().await.expect("recorded").len(), 0);
+    }
+
+    /// Control: the workspace default OFF (today's behaviour) — no header, no hop, even
+    /// with a chain stored.
+    #[tokio::test]
+    async fn gwy52_workspace_off_keeps_failover_opt_in() {
+        let _bypass = LoopbackBypassGuard::new();
+        let (bad, good, mut state) = failing_openai_and_ok_ollama().await;
+        state.entitlements = Some(entitlements_with_failover(
+            false,
+            &["nebius/meta-llama-3.1-8b"],
+        ));
+        let resp = chat_completions_handler(State(state), authed(), gpt4o()).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            !bad.received_requests().await.expect("recorded").is_empty(),
+            "the primary must have been TRIED — otherwise 'no hop' proves nothing"
+        );
+        assert_eq!(good.received_requests().await.expect("recorded").len(), 0);
+    }
+
+    /// Row 3, with the header: the WORKSPACE chain replaces the operator chain.
+    #[tokio::test]
+    async fn gwy52_the_workspace_chain_replaces_the_operator_chain() {
+        let _bypass = LoopbackBypassGuard::new();
+        let (_bad, good, mut state) = failing_openai_and_ok_ollama().await;
+        state.entitlements = Some(entitlements_with_failover(
+            false,
+            &["nebius/meta-llama-3.1-8b"],
+        ));
+        let mut headers = authed();
+        headers.insert(
+            "x-tracelane-failover",
+            axum::http::HeaderValue::from_static("cross-provider"),
+        );
+        let resp = chat_completions_handler(State(state), headers, gpt4o()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(good.received_requests().await.expect("recorded").len(), 1);
+    }
+
+    // ── GWY-53 — self-serve content capture, spec §7 rows 1–3 and 5 ─────────────
+    //
+    // Every test drives the REAL chat handler against a wiremock upstream and reads the
+    // span the gateway emitted (`otlp_emit::test_sink`), never a builder in isolation.
+    // No `trace_content:` block is installed in this test binary, so ONLY the workspace
+    // half can turn capture on here — which is exactly the half GWY-53 adds.
+
+    const GWY53_PROMPT: &str = "gwy53: what did my app send?";
+    const GWY53_ANSWER: &str = "gwy53: the model's own answer";
+
+    /// A cache whose every tenant resolves with this capture choice; `r2` also grants
+    /// the R2 secrets rail (paid), for the redaction proof.
+    fn entitlements_with_capture(
+        input: bool,
+        output: bool,
+        r2: bool,
+    ) -> Arc<crate::entitlement_cache::EntitlementCache> {
+        Arc::new(crate::entitlement_cache::EntitlementCache::new(Arc::new(
+            move |_tenant| {
+                Box::pin(async move {
+                    Ok(crate::entitlement_cache::ResolvedEntitlements {
+                        content_capture: crate::db::workspace_capture::WorkspaceCapture {
+                            input,
+                            output,
+                        },
+                        f_guardrail_r2: r2,
+                        ..crate::entitlement_cache::ResolvedEntitlements::deny_all()
+                    })
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = anyhow::Result<
+                                        crate::entitlement_cache::ResolvedEntitlements,
+                                    >,
+                                > + Send,
+                        >,
+                    >
+            },
+        )))
+    }
+
+    /// The upstream answers in SSE whatever the CALLER asked for: the OpenAI-compatible
+    /// adapter always requests a stream upstream (`providers/openai.rs`,
+    /// `build_openai_stream`) and the buffered path assembles it. A JSON body here
+    /// would parse as an EMPTY answer — which is how the first draft of these tests
+    /// "failed" for the wrong reason.
+    async fn chat_answering(content: &str) -> MockServer {
+        let server = MockServer::start().await;
+        // Content and usage in SEPARATE frames, as OpenAI sends them: a frame carrying
+        // `usage` is read as the usage chunk (`providers/openai.rs`), so a combined
+        // frame would deliver an empty answer.
+        let content_frame = json!({
+            "id": "chatcmpl-gwy53", "object": "chat.completion.chunk", "model": "llama3",
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+        });
+        let final_frame = json!({
+            "id": "chatcmpl-gwy53", "object": "chat.completion.chunk", "model": "llama3",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "data: {content_frame}\n\ndata: {final_frame}\n\ndata: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Drive one chat call and return the span it emitted (the SSE body is drained
+    /// first, so the finalizer has run).
+    async fn gwy53_span(state: AppState, stream: bool) -> tracelane_shared::TracelaneSpan {
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = chat_completions_handler(
+            State(state),
+            authed_with_trace(trace_id),
+            Json(json!({
+                "model": "ollama/llama3",
+                "stream": stream,
+                "messages": [{"role": "user", "content": GWY53_PROMPT}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let mut spans = Vec::new();
+        for _ in 0..50 {
+            spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+            if !spans.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        spans
+            .into_iter()
+            .next()
+            .expect("the request emitted a span")
+    }
+
+    fn text_of(v: Option<&serde_json::Value>) -> String {
+        v.map(serde_json::Value::to_string).unwrap_or_default()
+    }
+
+    /// Row 1 — the default: a workspace that did not opt in stores no text, and a
+    /// deployment with no control plane stores none either (tenancy rule).
+    #[tokio::test]
+    async fn gwy53_capture_off_leaves_no_text_on_the_span() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_answering(GWY53_ANSWER).await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        state.entitlements = Some(entitlements_with_capture(false, false, false));
+        let span = gwy53_span(state, false).await;
+        assert!(span.attributes.gen_ai_input_messages.is_none());
+        assert!(span.attributes.gen_ai_output_messages.is_none());
+
+        let no_control_plane = test_state(registry_pointing_ollama_at(server.uri()));
+        assert!(no_control_plane.entitlements.is_none());
+        let span = gwy53_span(no_control_plane, false).await;
+        assert!(
+            span.attributes.gen_ai_input_messages.is_none()
+                && span.attributes.gen_ai_output_messages.is_none(),
+            "no control plane = the unprivileged state = no capture"
+        );
+    }
+
+    /// Row 2 — opted in: the span carries the request messages AND the response text,
+    /// on the buffered path and the streamed one.
+    #[tokio::test]
+    async fn gwy53_capture_on_records_request_and_response_buffered_and_streamed() {
+        let _bypass = LoopbackBypassGuard::new();
+        for stream in [false, true] {
+            let server = chat_answering(GWY53_ANSWER).await;
+            let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+            state.entitlements = Some(entitlements_with_capture(true, true, false));
+            let span = gwy53_span(state, stream).await;
+            let input = text_of(span.attributes.gen_ai_input_messages.as_ref());
+            let output = text_of(span.attributes.gen_ai_output_messages.as_ref());
+            assert!(
+                input.contains(GWY53_PROMPT),
+                "stream={stream}: the request text must be on the span, got {input:?}"
+            );
+            assert!(
+                output.contains(GWY53_ANSWER),
+                "stream={stream}: the response text must be on the span, got {output:?}"
+            );
+        }
+    }
+
+    /// Each half is independent: input-only records no answer.
+    #[tokio::test]
+    async fn gwy53_input_only_records_no_response() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = chat_answering(GWY53_ANSWER).await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        state.entitlements = Some(entitlements_with_capture(true, false, false));
+        let span = gwy53_span(state, false).await;
+        assert!(text_of(span.attributes.gen_ai_input_messages.as_ref()).contains(GWY53_PROMPT));
+        assert!(span.attributes.gen_ai_output_messages.is_none());
+    }
+
+    /// Row 3 — a secret is NEVER what the span stores: under R2 because the caller
+    /// received the redacted text, and without R2 because the stored copy is redacted on
+    /// every plan (security review 2026-09-28, H-2).
+    #[tokio::test]
+    async fn gwy53_a_guardrail_redacted_value_is_never_persisted() {
+        const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+        let _bypass = LoopbackBypassGuard::new();
+        for stream in [false, true] {
+            let answer = format!("here is a fresh key {SECRET} keep it safe");
+            for r2 in [false, true] {
+                let server = chat_answering(&answer).await;
+                let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+                let cache = entitlements_with_capture(true, true, r2);
+                state.guardrail = Arc::new(crate::guardrail::GuardrailEngine::new(
+                    Arc::clone(&state.audit_chain),
+                    None,
+                    Some(Arc::clone(&cache)),
+                    Arc::new(crate::guardrail::capability::CapabilityRegistry::new()),
+                ));
+                state.entitlements = Some(cache);
+                let span = gwy53_span(state, stream).await;
+                let output = text_of(span.attributes.gen_ai_output_messages.as_ref());
+                // Security review 2026-09-28 (H-2): the STORED copy is redacted on every
+                // plan, so the pre-fix control ("without R2 the raw value is stored") is now
+                // the defect this asserts against. The leak-visibility this test used the
+                // control for is held by `server::spans::tests::gwy53_stored_*`, which were
+                // red on the pre-fix code.
+                assert!(
+                    !output.contains(SECRET),
+                    "stream={stream} r2={r2}: a secret reached the span: {output:?}"
+                );
+                assert!(
+                    output.contains("[REDACTED:aws_key]"),
+                    "stream={stream} r2={r2}: the stored copy carries the redaction marker: {output:?}"
+                );
+            }
+        }
     }
 }

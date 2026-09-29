@@ -298,6 +298,36 @@ arbitrary name to a provider plus the upstream model to send. Aliases are
 consulted by exact name, before the prefix table above, so an alias can name one
 model but never widen the built-in routing.
 
+## Workspace model aliases
+
+Call a model by a name you control, and change what it points at from
+**Settings → Gateway → Model aliases** — no code change, no deploy.
+
+```
+fast    →  claude-haiku-4-5-20251001
+gpt-4o  →  gpt-4o-mini        # an alias may reuse a real model name to redirect it
+```
+
+Then send `"model": "fast"` to `/v1/chat/completions` or `/v1/embeddings`.
+
+- **One alias, one target.** A target must be a model the gateway can route when
+  you save it, and it cannot be another of your aliases — aliases resolve in one
+  hop. If a target later stops routing, requests for that alias are refused with
+  `400 unroutable_model`; the gateway never substitutes a default.
+- **Owners only.** Only a workspace owner, signed in, can see, add, change or
+  delete aliases. API keys can neither read nor change them.
+- **Visible in the trace.** The span records the alias you sent as the
+  requested model. When the provider reports which model served the request
+  (OpenAI-compatible providers, Azure OpenAI and Anthropic do), the span records
+  that too and marks the difference as an alias substitution.
+- **Applies to your next request.** On a deployment running more than one
+  gateway, the other gateways pick up a change within 15 minutes.
+- **Up to 50 per workspace.**
+- Not applied on the Anthropic-native `/v1/messages` route.
+
+`tracelane.yaml` aliases (above) are the operator's, apply to every workspace on
+the deployment, and are resolved after yours.
+
 ## Failover
 
 The gateway fails over on upstream **500 / 502 / 503 / 504** (not 429 — a

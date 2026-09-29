@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * /dashboards — list the tenant's custom dashboards, create new ones.
  *
@@ -93,7 +94,7 @@ export default async function DashboardsPage() {
 		<div className="space-y-8 px-1 py-2 sm:px-2 sm:py-4 lg:px-3">
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div>
-					<h1 className="t-h1">Dashboards</h1>
+					<PageHeader title={<>Dashboards</>} />
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Compose tiles from the metric catalog — the same numbers as the
 						built-in pages, arranged your way.

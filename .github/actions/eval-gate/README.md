@@ -63,19 +63,19 @@ gate for the whole repo.
   continuous, and there the two differ: a judge scoring 0.68 against a 0.70 rule
   and one scoring 0.02 are the same "failed" and very different results.
 - **Errored cases are excluded from the mean**, not scored as zero. One provider
-  `429` in a 20-case run is not a 5% below-the-floor result, and a gate that goes red on a
+  `429` in a 20-case run is not a 5% regression, and a gate that goes red on a
   `429` gets deleted in a week. They are bounded separately by `max-error-rate`
   (default `0.10`); above it the verdict is `3`, and a run where *every* case
   errored is `3` — never a vacuous pass.
 
 ## What this gate does NOT do
 
-**This gate asserts a FLOOR on a single run. It does not detect below-the-floor results.**
+**This gate asserts a FLOOR on a single run. It does not detect regressions.**
 There is no baseline, no history and no comparison — the same shape as a
 coverage threshold, which nobody considers broken for lacking a previous run.
 A run scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and
-calling the second result "no below-the-floor result" would be a claim nothing checked.
-Comparing a run against an earlier one is a real gap and is filed, not built:
+calling the second result "no regression" would be a claim nothing checked.
+Comparing a run against an earlier one is not implemented:
 what counts as the baseline is a design decision, not a flag.
 
 ## Requirements

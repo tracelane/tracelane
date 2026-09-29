@@ -1,0 +1,19 @@
+-- 28 — REV-1 / B-469 (independent review, 2026-09-20): give `meter_counters` a server-side
+-- INSERT dedup window so a batch retried with the SAME `insert_deduplication_token` is
+-- accepted and discarded rather than summed a second time.
+--
+-- WHY. `meter_counters` is SummingMergeTree keyed (tenant_id, day, meter, dim, source) with
+-- no batch identity, and ClickHouse documents that an INSERT can COMMIT and still report
+-- failure to the client (a timeout, a connection dropped after the server finished). Both
+-- writers (gateway `billing/meters.rs`, ingest `clickhouse_writer.rs`) retried a failed batch
+-- MERGED with newer usage, so that window counted the batch twice and nothing on /health
+-- could tell. Now every batch is immutable, carries a uuid token, and is retried unchanged;
+-- with this window > 0 the server dedups BY TOKEN (data-independent) for the last N inserts.
+--
+-- 1000 inserts ≈ 2.8 h of gateway flushes (one per 10 s) plus ingest's — far wider than any
+-- retry. A token sent to a table with the window at 0 is accepted and IGNORED (proven both
+-- ways by `rev1_a_retried_batch_with_the_same_token_is_counted_once` in
+-- scripts/ci/run-clickhouse-integration.sh), so the ORDER is: this ALTER on prod BY HAND,
+-- THEN the gateway/ingest that send the token. Apply as the admin user (the service users
+-- have no DDL grant, B-383). Idempotent.
+ALTER TABLE tracelane.meter_counters MODIFY SETTING non_replicated_deduplication_window = 1000;

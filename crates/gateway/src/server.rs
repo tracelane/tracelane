@@ -88,17 +88,20 @@ mod stream;
 pub(crate) use chat::chat_completions_handler;
 pub(crate) use dispatch::{
     DispatchGuard, ProviderKey, REQUESTS_CANCELLED_IN_DISPATCH, bench_mock_active,
-    dispatch_to_provider, resolve_provider_key,
+    dispatch_to_provider, resolve_provider_key, resolve_provider_key_traced,
 };
 pub(crate) use embeddings::embeddings_handler;
-pub(crate) use errors::provider_error_response;
+pub(crate) use errors::{
+    INVALID_ZDR_CONSTRAINT_MESSAGE, provider_error_response, zdr_unsatisfiable_message,
+};
 pub use quota::{WORKSPACE_SPEND_THIS_MONTH_SQL, next_month_boundary_iso};
 pub(crate) use quota::{
-    current_year_month, spend_baseline_from_clickhouse, workspace_spend_baseline_from_clickhouse,
+    current_year_month, key_spend_sql, spend_baseline_from_clickhouse,
+    workspace_spend_baseline_from_clickhouse,
 };
 pub(crate) use spans::{
-    CallerIdentity, CapturedInput, GatewayTiming, RequestConfig, SpanUsageMeta, build_gateway_span,
-    record_key_spend, spawn_span_publish,
+    CallerIdentity, CapturedInput, GatewayTiming, RequestConfig, ServedMeta, SpanUsageMeta,
+    build_gateway_span, build_prompt_resolution_span, record_key_spend, spawn_span_publish,
 };
 #[allow(unused_imports)]
 pub(crate) use stream::DROP_COUNTER_TEST_LOCK;
@@ -209,6 +212,11 @@ pub struct AppState {
     /// plane; `/v1/billing/usage` reads this and reports `rates_available:
     /// false` rather than a fabricated number.
     pub rate_card: Arc<ArcSwap<crate::billing::RateCard>>,
+    /// `GWY-49`: per-provider zero-data-retention capability (Neon
+    /// `provider_capabilities`, refreshed with the rate card). `unavailable()` — nothing
+    /// eligible, every constrained request refused — until the first load succeeds,
+    /// and forever without a control plane: fail-CLOSED by design (`zdr.rs`).
+    pub zdr: Arc<ArcSwap<crate::zdr::ZdrCapabilities>>,
     pub predictive: Arc<PredictiveLayer>,
     /// Predictive enforcement mode (ADR-055 amendment — flight-recorder posture).
     /// When FALSE (the DEFAULT), the predictive layer is OBSERVE-FIRST: a `Block`
@@ -429,7 +437,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     //       tamper-evident guarantee. `warm_from_postgres` resumes each tenant's
     //       seq + prev_hash so the chain continues unbroken across restarts.
     //   #5: without a `TenantAuditKeyStore` the anchor falls back to the global
-    //       `TRACELANE_REKOR_SIGNING_KEY` (unset in prod) → no signature at all.
+    //       `TRACELANE_REKOR_SIGNING_KEY` → every tenant signs with ONE shared key.
+    //       (This comment said "unset in prod" until 2026-09-28; it IS set in prod —
+    //       it is the PLATFORM key that signs a tenant's batches until the tenant has
+    //       its own, published at `/v1/audit/platform-pubkey` since AUD-29.)
     //       Wiring the store lets each tenant's Merkle root be signed by a
     //       tenant-scoped Ed25519 key (`tenant_audit_keys`), envelope-encrypted
     //       under the BYOK master key. A second `from_env()` builds the Arc the
@@ -481,7 +492,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Entitlement-driven per-plan retention sweep. Gated OFF by default;
     // `TRACELANE_RETENTION_SWEEP=dryrun|enforce` enables it. The flat 365d table
     // TTL is the fail-safe backstop (never deletes a paying tenant early); this
-    // trims each tenant to their plan window (Free 7 … Enterprise 365).
+    // trims each tenant to their plan window (Free 30 / paid 730 — `plans.v3.json`
+    // `queryable_days`; this said "Free 7 … Enterprise 365" until RI-02, 2026-09-20)
+    // and, since RI-02, deletes rows of tenants Neon no longer knows (rule 5).
     if let Some(pool) = pg.clone() {
         crate::retention_sweep::spawn_retention_task(
             pool,
@@ -644,6 +657,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // head-writer consumer. On any setup failure the audit path stays SYNCHRONOUS
     // (fail-safe): publish() falls back to append() when no JetStream is wired.
     if let Some(ref nats_client) = nats {
+        // RI-06 / B-449: the live view of the spans stream boundary on /health — reads
+        // TRACELANE_SPANS + the ingest durable's info every 10 s; NATS only.
+        crate::spans_stream::spawn((**nats_client).clone());
         let js = async_nats::jetstream::new((**nats_client).clone());
         match crate::audit_consumer::ensure_audit_stream(&js).await {
             // NEVER ENABLE THE ASYNC PATH WITHOUT THE POSTGRES IT REQUIRES.
@@ -716,9 +732,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // R21/R32: the time-based anchor flush. Spawned HERE — last of the audit-chain
     // wiring — because the sweep reads the anchor watermark seeded by
     // `warm_from_postgres` above and dispatches through the billing hook set
-    // directly above it. Ordering is belt-and-braces rather than load-bearing: the
-    // sweeper sleeps one full `ANCHOR_SWEEP_INTERVAL` before its first pass and
-    // reads the hook at flush time, not at spawn time.
+    // directly above it. Ordering IS load-bearing since B-483 (2026-09-22): the
+    // sweeper's first pass runs `ANCHOR_SWEEP_FIRST_PASS_DELAY` (10 s) after spawn,
+    // not a whole interval, so a hole the previous process left is anchored before
+    // the deploy's own ledger proof reads the chain. It reads the hook at flush time,
+    // not at spawn time.
     //
     // WHY A BACKGROUND TASK AND NOT A CHECK IN `publish()`: an append-triggered
     // condition cannot fix the tenants this exists for. `should_anchor` is a pure
@@ -734,6 +752,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         max_batch_age_secs = crate::audit::ANCHOR_MAX_BATCH_AGE.as_secs(),
         sweep_interval_secs = crate::audit::ANCHOR_SWEEP_INTERVAL.as_secs(),
+        first_pass_delay_secs = crate::audit::ANCHOR_SWEEP_FIRST_PASS_DELAY.as_secs(),
         "audit anchor age-sweeper started"
     );
 
@@ -892,7 +911,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     providers.clone(),
                     cfg.clone(),
                 )
-                .with_entitlements(entitlements.clone()),
+                .with_entitlements(entitlements.clone())
+                .with_prompt_router(prompt_router.clone()),
             ))
         }
         (Some(_), None) => {
@@ -924,8 +944,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let rate_card = Arc::new(ArcSwap::from_pointee(
         crate::billing::RateCard::unavailable(),
     ));
+    // GWY-49: the ZDR capability map, loaded and refreshed on the rate card's cadence.
+    let zdr = Arc::new(ArcSwap::from_pointee(
+        crate::zdr::ZdrCapabilities::unavailable(),
+    ));
     if let Some(pool) = pg.as_ref() {
         crate::billing::rating::spawn_refresher(pool.clone(), Arc::clone(&rate_card)).await;
+        crate::zdr::spawn_refresher(pool.clone(), Arc::clone(&zdr)).await;
         // A3 velocity breaker — ONE GROUP BY tick over ALL keys, never per key.
         if let Some(url) = config.clickhouse_url.clone() {
             crate::billing::velocity_breaker::spawn(pool.clone(), url, Arc::clone(&rate_card));
@@ -962,6 +987,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // cache — two caches would drift and a tenant could be entitled on one surface and
     // not the other, which is the shape `.claude/rules/tenancy.md` exists to prevent.
     let entitlements_for_state = entitlements.clone();
+    // RI-05 / M2: built here (not inline in the `AppState` literal below) so the
+    // minute-roll task can be spawned with its own `Arc` clone before the
+    // registry moves into `state`. `spawn` turns each closed per-minute bucket
+    // into one `tracelane.admission.rejected` span, published through the SAME
+    // `nats` client the rest of the gateway uses (`crates/gateway/src/rejection_metrics.rs`).
+    let rejection_metrics = Arc::new(crate::rejection_metrics::RejectionRegistry::new());
+    crate::rejection_metrics::spawn(Arc::clone(&rejection_metrics), nats.clone());
     let state = AppState {
         providers,
         semantic_cache,
@@ -970,6 +1002,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         quota_ch_url: config.clickhouse_url.clone(),
         meters,
         rate_card,
+        zdr,
         predictive,
         // Observe-first by default (ADR-055 amendment); opt-in enforcement.
         predictive_enforce: std::env::var("TRACELANE_PREDICTIVE_ENFORCE")
@@ -984,7 +1017,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         bench_mock_upstream: config.bench_mock_upstream,
         no_control_plane_rate_limit_rpm:
             crate::rate_limiter::no_control_plane_rate_limit_rpm_from_env(),
-        rejection_metrics: Arc::new(crate::rejection_metrics::RejectionRegistry::new()),
+        rejection_metrics,
         hotpath: crate::hotpath::Config::from_env(),
         failover: self::config::failover(),
         pg,
@@ -1076,14 +1109,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // self-host deployment silently show no usage. Polar is the payment processor;
     // consumption is ours.
     app = app.merge(crate::billing::usage::routes(state.clone()));
+    app = app.merge(crate::trace_reads::effective_settings_routes(state.clone()));
     tracing::info!("billing usage mounted at /v1/billing/usage");
 
     // WorkOS webhook — same secret-or-skip pattern as the Polar webhook above.
     // Provisions tenants from organization.created and users from
-    // user.created / dsync.user.created. Without WORKOS_WEBHOOK_SECRET
+    // user.created / dsync.user.created / organization_membership.created.
+    // Without WORKOS_WEBHOOK_SECRET
     // the route stays absent.
     if let Some(wh_cfg) = crate::auth::workos_webhook::WorkOsWebhookConfig::from_env() {
         let wh_state = crate::auth::workos_webhook::WorkOsWebhookState {
+            pg: state.pg.clone(),
             config: Arc::new(wh_cfg),
             // Ingress cap on control-plane–growing WorkOS events.
             rate_limiter: Arc::new(crate::auth::workos_webhook::WebhookRateLimiter::from_env()),
@@ -1105,21 +1141,46 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // from Postgres at request time (503 when PG is unset), so it mounts
     // unconditionally. Lets an offline verifier fetch the TRUSTED --tenant-pubkey
     // from our TLS-authenticated domain instead of trusting the export's copy.
-    app = app
-        .merge(crate::audit_pubkey::routes().with_state(crate::audit_pubkey::PubkeyState::new()));
-    tracing::info!("Audit pubkey mounted at /v1/audit/pubkey");
+    // AUD-29: the PLATFORM key's public half, derived + self-checked once at boot.
+    let platform_pubkey = config
+        .rekor_signing_key
+        .as_ref()
+        .and_then(|k| crate::audit::platform_pubkey_b64(secrecy::ExposeSecret::expose_secret(k)));
+    app =
+        app.merge(crate::audit_pubkey::routes().with_state(
+            crate::audit_pubkey::PubkeyState::new().with_platform_pubkey(platform_pubkey),
+        ));
+    tracing::info!("Audit pubkey mounted at /v1/audit/pubkey and /v1/audit/platform-pubkey");
 
     // Audit-log export endpoint — customer-facing audit-log download.
-    // Streams NDJSON rows from `tracelane.audit_log` filtered by the
-    // requesting tenant + time range. Mounted only when CLICKHOUSE_URL
-    // is set; without it the route stays absent (clean 404 on dev
-    // beats 500 on every request).
+    // Streams NDJSON rows filtered by the requesting tenant + time range.
+    //
+    // ADR-078 (ruled B, 2026-09-20): with a Postgres control plane the reader is
+    // the CANONICAL one (`PgExportReader` — rows and anchor bundles from
+    // `audit_log_rows` / `audit_anchor_records`; the aggregate summary from the
+    // ClickHouse copy, ruling Q3). Without Postgres (dev / OSS self-host) the
+    // ClickHouse reader stays: there is no canonical store to prefer. Mounted only
+    // when CLICKHOUSE_URL is set — the trace/SLO reads below share this block, and
+    // a stack with neither store has nothing to export (clean 404 on dev beats 500
+    // on every request).
     if let Some(ref ch_url) = config.clickhouse_url {
         let ch = crate::clickhouse_query::ch_client(ch_url.clone());
-        let reader = std::sync::Arc::new(
-            crate::audit_export::ClickHouseExportReader::new(ch)
-                .with_entitlements(entitlements.clone()),
-        );
+        let ch_reader = crate::audit_export::ClickHouseExportReader::new(ch)
+            .with_entitlements(entitlements.clone());
+        let reader: std::sync::Arc<dyn crate::audit_export::AuditExportReader> = match state
+            .pg
+            .clone()
+        {
+            Some(pool) => {
+                tracing::info!(
+                    "audit export reads the canonical ledger (Postgres); the summary reads the ClickHouse copy"
+                );
+                std::sync::Arc::new(
+                    crate::audit_export::PgExportReader::new(pool).with_summary_copy(ch_reader),
+                )
+            }
+            None => std::sync::Arc::new(ch_reader),
+        };
         let export_state = crate::audit_export::ExportState {
             reader,
             // Audit-SKU entitlement gate. Reuse the app's entitlement
@@ -1148,15 +1209,27 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // never from a session org_id bound into the query. Same CLICKHOUSE_URL
         // gate as the audit export above (ClickHouse is on-node only).
         let trace_ch = crate::clickhouse_query::ch_client(ch_url.clone());
+        app = app.merge(
+            crate::kya_routes::routes().with_state(crate::kya_routes::KyaState {
+                ch: trace_ch.clone(),
+                entitlements: state.entitlements.clone(),
+            }),
+        );
         // B-330 / DSH-13: the reader resolves each tenant's OWN cap tier from the
         // entitlement cache (no Postgres per request); `None` here means no control
         // plane, which the reader treats as the Free tier — fail-closed.
         // Typed as the trait object (rather than left as `Arc<ClickHouseTraceReader>`)
         // so the SAME reader — and so the SAME tenant-capped seam, SRE #20 — can be
         // reused below by the OBS-48 share routes without a second ClickHouse client.
+        // B-513 (CX-14, 2026-09-22): the trace page's chain-status chip reads the
+        // CANONICAL ledger (Postgres, ADR-078 B) when a pool exists — the ClickHouse
+        // copy is written fail-open after commit and repaired only at boot, so a row
+        // whose copy write failed read "not in the ledger" on the page while the
+        // canonical store held it. No pool (self-host) → the copy, as before.
         let trace_reader: std::sync::Arc<dyn crate::trace_reads::TraceReader> = std::sync::Arc::new(
             crate::trace_reads::ClickHouseTraceReader::new(trace_ch)
-                .with_entitlements(state.entitlements.clone()),
+                .with_entitlements(state.entitlements.clone())
+                .with_pg_pool(state.pg.clone()),
         );
         let trace_state = crate::trace_reads::TraceReadState {
             reader: trace_reader.clone(),
@@ -1219,10 +1292,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Postgres is configured — the master-key requirement is checked at
     // request time inside the handlers so dev mode (no BYOK_MASTER_KEY)
     // still returns a clean 503 instead of crashing on route mount.
-    if state.pg.is_some() {
+    if let Some(pg) = &state.pg {
         let byok_app = crate::byok_api::provider_keys_api::router(state.clone());
+        app = app.merge(
+            crate::provider_key_validate::routes()
+                .with_state(crate::provider_key_validate::ValidationState { pool: pg.clone() }),
+        );
         app = app.merge(byok_app);
         tracing::info!("BYOK management mounted at /v1/byok/provider-keys (POST/GET/DELETE)");
+
+        // GWY-27: the workspace's own model aliases. Needs the control plane (the
+        // table lives there); without it there is nothing to manage and the route is
+        // a clean 404, like every other Postgres-gated group.
+        app = app.merge(crate::model_alias_routes::router(state.clone()));
+        // GWY-53: the owner's content-capture opt-in, ledgered. Same Postgres gate.
+        app = app.merge(crate::workspace_capture_routes::router(state.clone()));
 
         // The WRITE path for R3 rug-pull detection. The read path
         // (registry_loader), the table and the comparison all shipped earlier;
@@ -1240,10 +1324,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // minted keys stay verify-compatible with `lookup_tenant_by_key_body`.
     if let Some(pool) = state.pg.as_ref() {
         let key_state = crate::key_routes::KeyRoutesState {
-            minter: std::sync::Arc::new(crate::key_routes::PgKeyMinter { pool: pool.clone() }),
+            minter: std::sync::Arc::new(crate::key_routes::PgKeyMinter {
+                pool: pool.clone(),
+                // SET-38: `GET /v1/keys/{id}`'s `recorded_usd` reads the same
+                // ClickHouse the key budget seeds from, capped at the tenant's tier.
+                ch_url: state.quota_ch_url.clone(),
+                entitlements: state.entitlements.clone(),
+            }),
         };
         app = app.merge(crate::key_routes::routes().with_state(key_state));
-        tracing::info!("API-key mint mounted at POST /v1/keys");
+        tracing::info!("API keys mounted at POST /v1/keys and GET/PATCH/DELETE /v1/keys/{{id}}");
 
         // OBS-18 annotations. Postgres-backed (mutable, low-volume, read one
         // trace at a time), so it mounts here beside the other PG routes rather
@@ -1355,6 +1445,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
         let prompt_state = crate::prompt_routes::PromptRoutesState {
             router: state.prompt_router.clone(),
+            span_state: state.clone(),
             entitlements: state.entitlements.clone(),
             audit_chain: state.audit_chain.clone(),
             eval,
@@ -1497,7 +1588,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum serve error")?;
-    drain_on_shutdown(nats.as_deref()).await;
+    drain_on_shutdown(nats.as_deref(), Some(&state.audit_chain)).await;
     Ok(())
 }
 
@@ -1660,7 +1751,30 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Durati
 /// Wait for spawned span publishes to be acked, then flush the NATS client.
 /// Every outstanding publish at the deadline is counted as a publish failure —
 /// a span the stream never confirmed — so the loss is on the counter, not silent.
-pub(crate) async fn drain_on_shutdown(nats: Option<&async_nats::Client>) {
+pub(crate) async fn drain_on_shutdown(
+    nats: Option<&async_nats::Client>,
+    audit_chain: Option<&crate::audit::AuditChain>,
+) {
+    // B-493 (verifier, 2026-09-21): the SELF-HOST ledger writer holds rows whose
+    // seqs the chain already consumed; a clean restart used to drop them with no
+    // line. Drained first, under the same bound, and what did not land is LOST —
+    // said so, never assumed written. No-op on the hosted path (no writer runs)
+    // and when no chain is handed in.
+    let unlanded = match audit_chain {
+        Some(chain) => match chain.drain_ledger_writer(SHUTDOWN_DRAIN_TIMEOUT).await {
+            Ok(()) => 0,
+            Err(_) => chain.ledger_writer_unlanded(),
+        },
+        None => 0,
+    };
+    if unlanded > 0 {
+        tracing::error!(
+            rows = unlanded,
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            "shutdown drain timed out — these self-host ledger rows never reached \
+             ClickHouse and are LOST (their seqs are consumed: the chain has holes)"
+        );
+    }
     let left = crate::otlp_emit::drain_in_flight(SHUTDOWN_DRAIN_TIMEOUT).await;
     if left > 0 {
         for _ in 0..left {
@@ -1744,6 +1858,20 @@ fn audit_backlog_json() -> serde_json::Value {
     })
 }
 
+/// B-559 — the wire value of `audit_backfill_failures`: attestation failures NOT since
+/// resolved. A backfill failure is permanent (nothing retries it), so every one counts for
+/// the process lifetime. An age-sweep skip is retried by the next pass, so its count
+/// contributes only while the kind is OPEN — once a clean pass resolves it, it stops
+/// holding `audit_attestation_healthy` false. The lifetime tally stays readable in
+/// `degraded_history` and `/v1/gateway/stats`.
+pub(crate) fn unresolved_attestation_failures(
+    backfill_failed: u64,
+    sweep_skips: u64,
+    sweep_skip_open: bool,
+) -> u64 {
+    backfill_failed + if sweep_skip_open { sweep_skips } else { 0 }
+}
+
 /// The `/health` body (A1), extracted so the contract is testable without a server.
 pub(crate) fn health_body(
     capture_enabled: bool,
@@ -1782,6 +1910,8 @@ pub(crate) fn health_body(
             })
         })
         .collect();
+    let (auth_hits, auth_misses, auth_stale_served, auth_negative_hits) =
+        crate::db::api_keys::auth_cache_counters();
     serde_json::json!({
         "status": "ok",
         "service": "tracelane-gateway",
@@ -1794,6 +1924,31 @@ pub(crate) fn health_body(
         // EXPECTED shape; it is what keeps the p99 off the Neon resume.
         "auth_stale_served": crate::db::api_keys::AUTH_STALE_SERVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
         "entitlement_stale_served": crate::entitlement_cache::STALE_SERVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        // B-568 I6 (2026-09-27): the hot-path caches' own counters, since boot, so
+        // "did that sparse request pay the control plane?" is answerable from a
+        // counter instead of a rate-limited log line. `auth_cache.misses` INCLUDES
+        // the stale-served and negative-cache answers; the control-plane round
+        // trips are `misses − stale_served − negative_hits`.
+        "auth_cache": {
+            "hits": auth_hits,
+            "misses": auth_misses,
+            "stale_served": auth_stale_served,
+            "negative_hits": auth_negative_hits,
+        },
+        // B-568 F2: BYOK keys served past their TTL while one refresh re-read them,
+        // and entries a refresh evicted because the key was gone (fail-CLOSED).
+        "byok_cache": {
+            "stale_served": crate::db::provider_keys::BYOK_STALE_SERVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+            "refresh_evicted": crate::db::provider_keys::BYOK_REFRESH_EVICTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        // B-568 I6: every request whose pre-dispatch overhead crossed the slow-line
+        // threshold, INCLUDING the ones the 1-per-10 s rate limit kept out of the
+        // log — the count the log cannot give. `slow_post_total` is the buffered
+        // post-provider segment (I4), counted apart.
+        "hotpath": {
+            "slow_total": crate::hotpath::slow_total(),
+            "slow_post_total": crate::hotpath::slow_post_total(),
+        },
         // R17. Deliberately NOT folded into `capture_healthy`: capture and
         // attestation fail independently and a reader must be able to tell which
         // is broken. Every span can be captured while the ledger silently stops
@@ -1823,6 +1978,23 @@ pub(crate) fn health_body(
         // `healthy` is false when the reading is STALE as well as when it is
         // high — a number nobody has refreshed is not a zero.
         "audit_backlog": audit_backlog_json(),
+        // B-493 (2026-09-21): the SELF-HOST ledger writer (no Postgres) — rows
+        // queued / landed / retried batches / appends refused because the queue
+        // was full. `null` on the hosted path. A growing `in_flight` with
+        // `retried_batches` moving = ClickHouse refusing audit_log writes; a
+        // non-zero `refused_appends` = requests were 503'd fail-closed.
+        "ledger_writer": crate::audit::ledger_writer_health_json(),
+        // RI-06 / B-449 (2026-09-19): the spans JetStream boundary — first/last retained
+        // sequence, the ingest durable's ack floor, pending, and `visible_gap` = spans the
+        // stream trimmed past the acked prefix as visible NOW. Exact only while ingest is
+        // not acking (the moment it matters); the exact per-episode count is ingest's
+        // `spans_lost_before_consume` and `tracelane.capture_gaps`. A stale reading is
+        // unhealthy, never a zero.
+        "spans_stream": crate::spans_stream::health_json(),
+        // GWY-49: whether the ZDR capability table has been read and how many providers
+        // are `default`. `capabilities_loaded: false` = every `x-tracelane-zdr: required`
+        // request is being refused — fail-closed, and visible here rather than silent.
+        "zdr": crate::zdr::health_json(),
         // B-383 (a): which master keys this process holds and which it encrypts
         // under — the operator's read during a rotation (runbooks/byok-key-loss.md
         // § Case A). Ids only, never material. (First landed 2026-09-12, lost to
@@ -1875,11 +2047,16 @@ async fn health_handler() -> impl IntoResponse {
     // R21 adds the second cause, summed for the same reason `spans_dropped` sums its
     // two: "the post-anchor backfill failed" and "the age sweep could not read the
     // tenant, so it never anchored at all" are different faults with one consequence —
-    // rows that stay unsigned and unanchored with nothing to retry them. The wire field
-    // name is a contract (R17: the watchdog greps it), so it stays; the two counters
-    // remain separable by `kind` at /v1/gateway/stats when an operator needs the cause.
-    let audit_backfill_failures =
-        count(Degradation::AuditBackfillFailed) + count(Degradation::AuditAgeSweepSkipped);
+    // rows that stay unsigned and unanchored. B-559: only the backfill failure has
+    // nothing to retry it; a sweep skip is retried every pass, so it counts only while
+    // OPEN (`unresolved_attestation_failures`). The wire field name is a contract (R17:
+    // the watchdog greps it), so it stays; the two counters remain separable by `kind`
+    // at /v1/gateway/stats when an operator needs the cause.
+    let audit_backfill_failures = unresolved_attestation_failures(
+        count(Degradation::AuditBackfillFailed),
+        count(Degradation::AuditAgeSweepSkipped),
+        tracelane_shared::degradation::is_open(Degradation::AuditAgeSweepSkipped),
+    );
     Json(health_body(
         capture_enabled,
         spans_dropped,
@@ -1951,9 +2128,9 @@ pub(crate) fn build_prompt_router(
         );
     } else {
         tracing::warn!(
-            "PromptRouter using in-memory NoOp persister + PermissiveGate \
+            "PromptRouter using in-memory NoOp persister + UnavailableGate \
              (CLICKHOUSE_URL unset): promotion records are NOT durable and \
-             eval gates are NOT enforced — set CLICKHOUSE_URL in production"
+             evaluation evidence is unavailable; ordinary promotions fail closed — set CLICKHOUSE_URL in production"
         );
     }
     Arc::new(prompt_router)
@@ -2235,6 +2412,47 @@ mod tests {
     /// green PromptGuard for a sidecar production does not run. A rename disabled a
     /// control in silence.
     ///
+    /// B-568 I6: the hot-path counters ride `/health`, and the slow count MOVES when a
+    /// slow request is timed — including one the log rate limit suppresses. A key
+    /// that was present but frozen at 0 would pass a presence check and tell the
+    /// operator nothing, so the counter is driven, not just looked for.
+    #[test]
+    fn health_publishes_the_hot_path_counters_and_they_move() {
+        let before = health_body(true, 0, 0);
+        for key in ["hits", "misses", "stale_served", "negative_hits"] {
+            assert!(
+                before["auth_cache"][key].is_u64(),
+                "auth_cache.{key} must be a count: {}",
+                before["auth_cache"]
+            );
+        }
+        for key in ["stale_served", "refresh_evicted"] {
+            assert!(before["byok_cache"][key].is_u64(), "byok_cache.{key}");
+        }
+        let slow_before = before["hotpath"]["slow_total"]
+            .as_u64()
+            .expect("slow_total");
+        let post_before = before["hotpath"]["slow_post_total"]
+            .as_u64()
+            .expect("slow_post_total");
+
+        // Two slow pre-dispatch requests back to back: the second is inside the
+        // 10 s rate limit, so at most one logs — both must count.
+        let cfg = crate::hotpath::Config::default();
+        let t = crate::hotpath::StageTimer::new();
+        t.emit_if_slow(&cfg, cfg.threshold_us + 1);
+        t.emit_if_slow(&cfg, cfg.threshold_us + 1);
+        let after = health_body(true, 0, 0);
+        assert!(
+            after["hotpath"]["slow_total"].as_u64().unwrap() >= slow_before + 2,
+            "a rate-limited slow request must still count"
+        );
+        // …and a slow POST segment is counted apart from them.
+        crate::hotpath::StageTimer::post("chat").emit_if_slow(&cfg, cfg.threshold_us + 1);
+        let post = health_body(true, 0, 0);
+        assert!(post["hotpath"]["slow_post_total"].as_u64().unwrap() > post_before);
+    }
+
     /// The count now comes from here. This test exists so the KEY cannot be dropped or
     /// renamed without something going red: the log-grep failed precisely because no
     /// test owned the name it depended on.
@@ -2444,6 +2662,35 @@ mod tests {
         );
     }
 
+    /// B-493: the self-host ledger writer's counters are on `/health` — `null`
+    /// until a writer starts (the hosted path never starts one), an object with
+    /// the five counters once it has. The test binary may or may not have
+    /// started one (the audit tests do), so both shapes are asserted by form.
+    #[test]
+    fn health_carries_the_self_host_ledger_writer_field() {
+        let body = health_body(true, 0, 0);
+        let w = body
+            .get("ledger_writer")
+            .expect("ledger_writer field present");
+        if w.is_object() {
+            for key in [
+                "queued",
+                "landed",
+                "in_flight",
+                "batches",
+                "retried_batches",
+                "refused_appends",
+            ] {
+                assert!(w[key].is_u64(), "ledger_writer.{key} must be a count: {w}");
+            }
+        } else {
+            assert!(
+                w.is_null(),
+                "ledger_writer is null off the self-host path: {w}"
+            );
+        }
+    }
+
     /// `/health` must distinguish "up" from "recording". Those were the same field.
     #[test]
     fn health_reports_capture_separately_from_liveness() {
@@ -2479,6 +2726,27 @@ mod tests {
     /// reader can tell which one is broken. The two assertions below are opposing on
     /// purpose: neither alone separates "the field exists" from "the field is wired
     /// to the right counter".
+    #[test]
+    fn b559_a_resolved_sweep_skip_no_longer_holds_attestation_red() {
+        // Open skip: counts, attestation unhealthy — the prod shape at 2026-09-25 03:48.
+        let open = unresolved_attestation_failures(0, 1, true);
+        assert_eq!(open, 1);
+        assert_eq!(
+            health_body(true, 0, open)["audit_attestation_healthy"],
+            false
+        );
+        // The next clean pass resolved it: the lifetime tally no longer holds it red.
+        let resolved = unresolved_attestation_failures(0, 1, false);
+        assert_eq!(resolved, 0);
+        assert_eq!(
+            health_body(true, 0, resolved)["audit_attestation_healthy"],
+            true
+        );
+        // A backfill failure is never forgiven by a clean sweep — nothing retries it.
+        assert_eq!(unresolved_attestation_failures(2, 5, false), 2);
+        assert_eq!(unresolved_attestation_failures(2, 5, true), 7);
+    }
+
     #[test]
     fn health_reports_audit_attestation_separately_from_capture() {
         // Perfect capture, BROKEN attestation. This is the state that was invisible:
@@ -2538,7 +2806,7 @@ mod tests {
         // And the real drain path with nothing in flight and no client returns promptly.
         drop(_release);
         let t0 = std::time::Instant::now();
-        drain_on_shutdown(None).await;
+        drain_on_shutdown(None, None).await;
         assert!(t0.elapsed() < std::time::Duration::from_secs(2));
     }
 

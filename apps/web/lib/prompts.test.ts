@@ -114,6 +114,9 @@ describe("fetchVersion — per-user JWT tenant isolation", () => {
 		try {
 			await fetchVersion("shared-prompt", "production");
 			expect(bearerOf()).toBe("Bearer jwt-tenant-a");
+			expect(fetchMock.mock.calls[0]?.[0]).toContain(
+				"/shared-prompt/configuration?env=production",
+			);
 			expect(bearerOf()).not.toContain("POISON");
 		} finally {
 			vi.unstubAllEnvs();

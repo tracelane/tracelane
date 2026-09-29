@@ -95,7 +95,7 @@ export function BarChart({
 		return (
 			<div
 				className={cn(
-					"flex items-center justify-center rounded-lg border border-line border-dashed text-ink-3 text-xs",
+					"flex items-center justify-center rounded-card border border-line border-dashed text-ink-3 text-xs",
 					className,
 				)}
 				style={{ height: height + AXIS_H }}

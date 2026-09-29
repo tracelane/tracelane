@@ -102,14 +102,8 @@ pub struct FailoverHop {
 /// off is the only safe default: a cache that turns itself on serves a
 /// remembered answer to somebody who never asked for one.
 ///
-/// **Operator-level for now, deliberately.** The founder's brief asks for a
-/// per-KEY toggle, and that needs a Neon migration plus a `PATCH /v1/keys/{id}`
-/// that does not exist yet (`key_routes.rs` mounts only `POST /v1/keys`, and the
-/// whole web api-keys tree has zero `PATCH`/`PUT` — there is no update path for a
-/// minted key at all). Shipping the operator switch first gets the feature and
-/// its measured latency into production without stranding either behind a
-/// migration; per-key granularity is a refinement of WHO may enable it, not of
-/// what it does.
+/// The operator TTL is the upper bound for request cache control. Explicit
+/// request TTLs also respect the caller's cached plan entitlement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticCacheConfig {
     embedding_models: Vec<String>,
@@ -171,6 +165,19 @@ pub struct FailoverConfig {
 }
 
 impl FailoverConfig {
+    /// A chain built directly, for handler tests that need a candidate routing to a
+    /// mock (GWY-49's prune-and-route proof). Production only ever gets one through
+    /// the `failover:` parser above, hence gated.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test(chain: Vec<FailoverHop>, retries: u32, backoff_ms: u64) -> Self {
+        Self {
+            chain,
+            retries,
+            backoff_ms,
+        }
+    }
+
     /// The ordered hops, primary-first. Never empty — an empty `chain:` is a
     /// parse error, not a config that disables failover.
     #[must_use]
@@ -302,10 +309,12 @@ impl FileConfig {
         self.models.get(model)
     }
 
-    // `semantic_cache(&self) -> Option<&SemanticCacheConfig>` was deleted
-    // 2026-09-12 (B-390) — zero callers anywhere, including tests; the free
-    // function `config::semantic_cache()` below (which production calls)
-    // reads `CONFIG.get()...semantic_cache` as a field directly instead.
+    /// Request-cache tests use a parsed configuration without mutating the
+    /// process-global installed config. Runtime uses `config::semantic_cache`.
+    #[cfg(test)]
+    pub fn semantic_cache(&self) -> Option<&SemanticCacheConfig> {
+        self.semantic_cache.as_ref()
+    }
 
     /// The `trace_content:` block, or `None` when absent — which means content
     /// capture is OFF for everyone.
@@ -371,6 +380,18 @@ pub fn alias(model: &str) -> Option<&'static ModelAlias> {
     CONFIG.get()?.alias(model)
 }
 
+/// Installed alias routing only; never credentials or operator file contents.
+pub fn alias_snapshot() -> Vec<serde_json::Value> {
+    CONFIG
+        .get()
+        .map(|cfg| {
+            cfg.models.iter().map(|(name, alias)| serde_json::json!({
+        "name": name, "provider": alias.provider_id, "upstream_model": alias.upstream_model
+    })).collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The installed `failover:` block, or `None` — which is both "no config file"
 /// and "a config file with no `failover:` block", because the two mean the same
 /// thing: the built-in chain and retry policy apply.
@@ -397,29 +418,96 @@ pub fn model_policy() -> Option<&'static ModelPolicyConfig> {
     CONFIG.get().and_then(|c| c.model_policy.as_ref())
 }
 
-/// THE content-capture decision — the ONE policy (B-299, founder-ruled 2026-09-03).
+/// The per-field byte cap when no `trace_content:` block is installed — the same
+/// default the parser applies to a block that omits `max_field_bytes`. A workspace
+/// that opted in (GWY-53) on a deployment whose operator wrote no block still gets
+/// a bounded span: `otlp_emit::publish_span` has no payload check of its own.
+pub const DEFAULT_MAX_FIELD_BYTES: usize = 65_536;
+
+/// What the content-capture policy decided for ONE tenant (GWY-53). `Copy`, so the
+/// chat handler decides once and threads the value to the buffered and SSE paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentCapture {
+    /// Record the request text (`gen_ai_input_messages`, `gen_ai_system_instructions`).
+    pub input: bool,
+    /// Record the response text the caller RECEIVED (`gen_ai_output_messages`).
+    pub output: bool,
+    /// Per-field cap, `…[truncated]` past it.
+    pub max_field_bytes: usize,
+}
+
+impl ContentCapture {
+    /// Capture nothing. Test-only: production always goes through `capture_decision`,
+    /// never a hand-built value.
+    #[cfg(test)]
+    pub const OFF: Self = Self {
+        input: false,
+        output: false,
+        max_field_bytes: DEFAULT_MAX_FIELD_BYTES,
+    };
+
+    /// May the online-eval judge read this request? It reads the request AND grades
+    /// the answer, so it needs BOTH halves: text storage refuses to keep must not be
+    /// read for judging either (B-299).
+    #[must_use]
+    pub const fn judge_may_read(&self) -> bool {
+        self.input && self.output
+    }
+
+    /// Is ANY text recorded for this workspace?
+    #[must_use]
+    pub const fn any(&self) -> bool {
+        self.input || self.output
+    }
+}
+
+/// THE content-capture decision — the ONE policy (B-299, founder-ruled 2026-09-03;
+/// GWY-53 added the workspace half 2026-09-27).
 ///
 /// Every consumer of a tenant's prompt/response TEXT routes through here: span
-/// storage (`server::CapturedInput::build`), dataset export
-/// (`dataset_routes::capture_enabled`) and the online-eval judge
-/// (`online_eval::admission`). A second check with its own reading of the config
-/// is how the judge came to see content that storage refused to keep — B-299.
+/// storage (`server::CapturedInput::build`, `CapturedOutput::build`), dataset
+/// export (`dataset_routes::capture_enabled`), the online-eval judge
+/// (`online_eval::admission`) and the two read-side labels. A second check with its
+/// own reading of the config is how the judge came to see content that storage
+/// refused to keep — B-299.
+///
+/// `input = operator allowlist ∨ workspace.input`, likewise `output`.
+///
+/// `workspace` is the entitlement cache's copy of the owner's choice
+/// (`ResolvedEntitlements::content_capture`). **`None` — no control plane — is the
+/// unprivileged state and turns the workspace half OFF** (`.claude/rules/tenancy.md`).
+/// The operator allowlist is not a cache read, so it still applies there: it is the
+/// operator's own file on the operator's own deployment.
 ///
 /// Pure so it is testable without the process-global config: pass
 /// `trace_content()` for the live answer.
 #[must_use]
 pub fn capture_decision(
     cfg: Option<&TraceContentConfig>,
+    workspace: Option<crate::db::workspace_capture::WorkspaceCapture>,
     tenant_id: &tracelane_shared::TenantId,
-) -> bool {
-    cfg.is_some_and(|c| c.captures(tenant_id))
+) -> ContentCapture {
+    let allowlisted = cfg.is_some_and(|c| c.captures(tenant_id));
+    let ws = workspace.unwrap_or_default();
+    ContentCapture {
+        input: allowlisted || ws.input,
+        output: allowlisted || ws.output,
+        max_field_bytes: cfg.map_or(DEFAULT_MAX_FIELD_BYTES, TraceContentConfig::max_field_bytes),
+    }
 }
 
-/// `capture_decision` against the installed config. Fail-CLOSED: no block, no
-/// allowlist entry, or no config at all ⇒ `false`.
-#[must_use]
-pub fn content_capture_enabled(tenant_id: &tracelane_shared::TenantId) -> bool {
-    capture_decision(trace_content(), tenant_id)
+/// [`capture_decision`] for a read route: the workspace half from the entitlement
+/// cache (never a Postgres read per request), the operator half from the installed
+/// config. No cache ⇒ the workspace half is OFF.
+pub async fn content_capture_for(
+    cache: Option<&crate::entitlement_cache::EntitlementCache>,
+    tenant_id: &tracelane_shared::TenantId,
+) -> ContentCapture {
+    let workspace = match cache {
+        Some(c) => Some(c.resolved(*tenant_id.as_uuid()).await.content_capture),
+        None => None,
+    };
+    capture_decision(trace_content(), workspace, tenant_id)
 }
 /// `failover::retry_policy`. One relaxed atomic load when it is reached.
 #[must_use]
@@ -1163,7 +1251,7 @@ fn build_trace_content(
     }
 
     let max_field_bytes = match max_field_bytes {
-        None => 65_536,
+        None => DEFAULT_MAX_FIELD_BYTES,
         Some((v, ln)) => {
             let n: usize = v.parse().with_context(|| {
                 format!("line {ln}: `max_field_bytes` must be a positive integer, got `{v}`")
@@ -2118,6 +2206,61 @@ failover:
             "a tenant NOT on the allowlist must never capture — this is the whole \
              safety property of the feature"
         );
+    }
+
+    /// GWY-53 — THE decision table. Operator allowlist OR the workspace opt-in, per
+    /// half; no control plane (`workspace = None`) turns the workspace half OFF, and
+    /// the operator half still applies because it is not a cache read.
+    #[test]
+    fn gwy53_capture_decision_is_allowlist_or_workspace_and_fails_closed_without_a_cache() {
+        use crate::db::workspace_capture::WorkspaceCapture;
+        let cfg = parse(
+            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 2048\n",
+        )
+        .expect("parses")
+        .trace_content()
+        .expect("block present")
+        .clone();
+        let listed = tracelane_shared::TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("a4037bef-e786-44e3-bfb6-88c93ba9d381").expect("uuid"),
+        );
+        let customer = tracelane_shared::TenantId::from_jwt_claim(
+            uuid::Uuid::parse_str("32ccef57-0000-0000-0000-000000000000").expect("uuid"),
+        );
+        let both = WorkspaceCapture {
+            input: true,
+            output: true,
+        };
+        let input_only = WorkspaceCapture {
+            input: true,
+            output: false,
+        };
+
+        // Default: a customer who never opted in captures nothing.
+        let d = capture_decision(Some(&cfg), Some(WorkspaceCapture::default()), &customer);
+        assert!(!d.input && !d.output, "default OFF");
+        // The workspace opt-in, per half.
+        let d = capture_decision(Some(&cfg), Some(both), &customer);
+        assert!(
+            d.input && d.output,
+            "an owner's opt-in turns both halves on"
+        );
+        assert_eq!(d.max_field_bytes, 2048, "the operator's cap still applies");
+        let d = capture_decision(Some(&cfg), Some(input_only), &customer);
+        assert!(d.input && !d.output, "each half is independent");
+        // No control plane: the workspace half is OFF even if a stale value said on.
+        let d = capture_decision(Some(&cfg), None, &customer);
+        assert!(!d.input && !d.output, "no cache = no workspace grant");
+        let d = capture_decision(None, None, &customer);
+        assert_eq!(d, ContentCapture::OFF, "no config and no cache = OFF");
+        // The operator allowlist holds regardless of the workspace half.
+        let d = capture_decision(Some(&cfg), None, &listed);
+        assert!(d.input && d.output);
+        // A workspace opt-in on a deployment with no `trace_content:` block is still
+        // bounded by the parser's default cap.
+        let d = capture_decision(None, Some(both), &customer);
+        assert!(d.input && d.output);
+        assert_eq!(d.max_field_bytes, DEFAULT_MAX_FIELD_BYTES);
     }
 
     /// GWY-45. The allowlist is the ONLY thing standing between a tenant and

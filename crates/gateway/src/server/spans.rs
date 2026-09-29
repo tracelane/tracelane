@@ -102,7 +102,54 @@ pub(super) fn merge_usage_tokens(
 /// Token usage and streaming metadata threaded onto the gateway span. Keeps
 /// `build_gateway_span`'s argument list bounded while carrying the v1.41
 /// cache/streaming/conversation attributes (ADR-032).
-#[derive(Debug, Default, Clone, Copy)]
+/// RI-05 / B-444: what the provider said about its own response — kept as the
+/// FIRST `ProviderEvent::ResponseMeta` a consumer saw. Every field absent when the
+/// provider sent none; never filled from the request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ServedMeta {
+    pub(crate) id: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) system_fingerprint: Option<String>,
+}
+
+impl ServedMeta {
+    /// Keep the first non-empty claim; a later frame never overwrites it.
+    pub(crate) fn absorb(&mut self, id: Option<String>, model: Option<String>, fp: Option<String>) {
+        if self.id.is_none() {
+            self.id = id;
+        }
+        if self.model.is_none() {
+            self.model = model;
+        }
+        if self.system_fingerprint.is_none() {
+            self.system_fingerprint = fp;
+        }
+    }
+}
+
+/// RI-05 / B-444: why the served model differs from the requested one. Pure.
+/// `None` when they are equal or the served model is unknown — a substitution is
+/// never inferred, only observed.
+#[must_use]
+pub(crate) fn substitution(
+    requested: &str,
+    served: Option<&str>,
+    alias_applied: bool,
+    failover: bool,
+) -> Option<&'static str> {
+    let served = served?;
+    if served == requested {
+        return None;
+    }
+    Some(match (alias_applied, failover) {
+        (true, true) => "alias+failover",
+        (true, false) => "alias",
+        (false, true) => "failover",
+        (false, false) => "provider",
+    })
+}
+
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SpanUsageMeta {
     pub(crate) cache_read_input_tokens: Option<u32>,
     pub(crate) cache_creation_input_tokens: Option<u32>,
@@ -112,22 +159,34 @@ pub(crate) struct SpanUsageMeta {
     /// cost from the model price catalog (`crate::pricing`). Lands as
     /// `gen_ai.usage.cost`.
     pub(crate) cost_usd: Option<f64>,
+    /// RI-05 / B-444: the provider's own claims about the response (first
+    /// `ResponseMeta`); `Default` = nothing claimed.
+    pub(crate) served: ServedMeta,
+    /// B-354's normalised stop reason, now also recorded on the span
+    /// (`gen_ai.response.finish_reasons`).
+    pub(crate) finish_reason: Option<crate::providers::FinishReason>,
+    /// RI-05 M1 + M4: the request's full dispatch ledger — same-provider
+    /// retries then failover hops/skips, in order. `Default` = empty, which
+    /// is what a bench-mock call, a semantic-cache hit and a clean single
+    /// attempt all pass; `build_gateway_span` decides whether an empty or
+    /// single-clean-element ledger is WRITTEN at all
+    /// (`tracelane_shared::span::dispatch_attempts_worth_recording`).
+    pub(crate) dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
+    /// RI-05 / M11: reasoning ("thinking") output tokens, broken out from the
+    /// (still-inclusive) `output_tokens` total. `None` when the provider
+    /// reported no such field (Anthropic; a non-thinking OpenAI/Gemini model).
+    pub(crate) reasoning_output_tokens: Option<u32>,
 }
 
 /// GWY-45: the captured request content for one span, already truncated.
 ///
-/// **Built ONLY when the tenant is on the `trace_content:` allowlist.** The gate
-/// is a single `OnceLock` read (`config::trace_content()`), evaluated before any
-/// allocation, so a non-allowlisted tenant — which is every tenant today — pays
-/// one atomic load and nothing else.
+/// **Built ONLY when `ContentCapture::input` is set** — the operator's
+/// `trace_content:` allowlist OR the workspace owner's opt-in (GWY-53), decided
+/// once per request by `config::capture_decision`. The check is a bool read before
+/// any allocation, so a workspace that did not opt in pays nothing else.
 ///
-/// v1 is INPUT ONLY. Output is deliberately absent: the span is published BEFORE
-/// the response-side guardrail seam so that a BLOCKED request still produces a
-/// span (the #81 span-drop), and the comment at that call site justifies the
-/// ordering with "the span carries NO response body". Attaching output there
-/// would make that false and would persist exactly the text the seam redacts.
-/// `prompt_eval.rs` reads only `gen_ai_input_messages`, so input alone is the
-/// whole unblock.
+/// The RESPONSE half is [`CapturedOutput`], built after the response-side guardrail
+/// seam (OBS-51) — never here, where the text would be pre-redaction.
 #[derive(Debug, Clone)]
 pub(crate) struct CapturedInput {
     /// Serialized `Vec<tracelane_shared::model::Message>` — the SAME type
@@ -140,39 +199,64 @@ pub(crate) struct CapturedInput {
     /// `role: "system"` message and is what Anthropic-style callers use. Missing
     /// it would have left system instructions empty for most of prod.
     system: Option<serde_json::Value>,
+    /// GWY-53: the OLDEST messages left out so the field fits its cap; recorded
+    /// on the span as `tracelane_input_messages_omitted` when non-zero.
+    omitted: usize,
 }
 
 impl CapturedInput {
-    /// Returns `None` unless the tenant is allowlisted — the early return IS the
-    /// hot-path guarantee.
+    /// Returns `None` unless `capture.input` — the early return IS the hot-path
+    /// guarantee. `capture` is the caller's ONE `config::capture_decision` for this
+    /// request (B-299; GWY-53 added the workspace half).
     pub(crate) fn build(
-        tenant_id: &tracelane_shared::TenantId,
+        capture: super::config::ContentCapture,
         req: &tracelane_shared::ChatRequest,
     ) -> Option<Self> {
-        let cfg = super::config::trace_content()?;
-        // B-299: the ONE policy, shared with the judge and dataset export.
-        if !super::config::capture_decision(Some(cfg), tenant_id) {
+        if !capture.input {
             return None;
         }
-        let cap = cfg.max_field_bytes();
+        let cap = capture.max_field_bytes;
 
         // Truncate DURING construction, not after: serializing a 10 MB prompt and
-        // then throwing it away still cost the 10 MB.
+        // then throwing it away still cost the 10 MB. GWY-53: EVERY string a message
+        // can carry is capped — text parts, tool results, tool-call arguments, image
+        // URLs — not only plain text, which was the one shape our dogfood sent.
         let mut msgs = req.messages.clone();
         for m in &mut msgs {
-            if let tracelane_shared::model::MessageContent::Text(t) = &mut m.content {
-                truncate_utf8(t, cap);
-            }
+            cap_message(m, cap);
+            bound_parts(m, cap);
         }
-        let messages = serde_json::to_value(&msgs).ok()?;
+
+        // GWY-53: `gen_ai_input_messages` is ONE field, so the cap bounds the whole
+        // array. An over-size span is refused by NATS whole (no payload check in
+        // `otlp_emit::publish_span`), so a long agent history would otherwise cost the
+        // customer the trace itself. Keep the NEWEST turns that fit — always at least
+        // the last one, which is itself within the cap — and COUNT what was left out.
+        let mut kept: Vec<serde_json::Value> = Vec::new();
+        let mut used = 2; // `[` and `]`
+        for m in msgs.iter().rev() {
+            let v = serde_json::to_value(m).ok()?;
+            let len = v.to_string().len() + usize::from(!kept.is_empty());
+            if !kept.is_empty() && used + len > cap {
+                break;
+            }
+            used += len;
+            kept.push(v);
+        }
+        let omitted = msgs.len() - kept.len();
+        kept.reverse();
 
         let system = req.system.as_ref().map(|sys| {
             let mut s = sys.clone();
-            truncate_utf8(&mut s, cap);
+            store_safe(&mut s, cap);
             serde_json::Value::String(s)
         });
 
-        Some(Self { messages, system })
+        Some(Self {
+            messages: serde_json::Value::Array(kept),
+            system,
+            omitted,
+        })
     }
 
     /// Post-construction mutation, matching the two existing precedents in this
@@ -182,6 +266,111 @@ impl CapturedInput {
     pub(crate) fn apply(self, attrs: &mut tracelane_shared::SpanAttributes) {
         attrs.gen_ai_input_messages = Some(self.messages);
         attrs.gen_ai_system_instructions = self.system;
+        if self.omitted > 0 {
+            attrs.extra.insert(
+                "tracelane_input_messages_omitted".to_string(),
+                serde_json::Value::from(self.omitted),
+            );
+        }
+    }
+}
+
+/// Security review 2026-09-28 (M-1): one captured message may serialize to at most this
+/// many field caps. Every string is capped, but a message with many parts is not, and
+/// NATS refuses an over-size span whole. At the default 64 KiB cap this is 512 KiB,
+/// under NATS's 1 MiB `max_payload`. A format bound, not a tunable.
+const MESSAGE_BYTES_MULTIPLE: usize = 8;
+
+/// Security review 2026-09-28 (H-1 / H-2): the ONE way a captured string is stored.
+/// Redact FIRST with the policy crate's detector set (credentials + structured PII,
+/// `[REDACTED:<category>]` markers), then cap. This runs on every plan and every route,
+/// independent of the R2 rail: R2 rewrites what is SENT, this bounds what is KEPT.
+/// Only reached when the workspace or the operator opted into capture.
+fn store_safe(s: &mut String, cap: usize) {
+    *s = tracelane_policy::pii::redact(s);
+    truncate_utf8(s, cap);
+}
+
+/// Redact every string leaf of a structured value (a tool call's JSON input) in place.
+fn redact_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => *s = tracelane_policy::pii::redact(s),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(redact_json),
+        serde_json::Value::Object(o) => o.values_mut().for_each(redact_json),
+        _ => {}
+    }
+}
+
+/// Security review 2026-09-28 (M-1): if one message still serializes past
+/// `MESSAGE_BYTES_MULTIPLE × cap`, drop its OLDEST parts until it fits, keeping the
+/// newest, and say so in a leading text part — never a silent cut.
+fn bound_parts(m: &mut tracelane_shared::model::Message, cap: usize) {
+    use tracelane_shared::model::{ContentPart, MessageContent};
+    let limit = MESSAGE_BYTES_MULTIPLE.saturating_mul(cap);
+    let MessageContent::Parts(parts) = &mut m.content else {
+        return;
+    };
+    let size = |p: &ContentPart| serde_json::to_string(p).map_or(0, |j| j.len() + 1);
+    let mut total: usize = parts.iter().map(size).sum();
+    let mut dropped = 0usize;
+    while total > limit && parts.len() > 1 {
+        total -= size(&parts.remove(0));
+        dropped += 1;
+    }
+    if dropped > 0 {
+        parts.insert(
+            0,
+            ContentPart::Text {
+                text: format!("…[{dropped} earlier parts omitted]"),
+                cache_control: None,
+            },
+        );
+    }
+}
+
+/// GWY-53: cap every customer string one message can carry, each at `cap` bytes with
+/// the visible `…[truncated]` marker. A `data:` image URL keeps its media type and
+/// drops its bytes — a truncated base64 prefix is not an image, only weight.
+fn cap_message(m: &mut tracelane_shared::model::Message, cap: usize) {
+    use tracelane_shared::model::{ContentPart, MessageContent};
+    match &mut m.content {
+        MessageContent::Text(t) => store_safe(t, cap),
+        MessageContent::Parts(parts) => {
+            for p in parts {
+                match p {
+                    ContentPart::Text { text, .. } => store_safe(text, cap),
+                    ContentPart::ToolResult { content, .. } => store_safe(content, cap),
+                    ContentPart::ToolUse { input, .. } => cap_json(input, cap),
+                    ContentPart::ImageUrl { image_url } => {
+                        if image_url.url.starts_with("data:")
+                            && let Some(comma) = image_url.url.find(',')
+                        {
+                            image_url.url.truncate(comma + 1);
+                            image_url.url.push_str("…[omitted]");
+                        }
+                        store_safe(&mut image_url.url, cap);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(calls) = m.tool_calls.as_mut() {
+        for c in calls {
+            cap_json(&mut c.input, cap);
+        }
+    }
+}
+
+/// A JSON value over the cap becomes its own serialized text, truncated and marked —
+/// the same treatment `CapturedOutput` gives tool arguments (a string survives a cut;
+/// a half-object does not parse).
+fn cap_json(v: &mut serde_json::Value, cap: usize) {
+    redact_json(v);
+    let s = v.to_string();
+    if s.len() > cap {
+        let mut s = s;
+        truncate_utf8(&mut s, cap);
+        *v = serde_json::Value::String(s);
     }
 }
 
@@ -201,21 +390,59 @@ pub(crate) struct CapturedOutput {
 }
 
 impl CapturedOutput {
-    /// `None` unless the tenant is allowlisted, OR the text is empty (nothing
-    /// to attach — a fully content-filtered response, for instance).
-    pub(crate) fn build(tenant_id: &tracelane_shared::TenantId, text: &str) -> Option<Self> {
-        if text.is_empty() {
+    /// `None` unless the tenant is allowlisted, OR both `text` is empty AND
+    /// `tool_calls` is empty (nothing to attach — a fully content-filtered
+    /// response, or a call that named no tool, for instance).
+    ///
+    /// RI-05 / M19: `tool_calls` — `(id, name, raw accumulated arguments)`,
+    /// from `ToolCallAccumulator::for_span` on both the buffered and the
+    /// streaming path — are customer content exactly like `text`, so they ride
+    /// the SAME gate and the SAME `max_field_bytes` cap, never a second one.
+    pub(crate) fn build(
+        capture: super::config::ContentCapture,
+        text: &str,
+        tool_calls: &[(Option<String>, Option<String>, String)],
+    ) -> Option<Self> {
+        if !capture.output || (text.is_empty() && tool_calls.is_empty()) {
             return None;
         }
-        let cfg = super::config::trace_content()?;
-        if !super::config::capture_decision(Some(cfg), tenant_id) {
-            return None;
-        }
+        Some(Self::from_config(text, tool_calls, capture.max_field_bytes))
+    }
+
+    /// The gate decision split from the SHAPE-BUILDING, so the truncation and
+    /// tool-call-part logic is unit-testable against a REAL, YAML-parsed
+    /// `TraceContentConfig` without touching the process-global `CONFIG` slot
+    /// — which is write-once for the whole test binary
+    /// (`config::install_for_test`'s own doc comment says so, and
+    /// `embeddings.rs`'s alias test already claims that one slot).
+    fn from_config(
+        text: &str,
+        tool_calls: &[(Option<String>, Option<String>, String)],
+        cap: usize,
+    ) -> Self {
         let mut t = text.to_string();
-        truncate_utf8(&mut t, cfg.max_field_bytes());
-        Some(Self {
-            messages: output_messages_json(&t),
-        })
+        store_safe(&mut t, cap);
+        // RI-05 / M19: arguments stay a STRING, never parsed — the same
+        // contract OpenAI's own wire uses (`ToolCallAccumulator::to_openai_json`'s
+        // doc). Parsing a truncated argument fragment would either fail
+        // outright or silently swallow the `…[truncated]` marker; a string
+        // survives truncation exactly like message text does.
+        let calls: Vec<tracelane_shared::ToolCall> = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name, args))| {
+                let mut a = args.clone();
+                store_safe(&mut a, cap);
+                tracelane_shared::ToolCall {
+                    id: id.clone().unwrap_or_else(|| format!("call_{i}")),
+                    name: name.clone().unwrap_or_default(),
+                    input: serde_json::Value::String(a),
+                }
+            })
+            .collect();
+        Self {
+            messages: output_messages_json(&t, calls),
+        }
     }
 
     pub(crate) fn apply(self, attrs: &mut tracelane_shared::SpanAttributes) {
@@ -224,12 +451,23 @@ impl CapturedOutput {
 }
 
 /// The `gen_ai.output.messages` shape both the buffered path
-/// ([`CapturedOutput`]) and the streaming path (`StreamFinalizer`'s ring
-/// buffer, `server/stream.rs`) render into — ONE shape, so a consumer reading
+/// ([`CapturedOutput`]) and the streaming path (`StreamFinalizer`, via
+/// [`CapturedOutput::build`]) render into — ONE shape, so a consumer reading
 /// either path's span sees the same structure OTel's `gen_ai_input_messages`
-/// already uses (a single-element message array).
-pub(crate) fn output_messages_json(text: &str) -> serde_json::Value {
-    serde_json::json!([{ "role": "assistant", "content": text }])
+/// already uses (a single-element message array), and RI-05's tool-call parts
+/// ride the SAME `Message`/`ToolCall` types `gen_ai_input_messages` already
+/// carries on an assistant turn that replays a prior tool call — one message
+/// shape for input and output, not two.
+pub(crate) fn output_messages_json(
+    text: &str,
+    tool_calls: Vec<tracelane_shared::ToolCall>,
+) -> serde_json::Value {
+    serde_json::json!([tracelane_shared::Message {
+        role: tracelane_shared::Role::Assistant,
+        content: tracelane_shared::MessageContent::Text(text.to_string()),
+        tool_call_id: None,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+    }])
 }
 
 /// Truncate a `String` to at most `max` BYTES without splitting a UTF-8 char,
@@ -278,6 +516,37 @@ fn truncate_utf8(s: &mut String, max: usize) {
 const MAX_TOOL_NAMES: usize = 32;
 const MAX_TOOL_NAME_BYTES: usize = 64;
 
+/// RI-05 / M19: bound a tool-name list the SAME way `RequestConfig::build`
+/// bounds the OFFERED names above (`MAX_TOOL_NAMES` / `MAX_TOOL_NAME_BYTES`) —
+/// reused here for the CALLED names (`tracelane_response_tool_names`,
+/// `ToolCallAccumulator::response_tool_names`) so the two populations share
+/// one cap rather than drifting apart. `None` for an empty input, matching
+/// every other "absent means nothing sent" field in this file.
+/// `OBS-50`: the argument sizes that ride beside [`bounded_tool_names`] — one
+/// `u32` per called tool, in call order, the same `MAX_TOOL_NAMES` cap, `None`
+/// for no calls. Sizes are of the RAW accumulated arguments (before the content
+/// gate's truncation), so a cut argument still reports what the model produced.
+pub(crate) fn bounded_tool_arg_bytes<'a>(args: impl Iterator<Item = &'a str>) -> Option<Vec<u32>> {
+    let out: Vec<u32> = args
+        .take(MAX_TOOL_NAMES)
+        .map(|a| u32::try_from(a.len()).unwrap_or(u32::MAX))
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+pub(crate) fn bounded_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> Option<Vec<String>> {
+    let out: Vec<String> = names
+        .filter(|n| !n.is_empty())
+        .take(MAX_TOOL_NAMES)
+        .map(|n| {
+            let mut n = n.to_owned();
+            truncate_utf8(&mut n, MAX_TOOL_NAME_BYTES);
+            n
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
 /// Everything the CALLER told us about WHO and WHAT this request belongs to.
 ///
 /// Five values, all customer-supplied, all optional, all bounded at the trust
@@ -313,6 +582,8 @@ const MAX_TOOL_NAME_BYTES: usize = 64;
 /// `.clone()` calls it replaces.
 #[derive(Clone, Default)]
 pub(crate) struct CallerIdentity {
+    pub(crate) agent_name: Option<String>,
+    pub(crate) client_name: Option<String>,
     /// `x-agent-id` — KYA. Which agent made this call.
     pub(crate) agent_id: Option<String>,
     /// `x-human-authorizer` — KYA. Who approved this agent to run. NOT the end
@@ -327,6 +598,26 @@ pub(crate) struct CallerIdentity {
     pub(crate) end_user_id: Option<String>,
     /// `x-conversation-id`, falling back to `x-session-id`. Groups turns.
     pub(crate) conversation_id: Option<String>,
+    /// RI-05 / B-444: the model string the CALLER sent, taken at admission BEFORE
+    /// the `tracelane.yaml` alias rewrite and never reassigned by failover — so
+    /// `gen_ai_request_model` says what was asked for even when `model` (the
+    /// routing/billing attribution) was rewritten or replaced.
+    pub(crate) requested_model: Option<String>,
+    /// RI-05 M18 (follow-up, 2026-09-20): `x-tracelane-step-index` — the caller's own
+    /// position in its agent loop, a small integer. Parsed, never echoed as text; an
+    /// unparseable value is ABSENT, not an error (the proxy cannot know the step). The
+    /// OTLP path sets the same span field from the `tracelane.agent.step_index` attribute.
+    pub(crate) agent_step_index: Option<u32>,
+    /// GWY-27: the caller's model string was one of this WORKSPACE's aliases and was
+    /// resolved to its target at hot-path entry. Makes `tracelane_model_substitution`
+    /// read `"alias"` exactly as an operator (`tracelane.yaml`) alias does.
+    pub(crate) tenant_alias_applied: bool,
+    /// B-568 I5: this request made a control-plane round trip before dispatch
+    /// (auth cold branch, BYOK cache miss, entitlement blocking resolve, JWT bridge
+    /// miss). Set by admission and the handlers from `StageTimer::is_cold`, never
+    /// from a header. Rides the span as `tracelane_gateway_cold_start = true`, and
+    /// only when the span also carries a measured overhead.
+    pub(crate) cold_start: bool,
 }
 
 /// `Debug` that prints PRESENCE, never VALUES.
@@ -345,22 +636,38 @@ impl std::fmt::Debug for CallerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let p = |v: &Option<String>| if v.is_some() { "set" } else { "unset" };
         f.debug_struct("CallerIdentity")
+            .field("agent_name", &p(&self.agent_name))
+            .field("client_name", &p(&self.client_name))
             .field("agent_id", &p(&self.agent_id))
             .field("human_authorizer", &p(&self.human_authorizer))
             .field("business_reference", &p(&self.business_reference))
             .field("end_user_id", &p(&self.end_user_id))
             .field("conversation_id", &p(&self.conversation_id))
+            .field("agent_step_index", &self.agent_step_index.is_some())
             .finish()
     }
 }
 
 impl CallerIdentity {
+    pub(crate) fn assignment_key(&self) -> Option<String> {
+        self.end_user_id
+            .as_ref()
+            .map(|v| format!("user:{v}"))
+            .or_else(|| {
+                self.conversation_id
+                    .as_ref()
+                    .map(|v| format!("conversation:{v}"))
+            })
+            .or_else(|| self.agent_id.as_ref().map(|v| format!("agent:{v}")))
+    }
+
     /// Read all five from request headers, bounded, at the trust boundary.
     ///
-    /// **Every value is length-bounded and DROPPED rather than truncated above
+    /// **Correlation ids are length-bounded and DROPPED rather than truncated above
     /// the cap** — `bounded_end_user_id`'s doc says why: a truncated id is a
     /// *wrong* id, and a wrong id silently attributes one request to another
     /// agent, person or session. Absence is recoverable; misattribution is not.
+    /// The optional agent display name is separately truncated to the catalog cap.
     ///
     /// The body-sourced end-user spellings (OpenAI's `user`, Anthropic's
     /// `metadata.user_id`) are NOT read here — they need the parsed body, which
@@ -374,6 +681,14 @@ impl CallerIdentity {
                 .and_then(tracelane_shared::span::bounded_end_user_id)
         };
         Self {
+            agent_name: headers
+                .get("x-tracelane-agent-name")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::kya_identity::bounded_agent_name),
+            client_name: headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::kya_identity::classify_client),
             agent_id: h("x-agent-id"),
             human_authorizer: h("x-human-authorizer"),
             business_reference: headers
@@ -382,12 +697,36 @@ impl CallerIdentity {
                 .and_then(tracelane_shared::span::bounded_business_reference),
             end_user_id: h("x-tracelane-user-id").or_else(|| h("x-user-id")),
             conversation_id: h("x-conversation-id").or_else(|| h("x-session-id")),
+            // RI-05: set by `with_requested_model` from the body, never from a header.
+            requested_model: None,
+            // GWY-27: set by the handler that resolves a workspace alias, never here.
+            tenant_alias_applied: false,
+            // B-568 I5: set by admission / the handler from the stage timer, never here.
+            cold_start: false,
+            agent_step_index: headers
+                .get("x-tracelane-step-index")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u32>().ok()),
         }
     }
 
     /// `OBS-20`. Fill `end_user_id` from the request BODY when no header supplied
     /// one. Header wins — it is the explicit signal, and the only one a customer
     /// can set without touching a body their SDK owns.
+    /// RI-05 / B-444: the body's `model` string, verbatim. Absent when the body has
+    /// none (embeddings bodies do; `/v1/messages` does) — then `build_gateway_span`
+    /// falls back to the routing model, as before.
+    pub(crate) fn with_requested_model(mut self, body: &serde_json::Value) -> Self {
+        if self.requested_model.is_none() {
+            self.requested_model = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned);
+        }
+        self
+    }
+
     pub(crate) fn or_body_end_user(mut self, body: &serde_json::Value) -> Self {
         if self.end_user_id.is_none() {
             self.end_user_id = ["user", "safety_identifier"]
@@ -444,9 +783,21 @@ pub(crate) struct RequestConfig {
     /// them in one struct only because they travel together would let a future
     /// reader think the gateway flagged something it merely recorded.
     misconfig_flags: Option<Vec<String>>,
+    /// `GWY-49`. Populated by [`RequestConfig::with_zdr`] once routing has judged the
+    /// constraint — request configuration in the literal sense: the caller asked for it.
+    zdr_required: Option<bool>,
+    zdr_eligible_providers: Option<Vec<String>>,
 }
 
 impl RequestConfig {
+    /// `GWY-49`: record that the request carried `x-tracelane-zdr: required` and which
+    /// providers passed the check (primary first). Called only under the constraint.
+    pub(crate) fn with_zdr(mut self, eligible_providers: Vec<String>) -> Self {
+        self.zdr_required = Some(true);
+        self.zdr_eligible_providers = Some(eligible_providers);
+        self
+    }
+
     /// Read the configuration off the inbound request. Infallible and total:
     /// there is no tenant gate and no early return, because there is nothing
     /// here to gate (see the type doc).
@@ -537,6 +888,8 @@ impl RequestConfig {
             tool_definitions_hash,
             deployment_id: deployment_identity(&req.model),
             misconfig_flags: None,
+            zdr_required: None,
+            zdr_eligible_providers: None,
         }
     }
 
@@ -615,6 +968,8 @@ impl RequestConfig {
         attrs.tracelane_request_tool_definitions_hash = self.tool_definitions_hash;
         attrs.tracelane_request_deployment_id = self.deployment_id;
         attrs.tracelane_misconfig_flags = self.misconfig_flags;
+        attrs.tracelane_zdr_required = self.zdr_required;
+        attrs.tracelane_zdr_eligible_providers = self.zdr_eligible_providers;
     }
 }
 
@@ -691,6 +1046,34 @@ fn gateway_overhead_us(
     u32::try_from((pre + post).max(0)).ok()
 }
 
+/// B-568 I4: move a built span's `end_time` to the moment the response actually
+/// leaves, and charge the gap to the gateway overhead.
+///
+/// `build_gateway_span` stamps `end_time = now()` on the line after
+/// `provider_complete_ts`, so on the buffered path the response-side guardrail
+/// seam, the output capture and the span bookkeeping all ran AFTER the span
+/// ended and were counted in neither segment — client-visible latency no number
+/// showed. With `overhead = pre + (end − provider_complete)`, moving `end` by `d`
+/// moves overhead by exactly `d` and leaves `provider = total − overhead`
+/// untouched, so the two segments still sum to the total to the microsecond.
+///
+/// A span with no measured overhead keeps `None` (nothing is invented), and a
+/// `sent` earlier than the recorded end (a wall-clock step backwards) changes
+/// nothing rather than shortening the span.
+pub(crate) fn restamp_sent(span: &mut TracelaneSpan, sent: chrono::DateTime<chrono::Utc>) {
+    let Some(built) = span.end_time else {
+        return;
+    };
+    let Some(gap_us) = (sent - built).num_microseconds().filter(|us| *us > 0) else {
+        return;
+    };
+    span.end_time = Some(sent);
+    if let Some(oh) = span.attributes.tracelane_gateway_overhead_us {
+        span.attributes.tracelane_gateway_overhead_us =
+            Some(oh.saturating_add(u32::try_from(gap_us).unwrap_or(u32::MAX)));
+    }
+}
+
 /// Build a `TracelaneSpan` from gateway request/response metadata.
 ///
 /// Called after the provider responds (or errors) to record the full round-trip.
@@ -724,6 +1107,11 @@ pub(crate) fn build_gateway_span(
 ) -> TracelaneSpan {
     let provider = provider_name_from_model(model);
     let end_time = chrono::Utc::now();
+    let requested_model: &str = identity.requested_model.as_deref().unwrap_or(model);
+    // A `tracelane.yaml` alias on the requested string means the upstream saw a
+    // different model by our doing (GWY-39); `config::alias` is one `OnceLock` read.
+    let alias_applied =
+        identity.tenant_alias_applied || super::config::alias(requested_model).is_some();
     // Gateway overhead = time Tracelane adds, EXCLUDING the provider round-trip:
     // (dispatch − received) + (sent − provider-complete). `None` when there was
     // no measured provider round-trip (dispatch failures / guardrail blocks).
@@ -749,12 +1137,34 @@ pub(crate) fn build_gateway_span(
             // legacy-downstream round-trip (ADR-032).
             gen_ai_system: Some(provider.to_string()),
             gen_ai_provider_name: Some(provider.to_string()),
-            gen_ai_request_model: Some(model.to_string()),
-            gen_ai_response_model: Some(model.to_string()),
+            // RI-05 / B-444: the REQUESTED string is the caller's (pre-alias,
+            // pre-failover) when admission recorded it; `model` — the routing and
+            // billing attribution, rewritten by failover — is the fallback for the
+            // routes that do not record it (embeddings, /v1/messages).
+            gen_ai_request_model: Some(requested_model.to_string()),
+            // The SERVED model is the provider's own claim — ABSENT when it sent
+            // none. Until 2026-09-19 this was a copy of the requested string, so the
+            // two columns could never disagree and read paths trusted the copy as
+            // the served model (B-444).
+            gen_ai_response_model: usage_meta.served.model.clone(),
+            gen_ai_response_id: usage_meta.served.id.clone(),
+            gen_ai_response_finish_reasons: usage_meta
+                .finish_reason
+                .map(|r| vec![r.as_str().to_string()]),
+            tracelane_model_substitution: substitution(
+                requested_model,
+                usage_meta.served.model.as_deref(),
+                alias_applied,
+                failover_from.is_some(),
+            )
+            .map(str::to_owned),
             gen_ai_usage_input_tokens: Some(input_tokens),
             gen_ai_usage_output_tokens: Some(output_tokens),
             gen_ai_usage_cache_read_input_tokens: usage_meta.cache_read_input_tokens,
             gen_ai_usage_cache_creation_input_tokens: usage_meta.cache_creation_input_tokens,
+            // RI-05 / M11: broken out from the still-inclusive `output_tokens`
+            // above (cost/billing parity unchanged, `google.rs`'s rule).
+            gen_ai_usage_reasoning_output_tokens: usage_meta.reasoning_output_tokens,
             // Provider-reported cost when present; otherwise derive it from the
             // token counts + the model price catalog. `None` (unknown model) is
             // preserved — the gateway never fabricates a cost (ADR-055).
@@ -772,19 +1182,52 @@ pub(crate) fn build_gateway_span(
             gen_ai_request_stream: Some(usage_meta.stream),
             gen_ai_response_time_to_first_chunk: ttft_secs,
             tracelane_gateway_overhead_us: gateway_overhead_us,
+            // B-568 I5: present only when true AND beside a measured overhead —
+            // the dashboard splits the overhead population, so a flag with no
+            // number behind it would count a sample the quantile never saw.
+            tracelane_gateway_cold_start: (identity.cold_start && gateway_overhead_us.is_some())
+                .then_some(true),
             gen_ai_conversation_id: identity.conversation_id.clone(),
             tracelane_aft_id: aft_id.map(str::to_owned),
             tracelane_kya_agent_id: identity.agent_id.clone(),
+            tracelane_agent_step_index: identity.agent_step_index,
             tracelane_kya_human_authorizer: identity.human_authorizer.clone(),
             tracelane_business_reference: identity.business_reference.clone(),
             user_id: identity.end_user_id.clone(),
+            gen_ai_agent_name: identity.agent_name.clone(),
+            tracelane_client_name: identity.client_name.clone(),
+            tracelane_agent_name_source: identity.agent_name.as_ref().map(|_| "header".into()),
             // Present only when a cross-provider failover served this
             // request. The rollup counts `countIf(tracelane_failover_activated)`;
             // `tracelane_failover_from` names the primary provider that errored.
             tracelane_failover_activated: failover_from.map(|_| true),
             tracelane_failover_from: failover_from.map(str::to_owned),
+            // RI-05 M1 + M4: absent unless the ledger is worth recording —
+            // more than one attempt, or any attempt that errored (spec §2.1).
+            // A clean single attempt writes nothing, which together with
+            // `gen_ai_response_id` distinguishes a verified-clean span from a
+            // pre-RI-05 one that never carried this field at all.
+            tracelane_dispatch_attempts: {
+                let write = tracelane_shared::span::dispatch_attempts_worth_recording(
+                    &usage_meta.dispatch_attempts,
+                );
+                write.then_some(usage_meta.dispatch_attempts)
+            },
             // GWY-43: which API key paid for this. `None` for a JWT session.
             tracelane_api_key_id: api_key_id.map(str::to_owned),
+            // RI-05 M5: OpenAI's `system_fingerprint`, spelled as the OTLP passthrough
+            // spells it (`decode.rs` maps `gen_ai.openai.*` → `openai.*` into `extra`).
+            extra: usage_meta
+                .served
+                .system_fingerprint
+                .as_ref()
+                .map(|fp| {
+                    std::collections::HashMap::from([(
+                        "openai.response.system_fingerprint".to_string(),
+                        serde_json::Value::String(fp.clone()),
+                    )])
+                })
+                .unwrap_or_default(),
             ..Default::default()
         },
         // A FAILED request (upstream 4xx/5xx/timeout, mid-stream provider error, or
@@ -920,9 +1363,144 @@ impl LogprobAccumulator {
     }
 }
 
+/// A prompt resolution is an observed operation, with no invented model usage.
+pub(crate) fn build_prompt_resolution_span(
+    tenant: &TenantId,
+    name: &str,
+    resolution: &crate::prompt_router::PromptResolution,
+    identity: &CallerIdentity,
+) -> TracelaneSpan {
+    let now = chrono::Utc::now();
+    let mut extra = std::collections::HashMap::from([
+        ("tracelane.prompt.name".into(), serde_json::json!(name)),
+        (
+            "tracelane.prompt.version_id".into(),
+            serde_json::json!(resolution.version.prompt_version_id),
+        ),
+        (
+            "tracelane.prompt.arm".into(),
+            serde_json::json!(resolution.arm),
+        ),
+    ]);
+    if let Some(id) = resolution.canary_id {
+        extra.insert("tracelane.prompt.canary_id".into(), serde_json::json!(id));
+    }
+    TracelaneSpan {
+        span_id: Uuid::new_v4(),
+        trace_id: Uuid::new_v4(),
+        parent_span_id: None,
+        tenant_id: tenant.clone(),
+        name: "prompt.resolve".into(),
+        start_time: now,
+        end_time: Some(now),
+        attributes: SpanAttributes {
+            gen_ai_operation_name: Some("prompt.resolve".into()),
+            user_id: identity.end_user_id.clone(),
+            gen_ai_agent_name: identity.agent_name.clone(),
+            tracelane_client_name: identity.client_name.clone(),
+            tracelane_agent_name_source: identity.agent_name.as_ref().map(|_| "header".into()),
+            gen_ai_conversation_id: identity.conversation_id.clone(),
+            tracelane_kya_agent_id: identity.agent_id.clone(),
+            extra,
+            ..Default::default()
+        },
+        status: SpanStatus {
+            code: SpanStatusCode::Ok,
+            message: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kya_attributes(headers: HeaderMap) -> serde_json::Value {
+        let span = build_gateway_span(
+            &TenantId::from_jwt_claim(uuid::Uuid::from_u128(7)),
+            uuid::Uuid::from_u128(1),
+            None,
+            "claude-haiku-4-5",
+            &CallerIdentity::from_headers(&headers),
+            chrono::Utc::now(),
+            1,
+            1,
+            None,
+            SpanUsageMeta::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        serde_json::to_value(span.attributes).unwrap()
+    }
+
+    #[test]
+    fn kya_header_names_the_agent_and_records_its_source() {
+        let mut h = HeaderMap::new();
+        h.insert("x-tracelane-agent-name", "  KYA-Proof  ".parse().unwrap());
+        let a = kya_attributes(h);
+        assert_eq!(a["gen_ai_agent_name"], "kya-proof");
+        assert_eq!(a["tracelane_agent_name_source"], "header");
+    }
+
+    #[test]
+    fn kya_name_is_printable_and_truncated_at_64_characters() {
+        let mut h = HeaderMap::new();
+        h.insert("x-tracelane-agent-name", "a".repeat(70).parse().unwrap());
+        assert_eq!(kya_attributes(h)["gen_ai_agent_name"], "a".repeat(64));
+        for raw in ["", "   ", "bad\tname"] {
+            let mut h = HeaderMap::new();
+            h.insert("x-tracelane-agent-name", raw.parse().unwrap());
+            assert!(kya_attributes(h).get("gen_ai_agent_name").is_none());
+        }
+    }
+
+    #[test]
+    fn kya_observed_clients_are_classified_without_retaining_user_agent() {
+        // Product tokens observed from local requests by the installed CLIs.
+        // The synthetic suffix probes privacy without preserving host metadata.
+        for (token, client) in [
+            ("claude-cli/2.1.281", "claude-code"),
+            ("codex_exec/0.155.1", "codex"),
+        ] {
+            let ua = format!("{token} private-machine-metadata");
+            let mut h = HeaderMap::new();
+            h.insert("user-agent", ua.parse().unwrap());
+            let a = kya_attributes(h);
+            assert_eq!(a["tracelane_client_name"], client);
+            assert!(!a.to_string().contains(&ua));
+            assert!(!a.to_string().contains("private-machine"));
+            assert!(a.get("gen_ai_agent_name").is_none());
+        }
+        for ua in ["unknown/1", "xclaude-cli/2.1.281", "codex/1", ""] {
+            let mut h = HeaderMap::new();
+            h.insert("user-agent", ua.parse().unwrap());
+            assert!(kya_attributes(h).get("tracelane_client_name").is_none());
+        }
+    }
+
+    /// RI-05 M18 follow-up: the proxy header is a small integer or nothing. Garbage,
+    /// negatives and empties are ABSENT — never an error, never echoed as text.
+    #[test]
+    fn step_index_header_parses_a_small_integer_and_drops_everything_else() {
+        let mut h = HeaderMap::new();
+        h.insert("x-tracelane-step-index", " 3 ".parse().unwrap());
+        assert_eq!(CallerIdentity::from_headers(&h).agent_step_index, Some(3));
+        for bad in ["-1", "three", "", "3.5", "99999999999"] {
+            let mut h = HeaderMap::new();
+            h.insert("x-tracelane-step-index", bad.parse().unwrap());
+            assert_eq!(
+                CallerIdentity::from_headers(&h).agent_step_index,
+                None,
+                "{bad:?} must not parse"
+            );
+        }
+        assert_eq!(
+            CallerIdentity::from_headers(&HeaderMap::new()).agent_step_index,
+            None
+        );
+    }
 
     /// `OBS-20`. **The hazard this test exists for is transposition, not absence.**
     ///
@@ -937,6 +1515,141 @@ mod tests {
     /// So this passes a DISTINGUISHABLE value for each and asserts each one
     /// lands in its own attribute. It fails the moment two are swapped, which is
     /// the only failure mode worth a test here.
+    /// RI-05 / B-444 — RED against the pre-2026-09-19 builder, which wrote the
+    /// requested string into `gen_ai_response_model` on every span. A span built
+    /// from a call the provider said NOTHING about must not claim a served model.
+    #[test]
+    fn a_span_never_copies_the_requested_model_into_the_served_column() {
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let span = build_gateway_span(
+            &tenant,
+            uuid::Uuid::from_u128(1),
+            None,
+            "claude-sonnet-4-6",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+            1,
+            1,
+            None,
+            SpanUsageMeta::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            span.attributes.gen_ai_request_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert!(
+            span.attributes.gen_ai_response_model.is_none(),
+            "nothing was served, so the served column must be ABSENT, not a copy of the request (B-444)"
+        );
+    }
+
+    #[test]
+    fn substitution_is_observed_never_inferred() {
+        assert_eq!(
+            substitution("gpt-4o", None, false, false),
+            None,
+            "served unknown → none"
+        );
+        assert_eq!(
+            substitution("gpt-4o", Some("gpt-4o"), true, true),
+            None,
+            "equal → none"
+        );
+        assert_eq!(
+            substitution("my-alias", Some("gpt-4o-2024-08-06"), true, false),
+            Some("alias")
+        );
+        assert_eq!(
+            substitution("gpt-4o", Some("claude-sonnet-4-6"), false, true),
+            Some("failover")
+        );
+        assert_eq!(
+            substitution("a", Some("b"), true, true),
+            Some("alias+failover")
+        );
+        assert_eq!(
+            substitution("gpt-4o", Some("gpt-4o-2024-08-06"), false, false),
+            Some("provider"),
+            "neither we nor a failover changed it: the silent-substitution signal"
+        );
+    }
+
+    #[test]
+    fn the_served_model_id_fingerprint_and_finish_reason_land_and_a_caller_string_survives() {
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let identity = CallerIdentity {
+            requested_model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let span = build_gateway_span(
+            &tenant,
+            uuid::Uuid::from_u128(1),
+            None,
+            "claude-sonnet-4-6", // the routing/billing attribution AFTER a failover
+            &identity,
+            chrono::Utc::now(),
+            1,
+            1,
+            None,
+            SpanUsageMeta {
+                served: ServedMeta {
+                    id: Some("chatcmpl-abc".into()),
+                    model: Some("claude-sonnet-4-6-20260301".into()),
+                    system_fingerprint: Some("fp_123".into()),
+                },
+                finish_reason: Some(crate::providers::FinishReason::Length),
+                ..Default::default()
+            },
+            Some("openai"),
+            None,
+            None,
+            None,
+        );
+        let a = &span.attributes;
+        assert_eq!(
+            a.gen_ai_request_model.as_deref(),
+            Some("gpt-4o"),
+            "the CALLER's string, not the failover model"
+        );
+        assert_eq!(
+            a.gen_ai_response_model.as_deref(),
+            Some("claude-sonnet-4-6-20260301"),
+            "the provider's own string"
+        );
+        assert_eq!(a.gen_ai_response_id.as_deref(), Some("chatcmpl-abc"));
+        assert_eq!(
+            a.gen_ai_response_finish_reasons,
+            Some(vec!["length".to_string()])
+        );
+        assert_eq!(a.tracelane_model_substitution.as_deref(), Some("failover"));
+        assert_eq!(
+            a.extra.get("openai.response.system_fingerprint"),
+            Some(&serde_json::Value::String("fp_123".into()))
+        );
+    }
+
+    #[test]
+    fn served_meta_keeps_the_first_claim() {
+        let mut m = ServedMeta::default();
+        m.absorb(Some("id-1".into()), None, None);
+        m.absorb(Some("id-2".into()), Some("m-2".into()), Some("fp-2".into()));
+        assert_eq!(
+            m.id.as_deref(),
+            Some("id-1"),
+            "a later frame never overwrites"
+        );
+        assert_eq!(
+            m.model.as_deref(),
+            Some("m-2"),
+            "but fills what was still empty"
+        );
+        assert_eq!(m.system_fingerprint.as_deref(), Some("fp-2"));
+    }
+
     #[test]
     fn each_caller_identity_lands_in_its_own_attribute_and_none_are_transposed() {
         let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
@@ -951,6 +1664,9 @@ mod tests {
                 business_reference: Some("BUSINESS".into()),
                 end_user_id: Some("ENDUSER".into()),
                 conversation_id: Some("CONVERSATION".into()),
+                requested_model: None,
+                agent_step_index: Some(7),
+                ..CallerIdentity::default()
             },
             chrono::Utc::now(),
             1,
@@ -961,6 +1677,10 @@ mod tests {
                 cache_creation_input_tokens: None,
                 stream: false,
                 cost_usd: None,
+                served: ServedMeta::default(),
+                finish_reason: None,
+                dispatch_attempts: Vec::new(),
+                reasoning_output_tokens: None,
             },
             Some("FAILOVERFROM"),
             None,
@@ -969,6 +1689,11 @@ mod tests {
         );
         let a = &span.attributes;
         assert_eq!(a.tracelane_kya_agent_id.as_deref(), Some("AGENT"));
+        assert_eq!(
+            a.tracelane_agent_step_index,
+            Some(7),
+            "the header rides onto the span"
+        );
         assert_eq!(
             a.tracelane_kya_human_authorizer.as_deref(),
             Some("AUTHORIZER")
@@ -1052,9 +1777,248 @@ mod tests {
             system: None,
             metadata: None,
         };
+        // No operator block AND no control plane: the decision the OSS self-host makes.
+        let capture = crate::server::config::capture_decision(None, None, &tenant);
         assert!(
-            CapturedInput::build(&tenant, &req).is_none(),
+            CapturedInput::build(capture, &req).is_none(),
             "with no trace_content block installed, capture MUST be off — an              absent config is the unprivileged state (.claude/rules/tenancy.md)"
+        );
+    }
+
+    // ── GWY-53 — the cap holds for EVERY shape a customer can send ───────────
+    //
+    // Until GWY-53 only our dogfood's short text prompts were captured, so only
+    // `MessageContent::Text` was truncated. A customer sends multimodal parts,
+    // tool results and long agent histories — and `otlp_emit::publish_span` has no
+    // payload check, so an over-size span is refused by NATS WHOLE: the customer
+    // who opted in to MORE data would lose the trace entirely.
+
+    fn gwy53_on(cap: usize) -> crate::server::config::ContentCapture {
+        crate::server::config::ContentCapture {
+            input: true,
+            output: true,
+            max_field_bytes: cap,
+        }
+    }
+
+    fn gwy53_req(messages: Vec<tracelane_shared::model::Message>) -> tracelane_shared::ChatRequest {
+        tracelane_shared::ChatRequest {
+            top_p: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+            model: "gpt-4o".to_owned(),
+            messages,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            stream: None,
+            system: None,
+            metadata: None,
+        }
+    }
+
+    fn gwy53_msg(
+        content: tracelane_shared::model::MessageContent,
+    ) -> tracelane_shared::model::Message {
+        tracelane_shared::model::Message {
+            role: tracelane_shared::model::Role::User,
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    // Security review 2026-09-28 (H-1 / H-2): the stored copy is redacted on EVERY plan,
+    // not only when the R2 rail is entitled and not only on the chat route — an owner who
+    // consented to capture did not consent to storing their own users' secrets.
+    // AWS's own documented example key — accepted by `.gitleaks.toml`, never a real credential.
+    const GWY53_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    #[test]
+    fn gwy53_stored_input_is_redacted_on_every_plan_not_only_under_r2() {
+        use tracelane_shared::model::{ContentPart, MessageContent};
+        let mut req = gwy53_req(vec![
+            gwy53_msg(MessageContent::Text(format!(
+                "my aws key is {GWY53_SECRET}"
+            ))),
+            gwy53_msg(MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: "t1".into(),
+                content: format!("found {GWY53_SECRET}"),
+                cache_control: None,
+            }])),
+        ]);
+        req.system = Some(format!("system {GWY53_SECRET}"));
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(4096), &req)
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = format!(
+            "{}{}",
+            attrs.gen_ai_input_messages.expect("messages"),
+            attrs.gen_ai_system_instructions.expect("system")
+        );
+        assert!(
+            !stored.contains(GWY53_SECRET),
+            "a secret was stored: {stored}"
+        );
+        assert!(stored.contains("[REDACTED:aws_key]"), "{stored}");
+    }
+
+    #[test]
+    fn gwy53_secrets_inside_tool_call_json_are_redacted_even_under_the_cap() {
+        use tracelane_shared::model::{ContentPart, MessageContent};
+        let req = gwy53_req(vec![gwy53_msg(MessageContent::Parts(vec![
+            ContentPart::ToolUse {
+                id: "t2".into(),
+                name: "deploy".into(),
+                input: serde_json::json!({ "creds": { "aws": GWY53_SECRET } }),
+            },
+        ]))]);
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(4096), &req)
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = attrs.gen_ai_input_messages.expect("messages").to_string();
+        assert!(!stored.contains(GWY53_SECRET), "{stored}");
+    }
+
+    #[test]
+    fn gwy53_stored_output_and_tool_arguments_are_redacted() {
+        let out = CapturedOutput::build(
+            gwy53_on(4096),
+            &format!("here it is: {GWY53_SECRET}"),
+            &[(
+                Some("c1".into()),
+                Some("f".into()),
+                format!("{{\"k\":\"{GWY53_SECRET}\"}}"),
+            )],
+        )
+        .expect("capture on");
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        out.apply(&mut attrs);
+        let stored = attrs.gen_ai_output_messages.expect("output").to_string();
+        assert!(!stored.contains(GWY53_SECRET), "{stored}");
+        assert!(stored.contains("[REDACTED:aws_key]"), "{stored}");
+    }
+
+    // Security review 2026-09-28 (M-1): one message with many parts was bounded only
+    // per string, so it could still outgrow the NATS payload and lose the span whole.
+    #[test]
+    fn gwy53_one_message_with_many_parts_is_bounded_and_says_what_it_dropped() {
+        use tracelane_shared::model::{ContentPart, MessageContent};
+        let cap = 1024;
+        let parts: Vec<ContentPart> = (0..40)
+            .map(|i| ContentPart::Text {
+                text: format!("part-{i:02}-{}", "y".repeat(2_000)),
+                cache_control: None,
+            })
+            .collect();
+        let req = gwy53_req(vec![gwy53_msg(MessageContent::Parts(parts))]);
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(cap), &req)
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = attrs.gen_ai_input_messages.expect("messages").to_string();
+        assert!(
+            stored.len() <= MESSAGE_BYTES_MULTIPLE * cap + 512,
+            "one message must stay within the per-message bound — got {} bytes",
+            stored.len()
+        );
+        assert!(stored.contains("part-39-"), "the newest part is kept");
+        assert!(
+            stored.contains("earlier parts omitted"),
+            "{}",
+            &stored[..200]
+        );
+    }
+
+    #[test]
+    fn gwy53_every_string_in_a_multimodal_message_is_capped_and_image_bytes_are_not_kept() {
+        use tracelane_shared::model::{ContentPart, ImageUrl, MessageContent};
+        let cap = 1024;
+        let big = "x".repeat(5_000);
+        let image = format!("data:image/png;base64,{}", "A".repeat(200_000));
+        let req = gwy53_req(vec![gwy53_msg(MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: big.clone(),
+                cache_control: None,
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: image,
+                    detail: None,
+                },
+            },
+            ContentPart::ToolResult {
+                tool_use_id: "t1".into(),
+                content: big.clone(),
+                cache_control: None,
+            },
+            ContentPart::ToolUse {
+                id: "t2".into(),
+                name: "search".into(),
+                input: serde_json::json!({ "q": big }),
+            },
+        ]))]);
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(cap), &req)
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = attrs.gen_ai_input_messages.expect("messages").to_string();
+        assert!(
+            stored.len() < 6 * cap,
+            "four parts, each within the cap, plus JSON overhead — got {} bytes",
+            stored.len()
+        );
+        assert!(!stored.contains(&"A".repeat(2_000)), "no image bytes kept");
+        assert!(
+            stored.contains("data:image/png;base64,"),
+            "the media type stays"
+        );
+        assert!(stored.contains("…[truncated]"), "every cut is marked");
+    }
+
+    #[test]
+    fn gwy53_a_long_history_keeps_the_newest_messages_within_one_field_cap() {
+        use tracelane_shared::model::MessageContent;
+        let cap = 4_096;
+        let mut msgs: Vec<_> = (0..40)
+            .map(|i| {
+                gwy53_msg(MessageContent::Text(format!(
+                    "turn {i:02} {}",
+                    "y".repeat(1_000)
+                )))
+            })
+            .collect();
+        msgs.push(gwy53_msg(MessageContent::Text(
+            "the newest question".into(),
+        )));
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(cap), &gwy53_req(msgs))
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = attrs.gen_ai_input_messages.expect("messages");
+        let len = stored.to_string().len();
+        assert!(
+            len <= cap,
+            "the whole field is bounded by the cap, got {len}"
+        );
+        let kept = stored.as_array().expect("array");
+        assert_eq!(
+            kept.last().and_then(|m| m["content"].as_str()),
+            Some("the newest question"),
+            "the NEWEST turn is always kept"
+        );
+        assert!(kept.len() < 41);
+        // Still the consumer's shape: `prompt_eval.rs` deserializes Vec<Message>.
+        let _: Vec<tracelane_shared::model::Message> =
+            serde_json::from_value(stored.clone()).expect("still Vec<Message>");
+        assert_eq!(
+            attrs.extra.get("tracelane_input_messages_omitted"),
+            Some(&serde_json::json!(41 - kept.len())),
+            "what was left out is COUNTED, never silent"
         );
     }
 
@@ -1508,5 +2472,346 @@ mod tests {
         let (mut i3, mut o3) = (0u32, 0u32);
         merge_usage_tokens(&mut i3, &mut o3, 100, 50);
         assert_eq!((i3, o3), (100, 50));
+    }
+
+    // ── B-568 I5: the cold-start attribute ────────────────────────────────
+
+    fn span_with(identity: &CallerIdentity, timing: Option<GatewayTiming>) -> TracelaneSpan {
+        build_gateway_span(
+            &TenantId::from_jwt_claim(uuid::Uuid::from_u128(7)),
+            uuid::Uuid::from_u128(1),
+            None,
+            "claude-sonnet-4-6",
+            identity,
+            chrono::Utc::now(),
+            1,
+            1,
+            None,
+            SpanUsageMeta::default(),
+            None,
+            timing,
+            None,
+            None,
+        )
+    }
+
+    fn now_timing() -> Option<GatewayTiming> {
+        let now = chrono::Utc::now();
+        Some(GatewayTiming {
+            dispatch_ts: now,
+            provider_complete_ts: now,
+            ttft_us: None,
+        })
+    }
+
+    /// `true` and PRESENT on a cold request with a measured overhead; ABSENT on a
+    /// warm one (never `Some(false)` — the key's presence IS the fact, which keeps
+    /// the warm majority of spans byte-identical to before); ABSENT on a cold
+    /// request with no measured overhead, because the dashboard splits the
+    /// OVERHEAD population and a flag with no number behind it would count a
+    /// sample the quantile never saw.
+    #[test]
+    fn cold_start_is_present_only_when_true_and_measured() {
+        let cold = CallerIdentity {
+            cold_start: true,
+            ..CallerIdentity::default()
+        };
+        assert_eq!(
+            span_with(&cold, now_timing())
+                .attributes
+                .tracelane_gateway_cold_start,
+            Some(true)
+        );
+        assert_eq!(
+            span_with(&CallerIdentity::default(), now_timing())
+                .attributes
+                .tracelane_gateway_cold_start,
+            None,
+            "a warm span must not carry the key at all"
+        );
+        assert_eq!(
+            span_with(&cold, None)
+                .attributes
+                .tracelane_gateway_cold_start,
+            None,
+            "no measured overhead ⇒ no cold flag"
+        );
+        let json = serde_json::to_string(&span_with(&CallerIdentity::default(), now_timing()))
+            .expect("serialise");
+        assert!(
+            !json.contains("tracelane_gateway_cold_start"),
+            "absent must mean absent on the wire, not null: {json}"
+        );
+    }
+
+    // ── B-568 I4: an honest `sent` ────────────────────────────────────────
+
+    /// Restamping `sent` moves `end_time` AND grows the overhead by exactly the
+    /// interval the gateway kept the client waiting after the span was built —
+    /// so `overhead + provider == total` still holds to the microsecond.
+    #[test]
+    fn restamp_sent_moves_end_time_and_charges_the_gap_to_overhead() {
+        let received = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let dispatch = received + chrono::Duration::milliseconds(3);
+        let complete = dispatch + chrono::Duration::milliseconds(500);
+        let built = complete + chrono::Duration::microseconds(40);
+        let sent = built + chrono::Duration::milliseconds(7); // response guard etc.
+        let mut span = span_with(&CallerIdentity::default(), None);
+        span.start_time = received;
+        span.end_time = Some(built);
+        span.attributes.tracelane_gateway_overhead_us =
+            gateway_overhead_us(received, dispatch, complete, built);
+        assert_eq!(span.attributes.tracelane_gateway_overhead_us, Some(3_040));
+
+        restamp_sent(&mut span, sent);
+
+        assert_eq!(span.end_time, Some(sent));
+        assert_eq!(
+            span.attributes.tracelane_gateway_overhead_us,
+            gateway_overhead_us(received, dispatch, complete, sent),
+            "the restamped number must equal the one computed at `sent`"
+        );
+        assert_eq!(span.attributes.tracelane_gateway_overhead_us, Some(10_040));
+        let total = u32::try_from((sent - received).num_microseconds().unwrap()).unwrap();
+        let provider = total - span.attributes.tracelane_gateway_overhead_us.unwrap();
+        assert_eq!(provider, 500_000, "the provider segment must not move");
+    }
+
+    /// A span with no measured overhead (a dispatch failure) keeps `None` — the
+    /// restamp must not invent a number — and a wall clock that stepped BACK
+    /// never shortens the span or the overhead.
+    #[test]
+    fn restamp_sent_never_invents_or_shrinks() {
+        let t0 = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut span = span_with(&CallerIdentity::default(), None);
+        span.start_time = t0;
+        span.end_time = Some(t0 + chrono::Duration::milliseconds(10));
+        restamp_sent(&mut span, t0 + chrono::Duration::milliseconds(12));
+        assert_eq!(span.attributes.tracelane_gateway_overhead_us, None);
+        assert_eq!(span.end_time, Some(t0 + chrono::Duration::milliseconds(12)));
+
+        span.attributes.tracelane_gateway_overhead_us = Some(2_000);
+        restamp_sent(&mut span, t0 + chrono::Duration::milliseconds(5));
+        assert_eq!(span.end_time, Some(t0 + chrono::Duration::milliseconds(12)));
+        assert_eq!(span.attributes.tracelane_gateway_overhead_us, Some(2_000));
+    }
+
+    // ── RI-05 slices 4-5 ──────────────────────────────────────────────────
+
+    /// M11: `SpanUsageMeta.reasoning_output_tokens` lands on
+    /// `gen_ai_usage_reasoning_output_tokens`, and is ABSENT (not `0`) when
+    /// nothing was reported.
+    #[test]
+    fn reasoning_output_tokens_land_on_the_span_and_absence_stays_absent() {
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let with_reasoning = build_gateway_span(
+            &tenant,
+            uuid::Uuid::from_u128(1),
+            None,
+            "gpt-5-thinking",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+            10,
+            50,
+            None,
+            SpanUsageMeta {
+                reasoning_output_tokens: Some(7),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            with_reasoning
+                .attributes
+                .gen_ai_usage_reasoning_output_tokens,
+            Some(7)
+        );
+        // `output_tokens` (the second positional `u32` argument) is UNCHANGED
+        // by reasoning — it stays the inclusive total, exactly as before this
+        // field existed (`google.rs`'s rule, mirrored at the gateway span).
+        assert_eq!(
+            with_reasoning.attributes.gen_ai_usage_output_tokens,
+            Some(50)
+        );
+
+        let without = build_gateway_span(
+            &tenant,
+            uuid::Uuid::from_u128(2),
+            None,
+            "claude-sonnet-4-6",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+            10,
+            50,
+            None,
+            SpanUsageMeta::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            without.attributes.gen_ai_usage_reasoning_output_tokens, None,
+            "no provider claim ⇒ absent, never a fabricated 0"
+        );
+    }
+
+    /// M19: `bounded_tool_names` caps count and per-name bytes the SAME way
+    /// `RequestConfig` bounds the OFFERED names — one shared function, so the
+    /// two populations cannot drift apart.
+    #[test]
+    fn bounded_tool_names_caps_count_and_bytes_and_drops_empties() {
+        // Over MAX_TOOL_NAMES (32): only the first 32 survive.
+        let many: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
+        let bounded = bounded_tool_names(many.iter().map(String::as_str)).unwrap();
+        assert_eq!(bounded.len(), MAX_TOOL_NAMES);
+        assert_eq!(bounded[0], "tool_0");
+
+        // Over MAX_TOOL_NAME_BYTES (64): truncated with the visible marker,
+        // never silently.
+        let long_name = "x".repeat(100);
+        let bounded = bounded_tool_names(std::iter::once(long_name.as_str())).unwrap();
+        assert!(bounded[0].len() <= MAX_TOOL_NAME_BYTES);
+        assert!(bounded[0].ends_with("…[truncated]"));
+
+        // Empty input and an all-empty-string input both yield `None`, never
+        // `Some(vec![])` — the same "absent means nothing sent" rule as
+        // `tracelane_request_tool_names`.
+        assert_eq!(bounded_tool_names(std::iter::empty()), None);
+        assert_eq!(bounded_tool_names(std::iter::once("")), None);
+    }
+
+    /// M19 — THE GATE-OFF PROOF, the same fail-closed shape
+    /// `capture_is_none_when_no_trace_content_block_is_installed` already
+    /// proves for `CapturedInput`: with no `trace_content:` block installed
+    /// (every deployment today), `CapturedOutput::build` returns `None` even
+    /// when tool calls WERE made — the arguments must not leak just because a
+    /// tool happened to be involved.
+    #[test]
+    fn captured_output_is_none_when_no_trace_content_block_is_installed_even_with_tool_calls() {
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let calls = vec![(
+            Some("call_1".to_owned()),
+            Some("get_weather".to_owned()),
+            r#"{"city":"Bangalore"}"#.to_owned(),
+        )];
+        let capture = crate::server::config::capture_decision(None, None, &tenant);
+        assert!(
+            CapturedOutput::build(capture, "", &calls).is_none(),
+            "with no trace_content block installed, capture MUST be off — \
+             an absent config is the unprivileged state (.claude/rules/tenancy.md)"
+        );
+        assert!(
+            CapturedOutput::build(capture, "some text", &[]).is_none(),
+            "same gate, no tool calls either — unchanged from before RI-05"
+        );
+        assert!(
+            CapturedOutput::build(capture, "", &[]).is_none(),
+            "nothing to attach at all"
+        );
+        // GWY-53: input-only opt-in must not capture OUTPUT.
+        let input_only = crate::server::config::capture_decision(
+            None,
+            Some(crate::db::workspace_capture::WorkspaceCapture {
+                input: true,
+                output: false,
+            }),
+            &tenant,
+        );
+        assert!(
+            CapturedOutput::build(input_only, "some text", &calls).is_none(),
+            "an input-only opt-in must never record the response"
+        );
+    }
+
+    /// M19 — THE GATE-ON SHAPE, proven against a REAL, YAML-parsed
+    /// `TraceContentConfig` rather than the process-global `CONFIG` slot,
+    /// which is write-once for the whole test binary
+    /// (`config::install_for_test`'s doc: "Returns `false` if a config was
+    /// already installed"; `embeddings.rs`'s alias test already claims that
+    /// one slot). `CapturedOutput::from_config` is the gate decision split
+    /// from the shape-building for exactly this reason.
+    #[test]
+    fn captured_output_from_config_carries_tool_call_parts_truncated_at_the_cap() {
+        // The parser's own floor is 1024 bytes — small enough to force
+        // truncation with a short fixture string.
+        let parsed = crate::server::config::parse(
+            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n  max_field_bytes: 1024\n",
+        )
+        .expect("a well-formed trace_content block must parse");
+        let cfg = parsed.trace_content().expect("block present");
+        assert_eq!(cfg.max_field_bytes(), 1024);
+
+        // A normal-sized call: present, untouched.
+        let calls = vec![(
+            Some("call_1".to_owned()),
+            Some("get_weather".to_owned()),
+            r#"{"city":"Bangalore"}"#.to_owned(),
+        )];
+        let out =
+            CapturedOutput::from_config("the weather is sunny", &calls, cfg.max_field_bytes());
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        out.apply(&mut attrs);
+        let msgs = attrs.gen_ai_output_messages.expect("messages present");
+        let msg = &msgs[0];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "the weather is sunny");
+        let tc = &msg["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["name"], "get_weather");
+        assert_eq!(tc["input"], r#"{"city":"Bangalore"}"#);
+
+        // An over-cap argument string is truncated WITH the visible marker —
+        // the same treatment message text gets, never a second gate.
+        let huge_args = format!(r#"{{"city":"{}"}}"#, "x".repeat(2000));
+        let calls = vec![(None, Some("lookup".to_owned()), huge_args)];
+        let out = CapturedOutput::from_config("", &calls, cfg.max_field_bytes());
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        out.apply(&mut attrs);
+        let msgs = attrs.gen_ai_output_messages.expect("messages present");
+        let tc = &msgs[0]["tool_calls"][0];
+        let stored = tc["input"].as_str().expect("arguments stored as a string");
+        assert!(
+            stored.len() <= cfg.max_field_bytes(),
+            "must respect the byte cap: got {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.ends_with("…[truncated]"),
+            "a cut argument string must say so, exactly like a cut message"
+        );
+        // A call with no id is synthesised one from its position, never blank.
+        assert_eq!(tc["id"], "call_0");
+        // The empty TEXT half still renders as `content: ""` (`MessageContent`
+        // is a required field, never `Option`) — the tool call is what makes
+        // this message worth attaching at all, and it is present.
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"], "");
+    }
+
+    /// M19 — a response with NO text and only a tool call is not silently
+    /// suppressed: `CapturedOutput::build` used to early-return on
+    /// `text.is_empty()` alone (the pre-RI-05 shape), which would have thrown
+    /// away exactly the common case of a tool-only turn.
+    #[test]
+    fn captured_output_from_config_keeps_tool_calls_when_text_is_empty() {
+        let parsed = crate::server::config::parse(
+            "trace_content:\n  tenants: a4037bef-e786-44e3-bfb6-88c93ba9d381\n",
+        )
+        .expect("parses");
+        let cfg = parsed.trace_content().expect("block present");
+        let calls = vec![(
+            Some("call_1".to_owned()),
+            Some("get_weather".to_owned()),
+            "{}".to_owned(),
+        )];
+        let out = CapturedOutput::from_config("", &calls, cfg.max_field_bytes());
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        out.apply(&mut attrs);
+        let msgs = attrs.gen_ai_output_messages.expect("messages present");
+        assert_eq!(msgs[0]["tool_calls"][0]["name"], "get_weather");
     }
 }

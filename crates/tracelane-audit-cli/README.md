@@ -91,8 +91,6 @@ Four independent cryptographic checks, all bundled into one
 If any check fails, the verifier prints a field-level diff
 identifying the offending `seq` + which check failed.
 
-## V1 launch deferrals
+## Output formats
 
-- `--format pdf` (a printable rendering of the verification report) is
-  queued for V1.1. The `text` and `json` formats carry the
-  full report today.
+`text` and `json` carry the full verification report. A PDF format is not available.

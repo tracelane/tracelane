@@ -107,6 +107,16 @@ const PAIRS = [
 	// `bg-selected text-selected-on`. A gate must assert what is RENDERED; asserting a
 	// combination nobody uses is a red that teaches people to edit the gate.
 	["selected-on", "selected", 4.5, "label on the selected/active pill"],
+	// `ink-inverse` ON `ink` IS RENDERED (RangeControl.tsx and kya/ActivityView.tsx drew
+	// `bg-ink text-ink-inverse` pills). The comment above assumed nothing did; on
+	// 2026-09-27 the restyle set --ink-inverse to the same navy as --ink and every such
+	// pill went dark-on-dark ON PROD, with this checker green. Asserted now, both themes.
+	[
+		"ink-inverse",
+		"ink",
+		4.5,
+		"text on an ink-filled pill (bg-ink text-ink-inverse)",
+	],
 	["ok", "bg", 3.0, "status ok (UI)"],
 	["danger", "bg", 3.0, "status danger (UI)"],
 	["warn", "bg", 3.0, "status warn (UI)"],

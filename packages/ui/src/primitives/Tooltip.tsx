@@ -92,7 +92,15 @@ export function Tooltip({
 		const flip = wantsTop ? noRoomTop : noRoomBottom;
 		const onTop = wantsTop ? !flip : flip;
 		setPos({
-			x: r.left + r.width / 2,
+			// Reserve half the maximum tooltip width plus an edge gutter.
+			// This also handles phones narrower than the normal 320px maximum.
+			x: Math.max(
+				Math.min(160, (window.innerWidth - 16) / 2) + 8,
+				Math.min(
+					r.left + r.width / 2,
+					window.innerWidth - Math.min(160, (window.innerWidth - 16) / 2) - 8,
+				),
+			),
 			y: onTop ? r.top - 8 : r.bottom + 8,
 			flip: !onTop,
 		});
@@ -159,6 +167,7 @@ export function Tooltip({
 					// disappears inside one.
 					style={{
 						position: "fixed",
+						maxWidth: "min(320px, calc(100vw - 16px))",
 						left: pos.x,
 						top: pos.y,
 						transform: `translate(-50%, ${pos.flip ? "0" : "-100%"})`,
@@ -176,7 +185,7 @@ export function Tooltip({
 					// the tooltip in the two themes — one expression, an edge in both. The
 					// StatCard hint tooltip already carried a hairline; the shared primitive,
 					// which is the one most surfaces use, did not.
-					className="tl-tooltip pointer-events-none max-w-xs rounded-lg border border-ink-inverse/15 px-2.5 py-1.5 text-xs leading-snug"
+					className="tl-tooltip pointer-events-none max-w-xs rounded-card border border-ink-inverse/15 px-2.5 py-1.5 text-xs leading-snug"
 				>
 					{content}
 				</span>

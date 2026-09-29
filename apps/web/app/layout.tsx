@@ -40,6 +40,7 @@
  * or wizard flows never show app chrome.
  */
 
+import { ErrorListener } from "@/components/ErrorListener";
 import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { AppShell } from "@/components/layout/AppShell";
 import { OrgSwitcher } from "@/components/layout/OrgSwitcher";
@@ -167,6 +168,7 @@ export default async function RootLayout({
 					{children}
 				</AppShell>
 				<CommandPalette />
+				<ErrorListener />
 			</body>
 		</html>
 	);

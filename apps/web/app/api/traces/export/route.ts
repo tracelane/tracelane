@@ -45,6 +45,10 @@ export async function GET(req: NextRequest) {
 	// as data the customer can act on, and nothing on the page says it is wrong.
 	const endUser = sp.get("end_user");
 	if (endUser) g.set("end_user", endUser);
+	for (const name of ["agent", "model_family"]) {
+		const value = sp.get(name);
+		if (value) g.set(name, value);
+	}
 	const status = sp.get("status");
 	if (status === "error") g.set("has_error", "true");
 	else if (status === "ok") g.set("has_error", "false");

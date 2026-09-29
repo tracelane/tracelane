@@ -37,7 +37,7 @@ openai = ["openai>=1.40.0"]
 # The floors below are NOT verified — they are the conservative lower bounds we are
 # willing to claim, and nothing has been run against them.
 langchain = ["langchain-core>=0.2.0"]
-langgraph = ["langgraph>=0.2.0"]
+langgraph = ["langgraph>=0.2.0", "openinference-instrumentation-langchain>=0.1.76"]
 llamaindex = ["llama-index-core>=0.11.0"]
 crewai = ["crewai>=0.70.0"]
 all = [

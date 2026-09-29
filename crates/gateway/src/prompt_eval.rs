@@ -1820,6 +1820,13 @@ impl PromptEvalEngine {
                 cache_creation_input_tokens: None,
                 stream: false,
                 cost_usd: out.cost_usd,
+                served: crate::server::ServedMeta::default(),
+                finish_reason: None,
+                // RI-05: an eval case dispatches directly through
+                // `dispatch_to_provider`, not `dispatch_with_retry` — no
+                // ledger to attach.
+                dispatch_attempts: Vec::new(),
+                reasoning_output_tokens: None,
             },
             None,
             None,

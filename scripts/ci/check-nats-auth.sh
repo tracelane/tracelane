@@ -60,7 +60,15 @@ run_tests() {
   export NATS_TEST_URL_ANON="nats://127.0.0.1:${PORT}"
   cargo test -p ingest --bin ingest b383_ingest_nats_user -- --ignored 2>&1 | grep -E '^test |panicked|test result' || rc=1
   [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+  # RI-06 / B-449: the gap tracker against a real stream that trims — boot gap 4..18 (15)
+  # and an in-flight hole at 20 (1), 16 spans the pre-RI-06 loop could not see.
+  cargo test -p ingest --bin ingest ri06_gap_tracker_counts_trimmed -- --ignored 2>&1 | grep -E '^test |panicked|test result' || rc=1
+  [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
   cargo test -p gateway --bin gateway b383_gateway_nats_user -- --ignored 2>&1 | grep -E '^test |panicked|test result' || rc=1
+  [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+  # RI-07 / B-443: Nats-Msg-Id dedups a republished span at the boundary; the OTLP route's
+  # publish loop rejects what JetStream refused (acks, not enqueues).
+  cargo test -p gateway --bin gateway ri07_ -- --ignored 2>&1 | grep -E '^test |panicked|test result' || rc=1
   [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
   return $rc
 }

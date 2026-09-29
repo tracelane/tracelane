@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * PlanLadder — the in-app plan comparison (SET-15 / ADR-076 §8 `#plans`).
@@ -49,7 +50,7 @@ function PlanColumn({
 
 	return (
 		<div
-			className={`surface-card rounded-lg p-5 flex flex-col gap-3${
+			className={`surface-card rounded-card p-5 flex flex-col gap-3${
 				isCurrent ? " border-action-line border-2" : ""
 			}`}
 			data-plan={card.plan}
@@ -98,12 +99,13 @@ function PlanColumn({
 						action={`/api/checkout?tier=${card.plan}&interval=${interval}`}
 						method="post"
 					>
-						<button
+						<Button
+							variant="bare"
 							type="submit"
 							className="w-full rounded bg-action px-3 py-1.5 text-xs font-medium text-action-on transition-colors hover:bg-action/90"
 						>
 							{ctaLabel}
-						</button>
+						</Button>
 					</form>
 				) : card.plan === "enterprise" ? (
 					<a
@@ -131,20 +133,28 @@ export interface PlanLadderProps {
 export function PlanLadder({ cards, currentPlan }: PlanLadderProps) {
 	const [interval, setInterval] = useState<Interval>("month");
 	const currentIndex = LADDER.findIndex((p) => p === currentPlan);
+	// `card.priceYear` is `null` for every card while `plans.v3.json`'s
+	// `annual_available` is false (`plan-catalog.ts`) — the same switch that
+	// gates the checkout route's `interval=year`. A toggle that changes
+	// nothing (no card has a second price to show) is worse than none: it
+	// invites a click that produces no visible change.
+	const annualOffered = cards.some((c) => c.priceYear !== null);
 
 	return (
 		<div className="space-y-6">
-			<div className="flex justify-start">
-				<SegmentedControl
-					label="Billing interval"
-					value={interval}
-					onChange={setInterval}
-					options={[
-						{ value: "month", label: "Monthly" },
-						{ value: "year", label: "Annual" },
-					]}
-				/>
-			</div>
+			{annualOffered && (
+				<div className="flex justify-start">
+					<SegmentedControl
+						label="Billing interval"
+						value={interval}
+						onChange={setInterval}
+						options={[
+							{ value: "month", label: "Monthly" },
+							{ value: "year", label: "Annual" },
+						]}
+					/>
+				</div>
+			)}
 
 			{/* Wide content scrolls inside its own container — the page never
 			    scrolls horizontally. */}
@@ -161,7 +171,7 @@ export function PlanLadder({ cards, currentPlan }: PlanLadderProps) {
 				))}
 			</div>
 
-			<div className="surface-card surface-card--quiet rounded-lg p-5">
+			<div className="surface-card surface-card--quiet rounded-card p-5">
 				<p className="t-card-title mb-2">{NEVER_METERED_TITLE}</p>
 				<p className="text-xs text-ink-2 leading-relaxed">
 					{neverMeteredCopy()}

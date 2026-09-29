@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * BillingPortalButton — calls POST /api/billing/portal and redirects to the
@@ -12,6 +13,7 @@
  * at all (no billing account yet; not the workspace owner).
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useState } from "react";
 
 type PortalFailure = {
@@ -42,7 +44,7 @@ export function BillingPortalButton() {
 		setLoading(true);
 		setError(null);
 		try {
-			const res = await fetch("/api/billing/portal", { method: "POST" });
+			const res = await apiFetchRaw("/api/billing/portal", { method: "POST" });
 			if (!res.ok) {
 				const body = (await res.json().catch(() => ({}))) as PortalFailure;
 				setError(messageFor(res.status, body));
@@ -59,14 +61,15 @@ export function BillingPortalButton() {
 
 	return (
 		<div className="flex flex-col items-end gap-1">
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={open}
 				disabled={loading}
 				className="px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-50 transition-colors"
 			>
 				{loading ? "Opening…" : "Manage billing"}
-			</button>
+			</Button>
 			{error && (
 				<p className="max-w-xs text-right text-xs text-danger-ink">{error}</p>
 			)}

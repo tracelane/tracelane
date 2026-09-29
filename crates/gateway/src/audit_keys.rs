@@ -408,10 +408,7 @@ impl TenantAuditKeyStore {
                 .check(*tenant_id.as_uuid(), FeatureKey::AuditSelfVerify)
                 .await
         {
-            anyhow::bail!(
-                "tenant not entitled to a per-tenant audit keypair (f_audit_selfverify); \
-                 caller falls back to the global signing key"
-            );
+            return Err(anyhow::Error::new(NotEntitledToTenantKey));
         }
 
         // Generate and persist a new keypair.
@@ -611,8 +608,41 @@ impl TenantAuditKeyStore {
     }
 }
 
+/// AUD-29 — the ONE `get_or_create` failure after which signing with the shared
+/// PLATFORM key is correct: this tenant has no key of its own and is not entitled to
+/// mint one, so the platform key is its signer. Every OTHER failure is transient (a
+/// Postgres or decrypt blip) and the caller must retry, because a tenant that already
+/// HAS a key would get a platform-signed batch its verifiers report as
+/// `platform_key_after_workspace_key` — permanently.
+#[derive(Debug)]
+pub struct NotEntitledToTenantKey;
+
+impl std::fmt::Display for NotEntitledToTenantKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "tenant not entitled to a per-tenant audit keypair (f_audit_selfverify); \
+             the platform key signs its batches",
+        )
+    }
+}
+
+impl std::error::Error for NotEntitledToTenantKey {}
+
 #[cfg(test)]
 mod tests {
+
+    /// AUD-29: the anchor path falls back to the PLATFORM key at once ONLY for this
+    /// error — including through a context layer — and retries everything else.
+    #[test]
+    fn not_entitled_is_recognisable_and_nothing_else_is() {
+        let direct = anyhow::Error::new(NotEntitledToTenantKey);
+        assert!(direct.is::<NotEntitledToTenantKey>());
+        let wrapped = anyhow::Error::new(NotEntitledToTenantKey).context("minting");
+        assert!(wrapped.downcast_ref::<NotEntitledToTenantKey>().is_some());
+        let transient = anyhow::anyhow!("acquire Postgres connection for tenant audit key");
+        assert!(!transient.is::<NotEntitledToTenantKey>());
+    }
+
     use super::*;
     use uuid::Uuid;
 

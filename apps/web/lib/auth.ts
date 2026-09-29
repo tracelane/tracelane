@@ -12,6 +12,7 @@ import {
 	e2eTestGatewayToken,
 	e2eTestSession,
 } from "@/lib/e2e-auth";
+import { signInPath } from "@/lib/return-to";
 import { withAuth } from "@workos-inc/authkit-nextjs";
 import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
@@ -79,7 +80,7 @@ export async function requireSession(): Promise<Session> {
 	// throwing on no-session; the explicit `redirect()` stays OUTSIDE any catch so
 	// its NEXT_REDIRECT is never swallowed.
 	const session = await withAuth().catch(() => null);
-	if (!session?.user) redirect("/sign-in");
+	if (!session?.user) redirect(await signInPath());
 	const { user, organizationId, role } = session;
 
 	if (!organizationId) redirect("/onboarding");
@@ -123,7 +124,8 @@ const orgArchivedCache = new Map<
  * module top level (the Workers build reads env lazily — see `db/index.ts`).
  * `TRACELANE_ORG_ARCHIVED_TTL_MS` override exists so a test can set it small.
  */
-function orgArchivedCacheTtlMs(): number {
+// Shared cadence for cached web control-plane reference reads.
+export function orgArchivedCacheTtlMs(): number {
 	const raw = process.env.TRACELANE_ORG_ARCHIVED_TTL_MS;
 	const parsed = raw ? Number(raw) : Number.NaN;
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : 900_000;
@@ -268,7 +270,11 @@ export const requireGatewayToken = cache(
 		// redirected where. Only the throw becomes a redirect.
 		const auth = await withAuth().catch(() => null);
 
-		if (!auth) redirect("/sign-in");
+		// `!auth?.user`, not `!auth`: AuthKit resolves an EXPIRED or signed-out session
+		// as `{ user: null }` (NoUserInfo) — a truthy object with no organizationId — so
+		// the old `!auth` let it fall through to `!organizationId` and sent every
+		// expired session to the /onboarding wizard (founder report 2026-09-27).
+		if (!auth?.user) redirect(await signInPath());
 		const { organizationId, accessToken } = auth;
 
 		if (!organizationId) redirect("/onboarding");

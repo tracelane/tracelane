@@ -1,3 +1,6 @@
+import { fmtCount } from "@tracelanedev/ui";
+import { PageHeader } from "@tracelanedev/ui";
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * /prompts — list of named prompts for the authenticated tenant.
  *
@@ -20,7 +23,13 @@ import { requireSession } from "@/lib/auth";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { absoluteDate } from "@/lib/format-date";
 import { fetchPromptList } from "@/lib/prompts";
-import { Badge, Card, ErrorState, Skeleton } from "@tracelanedev/ui";
+import {
+	Badge,
+	Card,
+	ErrorState,
+	ObjectSurface,
+	Skeleton,
+} from "@tracelanedev/ui";
 import { eq } from "drizzle-orm";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -43,10 +52,10 @@ async function PromoteGateBanner() {
 	const ent = await resolveEntitlements(row?.id, plan);
 	if (ent.prompt_promotion_write) return null;
 	return (
-		// `rounded-lg` (the control band), matching WarmingBanner — a full-width
+		// `rounded-card` (the control band), matching WarmingBanner — a full-width
 		// notice strip is not a card, and the two strips in the app were at two
 		// different radii (12px here, 8px there) for no reason anyone recorded.
-		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
+		<div className="mb-4 flex flex-wrap items-center gap-2 rounded-card border border-action-line bg-action-soft px-4 py-2.5 text-sm text-action-ink">
 			<span>
 				<span className="font-semibold">
 					🔒 Promoting a version across environments requires Team ($229/mo)
@@ -55,7 +64,7 @@ async function PromoteGateBanner() {
 			</span>
 			<Link
 				href="/settings/billing"
-				className="ml-auto rounded-lg border border-action-line bg-surface px-3 py-1 font-medium text-action-ink transition-colors hover:bg-surface-2"
+				className="ml-auto rounded-card border border-action-line bg-surface px-3 py-1 font-medium text-action-ink transition-colors hover:bg-surface-2"
 			>
 				Upgrade →
 			</Link>
@@ -98,47 +107,64 @@ async function PromptListData() {
 
 	return (
 		<Card className="relative overflow-x-auto">
-			<table className="w-full text-sm">
-				<thead className="border-b border-line">
-					<tr>
-						<th className="px-3 py-1.5 text-left font-medium text-ink-2">
+			<Table className="w-full text-sm">
+				<THead className="border-b border-line">
+					<TR>
+						<TH className="px-3 py-1.5 text-left font-medium text-ink-2">
 							Name
-						</th>
-						<th className="px-3 py-1.5 text-right font-medium text-ink-2">
+						</TH>
+						<TH className="px-3 py-1.5 text-right font-medium text-ink-2">
 							Versions
-						</th>
-						<th className="px-3 py-1.5 text-left font-medium text-ink-2">
+						</TH>
+						<TH className="px-3 py-1.5 text-left font-medium text-ink-2">
 							Active
-						</th>
-						<th
+						</TH>
+						<TH
 							className="px-3 py-1.5 text-right font-medium text-ink-2"
 							title="Last authored version — a promotion without a new version doesn't change this."
 						>
 							Last authored
-						</th>
-						<th className="px-3 py-1.5 text-right font-medium text-ink-2">
+						</TH>
+						<TH className="px-3 py-1.5 text-right font-medium text-ink-2">
 							<span className="sr-only">Actions</span>
-						</th>
-					</tr>
-				</thead>
-				<tbody className="divide-y divide-line">
+						</TH>
+						<TH className="px-3 py-2">
+							<span className="sr-only">Object actions</span>
+						</TH>
+					</TR>
+				</THead>
+				<TBody className="divide-y divide-line">
 					{list.map((prompt) => (
-						<tr
+						<ObjectSurface
 							key={prompt.prompt_id}
+							objectId={prompt.prompt_id}
+							title={prompt.name}
+							href={`/prompts/${encodeURIComponent(prompt.name)}`}
+							fields={[
+								{ label: "Versions", value: fmtCount(prompt.versions) },
+								{
+									label: "Active versions",
+									value:
+										prompt.active
+											.map((a) => `${a.env} v${a.version_number}`)
+											.join(" · ") || "None",
+								},
+								{ label: "Updated", value: formatDate(prompt.updated_at_ms) },
+							]}
 							className="transition-colors hover:bg-surface-hover"
 						>
-							<td className="px-3 py-2">
+							<TD className="px-3 py-2">
 								<Link
 									href={`/prompts/${encodeURIComponent(prompt.name)}`}
 									className="font-mono font-medium text-ink hover:text-action-ink hover:underline"
 								>
 									{prompt.name}
 								</Link>
-							</td>
-							<td className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
-								{prompt.versions}
-							</td>
-							<td className="px-3 py-2">
+							</TD>
+							<TD className="px-3 py-2 text-right font-mono tabular-nums text-ink-2">
+								{fmtCount(prompt.versions)}
+							</TD>
+							<TD className="px-3 py-2">
 								<div className="flex flex-wrap gap-1.5">
 									{prompt.active.length === 0 ? (
 										<span className="text-xs text-ink-3">none</span>
@@ -150,17 +176,17 @@ async function PromptListData() {
 										))
 									)}
 								</div>
-							</td>
-							<td className="px-3 py-2 text-right text-xs tabular-nums text-ink-2">
+							</TD>
+							<TD className="px-3 py-2 text-right text-xs tabular-nums text-ink-2">
 								{formatDate(prompt.updated_at_ms)}
-							</td>
-							<td className="px-3 py-2 text-right">
+							</TD>
+							<TD className="px-3 py-2 text-right">
 								<DeletePromptButton name={prompt.name} />
-							</td>
-						</tr>
+							</TD>
+						</ObjectSurface>
 					))}
-				</tbody>
-			</table>
+				</TBody>
+			</Table>
 		</Card>
 	);
 }
@@ -182,7 +208,7 @@ export default function PromptsListPage() {
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-4 flex flex-col items-start gap-4 sm:flex-row sm:justify-between">
 				<div>
-					<h1 className="t-h1">Prompts</h1>
+					<PageHeader title={<>Prompts</>} />
 					<p className="mt-1 max-w-xl text-sm text-ink-2">
 						Version a prompt, then promote it across environments — every
 						promotion is written to the audit ledger.

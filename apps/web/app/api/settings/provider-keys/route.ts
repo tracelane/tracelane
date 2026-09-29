@@ -1,6 +1,6 @@
 /**
  * GET  /api/settings/provider-keys — list the tenant's stored LLM provider
- *      keys (provider_id + last4 only; ciphertext never leaves the gateway).
+ *      keys (fingerprint, saved time and health; ciphertext never leaves the gateway).
  * POST /api/settings/provider-keys — upload / overwrite a provider key
  *      (sk-ant-…, sk-…, etc.) for a given provider.
  *
@@ -25,6 +25,7 @@ import { type NextRequest, NextResponse } from "next/server";
 interface ProviderKeySummary {
 	provider_id: string;
 	last4: string;
+	saved_at: string;
 }
 
 /**

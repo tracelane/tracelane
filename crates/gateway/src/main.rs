@@ -45,22 +45,28 @@ mod health_probe;
 mod hotpath;
 mod key_routes;
 mod kill_switch;
+mod kya_identity;
+mod kya_routes;
 mod metrics;
+mod model_alias_routes;
 mod notification_routes;
 mod otlp_emit;
 mod payment;
 mod preauth_limiter;
 mod predictive;
 mod pricing;
+mod provider_key_validate;
 mod providers;
 mod rate_limiter;
 mod rejection_metrics;
 mod retention_sweep;
+mod workspace_capture_routes;
 // Credential redaction now lives in tracelane_shared::redact so ingest
 // can install the same byte-scan layer (A10). Local alias keeps existing
 // call sites stable.
 use tracelane_shared::redact;
 mod server;
+mod spans_stream;
 mod spend;
 mod ssrf_guard;
 mod tool_analytics;
@@ -83,9 +89,11 @@ mod prompt_history;
 mod prompt_router;
 mod prompt_routes;
 mod semantic_cache;
+mod zdr;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    crate::kya_identity::initialize()?;
     // SRE register #45 — the container HEALTHCHECK (`gateway --health-probe`).
     // Before tracing and before config: a probe must not depend on anything but
     // the port, and must not emit a log line every 30 s.

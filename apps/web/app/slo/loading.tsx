@@ -25,7 +25,7 @@ export default function Loading() {
 				</div>
 				<Skeleton className="h-60 w-full rounded-[var(--radius-card)] lg:col-span-4" />
 			</div>
-			<Skeleton className="h-11 w-full rounded-lg" />
+			<Skeleton className="h-11 w-full rounded-card" />
 			<Skeleton className="h-72 w-full rounded-[var(--radius-card)]" />
 			<Skeleton className="h-56 w-full rounded-[var(--radius-card)]" />
 		</div>

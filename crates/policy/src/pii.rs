@@ -19,6 +19,10 @@
 //!   8. IPv4 addresses
 //!   9. IPv6 addresses (compact subset — covers most real-world)
 //!
+//! Also (B-556, 2026-09-24): Tracelane's own `tlane_` API key (a secret, in
+//! `RULES`), and — in the one-way [`redact`] path only — any value that follows
+//! a credential NAME (`api_key=…`, `"password": "…"`), whatever its shape.
+//!
 //! Redacted values are replaced with `[REDACTED:<category>]`. The
 //! original character span is shrunk to a fixed marker so downstream
 //! consumers never see raw secrets even in error logs.
@@ -52,6 +56,16 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // Convergence with `tracelane_shared::redact` (A25) — span-attribute
         // redaction and log-line redaction now cover the same shapes.
         (r"AKIA[0-9A-Z]{16}", "[REDACTED:aws_key]", "aws_key", true),
+        // Tracelane's own API key (`tlane_` + 43 base62). The log redactor has had
+        // this shape since A25; the span path did not, so a customer pasting their
+        // own key into a prompt stored it verbatim. Floor of 20, never a pinned
+        // length, so a short key PREFIX shown in the UI stays legible.
+        (
+            r"tlane_[A-Za-z0-9]{20,}",
+            "[REDACTED:tracelane_key]",
+            "tracelane_key",
+            true,
+        ),
         (
             r"gh[opsu]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{22}_[A-Za-z0-9_]{59}",
             "[REDACTED:github_token]",
@@ -195,6 +209,47 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         .collect()
 });
 
+/// A credential recognised by its NAME rather than its shape: `api_key=…`,
+/// `"password": "…"`, `export MY_API_KEY=…`, `x-api-key: …`. The value is
+/// replaced and the name kept, so the reader still sees WHAT was there.
+///
+/// Span / one-way path ONLY — deliberately not in `RULES`. `RULES` also feeds
+/// the reversible redactor, where a secret category makes guardrail R2 fail
+/// CLOSED; a name-keyed rule is broad enough that blocking a request on it would
+/// be a false-positive block (ADR-055: observe-first). Masking a stored copy
+/// over-redacts at worst; blocking a customer's call is the failure it prevents.
+///
+/// The value must be ≥ 8 chars and must not start with `[` (an existing marker),
+/// which keeps `password: short` and `api_key_id: …` legible.
+static NAMED_CREDENTIAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)(\b[a-z0-9_-]*?(?:api[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key)\\?["']?\s*[:=]\s*\\?["']?)([^\s"'\\`,;&\[][^\s"'\\`,;&]{7,})"#,
+    )
+    .expect("named-credential regex compiles")
+});
+
+/// `Authorization: Basic …` and the other non-Bearer schemes (Digest,
+/// Negotiate, ApiKey, Token) — the `Bearer` rule in `RULES` covers only that
+/// one. Anchored on the header NAME so prose like "Basic understanding" stays.
+/// One-way path only, for the same reason as [`NAMED_CREDENTIAL_RE`].
+static AUTH_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)(\b(?:proxy-)?authorization\s*[:=]\s*["']?(?:basic|digest|negotiate|apikey|token)\s+)([^\s"',;]{8,})"#,
+    )
+    .expect("auth-header regex compiles")
+});
+
+/// A `Cookie:` / `Set-Cookie:` header: the whole value to end of line, since a
+/// session cookie is a credential whatever it is called. Needs the colon right
+/// after the name, so "the cookie policy: …" is left alone.
+///
+/// Known limit, stated so nobody assumes otherwise: none of the name-keyed rules
+/// reach a YAML block scalar (`password: |` then the value on the next line) —
+/// the value is on another line from its name.
+static COOKIE_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(\b(?:set-)?cookie\s*:\s*)([^\r\n"']+)"#).expect("cookie regex compiles")
+});
+
 /// Credit-card candidate matcher, shared by the one-way and reversible
 /// paths (13–19 digit runs; Luhn-gated by the caller).
 static CC_RE: Lazy<Regex> =
@@ -212,6 +267,15 @@ pub fn redact(value: &str) -> String {
     for rule in RULES.iter() {
         if rule.pattern.is_match(&result) {
             result = rule.pattern.replace_all(&result, rule.marker).into_owned();
+        }
+    }
+    for (re, replacement) in [
+        (&*NAMED_CREDENTIAL_RE, "${1}[REDACTED:credential]"),
+        (&*AUTH_HEADER_RE, "${1}[REDACTED:credential]"),
+        (&*COOKIE_HEADER_RE, "${1}[REDACTED:cookie]"),
+    ] {
+        if re.is_match(&result) {
+            result = re.replace_all(&result, replacement).into_owned();
         }
     }
     // Second pass: the credit_card_candidate marker may have replaced
@@ -470,6 +534,134 @@ pub fn reinsert(text: &str, entries: &[RedactionEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only key bodies: clearly fake, but the SHAPE of a real key (tlane_ + 43 base62).
+    const FAKE_TLANE: &str = "tlane_UNITTESTfakeKEYdoNOTuse0000000000000000000";
+
+    #[test]
+    fn redacts_tracelane_api_key() {
+        let r = redact(&format!(
+            "curl -H 'x-key: {FAKE_TLANE}' https://api.tracelane.dev"
+        ));
+        assert!(r.contains("[REDACTED:tracelane_key]"), "{r}");
+        assert!(!r.contains("UNITTESTfakeKEY"), "{r}");
+    }
+
+    #[test]
+    fn tracelane_key_is_a_secret_in_the_reversible_redactor_too() {
+        let rr = redact_reversible(&format!("my key is {FAKE_TLANE}"));
+        assert!(rr.has_secret(), "{:?}", rr.redacted);
+        assert!(!rr.redacted.contains("UNITTESTfakeKEY"));
+    }
+
+    #[test]
+    fn a_short_tlane_prefix_is_not_a_key() {
+        // A key id / prefix shown in the UI is not the secret.
+        assert_eq!(redact("key prefix tlane_Ab12cd"), "key prefix tlane_Ab12cd");
+    }
+
+    #[test]
+    fn redacts_credential_values_by_their_name_whatever_the_format() {
+        for (input, leaked) in [
+            (
+                "api_key=unittestNotARealValue123",
+                "unittestNotARealValue123",
+            ),
+            (
+                r#"{"api_key": "unittestNotARealValue123"}"#,
+                "unittestNotARealValue123",
+            ),
+            (
+                r#"{\"password\": \"hunter2hunter2xx\"}"#,
+                "hunter2hunter2xx",
+            ),
+            (
+                "export MY_SERVICE_API_KEY=unittestNotARealValue123",
+                "unittestNotARealValue123",
+            ),
+            (
+                "DB_PASSWORD: 'correct-horse-battery'",
+                "correct-horse-battery",
+            ),
+            (
+                "client_secret = unittestNotARealValue123",
+                "unittestNotARealValue123",
+            ),
+            (
+                "x-api-key: unittestNotARealValue123",
+                "unittestNotARealValue123",
+            ),
+            (
+                "auth_token:unittestNotARealValue123;next",
+                "unittestNotARealValue123",
+            ),
+        ] {
+            let r = redact(input);
+            assert!(!r.contains(leaked), "leaked from {input:?} -> {r:?}");
+            assert!(r.contains("[REDACTED:credential]"), "{input:?} -> {r:?}");
+        }
+    }
+
+    #[test]
+    fn credential_rule_keeps_the_name_and_leaves_prose_alone() {
+        assert_eq!(
+            redact("api_key=unittestNotARealValue123"),
+            "api_key=[REDACTED:credential]"
+        );
+        for clean in [
+            "the password is strong",
+            "password: short",
+            "max_tokens: 100000000000",
+            "api_key_id: 5f0c2a4e",
+            "secretary=unittestNotARealValue123",
+            "token count = 123456789",
+        ] {
+            assert_eq!(redact(clean), clean, "over-redacted {clean:?}");
+        }
+    }
+
+    #[test]
+    fn redacts_basic_and_other_auth_schemes_and_cookie_headers() {
+        for (input, leaked) in [
+            (
+                "Authorization: Basic dW5pdHRlc3Q6bm90QVJlYWxQYXNzd29yZA==",
+                "dW5pdHRlc3Q6bm90",
+            ),
+            (
+                "-H 'Proxy-Authorization: Digest unittestNotARealValue123'",
+                "unittestNotARealValue123",
+            ),
+            (
+                "Cookie: session=unittestNotARealValue123; auth=unittestSecondValue456",
+                "unittestNotARealValue123",
+            ),
+            (
+                "Cookie: session=unittestNotARealValue123; auth=unittestSecondValue456",
+                "unittestSecondValue456",
+            ),
+            (
+                "set-cookie: sid=unittestNotARealValue123; Path=/",
+                "unittestNotARealValue123",
+            ),
+        ] {
+            let r = redact(input);
+            assert!(!r.contains(leaked), "leaked from {input:?} -> {r:?}");
+        }
+        for clean in [
+            "Basic understanding of cookies",
+            "the cookie policy: accept all",
+        ] {
+            assert_eq!(redact(clean), clean, "over-redacted {clean:?}");
+        }
+    }
+
+    #[test]
+    fn credential_rule_is_span_only_not_a_guardrail_secret() {
+        // The name-keyed rule is broad by design; it must not make guardrail R2
+        // fail-closed on prose like `password: correct-horse-battery`.
+        let rr = redact_reversible("DB_PASSWORD: 'correct-horse-battery'");
+        assert!(!rr.has_secret(), "{:?}", rr.redacted);
+    }
 
     #[test]
     fn clean_string_unchanged() {

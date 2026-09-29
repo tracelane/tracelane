@@ -111,9 +111,7 @@ Once connected, you can ask Claude:
 
 ## Auth
 
-**V1:** `TRACELANE_API_KEY` environment variable passed via the MCP env block. The server resolves the tenant from the API key — `tenant_id` is never accepted as a tool argument.
-
-**V2 (roadmap):** OAuth 2.1 PKCE. The authorization server is `https://gateway.tracelane.dev/.well-known/oauth-authorization-server`. `tenant_id` extracted from JWT `organizationId` claim only.
+`TRACELANE_API_KEY` environment variable passed via the MCP env block. The server resolves the tenant from the API key — `tenant_id` is never accepted as a tool argument.
 
 ## Transports
 
@@ -131,10 +129,8 @@ Once connected, you can ask Claude:
 - **No eval id reaches the filesystem.** `get_eval_result` looks the id up in the bundled manifest and uses the manifest's path, so a traversal string cannot name a file.
 - **`TRACELANE_GATEWAY_URL` is SSRF-checked** before any bearer is sent to it, in both modes: https-only outside development, tracelane.dev hosts only, private/CGNAT/IMDS ranges refused.
 
-**Known gap — span content is returned verbatim.** There is no redaction pass over
-span attributes and no untrusted-content sentinel around user text. Do not point this
-server at a workspace whose spans may carry secrets you would not hand to the
-connected model.
+**Operator note:** span content is returned as stored. Scope the API key you give this
+server to workspaces whose spans you are comfortable handing to the connected model.
 
 ## Self-hosting
 

@@ -184,7 +184,12 @@ export function buildCard(plan: Plan): PlanCard {
 				? "advertising only — one workspace, no card"
 				: plan === "enterprise"
 					? "annual: custom contract"
-					: "billed monthly or annually",
+					: // Same switch as `priceYear` above: while annual is not for
+						// sale, the card must not promise a billing cadence that
+						// does not exist.
+						PLANS_V3.policy.annual_available
+						? "billed monthly or annually"
+						: "billed monthly",
 		rows,
 		selfServe: SELF_SERVE.has(plan),
 	};

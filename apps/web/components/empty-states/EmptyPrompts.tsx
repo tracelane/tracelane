@@ -1,3 +1,5 @@
+"use client";
+import { Button } from "@tracelanedev/ui";
 /**
  * EmptyPrompts — zero-state for the prompts list page.
  *
@@ -9,7 +11,7 @@
  * prompt exists — the detail page has a built-in "Author new version" form.
  *
  * ── THE DASHED BOX IS GONE (P0.9, 2026-08-22) ───────────────────────────────
- * Same change, same reason, as EmptyTraces: this drew `rounded-xl border
+ * Same change, same reason, as EmptyTraces: this drew `rounded-card border
  * border-dashed border-line p-10`, and a dashed rectangle is what a BROKEN
  * region looks like, not an empty one. The shared `EmptyState` primitive
  * dropped its own dashed box in the same pass. This component keeps its own
@@ -18,8 +20,6 @@
  * now uses the primitive's exact vocabulary for the icon chip, the statement
  * and the explanation, so the two read as one component.
  */
-
-"use client";
 
 import Link from "next/link";
 import { useState } from "react";
@@ -71,7 +71,7 @@ export function EmptyPrompts() {
 			<div className="mb-6 flex flex-col items-center gap-3">
 				<span
 					aria-hidden="true"
-					className="grid h-9 w-9 place-items-center rounded-xl bg-surface-2 text-ink-2"
+					className="grid h-9 w-9 place-items-center rounded-card bg-surface-2 text-ink-2"
 				>
 					<svg
 						aria-hidden="true"
@@ -107,7 +107,8 @@ export function EmptyPrompts() {
 			<div className="surface-card surface-card--quiet mb-6 overflow-hidden border border-line text-left">
 				<div className="flex border-b border-line bg-canvas-sunken">
 					{(["author", "promote"] as const).map((t) => (
-						<button
+						<Button
+							variant="bare"
 							key={t}
 							type="button"
 							onClick={() => setTab(t)}
@@ -118,7 +119,7 @@ export function EmptyPrompts() {
 							}`}
 						>
 							{t === "author" ? "Author version" : "Promote"}
-						</button>
+						</Button>
 					))}
 				</div>
 				<pre className="overflow-x-auto p-4 font-mono text-xs leading-relaxed text-ink">
@@ -128,7 +129,7 @@ export function EmptyPrompts() {
 
 			<div className="flex flex-wrap items-center justify-center gap-4">
 				<Link
-					href="https://docs.tracelane.dev/prompts"
+					href="https://docs.tracelane.dev/prompt-promotion"
 					target="_blank"
 					rel="noopener noreferrer"
 					className="text-xs text-ink-2 hover:text-ink underline underline-offset-2 transition-colors"

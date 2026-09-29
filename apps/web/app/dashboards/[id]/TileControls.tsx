@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * TileControls — the presentational button cluster for one tile: resize
@@ -60,7 +61,8 @@ export function TileControls({
 		>
 			{sizeControls && (
 				<>
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => onResizeWidth("narrower")}
 						disabled={disabled || width === 4}
@@ -69,8 +71,9 @@ export function TileControls({
 						className={BTN}
 					>
 						W−
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => onResizeWidth("wider")}
 						disabled={disabled || width === 12}
@@ -79,8 +82,9 @@ export function TileControls({
 						className={BTN}
 					>
 						W+
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => onResizeHeight("shorter")}
 						disabled={disabled || height === "compact"}
@@ -89,8 +93,9 @@ export function TileControls({
 						className={BTN}
 					>
 						H−
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => onResizeHeight("taller")}
 						disabled={disabled || height === "tall"}
@@ -99,11 +104,12 @@ export function TileControls({
 						className={BTN}
 					>
 						H+
-					</button>
+					</Button>
 					<span aria-hidden="true" className="mx-0.5 h-3 w-px bg-line-2" />
 				</>
 			)}
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={() => onMove("up")}
 				disabled={disabled || tileIndex === 0}
@@ -112,8 +118,9 @@ export function TileControls({
 				className={BTN}
 			>
 				↑
-			</button>
-			<button
+			</Button>
+			<Button
+				variant="bare"
 				type="button"
 				onClick={() => onMove("down")}
 				disabled={disabled || tileIndex === totalTiles - 1}
@@ -122,8 +129,9 @@ export function TileControls({
 				className={BTN}
 			>
 				↓
-			</button>
-			<button
+			</Button>
+			<Button
+				variant="bare"
 				type="button"
 				onClick={onRemove}
 				disabled={disabled}
@@ -132,7 +140,7 @@ export function TileControls({
 				className="rounded px-1.5 py-0.5 text-2xs font-medium text-danger transition-colors hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-30 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring"
 			>
 				×
-			</button>
+			</Button>
 		</fieldset>
 	);
 }

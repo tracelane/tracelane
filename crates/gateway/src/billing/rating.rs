@@ -94,6 +94,17 @@ pub struct Policy {
     pub velocity_sigma: f64,
     pub velocity_window_days: i64,
     pub velocity_interval_secs: u64,
+    /// B-442 (b): a candidate already checked against `api_keys` is not re-read for
+    /// this long. Must exceed Neon's suspend timeout (300 s) or a spike day pins the
+    /// compute every tick — the 2026-09-19 `pg_stat_statements` read showed exactly
+    /// that (`calls` 1 → 9 in 43 min with candidates present).
+    pub velocity_recheck_secs: u64,
+    /// B-445 (2026-09-19): a blob with no `blob_refs` reference is deleted by the weekly
+    /// GC only once it is OLDER than this — the quarantine that turns "a ref insert
+    /// failed on Tuesday" from a Sunday data loss into a window the redelivery
+    /// (ingest now writes blobs/refs INSIDE the durable flush) closes long before.
+    /// `billing_policy.blob_gc_grace_days`, seeded from `plans.v3.json`.
+    pub blob_gc_grace_days: i64,
 }
 
 impl Default for Policy {
@@ -106,6 +117,8 @@ impl Default for Policy {
             velocity_sigma: 2.0,
             velocity_window_days: 7,
             velocity_interval_secs: 300,
+            velocity_recheck_secs: 3600,
+            blob_gc_grace_days: 14,
         }
     }
 }
@@ -266,6 +279,12 @@ impl Policy {
                 default.velocity_interval_secs as i64,
             ))
             .unwrap_or(default.velocity_interval_secs),
+            velocity_recheck_secs: u64::try_from(int(
+                "velocity_recheck_secs",
+                default.velocity_recheck_secs as i64,
+            ))
+            .unwrap_or(default.velocity_recheck_secs),
+            blob_gc_grace_days: int("blob_gc_grace_days", default.blob_gc_grace_days).max(0),
         }
     }
 }
@@ -282,11 +301,7 @@ pub async fn spawn_refresher(pool: crate::db::DbPool, card: Arc<ArcSwap<RateCard
         }
     }
     tokio::spawn(async move {
-        // Same TTL as the entitlement cache's own refresh cadence
-        // (`entitlement_cache::TTL`) — one config value, reused, so the two
-        // caches cannot drift into two different "how stale can this be"
-        // answers.
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(900));
+        let mut ticker = tokio::time::interval(refresh_interval());
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -298,6 +313,28 @@ pub async fn spawn_refresher(pool: crate::db::DbPool, card: Arc<ArcSwap<RateCard
             }
         }
     });
+}
+
+/// The refresher's cadence by default: the entitlement cache's own TTL
+/// (`entitlement_cache::TTL`) — one value, reused, so the two caches cannot
+/// drift into two different "how stale can this be" answers.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// The cadence actually used: `TRACELANE_RATE_CARD_REFRESH_SECS` when set and
+/// parseable (floor 60 s), else [`REFRESH_INTERVAL`]. The same knob shape as
+/// `alerts::checker::rules_cache_ttl` and for the same reason (NEON-COMPUTE-PIN):
+/// every refresh is a control-plane query, and with zero tenants four Postgres
+/// reads an hour is four Neon compute wakes an hour. `scripts/ops/growth-mode.sh
+/// off` sets 21600 (6 h); `on` deletes the line. A rate-card change lands within
+/// the interval — at zero users nobody is waiting for it.
+pub(crate) fn refresh_interval() -> std::time::Duration {
+    std::env::var("TRACELANE_RATE_CARD_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(REFRESH_INTERVAL, |s| {
+            std::time::Duration::from_secs(s.max(60))
+        })
 }
 
 /// One meter's rated usage, as `/v1/billing/usage` renders it.

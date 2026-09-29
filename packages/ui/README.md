@@ -6,10 +6,7 @@ from.
 
 > **One source, and this file is not it.** `src/styles/tokens.css` is the **only** definition
 > of colour, type and layout. If this README and that file ever disagree, **the file wins and
-> this README is the defect** — which is exactly what happened here: until 2026-08-15 this
-> page described a "Neon" system (lime, teal, Space Grotesk, dark-default) that had been
-> superseded **twice** and matched nothing in the package it documents. It is deliberately
-> short now, so it cannot rot that way again.
+> this README is the defect** It is deliberately short so that it cannot drift from the file.
 
 ## Use
 
@@ -48,22 +45,12 @@ reference families by name only and do not load anything.**
 ## Verify
 
 - `pnpm --filter @tracelanedev/ui contrast:check` — WCAG ≥4.5:1 text / ≥3:1 UI, both themes.
-  **Now genuinely a gate**: `scripts/verify-all.sh` runs it, and `--selftest` proves it goes
-  red on a low-contrast pair. Until 2026-08-15 this README called it "(CI gate)" while it was
-  invoked by nothing *and* carried two bugs that hid each other — it labelled the light block
-  "DARK" and then threw on a dark selector that had never existed. A doc asserting a control
-  that does not exist is worse than no doc; this line is now checked by the thing it describes.
+  Run by `scripts/verify-all.sh`; its `--selftest` proves it goes red on a low-contrast pair.
 - `pnpm --filter @tracelanedev/ui typecheck` · `pnpm --filter @tracelanedev/ui lint`.
 
-## Removed
+## Preview
 
-`preview/index.html` was **deleted 2026-08-15**, not merely un-linked. It rendered a
-palette page for the retired "Neon" system — two generations stale — and shipped publicly.
-It rotted because `package.json`'s `preview` script pointed at
-`scripts/build-preview.mjs`, **a generator that does not exist**, so the page could never
-be regenerated and nothing ever failed to say so. The dead script is gone too. If a preview
-page comes back, it must be **generated from `tokens.css`**, like `contrast-check.mjs` is —
-a hand-maintained copy of the palette is a second source of truth by construction.
+There is no hand-maintained palette preview page. If one is added, it must be **generated from `tokens.css`**, like `contrast-check.mjs` is — a hand-maintained copy of the palette is a second source of truth by construction.
 
 ## Rules
 
@@ -71,4 +58,3 @@ Semantic tokens only — a palette swap must never touch component code. Tabular
 every figure. Every surface ships its empty / loading / error state. No dead buttons.
 
 **Colour is data.** Chrome is monochrome; a colour on screen means something happened.
-The full decision record is private to the Tracelane repo.

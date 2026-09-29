@@ -26,6 +26,7 @@ import {
 	pgEnum,
 	pgTable,
 	primaryKey,
+	smallint,
 	text,
 	timestamp,
 	uniqueIndex,
@@ -336,6 +337,8 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	coldGbIncluded: numeric("cold_gb_included", { precision: 12, scale: 3 }),
 	unlimitedSeats: boolean("unlimited_seats").notNull().default(false),
 	fSso: boolean("f_sso").notNull().default(false),
+	fCacheControl: boolean("f_cache_control").notNull().default(false),
+	cacheTtlHours: integer("cache_ttl_hours").notNull().default(0),
 	overageAllowed: boolean("overage_allowed").notNull().default(false), // Free: no overage, ages out
 	overflowMode: text("overflow_mode").notNull().default("auto_age"),
 	// The Polar product ids for this plan, written by scripts/ops/polar-sync.mjs
@@ -572,6 +575,8 @@ export const apiKeys = pgTable(
 			.defaultNow()
 			.notNull(),
 		lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+		// NULL = no retirement scheduled; future = active until that instant.
+		// Migration 0048 notifies auth caches whenever this deadline changes.
 		revokedAt: timestamp("revoked_at", { withTimezone: true }),
 		// ── A13 / SET-20: scoped, time-bounded, budget-capped keys ──────────
 		// Applied to Neon by migration 0024 (un-journaled) BEFORE the gateway
@@ -738,10 +743,125 @@ export type ProviderKey = typeof providerKeys.$inferSelect;
 // Merkle root for Rekor anchoring. Mirror migrations 06 + 03.
 // Refs: crates/gateway/src/db/audit_chain_state.rs, crates/gateway/src/audit_keys.rs.
 
-export const auditChainState = pgTable("audit_chain_state", {
+// Migration 0020 (ADR-069): the async audit consumer's idempotency backstop. One row per
+// gateway-minted `event_id` (a ULID), inserted INSIDE the head-advance transaction with
+// ON CONFLICT DO NOTHING — a JetStream redelivery therefore cannot mint a second seq.
+// Declared here 2026-09-19 (B-446): it had lived only in the migration for a month.
+// Reader/writer: crates/gateway/src/db/audit_chain_state.rs. Retained on purge (the
+// ids are opaque; ADR-068).
+export const auditAppended = pgTable("audit_appended", {
+	eventId: text("event_id").primaryKey(),
+	appendedAt: timestamp("appended_at", { withTimezone: true })
+		.defaultNow()
+		.notNull(),
+});
+
+// Migration 0016: the durable MCP tool-capability pin store read by the gateway's
+// predictive R3 pinning rail (crates/gateway/src/predictive/mcp_hash_watcher.rs). `caps`
+// is a 0..7 bitset (CHECK `tool_capabilities_caps_range` in the migration); `def_hash`
+// is the pinned tool-definition hash, nullable. Declared here 2026-09-19 (B-446).
+export const toolCapabilities = pgTable(
+	"tool_capabilities",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		toolName: text("tool_name").notNull(),
+		caps: smallint("caps").notNull().default(0),
+		defHash: text("def_hash"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.toolName] }),
+		check("tool_capabilities_caps_range", sql`${t.caps} BETWEEN 0 AND 7`),
+	],
+);
+
+// Migration 0050 (GWY-27, 2026-09-26): per-workspace model aliases. One alias → one
+// concrete target model; the gateway validates the target against its routing map on
+// write (owner-only `PUT/DELETE /v1/model-aliases`) and reads the map inside its
+// entitlement refresh. The cap lives in billing_policy.model_aliases_max_per_workspace.
+export const modelAliases = pgTable(
+	"model_aliases",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		alias: text("alias").notNull(),
+		targetModel: text("target_model").notNull(),
+		updatedBy: text("updated_by").notNull().default(""),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.alias] }),
+		check(
+			"model_aliases_alias_shape",
+			sql`${t.alias} ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$'`,
+		),
+		check("model_aliases_not_self", sql`${t.alias} <> ${t.targetModel}`),
+		check(
+			"model_aliases_target_len",
+			sql`char_length(${t.targetModel}) BETWEEN 1 AND 256`,
+		),
+	],
+);
+
+// Migration 0051 (GWY-52, 2026-09-26): a workspace's own cross-provider failover —
+// on by default for its requests, with its own ordered fallback models. The gateway
+// validates every model on write (owner-only `PUT /v1/gateway/failover`) and reads the
+// row inside its entitlement refresh. Cap: billing_policy.failover_models_max.
+export const workspaceFailover = pgTable(
+	"workspace_failover",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		enabled: boolean("enabled").notNull().default(false),
+		models: text("models").array().notNull().default(sql`'{}'`),
+		updatedBy: text("updated_by").notNull().default(""),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		check("workspace_failover_models_len", sql`cardinality(${t.models}) <= 32`),
+	],
+);
+
+// GWY-53: a workspace owner's opt-in to record prompt (input) and response (output)
+// text on gateway spans. No row = both off. Hand-written migration 0052; written only by
+// the owner-gated `PUT /v1/workspace/capture`, which ledgers every change.
+export const workspaceContentCapture = pgTable("workspace_content_capture", {
 	tenantId: uuid("tenant_id")
 		.primaryKey()
 		.references(() => tenants.id, { onDelete: "cascade" }),
+	input: boolean("input").notNull().default(false),
+	output: boolean("output").notNull().default(false),
+	updatedBy: text("updated_by").notNull().default(""),
+	updatedAt: timestamp("updated_at", { withTimezone: true })
+		.defaultNow()
+		.notNull(),
+});
+
+export const auditChainState = pgTable("audit_chain_state", {
+	// NO `.references(() => tenants.id)` here — deliberately (B-446, 2026-09-19).
+	// Migration 0018 DROPPED `audit_chain_state_tenant_id_fkey` so the ledger head
+	// survives a tenant purge (ADR-068 option (c): the ledger is retained, the tenant
+	// row is deleted). This file carried the cascade for a year after that; a
+	// `drizzle-kit generate` from it would have re-added the FK and silently defeated
+	// retention. `scripts/ci/check-schema-ts-vs-migrations.py` now refuses a
+	// `.references()` whose FK a migration dropped.
+	tenantId: uuid("tenant_id").primaryKey(),
 	lastSeq: bigint("last_seq", { mode: "number" }).notNull(),
 	// Raw 32-byte SHA-256 of the most recent chain row (bytes end-to-end).
 	lastRowHash: bytea("last_row_hash").notNull(),
@@ -751,6 +871,71 @@ export const auditChainState = pgTable("audit_chain_state", {
 });
 
 export type AuditChainState = typeof auditChainState.$inferSelect;
+
+// ── The tamper-evident ledger, CANONICAL in Postgres (ADR-078, ruled B 2026-09-20) ──
+// Chain rows and per-batch anchor bundles are written in the SAME transaction that
+// advances `audit_chain_state`, so the head and the rows cannot disagree after a
+// restore — the defect ADR-078 exists to close. ClickHouse `tracelane.audit_log` /
+// `audit_anchor_records` are now a DERIVED copy backfilled after commit.
+//
+// Column-for-column mirrors of the ClickHouse tables (`infra/dev/clickhouse/
+// schema.sql`), so a row carries byte-identical `seq` / `prev_hash` / `row_hash`
+// in both stores (ADR-072: a migration, never a re-chain). `payload` is TEXT, not
+// jsonb — the row hash covers the payload BYTES and jsonb re-serialises.
+//
+// NO `.references(() => tenants.id)` — the ledger is retained through a tenant
+// purge (ADR-068 option (c)), exactly like `audit_chain_state` above.
+export const auditLogRows = pgTable(
+	"audit_log_rows",
+	{
+		tenantId: uuid("tenant_id").notNull(),
+		seq: bigint("seq", { mode: "number" }).notNull(),
+		eventTime: timestamp("event_time", {
+			withTimezone: true,
+			precision: 6,
+		}).notNull(),
+		eventType: text("event_type").notNull(),
+		actor: text("actor").notNull(),
+		payload: text("payload").notNull().default("{}"),
+		// Hex SHA-256 of the previous row / this row — the chain (`audit_format::row_hash_v2`).
+		prevHash: text("prev_hash").notNull().default(""),
+		rowHash: text("row_hash").notNull(),
+		rekorEntryId: text("rekor_entry_id"),
+		// Ed25519 over the batch Merkle root (ADR-057); '' until the batch anchors.
+		signature: text("signature").notNull().default(""),
+		signingPubkey: text("signing_pubkey").notNull().default(""),
+	},
+	(t) => [primaryKey({ columns: [t.tenantId, t.seq] })],
+);
+
+export type AuditLogRow = typeof auditLogRows.$inferSelect;
+
+export const auditAnchorRecords = pgTable(
+	"audit_anchor_records",
+	{
+		tenantId: uuid("tenant_id").notNull(),
+		batchStartSeq: bigint("batch_start_seq", { mode: "number" }).notNull(),
+		batchEndSeq: bigint("batch_end_seq", { mode: "number" }).notNull(),
+		merkleRoot: text("merkle_root").notNull(),
+		// 'anchored' | 'unanchored'
+		anchorState: text("anchor_state").notNull(),
+		ed25519Sig: text("ed25519_sig").notNull().default(""),
+		ed25519Pubkey: text("ed25519_pubkey").notNull().default(""),
+		ecdsaPubkeySpki: text("ecdsa_pubkey_spki").notNull().default(""),
+		rekorLogUrl: text("rekor_log_url").notNull().default(""),
+		rekorLogIndex: text("rekor_log_index").notNull().default(""),
+		canonicalizedBody: text("canonicalized_body").notNull().default(""),
+		inclusionProof: text("inclusion_proof").notNull().default(""),
+		checkpointEnvelope: text("checkpoint_envelope").notNull().default(""),
+		anchoredAt: timestamp("anchored_at", {
+			withTimezone: true,
+			precision: 6,
+		}).notNull(),
+	},
+	(t) => [primaryKey({ columns: [t.tenantId, t.batchStartSeq] })],
+);
+
+export type AuditAnchorRecord = typeof auditAnchorRecords.$inferSelect;
 
 export const tenantAuditKeys = pgTable(
 	"tenant_audit_keys",
@@ -1411,6 +1596,37 @@ export const billingPolicy = pgTable("billing_policy", {
 });
 
 export type BillingPolicyRow = typeof billingPolicy.$inferSelect;
+
+/**
+ * `GWY-49` (2026-09-20): the zero-data-retention capability of every provider the gateway
+ * can route to — a reference table (CLAUDE.md §23), seeded from
+ * `apps/web/db/provider_capabilities.v1.json`, read by the gateway through its refresher.
+ * `zdr`: `none` (nothing promised) · `default` (no retention, no training, for every
+ * account) · `enterprise` (only under a contract the customer holds). Every row ships as
+ * `none` until someone has READ the provider's policy page and dated it — `policy_url` +
+ * `verified_at` are what make a `default`/`enterprise` row admissible (the seed refuses one
+ * without both). Migration 0046.
+ */
+export const providerCapabilities = pgTable(
+	"provider_capabilities",
+	{
+		providerId: text("provider_id").primaryKey(),
+		zdr: text("zdr").notNull().default("none"),
+		policyUrl: text("policy_url"),
+		verifiedAt: timestamp("verified_at", { withTimezone: true }),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		check(
+			"provider_capabilities_zdr_chk",
+			sql`${t.zdr} IN ('none', 'default', 'enterprise')`,
+		),
+	],
+);
+
+export type ProviderCapabilityRow = typeof providerCapabilities.$inferSelect;
 
 /**
  * Idempotency for the 75%/90%/100% usage-warning emails: one email per

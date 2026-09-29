@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * `/s/[token]` 404 — rendered when `page.tsx` calls `notFound()` for a
  * missing, expired OR revoked token. Spec §4: the three cases are
@@ -19,7 +20,7 @@ export default function SharedTraceNotFound() {
 					<p className="font-mono text-5xl font-semibold leading-none text-ink-3">
 						404
 					</p>
-					<h1 className="t-h1 mt-3">Shared trace unavailable</h1>
+					<PageHeader title={<>Shared trace unavailable</>} />
 					{/* Exact copy, spec §4. */}
 					<p className="mt-1.5 text-sm text-ink-2">
 						This shared trace has expired or was revoked. Ask the owner for a
@@ -28,7 +29,7 @@ export default function SharedTraceNotFound() {
 					<div className="mt-6">
 						<Link
 							href="https://tracelane.dev"
-							className="inline-flex h-9 items-center rounded-lg border border-line bg-surface px-4 text-sm font-medium text-ink transition-colors hover:bg-surface-2"
+							className="inline-flex h-9 items-center rounded-card border border-line bg-surface px-4 text-sm font-medium text-ink transition-colors hover:bg-surface-2"
 						>
 							Recorded with Tracelane — record your own →
 						</Link>

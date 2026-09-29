@@ -228,6 +228,94 @@ pub enum Degradation {
     /// and this counts how often the wedge's export could not be produced.
     /// `crates/gateway/src/audit_export.rs`.
     AuditExportIncomplete = 22,
+    /// RI-06 / B-449 (2026-09-19): spans that reached the `TRACELANE_SPANS` JetStream
+    /// stream, were ACKED to the publisher, and were removed by the stream's limits
+    /// (`max_age` 3 d, `max_bytes` 4 GiB, `DiscardPolicy::Old`), an operator delete or
+    /// `max_deliver` exhaustion BEFORE ingest consumed them. Detected by ingest's
+    /// `GapTracker` from stream-sequence continuity (`crates/ingest/src/gap_tracker.rs`).
+    /// **For this kind `count` is SPANS, not occurrences** — recorded with [`note_n`].
+    /// Until this existed the loss was counted nowhere: the gateway held a positive ack
+    /// and ingest never saw the message (ADR-077 Part II C17-ingest).
+    SpansLostBeforeConsume = 23,
+    /// RI-06: a detected gap could not be written to `tracelane.capture_gaps` — the loss
+    /// IS counted (`SpansLostBeforeConsume`) but its durable episode row is missing, so
+    /// the evidence trail is short by one episode. Check the `tl_ingest` INSERT grant on
+    /// `capture_gaps` and ClickHouse reachability.
+    CaptureGapAttestFailed = 24,
+    /// RI-06: the gateway's live view of the spans stream boundary
+    /// (`/health.spans_stream`) is unhealthy — a gap is visible between the ingest
+    /// durable's ack floor and the stream's first retained message (spans trimmed before
+    /// consume, exact while ingest is not acking), OR the reading is stale (>60 s) — "I
+    /// cannot see" is not "nothing is wrong". Noted by the gateway poller, resolved on a
+    /// healthy reading; the same shape as `AuditBacklog`.
+    SpansStreamGap = 25,
+    /// RI-04 (2026-09-19) — a background job's cross-process leader claim
+    /// (`db::job_guard::claim`) could not determine whether it won: the pool,
+    /// the claim transaction, or the `pg_try_advisory_xact_lock` probe itself
+    /// failed. NOT "another process has it" (B-428) — this cadence was simply
+    /// skipped this tick because nothing could prove who, if anyone, holds it.
+    /// A Postgres that always fails this probe would otherwise look identical
+    /// to "the other process always wins the race", with no signal that the
+    /// guarded job (retention sweep, daily metering, weekly blob GC) has
+    /// stopped running anywhere at all.
+    JobClaimFailed = 26,
+    /// RI-05 / M2 (2026-09-20) — `RejectionRegistry`'s per-minute
+    /// `(tenant, api_key_id, reason)` bucket table hit its live-triple cap
+    /// (`crates/gateway/src/rejection_metrics.rs::MAX_LIVE_BUCKETS`) and a NEW
+    /// triple was refused a bucket for the rest of that minute — its refusals are
+    /// still counted on the existing process-lifetime counters
+    /// (`/v1/gateway/stats`), but they will NOT get their own
+    /// `tracelane.admission.rejected` aggregate span. This is the DoS-safety
+    /// bound working as designed (unbounded distinct triples cannot grow the
+    /// table forever), but a repeatedly-open kind means something is minting a
+    /// large number of DISTINCT (tenant, key, reason) triples in one minute —
+    /// worth knowing, not merely tolerating.
+    RejectionBucketCapReached = 27,
+    /// ADR-078 (B, 2026-09-20) — a chain row batch or an anchor bundle COMMITTED to
+    /// the canonical Postgres ledger but its copy into ClickHouse `audit_log` /
+    /// `audit_anchor_records` failed. The chain is intact and durable (Postgres is
+    /// canonical; export and verify read it); what is stale is the derived copy the
+    /// dashboards and the per-trace chain view read. The boot reconcile rebuilds it,
+    /// so a kind that stays OPEN means ClickHouse has been refusing ledger writes
+    /// since `first_seen` — check ClickHouse, not the chain.
+    LedgerCopyFailed = 28,
+    /// ADR-078 (B, 2026-09-20) — at boot, a tenant's persisted head
+    /// (`audit_chain_state.last_seq`) is AHEAD of the rows the canonical store holds
+    /// and the ClickHouse copy could not fill the gap with rows that chain. This is
+    /// the head-ahead-of-rows case the ruling names: it can only follow a Postgres
+    /// restore to an earlier point while a newer copy did not survive either. The
+    /// head is NEVER reset downward and no gap row is written — that tenant's chain
+    /// stays RED for verifiers and this is an INCIDENT (an RCA), not a repair.
+    LedgerHeadAheadOfRows = 29,
+    /// B-469 (REV-1, 2026-09-20) — a `meter_counters` batch that failed to insert
+    /// waited for an unchanged retry longer than the pending queue allows (24 h
+    /// of flushes) and was DROPPED, oldest first. Meter data was lost in the
+    /// customer's favour, never double-counted: the alternative — merging a
+    /// failed batch back into the live buffer — is how a committed-but-
+    /// unacknowledged insert used to be counted twice.
+    /// `crates/gateway/src/billing/meters.rs`, `crates/ingest/src/clickhouse_writer.rs`.
+    MeterBatchDropped = 30,
+    /// B-493 (2026-09-21) — ingest's span batch INSERT was refused by ClickHouse and
+    /// is being retried across the back-off ladder (`clickhouse_writer.rs`,
+    /// `CH_INSERT_BACKOFF`). Nothing is lost while it retries: the batch's
+    /// messages stay unacked in JetStream. What this counts is how long ClickHouse
+    /// has been refusing span writes — on a self-host box the cause found was the
+    /// gateway's own unbatched ledger inserts saturating `max_concurrent_queries`.
+    SpanWriteRetrying = 31,
+    /// GWY-27 / GWY-52 (2026-09-26) — a workspace's own gateway settings (model aliases,
+    /// failover) could not be read in the gateway's entitlement refresh, so that tenant
+    /// resolves with NONE of them until the next refresh succeeds: no aliases (an alias
+    /// call gets `400 unroutable_model`, never a default target) and the operator's
+    /// failover default. Fail-OPEN for entitlements — a routing setting must not drop a
+    /// tenant to fallback limits. `crates/gateway/src/entitlement_cache.rs`.
+    WorkspaceGatewayConfigUnreadable = 32,
+    /// AUD-29 (2026-09-28) — the per-tenant Ed25519 key could not be loaded after the
+    /// full retry ladder, so a batch was signed with the shared PLATFORM key instead.
+    /// For a tenant that already HAS its own key, the offline verifiers then report
+    /// that batch as `platform_key_after_workspace_key` — a permanent RED on the
+    /// wedge that looks exactly like an insider append. It should never happen; when
+    /// it does, someone must know the same hour. `crates/gateway/src/audit.rs`.
+    AuditPlatformKeyFallback = 33,
 }
 
 impl Degradation {
@@ -260,6 +348,17 @@ impl Degradation {
             Self::UsageWarningEmailUnconfigured => "email_unconfigured",
             Self::MeteringGaugeGapBackfilled => "metering_gauge_gap_backfilled",
             Self::AuditExportIncomplete => "audit_export_incomplete",
+            Self::SpansLostBeforeConsume => "spans_lost_before_consume",
+            Self::CaptureGapAttestFailed => "capture_gap_attest_failed",
+            Self::SpansStreamGap => "spans_stream_gap",
+            Self::JobClaimFailed => "job_claim_failed",
+            Self::RejectionBucketCapReached => "rejection_bucket_cap_reached",
+            Self::LedgerCopyFailed => "ledger_copy_failed",
+            Self::LedgerHeadAheadOfRows => "ledger_head_ahead_of_rows",
+            Self::MeterBatchDropped => "meter_batch_dropped",
+            Self::SpanWriteRetrying => "span_write_retrying",
+            Self::WorkspaceGatewayConfigUnreadable => "workspace_gateway_config_unreadable",
+            Self::AuditPlatformKeyFallback => "audit_platform_key_fallback",
         }
     }
 
@@ -385,6 +484,83 @@ impl Degradation {
                  ClickHouse reachability and the gateway user's grants on audit_log / \
                  audit_anchor_records."
             }
+            Self::SpansLostBeforeConsume => {
+                "spans were removed from the TRACELANE_SPANS JetStream stream BEFORE ingest \
+                 consumed them (stream limits, an operator delete, or max_deliver exhaustion). \
+                 The publisher already held a positive ack, so nothing else counted them; \
+                 `count` here is the number of SPANS lost since this ingest started, and each \
+                 episode is a row in tracelane.capture_gaps. Check ingest uptime against the \
+                 stream's 3-day max_age and /health.spans_stream on the gateway."
+            }
+            Self::CaptureGapAttestFailed => {
+                "a detected span-loss episode could not be written to tracelane.capture_gaps; \
+                 the loss is still counted on spans_lost_before_consume but the durable evidence \
+                 row is missing. Check the tl_ingest INSERT grant on capture_gaps (migration 27) \
+                 and ClickHouse reachability from ingest."
+            }
+            Self::SpansStreamGap => {
+                "the spans JetStream boundary is unhealthy as seen from the gateway: either \
+                 spans are visible as trimmed past the ingest durable's ack floor (ingest is \
+                 down or far behind and the stream is discarding un-consumed spans), or the \
+                 gateway has not been able to read the stream/consumer info for over 60 s. \
+                 Check ingest (docker ps, its log) and /health.spans_stream; the exact loss per \
+                 episode is ingest's spans_lost_before_consume + tracelane.capture_gaps."
+            }
+            Self::JobClaimFailed => {
+                "a background job's cross-process leader claim could not determine whether it \
+                 won — the pool, the transaction, or the advisory-lock probe failed. This is \
+                 NOT another process holding the job; treat it as CANNOT DETERMINE and check \
+                 Postgres reachability. The guarded job (retention sweep / daily metering / \
+                 weekly blob GC) simply skipped this tick."
+            }
+            Self::RejectionBucketCapReached => {
+                "the admission-refusal aggregation table (RejectionRegistry) hit its live \
+                 (tenant, api_key_id, reason) triple cap for the current minute; the refusal \
+                 itself still counts on /v1/gateway/stats but will not get its own \
+                 tracelane.admission.rejected span this minute. A repeatedly open kind means \
+                 something is minting a large number of DISTINCT triples per minute — check \
+                 for a key/credential-stuffing sweep or a misbehaving multi-tenant client."
+            }
+            Self::LedgerCopyFailed => {
+                "a ledger batch or anchor bundle committed to the canonical Postgres ledger but \
+                 its ClickHouse copy failed. The chain is intact (export/verify read Postgres); \
+                 the dashboards' and per-trace chain view's copy is stale until the boot \
+                 reconcile rebuilds it. Repeatedly open = ClickHouse refusing ledger writes."
+            }
+            Self::LedgerHeadAheadOfRows => {
+                "a tenant's persisted chain head is AHEAD of the rows the canonical ledger \
+                 holds and the ClickHouse copy could not fill the gap with rows that chain. \
+                 Only a Postgres restore to an earlier point produces this. The head is not \
+                 reset and no gap row is written: that tenant's chain is RED for every \
+                 verifier until the missing rows are recovered — treat as an incident (RCA)."
+            }
+            Self::MeterBatchDropped => {
+                "a failed meter_counters batch waited for retry longer than the queue \
+                 allows (24 h of flushes) and was dropped — ClickHouse has refused meter \
+                 writes for over a day. Usage in that batch is UNDER-billed, never doubled. \
+                 Check ClickHouse reachability; the retry queue drains on its own once it \
+                 accepts writes."
+            }
+            Self::SpanWriteRetrying => {
+                "ingest's span batch INSERT is being refused by ClickHouse and retried \
+                 (back-off up to ~1 min per batch). Spans are safe in JetStream, unacked, \
+                 while it retries; capture LAGS. Repeatedly open = ClickHouse refusing \
+                 writes — check max_concurrent_queries, memory and disk on the data tier."
+            }
+            Self::WorkspaceGatewayConfigUnreadable => {
+                "the gateway could not read a workspace's own gateway settings (model \
+                 aliases, failover) from Postgres, so that workspace resolves with none \
+                 of them — an alias call gets 400 unroutable_model and failover falls back \
+                 to the operator default — until the next entitlement refresh. Check the \
+                 control-plane connection and that migrations 0050/0051 are applied."
+            }
+            Self::AuditPlatformKeyFallback => {
+                "an audit batch was signed with the shared PLATFORM key because the \
+                 workspace's own audit key could not be loaded after every retry. If that \
+                 workspace already has its own key, offline verifiers will report the batch \
+                 as platform_key_after_workspace_key — a permanent red on the ledger. Check \
+                 the control-plane connection and the BYOK master key."
+            }
         }
     }
 
@@ -414,13 +590,24 @@ impl Degradation {
             Self::UsageWarningEmailUnconfigured,
             Self::MeteringGaugeGapBackfilled,
             Self::AuditExportIncomplete,
+            Self::SpansLostBeforeConsume,
+            Self::CaptureGapAttestFailed,
+            Self::SpansStreamGap,
+            Self::JobClaimFailed,
+            Self::RejectionBucketCapReached,
+            Self::LedgerCopyFailed,
+            Self::LedgerHeadAheadOfRows,
+            Self::MeterBatchDropped,
+            Self::SpanWriteRetrying,
+            Self::WorkspaceGatewayConfigUnreadable,
+            Self::AuditPlatformKeyFallback,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 23;
+pub const COUNT: usize = 34;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -494,6 +681,17 @@ static SLOTS: [Slot; COUNT] = [
     Slot::new(),
     Slot::new(),
     Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
 ];
 
 /// A point-in-time view of one degradation, for `/v1/gateway/stats`.
@@ -528,8 +726,25 @@ pub struct Stat {
 /// None — infallible by construction. This is a **fault-tolerance** path: instrumenting
 /// a degradation must never itself be able to fail the request it is describing.
 pub fn note(kind: Degradation) -> u64 {
+    note_n(kind, 1)
+}
+
+/// Record `n` occurrences (or, for a kind whose `count` is a QUANTITY — spans lost,
+/// rows dropped — `n` units) in ONE call: one counter add, one episode transition, one
+/// rate-limited warn. RI-06 (2026-09-19): a 3-day ingest outage surfaces as one gap of
+/// thousands of spans at boot; calling [`note`] once per span would be thousands of
+/// atomic adds and the same single warn, so the quantity form is the honest one.
+/// `n == 0` records nothing and returns the current count — a zero-length gap is not an
+/// occurrence.
+///
+/// # Errors
+/// None — infallible by construction, for the same reason as [`note`].
+pub fn note_n(kind: Degradation, n: u64) -> u64 {
     let slot = &SLOTS[kind as usize];
-    let count = slot.count.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 0 {
+        return slot.count.load(Ordering::Relaxed);
+    }
+    let count = slot.count.fetch_add(n, Ordering::Relaxed) + n;
     let now = unix_now_secs();
 
     // B-437: a note that arrives while the kind is NOT open (never fired, or resolved
@@ -698,6 +913,22 @@ mod tests {
     // another test (or a parallel one) may have incremented the same kind. Every
     // assertion below is a DELTA, which is what the requirement actually needs:
     // "drive the degradation and assert the counter moved".
+
+    #[test]
+    fn note_n_adds_the_quantity_in_one_call_and_zero_records_nothing() {
+        // RI-06: the spans-lost kind counts SPANS. A gap of 15 is one call, +15.
+        let k = Degradation::SpansLostBeforeConsume;
+        let before = count(k);
+        assert_eq!(note_n(k, 15), before + 15);
+        assert_eq!(count(k), before + 15);
+        assert!(is_open(k), "a non-zero quantity opens the kind");
+        // Zero is not an occurrence: no add, no episode change, current count back.
+        let _ = resolve(k);
+        assert_eq!(note_n(k, 0), before + 15);
+        assert!(!is_open(k), "note_n(_, 0) must not re-open a resolved kind");
+        // note() is note_n(_, 1) — the two stay in lock-step.
+        assert_eq!(note(k), before + 16);
+    }
 
     #[test]
     fn note_advances_the_counter_for_that_kind_only() {

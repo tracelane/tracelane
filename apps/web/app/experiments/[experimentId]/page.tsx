@@ -1,3 +1,6 @@
+import { fmtDurationMs, fmtUsd } from "@/lib/metrics/format";
+import { PageHeader } from "@tracelanedev/ui";
+import { RunComparisonPicker } from "./RunComparisonPicker";
 /**
  * `EVL-02` — one experiment: its arms, and the way into the diff.
  *
@@ -29,12 +32,7 @@ function fmtScore(v: number | null): string {
 function fmtPct(v: number | null): string {
 	return v === null ? "—" : `${v.toFixed(1)}%`;
 }
-function fmtMs(v: number | null): string {
-	return v === null ? "—" : `${v.toLocaleString("en-US")}ms`;
-}
-function fmtUsd(v: number): string {
-	return `$${v.toFixed(4)}`;
-}
+const fmtMs = fmtDurationMs;
 
 /** Plain words. A status glyph alone does not survive a screen reader. */
 const ARM_STATUS_COPY: Record<ArmAggregate["status"], string> = {
@@ -55,7 +53,7 @@ function ArmRow({
 	itemCount: number;
 }) {
 	return (
-		<div className="rounded-lg border border-line bg-surface-2 p-3">
+		<div className="rounded-card border border-line bg-surface-2 p-3">
 			<div className="flex items-baseline justify-between gap-3">
 				<div className="t-metric-label">
 					Arm {letter}
@@ -147,29 +145,32 @@ export default async function ExperimentDetailPage({
 								"Nothing is wrong with the experiment itself — the gateway couldn't be reached. Try again.",
 						};
 		return (
-			<main className="p-6">
-				<h1 className="t-h1 mb-4">Experiment</h1>
+			<div className="p-6">
+				<PageHeader title={<>Experiment</>} />
 				<EmptyState title={copy.title} description={copy.description} />
 				<p className="mt-4 text-sm">
 					<Link className="underline" href="/experiments">
 						Back to experiments
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 
 	// The compare view diffs exactly TWO arms. Default to the first two, which is
 	// what a 2-arm experiment — the common case — wants with no selection at all.
-	const [first, second] = data.arms;
-	const compareHref =
-		first && second
-			? `/experiments/${encodeURIComponent(experimentId)}/compare?a=${encodeURIComponent(first.arm_id)}&b=${encodeURIComponent(second.arm_id)}`
-			: null;
 
 	return (
-		<main className="p-6">
-			<h1 className="t-h1 mb-1">{data.name}</h1>
+		<div className="p-6">
+			<div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+				<PageHeader title={data.name} />
+				<a
+					className="text-sm underline"
+					href={`/experiments/${encodeURIComponent(experimentId)}`}
+				>
+					Refresh results
+				</a>
+			</div>
 			<p className="mb-4 text-ink-3 text-sm">
 				dataset{" "}
 				<span className="font-mono">{data.dataset_id.slice(0, 8)}…</span> ·
@@ -181,7 +182,7 @@ export default async function ExperimentDetailPage({
 			</p>
 
 			{data.notes && (
-				<p className="mb-4 rounded-lg border border-line bg-surface-2 p-3 text-sm">
+				<p className="mb-4 rounded-card border border-line bg-surface-2 p-3 text-sm">
 					{data.notes}
 				</p>
 			)}
@@ -197,30 +198,13 @@ export default async function ExperimentDetailPage({
 				))}
 			</div>
 
-			{/* DISABLED WITH THE REASON ON IT, never enabled-then-failing. A diff
-			    against a partial arm reports every unfinished item as a regression;
-			    refusing is the only honest answer, and saying why is the difference
-			    between a refusal and a dead button. */}
-			{compareHref && data.comparable ? (
-				<Link
-					className="inline-block rounded-md border border-line px-3 py-1.5 text-sm underline"
-					href={compareHref}
-				>
-					Compare arm A and arm B →
-				</Link>
-			) : (
-				<p className="text-ink-3 text-sm">
-					{data.arms.length < 2
-						? "An experiment needs two finished arms to compare."
-						: "Comparing unlocks when both arms finish — an arm still running would make every item it has not reached read as a regression."}
-				</p>
-			)}
+			<RunComparisonPicker experimentId={experimentId} arms={data.arms} />
 
 			<p className="mt-4 text-sm">
 				<Link className="underline" href="/experiments">
 					Back to experiments
 				</Link>
 			</p>
-		</main>
+		</div>
 	);
 }

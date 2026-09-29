@@ -144,6 +144,11 @@ WILDCARD_PREFIXES = frozenset({"", "*", "/", "**", "?", ".", ".*"})
 KNOWN_DATA_FILES = {
     "crates/gateway/providers.tsv": "the ONE provider catalog (this guard reads it)",
     "crates/gateway/model_prices.tsv": "per-model pricing, read by pricing.rs; not a routing list",
+    # 2026-09-22 (B-138): a RECORDED WorkOS webhook delivery, read by exactly one
+    # test (`crates/gateway/src/auth/workos_webhook.rs`) as the event body the
+    # membership handler parses. It names no provider and no model, so it cannot
+    # be a second routing source — the guard asks, and this is the answer.
+    "crates/gateway/tests/fixtures/workos-membership-created.json": "recorded WorkOS membership event body for the provisioning test; carries no provider or model",
 }
 
 # Parser floors. A guard that silently parses nothing and reports OK is the defect

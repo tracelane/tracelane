@@ -25,6 +25,7 @@ apps/
 # migrations/*.sql"). Re-include just that dir; the rest of the Next.js app stays out.
 !apps/web/db/migrations
 !apps/web/db/migrations/**
+!apps/web/db/kya_catalog.v1.json
 evals/
 ml/
 bench/

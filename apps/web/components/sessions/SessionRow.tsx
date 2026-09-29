@@ -1,3 +1,7 @@
+import { fmtCount } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
+
+import { TD } from "@tracelanedev/ui";
 /**
  * One row of the `/sessions` table, plus the small pure helpers it shares
  * with the page's derived-window computation (`sessionWindow` in `page.tsx`).
@@ -12,11 +16,13 @@
  * no server-only imports is; this file has none.
  */
 
+import { IdentityAvatar } from "@/components/kya/IdentityAvatar";
 import { isRedactedEndUser } from "@/lib/end-user";
 import { formatDateTimeUtc } from "@/lib/format-date";
-import { fmtCompact, fmtDurationMs, fmtUsd } from "@/lib/metrics/format";
+import { resolveIdentity } from "@/lib/kya/identity";
+import { fmtCompact, fmtSessionDuration, fmtUsd } from "@/lib/metrics/format";
 import type { SessionSummary } from "@/lib/sessions";
-import { Badge } from "@tracelanedev/ui";
+import { Badge, ObjectSurface } from "@tracelanedev/ui";
 import Link from "next/link";
 
 /** Format a ClickHouse toString datetime or ISO 8601 string for display. */
@@ -33,7 +39,7 @@ export const formatCost = (usd: number): string =>
 	usd > 0 ? fmtUsd(usd) : "—";
 export const formatTokens = (n: number): string =>
 	n > 0 ? fmtCompact(n) : "—";
-export const formatDuration = (us: number): string => fmtDurationMs(us / 1000);
+export const formatDuration = (us: number): string => fmtSessionDuration(us);
 
 /**
  * OBS-20: render the customer's end user, distinguishing THREE states that a
@@ -52,12 +58,12 @@ export function EndUserCell({ value }: { value?: string }) {
 	}
 	if (isRedactedEndUser(value)) {
 		return (
-			<Badge
+			<StatusBadge
+				status="redacted"
 				tone="neutral"
 				title="An email address was sent as the user id and was removed by PII redaction before storage. Send an opaque id (a UUID or hash) instead."
-			>
-				redacted
-			</Badge>
+				label={<>redacted</>}
+			/>
 		);
 	}
 	// A real id links to this person's traces — that link IS the feature. The
@@ -95,7 +101,7 @@ export function SessionBar({
 				// `--chart-secondary` (the de-emphasised data-mark role) rather than
 				// `bg-ink-2/70`: an alpha re-composites against the row behind it, so
 				// the same bar changed value the moment the row was hovered.
-				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-sm bg-chart-secondary"
+				className="absolute top-1/2 h-2 -translate-y-1/2 rounded-control bg-chart-secondary"
 				style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
 			/>
 		</span>
@@ -107,9 +113,23 @@ export function SessionRow({
 	win,
 }: { s: SessionSummary; win: { startMs: number; endMs: number } | null }) {
 	const isError = s.status === "error";
+	const agent = resolveIdentity({ gen_ai_agent_name: s.agent_name }).agent;
 	return (
-		<tr className="border-b border-line transition-colors last:border-0 hover:bg-surface-hover">
-			<td className="px-3 py-2">
+		<ObjectSurface
+			objectId={s.session_id}
+			title={s.session_id}
+			href={`/sessions/${encodeURIComponent(s.session_id)}`}
+			fields={[
+				{ label: "Turns", value: fmtCount(s.turns) },
+				{ label: "Model", value: s.model || "—" },
+				{ label: "Tokens", value: formatTokens(s.total_tokens) },
+				{ label: "Duration", value: formatDuration(s.duration_us) },
+				{ label: "Cost", value: formatCost(s.cost_usd) },
+				{ label: "Status", value: <StatusBadge status={s.status} /> },
+			]}
+			className="border-b border-line transition-colors last:border-0 hover:bg-surface-hover"
+		>
+			<TD className="px-3 py-2">
 				<span className="inline-flex items-center gap-1.5">
 					<Link
 						href={`/sessions/${encodeURIComponent(s.session_id)}`}
@@ -126,42 +146,38 @@ export function SessionRow({
 					    deployed) and "field present but empty string" (no agent
 					    name on any span) — the two ways today's data can say
 					    "no agent". */}
-					{s.agent_name && <Badge tone="neutral">{s.agent_name}</Badge>}
+					{agent && <IdentityAvatar identity={agent} showLabel />}
 				</span>
-			</td>
-			<td className="px-3 py-2">
+			</TD>
+			<TD className="px-3 py-2">
 				<EndUserCell value={s.end_user} />
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
-				{s.turns}
-			</td>
-			<td className="px-3 py-2 font-mono text-xs text-ink-2">
+			</TD>
+			<TD className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
+				{fmtCount(s.turns)}
+			</TD>
+			<TD className="px-3 py-2 font-mono text-xs text-ink-2">
 				{s.model || "—"}
-			</td>
+			</TD>
 			{win && (
-				<td className="px-3 py-2">
+				<TD className="px-3 py-2">
 					<SessionBar s={s} win={win} />
-				</td>
+				</TD>
 			)}
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
+			<TD className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatTokens(s.total_tokens)}
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
+			</TD>
+			<TD className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatDuration(s.duration_us)}
-			</td>
-			<td className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
+			</TD>
+			<TD className="px-3 py-2 tabular-nums text-right text-sm text-ink-2">
 				{formatCost(s.cost_usd)}
-			</td>
-			<td className="px-3 py-2">
-				{isError ? (
-					<Badge tone="danger">error</Badge>
-				) : (
-					<Badge tone="ok">ok</Badge>
-				)}
-			</td>
-			<td className="px-3 py-2 text-right text-xs text-ink-2">
+			</TD>
+			<TD className="px-3 py-2">
+				{isError ? <StatusBadge status="error" /> : <StatusBadge status="ok" />}
+			</TD>
+			<TD className="px-3 py-2 text-right text-xs text-ink-2">
 				{formatDateTimeUtc(parseDate(s.last_activity).toISOString())}
-			</td>
-		</tr>
+			</TD>
+		</ObjectSurface>
 	);
 }

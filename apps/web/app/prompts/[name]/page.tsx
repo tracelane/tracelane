@@ -1,3 +1,6 @@
+import { ObjectPageCommands } from "@/components/command-palette/object-commands";
+import { formatDateTimeUtc } from "@/lib/format-date";
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * /prompts/[name] — prompt detail: active versions per env, history,
  * authoring form, and promotion control.
@@ -16,9 +19,10 @@
  */
 
 import { AuthorVersionForm } from "@/app/prompts/[name]/AuthorVersionForm";
+import { CanaryPanel } from "@/components/prompt-promotion/CanaryPanel";
 import { PromotionPanel } from "@/components/prompt-promotion/PromotionPanel";
 import { requireSession } from "@/lib/auth";
-import { ENVS, fetchHistory, fetchVersion } from "@/lib/prompts";
+import { ENVS, fetchCanary, fetchHistory, fetchVersion } from "@/lib/prompts";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -36,7 +40,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 function formatTimestamp(microsSinceEpoch: number): string {
 	const ms = Math.floor(microsSinceEpoch / 1000);
 	if (!Number.isFinite(ms) || ms <= 0) return "—";
-	return new Date(ms).toISOString().replace("T", " ").replace(/\..+$/, " UTC");
+	return formatDateTimeUtc(new Date(ms).toISOString());
 }
 
 function shortId(uuid: string | null | undefined): string {
@@ -45,11 +49,11 @@ function shortId(uuid: string | null | undefined): string {
 }
 
 /* This page kept its OWN spacing and radius scale — px-6 py-8, mb-8, mt-6, gap-4,
-   p-4, rounded-md, text-2xl — none of which are the app's. It was the only surface
+   p-4, rounded-control, text-2xl — none of which are the app's. It was the only surface
    still outside the design system after the 2026-08-16 pass, so a prompt detail read
    as a different product from the page that links to it.
    Now on the shared tokens: `surface-card` carries --radius-card (8px) instead of a
-   hardcoded rounded-md (6px), `t-h1`/`t-metric` come off the ADR-074 §2 ramp, and the
+   hardcoded rounded-control (6px), `t-h1`/`t-metric` come off the ADR-074 §2 ramp, and the
    rhythm matches the rest of the app. Class strings only — no markup changed. */
 const S = {
 	page: "mx-auto max-w-4xl px-4 py-4",
@@ -144,7 +148,7 @@ export default async function PromptDetailPage({ params }: Props) {
 	// Fan out env queries + history in parallel. Each is a fresh gateway
 	// round-trip minted with the per-user JWT. History is best-effort — a
 	// GatewayError yields [] and the empty state renders.
-	const [results, history] = await Promise.all([
+	const [results, history, canary] = await Promise.all([
 		Promise.all(
 			ENVS.map(async (env) => ({
 				env,
@@ -152,6 +156,7 @@ export default async function PromptDetailPage({ params }: Props) {
 			})),
 		),
 		fetchHistory(decodedName, 50),
+		fetchCanary(decodedName),
 	]);
 
 	// Surface the production content for inline preview.
@@ -174,8 +179,18 @@ export default async function PromptDetailPage({ params }: Props) {
 	const activeEnvs = new Set(
 		results.filter((r) => !("error" in r.data)).map((r) => r.env),
 	);
-	const nextStep =
-		activeEnvs.size === 0
+	// `fetchVersion`'s error string is `gateway responded <status>` — 404 means
+	// "no version in this env" (a real absence), anything else (500/503/etc.)
+	// means the read FAILED and this env's true state is unknown. "Author
+	// version 1 below" is a claim that NOTHING exists anywhere; it must not
+	// render off a read failure that could just as well be hiding a version
+	// (item 13).
+	const readFailed = results.some(
+		(r) => "error" in r.data && !r.data.error.includes("404"),
+	);
+	const nextStep = readFailed
+		? null
+		: activeEnvs.size === 0
 			? "Author version 1 below — it lands in staging, ready to promote."
 			: !activeEnvs.has("production")
 				? "A version is live in a lower environment — promote it to production below."
@@ -183,9 +198,32 @@ export default async function PromptDetailPage({ params }: Props) {
 
 	return (
 		<div className={S.page}>
+			<ObjectPageCommands
+				copyHref={`/prompts/${encodeURIComponent(decodedName)}`}
+				commands={[
+					{
+						id: "prompt-author",
+						label: "Author a new version",
+						href: "#author-version",
+						group: "action",
+					},
+					{
+						id: "prompt-promote",
+						label: "Review promotion",
+						href: "#promote-version",
+						group: "action",
+					},
+					{
+						id: "prompt-ledger",
+						label: "View promotion ledger",
+						href: "/audit",
+						group: "action",
+					},
+				]}
+			/>
 			{/* ── Header ── */}
 			<header className={S.header}>
-				<h1 className={S.title}>{decodedName}</h1>
+				<PageHeader title={decodedName} />
 				<p className={S.subtitle}>
 					Active version per environment. Updates on a successful promote or
 					auto-rollback.
@@ -196,7 +234,7 @@ export default async function PromptDetailPage({ params }: Props) {
 			<LifecycleStrip active={activeEnvs} />
 
 			{nextStep && (
-				<div className="mb-6 rounded-lg border border-line bg-surface-2 px-4 py-2.5 text-sm text-ink-2">
+				<div className="mb-6 rounded-card border border-line bg-surface-2 px-4 py-2.5 text-sm text-ink-2">
 					<span className="font-medium text-ink">Next:</span> {nextStep}
 				</div>
 			)}
@@ -250,11 +288,14 @@ export default async function PromptDetailPage({ params }: Props) {
 
 			{/* ── Author new version (Builder+) ── */}
 			<section className={S.section}>
-				<AuthorVersionForm promptName={decodedName} />
+				<div id="author-version">
+					<AuthorVersionForm promptName={decodedName} />
+				</div>
 			</section>
 
 			{/* ── Promote to production (Team+ gated — 403 → upgrade prompt) ── */}
 			<section className={S.section}>
+				<span id="promote-version" />
 				<PromotionPanel
 					// Re-mount when the staging version changes so the candidate-ID
 					// input re-initialises from the prop (e.g. right after authoring
@@ -265,9 +306,19 @@ export default async function PromptDetailPage({ params }: Props) {
 				/>
 			</section>
 
+			<section className={S.section}>
+				<CanaryPanel
+					key={canary.data?.canary_id ?? `none-${canary.status}`}
+					promptName={decodedName}
+					candidateVersionId={stagingVersionId}
+					initial={canary.data}
+					readStatus={canary.status}
+				/>
+			</section>
+
 			{/* ── Promotion / rollback history ── */}
 			<section className={S.section}>
-				{/* `.surface-card` rather than `rounded-lg`, so this panel picks up
+				{/* `.surface-card` rather than `rounded-card`, so this panel picks up
 				    `--radius-card` and matches `S.envCard` / `S.contentBlock` above,
 				    which already do. */}
 				<div className="surface-card border border-line bg-surface p-4">

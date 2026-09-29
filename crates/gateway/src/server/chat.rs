@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, sse::Sse},
 };
 use secrecy::ExposeSecret as _;
-use tracelane_shared::TenantId;
+use tracelane_shared::{DispatchAttempt, TenantId, span::extend_dispatch_attempts};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -23,9 +23,12 @@ use super::AppState;
 use super::buffered::buffer_provider_stream;
 use super::dispatch::{
     BENCH_MOCK_PROVIDER_ID, ProviderKey, breaker_outcome, dispatch_with_retry,
-    provider_name_from_model, resolve_provider_key,
+    provider_name_from_model, resolve_provider_key, resolve_provider_key_traced,
 };
-use super::errors::{provider_error_response, unroutable_model_response};
+use super::errors::{
+    invalid_zdr_constraint_response, provider_error_response, unroutable_model_response,
+    zdr_unsatisfiable_response,
+};
 use super::spans::{
     CapturedInput, GatewayTiming, RequestConfig, SpanUsageMeta, build_gateway_span,
     spawn_span_publish,
@@ -36,6 +39,29 @@ use super::stream::{StreamContext, provider_stream_to_sse};
 /// decision happens before the typed request is re-serialised anywhere.
 fn is_streaming_request(body: &serde_json::Value) -> bool {
     body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// RI-05 M4 — one ledger element for a failover candidate that was SKIPPED
+/// without ever being dispatched. Factored out as a pure constructor (rather
+/// than four inline struct literals at the four `continue` sites in the
+/// failover loop below) so the closed token vocabulary — `no_byok_key` |
+/// `breaker_open` | `killed` | `unroutable` | `zdr_ineligible` (GWY-49) — is
+/// unit-testable without a
+/// `ChatRequest`, an `AppState`, or a fake circuit breaker.
+///
+/// `attempt: 0` is a placeholder — `tracelane_shared::span::extend_dispatch_attempts`
+/// renumbers every element to its position in the request's full sequence
+/// when the caller merges this in.
+fn skipped_failover_attempt(provider: &str, model: &str, reason: &'static str) -> DispatchAttempt {
+    DispatchAttempt {
+        attempt: 0,
+        provider: provider.to_string(),
+        model: model.to_string(),
+        outcome: "skipped".to_string(),
+        status: None,
+        reason: Some(reason.to_string()),
+        took_ms: 0,
+    }
 }
 
 /// Optional prompt-promotion correlation extracted from the request body so
@@ -155,6 +181,10 @@ pub(crate) async fn chat_completions_handler(
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use crate::admission::{Chat, Route as _};
+    let cache_control = match crate::semantic_cache::CacheControl::parse(&headers) {
+        Ok(control) => control,
+        Err(err) => return err.response(false),
+    };
     // --- Step 1: ADMISSION. Nothing above this line resolves a credential. ---
     // Every refusal (401 / 403 / 400 / 429 / 402 / 503) is rendered on this wire
     // by `Chat::refuse`; an `Err` here means NO ledger row landed.
@@ -164,7 +194,7 @@ pub(crate) async fn chat_completions_handler(
     };
     let crate::admission::Admitted {
         claims,
-        identity,
+        mut identity,
         request_start,
         trace_id,
         inbound_parent,
@@ -181,6 +211,39 @@ pub(crate) async fn chat_completions_handler(
         body,
         request: mut chat_request,
     } = parsed;
+    let cache_policy = match cache_control.resolve(
+        entitlements.as_deref(),
+        state.semantic_cache.as_deref(),
+        !body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    ) {
+        Ok(policy) => policy,
+        Err(err) => {
+            dispatch_guard.abort(err.code, None);
+            return err.response(false);
+        }
+    };
+    let cache_context = state.prompt_router.canary_cache_context(&claims.tenant_id);
+    if cache_context.suspended
+        && matches!(
+            cache_control,
+            crate::semantic_cache::CacheControl::Use | crate::semantic_cache::CacheControl::Ttl(_)
+        )
+    {
+        dispatch_guard.abort("response_cache_suspended_for_canary", None);
+        return crate::semantic_cache::CacheRefusal {
+            status: StatusCode::CONFLICT,
+            code: "response_cache_suspended_for_canary",
+        }
+        .response(false);
+    }
+    let cache_policy = if cache_context.suspended {
+        cache_policy.suspend()
+    } else {
+        cache_policy
+    };
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
     // `mut`: on a successful cross-provider failover below we reassign this to
@@ -188,6 +251,28 @@ pub(crate) async fn chat_completions_handler(
     // response model, and billing all attribute to the real server. Bound
     // BEFORE the GWY-39 alias rewrite so it stays the CALLER's string.
     let mut model = chat_request.model.clone();
+
+    // GWY-27: a WORKSPACE alias resolves to its one target HERE, at entry, before
+    // anything keys on the model — deliberately earlier than the operator rewrite
+    // below. The response-cache key (`request_key`, below) hashes
+    // `chat_request.model`; resolving later would key an alias's answers under the
+    // alias, and repointing `fast` from A to B would keep serving A's cached answers.
+    // Provider resolution, failover, billing and the deployment id therefore all see
+    // the TARGET. What the caller sent survives on `identity.requested_model`
+    // (`gen_ai_request_model`), and `tenant_alias_applied` makes the span say
+    // `tracelane_model_substitution = "alias"` — nothing about the swap is silent.
+    // One map probe on the already-resolved entitlements; no alias ⇒ no change. A
+    // target that no longer routes fails CLOSED below (`unroutable_model`) — never a
+    // default target.
+    if let Some(target) = entitlements
+        .as_deref()
+        .and_then(|e| crate::db::model_aliases::resolve(&e.model_aliases, &model))
+    {
+        let target = target.to_owned();
+        chat_request.model.clone_from(&target);
+        model = target;
+        identity.tenant_alias_applied = true;
+    }
 
     // --- Step 2e: ONLINE-EVAL ADMISSION (EVL-28, item 11) ---
     //
@@ -208,15 +293,31 @@ pub(crate) async fn chat_completions_handler(
     // content and obeys the SAME capture policy as storage. A capture-off tenant's
     // request body is never flattened, never sent to a judge model, and no
     // derivative of it is persisted — `admission` refuses before `question` exists.
-    let content_capture = super::config::content_capture_enabled(tenant_id);
-    let online_eval_pending = match crate::online_eval::admission(
+    //
+    // GWY-53: decided ONCE for the whole request — the operator allowlist OR the
+    // workspace owner's opt-in (the entitlement cache's copy; `None` = no control
+    // plane = the workspace half OFF). Every span site below and the judge read
+    // THIS value; nothing re-decides later in the request.
+    let capture = super::config::capture_decision(
+        super::config::trace_content(),
+        entitlements.as_deref().map(|e| e.content_capture),
+        tenant_id,
+    );
+    let (online_eval_policy, policy_round_trip) = crate::online_eval::admission(
         tenant_id,
         trace_id,
         entitlements.as_deref(),
-        content_capture,
+        capture.judge_may_read(),
     )
-    .await
-    {
+    .await;
+    // B-568 I5: the policy cache has a 15-minute TTL and no stale serve, so an
+    // entitled sparse tenant reads Postgres here — the `online_eval_admission`
+    // stage the prod slow lines showed. A fifth cold source beside the spec's four.
+    if policy_round_trip {
+        timer.note_cold();
+        identity.cold_start = true;
+    }
+    let online_eval_pending = match online_eval_policy {
         Some(policy) => Some(crate::online_eval::Pending {
             entitlements: state.entitlements.clone(),
             policy,
@@ -284,7 +385,7 @@ pub(crate) async fn chat_completions_handler(
     // rejected 211 lines BEFORE the mock branch at :1358 — the benchmark has
     // never been reachable. BYOK resolution below is a second blocker on the
     // same path, so both are bypassed together.
-    let provider_id = if bench_mock {
+    let mut provider_id = if bench_mock {
         BENCH_MOCK_PROVIDER_ID
     } else {
         match crate::providers::ProviderRegistry::provider_id_for_model(&model) {
@@ -301,6 +402,123 @@ pub(crate) async fn chat_completions_handler(
             }
         }
     };
+    // GWY-49: the zero-data-retention constraint is judged HERE — after the provider is
+    // known, before any credential is resolved or any byte leaves for a provider. A
+    // header this gateway cannot read is refused rather than guessed. The router PRUNES
+    // (the roadmap's word): the primary is used if the table vouches for it; otherwise,
+    // and ONLY when the customer also opted into cross-provider failover, the first
+    // eligible candidate in their chain serves the request as if it had been asked for
+    // — recorded as a `zdr_ineligible` skip of the primary in the attempt ledger and as
+    // `failover_from` on the span, so nothing about the swap is silent. Tracelane never
+    // sends to a provider the customer did not name, directly or by that opt-in. Nothing
+    // eligible → 400 `zdr_unsatisfiable`. Fail-CLOSED: an unloaded table makes nothing
+    // eligible (`zdr.rs`).
+    let zdr_constraint = match crate::zdr::constraint_from_headers(&headers) {
+        Ok(c) => c,
+        Err(bad) => {
+            dispatch_guard.abort("invalid_zdr_constraint", None);
+            return invalid_zdr_constraint_response(&bad);
+        }
+    };
+    // Opt-in CROSS-PROVIDER failover, per request. Read here because the ZDR prune
+    // consults it; the failover loop further down uses the same value.
+    //
+    // GWY-52: a workspace may turn it ON for all its requests; a per-request
+    // `X-Tracelane-Failover: off` still wins, and the header's `cross-provider` works
+    // exactly as before. `None` entitlements (no control plane) = the operator default.
+    let failover_header = headers
+        .get("x-tracelane-failover")
+        .and_then(|v| v.to_str().ok());
+    let header_on = failover_header.is_some_and(|v| v.eq_ignore_ascii_case("cross-provider"));
+    let header_off = failover_header.is_some_and(|v| v.eq_ignore_ascii_case("off"));
+    let workspace_failover_on = entitlements.as_deref().is_some_and(|e| e.failover_enabled);
+    let cross_provider_failover = header_on || (workspace_failover_on && !header_off);
+    // The workspace's own fallback models (empty = the operator chain).
+    let workspace_failover_models: Arc<Vec<String>> = entitlements
+        .as_deref()
+        .map(|e| Arc::clone(&e.failover_models))
+        .unwrap_or_default();
+    // Set when the ZDR prune re-pointed the request at a failover candidate: the
+    // primary's ledger element (merged into `dispatch_attempts` once it exists) and the
+    // primary family for the span's `failover_from`.
+    let mut zdr_primary_skipped: Option<DispatchAttempt> = None;
+    let mut zdr_failover_from: Option<&'static str> = None;
+    let zdr_eligible: Option<Vec<String>> = match zdr_constraint {
+        None => None,
+        Some(crate::zdr::Constraint::Required) => {
+            let caps = state.zdr.load();
+            let primary_eligible = bench_mock || caps.eligible(provider_id);
+            // The providers the chain WOULD accept under the constraint, primary first —
+            // recorded on the span so an auditor can see the pruned set, not only the pick.
+            let mut eligible: Vec<String> = Vec::new();
+            if primary_eligible {
+                eligible.push(provider_id.to_string());
+            }
+            // (provider, model, provider_id) of the first candidate that is BOTH vouched
+            // for and routable — an unroutable one is not a candidate (its key would be
+            // the wrong one), same as the failover loop's own `unroutable` skip.
+            let mut first_candidate: Option<(&'static str, String, &'static str)> = None;
+            if cross_provider_failover {
+                let primary_family = provider_name_from_model(&model);
+                for (fo_provider, fo_model_owned) in crate::providers::failover::candidates_for(
+                    primary_family,
+                    &workspace_failover_models,
+                    state.failover,
+                ) {
+                    let fo_model: &str = &fo_model_owned;
+                    if !caps.eligible(fo_provider) {
+                        continue;
+                    }
+                    let Some(fo_pid) =
+                        crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
+                    else {
+                        continue;
+                    };
+                    if first_candidate.is_none() {
+                        first_candidate = Some((fo_provider, fo_model.to_owned(), fo_pid));
+                    }
+                    eligible.push(fo_provider.to_string());
+                }
+            }
+            if eligible.is_empty() {
+                // Per-request, so no log line (`.claude/rules/logging.md`): the refusal
+                // is on the error span (`zdr_unsatisfiable`, with `zdr_required` and the
+                // EMPTY eligible set) and in the 400 body, and
+                // `/health.zdr.capabilities_loaded` says whether the table ever loaded.
+                dispatch_guard.record_zdr(Vec::new());
+                dispatch_guard.abort("zdr_unsatisfiable", None);
+                return zdr_unsatisfiable_response(&model, provider_id, caps.default_count());
+            }
+            // Every later refusal (no key, breaker, guardrail…) and a client cancel
+            // carries the constraint too.
+            dispatch_guard.record_zdr(eligible.clone());
+            if !primary_eligible {
+                // `eligible` is non-empty and the primary is not in it, so a candidate is.
+                if let Some((fo_provider, fo_model, fo_pid)) = first_candidate {
+                    zdr_primary_skipped = Some(skipped_failover_attempt(
+                        provider_id,
+                        &model,
+                        "zdr_ineligible",
+                    ));
+                    zdr_failover_from = Some(provider_name_from_model(&model));
+                    tracing::debug!(
+                        from = provider_id,
+                        to = fo_provider,
+                        fo_model = %fo_model,
+                        "zdr: primary pruned — routing to the first eligible failover candidate"
+                    );
+                    // From here on the request is the candidate's: span provider, echoed
+                    // model, BYOK key, breaker and billing all follow `model`/`provider_id`,
+                    // exactly as a post-failure failover re-attributes them below.
+                    chat_request.model.clone_from(&fo_model);
+                    model = fo_model;
+                    provider_id = fo_pid;
+                }
+            }
+            Some(eligible)
+        }
+    };
+
     // A4: BYOK lookup first — per-tenant ciphertext in `provider_keys` decrypted
     // with AAD bound to (tenant_id, provider_id). On miss (no row, decrypt fail,
     // pool unavailable) fall back to the legacy env var. The env var is derived
@@ -317,7 +535,14 @@ pub(crate) async fn chat_completions_handler(
         // to ADD a key, not that their key was "rejected". Dispatching an empty
         // credential and relaying the upstream 401 read as "my key is broken" for a
         // user who had no key at all. Fail here, before the upstream round-trip.
-        match resolve_provider_key(tenant_id, provider_id, key_env).await {
+        let (resolved, byok_round_trip) =
+            resolve_provider_key_traced(tenant_id, provider_id, key_env).await;
+        // B-568 I5: a BYOK cache miss read the control plane on the request path.
+        if byok_round_trip {
+            timer.note_cold();
+            identity.cold_start = true;
+        }
+        match resolved {
             ProviderKey::Found(k) => k,
             outcome => {
                 let (status, code, message) = match outcome {
@@ -363,10 +588,12 @@ pub(crate) async fn chat_completions_handler(
     // BYTE-IDENTICAL string, so hashing after redaction would treat two
     // genuinely different requests as one and serve the wrong answer to the
     // second. Hashing before redaction is the only correct window.
-    let cache_key = state
-        .semantic_cache
-        .as_ref()
-        .map(|_| crate::semantic_cache::request_key(&chat_request));
+    let cache_key = state.semantic_cache.as_ref().map(|cache| {
+        cache.bind_key(
+            tenant_id,
+            cache_policy.key(crate::semantic_cache::request_key(&chat_request)),
+        )
+    });
 
     // GWY-48: built in the SAME pre-redaction window, and for a related reason.
     // The span must record what the CLIENT sent; `redact_request_in_place` below
@@ -388,6 +615,10 @@ pub(crate) async fn chat_completions_handler(
     // attribute describe the resolved model while its neighbour describes the
     // alias, which is worse than either choice made consistently.
     let request_config = RequestConfig::build(&chat_request).with_policy_flags();
+    let request_config = match &zdr_eligible {
+        Some(eligible) => request_config.with_zdr(eligible.clone()),
+        None => request_config,
+    };
 
     // GWY-39: a `tracelane.yaml` alias names the provider (resolved above, via
     // the canonical map) AND the upstream model. Only the OUTGOING request is
@@ -566,11 +797,6 @@ pub(crate) async fn chat_completions_handler(
         return resp;
     }
 
-    // Latency-split boundary: everything before this mark is gateway overhead
-    // (auth, quota, predictive, guardrail engine + the Step-4 audit append,
-    // untrusted-wrap); everything after, up to provider-complete, is the provider
-    // round-trip (incl. A7 retry / cross-provider failover). Stamped once, here.
-    let dispatch_ts = chrono::Utc::now();
     // B-375 (b): `dispatch_guard` has been ARMED since admission published the
     // ledger row. From here until a span is recorded by one of the normal paths
     // the request is "in flight with the provider" and a client that hangs up
@@ -580,18 +806,6 @@ pub(crate) async fn chat_completions_handler(
     // that records its own span; if it is still armed when the future is
     // dropped, `Drop` records a `client_cancelled` error span.
     timer.mark("guardrails");
-    // Emit against the SAME interval the span's overhead number opens with —
-    // `dispatch_ts - request_start` — so the log line and the span agree by
-    // construction instead of by two similar-looking clocks.
-    timer.emit_if_slow(
-        &state.hotpath,
-        u64::try_from(
-            (dispatch_ts - request_start)
-                .num_microseconds()
-                .unwrap_or(0),
-        )
-        .unwrap_or(0),
-    );
     // A7: one retry against the same provider on transient failure.
     //  (verifier finding a): consume the SAME `bench_mock` computed at the
     // routing bypass rather than re-deriving the condition here. A second inline
@@ -619,6 +833,34 @@ pub(crate) async fn chat_completions_handler(
         (Some(cache), Some(key), false) => cache.lookup(tenant_id, &model, key).await,
         _ => None,
     };
+    timer.mark("cache_lookup");
+
+    // Latency-split boundary: everything before this mark is gateway overhead
+    // (auth, quota, predictive, guardrail engine + the Step-4 audit append,
+    // untrusted-wrap, and — B-568 I3 — the response-cache lookup); everything
+    // after, up to provider-complete, is the provider round-trip (incl. A7 retry
+    // / cross-provider failover). Stamped once, here.
+    //
+    // B-568 I3 (2026-09-27) moved this stamp from BEFORE the cache lookup to
+    // after it. On a MISS the lookup used to be counted as PROVIDER time; it is
+    // the gateway's. On prod the exact tier is an in-process `moka` read (µs), so
+    // the number barely moves — but a semantic-tier lookup (an embedding call) is
+    // now charged to the gateway, where it belongs. A hit is unchanged: its span
+    // stamps both boundaries at `now`, so its whole duration is overhead.
+    let dispatch_ts = chrono::Utc::now();
+    // Emit against the SAME interval the span's overhead number opens with —
+    // `dispatch_ts - request_start` — so the log line and the span agree by
+    // construction instead of by two similar-looking clocks. A hit emits here
+    // too: its pre-dispatch cost is exactly what a slow hit needs explained.
+    timer.emit_if_slow(
+        &state.hotpath,
+        u64::try_from(
+            (dispatch_ts - request_start)
+                .num_microseconds()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
+    );
 
     // SERVE THE HIT — and emit its span before returning, because a served
     // request that produced no span is precisely the "trace gap" GWY-25 refused
@@ -645,6 +887,14 @@ pub(crate) async fn chat_completions_handler(
                 // an answer we did not buy. `SpendTracker::record` drops
                 // non-positive cost, so 0.0 also adds nothing to spend.
                 cost_usd: Some(0.0),
+                // RI-05: a cache hit made no provider call — nothing was SERVED,
+                // so the served model stays absent rather than echoing the request.
+                served: super::spans::ServedMeta::default(),
+                finish_reason: None,
+                // RI-05 M1 + M4: a cache hit never reaches `dispatch_with_retry` —
+                // no attempt was made, so the ledger is empty (absent on the span).
+                dispatch_attempts: Vec::new(),
+                reasoning_output_tokens: None,
             },
             None,
             // REAL TIMING, not `None`. `build_gateway_span` only emits
@@ -682,7 +932,7 @@ pub(crate) async fn chat_completions_handler(
         // captured input as a miss. Omitting it here would silently bias every
         // eval case set AWAY from repeated prompts — exactly the ones a cache
         // makes common.
-        if let Some(captured) = CapturedInput::build(tenant_id, &chat_request) {
+        if let Some(captured) = CapturedInput::build(capture, &chat_request) {
             captured.apply(&mut span.attributes);
         }
         // GWY-48, span site 1 of 4. A cache hit ran under the configuration the
@@ -710,20 +960,30 @@ pub(crate) async fn chat_completions_handler(
         // cache becomes a compatibility bug that only appears under load.
         // The hit recorded its own span (site 1 of 4) above.
         dispatch_guard.disarm();
-        return (
-            StatusCode::OK,
-            axum::response::AppendHeaders([
-                (axum::http::header::CONTENT_TYPE, "application/json"),
-                (
-                    axum::http::HeaderName::from_static("x-tracelane-cache"),
-                    hit.tier,
-                ),
-            ]),
-            hit.response_json,
-        )
-            .into_response();
+        return cache_policy.response(
+            (
+                StatusCode::OK,
+                axum::response::AppendHeaders([
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        axum::http::HeaderName::from_static("x-tracelane-cache"),
+                        hit.tier,
+                    ),
+                ]),
+                hit.response_json,
+            )
+                .into_response(),
+        );
     }
 
+    // RI-05 M1 + M4: this request's dispatch ledger — same-provider retries,
+    // then any cross-provider failover hops/skips, in the order they
+    // happened. Stays empty (and therefore ABSENT on the span, spec §2.1) for
+    // a bench-mock call and for a clean single attempt.
+    let mut dispatch_attempts: Vec<DispatchAttempt> = Vec::new();
+    if let Some(skip) = zdr_primary_skipped.take() {
+        extend_dispatch_attempts(&mut dispatch_attempts, vec![skip]);
+    }
     let mut provider_result = if bench_mock {
         // Bench-only instant upstream (TRACELANE_BENCH_MOCK_UPSTREAM). Replaces
         // ONLY the network dispatch with an instant canned stream, so a load
@@ -735,15 +995,18 @@ pub(crate) async fn chat_completions_handler(
             .chat_mock(&chat_request, provider_key.expose_secret(), tenant_id)
             .await
     } else {
-        dispatch_with_retry(
+        let (result, attempts) = dispatch_with_retry(
             &state.providers,
             &chat_request,
             provider_key.expose_secret(),
+            upstream,
             &model,
             tenant_id,
             crate::providers::failover::retry_policy(state.failover),
         )
-        .await
+        .await;
+        extend_dispatch_attempts(&mut dispatch_attempts, attempts);
+        result
     };
 
     // Feed the breaker: any dispatch error (timeout / 5xx / connection) is a
@@ -772,28 +1035,61 @@ pub(crate) async fn chat_completions_handler(
     // No new infra/state — reuses dispatch_with_retry + the per-provider key
     // store + the existing breakers. When opted in we fail over on any primary
     // error (the caller has chosen resilience over a possible extra call).
-    let cross_provider_failover = headers
-        .get("x-tracelane-failover")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("cross-provider"));
     // `Some(primary_provider)` once a cross-provider failover actually served the
     // request — threaded onto the span so the Gateway-ops rollup can count it and
-    // name the primary that errored.
-    let mut failover_from: Option<&'static str> = None;
+    // name the primary that errored (or, GWY-49, that the ZDR prune skipped).
+    let mut failover_from: Option<&'static str> = zdr_failover_from;
     if provider_result.is_err() && cross_provider_failover {
         let primary_family = provider_name_from_model(&model);
-        for (fo_provider, fo_model) in
-            crate::providers::failover::cross_provider_candidates(primary_family, state.failover)
-        {
-            if state.kill_switch.upstream_killed(fo_provider)
-                || !state.circuit_breaker.allow(fo_provider, region)
-            {
+        for (fo_provider, fo_model_owned) in crate::providers::failover::candidates_for(
+            primary_family,
+            &workspace_failover_models,
+            state.failover,
+        ) {
+            let fo_model: &str = &fo_model_owned;
+            // GWY-49: under the constraint, a failover candidate the table does not vouch
+            // for is not a candidate — skipped and recorded like the other four skips.
+            if zdr_constraint.is_some() && !state.zdr.load().eligible(fo_provider) {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "zdr_ineligible",
+                    )],
+                );
+                continue;
+            }
+            if state.kill_switch.upstream_killed(fo_provider) {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(fo_provider, fo_model, "killed")],
+                );
+                continue;
+            }
+            if !state.circuit_breaker.allow(fo_provider, region) {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "breaker_open",
+                    )],
+                );
                 continue;
             }
             // Fail closed on an unroutable failover candidate — skip it,
             // never default to a provider (its key would be the wrong one).
             let Some(fo_pid) = crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
             else {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "unroutable",
+                    )],
+                );
                 continue;
             };
             let fo_env = crate::providers::ProviderRegistry::env_var_for_provider_id(fo_pid);
@@ -808,19 +1104,29 @@ pub(crate) async fn chat_completions_handler(
                     provider = fo_provider,
                     "cross-provider failover skipped — no BYOK key for this provider"
                 );
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "no_byok_key",
+                    )],
+                );
                 continue;
             }
             let mut fo_request = chat_request.clone();
             fo_request.model = fo_model.to_string();
-            let fo_result = dispatch_with_retry(
+            let (fo_result, fo_attempts) = dispatch_with_retry(
                 &state.providers,
                 &fo_request,
                 fo_key.expose_secret(),
+                fo_provider,
                 fo_model,
                 tenant_id,
                 crate::providers::failover::retry_policy(state.failover),
             )
             .await;
+            extend_dispatch_attempts(&mut dispatch_attempts, fo_attempts);
             if let Some(ok) = breaker_outcome(&fo_result) {
                 state.circuit_breaker.record(fo_provider, region, ok);
             }
@@ -892,6 +1198,9 @@ pub(crate) async fn chat_completions_handler(
             // That is this request's span; the four typed returns below must
             // not be followed by a second, `client_cancelled` one — `abort`
             // records it and disarms in one step.
+            // RI-05 M1: the failure span is the one an operator opens — it carries
+            // every attempt and skip that led here, not only the terminal reason.
+            dispatch_guard.record_attempts(std::mem::take(&mut dispatch_attempts));
             dispatch_guard.abort(err_reason, None);
 
             // An upstream 401/403 means the tenant's BYOK provider key was
@@ -1004,7 +1313,7 @@ pub(crate) async fn chat_completions_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if is_streaming {
+    let response = if is_streaming {
         // The generator's `StreamFinalizer` owns the record from its first poll
         // (B-375 a). The dispatch guard is handed INTO the generator and
         // disarmed there, once the finalizer exists — a client that hangs up
@@ -1048,6 +1357,9 @@ pub(crate) async fn chat_completions_handler(
                 response_inputs,
                 redaction_map: guardrail_redaction_map,
                 failover_from,
+                // RI-05 M1 + M4: the request's full dispatch ledger, built
+                // above across the primary call and any failover hops/skips.
+                dispatch_attempts,
                 // GWY-43: the api_keys row id, and ONLY when an API key authorised
                 // the request. A session has no key, and `claims.sub` would hand back
                 // a WorkOS user id — a different namespace in the same column.
@@ -1066,6 +1378,9 @@ pub(crate) async fn chat_completions_handler(
                 input_bytes_for_estimate: serde_json::to_vec(&chat_request.messages)
                     .map(|v| v.len())
                     .unwrap_or(0),
+                // GWY-53: the same decision the buffered path gets.
+                capture,
+                captured_input: CapturedInput::build(capture, &chat_request),
             },
         );
         Sse::new(sse).into_response()
@@ -1098,13 +1413,17 @@ pub(crate) async fn chat_completions_handler(
             response_inputs,
             guardrail_redaction_map,
             failover_from,
+            // RI-05 M1 + M4: the request's full dispatch ledger, built above
+            // across the primary call and any failover hops/skips.
+            dispatch_attempts,
             claims.api_key_id(),
             state.semantic_cache.clone(),
             cache_key,
-            CapturedInput::build(tenant_id, &chat_request),
+            CapturedInput::build(capture, &chat_request),
             // GWY-48, span site 2 of 4.
             request_config,
             online_eval_pending,
+            capture,
         )
         .await;
         // The buffered path recorded its span (success or error) inside
@@ -1113,7 +1432,8 @@ pub(crate) async fn chat_completions_handler(
         // the cancellation instead.
         dispatch_guard.disarm();
         resp.into_response()
-    }
+    };
+    cache_policy.response(response)
 }
 
 #[cfg(test)]
@@ -1122,6 +1442,40 @@ mod tests {
     use serde_json::json;
 
     const UUID_AB: &str = "00000000-0000-0000-0000-0000000000ab";
+
+    // ── RI-05 M4: the failover-skip token mapping, as a pure function ──
+    //
+    // NOT COVERED here: which of the four causes actually FIRES at which of
+    // the four `continue` sites in the real failover loop (a killed
+    // upstream, a denying breaker, an unroutable model, an empty BYOK key) —
+    // that needs a live/mocked `AppState` per cause and is integration-level
+    // work this slice does not add. What IS covered: the four tokens this
+    // spec names are exactly the four the constructor can produce, and each
+    // one round-trips through the struct correctly.
+    #[test]
+    fn skipped_failover_attempt_carries_the_closed_token_set() {
+        for reason in [
+            "no_byok_key",
+            "breaker_open",
+            "killed",
+            "unroutable",
+            "zdr_ineligible",
+        ] {
+            let a = skipped_failover_attempt("openai", "gpt-4o", reason);
+            assert_eq!(a.outcome, "skipped");
+            assert_eq!(a.provider, "openai");
+            assert_eq!(a.model, "gpt-4o");
+            assert_eq!(a.reason.as_deref(), Some(reason));
+            assert_eq!(
+                a.status, None,
+                "a skipped candidate was never dispatched — no status"
+            );
+            assert_eq!(
+                a.took_ms, 0,
+                "a skipped candidate was never dispatched — no elapsed time"
+            );
+        }
+    }
 
     #[test]
     fn prompt_observation_carries_only_the_version_id() {
@@ -1204,6 +1558,78 @@ mod route_tests {
     use crate::handler_harness::{
         LoopbackBypassGuard, authed, body_json, registry_pointing_ollama_at, test_state,
     };
+
+    #[tokio::test]
+    async fn request_cache_bypass_never_serves_a_warm_answer() {
+        let _serial = CANCEL_COUNTER.lock().await;
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        let reply = |content: &str| {
+            json!({
+                "id": "cache-control-proof", "object": "chat.completion", "model": "ollama/llama3",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"fresh\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        let cfg =
+            crate::server::config::parse("semantic_cache:\n  embedding_models: ollama/llama3\n")
+                .unwrap();
+        let cache = Arc::new(crate::semantic_cache::SemanticCache::new(
+            crate::clickhouse_query::ch_client(server.uri()),
+            state.providers.clone(),
+            cfg.semantic_cache().unwrap().clone(),
+        ));
+        let body = json!({"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]});
+        let request: tracelane_shared::ChatRequest = serde_json::from_value(body.clone()).unwrap();
+        let key = crate::semantic_cache::request_key(&request);
+        cache
+            .store(
+                &crate::handler_harness::dev_tenant(),
+                "ollama/llama3",
+                &key,
+                &reply("cached").to_string(),
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        state.semantic_cache = Some(cache);
+        let first =
+            chat_completions_handler(State(state.clone()), authed(), Json(body.clone())).await;
+        assert_eq!(first.headers().get("x-tracelane-cache").unwrap(), "exact");
+        assert_eq!(
+            body_json(first).await["choices"][0]["message"]["content"],
+            "cached"
+        );
+        let mut headers = authed();
+        headers.insert("x-tracelane-cache", "bypass".parse().unwrap());
+        let fresh =
+            chat_completions_handler(State(state.clone()), headers, Json(body.clone())).await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(
+            fresh.headers().get("x-tracelane-cache").unwrap(),
+            "bypass",
+            "request opt-out must not reuse a warm response"
+        );
+        assert_eq!(
+            body_json(fresh).await["choices"][0]["message"]["content"],
+            "fresh"
+        );
+        // Bypass must not overwrite the shared entry either.
+        let after = chat_completions_handler(State(state), authed(), Json(body)).await;
+        assert_eq!(
+            body_json(after).await["choices"][0]["message"]["content"],
+            "cached"
+        );
+    }
 
     // ── B-375 (b): a client that hangs up while the provider is still being
     // awaited leaves a record. Driven through the REAL handler — the first

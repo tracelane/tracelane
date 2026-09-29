@@ -13,53 +13,13 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { type Command, buildCommands } from "./commands";
+import { currentObjectCommands, runObjectCommand } from "./object-commands";
 
-interface Action {
-	id: string;
-	label: string;
-	description?: string;
-	href?: string;
-	shortcut?: string;
-	group: "navigation" | "action";
-}
-
-const STATIC_ACTIONS: Action[] = [
-	{
-		id: "traces",
-		label: "Traces",
-		description: "Browse all spans and traces",
-		href: "/traces",
-		group: "navigation",
-	},
-	{
-		id: "sessions",
-		label: "Sessions",
-		description: "View agent sessions grouped by run",
-		href: "/sessions",
-		group: "navigation",
-	},
-	{
-		id: "slo",
-		label: "SLO Dashboard",
-		description: "Service level objectives and error budgets",
-		href: "/slo",
-		group: "navigation",
-	},
-	{
-		id: "prompts",
-		label: "Prompt Studio",
-		description: "Promote and version prompts",
-		href: "/prompts",
-		group: "navigation",
-	},
-	{
-		id: "byok-keys",
-		label: "BYOK Keys",
-		description: "Manage customer-managed encryption keys",
-		href: "/settings/byok",
-		group: "navigation",
-	},
-];
+// OBS-02: the commands live in `./commands` — derived from the sidebar's own list,
+// plus verbs and whatever the query itself names (a trace id, a search, a model).
+// This file used to carry a hardcoded list of 5 destinations out of ~50 screens.
+type Action = Command;
 
 /**
  * The matched run inside a result label or description.
@@ -103,20 +63,18 @@ export function CommandPalette() {
 	const [query, setQuery] = useState("");
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const inputRef = useRef<HTMLInputElement>(null);
-	const listRef = useRef<HTMLUListElement>(null);
+	const listRef = useRef<HTMLDivElement>(null);
 	const dialogRef = useRef<HTMLDialogElement>(null);
 	const router = useRouter();
 
-	const filtered = STATIC_ACTIONS.filter(
-		(a) =>
-			!query ||
-			a.label.toLowerCase().includes(query.toLowerCase()) ||
-			a.description?.toLowerCase().includes(query.toLowerCase()),
-	);
+	const [context, setContext] = useState<Command[]>([]);
+	const filtered = buildCommands(query, context);
 
 	const execute = useCallback(
 		(action: Action) => {
-			if (action.href) router.push(action.href);
+			if (action.target)
+				requestAnimationFrame(() => runObjectCommand(action.id));
+			else if (action.href) router.push(action.href);
 			setOpen(false);
 			setQuery("");
 			setSelectedIndex(0);
@@ -152,6 +110,7 @@ export function CommandPalette() {
 			setQuery("");
 			return;
 		}
+		setContext(currentObjectCommands());
 		const el = dialogRef.current;
 		if (!el) return;
 		if (!el.open) el.showModal();
@@ -236,7 +195,7 @@ export function CommandPalette() {
 			 *     flat in light, and in dark the panel (#0d0e10) was DARKER than the
 			 *     cards behind it. `--surface` is lighter than the ground in both
 			 *     themes, which is what "in front" means here.
-			 *   · `--radius-card`, not Tailwind's 16px `rounded-2xl`. The system has two
+			 *   · `--radius-card`, not Tailwind's 16px `rounded-card`. The system has two
 			 *     radii; a panel takes the card one.
 			 *   · `--shadow-overlay`, not Tailwind's heaviest stock drop. The overlay
 			 *     elevation is defined once, in both themes, and a default-scale shadow
@@ -276,10 +235,11 @@ export function CommandPalette() {
 					<input
 						ref={inputRef}
 						className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-3"
-						placeholder="Jump to a page…"
+						placeholder="Go to a page, run an action, or paste a trace id…"
 						value={query}
 						onChange={handleQueryChange}
 						aria-label="Search"
+						aria-controls="command-results"
 						aria-autocomplete="list"
 						aria-activedescendant={
 							filtered[selectedIndex]
@@ -295,20 +255,28 @@ export function CommandPalette() {
 					</kbd>
 				</div>
 
-				{/* Results */}
-				<ul
+				{/* Rich command labels and descriptions cannot be rendered by a native select. */}
+
+				<div
 					ref={listRef}
 					aria-label="Actions"
+					// biome-ignore lint/a11y/useSemanticElements: rich autocomplete listbox keeps focus in its search input.
+					role="listbox"
+					tabIndex={-1}
+					id="command-results"
 					className="max-h-72 overflow-y-auto py-2"
 				>
 					{filtered.length === 0 && (
-						<li className="px-4 py-6 text-center text-xs text-ink-2">
+						<p className="px-4 py-6 text-center text-xs text-ink-2">
 							No results for &ldquo;{query}&rdquo;
-						</li>
+						</p>
 					)}
 					{filtered.map((action, idx) => (
-						<li
+						<div
 							key={action.id}
+							// biome-ignore lint/a11y/useSemanticElements: rich command descriptions cannot be native options.
+							role="option"
+							tabIndex={-1}
 							id={`cmd-item-${action.id}`}
 							aria-selected={idx === selectedIndex}
 							/*
@@ -321,13 +289,14 @@ export function CommandPalette() {
 							 * also `--surface`, which is now the panel's own colour — a
 							 * hover that changes nothing.
 							 */
-							className={`mx-2 flex cursor-pointer items-center gap-3 rounded-[var(--radius-control)] px-3 py-2.5 text-sm transition-colors ${
+							className={`command-palette-option mx-2 flex cursor-pointer items-center gap-3 rounded-[var(--radius-control)] px-3 py-2.5 text-sm transition-colors ${
 								idx === selectedIndex ? "bg-surface-2 text-ink" : "text-ink"
 							}`}
 							onClick={() => execute(action)}
 							onKeyDown={(e) => {
 								if (e.key === "Enter" || e.key === " ") {
 									e.preventDefault();
+									e.stopPropagation();
 									execute(action);
 								}
 							}}
@@ -358,9 +327,9 @@ export function CommandPalette() {
 									d="M9 5l7 7-7 7"
 								/>
 							</svg>
-						</li>
+						</div>
 					))}
-				</ul>
+				</div>
 
 				{/* Footer hint */}
 				{/* Footer hint keys take the same `--canvas-sunken` material as the two

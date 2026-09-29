@@ -310,13 +310,13 @@ struct DailyRow {
     // crate's own `chrono` feature only via a custom visitor; simplest here
     // is to read it as the ISO string ClickHouse renders for `toString(day)`.
     //
-    // The FIELD ITSELF is unread (only `.value` is consulted below — the
-    // burst-exemption input needs a chronologically-ordered VALUE series,
-    // not the date labels), but it is NOT dead: `clickhouse::Row` decodes
-    // RowBinary POSITIONALLY, so removing this field would desync every row
-    // against the query's 2-column `SELECT toString(day), sum(value)` shape
-    // — the exact B-274 class this repo has hit five times.
-    #[allow(dead_code)]
+    // READ since B-468 (REV-1, 2026-09-20): `dense_period_series` places each
+    // value at its day's index so a day with no rows is an explicit zero in
+    // the burst-exemption input — the same rule the metering job's trailing
+    // series follows, so the page and the invoice net the same days. It was
+    // unread (the series was sparse) from BILL-01 until then. `clickhouse::Row`
+    // decodes RowBinary POSITIONALLY, so the field order must stay
+    // `(day, value)` against the 2-column SELECT — the B-274 class.
     day: String,
     value: f64,
 }
@@ -337,6 +337,38 @@ struct GaugeRow {
     day: String,
     value: f64,
     computed_at: String,
+}
+
+/// **B-468 (REV-1): the period's daily series is DENSE and indexed by date.**
+/// One entry per day from `start` through `end_incl`, a day with no rows an
+/// explicit `0.0`, so `rating::burst_exempt_days` sees every zero day the
+/// metering job sees. A row outside `[start, end_incl]` is a query defect and
+/// is dropped (debug-asserted) rather than allowed to shift the series.
+fn dense_period_series(
+    rows: Vec<DailyRow>,
+    start: chrono::NaiveDate,
+    end_incl: chrono::NaiveDate,
+) -> Vec<f64> {
+    let len = usize::try_from((end_incl - start).num_days() + 1).unwrap_or(0);
+    let mut out = vec![0.0; len];
+    for r in rows {
+        let Ok(day) = r.day.parse::<chrono::NaiveDate>() else {
+            debug_assert!(
+                false,
+                "period daily read projected an unparseable day: {}",
+                r.day
+            );
+            continue;
+        };
+        match usize::try_from((day - start).num_days()) {
+            Ok(i) if i < len => out[i] += r.value,
+            _ => debug_assert!(
+                false,
+                "period daily read returned a day outside the period: {day}"
+            ),
+        }
+    }
+    out
 }
 
 /// Per-day `ingest_bytes` counter totals for `[since, today]`, oldest first —
@@ -619,7 +651,7 @@ async fn usage_handler(
             tracing::warn!(error = %e, "billing usage: meter_counters daily read failed");
             Vec::new()
         });
-    let ingest_daily: Vec<f64> = daily_rows.into_iter().map(|r| r.value).collect();
+    let ingest_daily: Vec<f64> = dense_period_series(daily_rows, since, now.date_naive());
 
     // ONE query: the four GAUGE meters, per (day, meter) this period —
     // `argMax(value, computed_at)` collapses a same-day re-run to its

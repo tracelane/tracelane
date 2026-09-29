@@ -151,6 +151,27 @@ export function sloTrafficSeries(
 	);
 }
 
+/**
+ * Narrow a `ChartData` to just the named series ids, same buckets/n/hasData.
+ *
+ * `sloTrafficSeries` always computes all three of requests/errors/tokens
+ * together (one pass over the rows), but a single-metric tile — "Requests
+ * per bucket", "Errors per bucket", "Tokens" (`traffic_series` /
+ * `errors_series` / `tokens` in the registry) — must plot only the ONE
+ * series it was configured for. Before this, a "requests" tile plotted
+ * requests+errors+tokens on one linear axis; tokens is routinely 100-1000x
+ * the request count, so requests and errors both read as a flat line at
+ * zero (item 7, 2026-09-27 audit).
+ */
+export function pickSeries(data: ChartData, ids: readonly string[]): ChartData {
+	return {
+		buckets: data.buckets,
+		series: data.series.filter((s) => ids.includes(s.id)),
+		n: data.n,
+		hasData: data.hasData,
+	};
+}
+
 /** `SloTimePoint`s (one merged row per bucket) → p50 / p95 / p99 per bucket. */
 export function sloLatencySeries(
 	r: Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs">,
@@ -192,6 +213,53 @@ export function sloLatencySeries(
 		(p, id) => (id === "p50" ? p.p50_ms : id === "p95" ? p.p95_ms : p.p99_ms),
 		(p) => p.requests,
 	);
+}
+
+/**
+ * `SloRow`s → error rate (%) per bucket = errors/requests × 100. B-504 / CX-05:
+ * the picker offered `error_rate` as a series (the registry's `kind: "percent"`
+ * promises a ratio) but no percent series existed anywhere in this file —
+ * `fetchSeriesData` fell through to `sloTrafficSeries`, which draws three COUNT
+ * series (requests / errors / tokens) under the "Error rate" title with no
+ * ratio drawn at all.
+ *
+ * Folds through `sloTrafficSeries` (same LLM-only filter, same bucket sums) and
+ * derives the ratio from its two count series, so this can never disagree with
+ * the traffic chart about what a bucket's requests/errors are.
+ *
+ * `null` when a bucket had NO requests — the file's own quantile rule (:9-11):
+ * a bucket nothing happened in is a GAP, not a false 0%. A bucket with
+ * requests but zero errors is a true, drawn 0%.
+ */
+export function sloErrorRateSeries(
+	r: Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs">,
+	rows: readonly SloRow[],
+): ChartData {
+	const traffic = sloTrafficSeries(r, rows);
+	const requests = traffic.series.find((s) => s.id === "requests");
+	const errors = traffic.series.find((s) => s.id === "errors");
+	const values = traffic.buckets.map((_, i) => {
+		const req = requests?.values[i] ?? 0;
+		if (!req) return null;
+		const err = errors?.values[i] ?? 0;
+		return (err / req) * 100;
+	});
+	return {
+		buckets: traffic.buckets,
+		series: [
+			{
+				id: "error_rate",
+				label: "error rate",
+				kind: "percent",
+				tone: "danger",
+				mark: "line",
+				fillZero: false,
+				values,
+			},
+		],
+		n: traffic.n,
+		hasData: traffic.hasData,
+	};
 }
 
 /** One series' values as a spark (nulls → 0) — for `StatCard.spark`. */

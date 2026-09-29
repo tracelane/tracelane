@@ -31,8 +31,16 @@
  */
 
 import { CopyButton } from "@/components/trace-viewer/CopyButton";
+import { apiFetchRaw } from "@/lib/api-fetch";
+import {
+	announcePopoverOpen,
+	onOtherPopoverOpen,
+} from "@/lib/popover-coordination";
 import { Button, SegmentedControl } from "@tracelanedev/ui";
 import { useEffect, useState } from "react";
+
+/** This popover's id — see `lib/popover-coordination.ts` (item 8). */
+const POPOVER_ID = "share-dialog";
 
 export type ShareLink = {
 	id: string;
@@ -132,7 +140,7 @@ export function ShareLinkRow({
 }) {
 	const expiresIn = daysUntil(link.expires_at);
 	return (
-		<div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-line px-2.5 py-1.5 text-sm">
+		<div className="flex flex-wrap items-center justify-between gap-2 rounded-control border border-line px-2.5 py-1.5 text-sm">
 			<div className="min-w-0 flex-1">
 				{mintedUrl ? (
 					<div className="flex items-center gap-1.5">
@@ -153,7 +161,7 @@ export function ShareLinkRow({
 			</div>
 			<Button
 				type="button"
-				variant="ghost"
+				variant="danger"
 				size="sm"
 				disabled={revoking}
 				onClick={() => onRevoke(link.id)}
@@ -164,8 +172,11 @@ export function ShareLinkRow({
 	);
 }
 
-export function ShareDialog({ traceId }: { traceId: string }) {
-	const [open, setOpen] = useState(false);
+export function ShareDialog({
+	traceId,
+	embedded = false,
+}: { traceId: string; embedded?: boolean }) {
+	const [open, setOpen] = useState(embedded);
 	const [expiry, setExpiry] = useState<ExpiryDays>("30");
 	const [links, setLinks] = useState<ShareLink[] | null>(null);
 	const [mintedUrls, setMintedUrls] = useState<Record<string, string>>({});
@@ -174,13 +185,24 @@ export function ShareDialog({ traceId }: { traceId: string }) {
 	const [minting, setMinting] = useState(false);
 	const [revokingId, setRevokingId] = useState<string | null>(null);
 
+	// Close THIS popover when a sibling (TraceFlag's edit panel) opens, and
+	// announce our own opens the same way — item 8, so the two never overlap.
+	useEffect(() => onOtherPopoverOpen(POPOVER_ID, () => setOpen(false)), []);
+	function toggleOpen(): void {
+		setOpen((v) => {
+			const next = !v;
+			if (next) announcePopoverOpen(POPOVER_ID);
+			return next;
+		});
+	}
+
 	// Load the active-links list once, the first time the panel opens.
 	useEffect(() => {
 		if (!open || links !== null) return;
 		let cancelled = false;
 		(async () => {
 			try {
-				const res = await fetch(
+				const res = await apiFetchRaw(
 					`/api/traces/${encodeURIComponent(traceId)}/shares`,
 				);
 				if (!res.ok) {
@@ -204,7 +226,7 @@ export function ShareDialog({ traceId }: { traceId: string }) {
 		setMinting(true);
 		setMintError(null);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/traces/${encodeURIComponent(traceId)}/shares`,
 				{
 					method: "POST",
@@ -230,7 +252,7 @@ export function ShareDialog({ traceId }: { traceId: string }) {
 		setRevokingId(id);
 		setMintError(null);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/traces/${encodeURIComponent(traceId)}/shares/${encodeURIComponent(id)}`,
 				{ method: "DELETE" },
 			);
@@ -248,17 +270,25 @@ export function ShareDialog({ traceId }: { traceId: string }) {
 
 	return (
 		<div className="relative inline-block">
-			<Button
-				type="button"
-				variant="secondary"
-				size="sm"
-				onClick={() => setOpen((v) => !v)}
-			>
-				Share
-			</Button>
+			{!embedded && (
+				<Button
+					type="button"
+					variant="secondary"
+					size="sm"
+					onClick={toggleOpen}
+				>
+					Share
+				</Button>
+			)}
 
 			{open && (
-				<div className="absolute right-0 z-10 mt-1.5 w-80 space-y-3 rounded-lg border border-line bg-surface p-3 shadow-[var(--shadow-card)]">
+				<div
+					className={
+						embedded
+							? "space-y-3"
+							: "absolute right-0 z-10 mt-1.5 w-80 space-y-3 rounded-card border border-line bg-surface p-3 shadow-[var(--shadow-card)]"
+					}
+				>
 					<SegmentedControl
 						label="Link expiry"
 						value={expiry}

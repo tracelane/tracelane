@@ -103,6 +103,47 @@ describe("canAdmin (PL-9 — the UI gate must mirror the FIXED gateway gate)", (
 	});
 });
 
+describe("an EXPIRED session (founder bug 2026-09-27: expiry landed on /onboarding)", () => {
+	// AuthKit 4.x resolves a signed-out/expired session as `NoUserInfo` —
+	// `{ user: null }`, organizationId undefined — it does NOT throw. A gate that
+	// tests `!auth` sees a truthy object, then `!organizationId`, and sends a
+	// signed-out visitor to the org-creation wizard.
+	const expired = { user: null };
+
+	it("requireGatewayToken sends it to /sign-in, never /onboarding", async () => {
+		vi.stubEnv("NODE_ENV", "test");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "");
+		h.withAuth.mockResolvedValue(expired);
+		const { requireGatewayToken } = await import("./auth");
+		await expect(requireGatewayToken()).rejects.toThrow(
+			"NEXT_REDIRECT:/sign-in",
+		);
+		expect(h.redirect).not.toHaveBeenCalledWith("/onboarding");
+	});
+
+	it("requireSession sends it to /sign-in, never /onboarding", async () => {
+		vi.stubEnv("NODE_ENV", "test");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "");
+		h.withAuth.mockResolvedValue(expired);
+		const { requireSession } = await import("./auth");
+		await expect(requireSession()).rejects.toThrow("NEXT_REDIRECT:/sign-in");
+	});
+
+	it("a SIGNED-IN user with no organization still goes to /onboarding", async () => {
+		vi.stubEnv("NODE_ENV", "test");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "");
+		h.withAuth.mockResolvedValue({
+			user: { id: "user_new", email: "new@example.com" },
+			organizationId: undefined,
+			accessToken: "jwt",
+		});
+		const { requireGatewayToken } = await import("./auth");
+		await expect(requireGatewayToken()).rejects.toThrow(
+			"NEXT_REDIRECT:/onboarding",
+		);
+	});
+});
+
 describe("requireGatewayToken", () => {
 	it("BYPASS: returns the fake token + disposable tenant WITHOUT calling WorkOS", async () => {
 		vi.stubEnv("NODE_ENV", "test");
@@ -123,6 +164,8 @@ describe("requireGatewayToken", () => {
 		vi.stubEnv("NODE_ENV", "test");
 		vi.stubEnv("TRACELANE_E2E_AUTH", "");
 		h.withAuth.mockResolvedValue({
+			// A real signed-in session always carries `user` (AuthKit's UserInfo).
+			user: { id: "user_real", email: "real@example.com" },
 			organizationId: "org_real",
 			accessToken: "real.jwt.token",
 		});
@@ -160,6 +203,8 @@ describe("requireGatewayToken", () => {
 		vi.stubEnv("NODE_ENV", "test");
 		vi.stubEnv("TRACELANE_E2E_AUTH", "");
 		h.withAuth.mockResolvedValue({
+			// A real signed-in session always carries `user` (AuthKit's UserInfo).
+			user: { id: "user_real", email: "real@example.com" },
 			organizationId: "org_real",
 			accessToken: "real.jwt.token",
 		});

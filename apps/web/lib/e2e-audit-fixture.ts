@@ -45,6 +45,50 @@ export async function e2eAuditFixture(
 	const { ANCHORED_NDJSON, TRUSTED_PUBKEY_B64 } = await import(
 		"@/e2e/fixtures/audit-fixture-data"
 	);
+	if (variant === "newest-billion" || variant === "tampered-later") {
+		const { genesisV2, rowHashV2 } = await import(
+			"@tracelanedev/audit-verifier"
+		);
+		const tenant = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const uuid = Uint8Array.from(
+			Buffer.from(tenant.replaceAll("-", ""), "hex"),
+		);
+		const start = variant === "newest-billion" ? 999_999_000 : 0;
+		// No synthetic public witness: a recent window without an included anchor must be unrooted.
+		let prev = start === 0 ? genesisV2(uuid) : new Uint8Array(32).fill(7);
+		const lines: string[] = [];
+		for (let i = 0; i < 1000; i++) {
+			const seq = start + i;
+			const payload = JSON.stringify({ request: seq });
+			const hash = rowHashV2(
+				prev,
+				uuid,
+				seq,
+				"chat.completions.request",
+				"fixture",
+				payload,
+			);
+			lines.push(
+				JSON.stringify({
+					format: "v2.1",
+					tenant_id: tenant,
+					seq,
+					event_time: "2026-09-24T00:00:00Z",
+					event_type: "chat.completions.request",
+					actor: "fixture",
+					payload:
+						variant === "tampered-later" && i === 75
+							? `${payload}_TAMPERED`
+							: payload,
+					prev_hash: Buffer.from(prev).toString("hex"),
+					row_hash: Buffer.from(hash).toString("hex"),
+					rekor_entry_id: null,
+				}),
+			);
+			prev = hash;
+		}
+		return { ndjson: lines.join("\n"), tenantPubkeyB64: "" };
+	}
 	const ndjson =
 		variant === "tampered" ? tamper(ANCHORED_NDJSON) : ANCHORED_NDJSON;
 	return { ndjson, tenantPubkeyB64: TRUSTED_PUBKEY_B64 };

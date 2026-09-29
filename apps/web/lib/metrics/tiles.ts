@@ -17,6 +17,8 @@
 
 import { type SloBudget, computeSloBudget } from "@/app/slo/budget";
 import type { SloSummary } from "@/app/slo/types";
+import type { TraceGroup } from "@/components/trace-viewer/TraceGroupTable";
+import { LIVE_SIGNATURE_IDS, aftFor } from "@/lib/aft-taxonomy";
 
 // `./fetch` reaches `@/lib/gateway` → `@/lib/auth` (the WorkOS runtime). It is loaded on FIRST
 // USE, not at module top, so the pure exports of this file (`sloHeadline`) stay importable from
@@ -30,6 +32,7 @@ const F = (): Promise<Fetchers> => {
 };
 import {
 	type FormattedPercent,
+	type MetricKind,
 	fmtBudget,
 	fmtCompact,
 	fmtCount,
@@ -39,8 +42,14 @@ import {
 	fmtUsd,
 } from "./format";
 import { METRICS, type MetricId } from "./registry";
-import { sloLatencySeries, sloTrafficSeries } from "./series";
 import {
+	pickSeries,
+	sloErrorRateSeries,
+	sloLatencySeries,
+	sloTrafficSeries,
+} from "./series";
+import {
+	BREAKDOWN_FETCH_LIMIT,
 	DEFAULT_SLO_TARGET,
 	type Limiter,
 	shapeSupported,
@@ -67,6 +76,15 @@ export interface SloHeadline {
 	llmCalls: string;
 	errorRate: FormattedPercent;
 	availability: FormattedPercent;
+	/**
+	 * B-511: the burn-rate gauge and the budget-remaining reading, both dashed at
+	 * `n === 0` — the same small-sample rule `availability` already applies via
+	 * `fmtPercent`'s `noSample` branch. Before this, a reachable summary with zero
+	 * requests printed a healthy-looking '0.00×' burn and '100%' remaining right
+	 * beside an honest '—' for Availability, in the same card.
+	 */
+	burn: string;
+	budgetRemaining: string;
 	/** `n` the rates were measured over (the LLM-request count). */
 	n: number | null;
 }
@@ -88,6 +106,8 @@ export function sloHeadline(input: SloHeadlineInput): SloHeadline {
 			n,
 			target: input.target,
 		}),
+		burn: n === 0 ? "—" : fmtRatio(budget.burnRate),
+		budgetRemaining: n === 0 ? "—" : fmtBudget(budget.budgetRemainingPct),
 	};
 }
 
@@ -116,7 +136,18 @@ export interface TileDef {
 export type TileData =
 	| { kind: "stat"; value: string; n: number | null }
 	| { kind: "series"; data: import("./series").ChartData; label: string }
-	| { kind: "breakdown"; rows: BreakdownRow[]; label: string }
+	| {
+			kind: "breakdown";
+			rows: BreakdownRow[];
+			label: string;
+			/**
+			 * The registry kind of every `value` in `rows` — the page formats with
+			 * `fmtByKind(metricKind, value)`, never a generic number formatter (B-506:
+			 * one `toLocaleString(maximumFractionDigits: 2)` printed a $0.0012 model
+			 * spend as `0` and dropped `%` / `ms` from every rate and latency row).
+			 */
+			metricKind: MetricKind;
+	  }
 	| { kind: "unreachable"; label: string }
 	| { kind: "unknown_metric"; metricId: string }
 	| { kind: "entitlement_blocked"; label: string }
@@ -126,6 +157,9 @@ export type BreakdownRow = {
 	key: string;
 	value: number;
 	n?: number;
+	/** Cost rows only: requests in this bucket the gateway could NOT price — never
+	 *  folded into `value` as zero (the built-in `/gateway` table shows the same column). */
+	unpriced?: number;
 };
 
 type Win = Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs">;
@@ -214,7 +248,7 @@ async function fetchTileDataInner(
 				reason: `${label} has no breakdown by ${dimension}`,
 			};
 		}
-		return { kind: "breakdown", rows, label };
+		return { kind: "breakdown", rows, label, metricKind: def.kind };
 	}
 
 	return { kind: "unsupported_shape", reason: `unknown shape: ${shape}` };
@@ -283,16 +317,14 @@ async function fetchStatValue(
 		case "burn_rate": {
 			const head = await sloHeadFor(r, opts);
 			if (head === null) return null;
-			// `fmtRatio` is what /dashboard's error-budget card renders (`const fmtBurn = fmtRatio`).
-			return { formatted: fmtRatio(head.budget.burnRate), n: head.n };
+			// `head.burn` is the same string /dashboard's error-budget card renders
+			// (B-511: dashed at n === 0, never a healthy-looking '0.00×').
+			return { formatted: head.burn, n: head.n };
 		}
 		case "budget_remaining": {
 			const head = await sloHeadFor(r, opts);
 			if (head === null) return null;
-			return {
-				formatted: fmtBudget(head.budget.budgetRemainingPct),
-				n: head.n,
-			};
+			return { formatted: head.budgetRemaining, n: head.n };
 		}
 		case "tokens": {
 			const models = await (await F()).fetchSloModels(r);
@@ -414,15 +446,19 @@ async function fetchStatValue(
 			return { formatted: fmtDurationMs(gs.p95_ms), n: gs.total_evaluations };
 		}
 		case "signatures_matched": {
-			const sig = await (await F()).fetchSignaturesFor(r);
+			// B-508 / CX-09: scoped to the LIVE detector set, exactly like
+			// app/signatures/page.tsx does — an unscoped read counts roadmap
+			// entries (never detected) toward a tile whose own hint promises
+			// "live" detection.
+			const sig = await (await F()).fetchSignaturesFor(r, LIVE_SIGNATURE_IDS);
 			if (sig === null) return null;
-			return {
-				formatted: fmtCount(sig.signatures.length),
-				n: sig.signatures.length,
-			};
+			const matched = sig.signatures.filter(
+				(s) => aftFor(s.signature_id)?.detectorStatus !== "roadmap",
+			).length;
+			return { formatted: fmtCount(matched), n: matched };
 		}
 		case "traces_affected": {
-			const sig = await (await F()).fetchSignaturesFor(r);
+			const sig = await (await F()).fetchSignaturesFor(r, LIVE_SIGNATURE_IDS);
 			if (sig === null) return null;
 			return {
 				formatted:
@@ -492,7 +528,13 @@ async function fetchStatValue(
 				n: null,
 			};
 		default: {
-			const _exhaustive: never = id;
+			// Entity metrics require a specific experiment/arm pair or identity. The tile
+			// support matrix refuses these before fetching; retain exhaustiveness
+			// for every metric that can be shown without that entity context.
+			const _entity: Extract<
+				(typeof METRICS)[MetricId],
+				{ window: "entity" } | { family: "kya" }
+			>["id"] = id;
 			return null;
 		}
 	}
@@ -505,14 +547,35 @@ async function fetchSeriesData(
 	r: Win,
 ): Promise<import("./series").ChartData | null> {
 	switch (id) {
+		// `sloTrafficSeries` always computes requests+errors+tokens together
+		// (one pass over the rows), but each of these is a SINGLE-metric tile
+		// (registry: "Requests per bucket" / "LLM calls" / "Tokens" / "Errors
+		// per bucket") and must plot only its own series — `pickSeries` narrows
+		// to it. Before this fix all three ids returned all three series, so a
+		// "requests" tile plotted tokens (routinely 100-1000x larger) on the
+		// same linear axis and requests read as a flat zero (item 7).
 		case "traffic_series":
-		case "llm_calls":
-		case "error_rate":
-		case "tokens":
+		case "llm_calls": {
+			const rows = await (await F()).fetchSloRows(r);
+			if (rows === null) return null;
+			return pickSeries(sloTrafficSeries(r, rows), ["requests"]);
+		}
 		case "errors_series": {
 			const rows = await (await F()).fetchSloRows(r);
 			if (rows === null) return null;
-			return sloTrafficSeries(r, rows);
+			return pickSeries(sloTrafficSeries(r, rows), ["errors"]);
+		}
+		case "tokens": {
+			const rows = await (await F()).fetchSloRows(r);
+			if (rows === null) return null;
+			return pickSeries(sloTrafficSeries(r, rows), ["tokens"]);
+		}
+		case "error_rate": {
+			// B-504 / CX-05: a real ratio series, not three count series under a
+			// percent label — see `sloErrorRateSeries`.
+			const rows = await (await F()).fetchSloRows(r);
+			if (rows === null) return null;
+			return sloErrorRateSeries(r, rows);
 		}
 		case "latency_series":
 		case "latency_p50":
@@ -577,46 +640,56 @@ async function fetchBreakdownData(
 		if (by) {
 			const cost = await (await F()).fetchCostBreakdownFor(r, by);
 			if (cost === null) return null;
-			return (cost.rows ?? []).map((row) => ({
+			// `/v1/costs` takes no `limit` and returns up to the gateway's provider cap,
+			// sorted `cost_usd DESC` — the cut keeps the tile's "(of the top 20)" exact.
+			return (cost.rows ?? []).slice(0, BREAKDOWN_FETCH_LIMIT).map((row) => ({
 				key: row.dimension || "(unattributed)",
 				value: row.cost_usd ?? 0,
 				n: row.requests,
+				unpriced: row.unpriced_requests,
 			}));
 		}
 	}
 
 	if (id === "verdicts" || id === "block_rate" || id === "decision_mix") {
-		// Guardrail verdicts can be broken down by decision or rail.
-		const verdicts = await (await F()).fetchGuardrailVerdictsFor(r, {
-			limit: 200,
-		});
-		if (verdicts === null) return null;
-		// Aggregate by decision or by first rail parsed from the JSON string.
-		const agg = new Map<string, number>();
-		for (const v of verdicts) {
-			let key = "unknown";
-			if (dimension === "decision") {
-				key = v.decision || "unknown";
-			} else if (dimension === "rail") {
-				try {
-					const parsed = JSON.parse(v.rails) as Array<{ rail?: string }>;
-					key = parsed[0]?.rail ?? "unknown";
-				} catch {
-					key = "unknown";
-				}
-			}
-			agg.set(key, (agg.get(key) ?? 0) + 1);
+		// B-501 / B-507: the SAME route the built-in `/guardrails` page renders and the
+		// registry's `source` names — exact window counts, one entry per rail EVALUATED.
+		// This used to aggregate the newest ≤200 rows of `/v1/guardrails/verdicts` and
+		// credit each verdict to its first rail only: counts under a rate label, capped
+		// to a list page, and blind to every rail after `rails[0]`.
+		const gs = await (await F()).fetchGuardrailStatsFor(r);
+		if (gs === null) return null;
+		if (dimension === "decision") {
+			// The four counts, in the order the built-in decision-mix card lists them.
+			return [
+				{ key: "allow", value: gs.allows, n: gs.allows },
+				{ key: "block", value: gs.blocks, n: gs.blocks },
+				{ key: "redact", value: gs.redacts, n: gs.redacts },
+				{ key: "warn", value: gs.warns, n: gs.warns },
+			];
 		}
-		return [...agg.entries()]
-			.sort((a, b) => b[1] - a[1])
-			.map(([key, value]) => ({ key, value, n: value }));
+		if (dimension === "rail") {
+			// `rails` arrives `ORDER BY evaluations DESC` under the gateway's rail cap.
+			return (gs.rails ?? []).slice(0, BREAKDOWN_FETCH_LIMIT).map((rail) => ({
+				key: rail.rail,
+				value: id === "block_rate" ? rail.block_rate_pct : rail.evaluations,
+				n: rail.evaluations,
+			}));
+		}
+		return "unsupported";
 	}
 
-	if (id === "traces_total" || id === "requests_routed" || id === "llm_calls") {
-		// Groups via /v1/traces/groups?by=
+	if (id === "traces_total") {
+		// Groups via /v1/traces/groups?by= — `TraceGroupBy` (trace_reads.rs) has
+		// ONLY model/operation/status, no `provider` variant, so this branch is
+		// `traces_total` ONLY (B-502 / CX-03). `llm_calls`/`requests_routed` fall
+		// through to the generic `/v1/metrics/breakdown` route below, which DOES
+		// serve provider/api_key — routing them here either 400'd (provider) or
+		// silently produced nothing (the response is a BARE ARRAY of `TraceGroup`,
+		// not a `{ groups }` wrapper, and the fields are `group_key`/`trace_count`,
+		// not `key`/`count`).
 		const dimMap: Record<string, string> = {
 			model: "model",
-			provider: "provider",
 			status: "status",
 			operation: "operation",
 		};
@@ -624,15 +697,15 @@ async function fetchBreakdownData(
 		if (by) {
 			const q = wp(r);
 			q.set("by", by);
-			q.set("limit", "20");
+			q.set("limit", String(BREAKDOWN_FETCH_LIMIT));
 			try {
-				const data = await gatewayGet<{
-					groups: { key: string; count: number }[];
-				}>(`/v1/traces/groups?${q.toString()}`);
-				return (data.groups ?? []).map((g) => ({
-					key: g.key ?? "(unknown)",
-					value: g.count,
-					n: g.count,
+				const data = await gatewayGet<TraceGroup[]>(
+					`/v1/traces/groups?${q.toString()}`,
+				);
+				return (data ?? []).map((g) => ({
+					key: g.group_key || "(unknown)",
+					value: g.trace_count,
+					n: g.trace_count,
 				}));
 			} catch (err) {
 				if (err instanceof GatewayError) return null;
@@ -650,7 +723,7 @@ async function fetchBreakdownData(
 	const q = wp(r);
 	q.set("metric", gatewayMetric);
 	q.set("by", gatewayBy);
-	q.set("limit", "20");
+	q.set("limit", String(BREAKDOWN_FETCH_LIMIT));
 	try {
 		const data = await gatewayGet<{
 			metric: string;

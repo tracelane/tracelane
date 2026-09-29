@@ -1,10 +1,9 @@
 ---
 import Logo from "./Logo.astro";
-import Icon from "./Icon.astro";
 
 const links = [
-  { href: "/#what", label: "Product" },
-  { href: "/#audit", label: "Audit ledger" },
+  { href: "/product", label: "Product" },
+  { href: "/product#audit", label: "Audit ledger" },
   { href: "/pricing", label: "Pricing" },
   { href: "/security", label: "Security" },
   { href: "https://docs.tracelane.dev", label: "Docs", external: true },
@@ -29,18 +28,19 @@ const links = [
        `minmax(0,1fr)` lets a track shrink past its content; the actions group is
        `justify-self-end`, so it overflows LEFT into the empty centre track,
        which is where the hidden nav's space already is. -->
-  <div class="site-bar grid h-[4rem] items-center" style="grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)">
+  <div class="site-bar grid items-center" >
     <a href="/" class="col-start-1 flex items-center text-fg justify-self-start" aria-label="tracelane home">
       <Logo size={26} />
     </a>
 
-    <nav aria-label="Primary" class="col-start-2 hidden md:block justify-self-center">
+    <nav aria-label="Primary" class="col-start-2 hidden lg:block justify-self-center">
       <ul class="flex items-center gap-1">
         {links.map((l) => (
           <li>
             <a
               href={l.href}
               class="nav-link"
+              aria-current={Astro.url.pathname === l.href ? "page" : undefined}
               rel={l.external ? "noopener" : undefined}
             >{l.label}{l.external && <span class="ext" aria-hidden="true">↗</span>}</a>
           </li>
@@ -48,18 +48,37 @@ const links = [
       </ul>
     </nav>
 
-    <div class="col-start-3 flex items-center gap-2 justify-self-end">
-      <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false" aria-label="Switch to dark theme">
-        <Icon name="sun" size={17} dot={false} class="theme-toggle-icon theme-toggle-icon--sun" />
-        <Icon name="moon" size={17} dot={false} class="theme-toggle-icon theme-toggle-icon--moon" />
-      </button>
-      <a href="https://github.com/tracelane" class="nav-link hidden sm:inline-flex" rel="me noopener">GitHub</a>
+    <div class="site-actions col-start-3 flex items-center gap-2 justify-self-end">
+      <details class="site-mobile-nav">
+        <summary aria-label="Open navigation">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+        </summary>
+        <nav aria-label="Mobile primary">
+          {links.map((l) => <a href={l.href} class="nav-link" aria-current={Astro.url.pathname === l.href ? "page" : undefined} rel={l.external ? "noopener" : undefined}>{l.label}</a>)}
+        </nav>
+      </details>
+      <a href="https://github.com/tracelane" class="site-github nav-link hidden sm:inline-flex" rel="me noopener">GitHub</a>
       <a href="https://app.tracelane.dev/sign-in" class="btn-primary btn-sm">Start free</a>
     </div>
   </div>
 </header>
 
 <script is:inline>
+  // The disclosure remains usable without JavaScript. Close after selection or Escape.
+  (function () {
+    var menu = document.querySelector(".site-mobile-nav");
+    if (!menu) return;
+    menu.querySelectorAll("a").forEach(function (link) {
+      link.addEventListener("click", function () { menu.removeAttribute("open"); });
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && menu.hasAttribute("open")) {
+        menu.removeAttribute("open");
+        menu.querySelector("summary").focus();
+      }
+    });
+  })();
+
   // header gains a hairline rule once the page is scrolled
   (function () {
     var header = document.querySelector(".site-header");
@@ -72,22 +91,4 @@ const links = [
     window.addEventListener("scroll", onScroll, { passive: true });
   })();
 
-  // theme toggle — persists the explicit choice; unset falls back to OS pref
-  (function () {
-    var KEY = "tracelane-theme";
-    var btn = document.getElementById("theme-toggle");
-    if (!btn) return;
-    function sync() {
-      var dark = document.documentElement.dataset.theme === "dark";
-      btn.setAttribute("aria-pressed", String(dark));
-      btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
-    }
-    sync();
-    btn.addEventListener("click", function () {
-      var next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-      document.documentElement.dataset.theme = next;
-      try { localStorage.setItem(KEY, next); } catch (e) {}
-      sync();
-    });
-  })();
 </script>

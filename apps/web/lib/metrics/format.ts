@@ -10,7 +10,7 @@
  * with decimals.
  */
 
-import { fmtDurMs } from "@tracelanedev/ui";
+import { fmtCount, fmtDur, fmtDurMs } from "@tracelanedev/ui";
 
 export type MetricKind =
 	| "count"
@@ -20,11 +20,7 @@ export type MetricKind =
 	| "currency"
 	| "ratio";
 
-/** `1,284` — grouped integer. Non-finite → `—`. */
-export function fmtCount(n: number | null | undefined): string {
-	if (n == null || !Number.isFinite(n)) return "—";
-	return Math.round(n).toLocaleString("en-US");
-}
+export { fmtCount } from "@tracelanedev/ui";
 
 /** `1.2K` · `3.4M` — for tokens and other volumes where the magnitude is the point. */
 export function fmtCompact(n: number | null | undefined): string {
@@ -47,6 +43,57 @@ export function fmtDurationMs(ms: number | null | undefined): string {
 }
 
 /**
+ * A SESSION-scale duration (minutes to many hours) — `fmtDur`/`fmtDurationMs`
+ * are for a single span/trace and deliberately stay in µs/ms/s even past an
+ * hour, which is correct for a request but reads as nonsense ("82837.91s")
+ * for a multi-turn session's total span (item 9). Takes MICROSECONDS.
+ *
+ *   < 60s   → "12.3s"
+ *   < 60m   → "25m 00s"
+ *   ≥ 60m   → "23h 00m" (minutes/hours are FLOORED, not rounded, so this
+ *             never reports a round-trip past the unit it just named)
+ *
+ * `null`/non-finite/non-positive is `—`, the same "0 is not a measurement"
+ * rule `fmtDurationMs` states above.
+ */
+export function fmtSessionDuration(us: number | null | undefined): string {
+	if (us == null || !Number.isFinite(us) || us <= 0) return "—";
+	const totalSeconds = us / 1_000_000;
+	if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+	const totalMinutes = Math.floor(totalSeconds / 60);
+	if (totalMinutes < 60) {
+		const s = Math.min(59, Math.round(totalSeconds - totalMinutes * 60));
+		return `${totalMinutes}m ${String(s).padStart(2, "0")}s`;
+	}
+	const h = Math.floor(totalMinutes / 60);
+	const m = totalMinutes % 60;
+	return `${h}h ${String(m).padStart(2, "0")}m`;
+}
+
+/**
+ * Signed delta between two trace durations, in MICROSECONDS (`B − A`, per the
+ * gateway's `/v1/traces/compare` alignment). `—` when there is nothing to
+ * compare (a one-sided row).
+ *
+ * The sign is derived from `us` ONCE and applied to both halves — never
+ * re-derived from `pct`. Before this (CX-15 / B-514), the duration half used
+ * `Math.abs(us)` with a sign that was only ever `"+"` or `""`, while the
+ * percentage half kept its own sign via `toFixed`'s default behaviour on a
+ * negative number: a faster B rendered `90.0ms (-90%)` — an unsigned duration
+ * beside a signed percentage that contradicted it.
+ */
+export function fmtSignedDeltaUs(
+	us: number | null,
+	pct: number | null,
+): string {
+	if (us === null) return "—";
+	const sign = us > 0 ? "+" : us < 0 ? "-" : "";
+	const duration = `${sign}${fmtDur(Math.abs(us))}`;
+	if (pct === null) return duration;
+	return `${duration} (${sign}${Math.abs(pct).toFixed(0)}%)`;
+}
+
+/**
  * USD. `null`/`undefined` (unpriced, unreachable) → `—`; a measured 0 → `$0.00`;
  * ≥ $1 → 2 dp; below → 4 dp so a fraction of a cent is visible.
  */
@@ -62,6 +109,22 @@ export function fmtUsd(usd: number | null | undefined): string {
 export function fmtRatio(x: number | null | undefined): string {
 	if (x == null || Number.isNaN(x)) return "—";
 	return Number.isFinite(x) ? `${x.toFixed(2)}×` : "∞×";
+}
+
+/**
+ * An availability target (SLA), as the fewest decimals that carry the
+ * contracted figure: `99.95%` stays `99.95%`, `99.9%` stays `99.9%`, `99%`
+ * drops its trailing zeros. A flat `.toFixed(1)` rounds the 99.95% Enterprise
+ * tier into `100.0%` — the one tier where that reads as a target no plan
+ * actually sells, while the error budget it is computed against stays
+ * non-zero underneath (CX-11 / B-510).
+ *
+ * Takes the raw fraction (`SloBudget.target`, 0–1), not the already-`*100`
+ * `targetPct` — `target * 100` inside `toFixed(3)` is the one multiplication,
+ * so there is no `/100` round trip to reintroduce float noise.
+ */
+export function fmtTarget(target: number): string {
+	return `${Number((target * 100).toFixed(3))}%`;
 }
 
 /**
@@ -178,4 +241,11 @@ export function fmtBudget(pct: number): string {
 	if (!Number.isFinite(pct)) return "over budget";
 	if (pct < 0) return `${Math.abs(pct).toFixed(0)}% over`;
 	return `${pct.toFixed(0)}%`;
+}
+
+/** Binary byte counts displayed in KiB/MiB; unavailable is never a measured zero. */
+export function fmtBytes(n: number | null | undefined): string {
+	if (n == null || !Number.isFinite(n) || n < 0) return "—";
+	const mb = n >= 1024 * 1024;
+	return `${Number((n / (mb ? 1024 * 1024 : 1024)).toFixed(1))} ${mb ? "MiB" : "KiB"}`;
 }

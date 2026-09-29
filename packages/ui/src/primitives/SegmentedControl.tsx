@@ -188,7 +188,7 @@ export function SegmentedControl<V extends string = string>({
 			{options.map((o) => {
 				const active = o.value === value;
 				const cls = cn(
-					"rounded-md font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring",
+					"rounded-control font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring",
 					SIZE[size],
 					active
 						? // The lifted segment. `border-line` + `--shadow-card` is the same

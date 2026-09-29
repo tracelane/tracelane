@@ -70,6 +70,12 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
 const GONE_TO: Record<string, string> = {
 	"/docs": "https://docs.tracelane.dev/",
 	"/vs/langsmith-engine": "/",
+	// SITE-04 (2026-09-29): the four /product/<section> pages (2026-09-27) were folded into
+	// one /product page; each old URL lands on its own section.
+	"/product/gateway": "/product#gateway",
+	"/product/observability": "/product#observability",
+	"/product/audit": "/product#audit",
+	"/product/evals": "/product#evals",
 };
 
 const APEX = "tracelane.dev";
@@ -88,6 +94,52 @@ export function resolveRedirect(host: string, url: URL): string | null {
 	return target.startsWith("http")
 		? target
 		: new URL(target, url.origin).toString();
+}
+
+/**
+ * B-588: answer a byte-range request for a static asset. The static-asset handler
+ * returns 200 + the whole file to a `Range` request, and Safari / iOS refuse to play
+ * an mp4 served that way. RFC 9110 §14: one range per request (a video element never
+ * asks for more), `bytes=a-b` / `bytes=a-` / `bytes=-n`, an end past the file is
+ * clamped, a start past it is 416. Anything unparsable is served whole, as the spec
+ * allows. A non-200 asset passes through untouched.
+ */
+export async function serveRange(
+	request: Request,
+	asset: Response,
+): Promise<Response> {
+	if (asset.status !== 200) return asset;
+	const bytes = new Uint8Array(await asset.arrayBuffer());
+	const size = bytes.length;
+	const headers = new Headers(asset.headers);
+	headers.set("accept-ranges", "bytes");
+	const noBody = request.method === "HEAD";
+	const m = /^bytes=(\d*)-(\d*)$/.exec(request.headers.get("range")?.trim() ?? "");
+	if (!m || (m[1] === "" && m[2] === "")) {
+		headers.set("content-length", String(size));
+		return new Response(noBody ? null : bytes, { status: 200, headers });
+	}
+	let start: number;
+	let end: number;
+	if (m[1] === "") {
+		start = Math.max(0, size - Number(m[2]));
+		end = size - 1;
+	} else {
+		start = Number(m[1]);
+		end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
+	}
+	if (start >= size || start > end) {
+		return new Response(null, {
+			status: 416,
+			headers: { "content-range": `bytes */${size}`, "accept-ranges": "bytes" },
+		});
+	}
+	headers.set("content-range", `bytes ${start}-${end}/${size}`);
+	headers.set("content-length", String(end - start + 1));
+	return new Response(noBody ? null : bytes.slice(start, end + 1), {
+		status: 206,
+		headers,
+	});
 }
 
 export default {
@@ -121,6 +173,13 @@ export default {
 		// (CF 1101) rather than a 404.
 		if (!env.ASSETS) {
 			return new Response("Not found", { status: 404 });
+		}
+		// B-588: video needs byte ranges; `run_worker_first` routes *.mp4 here.
+		if (url.pathname.endsWith(".mp4")) {
+			const asset = await env.ASSETS.fetch(
+				new Request(url.toString(), { method: "GET" }),
+			);
+			return serveRange(request, asset);
 		}
 		return env.ASSETS.fetch(request);
 	},

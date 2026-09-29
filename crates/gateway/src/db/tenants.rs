@@ -231,6 +231,22 @@ pub async fn get_by_polar_customer(pool: &Pool, polar_customer_id: &str) -> Resu
 /// Fail-closed: a pool/query error surfaces as `Err` so the auth path rejects
 /// the request rather than resolving the wrong tenant. (Security path — never
 /// fail-open here, unlike the entitlement cache.)
+/// Does Neon still know this tenant at all — archived or not? A purged tenant has NO
+/// row (the purge tool deletes it; RI-02 treats that absence as the durable purge
+/// record), so `false` here means "purged", never "archived".
+///
+/// # Errors
+/// Fail-CLOSED for the caller's purposes: a Postgres error propagates rather than
+/// answering `false`, because `false` licenses treating a ledger head as frozen.
+pub async fn exists(pool: &Pool, tenant_id: Uuid) -> Result<bool> {
+    let client = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+    let row = client
+        .query_opt("SELECT 1 FROM tenants WHERE id = $1", &[&tenant_id])
+        .await
+        .context("SELECT tenants.exists failed")?;
+    Ok(row.is_some())
+}
+
 pub async fn get_tenant_id_by_workos_org(pool: &Pool, workos_org_id: &str) -> Result<Option<Uuid>> {
     let client = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
     let row = client

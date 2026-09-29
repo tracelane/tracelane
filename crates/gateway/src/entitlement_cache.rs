@@ -252,6 +252,8 @@ pub struct ResolvedEntitlements {
     /// `FeatureKey`) because the resolver reads it directly for the pricing
     /// page + `/v1/billing/usage`'s `plan` block.
     pub f_sso: bool,
+    pub f_cache_control: bool,
+    pub cache_ttl_hours: u32,
     // ── BILL-01 / ADR-076 — the six-meter model's per-plan allowances ───────
     //
     // `None` on any `*_included` field means CUSTOM (Enterprise only — the
@@ -330,6 +332,24 @@ pub struct ResolvedEntitlements {
     /// the plan window. **Never read this directly at a window-scoped call
     /// site — call [`Self::effective_window_days`].**
     pub auto_age_window_days: Option<i32>,
+    /// GWY-27: this workspace's model aliases, alias → ONE concrete target model.
+    /// Loaded by a second query on the same connection inside the refresh
+    /// ([`pg_resolver`]) — never per request. Empty when the workspace has none, when
+    /// there is no control plane, and when that read FAILED (fail-closed routing:
+    /// an alias then answers `400 unroutable_model`, never a default target).
+    pub model_aliases: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+    /// GWY-52: the workspace turned cross-provider failover ON for its requests (a
+    /// per-request `X-Tracelane-Failover: off` still wins). `false` = the operator
+    /// default (opt-in per request), which is also the answer when the read failed.
+    pub failover_enabled: bool,
+    /// GWY-52: the workspace's own ordered fallback models; empty = the operator chain.
+    pub failover_models: std::sync::Arc<Vec<String>>,
+    /// GWY-53: the owner's opt-in to record prompt/response text
+    /// (`workspace_content_capture`). Loaded in the same refresh as the GWY-27/52
+    /// settings, never per request. Both OFF when unset, on `deny_all`/bench, and when
+    /// the read FAILED — fail-closed, the privacy-safe direction. Applied only through
+    /// `config::capture_decision`.
+    pub content_capture: crate::db::workspace_capture::WorkspaceCapture,
 }
 
 impl ResolvedEntitlements {
@@ -375,6 +395,8 @@ impl ResolvedEntitlements {
             f_online_evals: false,
             f_annotation_queues: false,
             f_sso: false,
+            f_cache_control: false,
+            cache_ttl_hours: 0,
             // Deny-all = zero allowances on every meter, a conservative 30-day
             // window (ADR-076: "deny = zero allowances, 30-day window"). NOT
             // `None` (which would mean "custom/unlimited") — this is the
@@ -408,6 +430,10 @@ impl ResolvedEntitlements {
             // state, which does not apply when there is no control plane.
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
+            model_aliases: std::sync::Arc::default(),
+            failover_enabled: false,
+            failover_models: std::sync::Arc::default(),
+            content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
         }
     }
 
@@ -489,6 +515,8 @@ impl ResolvedEntitlements {
             f_online_evals: false,
             f_annotation_queues: false,
             f_sso: false,
+            f_cache_control: false,
+            cache_ttl_hours: 0,
             // BILL-01: bench = None/unlimited on every meter — the point of the
             // grant is that no allowance and no rate-limit tier can reject the
             // run (`rate_limit_rpm: None` on this grant is what confers it —
@@ -520,6 +548,10 @@ impl ResolvedEntitlements {
             // for a no-control-plane grant, so no auto-age shrink either.
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
+            model_aliases: std::sync::Arc::default(),
+            failover_enabled: false,
+            failover_models: std::sync::Arc::default(),
+            content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
         }
     }
 
@@ -626,11 +658,19 @@ impl EntitlementCache {
 
     /// Resolve the full entitlement set for `tenant` (warm-cache on hit).
     pub async fn resolved(&self, tenant: Uuid) -> Arc<ResolvedEntitlements> {
+        self.resolved_traced(tenant).await.0
+    }
+
+    /// [`Self::resolved`], also reporting whether THIS request waited on a
+    /// blocking resolve (B-568 I5 — one of the four control-plane round trips that
+    /// make a request cold). `false` for a warm hit and for a stale-served answer,
+    /// whose refresh runs off the request path.
+    pub async fn resolved_traced(&self, tenant: Uuid) -> (Arc<ResolvedEntitlements>, bool) {
         if let Some(cached) = self.cache.get(&tenant).await {
             if cached.fetched_at.elapsed() >= REFRESH_AHEAD {
                 self.spawn_refresh(tenant);
             }
-            return Arc::new(cached.resolved.clone());
+            return (Arc::new(cached.resolved.clone()), false);
         }
         // STALE-WHILE-REVALIDATE (2026-09-04, the p95 investigation). After the
         // 15-minute TTL the entry is gone from `cache`, but `last_known` still
@@ -647,9 +687,14 @@ impl EntitlementCache {
         {
             STALE_SERVED_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.spawn_refresh(tenant);
-            return last.clone();
+            return (last.clone(), false);
         }
-        self.resolve_and_store(tenant).await
+        (self.resolve_and_store(tenant).await, true)
+    }
+
+    /// Whether a real resolver result exists, rather than the outage fallback.
+    pub fn has_resolved(&self, tenant: Uuid) -> bool {
+        self.last_known.contains_key(&tenant)
     }
 
     /// Miss path: resolve from Postgres, populate the cache + last-known store.
@@ -769,6 +814,7 @@ pub(crate) const SQL: &str = "\
                   COALESCE(we.f_annotation_queues, pe.f_annotation_queues) AS f_annotation_queues, \
                   COALESCE(we.f_audit_selfverify, pe.f_audit_selfverify) AS f_audit_selfverify, \
                   COALESCE(we.f_sso, pe.f_sso) AS f_sso, \
+                  pe.f_cache_control AS f_cache_control, pe.cache_ttl_hours AS cache_ttl_hours, \
                   COALESCE(we.hot_gb_included, pe.hot_gb_included)::text AS hot_gb_included_text, \
                   COALESCE(we.ingest_gb_included, pe.ingest_gb_included)::text AS ingest_gb_included_text, \
                   COALESCE(we.cold_gb_included, pe.cold_gb_included)::text AS cold_gb_included_text, \
@@ -818,7 +864,13 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
             // has no numeric->f64 conversion, and a NULL (Enterprise "custom")
             // must survive as a NULL string, never a coerced zero.
             match client.query_opt(SQL, &[&tenant]).await? {
-                Some(row) => Ok(row_to_resolved(&row)),
+                Some(row) => {
+                    let mut resolved = row_to_resolved(&row);
+                    attach_model_aliases(&client, &tenant, &mut resolved).await;
+                    attach_workspace_failover(&client, &tenant, &mut resolved).await;
+                    attach_content_capture(&client, &tenant, &mut resolved).await;
+                    Ok(resolved)
+                }
                 // No tenant row at all (unknown / archived tenant) — fail
                 // CLOSED to nothing, ADR-073 §5. This is deliberately NOT the
                 // same as "no workspace_entitlements row", which the LEFT JOIN
@@ -827,6 +879,88 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
             }
         }) as Pin<Box<dyn Future<Output = anyhow::Result<ResolvedEntitlements>> + Send>>
     })
+}
+
+/// GWY-27: load the workspace's model aliases onto an already-resolved entitlement
+/// set, on the connection the refresh already holds — no extra Neon wake, never per
+/// request. A failed read does NOT fail the resolve: on a cold process that would drop
+/// the tenant to fallback limits over a routing convenience. It leaves NO aliases (an
+/// alias call answers `400 unroutable_model`, never a default target) and counts
+/// `workspace_gateway_config_unreadable`; a later successful read resolves that kind.
+pub(crate) async fn attach_model_aliases(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) {
+    match crate::db::model_aliases::list_with(client, tenant).await {
+        Ok(aliases) => {
+            resolved.model_aliases = Arc::new(aliases);
+            // The read works again (the cause is systemic — a missing migration, a
+            // dead connection — not per-tenant). Idempotent.
+            tracelane_shared::degradation::resolve(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            );
+        }
+        Err(e) => {
+            resolved.model_aliases = Arc::default();
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            ) == 1
+            {
+                tracing::warn!(error = %e, tenant_id = %tenant, "model aliases unreadable — this workspace resolves with none until the next refresh. Further occurrences are counted, not logged (kind=workspace_gateway_config_unreadable)");
+            }
+        }
+    }
+}
+
+/// GWY-52: load the workspace's own failover settings, on the refresh's connection. A
+/// failed read leaves the OPERATOR default (off, operator chain) — never a guessed chain
+/// — and counts `workspace_gateway_config_unreadable`; the entitlements are untouched.
+pub(crate) async fn attach_workspace_failover(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) {
+    match crate::db::workspace_failover::get_with(client, tenant).await {
+        Ok(row) => {
+            let row = row.unwrap_or_default();
+            resolved.failover_enabled = row.enabled;
+            resolved.failover_models = Arc::new(row.models);
+        }
+        Err(e) => {
+            resolved.failover_enabled = false;
+            resolved.failover_models = Arc::default();
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            ) == 1
+            {
+                tracing::warn!(error = %e, tenant_id = %tenant, "workspace failover settings unreadable — operator default until the next refresh. Further occurrences are counted, not logged (kind=workspace_gateway_config_unreadable)");
+            }
+        }
+    }
+}
+
+/// GWY-53: load the owner's content-capture choice, on the refresh's connection. A
+/// failed read (a missing table is the shape of an unapplied migration) leaves capture
+/// OFF — never the previous value, never on — and counts
+/// `workspace_gateway_config_unreadable`; the entitlements are untouched.
+pub(crate) async fn attach_content_capture(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) {
+    match crate::db::workspace_capture::get_with(client, tenant).await {
+        Ok(row) => resolved.content_capture = row.unwrap_or_default(),
+        Err(e) => {
+            resolved.content_capture = crate::db::workspace_capture::WorkspaceCapture::default();
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            ) == 1
+            {
+                tracing::warn!(error = %e, tenant_id = %tenant, "workspace content-capture setting unreadable — capture OFF until the next refresh. Further occurrences are counted, not logged (kind=workspace_gateway_config_unreadable)");
+            }
+        }
+    }
 }
 
 /// Map one entitlements row onto [`ResolvedEntitlements`], **by COLUMN NAME**.
@@ -892,6 +1026,8 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         f_annotation_queues: row.get("f_annotation_queues"),
         f_audit_selfverify: row.get("f_audit_selfverify"),
         f_sso: row.get("f_sso"),
+        f_cache_control: row.get("f_cache_control"),
+        cache_ttl_hours: u32::try_from(row.get::<_, i32>("cache_ttl_hours")).unwrap_or(0),
         // BILL-01 / ADR-076 — numeric(12,3) GB figures arrive cast to text
         // (tokio-postgres has no native numeric->f64); NULL (Enterprise
         // "custom") survives as `None`, never a coerced zero. Converted to
@@ -953,6 +1089,12 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
             .filter(|v| v.is_finite() && *v >= 0.0)
             .map(|v| (v * 1_000_000.0).round() as u64),
         auto_age_window_days: row.get("auto_age_window_days"),
+        // Filled by `pg_resolver` from `model_aliases` after this row is mapped.
+        model_aliases: std::sync::Arc::default(),
+        // Filled by `pg_resolver` from `workspace_failover` after this row is mapped.
+        failover_enabled: false,
+        failover_models: std::sync::Arc::default(),
+        content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
     }
 }
 
@@ -1282,6 +1424,8 @@ mod tests {
             f_full_capture: true,
             f_alerts: true,
             f_sso: true,
+            f_cache_control: false,
+            cache_ttl_hours: 0,
             // Enterprise: every allowance is "custom" — genuinely `None`, not a
             // large number, matching what a NULL `plan_entitlements` column
             // resolves to.
@@ -1310,6 +1454,10 @@ mod tests {
             workspace_budget_micro_usd: 0,
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
+            model_aliases: std::sync::Arc::default(),
+            failover_enabled: false,
+            failover_models: std::sync::Arc::default(),
+            content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
         }
     }
 
@@ -1345,6 +1493,35 @@ mod tests {
             assert!(cache.check(tenant, FeatureKey::Pr7Trajectory).await);
         }
         assert_eq!(count.load(Ordering::SeqCst), 1, "warm path re-resolved");
+    }
+
+    /// B-568 I5: only the resolve the request WAITED on counts as cold. The first
+    /// read blocks; a warm read does not; a stale-served read (TTL gone, last-known
+    /// present) does not either — its refresh runs off the request path. A
+    /// `resolved_traced` that always said `false` would hide the first case, one
+    /// that always said `true` would call every sparse tenant cold.
+    #[tokio::test]
+    async fn resolved_traced_reports_only_the_blocking_resolve() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cache = EntitlementCache::new(counting_resolver(count.clone(), fail));
+        let tenant = Uuid::new_v4();
+
+        let (_, blocked) = cache.resolved_traced(tenant).await;
+        assert!(
+            blocked,
+            "a never-resolved tenant waits on the control plane"
+        );
+        let (_, blocked) = cache.resolved_traced(tenant).await;
+        assert!(!blocked, "a warm hit must not report a round trip");
+
+        // Past the TTL: the moka entry is gone, last-known is not → stale-served.
+        cache.cache.invalidate(&tenant).await;
+        let (_, blocked) = cache.resolved_traced(tenant).await;
+        assert!(
+            !blocked,
+            "a stale-served answer's refresh is off-path, not cold"
+        );
     }
 
     #[tokio::test]
@@ -1454,6 +1631,251 @@ mod tests {
         assert!(!e.is_promotion_frozen());
         e.promotion_frozen_at = Some(chrono::Utc::now());
         assert!(e.is_promotion_frozen());
+    }
+
+    /// GWY-27, against the runner's REAL Postgres: the refresh's alias step loads the
+    /// workspace's map, and when the read FAILS (here: a session that cannot see the
+    /// table — the shape of an unapplied migration) it leaves NO aliases and counts
+    /// `workspace_gateway_config_unreadable` instead of failing the entitlement resolve.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn gwy27_attach_model_aliases_loads_the_map_and_fails_to_none() {
+        use tracelane_shared::degradation::{Degradation, count, is_open};
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(conn);
+        let org = format!("org_gwy27r_{}", Uuid::new_v4().simple());
+        let id: Uuid = client
+            .query_one(
+                "INSERT INTO tenants (workos_org_id, name) VALUES ($1, $2) RETURNING id",
+                &[&org, &"gwy27-resolver-test"],
+            )
+            .await
+            .expect("tenant")
+            .get(0);
+        client
+            .execute(
+                "INSERT INTO model_aliases (tenant_id, alias, target_model) \
+                 VALUES ($1, 'fast', 'gpt-4o-mini'), ($1, 'smart', 'gpt-5')",
+                &[&id],
+            )
+            .await
+            .expect("aliases");
+
+        let mut resolved = ResolvedEntitlements::deny_all();
+        attach_model_aliases(&client, &id, &mut resolved).await;
+        let want: std::collections::BTreeMap<String, String> = [
+            ("fast".to_string(), "gpt-4o-mini".to_string()),
+            ("smart".to_string(), "gpt-5".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(*resolved.model_aliases, want);
+        assert!(!is_open(Degradation::WorkspaceGatewayConfigUnreadable));
+
+        // The failure direction, for real: this session cannot see the table.
+        let empty = format!("gwy27_empty_{}", Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {empty}; SET search_path TO {empty}"
+            ))
+            .await
+            .expect("empty schema");
+        let before = count(Degradation::WorkspaceGatewayConfigUnreadable);
+        let mut unreadable = resolved.clone();
+        attach_model_aliases(&client, &id, &mut unreadable).await;
+        assert!(
+            unreadable.model_aliases.is_empty(),
+            "an unreadable map must resolve to NO aliases — fail-closed routing — never the previous map"
+        );
+        assert!(
+            count(Degradation::WorkspaceGatewayConfigUnreadable) > before,
+            "and it is counted"
+        );
+        assert!(is_open(Degradation::WorkspaceGatewayConfigUnreadable));
+        assert_eq!(
+            unreadable.plan_lookup_key, resolved.plan_lookup_key,
+            "the entitlements themselves are untouched"
+        );
+
+        // Recovery: a successful read closes the kind.
+        client
+            .batch_execute("SET search_path TO public")
+            .await
+            .expect("reset search_path");
+        attach_model_aliases(&client, &id, &mut unreadable).await;
+        assert_eq!(*unreadable.model_aliases, want);
+        assert!(!is_open(Degradation::WorkspaceGatewayConfigUnreadable));
+        client
+            .execute("DELETE FROM tenants WHERE id = $1", &[&id])
+            .await
+            .expect("cleanup");
+    }
+
+    /// GWY-52, real Postgres: the refresh loads the workspace's failover row; an
+    /// unreadable table leaves the OPERATOR default (off, no chain) and is counted.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn gwy52_attach_workspace_failover_loads_and_fails_to_default() {
+        use tracelane_shared::degradation::{Degradation, count};
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(conn);
+        let id: Uuid = client
+            .query_one(
+                "INSERT INTO tenants (workos_org_id, name) VALUES ($1, 'gwy52r') RETURNING id",
+                &[&format!("org_gwy52r_{}", Uuid::new_v4().simple())],
+            )
+            .await
+            .expect("tenant")
+            .get(0);
+        let mut resolved = ResolvedEntitlements::deny_all();
+        attach_workspace_failover(&client, &id, &mut resolved).await;
+        assert!(
+            !resolved.failover_enabled && resolved.failover_models.is_empty(),
+            "unset = default"
+        );
+        client
+            .execute(
+                "INSERT INTO workspace_failover (tenant_id, enabled, models) VALUES ($1, true, $2)",
+                &[&id, &vec!["gpt-4o-mini".to_string()]],
+            )
+            .await
+            .expect("row");
+        attach_workspace_failover(&client, &id, &mut resolved).await;
+        assert!(resolved.failover_enabled);
+        assert_eq!(*resolved.failover_models, vec!["gpt-4o-mini".to_string()]);
+
+        let empty = format!("gwy52_empty_{}", Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {empty}; SET search_path TO {empty}"
+            ))
+            .await
+            .expect("empty schema");
+        let before = count(Degradation::WorkspaceGatewayConfigUnreadable);
+        attach_workspace_failover(&client, &id, &mut resolved).await;
+        assert!(
+            !resolved.failover_enabled && resolved.failover_models.is_empty(),
+            "an unreadable row is the operator default, never the previous settings"
+        );
+        assert!(count(Degradation::WorkspaceGatewayConfigUnreadable) > before);
+        client
+            .batch_execute("SET search_path TO public")
+            .await
+            .expect("reset");
+        client
+            .execute("DELETE FROM tenants WHERE id = $1", &[&id])
+            .await
+            .expect("cleanup");
+    }
+
+    /// GWY-53, real Postgres: the refresh loads the owner's capture choice through the
+    /// FULL resolver (not just the attach step — a resolver that forgot to call it would
+    /// pass a step-only test); an unreadable table resolves capture OFF — never the
+    /// previous ON — and is counted.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn gwy53_attach_content_capture_loads_and_fails_closed() {
+        use crate::db::workspace_capture::WorkspaceCapture;
+        use tracelane_shared::degradation::{Degradation, count};
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(conn);
+        // The migrations create `plan_entitlements` but seed no rows (the seed is
+        // `apps/web/db/seed.mjs`), so the resolver's JOIN would match nothing and
+        // every read below would be `deny_all` by accident — passing "unset = OFF"
+        // for the wrong reason. Measured on the runner's DB 2026-09-28: 0 rows.
+        client
+            .execute(
+                "INSERT INTO plan_entitlements (plan_lookup_key, indexed_window_days, queryable_days, ledger_days) \
+                 VALUES ('builder_v1', 30, 730, 730) \
+                 ON CONFLICT (plan_lookup_key) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("plan row");
+        let id: Uuid = client
+            .query_one(
+                "INSERT INTO tenants (workos_org_id, name, plan) VALUES ($1, 'gwy53r', 'builder'::text::plan) RETURNING id",
+                &[&format!("org_gwy53r_{}", Uuid::new_v4().simple())],
+            )
+            .await
+            .expect("tenant")
+            .get(0);
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.url = Some(url.clone());
+        let pool = cfg
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .expect("pool");
+        let resolve = pg_resolver(pool);
+        let unset = resolve(id).await.expect("resolve");
+        assert_eq!(
+            unset.plan_lookup_key, "builder_v1",
+            "the resolver must have matched the tenant — a deny_all here proves nothing"
+        );
+        assert_eq!(
+            unset.content_capture,
+            WorkspaceCapture::default(),
+            "unset = OFF"
+        );
+        client
+            .execute(
+                "INSERT INTO workspace_content_capture (tenant_id, input, output) VALUES ($1, true, true)",
+                &[&id],
+            )
+            .await
+            .expect("row");
+        assert_eq!(
+            resolve(id).await.expect("resolve").content_capture,
+            WorkspaceCapture {
+                input: true,
+                output: true
+            },
+            "the resolver must load the row"
+        );
+
+        let mut resolved = ResolvedEntitlements::deny_all();
+        attach_content_capture(&client, &id, &mut resolved).await;
+        assert!(resolved.content_capture.input && resolved.content_capture.output);
+        let empty = format!("gwy53_empty_{}", Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {empty}; SET search_path TO {empty}"
+            ))
+            .await
+            .expect("empty schema");
+        let before = count(Degradation::WorkspaceGatewayConfigUnreadable);
+        attach_content_capture(&client, &id, &mut resolved).await;
+        assert_eq!(
+            resolved.content_capture,
+            WorkspaceCapture::default(),
+            "an unreadable row is capture OFF, never the previous ON"
+        );
+        assert!(count(Degradation::WorkspaceGatewayConfigUnreadable) > before);
+        client
+            .batch_execute("SET search_path TO public")
+            .await
+            .expect("reset");
+        client
+            .execute("DELETE FROM tenants WHERE id = $1", &[&id])
+            .await
+            .expect("cleanup");
     }
 
     /// ADR-073 / B-241, against a REAL Postgres: a tenant whose `tenants.plan =

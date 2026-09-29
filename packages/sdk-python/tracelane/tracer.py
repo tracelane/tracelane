@@ -59,8 +59,8 @@ def init(
         api_key: Tracelane tenant API key.
         service_name: OTel service.name resource attribute.
         sample_rate: Head sampling rate (0.0–1.0). Tail sampler applies after.
-        auto_instrument: If True, auto-instrument all installed AI libraries
-            after SDK init. Equivalent to calling auto_instrument() manually.
+        auto_instrument: If True, attempt the supported automatic integrations
+            after SDK init and print each attachment outcome. Equivalent to calling auto_instrument() manually.
     """
     global _provider
     if _provider is not None:

@@ -107,14 +107,19 @@ fn cache() -> &'static PolicyCache {
 /// "yes". Absent control plane resolving to OFF is `.claude/rules/tenancy.md`:
 /// a no-cache path denies, it never grants. Here that is also the free
 /// direction: no policy, no spend.
-async fn policy_for(tenant_id: &TenantId) -> Option<Arc<Policy>> {
+///
+/// The `bool` (B-568 I5) is whether THIS request waited on a control-plane read:
+/// a cache miss with a Postgres pool present. A miss with no pool made no round
+/// trip and reports `false`.
+async fn policy_for(tenant_id: &TenantId) -> (Option<Arc<Policy>>, bool) {
     let key = *tenant_id.as_uuid();
     if let Some(hit) = cache().get(&key).await {
-        return hit;
+        return (hit, false);
     }
+    let round_trip = crate::db::global_pool().is_some();
     let loaded = load_policy(key).await;
     cache().insert(key, loaded.clone()).await;
-    loaded
+    (loaded, round_trip)
 }
 
 async fn load_policy(tenant_uuid: Uuid) -> Option<Arc<Policy>> {
@@ -147,23 +152,24 @@ pub async fn invalidate(tenant_id: &TenantId) {
     cache().invalidate(tenant_id.as_uuid()).await;
 }
 
-/// Is this trace in the sample?
+/// Is this assignment in the sample? Online eval passes the trace UUID bytes;
+/// prompt resolutions pass a bounded caller identity.
 ///
 /// **DETERMINISTIC, NEVER RANDOM, and that is a product requirement rather than
 /// an implementation taste.** A customer must be able to say WHICH traces were
 /// scored and re-run exactly that set; a random draw makes "why was this one
 /// scored" unanswerable and makes any re-run a different sample. `blake3` of
-/// `salt || trace_id`, first 8 bytes as a big-endian u64, compared against
+/// `salt || assignment_key`, first 8 bytes as a big-endian u64, compared against
 /// `rate * u64::MAX`.
 ///
 /// The salt is per-policy so two workspaces sampling at the same rate do not
 /// score correlated traces — without it, "1%" would mean the same 1% of trace
 /// ids everywhere, which is a systematic bias, not a sample.
 #[must_use]
-pub fn should_sample(salt: &str, trace_id: Uuid, rate: f64) -> bool {
+pub fn should_sample(salt: &str, assignment_key: &[u8], rate: f64) -> bool {
     // Guard both ends explicitly. `rate <= 0.0` is off; `>= 1.0` is everything.
-    // Neither is reachable through the table (CHECK 0..=0.10) — this function is
-    // pure and is unit-tested directly, so it defends its own contract.
+    // Online evaluation bounds its rate separately; prompt canaries allow the
+    // full unit interval. This pure sampler defends both callers.
     // NaN is spelled out rather than caught by a negated comparison. `!(rate >
     // 0.0)` was NaN-safe and unreadable; this is both. A NaN rate cannot reach
     // here through the table (the CHECK rejects it) — this function is pure and
@@ -176,7 +182,7 @@ pub fn should_sample(salt: &str, trace_id: Uuid, rate: f64) -> bool {
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(salt.as_bytes());
-    hasher.update(trace_id.as_bytes());
+    hasher.update(assignment_key);
     let digest = hasher.finalize();
     let bytes: [u8; 8] = digest.as_bytes()[..8].try_into().unwrap_or([0u8; 8]);
     let drawn = u64::from_be_bytes(bytes);
@@ -209,28 +215,33 @@ pub fn skipped_capture_off() -> u64 {
 /// JUDGING either: `false` refuses here, before the body is flattened, before
 /// any provider call, before any `online_eval_scores.reason` could paraphrase it.
 /// Counted on `skipped_capture_off()` so the refusal is observable, not silent.
+///
+/// The `bool` (B-568 I5) says whether the policy read went to the control plane on
+/// this request — the policy cache has a 15-minute TTL and no stale serve, so a
+/// sparse entitled tenant pays it, and the request is then cold.
 pub async fn admission(
     tenant_id: &TenantId,
     trace_id: Uuid,
     entitlements: Option<&crate::entitlement_cache::ResolvedEntitlements>,
     content_capture: bool,
-) -> Option<Arc<Policy>> {
+) -> (Option<Arc<Policy>>, bool) {
     // Entitlement first: it is the cheapest check and the one that must fail
     // closed. `None` (no control plane) is the unprivileged state — no feature.
-    if !entitlements?.has(crate::entitlement_cache::FeatureKey::OnlineEvals) {
-        return None;
+    let entitled =
+        entitlements.is_some_and(|e| e.has(crate::entitlement_cache::FeatureKey::OnlineEvals));
+    if !entitled {
+        return (None, false);
     }
     // B-299: capture policy BEFORE the policy lookup, so a capture-off tenant
     // costs no I/O and no judge, whatever policy it has configured.
     if !content_capture {
         SKIPPED_CAPTURE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
+        return (None, false);
     }
-    let policy = policy_for(tenant_id).await?;
-    if !policy.enabled {
-        return None;
-    }
-    should_sample(&policy.sample_salt, trace_id, policy.sample_rate).then_some(policy)
+    let (policy, round_trip) = policy_for(tenant_id).await;
+    let sampled = policy
+        .filter(|p| p.enabled && should_sample(&p.sample_salt, trace_id.as_bytes(), p.sample_rate));
+    (sampled, round_trip)
 }
 
 /// Flatten a chat request body's user-visible text for the judge.
@@ -615,7 +626,7 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
             status: "scored".into(),
             score: Some(v.score),
             verdict: v.verdict,
-            reason: truncate(&v.reason, REASON_MAX_CHARS).to_string(),
+            reason: stored_judge_text(&v.reason),
             error: None,
             cost_usd,
             latency_ms,
@@ -625,7 +636,7 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
             score: None,
             verdict: String::new(),
             reason: String::new(),
-            error: Some(why),
+            error: Some(stored_judge_text(&why)),
             cost_usd,
             latency_ms,
         },
@@ -702,6 +713,13 @@ fn emit_judge_span(
             // computed — passing our value keeps the span and the score row
             // reporting one number rather than two that could disagree.
             cost_usd,
+            served: crate::server::ServedMeta::default(),
+            finish_reason: None,
+            // RI-05: the judge is a fresh provider call the judge machinery
+            // dispatches directly, never through `dispatch_with_retry` — no
+            // ledger to attach.
+            dispatch_attempts: Vec::new(),
+            reasoning_output_tokens: None,
         },
         None,
         None,
@@ -711,6 +729,18 @@ fn emit_judge_span(
     span.attributes.tracelane_eval_role = Some("judge".to_string());
     span.attributes.tracelane_eval_run_id = Some(job.policy.id.to_string());
     crate::otlp_emit::spawn_publish(Arc::clone(nats), span, "online-eval judge");
+}
+
+/// What `online_eval_scores` keeps of a judge's prose: masked, then bounded.
+///
+/// The judge reads the live request body, so its `reason` — or a validation
+/// error that echoes its output — can quote a credential the customer pasted.
+/// This table is written here, not through ingest, so ingest's span redaction
+/// never sees it. Mask BEFORE truncating: a cut through a key would leave a
+/// fragment too short for the rules to recognise.
+fn stored_judge_text(raw: &str) -> String {
+    let masked = tracelane_policy::pii::redact(raw);
+    truncate(&masked, REASON_MAX_CHARS).to_string()
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -920,6 +950,74 @@ async fn write_score(job: &JudgeJob, row: ScoreRow) -> anyhow::Result<()> {
 mod clickhouse_roundtrip {
     use super::*;
 
+    /// The recent-scores read must honour its window (2026-09-27, found on prod:
+    /// Settings → Online evals titled "Recent scores — last 24 hours" listed 18 days
+    /// of rows). A score from 48 hours ago must NOT come back from a 24-hour read.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn a_24_hour_score_read_excludes_an_older_score() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL")
+            .expect("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        clickhouse::Client::default()
+            .with_url(url.clone())
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let ch = clickhouse::Client::default()
+            .with_url(url)
+            .with_database("tracelane");
+        let sql = include_str!(
+            "../../../infra/dev/clickhouse/migrations/20_evl28_online_eval_scores.sql"
+        );
+        for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+            ch.query(&stmt).execute().await.expect("migration 20 stmt");
+        }
+
+        let tenant = Uuid::new_v4().to_string();
+        let recent = Uuid::new_v4().to_string();
+        let old = Uuid::new_v4().to_string();
+        let now = crate::clickhouse_query::datetime64_millis_now();
+        let mut insert = ch.insert("online_eval_scores").expect("insert init");
+        for (trace, scored_at) in [(&recent, now), (&old, now - 48 * 3_600_000)] {
+            insert
+                .write(&ScoreInsert {
+                    tenant_id: &tenant,
+                    trace_id: trace,
+                    span_id: "span-1",
+                    policy_id: Uuid::new_v4(),
+                    rubric: "answers_the_question",
+                    judge_model: "claude-haiku-4-5-20251001",
+                    status: "scored",
+                    score: Some(0.5),
+                    verdict: "pass",
+                    reason: "window test",
+                    error: None,
+                    cost_usd: Some(0.0),
+                    latency_ms: 1,
+                    scored_at,
+                })
+                .await
+                .expect("score write");
+        }
+        insert.end().await.expect("insert end");
+
+        let rows = ch
+            .query(&crate::online_eval_routes::scores_sql(false))
+            .bind(tenant.clone())
+            .bind(24_u32)
+            .bind(50_u32)
+            .fetch_all::<crate::online_eval_routes::ScoreDto>()
+            .await
+            .expect("the recent-scores read must run against the real schema");
+        let traces: Vec<&str> = rows.iter().map(|r| r.trace_id.as_str()).collect();
+        assert_eq!(
+            traces,
+            vec![recent.as_str()],
+            "a 24-hour read returned {traces:?} — the 48-hour-old score must be excluded"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
     async fn a_score_row_reaches_a_real_clickhouse() {
@@ -1102,11 +1200,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_judge_reason_never_stores_a_credential_it_paraphrased() {
+        // The judge reads the live request, so its `reason` can quote a key the
+        // customer pasted. `online_eval_scores` is not written through ingest's
+        // span redaction, so this site has to mask it itself.
+        let key = "tlane_UNITTESTfakeKEYdoNOTuse0000000000000000000";
+        let stored = stored_judge_text(&format!("The user pasted {key} into the prompt"));
+        assert!(!stored.contains("UNITTESTfakeKEY"), "{stored}");
+        assert!(stored.contains("[REDACTED:tracelane_key]"), "{stored}");
+        let err = stored_judge_text("did not conform: {\"api_key\": \"unittestNotARealValue123\"}");
+        assert!(!err.contains("unittestNotARealValue123"), "{err}");
+    }
+
+    #[test]
+    fn stored_judge_text_is_still_bounded() {
+        let long = "a".repeat(REASON_MAX_CHARS + 50);
+        assert_eq!(stored_judge_text(&long).chars().count(), REASON_MAX_CHARS);
+    }
+
+    #[test]
     fn sampling_is_deterministic_for_the_same_trace() {
         let t = Uuid::new_v4();
-        let a = should_sample("salt-a", t, 0.5);
+        let a = should_sample("salt-a", t.as_bytes(), 0.5);
         for _ in 0..50 {
-            assert_eq!(a, should_sample("salt-a", t, 0.5), "same inputs must agree");
+            assert_eq!(
+                a,
+                should_sample("salt-a", t.as_bytes(), 0.5),
+                "same inputs must agree"
+            );
         }
     }
 
@@ -1115,8 +1236,14 @@ mod tests {
         // Two policies at the same rate must not score the same trace ids.
         // Not a claim about any single trace — a claim about the SET.
         let traces: Vec<Uuid> = (0..500).map(|_| Uuid::new_v4()).collect();
-        let a: Vec<bool> = traces.iter().map(|t| should_sample("A", *t, 0.5)).collect();
-        let b: Vec<bool> = traces.iter().map(|t| should_sample("B", *t, 0.5)).collect();
+        let a: Vec<bool> = traces
+            .iter()
+            .map(|t| should_sample("A", t.as_bytes(), 0.5))
+            .collect();
+        let b: Vec<bool> = traces
+            .iter()
+            .map(|t| should_sample("B", t.as_bytes(), 0.5))
+            .collect();
         let agree = a.iter().zip(&b).filter(|(x, y)| x == y).count();
         // Independent 50/50 draws agree ~50% of the time. Identical salts would
         // agree 100%. The band is wide because this asserts DECORRELATION, not a
@@ -1131,8 +1258,8 @@ mod tests {
     fn rate_zero_never_samples_and_rate_one_always_does() {
         for _ in 0..200 {
             let t = Uuid::new_v4();
-            assert!(!should_sample("s", t, 0.0));
-            assert!(should_sample("s", t, 1.0));
+            assert!(!should_sample("s", t.as_bytes(), 0.0));
+            assert!(should_sample("s", t.as_bytes(), 1.0));
         }
     }
 
@@ -1142,7 +1269,7 @@ mod tests {
         // meaningful on the surface. A wide band, deliberately: this asserts the
         // hash is not degenerate, not that it is a perfect uniform.
         let hits = (0..20_000)
-            .filter(|_| should_sample("salt", Uuid::new_v4(), 0.01))
+            .filter(|_| should_sample("salt", Uuid::new_v4().as_bytes(), 0.01))
             .count();
         assert!((100..=320).contains(&hits), "1% of 20000 drew {hits}");
     }
@@ -1168,7 +1295,11 @@ mod capture_policy {
         let before = skipped_capture_off();
         // No control-plane pool exists in a unit test: had this reached
         // `policy_for`, it would have hit the pool, not returned on the flag.
-        let verdict = admission(&tenant(), Uuid::new_v4(), Some(&ents), false).await;
+        let (verdict, round_trip) = admission(&tenant(), Uuid::new_v4(), Some(&ents), false).await;
+        assert!(
+            !round_trip,
+            "a refusal before the lookup made no control-plane read"
+        );
         assert!(
             verdict.is_none(),
             "a capture-off tenant must never be admitted"
@@ -1183,7 +1314,7 @@ mod capture_policy {
     #[tokio::test]
     async fn not_entitled_is_refused_before_the_capture_counter_moves() {
         let before = skipped_capture_off();
-        let verdict = admission(&tenant(), Uuid::new_v4(), None, false).await;
+        let (verdict, _) = admission(&tenant(), Uuid::new_v4(), None, false).await;
         assert!(verdict.is_none());
         assert_eq!(
             skipped_capture_off(),
@@ -1196,6 +1327,17 @@ mod capture_policy {
     #[test]
     fn capture_decision_is_fail_closed_without_a_block() {
         let t = tenant();
-        assert!(!crate::server::config::capture_decision(None, &t));
+        assert!(!crate::server::config::capture_decision(None, None, &t).judge_may_read());
+        // GWY-53: the judge needs BOTH halves — an input-only opt-in must not let it
+        // read the answer it would grade.
+        let input_only = crate::server::config::capture_decision(
+            None,
+            Some(crate::db::workspace_capture::WorkspaceCapture {
+                input: true,
+                output: false,
+            }),
+            &t,
+        );
+        assert!(!input_only.judge_may_read());
     }
 }

@@ -21,6 +21,37 @@ export const metadata: Metadata = { title: "Billing — Settings" };
 // Reads the session cookie + Postgres at request time — never prerender.
 export const dynamic = "force-dynamic";
 
+/**
+ * `/api/checkout` 303-redirects a failed form POST back here with
+ * `?checkout_error=<code>` (item 3) rather than returning raw JSON the
+ * browser would render as an unstyled page. Every code the route can send.
+ */
+const CHECKOUT_ERROR_MESSAGES: Record<string, string> = {
+	unknown_tier: "That plan isn't recognized. Pick a plan below and try again.",
+	annual_unavailable:
+		"Annual billing isn't available yet — pick a monthly plan.",
+	checkout_unconfigured:
+		"Checkout isn't configured for that plan yet. Try again shortly, or contact support.",
+	checkout_unavailable:
+		"Checkout is temporarily unavailable. Try again shortly, or contact support.",
+	portal_unavailable:
+		"The billing portal is temporarily unavailable. Try again shortly, or contact support.",
+};
+
+function CheckoutErrorBanner({ code }: { code: string }) {
+	const message =
+		CHECKOUT_ERROR_MESSAGES[code] ??
+		"Something went wrong starting checkout. Try again shortly, or contact support.";
+	return (
+		<p
+			role="alert"
+			className="rounded-control border border-danger/30 bg-danger-soft px-3 py-2 text-xs text-danger-ink"
+		>
+			{message}
+		</p>
+	);
+}
+
 async function getTenantBilling(workosOrgId: string) {
 	const rows = await db
 		.select({
@@ -39,8 +70,12 @@ async function getTenantBilling(workosOrgId: string) {
 	return rows[0] ?? null;
 }
 
-export default async function BillingPage() {
-	const session = await requireSession();
+export default async function BillingPage({
+	searchParams,
+}: {
+	searchParams: Promise<{ checkout_error?: string }>;
+}) {
+	const [session, sp] = await Promise.all([requireSession(), searchParams]);
 	const billing = await getTenantBilling(session.tenantId);
 
 	if (!billing) redirect("/onboarding");
@@ -70,6 +105,9 @@ export default async function BillingPage() {
 
 	return (
 		<div className="space-y-6">
+			{sp.checkout_error ? (
+				<CheckoutErrorBanner code={sp.checkout_error} />
+			) : null}
 			{/* The current tier FIRST — the one fact every visitor to this page
 			    wants before any meter (founder, 2026-09-14). */}
 			<PlanHeader

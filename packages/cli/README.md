@@ -137,7 +137,7 @@ provider routing, model aliases, and rate-limit metadata.
 ### `tlane replay`
 
 Read-only time-travel viewer — renders a recorded trace's spans step-by-step
-It does not re-execute the trace; cross-model re-execution is on the roadmap.
+It does not re-execute the trace.
 
 ```bash
 tlane replay <trace-id>
@@ -190,7 +190,7 @@ There is no baseline, no history and no comparison: the same shape as a coverage
 threshold, which nobody considers broken for lacking a previous run. A run
 scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
 the second "no regression" would be a claim nothing checked. Comparing a run
-against an earlier one is a real gap and is filed, not built — what counts as
+against an earlier one is not supported — what counts as
 the baseline is a design decision, not a flag.
 
 The three-line GitHub Action wrapper is at
@@ -223,7 +223,7 @@ against the SDK's adapters. A polyglot repo gets both bootstraps.
 including every TypeScript adapter — wraps an object only you can construct, so
 the bootstrap imports the right `instrument*` function and emits the exact
 one-line call next to it. The TypeScript SDK has no zero-config patching:
-`autoInstrument()` throws by design and lands in v1.1.
+`autoInstrument()` throws by design.
 
 **What it will not do.** `.env` is only ever appended to — an existing
 `TRACELANE_API_KEY` is never rewritten, `--force` included. An existing config or

@@ -423,8 +423,10 @@ pub(crate) struct Admitted<R: Route> {
     /// Shared by the request-side guardrail verdict and the response-side seam.
     pub correlation_id: ulid::Ulid,
     pub dispatch_guard: DispatchGuard,
-    /// B-256 per-stage timing. The pipeline marks its stages; the chat handler
-    /// keeps marking and emits at the dispatch boundary.
+    /// B-256 per-stage timing. Opened BEFORE credential validation (B-568 I1), so
+    /// its first stage is `authenticate`; the pipeline marks its stages; each of
+    /// the three handlers keeps marking and emits at its dispatch boundary. It also
+    /// carries the cold-start fact the handlers add their BYOK miss to (I5).
     pub timer: crate::hotpath::StageTimer,
     #[cfg(test)]
     pub steps: Vec<Step>,
@@ -443,15 +445,44 @@ pub(crate) async fn admit<R: Route>(
     headers: &HeaderMap,
     body: R::Body,
 ) -> Result<Admitted<R>, Refusal> {
+    admit_via::<R, _, _>(state, headers, body, |credential| async move {
+        crate::auth::validate_authorization_traced(&credential).await
+    })
+    .await
+}
+
+/// [`admit`] with the credential validator as a parameter. Production passes
+/// `validate_authorization_traced` and nothing else; a test passes a validator
+/// that takes a known time, so the claim "the timer covers authentication"
+/// (B-568 I1) is asserted by a run rather than by reading the code.
+async fn admit_via<R, F, Fut>(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: R::Body,
+    validate: F,
+) -> Result<Admitted<R>, Refusal>
+where
+    R: Route,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Claims, crate::auth::AuthPath)>>,
+{
     // Captured BEFORE auth so the span's overhead number opens at the moment the
     // request arrived, not after the credential check.
     let request_start = chrono::Utc::now();
+    // B-568 I1: the stage timer opens on the NEXT line, so its stages cover the
+    // same interval the span's overhead number does — authentication included.
+    // Until 2026-09-27 it was created inside `run`, after this await, and a cold
+    // key lookup (pool checkout + SELECT + Argon2id) showed up only as
+    // `unaccounted_us`. Costs nothing new: the `Instant::now()` moved, it was not
+    // added.
+    let mut timer = crate::hotpath::StageTimer::new();
+    timer.set_route(R::NAME);
     let mut progress = Progress::new();
     progress.enter(Step::Auth);
     let Some(authorization) = R::credential(headers) else {
         return Err(Refusal::MissingCredentials);
     };
-    let claims = match crate::auth::validate_authorization(&authorization).await {
+    let (claims, auth_path) = match validate(authorization).await {
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "authentication failed");
@@ -461,7 +492,9 @@ pub(crate) async fn admit<R: Route>(
             return Err(Refusal::AuthFailed { status, message });
         }
     };
-    run::<R>(state, headers, body, claims, request_start, progress).await
+    timer.set_auth(auth_path.label(), auth_path.is_cold());
+    timer.mark("authenticate");
+    run::<R>(state, headers, body, claims, request_start, progress, timer).await
 }
 
 /// The cascade from the scope gate down, with a caller-supplied credential.
@@ -482,14 +515,22 @@ pub(crate) async fn admit_with_claims<R: Route>(
     claims: Claims,
 ) -> Result<Admitted<R>, Refusal> {
     let request_start = chrono::Utc::now();
+    let mut timer = crate::hotpath::StageTimer::new();
+    timer.set_route(R::NAME);
+    timer.set_auth(crate::auth::AuthPath::Static.label(), false);
+    timer.mark("authenticate");
     let mut progress = Progress::new();
     // The caller authenticated; the step is accounted for so the order check
     // and the step log both read the same sequence as `admit`.
     progress.enter(Step::Auth);
-    run::<R>(state, headers, body, claims, request_start, progress).await
+    run::<R>(state, headers, body, claims, request_start, progress, timer).await
 }
 
 /// The steps after `Auth`, in [`ORDER`]. One function, three callers.
+///
+/// `timer` arrives already carrying the `authenticate` stage (B-568 I1). B-256:
+/// each further stage costs one `Instant::now()`, and the timer emits NOTHING
+/// unless the pre-dispatch segment is over threshold.
 #[tracing::instrument(skip_all, fields(route = R::NAME, tenant_id = tracing::field::Empty))]
 async fn run<R: Route>(
     state: &AppState,
@@ -498,14 +539,12 @@ async fn run<R: Route>(
     claims: Claims,
     request_start: chrono::DateTime<chrono::Utc>,
     mut progress: Progress,
+    mut timer: crate::hotpath::StageTimer,
 ) -> Result<Admitted<R>, Refusal> {
     // Trace identity — W3C `traceparent` first (joins the caller's own trace and
     // parents our span under theirs, ADR-075 / B-311), then the legacy
     // `x-trace-id`, then a fresh UUID.
     let (trace_id, inbound_parent) = crate::trace_context::resolve_trace_identity(headers);
-    // B-256: per-stage hot-path timing. Costs one `Instant::now()` per stage and
-    // emits NOTHING unless the pre-dispatch segment is over threshold.
-    let mut timer = crate::hotpath::StageTimer::new();
 
     // ── Scope (A13). Immediately after auth and BEFORE anything expensive. ──
     // A key scoped `read` (the shape you hand an external auditor) must not be
@@ -524,7 +563,9 @@ async fn run<R: Route>(
     }
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
-    timer.mark("auth");
+    // Renamed from `auth` (B-568 I1): this stage is the scope comparison and
+    // nothing else; credential validation is the `authenticate` stage before it.
+    timer.mark("scope");
 
     // ── PARSE. Before the first charge, by construction: `Step::KeyBudget`
     // below reads `claims.api_key_id()`/`claims.budget_usd_monthly`, but the
@@ -538,7 +579,11 @@ async fn run<R: Route>(
     // across the three handlers, which is what let the two rules diverge.
     // `or_body_end_user` runs on the RAW body, before any redaction and before
     // the GWY-39 alias rewrite, so the span records what the CALLER sent.
-    let identity = CallerIdentity::from_headers(headers).or_body_end_user(parsed.request_json());
+    let identity = CallerIdentity::from_headers(headers)
+        .or_body_end_user(parsed.request_json())
+        // RI-05 / B-444: the caller's model string, BEFORE the alias rewrite in
+        // chat.rs and untouched by failover — `gen_ai_request_model`'s source.
+        .with_requested_model(parsed.request_json());
     timer.mark("parse");
 
     // ── Entitlements (one warm resolve) ──
@@ -560,7 +605,15 @@ async fn run<R: Route>(
         Some(Arc::new(ResolvedEntitlements::bench_unlimited()))
     } else {
         match &state.entitlements {
-            Some(cache) => Some(cache.resolved(*tenant_id.as_uuid()).await),
+            Some(cache) => {
+                // B-568 I5: a blocking resolve (a tenant never resolved in this
+                // process, or a forced re-resolve) is a control-plane round trip.
+                let (resolved, blocked) = cache.resolved_traced(*tenant_id.as_uuid()).await;
+                if blocked {
+                    timer.note_cold();
+                }
+                Some(resolved)
+            }
             None => None,
         }
     };
@@ -583,10 +636,17 @@ async fn run<R: Route>(
             .rate_limiter
             .check_scoped(tenant_id, rpm, claims.api_key_id(), claims.rate_limit_rpm)
     {
-        // Count the rejection for the Gateway-ops live counter. A 429 emits no
-        // span (no dispatch), so this in-process tally is how the surface reports
-        // rate-limiting honestly instead of a fabricated zero.
-        state.rejection_metrics.record_rate_limited(tenant_id);
+        // Count the rejection for the Gateway-ops live counter, AND bucket it for
+        // the RI-05 / M2 aggregate span (`tracelane.admission.rejected`, rolled up
+        // per minute by `rejection_metrics::spawn`) — a 429 emits no per-request
+        // span (no dispatch), so this is how the load the limiter is shedding
+        // still leaves a record, without one span per rejected request.
+        state.rejection_metrics.record_admission_refusal(
+            tenant_id,
+            claims.api_key_id(),
+            crate::rejection_metrics::RejectionReason::RateLimited,
+            chrono::Utc::now(),
+        );
         return Err(Refusal::RateLimited { retry_after_secs });
     }
     timer.mark("entitlements");
@@ -629,7 +689,12 @@ async fn run<R: Route>(
             spent_usd,
         } = spend.check(who, Some(budget))
         {
-            state.rejection_metrics.record_budget_exceeded(tenant_id);
+            state.rejection_metrics.record_admission_refusal(
+                tenant_id,
+                Some(key_id_str),
+                crate::rejection_metrics::RejectionReason::KeyBudgetExceeded,
+                chrono::Utc::now(),
+            );
             tracing::warn!(
                 tenant_id = %tenant_id,
                 api_key_id = %key_id_str,
@@ -668,7 +733,15 @@ async fn run<R: Route>(
             spent_usd,
         } = spend.check(who, Some(budget_usd))
         {
-            state.rejection_metrics.record_budget_exceeded(tenant_id);
+            // Whichever key made THIS request, if any — the workspace cap can be
+            // tripped by any key in the tenant, so this attributes the triple to
+            // the one that happened to trip it, same as the KeyBudget site above.
+            state.rejection_metrics.record_admission_refusal(
+                tenant_id,
+                claims.api_key_id(),
+                crate::rejection_metrics::RejectionReason::WorkspaceBudgetExceeded,
+                chrono::Utc::now(),
+            );
             tracing::warn!(
                 tenant_id = %tenant_id,
                 budget_usd,
@@ -718,8 +791,10 @@ async fn run<R: Route>(
     // Durable CAPTURE before dispatch (acked JetStream publish); the head-advance
     // runs off the request path. A publish failure 503s — the audit product does
     // not serve unrecorded requests. Since A2 the SYNCHRONOUS fallback is
-    // fail-closed too. Dev / self-host never hit it: with no Postgres pool the
-    // append is in-memory and cannot fail.
+    // fail-closed too, and since B-493 (2026-09-21) that includes dev / self-host:
+    // with no Postgres pool the append is in-memory and its ClickHouse row rides a
+    // bounded writer queue — a full queue (ClickHouse refusing `audit_log` writes)
+    // refuses the append with the same 503, and the refused event consumes no seq.
     progress.enter(Step::Audit);
     let mut audit_payload = R::audit_payload(&parsed, trace_id, warn_aft_id);
     // Customer business reference (wedge item 5), when supplied — ties the
@@ -741,6 +816,10 @@ async fn run<R: Route>(
         return Err(Refusal::AuditUnavailable);
     }
     timer.mark("audit");
+    // B-568 I5: what admission knows so far (auth cold branch, JWT bridge miss,
+    // blocking entitlement resolve). The handler adds its own BYOK miss.
+    let mut identity = identity;
+    identity.cold_start = timer.is_cold();
 
     // The ledger row exists. From here every exit must leave a span (R13), and a
     // client that hangs up must leave one too (B-375 b): arm the guard NOW, not
@@ -943,6 +1022,76 @@ mod tests {
             ),
             ..crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey)
         }
+    }
+
+    // ── B-568 I1: the stage timer covers authentication ──
+
+    /// The pre-dispatch stages must account for the WHOLE interval the span's
+    /// overhead number opens with — `request_start` onwards — including the
+    /// credential check. The validator here takes a known 5 ms; if the timer were
+    /// created after it (the pre-B-568 shape) those 5 ms would land in
+    /// `unaccounted_us`, which is exactly the blind spot the prod slow lines had.
+    #[tokio::test]
+    async fn the_stage_timer_opens_before_authentication() {
+        const AUTH_US: u64 = 5_000;
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        let a = admit_via::<Chat, _, _>(&state, &authed(), chat_body(), |_cred| async {
+            tokio::time::sleep(std::time::Duration::from_micros(AUTH_US)).await;
+            Ok((
+                crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey),
+                crate::auth::AuthPath::ApiKey(crate::db::api_keys::LookupPath::Cold),
+            ))
+        })
+        .await
+        .unwrap_or_else(|r| panic!("admission refused: {r:?}"));
+        let overhead_us = u64::try_from(
+            (chrono::Utc::now() - a.request_start)
+                .num_microseconds()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let accounted = a.timer.accounted_us();
+        assert!(
+            overhead_us.saturating_sub(accounted) < 1_000,
+            "stages accounted {accounted} us of {overhead_us} us — the rest is \
+             unaccounted, so authentication is outside the timer"
+        );
+        let authenticate = a
+            .timer
+            .stages()
+            .find(|(name, _)| *name == "authenticate")
+            .map(|(_, us)| u64::from(us));
+        assert!(
+            authenticate.is_some_and(|us| us >= AUTH_US),
+            "the first stage must be `authenticate` and carry the validator's time, got {authenticate:?}"
+        );
+        // The branch that answered is carried, and a cold branch marks the request cold.
+        assert!(
+            a.timer.is_cold(),
+            "a cold auth branch must mark the request cold"
+        );
+        assert!(a.identity.cold_start, "and the span identity must carry it");
+        let mut a = a;
+        a.dispatch_guard.disarm();
+    }
+
+    /// The negative: a warm branch leaves the request warm (nothing else in this
+    /// fixture goes to a control plane — there is none).
+    #[tokio::test]
+    async fn a_warm_auth_branch_leaves_the_request_warm() {
+        let state = test_state(ProviderRegistry::new().expect("registry"));
+        let a = admit_via::<Chat, _, _>(&state, &authed(), chat_body(), |_cred| async {
+            Ok((
+                crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey),
+                crate::auth::AuthPath::ApiKey(crate::db::api_keys::LookupPath::Warm),
+            ))
+        })
+        .await
+        .unwrap_or_else(|r| panic!("admission refused: {r:?}"));
+        assert!(!a.timer.is_cold());
+        assert!(!a.identity.cold_start);
+        let mut a = a;
+        a.dispatch_guard.disarm();
     }
 
     // ── The order, observed ──

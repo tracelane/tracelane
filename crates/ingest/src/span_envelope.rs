@@ -38,3 +38,51 @@ impl SpanEnvelope {
         }
     }
 }
+
+/// The stream sequences this process holds but has not acked — in the channel or
+/// in the writer's batch. B-493 run 4 (2026-09-21): while the writer held one batch
+/// through a ClickHouse stall and progress-acked it, the NEXT batch sat in the
+/// channel with nobody to progress-ack it, JetStream redelivered it at `ack_wait`
+/// (3,936 redeliveries) and the copies were queued behind the originals — each an
+/// extra INSERT the `mv_*` views count. A redelivery of a sequence this process
+/// still holds is a duplicate by definition (the original will be acked, which acks
+/// the message whatever its delivery count) and is dropped at the consumer instead.
+/// Process-local on purpose: after a crash the set is gone and the redelivery is
+/// the real recovery path.
+mod held {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static HELD: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    /// Record `seq` as held; `false` if this process already holds it.
+    pub fn hold(seq: u64) -> bool {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(seq)
+    }
+
+    /// The message was acked (or terminally handled) — its sequence is no longer held.
+    pub fn release(seq: u64) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&seq);
+    }
+}
+
+pub use held::{hold, release};
+
+#[cfg(test)]
+mod held_tests {
+    #[test]
+    fn a_sequence_is_held_once_until_released() {
+        assert!(super::hold(9_000_001));
+        assert!(
+            !super::hold(9_000_001),
+            "a redelivery of a held sequence is refused"
+        );
+        super::release(9_000_001);
+        assert!(super::hold(9_000_001), "released, it can be held again");
+        super::release(9_000_001);
+    }
+}

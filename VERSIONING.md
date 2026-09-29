@@ -43,7 +43,7 @@ versa — see [SDK ↔ gateway compatibility](#sdk--gateway-compatibility).
 - Clients should **ignore unknown response fields** so an additive change never breaks them.
 - **Not covered by the `/v1` contract:** internal error *message strings* (the machine-readable
   `error` code is stable; the human `message` is not), undocumented fields, and endpoints
-  explicitly marked *roadmap/V1.1* in the docs.
+  explicitly marked *roadmap* in the docs.
 
 ## Pre-1.0 posture
 
@@ -82,9 +82,6 @@ in `CHANGELOG.md` under a `Deprecated` heading with the replacement and the earl
 may be removed. Post-1.0, deprecations carry a **minimum one-minor-version window** (a thing
 deprecated in `x.n` is not removed before `x.(n+2)` or the next major, whichever is sooner), and
 HTTP responses for a deprecated `/v1` route will carry a `Deprecation` / `Sunset` header.
-
-> A fuller standalone DEPRECATION policy (per-surface sunset timelines, header semantics) is a
-> post-launch follow-up; this section is the pre-publish minimum.
 
 ## Release cadence — one tag, everything that moved
 

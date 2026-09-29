@@ -151,3 +151,107 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 		expect(report.anchors_included).toBeGreaterThan(0);
 	});
 });
+
+// AUD-29 — the platform-key trust root. Shared vectors (offline, deterministic):
+// evals/audit-ledger/generate_platform_key_vectors.py. Rust and Python assert the same.
+describe("AUD-29 platform-key trust root", () => {
+	const meta = JSON.parse(
+		readFileSync(vector("platform-key-vectors.meta.json"), "utf8"),
+	);
+	const key = (b64: string) => Uint8Array.from(Buffer.from(b64, "base64"));
+	const platformPubkey = key(meta.platform_ed25519_pubkey_b64);
+	const tenantPubkey = key(meta.workspace_ed25519_pubkey_b64);
+	const run = (name: string, opts: Record<string, unknown>) =>
+		verifyLedgerText(readFileSync(vector(`${name}.ndjson`), "utf8"), {
+			formatVersion: "v2.1",
+			offline: true,
+			...opts,
+		});
+	const kinds = (r: { errors: { kind: string }[] }) =>
+		r.errors.map((e) => e.kind);
+
+	it("(a) all platform-signed batches verify and are counted apart", async () => {
+		const r = await run("platform-only", { tenantPubkey, platformPubkey });
+		expect(kinds(r)).toEqual([]);
+		expect(r.signatures_valid).toBe(true);
+		expect(r.platform_signed_batches).toBe(2);
+		expect(r.platform_signed_ranges).toEqual([
+			{ start_seq: 0, end_seq: 4 },
+			{ start_seq: 5, end_seq: 9 },
+		]);
+	});
+
+	it("(b) a platform-signed PREFIX then the workspace key verifies", async () => {
+		const r = await run("platform-then-workspace", {
+			tenantPubkey,
+			platformPubkey,
+		});
+		expect(kinds(r)).toEqual([]);
+		expect(r.signatures_valid).toBe(true);
+		expect(r.platform_signed_batches).toBe(1);
+	});
+
+	it("(c) a platform-signed batch AFTER the workspace key is RED", async () => {
+		const r = await run("workspace-then-platform", {
+			tenantPubkey,
+			platformPubkey,
+		});
+		expect(kinds(r)).toEqual(["platform_key_after_workspace_key"]);
+		expect(r.signatures_valid).toBe(false);
+	});
+
+	it("(d) a platform key that did not sign the batch is untrusted", async () => {
+		const r = await run("platform-then-workspace", {
+			tenantPubkey,
+			platformPubkey: key(meta.unrelated_ed25519_pubkey_b64),
+		});
+		expect(kinds(r)).toEqual(["untrusted_tenant_key"]);
+		expect(r.platform_signed_batches).toBe(0);
+	});
+
+	it("(f) the published takeover seq holds the rule with NO workspace batch in view", async () => {
+		const r = await run("platform-only", {
+			tenantPubkey,
+			platformPubkey,
+			workspaceKeySinceSeq: 5,
+		});
+		expect(kinds(r)).toEqual(["platform_key_after_workspace_key"]);
+		expect(r.signatures_valid).toBe(false);
+		expect(r.platform_signed_batches).toBe(1);
+		expect(r.platform_signed_ranges).toEqual([{ start_seq: 0, end_seq: 4 }]);
+	});
+
+	it("(g) takeover at seq 0 leaves no platform batch trusted", async () => {
+		const r = await run("platform-only", {
+			tenantPubkey,
+			platformPubkey,
+			workspaceKeySinceSeq: 0,
+		});
+		expect(kinds(r)).toEqual([
+			"platform_key_after_workspace_key",
+			"platform_key_after_workspace_key",
+		]);
+		expect(r.platform_signed_batches).toBe(0);
+	});
+
+	it("(h) a platform-signed SHADOW of a workspace batch is RED", async () => {
+		const r = await run("platform-shadow", { tenantPubkey, platformPubkey });
+		expect(kinds(r)).toEqual(["platform_key_after_workspace_key"]);
+		expect(r.platform_signed_batches).toBe(0);
+	});
+
+	it("(i) a platform key in the pinned LIST verifies (rotation keeps the old key)", async () => {
+		const r = await run("platform-then-workspace", {
+			tenantPubkey,
+			platformPubkeys: [key(meta.unrelated_ed25519_pubkey_b64), platformPubkey],
+		});
+		expect(kinds(r)).toEqual([]);
+		expect(r.platform_signed_batches).toBe(1);
+	});
+
+	it("(e) without platformPubkey a platform-signed batch is untrusted (unchanged)", async () => {
+		const r = await run("platform-then-workspace", { tenantPubkey });
+		expect(kinds(r)).toEqual(["untrusted_tenant_key"]);
+		expect(r.signatures_valid).toBe(false);
+	});
+});

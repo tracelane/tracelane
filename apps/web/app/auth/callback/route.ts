@@ -29,12 +29,8 @@ export const GET = handleAuth({
 		) {
 			return NextResponse.redirect(new URL("/sign-in", request.url));
 		}
-		return NextResponse.json(
-			{
-				error: "sign_in_failed",
-				description: "Couldn't complete sign-in. Please try signing in again.",
-			},
-			{ status: 400 },
-		);
+		// A person reads this, often on a phone — send them to a page with a way
+		// forward, not a JSON body (B-561, 2026-09-27). Detail stays in the log above.
+		return NextResponse.redirect(new URL("/auth/error", request.url));
 	},
 });

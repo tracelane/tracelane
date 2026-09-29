@@ -1,4 +1,7 @@
 "use client";
+import { fmtCount, fmtUsd } from "@/lib/metrics/format";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * ApiKeyManager — self-service tlane_* API key management UI.
@@ -10,10 +13,13 @@
  */
 
 import { Modal } from "@/components/Modal";
-import { apiFetch } from "@/lib/api-fetch";
-import { absoluteDate } from "@/lib/format-date";
+import { apiFetch, apiFetchRaw } from "@/lib/api-fetch";
+import { absoluteDate, formatDateTimeUtc } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { ObjectSurface } from "@tracelanedev/ui";
+import { Button, Toast, usePeek } from "@tracelanedev/ui";
+import { useEffect, useState } from "react";
+import { KeyEditDrawer } from "./KeyEditDrawer";
 
 export interface ApiKeyRow {
 	id: string;
@@ -43,6 +49,41 @@ export interface ApiKeyRow {
 	budgetUsdMonthly?: string | number | null;
 	/** GWY-43. Requests/min ceiling for this key; `null` = the plan limit only. */
 	rateLimitRpm?: number | null;
+	/**
+	 * BILL-01 A3 / SET-38. The window `budgetUsdMonthly` applies to — the column
+	 * name is historical; a `daily` key's budget is per day.
+	 */
+	budgetReset?: "daily" | "weekly" | "monthly";
+	/** BILL-01 A3. Anomaly-triggered freeze opted in for this key. */
+	velocityBreaker?: boolean;
+	/** Scheduled retirement of a rotated key, in UTC. */
+	revokedAt?: string | null;
+}
+
+/**
+ * Who is looking at the key list — passed down from the server page's session.
+ * UI gating only: the gateway re-decides every edit, and is authoritative.
+ */
+export interface KeyViewer {
+	/** WorkOS role slug (`owner` / `admin` / `member` / `viewer`), or `null`. */
+	role: string | null;
+	/** WorkOS user id — compared with a key's `mintedBy`. */
+	userId: string;
+}
+
+/**
+ * SET-38 §2 — may this viewer edit this key's limits? Mirrors the gateway's
+ * `key_editor` (`crates/gateway/src/key_routes.rs`) for a dashboard session:
+ * an owner (or WorkOS `admin`) may edit any key; a member only a key they minted;
+ * a viewer, or a session with no recognised role, none. Fail-closed on an
+ * unknown role, exactly like the gateway.
+ */
+export function canEditKeyLimits(viewer: KeyViewer, row: ApiKeyRow): boolean {
+	if (viewer.role === "owner" || viewer.role === "admin") return true;
+	if (viewer.role === "member") {
+		return row.mintedBy != null && row.mintedBy === viewer.userId;
+	}
+	return false;
 }
 
 /** The closed scope vocabulary, mirrored from `tracelane_shared::api_scope`. */
@@ -84,10 +125,22 @@ function scopeLabel(scope: string[] | null | undefined): string {
  * parse renders as no cap, which matches the gateway — `db::api_keys` filters a
  * budget it cannot parse down to `None` rather than treating it as zero.
  */
-function formatBudget(v: string | number | null | undefined): string | null {
+/** The budget's reset window as a suffix (B-586: this read `/mo` for every key). */
+const BUDGET_SUFFIX = {
+	daily: "/day",
+	weekly: "/week",
+	monthly: "/mo",
+} as const;
+
+function formatBudget(
+	v: string | number | null | undefined,
+	reset: ApiKeyRow["budgetReset"],
+): string | null {
 	if (v == null) return null;
 	const n = typeof v === "number" ? v : Number.parseFloat(v);
-	return Number.isFinite(n) && n > 0 ? `$${n.toFixed(2)}/mo` : null;
+	return Number.isFinite(n) && n > 0
+		? `${fmtUsd(n)}${BUDGET_SUFFIX[reset ?? "monthly"]}`
+		: null;
 }
 
 /**
@@ -99,7 +152,7 @@ function formatBudget(v: string | number | null | undefined): string | null {
  */
 function limitsLabel(key: ApiKeyRow): string | null {
 	const parts: string[] = [];
-	const budget = formatBudget(key.budgetUsdMonthly);
+	const budget = formatBudget(key.budgetUsdMonthly, key.budgetReset);
 	if (budget) parts.push(budget);
 	if (key.rateLimitRpm != null && key.rateLimitRpm > 0) {
 		parts.push(`${key.rateLimitRpm} req/min`);
@@ -148,14 +201,20 @@ function idleHint(createdAt: string, lastUsedAt: string | null): string | null {
  * limit the customer cannot see is one they cannot trust. Until GWY-43 the
  * budget column was writable only by hand-written SQL and readable nowhere.
  */
-function LimitsCell({ row }: { row: ApiKeyRow }) {
+function LimitsCell({
+	row,
+	flash = false,
+}: { row: ApiKeyRow; flash?: boolean }) {
 	const label = limitsLabel(row);
 	return (
-		<td className="py-2 pr-3 text-xs">
+		<TD
+			className={`py-2 pr-3 text-xs ${flash ? "animate-pulse bg-surface-2" : ""}`}
+			style={{ animationIterationCount: 1 }}
+		>
 			{label ? (
 				<span
 					className="text-ink-2"
-					title="Set when the key was created. The budget is a hard stop (402 until the month rolls over); the rate limit returns 429 and narrows the workspace plan limit for this key."
+					title="The budget is a hard stop (402 until its selected window resets); the rate limit returns 429 and narrows the workspace plan limit for this key."
 				>
 					{label}
 				</span>
@@ -167,12 +226,13 @@ function LimitsCell({ row }: { row: ApiKeyRow }) {
 					None
 				</span>
 			)}
-		</td>
+		</TD>
 	);
 }
 
 interface CreateResult extends ApiKeyRow {
 	rawKey: string;
+	oldKeyRevokedAt?: string;
 }
 
 async function fetchKeys(): Promise<ApiKeyRow[]> {
@@ -190,7 +250,7 @@ export interface CreateKeyInput {
 }
 
 async function createKey(input: CreateKeyInput): Promise<CreateResult> {
-	const res = await fetch("/api/settings/api-keys", {
+	const res = await apiFetchRaw("/api/settings/api-keys", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
@@ -219,10 +279,18 @@ async function createKey(input: CreateKeyInput): Promise<CreateResult> {
 }
 
 async function revokeKey(id: string): Promise<void> {
-	const res = await fetch(`/api/settings/api-keys/${encodeURIComponent(id)}`, {
-		method: "DELETE",
-	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const res = await apiFetchRaw(
+		`/api/settings/api-keys/${encodeURIComponent(id)}`,
+		{
+			method: "DELETE",
+		},
+	);
+	if (!res.ok) {
+		// The proxy now answers with a reason (owner-only, not found, unchanged);
+		// `HTTP 403` alone would throw that away.
+		const body = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new Error(body.error ?? `HTTP ${res.status}`);
+	}
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -235,13 +303,14 @@ function CopyButton({ text }: { text: string }) {
 	};
 
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={copy}
 			className="text-xs px-2 py-1 rounded border border-line text-ink-2 hover:text-ink hover:border-ink-3 transition-colors"
 		>
 			{copied ? "Copied!" : "Copy"}
-		</button>
+		</Button>
 	);
 }
 
@@ -249,11 +318,13 @@ function NewKeyModal({
 	rawKey,
 	name,
 	scope,
+	revokedAt,
 	onDone,
 }: {
 	rawKey: string;
 	name: string;
 	scope: string[] | null | undefined;
+	revokedAt?: string | null;
 	onDone: () => void;
 }) {
 	return (
@@ -274,7 +345,7 @@ function NewKeyModal({
 			width="lg"
 			dismissable={false}
 		>
-			<div className="rounded-lg bg-bg border border-line p-3 flex items-center justify-between gap-3">
+			<div className="rounded-card bg-bg border border-line p-3 flex items-center justify-between gap-3">
 				<code className="text-xs font-mono text-action-ink break-all">
 					{rawKey}
 				</code>
@@ -291,7 +362,7 @@ function NewKeyModal({
 			 * Chat is called out by name because it is the scope with a bill
 			 * attached — the others cost visibility, this one costs money.
 			 */}
-			<div className="rounded-lg border border-line p-3">
+			<div className="rounded-card border border-line p-3">
 				<p className="text-2xs text-ink-2 mb-1.5">This key can:</p>
 				<p className="text-xs text-ink">{scopeLabel(scope)}</p>
 				{Array.isArray(scope) && scope.includes("chat") && (
@@ -310,19 +381,27 @@ function NewKeyModal({
 			</div>
 
 			<p className="text-2xs text-ink-2">
+				{revokedAt && (
+					<>
+						The old key is scheduled to stop working at{" "}
+						{formatDateTimeUtc(revokedAt)}. Its existing expiry still applies.
+						Update your agents with the successor shown above before then.{" "}
+					</>
+				)}
 				Store this key in your secrets manager — this is the only time it's
 				shown. We keep only a one-way verifier digest (HMAC + Argon2id), never
 				the key itself; if you lose it, revoke and create a new one.
 			</p>
 
 			<div className="flex justify-end pt-1">
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={onDone}
 					className="px-4 py-2 rounded text-sm bg-surface-2 text-ink hover:bg-surface-3 transition-colors"
 				>
 					I&apos;ve saved it
-				</button>
+				</Button>
 			</div>
 		</Modal>
 	);
@@ -569,31 +648,147 @@ export function CreateKeyDialog({
 					</p>
 				)}
 				<div className="flex justify-end gap-2 pt-1">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						disabled={pending}
 						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
 					>
 						Cancel
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="submit"
 						disabled={!name.trim() || pending}
 						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 					>
 						{pending ? "Creating…" : "Create"}
-					</button>
+					</Button>
 				</div>
 			</form>
 		</Modal>
 	);
 }
 
-export function ApiKeyManager() {
+function RotateKeyDialog({
+	row,
+	onClose,
+	onRotate,
+	pending,
+	error,
+}: {
+	row: ApiKeyRow;
+	onClose: () => void;
+	onRotate: (graceHours: number) => void;
+	pending: boolean;
+	error: Error | null;
+}) {
+	const [chosen, setChosen] = useState<string | null>(null);
+	const policy = useQuery({
+		queryKey: ["api-key-rotation-policy"],
+		queryFn: () =>
+			apiFetch<{ graceHours: number }>(
+				"/api/settings/api-keys/rotation-policy",
+			),
+	});
+	const grace = chosen ?? (policy.data ? String(policy.data.graceHours) : "");
+	const hours = Number(grace);
+	const valid =
+		grace.trim() !== "" && Number.isSafeInteger(hours) && hours >= 0;
+	return (
+		<Modal
+			title="Rotate API key"
+			description={row.name}
+			onClose={onClose}
+			dismissable={!pending}
+		>
+			<p className="text-sm text-ink-2">
+				The successor keeps this key&apos;s scope, limits and expiry. Copy it
+				once, then update your agents during the grace period. Rotation requires
+				a workspace owner.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (valid && !pending) onRotate(hours);
+				}}
+				className="space-y-3"
+			>
+				<label htmlFor="rotation-grace" className="block text-sm text-ink">
+					Grace period (hours)
+				</label>
+				<input
+					id="rotation-grace"
+					type="number"
+					min="0"
+					step="1"
+					value={grace}
+					onChange={(e) => setChosen(e.target.value)}
+					disabled={pending}
+					className="w-full rounded border border-line bg-bg px-3 py-2 text-ink"
+				/>
+				<p className="text-xs text-ink-2">
+					Zero retires the old key immediately. An earlier expiry still applies.
+				</p>
+				{policy.isLoading && (
+					<p className="text-xs text-ink-2">Loading default grace period…</p>
+				)}
+				{policy.isError && (
+					<p role="alert" className="text-xs text-danger-ink">
+						Could not load the default. Enter a grace period to continue.
+					</p>
+				)}
+				{error && (
+					<p role="alert" className="text-xs text-danger-ink">
+						Couldn&apos;t rotate the key: {error.message}
+					</p>
+				)}
+				<div className="flex justify-end gap-2">
+					<Button
+						variant="bare"
+						type="button"
+						onClick={onClose}
+						disabled={pending}
+						className="rounded border border-line px-3 py-2 text-sm"
+					>
+						Cancel
+					</Button>
+					<Button
+						variant="bare"
+						type="submit"
+						disabled={!valid || pending}
+						className="rounded bg-action px-3 py-2 text-sm text-action-on disabled:opacity-40"
+					>
+						{pending ? "Rotating…" : "Rotate key"}
+					</Button>
+				</div>
+			</form>
+		</Modal>
+	);
+}
+
+export function ApiKeyManager({
+	viewer,
+}: {
+	viewer: KeyViewer;
+}) {
 	const qc = useQueryClient();
+	const [keyId, setKeyId] = usePeek("key");
+	const [notice, setNotice] = useState<string | null>(null);
+	const [changed, setChanged] = useState<{
+		id: string;
+		fields: string[];
+	} | null>(null);
+
+	useEffect(() => {
+		if (!changed) return;
+		const timer = setTimeout(() => setChanged(null), 1600);
+		return () => clearTimeout(timer);
+	}, [changed]);
 	const [showCreate, setShowCreate] = useState(false);
 	const [newKey, setNewKey] = useState<CreateResult | null>(null);
+	const [rotating, setRotating] = useState<ApiKeyRow | null>(null);
 
 	const {
 		data: keys = [],
@@ -605,6 +800,13 @@ export function ApiKeyManager() {
 		staleTime: 30_000,
 	});
 
+	const editing = keys.find((row) => row.id === keyId);
+	useEffect(() => {
+		if (keyId && !isLoading)
+			document
+				.getElementById(`key-${keyId}`)
+				?.scrollIntoView?.({ block: "center" });
+	}, [keyId, isLoading]);
 	const createMutation = useMutation({
 		mutationFn: createKey,
 		onSuccess: (result) => {
@@ -618,6 +820,31 @@ export function ApiKeyManager() {
 		mutationFn: revokeKey,
 		onSuccess: () => void qc.invalidateQueries({ queryKey: ["api-keys"] }),
 	});
+	const rotationMutation = useMutation({
+		mutationFn: async ({
+			id,
+			graceHours,
+		}: { id: string; graceHours: number }) => {
+			const res = await apiFetchRaw(
+				`/api/settings/api-keys/${encodeURIComponent(id)}/rotate`,
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ graceHours }),
+				},
+			);
+			if (!res.ok) {
+				const body = (await res.json().catch(() => ({}))) as { error?: string };
+				throw new Error(body.error ?? `HTTP ${res.status}`);
+			}
+			return res.json() as Promise<CreateResult>;
+		},
+		onSuccess: (result) => {
+			void qc.invalidateQueries({ queryKey: ["api-keys"] });
+			setRotating(null);
+			setNewKey(result);
+		},
+	});
 
 	return (
 		<div className="space-y-4">
@@ -629,7 +856,8 @@ export function ApiKeyManager() {
 						environment.
 					</p>
 				</div>
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => {
 						createMutation.reset(); // clear any stale error before reopening
@@ -638,9 +866,12 @@ export function ApiKeyManager() {
 					className="px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ New key
-				</button>
+				</Button>
 			</div>
 
+			{keyId && !isLoading && !isError && !editing && (
+				<p role="alert">That key isn't in this workspace</p>
+			)}
 			{isLoading && (
 				<p className="text-sm text-ink-2 animate-pulse">Loading…</p>
 			)}
@@ -654,7 +885,7 @@ export function ApiKeyManager() {
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
-				<div className="rounded-lg border border-dashed border-line p-8 text-center">
+				<div className="rounded-card border border-dashed border-line p-8 text-center">
 					<p className="text-sm text-ink-2">No API keys yet.</p>
 					<p className="text-xs text-ink-3 mt-1">
 						Create one to start routing agent traffic through Tracelane.
@@ -663,23 +894,23 @@ export function ApiKeyManager() {
 			)}
 
 			{keys.length > 0 && (
-				<div className="overflow-x-auto rounded-lg border border-line">
-					<table className="w-full text-left">
-						<thead className="bg-surface text-xs text-ink-2">
-							<tr>
-								<th className="py-1.5 px-3 font-medium">Name</th>
-								<th className="py-1.5 pr-3 font-medium">Prefix</th>
-								<th className="py-1.5 pr-3 font-medium">Scope</th>
-								<th className="py-1.5 pr-3 font-medium">Expires</th>
-								<th
+				<div className="overflow-x-auto rounded-card border border-line">
+					<Table className="w-full text-left">
+						<THead className="bg-surface text-xs text-ink-2">
+							<TR>
+								<TH className="py-1.5 px-3 font-medium">Name</TH>
+								<TH className="py-1.5 pr-3 font-medium">Prefix</TH>
+								<TH className="py-1.5 pr-3 font-medium">Scope</TH>
+								<TH className="py-1.5 pr-3 font-medium">Expires</TH>
+								<TH
 									className="py-1.5 pr-3 font-medium"
 									title="Per-key monthly spend cap and requests-per-minute cap, both enforced by the gateway."
 								>
 									Limits
-								</th>
-								<th className="py-1.5 pr-3 font-medium">Created</th>
-								<th className="py-1.5 pr-3 font-medium">Created by</th>
-								<th
+								</TH>
+								<TH className="py-1.5 pr-3 font-medium">Created</TH>
+								<TH className="py-1.5 pr-3 font-medium">Created by</TH>
+								<TH
 									className="py-1.5 pr-3 font-medium"
 									title="Refreshed when a key misses the auth cache, so it can lag real usage by up to 15 minutes."
 								>
@@ -687,18 +918,68 @@ export function ApiKeyManager() {
 									<span className="font-normal text-ink-3" aria-hidden="true">
 										†
 									</span>
-								</th>
-								<th className="py-1.5 pr-3 font-medium" />
-							</tr>
-						</thead>
-						<tbody>
+								</TH>
+								<TH className="py-1.5 pr-3 font-medium" />
+								<TH className="px-3 py-2">
+									<span className="sr-only">Object actions</span>
+								</TH>
+							</TR>
+						</THead>
+						<TBody>
 							{keys.map((key) => (
-								<tr key={key.id} className="border-t border-line last:border-0">
-									<td className="py-2 px-3 text-sm text-ink">{key.name}</td>
-									<td className="py-2 pr-3 font-mono text-xs text-ink-2">
+								<ObjectSurface
+									key={key.id}
+									id={`key-${key.id}`}
+									objectId={key.id}
+									title={key.name}
+									href={`/settings/api-keys?key=${encodeURIComponent(key.id)}`}
+									fields={[
+										{ label: "Prefix", value: key.keyPrefix },
+										{ label: "Scope", value: scopeLabel(key.scope) },
+										{
+											label: "Budget",
+											value:
+												key.budgetUsdMonthly == null
+													? "Not set"
+													: fmtUsd(Number(key.budgetUsdMonthly)),
+										},
+										{
+											label: "RPM",
+											value:
+												key.rateLimitRpm == null
+													? "Not set"
+													: fmtCount(key.rateLimitRpm),
+										},
+									]}
+									actions={[
+										{
+											label: "Edit limits",
+											disabled:
+												!canEditKeyLimits(viewer, key) ||
+												isExpired(key.expiresAt),
+											onSelect: () => setKeyId(key.id),
+										},
+									]}
+									className="border-t border-line last:border-0"
+								>
+									<TD
+										className={`py-2 px-3 text-sm text-ink ${changed?.id === key.id && changed.fields.includes("name") ? "animate-pulse bg-surface-2" : ""}`}
+										style={{ animationIterationCount: 1 }}
+									>
+										{key.name}
+										{key.revokedAt && (
+											<p className="text-xs text-warn-ink">
+												Retires {formatDateTimeUtc(key.revokedAt)}
+											</p>
+										)}
+									</TD>
+									<TD className="py-2 pr-3 font-mono text-xs text-ink-2">
 										tlane_{key.keyPrefix}…
-									</td>
-									<td className="py-2 pr-3 text-xs">
+									</TD>
+									<TD
+										className={`py-2 pr-3 text-xs ${changed?.id === key.id ? "animate-pulse bg-surface-2" : ""}`}
+										style={{ animationIterationCount: 1 }}
+									>
 										{/* `null` scope is a LEGACY key with the full surface —
 										    never render it as an empty list, which would read as
 										    "no access" and is the opposite of the truth. */}
@@ -708,14 +989,17 @@ export function ApiKeyManager() {
 											}
 											title={
 												key.scope == null
-													? "Minted before scopes existed — carries the full API surface. Re-mint with explicit scopes to narrow it."
+													? "Minted before scopes existed — carries the full API surface. Use Edit limits to narrow it in place."
 													: undefined
 											}
 										>
 											{scopeLabel(key.scope)}
 										</span>
-									</td>
-									<td className="py-2 pr-3 text-xs">
+									</TD>
+									<TD
+										className={`py-2 pr-3 text-xs ${changed?.id === key.id ? "animate-pulse bg-surface-2" : ""}`}
+										style={{ animationIterationCount: 1 }}
+									>
 										{key.expiresAt ? (
 											<span
 												className={
@@ -730,15 +1014,27 @@ export function ApiKeyManager() {
 										) : (
 											<span className="text-ink-3">Never</span>
 										)}
-									</td>
-									<LimitsCell row={key} />
-									<td className="py-2 pr-3 text-xs text-ink-2">
+									</TD>
+									<LimitsCell
+										row={key}
+										flash={
+											changed?.id === key.id &&
+											changed.fields.some((f) =>
+												[
+													"budget_usd_monthly",
+													"budget_reset",
+													"rate_limit_rpm",
+												].includes(f),
+											)
+										}
+									/>
+									<TD className="py-2 pr-3 text-xs text-ink-2">
 										{absoluteDate(key.createdAt)}
-									</td>
-									<td className="py-2 pr-3 font-mono text-xs text-ink-3">
+									</TD>
+									<TD className="py-2 pr-3 font-mono text-xs text-ink-3">
 										{key.mintedBy ? `${key.mintedBy.slice(0, 14)}…` : "—"}
-									</td>
-									<td className="py-2 pr-3 text-xs text-ink-2">
+									</TD>
+									<TD className="py-2 pr-3 text-xs text-ink-2">
 										{key.lastUsedAt ? (
 											absoluteDate(key.lastUsedAt)
 										) : (
@@ -749,20 +1045,40 @@ export function ApiKeyManager() {
 												{idleHint(key.createdAt, key.lastUsedAt) ?? "Never"}
 											</span>
 										)}
-									</td>
-									<td className="py-2 pr-3">
-										<button
+									</TD>
+									<TD className="py-2 pr-3">
+										{canEditKeyLimits(viewer, key) &&
+											!isExpired(key.expiresAt) && (
+												<Button size="sm" onClick={() => setKeyId(key.id)}>
+													Edit limits
+												</Button>
+											)}
+										<Button
+											variant="bare"
+											type="button"
+											disabled={!!key.revokedAt || isExpired(key.expiresAt)}
+											onClick={() => {
+												rotationMutation.reset();
+												setRotating(key);
+											}}
+											className="mr-2 rounded border border-line px-2 py-1 text-xs text-ink-2 disabled:opacity-40"
+										>
+											Rotate
+										</Button>
+										<Button
+											variant="bare"
 											type="button"
 											onClick={() => {
 												if (
 													window.confirm(
-														// This said "will immediately fail authentication".
-														// The gateway caches a positive auth result, so a
-														// revoked key keeps working until that entry expires —
-														// bounded at 60 seconds, and it was 15 minutes until
-														// 2026-08-12. Revocation is recorded instantly; it is
-														// ENFORCED within a minute, and the copy now says which.
-														`Revoke "${key.name}"? The key stops working within 60 seconds — any agent still using it will start failing authentication. This cannot be undone.`,
+														// B-586 (SET-38 B6): revoke now goes THROUGH THE
+														// GATEWAY, which clears its own auth cache in the same
+														// step, so the key's NEXT request is refused. Until then
+														// this read "within 60 seconds", because the revoke was a
+														// dashboard database write the gateway's 60 s cache never
+														// saw. Requests already admitted still finish — hence
+														// "next request", never "immediately".
+														`Revoke "${key.name}"? The key stops working on its next request — any agent still using it will start failing authentication. This cannot be undone.`,
 													)
 												) {
 													revokeMutation.mutate(key.id);
@@ -771,12 +1087,12 @@ export function ApiKeyManager() {
 											className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 										>
 											Revoke
-										</button>
-									</td>
-								</tr>
+										</Button>
+									</TD>
+								</ObjectSurface>
 							))}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 					<p className="px-4 pb-3 pt-2 text-2xs text-ink-3">
 						† <strong>Last used</strong> is refreshed when a key misses the auth
 						cache, so it can lag real usage by up to 15 minutes. A key used
@@ -786,6 +1102,24 @@ export function ApiKeyManager() {
 				</div>
 			)}
 
+			{editing && canEditKeyLimits(viewer, editing) && (
+				<KeyEditDrawer
+					key={editing.id}
+					row={editing}
+					onClose={() => setKeyId(null)}
+					onSaved={(updated, fields) => {
+						qc.setQueryData<ApiKeyRow[]>(["api-keys"], (old) =>
+							old?.map((row) =>
+								row.id === updated.id ? { ...row, ...updated } : row,
+							),
+						);
+						setChanged({ id: updated.id, fields });
+						setKeyId(null);
+						setNotice("Limits updated — applies to this key's next request");
+					}}
+				/>
+			)}
+			<Toast message={notice} onDismiss={() => setNotice(null)} />
 			{showCreate && (
 				<CreateKeyDialog
 					onClose={() => {
@@ -803,7 +1137,25 @@ export function ApiKeyManager() {
 					rawKey={newKey.rawKey}
 					name={newKey.name}
 					scope={newKey.scope}
-					onDone={() => setNewKey(null)}
+					revokedAt={newKey.oldKeyRevokedAt}
+					onDone={() => {
+						setNewKey(null);
+						createMutation.reset();
+						rotationMutation.reset();
+					}}
+				/>
+			)}
+			{rotating && (
+				<RotateKeyDialog
+					row={rotating}
+					onClose={() => {
+						if (!rotationMutation.isPending) setRotating(null);
+					}}
+					onRotate={(graceHours) =>
+						rotationMutation.mutate({ id: rotating.id, graceHours })
+					}
+					pending={rotationMutation.isPending}
+					error={rotationMutation.error}
 				/>
 			)}
 		</div>

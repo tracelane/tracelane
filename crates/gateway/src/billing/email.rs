@@ -129,6 +129,17 @@ async fn send_one(
     pct: f64,
     threshold: u32,
 ) {
+    // Nothing to send without a key: note it and stop BEFORE the SSRF guard, which
+    // resolves `api.resend.com` over real DNS. B-478 (2026-09-20): with the guard
+    // first, an unconfigured process did a DNS lookup per warning for nothing, and
+    // the test of this branch depended on the internet — it went red the moment a
+    // power outage dropped the connection mid-gate.
+    if resend_api_key.is_none() {
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::UsageWarningEmailUnconfigured,
+        );
+        return;
+    }
     let url = tracelane_shared::email::RESEND_API_URL;
     if let Err(e) = crate::ssrf_guard::validate_url(url).await {
         // Unreachable in practice (a fixed literal, not operator input), but

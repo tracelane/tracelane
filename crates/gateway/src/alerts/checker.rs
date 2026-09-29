@@ -10,12 +10,13 @@
 //! means an ongoing breach alerts once, not every tick — no spam, no cooldown
 //! bookkeeping needed for V1.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::{AlertRule, breach_message, fire_alert_async, is_breach};
+use super::{AlertRule, breach_message, is_breach};
 use crate::db::DbPool;
 use crate::entitlement_cache::{EntitlementCache, FeatureKey};
 
@@ -126,13 +127,88 @@ type RuleWithDest = (AlertRule, super::AlertDestination);
 /// `(fetched_at, rules)` — `None` until the first fetch.
 type CachedRules = Option<(std::time::Instant, Vec<RuleWithDest>)>;
 
+/// The decision this tick, from the CURRENT observation and this process's LIVE
+/// knowledge of the rule's state (B-477).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transition {
+    /// ok → breach: try the Postgres CAS; fire iff it is won.
+    Fire,
+    /// breach → ok: write the recovery.
+    Recover,
+    /// Nothing to write.
+    Steady,
+}
+
+/// **B-477 (REV-4, 2026-09-21): transition state lives HERE, not in the rule cache.**
+/// `cached_rules` clones the rule rows — `last_state` included — and serves them for
+/// the whole TTL (900 s default; **21,600 s on prod** under `growth-mode.sh off`).
+/// The transition match used to read `rule.last_state` from that clone: after a won
+/// `ok→breach` CAS wrote Postgres, the cache still said `ok`, so the recovery was
+/// matched as steady state and never written, and the NEXT breach's CAS found the
+/// row already at `breach`, got `Ok(false)`, and sent nothing — every episode after
+/// the first was lost until the cache expired. This map is seeded from the rows at
+/// every refresh (Postgres is the cross-process truth) and then advanced by this
+/// process's own successful transitions, so a decision always reads the state this
+/// process last established. The Postgres CAS stays the cross-process guard (RI-04);
+/// zero extra reads (NEON-COMPUTE-PIN unchanged).
+#[derive(Default)]
+pub(crate) struct LiveStates {
+    by_rule: HashMap<Uuid, String>,
+}
+
+impl LiveStates {
+    /// Seed from a freshly fetched rule set: Postgres wins over anything remembered.
+    pub(crate) fn seed(&mut self, rules: impl IntoIterator<Item = (Uuid, String)>) {
+        for (id, state) in rules {
+            self.by_rule.insert(id, state);
+        }
+    }
+
+    /// The state this process last established for `id`, else `fallback` (the
+    /// cached row's — only for a rule seen for the first time before any refresh).
+    pub(crate) fn state<'a>(&'a self, id: Uuid, fallback: &'a str) -> &'a str {
+        self.by_rule.get(&id).map_or(fallback, String::as_str)
+    }
+
+    /// Record a confirmed delivery or accepted recovery/reset. A competing
+    /// CAS claim is not evidence that another checker delivered a notification.
+    pub(crate) fn record(&mut self, id: Uuid, state: &str) {
+        self.by_rule.insert(id, state.to_string());
+    }
+}
+
+/// Pure: the transition for `breach` given the live `state`.
+pub(crate) fn transition(breach: bool, state: &str) -> Transition {
+    match (breach, state) {
+        (true, "ok") => Transition::Fire,
+        (false, "breach") => Transition::Recover,
+        _ => Transition::Steady, // (true, breach) already alerted; (false, ok) steady
+    }
+}
+
+// Existing health kind is shared with failed evaluation. It now covers failed
+// delivery/state recording too; no new shared/ingest-linked kind is introduced.
+fn note_processing_failure() {
+    tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::AlertEvalSkipped,
+    );
+}
+#[derive(Clone, Copy)]
+enum PendingState {
+    Reset,
+    Confirmed(std::time::SystemTime),
+}
+
 pub struct AlertChecker {
+    pending: tokio::sync::Mutex<HashMap<Uuid, PendingState>>,
     pool: DbPool,
     ch: clickhouse::Client,
     entitlements: Arc<EntitlementCache>,
     interval: Duration,
     /// `(fetched_at, rules)`. `None` = never fetched.
     rules_cache: tokio::sync::RwLock<CachedRules>,
+    /// B-477: the LIVE transition state per rule — see [`LiveStates`].
+    live: tokio::sync::Mutex<LiveStates>,
     /// When the daily miss-cohort overhead REPORT last ran. `None` = never.
     /// See [`AlertChecker::maybe_report_miss_cohort_overhead`].
     last_overhead_report: tokio::sync::Mutex<Option<std::time::Instant>>,
@@ -146,11 +222,13 @@ impl AlertChecker {
         interval: Duration,
     ) -> Self {
         Self {
+            pending: tokio::sync::Mutex::new(HashMap::new()),
             pool,
             ch,
             entitlements,
             interval,
             rules_cache: tokio::sync::RwLock::new(None),
+            live: tokio::sync::Mutex::new(LiveStates::default()),
             last_overhead_report: tokio::sync::Mutex::new(None),
         }
     }
@@ -165,8 +243,8 @@ impl AlertChecker {
             ticker.tick().await; // discard the immediate first tick
             loop {
                 ticker.tick().await;
-                if let Err(err) = self.run_once().await {
-                    tracing::warn!(error = %err, "alert checker tick failed");
+                if self.run_once().await.is_err() {
+                    note_processing_failure();
                 }
             }
         });
@@ -184,13 +262,29 @@ impl AlertChecker {
             return Ok(rules.clone());
         }
         let rules = super::list_enabled_rules_with_dest(&self.pool).await?;
+        // B-477: a refresh re-seeds the live states from Postgres (cross-process truth).
+        self.live
+            .lock()
+            .await
+            .seed(rules.iter().map(|(r, _)| (r.id, r.last_state.clone())));
         *self.rules_cache.write().await = Some((std::time::Instant::now(), rules.clone()));
         Ok(rules)
     }
 
+    async fn retry_state(&self, id: Uuid, state: PendingState) -> anyhow::Result<()> {
+        match state {
+            PendingState::Reset => {
+                super::release_failed_breach(&self.pool, id).await?;
+                self.live.lock().await.record(id, "ok");
+            }
+            PendingState::Confirmed(at) => super::record_delivery(&self.pool, id, at).await?,
+        }
+        Ok(())
+    }
+
     /// One evaluation pass over all enabled rules.
     pub async fn run_once(&self) -> anyhow::Result<()> {
-        // B-264 / R75. Deliberately BEFORE the zero-rules early return below.
+        // B-264 / R75. Deliberately BEFORE the rule processing below.
         //
         // This is an OPERATOR self-check, not a tenant alert rule, and prod has
         // zero rules — so placing it inside the rule loop would have made it a
@@ -205,11 +299,21 @@ impl AlertChecker {
 
         let rules = self.cached_rules().await?;
         // Zero rules is the steady state today (alerting ships dark), and it must
-        // cost nothing: no ClickHouse queries, no entitlement lookups, no work.
-        if rules.is_empty() {
-            return Ok(());
+        // cost no metric reads or entitlement lookups. Pending state writes still retry.
+        let mut healthy = true;
+        let pending = self.pending.lock().await.clone();
+        for (id, pending_state) in pending {
+            if self.retry_state(id, pending_state).await.is_ok() {
+                self.pending.lock().await.remove(&id);
+            } else {
+                healthy = false;
+                note_processing_failure();
+            }
         }
         for (rule, dest) in rules {
+            if self.pending.lock().await.contains_key(&rule.id) {
+                continue;
+            }
             // Re-gate on the entitlement so a revoked tenant stops firing.
             if !self
                 .entitlements
@@ -226,53 +330,88 @@ impl AlertChecker {
                 // would be worse — but it was completely uninstrumented, which is the
                 // exact defect this registry exists to close. The thing that tells you
                 // something is broken must not itself break quietly.
-                tracelane_shared::degradation::note(
-                    tracelane_shared::degradation::Degradation::AlertEvalSkipped,
-                );
+                healthy = false;
+                note_processing_failure();
                 continue; // metric unavailable this tick → fail-safe skip
             };
             let breach = is_breach(value, &rule.comparator, rule.threshold);
-            match (breach, rule.last_state.as_str()) {
-                (true, "ok") => {
-                    // Edge: ok → breach. Fire once, record the fire.
-                    tracing::info!(
-                        rule_id = %rule.id,
-                        tenant_id = %rule.tenant_id,
-                        metric = %rule.metric,
-                        value,
-                        threshold = rule.threshold,
-                        "alert breach — firing notification"
-                    );
-                    fire_alert_async(dest.url.clone(), breach_message(&rule, value));
-                    // DSH-01: also land it in the tenant's in-app inbox. This is
-                    // on the ok->breach EDGE, so it is one row per breach, not one
-                    // per tick — the same discipline the webhook fire already
-                    // follows (.claude/rules/logging.md: transitions, not
-                    // occurrences).
-                    //
-                    // Deliberately AFTER the webhook: the outbound alert is the
-                    // load-bearing delivery and must not wait on a Postgres write.
-                    // `notify` fails OPEN and logs, so a full inbox table can
-                    // never suppress an alert.
-                    crate::notification_routes::notify(
-                        &self.pool,
-                        rule.tenant_id,
-                        "alert",
-                        &format!("Alert fired: {}", rule.metric),
-                        &breach_message(&rule, value),
-                        "warning",
-                        "/slo",
-                    )
-                    .await;
-                    let _ = super::update_rule_state(&self.pool, rule.id, "breach", true).await;
+            // B-477: decide from the LIVE state, never from the cached row.
+            let decision = {
+                let live = self.live.lock().await;
+                transition(breach, live.state(rule.id, &rule.last_state))
+            };
+            match decision {
+                Transition::Fire => {
+                    // RI-04: the claim stays FIRST. The at-most-once delivery-loss
+                    // ceiling was superseded on 2026-09-22.
+                    match super::claim_breach(&self.pool, rule.id).await {
+                        Ok(true) => {
+                            let delivered = tokio::time::timeout(
+                                super::WEBHOOK_VALIDATE_TIMEOUT + super::WEBHOOK_TIMEOUT,
+                                super::deliver_alert(&dest.url, &breach_message(&rule, value)),
+                            )
+                            .await;
+                            if !matches!(delivered, Ok(Ok(_))) {
+                                healthy = false;
+                                note_processing_failure();
+                                self.pending
+                                    .lock()
+                                    .await
+                                    .insert(rule.id, PendingState::Reset);
+                                if self.retry_state(rule.id, PendingState::Reset).await.is_ok() {
+                                    self.pending.lock().await.remove(&rule.id);
+                                }
+                                continue;
+                            }
+                            // Remote delivery is now confirmed. Retain its actual time
+                            // if Postgres is temporarily unavailable; never resend just
+                            // because persisting that timestamp failed.
+                            self.live.lock().await.record(rule.id, "breach");
+                            let confirmed = PendingState::Confirmed(std::time::SystemTime::now());
+                            if self.retry_state(rule.id, confirmed).await.is_err() {
+                                healthy = false;
+                                note_processing_failure();
+                                self.pending.lock().await.insert(rule.id, confirmed);
+                            }
+                            tracing::info!(rule_id = %rule.id, tenant_id = %rule.tenant_id,
+                                metric = %rule.metric, value, "alert webhook delivered");
+                            crate::notification_routes::notify(
+                                &self.pool,
+                                rule.tenant_id,
+                                "alert",
+                                &format!("Alert delivered: {}", rule.metric),
+                                &breach_message(&rule, value),
+                                "warning",
+                                "/slo",
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            // A competing claim may still fail and roll back. It is
+                            // not evidence of delivery: keep trying CAS on later ticks.
+                        }
+                        Err(_) => {
+                            healthy = false;
+                            note_processing_failure();
+                        }
+                    }
                 }
-                (false, "breach") => {
-                    // Recovery: breach → ok. Reset so the next breach re-fires.
-                    let _ = super::update_rule_state(&self.pool, rule.id, "ok", false).await;
+                Transition::Recover => {
+                    match super::release_failed_breach(&self.pool, rule.id).await {
+                        Ok(()) => self.live.lock().await.record(rule.id, "ok"),
+                        Err(_) => {
+                            healthy = false;
+                            note_processing_failure();
+                        }
+                    }
                 }
-                // (true, "breach") already alerted; (false, "ok") steady state.
-                _ => {}
+                Transition::Steady => {}
             }
+        }
+        if healthy {
+            tracelane_shared::degradation::resolve(
+                tracelane_shared::degradation::Degradation::AlertEvalSkipped,
+            );
         }
         Ok(())
     }
@@ -322,16 +461,19 @@ impl AlertChecker {
     /// post-fix hours read HIGHER than regressed ones. Widest scope is necessary
     /// and NOT sufficient; the cohort must be held fixed.
     ///
-    /// **⚠️ THIS IS A REPORT UNTIL SOMETHING RELIABLY GENERATES MISSES, AND TODAY
-    /// NOTHING DOES.** Measured on prod 2026-08-22: `n_miss = 0` for BOTH models
-    /// over 24 h **and over 7 days** — every span carrying the dimension is a HIT,
-    /// and the p50 is `nan`. The cause is structural, not a quiet week: the
-    /// dogfood driver replays a FIXED 15-prompt array, so after the first pass it
-    /// can never miss again. **A control over an empty cohort is CLASS-1 with a
-    /// green badge** — which is B-264's own lesson — so this emits and never
-    /// decides. Promoting it to a control needs one thing: vary the dogfood
-    /// prompt set so misses exist. That is a change to
-    /// `/opt/tracelane/dogfood/dogfood.sh`, not new infrastructure.
+    /// **⚠️ THIS WAS A REPORT OVER AN EMPTY COHORT, AND THE CAUSE WAS NOT THE ONE
+    /// WRITTEN HERE.** Measured on prod 2026-08-22: `n_miss = 0` for BOTH models
+    /// over 24 h **and over 7 days** — every span carrying the dimension was a HIT,
+    /// and the p50 was `nan`. This doc blamed the dogfood driver's FIXED 15-prompt
+    /// array (true, and still worth varying) — but the ADR-077 pass found the
+    /// structural cause (B-447, 2026-09-19): **nothing ever WROTE `false`.** The
+    /// only writer was the cache-hit span in `chat.rs`; a consulted-and-missed
+    /// request wrote nothing, so this query's MISS cohort could not be populated
+    /// by any traffic pattern. `server/buffered.rs` now writes `Some(false)` on a
+    /// consulted miss, so the cohort fills from the first post-deploy miss.
+    /// **A control over an empty cohort is CLASS-1 with a green badge** — B-264's
+    /// own lesson — so this still emits and never decides until the cohort is
+    /// read non-empty on prod.
     ///
     /// An empty cohort therefore prints CANNOT DETERMINE and never a number. A
     /// `nan` or a `0` rendered as a p50 is the zero-vs-unknown failure this
@@ -532,8 +674,97 @@ fn ingest_pct(used_bytes: f64, included_bytes: Option<u64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use super::{LiveStates, Transition, transition};
     use super::{RULES_CACHE_TTL, ingest_pct, plan_key_to_error_budget};
     use std::time::Duration;
+
+    /// **B-477 (REV-4) — the episode sequence, both shapes.** A rule observed
+    /// ok → breach → ok → breach must FIRE TWICE with the recovery written between.
+    /// Driven through the pure transition + the live-state map with the same
+    /// outcomes the Postgres CAS produces (a won claim, an accepted recovery). The
+    /// falsification is the OLD shape beside it: deciding from the cached row's
+    /// state (`ok` for the whole TTL) fires ONCE and never writes the recovery —
+    /// every later episode is lost.
+    #[test]
+    fn b477_a_second_breach_episode_fires_when_state_is_live_and_not_when_cached() {
+        let id = uuid::Uuid::new_v4();
+        let observations = [false, true, false, true];
+        // NEW: the live map advances with each established transition.
+        let mut live = LiveStates::default();
+        live.seed([(id, "ok".to_string())]);
+        let mut fires = 0;
+        let mut recoveries = 0;
+        for breach in observations {
+            match transition(breach, live.state(id, "ok")) {
+                Transition::Fire => {
+                    fires += 1; // the CAS ok->breach is won: the row said ok
+                    live.record(id, "breach");
+                }
+                Transition::Recover => {
+                    recoveries += 1;
+                    live.record(id, "ok");
+                }
+                Transition::Steady => {}
+            }
+        }
+        assert_eq!(
+            (fires, recoveries),
+            (2, 1),
+            "two episodes ⇒ two fires, one recovery between"
+        );
+
+        // OLD: the cached row says `ok` for the whole TTL; the DB row flips to
+        // `breach` on the first won CAS and never comes back.
+        let cached_state = "ok";
+        let mut db_state = "ok";
+        let mut old_fires = 0;
+        let mut old_recoveries = 0;
+        for breach in observations {
+            match transition(breach, cached_state) {
+                Transition::Fire => {
+                    if db_state == "ok" {
+                        old_fires += 1; // CAS won
+                        db_state = "breach";
+                    } // else CAS refused: nothing sent
+                }
+                Transition::Recover => old_recoveries += 1,
+                Transition::Steady => {}
+            }
+        }
+        assert_eq!(
+            (old_fires, old_recoveries),
+            (1, 0),
+            "the pre-B-477 shape loses the second episode and never writes the recovery"
+        );
+        // And the self-healing half: a refused CAS (the row already says breach) is
+        // recorded as `breach`, so the next `ok` observation recovers instead of idling.
+        let mut healed = LiveStates::default();
+        healed.seed([(id, "ok".to_string())]);
+        assert_eq!(transition(true, healed.state(id, "ok")), Transition::Fire);
+        healed.record(id, "breach"); // Ok(false) from the CAS — the row was already in breach
+        assert_eq!(
+            transition(false, healed.state(id, "ok")),
+            Transition::Recover
+        );
+    }
+
+    /// A refresh re-seeds from Postgres: what the rows say wins over what this
+    /// process remembered (cross-process truth), and an unknown rule falls back to
+    /// its row's state.
+    #[test]
+    fn b477_a_refresh_reseeds_from_the_rows() {
+        let id = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut live = LiveStates::default();
+        live.record(id, "breach");
+        live.seed([(id, "ok".to_string())]);
+        assert_eq!(live.state(id, "x"), "ok");
+        assert_eq!(
+            live.state(other, "breach"),
+            "breach",
+            "unknown ⇒ the row's state"
+        );
+    }
 
     ///  #6: burn is divided by the tenant's PLAN error budget (ADR-020),
     /// not a hardcoded 99.9%. The discriminating case: a Team tenant's target is
@@ -619,5 +850,209 @@ mod tests {
         assert_eq!(team_burn, 2.0);
         assert_eq!(old_hardcoded_burn, 20.0);
         assert_eq!(old_hardcoded_burn / team_burn, 10.0); // 10× overstated, now fixed
+    }
+}
+#[cfg(all(test, debug_assertions))]
+mod delivery_proofs {
+    use super::*;
+    use crate::entitlement_cache::ResolvedEntitlements;
+    use crate::handler_harness::LoopbackBypassGuard;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    #[tokio::test]
+    #[ignore = "initialized local Postgres and ClickHouse only; applies no schema"]
+    async fn delivery_failure_retries_and_only_confirmed_delivery_is_announced() {
+        prove_delivery(false).await;
+    }
+    #[tokio::test]
+    #[ignore = "requires existing notifications schema as well as local proof services"]
+    async fn delivery_inbox_readback_requires_notifications_schema() {
+        prove_delivery(true).await;
+    }
+    async fn prove_delivery(inbox_readback: bool) {
+        let _guard = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let pool = super::super::ri04_cas_tests::pool_from_test_url(
+            &std::env::var("POSTGRES_TEST_URL").expect("local PostgreSQL URL"),
+        );
+        let client = pool.get().await.unwrap();
+        let org = format!("org_delivery_{}", Uuid::new_v4().simple());
+        let tenant:Uuid=client.query_one("INSERT INTO tenants (workos_org_id,name) VALUES ($1,'delivery proof') RETURNING id",&[&org]).await.unwrap().get(0);
+        let url = format!("{}/hook", server.uri());
+        let dest:Uuid=client.query_one("INSERT INTO alert_destinations (tenant_id,name,kind,url) VALUES ($1,'proof','slack',$2) RETURNING id",&[&tenant,&url]).await.unwrap().get(0);
+        let id:Uuid=client.query_one("INSERT INTO alert_rules (tenant_id,metric,comparator,threshold,window_minutes,destination_id) VALUES ($1,'cost_usd','lt',1,60,$2) RETURNING id",&[&tenant,&dest]).await.unwrap().get(0);
+        let rule = AlertRule {
+            id,
+            tenant_id: tenant,
+            metric: "cost_usd".into(),
+            comparator: "lt".into(),
+            threshold: 1.0,
+            window_minutes: 60,
+            destination_id: dest,
+            enabled: true,
+            last_state: "ok".into(),
+        };
+        let destination = super::super::AlertDestination {
+            id: dest,
+            name: "proof".into(),
+            kind: "slack".into(),
+            url,
+        };
+        let entitlements = Arc::new(EntitlementCache::new(Arc::new(|_| {
+            Box::pin(async {
+                let mut e = ResolvedEntitlements::deny_all();
+                e.f_alerts = true;
+                Ok(e)
+            })
+        })));
+        let checker = AlertChecker::new(
+            pool.clone(),
+            crate::clickhouse_query::ch_client(
+                std::env::var("CLICKHOUSE_TEST_URL").expect("local ClickHouse URL"),
+            ),
+            entitlements,
+            Duration::from_secs(60),
+        );
+        *checker.rules_cache.write().await =
+            Some((std::time::Instant::now(), vec![(rule, destination)]));
+        *checker.last_overhead_report.lock().await = Some(std::time::Instant::now());
+        let before = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::AlertEvalSkipped,
+        );
+        checker.run_once().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT last_state,last_fired_at IS NULL FROM alert_rules WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<_, String>(0),
+            "ok",
+            "failed delivery must restore the edge for retry"
+        );
+        assert!(
+            row.get::<_, bool>(1),
+            "attempt is not a confirmed send time"
+        );
+        assert_eq!(
+            crate::notification_routes::notification_attempts(tenant),
+            0,
+            "failed webhook must not call the notification writer"
+        );
+        if inbox_readback {
+            let count: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM notifications WHERE tenant_id=$1",
+                    &[&tenant],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 0);
+        }
+        assert!(
+            tracelane_shared::degradation::count(
+                tracelane_shared::degradation::Degradation::AlertEvalSkipped
+            ) > before
+        );
+        // Recovery after an unannounced breach is a steady state, not a recovery write.
+        assert_eq!(
+            transition(false, checker.live.lock().await.state(id, "ok")),
+            Transition::Steady
+        );
+        // A rollback that could not be stored stays pending; retry it before
+        // the next observation, without waiting for the rule-cache TTL.
+        assert!(super::super::claim_breach(&pool, id).await.unwrap());
+        checker.pending.lock().await.insert(id, PendingState::Reset);
+        checker.run_once().await.unwrap();
+        assert!(!checker.pending.lock().await.contains_key(&id));
+        assert_eq!(checker.live.lock().await.state(id, "unknown"), "ok");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_delay(
+                super::super::WEBHOOK_TIMEOUT
+                    + super::super::WEBHOOK_VALIDATE_TIMEOUT
+                    + Duration::from_secs(1),
+            ))
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        checker.run_once().await.unwrap();
+        assert!(
+            started.elapsed()
+                < super::super::WEBHOOK_TIMEOUT + super::super::WEBHOOK_VALIDATE_TIMEOUT
+        );
+        assert_eq!(checker.live.lock().await.state(id, "unknown"), "ok");
+        assert_eq!(crate::notification_routes::notification_attempts(tenant), 0);
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        checker.run_once().await.unwrap();
+        checker.run_once().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT last_state,last_fired_at IS NOT NULL FROM alert_rules WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "breach");
+        assert!(row.get::<_, bool>(1));
+        assert_eq!(crate::notification_routes::notification_attempts(tenant), 1);
+        if inbox_readback {
+            let count: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM notifications WHERE tenant_id=$1",
+                    &[&tenant],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 1);
+        }
+        // Retry a failed timestamp write without another webhook or inbox call.
+        let delivered_at = std::time::SystemTime::now();
+        client
+            .execute(
+                "UPDATE alert_rules SET last_fired_at=NULL WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        checker
+            .pending
+            .lock()
+            .await
+            .insert(id, PendingState::Confirmed(delivered_at));
+        checker.run_once().await.unwrap();
+        let recorded: bool = client
+            .query_one(
+                "SELECT last_fired_at = $2::timestamptz FROM alert_rules WHERE id=$1",
+                &[&id, &delivered_at],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(recorded);
+        assert_eq!(crate::notification_routes::notification_attempts(tenant), 1);
+        server.verify().await;
+        client
+            .execute("DELETE FROM tenants WHERE id=$1", &[&tenant])
+            .await
+            .unwrap();
     }
 }

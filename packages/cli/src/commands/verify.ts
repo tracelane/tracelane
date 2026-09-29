@@ -33,7 +33,13 @@ import type { Command } from "commander";
 // needs the verifier's published types.
 type VerifyLedger = (
 	path: string,
-	options?: { offline?: boolean; tenantPubkey?: Uint8Array },
+	options?: {
+		offline?: boolean;
+		tenantPubkey?: Uint8Array;
+		platformPubkey?: Uint8Array;
+		platformPubkeys?: Uint8Array[];
+		workspaceKeySinceSeq?: number;
+	},
 ) => Promise<{
 	ledger_path: string;
 	rows_seen: number;
@@ -44,8 +50,40 @@ type VerifyLedger = (
 	anchors_included: number;
 	anchors_unverified: number;
 	strip_detected: boolean;
+	/** B-483 — rows inside NO anchor batch although a later batch exists: a hole
+	 * below the anchor watermark. Nonzero is never PASS. */
+	rows_uncovered_by_anchors: number;
+	/** B-483 — rows past the tenant's last anchor: the ordinary tail, not a hole. */
+	rows_unanchored_tail: number;
+	/** AUD-29 — batches verified against Tracelane's PLATFORM key, not the workspace key. */
+	platform_signed_batches?: number;
+	platform_signed_ranges?: Array<{ start_seq: number; end_seq: number }>;
 	errors: Array<{ seq: number | null; kind: string; detail: string }>;
 }>;
+
+/**
+ * The verdict, in one place so a test can hold it (B-483, 2026-09-21).
+ * INCOMPLETE — anchor records were present but never verified (no trusted key);
+ * FAIL — the chain, a signature, or anchor COVERAGE is broken; PASS — all three hold.
+ * A hole below the anchor watermark is unsigned and un-anchored: the rows exist, the
+ * chain over them may even hash, and nobody can prove they were not rewritten. The
+ * Rust CLI (`crates/tracelane-audit-cli`) applies the identical predicate.
+ */
+export function verdictOf(report: {
+	hash_chain_valid: boolean;
+	signatures_valid: boolean;
+	anchors_unverified: number;
+	rows_uncovered_by_anchors?: number;
+}): "PASS" | "FAIL" | "INCOMPLETE" {
+	if (report.anchors_unverified > 0) {
+		return "INCOMPLETE";
+	}
+	return report.hash_chain_valid &&
+		report.signatures_valid &&
+		(report.rows_uncovered_by_anchors ?? 0) === 0
+		? "PASS"
+		: "FAIL";
+}
 
 export function registerVerifyCommand(program: Command): void {
 	program
@@ -62,11 +100,25 @@ export function registerVerifyCommand(program: Command): void {
 			"--tenant-pubkey <base64>",
 			"Trusted tenant Ed25519 pubkey (base64) from your Tracelane dashboard (Settings → Audit signing key, or GET /v1/audit/pubkey). Enables signature + public-anchor verification; without it, only the hash chain is checked.",
 		)
+		.option(
+			"--platform-pubkey <base64>",
+			"Tracelane's platform Ed25519 pubkey (base64) — signs a workspace's batches before it has its own key (GET /v1/audit/platform-pubkey). Defaults to the key pinned in this release.",
+		)
+		.option(
+			"--workspace-key-since-seq <seq>",
+			"The first ledger seq your workspace key signed (workspace_key_since_seq from GET /v1/audit/pubkey?tenant_id=…). A platform-signed batch at or past it FAILS even when the range holds no workspace-signed batch.",
+		)
 		.option("--json", "Emit the verification report as JSON to stdout", false)
 		.action(
 			async (
 				ledgerArg: string,
-				opts: { offline?: boolean; tenantPubkey?: string; json?: boolean },
+				opts: {
+					offline?: boolean;
+					tenantPubkey?: string;
+					platformPubkey?: string;
+					workspaceKeySinceSeq?: string;
+					json?: boolean;
+				},
 			) => {
 				const path = resolve(process.cwd(), ledgerArg);
 				if (!existsSync(path)) {
@@ -75,6 +127,7 @@ export function registerVerifyCommand(program: Command): void {
 				}
 
 				let verifyLedger: VerifyLedger;
+				let pinnedPlatformB64: readonly string[] = [];
 				try {
 					// Variable indirection so `tsc --noEmit` doesn't try to
 					// resolve the workspace package at compile time. The
@@ -82,8 +135,10 @@ export function registerVerifyCommand(program: Command): void {
 					const verifierPkg = "@tracelanedev/audit-verifier/node";
 					const mod = (await import(verifierPkg)) as {
 						verifyLedger: VerifyLedger;
+						TRACELANE_PLATFORM_PUBKEYS_B64?: readonly string[];
 					};
 					verifyLedger = mod.verifyLedger;
+					pinnedPlatformB64 = mod.TRACELANE_PLATFORM_PUBKEYS_B64 ?? [];
 				} catch (err) {
 					process.stderr.write(
 						`tlane verify: @tracelanedev/audit-verifier not installed. Run 'pnpm -w install' first.\n${(err as Error).message}\n`,
@@ -104,9 +159,46 @@ export function registerVerifyCommand(program: Command): void {
 					}
 				}
 
+				// AUD-29: the platform key — an explicit flag wins; otherwise EVERY key
+				// pinned in this verifier release (a rotation keeps the retired key).
+				// Never a key read from the ledger itself.
+				const platformSource = opts.platformPubkey
+					? "--platform-pubkey"
+					: pinnedPlatformB64.length > 0
+						? "pinned in this release"
+						: "none";
+				const platformPubkeys: Uint8Array[] = [];
+				for (const b64 of opts.platformPubkey
+					? [opts.platformPubkey]
+					: pinnedPlatformB64) {
+					const k = Uint8Array.from(Buffer.from(b64, "base64"));
+					if (k.length !== 32) {
+						process.stderr.write(
+							`tlane verify: --platform-pubkey must be a base64 32-byte Ed25519 key (got ${k.length} bytes)\n`,
+						);
+						process.exit(2);
+					}
+					platformPubkeys.push(k);
+				}
+				let workspaceKeySinceSeq: number | undefined;
+				if (opts.workspaceKeySinceSeq !== undefined) {
+					workspaceKeySinceSeq = Number(opts.workspaceKeySinceSeq);
+					if (
+						!Number.isSafeInteger(workspaceKeySinceSeq) ||
+						workspaceKeySinceSeq < 0
+					) {
+						process.stderr.write(
+							"tlane verify: --workspace-key-since-seq must be a non-negative integer\n",
+						);
+						process.exit(2);
+					}
+				}
+
 				const report = await verifyLedger(path, {
 					offline: opts.offline,
 					tenantPubkey,
+					platformPubkeys,
+					workspaceKeySinceSeq,
 				});
 
 				// FAIL CLOSED (P0, 2026-08-07). Anchor records present but skipped
@@ -117,15 +209,11 @@ export function registerVerifyCommand(program: Command): void {
 				// vacuously true in chain-only mode; the verifier's own contract
 				// says never gate on it alone.
 				const unchecked = report.anchors_unverified > 0;
+				const status = verdictOf(report);
 
 				if (opts.json) {
 					process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 				} else {
-					const status = unchecked
-						? "INCOMPLETE"
-						: report.hash_chain_valid && report.signatures_valid
-							? "PASS"
-							: "FAIL";
 					process.stdout.write(`tlane verify: ${status}\n`);
 					process.stdout.write(
 						`  ledger:                ${report.ledger_path}\n`,
@@ -150,6 +238,18 @@ export function registerVerifyCommand(program: Command): void {
 						// meaningful WITH its log (v2 `log2025-1` and the legacy v1 log have
 						// independent index spaces).
 						`  anchors_included:      ${report.anchors_included}${report.anchors_included > 0 ? " (Sigstore Rekor v2 · log2025-1.rekor.sigstore.dev)" : ""}\n`,
+					);
+					// B-483: a nonzero hole count is printed with what it means, because a
+					// reader who sees only the number reads "not anchored yet" — it is "never".
+					process.stdout.write(
+						`  rows_uncovered_by_anchors: ${report.rows_uncovered_by_anchors ?? 0}${(report.rows_uncovered_by_anchors ?? 0) > 0 ? " (a HOLE below the anchor watermark — unsigned, un-anchored; never PASS)" : ""}\n`,
+					);
+					process.stdout.write(
+						`  rows_unanchored_tail:  ${report.rows_unanchored_tail ?? 0}${(report.rows_unanchored_tail ?? 0) > 0 ? " (past the last anchor — the next batch is still filling)" : ""}\n`,
+					);
+					const platformSigned = report.platform_signed_batches ?? 0;
+					process.stdout.write(
+						`  platform_signed_batches: ${platformSigned}${platformSigned > 0 ? ` (verified against Tracelane's platform key — ${platformSource} — before this workspace had its own key; Tracelane vouches for these, not your key)` : ""}\n`,
 					);
 					if (report.strip_detected) {
 						process.stdout.write(
@@ -185,11 +285,7 @@ Get it out-of-band from Settings \u2192 Audit signing key, or GET /v1/audit/pubk
 					);
 				}
 
-				process.exit(
-					!unchecked && report.hash_chain_valid && report.signatures_valid
-						? 0
-						: 1,
-				);
+				process.exit(status === "PASS" ? 0 : 1);
 			},
 		);
 }

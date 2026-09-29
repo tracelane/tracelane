@@ -30,15 +30,69 @@
 
 use anyhow::{Context as _, Result, bail};
 use reqwest::Url;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use tracing::instrument;
 
-/// Validate an outbound URL before use.
+/// What [`validate_url_pinned`] validated: the host name (kept for TLS SNI and
+/// certificate verification) and the exact socket addresses that passed the
+/// blocked-range check. **B-472 (REV-3, 2026-09-21):** `validate_url` used to
+/// resolve, check, and return `()`, and the caller then connected by HOST NAME —
+/// a second, independent resolution. A customer who controls the authoritative
+/// DNS for their webhook host answers a public address at validation and
+/// `169.254.169.254` (or an RFC1918 address) at connection, and the check has
+/// validated nothing. [`PinnedTarget::pin`] makes the connection go to the
+/// addresses that were checked.
+#[derive(Debug, Clone)]
+pub struct PinnedTarget {
+    host: String,
+    /// Empty for an IP-literal host: there is no resolution to race.
+    addrs: Vec<SocketAddr>,
+}
+
+impl PinnedTarget {
+    /// Bind a client to the validated addresses: reqwest's resolver overrides for
+    /// `host` are the addresses that passed, so the connection cannot follow a DNS
+    /// answer that changed after the check. The host name stays in the URL, so TLS
+    /// SNI and certificate verification are unchanged.
+    pub fn pin(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        if self.addrs.is_empty() {
+            builder
+        } else {
+            builder.resolve_to_addrs(&self.host, &self.addrs)
+        }
+    }
+
+    /// Test-only constructor: a pinned target for a host that need not resolve.
+    #[cfg(test)]
+    pub(crate) fn for_test(host: &str, addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            host: host.to_string(),
+            addrs,
+        }
+    }
+}
+
+/// Validate an outbound URL before use — the `()` form, for OPERATOR-supplied
+/// URLs (provider base URLs, Polar, Resend, JWKS, Rekor, PostHog) whose DNS is
+/// not attacker-controlled. **A customer-supplied URL must use
+/// [`validate_url_pinned`] and [`PinnedTarget::pin`]** (B-472): this form
+/// resolves and checks, and the caller's own connect resolves AGAIN.
+///
+/// # Errors
+/// As [`validate_url_pinned`].
+pub async fn validate_url(raw: &str) -> Result<()> {
+    validate_url_pinned(raw).await.map(|_| ())
+}
+
+/// Validate an outbound URL and return WHAT WAS VALIDATED, so the caller can
+/// connect to exactly those addresses ([`PinnedTarget::pin`]).
 ///
 /// Returns `Err` if the URL is disallowed by SSRF policy (bad scheme,
 /// private IP, DNS resolves to a private IP, etc.). Performs DNS resolution
-/// to check all resolved addresses — TOCTOU is acceptable here since
-/// network calls follow immediately after validation.
+/// and checks EVERY resolved address; the addresses are returned rather than
+/// discarded — until B-472 this comment said "TOCTOU is acceptable here since
+/// network calls follow immediately after validation", which is exactly the
+/// window a rebinding record with a zero TTL is built for.
 ///
 /// # Errors
 /// - URL parse failure
@@ -47,7 +101,7 @@ use tracing::instrument;
 /// - DNS resolves to a blocked range
 /// - DNS resolution failure
 #[instrument(skip(raw), fields(host = tracing::field::Empty))]
-pub async fn validate_url(raw: &str) -> Result<()> {
+pub async fn validate_url_pinned(raw: &str) -> Result<PinnedTarget> {
     let url = Url::parse(raw).context("invalid URL")?;
 
     match url.scheme() {
@@ -64,15 +118,22 @@ pub async fn validate_url(raw: &str) -> Result<()> {
     // var at all, even if an operator sets it. Documented + grep-able.
     let allow_loopback = is_loopback_bypass_enabled();
 
-    // If host is already an IP literal, check it directly without DNS.
+    // If host is already an IP literal, check it directly without DNS. Nothing
+    // to pin: a literal cannot be rebound.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if allow_loopback && is_loopback_only(&ip) {
-            return Ok(());
+            return Ok(PinnedTarget {
+                host: host.to_string(),
+                addrs: Vec::new(),
+            });
         }
         if is_blocked_ip(&ip) {
             bail!("SSRF: IP {ip} is in a blocked range");
         }
-        return Ok(());
+        return Ok(PinnedTarget {
+            host: host.to_string(),
+            addrs: Vec::new(),
+        });
     }
 
     // DNS resolution + check every resolved address.
@@ -99,7 +160,10 @@ pub async fn validate_url(raw: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(PinnedTarget {
+        host: host.to_string(),
+        addrs,
+    })
 }
 
 // Test-only thread-local loopback-bypass flag (debug builds only).
@@ -282,6 +346,80 @@ fn is_ipv6_documentation(ip: &std::net::Ipv6Addr) -> bool {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// **B-472 (REV-3) — the pin, both directions.** A wiremock on loopback; a
+    /// host name that resolves to NOTHING (`rebind.test`) pinned to the mock's
+    /// address reaches the mock — the connection used the validated address, not
+    /// DNS. The same host unpinned cannot connect at all. This is the DNS-rebinding
+    /// window closed: whatever the host's DNS answers between validation and
+    /// connect, the socket goes where the guard looked.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_pinned_client_connects_to_the_validated_address_not_to_dns() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mock_addr: SocketAddr = server.address().to_owned();
+        let url = format!("http://rebind.test:{}/hook", mock_addr.port());
+
+        let pinned = PinnedTarget::for_test("rebind.test", vec![mock_addr]);
+        let client = pinned.pin(safe_client_builder()).build().expect("client");
+        let resp = client
+            .post(&url)
+            .send()
+            .await
+            .expect("pinned request reaches the mock");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // Negative: no pin ⇒ the name must resolve, and it does not.
+        let unpinned = safe_client_builder().build().expect("client");
+        let err = unpinned
+            .post(&url)
+            .send()
+            .await
+            .expect_err("an unpinned request to a non-resolving host cannot connect");
+        assert!(err.is_connect() || err.is_request(), "{err}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "nothing more arrived"
+        );
+    }
+
+    /// `validate_url_pinned` hands back the addresses it checked: `localhost` under
+    /// the test bypass yields loopback addresses; a literal yields no addrs (nothing
+    /// to pin); a blocked literal is refused before any pin exists.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn validate_url_pinned_returns_the_checked_addresses() {
+        set_loopback_bypass_for_tests(true);
+        let p = validate_url_pinned("http://localhost:8080/x")
+            .await
+            .expect("localhost under bypass");
+        assert_eq!(p.host, "localhost");
+        assert!(!p.addrs.is_empty(), "a resolved host carries its addresses");
+        assert!(
+            p.addrs
+                .iter()
+                .all(|a| a.ip().is_loopback() && a.port() == 8080)
+        );
+        let lit = validate_url_pinned("http://127.0.0.1:9/x")
+            .await
+            .expect("loopback literal under bypass");
+        assert!(lit.addrs.is_empty(), "an IP literal has nothing to pin");
+        set_loopback_bypass_for_tests(false);
+        let refused = validate_url_pinned("http://169.254.169.254/latest/meta-data").await;
+        assert!(
+            refused.is_err(),
+            "link-local is refused before any pin exists"
+        );
+    }
 
     #[test]
     fn blocks_rfc1918() {

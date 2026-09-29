@@ -1,3 +1,5 @@
+"use client";
+import { Button } from "@tracelanedev/ui";
 /**
  * RangeControl — the ONE time-range control (DSH-11 §3b). Presets from the
  * shared `PRESETS` list plus a **Custom** window, driving a server-rendered page
@@ -16,7 +18,6 @@
  * now applied to every page. The popover is a plain positioned card: no portal,
  * no blur, one overlay shadow.
  */
-"use client";
 
 import { useNavProgress } from "@/components/NavProgress";
 import {
@@ -223,20 +224,22 @@ export function RangeControl({
 					<div className="flex items-center justify-between gap-2">
 						<span className="text-2xs text-ink-3">up to 30 days wide</span>
 						<div className="flex gap-1.5">
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								onClick={() => setOpen(false)}
 								className="rounded-[var(--radius-control)] px-2 py-1 text-xs text-ink-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 							>
 								Cancel
-							</button>
-							<button
+							</Button>
+							<Button
+								variant="bare"
 								type="button"
 								onClick={apply}
-								className="rounded-[var(--radius-control)] bg-ink px-2.5 py-1 text-xs font-medium text-ink-inverse focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+								className="rounded-[var(--radius-control)] bg-selected px-2.5 py-1 text-xs font-medium text-selected-on focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 							>
 								Apply
-							</button>
+							</Button>
 						</div>
 					</div>
 				</div>

@@ -1,3 +1,4 @@
+import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
 /**
  * Settings section layout — secondary nav tabs + content area.
  *
@@ -25,7 +26,7 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
 	return (
 		<Providers>
 			<div className="px-2 py-3 sm:px-4 sm:py-4">
-				<h1 className="t-h1 mb-6">Settings</h1>
+				<SettingsPageHeader />
 				<div className="flex flex-col gap-6 sm:flex-row sm:gap-8">
 					<SettingsNav />
 					<div className="flex-1 min-w-0">{children}</div>

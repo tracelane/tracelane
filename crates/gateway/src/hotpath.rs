@@ -32,26 +32,37 @@
 //! # What it covers, and what it does not
 //!
 //! It splits the **pre-dispatch** segment — `dispatch_ts − request_start`, which
-//! is auth, entitlements, quota, both budget ceilings, detection, the audit
-//! append, routing/BYOK and the request-side guardrails. That is where every
-//! control-plane Postgres round trip on the hot path lives.
+//! is authentication, entitlements, quota, both budget ceilings, detection, the
+//! audit append, routing/BYOK, the request-side guardrails and (chat) the
+//! response-cache lookup. That is where every control-plane Postgres round trip
+//! on the hot path lives.
 //!
-//! It does **not** split the post-provider segment (span build + publish). The
-//! response path forks into streaming and buffered closures that own their own
-//! completion, and threading a timer through them is a larger change than the
-//! question needs — the span's `tracelane_gateway_overhead_us` is
-//! `pre + post`, so `post` is recoverable as `overhead − pre` by joining the
-//! emitted line to the span on time. Stated here rather than left for a reader
-//! to discover, because an instrument whose blind spot is undocumented is how a
-//! partial measurement gets reported as a whole one.
+//! **B-568 I1 (2026-09-27): the timer opens BEFORE credential validation.** Until
+//! then it was created inside `admission::run`, after `validate_authorization` had
+//! returned, so a cold API-key lookup (pool checkout, SELECT, Argon2id) was inside
+//! `overhead_us` and inside NO stage — the line reported it only as
+//! `unaccounted_us`. The first mark is now `authenticate`, and the line names the
+//! branch that served it (`auth=`) and the route (`route=`), so `accounted_us`
+//! equals the pre-dispatch overhead to within two adjacent clock reads.
+//!
+//! **The post-provider segment has its own timer (B-568 I4), buffered path only**:
+//! `span_build`, `response_guard`, `capture_output`, `publish`, emitted under the
+//! same threshold and the same rate limit with `segment=post`, and counted apart
+//! (`slow_post_total`). The streaming path finalizes after the last chunk inside
+//! the SSE generator; its per-chunk guard time sits inside the provider segment —
+//! documented, not split.
 //!
 //! # What it deliberately does NOT do
 //!
-//! It does not add a span attribute. Span size is a load-bearing number in this
-//! product, and eight more
-//! fields on every span would grow it several-fold to answer a question that is
-//! only ever asked about the slow tail. If the breakdown later earns a place in
-//! ClickHouse it can be added deliberately, with that cost priced in.
+//! It does not put the stage breakdown on the span. Span size is a load-bearing
+//! number in this product, and eight more fields on every span would grow it
+//! several-fold to answer a question that is only ever asked about the slow tail.
+//!
+//! **The ONE deliberate exception (B-568 I5):** whether the request paid a
+//! control-plane round trip before dispatch ([`StageTimer::note_cold`]) rides the
+//! span as `tracelane_gateway_cold_start = true`, PRESENT ONLY when true. One
+//! boolean on the minority of spans is the single fact the dashboard needs to tell
+//! a warm gateway from a cold one; the stage breakdown stays log-only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -112,9 +123,45 @@ impl Default for Config {
     }
 }
 
-/// Count of slow requests since boot. Monotonic; reported on every emitted line
-/// so a suppressed burst is still visible as a rate.
+/// Count of slow requests since boot (pre-dispatch segment). Monotonic; reported
+/// on every emitted line so a suppressed burst is still visible as a rate, and on
+/// `/health` (`hotpath.slow_total`, B-568 I6) so the count does not depend on a
+/// log line surviving the rate limit.
 static SLOW_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// The same count for the post-provider segment (`segment=post`, B-568 I4). Kept
+/// apart so a slow response guard is never read as a slow authentication.
+static SLOW_POST_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Slow pre-dispatch requests since boot — `/health`'s `hotpath.slow_total`.
+#[must_use]
+pub fn slow_total() -> u64 {
+    SLOW_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Slow post-provider segments since boot — `/health`'s `hotpath.slow_post_total`.
+#[must_use]
+pub fn slow_post_total() -> u64 {
+    SLOW_POST_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Which half of the gateway's overhead a timer splits. Both are emitted under
+/// one threshold and one rate limit, and counted separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    /// `dispatch_ts − request_start`.
+    Pre,
+    /// `sent − provider_complete` (buffered path).
+    Post,
+}
+
+impl Segment {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pre => "pre",
+            Self::Post => "post",
+        }
+    }
+}
 /// `Instant`-derived millis of the last emitted line, for the rate limit.
 static LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -138,15 +185,25 @@ fn mono_ms() -> u64 {
 /// Cost per `mark` is one `Instant::now()` and two array writes — no allocation,
 /// no lock, no formatting. Formatting happens only on the slow path, after the
 /// threshold and the rate limit have both passed.
+///
+/// The labels (`route`, `auth`, `segment`, `cold`) are `&'static str` / `Copy`
+/// values written once per request — no allocation on the healthy path.
 pub struct StageTimer {
     last: Instant,
     names: [&'static str; MAX_STAGES],
     micros: [u32; MAX_STAGES],
     n: usize,
     dropped: u32,
+    route: &'static str,
+    auth: &'static str,
+    segment: Segment,
+    cold: bool,
 }
 
 impl StageTimer {
+    /// A pre-dispatch timer. Create it at the moment the request is received —
+    /// `admission::admit` does so on the line after `request_start` is stamped,
+    /// BEFORE the credential is validated (B-568 I1).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -155,7 +212,50 @@ impl StageTimer {
             micros: [0; MAX_STAGES],
             n: 0,
             dropped: 0,
+            route: "unknown",
+            auth: "unknown",
+            segment: Segment::Pre,
+            cold: false,
         }
+    }
+
+    /// A post-provider timer (B-568 I4). Create it where `provider_complete_ts`
+    /// is stamped.
+    #[must_use]
+    pub fn post(route: &'static str) -> Self {
+        Self {
+            route,
+            segment: Segment::Post,
+            ..Self::new()
+        }
+    }
+
+    /// The route label on the emitted line: `chat` | `messages` | `embeddings`.
+    pub fn set_route(&mut self, route: &'static str) {
+        self.route = route;
+    }
+
+    /// The credential branch that served this request (`warm` | `stale` | `cold`
+    /// | `jwt` | `jwt_cold` | `static`). A cold branch also marks the request cold.
+    pub fn set_auth(&mut self, label: &'static str, cold: bool) {
+        self.auth = label;
+        if cold {
+            self.cold = true;
+        }
+    }
+
+    /// Record that this request made a control-plane round trip before dispatch
+    /// (auth cold branch, BYOK cache miss, entitlement blocking resolve, JWT
+    /// bridge miss). Sticky: once cold, the request stays cold.
+    pub fn note_cold(&mut self) {
+        self.cold = true;
+    }
+
+    /// Whether any pre-dispatch step went to the control plane — the source of
+    /// the span's `tracelane_gateway_cold_start` (B-568 I5).
+    #[must_use]
+    pub fn is_cold(&self) -> bool {
+        self.cold
     }
 
     /// Close the stage that ended here, recording it under `name`.
@@ -200,7 +300,11 @@ impl StageTimer {
         if overhead_us < cfg.threshold_us {
             return false;
         }
-        let nth = SLOW_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let counter = match self.segment {
+            Segment::Pre => &SLOW_TOTAL,
+            Segment::Post => &SLOW_POST_TOTAL,
+        };
+        let nth = counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Claim the emission slot with a CAS, so two concurrent slow requests
         // cannot both decide they are the one allowed to log. The loop retries
@@ -248,6 +352,10 @@ impl StageTimer {
             unaccounted_us = overhead_us.saturating_sub(accounted),
             slow_total = nth,
             dropped_marks = self.dropped,
+            segment = self.segment.label(),
+            route = self.route,
+            auth = self.auth,
+            cold = self.cold,
             stages = %breakdown,
             "TRACELANE_SLOW_REQUEST — gateway overhead over threshold; per-stage breakdown"
         );

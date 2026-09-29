@@ -177,15 +177,10 @@ Rust's `TenantId` has three named constructors, one per trust boundary
 | `TenantId::from_spiffe_svid` | `:56` | a verified SPIFFE X.509-SVID (the ingest mTLS path) |
 | `TenantId::from_self_host_config` | `:68` | the single operator-configured tenant of a self-host deployment, reachable only in single-tenant mode |
 
-There is a fourth path, and the type's own docs say so (`tenant.rs:9-33`): the
-struct derives `Deserialize` with `#[serde(transparent)]` (`tenant.rs:41-43`),
-so serde can build a `TenantId` from bytes. What contains that path is the
-deployment, not the type: the only production bytes-to-`TenantId` site is the
-ingest NATS consumer decoding a payload the gateway wrote from a validated
-claim, and the OTLP resource-attribute fallback is compiled only into debug
-builds (`crates/shared/src/otlp/decode.rs:117-125`). A guard fails any
-`Deserialize`-deriving struct that carries a `TenantId` field unless it is
-allowlisted with a note saying who writes the bytes
+Outside those constructors, a `TenantId` is only ever decoded from a payload the
+gateway itself wrote from a validated claim (the ingest NATS consumer), and a CI
+guard fails any `Deserialize`-deriving struct that carries a `TenantId` field
+unless it is explicitly allowlisted
 (`scripts/ci/check-tenant-id-provenance.sh:276-295`).
 See [SECURITY.md](../../SECURITY.md).
 
@@ -195,7 +190,7 @@ See [SECURITY.md](../../SECURITY.md).
 
 The gateway runs the predictive layer inline, as one step of the shared
 admission pipeline (`crates/gateway/src/admission.rs:710-739`). It is a set of
-**inline heuristic guardrails**; the ML ensemble is on the roadmap. Detection is
+**inline heuristic guardrails**; ML-based detection is not enabled. Detection is
 observe-first by design: each predictor returns `Allow | Warn | Block` with an
 `aft_id` (`crates/gateway/src/predictive/mod.rs:42-46`); a `Block` is
 **recorded, not enforced** — the `aft_id` rides into the chat and messages
@@ -227,12 +222,9 @@ request carries their field. This is the same disclosure as `README.md`; what
 runs inline on chat requests is the guardrail rail set, below (which rails a
 tenant gets is plan-gated, `crates/gateway/src/guardrail/rail.rs:65,159`).
 
-**Registered, returning a constant.** `trajectory_guard` and `slm_judge` are in
-the stack with their `ort` inference commented out
-(`predictive/trajectory_guard.rs:78-79`, `predictive/slm_judge.rs:66`), so they
-return `Allow`. The `prompt_guard_pr6` sidecar predictor is added only when
-`PROMPT_GUARD_URL` is set (`predictive/mod.rs:113-130`). Do not plan against
-these. (Older `PRn` labels are dropped here on purpose — the same label meant
+**Not enabled.** The ML-based predictors are not enabled and cannot produce a
+verdict. A prompt-guard predictor is added only when `PROMPT_GUARD_URL` is set.
+Do not plan against these. (Older `PRn` labels are dropped here on purpose — the same label meant
 different things across doc generations; the names above are the predictors'
 `name()` values.)
 
@@ -272,9 +264,9 @@ body has started aborts the transfer rather than shipping a short file
 
 The self-host path without Postgres uses a process-local chain and a ClickHouse
 table written through a bounded, batched, retried queue (`audit.rs:1740`,
-`append_in_memory`): a row that cannot be queued refuses the request, rows still
-queued at exit are lost, and the code's own comment (`audit.rs:1060-1088`) says
-not to describe that tier as a tamper-evident ledger.
+`append_in_memory`): a row that cannot be queued refuses the request, and rows still
+queued at exit can be lost, so this tier should not be relied on as a
+tamper-evident ledger.
 
 The chain hash is the **v2** encoding
 (`crates/gateway/src/audit_format/mod.rs:77-80,102-134,278-281`):

@@ -142,8 +142,7 @@ Eight steps to running Tracelane on your own infra.
     against the `.cosign.bundle` beside each binary, cosign >= 3.0.6) and on the
     container image (`cosign verify` on the published image digest).
   - `cargo audit` and `pnpm audit` clean on the deployed commit.
-  - Backups: ClickHouse → R2, Postgres → daily snapshot.
-  - Alerting: error + uptime monitoring wired before GA (tooling being finalized).
+  - Back up ClickHouse and Postgres.
 </Step>
 
 </Steps>

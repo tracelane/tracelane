@@ -1,3 +1,6 @@
+import { fmtCount } from "@/lib/metrics/format";
+import { fmtDur } from "@tracelanedev/ui";
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * TraceGroupTable — server component: traces grouped by a dimension (model /
  * operation / status) with per-group count, error rate, and avg/p95 duration.
@@ -16,11 +19,7 @@ export type TraceGroup = {
 	p95_duration_us: number;
 };
 
-function fmtDuration(us: number): string {
-	if (us < 1_000) return `${Math.round(us)}µs`;
-	if (us < 1_000_000) return `${(us / 1_000).toFixed(1)}ms`;
-	return `${(us / 1_000_000).toFixed(2)}s`;
-}
+const fmtDuration = fmtDur;
 
 /** Link to the filtered trace list when the group dimension is a list filter. */
 function groupFilterHref(by: string, key: string): string | null {
@@ -48,30 +47,30 @@ export function TraceGroupTable({
 	const label =
 		by === "model" ? "Model" : by === "operation" ? "Operation" : "Status";
 	return (
-		<div className="overflow-x-auto rounded-lg border border-line">
-			<table className="w-full text-sm">
-				<thead className="bg-surface-2">
-					<tr>
-						<th className="px-3 py-1.5 text-left t-metric-label">{label}</th>
-						<th className="px-3 py-1.5 text-right t-metric-label">Traces</th>
-						<th className="px-3 py-1.5 text-right t-metric-label">
+		<div className="overflow-x-auto rounded-card border border-line">
+			<Table className="w-full text-sm">
+				<THead className="bg-surface-2">
+					<TR>
+						<TH className="px-3 py-1.5 text-left t-metric-label">{label}</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">Traces</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">
 							Error rate
-						</th>
-						<th className="px-3 py-1.5 text-right t-metric-label">Avg</th>
-						<th className="px-3 py-1.5 text-right t-metric-label">p95</th>
-					</tr>
-				</thead>
-				<tbody className="divide-y">
+						</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">Avg</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">p95</TH>
+					</TR>
+				</THead>
+				<TBody className="divide-y">
 					{groups.map((g) => {
 						const href = groupFilterHref(by, g.group_key);
 						const errPct =
 							g.trace_count > 0 ? (g.error_traces / g.trace_count) * 100 : 0;
 						return (
-							<tr
+							<TR
 								key={g.group_key}
 								className="transition-colors hover:bg-surface-hover"
 							>
-								<td className="px-3 py-2 font-mono text-xs">
+								<TD className="px-3 py-2 font-mono text-xs">
 									{href ? (
 										<Link
 											href={href}
@@ -82,28 +81,28 @@ export function TraceGroupTable({
 									) : (
 										g.group_key || "—"
 									)}
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
-									{g.trace_count.toLocaleString()}
-								</td>
-								<td className="px-3 py-2 text-right">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+									{fmtCount(g.trace_count)}
+								</TD>
+								<TD className="px-3 py-2 text-right">
 									<span
 										className={`font-mono text-xs tabular-nums ${errPct > 5 ? "text-danger-ink" : errPct > 1 ? "text-warn-ink" : "text-ok-ink"}`}
 									>
 										{errPct.toFixed(1)}%
 									</span>
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDuration(g.avg_duration_us)}
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDuration(g.p95_duration_us)}
-								</td>
-							</tr>
+								</TD>
+							</TR>
 						);
 					})}
-				</tbody>
-			</table>
+				</TBody>
+			</Table>
 		</div>
 	);
 }

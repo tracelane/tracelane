@@ -1,0 +1,68 @@
+---
+title: LangGraph
+description: Automatically capture LangGraph runs and child spans through the Python SDK's OTLP exporter.
+classification: PUBLIC
+---
+
+Install the optional integration in your application environment:
+
+```bash
+pip install 'tracelane[langgraph]'
+```
+
+Call `init()` and `auto_instrument()` before running your graphs. Each attachment
+attempt prints a result to stderr. LangGraph uses OpenInference's LangChain
+callbacks, so related LangChain runs are also captured. It uses the same OTel
+provider and OTLP exporter as the rest of the SDK; it does not create a second
+exporter or change the parent IDs after capture.
+
+```python
+import os
+from typing import TypedDict
+from langgraph.graph import END, START, StateGraph
+from tracelane import init, auto_instrument, shutdown
+
+class State(TypedDict):
+    value: int
+
+init(endpoint="https://gateway.tracelane.dev",
+     api_key=os.environ["TRACELANE_API_KEY"], service_name="graph-example")
+auto_instrument()
+workflow = StateGraph(State)
+workflow.add_node("increment", lambda state: {"value": state["value"] + 1})
+workflow.add_node("double", lambda state: {"value": state["value"] * 2})
+workflow.add_edge(START, "increment")
+workflow.add_edge("increment", "double")
+workflow.add_edge("double", END)
+try:
+    assert workflow.compile().invoke({"value": 1}) == {"value": 4}
+finally:
+    shutdown()  # flush pending spans
+```
+
+The trace contains a graph root and two child spans. Sync/async invocation and
+streaming use the same callbacks. Calling `auto_instrument()` again does not add
+another callback. Inputs, outputs, prompts, invocation parameters and embedding
+vectors are hidden by this integration; graph names and custom metadata can still
+be recorded. Do not put credentials in names or metadata. If another component
+already instrumented LangChain, its configuration is retained and the diagnostic
+says so; its content-capture policy may differ.
+
+### Manual fallback
+
+If the diagnostic says `unavailable` or `could not instrument`, verify that the
+optional dependency is present and compatible. You can instead explicitly wrap a
+compiled graph:
+
+```python
+from tracelane import instrument_langgraph
+
+graph = workflow.compile()
+instrument_langgraph(graph)
+graph.invoke({"value": 1})
+```
+
+This fallback emits graph-level spans for `invoke`, `ainvoke`, and `stream`; it
+does not capture the child tree automatically. Choose the automatic integration
+or the manual wrapper to avoid extra graph-level spans. SDK/OTLP spans are
+captured, not chained in the gateway audit ledger.

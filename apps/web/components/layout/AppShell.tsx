@@ -22,6 +22,7 @@
  */
 
 import { NavProgressProvider, TopLoadingBar } from "@/components/NavProgress";
+import { PageContainer } from "@tracelanedev/ui";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { Sidebar } from "./Sidebar";
@@ -30,6 +31,7 @@ import { TopBar } from "./TopBar";
 function isBareRoute(pathname: string): boolean {
 	return (
 		pathname === "/onboarding" ||
+		pathname === "/organization-deleted" ||
 		pathname.startsWith("/sign-in") ||
 		pathname.startsWith("/auth") ||
 		// OBS-48 `/s/[token]` is the UNAUTHENTICATED public share page
@@ -58,12 +60,15 @@ export function AppShell({
 
 	// Full-screen, self-contained routes: no frame, no nav chrome.
 	if (isBareRoute(pathname)) {
-		return <div className="min-h-screen bg-canvas">{children}</div>;
+		return <main>{children}</main>;
 	}
 
 	return (
 		<NavProgressProvider>
 			<TopLoadingBar />
+			<a href="#workspace-content" className="workspace-skip-link">
+				Skip to content
+			</a>
 			<div className="flex min-h-screen bg-canvas">
 				<Sidebar defaultCollapsed={defaultCollapsed} />
 				<div className="flex min-w-0 flex-1 flex-col">
@@ -90,9 +95,9 @@ export function AppShell({
 					 * for it. Vertical padding is `py-6` so the first card clears the sticky
 					 * bar rather than touching it.
 					 */}
-					<main className="app-canvas min-w-0 flex-1 px-4 py-4 sm:px-6 lg:px-8 xl:px-10">
+					<PageContainer id="workspace-content" tabIndex={-1}>
 						{children}
-					</main>
+					</PageContainer>
 				</div>
 			</div>
 		</NavProgressProvider>

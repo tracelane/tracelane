@@ -247,6 +247,8 @@ for (const [key, p] of Object.entries(v3.plans)) {
 			cold_gb_included = ${p.cold_gb_included ?? null},
 			unlimited_seats = ${p.unlimited_seats},
 			f_sso = ${p.f_sso},
+			f_cache_control = ${p.f_cache_control},
+			cache_ttl_hours = ${p.cache_ttl_hours},
 			overage_allowed = ${p.overage_allowed},
 			rate_limit_rpm = ${p.rate_limit_rpm},
 			updated_at = now()
@@ -283,6 +285,15 @@ for (const [meter, lo, hi, usd, unit] of rateRows) {
 }
 const pol = v3.policy;
 const policyRows = {
+	web_list_page_sizes: pol.web_list_page_sizes,
+	// EVL-03 §5: every playground cap/window/poll-interval lives here, never as
+	// a literal in the route or the form (CLAUDE.md §23).
+	playground_limits: pol.playground_limits,
+	// OBS-56: the trace-list bulk-select cap (§23) — read on the write path by
+	// the batch annotation route (fail-closed: a missing/invalid row refuses
+	// the write with 503 rather than guessing a limit).
+	bulk_trace_action_max: pol.bulk_trace_action_max,
+	key_rotation_grace_hours: pol.key_rotation_grace_hours,
 	burst_multiple: pol.burst_multiple_of_trailing_30d_avg,
 	// The gateway reads the two thresholds as SEPARATE scalar keys (rating.rs Policy);
 	// the array form stays for the web app. Bare JSON scalars — a quoted string would
@@ -293,6 +304,11 @@ const policyRows = {
 	velocity_sigma: pol.velocity_sigma,
 	velocity_window_days: pol.velocity_window_days,
 	velocity_interval_secs: pol.velocity_interval_secs,
+	// B-442 (b): how long a candidate's opt-in check stays good. Longer than Neon's
+	// 300 s suspend timeout ON PURPOSE — a spike-day candidate stays a candidate until
+	// UTC midnight, and re-reading api_keys every tick pinned the compute all day.
+	velocity_recheck_secs: pol.velocity_recheck_secs,
+	blob_gc_grace_days: pol.blob_gc_grace_days,
 	rollover: pol.rollover,
 	annual_available: pol.annual_available,
 	price_protection_months: pol.price_protection_months,
@@ -316,6 +332,39 @@ for (const [key, value] of Object.entries(policyRows)) {
 }
 console.log(
 	`[seed] pricing v3: ${rateRows.length} pricing_rates rows + ${Object.keys(policyRows).length} billing_policy rows`,
+);
+
+// GWY-49: provider ZDR capabilities (reference table, §23). A `default`/`enterprise` row is a
+// claim about a third party's data handling and is REFUSED without the policy URL and the
+// date someone read it — every row in v1 is `none` until that work is done (spec §9 Q1).
+const caps = JSON.parse(
+	readFileSync(
+		new URL("./provider_capabilities.v1.json", import.meta.url),
+		"utf8",
+	),
+);
+let capRows = 0;
+for (const [providerId, c] of Object.entries(caps.providers)) {
+	if (!["none", "default", "enterprise"].includes(c.zdr)) {
+		throw new Error(
+			`[seed] provider_capabilities: ${providerId} has zdr=${c.zdr}`,
+		);
+	}
+	if (c.zdr !== "none" && !(c.policy_url && c.verified_at)) {
+		throw new Error(
+			`[seed] provider_capabilities: ${providerId} claims zdr=${c.zdr} without policy_url + verified_at — a claim about a third party needs its source and date`,
+		);
+	}
+	await sql`
+		insert into provider_capabilities (provider_id, zdr, policy_url, verified_at)
+		values (${providerId}, ${c.zdr}, ${c.policy_url}, ${c.verified_at})
+		on conflict (provider_id) do update set
+			zdr = excluded.zdr, policy_url = excluded.policy_url,
+			verified_at = excluded.verified_at, updated_at = now()`;
+	capRows += 1;
+}
+console.log(
+	`[seed] provider_capabilities: ${capRows} rows from provider_capabilities.v1.json`,
 );
 
 const rows = await sql`

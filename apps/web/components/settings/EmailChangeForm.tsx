@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * EmailChangeForm — self-serve email change (SET-26).
@@ -28,7 +29,7 @@ interface ChangeResult {
 }
 
 const FIELD =
-	"w-full rounded-lg bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
+	"w-full rounded-card bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
 
 export function EmailChangeForm({ email }: { email: string }) {
 	const [newEmail, setNewEmail] = useState("");
@@ -80,7 +81,7 @@ export function EmailChangeForm({ email }: { email: string }) {
 
 	if (done) {
 		return (
-			<section className="space-y-2 rounded-lg border border-line p-4">
+			<section className="space-y-2 rounded-card border border-line p-4">
 				<h3 className="text-xs font-semibold text-ink">Email changed</h3>
 				<p className="text-xs text-ink-2">
 					Your account address is now{" "}
@@ -99,7 +100,7 @@ export function EmailChangeForm({ email }: { email: string }) {
 				</p>
 				<a
 					href="/sign-out"
-					className="inline-block rounded-lg border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
+					className="inline-block rounded-card border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 				>
 					Sign out
 				</a>
@@ -162,14 +163,15 @@ export function EmailChangeForm({ email }: { email: string }) {
 			/>
 
 			<div className="flex items-center gap-3 pt-1">
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					disabled={!ready || pending}
 					onClick={submit}
-					className="rounded-lg bg-action px-3 py-1.5 text-xs font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
+					className="rounded-control bg-action px-3 py-1.5 text-xs font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
 				>
 					{pending ? "Changing…" : "Change email"}
-				</button>
+				</Button>
 				{error && <span className="text-xs text-danger-ink">{error}</span>}
 			</div>
 		</section>

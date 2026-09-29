@@ -51,6 +51,7 @@ EXIT: 0 all good · 1 a violation · 2 usage / not a git repo
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -117,6 +118,14 @@ def scan(root: Path) -> tuple[list[str], list[str]]:
 def selftest() -> int:
     """Prove it BLOCKS — planting each violation in a throwaway git repo."""
     import tempfile
+
+    # Strip every inherited GIT_* var for this whole process (it only builds fixtures).
+    # A hook in a LINKED worktree exports an absolute GIT_DIR/GIT_INDEX_FILE, which
+    # beats `git -C` — so this fixture's `config user.email t@t` landed in the SHARED
+    # repo config and authored 380 real commits as `t <t@t>` (2026-08-24 → 2026-09-26,
+    # reproduced). `.githooks/check-commit-author.sh` is the control for the class.
+    for k in [k for k in os.environ if k.startswith("GIT_")]:
+        del os.environ[k]
 
     fails = 0
     with tempfile.TemporaryDirectory() as td:

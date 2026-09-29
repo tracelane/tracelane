@@ -19,8 +19,10 @@ import { db } from "@/db";
 import { apiKeys, tenants, users } from "@/db/schema";
 import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
 import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
+
+import { withOwnerMutation } from "../team/owner-lock";
 
 const WORKOS = "https://api.workos.com";
 
@@ -118,80 +120,90 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	const members = await listMemberships(key, session.tenantId);
-	if (members === null) {
-		return NextResponse.json(
-			{ error: "could not verify membership" },
-			{ status: 502 },
+	return withOwnerMutation(session.tenantId, async () => {
+		const members = await listMemberships(key, session.tenantId);
+		if (members === null) {
+			return NextResponse.json(
+				{ error: "could not verify membership" },
+				{ status: 502 },
+			);
+		}
+		const owners = members.filter((m) => isPrivilegedRole(m.role.slug));
+		const soleUser = members.length <= 1;
+		const isOwner = members.some(
+			(m) => m.user_id === session.userId && isPrivilegedRole(m.role.slug),
 		);
-	}
-	const owners = members.filter((m) => isPrivilegedRole(m.role.slug));
-	const soleUser = members.length <= 1;
-	const isOwner = members.some(
-		(m) => m.user_id === session.userId && isPrivilegedRole(m.role.slug),
-	);
 
-	// Case 2: last owner with other members → block (must transfer first).
-	if (!soleUser && isOwner && owners.length <= 1) {
-		return NextResponse.json(
-			{
-				error: "last_owner_protected",
-				detail: "transfer ownership before deleting your account",
-			},
-			{ status: 409 },
-		);
-	}
+		// Case 2: last owner with other members → block (must transfer first).
+		if (!soleUser && isOwner && owners.length <= 1) {
+			return NextResponse.json(
+				{
+					error: "last_owner_protected",
+					detail: "transfer ownership before deleting your account",
+				},
+				{ status: 409 },
+			);
+		}
 
-	// Resolve the internal tenant id once (for key-revoke + archive).
-	const [t] = await db
-		.select({ id: tenants.id })
-		.from(tenants)
-		.where(eq(tenants.workosOrgId, session.tenantId))
-		.limit(1);
+		// Resolve the internal tenant id once (for key-revoke + archive).
+		const [t] = await db
+			.select({ id: tenants.id })
+			.from(tenants)
+			.where(eq(tenants.workosOrgId, session.tenantId))
+			.limit(1);
 
-	if (soleUser) {
-		// Case 1: sole user → this IS org deletion. Soft-delete + revoke all keys.
-		if (t) {
-			try {
-				await db
-					.update(tenants)
-					.set({ archivedAt: new Date() })
-					.where(eq(tenants.id, t.id));
-				// B-361: same-isolate immediacy for the acting user; see the
-				// function doc on `invalidateOrgArchivedCache` for the
-				// cross-isolate staleness this deliberately accepts.
-				invalidateOrgArchivedCache(session.tenantId);
-				await db
-					.update(apiKeys)
-					.set({ revokedAt: new Date() })
-					.where(and(eq(apiKeys.tenantId, t.id), isNull(apiKeys.revokedAt)));
-			} catch {
-				console.error("[account/delete] org soft-delete side effects failed");
+		if (soleUser) {
+			// Case 1: sole user → this IS org deletion. Soft-delete + revoke all keys.
+			if (t) {
+				try {
+					await db
+						.update(tenants)
+						.set({ archivedAt: new Date() })
+						.where(eq(tenants.id, t.id));
+					// B-361: same-isolate immediacy for the acting user; see the
+					// function doc on `invalidateOrgArchivedCache` for the
+					// cross-isolate staleness this deliberately accepts.
+					invalidateOrgArchivedCache(session.tenantId);
+					await db
+						.update(apiKeys)
+						.set({ revokedAt: new Date() })
+						.where(
+							and(
+								eq(apiKeys.tenantId, t.id),
+								or(
+									isNull(apiKeys.revokedAt),
+									gt(apiKeys.revokedAt, sql`now()`),
+								),
+							),
+						);
+				} catch {
+					console.error("[account/delete] org soft-delete side effects failed");
+				}
 			}
 		}
-	}
 
-	// Delete the WorkOS user (cascades their memberships + revokes their sessions).
-	const del = await fetch(
-		`${WORKOS}/user_management/users/${encodeURIComponent(session.userId)}`,
-		{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
-	);
-	if (!del.ok) {
-		return NextResponse.json(
-			{ error: "workos_user_delete_failed" },
-			{ status: 502 },
+		// Delete the WorkOS user (cascades their memberships + revokes their sessions).
+		const del = await fetch(
+			`${WORKOS}/user_management/users/${encodeURIComponent(session.userId)}`,
+			{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
 		);
-	}
+		if (!del.ok) {
+			return NextResponse.json(
+				{ error: "workos_user_delete_failed" },
+				{ status: 502 },
+			);
+		}
 
-	// Tombstone the mirror row (keep for ledger FK integrity; email anonymized).
-	try {
-		await tombstoneMirror(session.userId);
-	} catch {
-		console.error("[account/delete] mirror tombstone failed");
-	}
+		// Tombstone the mirror row (keep for ledger FK integrity; email anonymized).
+		try {
+			await tombstoneMirror(session.userId);
+		} catch {
+			console.error("[account/delete] mirror tombstone failed");
+		}
 
-	return NextResponse.json(
-		{ deleted: true, orgDeleted: soleUser },
-		{ status: 200 },
-	);
+		return NextResponse.json(
+			{ deleted: true, orgDeleted: soleUser },
+			{ status: 200 },
+		);
+	});
 }

@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * LiveTraces — opt-in live trace feed (V-4).
@@ -24,6 +25,8 @@ import { TraceList, type TraceSummary } from "./TraceList";
 type Frame = { rows: TraceSummary[]; stale: boolean; servedAt: number };
 
 type LiveStatus = "connecting" | "live" | "reconnecting" | "error";
+/** A close within this long after a fresh frame is the normal cycle, not a drop. */
+const LIVE_GRACE_MS = 30_000;
 
 /** Relative label for the last-updated timestamp. */
 function updateLabel(ts: number): string {
@@ -45,6 +48,8 @@ export function LiveTraces({
 	const [status, setStatus] = useState<LiveStatus>("connecting");
 	const [updatedAt, setUpdatedAt] = useState<number | null>(null);
 	const esRef = useRef<EventSource | null>(null);
+	/** When the last fresh `full` frame arrived — the route closes after every one. */
+	const lastFullAt = useRef<number>(0);
 
 	useEffect(() => {
 		if (!live) {
@@ -74,6 +79,7 @@ export function LiveTraces({
 				const f = JSON.parse(e.data) as Frame;
 				setRows(f.rows);
 				setUpdatedAt(Date.now());
+				lastFullAt.current = Date.now();
 				setStatus("live");
 			} catch {
 				/* malformed frame — keep last-good rows */
@@ -83,9 +89,16 @@ export function LiveTraces({
 			// A server `error` frame carries data; a bare connection drop does not
 			// (EventSource auto-reconnects → the next read cycle resumes the feed).
 			const data = (e as MessageEvent).data;
-			setStatus(
-				typeof data === "string" && data.length > 0 ? "error" : "reconnecting",
-			);
+			if (typeof data === "string" && data.length > 0) {
+				setStatus("error");
+				return;
+			}
+			// The route sends partial → full → CLOSE by design, and EventSource reports
+			// that normal close as a data-less `error` before reconnecting. Right after a
+			// fresh frame that is the healthy polling cycle, not a drop (2026-09-27: the
+			// badge read "Reconnecting…" on every cycle and never "Live").
+			if (Date.now() - lastFullAt.current < LIVE_GRACE_MS) return;
+			setStatus("reconnecting");
 		};
 
 		es.addEventListener("partial", onPartial);
@@ -136,22 +149,28 @@ export function LiveTraces({
 					</span>
 				)}
 				{/* Live toggle: active = surface-3 bg (operational state, not CTA) */}
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => setLive((v) => !v)}
 					aria-pressed={live}
-					className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring ${
+					className={`rounded-control border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring ${
 						live
 							? "border-line-2 bg-surface-3 text-ink"
 							: "border-line text-ink-2 hover:text-ink"
 					}`}
 				>
 					{live ? "Stop live" : "● Live"}
-				</button>
+				</Button>
 			</div>
 
-			{live && rows !== null ? (
-				rows.length === 0 ? (
+			{live && (
+				<p className="mb-2 text-xs text-ink-2">Pause live to select traces</p>
+			)}
+			{live ? (
+				rows === null ? (
+					<p aria-live="polite">Connecting to live traces…</p>
+				) : rows.length === 0 ? (
 					<EmptyState
 						title="No live traces yet"
 						description="New traces matching the current filters appear here automatically."

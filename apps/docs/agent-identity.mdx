@@ -1,0 +1,82 @@
+---
+classification: PUBLIC
+title: "Agent and model activity"
+description: "Follow a caller's model calls from its identity card into traces."
+---
+
+Open **Observe → Agents** to see the agents and model families recorded in your
+workspace. The Agents and Models tabs show calls from the selected 7 or 30 days,
+clipped to your plan's retention. Open a card for usage, cost, call errors, latency,
+related identities, recorded tools and recent traces.
+
+## Name an agent
+
+For a request through `/v1/chat/completions`, `/v1/embeddings` or `/v1/messages`,
+send this header:
+
+```http
+x-tracelane-agent-name: my-agent
+```
+
+The gateway trims and lowercases the name, truncates it to 64 characters, and
+ignores empty values or values containing control characters. Use a project or
+agent name rather than personal information. The header does not affect access
+control or workspace selection.
+
+For SDK and OpenTelemetry capture, set the standard attributes on the LLM span:
+
+```typescript
+span.setAttribute("gen_ai.agent.name", "my-agent");
+span.setAttribute("gen_ai.operation.name", "chat");
+```
+
+Use `embeddings` or `messages` for those operations. Spans without one of these
+operation names do not count as Calls, even when they carry an agent name. Some
+SDK integrations require you to supply the operation attribute explicitly.
+
+A supplied agent name takes priority over a recognised client. The gateway's
+client classifier stores only a catalog name, such as `claude-code`, or nothing
+for an unknown client. It does not store the request's User-Agent in the span.
+A recognised client name describes the request; it does not establish who sent it.
+
+The currently observed Codex CLI uses the Responses API. This gateway does not
+serve `/v1/responses`; a catalog entry alone does not make that protocol work.
+Use a supported gateway route or SDK span capture for identity activity.
+
+## Read a card
+
+- **Direct API calls** includes calls without an agent name or recognised client.
+- **Unidentified model** includes calls without a model name. Neither bucket is dropped.
+- Response model takes priority over request model. Route prefixes and dated
+  suffixes are removed to group model families.
+- **Made by** comes from the catalog; **Served by** comes from the recorded
+  provider. A Meta model served by Groq shows both.
+- An identity outside the catalog gets its recorded key and a monogram.
+- **Identity source** distinguishes SDK names, header names, recognised clients
+  and unnamed calls. These are caller-supplied signals.
+
+**Calls** counts only chat, embeddings and messages spans, not tool, agent or
+internal spans. Tokens and cost show a dash when all calls lack that measurement;
+calls missing usage or prices are counted separately. First and last seen are
+within the selected window. Error rate counts spans with error status; latency
+uses recorded span duration.
+
+Tools are names captured on tool spans or model responses. Without captured tool
+names, the profile says **No tool calls recorded**. The directory shows at most
+200 identities by Calls; related identities and tools show the top 10 with a
+remaining count. Profiles link to 20 recent traces. **View all in Traces** keeps
+the identity and selected time window as filters, including exports.
+
+## Read activity through the API
+
+Use a session token or an API key with the `read` scope. The gateway obtains the
+workspace from that credential; there is no caller-supplied tenant parameter.
+
+```http
+GET /v1/kya/identities?kind=agent&window=7d
+GET /v1/kya/identities/agent/my-agent?window=30d
+```
+
+Use `kind=model` for model families. Identities with no calls in the selected window and identities outside your
+workspace return the same 404 on the profile route. Failed reads remain
+errors, rather than turning into zero activity.

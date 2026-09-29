@@ -1,3 +1,7 @@
+import { fmtCount, fmtDurationMs, fmtUsd } from "@/lib/metrics/format";
+import { fmtDur } from "@tracelanedev/ui";
+import { PageHeader } from "@tracelanedev/ui";
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * `EVL-02` — the experiment diff. Two arms, one screen, regressions first.
  *
@@ -28,6 +32,7 @@ import type {
 	ExperimentCompareResponse,
 } from "@/app/api/experiments/route";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
+import { METRICS } from "@/lib/metrics/registry";
 import { EmptyState } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -48,15 +53,13 @@ function fmtDeltaScore(v: number | null): string {
 	return `${sign}${Math.abs(v).toFixed(2)}`;
 }
 
-function fmtMs(v: number | null): string {
-	return v === null ? "—" : `${v.toLocaleString("en-US")}ms`;
-}
+const fmtMs = fmtDurationMs;
 
 /** Signed latency delta, with the ratio only when there IS one. */
 function fmtDeltaMs(ms: number | null, pct: number | null): string {
 	if (ms === null) return "—";
 	const sign = ms > 0 ? "+" : ms < 0 ? "−" : "±";
-	const abs = `${sign}${Math.abs(ms).toLocaleString("en-US")}ms`;
+	const abs = `${sign}${fmtDur(Math.abs(ms) * 1000)}`;
 	// pct is null when the A-side latency was 0. Show the absolute move and omit
 	// the ratio rather than inventing one.
 	return pct === null ? abs : `${abs} (${sign}${Math.abs(pct).toFixed(0)}%)`;
@@ -69,9 +72,6 @@ function fmtDeltaMs(ms: number | null, pct: number | null): string {
  * model whose price we do not know, and summing that as zero is the exact
  * coercion that made the spend tile under-report silently.
  */
-function fmtUsd(v: number | null): string {
-	return v === null ? "—" : `$${v.toFixed(4)}`;
-}
 
 function fmtPct(v: number | null): string {
 	return v === null ? "—" : `${v.toFixed(1)}%`;
@@ -79,9 +79,9 @@ function fmtPct(v: number | null): string {
 
 /** The verdict's TEXT marker. Never a glyph alone — see the header comment. */
 const VERDICT_LABEL: Record<ComparedItem["verdict"], string> = {
-	regressed: "▼ regressed",
+	regressed: "▼ worse (regressed)",
 	unknown: "? unknown",
-	improved: "▲ improved",
+	improved: "▲ better (improved)",
 	unchanged: "· unchanged",
 	only_in_a: "+ only in A",
 	only_in_b: "+ only in B",
@@ -91,21 +91,42 @@ function Side({ side }: { side: ComparedSide | null }) {
 	if (side === null) {
 		return <span className="text-ink-3">—</span>;
 	}
-	return <span>{fmtScore(side.score)}</span>;
+	return (
+		<div className="space-y-1 whitespace-nowrap">
+			<div>
+				<span className="text-ink-3">
+					{METRICS.experiment_case_score.label}:{" "}
+				</span>
+				<span>{fmtScore(side.score)}</span>
+			</div>
+			<div>
+				<span className="text-ink-3">
+					{METRICS.experiment_case_latency.label}:{" "}
+				</span>
+				{fmtMs(side.latency_ms)}
+			</div>
+			<div>
+				<span className="text-ink-3">
+					{METRICS.experiment_case_cost.label}:{" "}
+				</span>
+				{fmtUsd(side.cost_usd)}
+			</div>
+		</div>
+	);
 }
 
 /** One arm's header strip (spec §3a). Every `—` below is UNKNOWN, not zero. */
 function ArmCard({ arm, letter }: { arm: ArmAggregate; letter: "A" | "B" }) {
 	return (
-		<div className="rounded-lg border border-line bg-surface-2 p-3">
+		<div className="rounded-card border border-line bg-surface-2 p-3">
 			<div className="t-metric-label">
-				Arm {letter}
+				{letter === "A" ? "Baseline (A)" : "Candidate (B)"}
 				{arm.arm_label ? ` · ${arm.arm_label}` : ` · #${arm.ordinal}`}
 			</div>
 			<div className="mt-1 font-mono text-sm break-all">{arm.model || "—"}</div>
 			<dl className="mt-2 space-y-1 text-sm">
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">Pass rate</dt>
+					<dt className="text-ink-3">{METRICS.experiment_pass_rate.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>
 						{fmtPct(arm.pass_rate)}
 						<span className="ml-1 text-ink-3 text-xs">
@@ -114,19 +135,19 @@ function ArmCard({ arm, letter }: { arm: ArmAggregate; letter: "A" | "B" }) {
 					</dd>
 				</div>
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">Mean score</dt>
+					<dt className="text-ink-3">{METRICS.experiment_mean.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>
 						{fmtScore(arm.mean_score)}
 					</dd>
 				</div>
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">p95 latency</dt>
+					<dt className="text-ink-3">{METRICS.experiment_p95.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>
 						{fmtMs(arm.p95_latency_ms)}
 					</dd>
 				</div>
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">Total cost</dt>
+					<dt className="text-ink-3">{METRICS.experiment_cost.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>
 						{fmtUsd(arm.total_cost_usd)}
 						{/* An unknown cost is its OWN number, never folded into the sum
@@ -139,18 +160,21 @@ function ArmCard({ arm, letter }: { arm: ArmAggregate; letter: "A" | "B" }) {
 					</dd>
 				</div>
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">Items</dt>
+					<dt className="text-ink-3">{METRICS.experiment_matched.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>
 						{arm.items_matched} compared
 						{arm.items_run !== arm.items_matched && (
-							<span className="ml-1 text-ink-3 text-xs">
-								of {arm.items_run} run
-							</span>
+							<>
+								{" "}
+								<span className="text-ink-3 text-xs">
+									of {arm.items_run} run
+								</span>
+							</>
 						)}
 					</dd>
 				</div>
 				<div className="flex justify-between gap-3">
-					<dt className="text-ink-3">Errored</dt>
+					<dt className="text-ink-3">{METRICS.experiment_errored.label}</dt>
 					<dd style={{ fontVariantNumeric: "tabular-nums" }}>{arm.errored}</dd>
 				</div>
 			</dl>
@@ -172,8 +196,8 @@ export default async function CompareArmsPage({
 
 	if (!a || !b) {
 		return (
-			<main className="p-6">
-				<h1 className="t-h1 mb-4">Compare arms</h1>
+			<div className="p-6">
+				<PageHeader title={<>Compare arms</>} />
 				<EmptyState
 					title="Pick two arms to compare"
 					description="Open the experiment and choose two arms, or pass ?a=<arm_id>&b=<arm_id>."
@@ -186,7 +210,7 @@ export default async function CompareArmsPage({
 						Back to the experiment
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 
@@ -226,8 +250,8 @@ export default async function CompareArmsPage({
 									"Nothing is wrong with the experiment itself — the gateway couldn't be reached. Try again.",
 							};
 		return (
-			<main className="p-6">
-				<h1 className="t-h1 mb-4">Compare arms</h1>
+			<div className="p-6">
+				<PageHeader title={<>Compare arms</>} />
 				<EmptyState title={copy.title} description={copy.description} />
 				<p className="mt-4 text-sm">
 					<Link
@@ -237,15 +261,15 @@ export default async function CompareArmsPage({
 						Back to the experiment
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 
 	const t = data.thresholds;
 
 	return (
-		<main className="p-6">
-			<h1 className="t-h1 mb-1">{data.name}</h1>
+		<div className="p-6">
+			<PageHeader title={data.name} />
 			<p className="mb-3 text-ink-3 text-sm">
 				dataset{" "}
 				<span className="font-mono">{data.dataset_id.slice(0, 8)}…</span> ·
@@ -258,14 +282,16 @@ export default async function CompareArmsPage({
 			    gateway so this page and the API cannot disagree about it. */}
 			<p className="mb-1 font-medium text-sm">{data.summary}</p>
 			<p className="mb-4 text-ink-3 text-xs">
-				▼ regressed = score down ≥{t.score_delta_min.toFixed(2)}, or pass →
-				fail. ▲/▼ latency fires only above BOTH {t.latency_delta_min_ms}ms and{" "}
-				{t.latency_delta_min_pct}%.
+				Worse (regressed) = score down ≥{t.score_delta_min.toFixed(2)}, or pass
+				→ fail. Better (improved) is the reverse; unchanged stays within the
+				score threshold. Cost and latency are independent. ▲/▼ latency fires
+				only above BOTH {t.latency_delta_min_ms}ms and {t.latency_delta_min_pct}
+				%.
 			</p>
 
 			{/* A PARTIAL comparison must never read as a complete one. */}
 			{data.partial_note && (
-				<p className="mb-4 rounded-lg border border-line bg-surface-2 p-3 text-sm">
+				<p className="mb-4 rounded-card border border-line bg-surface-2 p-3 text-sm">
 					{data.partial_note}
 				</p>
 			)}
@@ -276,25 +302,31 @@ export default async function CompareArmsPage({
 			</div>
 
 			<div className="overflow-x-auto">
-				<table className="w-full text-sm">
-					<thead>
-						<tr className="border-line border-b text-left">
-							<th className="px-3 py-1.5">Item</th>
-							<th className="px-3 py-1.5 text-right">A</th>
-							<th className="px-3 py-1.5 text-right">B</th>
-							<th className="px-3 py-1.5 text-right">Δ score</th>
-							<th className="px-3 py-1.5 text-right">Δ latency</th>
-							<th className="px-3 py-1.5 text-right">Δ cost</th>
-							<th className="px-3 py-1.5">Verdict</th>
-						</tr>
-					</thead>
-					<tbody>
+				<Table className="w-full text-sm">
+					<THead>
+						<TR className="border-line border-b text-left">
+							<TH className="px-3 py-1.5">Item</TH>
+							<TH className="px-3 py-1.5 text-right">Baseline (A)</TH>
+							<TH className="px-3 py-1.5 text-right">Candidate (B)</TH>
+							<TH className="px-3 py-1.5 text-right">
+								{METRICS.experiment_score_delta.label}
+							</TH>
+							<TH className="px-3 py-1.5 text-right">
+								{METRICS.experiment_latency_delta.label}
+							</TH>
+							<TH className="px-3 py-1.5 text-right">
+								{METRICS.experiment_cost_delta.label}
+							</TH>
+							<TH className="px-3 py-1.5">Verdict</TH>
+						</TR>
+					</THead>
+					<TBody>
 						{data.rows.map((r) => (
-							<tr
+							<TR
 								key={`${r.dataset_item_id ?? "ord"}-${r.item_ordinal}`}
 								className="border-line border-b"
 							>
-								<td className="px-3 py-2">
+								<TD className="px-3 py-2">
 									<div className="truncate">{r.label || "(unnamed)"}</div>
 									{/* The error text INLINE on the row, not behind a hover:
 									    an unknown verdict is actionable and the reason is the
@@ -310,30 +342,28 @@ export default async function CompareArmsPage({
 										</div>
 									)}
 									{(r.a?.output_truncated || r.b?.output_truncated) && (
-										<div className="text-ink-3 text-xs">
-											… output truncated at 8 KB
-										</div>
+										<div className="text-ink-3 text-xs">… output truncated</div>
 									)}
-								</td>
-								<td
+								</TD>
+								<TD
 									className="px-3 py-2 text-right font-mono"
 									style={{ fontVariantNumeric: "tabular-nums" }}
 								>
 									<Side side={r.a} />
-								</td>
-								<td
+								</TD>
+								<TD
 									className="px-3 py-2 text-right font-mono"
 									style={{ fontVariantNumeric: "tabular-nums" }}
 								>
 									<Side side={r.b} />
-								</td>
-								<td
+								</TD>
+								<TD
 									className="px-3 py-2 text-right font-mono"
 									style={{ fontVariantNumeric: "tabular-nums" }}
 								>
 									{fmtDeltaScore(r.delta_score)}
-								</td>
-								<td
+								</TD>
+								<TD
 									className="px-3 py-2 text-right font-mono"
 									style={{ fontVariantNumeric: "tabular-nums" }}
 								>
@@ -344,22 +374,22 @@ export default async function CompareArmsPage({
 									{r.latency_faster && (
 										<span className="ml-1 text-xs">▼ faster</span>
 									)}
-								</td>
-								<td
+								</TD>
+								<TD
 									className="px-3 py-2 text-right font-mono"
 									style={{ fontVariantNumeric: "tabular-nums" }}
 								>
 									{fmtUsd(r.delta_cost_usd)}
 									{r.cost_higher && <span className="ml-1 text-xs">▲</span>}
 									{r.cost_lower && <span className="ml-1 text-xs">▼</span>}
-								</td>
-								<td className="px-3 py-2 whitespace-nowrap">
+								</TD>
+								<TD className="px-3 py-2 whitespace-nowrap">
 									{VERDICT_LABEL[r.verdict]}
-								</td>
-							</tr>
+								</TD>
+							</TR>
 						))}
-					</tbody>
-				</table>
+					</TBody>
+				</Table>
 			</div>
 
 			{/* The six counts, so a reader can add them up and get the row count —
@@ -379,6 +409,6 @@ export default async function CompareArmsPage({
 					Back to the experiment
 				</Link>
 			</p>
-		</main>
+		</div>
 	);
 }

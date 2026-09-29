@@ -67,7 +67,34 @@ export interface VerifyOptions {
 	 * pubkey differs are REJECTED (fail closed). Absent → chain-only mode:
 	 * signatures/anchors are reported UNVERIFIED (never green). */
 	tenantPubkey?: Uint8Array;
+	/** AUD-29: Tracelane's shared PLATFORM Ed25519 pubkey (32 raw bytes) — the key a
+	 * workspace's batches are signed with before the workspace has its own key.
+	 * Obtained out-of-band (`GET /v1/audit/platform-pubkey`, or the pinned
+	 * {@link TRACELANE_PLATFORM_PUBKEY_B64}). A batch signed by it verifies as
+	 * PLATFORM-SIGNED (counted apart, never as the workspace's own signature) and is
+	 * accepted only as a PREFIX: a platform-signed batch after a workspace-signed
+	 * one is `platform_key_after_workspace_key`. Absent → today's behaviour. */
+	platformPubkey?: Uint8Array;
+	/** AUD-29: further platform keys (a rotation keeps the retired key here so the
+	 * batches it signed still verify). Union with `platformPubkey`. */
+	platformPubkeys?: Uint8Array[];
+	/** AUD-29: the first ledger seq the WORKSPACE key signed — `workspace_key_since_seq`
+	 * from `GET /v1/audit/pubkey`. Any platform-signed batch reaching it is
+	 * `platform_key_after_workspace_key` even when the loaded view holds no
+	 * workspace-signed batch (the windowed-export append). */
+	workspaceKeySinceSeq?: number;
 }
+
+/** AUD-29: every production platform signing key, pinned in this release so an
+ * auditor does not have to take them from Tracelane's API or from the evidence. A
+ * rotation APPENDS; a retired key stays so the batches it signed still verify. */
+export const TRACELANE_PLATFORM_PUBKEYS_B64: readonly string[] = [
+	"fKMom1FbENpYSF/EVNCkd4sOEnHVlbsDf13CNfkewl8=",
+];
+/** AUD-29: the CURRENT platform key (the last pinned one). */
+export const TRACELANE_PLATFORM_PUBKEY_B64 = TRACELANE_PLATFORM_PUBKEYS_B64[
+	TRACELANE_PLATFORM_PUBKEYS_B64.length - 1
+] as string;
 
 export interface VerifyError {
 	seq: number | null;
@@ -103,6 +130,17 @@ export interface VerifyReport {
 	 * resolved+included Rekor anchor inside the window). A windowed verify with no
 	 * anchor to root it is `false` → RED (`unrooted_window`), never green. */
 	trust_established: boolean;
+	/** B-483 — rows inside NO anchor record's range although a LATER batch of the same
+	 * tenant exists: a HOLE below the anchor watermark, unsigned and un-anchored.
+	 * Contiguous batches are not covered rows; **a nonzero count is never green.** */
+	rows_uncovered_by_anchors: number;
+	/** Rows past the LAST anchor of their tenant — the ordinary un-anchored tail (the
+	 * next batch is still filling). Reported so "not yet" reads apart from "never". */
+	rows_unanchored_tail: number;
+	/** AUD-29: batches whose attestation verified against the PLATFORM key, not the
+	 * workspace key — verified, but Tracelane (not the workspace key) vouches. */
+	platform_signed_batches: number;
+	platform_signed_ranges: { start_seq: number; end_seq: number }[];
 	errors: VerifyError[];
 }
 
@@ -459,6 +497,10 @@ export async function verifyLedgerText(
 		strip_detected: false,
 		verified_from_seq: 0,
 		trust_established: true,
+		rows_uncovered_by_anchors: 0,
+		rows_unanchored_tail: 0,
+		platform_signed_batches: 0,
+		platform_signed_ranges: [],
 		errors: [],
 	};
 
@@ -501,11 +543,85 @@ export async function verifyLedgerText(
 		rows,
 		anchors,
 		options.tenantPubkey,
+		[
+			...(options.platformPubkey ? [options.platformPubkey] : []),
+			...(options.platformPubkeys ?? []),
+		],
+		options.workspaceKeySinceSeq,
 	);
 
 	verifyChain(report, rows, formatVersion, includedStarts);
 
+	// B-483: anchor COVERAGE per row — neither pass above asks whether every row is
+	// inside some anchor batch, so a batch whose anchor never landed reads green.
+	countAnchorCoverage(report, rows, anchors);
+
 	return report;
+}
+
+/** B-483: per tenant, every row with `seq <= max(batch_end_seq)` that no anchor's
+ * `[batch_start_seq, batch_end_seq]` contains is a HOLE (`rows_uncovered_by_anchors`);
+ * rows above the tenant's last anchor are the TAIL (`rows_unanchored_tail`). One
+ * `anchor_coverage_gap` error per contiguous hole, naming its range. Rows below
+ * `report.verified_from_seq` are skipped: on a WINDOWED verify (ADR-070) the loaded rows
+ * begin before the rooting anchor and are already declared present-but-unverified —
+ * counting them would report a hole the view cannot see (the /audit page loads a
+ * window). Runs AFTER `verifyChain`, which sets the root. Exported for the unit test;
+ * mirrors `count_anchor_coverage` in the Rust verifier. */
+export function countAnchorCoverage(
+	report: VerifyReport,
+	rows: Pick<AuditRow, "tenant_id" | "seq">[],
+	anchors: Pick<
+		AnchorRecord,
+		"tenant_id" | "batch_start_seq" | "batch_end_seq"
+	>[],
+): void {
+	const ranges = new Map<string, [number, number][]>();
+	for (const a of anchors) {
+		const list = ranges.get(a.tenant_id) ?? [];
+		list.push([a.batch_start_seq, a.batch_end_seq]);
+		ranges.set(a.tenant_id, list);
+	}
+	const byTenant = new Map<string, number[]>();
+	for (const r of rows) {
+		if (r.seq < report.verified_from_seq) continue;
+		const list = byTenant.get(r.tenant_id) ?? [];
+		list.push(r.seq);
+		byTenant.set(r.tenant_id, list);
+	}
+	const pushGap = (tenant: string, lo: number, hi: number) =>
+		report.errors.push({
+			seq: lo,
+			kind: "anchor_coverage_gap",
+			detail: `tenant ${tenant}: rows ${lo}..${hi} (${hi - lo + 1} rows) are inside no anchor batch although a later batch exists — unsigned and un-anchored, a hole below the anchor watermark`,
+		});
+	for (const [tenant, seqsRaw] of byTenant) {
+		const anchorRanges = ranges.get(tenant) ?? [];
+		const watermark = anchorRanges.length
+			? Math.max(...anchorRanges.map(([, e]) => e))
+			: undefined;
+		const seqs = [...new Set(seqsRaw)].sort((a, b) => a - b);
+		let hole: [number, number] | undefined;
+		for (const seq of seqs) {
+			const covered = anchorRanges.some(([s, e]) => s <= seq && seq <= e);
+			if (covered) {
+				if (hole) pushGap(tenant, hole[0], hole[1]);
+				hole = undefined;
+				continue;
+			}
+			if (watermark !== undefined && seq <= watermark) {
+				report.rows_uncovered_by_anchors += 1;
+				if (hole && hole[1] + 1 === seq) hole = [hole[0], seq];
+				else {
+					if (hole) pushGap(tenant, hole[0], hole[1]);
+					hole = [seq, seq];
+				}
+			} else {
+				report.rows_unanchored_tail += 1;
+			}
+		}
+		if (hole) pushGap(tenant, hole[0], hole[1]);
+	}
 }
 
 // Exported for the ADR-070 windowed regression tests (advanced/low-level).
@@ -728,6 +844,8 @@ function verifyAnchorsOffline(
 	rows: AuditRow[],
 	anchors: AnchorRecord[],
 	tenantPubkey?: Uint8Array,
+	platformPubkeys: Uint8Array[] = [],
+	workspaceKeySinceSeq?: number,
 ): Map<string, number> {
 	// ADR-070: per-tenant earliest fully-covered + publicly-INCLUDED anchor batch
 	// start — the trust root a windowed verify anchors to.
@@ -743,6 +861,13 @@ function verifyAnchorsOffline(
 		}
 	}
 
+	const signersByTenant = new Map<
+		string,
+		{
+			workspaceMinStart: number;
+			platform: { start_seq: number; end_seq: number }[];
+		}
+	>();
 	for (const a of anchors) {
 		const committed = a.anchor_state === "anchored";
 		const label = `batch ${a.batch_start_seq}-${a.batch_end_seq}`;
@@ -823,16 +948,26 @@ function verifyAnchorsOffline(
 			report.signatures_valid = false;
 			continue;
 		}
-		if (!bytesEqual(bundlePubkey, tenantPubkey)) {
-			report.errors.push({
-				seq: null,
-				kind: "untrusted_tenant_key",
-				detail: `${label}: anchor Ed25519 pubkey != trusted --tenant-pubkey (rejected — untrusted anchor key)`,
-			});
-			report.signatures_valid = false;
-			continue;
+		// AUD-29: the workspace key, else the platform key (verified, counted apart),
+		// else untrusted. Never a key taken from the evidence itself.
+		let signingKey: Uint8Array;
+		let platformSigned = false;
+		if (bytesEqual(bundlePubkey, tenantPubkey)) {
+			signingKey = tenantPubkey;
+		} else {
+			const platform = platformPubkeys.find((k) => bytesEqual(bundlePubkey, k));
+			if (!platform) {
+				report.errors.push({
+					seq: null,
+					kind: "untrusted_tenant_key",
+					detail: `${label}: anchor Ed25519 pubkey != trusted --tenant-pubkey (rejected — untrusted anchor key)`,
+				});
+				report.signatures_valid = false;
+				continue;
+			}
+			signingKey = platform;
+			platformSigned = true;
 		}
-
 		// Extract ECDSA material from the canonicalized body (anchored only).
 		let anchoredMeta: {
 			ecdsaSpki: Uint8Array;
@@ -896,7 +1031,7 @@ function verifyAnchorsOffline(
 			report.signatures_valid = false;
 			continue;
 		}
-		if (!ed25519.verify(attSig, msg, tenantPubkey)) {
+		if (!ed25519.verify(attSig, msg, signingKey)) {
 			report.errors.push({
 				seq: null,
 				kind: "attestation_invalid",
@@ -905,6 +1040,20 @@ function verifyAnchorsOffline(
 			report.signatures_valid = false;
 			continue;
 		}
+		// AUD-29: the attestation verified — record WHICH trust root vouched for it.
+		const signers = signersByTenant.get(a.tenant_id) ?? {
+			workspaceMinStart: Number.POSITIVE_INFINITY,
+			platform: [] as { start_seq: number; end_seq: number }[],
+		};
+		if (platformSigned) {
+			signers.platform.push({
+				start_seq: a.batch_start_seq,
+				end_seq: a.batch_end_seq,
+			});
+		} else if (a.batch_start_seq < signers.workspaceMinStart) {
+			signers.workspaceMinStart = a.batch_start_seq;
+		}
+		signersByTenant.set(a.tenant_id, signers);
 
 		if (!committed || !a.rekor || !entrySig || !entryPoint || !artifactHash) {
 			// Honest signed-but-unanchored batch: attestation verified, nothing more.
@@ -955,8 +1104,15 @@ function verifyAnchorsOffline(
 			report.anchors_included += 1;
 			// ADR-070: this fully-covered batch is publicly included → it can
 			// root a windowed verify. Track the earliest such start per tenant.
+			// AUD-29: NEVER a platform-signed batch — the platform key is trusted
+			// only as a verified PREFIX of a chain, not as the root that makes a
+			// window trustworthy (a platform-key holder could otherwise anchor a
+			// forged window and have it rooted).
 			const includedPrev = includedStarts.get(a.tenant_id);
-			if (includedPrev === undefined || a.batch_start_seq < includedPrev)
+			if (
+				!platformSigned &&
+				(includedPrev === undefined || a.batch_start_seq < includedPrev)
+			)
 				includedStarts.set(a.tenant_id, a.batch_start_seq);
 		} catch (e) {
 			report.errors.push({
@@ -967,5 +1123,31 @@ function verifyAnchorsOffline(
 			report.signatures_valid = false;
 		}
 	}
+	// AUD-29 downgrade rule: the platform key is accepted only as a PREFIX. Once the
+	// workspace key has signed a batch, a later platform-signed batch is what an
+	// attacker holding the platform key would append — RED, never amber.
+	// `>=`: a platform-signed batch starting WHERE a workspace-signed one starts is a
+	// shadow of it, not a prefix. `workspaceKeySinceSeq` (published out-of-band)
+	// holds the rule even when the loaded view contains no workspace-signed batch.
+	for (const signers of signersByTenant.values()) {
+		const boundary = Math.min(
+			signers.workspaceMinStart,
+			workspaceKeySinceSeq ?? Number.POSITIVE_INFINITY,
+		);
+		for (const r of signers.platform) {
+			if (r.start_seq >= boundary || r.end_seq >= boundary) {
+				report.errors.push({
+					seq: null,
+					kind: "platform_key_after_workspace_key",
+					detail: `batch ${r.start_seq}-${r.end_seq}: signed by the platform key at or after seq ${boundary}, where the workspace key had taken over`,
+				});
+				report.signatures_valid = false;
+			} else {
+				report.platform_signed_batches += 1;
+				report.platform_signed_ranges.push(r);
+			}
+		}
+	}
+	report.platform_signed_ranges.sort((x, y) => x.start_seq - y.start_seq);
 	return includedStarts;
 }

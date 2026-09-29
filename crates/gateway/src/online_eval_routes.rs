@@ -626,6 +626,29 @@ struct ScoresResponse {
 }
 
 #[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+/// The recent-scores read, shared by `scores_handler` and its real-ClickHouse test.
+///
+/// Binds, in order: tenant_id, hours, [trace_id], limit.
+///
+/// THE ALIAS IS `scored_at_ms`, NEVER `scored_at`. In ClickHouse a SELECT alias
+/// shadows the column of the same name inside WHERE, so `… AS scored_at` turned the
+/// window filter into millis-vs-DateTime and EVERY row passed — Settings → Online
+/// evals said "last 24 hours" over 18 days of scores (found on prod 2026-09-27; the
+/// B-424 alias-shadowing class). `ScoreDto` is read positionally (RowBinary,
+/// clickhouse 0.13), so its field keeps the `scored_at` name the web reads.
+/// `online_eval::clickhouse_roundtrip::a_24_hour_score_read_excludes_an_older_score`
+/// is the control, against a real ClickHouse.
+pub(crate) fn scores_sql(trace_filter: bool) -> String {
+    let trace_filter = if trace_filter { "AND trace_id = ?" } else { "" };
+    format!(
+        "SELECT trace_id, span_id, rubric, judge_model, status, score, verdict, reason, \
+                error, cost_usd, latency_ms, toUnixTimestamp64Milli(scored_at) AS scored_at_ms \
+           FROM online_eval_scores FINAL \
+          WHERE tenant_id = ? AND scored_at >= now() - toIntervalHour(?) {trace_filter} \
+          ORDER BY scored_at DESC LIMIT ?"
+    )
+}
+
 async fn scores_handler(
     State(state): State<OnlineEvalRoutesState>,
     Query(q): Query<WindowQuery>,
@@ -648,19 +671,8 @@ async fn scores_handler(
     //
     // Every value is BOUND, never interpolated — `?` placeholders through the
     // ADR-031 cap wrapper, which is also what `no-raw-ch-query.sh` requires.
-    let trace_filter = if q.trace_id.is_some() {
-        "AND trace_id = ?"
-    } else {
-        ""
-    };
     let sql = crate::clickhouse_query::TenantQuery::new(
-        format!(
-            "SELECT trace_id, span_id, rubric, judge_model, status, score, verdict, reason, \
-                    error, cost_usd, latency_ms, toUnixTimestamp64Milli(scored_at) AS scored_at \
-               FROM online_eval_scores FINAL \
-              WHERE tenant_id = ? AND scored_at >= now() - toIntervalHour(?) {trace_filter} \
-              ORDER BY scored_at DESC LIMIT ?"
-        ),
+        scores_sql(q.trace_id.is_some()),
         crate::clickhouse_query::tier_for_tenant(Some(&state.entitlements), &claims.tenant_id)
             .await,
     )
@@ -861,15 +873,20 @@ async fn summary_handler(
     // pair of numbers exists to prevent, produced by the denominator rather
     // than by the sampler.
     //
-    // `spans` already carries the flag (`server.rs:2396`), and it is
-    // `skip_serializing_if = "Option::is_none"`, so PRESENCE is the hit —
-    // verified on prod: `JSONHas` and `extract != ''` both take 222 to 29, and
-    // the raw value reads `true`.
+    // `spans` already carries the flag (`server/chat.rs`, the cache-hit span), and
+    // it is `skip_serializing_if = "Option::is_none"`. Until 2026-09-19 PRESENCE
+    // was the hit — verified on prod: `JSONHas` and `extract != ''` both took 222
+    // to 29, and the raw value read `true`. **B-447 changed that:** a consulted-
+    // and-MISSED request now writes `false` (`server/buffered.rs`), and a miss IS
+    // eligible for judging, so the predicate excludes the VALUE `true`, never mere
+    // presence — `NOT JSONHas` here would have silently shrunk the denominator to
+    // the pre-B-447 spans the day the fix deployed.
     let eligible_sql = crate::clickhouse_query::TenantQuery::new(
         "SELECT toUInt64(uniqExact(trace_id)) AS eligible FROM spans FINAL \
           WHERE tenant_id = ? AND name = 'gen_ai.chat' \
             AND JSONExtractString(attributes, 'tracelane_eval_run_id') = '' \
-            AND NOT JSONHas(attributes, 'tracelane_semantic_cache_hit') \
+            AND NOT (JSONHas(attributes, 'tracelane_semantic_cache_hit') \
+                     AND JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')) \
             AND start_time >= now() - toIntervalHour(?)",
         crate::clickhouse_query::tier_for_tenant(Some(&state.entitlements), &claims.tenant_id)
             .await,
@@ -890,7 +907,14 @@ async fn summary_handler(
             )
         })?;
 
-    let content_capture = crate::server::config::content_capture_enabled(&claims.tenant_id);
+    // GWY-53: the judge's own predicate (`judge_may_read` — BOTH halves), so this
+    // flag explains `admissions_refused_capture_off` exactly.
+    let content_capture = crate::server::config::content_capture_for(
+        Some(state.entitlements.as_ref()),
+        &claims.tenant_id,
+    )
+    .await
+    .judge_may_read();
     Ok(Json(SummaryResponse {
         content_capture,
         admissions_refused_capture_off: crate::online_eval::skipped_capture_off(),

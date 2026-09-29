@@ -25,14 +25,15 @@
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::db::api_keys::MintedKey;
+use crate::db::api_keys::{KeyEditor, KeyPatch, KeyRecord, MintedKey, UpdateOutcome};
 use tracelane_shared::TenantId;
 
 /// Upper bound on the user-supplied key name (defensive; the column is TEXT).
@@ -43,6 +44,14 @@ const MAX_KEY_NAME_LEN: usize = 128;
 /// `async_trait` is fine — CLAUDE.md bans it only on the gateway hot path.
 #[async_trait::async_trait]
 pub trait KeyMinter: Send + Sync {
+    async fn rotation_grace_hours(&self) -> Result<i64>;
+    async fn rotate(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        actor: &str,
+        grace_hours: i64,
+    ) -> Result<Option<crate::db::api_keys::RotatedKey>>;
     /// Mint a key for `tenant`, returning the row plus the one-time raw secret.
     /// `minted_by` is the WorkOS user id of the minting user (for §3
     /// key-revoke-on-member-removal); `None` for API-key / service auth.
@@ -53,15 +62,57 @@ pub trait KeyMinter: Send + Sync {
         minted_by: Option<&str>,
         opts: crate::db::api_keys::MintOptions,
     ) -> Result<MintedKey>;
+    /// SET-38 — one key of `tenant`; `None` if absent or revoked.
+    async fn get_key(&self, tenant: &TenantId, id: uuid::Uuid) -> Result<Option<KeyRecord>>;
+    /// SET-38 — edit in place; authorization is enforced under the row lock.
+    async fn update_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        editor: KeyEditor<'_>,
+        patch: &KeyPatch,
+        actor: &str,
+    ) -> Result<UpdateOutcome>;
+    /// B-586 — revoke through the gateway, invalidating the auth cache.
+    async fn revoke_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        actor: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+    /// This key's recorded spend in its current budget window. `None` when it
+    /// cannot be read — NEVER `Some(0.0)` for "unknown".
+    async fn recorded_spend(
+        &self,
+        tenant: &TenantId,
+        key_id: uuid::Uuid,
+        cadence: crate::spend::BudgetReset,
+    ) -> Option<f64>;
 }
 
 /// Production minter — inserts through the shared Postgres pool.
 pub struct PgKeyMinter {
     pub pool: deadpool_postgres::Pool,
+    /// ClickHouse for `recorded_usd`; `None` ⇒ the spend is reported unknown.
+    pub ch_url: Option<String>,
+    /// For the ADR-031 read caps at the tenant's own tier.
+    pub entitlements: Option<Arc<crate::entitlement_cache::EntitlementCache>>,
 }
 
 #[async_trait::async_trait]
 impl KeyMinter for PgKeyMinter {
+    async fn rotation_grace_hours(&self) -> Result<i64> {
+        crate::db::api_keys::rotation_grace_hours(&self.pool).await
+    }
+    async fn rotate(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        actor: &str,
+        grace_hours: i64,
+    ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
+        crate::db::api_keys::rotate(&self.pool, tenant, id, actor, grace_hours).await
+    }
     async fn mint(
         &self,
         tenant: &TenantId,
@@ -70,6 +121,84 @@ impl KeyMinter for PgKeyMinter {
         opts: crate::db::api_keys::MintOptions,
     ) -> Result<MintedKey> {
         crate::db::api_keys::mint(&self.pool, tenant, name, minted_by, opts).await
+    }
+    async fn get_key(&self, tenant: &TenantId, id: uuid::Uuid) -> Result<Option<KeyRecord>> {
+        crate::db::api_keys::get(&self.pool, tenant, id).await
+    }
+    async fn update_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        editor: KeyEditor<'_>,
+        patch: &KeyPatch,
+        actor: &str,
+    ) -> Result<UpdateOutcome> {
+        crate::db::api_keys::update(&self.pool, tenant, id, editor, patch, actor).await
+    }
+    async fn revoke_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        actor: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        crate::db::api_keys::revoke_key(&self.pool, tenant, id, actor).await
+    }
+    async fn recorded_spend(
+        &self,
+        tenant: &TenantId,
+        key_id: uuid::Uuid,
+        cadence: crate::spend::BudgetReset,
+    ) -> Option<f64> {
+        recorded_spend_from_clickhouse(
+            self.ch_url.as_deref(),
+            self.entitlements.as_ref(),
+            tenant,
+            key_id,
+            cadence,
+        )
+        .await
+    }
+}
+
+/// `recorded_usd` for `GET /v1/keys/{id}`: the SAME query the key budget seeds
+/// from (`key_spend_sql(cadence)`), tenant-first, capped at the tenant's tier.
+///
+/// **Fail to `None`, never to `0`.** The budget seed fails OPEN to 0 because a
+/// ClickHouse fault must not stop production traffic; a DISPLAY that turned the
+/// same fault into "$0.00 spent" would tell a customer their key is idle while it
+/// may be at its cap. Unknown is rendered as unknown.
+async fn recorded_spend_from_clickhouse(
+    ch_url: Option<&str>,
+    entitlements: Option<&Arc<crate::entitlement_cache::EntitlementCache>>,
+    tenant: &TenantId,
+    key_id: uuid::Uuid,
+    cadence: crate::spend::BudgetReset,
+) -> Option<f64> {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct SumRow {
+        usd: f64,
+    }
+    let url = ch_url?.to_owned();
+    let tier = crate::clickhouse_query::tier_for_tenant(entitlements, tenant).await;
+    let sql =
+        crate::clickhouse_query::TenantQuery::new(crate::server::key_spend_sql(cadence), tier)
+            .with_log_comment(format!("tenant_id={tenant}"))
+            .sql_with_settings();
+    match crate::clickhouse_query::ch_client(url)
+        .query(&sql)
+        .bind(tenant.to_string())
+        .bind(key_id.to_string())
+        .fetch_one::<SumRow>()
+        .await
+    {
+        Ok(row) if row.usd.is_finite() && row.usd >= 0.0 => Some(row.usd),
+        Ok(_) => None,
+        Err(e) => {
+            // Human-triggered (a drawer opening), not per-request traffic: debug,
+            // and the UI states "Spend unavailable right now" from the `null`.
+            tracing::debug!(error = %e, tenant_id = %tenant, "recorded_usd read failed; reporting unknown");
+            None
+        }
     }
 }
 
@@ -122,6 +251,9 @@ struct CreateKeyBody {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateKeyResponse {
+    /// Only on rotation: the OLD key's retirement time, not the successor's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_key_revoked_at: Option<String>,
     id: String,
     name: String,
     key_prefix: String,
@@ -156,7 +288,798 @@ fn known_scope_slugs() -> Vec<&'static str> {
 
 /// Mount the mint route. Merged in `server.rs` when Postgres is configured.
 pub fn routes() -> Router<KeyRoutesState> {
-    Router::new().route("/v1/keys", post(create_key_handler))
+    Router::new()
+        .route("/v1/keys", post(create_key_handler))
+        .route("/v1/keys/rotation-policy", get(rotation_policy_handler))
+        .route("/v1/keys/{id}/rotate", post(rotate_key_handler))
+        // SET-38 (read + edit in place) and B-586 (revoke through the gateway, so
+        // the in-process auth cache is invalidated). `rotation-policy` above is a
+        // static segment, which the router matches before this capture.
+        .route(
+            "/v1/keys/{id}",
+            get(get_key_handler)
+                .patch(update_key_handler)
+                .delete(revoke_key_handler),
+        )
+}
+
+// ── SET-38: GET / PATCH /v1/keys/{id}, and B-586: DELETE /v1/keys/{id} ──────
+
+/// A JSON error body: a stable `error` code, a human `message`, and the `field`
+/// when one field is at fault. Every SET-38 / B-586 refusal uses this shape, so
+/// the dashboard can put the text beside the named field.
+fn json_error(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    field: Option<&str>,
+) -> Response {
+    let mut body = serde_json::json!({ "error": code, "message": message.into() });
+    if let Some(f) = field {
+        body["field"] = serde_json::Value::String(f.to_owned());
+    }
+    (status, Json(body)).into_response()
+}
+
+fn field_error(e: FieldError) -> Box<Response> {
+    Box::new(json_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_field",
+        e.message,
+        Some(e.field),
+    ))
+}
+
+/// A path id that is not a UUID names no key: the same 404 as a missing one, and
+/// only AFTER authentication (axum's typed `Path<Uuid>` would 400 an anonymous
+/// caller before the auth check ran).
+fn parse_key_id(raw: &str) -> Result<uuid::Uuid, Box<Response>> {
+    uuid::Uuid::parse_str(raw).map_err(|_| Box::new(key_not_found()))
+}
+
+fn key_not_found() -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "key not found, expired, or revoked",
+        None,
+    )
+}
+
+fn role_forbidden(required: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::auth::role_forbidden_json(required),
+    )
+        .into_response()
+}
+
+/// Who may EDIT a key's limits (spec §2 "authorization"). Fail CLOSED:
+///
+/// * a **verified owner** (WorkOS JWT, role owner/admin) — any key;
+/// * a **member** (WorkOS JWT) — only a key they minted (`minted_by = sub`);
+/// * the **self-host operator** (master key) — any key;
+/// * **everything else is refused**: a viewer, a JWT with an absent or
+///   unrecognised role (PL-9), an mTLS identity, and **any `tlane_` API key** —
+///   a key must never edit keys, itself included, or a budget-capped key could
+///   lift its own cap.
+///
+/// This is deliberately NARROWER than create's `can_mint_keys`: that lets a
+/// member act on the workspace in general, and applied to editing it would let a
+/// member throttle an owner's production key to 1 req/min — the same ingress
+/// kill the web revoke route refuses.
+fn key_editor(claims: &crate::auth::Claims) -> Option<KeyEditor<'_>> {
+    use crate::auth::{AuthMethod, Role};
+    match claims.auth_method {
+        AuthMethod::SelfHostMasterKey => Some(KeyEditor::Any),
+        AuthMethod::JwtBearer => match claims.role {
+            Some(Role::Owner) => Some(KeyEditor::Any),
+            Some(Role::Member) => Some(KeyEditor::MintedBy(&claims.sub)),
+            Some(Role::Viewer) | None => None,
+        },
+        AuthMethod::ApiKey | AuthMethod::Mtls => None,
+    }
+}
+
+/// Who may READ one key: any recognised workspace role on a human session (the
+/// dashboard's key list is visible to every role), or the self-host operator.
+/// Not an API key — a machine credential has no business enumerating keys.
+fn can_read_keys(claims: &crate::auth::Claims) -> bool {
+    use crate::auth::AuthMethod;
+    match claims.auth_method {
+        AuthMethod::SelfHostMasterKey => true,
+        AuthMethod::JwtBearer => claims.role.is_some(),
+        AuthMethod::ApiKey | AuthMethod::Mtls => false,
+    }
+}
+
+/// Who may REVOKE: a verified owner (as the web revoke's `requireOrgAdmin`, and as
+/// rotate) or the self-host operator. Never a member, never a key.
+fn can_revoke_keys(claims: &crate::auth::Claims) -> bool {
+    claims.is_verified_owner()
+        || matches!(
+            claims.auth_method,
+            crate::auth::AuthMethod::SelfHostMasterKey
+        )
+}
+
+/// A key as the settings surface sees it: the create response without `rawKey`,
+/// plus who minted it and its scheduled retirement. camelCase, like the create
+/// response and the dashboard's `ApiKeyRow`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyView {
+    id: String,
+    name: String,
+    key_prefix: String,
+    last_used_at: Option<String>,
+    created_at: String,
+    minted_by: Option<String>,
+    scope: Option<Vec<String>>,
+    expires_at: Option<String>,
+    budget_usd_monthly: Option<f64>,
+    rate_limit_rpm: Option<i32>,
+    budget_reset: &'static str,
+    velocity_breaker: bool,
+    /// A future value: the key is retiring (rotated, in its grace window).
+    revoked_at: Option<String>,
+}
+
+impl From<KeyRecord> for KeyView {
+    fn from(r: KeyRecord) -> Self {
+        Self {
+            id: r.id.to_string(),
+            name: r.name,
+            key_prefix: r.key_prefix,
+            last_used_at: r.last_used_at.map(|t| t.to_rfc3339()),
+            created_at: r.created_at.to_rfc3339(),
+            minted_by: r.minted_by,
+            scope: r.scope,
+            expires_at: r.expires_at.map(|t| t.to_rfc3339()),
+            budget_usd_monthly: r.budget_usd_monthly,
+            rate_limit_rpm: r.rate_limit_rpm,
+            budget_reset: r.budget_reset.as_str(),
+            velocity_breaker: r.velocity_breaker,
+            revoked_at: r.revoked_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
+/// `spend` in `GET /v1/keys/{id}` — spec §2, field names as the spec writes them.
+#[derive(Debug, Serialize)]
+struct KeySpendView {
+    /// `"day" | "week" | "month"` — the key's `budget_reset` window.
+    window: &'static str,
+    /// RFC3339 UTC start of the current window (the same UTC boundary the
+    /// ClickHouse query's `toStartOfDay` / `toMonday` / `toStartOfMonth` reads).
+    window_starts_at: String,
+    /// `null` = could not be read. A true zero is `0.0`.
+    recorded_usd: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyDetailResponse {
+    #[serde(flatten)]
+    key: KeyView,
+    spend: KeySpendView,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUpdateResponse {
+    #[serde(flatten)]
+    key: KeyView,
+    /// Wire names of the fields that actually changed; `[]` for a no-op.
+    changed: Vec<&'static str>,
+}
+
+/// The UTC start of the budget window `cadence` is in at `now`.
+fn window_start(
+    cadence: crate::spend::BudgetReset,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (&'static str, chrono::DateTime<chrono::Utc>) {
+    use chrono::{Datelike as _, TimeZone as _};
+    let day = now.date_naive();
+    let (label, date) = match cadence {
+        crate::spend::BudgetReset::Daily => ("day", day),
+        crate::spend::BudgetReset::Weekly => (
+            "week",
+            day - chrono::Duration::days(i64::from(day.weekday().num_days_from_monday())),
+        ),
+        crate::spend::BudgetReset::Monthly => ("month", day.with_day(1).unwrap_or(day)),
+    };
+    (
+        label,
+        chrono::Utc.from_utc_datetime(&date.and_time(chrono::NaiveTime::MIN)),
+    )
+}
+
+/// `GET /v1/keys/{id}` — one key plus its recorded spend this budget window.
+#[tracing::instrument(skip(state, headers), fields(tenant_id = tracing::field::Empty))]
+async fn get_key_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let claims = match claims_from_auth(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if !can_read_keys(&claims) {
+        return role_forbidden("viewer");
+    }
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+    let id = match parse_key_id(&id) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let record = match state.minter.get_key(&claims.tenant_id, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return key_not_found(),
+        Err(err) => {
+            tracing::error!(error = %format!("{err:#}"), "API key read failed");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "failed to read API key",
+                None,
+            );
+        }
+    };
+    let (window, starts) = window_start(record.budget_reset, chrono::Utc::now());
+    let recorded_usd = state
+        .minter
+        .recorded_spend(&claims.tenant_id, record.id, record.budget_reset)
+        .await;
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(KeyDetailResponse {
+            key: record.into(),
+            spend: KeySpendView {
+                window,
+                window_starts_at: starts.to_rfc3339(),
+                recorded_usd,
+            },
+        }),
+    )
+        .into_response()
+}
+
+/// Present-and-null vs absent — the JSON Merge Patch distinction. With
+/// `#[serde(default)]`, an absent field stays `None`; a present one (including
+/// `null`) becomes `Some(..)`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// `PATCH /v1/keys/{id}` body — RFC 7396. Absent = unchanged, `null` = clear,
+/// value = set. `deny_unknown_fields`: a `tenant_id` (or any other smuggled
+/// field) is a 400, never silently ignored.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchKeyBody {
+    #[serde(default, deserialize_with = "present")]
+    name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    scope: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "present")]
+    expires_at: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    budget_usd_monthly: Option<Option<f64>>,
+    /// `i64` for the same reason as create: one validator reports every
+    /// out-of-range value as a 400 naming the field.
+    #[serde(default, deserialize_with = "present")]
+    rate_limit_rpm: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "present")]
+    budget_reset: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    velocity_breaker: Option<Option<bool>>,
+}
+
+fn cannot_clear(field: &'static str) -> Box<Response> {
+    Box::new(json_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_field",
+        format!("{field} cannot be cleared — send a value, or omit it to leave it unchanged"),
+        Some(field),
+    ))
+}
+
+/// Validate a patch through the SAME validators create uses. Pure (the clock is a
+/// parameter), so every refusal is unit-testable.
+fn validate_patch(
+    body: PatchKeyBody,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyPatch, Box<Response>> {
+    let mut patch = KeyPatch::default();
+    match body.name {
+        None => {}
+        Some(None) => return Err(cannot_clear("name")),
+        Some(Some(n)) => patch.name = Some(validate_name(&n).map_err(field_error)?.to_owned()),
+    }
+    match body.scope {
+        None => {}
+        // A key may LEAVE the legacy full-surface state and never re-enter it:
+        // `null` would widen the key to every scope, `admin` included.
+        Some(None) => {
+            return Err(Box::new(json_error(
+                StatusCode::BAD_REQUEST,
+                "scope_cannot_become_legacy",
+                "scope cannot be set to null — a key can leave the legacy full-access state \
+                 but never re-enter it. Send the scopes this key needs.",
+                Some("scope"),
+            )));
+        }
+        Some(Some(v)) => patch.scope = Some(validate_scope(Some(v)).map_err(field_error)?),
+    }
+    match body.expires_at {
+        None => {}
+        Some(None) => patch.expires_at = Some(None),
+        Some(Some(raw)) => {
+            let at = validate_expires_at(&raw, now).map_err(|mut e| {
+                if e.message.ends_with("in the future") {
+                    e.message.push_str(" — to stop a key now, revoke it");
+                }
+                field_error(e)
+            })?;
+            patch.expires_at = Some(Some(at));
+        }
+    }
+    match body.budget_usd_monthly {
+        None => {}
+        Some(None) => patch.budget_usd_monthly = Some(None),
+        Some(Some(b)) => {
+            patch.budget_usd_monthly = Some(Some(validate_budget_usd(b).map_err(field_error)?));
+        }
+    }
+    match body.rate_limit_rpm {
+        None => {}
+        Some(None) => patch.rate_limit_rpm = Some(None),
+        Some(Some(r)) => {
+            patch.rate_limit_rpm = Some(Some(validate_rate_limit_rpm(r).map_err(field_error)?));
+        }
+    }
+    match body.budget_reset {
+        None => {}
+        Some(None) => return Err(cannot_clear("budget_reset")),
+        Some(Some(r)) => {
+            patch.budget_reset = Some(validate_budget_reset(&r).map_err(field_error)?);
+        }
+    }
+    match body.velocity_breaker {
+        None => {}
+        Some(None) => return Err(cannot_clear("velocity_breaker")),
+        Some(Some(v)) => patch.velocity_breaker = Some(v),
+    }
+    if patch == KeyPatch::default() {
+        return Err(Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "nothing_to_change",
+            "the patch names no field — send at least one of name, scope, expires_at, \
+             budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker",
+            None,
+        )));
+    }
+    Ok(patch)
+}
+
+/// `PATCH /v1/keys/{id}` — edit a key's limits in place (SET-38). Order: auth →
+/// role → body → the transaction (which authorizes a member against
+/// `minted_by` under the row lock). Tenant ONLY from the validated claims.
+#[tracing::instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
+async fn update_key_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let claims = match claims_from_auth(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let Some(editor) = key_editor(&claims) else {
+        return role_forbidden("member");
+    };
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+    let id = match parse_key_id(&id) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    // An OBJECT, checked before the typed parse: serde also builds a struct from
+    // a JSON ARRAY, positionally — `["x"]` would read as `{"name":"x"}`. Found by
+    // this route's own refusal test; a patch must name every field it sets.
+    let parsed: PatchKeyBody =
+        match serde_json::from_slice::<serde_json::Value>(&body).and_then(|v| {
+            if v.is_object() {
+                serde_json::from_value(v)
+            } else {
+                Err(serde::de::Error::custom("expected a JSON object"))
+            }
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_body",
+                    format!("the body must be a JSON object of the editable fields: {e}"),
+                    None,
+                );
+            }
+        };
+    let patch = match validate_patch(parsed, chrono::Utc::now()) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    match state
+        .minter
+        .update_key(&claims.tenant_id, id, editor, &patch, &claims.sub)
+        .await
+    {
+        Ok(UpdateOutcome::Updated { record, changed }) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(KeyUpdateResponse {
+                key: (*record).into(),
+                changed,
+            }),
+        )
+            .into_response(),
+        Ok(UpdateOutcome::NotFound) => key_not_found(),
+        // A member on a key someone else minted: only an owner may.
+        Ok(UpdateOutcome::Forbidden) => role_forbidden("owner"),
+        Ok(UpdateOutcome::Retiring { revoked_at }) => {
+            let mut resp = json_error(
+                StatusCode::CONFLICT,
+                "key_retiring",
+                format!(
+                    "This key is being rotated and retires {}. Edit its successor instead.",
+                    revoked_at.to_rfc3339()
+                ),
+                None,
+            );
+            resp.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            resp
+        }
+        Err(err) => {
+            // Fail CLOSED: the transaction rolled back, so "nothing was changed"
+            // is true, and the message says so.
+            tracing::error!(error = %format!("{err:#}"), "API key update failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "not_saved",
+                "failed to update API key — nothing was changed",
+                None,
+            )
+        }
+    }
+}
+
+/// `DELETE /v1/keys/{id}` — B-586: revoke through the gateway so the in-process
+/// auth cache is invalidated in the same step. 204 on success; 404 when the key
+/// is not in this tenant or already revoked.
+#[tracing::instrument(skip(state, headers), fields(tenant_id = tracing::field::Empty))]
+async fn revoke_key_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let claims = match claims_from_auth(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if !can_revoke_keys(&claims) {
+        return role_forbidden("owner");
+    }
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+    let id = match parse_key_id(&id) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    match state
+        .minter
+        .revoke_key(&claims.tenant_id, id, &claims.sub)
+        .await
+    {
+        Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "key not found or already revoked",
+            None,
+        ),
+        Err(err) => {
+            tracing::error!(error = %format!("{err:#}"), "API key revoke failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "not_revoked",
+                "failed to revoke API key — the key is unchanged",
+                None,
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateKeyBody {
+    grace_hours: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotationPolicyResponse {
+    grace_hours: i64,
+}
+
+/// Off-hot-path reference read. Fail CLOSED rather than invent a default.
+#[tracing::instrument(skip(state, headers))]
+async fn rotation_policy_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+) -> Result<Json<RotationPolicyResponse>, (StatusCode, String)> {
+    let claims = claims_from_auth(&headers).await?;
+    if !claims.can_mint_keys() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("member"),
+        ));
+    }
+    let grace_hours = state.minter.rotation_grace_hours().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rotation policy unavailable".into(),
+        )
+    })?;
+    Ok(Json(RotationPolicyResponse { grace_hours }))
+}
+
+/// Rotate credentials only for a verified workspace owner; fail CLOSED.
+#[tracing::instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
+async fn rotate_key_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<RotateKeyBody>,
+) -> Result<Response, (StatusCode, String)> {
+    let claims = claims_from_auth(&headers).await?;
+    if !claims.is_verified_owner() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        ));
+    }
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+    let grace = match body.grace_hours {
+        Some(hours) => hours,
+        None => state.minter.rotation_grace_hours().await.map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rotation policy unavailable".into(),
+            )
+        })?,
+    };
+    if !crate::db::api_keys::valid_rotation_grace(grace) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "grace_hours must be a non-negative whole number within the timestamp range".into(),
+        ));
+    }
+    let result = state
+        .minter
+        .rotate(&claims.tenant_id, id, &claims.sub, grace)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to rotate API key".into(),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "key not found, expired, or already rotated/revoked".into(),
+        ))?;
+    let minted = result.minted;
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(CreateKeyResponse {
+            old_key_revoked_at: Some(result.revoked_at.to_rfc3339()),
+            id: minted.api_key.id.to_string(),
+            name: minted.api_key.name,
+            key_prefix: minted.key_prefix,
+            last_used_at: None,
+            created_at: minted.api_key.created_at.to_rfc3339(),
+            raw_key: minted.raw_key,
+            scope: minted.api_key.scope,
+            expires_at: minted.api_key.expires_at.map(|v| v.to_rfc3339()),
+            budget_usd_monthly: result.options.budget_usd_monthly,
+            rate_limit_rpm: result.options.rate_limit_rpm,
+            budget_reset: result
+                .options
+                .budget_reset
+                .unwrap_or(crate::spend::BudgetReset::Monthly)
+                .as_str(),
+            velocity_breaker: result.options.velocity_breaker,
+        }),
+    )
+        .into_response())
+}
+
+// ── SET-38 B1: ONE validator per field, shared by create and edit ───────────
+
+/// One refused field: its wire name and the 400 text that names the problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldError {
+    field: &'static str,
+    message: String,
+}
+
+impl FieldError {
+    fn new(field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+/// `POST /v1/keys`'s refusal shape: a plain-text 400 carrying the message.
+fn bad_request(e: FieldError) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, e.message)
+}
+
+/// Trimmed, non-empty, at most [`MAX_KEY_NAME_LEN`] characters.
+fn validate_name(raw: &str) -> Result<&str, FieldError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(FieldError::new("name", "name must not be empty"));
+    }
+    if name.chars().count() > MAX_KEY_NAME_LEN {
+        return Err(FieldError::new(
+            "name",
+            format!("name must be at most {MAX_KEY_NAME_LEN} characters"),
+        ));
+    }
+    Ok(name)
+}
+
+/// A13 / R73 — a key must state what it may do: required, non-empty, every slug
+/// known. Normalised and de-duplicated so the stored array is canonical.
+fn validate_scope(raw: Option<Vec<String>>) -> Result<Vec<String>, FieldError> {
+    let raw = match raw {
+        // R73 (founder ruling, 2026-08-22) — **AN OMITTED `scope` IS A 400.**
+        //
+        // This arm used to be `None => None`, with `.with_default_scope()` below
+        // filling in `{chat, read, ingest}`. Migration 0024's hand-off note always
+        // said the mint route must REQUIRE a scope; the deviation was taken on the
+        // stated grounds that requiring one "would 400 every existing caller of
+        // `POST /v1/keys` the moment this deploys, the dashboard proxy included."
+        //
+        // THAT REASON WAS MEASURED AND IS FALSE. Of 37 keys ever minted on prod,
+        // 23 carry SQL NULL and 14 an explicit scope — and all 14 explicit ones are
+        // revoked, so **zero live keys were minted through this default**. The
+        // dashboard cannot reach the arm either: `ApiKeyManager.tsx` gates submit on
+        // `scope.length > 0`, and the proxy forwards the field only when present.
+        // Self-host cannot reach it at all — minting needs a Postgres control plane
+        // that self-host does not run (`README.md:71`).
+        //
+        // Why REQUIRED beats a narrower default: a default is a decision made by
+        // whoever wrote it, for every caller who never reads it. `chat` spends the
+        // tenant's provider money, so the quiet path was handing out the one
+        // capability with a bill attached. Refusing makes the caller state it.
+        None => {
+            return Err(FieldError::new(
+                "scope",
+                format!(
+                    "scope is required — a key must state what it may do, because \
+                     an omitted scope used to grant `chat`, which spends this \
+                     workspace's provider budget. Pass e.g. \"scope\": [\"chat\", \
+                     \"read\"]. Known scopes: {}",
+                    known_scope_slugs().join(", ")
+                ),
+            ));
+        }
+        Some(raw) => raw,
+    };
+    if raw.is_empty() {
+        return Err(FieldError::new(
+            "scope",
+            format!(
+                "scope must not be empty — state at least one. Known scopes: {}",
+                known_scope_slugs().join(", ")
+            ),
+        ));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for slug in &raw {
+        let Some(parsed) = tracelane_shared::api_scope::Scope::from_slug(slug) else {
+            return Err(FieldError::new(
+                "scope",
+                format!(
+                    "unknown scope {slug:?} — known scopes: {}",
+                    known_scope_slugs().join(", ")
+                ),
+            ));
+        };
+        // Normalise + de-duplicate so the stored array is canonical.
+        let slug = parsed.as_slug().to_string();
+        if !out.contains(&slug) {
+            out.push(slug);
+        }
+    }
+    Ok(out)
+}
+
+/// RFC3339, strictly after `now`. An already-expired key would authenticate
+/// nothing — almost certainly a mistake, and silently writing a dead credential
+/// is worse than refusing.
+fn validate_expires_at(
+    raw: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, FieldError> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| FieldError::new("expires_at", format!("expires_at must be RFC3339: {e}")))?
+        .with_timezone(&chrono::Utc);
+    if parsed <= now {
+        return Err(FieldError::new(
+            "expires_at",
+            "expires_at must be in the future",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Finite and non-negative (`api_keys_budget_nonneg_chk` says the same at the DB).
+fn validate_budget_usd(b: f64) -> Result<f64, FieldError> {
+    if !b.is_finite() || b < 0.0 {
+        return Err(FieldError::new(
+            "budget_usd_monthly",
+            "budget_usd_monthly must be a finite, non-negative number",
+        ));
+    }
+    Ok(b)
+}
+
+/// GWY-43 — same shape as the budget check, one difference: 0 is REFUSED rather
+/// than accepted. A zero budget is a coherent (if useless) ceiling, but a zero
+/// rate limit is a key that can never be used, and `revoked_at` is how a key is
+/// switched off. `api_keys_rate_limit_rpm_positive_chk` (migration 0029) says the
+/// same thing at the DB; catching it here turns a constraint-violation 500 into a
+/// 400 that names the field. The ceiling is `i32::MAX` because the column is
+/// `integer`.
+fn validate_rate_limit_rpm(rpm: i64) -> Result<i32, FieldError> {
+    match i32::try_from(rpm) {
+        Ok(v) if v > 0 => Ok(v),
+        _ => Err(FieldError::new(
+            "rate_limit_rpm",
+            format!(
+                "rate_limit_rpm must be a whole number of requests per minute \
+                 between 1 and {} — omit it to use the workspace plan limit",
+                i32::MAX
+            ),
+        )),
+    }
+}
+
+/// BILL-01 A3 — one of the three values the `CHECK`-constrained column holds.
+fn validate_budget_reset(raw: &str) -> Result<crate::spend::BudgetReset, FieldError> {
+    match raw {
+        "daily" => Ok(crate::spend::BudgetReset::Daily),
+        "weekly" => Ok(crate::spend::BudgetReset::Weekly),
+        "monthly" => Ok(crate::spend::BudgetReset::Monthly),
+        other => Err(FieldError::new(
+            "budget_reset",
+            format!("budget_reset must be one of daily, weekly, monthly (got {other:?})"),
+        )),
+    }
 }
 
 /// Extract the validated claims from the `Authorization` header. Tenant
@@ -203,156 +1126,33 @@ async fn create_key_handler(
     let tenant = claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant.to_string());
 
-    let name = body.name.trim();
-    if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
-    }
-    if name.chars().count() > MAX_KEY_NAME_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("name must be at most {MAX_KEY_NAME_LEN} characters"),
-        ));
-    }
-
-    // ── A13: validate scope / expiry / budget BEFORE minting ───────────────
+    // ── A13: validate every field BEFORE minting ────────────────────────────
     // Rejected here rather than at the DB so the caller gets a 400 naming the
-    // problem instead of a 500 from a constraint violation.
-    let scope = match body.scope {
-        // R73 (founder ruling, 2026-08-22) — **AN OMITTED `scope` IS A 400.**
-        //
-        // This arm used to be `None => None`, with `.with_default_scope()` below
-        // filling in `{chat, read, ingest}`. Migration 0024's hand-off note always
-        // said the mint route must REQUIRE a scope; the deviation was taken on the
-        // stated grounds that requiring one "would 400 every existing caller of
-        // `POST /v1/keys` the moment this deploys, the dashboard proxy included."
-        //
-        // THAT REASON WAS MEASURED AND IS FALSE. Of 37 keys ever minted on prod,
-        // 23 carry SQL NULL and 14 an explicit scope — and all 14 explicit ones are
-        // revoked, so **zero live keys were minted through this default**. The
-        // dashboard cannot reach the arm either: `ApiKeyManager.tsx` gates submit on
-        // `scope.length > 0`, and the proxy forwards the field only when present.
-        // Self-host cannot reach it at all — minting needs a Postgres control plane
-        // that self-host does not run (`README.md:71`).
-        //
-        // Why REQUIRED beats a narrower default: a default is a decision made by
-        // whoever wrote it, for every caller who never reads it. `chat` spends the
-        // tenant's provider money, so the quiet path was handing out the one
-        // capability with a bill attached. Refusing makes the caller state it.
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "scope is required — a key must state what it may do, because \
-                     an omitted scope used to grant `chat`, which spends this \
-                     workspace's provider budget. Pass e.g. \"scope\": [\"chat\", \
-                     \"read\"]. Known scopes: {}",
-                    known_scope_slugs().join(", ")
-                ),
-            ));
-        }
-        Some(raw) => {
-            if raw.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "scope must not be empty — state at least one. Known scopes: {}",
-                        known_scope_slugs().join(", ")
-                    ),
-                ));
-            }
-            let mut out = Vec::with_capacity(raw.len());
-            for slug in &raw {
-                let Some(parsed) = tracelane_shared::api_scope::Scope::from_slug(slug) else {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "unknown scope {slug:?} — known scopes: {}",
-                            known_scope_slugs().join(", ")
-                        ),
-                    ));
-                };
-                // Normalise + de-duplicate so the stored array is canonical.
-                let slug = parsed.as_slug().to_string();
-                if !out.contains(&slug) {
-                    out.push(slug);
-                }
-            }
-            Some(out)
-        }
-    };
-
-    let expires_at = match body.expires_at.as_deref() {
-        None => None,
-        Some(raw) => {
-            let parsed = chrono::DateTime::parse_from_rfc3339(raw)
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("expires_at must be RFC3339: {e}"),
-                    )
-                })?
-                .with_timezone(&chrono::Utc);
-            // An already-expired key would authenticate nothing — almost
-            // certainly a mistake, and silently minting a dead credential is
-            // worse than refusing.
-            if parsed <= chrono::Utc::now() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "expires_at must be in the future".into(),
-                ));
-            }
-            Some(parsed)
-        }
-    };
-
-    if let Some(b) = body.budget_usd_monthly
-        && (!b.is_finite() || b < 0.0)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "budget_usd_monthly must be a finite, non-negative number".into(),
-        ));
+    // problem instead of a 500 from a constraint violation. SET-38 B1: each field
+    // goes through ONE shared validator, which `PATCH /v1/keys/{id}` calls too, so
+    // create and edit cannot disagree about what a valid value is.
+    let name = validate_name(&body.name).map_err(bad_request)?;
+    let scope = Some(validate_scope(body.scope).map_err(bad_request)?);
+    let expires_at = body
+        .expires_at
+        .as_deref()
+        .map(|raw| validate_expires_at(raw, chrono::Utc::now()))
+        .transpose()
+        .map_err(bad_request)?;
+    if let Some(b) = body.budget_usd_monthly {
+        validate_budget_usd(b).map_err(bad_request)?;
     }
-
-    // GWY-43 — same shape as the budget check above, one difference: 0 is
-    // REFUSED rather than accepted. A zero budget is a coherent (if useless)
-    // ceiling, but a zero rate limit is a key that can never be used, and
-    // `revoked_at` is how a key is switched off. `api_keys_rate_limit_rpm_positive_chk`
-    // (migration 0029) says the same thing at the DB; catching it here turns a
-    // constraint-violation 500 into a 400 that names the field. The ceiling is
-    // `i32::MAX` because the column is `integer`.
-    let rate_limit_rpm = match body.rate_limit_rpm {
-        None => None,
-        Some(rpm) => match i32::try_from(rpm) {
-            Ok(v) if v > 0 => Some(v),
-            _ => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "rate_limit_rpm must be a whole number of requests per minute \
-                         between 1 and {} — omit it to use the workspace plan limit",
-                        i32::MAX
-                    ),
-                ));
-            }
-        },
-    };
-
-    // BILL-01 A3: validated the same way as every other field here — a 400
-    // naming the problem, before the mint, rather than a constraint
-    // violation from the CHECK-constrained column.
-    let budget_reset = match body.budget_reset.as_deref() {
-        None => None,
-        Some("daily") => Some(crate::spend::BudgetReset::Daily),
-        Some("weekly") => Some(crate::spend::BudgetReset::Weekly),
-        Some("monthly") => Some(crate::spend::BudgetReset::Monthly),
-        Some(other) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("budget_reset must be one of daily, weekly, monthly (got {other:?})"),
-            ));
-        }
-    };
+    let rate_limit_rpm = body
+        .rate_limit_rpm
+        .map(validate_rate_limit_rpm)
+        .transpose()
+        .map_err(bad_request)?;
+    let budget_reset = body
+        .budget_reset
+        .as_deref()
+        .map(validate_budget_reset)
+        .transpose()
+        .map_err(bad_request)?;
 
     let opts = crate::db::api_keys::MintOptions {
         scope,
@@ -393,6 +1193,7 @@ async fn create_key_handler(
     Ok((
         StatusCode::CREATED,
         Json(CreateKeyResponse {
+            old_key_revoked_at: None,
             id: minted.api_key.id.to_string(),
             name: minted.api_key.name,
             key_prefix: minted.key_prefix,
@@ -421,6 +1222,68 @@ mod tests {
 
     const DEV_TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
+    #[tokio::test]
+    async fn rotation_route_requires_authentication() {
+        use tower::ServiceExt;
+        let (state, _) = mock_state();
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/keys/00000000-0000-0000-0000-000000000001/rotate")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rotation_returns_one_time_successor_and_preserves_settings() {
+        let _guard = DevAuthGuard::new();
+        let (state, seen) = mock_state();
+        let response = rotate_key_handler(
+            State(state),
+            bearer_headers(),
+            Path(Uuid::nil()),
+            Json(RotateKeyBody { grace_hours: None }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["scope"], serde_json::json!(["read"]));
+        assert_eq!(out["budgetUsdMonthly"], 12.0);
+        assert!(out["rawKey"].as_str().unwrap().starts_with("tlane_"));
+        assert!(out["oldKeyRevokedAt"].is_string());
+        assert_eq!(seen.lock().unwrap().as_slice(), &[DEV_TENANT]);
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_negative_grace_before_minting() {
+        let _guard = DevAuthGuard::new();
+        let (state, seen) = mock_state();
+        let error = rotate_key_handler(
+            State(state),
+            bearer_headers(),
+            Path(Uuid::nil()),
+            Json(RotateKeyBody {
+                grace_hours: Some(-1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
     /// Records the tenant it was asked to mint for so tests can prove the
     /// handler passes `Claims.tenant_id` (never a body/header value).
     struct MockKeyMinter {
@@ -431,6 +1294,30 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl KeyMinter for MockKeyMinter {
+        async fn rotation_grace_hours(&self) -> Result<i64> {
+            Ok(24)
+        }
+        async fn rotate(
+            &self,
+            tenant: &TenantId,
+            _id: uuid::Uuid,
+            actor: &str,
+            grace_hours: i64,
+        ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
+            let options = crate::db::api_keys::MintOptions {
+                scope: Some(vec!["read".into()]),
+                budget_usd_monthly: Some(12.0),
+                ..Default::default()
+            };
+            let minted = self
+                .mint(tenant, "rotated", Some(actor), options.clone())
+                .await?;
+            Ok(Some(crate::db::api_keys::RotatedKey {
+                minted,
+                options,
+                revoked_at: Utc::now() + chrono::Duration::hours(grace_hours),
+            }))
+        }
         async fn mint(
             &self,
             tenant: &TenantId,
@@ -453,6 +1340,36 @@ mod tests {
                 key_prefix: "AbC012".into(),
                 raw_key: "tlane_MOCKKEYBODYdonotuseinprod".into(),
             })
+        }
+        // The mint/rotate tests never reach these; SET-38's own mock is below.
+        async fn get_key(&self, _: &TenantId, _: Uuid) -> Result<Option<KeyRecord>> {
+            anyhow::bail!("not used by the mint tests")
+        }
+        async fn update_key(
+            &self,
+            _: &TenantId,
+            _: Uuid,
+            _: KeyEditor<'_>,
+            _: &KeyPatch,
+            _: &str,
+        ) -> Result<UpdateOutcome> {
+            anyhow::bail!("not used by the mint tests")
+        }
+        async fn revoke_key(
+            &self,
+            _: &TenantId,
+            _: Uuid,
+            _: &str,
+        ) -> Result<Option<DateTime<Utc>>> {
+            anyhow::bail!("not used by the mint tests")
+        }
+        async fn recorded_spend(
+            &self,
+            _: &TenantId,
+            _: Uuid,
+            _: crate::spend::BudgetReset,
+        ) -> Option<f64> {
+            None
         }
     }
 
@@ -919,5 +1836,730 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "no mint may happen on an invalid name"
         );
+    }
+}
+
+/// SET-38 (B2) and B-586 (B6) at the ROUTE: who may call, what reaches the
+/// store, and what each outcome looks like on the wire. Claims are injected with
+/// `auth::test_claims` so every principal — owner, member, viewer, role-less JWT,
+/// `tlane_` key, operator — is exercised without WorkOS. Every must-accept has
+/// its must-reject beside it.
+#[cfg(test)]
+mod set38_tests {
+    use super::*;
+    use crate::auth::{AuthMethod, Claims, Role, test_claims};
+    use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const TENANT: &str = "00000000-0000-0000-0000-0000000000aa";
+    const KEY: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// What the store was asked to do.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Call {
+        Get(String, Uuid),
+        Update(String, Uuid, String, KeyPatch, String),
+        Revoke(String, Uuid, String),
+        Spend(String, Uuid),
+    }
+
+    struct EditMock {
+        calls: Arc<Mutex<Vec<Call>>>,
+        update: Mutex<Option<Result<UpdateOutcome>>>,
+        revoke: Mutex<Option<Result<Option<DateTime<Utc>>>>>,
+        found: bool,
+        spend: Option<f64>,
+    }
+
+    fn record() -> KeyRecord {
+        KeyRecord {
+            id: Uuid::parse_str(KEY).unwrap(),
+            name: "ci-nightly".into(),
+            key_prefix: "ab12cd".into(),
+            created_at: DateTime::from_timestamp(1_778_000_000, 0).unwrap(),
+            last_used_at: None,
+            minted_by: Some("user_owner".into()),
+            scope: Some(vec!["chat".into()]),
+            expires_at: None,
+            budget_usd_monthly: Some(50.0),
+            rate_limit_rpm: Some(20),
+            budget_reset: crate::spend::BudgetReset::Weekly,
+            velocity_breaker: false,
+            revoked_at: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KeyMinter for EditMock {
+        async fn rotation_grace_hours(&self) -> Result<i64> {
+            anyhow::bail!("unused")
+        }
+        async fn rotate(
+            &self,
+            _: &TenantId,
+            _: Uuid,
+            _: &str,
+            _: i64,
+        ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
+            anyhow::bail!("unused")
+        }
+        async fn mint(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: Option<&str>,
+            _: crate::db::api_keys::MintOptions,
+        ) -> Result<MintedKey> {
+            anyhow::bail!("unused")
+        }
+        async fn get_key(&self, tenant: &TenantId, id: Uuid) -> Result<Option<KeyRecord>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Get(tenant.to_string(), id));
+            Ok(self.found.then(record))
+        }
+        async fn update_key(
+            &self,
+            tenant: &TenantId,
+            id: Uuid,
+            editor: KeyEditor<'_>,
+            patch: &KeyPatch,
+            actor: &str,
+        ) -> Result<UpdateOutcome> {
+            let editor = match editor {
+                KeyEditor::Any => "any".to_string(),
+                KeyEditor::MintedBy(s) => format!("minted_by:{s}"),
+            };
+            self.calls.lock().unwrap().push(Call::Update(
+                tenant.to_string(),
+                id,
+                editor,
+                patch.clone(),
+                actor.to_string(),
+            ));
+            self.update.lock().unwrap().take().unwrap_or_else(|| {
+                Ok(UpdateOutcome::Updated {
+                    record: Box::new(record()),
+                    changed: vec!["rate_limit_rpm"],
+                })
+            })
+        }
+        async fn revoke_key(
+            &self,
+            tenant: &TenantId,
+            id: Uuid,
+            actor: &str,
+        ) -> Result<Option<DateTime<Utc>>> {
+            self.calls.lock().unwrap().push(Call::Revoke(
+                tenant.to_string(),
+                id,
+                actor.to_string(),
+            ));
+            self.revoke
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Ok(Some(Utc::now())))
+        }
+        async fn recorded_spend(
+            &self,
+            tenant: &TenantId,
+            key_id: Uuid,
+            _: crate::spend::BudgetReset,
+        ) -> Option<f64> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Spend(tenant.to_string(), key_id));
+            self.spend
+        }
+    }
+
+    fn mock_with(found: bool, spend: Option<f64>) -> (Arc<EditMock>, Arc<Mutex<Vec<Call>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let m = Arc::new(EditMock {
+            calls: calls.clone(),
+            update: Mutex::new(None),
+            revoke: Mutex::new(None),
+            found,
+            spend,
+        });
+        (m, calls)
+    }
+
+    fn mock() -> (Arc<EditMock>, Arc<Mutex<Vec<Call>>>) {
+        mock_with(true, Some(12.4))
+    }
+
+    fn claims(method: AuthMethod, role: Option<Role>, sub: &str) -> Claims {
+        Claims {
+            tenant_id: TenantId::from_jwt_claim(Uuid::parse_str(TENANT).unwrap()),
+            sub: sub.into(),
+            auth_method: method,
+            role,
+            key_scope: tracelane_shared::api_scope::KeyScope::LegacyFullSurface,
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
+        }
+    }
+    fn owner() -> Claims {
+        claims(AuthMethod::JwtBearer, Some(Role::Owner), "user_owner")
+    }
+    fn member() -> Claims {
+        claims(AuthMethod::JwtBearer, Some(Role::Member), "user_member")
+    }
+    fn viewer() -> Claims {
+        claims(AuthMethod::JwtBearer, Some(Role::Viewer), "user_viewer")
+    }
+    fn roleless_jwt() -> Claims {
+        claims(AuthMethod::JwtBearer, None, "user_nobody")
+    }
+    /// A `tlane_` key — including the very key being edited (`apikey:<KEY>`).
+    fn api_key_itself() -> Claims {
+        claims(AuthMethod::ApiKey, None, &format!("apikey:{KEY}"))
+    }
+    fn operator() -> Claims {
+        claims(AuthMethod::SelfHostMasterKey, None, "self-host")
+    }
+
+    /// Send one request through the real router. `who = None` sends NO
+    /// Authorization header (the 401 path); otherwise the claims are injected.
+    async fn send(
+        m: Arc<EditMock>,
+        who: Option<Claims>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let _guard = who.clone().map(test_claims::Guard::set);
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if who.is_some() {
+            req = req.header("authorization", "Bearer unit-test-token-not-real");
+        }
+        let resp = routes()
+            .with_state(KeyRoutesState { minter: m })
+            .oneshot(req.body(axum::body::Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn key_path() -> String {
+        format!("/v1/keys/{KEY}")
+    }
+
+    fn updates(calls: &Arc<Mutex<Vec<Call>>>) -> Vec<Call> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c, Call::Update(..)))
+            .cloned()
+            .collect()
+    }
+
+    // ── PATCH: who may edit ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_without_credentials_is_401_and_touches_nothing() {
+        let (m, calls) = mock();
+        let (s, _) = send(m, None, "PATCH", &key_path(), r#"{"rate_limit_rpm":2}"#).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Must REJECT: viewer, a JWT with no recognised role, an mTLS identity, and a
+    /// `tlane_` key — including the key editing ITSELF (a capped key must never
+    /// lift its own cap). Each is a 403 `role_forbidden` that never reaches the store.
+    #[tokio::test]
+    async fn patch_refuses_viewer_roleless_jwt_mtls_and_any_api_key() {
+        for who in [
+            viewer(),
+            roleless_jwt(),
+            api_key_itself(),
+            claims(AuthMethod::Mtls, None, "spiffe://x"),
+        ] {
+            let (m, calls) = mock();
+            let label = format!("{:?}/{:?}", who.auth_method, who.role);
+            let (s, body) = send(
+                m,
+                Some(who),
+                "PATCH",
+                &key_path(),
+                r#"{"budget_usd_monthly":1000000}"#,
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{label} must be refused");
+            assert_eq!(body["error"], "role_forbidden", "{label}");
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{label}: a refused caller must never reach the store"
+            );
+        }
+    }
+
+    /// Must ACCEPT: owner and operator edit ANY key; a member reaches the store
+    /// only as `MintedBy(their own sub)`, which the row lock then enforces. The
+    /// tenant handed down is the CLAIMS tenant, and the actor is the claims `sub`.
+    #[tokio::test]
+    async fn patch_passes_the_right_editor_and_the_claims_tenant() {
+        for (who, editor) in [
+            (owner(), "any".to_string()),
+            (operator(), "any".to_string()),
+            (member(), "minted_by:user_member".to_string()),
+        ] {
+            let (m, calls) = mock();
+            let sub = who.sub.clone();
+            let (s, body) = send(
+                m,
+                Some(who),
+                "PATCH",
+                &key_path(),
+                r#"{"rate_limit_rpm":2}"#,
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{editor}");
+            assert_eq!(body["changed"], serde_json::json!(["rate_limit_rpm"]));
+            assert_eq!(body["rateLimitRpm"], 20, "the response is the stored row");
+            assert!(
+                body.get("rawKey").is_none(),
+                "an edit never reveals a secret"
+            );
+            let got = updates(&calls);
+            assert_eq!(got.len(), 1);
+            let Call::Update(tenant, id, ed, patch, actor) = &got[0] else {
+                unreachable!()
+            };
+            assert_eq!(tenant, TENANT, "tenant from the claims, never the request");
+            assert_eq!(id.to_string(), KEY);
+            assert_eq!(ed, &editor);
+            assert_eq!(actor, &sub);
+            assert_eq!(patch.rate_limit_rpm, Some(Some(2)));
+        }
+    }
+
+    /// A member editing a key someone else minted: the store says Forbidden under
+    /// the row lock, and the route answers 403 naming `owner`.
+    #[tokio::test]
+    async fn patch_member_on_someone_elses_key_is_403() {
+        let (m, _) = mock();
+        *m.update.lock().unwrap() = Some(Ok(UpdateOutcome::Forbidden));
+        let (s, body) = send(
+            m,
+            Some(member()),
+            "PATCH",
+            &key_path(),
+            r#"{"rate_limit_rpm":1}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "role_forbidden");
+        assert_eq!(body["required_role"], "owner");
+    }
+
+    /// Another tenant's key id, a revoked key, an expired key: all one 404.
+    /// A retiring key: 409 `key_retiring`. A store failure: 500 "nothing was changed".
+    #[tokio::test]
+    async fn patch_maps_every_store_outcome() {
+        let cases: Vec<(Result<UpdateOutcome>, StatusCode, &str)> = vec![
+            (
+                Ok(UpdateOutcome::NotFound),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                Ok(UpdateOutcome::Retiring {
+                    revoked_at: DateTime::from_timestamp(1_900_000_000, 0).unwrap(),
+                }),
+                StatusCode::CONFLICT,
+                "key_retiring",
+            ),
+            (
+                Err(anyhow::anyhow!("audit insert refused")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "not_saved",
+            ),
+        ];
+        for (outcome, status, code) in cases {
+            let (m, _) = mock();
+            *m.update.lock().unwrap() = Some(outcome);
+            let (s, body) = send(
+                m,
+                Some(owner()),
+                "PATCH",
+                &key_path(),
+                r#"{"rate_limit_rpm":1}"#,
+            )
+            .await;
+            assert_eq!(s, status, "{code}");
+            assert_eq!(body["error"], code);
+            if code == "not_saved" {
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("nothing was changed")
+                );
+            }
+            if code == "key_retiring" {
+                assert!(body["message"].as_str().unwrap().contains("successor"));
+            }
+        }
+    }
+
+    // ── PATCH: what may be sent ────────────────────────────────────────────
+
+    /// Every refused body is a 400 that NEVER reaches the store: a smuggled
+    /// `tenant_id`, `scope: null` (re-entering legacy), a past expiry, an
+    /// out-of-range budget and rate limit, an unknown scope, a cleared name, an
+    /// empty patch, and a non-object.
+    #[tokio::test]
+    async fn patch_refusals_are_400_and_never_reach_the_store() {
+        let cases = [
+            (
+                r#"{"tenant_id":"00000000-0000-0000-0000-0000000000bb","rate_limit_rpm":2}"#,
+                "invalid_body",
+                None,
+            ),
+            (
+                r#"{"scope":null}"#,
+                "scope_cannot_become_legacy",
+                Some("scope"),
+            ),
+            (
+                r#"{"expires_at":"2020-01-01T00:00:00Z"}"#,
+                "invalid_field",
+                Some("expires_at"),
+            ),
+            (
+                r#"{"expires_at":"next tuesday"}"#,
+                "invalid_field",
+                Some("expires_at"),
+            ),
+            (
+                r#"{"budget_usd_monthly":-1}"#,
+                "invalid_field",
+                Some("budget_usd_monthly"),
+            ),
+            (
+                r#"{"rate_limit_rpm":0}"#,
+                "invalid_field",
+                Some("rate_limit_rpm"),
+            ),
+            (
+                r#"{"rate_limit_rpm":2147483648}"#,
+                "invalid_field",
+                Some("rate_limit_rpm"),
+            ),
+            (r#"{"scope":["superuser"]}"#, "invalid_field", Some("scope")),
+            (r#"{"scope":[]}"#, "invalid_field", Some("scope")),
+            (r#"{"name":null}"#, "invalid_field", Some("name")),
+            (r#"{"name":"   "}"#, "invalid_field", Some("name")),
+            (
+                r#"{"budget_reset":"hourly"}"#,
+                "invalid_field",
+                Some("budget_reset"),
+            ),
+            (
+                r#"{"budget_reset":null}"#,
+                "invalid_field",
+                Some("budget_reset"),
+            ),
+            (
+                r#"{"velocity_breaker":null}"#,
+                "invalid_field",
+                Some("velocity_breaker"),
+            ),
+            (r#"{}"#, "nothing_to_change", None),
+            (r#"[]"#, "invalid_body", None),
+            // serde would read this positionally as `{"name":"renamed"}`.
+            (r#"["renamed"]"#, "invalid_body", None),
+            (r#""#, "invalid_body", None),
+        ];
+        for (body, code, field) in cases {
+            let (m, calls) = mock();
+            let (s, out) = send(m, Some(owner()), "PATCH", &key_path(), body).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(out["error"], code, "{body}");
+            if let Some(f) = field {
+                assert_eq!(out["field"], f, "{body} must name the field");
+            }
+            assert!(
+                updates(&calls).is_empty(),
+                "{body} must not reach the store"
+            );
+        }
+    }
+
+    /// The past-expiry message tells the user what they probably meant.
+    #[tokio::test]
+    async fn patch_past_expiry_points_at_revoke() {
+        let (m, _) = mock();
+        let (_, out) = send(
+            m,
+            Some(owner()),
+            "PATCH",
+            &key_path(),
+            r#"{"expires_at":"2020-01-01T00:00:00Z"}"#,
+        )
+        .await;
+        assert!(out["message"].as_str().unwrap().contains("revoke it"));
+    }
+
+    /// Must ACCEPT: absent = unchanged, `null` = clear, value = set — and a scope
+    /// is normalised by create's own validator before it reaches the store.
+    #[tokio::test]
+    async fn patch_merge_semantics_reach_the_store_exactly() {
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(owner()),
+            "PATCH",
+            &key_path(),
+            r#"{"budget_usd_monthly":null,"rate_limit_rpm":null,"expires_at":null,
+                "scope":["READ"," read ","chat"],"budget_reset":"daily",
+                "velocity_breaker":true,"name":"  renamed  "}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let Call::Update(_, _, _, patch, _) = &updates(&calls)[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            patch,
+            &KeyPatch {
+                name: Some("renamed".into()),
+                scope: Some(vec!["read".into(), "chat".into()]),
+                expires_at: Some(None),
+                budget_usd_monthly: Some(None),
+                rate_limit_rpm: Some(None),
+                budget_reset: Some(crate::spend::BudgetReset::Daily),
+                velocity_breaker: Some(true),
+            }
+        );
+        // An absent field stays absent.
+        let (m, calls) = mock();
+        send(
+            m,
+            Some(owner()),
+            "PATCH",
+            &key_path(),
+            r#"{"rate_limit_rpm":5}"#,
+        )
+        .await;
+        let Call::Update(_, _, _, patch, _) = &updates(&calls)[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            patch,
+            &KeyPatch {
+                rate_limit_rpm: Some(Some(5)),
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A path id that is not a UUID: 404 for an authenticated caller, 401 for an
+    /// anonymous one (auth runs first).
+    #[tokio::test]
+    async fn a_non_uuid_id_is_404_after_auth_and_401_before() {
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(owner()),
+            "PATCH",
+            "/v1/keys/not-a-uuid",
+            r#"{"rate_limit_rpm":2}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(calls.lock().unwrap().is_empty());
+        let (m, _) = mock();
+        let (s, _) = send(m, None, "PATCH", "/v1/keys/not-a-uuid", "{}").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── GET /v1/keys/{id} ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_returns_the_row_and_this_windows_recorded_spend() {
+        for who in [owner(), member(), viewer(), operator()] {
+            let (m, calls) = mock();
+            let (s, body) = send(m, Some(who), "GET", &key_path(), "").await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(body["name"], "ci-nightly");
+            assert_eq!(body["budgetReset"], "weekly");
+            assert_eq!(body["spend"]["window"], "week");
+            assert_eq!(body["spend"]["recorded_usd"], 12.4);
+            assert!(body.get("rawKey").is_none());
+            let seen = calls.lock().unwrap().clone();
+            let key = Uuid::parse_str(KEY).unwrap();
+            assert_eq!(
+                seen,
+                vec![
+                    Call::Get(TENANT.into(), key),
+                    Call::Spend(TENANT.into(), key)
+                ],
+                "tenant from the claims for BOTH reads"
+            );
+        }
+    }
+
+    /// Unknown spend is `null`, NEVER `0` — and a true zero stays `0`.
+    #[tokio::test]
+    async fn get_reports_unknown_spend_as_null_and_a_true_zero_as_zero() {
+        for (spend, want) in [
+            (None, serde_json::Value::Null),
+            (Some(0.0), serde_json::json!(0.0)),
+        ] {
+            let (m, _) = mock_with(true, spend);
+            let (s, body) = send(m, Some(owner()), "GET", &key_path(), "").await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(body["spend"]["recorded_usd"], want);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_refuses_api_keys_and_roleless_jwts_and_404s_a_missing_key() {
+        for who in [api_key_itself(), roleless_jwt()] {
+            let (m, calls) = mock();
+            let (s, _) = send(m, Some(who), "GET", &key_path(), "").await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        let (m, _) = mock();
+        let (s, _) = send(m, None, "GET", &key_path(), "").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (m, _) = mock_with(false, Some(1.0));
+        let (s, body) = send(m, Some(owner()), "GET", &key_path(), "").await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "another tenant's key reads as absent"
+        );
+        assert_eq!(body["error"], "not_found");
+    }
+
+    /// The window start is the UTC boundary the ClickHouse query reads from.
+    #[test]
+    fn window_start_matches_the_clickhouse_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-09-27T15:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc); // a Sunday
+        let at = |c| {
+            let (label, t) = window_start(c, now);
+            (label, t.to_rfc3339())
+        };
+        assert_eq!(
+            at(crate::spend::BudgetReset::Daily),
+            ("day", "2026-09-27T00:00:00+00:00".into())
+        );
+        assert_eq!(
+            at(crate::spend::BudgetReset::Weekly),
+            ("week", "2026-09-21T00:00:00+00:00".into()),
+            "ISO week: Monday 00:00 UTC"
+        );
+        assert_eq!(
+            at(crate::spend::BudgetReset::Monthly),
+            ("month", "2026-09-01T00:00:00+00:00".into())
+        );
+    }
+
+    /// The production spend read fails to `None` — never `Some(0.0)` — when
+    /// ClickHouse is absent or unreachable.
+    #[tokio::test]
+    async fn recorded_spend_is_none_when_clickhouse_is_absent_or_unreachable() {
+        let tenant = TenantId::from_jwt_claim(Uuid::parse_str(TENANT).unwrap());
+        let key = Uuid::parse_str(KEY).unwrap();
+        assert_eq!(
+            recorded_spend_from_clickhouse(
+                None,
+                None,
+                &tenant,
+                key,
+                crate::spend::BudgetReset::Monthly
+            )
+            .await,
+            None
+        );
+        // Port 9 (discard) on loopback: refused at once; nothing leaves the box.
+        assert_eq!(
+            recorded_spend_from_clickhouse(
+                Some("http://127.0.0.1:9"),
+                None,
+                &tenant,
+                key,
+                crate::spend::BudgetReset::Monthly
+            )
+            .await,
+            None,
+            "an unreadable spend must be unknown, never $0.00"
+        );
+    }
+
+    // ── DELETE /v1/keys/{id} (B-586) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_by_an_owner_revokes_in_the_claims_tenant() {
+        for who in [owner(), operator()] {
+            let (m, calls) = mock();
+            let sub = who.sub.clone();
+            let (s, _) = send(m, Some(who), "DELETE", &key_path(), "").await;
+            assert_eq!(s, StatusCode::NO_CONTENT);
+            assert_eq!(
+                calls.lock().unwrap().clone(),
+                vec![Call::Revoke(
+                    TENANT.into(),
+                    Uuid::parse_str(KEY).unwrap(),
+                    sub
+                )]
+            );
+        }
+    }
+
+    /// Must REJECT: a member (revoke is owner-only, as the web route always was),
+    /// a viewer, a role-less JWT, and any `tlane_` key.
+    #[tokio::test]
+    async fn delete_refuses_member_viewer_roleless_and_api_keys() {
+        for who in [member(), viewer(), roleless_jwt(), api_key_itself()] {
+            let (m, calls) = mock();
+            let (s, body) = send(m, Some(who), "DELETE", &key_path(), "").await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            assert_eq!(body["required_role"], "owner");
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        let (m, _) = mock();
+        let (s, _) = send(m, None, "DELETE", &key_path(), "").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_maps_missing_and_failed_revocations() {
+        let (m, _) = mock();
+        *m.revoke.lock().unwrap() = Some(Ok(None));
+        let (s, body) = send(m, Some(owner()), "DELETE", &key_path(), "").await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "another tenant's / already revoked"
+        );
+        assert_eq!(body["error"], "not_found");
+        let (m, _) = mock();
+        *m.revoke.lock().unwrap() = Some(Err(anyhow::anyhow!("audit refused")));
+        let (s, body) = send(m, Some(owner()), "DELETE", &key_path(), "").await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "not_revoked");
     }
 }

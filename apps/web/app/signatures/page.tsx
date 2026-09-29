@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * Failure Signatures page (§4) — the AFT-1 taxonomy running live.
  *
@@ -155,9 +157,7 @@ function RoadmapRow({
 						title="Unknown id — not in taxonomy map."
 					>
 						{sig.signature_id}
-						<Badge tone="neutral" className="font-sans">
-							unmapped
-						</Badge>
+						<StatusBadge status="unmapped" className="font-sans" />
 					</span>
 				)}
 			</TD>
@@ -165,14 +165,14 @@ function RoadmapRow({
 				{t?.detection ?? "—"}
 			</TD>
 			<TD numeric muted>
-				{sig.your_hits.toLocaleString()}
+				{fmtCount(sig.your_hits)}
 			</TD>
 			<TD numeric>
 				<Link
 					href={tracesHref}
 					className="font-medium text-action-ink hover:underline"
 				>
-					{sig.traces_affected.toLocaleString()}
+					{fmtCount(sig.traces_affected)}
 					<span aria-hidden> →</span>
 				</Link>
 			</TD>
@@ -411,7 +411,7 @@ export default async function SignaturesPage({
 			    edited. */}
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div>
-					<h1 className="t-h1">Failure Signatures</h1>
+					<PageHeader title={<>Failure Signatures</>} />
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Live-detected failures matched against the AFT-1 taxonomy —
 						canonical id, your per-tenant counts, and affected traces.{" "}

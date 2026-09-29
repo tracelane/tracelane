@@ -40,7 +40,6 @@ chat path can return are:
 |---|---|---|
 | `unroutable_model` | 400 | the `model` string matches no provider prefix. The map **fails closed** — there is no default provider. Body also echoes `model`. |
 | `audit_unavailable` | 503 | the tamper-evident append could not be published. Fail-closed by design: the audit product does not serve unrecorded requests. |
-| `quota_exceeded` | 429 | monthly trace quota × the plan's hard-cap multiplier exhausted. |
 | `upstream_circuit_open` | 503 | per-(provider, region) breaker open. (An operator kill-switch can also open it; that lever is configured at service start, not at runtime.) Carries `Retry-After: 10`. |
 | `provider_key_rejected` | 401 | upstream rejected your BYOK key. |
 | `provider_rate_limited` | 429 | the **upstream** provider throttled you — not us. Carries `Retry-After: 60`. |
@@ -101,9 +100,6 @@ JWKS, peppered HMAC API-key lookup). Always mounted.
 Always mounted. OpenAI-compatible. Auth is read from the `authorization`
 header (`Bearer tlane_…`); `x-api-key` is not consulted on this route.
 
-*Corrected 2026-09-21 — this paragraph said this was the only completion route
-and that no `/v1/messages` existed; that stopped being true on 2026-09-06.*
-
 ### `POST /v1/messages` and `POST /v1/messages/count_tokens`
 
 Anthropic-native routes (Messages API wire format), always mounted. Requests
@@ -128,7 +124,7 @@ Routes to the right upstream provider based on the `model` prefix:
 | `grok*`, `xai/*` | xAI |
 | `vertex/*` | Google Vertex (service-account OAuth, not an API key) |
 | `together/*`, `fireworks/*`, `openrouter/*`, `ai21/*`, `@cf/*`, … | explicit-prefix aggregators + regional hosts |
-| ... | 150+ routable providers in total — 6 native adapters plus every row of the OpenAI-compatible catalog `crates/gateway/providers.tsv`; see [providers.md](providers.md) |
+| ... | 191 routable providers in total — 6 native adapters plus every row of the OpenAI-compatible catalog `crates/gateway/providers.tsv`; see [providers.md](providers.md) |
 
 **The map fails closed.** An unmatched model does not fall back to a default
 provider — it returns `400 unroutable_model`. That is deliberate: defaulting
@@ -293,9 +289,7 @@ they read ClickHouse, which is then the chain's only home.
 ### `GET /v1/audit/export?since=<iso8601>&until=<iso8601>&limit=<u32>`
 
 Requires **Enterprise** (`f_audit_addon`) — the bulk regulatory export is not
-sold as a separate add-on: `/v1/audit/export` does not yet meet the
-evidence-pack bar we hold a paid audit product to, so it folds into Enterprise
-instead of shipping at a price. Self-verification (`tlane verify`) needs no
+sold as a separate add-on; it is part of Enterprise. Self-verification (`tlane verify`) needs no
 entitlement on any tier. Without Enterprise: `403
 {"error":"entitlement_required","feature":"audit_ledger","message":…,"upgrade_url":…}`.
 If the entitlement cache is unreachable the export fails **closed** with `503` —
@@ -491,7 +485,7 @@ The HTTP API is the canonical contract. SDKs and CLIs wrap it:
 - `pnpm add @tracelanedev/sdk` (TypeScript SDK)
 - `tlane <subcommand>` — see [cli.md](cli.md):
   - `tlane verify` — offline audit-log verification
-  - `tlane prompt {list,show,promote,rollback,diff}` — B1 prompt workflow
+  - `tlane prompt {list,show,promote,rollback,diff}` — prompt workflow
   - `tlane import-litellm` / `tlane import-helicone` — migration
   - `tlane export` — generate a compliance evidence pack (offline; not a span exporter)
   - `tlane replay` — re-render a captured trace step by step (read-only; it does

@@ -94,7 +94,7 @@ describe("WaterfallView — the axis is ADR-074 §7's ruler, not a local one", (
 		expect(long).toContain("Elapsed time axis");
 		expect(long).not.toContain("Time axis, UTC");
 		expect(long).not.toMatch(/>\d\d:\d\d:\d\d</);
-		expect(long).toContain("90.00s");
+		expect(long).toContain("1.5m");
 	});
 
 	it("treats totalUs as MICROseconds — a unit slip makes the axis 1000x wrong", () => {

@@ -18,7 +18,7 @@ export function WarmingBanner() {
 		 * this is a full-width notice strip, and a 18px card radius on a 44px-tall
 		 * bar reads as a pill.
 		 */
-		<div className="mb-6 flex items-center gap-2 rounded-lg border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn-ink">
+		<div className="mb-6 flex items-center gap-2 rounded-card border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn-ink">
 			<svg
 				aria-hidden="true"
 				className="h-4 w-4 shrink-0"

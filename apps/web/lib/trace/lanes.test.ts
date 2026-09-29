@@ -207,3 +207,31 @@ describe("computeLanes — no hand-off recorded when the named parent has no lan
 		expect(lane.handoffFromKey).toBeUndefined();
 	});
 });
+
+it("groups recognised gateway clients while preserving explicit instance and name priority", () => {
+	const rows = [
+		span({
+			span_id: "client",
+			attributes: J({ tracelane_client_name: "codex" }),
+		}),
+		span({
+			span_id: "named",
+			attributes: J({
+				tracelane_client_name: "codex",
+				gen_ai_agent_name: "Builder",
+			}),
+		}),
+		span({
+			span_id: "instance",
+			attributes: J({
+				tracelane_client_name: "codex",
+				"gen_ai.agent.id": "instance-1",
+			}),
+		}),
+	];
+	expect(
+		computeLanes(rows)
+			.map((l) => l.key)
+			.sort(),
+	).toEqual(["Builder", "codex", "instance-1"]);
+});

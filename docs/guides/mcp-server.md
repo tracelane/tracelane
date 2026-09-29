@@ -62,28 +62,25 @@ described in full; the reference for every tool is the
 
 ### `search_traces`
 
-Search your agent traces by time range, model, provider, or guardrail outcome.
+Search your agent traces by free text, model, or error status.
 
 **Parameters:**
 ```json
 {
-  "query": "string (free-text search across span names and attributes)",
-  "from": "ISO-8601 timestamp (optional, default: 1 hour ago)",
-  "to": "ISO-8601 timestamp (optional, default: now)",
-  "provider": "string (optional: openai | anthropic | gemini | …)",
-  "model": "string (optional: model ID filter)",
-  "intervention": "none | warn | block (optional)",
-  "limit": "integer (default: 20, max: 100)"
+  "query": "string (case-insensitive substring across span names and attributes; gateway mode requires at least 4 characters)",
+  "model_filter": "string (optional: restrict to spans whose attributes mention this model)",
+  "has_error": "boolean (optional: restrict to error spans)",
+  "limit": "integer (default: 10, max: 50)"
 }
 ```
 
-**Returns:** Array of trace summaries with root span name, duration, span count, intervention status.
+**Returns:** Matching traces, distinct per trace.
 
 ---
 
 ### `replay_trace`
 
-Retrieve the full span tree for a trace, suitable for time-machine replay.
+Retrieve the stored span tree for a trace (read-only; it does not re-execute anything).
 
 **Parameters:**
 ```json
@@ -103,8 +100,9 @@ Get a human-readable explanation of why a guardrail blocked or warned on a speci
 **Parameters:**
 ```json
 {
-  "span_id": "string (UUID)",
-  "aft_id": "string (optional: specific AFT rule ID, e.g. AFT-MCP-RUGPULL-001)"
+  "correlation_id": "string (optional: the id in a guardrail block's 403 response body)",
+  "trace_id": "string (optional: use together with span_id, for a detection flag on a span that executed)",
+  "span_id": "string (optional: use together with trace_id)"
 }
 ```
 
@@ -145,4 +143,4 @@ npx @tracelanedev/mcp
 
 `apps/mcp/` — TypeScript, `@modelcontextprotocol/sdk`, tenant-scoped. Auth is a
 bearer token (`tlane_*` key or JWT) resolved through the gateway's
-`/v1/auth/whoami`; OAuth 2.1 PKCE is roadmap, not implemented.
+`/v1/auth/whoami`.

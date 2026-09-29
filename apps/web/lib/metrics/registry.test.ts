@@ -36,8 +36,19 @@ describe("registry — one label, one definition", () => {
 	});
 
 	it("the two request definitions are two labels — never one", () => {
-		expect(METRICS.llm_calls.dedup).toBe("slo MV (not deduplicated)");
+		// B-500: the SLO family reads spans FINAL for windows ≤ 24 h and the hourly
+		// view above, as ONE class — every windowed SLO metric carries it, so the
+		// headline, table and chart cannot be described as reading different tables.
+		expect(METRICS.llm_calls.dedup).toBe(
+			"spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
+		);
+		for (const m of allMetrics()) {
+			if (m.family === "slo" && m.window === "windowed") {
+				expect(m.dedup, `${m.id} dedup class`).toBe(METRICS.llm_calls.dedup);
+			}
+		}
 		expect(METRICS.requests_routed.dedup).toBe("spans FINAL");
+		expect(METRICS.llm_calls.dedup).not.toBe(METRICS.requests_routed.dedup);
 		expect(METRICS.llm_calls.label).not.toBe(METRICS.requests_routed.label);
 	});
 

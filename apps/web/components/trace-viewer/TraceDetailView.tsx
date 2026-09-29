@@ -110,10 +110,12 @@ function toNode(row: VisibleRow, hitCounts?: Record<string, number>): SpanNode {
 }
 
 export function TraceDetailView({
+	traceId,
 	spans,
 	hitCounts,
 }: {
 	spans: Span[];
+	traceId?: string;
 	/**
 	 * OBS-33 — per-tenant `your_hits` per signature id, resolved SERVER-side by the
 	 * page and passed down. Undefined when the aggregate was unavailable; the badge
@@ -121,7 +123,14 @@ export function TraceDetailView({
 	 */
 	hitCounts?: Record<string, number>;
 }) {
-	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [selectedId, setSelectedId] = useState<string | null>(
+		spans[0]?.span_id ?? null,
+	);
+	useEffect(() => {
+		const requested = new URLSearchParams(window.location.search).get("span");
+		if (requested && spans.some((span) => span.span_id === requested))
+			setSelectedId(requested);
+	}, [spans]);
 	const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
 	const [query, setQuery] = useState("");
 	const [errorsOnly, setErrorsOnly] = useState(false);
@@ -260,7 +269,7 @@ export function TraceDetailView({
 			<TraceSummaryHeader spans={spans} />
 			<div className="flex flex-col gap-4 md:h-[calc(100vh-320px)] md:min-h-[400px] md:flex-row">
 				{/* The span-view panel is a card, so it takes `--radius-card` from
-				    `.surface-card` rather than the 12px `rounded-xl` it used to hardcode —
+				    `.surface-card` rather than the 12px `rounded-card` it used to hardcode —
 				    a bordered panel with padding and content is exactly what that class is
 				    for, and hardcoding a radius is how a card drifts off the system. The
 				    fill was `bg-surface`: a 40%-opaque white over an unknown parent is
@@ -308,20 +317,21 @@ export function TraceDetailView({
 							onChange={(e) => setQuery(e.target.value)}
 							placeholder="Search spans…"
 							aria-label="Search spans"
-							className="w-full max-w-xs rounded-sm border border-line bg-surface px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							className="w-full max-w-xs rounded-control border border-line bg-surface px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						/>
 						{/* Failures only (keyboard `f`) — always rendered, even at zero
 						    errors, so the shortcut and the "N hidden" count are reachable
 						    and the toggle can be left ON into a clean trace (spec §4: "No
 						    failures, toggle on" is a real, reachable state, not merely a
 						    theoretical one). */}
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setErrorsOnly((v) => !v)}
 							aria-pressed={errorsOnly}
 							title="Failures only (f) — show only error spans and the path down to them (their lane, in Lanes view)"
 							className={cn(
-								"flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2",
+								"flex shrink-0 items-center gap-1.5 rounded-control border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2",
 								errorsOnly
 									? "border-danger/40 bg-danger-soft text-danger-ink"
 									: "border-line text-ink-2 hover:bg-surface-2 hover:text-ink",
@@ -338,20 +348,19 @@ export function TraceDetailView({
 									· {hiddenByFailuresOnly} hidden
 								</span>
 							)}
-						</button>
+						</Button>
 
-						{/* Compact span-kind legend — only shown when ≥ 2 kinds are visible.
-						    Marks match the waterfall bars exactly (the same KIND_BAR map, imported
-						    rather than restated). Each entry is a dot on the monochrome VALUE ramp
-						    plus its small-caps label, so the label carries the meaning and the dot
-						    only ranks it — the marks are no longer hues to be told apart. */}
+						{/* Kind labels and shared categorical marks; errors remain status-driven. */}
 						{showLegend && (
 							<div
-								className="flex items-center gap-3 t-metric-label"
+								className="flex flex-wrap items-center gap-2 text-2xs font-medium text-ink-2"
 								aria-label="Span kind legend"
 							>
 								{usedKinds.map((kind) => (
-									<span key={kind} className="flex items-center gap-1">
+									<span
+										key={kind}
+										className="flex items-center gap-1.5 rounded-control border border-line px-2 py-1"
+									>
 										<span
 											className={cn("h-1.5 w-1.5 rounded-full", KIND_BAR[kind])}
 											aria-hidden
@@ -469,7 +478,11 @@ export function TraceDetailView({
 					<div className="border-b border-line bg-canvas-sunken px-4 py-3">
 						<h2 className="text-sm font-semibold text-ink">Span Inspector</h2>
 					</div>
-					<SpanInspector span={selectedSpan} />
+					<SpanInspector
+						key={selectedId}
+						traceId={traceId}
+						span={selectedSpan}
+					/>
 				</div>
 			</div>
 		</div>

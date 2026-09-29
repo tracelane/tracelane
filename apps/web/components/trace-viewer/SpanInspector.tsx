@@ -1,4 +1,10 @@
 "use client";
+import { ObjectPageCommands } from "@/components/command-palette/object-commands";
+import { fmtUsd } from "@/lib/metrics/format";
+
+import { fmtCount } from "@/lib/metrics/format";
+
+import { TBody, TD, TR, Table } from "@tracelanedev/ui";
 
 /**
  * SpanInspector — side panel showing the details for a selected span.
@@ -15,9 +21,11 @@
  * and made prose unreadable.
  */
 
+import { DatasetAction } from "@/app/datasets/DatasetAction";
 import { aftLabel } from "@/lib/aft-labels";
 
 import { formatDateTimeUtc } from "@/lib/format-date";
+import { extractToolCalls, formatBytes } from "@/lib/tool-calls";
 import { extractGenAi } from "@/lib/trace-tree";
 import { fmtDur } from "@tracelanedev/ui";
 import { CopyButton } from "./CopyButton";
@@ -65,13 +73,13 @@ function AttributeRow({ k, v }: { k: string; v: unknown }) {
 		typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);
 	const mono = isMonoValue(k, v);
 	return (
-		<tr className="align-top">
+		<TR className="align-top">
 			{/* Attribute key — always mono (it's a code symbol). */}
-			<td className="whitespace-nowrap py-1 pr-3 font-mono text-xs text-ink-3">
+			<TD className="whitespace-nowrap py-1 pr-3 font-mono text-xs text-ink-3">
 				{k}
-			</td>
+			</TD>
 			{/* Attribute value — mono for id/hash/numeric; regular for prose. */}
-			<td
+			<TD
 				className={
 					mono
 						? "break-all py-1 font-mono text-xs tabular-nums text-ink"
@@ -79,8 +87,8 @@ function AttributeRow({ k, v }: { k: string; v: unknown }) {
 				}
 			>
 				{display}
-			</td>
-		</tr>
+			</TD>
+		</TR>
 	);
 }
 
@@ -115,13 +123,26 @@ function SummaryRow({
 }
 
 const fmt = (n: number | undefined): string =>
-	n === undefined ? "—" : n.toLocaleString("en-US");
+	n === undefined ? "—" : fmtCount(n);
 
-export function SpanInspector({ span }: { span: Span | null }) {
+export function SpanInspector({
+	span,
+	traceId,
+}: { span: Span | null; traceId?: string }) {
 	if (!span) {
 		return (
-			<div className="flex h-full items-center justify-center text-sm text-ink-3">
-				Select a span to inspect
+			<div className="flex h-full min-h-64 flex-col items-center justify-center gap-3 p-8 text-center">
+				<span
+					aria-hidden
+					className="flex h-12 w-12 items-center justify-center rounded-card border border-line bg-action-soft text-xl text-action-ink"
+				>
+					⌖
+				</span>
+				<p className="text-sm font-medium text-ink">Select a span to inspect</p>
+				<p className="max-w-60 text-xs leading-relaxed text-ink-2">
+					Choose a step in the trace to explore its recorded attributes and
+					timing.
+				</p>
 			</div>
 		);
 	}
@@ -139,16 +160,24 @@ export function SpanInspector({ span }: { span: Span | null }) {
 		([k]) => k.startsWith("gen_ai.") || k.startsWith("gen_ai_"),
 	);
 	const llm = Object.entries(attrs).filter(([k]) => k.startsWith("llm."));
-	const tracelane = Object.entries(attrs).filter(([k]) =>
-		k.startsWith("tracelane."),
+	// Both spellings: the dotted OTLP form AND the underscore-flattened stored form
+	// the gateway writes (`tracelane_response_tool_names`, `tracelane_dispatch_attempts`)
+	// — until OBS-50 (2026-09-20) only the dotted form matched, so every gateway
+	// `tracelane_*` attribute rendered under "Other".
+	const tracelane = Object.entries(attrs).filter(
+		([k]) => k.startsWith("tracelane.") || k.startsWith("tracelane_"),
 	);
 	const other = Object.entries(attrs).filter(
 		([k]) =>
 			!k.startsWith("gen_ai.") &&
 			!k.startsWith("gen_ai_") &&
 			!k.startsWith("llm.") &&
-			!k.startsWith("tracelane."),
+			!k.startsWith("tracelane.") &&
+			!k.startsWith("tracelane_"),
 	);
+
+	// OBS-50: per-tool-call detail. Empty rows → no section at all (never an empty one).
+	const toolCalls = extractToolCalls(span.attributes);
 
 	const summary = extractGenAi(span.attributes);
 	const hasSummary =
@@ -169,17 +198,51 @@ export function SpanInspector({ span }: { span: Span | null }) {
 
 	return (
 		<div className="h-full space-y-4 overflow-y-auto p-4">
+			<ObjectPageCommands
+				commands={[
+					...(traceId && summary.model !== undefined
+						? [
+								{
+									id: "span-playground",
+									label: "Open selected span in playground",
+									href: `/playground?trace=${encodeURIComponent(traceId)}&span=${encodeURIComponent(span.span_id)}`,
+									group: "action" as const,
+								},
+							]
+						: []),
+					...(typeof attrs.gen_ai_conversation_id === "string" &&
+					attrs.gen_ai_conversation_id
+						? [
+								{
+									id: "span-session",
+									label: "Open session",
+									href: `/sessions/${encodeURIComponent(attrs.gen_ai_conversation_id)}`,
+									group: "action" as const,
+								},
+							]
+						: []),
+				]}
+			/>
 			<div>
 				<div className="mb-2 flex items-center justify-between gap-2">
 					<SectionHeading>Span</SectionHeading>
+					{traceId && summary.model !== undefined && (
+						<a
+							className="text-xs text-action-ink underline"
+							href={`/playground?trace=${encodeURIComponent(traceId)}&span=${encodeURIComponent(span.span_id)}`}
+						>
+							Open in playground
+						</a>
+					)}
+					{traceId && <DatasetAction traceId={traceId} spanId={span.span_id} />}
 					<div className="flex items-center gap-1.5">
 						<CopyButton value={span.span_id} label="Copy ID" />
 						<CopyButton value={span.attributes} label="Copy attributes" />
 					</div>
 				</div>
 				<div className="overflow-x-auto">
-					<table className="w-full">
-						<tbody>
+					<Table className="w-full">
+						<TBody>
 							<AttributeRow k="name" v={span.name} />
 							<AttributeRow k="span_id" v={span.span_id} />
 							<AttributeRow k="parent_span_id" v={span.parent_span_id ?? "—"} />
@@ -196,13 +259,13 @@ export function SpanInspector({ span }: { span: Span | null }) {
 								k="start_time"
 								v={formatDateTimeUtc(span.start_time)}
 							/>
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			</div>
 
 			{businessRef && (
-				<div className="rounded-lg border border-line bg-surface-2 p-3">
+				<div className="rounded-card border border-line bg-surface-2 p-3">
 					<div className="mb-1 flex items-center justify-between gap-2">
 						<SectionHeading>Business reference</SectionHeading>
 						<CopyButton value={businessRef} label="Copy" />
@@ -216,8 +279,57 @@ export function SpanInspector({ span }: { span: Span | null }) {
 				</div>
 			)}
 
+			{toolCalls.rows.length > 0 && (
+				<div
+					className="rounded-card border border-line bg-surface-2 p-3"
+					data-testid="tool-calls"
+				>
+					<SectionHeading>{`Tool calls (${toolCalls.rows.length})`}</SectionHeading>
+					{/* Turn outcome from the provider's own finish reason; this span's
+					    latency is the PROVIDER round trip — the tool itself runs on the
+					    customer's side and its duration is not on this span. */}
+					<div className="mb-2 flex items-baseline justify-between gap-3 text-xs text-ink-3">
+						<span>
+							{toolCalls.endedOnToolCall
+								? "turn ended on the tool call"
+								: toolCalls.finishReasons.length > 0
+									? `turn ended: ${toolCalls.finishReasons.join(", ")}`
+									: "turn outcome —"}
+						</span>
+						<span className="font-mono tabular-nums">
+							{fmtDur(span.duration_us)} provider round trip
+						</span>
+					</div>
+					<ul className="space-y-2">
+						{toolCalls.rows.map((row, i) => (
+							<li key={`${row.name}-${i}`} className="text-xs">
+								<div className="flex items-baseline justify-between gap-3">
+									{/* A function name is a code symbol — mono. */}
+									<span className="font-mono text-ink">{row.name}</span>
+									<span className="font-mono tabular-nums text-ink-3">
+										{formatBytes(row.argumentBytes)}
+									</span>
+								</div>
+								{row.captured ? (
+									<pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-surface p-2 font-mono text-2xs text-ink">
+										{typeof row.arguments === "string"
+											? row.arguments
+											: JSON.stringify(row.arguments, null, 2)}
+									</pre>
+								) : (
+									<div className="mt-1 text-ink-3">
+										— arguments not captured (content capture is off for this
+										workspace)
+									</div>
+								)}
+							</li>
+						))}
+					</ul>
+				</div>
+			)}
+
 			{hasSummary && (
-				<div className="rounded-lg border border-line bg-surface-2 p-3">
+				<div className="rounded-card border border-line bg-surface-2 p-3">
 					<SectionHeading>GenAI</SectionHeading>
 					<div>
 						{/* Model/system/operation are names (prose) — regular font. */}
@@ -246,9 +358,7 @@ export function SpanInspector({ span }: { span: Span | null }) {
 						/>
 						<SummaryRow
 							label="Cost"
-							value={
-								summary.cost !== undefined ? `$${summary.cost.toFixed(4)}` : "—"
-							}
+							value={summary.cost !== undefined ? fmtUsd(summary.cost) : "—"}
 							mono={summary.cost !== undefined}
 						/>
 					</div>
@@ -300,13 +410,13 @@ export function SpanInspector({ span }: { span: Span | null }) {
 				<div>
 					<SectionHeading>GenAI Attributes</SectionHeading>
 					<div className="overflow-x-auto">
-						<table className="w-full">
-							<tbody>
+						<Table className="w-full">
+							<TBody>
 								{genAi.map(([k, v]) => (
 									<AttributeRow key={k} k={k} v={v} />
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
 				</div>
 			)}
@@ -315,13 +425,13 @@ export function SpanInspector({ span }: { span: Span | null }) {
 				<div>
 					<SectionHeading>LLM Attributes</SectionHeading>
 					<div className="overflow-x-auto">
-						<table className="w-full">
-							<tbody>
+						<Table className="w-full">
+							<TBody>
 								{llm.map(([k, v]) => (
 									<AttributeRow key={k} k={k} v={v} />
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
 				</div>
 			)}
@@ -330,13 +440,13 @@ export function SpanInspector({ span }: { span: Span | null }) {
 				<div>
 					<SectionHeading>Tracelane</SectionHeading>
 					<div className="overflow-x-auto">
-						<table className="w-full">
-							<tbody>
+						<Table className="w-full">
+							<TBody>
 								{tracelane.map(([k, v]) => (
 									<AttributeRow key={k} k={k} v={v} />
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
 				</div>
 			)}
@@ -345,13 +455,13 @@ export function SpanInspector({ span }: { span: Span | null }) {
 				<div>
 					<SectionHeading>Other</SectionHeading>
 					<div className="overflow-x-auto">
-						<table className="w-full">
-							<tbody>
+						<Table className="w-full">
+							<TBody>
 								{other.map(([k, v]) => (
 									<AttributeRow key={k} k={k} v={v} />
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
 				</div>
 			)}

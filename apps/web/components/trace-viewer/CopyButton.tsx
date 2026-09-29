@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * CopyButton — small clipboard affordance for the trace viewer (V-5).
@@ -37,7 +38,8 @@ export function CopyButton({
 	};
 
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={copy}
 			aria-label={copied ? "Copied" : label}
@@ -47,6 +49,6 @@ export function CopyButton({
 			}
 		>
 			{copied ? "Copied" : label}
-		</button>
+		</Button>
 	);
 }

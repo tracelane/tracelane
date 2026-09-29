@@ -49,6 +49,7 @@ ALLOWLIST: dict[str, str] = {
     "/v1/share/{token}": "public share link (OBS-48): the token is the credential, rate-limited per IP",
     "/v1/audit/pubkey": "public verification key (ADR-062): unauthenticated by design, rate-limited",
     "/v1/audit/pubkey/{tenant_id}": "public per-tenant verification key: unauthenticated by design, rate-limited",
+    "/v1/audit/platform-pubkey": "public PLATFORM verification key (AUD-29): the second trust root, unauthenticated by design, rate-limited",
     "/v1/webhooks/workos": "HMAC-verified webhook (its own credential; `auth::workos_webhook`)",
     "/v1/traces": "OTLP ingest (`trace_ingest.rs`): authenticates + `ingest` scope inline — mounted from server.rs, so the same-file follow cannot see it; asserted by trace_ingest's own tests",
     "/v1/chat/completions": "the chat handler: auth + scope run by `crate::admission::admit` (B-385 — Step::Auth < Step::Scope is a compile-time fact), proven by `admission::tests` + `handler_harness`",
@@ -61,7 +62,10 @@ ALLOWLIST: dict[str, str] = {
 
 AUTH_CALL = re.compile(r"\bvalidate_authorization\(")
 SCOPE_CALL = re.compile(
-    r"\b(allows_scope|can_admin|is_verified_owner|can_mint_keys|can_write_prompts|require_scope)\("
+    # `key_editor` / `can_read_keys` (SET-38, crates/gateway/src/key_routes.rs): match on
+    # `auth_method` and refuse EVERY API key and mTLS identity — stricter than a scope
+    # check; verified by the 2026-09-27 security review. Local to that file by name.
+    r"\b(allows_scope|can_admin|is_verified_owner|can_mint_keys|can_write_prompts|require_scope|key_editor|can_read_keys)\("
 )
 ROUTE_HEAD = re.compile(r'\.route\(\s*"(/[^"]*)"\s*,')
 HANDLER_IN_METHOD = re.compile(

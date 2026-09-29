@@ -21,7 +21,7 @@ and Helicone's `ai-gateway` carries a
 | Tamper-evident audit ledger | Included on every tier (hash chain + a per-tenant Ed25519 key on every tier — generated and held by Tracelane, so the signature proves integrity against third parties and the public Rekor anchor is what proves it against us; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap); 7-year retention + bulk export on Enterprise | — |
 | Auto-rollback on objective metrics | EWMA drift on metrics you post; not autonomous | — |
 | Migration tool | `tlane migrate helicone` — config + env rewrite (one command) | — |
-| Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) |
+| Self-host | Apache 2.0 full stack; single-node Docker Compose | Hosted + self-host (4-DB) — see the [`Helicone/helicone` README](https://github.com/Helicone/helicone) |
 | BYOK | Envelope encryption, AAD bound to (tenant_id, provider_id) | Supported |
 
 *A `—` in the Helicone column means we found no such capability documented in Helicone's

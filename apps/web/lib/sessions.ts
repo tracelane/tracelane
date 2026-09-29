@@ -109,3 +109,105 @@ export async function fetchSessionTraces(
 		throw err;
 	}
 }
+
+/**
+ * `OBS-55` — the session transcript's whole-session totals, computed over
+ * EVERY span of the session, never derived from a page. `cost_usd` is `null`
+ * when `priced_spans` is 0 — an honestly-unknown cost, never a fabricated
+ * $0.00.
+ */
+export type SessionTranscriptTotals = {
+	turns: number;
+	spans: number;
+	input_tokens: number;
+	output_tokens: number;
+	cost_usd: number | null;
+	priced_spans: number;
+	first_start: string;
+	last_end: string;
+	duration_us: number;
+	error_spans: number;
+	models: string[];
+	end_user: string;
+	agent_name: string;
+};
+
+/** The tenant's own content-capture setting (B-299, the one policy). */
+export type SessionCapture = { workspace_policy: "on" | "off" };
+
+/**
+ * The turn's last LLM call, content-rehydrated. `content` distinguishes FOUR
+ * causes for "no text here" — never collapsed to one, per the spec's dataset
+ * surface convention: `"captured"` (text is present), `"absent"` (recorded
+ * before capture was on, or by a route that does not capture this yet),
+ * `"unloaded"` (a stored `$ref` failed to rehydrate — retry), `"unreadable"`
+ * (present but not in a shape this gateway can parse).
+ */
+export type SessionExchange = {
+	span_id: string;
+	input_tail: unknown[];
+	input_message_count: number;
+	output: unknown;
+	finish_reasons: string[];
+	/**
+	 * `{tracelane_response_tool_names, tracelane_response_tool_arg_bytes,
+	 * gen_ai_output_messages, gen_ai_response_finish_reasons}` as a JSON
+	 * STRING — pass this straight to the EXISTING `extractToolCalls`
+	 * (`lib/tool-calls.ts`), never a second tool-call interpretation.
+	 */
+	tool_attrs: string;
+	content: "captured" | "absent" | "unloaded" | "unreadable";
+};
+
+/** One turn (trace) of the transcript, ascending. */
+export type SessionTurn = {
+	trace_id: string;
+	/** 1-based, exact against the WHOLE session on any page. */
+	ordinal: number;
+	start_time: string;
+	duration_us: number;
+	span_count: number;
+	error_spans: number;
+	/** The FIRST error span's message in this turn; `""` when none. */
+	status_message: string;
+	intervention: number;
+	input_tokens: number;
+	output_tokens: number;
+	cost_usd: number | null;
+	model: string;
+	/** `null` only when the turn has no LLM span at all. */
+	exchange: SessionExchange | null;
+};
+
+export type SessionTranscriptResponse = {
+	totals: SessionTranscriptTotals;
+	capture: SessionCapture;
+	turns: SessionTurn[];
+	next_cursor: string | null;
+};
+
+/**
+ * `OBS-55` — one page of `GET /v1/sessions/{id}/transcript`.
+ *
+ * Same 404-vs-error posture as {@link fetchSessionTraces}: a **404** (missing
+ * or another tenant's session — the SAME body either way) becomes `null`; any
+ * other `GatewayError` re-throws to the nearest error boundary, because a real
+ * outage must never read as "this session does not exist" (B-335d).
+ */
+export async function fetchSessionTranscript(
+	sessionId: string,
+	opts?: { limit?: number; cursor?: string },
+): Promise<SessionTranscriptResponse | null> {
+	const params = new URLSearchParams();
+	if (opts?.limit) params.set("limit", String(opts.limit));
+	if (opts?.cursor) params.set("cursor", opts.cursor);
+	const qs = params.toString();
+	try {
+		return await gatewayGet<SessionTranscriptResponse>(
+			`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${qs ? `?${qs}` : ""}`,
+		);
+	} catch (err) {
+		if (err instanceof GatewayError && err.status === 404) return null;
+		throw err;
+	}
+}

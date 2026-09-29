@@ -8,8 +8,7 @@ classification: PUBLIC
 # Audit control mapping — EU AI Act Article 12
 
 **Effective date:** 2026-06-16 (V1 launch). **Coverage:** every
-workspace on the **Enterprise plan** (the Article-12 export grant, `f_audit_addon = TRUE` in
-`workspace_entitlements`).
+workspace on the **Enterprise plan** (the Article-12 export grant).
 
 > **What this page is — and is not.** This is a **technical control
 > mapping**: it describes what Tracelane ships, cited to source, grouped
@@ -43,8 +42,7 @@ verify a ledger export independently.
 > today covers **gateway-proxied** events (LLM provider calls, guardrail
 > verdicts and prompt-promotion verdicts routed through the Tracelane
 > gateway) — spans captured via the SDK/OTLP self-host path are recorded
-> full-fidelity but are **not chained or anchored** (batch-digest
-> coverage of that path is the next increment). The tamper-evidence
+> full-fidelity but are **not chained or anchored**. The tamper-evidence
 > guarantee rests on the live hash chain + offline recompute; the Ed25519
 > signature and Rekor inclusion proof are additional,
 > independently-verifiable layers on top.
@@ -89,17 +87,13 @@ The ClickHouse copy the dashboards read is written **after** the commit and
 never on the path that assigns a sequence; export and verification read the
 Postgres store and do not fall back to the copy.
 
-**What "acked" does and does not guarantee — corrected 2026-09-20, restated
-by failure mode 2026-09-21.** Until 2026-09-20 this paragraph said the acked
-publish meant the event was "durably captured before the request is served".
-That overstated it. The ack means the JetStream server has **written the event
-to its file store**; the store is fsynced on the server's `sync_interval`, which
-production runs at **100 ms** (the production NATS configuration, read back from the
-running server's `/jsz`; nats-server's own default is 2 minutes). The event
-reaches the canonical Postgres ledger when the head-writer consumes it, normally
-within milliseconds — the lag is `audit_backlog` on `/health`. The production
-node is a single un-replicated JetStream server; a replicated stream is not
-deployed. So, failure by failure:
+**What "acked" does and does not guarantee.** The ack means the JetStream server
+has **written the event to its file store**; the store is fsynced on the server's
+`sync_interval`, which production runs at **100 ms**. The event reaches the
+canonical Postgres ledger when the head-writer consumes it, normally within
+milliseconds — the lag is `audit_backlog` on `/health`. The production node is a
+single un-replicated JetStream server; a replicated stream is not deployed. So,
+failure by failure:
 
 - **The nats-server process crashes:** nothing is lost — the OS still holds the
   written pages and flushes them.
@@ -114,47 +108,25 @@ deployed. So, failure by failure:
   of the ledger — the chain rows and anchor bundles are not on that node; they
   live in the Postgres control plane, off the host.
 - **The ledger's own store is lost:** what protects the ledger is Tracelane's
-  own hourly archive of the canonical chain rows and anchor bundles to object
-  storage, each file count-checked against the store before upload — **recovery
-  point ≤ 1 hour**. That is the number we state. We do not rest any durability claim on the database
-  provider's point-in-time-recovery window: its retention for our project has not
-  been read and verified, so it is not claimed.
+  own hourly off-host archive of the canonical chain rows and anchor bundles,
+  each file count-checked against the store before upload — **recovery point
+  ≤ 1 hour**. That is the number we state; we do not rest any durability claim
+  on the database provider's point-in-time-recovery window.
 
 **Two honest notes on the failure modes.**
 
-1. A `kill.audit.async` kill-switch flag (declared at `audit.rs:374`, read at
-   `audit.rs:1053-1057`) selects the synchronous append instead of the queued one.
-   **Corrected 2026-08-14 — this sentence previously read "forces the
-   synchronous append fleet-wide with no redeploy", and that overstated the
-   control in two ways.** The flag set is read **once, at process start**
-   (`kill_switch.rs:65-113`, from `TRACELANE_KILLSWITCH_FLAGS` into an immutable
-   snapshot; a periodic refresh exists in the code only when a feature-flag
-   service is configured, which production does not), so changing it takes
-   effect on a **service restart** — it is not a live runtime toggle. And in the current production deployment no flag is set
-   at all, so today this fallback is reached only by the conditions below
-   (JetStream unavailable), never by an operator. We are correcting this rather
-   than restating it because a conformance statement that credits us with a
-   control we cannot exercise is exactly the kind of claim this document exists
-   not to make.
-   **Corrected again 2026-09-21 — this note said the fallback was "deliberately
-   fail-open: if the append fails it logs a warning and the request is served
-   with no audit record". That has been false since 2026-08-11.** The synchronous
-   fallback is **fail-closed like the queued path**: when a control plane is
-   configured and the ledger append fails, the request is refused
-   (`audit.rs:1060-1088`; the test `kill_audit_async_cannot_suppress_the_record`
-   pins it). The flag can therefore *defer* how a record is written; it can no
-   longer *suppress* one. The honest limit that remains is the deployment tier
-   with **no** control plane — dev and self-host without Postgres — where the
-   record is a process-local hash chain plus a ClickHouse table written through
-   a bounded, batched, retried queue (`audit.rs:1740`); a request whose row
-   cannot be queued is refused, rows still queued when the process exits are
-   lost, and that tier is not the tamper-evident ledger this statement
-   describes and is not claimed as one.
-2. An operator with control of that flag can therefore change the
-   failure mode, and the flag's state is not itself recorded in the
-   ledger. What the chain proves is that the records it *does* contain
-   have not been altered — not that no record was ever suppressed
-   upstream of it.
+1. A configuration flag can select the synchronous append instead of the queued
+   one; it takes effect on a service restart. The synchronous path is
+   **fail-closed like the queued path**: when a control plane is configured and
+   the ledger append fails, the request is refused, so the flag can *defer* how a
+   record is written but not *suppress* one. The limit that remains is the
+   deployment tier with **no** control plane — dev and self-host without Postgres
+   — where the record is a process-local hash chain plus a ClickHouse table
+   written through a bounded, batched, retried queue; rows still queued when the
+   process exits are lost, and that tier is not the tamper-evident ledger this
+   statement describes and is not claimed as one.
+2. What the chain proves is that the records it *does* contain have not been
+   altered — not that no record was ever suppressed upstream of it.
 
 The implementation is open-source under Apache-2.0 at
 `crates/gateway/src/audit.rs` and is independently reviewable.
@@ -192,22 +164,17 @@ queryable but not chained.
 
 ### Article 12(2)(c) — retention floor
 
-The Enterprise plan carries a **180-day minimum retention** commitment for ledger
-data. Two properties carry it and both are checkable against a running system:
-no scheduled job deletes ledger data — the retention sweep operates on span
-tables only — and the ledger tables carry no TTL, so no row expires on its own.
+The Enterprise plan's ledger retention window is **seven years**. Two properties
+back it and both are checkable against a running system: no scheduled job deletes
+ledger data — the retention sweep operates on span tables only — and the ledger
+tables carry no TTL, so no row expires on its own.
 
 **Stated precisely, because the limit matters more than the reassurance:** that
-floor is operational and contractual rather than programmatically enforced.
+window is operational and contractual rather than programmatically enforced.
 Retention holds because nothing expires ledger rows automatically, not because
-a runtime check refuses a shorter value. A shorter contractual term would be a
-process failure, not one the software currently refuses.
+a runtime check refuses a shorter value.
 
 Workspaces without the Enterprise export grant are **not** covered by this mapping.
-There is no per-plan expiry of ledger data to describe: no ledger table
-carries a TTL and the retention sweep operates on span tables only, as
-this document states below. Ledger data is retained indefinitely on every
-plan today.
 
 ### Article 12(3)(a) — reproducible verification procedure
 
@@ -231,8 +198,7 @@ transparency log operated by the Linux Foundation Open Source Security
 Foundation (OpenSSF), so a reviewer can re-verify each anchor
 independently — offline against the bundled inclusion proof + signed
 checkpoint — without trusting any Tracelane HTTPS endpoint. Public
-anchoring **is operating in production** (first anchor: log index
-`19398597`, 2026-07-13).
+anchoring **is operating in production**.
 
 **Forgery resistance (why a real Rekor entry is not enough).** Rekor v2
 is a *permissionless* log: anyone can submit any well-formed entry and
@@ -267,12 +233,8 @@ endpoint is gated on the Enterprise export entitlement
 entitlement source is unavailable the export is refused rather than
 served (fail-closed).
 
-One honest limitation on the credential model: API keys are
-**workspace-scoped and revocable, but they are not per-endpoint-scoped
-and carry no expiry** unless you set them — the `api_keys` table has both a scope and an
-`expires_at` column (`apps/web/db/schema.ts`). Access for a review is
-therefore narrowed operationally: mint a key for the workspace under
-review, and revoke it when the review closes.
+For a review, the recommended practice is to mint a key for the workspace under
+review and revoke it when the review closes.
 
 ### Article 12(3)(c) — independent third-party review
 
@@ -315,23 +277,19 @@ Tenant isolation is enforced at two independent layers — see
    table (`apps/web/db/schema.ts`). Postgres row-level security is not
    enabled; scoping is by query filter.
 
-## Known gaps and V1.1 follow-ups
+## Known gaps
 
-This mapping describes V1 launch. The following are **not shipped
-today**:
+This mapping describes what ships today. The following are **not shipped**:
 
 - **Ledger coverage of the SDK/OTLP path.** Only gateway-proxied events
   are chained. Spans captured via the SDK or OTLP direct path are
   recorded full-fidelity but are not chained or anchored.
 - **Ledger coverage of tool, A2A and MCP invocations.** Recorded as
   spans; not written as ledger events.
-- **Automated audit-data retention cleanup job.** V1 does not delete
-  audit data, so the 180-day floor is trivially satisfied; V1.1 ships
-  a scheduled cleanup that enforces the retention ceiling.
-- **PDF export.** `tracelane-audit export --format pdf` is queued for
-  V1.1. V1 produces the equivalent human-readable content via
-  `--format text` and `--format json`.
-- **Per-tenant chain-state isolation hardening.** V1's per-tenant `seq`
+- **Automated audit-data retention cleanup job.** No job deletes audit data
+  today.
+- **PDF export.** Not available.
+- **Per-tenant chain-state isolation hardening.** The per-tenant `seq`
   and per-tenant Ed25519 keypair already enforce per-tenant cryptographic
   integrity. Further in-process isolation, as defence in depth against
   operator-side error, is on the roadmap.

@@ -11,7 +11,7 @@ import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
 import { callerIsOrgAdmin } from "@/lib/workos-org";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
 interface RenameBody {
@@ -103,10 +103,11 @@ interface DeleteBody {
  * (IDENTITY_TEAM_SPEC §5). Owner-only, type-org-name confirmation.
  *
  * Soft-delete = `tenants.archived_at = now()` + revoke ALL of the tenant's
- * `tlane_` keys (so gateway traffic 401s immediately — the key lookup filters
- * `revoked_at IS NULL`). Dashboard access is blocked by the archived-org guard
+ * `tlane_` keys, including keys in rotation grace (gateway authentication rejects
+ * elapsed revocation once its cached grant is invalidated or refreshed). Dashboard access is blocked by the archived-org guard
  * in requireSession. Hard purge (WorkOS org delete, ClickHouse/R2/Neon rows,
- * Polar subscription cancel) is the scheduled job [V1.1] — data is
+ * Polar subscription cancel) is the daily `tlane-purge-archived` job
+ * (`infra/prod/systemd/tlane-purge-archived.timer`) — data is
  * "purged within 30 days"; soft-delete is reversible in-window (archived_at =
  * NULL) until then.
  */
@@ -170,7 +171,12 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		await db
 			.update(apiKeys)
 			.set({ revokedAt: new Date() })
-			.where(and(eq(apiKeys.tenantId, t.id), isNull(apiKeys.revokedAt)));
+			.where(
+				and(
+					eq(apiKeys.tenantId, t.id),
+					or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+				),
+			);
 	} catch {
 		console.error("[workspace/delete] soft-delete side effects failed");
 		return NextResponse.json({ error: "soft_delete_failed" }, { status: 502 });

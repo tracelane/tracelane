@@ -40,5 +40,7 @@ pub use model::{
     ChatRequest, ChatResponse, Choice, ContentPart, ImageUrl, Message, MessageContent,
     RequestMetadata, Role, Tool, ToolCall, ToolChoice, Usage,
 };
-pub use span::{Intervention, SpanAttributes, SpanStatus, SpanStatusCode, TracelaneSpan};
+pub use span::{
+    DispatchAttempt, Intervention, SpanAttributes, SpanStatus, SpanStatusCode, TracelaneSpan,
+};
 pub use tenant::TenantId;

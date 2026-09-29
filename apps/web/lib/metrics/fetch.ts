@@ -73,21 +73,32 @@ export function fetchSloRows(
 	return orNull(gatewayGet<SloRow[]>(url("/v1/slo", q)));
 }
 
-/** `GET /v1/slo/summary` — the TRUE window-wide quantiles + requests/errors. */
+/**
+ * `GET /v1/slo/summary` — the TRUE window-wide quantiles + requests/errors.
+ *
+ * Carries the bucket like the two series routes do (B-500): the gateway reads
+ * `spans FINAL` by `start_time` when it sees a sub-hour bucket and the hourly
+ * view by `bucket_hour` when it does not, so the headline and the chart count
+ * the same spans only when both are asked the same way. Without it, a 1 h
+ * preset opened at 14:37 drew the chart over 13:37–14:37 and the headline over
+ * 14:00–14:37.
+ */
 export function fetchSloSummary(
 	r: Win,
 	opts: { provider?: string; model?: string } = {},
 ): Promise<SloSummary | null> {
-	const q = windowParams(r);
+	const q = windowParams(r, { bucket: true });
 	if (opts.provider) q.set("provider", opts.provider);
 	if (opts.model) q.set("model", opts.model);
 	return orNull(gatewayGet<SloSummary>(url("/v1/slo/summary", q)));
 }
 
-/** `GET /v1/slo/models` — one merged row per (provider, model). */
+/** `GET /v1/slo/models` — one merged row per (provider, model); bucket as above (B-500). */
 export function fetchSloModels(r: Win): Promise<SloModelRow[] | null> {
 	return orNull(
-		gatewayGet<SloModelRow[]>(url("/v1/slo/models", windowParams(r))),
+		gatewayGet<SloModelRow[]>(
+			url("/v1/slo/models", windowParams(r, { bucket: true })),
+		),
 	);
 }
 
@@ -112,7 +123,10 @@ export function fetchGatewayStatsFor(r: Win): Promise<GatewayStats | null> {
 }
 
 /**
- * `GET /v1/costs` — spend attribution. Takes `hours` beside the pair (see `hoursOf`).
+ * `GET /v1/costs` — spend attribution. The gateway honours the `since/until`
+ * pair (CX-26 / B-525 — until then it served a rolling `now − hours` under the
+ * page's absolute label); `hours` still rides beside it for a gateway that
+ * predates the fix (see `hoursOf`, and the S-gw→web deploy order).
  * `scope` is OPTIONAL and omitted by default — the gateway's own `CostQuery.scope`
  * defaults to `"all"` (`crates/gateway/src/trace_reads.rs::CostScope::parse`), so
  * every existing caller that never passed one keeps asking for exactly what it
@@ -152,6 +166,16 @@ export type ToolRow = {
 export type ToolAnalytics = {
 	window_hours: number;
 	total_calls: number;
+	/**
+	 * B-524 / CX-25: `tools.length < ` the window's true distinct-tool count —
+	 * the LIMIT cut real tools out of `tools` below. `total_calls` still
+	 * covers every one of them (the gateway sums via a ClickHouse window
+	 * function evaluated before its own LIMIT); only the per-tool breakdown
+	 * is a subset when this is `true`. Optional (not required) so an
+	 * existing mock/fixture built before this field shipped keeps compiling —
+	 * treat a missing value as `false` (unknown, not "truncated").
+	 */
+	truncated?: boolean;
 	tools: ToolRow[];
 };
 

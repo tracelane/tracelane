@@ -26,7 +26,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { resolveRedirect } from "../functions/api/notify.ts";
+import { resolveRedirect, serveRange } from "../functions/api/notify.ts";
 import { LADDER, formatPrice, plan } from "../src/lib/plans.ts";
 
 const SITE = join(import.meta.dirname, "..");
@@ -69,6 +69,22 @@ describe("redirects — retired URLs keep their link equity", () => {
 		// or a visitor arriving at the sitemap URL gets bounced to the homepage.
 		assert.equal(resolveRedirect("tracelane.dev", url("/changelog")), null);
 		assert.equal(resolveRedirect("tracelane.dev", url("/changelog/")), null);
+	});
+
+	test("the retired /product/<section> pages 301 to their section on /product (SITE-04)", () => {
+		for (const s of ["gateway", "observability", "audit", "evals"]) {
+			assert.equal(
+				resolveRedirect("tracelane.dev", url(`/product/${s}`)),
+				`https://tracelane.dev/product#${s}`,
+			);
+			assert.equal(
+				resolveRedirect("tracelane.dev", url(`/product/${s}/`)),
+				`https://tracelane.dev/product#${s}`,
+			);
+		}
+		// The one page itself must NOT redirect, or the 301s would loop.
+		assert.equal(resolveRedirect("tracelane.dev", url("/product")), null);
+		assert.equal(resolveRedirect("tracelane.dev", url("/product/")), null);
 	});
 
 	test("www 301s to the apex, preserving the path", () => {
@@ -334,5 +350,57 @@ describe("honesty + security headers", () => {
 			const s = readFileSync(join(SITE, "src", "pages", f), "utf8");
 			assert.ok(!/tamper-proof/i.test(s), `${f} says "tamper-proof"`);
 		}
+	});
+});
+
+// B-588 (2026-09-27): the static-asset handler answers a Range request with 200 and the
+// whole file, and Safari / iOS will not play an mp4 served without byte ranges. The
+// Worker answers .mp4 itself; these pin the RFC 9110 shapes it must return.
+describe("video byte ranges (B-588)", () => {
+	const body = new Uint8Array(5000).map((_, i) => i % 251);
+	const asset = () =>
+		new Response(body, { headers: { "content-type": "video/mp4" } });
+	const req = (range?: string, method = "GET") =>
+		new Request("https://tracelane.dev/film.mp4", {
+			method,
+			headers: range ? { range } : {},
+		});
+
+	test("a bounded range is a 206 with exactly those bytes", async () => {
+		const r = await serveRange(req("bytes=0-1023"), asset());
+		assert.equal(r.status, 206);
+		assert.equal(r.headers.get("content-range"), "bytes 0-1023/5000");
+		assert.equal(r.headers.get("content-length"), "1024");
+		assert.equal(r.headers.get("accept-ranges"), "bytes");
+		const got = new Uint8Array(await r.arrayBuffer());
+		assert.equal(got.length, 1024);
+		assert.equal(got[1000], body[1000]);
+	});
+	test("an open range runs to the end; a suffix range takes the last N", async () => {
+		const open = await serveRange(req("bytes=4990-"), asset());
+		assert.equal(open.headers.get("content-range"), "bytes 4990-4999/5000");
+		const suffix = await serveRange(req("bytes=-100"), asset());
+		assert.equal(suffix.headers.get("content-range"), "bytes 4900-4999/5000");
+		assert.equal((await suffix.arrayBuffer()).byteLength, 100);
+	});
+	test("an end past the file is clamped, a start past it is 416", async () => {
+		const clamped = await serveRange(req("bytes=4000-99999"), asset());
+		assert.equal(clamped.headers.get("content-range"), "bytes 4000-4999/5000");
+		const bad = await serveRange(req("bytes=6000-"), asset());
+		assert.equal(bad.status, 416);
+		assert.equal(bad.headers.get("content-range"), "bytes */5000");
+	});
+	test("no Range is a 200 that advertises ranges; HEAD carries no body", async () => {
+		const full = await serveRange(req(), asset());
+		assert.equal(full.status, 200);
+		assert.equal(full.headers.get("accept-ranges"), "bytes");
+		assert.equal((await full.arrayBuffer()).byteLength, 5000);
+		const head = await serveRange(req("bytes=0-9", "HEAD"), asset());
+		assert.equal(head.status, 206);
+		assert.equal(head.body, null);
+	});
+	test("a missing asset passes through untouched", async () => {
+		const r = await serveRange(req("bytes=0-9"), new Response("nf", { status: 404 }));
+		assert.equal(r.status, 404);
 	});
 });

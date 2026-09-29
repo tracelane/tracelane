@@ -46,7 +46,8 @@ function barStyle(
 	const marker = `data-span-row="${spanId}"`;
 	const at = html.indexOf(marker);
 	if (at === -1) throw new Error(`${spanId} not found in rendered HTML`);
-	const rowHtml = html.slice(at, at + 2000);
+	const nextRow = html.indexOf("data-span-row=", at + marker.length);
+	const rowHtml = html.slice(at, nextRow === -1 ? undefined : nextRow);
 	const left = rowHtml.match(/left:(\d+(?:\.\d+)?)%/);
 	const width = rowHtml.match(/width:(\d+(?:\.\d+)?)%/);
 	const leftPct = left?.[1];

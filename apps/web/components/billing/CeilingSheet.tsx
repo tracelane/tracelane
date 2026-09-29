@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * CeilingSheet — the monthly spend ceiling dialog (spec §8 `#ceiling`).
@@ -20,6 +21,7 @@
  */
 
 import { Modal } from "@/components/Modal";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useState } from "react";
 
 export function CeilingSheet({
@@ -46,7 +48,7 @@ export function CeilingSheet({
 		setError(null);
 		const usd = enabled ? amount : null;
 		try {
-			const res = await fetch("/api/billing/ceiling", {
+			const res = await apiFetchRaw("/api/billing/ceiling", {
 				method: "PUT",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ usd, overflow_mode: mode }),
@@ -72,7 +74,8 @@ export function CeilingSheet({
 			>
 				<div className="mb-4 flex items-center justify-between">
 					<span className="text-xs text-ink-2">Spend ceiling</span>
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						role="switch"
 						aria-checked={enabled}
@@ -91,7 +94,7 @@ export function CeilingSheet({
 									: "left-0.5 bg-surface"
 							}`}
 						/>
-					</button>
+					</Button>
 				</div>
 
 				<label
@@ -146,21 +149,23 @@ export function CeilingSheet({
 				{error && <p className="mb-3 text-xs text-danger-ink">{error}</p>}
 
 				<div className="flex gap-2">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						disabled={!canManage || saving}
 						onClick={save}
 						className="flex-1 rounded-[var(--radius-control)] bg-action px-3 py-1.5 text-xs font-medium text-action-on transition-colors hover:bg-action/90 disabled:opacity-50"
 					>
 						{saving ? "Saving…" : "Save"}
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						className="flex-1 rounded-[var(--radius-control)] border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 					>
 						Cancel
-					</button>
+					</Button>
 				</div>
 			</div>
 		</Modal>

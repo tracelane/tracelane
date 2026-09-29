@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * /plans — the in-app plan ladder (SET-15 / ADR-076).
  *
@@ -58,7 +59,7 @@ export default async function PlansPage() {
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-4 space-y-1">
-				<h1 className="t-h1">Plans</h1>
+				<PageHeader title={<>Plans</>} />
 				<p className="text-xs text-ink-2">
 					Six meters, priced the same way on every paid tier. Manage your
 					subscription, payment method and invoices in{" "}

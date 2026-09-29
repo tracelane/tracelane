@@ -113,7 +113,7 @@ export async function fetchVersion(
 ): Promise<ResolvedVersion | { error: string }> {
 	try {
 		return await gatewayGet<ResolvedVersion>(
-			`/v1/prompts/${encodeURIComponent(name)}?env=${env}`,
+			`/v1/prompts/${encodeURIComponent(name)}/configuration?env=${env}`,
 		);
 	} catch (err) {
 		if (err instanceof GatewayError) {
@@ -142,5 +142,28 @@ export async function fetchHistory(
 	} catch (err) {
 		if (err instanceof GatewayError) return [];
 		throw err;
+	}
+}
+
+export type Canary = {
+	canary_id: string;
+	stable_version_id: string;
+	candidate_version_id: string;
+	candidate_percent: number;
+};
+export async function fetchCanary(
+	name: string,
+): Promise<{ data: Canary | null; status: number }> {
+	try {
+		return {
+			data: await gatewayGet<Canary | null>(
+				`/v1/prompts/${encodeURIComponent(name)}/canary`,
+			),
+			status: 200,
+		};
+	} catch (error) {
+		if (error instanceof GatewayError)
+			return { data: null, status: error.status };
+		throw error;
 	}
 }

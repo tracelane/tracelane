@@ -20,7 +20,8 @@ vi.mock("@/lib/auth", () => ({
 	})),
 }));
 
-import { DELETE } from "./route";
+import { NextRequest } from "next/server";
+import { DELETE, GET } from "./route";
 
 const fetchMock = vi.fn();
 
@@ -76,4 +77,20 @@ describe("DELETE /api/prompts/[name]", () => {
 		const body = (await res.json()) as { error: string };
 		expect(body.error).toBe("gateway_unreachable");
 	});
+});
+
+it("reads configuration for experiment arms without drawing a canary assignment", async () => {
+	fetchMock.mockResolvedValue(
+		new Response(JSON.stringify({ prompt_version_id: "stable" }), {
+			status: 200,
+		}),
+	);
+	const response = await GET(
+		new NextRequest("https://app.example/api/prompts/greet?env=production"),
+		makeParams("greet"),
+	);
+	expect(response.status).toBe(200);
+	expect(fetchMock.mock.calls[0]?.[0]).toBe(
+		"https://gateway.example/v1/prompts/greet/configuration?env=production",
+	);
 });

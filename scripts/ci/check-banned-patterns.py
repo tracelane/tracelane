@@ -191,6 +191,15 @@ PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         re.compile(
             r"expose_secret\(\)\s*\.\s*(to_string|to_owned|into)\(\)"
             r"|String::from\(\s*[A-Za-z_][A-Za-z0-9_.]*\.expose_secret\(\)\s*\)"
+            # `format!`/`write!` interpolating an exposed secret is the SAME
+            # un-zeroized copy wearing a different hat. Found 2026-09-22 by the
+            # security review, live at one site: a WorkOS management key built
+            # as `format!("Bearer {}", key.expose_secret())` read green here
+            # while `.to_string()` two lines away would have blocked. The repo's
+            # shape is `bearer_auth(secret.expose_secret())` — the copy happens
+            # inside the client, not in a String we own.
+            r"|(format|write|writeln|print|println|eprint|eprintln)!\s*\([^)]*"
+            r"[A-Za-z_][A-Za-z0-9_.]*\.expose_secret\(\)"
         ),
         "`expose_secret()` copied into a plain String is no longer zeroized on drop; keep it typed and expose at the last moment",
     ),
@@ -338,6 +347,18 @@ def selftest() -> int:
             "crates/x/src/nats.rs",
             "fn k() { o.user_and_password(u, p.expose_secret().to_owned()) }\n",
             True,
+        ),
+        (
+            "7 format!(..) interpolating an exposed secret BLOCKS",
+            "crates/x/src/webhook.rs",
+            'fn k() { let h = format!("Bearer {}", key.expose_secret()); }\n',
+            True,
+        ),
+        (
+            "7 bearer_auth(expose_secret()) — the sanctioned shape — PASSES",
+            "crates/x/src/webhook.rs",
+            "fn k() { let r = c.get(u).bearer_auth(key.expose_secret()); }\n",
+            False,
         ),
         (
             "7 String::from(x.expose_secret()) BLOCKS",

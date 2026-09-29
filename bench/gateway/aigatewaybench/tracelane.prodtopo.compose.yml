@@ -1,0 +1,157 @@
+# REV-2 §7 follow-up (2026-09-21, founder batch B) — Tracelane in the PROD TOPOLOGY for
+# AIGatewayBench: the same stack as ../tracelane.compose.yml PLUS a Postgres control plane,
+# so the gateway takes the hot path prod takes — api-key auth against `api_keys`,
+# entitlements from `plan_entitlements`, and the ACKED JetStream audit publish
+# (`crates/gateway/src/admission.rs`, the audit step) with the head-writer consumer
+# appending to `audit_log_rows` in this Postgres. The published harness has no control
+# plane, so its gateway declines the async audit path (`crates/gateway/src/server.rs:681`)
+# and the measurement never contains the acked write. This file exists to measure it.
+#
+# What is deliberately NOT prod-shaped, and why it does not touch the measured path:
+#   * Postgres is local (prod's is Neon). Every per-request read is cached on TTL
+#     (CLAUDE.md §2, the B-256 class), so the remote round-trip is not on the hot path in
+#     prod either; the head-writer's Postgres INSERT is off the request path by design.
+#   * TRACELANE_REKOR_ANCHOR_EVERY is 1_000_000: the anchor task is spawned off-path
+#     (`audit.rs::anchor_task`) and would otherwise write ~N/100 real Sigstore entries per
+#     run. Not measured in either topology.
+#   * No `TRACELANE_CONFIG` (no tracelane.yaml) → no semantic cache, exactly as the
+#     published run: every request reaches the mock. A cache hit would make the gateway
+#     read FASTER than the direct baseline and measure nothing.
+#   * Ingest stays single-tenant self-host (release ingest refuses to boot without SPIRE
+#     otherwise, `crates/ingest/src/main.rs`); it consumes spans off-path and is stamped
+#     with the SAME tenant id the seed creates, so the capture proof still reads back.
+#
+# prodtopo/prepare.sh writes prodtopo/generated/{10-migrations,20-reference,30-seed}.sql
+# and prodtopo/generated/env (pepper, master key, bearer) BEFORE compose up; the gateway's
+# boot schema check (`entitlement_cache::verify_schema`) refuses a Postgres that is behind
+# the binary, which is why the migrations run in Postgres' own initdb, before the gateway.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    network_mode: host
+    environment:
+      POSTGRES_USER: tracelane
+      POSTGRES_PASSWORD: tracelane_bench
+      POSTGRES_DB: tracelane
+      # for the TCP healthcheck below (psql does not read POSTGRES_PASSWORD)
+      PGPASSWORD: tracelane_bench
+    volumes:
+      - tracelane_bench_pg_data:/var/lib/postgresql/data
+      - ./prodtopo/generated/10-migrations.sql:/docker-entrypoint-initdb.d/10-migrations.sql:ro
+      - ./prodtopo/generated/20-reference.sql:/docker-entrypoint-initdb.d/20-reference.sql:ro
+      - ./prodtopo/generated/30-seed.sql:/docker-entrypoint-initdb.d/30-seed.sql:ro
+    healthcheck:
+      # Over TCP on purpose: initdb's temporary server (the one that runs the three init
+      # files) listens on the unix socket ONLY, so a socket check goes green before the
+      # real server is up and the gateway's pool init lands in the restart window. The
+      # api_keys row is the LAST thing 30-seed.sql writes.
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U tracelane -d tracelane -tAc 'SELECT 1 FROM api_keys LIMIT 1' | grep -q 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    network_mode: host
+    environment:
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - tracelane_bench_clickhouse_data:/var/lib/clickhouse
+      - ../../../infra/self-host/clickhouse/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../../../infra/self-host/clickhouse/config.xml:/etc/clickhouse-server/config.d/self-host.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password ${CLICKHOUSE_PASSWORD:-tracelane_bench} --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  nats:
+    image: nats:2.10-alpine
+    network_mode: host
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - tracelane_bench_nats_data:/data
+      - ${GWBENCH_NATS_CONF_ABS:?run.sh sets this}:/etc/nats/nats.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  gateway:
+    build:
+      context: ../../..
+      dockerfile: infra/docker/gateway.Dockerfile
+    network_mode: host
+    env_file:
+      - ./prodtopo/generated/env
+    environment:
+      TRACELANE_PORT: "8080"
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+      ANTHROPIC_BASE_URL: ${GWBENCH_MOCK_URL:-http://127.0.0.1:9100}
+      # Kept so the boot path is identical to the published compose; NOT used for the
+      # tenant's key — with a control plane and a master key the env fallback is closed
+      # (`server/dispatch.rs::env_fallback_allowed`). The tenant's key is the BYOK row
+      # post-up.sh installs through /v1/byok/provider-keys.
+      ANTHROPIC_API_KEY: bench
+      TRACELANE_MASTER_KEY: "${TRACELANE_MASTER_KEY:?required — run.sh generates one}"
+      POSTGRES_URL: postgres://tracelane:tracelane_bench@127.0.0.1:5432/tracelane
+      POSTGRES_DIRECT_URL: postgres://tracelane:tracelane_bench@127.0.0.1:5432/tracelane
+      TRACELANE_REKOR_ANCHOR_EVERY: "1000000"
+      NATS_URL: nats://127.0.0.1:4222
+      CLICKHOUSE_URL: http://127.0.0.1:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  ingest:
+    build:
+      context: ../../..
+      dockerfile: infra/docker/ingest.Dockerfile
+    network_mode: host
+    environment:
+      TRACELANE_LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRACELANE_SELF_HOST: "1"
+      TRACELANE_SINGLE_TENANT_ID: ${GWBENCH_TENANT_ID:?prepare.sh writes this into generated/env}
+      NATS_URL: nats://127.0.0.1:4222
+      CLICKHOUSE_URL: http://127.0.0.1:8123
+      CLICKHOUSE_DB: tracelane
+      CLICKHOUSE_USER: tracelane
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-tracelane_bench}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+volumes:
+  tracelane_bench_pg_data:
+    driver: local
+  tracelane_bench_clickhouse_data:
+    driver: local
+  tracelane_bench_nats_data:
+    driver: local

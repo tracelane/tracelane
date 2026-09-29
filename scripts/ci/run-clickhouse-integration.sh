@@ -125,8 +125,11 @@ if [ "${1:-}" = "--selftest" ]; then
   # recovery is `cp` from the printed BACKUP path, and `git diff` shows it.
   trap restore EXIT INT TERM HUP
   echo "SELFTEST: $TARGET is mutated for the next step; pristine copy at $BACKUP"
-  OLD='WHERE tenant_id = ? AND datasets.dataset_id = toUUID(?) AND deleted = 0'
-  NEW='WHERE tenant_id = ? AND dataset_id = toUUID(?) AND deleted = 0'
+  # Both strings run PAST the closing quote so the plant can carry the `SELFTEST PLANT`
+  # marker as a trailing Rust comment (it cannot sit inside the SQL string literal) —
+  # `check-no-stranded-selftest-plant.sh` refuses that marker at commit time, 2026-09-20.
+  OLD='WHERE tenant_id = ? AND datasets.dataset_id = toUUID(?) AND deleted = 0",'
+  NEW='WHERE tenant_id = ? AND dataset_id = toUUID(?) AND deleted = 0", // SELFTEST PLANT (B-272 shape)'
   # B-285 (2026-08-25): DISTINGUISH "not there yet" FROM "left mutated by a dead run".
   #
   # `trap … EXIT INT TERM HUP` does not survive SIGKILL, and the meta-gate probes this
@@ -164,7 +167,35 @@ assert old in s, "mutation target absent"
 open(p, "w").write(s.replace(old, new, 1))
 PY
   echo "SELFTEST: unqualified the dataset_id WHERE (B-272's exact shape). Expecting RED."
-  bash "$0" >/dev/null 2>&1; _rc=$?
+  # B-494 (2026-09-21): the falsification runs ONLY the test the plant breaks — the
+  # dataset round-trip — not the whole 15-invocation suite the gate just ran green
+  # (~200 s to learn one fact). The real run below holds its EXECUTED count to a floor,
+  # so a suite that shrank cannot hide behind this narrowing; the selftest holds the
+  # DISCOVERED count of the round-trip family to a floor the same way.
+  # A list that FAILS (a compile error in the tree) is not "zero tests" — it is CANNOT
+  # DETERMINE, said as such, so a red here is never misread as a shrunken suite.
+  LIST_LOG="$(mktemp)"
+  if ! cargo test -p gateway --bin gateway clickhouse_roundtrip -- --list --ignored >"$LIST_LOG" 2>&1; then
+    echo "SELFTEST CANNOT DETERMINE — \`cargo test --list\` failed before any test was discovered (a compile error in the tree?):" >&2
+    grep -E '^error' "$LIST_LOG" | head -5 >&2
+    rm -f "$LIST_LOG"
+    exit 1
+  fi
+  DISCOVERED="$(grep -c ': test$' "$LIST_LOG" || true)"
+  rm -f "$LIST_LOG"
+  # Re-measured 2026-09-27 (OBS-55): `cargo test -p gateway --bin gateway
+  # clickhouse_roundtrip -- --list --ignored` discovers 21 tests, not the 16
+  # this line held — it was already stale before this change (independently
+  # of the one test OBS-55 adds), the same "these numbers rot" class
+  # `.claude/rules/testing.md` documents for the Rust test counts. Set to the
+  # measured value rather than merely +1, per CLAUDE.md §1 (a floor set below
+  # reality is worse than none).
+  EXPECTED_CH_ROUNDTRIP_TESTS=23  # 21 (OBS-55 re-measure) + B-568 C3 latency split + OBS-56 S4 batch resolution, 2026-09-28
+  if [ "${DISCOVERED:-0}" -lt "$EXPECTED_CH_ROUNDTRIP_TESTS" ]; then
+    echo "SELFTEST FAILED — discovered ${DISCOVERED:-0} clickhouse_roundtrip test(s), floor is $EXPECTED_CH_ROUNDTRIP_TESTS: the narrowed falsification would run fewer tests than the family holds (B-494)." >&2
+    exit 1
+  fi
+  TRACELANE_RUNNER_ONLY=clickhouse_roundtrip bash "$0" >/dev/null 2>&1; _rc=$?
   if [ "$_rc" -eq 3 ]; then
     echo "SELFTEST CANNOT DETERMINE — ClickHouse did not come up, so the mutated suite never ran (runner exit 3). Fix docker / host port 18123 first; this is NOT a passing selftest." >&2
     exit 1
@@ -190,18 +221,50 @@ if [ -z "${CLICKHOUSE_TEST_URL:-}" ]; then
 fi
 
 RC=0
+# B-494: every cargo invocation goes through `run_and_count`, which adds its `N passed`
+# to EXECUTED; the floor at the end refuses a run that executed fewer tests than the
+# suite holds — a filter that matches nothing is a green that tested nothing.
+# `TRACELANE_RUNNER_ONLY` is the --selftest's narrowed falsification (one filter, no floor).
+EXECUTED=0
+run_and_count() {
+  local out rc n
+  out="$(cargo test "$@" 2>&1)"; rc=$?
+  printf '%s\n' "$out" | grep -E '^test |panicked|^test result|^error' || true
+  for n in $(printf '%s\n' "$out" | sed -n 's/^test result: [a-z]*\. \([0-9]*\) passed.*/\1/p'); do
+    EXECUTED=$((EXECUTED + n))
+  done
+  return $rc
+}
+if [ -n "${TRACELANE_RUNNER_ONLY:-}" ]; then
+  run_and_count -p gateway --bin gateway "$TRACELANE_RUNNER_ONLY" -- --ignored || RC=1
+  exit $RC
+fi
 # The in-crate round trip: the REAL ClickHouseDatasetStore, the REAL ItemWriteRow.
-cargo test -p gateway --bin gateway clickhouse_roundtrip -- --ignored --nocapture || RC=1
+# The SAME filter reaches `trace_reads::clickhouse_roundtrip` — the reader-level
+# tests (the DSH-11 SQL acceptance, the B-379 merge/window, the `until` binds) and,
+# since 2026-09-21, B-500's `sub_hour_summary_counts_the_same_spans_as_the_sub_hour_rows`:
+# three LLM spans across an hour boundary, one sub-hour window, and the headline
+# (`/v1/slo/summary`), the table (`/v1/slo/models`) and the chart (`/v1/slo`) must
+# answer the SAME count. Only a server can show it — the string test proves the SQL's
+# shape, this proves what it COUNTS through the real reader and the real MV. Until
+# the fix the summary/models read `slo_hourly_stats` by `bucket_hour` while the rows
+# read `spans FINAL` by `start_time`, and answered 1 against 2 here.
+# Confirm the reach after any module rename: `cargo test -p gateway --bin gateway
+# clickhouse_roundtrip -- --ignored --list | grep sub_hour_summary`.
+run_and_count -p gateway --bin gateway clickhouse_roundtrip -- --ignored --nocapture || RC=1
 # B-383 (c) / B-387: the retention sweep's enforce DELETE against every content
 # table on the checked-in schema — the projection-vs-lightweight-delete refusal
 # (Code 344) is only visible to a server.
-cargo test -p gateway --bin gateway retention_sweep::tests::enforce_delete_is_accepted -- --ignored || RC=1
+run_and_count -p gateway --bin gateway retention_sweep::tests::enforce_delete_is_accepted -- --ignored || RC=1
+# RI-02 rule 5 (2026-09-20): the orphan-tenant step deletes a purged tenant's rows from every
+# content table and spares a bystander; an EMPTY live list is refused. Behaviour, not SQL text.
+run_and_count -p gateway --bin gateway retention_sweep::tests::ri02_orphan_step -- --ignored || RC=1
 # B-393 (BILL-01): blob rehydration against a real server. The lookup compares
 # `hex(hash)` (UPPERCASE on the server) to a bound string — a case mismatch
 # matches zero rows and is invisible to every unit test, because the miss is
 # the SQL's semantics, not the Rust's. This test existed and was `#[ignore]`d
 # but nothing ran it; prod found the defect first.
-cargo test -p gateway --bin gateway billing::blobs::tests::rehydrate_against_a_real_clickhouse -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::blobs::tests::rehydrate_against_a_real_clickhouse -- --ignored || RC=1
 # B-424 / B-425 (BILL-01, found on prod 2026-09-16): every read the metering job
 # makes, and the two period reads the usage page renders from, against a real
 # server. A SELECT alias shadowing a same-named column (`toString(day) AS day
@@ -209,10 +272,66 @@ cargo test -p gateway --bin gateway billing::blobs::tests::rehydrate_against_a_r
 # UInt64 aggregate decoded into an f64 field is a denormal on the server and
 # nothing else. Both failed on every run since BILL-01 deployed and no unit
 # test could see either.
-cargo test -p gateway --bin gateway billing::metering_job::tests::meter_reads_run_against_a_real_clickhouse -- --ignored || RC=1
-cargo test -p gateway --bin gateway billing::usage::tests::period_reads_run_against_a_real_clickhouse -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::metering_job::tests::meter_reads_run_against_a_real_clickhouse -- --ignored || RC=1
+# B-445: the blob GC leaves referenced and young blobs; only old unreferenced ones go.
+run_and_count -p gateway --bin gateway billing::metering_job::tests::gc_leaves_referenced_and_young_blobs_against_a_real_clickhouse -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::usage::tests::period_reads_run_against_a_real_clickhouse -- --ignored || RC=1
+# REV-1 (the Codex independent review's billing trio, 2026-09-20) — three money
+# defects the job's own log could never show, each proven on the real server:
+#   B-468  idle days billed at the last active day's value (the trailing series
+#          discarded its dates) — the backfill over a busy→idle→busy week must emit
+#          for the two busy periods ONLY, read back from a recording Polar.
+#   B-470  the completion marker landed BEFORE the Polar POST — a refused POST must
+#          leave the day UNMARKED, the next run re-emits it under the same external
+#          ids and only then marks it.
+#   B-469  a batch retried after a lost response counted twice — the same immutable
+#          batch + `insert_deduplication_token` sums ONCE on the real table (migration
+#          28) and TWICE on a clone without the window: the setting is the control.
+run_and_count -p gateway --bin gateway billing::metering_job::tests::rev1_idle_days_are_not_billed_against_a_real_clickhouse -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::metering_job::tests::rev1_a_failed_emission_withholds_the_marker_and_the_day_is_retried -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::metering_job::tests::rev1_a_kill_mid_emission_retries_the_day_under_the_same_external_ids -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::meters::tests::rev1_a_retried_batch_with_the_same_token_is_counted_once -- --ignored || RC=1
 # The previously-uncalled migration-03 parity test. Mirrors column shapes rather
 # than driving the persisters, so it is a weaker check — run for coverage, not
 # for confidence.
-cargo test -p gateway --test clickhouse_persister_integration -- --ignored || RC=1
+run_and_count -p gateway --test clickhouse_persister_integration -- --ignored || RC=1
+# RI-06 / B-449: the capture_gaps row (ingest) against the real schema — DateTime64(6)
+# as i64 micros, three UInt64s. The B-292 class: green in cargo test, red on the server.
+run_and_count -p ingest --bin ingest capture_gaps::tests::row_round_trips_against_a_real_clickhouse -- --ignored || RC=1
+# B-445: a failed blobs insert PROPAGATES (the batch stays unacked) instead of warning past it.
+run_and_count -p ingest --bin ingest clickhouse_writer::tests::flush_blobs_propagates_a_failed_insert_against_a_real_clickhouse -- --ignored || RC=1
+# B-524 (CX-25, 2026-09-22): tool analytics `total_calls` is the window's TRUE total — a
+# window function evaluated BEFORE the per-tool LIMIT — and `truncated` says when the list
+# was cut; the plant (Σ over the capped Vec) read 59 for 60 on a real server.
+run_and_count -p gateway --bin gateway tool_analytics::tests::the_total_survives_the_limit_and_says_when_it_did -- --ignored || RC=1
+# B-493 (2026-09-21): a span batch retried under the same insert_deduplication_token — the
+# "committed behind a client timeout, then retried" path — lands once and fires the mv_* views
+# ONCE (migration 29's window on `spans`); a clone without the window takes it twice.
+run_and_count -p ingest --bin ingest clickhouse_writer::tests::b493_a_retried_span_batch_fires_the_views_once_against_a_real_clickhouse -- --ignored || RC=1
+# B-542 (2026-09-23): the promotion gate binds evidence to the CANDIDATE, not just
+# (tenant, run) — a run that passed for version A must not promote version B. This is the
+# ONLY test that proves it against a real ClickHouse and the real schema, and it shipped
+# `#[ignore]`d with no runner entry, so it would have executed NEVER. That is the
+# B-292/B-274 class precisely: the serde attr on `prompt_version_id` is what makes the
+# projected column decode at all, and a regression there is invisible to `cargo test` and
+# to every StaticEvalGate test in the suite.
+run_and_count -p gateway --bin gateway prompt_router::tests::evidence_binding_real_clickhouse -- --ignored || RC=1
+# B-494: the executed floor — the sum of `N passed` over every invocation above, counted
+# on a green run 2026-09-21. A run that executes fewer is RED even if every test it ran passed.
+# +1 (2026-09-27, OBS-55): `session_transcript_totals_and_turns_against_a_real_clickhouse`
+# joined the `clickhouse_roundtrip -- --ignored --nocapture` line above and was run and
+# proven green against a real ClickHouse (24.12-alpine) before this floor moved — every
+# other line's contribution is unchanged by this session.
+# 34 → 35 (2026-09-27, B-568 C3): `trace_reads::clickhouse_roundtrip::
+# b568_latency_split_counts_the_right_populations_on_a_real_clickhouse` rides the
+# `clickhouse_roundtrip` filter above — what the dispatched / hit / warm / cold split
+# COUNTS on a real server, tenant isolation and the zero-sample decode included.
+# +1 OBS-56 S4 `batch_span_resolution_and_dedupe_against_a_real_clickhouse`.
+# All three merged 2026-09-28: 34 + OBS-55 + B-568 + OBS-56 S4 = 37.
+EXPECTED_CH_EXECUTED=40  # measured 2026-09-28 full gate: "executed 40 tests"
+if [ "$EXECUTED" -lt "$EXPECTED_CH_EXECUTED" ]; then
+  echo "clickhouse integration: FAIL — executed $EXECUTED test(s), floor is $EXPECTED_CH_EXECUTED: the suite shrank or a filter matched nothing (B-494)"
+  exit 1
+fi
+echo "clickhouse integration: executed $EXECUTED tests (floor $EXPECTED_CH_EXECUTED)"
 exit $RC

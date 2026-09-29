@@ -156,6 +156,86 @@ pub(crate) fn unroutable_model_response(model: &str) -> axum::response::Response
     resp
 }
 
+/// `GWY-49`: the one sentence both wires (OpenAI-shaped chat/embeddings, Anthropic-shaped
+/// `/v1/messages`) return for an unsatisfiable constraint. `eligible_default_count` is how
+/// many providers the gateway's table currently vouches for at ALL — when it is zero the
+/// advice "choose a provider that does" would be empty, so the message says so instead of
+/// pointing at a choice that does not exist yet.
+pub(crate) fn zdr_unsatisfiable_message(eligible_default_count: usize) -> String {
+    let base = "this request requires zero data retention (x-tracelane-zdr: required) and the \
+                provider serving this model does not carry a verified no-retention, no-training \
+                guarantee for every account";
+    if eligible_default_count == 0 {
+        format!(
+            "{base} — and no provider in this gateway's capability table carries one yet; \
+             drop the constraint until the table is populated"
+        )
+    } else {
+        format!(
+            "{base} — choose a model on one of the {eligible_default_count} provider(s) that \
+             do, or drop the constraint"
+        )
+    }
+}
+
+/// `GWY-49`: the request carried `x-tracelane-zdr: required` and the provider that
+/// serves this model does not carry a `default` zero-data-retention capability in the
+/// reference table (or the table is unreadable). 400, fail-CLOSED, no provider
+/// contacted. The body names the model and the provider so the customer knows WHICH
+/// promise is missing — never the table's internals.
+pub(crate) fn zdr_unsatisfiable_response(
+    model: &str,
+    provider: &str,
+    eligible_default_count: usize,
+) -> axum::response::Response {
+    let mut map = serde_json::Map::new();
+    map.insert("error".into(), "zdr_unsatisfiable".into());
+    map.insert(
+        "message".into(),
+        zdr_unsatisfiable_message(eligible_default_count).into(),
+    );
+    map.insert("model".into(), model.into());
+    map.insert("provider".into(), provider.into());
+    map.insert(
+        "eligible_provider_count".into(),
+        serde_json::Value::from(eligible_default_count),
+    );
+    json_400(map, b"{\"error\":\"zdr_unsatisfiable\"}")
+}
+
+/// `GWY-49`: the sentence for a header value this gateway does not understand.
+pub(crate) const INVALID_ZDR_CONSTRAINT_MESSAGE: &str =
+    "x-tracelane-zdr accepts exactly one value: `required`";
+
+/// `GWY-49`: `x-tracelane-zdr` carried a value this gateway does not understand. A
+/// compliance header is never guessed at — 400 before any routing.
+pub(crate) fn invalid_zdr_constraint_response(value: &str) -> axum::response::Response {
+    let mut map = serde_json::Map::new();
+    map.insert("error".into(), "invalid_zdr_constraint".into());
+    map.insert("message".into(), INVALID_ZDR_CONSTRAINT_MESSAGE.into());
+    // Bounded echo of what was sent, so a typo is visible; scrubbed below like every body.
+    map.insert(
+        "received".into(),
+        value.chars().take(64).collect::<String>().into(),
+    );
+    json_400(map, b"{\"error\":\"invalid_zdr_constraint\"}")
+}
+
+fn json_400(
+    map: serde_json::Map<String, serde_json::Value>,
+    fallback: &[u8],
+) -> axum::response::Response {
+    let raw =
+        serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_else(|_| fallback.to_vec());
+    let scrubbed = tracelane_shared::redact::scrub(&raw);
+    let mut resp = (StatusCode::BAD_REQUEST, scrubbed).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
 /// Build a client-facing provider-error response with a defense-in-depth
 /// redaction backstop.
 ///

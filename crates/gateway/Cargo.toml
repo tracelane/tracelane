@@ -96,9 +96,19 @@ aho-corasick = "1" # R7 topic/competitor multi-pattern match (§3 R7)
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The Vertex probe test signs a real JWT, so it needs a structurally valid RSA
+# PKCS#8 key. Generated in-process rather than committed: `crates/` ships
+# publicly, and a committed PEM is a private key in a public repo. Already in
+# Cargo.lock via rustls + jsonwebtoken's `aws_lc_rs` feature — no new crate.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 axum-test = "20"
 wiremock = "0.6"
 futures-util = "0.3"
+# B-493: decode the clickhouse crate's LZ4-framed INSERT bodies a wiremock
+# ClickHouse recorded, so a test can count the rows that reached the wire.
+# Already in Cargo.lock as clickhouse's own dependency; the default `frame`
+# feature would pull a NEW crate (twox-hash), so only the block decoder is enabled.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 # Criterion for hot-path microbenches (ADR-020 hard-cap budget: <500ns p99
 # overhead on the QuotaTracker check). default-features=false drops the rayon
 # dep we don't need.

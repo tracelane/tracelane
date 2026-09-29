@@ -12,7 +12,7 @@ import { cn } from "../lib/cn";
  *    close to the visual weight of a 13px card title, so a row of six chips
  *    competed with the headings above them. The chip is an annotation; it should
  *    read at the bottom of the hierarchy, not the middle.
- *  · `rounded-md` (6px) is KEPT and is now a deliberate statement rather than an
+ *  · `rounded-control` (6px) is KEPT and is now a deliberate statement rather than an
  *    inherited default: `--radius-control` is 8px, cards are 18px, and a badge is
  *    the smallest control in the system — the small end of the control band. A
  *    `rounded-full` pill here is what P0.6 bans as "decorative coloured badges".
@@ -53,7 +53,7 @@ const badge = cva(
 	// taller than its neighbours and read as a layout fault. A status chip is a
 	// single token by definition; if it does not fit, the COLUMN is wrong, and a
 	// chip that refuses to wrap is what makes that visible instead of hiding it.
-	"inline-flex items-center gap-1 whitespace-nowrap rounded-md px-2 py-0.5 text-2xs font-medium tabular-nums",
+	"inline-flex items-center gap-1 whitespace-nowrap rounded-control px-2 py-0.5 text-2xs font-medium tabular-nums",
 	{
 		variants: {
 			tone: {

@@ -92,17 +92,62 @@ WINDOW_MAX_CHARS = 600
 
 # reason -> the vocabulary this guard accepts; enforced only by convention
 # (a founder/reviewer reads the reason), not by the guard itself.
-REASONS = {"cli", "sdk", "webhook", "mcp", "deliberate-stub"}
+# `in-app-wrapper` added 2026-09-23. The other five mean "no in-app caller exists".
+# This one means the OPPOSITE and must never be confused with them: a real in-app
+# caller exists, but it sets the HTTP method inside a shared helper rather than at
+# the call site, so `find_caller`'s method-window cannot see it. Using
+# `deliberate-stub` for these would have recorded a falsehood inside a control,
+# which is worse than the false positive it silenced. Evidence MUST point at the
+# real caller line, and `evidence_path()` proves the file exists.
+REASONS = {"cli", "sdk", "webhook", "mcp", "deliberate-stub", "in-app-wrapper"}
 
 # (METHOD, url_path) -> (reason, evidence). Evidence is `file:line` or a doc
 # path, resolved relative to ROOT, and MUST exist on disk — see
 # `evidence_path()` and its use in `check()`.
 ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
+    # The browser error beacon (2026-09-27). A real in-app caller exists — every page
+    # mounts it via components/ErrorListener.tsx and the error boundaries — but it lives
+    # in apps/web/lib/, which this guard does not scan, and sends by sendBeacon.
+    ("POST", "/api/client-errors"): (
+        "in-app-wrapper",
+        "apps/web/lib/report-error.ts:53",
+    ),
     # Called only by Polar.sh's own webhook dispatcher — documented in the
     # route's own file header, never invoked from our UI by construction.
     ("POST", "/api/webhooks/polar"): (
         "webhook",
         "apps/web/app/api/webhooks/polar/route.ts:1",
+    ),
+    # These four ARE reachable in the app. `request()` and `save()` set the method
+    # inside the helper, so the URL literal and the method literal never share a
+    # window. Verified by reading each caller, not by trusting the shape.
+    ("POST", "/api/datasets"): (
+        "in-app-wrapper",
+        "apps/web/app/datasets/DatasetAction.tsx:64",
+    ),
+    ("POST", "/api/datasets/[id]/items"): (
+        "in-app-wrapper",
+        "apps/web/app/datasets/DatasetAction.tsx:72",
+    ),
+    # `OBS-56` S4 — the header's "Add to dataset" with no span_id (restored
+    # 2026-09-27 after B-582's removal). Same `request()` helper, same reason.
+    ("POST", "/api/datasets/[id]/items/batch"): (
+        "in-app-wrapper",
+        "apps/web/app/datasets/DatasetAction.tsx:84",
+    ),
+    # "Stop canary" button -> save("DELETE"); the method is a parameter.
+    ("DELETE", "/api/prompts/[name]/canary"): (
+        "in-app-wrapper",
+        "apps/web/components/prompt-promotion/CanaryPanel.tsx:150",
+    ),
+    # OBS-56 slice 2 (2026-09-27). The gateway route + web proxy ship ahead of
+    # the bulk-select bar's UI (slice 3, Codex, on `OBS-56`'s own vertical-slice
+    # ordering): `flagTracesBatch` is the caller the bar will use, but it lives
+    # in `apps/web/lib/`, which this guard's corpus does not scan (`app/**` +
+    # `components/**` only) — the same shape as `/api/client-errors` above.
+    ("POST", "/api/traces/annotations/batch"): (
+        "in-app-wrapper",
+        "apps/web/lib/annotations.ts:21",
     ),
 }
 

@@ -61,7 +61,7 @@ Prompt promotions roll back on EWMA thresholds over objective signals — cost, 
 and guardrail-fire rate — rather than a human noticing a regression days later. **The
 drift is computed from metric observations you post** to `/v1/prompts/:name/observe`;
 gateway traffic updates the baseline but does not itself trigger a revert, and
-autonomous background monitoring is on the V1.1 roadmap. See
+autonomous background monitoring is not built. See
 [prompt promotion](/prompt-promotion#auto-rollback).
 
 ### Apache 2.0, self-hostable
@@ -71,8 +71,7 @@ plans start at $29/mo (Builder); self-hosting the open-source stack is free.
 
 ## What Tracelane does not do
 
-- **Failure clustering.** Not shipped. Clustering-adjacent capabilities are on the V1.5
-  roadmap.
+- **Failure clustering.** Not shipped.
 - **Automated PR drafting against your repo.** Not shipped, and not on the near roadmap.
 - **Blocking enforcement by default.** Deliberate — see observe-first above.
 
@@ -82,7 +81,7 @@ plans start at $29/mo (Builder); self-hosting the open-source stack is free.
 
 <Accordion title="Does Tracelane do failure clustering today?">
 No. Tracelane positions on full-fidelity capture and the tamper-evident record, not on
-post-failure clustering. Clustering-adjacent capabilities are on the V1.5 roadmap. If
+post-failure clustering. If
 clustering is your primary need today, Tracelane is not yet the tool for that job.
 </Accordion>
 

@@ -18,7 +18,7 @@ All commands respect:
 |---|---|---|
 | `TRACELANE_API_KEY` | Tenant API key (`tlane_<base62>`) | required for live commands |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL | `https://gateway.tracelane.dev` |
-| `TRACELANE_TRACE_CONTENT` | **Not implemented — reads are ignored.** Prompt/response text is never captured by the CLI, the SDKs or the gateway. See [Security](/security#prompt-content) | — |
+| `TRACELANE_TRACE_CONTENT` | **Not implemented — reads are ignored.** The CLI and the SDK provider adapters do not capture prompt/response text; the gateway records it only when a workspace owner turns recording on. See [Security](/security#prompt-content) | — |
 
 ## Commands
 
@@ -121,8 +121,7 @@ There is no baseline, no history and no comparison: the same shape as a coverage
 threshold, which nobody considers broken for lacking a previous run. A run
 scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
 the second "no regression" would be a claim nothing checked. Comparing a run
-against an earlier one is a real gap and is filed, not built — what counts as
-the baseline is a design decision, not a flag.
+against an earlier one is not supported.
 
 Running the Tracelane repository's own conformance suite is a separate thing and
 is not part of this command: from a checkout, use `pnpm eval:run --suite=all`.
@@ -136,7 +135,7 @@ is not part of this command: from a checkout, use `pnpm eval:run --suite=all`.
 
 ### `tlane prompt list | show | promote | rollback | diff`
 
-Front-end for [B1 Prompt Promotion](/decisions/index).
+Front-end for [Prompt Promotion](/prompt-promotion).
 
 Every subcommand takes the prompt **name** as a positional argument, plus the
 shared `--gateway <url>` / `--token <bearer>` (defaulting to
@@ -226,9 +225,9 @@ tlane import-litellm --config ./litellm_config.yaml --dry-run
 
 ### `tlane replay <traceId>`
 
-Read-only time-travel viewer — fetches a recorded trace's spans and renders them
-step-by-step. It does **not** re-issue the request to a provider; cross-model
-re-execution is on the roadmap.
+Read-only trace inspection — fetches a recorded trace's spans and renders them
+step-by-step. It does **not** re-execute models or tools. For a fresh evaluation,
+use an [eval run](/eval-gates); recorded-trace inspection is not a new execution.
 
 ```bash
 tlane replay 9f2c8a1b...

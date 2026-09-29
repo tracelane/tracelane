@@ -24,6 +24,8 @@ COPY packages/verifier-rust/ packages/verifier-rust/
 # the old infra/dev/postgres/migrations set was deleted per ADR-040/),
 # so they must be present in the build context at the same relative path.
 COPY apps/web/db/migrations/ apps/web/db/migrations/
+# Reviewed identity classifier, embedded at compile time.
+COPY apps/web/db/kya_catalog.v1.json apps/web/db/kya_catalog.v1.json
 # BuildKit cache mounts persist the cargo registry + target/ across deploys, so a
 # gateway-only change recompiles just the changed crate (~1min) instead of the
 # full ~500-dep tree from scratch (~5min). The binary MUST be copied OUT of the

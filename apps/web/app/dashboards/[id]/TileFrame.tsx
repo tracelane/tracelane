@@ -39,6 +39,7 @@
  * is set once (12/"compact") and never cycles.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import {
 	type TileHeight,
 	type TileShape,
@@ -111,7 +112,7 @@ export function TileFrame({
 
 	async function patchTile(body: Record<string, unknown>): Promise<boolean> {
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/dashboards/${dashboardId}/tiles/${tileId}`,
 				{
 					method: "PATCH",
@@ -177,7 +178,7 @@ export function TileFrame({
 		setBusy("remove");
 		let ok = false;
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/dashboards/${dashboardId}/tiles/${tileId}`,
 				{ method: "DELETE" },
 			);

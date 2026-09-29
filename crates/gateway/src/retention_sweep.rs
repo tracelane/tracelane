@@ -54,24 +54,30 @@ pub enum SweepMode {
     Enforce,
 }
 
-/// Directory the pre-delete snapshot is written to. **Enforce is refused without
-/// it** — see [`SweepMode::from_env`].
+/// The env var that names a snapshot destination. **Enforce is refused without it**
+/// — see [`SweepMode::from_env`]. **B-452 (2026-09-22, §17): nothing in this module
+/// WRITES a snapshot** — `grep -n 'std::fs\|tokio::fs' retention_sweep.rs` → 0. The
+/// variable is a precondition the operator sets on purpose, not an undo that exists;
+/// the founder's Batch 6 ruling left the snapshot unbuilt (retention's system of
+/// record is Neon + the hourly ledger archive + the JetStream buffer, RI-06). The
+/// comments below that once said "written" are corrected to say "named".
 pub const SNAPSHOT_DIR_ENV: &str = "TRACELANE_RETENTION_SNAPSHOT_DIR";
 
 impl SweepMode {
     /// Parse from `TRACELANE_RETENTION_SWEEP`. Unknown / unset → `Off` (deletion
     /// is strictly opt-in — an operator must ask for `dryrun`/`enforce`).
     ///
-    /// **`Enforce` additionally requires a snapshot destination** and is
+    /// **`Enforce` additionally requires a snapshot destination to be NAMED** and is
     /// downgraded to `DryRun` without one (2026-08-11, founder-ruled).
     ///
     /// Retention deletion is the only irreversible action this process takes, and
-    /// it had **no undo**: the audit ledger records gateway actions, not row
-    /// deletions, so once a sweep ran the rows were simply gone. Requiring the
-    /// snapshot *at the mode boundary* rather than at the delete site means the
-    /// capability cannot be half-configured — you cannot end up in Enforce with
-    /// snapshots silently disabled, which is the configuration that would look
-    /// fine right up until someone needed the undo.
+    /// it has **no undo in this module**: the audit ledger records gateway actions,
+    /// not row deletions, so once a sweep ran the rows are gone from ClickHouse
+    /// (the JetStream buffer and the hourly ledger archive are the recovery paths,
+    /// RI-06 / ADR-078). The precondition was designed for a snapshot writer that was
+    /// never built (B-452); it is kept at the mode boundary so the intent — an
+    /// operator has to ask for deletion twice — survives, and so the day a writer
+    /// exists it has a destination.
     ///
     /// The downgrade is deliberate rather than a hard refusal to boot: the safe
     /// direction for a retention sweep is *not deleting*, and taking the gateway
@@ -90,8 +96,9 @@ impl SweepMode {
             tracing::error!(
                 env = SNAPSHOT_DIR_ENV,
                 "retention sweep asked for ENFORCE with no snapshot destination — \
-                 DOWNGRADED TO DRYRUN. Deletion is the one irreversible action here and \
-                 there is no undo without a pre-delete snapshot. Set the env var named \
+                 DOWNGRADED TO DRYRUN. Deletion is the one irreversible action here; \
+                 the destination is a deliberate second opt-in (no snapshot is written \
+                 by this process). Set the env var named \
                  in this event's `env` field to a writable path to enable enforcement."
             );
         }
@@ -125,10 +132,40 @@ impl SweepMode {
     }
 }
 
-/// Interval between sweeps.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60); // 6h
+/// RI-04 §9 Q4 (founder default, 2026-09-19): WALL-CLOCK slots, not a
+/// boot-relative interval — two gateway processes booted at different times
+/// never aligned their own timers on the old `SWEEP_INTERVAL`, so even with
+/// the RI-04 leader guard below both would still ATTEMPT a run inside the same
+/// rolling 6h window rather than converging on one actual run per slot. Four
+/// slots a day, spaced like the old interval; see
+/// [`secs_until_next_retention_slot`].
+const RETENTION_SLOT_HOURS: [u32; 4] = [0, 6, 12, 18];
+const RETENTION_SLOT_MINUTE: u32 = 20;
 /// Delay before the first sweep, so a fresh node settles before any deletion.
 const INITIAL_DELAY: Duration = Duration::from_secs(120);
+
+/// Seconds from `now` until the next fixed retention-sweep slot
+/// (00:20/06:20/12:20/18:20 UTC) — today's next slot if one remains, else
+/// tomorrow's first. Mirrors `billing::metering_job::secs_until_next_daily`'s
+/// same-day-else-tomorrow shape, generalised to more than one slot per day.
+/// Never zero (`tokio::time::sleep(0)` would fire immediately and busy-loop).
+fn secs_until_next_retention_slot(now: chrono::DateTime<chrono::Utc>) -> u64 {
+    let today = now.date_naive();
+    for &hour in &RETENTION_SLOT_HOURS {
+        let at = today
+            .and_hms_opt(hour, RETENTION_SLOT_MINUTE, 0)
+            .unwrap_or_else(|| today.and_time(chrono::NaiveTime::MIN));
+        if at > now.naive_utc() {
+            return (at - now.naive_utc()).num_seconds().max(1) as u64;
+        }
+    }
+    // Every slot today has passed — the first slot tomorrow.
+    let tomorrow = today + chrono::Duration::days(1);
+    let at = tomorrow
+        .and_hms_opt(RETENTION_SLOT_HOURS[0], RETENTION_SLOT_MINUTE, 0)
+        .unwrap_or_else(|| tomorrow.and_time(chrono::NaiveTime::MIN));
+    (at - now.naive_utc()).num_seconds().max(1) as u64
+}
 
 /// One retention-bearing table + its tenant-scoped count/delete SQL. Literal
 /// `FROM tracelane.<t>` + `WHERE tenant_id = ?` so the tenant-isolation CI guard
@@ -137,6 +174,11 @@ struct SweepTable {
     label: &'static str,
     count_sql: &'static str,
     delete_sql: &'static str,
+    /// RI-02 rule 5: rows whose `tenant_id` has NO `tenants` row — a purged tenant, or
+    /// one that never existed (B-236's bench fixtures). `?` binds the FULL live tenant
+    /// list; `sweep_orphans` refuses to run it on an empty list.
+    orphan_count_sql: &'static str,
+    orphan_delete_sql: &'static str,
 }
 
 const SWEEP_TABLES: &[SweepTable] = &[
@@ -146,6 +188,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.spans \
                      WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.spans WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.spans WHERE tenant_id NOT IN ?",
     },
     SweepTable {
         label: "trace_summaries",
@@ -165,6 +209,9 @@ const SWEEP_TABLES: &[SweepTable] = &[
         delete_sql: "ALTER TABLE tracelane.trace_summaries DELETE \
                      WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?) \
                      SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_summaries WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.trace_summaries DELETE \
+                            WHERE tenant_id NOT IN ? SETTINGS mutations_sync = 2",
     },
     // B-387 (2026-09-12): the sweep covered TWO of the content-bearing tables;
     // the privacy policy's per-plan window applies to every table that holds a
@@ -180,6 +227,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND event_time < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.guardrail_verdicts \
                      WHERE tenant_id = ? AND event_time < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.guardrail_verdicts WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.guardrail_verdicts WHERE tenant_id NOT IN ?",
     },
     SweepTable {
         label: "online_eval_scores",
@@ -187,6 +236,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND scored_at < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.online_eval_scores \
                      WHERE tenant_id = ? AND scored_at < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.online_eval_scores WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.online_eval_scores WHERE tenant_id NOT IN ?",
     },
     SweepTable {
         label: "trace_content_snapshots",
@@ -194,6 +245,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND captured_at < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.trace_content_snapshots \
                      WHERE tenant_id = ? AND captured_at < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_content_snapshots WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.trace_content_snapshots WHERE tenant_id NOT IN ?",
     },
     SweepTable {
         label: "semantic_cache",
@@ -201,6 +254,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND created_at < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.semantic_cache \
                      WHERE tenant_id = ? AND created_at < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.semantic_cache WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.semantic_cache WHERE tenant_id NOT IN ?",
     },
     // BILL-01 / ADR-076 §2.3 (step 9): `blob_refs` carries the SAME per-tenant
     // queryable-history predicate as every content table above — a reference
@@ -217,6 +272,8 @@ const SWEEP_TABLES: &[SweepTable] = &[
                     WHERE tenant_id = ? AND day < now() - toIntervalDay(?)",
         delete_sql: "DELETE FROM tracelane.blob_refs \
                      WHERE tenant_id = ? AND day < now() - toIntervalDay(?)",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.blob_refs WHERE tenant_id NOT IN ?",
+        orphan_delete_sql: "DELETE FROM tracelane.blob_refs WHERE tenant_id NOT IN ?",
     },
 ];
 
@@ -238,7 +295,8 @@ fn sweep_days(queryable_days: i32) -> Option<u64> {
 }
 
 /// Spawn the background retention sweep. No-op (logs) when `mode == Off` or no
-/// ClickHouse URL. Runs after `INITIAL_DELAY`, then every `SWEEP_INTERVAL`.
+/// ClickHouse URL. Runs after `INITIAL_DELAY`, then on the fixed wall-clock
+/// slots (RI-04 §9 Q4 — see [`secs_until_next_retention_slot`]).
 pub fn spawn_retention_task(pool: DbPool, ch_url: Option<String>, mode: SweepMode) {
     if mode == SweepMode::Off {
         tracing::info!(
@@ -254,12 +312,21 @@ pub fn spawn_retention_task(pool: DbPool, ch_url: Option<String>, mode: SweepMod
     tokio::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
         loop {
-            if let Err(e) = run_sweep(&pool, &ch_url, mode).await {
-                // Fail-safe: a resolution failure aborts the WHOLE run (no partial
-                // deletion on a bad tenant list); retry next interval.
-                tracing::error!(error = %e, "retention sweep run failed; retrying next interval");
-            }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            // RI-04: claimed before touching ClickHouse. Doubling this is 2×LOAD for
+            // the same result, not a correctness hazard (spec §2a #6) — but the guard
+            // costs nothing new here: it rides this slot's own Postgres round trip.
+            crate::db::job_guard::run_claimed(&pool, "retention_sweep", || async {
+                if let Err(e) = run_sweep(&pool, &ch_url, mode).await {
+                    // Fail-safe: a resolution failure aborts the WHOLE run (no
+                    // partial deletion on a bad tenant list); retry next slot.
+                    tracing::error!(error = %e, "retention sweep run failed; retrying next slot");
+                }
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                secs_until_next_retention_slot(chrono::Utc::now()),
+            ))
+            .await;
         }
     });
 }
@@ -291,10 +358,17 @@ async fn run_sweep(pool: &DbPool, ch_url: &str, mode: SweepMode) -> anyhow::Resu
             }
         }
     }
+    // RI-02 rule 5 (2026-09-20): rows of tenants that no longer exist. After the
+    // per-tenant pass so a live tenant's window is applied first; the tenant list is
+    // the SAME Neon read (`resolve_retentions`), so a failed read already aborted the
+    // run above (`?`) and can never reach this step with a partial list.
+    let orphans = sweep_orphans(&ch, &tenants, mode).await;
+    total += orphans;
     tracing::info!(
         ?mode,
         tenants = swept,
         rows = total,
+        orphan_rows = orphans,
         "retention sweep complete ({})",
         if mode == SweepMode::Enforce {
             "deleted"
@@ -303,6 +377,96 @@ async fn run_sweep(pool: &DbPool, ch_url: &str, mode: SweepMode) -> anyhow::Resu
         }
     );
     Ok(())
+}
+
+/// RI-02 rule 5 — the orphan-tenant step. Every `SWEEP_TABLES` entry: rows whose
+/// `tenant_id` is not in `tenants` (the live Neon list) are counted, and deleted in
+/// `Enforce`. The 2026-09-12 restore put 10,155 spans of purged / never-registered
+/// tenants back into prod (B-236's three ids, `max(ingested_at)` five days AFTER the
+/// purge); nothing removed them, because the per-tenant pass visits only tenants Neon
+/// still knows.
+///
+/// FAIL-SAFE, stated at the site: an EMPTY tenant list would make `NOT IN` match every
+/// row — "delete everything" — so it is REFUSED with a WARN and the step deletes
+/// nothing. `orphan_step_allowed` is the pure decision, unit-tested; a per-table
+/// failure skips that table and continues, like the per-tenant pass.
+///
+/// # Errors
+/// None returned — fault-tolerance path (CLAUDE.md §10): a failure here means the
+/// orphans wait for the next slot, never that the sweep aborts.
+async fn sweep_orphans(
+    ch: &clickhouse::Client,
+    tenants: &[TenantRetention],
+    mode: SweepMode,
+) -> u64 {
+    if !orphan_step_allowed(tenants.len()) {
+        tracing::warn!(
+            "retention sweep: orphan-tenant step REFUSED — the live tenant list is empty, \
+             and `NOT IN ()` would delete every row (RI-02 rule 5 fail-safe)"
+        );
+        return 0;
+    }
+    let ids: Vec<String> = tenants.iter().map(|t| t.tenant_id.clone()).collect();
+    let mut total = 0;
+    for t in SWEEP_TABLES {
+        match sweep_orphans_one(ch, t, &ids, mode).await {
+            Ok(n) => total += n,
+            Err(e) => tracing::warn!(
+                error = %e, table = t.label,
+                "retention sweep: orphan step failed for a table — skipping"
+            ),
+        }
+    }
+    total
+}
+
+/// The orphan step runs only against a NON-EMPTY tenant list. Pure, so the
+/// fail-safe is assertable without ClickHouse or Neon.
+const fn orphan_step_allowed(live_tenants: usize) -> bool {
+    live_tenants > 0
+}
+
+async fn sweep_orphans_one(
+    ch: &clickhouse::Client,
+    table: &SweepTable,
+    live_tenant_ids: &[String],
+    mode: SweepMode,
+) -> anyhow::Result<u64> {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct CountRow {
+        n: u64,
+    }
+    let CountRow { n } = ch
+        .query(&crate::clickhouse_query::ceiling(table.orphan_count_sql))
+        .bind(live_tenant_ids)
+        .fetch_one::<CountRow>()
+        .await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    match mode {
+        SweepMode::DryRun => {
+            tracing::info!(
+                table = table.label,
+                would_delete = n,
+                "retention sweep [dryrun]: rows of tenants with no `tenants` row"
+            );
+            Ok(rows_accounted(mode, n))
+        }
+        SweepMode::Enforce => {
+            ch.query(table.orphan_delete_sql)
+                .bind(live_tenant_ids)
+                .execute()
+                .await?;
+            tracing::info!(
+                table = table.label,
+                deleted = n,
+                "retention sweep [enforce]: deleted rows of tenants with no `tenants` row (RI-02 rule 5)"
+            );
+            Ok(rows_accounted(mode, n))
+        }
+        SweepMode::Off => Ok(rows_accounted(mode, n)),
+    }
 }
 
 /// Resolve `queryable_days` (BILL-01 / ADR-076 §2.2 — the deletion boundary,
@@ -421,6 +585,163 @@ async fn sweep_one(
 mod tests {
     use super::*;
 
+    /// RI-02 rule 5 fail-safe: the orphan step never runs against an EMPTY live
+    /// list, because `tenant_id NOT IN ()` is "every row". Pure decision, pinned.
+    #[test]
+    fn orphan_step_refuses_an_empty_tenant_list() {
+        assert!(!orphan_step_allowed(0));
+        assert!(orphan_step_allowed(1));
+        assert!(orphan_step_allowed(19));
+    }
+
+    /// RI-02 §2 guard: the sweep's tenant list still comes from `tenants` (a purged
+    /// tenant's row absence is the tombstone this whole spec relies on), and every
+    /// content table carries an orphan count + delete that filter on `tenant_id NOT IN ?`
+    /// against the table the label names — never a different table, never unfiltered.
+    #[test]
+    fn orphan_sql_exists_for_every_sweep_table_and_reads_the_live_tenant_list_from_tenants() {
+        assert!(RETENTION_TENANTS_SQL.contains("FROM tenants t"));
+        for t in SWEEP_TABLES {
+            for sql in [t.orphan_count_sql, t.orphan_delete_sql] {
+                assert!(
+                    sql.contains(&format!("tracelane.{}", t.label)),
+                    "{}: orphan SQL names another table: {sql}",
+                    t.label
+                );
+                assert!(
+                    sql.contains("WHERE tenant_id NOT IN ?"),
+                    "{}: orphan SQL is not the NOT IN shape: {sql}",
+                    t.label
+                );
+            }
+        }
+    }
+
+    /// RI-02 §7 proofs 2 + 3(b), against a REAL ClickHouse (`run-clickhouse-integration.sh`).
+    /// One orphan tenant (no `tenants` row) and one live tenant, one row each in all
+    /// SEVEN content tables. `sweep_orphans(Enforce)` with the live list → the orphan's
+    /// rows are gone from every table and the bystander's are untouched (counted before
+    /// and after). Then the fail-safe: an EMPTY list deletes nothing. RED first: with the
+    /// orphan step absent this test's first assertion reads 7, not 0.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn ri02_orphan_step_deletes_purged_tenants_rows_and_spares_bystanders() {
+        let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let root = clickhouse::Client::default().with_url(&url);
+        root.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let ch = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database("tracelane");
+        for sql in [
+            include_str!("../../../infra/dev/clickhouse/schema.sql"),
+            include_str!("../../../infra/dev/clickhouse/migrations/17_semantic_cache.sql"),
+            include_str!(
+                "../../../infra/dev/clickhouse/migrations/20_evl28_online_eval_scores.sql"
+            ),
+            include_str!(
+                "../../../infra/dev/clickhouse/migrations/21_evl29_trace_content_snapshots.sql"
+            ),
+        ] {
+            for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+                let _ = ch.query(&stmt).execute().await;
+            }
+        }
+        let orphan = uuid::Uuid::new_v4().to_string();
+        let live = uuid::Uuid::new_v4().to_string();
+        // (table, time column) — one row per tenant per table; a span also lands its
+        // trace_summaries row through the MV, so that table is seeded by the span.
+        let seeds: [(&str, &str); 6] = [
+            ("spans", "start_time"),
+            ("guardrail_verdicts", "event_time"),
+            ("online_eval_scores", "scored_at"),
+            ("trace_content_snapshots", "captured_at"),
+            ("semantic_cache", "created_at"),
+            ("blob_refs", "day"),
+        ];
+        for tenant in [&orphan, &live] {
+            for (table, col) in seeds {
+                let sql = if table == "spans" {
+                    "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) \
+                     VALUES (?, ?, 'ri02span0000000', 'ri02 fixture', now64(6) - INTERVAL 1 HOUR, now64(6) - INTERVAL 1 HOUR, '{}')"
+                        .to_string()
+                } else if table == "blob_refs" {
+                    format!("INSERT INTO tracelane.{table} (tenant_id, {col}) VALUES (?, today())")
+                } else {
+                    format!(
+                        "INSERT INTO tracelane.{table} (tenant_id, {col}) VALUES (?, now64(6) - INTERVAL 1 HOUR)"
+                    )
+                };
+                let mut q = ch.query(&sql).bind(tenant.as_str());
+                if table == "spans" {
+                    q = q.bind(uuid::Uuid::new_v4().to_string());
+                }
+                q.execute()
+                    .await
+                    .unwrap_or_else(|e| panic!("seed {table} for {tenant}: {e:#}"));
+            }
+        }
+        async fn rows_for(ch: &clickhouse::Client, tenant: &str) -> Vec<(String, u64)> {
+            let mut out = Vec::new();
+            for t in SWEEP_TABLES {
+                let n: u64 = ch
+                    .query(&format!(
+                        "SELECT count() FROM tracelane.{} WHERE tenant_id = ?",
+                        t.label
+                    ))
+                    .bind(tenant)
+                    .fetch_one()
+                    .await
+                    .expect("count");
+                out.push((t.label.to_string(), n));
+            }
+            out
+        }
+        let orphan_before = rows_for(&ch, &orphan).await;
+        let live_before = rows_for(&ch, &live).await;
+        assert!(
+            orphan_before.iter().all(|(_, n)| *n >= 1),
+            "every content table must hold the orphan's row before the step: {orphan_before:?}"
+        );
+
+        // 3(b) first: an EMPTY live list must delete NOTHING.
+        let refused = sweep_orphans(&ch, &[], SweepMode::Enforce).await;
+        assert_eq!(
+            refused, 0,
+            "an empty tenant list is refused, never 'everything'"
+        );
+        assert_eq!(
+            rows_for(&ch, &orphan).await,
+            orphan_before,
+            "nothing deleted on refusal"
+        );
+
+        // Proof 2: the live list names only `live` → the orphan's rows go, the bystander's stay.
+        let live_list = vec![TenantRetention {
+            tenant_id: live.clone(),
+            queryable_days: 730,
+        }];
+        let deleted = sweep_orphans(&ch, &live_list, SweepMode::Enforce).await;
+        assert!(
+            deleted >= 7,
+            "at least one orphan row per table was accounted: {deleted}"
+        );
+        let orphan_after = rows_for(&ch, &orphan).await;
+        assert!(
+            orphan_after.iter().all(|(_, n)| *n == 0),
+            "the orphan tenant must be gone from every content table: {orphan_after:?}"
+        );
+        assert_eq!(
+            rows_for(&ch, &live).await,
+            live_before,
+            "the bystander's rows are byte-for-byte untouched (same counts in every table)"
+        );
+    }
+
     #[test]
     fn mode_parse_defaults_off_and_is_opt_in() {
         assert_eq!(SweepMode::parse(""), SweepMode::Off);
@@ -430,6 +751,33 @@ mod tests {
         assert_eq!(SweepMode::parse("dryrun"), SweepMode::DryRun);
         assert_eq!(SweepMode::parse("dry-run"), SweepMode::DryRun);
         assert_eq!(SweepMode::parse(" Enforce "), SweepMode::Enforce);
+    }
+
+    #[test]
+    fn secs_until_next_retention_slot_same_day_before_a_slot() {
+        // 05:00 UTC -> the 06:20 slot is next, same day.
+        let now = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 19)
+                .unwrap()
+                .and_hms_opt(5, 0, 0)
+                .unwrap(),
+            chrono::Utc,
+        );
+        assert_eq!(secs_until_next_retention_slot(now), 80 * 60);
+    }
+
+    #[test]
+    fn secs_until_next_retention_slot_rolls_to_tomorrows_first_slot() {
+        // 19:00 UTC -> every slot today (00/06/12/18:20) has passed; next is
+        // tomorrow's 00:20.
+        let now = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 19)
+                .unwrap()
+                .and_hms_opt(19, 0, 0)
+                .unwrap(),
+            chrono::Utc,
+        );
+        assert_eq!(secs_until_next_retention_slot(now), 5 * 3600 + 20 * 60);
     }
 
     /// THE REGRESSION. `DryRun` returned 0, so `run_sweep`'s summary printed

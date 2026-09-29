@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * TopBar — the thin strip beside the sidebar (ADR-074 §6). It keeps ONLY four
@@ -54,7 +55,7 @@ function openPalette() {
 
 export function TopBar({ orgSlot }: { orgSlot?: ReactNode }) {
 	return (
-		<header className="glass sticky top-0 z-40 flex h-14 shrink-0 items-center gap-3 border-b border-line px-4">
+		<header className="sticky top-0 z-40 flex h-12 shrink-0 items-center gap-3 border-b border-line bg-surface px-4 max-lg:pl-16">
 			{/*
 			 * The command surface. `--surface` (the card white / #151619), NOT the
 			 * `--surface-2` well, and the deciding reason is the ⌘K key inside it:
@@ -68,11 +69,12 @@ export function TopBar({ orgSlot }: { orgSlot?: ReactNode }) {
 			 * secondary ink on hover, so the control is quiet at rest and answers when
 			 * approached.
 			 */}
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={openPalette}
 				aria-label="Search — open the command palette"
-				className="flex h-9 min-w-64 items-center gap-2.5 rounded-[var(--radius-control)] border border-line bg-surface px-3 text-ink-3 text-sm transition-colors hover:border-line-2 hover:text-ink-2 max-sm:min-w-0"
+				className="flex h-8 min-w-64 items-center gap-2.5 rounded-[var(--radius-control)] border border-transparent bg-surface-2 px-3 sm:min-w-[26rem] text-ink-3 text-sm transition-colors hover:border-line-2 hover:text-ink-2 max-sm:min-w-0"
 			>
 				<svg
 					viewBox="0 0 16 16"
@@ -92,7 +94,7 @@ export function TopBar({ orgSlot }: { orgSlot?: ReactNode }) {
 				<kbd className="ml-auto hidden rounded border border-line bg-canvas-sunken px-1.5 py-0.5 font-mono text-2xs text-ink-3 sm:inline">
 					⌘K
 				</kbd>
-			</button>
+			</Button>
 
 			<div className="ml-auto flex items-center gap-2">
 				{orgSlot}

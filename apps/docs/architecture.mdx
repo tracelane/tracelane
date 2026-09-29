@@ -4,185 +4,243 @@ description: Tour the five Tracelane components — Rust gateway, ingest workers
 classification: PUBLIC
 ---
 
-<Frame>
-  <img src="/images/architecture-data-flow.svg" alt="Tracelane architecture: agent → gateway → ingest → storage → dashboard/MCP/CLI" />
-</Frame>
-
 Tracelane is five components in one monorepo:
 
 <CardGroup cols={2}>
   <Card title="Rust gateway" icon="bolt">
-    Axum + tokio. BYOK provider routing across 191 LLM providers (6 native
-    adapters + any OpenAI-compatible endpoint). OTLP emit. Predictive layer
-    inline (observe-first by default). Zero-allocation hot path. <code>crates/gateway/</code>
+    Axum + tokio. BYOK routing across 191 routable providers (6 native adapters
+    + 185 OpenAI-compatible catalog entries). One typed admission pipeline shared
+    by the chat, embeddings and messages routes. Predictive layer inline,
+    observe-first by default. Emits its own spans. <code>crates/gateway/</code>
   </Card>
   <Card title="Rust ingest workers" icon="arrow-down-to-bracket">
-    OTLP receiver, NATS consumer, ClickHouse batched writes. High-throughput
-    single-node ingest. <code>crates/ingest/</code>
+    OTLP receiver, NATS JetStream consumer, batched ClickHouse inserts
+    acknowledged after the write. The only component that writes spans.
+    <code>crates/ingest/</code>
   </Card>
   <Card title="Next.js 15 dashboard" icon="display">
-    App Router, Tailwind 4, in-house component library and transcript-spine trace viewer (SVG/DOM).
-    <code>apps/web/</code>
+    App Router, Tailwind 4, in-house components. Trace viewer with waterfall,
+    transcript-spine and agent-lane views, rendered in the DOM. No ClickHouse
+    client. <code>apps/web/</code>
   </Card>
   <Card title="TypeScript MCP server" icon="plug">
-    Read-only, tenant-scoped, bearer-token auth. Run from source today; <code>npx @tracelanedev/mcp</code> once published to npm.
-    <code>apps/mcp/</code>
+    Read-only, tenant-scoped, bearer-token auth. <code>npx @tracelanedev/mcp</code>,
+    stdio or streamable-HTTP transport. <code>apps/mcp/</code>
   </Card>
   <Card title="Python eval orchestrator" icon="flask">
-    Wraps DeepEval + Ragas + Inspect AI behind a unified API. Runs in the
-    canonical repository's CI.
-    <code>evals/</code>
+    Wraps DeepEval + Ragas + Inspect AI behind a unified API. Runs in CI. <code>evals/</code>
   </Card>
 </CardGroup>
 
+
 ## Data flow
 
-```
-                       ┌────────────────────────────────────────┐
-                       │            Tracelane Gateway           │
-                       │   (Rust · axum · tokio · BYOK · OTLP)  │
-   client SDK  ───►    │                                        │
-                       │   ┌────────────────────────────────┐   │
-                       │   │   Predictive Guard Layer       │   │
-                       │   │   (PR1..PR8 — observe-first)   │   │
-                       │   └────────────────────────────────┘   │
-                       │            │                           │
-                       │            ▼                           │
-                       │   ┌────────────────────────────────┐   │
-                       │   │   Provider Adapter             │   │
-                       │   │   (Anthropic, OpenAI, …)       │   │
-                       │   └────────────────────────────────┘   │
-                       │            │                           │
-                       │            ▼ OTLP                      │
-                       └────────────│───────────────────────────┘
-                                    ▼
-                           ┌─────────────────┐
-                           │  Ingest workers │
-                           │  (Rust · NATS)  │
-                           └────────┬────────┘
-                                    ▼
-                       ┌──────────────────────────┐
-                       │  ClickHouse (hot tier)   │
-                       │  Postgres (metadata)     │
-                       └────────────┬─────────────┘
-                                    ▲
-                       ┌────────────┴─────────────┐
-                       │   Dashboard (Next.js)    │
-                       │   MCP server (TS)        │
-                       │   tlane CLI              │
-                       └──────────────────────────┘
+```mermaid
+flowchart LR
+  Client["OpenAI- or Anthropic-style client"] -->|"HTTPS · bearer"| Gateway["Gateway<br/>crates/gateway"]
+  SDK["OTel SDK / OTLP exporter"] -->|"POST /v1/traces · API key"| Gateway
+  SDK -.->|"OTLP · self-host, same host only"| Ingest["Ingest worker<br/>crates/ingest"]
+  Gateway -->|"HTTPS · your provider key"| Provider["LLM provider"]
+  Gateway -->|"spans · acked JetStream publish"| NATS[("NATS JetStream")]
+  Gateway -->|"audit events · acked JetStream publish"| NATS
+  NATS -->|"span consumer"| Ingest
+  NATS -->|"audit head-writer (a task inside the gateway)"| Gateway
+  Ingest -->|"batched inserts · ack after write"| CH[("ClickHouse")]
+  Gateway -->|"control plane · canonical ledger rows + anchors"| PG[("Postgres")]
+  Gateway -->|"ledger copy · verdicts · reads, never spans"| CH
+  Gateway -.->|"batch anchor · best-effort"| Rekor["Sigstore Rekor v2"]
+  Dashboard["Dashboard<br/>apps/web"] -->|"user JWT"| Gateway
+  Dashboard -->|"Drizzle · control-plane tables"| PG
+  MCP["MCP server<br/>apps/mcp"] -->|"HTTP transport · always via the gateway"| Gateway
+  MCP -.->|"stdio transport · self-host ClickHouse"| CH
+  CLI["tlane CLI"] -->|"HTTPS"| Gateway
 ```
 
-The three flows below are the same picture at higher resolution. Every box maps
-to a real crate or service — no aspirational components.
+Solid edges are the hosted product's path. Dashed edges exist only in a
+particular configuration: the ingest worker's own OTLP receiver is reachable
+inside the deployment network over mTLS, or on a self-host install as a
+plaintext port bound to the same host; the MCP server reads ClickHouse directly
+only on its stdio transport with `CLICKHOUSE_URL` set, and its HTTP transport
+refuses to start with that variable present; the Rekor anchor is best-effort and
+needs a configured Rekor endpoint.
+
 
 ### Write path
 
-<Frame>
-  <img src="/images/write-path.svg" alt="Write path: client → gateway (auth, rate/quota, inline pre-flight policy, audit chain append, provider dispatch) → NATS JetStream → ingest (OTLP receiver, decode, tail-sample, ack-after-write) → ClickHouse hot + R2 cold" />
-</Frame>
+A request enters the gateway through one typed admission pipeline shared by
+`/v1/chat/completions`, `/v1/embeddings` and `/v1/messages`. Its order is fixed
+in code and checked at compile time: authenticate (a WorkOS JWT or a `tlane_`
+API key, resolved to an internal tenant UUID) → scope → parse → entitlements →
+rate limit → key and workspace budgets → predictive layer (observe-first: its
+verdict is recorded on the request and enforced only when the operator sets
+`TRACELANE_PREDICTIVE_ENFORCE=1`) → audit publish. The audit publish is an
+acknowledged JetStream write, and it fails closed: if the ledger cannot take the
+event the request is refused with `503 audit_unavailable`, before any byte
+reaches a provider.
 
-A request enters the gateway (the typed admission pipeline in
-`crates/gateway/src/admission.rs`, then `server/chat.rs`), which validates the
-WorkOS JWT into an internal tenant UUID (`auth/api_key.rs`,
-`TenantId::from_jwt_claim`), applies per-tenant rate + quota
-(`rate_limiter.rs`), runs the inline pre-flight guardrail rails and observe-first
-predictors (`guardrail/`, `predictive/`), appends the per-tenant audit hash chain
-(`audit_format/mod.rs:102`, `row_hash_v2`), and dispatches to the upstream provider
-with cross-provider failover (`providers/`, `failover.rs`). Emitted OTel-GenAI spans
-travel over **NATS JetStream** to the ingest workers, which authenticate over SPIFFE
-mTLS (`ingest/src/otlp_receiver.rs:103`, `auth.rs`), decode (`otlp_decode.rs:86`),
-tail-sample (`tail_sampler.rs`), and only acknowledge after a durable ClickHouse
-flush (`nats_consumer.rs`, `span_envelope.rs`) — then write **ClickHouse**. Spans
-live in ClickHouse only; there is no cold-tier archival in this product today.
+
+After admission the chat handler resolves the provider and the tenant's own
+provider key, runs the inline guardrail rails over the request (a rail verdict
+is recorded to the ledger either way; a security rail can refuse the call with
+`403`), wraps tool-result content in an `<UNTRUSTED_USER_DATA>` sentinel, and
+dispatches with one same-provider retry. Cross-provider failover is off by
+default and enabled per request with `X-Tracelane-Failover: cross-provider`;
+a failover that served the request is named on the span.
+
+
+The gateway's own spans, and any OTLP batch a client sends to `POST /v1/traces`,
+are published to NATS JetStream with an acknowledged publish and a per-span
+`Nats-Msg-Id`, so a republished span is dropped at the boundary. The ingest
+consumer takes the tenant from the subject the message arrived on, never from
+the span body, tail-samples (errors and spans carrying an intervention are
+always kept; the default keep rate is 100%), batches the inserts, and acknowledges a
+message only after the ClickHouse write returns — a failed insert leaves the
+message unacknowledged and JetStream redelivers it.
+
+
+Span deletion follows the plan's queryable window (Free 30 days, every paid tier
+730 days), applied by an entitlement-driven sweep job that reads the plan table;
+the table's own TTL is a backstop behind it. Retention is not customer-configurable.
+
 
 ### Read path
 
-<Frame>
-  <img src="/images/read-path.svg" alt="Read path: dashboard (per-user WorkOS JWT, zero direct ClickHouse reads) → gateway read API (org_id → internal tenant UUID bridge, per-tier SQL caps, WHERE tenant_id = ?) → ClickHouse" />
-</Frame>
+```mermaid
+flowchart LR
+  Dashboard["Dashboard<br/>apps/web · no ClickHouse client"] -->|"per-user WorkOS JWT"| Read["Gateway read API<br/>trace_reads.rs"]
+  Read -->|"org_id → tenant UUID from the validated claim"| SQL["Tenant-bound SQL<br/>WHERE tenant_id = ? · per-tier caps"]
+  SQL -->|"bounded rows / memory / time"| CH[("ClickHouse")]
+  CH -->|"rows"| Read
+  Read -->|"JSON"| Dashboard
+```
 
-The dashboard holds **zero direct ClickHouse reads** — it sends a per-user WorkOS JWT
-to the gateway read API (`crates/gateway/src/trace_reads.rs`), which bridges the
-WorkOS `org_id` to the internal tenant UUID from the validated claim, builds a
-capped SQL query (`build_trace_list_sql:905`, `clickhouse_query.rs::TenantQuery`),
-and reads ClickHouse. **Every query is `WHERE tenant_id = ?`** with the value taken
-from the claim, never the request body — enforced by the CI grep
-(`scripts/ci/check-tenant-isolation.py`).
+The dashboard has no ClickHouse client. It forwards the signed-in user's WorkOS
+token to the gateway's read routes (`/v1/traces`, `/v1/sessions`, `/v1/slo`,
+`/v1/costs`, `/v1/guardrails/*`, `/v1/query/signatures` and the rest), which
+resolve the tenant from the validated claim — never from the path, query string
+or body — bind it first in a parameterised `WHERE tenant_id = ?`, and wrap the
+SELECT in a per-tier `SETTINGS` clause that caps rows read, memory and execution
+time. A trace that belongs to another tenant answers the same `404` as one that
+does not exist. Two CI guards hold this: one fails any query against
+`tracelane.*` whose literal carries no tenant filter, the other fails any
+ClickHouse read outside the capped wrapper.
+
 
 ### The ledger
 
-<Frame>
-  <img src="/images/ledger.svg" alt="Audit ledger: per-tenant SHA-256 hash chain (row_hash of tenant_id, seq, type, actor, canonical payload, prev_hash) → Merkle root every 100 events → Ed25519 signing (live) → best-effort Sigstore Rekor v2 anchor with resolved inclusion proof (distinct dashed treatment; universal anchoring on the roadmap)" />
-</Frame>
+```mermaid
+flowchart LR
+  Ev["Admitted request"] -->|"acked JetStream publish, before dispatch"| HW["Head-writer<br/>seq · prev_hash · row_hash"]
+  HW -->|"one transaction: head + row"| PG[("Postgres<br/>canonical ledger")]
+  HW -.->|"derived copy, after commit"| CH[("ClickHouse<br/>audit_log")]
+  PG -->|"every 100 rows or 24 h"| Batch["Merkle root<br/>RFC 6962"]
+  Batch -->|"Ed25519, per-tenant key"| Sig["Signed attestation<br/>stored with the batch"]
+  Batch -.->|"ECDSA-P256 · best-effort"| Rekor["Sigstore Rekor v2<br/>inclusion proof + log index"]
+  PG -->|"GET /v1/audit/export"| Export["NDJSON export"]
+  Export -->|"tlane verify · offline"| Verify["Rust / TypeScript / Python verifiers"]
+```
 
-Each audit event is `row_hash = SHA-256(tenant_id ‖ seq ‖ type ‖ actor ‖
-canonical_payload ‖ prev_hash)`, domain-separated and length-prefixed
-(`audit_format/mod.rs:102`). Every 100 events a Merkle root is assembled
-(`audit.rs:789`) and **Ed25519-signed** by the tenant's key (`audit.rs:174`) —
-signing is live. Anchored batches are additionally submitted to the public
-**Sigstore Rekor v2** transparency log on a best-effort, opt-in basis
-(`audit.rs:1077`, `submit_anchor_v2`) and carry a resolved inclusion proof + log
-index; universal per-run anchoring is on the roadmap (distinct dashed treatment in
-the diagram). `tlane verify` recomputes the chain offline with byte-identical Rust /
-Python / TypeScript verifiers.
+Each admitted request is appended as a row in a per-tenant hash chain, and
+guardrail verdicts are appended the same way:
+`row_hash = SHA-256(tenant_id ‖ seq ‖ type ‖ actor ‖ canonical_payload ‖
+prev_hash)`, domain-separated and length-prefixed over the RFC 8785 canonical
+payload. A single head-writer task inside the gateway assigns `seq` and commits
+the row and the chain head in one Postgres transaction; the ClickHouse
+`audit_log` table is a derived copy written after that commit, and the boot-time
+reconcile that rebuilds it recomputes each candidate row's content hash before
+adopting it into the canonical store.
+
+
+Batches close every 100 rows or after 24 hours, whichever comes first. Each
+batch's RFC 6962 Merkle root is signed with the tenant's own Ed25519 key, and
+the signed attestation binds the root to the batch's anchor state so a stripped
+or downgraded export fails offline verification. The root is additionally
+submitted to the public Sigstore Rekor v2 transparency log on a best-effort
+basis when the deployment configures a Rekor endpoint; an anchored batch carries
+the resolved inclusion proof, checkpoint and log index, and an unanchored batch
+stays signed-locally and still verifies its chain. Anchoring is per batch, never
+per event. The export
+(`GET /v1/audit/export`) streams the canonical Postgres rows and anchor records
+as NDJSON and fails closed: a read error aborts the transfer rather than
+returning a partial ledger. `tlane verify` recomputes the chain offline; the
+Rust, TypeScript and Python reference verifiers are held to the same verdicts on
+committed conformance vectors in CI.
+
+
+A self-host install with no Postgres control plane keeps a process-local chain
+and writes the ClickHouse copy on a best-effort basis; that tier has no
+canonical store and should not be read as the same durability as the hosted
+ledger.
+
 
 ## Source-of-truth split
 
-| Datum | Lives in | Rationale |
+| Datum | Lives in | Notes |
 |---|---|---|
-| Tenant + user metadata, API keys, billing | Postgres | OLTP: low volume, high integrity |
-| Spans (365-day TTL) | ClickHouse | OLAP: high-throughput fan-out queries |
-| Audit log | NDJSON files in a tamper-evident hash chain (Ed25519 batch signing + Sigstore Rekor v2 anchoring live, best-effort, on every plan) | Tamper-evident, byte-identical verifier across 3 languages |
-| Prompt versions + pinning | Postgres | Atomic promotion + rollback |
-| Predictive policies | Postgres | Tenant-scoped, hot-cached in gateway |
+| Tenant and user metadata, API keys, entitlements, plan and billing state | Postgres | Written by the dashboard through Drizzle; plan state is updated by the signature-verified billing webhook. Read by the gateway through in-process caches rather than per request. |
+| Spans and trace summaries | ClickHouse | Ingest is the only writer. Deleted at the end of the plan's queryable window by the sweep job. |
+| Canonical audit chain rows and anchor records | Postgres | Same transaction as the chain head. Export and self-verify read here and never fall back to the copy. |
+| Derived audit copy and guardrail verdicts | ClickHouse | Written by the gateway after commit; rebuilt by the boot reconcile. Dashboard reads. |
+| Prompt versions, promotion decisions, rollback events | ClickHouse | Read by the gateway's prompt router. |
+| Online-eval policies | Postgres | The policy rows; the score rows are in ClickHouse. |
+| Usage meters | ClickHouse | Counters written on the hot path and daily gauges from a metering job, which emits usage to the billing provider and records a day's completion marker only after every emission succeeded. |
 
-## Performance budgets
 
-The gateway-overhead row is **measured** (2026-09-07, LiteLLM's AIGatewayBench harness, 4 vCPU,
-two runs, capture on — [benchmark page](/benchmarks)); the pre-flight policy rows are still
-**internal CI targets** the benchmark suite enforces on PRs, not published measurements.
+## Performance
 
-| Metric | p50 | p95 | p99 |
-|---|---|---|---|
-| Gateway overhead (excl. provider time) | `2ms` measured (target `<5ms`) | `4ms` measured (target `<15ms`) | `5ms` measured (target `<25ms`) |
-| Ingest end-to-end | `<1s` | `<3s` | `<5s` |
-| Dashboard 10K-span trace load | `<200ms` | `<500ms` | `<1s` |
-| MCP query (filtered, indexed) | `<50ms` | `<150ms` | `<300ms` |
-| Predictive layer (inline, combined) | `<30ms` | `<50ms` | `<100ms` |
-| SLM judge (1B encoder, L4 GPU) | `<50ms` | `<100ms` | `<200ms` |
+The gateway-overhead figure is **measured**: 2 ms p50 / 4 ms p95 / 5 ms p99 over
+the direct-to-mock baseline, 2026-09-07, LiteLLM's AIGatewayBench harness on a
+4 vCPU host, two runs, capture on. Method, caveats and the other gateways are on
+the [benchmark page](/benchmarks). The benchmark script enforces a p99 below
+25 ms as a k6 threshold; that job runs on demand, not on every change.
 
-Measured 2026-09-07 with LiteLLM's AIGatewayBench harness on a 4 vCPU host, two runs, capture on — method, caveats and the other gateways on the [benchmark page](/benchmarks).
+The predictive layer's `<30ms p50 / <50ms p95 / <100ms p99` figure is an
+engineering target, not a measurement on production-equivalent hardware — see
+[Predictive guardrails](/predictive-guardrails). No other latency or throughput
+figure for ingest, the dashboard, the MCP server or the eval layer has been
+measured or is enforced, so none is published here.
 
-Throughput floors are likewise internal targets pending the Reliability Benchmark v1.0:
-- High-throughput single-node and multi-node ingest
-- Single-instance gateway throughput with full tracing on
-- SLM judge throughput on a single L4 GPU
 
 ## Security posture
 
-- **BYOK only for V1.** Provider keys sealed with AES-256-GCM (`ring` AEAD) under an envelope master key, AAD-bound to `(tenant_id, provider_id)`. A KMS-backed master key is on the roadmap.
-- **mTLS for ingest, TLS 1.3 minimum** for external traffic.
-- **Tenant isolation is structural.** Every ClickHouse query starts
-  `WHERE tenant_id = ?` (CI grep blocks any new SQL without it). The
-  `tenant_id` always comes from the JWT claim, never the request body.
-- **Prompt-injection-aware.** User-supplied span content is wrapped in
-  `<UNTRUSTED_USER_DATA>` before any agent reads it.
-- **Trusted Publishing OIDC only.** No long-lived PyPI/npm/crates.io tokens.
-- **Sigstore signing + CycloneDX SBOM.** Live on tagged release artifacts as of
-  `v0.2.3` — each binary ships a `.cosign.bundle`, and `sbom.cyclonedx.json` is
-  attached and signed — as well as on the container image and the weekly
+- **BYOK only.** Provider keys are sealed with AES-256-GCM (`ring` AEAD) under an
+  envelope master key, with the AAD bound to `provider-key:<tenant_uuid>:<provider_id>`
+  so a ciphertext cannot be moved between tenants or providers. KMS-backed
+  master-key management is not available yet.
+- **mTLS for ingest, TLS 1.3 only.** The ingest worker's OTLP receiver
+  terminates mTLS itself and is built with TLS 1.3 as its only protocol
+  version; plaintext mode exists for local development.
+- **Tenant identity comes from a validated credential.** Read routes resolve the
+  tenant from the claim and bind it in SQL; the query wrapper adds the resource
+  caps and leaves the tenant filter to the caller, which the CI guard checks per
+  query literal.
+- **Outbound calls to customer-supplied URLs are pinned.** The SSRF guard
+  validates the scheme and resolved addresses and returns the addresses it
+  checked; the alert-webhook and Vertex token-endpoint clients connect to
+  exactly those addresses, so a DNS answer that changes after validation is not
+  followed.
+- **Per-service data-plane credentials.** The gateway and ingest processes
+  authenticate to NATS with their own credentials and derive a private
+  reply-inbox prefix from that credential, so one service cannot receive the
+  other's deliveries. CI proofs run the real clients against the deployment's
+  NATS authorization and ClickHouse grants and assert the refusals, not only
+  the grants.
+- **Prompt-injection-aware.** Tool-result messages and tool-result content
+  parts in a proxied request are wrapped in `<UNTRUSTED_USER_DATA>` before the
+  model sees them; user turns are left alone.
+- **Trusted Publishing OIDC only.** npm, PyPI and crates.io publishes mint
+  short-lived tokens from the workflow's OIDC identity; the release workflows
+  reference no stored registry secret.
+- **Sigstore signing + CycloneDX SBOM.** Live on tagged release artifacts since
+  `v0.2.3` — each binary ships a `.cosign.bundle`, `sbom.cyclonedx.json` is
+  attached and signed — as well as on the container image and a weekly
   repository SBOM.
 
-## Subagents (Claude Code)
-
-The build is itself instrumented. We use fourteen subagents covering review,
-benchmarking, eval, security, incident response, marketing, competitor tracking,
-documentation upkeep, and memory curation. These live in the canonical repository and are not part of this mirror.
 
 ## Related
 
 - [Predictive guardrails](/predictive-guardrails) — what runs inline
-- [Providers](/providers) — 191 supported LLM providers
+- [Audit ledger](/audit-ledger) — the chain, signing and anchoring in detail
+- [Providers](/providers) — 191 routable LLM providers
 - [API reference](/api-reference) — REST surface
 - [Decisions](/decisions/index) — architectural decisions

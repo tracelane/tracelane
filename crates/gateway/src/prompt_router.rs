@@ -19,7 +19,7 @@
 //!   - Eval-gate enforcement on promote(): REAL via `ClickHouseEvalGate`
 //!     wired with `with_eval_gate(...)` — a promotion is blocked unless
 //!     its eval run is recorded `passed` in `eval_runs`. The default
-//!     `PermissiveGate` is used only in unit tests / dev with no DB.
+//!     `UnavailableGate` is used only in unit tests / dev with no DB.
 //!
 //! Performance budgets:
 //! - Routing pointer read (cached):        <1ms p99
@@ -79,6 +79,135 @@ pub struct PromptVersion {
     pub content: String,
     pub model_pin: Option<String>,
     pub sha256: [u8; 32],
+}
+
+/// Persisted configuration. Percentage is data chosen by the owner, never a default.
+///
+/// **NOT `Deserialize`, deliberately.** A `Deserialize` derive on a struct carrying a
+/// `TenantId` is a FOURTH constructor that builds the tenant straight from bytes, bypassing
+/// all three trust boundaries — and `grep TenantId::from_` does not show it, which is what
+/// makes it dangerous rather than merely wrong. `check-tenant-id-provenance.sh` caught this
+/// derive on the first gate after it landed. The only way in is `TryFrom<CanaryRow>` below,
+/// which takes the tenant through `tenant_from_stored`. `Serialize` stays: the record is
+/// returned as `Json<CanaryRecord>` by two read handlers and is never a request body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CanaryRecord {
+    pub tenant_id: TenantId,
+    pub prompt_name: String,
+    pub canary_id: Uuid,
+    pub stable_version_id: Uuid,
+    pub candidate_version_id: Uuid,
+    pub candidate_percent: f64,
+    pub enabled: bool,
+    pub changed_at_ms: i64,
+    pub changed_by: String,
+}
+#[derive(Clone, Debug, Default)]
+pub struct CanaryCacheContext {
+    pub suspended: bool,
+    pub namespace: String,
+}
+#[derive(Default)]
+struct CanarySnapshot {
+    records: HashMap<(TenantId, String), CanaryRecord>,
+    cache: HashMap<TenantId, CanaryCacheContext>,
+}
+impl CanarySnapshot {
+    fn new(records: HashMap<(TenantId, String), CanaryRecord>) -> Self {
+        let mut grouped: HashMap<TenantId, Vec<&CanaryRecord>> = HashMap::new();
+        for record in records.values() {
+            grouped
+                .entry(record.tenant_id.clone())
+                .or_default()
+                .push(record);
+        }
+        let cache = grouped
+            .into_iter()
+            .map(|(tenant, mut rows)| {
+                rows.sort_by(|a, b| a.prompt_name.cmp(&b.prompt_name));
+                let mut hash = blake3::Hasher::new();
+                for row in &rows {
+                    hash.update(&(row.prompt_name.len() as u64).to_le_bytes());
+                    hash.update(row.prompt_name.as_bytes());
+                    hash.update(row.canary_id.as_bytes());
+                }
+                (
+                    tenant,
+                    CanaryCacheContext {
+                        suspended: rows.iter().any(|r| r.enabled),
+                        namespace: hash.finalize().to_hex().to_string(),
+                    },
+                )
+            })
+            .collect();
+        Self { records, cache }
+    }
+}
+#[derive(Debug, thiserror::Error)]
+pub enum ResolutionRefusal {
+    #[error("canary_identity_required")]
+    IdentityRequired,
+    #[error("canary_state_unavailable")]
+    Unavailable,
+}
+#[derive(Debug)]
+pub struct PromptResolution {
+    pub version: PromptVersion,
+    pub arm: &'static str,
+    pub canary_id: Option<Uuid>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, clickhouse::Row)]
+struct CanaryRow {
+    tenant_id: String,
+    prompt_name: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    canary_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    stable_version_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    candidate_version_id: Uuid,
+    candidate_percent: f64,
+    enabled: u8,
+    changed_at: i64,
+    changed_by: String,
+}
+impl From<&CanaryRecord> for CanaryRow {
+    fn from(r: &CanaryRecord) -> Self {
+        Self {
+            tenant_id: r.tenant_id.to_string(),
+            prompt_name: r.prompt_name.clone(),
+            canary_id: r.canary_id,
+            stable_version_id: r.stable_version_id,
+            candidate_version_id: r.candidate_version_id,
+            candidate_percent: r.candidate_percent,
+            enabled: u8::from(r.enabled),
+            changed_at: r.changed_at_ms,
+            changed_by: r.changed_by.clone(),
+        }
+    }
+}
+impl TryFrom<CanaryRow> for CanaryRecord {
+    type Error = anyhow::Error;
+    fn try_from(r: CanaryRow) -> Result<Self> {
+        if r.enabled > 1
+            || !r.candidate_percent.is_finite()
+            || !(0.0..=100.0).contains(&r.candidate_percent)
+        {
+            return Err(anyhow!("invalid persisted canary configuration"));
+        }
+        Ok(Self {
+            tenant_id: tenant_from_stored(&r.tenant_id)?,
+            prompt_name: r.prompt_name,
+            canary_id: r.canary_id,
+            stable_version_id: r.stable_version_id,
+            candidate_version_id: r.candidate_version_id,
+            candidate_percent: r.candidate_percent,
+            enabled: r.enabled == 1,
+            changed_at_ms: r.changed_at,
+            changed_by: r.changed_by,
+        })
+    }
 }
 
 /// Outcome of a `promote()` call.
@@ -145,27 +274,39 @@ pub enum EvalRunStatus {
 }
 
 /// Eval gate hook — looks up an eval run's status by id, scoped to the
-/// tenant (every ClickHouse read is tenant-isolated per CLAUDE.md).
+/// tenant and exact candidate version. Passing evidence is not transferable.
 /// Production impl (`ClickHouseEvalGate`) queries `eval_runs`; tests pass
 /// a static map. Async because the production impl issues a network read —
 /// this is the control-plane promote path, not the gateway hot path, so
 /// `async_trait` is acceptable here (cf. `PromotionPersister`).
 #[async_trait::async_trait]
 pub trait EvalGate: Send + Sync {
-    async fn status(&self, tenant_id: &TenantId, eval_run_id: Uuid) -> Option<EvalRunStatus>;
+    async fn status(
+        &self,
+        tenant_id: &TenantId,
+        eval_run_id: Uuid,
+        candidate_version_id: Uuid,
+    ) -> Option<EvalRunStatus>;
 }
 
 /// In-process eval gate backed by a static map. Useful for tests and for
 /// the gateway's startup-config eval registry. Production swaps in a
 /// ClickHouse-backed implementation.
 pub struct StaticEvalGate {
-    pub statuses: HashMap<Uuid, EvalRunStatus>,
+    pub statuses: HashMap<(TenantId, Uuid, Uuid), EvalRunStatus>,
 }
 
 #[async_trait::async_trait]
 impl EvalGate for StaticEvalGate {
-    async fn status(&self, _tenant_id: &TenantId, eval_run_id: Uuid) -> Option<EvalRunStatus> {
-        self.statuses.get(&eval_run_id).copied()
+    async fn status(
+        &self,
+        tenant_id: &TenantId,
+        eval_run_id: Uuid,
+        candidate_version_id: Uuid,
+    ) -> Option<EvalRunStatus> {
+        self.statuses
+            .get(&(tenant_id.clone(), eval_run_id, candidate_version_id))
+            .copied()
     }
 }
 
@@ -312,6 +453,13 @@ pub struct RoutingEntry {
 /// Durable store for authored prompt versions + the list/reconstruction reads.
 #[async_trait::async_trait]
 pub trait VersionStore: Send + Sync {
+    async fn save_canary(&self, _record: &CanaryRecord) -> Result<()> {
+        Err(anyhow!("canary persistence unavailable"))
+    }
+    async fn load_canaries(&self) -> Result<Vec<CanaryRecord>> {
+        Ok(Vec::new())
+    }
+
     /// Persist a newly-authored version. `template_variables` + `created_by` are
     /// metadata beyond the lean in-memory [`PromptVersion`].
     async fn insert(
@@ -626,6 +774,19 @@ fn tenant_from_stored(s: &str) -> Result<TenantId> {
 
 #[async_trait::async_trait]
 impl VersionStore for ClickHouseVersionStore {
+    async fn save_canary(&self, record: &CanaryRecord) -> Result<()> {
+        let mut insert = self.client.insert("prompt_canaries")?;
+        insert.write(&CanaryRow::from(record)).await?;
+        insert.end().await?;
+        Ok(())
+    }
+    async fn load_canaries(&self) -> Result<Vec<CanaryRecord>> {
+        let rows=self.client.query(&crate::clickhouse_query::ceiling(
+            "SELECT tenant_id, prompt_name, canary_id, stable_version_id, candidate_version_id, candidate_percent, enabled, changed_at, changed_by FROM prompt_canaries ORDER BY changed_at DESC, canary_id DESC LIMIT 1 BY tenant_id, prompt_name"
+        )).fetch_all::<CanaryRow>().await?;
+        rows.into_iter().map(CanaryRecord::try_from).collect()
+    }
+
     async fn insert(
         &self,
         tenant_id: &TenantId,
@@ -926,6 +1087,10 @@ pub fn sha256_of(content: &str) -> [u8; 32] {
 /// ClickHouse `promotion_decisions` (latest-per-key) at startup, and
 /// `prompt_versions` for the version registry.
 pub struct PromptRouter {
+    lifecycle: tokio::sync::Mutex<()>,
+    canaries: ArcSwap<CanarySnapshot>,
+    canary_ready: std::sync::atomic::AtomicBool,
+
     /// `(tenant_id, prompt_name, env) -> active prompt_version_id`.
     routing: ArcSwap<HashMap<RoutingKey, Uuid>>,
     /// `prompt_version_id -> PromptVersion`.
@@ -941,8 +1106,8 @@ pub struct PromptRouter {
     /// key carries tenant_id)"; the key did not, and per `CLAUDE.md` §17 the
     /// code won and the ADR was the defect. Now it does.
     versions: ArcSwap<HashMap<(TenantId, Uuid), PromptVersion>>,
-    /// Eval-gate hook. Defaults to a permissive gate (every eval id reports
-    /// Passed). Tests + production override via `with_eval_gate(...)`.
+    /// Eval-gate hook. Missing evidence storage fails closed. Tests and
+    /// production install a store through `with_eval_gate(...)`.
     eval_gate: Arc<dyn EvalGate>,
     /// If true (default), `promote()` requires a passing eval_run_id unless
     /// the caller explicitly invokes `promote_with_override(...)`.
@@ -985,13 +1150,189 @@ pub struct RollbackOutcome {
 }
 
 impl PromptRouter {
-    /// Construct an empty router with a permissive eval gate (every eval
-    /// reports Passed). Use `with_eval_gate(...)` to plug in a real gate.
+    pub fn canary_cache_context(&self, tenant: &TenantId) -> CanaryCacheContext {
+        if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return CanaryCacheContext {
+                suspended: true,
+                namespace: "unavailable".into(),
+            };
+        }
+        self.canaries
+            .load()
+            .cache
+            .get(tenant)
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn canary(&self, tenant: &TenantId, name: &str) -> Result<Option<CanaryRecord>> {
+        if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResolutionRefusal::Unavailable.into());
+        }
+        Ok(self
+            .canaries
+            .load()
+            .records
+            .get(&(tenant.clone(), name.into()))
+            .filter(|r| r.enabled)
+            .cloned())
+    }
+    fn publish_canary(&self, record: CanaryRecord) {
+        self.canaries.rcu(|snapshot| {
+            let mut records = snapshot.records.clone();
+            records.insert(
+                (record.tenant_id.clone(), record.prompt_name.clone()),
+                record.clone(),
+            );
+            CanarySnapshot::new(records)
+        });
+    }
+    fn next_canary_time(&self, tenant: &TenantId, name: &str) -> i64 {
+        let now = crate::clickhouse_query::datetime64_millis_now();
+        self.canaries
+            .load()
+            .records
+            .get(&(tenant.clone(), name.into()))
+            .map_or(now, |old| now.max(old.changed_at_ms.saturating_add(1)))
+    }
+    pub async fn configure_canary(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        candidate: Uuid,
+        percent: f64,
+        actor: &str,
+    ) -> Result<CanaryRecord> {
+        let _write = self.lifecycle.lock().await;
+        if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResolutionRefusal::Unavailable.into());
+        }
+        if !percent.is_finite() || percent <= 0.0 || percent > 100.0 {
+            return Err(ClientFault(
+                "candidate percentage must be greater than 0 and at most 100".into(),
+            )
+            .into());
+        }
+        let stable = self
+            .route(tenant.clone(), name, Env::Production)
+            .await
+            .map_err(|_| {
+                ClientFault("production must have a stable version before starting a canary".into())
+            })?;
+        let candidate_version = self
+            .version_for_tenant(tenant, candidate)
+            .ok_or_else(|| ClientFault("candidate version is not owned by this tenant".into()))?;
+        if candidate == stable.prompt_version_id
+            || candidate_version.prompt_id != stable.prompt_id
+            || stable.prompt_id != prompt_id_for(tenant, name)
+        {
+            return Err(
+                ClientFault("candidate must be a different version of this prompt".into()).into(),
+            );
+        }
+        let record = CanaryRecord {
+            tenant_id: tenant.clone(),
+            prompt_name: name.into(),
+            canary_id: Uuid::new_v4(),
+            stable_version_id: stable.prompt_version_id,
+            candidate_version_id: candidate,
+            candidate_percent: percent,
+            enabled: true,
+            changed_at_ms: self.next_canary_time(tenant, name),
+            changed_by: actor.into(),
+        };
+        self.version_store.save_canary(&record).await?;
+        self.publish_canary(record.clone());
+        Ok(record)
+    }
+    // Caller holds lifecycle. Keep the old (suspended) cache snapshot until the
+    // promotion/archive outcome is known, then publish this durable tombstone.
+    async fn prepare_canary_stop(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        actor: &str,
+    ) -> Result<Option<CanaryRecord>> {
+        let Some(mut record) = self
+            .canaries
+            .load()
+            .records
+            .get(&(tenant.clone(), name.into()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        record.enabled = false;
+        record.canary_id = Uuid::new_v4();
+        record.changed_at_ms = self.next_canary_time(tenant, name);
+        record.changed_by = actor.into();
+        self.version_store.save_canary(&record).await?;
+        Ok(Some(record))
+    }
+    pub async fn stop_canary(&self, tenant: &TenantId, name: &str, actor: &str) -> Result<()> {
+        let _write = self.lifecycle.lock().await;
+        if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResolutionRefusal::Unavailable.into());
+        }
+        if let Some(record) = self.prepare_canary_stop(tenant, name, actor).await? {
+            self.publish_canary(record);
+        }
+        Ok(())
+    }
+    /// Request resolution: wait-free snapshots only, never storage I/O.
+    pub async fn resolve(
+        &self,
+        tenant: TenantId,
+        name: &str,
+        env: Env,
+        assignment: Option<&str>,
+    ) -> Result<PromptResolution> {
+        if env == Env::Production && !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResolutionRefusal::Unavailable.into());
+        }
+        let stable = self.route(tenant.clone(), name, env).await?;
+        if env == Env::Production
+            && let Some(record) = self.canary(&tenant, name)?
+        {
+            if record.stable_version_id != stable.prompt_version_id {
+                return Err(ResolutionRefusal::Unavailable.into());
+            }
+            let assignment = assignment
+                .filter(|key| !key.is_empty())
+                .ok_or(ResolutionRefusal::IdentityRequired)?;
+            let candidate = crate::online_eval::should_sample(
+                &format!("{tenant}:{name}:{}", record.canary_id),
+                assignment.as_bytes(),
+                record.candidate_percent / 100.0,
+            );
+            let version = if candidate {
+                self.version_for_tenant(&tenant, record.candidate_version_id)
+                    .ok_or(ResolutionRefusal::Unavailable)?
+            } else {
+                stable
+            };
+            return Ok(PromptResolution {
+                version,
+                arm: if candidate { "candidate" } else { "stable" },
+                canary_id: Some(record.canary_id),
+            });
+        }
+        Ok(PromptResolution {
+            version: stable,
+            arm: env.as_str(),
+            canary_id: None,
+        })
+    }
+
+    /// Construct an empty router with an unavailable, fail-closed eval gate.
+    /// Use `with_eval_gate(...)` to install an evidence store.
     pub fn new() -> Self {
         Self {
+            lifecycle: tokio::sync::Mutex::new(()),
+            canaries: ArcSwap::from_pointee(CanarySnapshot::default()),
+            canary_ready: std::sync::atomic::AtomicBool::new(true),
             routing: ArcSwap::from_pointee(HashMap::new()),
             versions: ArcSwap::from_pointee(HashMap::new()),
-            eval_gate: Arc::new(PermissiveGate),
+            eval_gate: Arc::new(UnavailableGate),
             require_eval_gate: true,
             persister: Arc::new(NoOpPersister),
             history_reader: Arc::new(crate::prompt_history::NoOpHistoryReader),
@@ -1004,6 +1345,8 @@ impl PromptRouter {
     /// Plug in a durable version store. Production: `ClickHouseVersionStore`.
     #[must_use]
     pub fn with_version_store(mut self, store: Arc<dyn VersionStore>) -> Self {
+        self.canary_ready
+            .store(false, std::sync::atomic::Ordering::Release);
         self.version_store = store;
         self
     }
@@ -1177,12 +1520,29 @@ impl PromptRouter {
         name: &str,
         deleted_by: &str,
     ) -> Result<()> {
+        let _write = self.lifecycle.lock().await;
+        if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResolutionRefusal::Unavailable.into());
+        }
+        let stopped = self
+            .prepare_canary_stop(tenant_id, name, deleted_by)
+            .await?;
         let prompt_id = prompt_id_for(tenant_id, name);
         // Durable FIRST — mirror create_version's ordering; never drop an
         // in-memory prompt whose archived state isn't durable.
-        self.version_store
+        if let Err(error) = self
+            .version_store
             .archive(tenant_id, name, prompt_id, deleted_by)
-            .await?;
+            .await
+        {
+            if let Some(record) = stopped {
+                self.publish_canary(record);
+                return Err(error.context(
+                    "Canary stopped; the prompt could not be archived. Reload and retry.",
+                ));
+            }
+            return Err(error);
+        }
         // Drop every registered version for this prompt.
         self.versions.rcu(|map| {
             let mut next = (**map).clone();
@@ -1201,6 +1561,9 @@ impl PromptRouter {
             next.retain(|k, _| k.0 != *tenant_id || k.1.as_str() != name);
             next
         });
+        if let Some(record) = stopped {
+            self.publish_canary(record);
+        }
         Ok(())
     }
 
@@ -1208,6 +1571,10 @@ impl PromptRouter {
     /// load error the router starts empty — a cold store must never crash the
     /// gateway (cf. the guardrail registry loader).
     pub async fn load_from_clickhouse(&self) {
+        let _write = self.lifecycle.lock().await;
+        self.canary_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut loaded = true;
         match self.version_store.load_versions().await {
             Ok(versions) => {
                 let map: HashMap<(TenantId, Uuid), PromptVersion> = versions
@@ -1219,6 +1586,7 @@ impl PromptRouter {
                 tracing::info!(versions = n, "prompt registry loaded from ClickHouse");
             }
             Err(err) => {
+                loaded = false;
                 tracing::warn!(
                     error = format!("{err:#}"),
                     "prompt version load failed — registry starts empty"
@@ -1248,6 +1616,7 @@ impl PromptRouter {
                 );
             }
             Err(err) => {
+                loaded = false;
                 tracing::warn!(
                     error = format!("{err:#}"),
                     "prev_production reconstruction failed — auto-rollback has no flip target \
@@ -1266,12 +1635,43 @@ impl PromptRouter {
                 tracing::info!(pointers = n, "prompt routing reconstructed from ClickHouse");
             }
             Err(err) => {
+                loaded = false;
                 tracing::warn!(
                     error = format!("{err:#}"),
                     "prompt routing load failed — routing starts empty"
                 );
             }
         }
+        match self.version_store.load_canaries().await {
+            Ok(records) => {
+                let valid = records.iter().all(|r| {
+                    !r.enabled
+                        || (self.routing.load().get(&(
+                            r.tenant_id.clone(),
+                            r.prompt_name.clone(),
+                            Env::Production,
+                        )) == Some(&r.stable_version_id)
+                            && self
+                                .version_for_tenant(&r.tenant_id, r.candidate_version_id)
+                                .is_some_and(|v| {
+                                    v.prompt_id == prompt_id_for(&r.tenant_id, &r.prompt_name)
+                                }))
+                });
+                loaded &= valid;
+                self.canaries.store(Arc::new(CanarySnapshot::new(
+                    records
+                        .into_iter()
+                        .map(|r| ((r.tenant_id.clone(), r.prompt_name.clone()), r))
+                        .collect(),
+                )));
+            }
+            Err(error) => {
+                loaded = false;
+                tracing::warn!(error=%error,"canary state unavailable; production resolutions and response reuse are refused");
+            }
+        }
+        self.canary_ready
+            .store(loaded, std::sync::atomic::Ordering::Release);
     }
 
     /// The tenant's prompts + activity for the dashboard list.
@@ -1340,6 +1740,7 @@ impl PromptRouter {
         eval_run_id: Option<Uuid>,
         actor: Option<&str>,
     ) -> Result<PromotionDecision> {
+        let _write = self.lifecycle.lock().await;
         // OBJECT-LEVEL AUTHORIZATION. `to_version_id` arrives from the request
         // body; without this a tenant could point its own routing pointer at
         // ANY version id it happened to know and then read that version's
@@ -1355,7 +1756,7 @@ impl PromptRouter {
         }
         // Eval-gate check.
         let decision_kind = match (eval_run_id, self.require_eval_gate) {
-            (Some(id), _) => match self.eval_gate.status(&tenant_id, id).await {
+            (Some(id), _) => match self.eval_gate.status(&tenant_id, id, to_version_id).await {
                 Some(EvalRunStatus::Passed) => DecisionKind::Promoted,
                 Some(EvalRunStatus::Failed | EvalRunStatus::Errored) => DecisionKind::BlockedByEval,
                 Some(EvalRunStatus::Running) => DecisionKind::BlockedByEval,
@@ -1404,6 +1805,8 @@ impl PromptRouter {
             decided_by: actor.map(str::to_owned),
         };
 
+        let stopped = self.persist_before_move(&tenant_id, &decision).await?;
+
         // Atomically swap the routing pointer iff the decision allows it.
         if matches!(
             decision_kind,
@@ -1423,7 +1826,9 @@ impl PromptRouter {
             );
         }
 
-        self.persist_promotion(&tenant_id, &decision).await?;
+        if let Some(record) = stopped {
+            self.publish_canary(record);
+        }
 
         Ok(decision)
     }
@@ -1474,6 +1879,7 @@ impl PromptRouter {
         operator_note: &str,
         actor: Option<&str>,
     ) -> Result<PromotionDecision> {
+        let _write = self.lifecycle.lock().await;
         // OBJECT-LEVEL AUTHORIZATION. `to_version_id` arrives from the request
         // body; without this a tenant could point its own routing pointer at
         // ANY version id it happened to know and then read that version's
@@ -1504,6 +1910,7 @@ impl PromptRouter {
             decided_by: actor.map(str::to_owned),
         };
 
+        let stopped = self.persist_before_move(&tenant_id, &decision).await?;
         self.routing.rcu(|map| {
             let mut next = (**map).clone();
             next.insert(key_to.clone(), to_version_id);
@@ -1517,7 +1924,9 @@ impl PromptRouter {
             to_version_id,
         );
 
-        self.persist_promotion(&tenant_id, &decision).await?;
+        if let Some(record) = stopped {
+            self.publish_canary(record);
+        }
         Ok(decision)
     }
 
@@ -1701,12 +2110,40 @@ impl PromptRouter {
     /// Audit-trail persistence — delegates to the configured persister.
     /// Default `NoOpPersister` drops the decision (unit tests); production
     /// `ClickHousePersister` writes a row to `promotion_decisions`.
-    async fn persist_promotion(
+    async fn persist_before_move(
         &self,
-        tenant_id: &TenantId,
+        tenant: &TenantId,
         decision: &PromotionDecision,
-    ) -> Result<()> {
-        self.persister.persist(tenant_id, decision).await
+    ) -> Result<Option<CanaryRecord>> {
+        let stopped = if decision.to_env == Env::Production
+            && matches!(
+                decision.decision,
+                DecisionKind::Promoted | DecisionKind::ManualOverride
+            ) {
+            // Unknown lifecycle state must not let a production move resurrect
+            // a split after restart. Ordinary reads remain available elsewhere.
+            if !self.canary_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ResolutionRefusal::Unavailable.into());
+            }
+            self.prepare_canary_stop(
+                tenant,
+                &decision.prompt_name,
+                decision.decided_by.as_deref().unwrap_or("unknown"),
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Err(error) = self.persister.persist(tenant, decision).await {
+            if let Some(record) = stopped {
+                self.publish_canary(record);
+                return Err(error.context(
+                    "Canary stopped; the production move could not be persisted. Reload and retry.",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(stopped)
     }
 }
 
@@ -1716,21 +2153,26 @@ impl Default for PromptRouter {
     }
 }
 
-/// Eval gate that always reports `Passed`. Used as the default for unit
-/// tests and for dev runs with no ClickHouse configured. Production swaps
-/// in `ClickHouseEvalGate` via `server.rs` (`with_eval_gate`).
-struct PermissiveGate;
+/// No evidence store is configured: supplied evaluation ids cannot authorize
+/// promotion. Explicit policy opt-out and attributed manual overrides keep
+/// their existing semantics. Production installs `ClickHouseEvalGate`.
+struct UnavailableGate;
 
 #[async_trait::async_trait]
-impl EvalGate for PermissiveGate {
-    async fn status(&self, _tenant_id: &TenantId, _eval_run_id: Uuid) -> Option<EvalRunStatus> {
-        Some(EvalRunStatus::Passed)
+impl EvalGate for UnavailableGate {
+    async fn status(
+        &self,
+        _tenant_id: &TenantId,
+        _eval_run_id: Uuid,
+        _candidate_version_id: Uuid,
+    ) -> Option<EvalRunStatus> {
+        None
     }
 }
 
 /// ClickHouse-backed eval gate. Resolves an eval run's status from
 /// `tracelane.eval_runs`, tenant-isolated. Wired by `server.rs` whenever
-/// `CLICKHOUSE_URL` is set; it replaces the permissive default so a
+/// `CLICKHOUSE_URL` is set; it replaces the unavailable default so a
 /// promotion is blocked unless its eval run is recorded `passed`.
 ///
 /// # Errors / fail-closed
@@ -1750,12 +2192,19 @@ impl ClickHouseEvalGate {
 #[derive(Debug, serde::Deserialize, clickhouse::Row)]
 struct EvalStatusRow {
     status: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    prompt_version_id: Uuid,
 }
 
 #[async_trait::async_trait]
 impl EvalGate for ClickHouseEvalGate {
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant_id))]
-    async fn status(&self, tenant_id: &TenantId, eval_run_id: Uuid) -> Option<EvalRunStatus> {
+    async fn status(
+        &self,
+        tenant_id: &TenantId,
+        eval_run_id: Uuid,
+        candidate_version_id: Uuid,
+    ) -> Option<EvalRunStatus> {
         // ADR-031 V1.1 sweep: single-row PK lookup, tenant-scoped and
         // LIMIT-bounded — internally bounded like the prompt-history
         // reads, so per-tier caps are additive. Exempted in
@@ -1763,7 +2212,7 @@ impl EvalGate for ClickHouseEvalGate {
         let rows = self
             .client
             .query(&crate::clickhouse_query::ceiling(
-                "SELECT status FROM eval_runs \
+                "SELECT status, prompt_version_id FROM eval_runs \
                  WHERE tenant_id = ? AND eval_run_id = ? \
                  ORDER BY completed_at DESC \
                  LIMIT 1",
@@ -1774,7 +2223,13 @@ impl EvalGate for ClickHouseEvalGate {
             .await;
 
         let status = match rows {
-            Ok(mut rows) => rows.pop()?.status,
+            Ok(mut rows) => {
+                let row = rows.pop()?;
+                if row.prompt_version_id != candidate_version_id {
+                    return None;
+                }
+                row.status
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -1801,7 +2256,7 @@ impl EvalGate for ClickHouseEvalGate {
 // ---- tests ------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
@@ -1828,6 +2283,8 @@ mod tests {
     /// by the on-node E2E (ADR-054 §Test), never by this mock.
     #[derive(Default)]
     struct MockVersionStore {
+        canaries: std::sync::Mutex<Vec<CanaryRecord>>,
+        canary_fails: std::sync::atomic::AtomicBool,
         inserted: std::sync::Mutex<Vec<(String, u32)>>,
         next: std::sync::atomic::AtomicU32,
         versions: Vec<(TenantId, PromptVersion)>,
@@ -1844,6 +2301,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl VersionStore for MockVersionStore {
+        async fn save_canary(&self, record: &CanaryRecord) -> Result<()> {
+            if self.canary_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("canary store unavailable");
+            }
+            let mut records = self.canaries.lock().unwrap();
+            records
+                .retain(|r| r.tenant_id != record.tenant_id || r.prompt_name != record.prompt_name);
+            records.push(record.clone());
+            Ok(())
+        }
+        async fn load_canaries(&self) -> Result<Vec<CanaryRecord>> {
+            if self.canary_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("canary store unavailable");
+            }
+            Ok(self.canaries.lock().unwrap().clone())
+        }
+
         async fn insert(
             &self,
             _t: &TenantId,
@@ -1904,6 +2378,290 @@ mod tests {
         }
     }
 
+    async fn canary_fixture_store(
+        tenant: TenantId,
+    ) -> (Arc<PromptRouter>, Arc<MockVersionStore>, Uuid, Uuid) {
+        let stable = pv(prompt_id_for(&tenant, "proof"), 1);
+        let candidate = pv(stable.prompt_id, 2);
+        let ids = (stable.prompt_version_id, candidate.prompt_version_id);
+        let store = Arc::new(MockVersionStore {
+            versions: vec![(tenant.clone(), stable), (tenant.clone(), candidate)],
+            routing: vec![RoutingEntry {
+                tenant_id: tenant,
+                prompt_name: "proof".into(),
+                env: Env::Production,
+                version_id: ids.0,
+            }],
+            ..Default::default()
+        });
+        let router = Arc::new(PromptRouter::new().with_version_store(store.clone()));
+        router.load_from_clickhouse().await;
+        (router, store, ids.0, ids.1)
+    }
+    pub(crate) async fn canary_fixture(tenant: TenantId) -> (Arc<PromptRouter>, Uuid, Uuid) {
+        let (router, _, stable, candidate) = canary_fixture_store(tenant).await;
+        (router, stable, candidate)
+    }
+    #[tokio::test]
+    async fn canary_lifecycle_is_durable_deterministic_and_tenant_bound() {
+        let tenant = tid(0x549);
+        let (router, store, stable, candidate) = canary_fixture_store(tenant.clone()).await;
+        assert!(
+            router
+                .configure_canary(&tenant, "proof", candidate, 0.0, "actor")
+                .await
+                .is_err()
+        );
+        assert!(
+            router
+                .configure_canary(&tenant, "proof", candidate, f64::NAN, "actor")
+                .await
+                .is_err()
+        );
+        assert!(
+            router
+                .configure_canary(&tenant, "proof", stable, 50.0, "actor")
+                .await
+                .is_err()
+        );
+        let foreign = pv(prompt_id_for(&tid(2), "proof"), 3);
+        router.register_version(&tid(2), foreign.clone());
+        assert!(
+            router
+                .configure_canary(&tenant, "proof", foreign.prompt_version_id, 50.0, "actor")
+                .await
+                .is_err()
+        );
+        router
+            .configure_canary(&tenant, "proof", candidate, 50.0, "actor")
+            .await
+            .unwrap();
+        assert!(
+            router
+                .resolve(tenant.clone(), "proof", Env::Production, None)
+                .await
+                .is_err()
+        );
+        let reboot = PromptRouter::new().with_version_store(store.clone());
+        reboot.load_from_clickhouse().await;
+        let mut arms = std::collections::HashSet::new();
+        for n in 0..100 {
+            let key = format!("user:{n}");
+            let a = router
+                .resolve(tenant.clone(), "proof", Env::Production, Some(&key))
+                .await
+                .unwrap();
+            let b = reboot
+                .resolve(tenant.clone(), "proof", Env::Production, Some(&key))
+                .await
+                .unwrap();
+            assert_eq!(a.version.prompt_version_id, b.version.prompt_version_id);
+            assert_eq!(a.canary_id, b.canary_id);
+            arms.insert(a.arm);
+        }
+        assert_eq!(arms.len(), 2);
+        assert!(
+            router
+                .resolve(tid(2), "proof", Env::Production, Some("user:1"))
+                .await
+                .is_err()
+        );
+        let before = router.canary_cache_context(&tenant).namespace;
+        store
+            .canary_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(router.stop_canary(&tenant, "proof", "actor").await.is_err());
+        assert!(router.canary(&tenant, "proof").unwrap().is_some());
+        assert!(
+            router
+                .promote_with_override(
+                    tenant.clone(),
+                    "proof",
+                    Env::Staging,
+                    Env::Production,
+                    candidate,
+                    "reviewed",
+                    Some("actor")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            router
+                .route(tenant.clone(), "proof", Env::Production)
+                .await
+                .unwrap()
+                .prompt_version_id,
+            stable
+        );
+        let unavailable = PromptRouter::new().with_version_store(store.clone());
+        unavailable.load_from_clickhouse().await;
+        assert!(unavailable.canary_cache_context(&tenant).suspended);
+        assert!(
+            unavailable
+                .resolve(tenant.clone(), "proof", Env::Production, Some("user:1"))
+                .await
+                .is_err()
+        );
+        store
+            .canary_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        router
+            .promote_with_override(
+                tenant.clone(),
+                "proof",
+                Env::Staging,
+                Env::Production,
+                candidate,
+                "reviewed",
+                Some("actor"),
+            )
+            .await
+            .unwrap();
+        assert!(router.canary(&tenant, "proof").unwrap().is_none());
+        assert_ne!(before, router.canary_cache_context(&tenant).namespace);
+        assert_eq!(
+            router
+                .resolve(tenant.clone(), "proof", Env::Production, None)
+                .await
+                .unwrap()
+                .version
+                .prompt_version_id,
+            candidate
+        );
+        router
+            .configure_canary(&tenant, "proof", stable, 25.0, "actor")
+            .await
+            .unwrap();
+        router
+            .rollback(
+                tenant.clone(),
+                "proof",
+                Env::Production,
+                stable,
+                "rollback",
+                Some("actor"),
+            )
+            .await
+            .unwrap();
+        assert!(router.canary(&tenant, "proof").unwrap().is_none());
+        router
+            .configure_canary(&tenant, "proof", candidate, 25.0, "actor")
+            .await
+            .unwrap();
+        router
+            .delete_prompt(&tenant, "proof", "actor")
+            .await
+            .unwrap();
+        assert!(router.canary(&tenant, "proof").unwrap().is_none());
+        assert!(
+            router
+                .route(tenant.clone(), "proof", Env::Production)
+                .await
+                .is_err()
+        );
+        assert!(!store.canaries.lock().unwrap()[0].enabled);
+    }
+    struct FailedPromotion;
+    #[async_trait::async_trait]
+    impl PromotionPersister for FailedPromotion {
+        async fn persist(&self, _: &TenantId, _: &PromotionDecision) -> Result<()> {
+            anyhow::bail!("promotion store unavailable")
+        }
+    }
+    #[tokio::test]
+    async fn canary_stop_survives_failed_move_or_archive() {
+        let tenant = tid(0x54B);
+        let (_, store, stable, candidate) = canary_fixture_store(tenant.clone()).await;
+        let router = PromptRouter::new()
+            .with_version_store(store.clone())
+            .with_persister(Arc::new(FailedPromotion));
+        router.load_from_clickhouse().await;
+        router
+            .configure_canary(&tenant, "proof", candidate, 25.0, "tester")
+            .await
+            .unwrap();
+        let error = router
+            .promote_with_override(
+                tenant.clone(),
+                "proof",
+                Env::Staging,
+                Env::Production,
+                candidate,
+                "reviewed",
+                Some("tester"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Canary stopped"));
+        assert!(router.canary(&tenant, "proof").unwrap().is_none());
+        assert_eq!(
+            router
+                .route(tenant.clone(), "proof", Env::Production)
+                .await
+                .unwrap()
+                .prompt_version_id,
+            stable
+        );
+        let reboot = PromptRouter::new().with_version_store(store.clone());
+        reboot.load_from_clickhouse().await;
+        assert!(reboot.canary(&tenant, "proof").unwrap().is_none());
+        router
+            .configure_canary(&tenant, "proof", candidate, 25.0, "tester")
+            .await
+            .unwrap();
+        store
+            .archive_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            router
+                .delete_prompt(&tenant, "proof", "tester")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Canary stopped")
+        );
+        assert!(router.canary(&tenant, "proof").unwrap().is_none());
+        assert!(router.route(tenant, "proof", Env::Production).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn canary_clickhouse_wire_roundtrip() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let store = ClickHouseVersionStore::new(
+            crate::clickhouse_query::ch_client(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        );
+        let (_, fixture, _, candidate) = canary_fixture_store(tid(0x54A)).await;
+        let router = PromptRouter::new().with_version_store(fixture);
+        router.load_from_clickhouse().await;
+        let record = router
+            .configure_canary(&tid(0x54A), "proof", candidate, 17.25, "tester")
+            .await
+            .unwrap();
+        store.save_canary(&record).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].url.as_str().contains("prompt_canaries"));
+        let bytes = requests[0].body.clone();
+        assert!(!bytes.is_empty());
+        server.reset().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+        let read = store.load_canaries().await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::to_value(&read[0]).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn create_version_unarchives_for_restart_survival() {
         // Re-creating a prompt (esp. one previously deleted) must write an
@@ -1912,6 +2670,7 @@ mod tests {
         // restart (the create-after-delete data-loss the audit caught).
         let store = Arc::new(MockVersionStore::default());
         let r = PromptRouter::new().with_version_store(store.clone());
+        r.load_from_clickhouse().await;
         let t = tid(30);
         let v = r
             .create_version(&t, "greet", "hi".into(), None, vec![], "u")
@@ -1959,6 +2718,7 @@ mod tests {
     async fn create_version_registers_and_lands_in_staging() {
         let store = Arc::new(MockVersionStore::default());
         let r = PromptRouter::new().with_version_store(store.clone());
+        r.load_from_clickhouse().await;
         let t = tid(7);
         let v = r
             .create_version(&t, "greeting", "hello".into(), None, vec![], "user_1")
@@ -1981,6 +2741,7 @@ mod tests {
     #[tokio::test]
     async fn create_version_increments_version_number() {
         let r = PromptRouter::new().with_version_store(Arc::new(MockVersionStore::default()));
+        r.load_from_clickhouse().await;
         let t = tid(8);
         let v1 = r
             .create_version(&t, "p", "a".into(), None, vec![], "u")
@@ -1997,6 +2758,7 @@ mod tests {
     #[tokio::test]
     async fn create_version_is_tenant_isolated() {
         let r = PromptRouter::new().with_version_store(Arc::new(MockVersionStore::default()));
+        r.load_from_clickhouse().await;
         let (a, b) = (tid(10), tid(11));
         r.create_version(&a, "shared", "x".into(), None, vec![], "u")
             .await
@@ -2131,6 +2893,7 @@ mod tests {
     async fn delete_prompt_archives_and_drops_from_memory() {
         let store = Arc::new(MockVersionStore::default());
         let r = PromptRouter::new().with_version_store(store.clone());
+        r.load_from_clickhouse().await;
         let t = tid(20);
         let v = r
             .create_version(&t, "greet", "hi".into(), None, vec![], "u")
@@ -2154,6 +2917,7 @@ mod tests {
     #[tokio::test]
     async fn delete_prompt_is_tenant_isolated() {
         let r = PromptRouter::new().with_version_store(Arc::new(MockVersionStore::default()));
+        r.load_from_clickhouse().await;
         let (a, b) = (tid(21), tid(22));
         r.create_version(&a, "shared", "x".into(), None, vec![], "u")
             .await
@@ -2180,6 +2944,7 @@ mod tests {
             .archive_fails
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let r = PromptRouter::new().with_version_store(store.clone());
+        r.load_from_clickhouse().await;
         let t = tid(23);
         r.create_version(&t, "keep", "v".into(), None, vec![], "u")
             .await
@@ -2223,6 +2988,7 @@ mod tests {
             .with_eval_gate(Arc::new(StaticEvalGate {
                 statuses: std::collections::HashMap::new(), // prod eval_runs is empty
             }));
+        router.load_from_clickhouse().await;
         let t = tid(88);
         let v = router
             .create_version(&t, "checkout-prompt", "v1".into(), None, vec![], "u")
@@ -2288,6 +3054,158 @@ mod tests {
                 .is_ok(),
             "override is the only path that reaches production today"
         );
+    }
+
+    #[tokio::test]
+    async fn evidence_binding_static_and_unavailable_fail_closed() {
+        let run = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let gate = StaticEvalGate {
+            statuses: HashMap::from([((tid(1), run, candidate), EvalRunStatus::Passed)]),
+        };
+        assert_eq!(
+            gate.status(&tid(1), run, candidate).await,
+            Some(EvalRunStatus::Passed)
+        );
+        assert_eq!(gate.status(&tid(2), run, candidate).await, None);
+        assert_eq!(gate.status(&tid(1), run, Uuid::new_v4()).await, None);
+        assert_eq!(gate.status(&tid(1), Uuid::new_v4(), candidate).await, None);
+        assert_eq!(UnavailableGate.status(&tid(1), run, candidate).await, None);
+    }
+
+    #[tokio::test]
+    async fn evidence_binding_query_and_decode_fail_closed() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        for response in [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_body_bytes(vec![255]),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let gate = ClickHouseEvalGate::new(crate::clickhouse_query::ch_client(server.uri()));
+            assert_eq!(
+                gate.status(&tid(1), Uuid::new_v4(), Uuid::new_v4()).await,
+                None
+            );
+        }
+    }
+
+    /// Exercises the real gate query/decoder against the supplied local database.
+    /// Uses unique rows in the existing schema; never creates or migrates a table.
+    #[tokio::test]
+    #[ignore = "requires the provisioned local ClickHouse (CLICKHOUSE_TEST_URL)"]
+    async fn evidence_binding_real_clickhouse() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("local ClickHouse URL");
+        let client = crate::clickhouse_query::ch_client(url);
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let a = pv(Uuid::new_v4(), 1);
+        let b = pv(a.prompt_id, 2);
+        let run = Uuid::new_v4();
+        client.query("INSERT INTO eval_runs (tenant_id, eval_run_id, prompt_version_id, eval_suite_id, started_at, completed_at, status, pass_count, fail_count, error_count, duration_ms, results_json) VALUES (?, ?, ?, ?, now64(3), now64(3), 'passed', 1, 0, 0, 1, '{}')")
+            .bind(tenant.to_string()).bind(run).bind(a.prompt_version_id).bind(Uuid::new_v4())
+            .execute().await.unwrap();
+        let router =
+            PromptRouter::new().with_eval_gate(Arc::new(ClickHouseEvalGate::new(client.clone())));
+        router.register_version(&tenant, a.clone());
+        router.register_version(&tenant, b.clone());
+        let wrong = router
+            .promote(
+                tenant.clone(),
+                "evidence",
+                Env::Staging,
+                Env::Production,
+                b.prompt_version_id,
+                Some(run),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong.decision,
+            DecisionKind::BlockedByEval,
+            "passing evidence for A must not promote B"
+        );
+        assert!(
+            router
+                .route(tenant.clone(), "evidence", Env::Production)
+                .await
+                .is_err()
+        );
+        let correct = router
+            .promote(
+                tenant.clone(),
+                "evidence",
+                Env::Staging,
+                Env::Production,
+                a.prompt_version_id,
+                Some(run),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(correct.decision, DecisionKind::Promoted);
+        assert_eq!(
+            router
+                .route(tenant.clone(), "evidence", Env::Production)
+                .await
+                .unwrap()
+                .prompt_version_id,
+            a.prompt_version_id
+        );
+        for status in ["running", "failed", "errored", "unknown"] {
+            let rejected_run = Uuid::new_v4();
+            client.query("INSERT INTO eval_runs (tenant_id, eval_run_id, prompt_version_id, eval_suite_id, started_at, completed_at, status) VALUES (?, ?, ?, ?, now64(3), now64(3), ?)")
+                .bind(tenant.to_string()).bind(rejected_run).bind(a.prompt_version_id).bind(Uuid::new_v4()).bind(status)
+                .execute().await.unwrap();
+            let decision = router
+                .promote(
+                    tenant.clone(),
+                    "evidence",
+                    Env::Staging,
+                    Env::Production,
+                    a.prompt_version_id,
+                    Some(rejected_run),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.decision,
+                DecisionKind::BlockedByEval,
+                "status {status} cannot authorize"
+            );
+        }
+        let missing = router
+            .promote(
+                tenant.clone(),
+                "evidence",
+                Env::Staging,
+                Env::Production,
+                a.prompt_version_id,
+                Some(Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.decision, DecisionKind::BlockedByEval);
+        let other = TenantId::from_jwt_claim(Uuid::new_v4());
+        router.register_version(&other, a.clone());
+        let foreign = router
+            .promote(
+                other,
+                "evidence",
+                Env::Staging,
+                Env::Production,
+                a.prompt_version_id,
+                Some(run),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.decision, DecisionKind::BlockedByEval);
     }
 
     /// REAL-ClickHouse round-trip of the full create_version WRITE path — the
@@ -2708,7 +3626,10 @@ mod tests {
         // Eval gate reports Passed for eval_run id `0xBEEF`.
         let mut statuses = HashMap::new();
         let eval_run = Uuid::from_u128(0xBEEF);
-        statuses.insert(eval_run, EvalRunStatus::Passed);
+        statuses.insert(
+            (tid(3), eval_run, Uuid::from_u128(0xCAFF)),
+            EvalRunStatus::Passed,
+        );
         let gate = Arc::new(StaticEvalGate { statuses });
 
         let r = PromptRouter::new().with_eval_gate(gate);
@@ -2742,7 +3663,10 @@ mod tests {
     async fn promote_blocked_when_eval_failed() {
         let mut statuses = HashMap::new();
         let eval_run = Uuid::from_u128(0xDEAD);
-        statuses.insert(eval_run, EvalRunStatus::Failed);
+        statuses.insert(
+            (tid(4), eval_run, Uuid::from_u128(0xF00E)),
+            EvalRunStatus::Failed,
+        );
         let gate = Arc::new(StaticEvalGate { statuses });
 
         let r = PromptRouter::new().with_eval_gate(gate);
@@ -2855,7 +3779,10 @@ mod tests {
     async fn eval_gated_promotion_persists_the_actor() {
         let mut statuses = HashMap::new();
         let eval_run = Uuid::from_u128(0x5EED);
-        statuses.insert(eval_run, EvalRunStatus::Passed);
+        statuses.insert(
+            (tid(22), eval_run, Uuid::from_u128(0x51D5)),
+            EvalRunStatus::Passed,
+        );
         let cap = Arc::new(CapturingPersister::default());
         let r = PromptRouter::new()
             .with_persister(cap.clone())

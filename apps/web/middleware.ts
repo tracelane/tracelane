@@ -15,6 +15,7 @@
  */
 
 import { e2eAuthEnabled } from "@/lib/e2e-auth";
+import { legacyCookieCleanup } from "@/lib/legacy-cookie-cleanup";
 import { authkitMiddleware } from "@workos-inc/authkit-nextjs";
 import {
 	type NextFetchEvent,
@@ -24,12 +25,20 @@ import {
 
 const authkit = authkitMiddleware();
 
-export default function middleware(
+export default async function middleware(
 	request: NextRequest,
 	event: NextFetchEvent,
 ) {
 	if (e2eAuthEnabled()) return NextResponse.next();
-	return authkit(request, event);
+	const response = await authkit(request, event);
+	// Expire a legacy `Domain=.tracelane.dev` session cookie left from before the
+	// cookie became host-only (lib/legacy-cookie-cleanup.ts). No-op unless a wos-*
+	// cookie arrives twice.
+	const stale = legacyCookieCleanup(request.headers.get("cookie"));
+	if (response && stale.length > 0) {
+		for (const header of stale) response.headers.append("set-cookie", header);
+	}
+	return response;
 }
 
 export const config = {

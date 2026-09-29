@@ -165,10 +165,84 @@ def _tripwire_digest(cwd: Path) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
+# B-494 (2026-09-21) — THE HEAVY RUNNERS KEY ON THEIR OWN INPUTS, NOT THE GLOBAL
+# TRIPWIRES. Measured: an unnarrowed meta-gate is 1,667 s, of which five integration
+# runners' selftests are 95 % — and it could not narrow in 8 of the last 12 full runs,
+# because a tripwire (verify-all.sh, export-deny.txt, a hook) had moved. But a runner's
+# selftest proves ONE thing: "this runner goes RED when its plant is reintroduced". That
+# verdict is a function of the runner script, the file it plants into, the tests that
+# detect the plant, and the schema those tests run against — not of the export deny list
+# or the pre-push hook. So each heavy runner's key is sha(script) + sha(this file) +
+# sha(each of its own inputs, directories walked in sorted order). Edit any of those and
+# it re-runs; edit verify-all.sh and it does not. Every other guard keeps the global set.
+# B-479 (2026-09-22): guards whose selftest PLANTS into the git index. A pass recorded in a
+# permissive moment (the plant landed, the gate caught it) would otherwise be trusted on
+# this box until the guard's bytes or a tripwire byte changed — and the pre-push gate is
+# the only enforcement on a private push. These are seconds; they run every time.
+NEVER_CACHE: frozenset[str] = frozenset({"scripts/ci/check-doc-classification.py"})
+
+RUNNER_INPUTS: dict[str, tuple[str, ...]] = {
+    "scripts/ci/run-postgres-integration.sh": (
+        "crates/gateway/src/db/api_keys.rs",  # the plant target (`::numeric`)
+        "crates/gateway/tests/postgres_tenant_integration.rs",  # the tests that detect it
+        "crates/gateway/src/billing/usage.rs",
+        "crates/gateway/src/entitlement_cache.rs",
+        "crates/gateway/src/alerts",
+        "apps/web/db/migrations",
+    ),
+    "scripts/ci/run-clickhouse-integration.sh": (
+        "crates/gateway/src/dataset_routes.rs",  # the plant target (B-272 shape)
+        "crates/gateway/src/clickhouse_query.rs",
+        "crates/gateway/src/billing",
+        "crates/gateway/src/retention_sweep.rs",
+        "crates/gateway/src/trace_reads.rs",
+        "crates/gateway/tests/clickhouse_persister_integration.rs",
+        "crates/ingest/src/clickhouse_writer.rs",
+        "crates/ingest/src/capture_gaps.rs",
+        "infra/dev/clickhouse",
+    ),
+    "scripts/ci/run-ledger-integration.sh": (
+        "crates/gateway/src/audit.rs",
+        "crates/gateway/src/audit_chain_state.rs",  # the plant target (`insert_rows_tx`)
+        "crates/gateway/src/db/ledger.rs",
+        "apps/web/db/migrations",
+        "infra/dev/clickhouse",
+    ),
+    "scripts/ci/check-nats-auth.sh": (
+        "infra/prod/nats/nats.conf",  # the plant target (an over-permission)
+        "crates/ingest/src/nats_consumer.rs",
+        "crates/gateway/src/audit_consumer.rs",
+        "crates/shared/src/nats_connect.rs",
+    ),
+    # check-gate-runner-semantics.py tests verify-all.sh itself: verify-all.sh IS its input.
+    "scripts/ci/check-gate-runner-semantics.py": ("scripts/verify-all.sh",),
+}
+
+
+def _digest_path(p: Path) -> str:
+    """A file's digest, or a directory's — every file under it in sorted order, so a
+    migration added, removed or edited changes the key."""
+    if p.is_dir():
+        h = hashlib.sha256()
+        for f in sorted(x for x in p.rglob("*") if x.is_file()):
+            h.update(str(f.relative_to(p)).encode())
+            h.update(_digest_file(f).encode())
+        return h.hexdigest()
+    return _digest_file(p)
+
+
 def _cache_key(script: str, cwd: Path, tripwire_digest: str) -> str:
     """The whole idea in one function: a selftest result is a function of the guard's
-    own bytes and the tripwire bytes, so THIS is that function, collapsed to a key."""
-    joined = f"{_digest_file(cwd / script)}:{tripwire_digest}"
+    own bytes and the tripwire bytes, so THIS is that function, collapsed to a key.
+    For the heavy runners in `RUNNER_INPUTS` the tripwire set is REPLACED by the
+    runner's own inputs plus this file (B-494)."""
+    inputs = RUNNER_INPUTS.get(script)
+    if inputs is not None:
+        own = ":".join(_digest_path(cwd / rel) for rel in inputs)
+        me = _digest_file(cwd / "scripts/ci/check-guard-selftests.py")
+        joined = f"{_digest_file(cwd / script)}:{me}:{own}"
+    else:
+        joined = f"{_digest_file(cwd / script)}:{tripwire_digest}"
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
@@ -298,7 +372,10 @@ def runner_for(script: str, prefix: list[str]) -> list[str]:
 # that goes red for a reason unrelated to the property it checks is a control
 # people learn to re-run rather than read.
 SLOW_SELFTESTS: dict[str, int] = {
-    "scripts/ci/run-postgres-integration.sh": 900,
+    # 2026-09-21: 900 timed out under a full (tripwire-invalidated) meta-gate re-run — the
+    # falsification compiles the gateway test binary twice in an isolated worktree; 7 min
+    # alone, past 15 with the box busy. A clock that fires on a healthy selftest is noise.
+    "scripts/ci/run-postgres-integration.sh": 1500,
     # B-285: same shape as its Postgres sibling — this one spins a ClickHouse container
     # AND rebuilds the gateway test binary, then runs the whole suite a second time to
     # prove it goes red. At 300s it timed out on 2026-08-25, and because the selftest
@@ -306,6 +383,10 @@ SLOW_SELFTESTS: dict[str, int] = {
     # failed an unrelated step. A short clock on a mutating guard is not a slow test, it
     # is a corrupted worktree.
     "scripts/ci/run-clickhouse-integration.sh": 900,
+    # ADR-078 (B): starts a throwaway Postgres AND ClickHouse, applies every migration,
+    # then runs the dual-store ledger proofs — and its selftest MUTATES a tracked source
+    # (the canonical insert) and reruns one of them to prove RED. Same shape, same clock.
+    "scripts/ci/run-ledger-integration.sh": 900,
     # B-383 (c): starts the prod ClickHouse image twice (the proof, then the planted
     # over-grant) and waits for the schema each time — ~90 s clean, more under load.
     "scripts/ci/check-clickhouse-users.sh": 600,
@@ -369,7 +450,7 @@ def check(
             continue
 
         key = None
-        if use_cache:
+        if use_cache and script not in NEVER_CACHE:
             assert resolved_cache_dir is not None
             key = _cache_key(script, cwd, tripwire_digest)
             if _cache_hit(resolved_cache_dir, script, key):
@@ -416,8 +497,8 @@ def check(
         else:
             if verbose:
                 print(f"  ok       {script}")
-            if use_cache:
-                assert resolved_cache_dir is not None and key is not None
+            if use_cache and key is not None:
+                assert resolved_cache_dir is not None
                 _cache_write(resolved_cache_dir, script, key)
     return len(guards), failures, ran, cached
 
@@ -562,6 +643,61 @@ def selftest() -> int:
         )
         print("✓ selftest: a changed tripwire file invalidates the cache too")
 
+        # (2c) B-494: a HEAVY RUNNER keys on its OWN inputs — a tripwire change does
+        # NOT invalidate it (that is the whole point), while a change to one of its
+        # listed inputs does. The fixture reuses the real runner's path so the
+        # RUNNER_INPUTS lookup applies; its inputs are fixture files under td2.
+        runner_rel = "scripts/ci/run-postgres-integration.sh"
+        runner = td2 / runner_rel
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1:-}" in --selftest) echo ok; exit 0;; "") exit 0;; *) exit 2;; esac\n'
+        )
+        runner.chmod(0o755)
+        for rel in RUNNER_INPUTS[runner_rel]:
+            fx = td2 / rel
+            if rel.endswith((".rs", ".sql", ".conf")) or "." in Path(rel).name:
+                fx.parent.mkdir(parents=True, exist_ok=True)
+                fx.write_text("fixture\n")
+            else:
+                fx.mkdir(parents=True, exist_ok=True)
+                (fx / "0001_fixture.sql").write_text("fixture\n")
+        verify_all_r = va2(f'    run "runner" bash {runner_rel}')
+        n, f, ran, cached = check(
+            verify_all_r, td2, use_cache=True, cache_dir=cache_dir2
+        )
+        assert n == 1 and not f and ran == 1 and cached == 0, (
+            f"runner first run must RUN: ran={ran} cached={cached} f={f}"
+        )
+        tripwire_fixture.write_text(tripwire_fixture.read_text() + "# changed again\n")
+        n, f, ran, cached = check(
+            verify_all_r, td2, use_cache=True, cache_dir=cache_dir2
+        )
+        assert n == 1 and not f and ran == 0 and cached == 1, (
+            "a tripwire change must NOT invalidate a heavy runner keyed on its own "
+            f"inputs (B-494): ran={ran} cached={cached}"
+        )
+        own = td2 / RUNNER_INPUTS[runner_rel][0]
+        own.write_text(own.read_text() + "// the plant target moved\n")
+        n, f, ran, cached = check(
+            verify_all_r, td2, use_cache=True, cache_dir=cache_dir2
+        )
+        assert n == 1 and not f and ran == 1 and cached == 0, (
+            "a change to one of the runner's OWN inputs must invalidate it: "
+            f"ran={ran} cached={cached}"
+        )
+        mig_dir = td2 / "apps/web/db/migrations"
+        (mig_dir / "0002_added.sql").write_text("a new migration\n")
+        n, f, ran, cached = check(
+            verify_all_r, td2, use_cache=True, cache_dir=cache_dir2
+        )
+        assert n == 1 and not f and ran == 1 and cached == 0, (
+            f"a file ADDED under an input directory must invalidate it: ran={ran} cached={cached}"
+        )
+        print(
+            "✓ selftest: a heavy runner ignores tripwire churn and re-runs on its own inputs (B-494)"
+        )
+
         # (3) a FAILING selftest is never cached — it must be retried every run.
         failing = td2 / "scripts" / "ci" / "failing.py"
         failing.write_text(
@@ -586,6 +722,31 @@ def selftest() -> int:
         )
         print(
             "✓ selftest: a failing selftest is never cached, and is re-run every time"
+        )
+
+        # (4) B-479: a guard in NEVER_CACHE is re-run on every call even when it passes —
+        # its selftest plants into the git index, and a pass from a permissive moment
+        # must not be carried. Proven on the real member of the set, by name, with a
+        # passing shim at that path in the fixture tree.
+        never_rel = next(iter(NEVER_CACHE))
+        never = td2 / never_rel
+        never.parent.mkdir(parents=True, exist_ok=True)
+        never.write_text(
+            "import sys\n"
+            "if '--selftest' in sys.argv: sys.exit(0)\n"
+            "if len(sys.argv) > 1: sys.exit(2)\n"
+            "sys.exit(0)\n"
+        )
+        verify_all4 = va2(f'    run "never-cached" python3 {never_rel}')
+        for attempt in (1, 2):
+            n, f, ran, cached = check(
+                verify_all4, td2, use_cache=True, cache_dir=cache_dir2
+            )
+            assert n == 1 and not f and ran == 1 and cached == 0, (
+                f"a NEVER_CACHE guard must run on attempt {attempt}: f={f} ran={ran} cached={cached}"
+            )
+        print(
+            "✓ selftest: a guard that plants into the index (NEVER_CACHE) is re-run every time, pass or not (B-479)"
         )
 
     print("\nselftest PASSED.")

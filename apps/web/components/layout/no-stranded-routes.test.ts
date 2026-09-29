@@ -31,7 +31,6 @@ const SCAN_DIRS = [APP, join(__dirname, "..", "..", "components")];
 
 /** Routes with no inbound link, each with the reason it is allowed to have none. */
 const DELIBERATE: Record<string, string> = {
-	"/datasets": "V1.1 ComingSoon stub — nav-config.tsx keeps it out until built",
 	"/legal/[doc]": "linked from marketing/external, not from app chrome",
 	"/": "root redirect — the entry point itself, nothing links to it internally",
 	// OBS-48: a public, unauthenticated share link — reached only via a token an

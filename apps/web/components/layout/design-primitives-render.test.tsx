@@ -215,8 +215,8 @@ describe("TimeRuler — labelled majors, silent minors", () => {
 describe("LedgerSeqChip — a RANGE, never a per-trace verified claim", () => {
 	it("states the sequence range and says workspace, not trace", () => {
 		const out = html(createElement(LedgerSeqChip, { from: 15700, to: 15799 }));
-		expect(out).toContain("15700");
-		expect(out).toContain("15799");
+		expect(out).toContain("15,700");
+		expect(out).toContain("15,799");
 		expect(out).toContain("workspace");
 	});
 

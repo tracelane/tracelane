@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * DividerTile — a full-width (12-column) section header: an optional label,
@@ -18,6 +19,7 @@
  * is never silently lost.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useRef, useState } from "react";
 
 interface Props {
@@ -51,7 +53,7 @@ export function DividerTile({ dashboardId, tileId, label, canEdit }: Props) {
 		if (next === lastSaved.current) return; // no-op — nothing to persist
 		setSaving(true);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/dashboards/${dashboardId}/tiles/${tileId}`,
 				{
 					method: "PATCH",
@@ -96,7 +98,8 @@ export function DividerTile({ dashboardId, tileId, label, canEdit }: Props) {
 					className="w-48 shrink-0 rounded-[var(--radius-control)] border border-line bg-surface px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-ink-2 focus:border-action focus:"
 				/>
 			) : canEdit ? (
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => setEditing(true)}
 					disabled={saving}
@@ -110,7 +113,7 @@ export function DividerTile({ dashboardId, tileId, label, canEdit }: Props) {
 							+ Add label
 						</span>
 					)}
-				</button>
+				</Button>
 			) : value ? (
 				<span className="shrink-0 whitespace-nowrap text-xs font-medium uppercase tracking-wide text-ink-2">
 					{value}

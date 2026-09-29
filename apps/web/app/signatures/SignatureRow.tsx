@@ -1,3 +1,8 @@
+"use client";
+import { fmtCount } from "@/lib/metrics/format";
+
+import { Button } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * SignatureRow — one live AFT-1 detection, expandable to its evidence story.
  *
@@ -50,7 +55,6 @@
  * Block severity. Links use --action-ink, which is the ink family rather than a
  * brand accent. Severity is the row's ONE chip.
  */
-"use client";
 
 import { aftFor } from "@/lib/aft-taxonomy";
 import { absoluteDate } from "@/lib/format-date";
@@ -155,7 +159,8 @@ export function SignatureRow({
 				    column of data, and 16px of gutter either side of a 12px mark pushed
 				    the first real column a third of an inch off the card edge. */}
 				<TD className="w-10 px-2">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						aria-expanded={open}
 						aria-controls={detailId}
@@ -169,10 +174,10 @@ export function SignatureRow({
 						// WHOLE row rather than only when the pointer finds the 24px mark.
 						// The `--surface-2` well on direct hover is the same inert chip
 						// every other icon in the system sits in.
-						className="grid h-6 w-6 place-items-center rounded-md text-ink-3 transition-colors group-hover:text-ink hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+						className="grid h-6 w-6 place-items-center rounded-control text-ink-3 transition-colors group-hover:text-ink hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						<Chevron open={open} />
-					</button>
+					</Button>
 				</TD>
 
 				{/* SIGNATURE — the NAME, in ink. The canonical id is the next column;
@@ -195,25 +200,22 @@ export function SignatureRow({
 							{sig.signature_id}
 							{/* `font-sans`: the chip inherits `font-mono` from the cell, and
 							    "unmapped" is a WORD, not a technical value. */}
-							<Badge tone="neutral" className="font-sans">
-								unmapped
-							</Badge>
+							<StatusBadge status="unmapped" className="font-sans" />
 						</span>
 					)}
 				</TD>
 
 				{/* SEVERITY — AFT-1 intervention type (observe-first: recorded, not enforced) */}
 				<TD>
-					<Badge
+					<StatusBadge
+						status={sev.label}
 						tone={sev.tone}
 						title="AFT-1 intervention type · observe-first — the decision is recorded, not enforced."
-					>
-						{sev.label}
-					</Badge>
+					/>
 				</TD>
 
 				{/* OCCURRENCES — `numeric`: right + tabular + mono, all three together. */}
-				<TD numeric>{sig.your_hits.toLocaleString()}</TD>
+				<TD numeric>{fmtCount(sig.your_hits)}</TD>
 
 				{/* TRACES — the functional link to the affected traces (--action-ink),
 				    in the same `numeric` column treatment so the two count columns
@@ -224,7 +226,7 @@ export function SignatureRow({
 						onClick={(e) => e.stopPropagation()}
 						className="font-medium text-action-ink hover:underline"
 					>
-						{sig.traces_affected.toLocaleString()}
+						{fmtCount(sig.traces_affected)}
 						<span aria-hidden> →</span>
 					</Link>
 				</TD>
@@ -293,7 +295,7 @@ export function SignatureRow({
 								onClick={(e) => e.stopPropagation()}
 								className="text-sm font-medium text-action-ink hover:underline"
 							>
-								View {sig.traces_affected.toLocaleString()}{" "}
+								View {fmtCount(sig.traces_affected)}{" "}
 								{sig.traces_affected === 1
 									? "affected trace"
 									: "affected traces"}{" "}

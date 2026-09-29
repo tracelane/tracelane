@@ -216,6 +216,9 @@ impl CohereProvider {
                                     cache_read: None,
                                     cache_creation: None,
                                     cost_usd: None,
+                                    // RI-05 / M11: Cohere has no reasoning-token concept on
+                                    // this wire.
+                                    reasoning: None,
                                 };
                                 return;
                             }

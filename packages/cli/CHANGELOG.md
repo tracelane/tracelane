@@ -4,6 +4,27 @@
 All notable changes to `@tracelanedev/cli` (`tlane`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - unreleased
+
+### Added
+- **`tlane verify --platform-pubkey`** — batches signed by Tracelane's platform
+  key before a workspace had its own key verify as platform-signed and are counted in the
+  report; a platform-signed batch after the workspace key's first batch fails. Without the
+  flag the key pinned in the verifier release is used, and the report says which.
+- **`tlane init claude-code`** — wires an already-installed Claude Code CLI to export its
+  trace tree to Tracelane through its OTel env block (`~/.claude/settings.json`, or
+  `./.claude/settings.json` with `--project`; `--print` writes nothing). `--proxy` also
+  routes Claude Code's own API calls through the gateway's Anthropic-native
+  `POST /v1/messages`, using the Anthropic key stored under Settings → LLM providers.
+
+### Changed
+- README pricing follows the current plans: prompt promote/rollback is available on
+  Team ($229+); Builder ($29) can list and show. The published 0.3.0 README carried the
+  earlier $249 / $59 figures.
+- `tlane migrate helicone`: the mapping table no longer suggests a `TRACELANE_USER_ID`
+  environment variable — end-user identity is per request (`X-Tracelane-User-Id`, or
+  OpenAI's `user` field) — and no longer describes a client-side cache toggle.
+
 ## [0.3.0] - 2026-09-01
 
 ### Security
@@ -60,8 +81,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   tag published this package to npm but produced no signed release artifacts
   (the release job could not resolve one of its pinned actions). 0.2.3 is the
   same code from a release that carries a GitHub Release, Cosign signatures and an
-  SBOM. A verified SLSA Level 3 attestation is not claimed - the
-  slsa-github-generator final job fails even on successful releases.
+  SBOM. Release artifacts are signed with
+  Sigstore cosign.
 
 ## [0.2.2] - 2026-08-01
 

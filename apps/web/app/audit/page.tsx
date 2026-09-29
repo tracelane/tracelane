@@ -1,70 +1,38 @@
-/**
- * Audit Ledger page — the tamper-evident record; the chain + self-verify on every
- * plan, the Article-12 export gated honestly to Enterprise (f_audit_addon).
- *
- * Entitled tenants get the chain visualization + a client-side "Verify integrity"
- * (the real verifier runs in their browser) + the Article-12 export. Non-entitled
- * tenants get the sales surface (what it does + upgrade CTA) — never fake data.
- * tenant_id comes from the WorkOS session; the gateway owns the tenant-scoped read.
- *
- * Window resolution (priority order):
- *   1. Explicit ?since=<ISO>&until=<ISO> — custom date range (auditor path)
- *   2. ?range=<key> — preset window (24h/7d/30d/90d/all)
- *   3. Default: "all"
- *
- * Speed notes:
- *   • getAuditAccess() is the only DB round-trip; LedgerData/SelfVerifyData
- *     receive the resolved pubkey as a prop — no duplicate requireSession() or
- *     tenant selects inside those components.
- *   • The two gateway fetches (summary + export) are fired in parallel via
- *     Promise.all with per-fetch .catch() so a summary failure doesn't abort export.
- *   • LedgerData/SelfVerifyData are wrapped in <Suspense> so HTML streams from
- *     the page shell immediately; the ledger content streams in after the gateway.
- */
-
+/** Audit evidence: a bounded check, never a workspace-wide integrity verdict. */
 import { AuditHelpBar } from "@/components/audit/AuditHelpBar";
 import {
 	AuditLedgerView,
-	type AuditSummary,
+	type AuditWindow,
+	type LedgerRange,
 } from "@/components/audit/AuditLedgerView";
 import { AuditSalesSurface } from "@/components/audit/AuditSalesSurface";
-import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import {
+	type AuditKeyContext,
+	AuditWorkflow,
+} from "@/components/audit/AuditWorkflow";
 import { db } from "@/db";
-import { tenantAuditKeys, tenants } from "@/db/schema";
+import { auditAnchorRecords, tenantAuditKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { e2eAuditFixture } from "@/lib/e2e-audit-fixture";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
-import { GatewayError, gatewayGet, gatewayGetText } from "@/lib/gateway";
-import { EmptyState, Skeleton } from "@tracelanedev/ui";
-import { eq } from "drizzle-orm";
+import { GatewayError, gatewayGet } from "@/lib/gateway";
+import { PageHeader } from "@tracelanedev/ui";
+import { and, eq, min } from "drizzle-orm";
 import type { Metadata } from "next";
 import { Suspense } from "react";
+import Loading from "./loading";
+import { auditFingerprint, readPlatformTrustRoot } from "./trust-root";
 
-export const metadata: Metadata = { title: "Audit Ledger — Tracelane" };
+export const metadata: Metadata = { title: "Audit evidence — Tracelane" };
 export const dynamic = "force-dynamic";
 
-/** Date-range windows for the ledger view → the export `since`/`until` params.
- * `all` maps to a wide floor (the ledger is append-only, no automatic expiry). */
-const RANGES = { "24h": 1, "7d": 7, "30d": 30, "90d": 90, all: null } as const;
-export type AuditRange = keyof typeof RANGES;
-/** Genesis floor for the append-only ledger — the export/summary window always
- * starts here so the chain the verifier sees begins at seq 0 (verifiable). */
-const GENESIS_SINCE = "2020-01-01T00:00:00Z";
-function rangeSinceIso(range: AuditRange): string {
-	const days = RANGES[range];
-	return days == null
-		? GENESIS_SINCE
-		: new Date(Date.now() - days * 86_400_000).toISOString();
-}
-
-/**
- * Single DB round-trip: session → tenant row → entitlements + audit key (parallel).
- * Returns everything LedgerData and SelfVerifyData need so they never re-query.
- */
 async function getAuditAccess(): Promise<{
 	selfVerify: boolean;
 	exportEntitled: boolean;
 	tenantPubkeyB64: string;
+	workspaceKeyCreatedAt?: string;
+	workspaceFingerprint?: string;
+	workspaceKeySinceSeq?: number;
 }> {
 	const session = await requireSession();
 	const [row] = await db
@@ -87,323 +55,265 @@ async function getAuditAccess(): Promise<{
 		resolveEntitlements(row?.id, plan),
 		row !== undefined
 			? db
-					.select({ pubkey: tenantAuditKeys.publicKeyB64 })
+					.select({
+						pubkey: tenantAuditKeys.publicKeyB64,
+						createdAt: tenantAuditKeys.createdAt,
+					})
 					.from(tenantAuditKeys)
 					.where(eq(tenantAuditKeys.tenantId, row.id))
 					.limit(1)
 					.then(([r]) => r)
+					.catch(() => undefined)
 			: Promise.resolve(undefined),
 	]);
+	// AUD-29: where the workspace key took over — the first batch it signed, from the
+	// CANONICAL anchor records (ADR-078 B). The verifier then refuses a platform-signed
+	// batch at or past it even when this window holds no workspace-signed batch. A
+	// failed read leaves it unset: the in-window rule still holds, and the page says
+	// nothing it did not check.
+	const workspaceKeySinceSeq =
+		row !== undefined && keyRow?.pubkey
+			? await db
+					.select({ since: min(auditAnchorRecords.batchStartSeq) })
+					.from(auditAnchorRecords)
+					.where(
+						and(
+							eq(auditAnchorRecords.tenantId, row.id),
+							eq(auditAnchorRecords.ed25519Pubkey, keyRow.pubkey),
+						),
+					)
+					.then(([r]) => r?.since ?? undefined)
+					.catch(() => undefined)
+			: undefined;
 	return {
 		selfVerify: entitlements.audit_self_verify,
 		exportEntitled: entitlements.audit_ledger,
-		// The plan's trace-retention (spans TTL). The audit_log itself has NO TTL
-		// (append-only) — shown as a contrast so the user sees the ledger outlives
-		// their trace data.
+		workspaceKeySinceSeq,
 		tenantPubkeyB64: keyRow?.pubkey ?? "",
+		workspaceKeyCreatedAt: keyRow?.createdAt.toISOString(),
+		workspaceFingerprint: keyRow?.pubkey
+			? await auditFingerprint(keyRow.pubkey).catch(() => undefined)
+			: undefined,
 	};
 }
 
-/** Server verdict shape returned by the FREE gateway self-verify endpoint
- * (ADR-066). We consume `chain_ndjson` to render + re-verify in the browser.
- * `total_in_window` is the EXACT uncapped count so the UI shows an honest
- * "Showing N of {total}" instead of the loaded cap reading as the whole ledger. */
 interface SelfVerifyResponse {
 	chain_ndjson: string;
-	/** Rows actually loaded (capped at the render limit). */
-	rows_verified?: number;
-	/** Exact uncapped count of chain rows in the retention window. */
-	total_in_window?: number;
+	window: AuditWindow;
 }
 
-/** Streaming fallback for Suspense — mirrors the loading.tsx skeleton without the
- * outer <main> so it nests correctly inside the page shell. */
-function AuditFallback() {
-	return (
-		<div className="space-y-4">
-			<Skeleton className="h-28 w-full rounded-[var(--radius-card)]" />
-			<Skeleton className="mt-2 h-5 w-40" />
-			<div className="mt-2 space-y-1.5">
-				{["a", "b", "c", "d", "e", "f", "g", "h"].map((id) => (
-					<Skeleton key={id} className="h-10 w-full" />
-				))}
-			</div>
-		</div>
-	);
-}
-
-/** FREE self-verify surface (ADR-066): render the caller's OWN recent chain +
- * the in-browser "Verify integrity" for tenants WITHOUT the Enterprise export entitlement.
- * The export affordance is hidden (canExport=false) and replaced by the upsell.
- * `tenantPubkeyB64` is resolved once by getAuditAccess() — not re-fetched here. */
-async function SelfVerifyData({
-	range,
-	since,
-	until,
+async function LedgerData({
 	tenantPubkeyB64,
-}: {
-	range: AuditRange;
-	since?: string;
-	until?: string;
+	exportEntitled,
+	...keys
+}: AuditKeyContext & {
 	tenantPubkeyB64: string;
+	exportEntitled: boolean;
 }) {
-	let res: SelfVerifyResponse;
-	try {
-		res = await gatewayGet<SelfVerifyResponse>("/v1/audit/self-verify");
-	} catch (err) {
-		if (err instanceof GatewayError) {
-			return (
-				<>
-					<WarmingBanner />
-					<EmptyState
-						title="No audit events yet"
-						description="Audit events appear here as your agents run — the tamper-evident chain starts from the first event."
-					/>
-				</>
-			);
-		}
-		throw err;
-	}
-	if (!res.chain_ndjson?.trim()) {
+	// Both plans use the SAME bounded self-verify route, which includes only fully
+	// covered anchor batches. Never call the bulk export to render the page.
+	// The lifetime inventory is distinct from the plan-retention count.
+	const [evidence, inventory] = await Promise.allSettled([
+		gatewayGet<SelfVerifyResponse>(
+			"/v1/audit/self-verify?limit=1000&order=desc",
+		),
+		gatewayGet<LedgerRange>("/v1/audit/ledger-range"),
+	]);
+	if (evidence.status === "rejected") {
+		const status =
+			evidence.reason instanceof GatewayError
+				? evidence.reason.status
+				: undefined;
 		return (
-			<EmptyState
-				title="No audit events yet"
-				description="Audit events appear here as your agents run — the tamper-evident chain starts from the first event."
-			/>
+			<section className="surface-card p-6" aria-live="polite">
+				<AuditWorkflow report={null} rows={0} batches={0} readError {...keys} />
+				<p className="mt-4 text-xs font-medium uppercase tracking-widest text-ink-2">
+					CANNOT DETERMINE
+				</p>
+				<h2 className="mt-2 text-xl font-semibold">
+					We couldn’t check your evidence
+				</h2>
+				<p className="mt-2 text-sm text-ink-2">
+					{status === 401
+						? "Sign in again to read this workspace’s ledger."
+						: status === 403
+							? "This workspace or sign-in does not have permission to read the ledger."
+							: "The ledger read did not complete. Its integrity is unknown here."}
+				</p>
+				<div className="mt-5 flex gap-5 text-sm">
+					<a
+						className="underline"
+						href={status === 401 ? "/sign-in" : "/audit"}
+					>
+						{status === 401 ? "Sign in" : "Retry ledger read"}
+					</a>
+					<a className="underline" href="/support">
+						Contact support
+					</a>
+				</div>
+			</section>
 		);
 	}
-	// The gateway self-verify endpoint returns the whole retention window; the
-	// range control filters the DISPLAYED chain in-browser. Compute the lower
-	// bound server-side (a deterministic string → no hydration drift): explicit
-	// `since` wins; a preset maps via rangeSinceIso; "all" → no filter.
-	const windowSince =
-		since ?? (range !== "all" ? rangeSinceIso(range) : undefined);
 	return (
 		<AuditLedgerView
-			ndjson={res.chain_ndjson}
+			{...keys}
+			ndjson={evidence.value.chain_ndjson}
 			tenantPubkeyB64={tenantPubkeyB64}
-			range={since ? undefined : range}
-			since={since}
-			until={until}
-			windowSince={windowSince}
-			windowUntil={until}
-			windowTotal={res.total_in_window}
-			canExport={false}
+			canExport={exportEntitled}
+			ledgerRange={
+				inventory.status === "fulfilled" ? inventory.value : undefined
+			}
+			window={evidence.value.window}
 		/>
-	);
-}
-
-/**
- * Enterprise export surface (f_audit_addon, seeded TRUE on Enterprise only).
- * `tenantPubkeyB64` is resolved once by getAuditAccess() — not re-fetched here.
- * The two gateway calls (summary + export) fire in parallel. A summary failure
- * is DEGRADED, not silent (B-335c): `/v1/audit/export` is capped at 1,000 rows
- * (`limit=1000` below), and `summary.total` is the ONLY exact, uncapped count —
- * without it, `AuditLedgerView` falls back to the loaded-row count, which is
- * indistinguishable from the true total once the ledger exceeds the cap. So a
- * failed summary read is surfaced with the same unreachable notice the rest of
- * this file uses, never folded into `undefined` and rendered as if nothing
- * happened.
- */
-async function LedgerData({
-	range,
-	since,
-	until,
-	tenantPubkeyB64,
-}: {
-	range: AuditRange;
-	since?: string;
-	until?: string;
-	tenantPubkeyB64: string;
-}) {
-	// Window resolution: explicit since/until wins over preset range.
-	const sinceIso = since ?? rangeSinceIso(range);
-	const untilIso = until ?? new Date().toISOString();
-
-	// Parallel gateway fetches. The export fetch determines the render path (no
-	// export, no page); the summary fetch degrades gracefully — `undefined`
-	// summary is a real, tracked state (`summaryUnreachable`), not a discard.
-	const [summaryOutcome, ndjsonOrNull] = await Promise.all([
-		gatewayGet<AuditSummary>(
-			`/v1/audit/summary?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`,
-		)
-			.then((s): { summary: AuditSummary; unreachable: false } => ({
-				summary: s,
-				unreachable: false,
-			}))
-			.catch((err: unknown): { summary: undefined; unreachable: true } => {
-				if (err instanceof GatewayError) {
-					return { summary: undefined, unreachable: true };
-				}
-				throw err;
-			}),
-		// Required export. A GatewayError is kept WITH ITS STATUS: a 5xx is the
-		// gateway REFUSING the export (B-427 — it now fails closed when the chain
-		// rows or anchor records cannot be read) and must render as a failed read,
-		// never as "no audit events yet". Other errors propagate.
-		gatewayGetText(
-			`/v1/audit/export?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}&limit=1000`,
-		).catch((err: unknown): GatewayError => {
-			if (err instanceof GatewayError) return err;
-			throw err;
-		}),
-	]);
-	const { summary, unreachable: summaryUnreachable } = summaryOutcome;
-
-	if (ndjsonOrNull instanceof GatewayError) {
-		if (ndjsonOrNull.status >= 500) {
-			// B-427: the export was refused because a read behind it failed. Nothing
-			// is shown rather than a partial ledger — a chain with its anchors
-			// missing looks complete and proves nothing. Say so; do not say "empty".
-			return (
-				<EmptyState
-					title="The audit ledger could not be read"
-					description={`The gateway refused the export (HTTP ${ndjsonOrNull.status}) rather than return an incomplete ledger. Nothing you recorded is lost — reload to retry, and contact support if it persists.`}
-				/>
-			);
-		}
-		return (
-			<>
-				<WarmingBanner />
-				<EmptyState
-					title="No audit events yet"
-					description="Audit events appear here as your agents run — the tamper-evident chain starts from the first event."
-				/>
-			</>
-		);
-	}
-	if (!ndjsonOrNull.trim()) {
-		return (
-			<EmptyState
-				title="No audit events yet"
-				description="Audit events appear here as your agents run — the tamper-evident chain starts from the first event."
-			/>
-		);
-	}
-	return (
-		<>
-			{/* The exact, uncapped total (`summary.total`) could not be read — the
-			    same unreachable notice used elsewhere on this page, so the count
-			    the ledger view falls back to (the loaded/capped rows) is never
-			    mistaken for the whole ledger. */}
-			{summaryUnreachable && (
-				<>
-					<WarmingBanner />
-					<p className="-mt-4 mb-6 text-xs text-ink-2">
-						The exact ledger total couldn&apos;t be read from the gateway — the
-						counts below reflect only the rows loaded for this view (capped at
-						1,000), not necessarily the complete ledger.
-					</p>
-				</>
-			)}
-			<AuditLedgerView
-				ndjson={ndjsonOrNull}
-				tenantPubkeyB64={tenantPubkeyB64}
-				range={since ? undefined : range}
-				since={since}
-				until={until}
-				summary={summary}
-				canExport
-			/>
-		</>
 	);
 }
 
 export default async function AuditPage({
 	searchParams,
 }: {
-	searchParams: Promise<{
-		e2e_fixture?: string;
-		range?: string;
-		since?: string;
-		until?: string;
-	}>;
+	searchParams: Promise<{ e2e_fixture?: string }>;
 }) {
 	const sp = await searchParams;
-	// E2E-only hero seam (returns null in prod): drives the REAL in-browser
-	// verifier over a REAL anchored/tampered fixture without a live gateway or a
-	// seeded Neon, so the launch gate actually asserts the audit hero. Gated on
-	// the dev/test e2e auth bypass — never active in production.
 	const fixture = sp.e2e_fixture ? await e2eAuditFixture(sp.e2e_fixture) : null;
-
-	// Verification is genesis-anchored (the verifier requires the chain to start at
-	// seq 0), so the view is NOT windowable. Force the full-chain-from-genesis view
-	// regardless of any legacy ?range=/&since= in the URL — a bookmarked "24h" must
-	// not resurrect the empty-window bug (it filtered the genesis-anchored first-1000
-	// rows down to zero). The complete ledger is the export.
-	const range: AuditRange = "all";
-	const since = undefined;
-	const until = undefined;
-
-	// Single DB round-trip: resolves entitlements + audit key in parallel.
-	// The fixture path bypasses real session/entitlement resolution.
+	// Reuse the existing dev/test-only fixture gate. No additional production bypass.
+	if (fixture && sp.e2e_fixture === "empty") fixture.ndjson = "";
+	if (fixture && sp.e2e_fixture === "proof-failed") {
+		fixture.ndjson = fixture.ndjson
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const record = JSON.parse(line);
+				if (record.type === "anchor")
+					record.rekor.checkpoint.envelope = "invalid-checkpoint";
+				return JSON.stringify(record);
+			})
+			.join("\n");
+	}
+	const platformRoot = await readPlatformTrustRoot();
+	// The existing explicit dev-only fixture gate is the only entry to these local vectors.
+	if (fixture && sp.e2e_fixture?.startsWith("platform-")) {
+		const workspace = await gatewayGet<{
+			ed25519_pubkey_b64: string;
+			created_at: string;
+			workspace_key_since_seq?: number | null;
+		}>("/v1/audit/pubkey");
+		// Dev-only fixture vectors are signed by a TEST platform key the fixture gateway
+		// serves; production never takes this branch (the pinned key is its root).
+		const fixturePlatform = await gatewayGet<{ ed25519_pubkey_b64: string }>(
+			"/v1/audit/platform-pubkey",
+		);
+		return (
+			<div className="mx-auto max-w-6xl space-y-5 px-4 py-6">
+				<PageHeader title="Audit evidence" />
+				<LedgerData
+					tenantPubkeyB64={workspace.ed25519_pubkey_b64}
+					exportEntitled
+					workspaceKeyCreatedAt={workspace.created_at}
+					workspaceKeySinceSeq={workspace.workspace_key_since_seq ?? undefined}
+					workspaceFingerprint={
+						await auditFingerprint(workspace.ed25519_pubkey_b64)
+					}
+					platformPubkeyB64={fixturePlatform.ed25519_pubkey_b64}
+					platformFingerprint={
+						await auditFingerprint(fixturePlatform.ed25519_pubkey_b64)
+					}
+					platformKeySource="gateway"
+				/>
+			</div>
+		);
+	}
 	const access = fixture
 		? {
-				selfVerify: false as const,
-				exportEntitled: false as const,
-				tenantPubkeyB64: "",
+				selfVerify: true,
+				exportEntitled: true,
+				tenantPubkeyB64: fixture.tenantPubkeyB64,
+				workspaceKeyCreatedAt: undefined,
+				workspaceFingerprint: fixture.tenantPubkeyB64
+					? await auditFingerprint(fixture.tenantPubkeyB64)
+					: undefined,
 			}
 		: await getAuditAccess();
-
 	return (
-		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			{/* No date-range control: "Verify integrity" recomputes the chain from its
-			    GENESIS root (seq 0), so it is inherently NOT windowable — a "last 24h"
-			    slice doesn't start at genesis and can't be verified (that was the
-			    24h-shows-0 bug). The view shows the first N events from genesis; the
-			    complete ledger is the export. */}
-			<div className="mb-4 max-w-2xl">
-				<h1 className="flex items-center gap-2.5 t-h1">
-					Audit Ledger
-					{/* DSH-16: the recorder's amber — this workspace's own indicator
-					    light for "everything below is being continuously ledgered".
-					    Decorative only; the h1's text and the paragraph's claim are
-					    unchanged. */}
-					<span
-						aria-hidden="true"
-						className="recorder-dot"
-						title="Continuously recorded to the tamper-evident ledger"
-					/>
-				</h1>
-				<p className="mt-1 text-sm text-ink-2">
-					A tamper-evident, independently verifiable record of every
-					gateway-proxied call and guardrail verdict.
-				</p>
-			</div>
-
-			<AuditHelpBar exportEntitled={access.exportEntitled} />
-
+		<div className="mx-auto max-w-6xl px-2 py-4 sm:px-6 sm:py-6">
+			<header className="mb-4 flex flex-wrap items-start justify-between gap-4">
+				<div>
+					<p className="mb-2 text-xs font-medium uppercase tracking-widest text-ink-3">
+						The evidence behind your AI
+					</p>
+					<PageHeader title={<>Audit evidence</>} />
+					<p className="mt-2 text-sm text-ink-2">
+						Check recorded events for changes. Inspect the proof. Know what
+						needs attention.
+					</p>
+				</div>
+				<a
+					href="https://docs.tracelane.dev/audit-ledger"
+					className="text-sm text-ink-2 underline underline-offset-4"
+				>
+					How verification works ↗
+				</a>
+			</header>
 			{fixture ? (
 				<AuditLedgerView
+					{...platformRoot}
+					workspaceFingerprint={access.workspaceFingerprint}
 					ndjson={fixture.ndjson}
 					tenantPubkeyB64={fixture.tenantPubkeyB64}
+					canExport={sp.e2e_fixture !== "free"}
+					ledgerRange={
+						sp.e2e_fixture === "unknown-total"
+							? undefined
+							: {
+									total:
+										sp.e2e_fixture === "billion" ||
+										sp.e2e_fixture === "newest-billion"
+											? 1_000_000_000
+											: sp.e2e_fixture === "empty"
+												? 0
+												: sp.e2e_fixture === "tampered-later"
+													? 1000
+													: 4,
+									from: 0,
+									to:
+										sp.e2e_fixture === "billion" ||
+										sp.e2e_fixture === "newest-billion"
+											? 999_999_999
+											: sp.e2e_fixture === "tampered-later"
+												? 999
+												: 3,
+									latest_event_at:
+										sp.e2e_fixture === "empty" ? null : "2026-09-24T00:00:00Z",
+									latest_anchor_at: [
+										"empty",
+										"newest-billion",
+										"tampered-later",
+									].includes(sp.e2e_fixture ?? "")
+										? null
+										: "2026-09-24T00:01:00Z",
+								}
+					}
+					window={{
+						since: "2026-07-01T00:00:00Z",
+						until: "2026-09-24T00:00:00Z",
+					}}
 				/>
-			) : access.exportEntitled ? (
-				// Enterprise (f_audit_addon): full chain + verify + Article-12 export.
-				// Wrapped in Suspense so the page shell (header) streams first; the
-				// ledger content streams in after the gateway round-trips complete.
-				<Suspense fallback={<AuditFallback />}>
-					<LedgerData
-						range={range}
-						since={since}
-						until={until}
-						tenantPubkeyB64={access.tenantPubkeyB64}
-					/>
-				</Suspense>
 			) : access.selfVerify ? (
-				// ADR-066 free surface: SEE + verify your OWN chain; export is the upsell.
-				<Suspense fallback={<AuditFallback />}>
-					<SelfVerifyData
-						range={range}
-						since={since}
-						until={until}
+				<Suspense fallback={<Loading />}>
+					<LedgerData
+						{...platformRoot}
+						workspaceFingerprint={access.workspaceFingerprint}
+						workspaceKeyCreatedAt={access.workspaceKeyCreatedAt}
+						workspaceKeySinceSeq={access.workspaceKeySinceSeq}
 						tenantPubkeyB64={access.tenantPubkeyB64}
+						exportEntitled={access.exportEntitled}
 					/>
 				</Suspense>
 			) : (
-				// Self-verify switched off for this workspace (rare override).
 				<AuditSalesSurface />
 			)}
+			<footer className="mt-6 space-y-4 border-t border-line pt-5">
+				<AuditHelpBar exportEntitled={access.exportEntitled} />
+			</footer>
 		</div>
 	);
 }

@@ -22,7 +22,7 @@ interface Params {
  * GET /api/prompts/[name]?env=production|staging — the version currently routed
  * to that environment (EVL-02).
  *
- * Proxies `GET /v1/prompts/{name}` with `env` forwarded. The gateway resolves the
+ * Proxies `GET /v1/prompts/{name}/configuration` with `env` forwarded. The gateway resolves the
  * tenant from the token and answers **404 when nothing is routed to that env**,
  * which is a real answer and not an error: the create dialog turns it into
  * "promote a version to staging first", which is the action. Collapsing it into a
@@ -35,7 +35,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 	const { name } = await params;
 	const env = req.nextUrl.searchParams.get("env") ?? "production";
 	const base = gatewayBaseUrl();
-	const url = `${base}/v1/prompts/${encodeURIComponent(name)}?env=${encodeURIComponent(env)}`;
+	const url = `${base}/v1/prompts/${encodeURIComponent(name)}/configuration?env=${encodeURIComponent(env)}`;
 
 	let upstream: Response;
 	try {

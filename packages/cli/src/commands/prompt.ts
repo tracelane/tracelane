@@ -3,7 +3,7 @@
  *
  * Wired to the live gateway endpoints landed in commits c28bac9 +
  * 4555ffb:
- *   GET  /v1/prompts/:name?env=...           -> show
+ *   GET  /v1/prompts/:name/configuration?env=...           -> show
  *   GET  /v1/prompts/:name/history?limit=N   -> list (per prompt)
  *   POST /v1/prompts/:name/promote           -> promote
  *   POST /v1/prompts/:name/rollback          -> rollback
@@ -186,7 +186,7 @@ export function registerPromptCommand(program: Command): void {
 		);
 
 	commonOpts(prompt.command("show <name>"))
-		.description("Show resolved active version per environment")
+		.description("Show configured active version per environment")
 		.option("--env <env>", "Single env (dev|staging|production|canary)")
 		.action(
 			async (
@@ -201,7 +201,7 @@ export function registerPromptCommand(program: Command): void {
 					try {
 						const v = await apiGet<ResolvedVersion>(
 							conn,
-							`/v1/prompts/${encodeURIComponent(name)}?env=${env}`,
+							`/v1/prompts/${encodeURIComponent(name)}/configuration?env=${env}`,
 						);
 						process.stdout.write(
 							`${env.padEnd(10)} v${v.version_number}  id=${shortId(v.prompt_version_id)}  sha=${v.sha256_hex.slice(0, 12)}…${v.model_pin ? `  model=${v.model_pin}` : ""}\n`,
@@ -337,11 +337,11 @@ export function registerPromptCommand(program: Command): void {
 					const [a, b] = await Promise.all([
 						apiGet<ResolvedVersion>(
 							conn,
-							`/v1/prompts/${encodeURIComponent(name)}?env=${opts.fromEnv}`,
+							`/v1/prompts/${encodeURIComponent(name)}/configuration?env=${opts.fromEnv}`,
 						),
 						apiGet<ResolvedVersion>(
 							conn,
-							`/v1/prompts/${encodeURIComponent(name)}?env=${opts.toEnv}`,
+							`/v1/prompts/${encodeURIComponent(name)}/configuration?env=${opts.toEnv}`,
 						),
 					]);
 					if (a.sha256_hex === b.sha256_hex) {

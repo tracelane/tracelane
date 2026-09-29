@@ -1073,8 +1073,25 @@ pub async fn messages_handler(
     body: Bytes,
 ) -> Response {
     use crate::admission::Route as _;
+    let control = match crate::semantic_cache::CacheControl::parse(&headers) {
+        Ok(control) => control,
+        Err(err) => return err.response(true),
+    };
     match crate::admission::admit::<Messages>(&state, &headers, body).await {
-        Ok(admitted) => messages_admitted(state, headers, admitted).await,
+        Ok(mut admitted) => {
+            let policy = match control.resolve(
+                admitted.entitlements.as_deref(),
+                state.semantic_cache.as_deref(),
+                false,
+            ) {
+                Ok(policy) => policy,
+                Err(err) => {
+                    admitted.dispatch_guard.abort(err.code, None);
+                    return err.response(true);
+                }
+            };
+            policy.response(messages_admitted(state, headers, admitted).await)
+        }
         Err(refusal) => Messages::refuse(refusal),
     }
 }
@@ -1110,7 +1127,7 @@ async fn messages_admitted(
 ) -> Response {
     let crate::admission::Admitted {
         claims,
-        identity,
+        mut identity,
         request_start,
         trace_id,
         inbound_parent,
@@ -1118,8 +1135,20 @@ async fn messages_admitted(
         warn_aft_id,
         correlation_id,
         mut dispatch_guard,
+        // B-568 I2: kept, not discarded in the `..` — this route (the one Claude
+        // Code uses) had no stage breakdown anywhere until 2026-09-27.
+        mut timer,
+        entitlements,
         ..
     } = admitted;
+    // GWY-53: the ONE capture decision (operator allowlist OR the workspace opt-in;
+    // no control plane = the workspace half OFF). This route records the REQUEST text
+    // only — its response capture is not built yet (spec §6).
+    let capture = crate::server::config::capture_decision(
+        crate::server::config::trace_content(),
+        entitlements.as_deref().map(|e| e.content_capture),
+        &claims.tenant_id,
+    );
     let MessagesParsed {
         raw: body,
         mut json_body,
@@ -1132,14 +1161,61 @@ async fn messages_admitted(
     // `SessionState` independently of the span.
     let conversation_id = identity.conversation_id.clone();
 
+    // GWY-49: the zero-data-retention constraint. This route has ONE provider
+    // (`PROVIDER_ID`) and no failover chain, so the check is that provider's capability
+    // and the eligible set is it or nothing; the same header, the same fail-CLOSED
+    // refusal as `/v1/chat/completions`, before any credential is resolved or a byte leaves — in THIS wire's
+    // error shape (`coded_error`), because a Claude SDK cannot read an OpenAI body.
+    let zdr_eligible: Option<Vec<String>> = match crate::zdr::constraint_from_headers(&headers) {
+        Ok(None) => None,
+        Ok(Some(crate::zdr::Constraint::Required)) => {
+            let caps = state.zdr.load();
+            if !caps.eligible(PROVIDER_ID) {
+                dispatch_guard.record_zdr(Vec::new());
+                dispatch_guard.abort("zdr_unsatisfiable", None);
+                return anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    error_type_for(StatusCode::BAD_REQUEST),
+                    &crate::server::zdr_unsatisfiable_message(caps.default_count()),
+                    &[
+                        ("code", json!("zdr_unsatisfiable")),
+                        ("model", json!(chat_request.model)),
+                        ("provider", json!(PROVIDER_ID)),
+                        ("eligible_provider_count", json!(caps.default_count())),
+                    ],
+                );
+            }
+            let eligible = vec![PROVIDER_ID.to_string()];
+            dispatch_guard.record_zdr(eligible.clone());
+            Some(eligible)
+        }
+        Err(bad) => {
+            dispatch_guard.abort("invalid_zdr_constraint", None);
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                error_type_for(StatusCode::BAD_REQUEST),
+                crate::server::INVALID_ZDR_CONSTRAINT_MESSAGE,
+                &[
+                    ("code", json!("invalid_zdr_constraint")),
+                    ("received", json!(bad.chars().take(64).collect::<String>())),
+                ],
+            );
+        }
+    };
+
     // --- Step 2: BYOK. Fail-CLOSED, and the two failures need OPPOSITE actions ---
-    let provider_key = match crate::server::resolve_provider_key(
+    let (resolved_key, byok_round_trip) = crate::server::resolve_provider_key_traced(
         tenant_id,
         PROVIDER_ID,
         crate::providers::ProviderRegistry::env_var_for_provider_id(PROVIDER_ID),
     )
-    .await
-    {
+    .await;
+    // B-568 I5: a BYOK cache miss read the control plane on the request path.
+    if byok_round_trip {
+        timer.note_cold();
+        identity.cold_start = true;
+    }
+    let provider_key = match resolved_key {
         ProviderKey::Found(k) if !k.expose_secret().is_empty() => k,
         outcome => {
             let (status, code, message) = match outcome {
@@ -1166,6 +1242,7 @@ async fn messages_admitted(
             return coded_error(status, code, message);
         }
     };
+    timer.mark("route_byok");
 
     // --- Step 3: Inline guardrails, request side. Fail-CLOSED ---
     // `correlation_id` was minted by admission; the response-side seam reuses it.
@@ -1285,7 +1362,20 @@ async fn messages_admitted(
     }
 
     // --- Step 5: Forward. NO retry, NO failover (spec §6) ---
+    // B-568 I2: guardrails + the egress body + the breaker, then the dispatch
+    // boundary — emitted against the same `dispatch_ts - request_start` the span's
+    // overhead number opens with, exactly as the chat route does.
+    timer.mark("guardrails");
     let dispatch_ts = chrono::Utc::now();
+    timer.emit_if_slow(
+        &state.hotpath,
+        u64::try_from(
+            (dispatch_ts - request_start)
+                .num_microseconds()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
+    );
     let upstream = match forward(
         &state,
         &headers,
@@ -1355,13 +1445,19 @@ async fn messages_admitted(
         request_start,
         dispatch_ts,
         api_key_id: claims.api_key_id().map(str::to_owned),
-        captured_input: CapturedInput::build(tenant_id, &chat_request),
+        captured_input: CapturedInput::build(capture, &chat_request),
         // GWY-48, span site 4 of 4. Built from the SAME converted `ChatRequest`
         // the chat route uses, so an Anthropic-native call and an OpenAI-shaped
         // one land identical attributes for identical settings — the property
         // that makes a cross-route query over `gen_ai_request_temperature` mean
         // anything.
-        request_config: crate::server::RequestConfig::build(&chat_request).with_policy_flags(),
+        request_config: {
+            let rc = crate::server::RequestConfig::build(&chat_request).with_policy_flags();
+            match &zdr_eligible {
+                Some(eligible) => rc.with_zdr(eligible.clone()),
+                None => rc,
+            }
+        },
         aft_id: warn_aft_id,
     };
     let response_inputs = crate::guardrail::ResponseInputs {
@@ -1525,6 +1621,14 @@ fn finish_span(state: &AppState, ctx: SpanContext, usage: UsageAcc, outcome: Fin
             // `build_gateway_span` derives it from `pricing::cost_usd`. An unknown
             // model yields `None`, never a fabricated zero (ADR-055).
             cost_usd: None,
+            served: crate::server::ServedMeta::default(),
+            finish_reason: None,
+            // RI-05: this route dispatches directly to the Anthropic adapter
+            // with no retry loop and no failover (see the comment two lines
+            // below) — there is no ledger to build.
+            dispatch_attempts: Vec::new(),
+            // RI-05 / M11: Anthropic has no reasoning-token field on the wire.
+            reasoning_output_tokens: None,
         },
         // No failover on this route, so never a failover attribution.
         None,
@@ -2040,7 +2144,14 @@ async fn count_tokens_with_claims(
             .rate_limiter
             .check_scoped(tenant_id, rpm, claims.api_key_id(), claims.rate_limit_rpm)
     {
-        state.rejection_metrics.record_rate_limited(tenant_id);
+        // RI-05 slice 3 follow-up (2026-09-20): the aggregate span, like the three
+        // admission sites — a refusal here was the last one counted but never recorded.
+        state.rejection_metrics.record_admission_refusal(
+            tenant_id,
+            claims.api_key_id(),
+            crate::rejection_metrics::RejectionReason::RateLimited,
+            chrono::Utc::now(),
+        );
         return anthropic_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
@@ -3104,5 +3215,44 @@ mod tests {
             "the ORIGINAL request bytes are what reach Anthropic — nothing is \
              re-serialised on the way out"
         );
+    }
+    #[tokio::test]
+    async fn kya_messages_records_header_identity_and_client_without_user_agent() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(JSON_FIXTURE, "application/json"))
+            .mount(&server)
+            .await;
+        let tenant = tenant();
+        install_byok(&tenant);
+        let trace = Uuid::new_v4();
+        let mut headers = headers_with_trace(trace);
+        headers.insert("x-tracelane-agent-name", "KYA-Proof".parse().unwrap());
+        headers.insert(
+            "user-agent",
+            "claude-cli/2.1.281 private-machine-metadata"
+                .parse()
+                .unwrap(),
+        );
+        let body=Bytes::from(json!({"model":"claude-sonnet-4-6","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}).to_string());
+        let response = messages_with_claims(
+            state_for(&server.uri(), in_memory_chain()),
+            headers,
+            body,
+            claims_for(&tenant),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let spans = span_capture::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let attrs = &spans[0].attributes;
+        assert_eq!(attrs.gen_ai_agent_name.as_deref(), Some("kya-proof"));
+        assert_eq!(attrs.tracelane_client_name.as_deref(), Some("claude-code"));
+        assert_eq!(attrs.tracelane_agent_name_source.as_deref(), Some("header"));
+        let stored = serde_json::to_string(&spans[0]).unwrap();
+        assert!(!stored.contains("claude-cli/"));
+        assert!(!stored.contains("private-machine-metadata"));
     }
 }

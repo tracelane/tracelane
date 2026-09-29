@@ -12,7 +12,7 @@ export interface Props {
 
 const {
   title = "tracelane — the flight recorder for AI agents",
-  description = "Open-source gateway for AI agents. Trace every run, replay the exact failure, and prove what happened with a tamper-evident ledger. Self-host or start free.",
+  description = "Open-source gateway for AI agents. Record every run, inspect the failing trace, and prove what happened with a tamper-evident ledger. Self-host or start free.",
   canonical = Astro.url.pathname,
   ogImage = "/og-default.png",
 } = Astro.props;
@@ -43,7 +43,6 @@ const jsonLd = {
       applicationCategory: "DeveloperApplication",
       operatingSystem: "Linux, macOS, Windows",
       offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
-      softwareVersion: "1.0.0",
       license: "https://www.apache.org/licenses/LICENSE-2.0",
       url: "https://tracelane.dev",
     },
@@ -52,30 +51,12 @@ const jsonLd = {
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
   <head>
-    <script is:inline>
-      /* Dark mode is the shared app tokens' own mechanism — `[data-theme="dark"]`
-         in the shared ui `tokens.css` — not a site-local palette. The
-         app itself flips that attribute from a user setting; the site has no
-         such setting, so it follows the OS/browser preference instead. Runs
-         BEFORE first paint (blocking, in <head>) so there is no flash. */
-      (function () {
-        var KEY = "tracelane-theme";
-        var mq = window.matchMedia("(prefers-color-scheme: dark)");
-        function stored() { try { return localStorage.getItem(KEY); } catch (e) { return null; } }
-        function apply() {
-          var t = stored();
-          document.documentElement.dataset.theme = t === "light" || t === "dark" ? t : (mq.matches ? "dark" : "light");
-        }
-        apply();
-        mq.addEventListener("change", function () { if (!stored()) apply(); });
-      })();
-    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f5f5f7" />
-    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="color-scheme" content="light" />
     <meta name="generator" content={Astro.generator} />
 
     <title>{title}</title>
@@ -122,7 +103,7 @@ const jsonLd = {
     />
     <link
       rel="preload"
-      href="/fonts/jetbrains-mono-var-latin.woff2"
+      href="/fonts/chivo-mono-var-latin.woff2"
       as="font"
       type="font/woff2"
       crossorigin="anonymous"

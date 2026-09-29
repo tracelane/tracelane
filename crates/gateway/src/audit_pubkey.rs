@@ -39,6 +39,10 @@ pub struct PubkeyState {
     /// Process-global token bucket (a generic limiter reused here — the endpoint
     /// has the same no-peer-IP constraint as the webhook cap).
     pub rate: Arc<WebhookRateLimiter>,
+    /// AUD-29: the PLATFORM key's public half (base64 raw 32 bytes), derived and
+    /// self-checked at boot by `audit::platform_pubkey_b64`. `None` = no global
+    /// signing key configured (or it failed the self-check) → the route says so.
+    pub platform_pubkey_b64: Option<Arc<str>>,
 }
 
 impl PubkeyState {
@@ -46,7 +50,15 @@ impl PubkeyState {
     pub fn new() -> Self {
         Self {
             rate: Arc::new(WebhookRateLimiter::new(DEFAULT_PUBKEY_RATE_PER_MIN)),
+            platform_pubkey_b64: None,
         }
+    }
+
+    /// AUD-29: attach the platform key's verified public half.
+    #[must_use]
+    pub fn with_platform_pubkey(mut self, b64: Option<String>) -> Self {
+        self.platform_pubkey_b64 = b64.map(Arc::from);
+        self
     }
 }
 
@@ -74,11 +86,51 @@ struct PubkeyResponse {
     anchor_ecdsa_spki_b64: String,
     /// SHA-256(spki) hex, or empty when no anchor key yet.
     anchor_ecdsa_fingerprint_sha256: String,
+    /// AUD-29 — the first ledger `seq` this workspace key signed (the smallest
+    /// `batch_start_seq` of a canonical anchor record carrying it), or `null` when it
+    /// has signed nothing yet. Verifiers treat any PLATFORM-signed batch reaching this
+    /// seq as `platform_key_after_workspace_key`, even in an export window that holds
+    /// no workspace-signed batch — the append a platform-key holder would need.
+    workspace_key_since_seq: Option<i64>,
 }
 
 /// Mount `GET /v1/audit/pubkey`.
 pub fn routes() -> Router<PubkeyState> {
-    Router::new().route("/v1/audit/pubkey", get(handler))
+    Router::new()
+        .route("/v1/audit/pubkey", get(handler))
+        .route("/v1/audit/platform-pubkey", get(platform_handler))
+}
+
+/// AUD-29 — `GET /v1/audit/platform-pubkey`: Tracelane's shared PLATFORM Ed25519
+/// key, the second trust root. It signs a workspace's batches until the workspace
+/// has its own key; the verifiers accept it only as a PREFIX of a workspace's
+/// ledger and label those batches platform-signed. Public (a public key is
+/// public), the same global rate limit, cacheable — it changes only with a key
+/// rotation, and the verifiers also pin it per release.
+async fn platform_handler(State(state): State<PubkeyState>) -> Response {
+    if let RateLimitDecision::Throttle { retry_after_secs } = state.rate.check() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after_secs.to_string())],
+            Json(serde_json::json!({ "error": "rate_limited" })),
+        )
+            .into_response();
+    }
+    let Some(b64) = state.platform_pubkey_b64.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no_platform_key" })),
+        )
+            .into_response();
+    };
+    (
+        [("cache-control", "public, max-age=3600")],
+        Json(serde_json::json!({
+            "ed25519_pubkey_b64": b64,
+            "fingerprint_sha256": fingerprint_of_b64(b64),
+        })),
+    )
+        .into_response()
 }
 
 async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>) -> Response {
@@ -142,6 +194,22 @@ async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>)
 
     let ed25519_pubkey_b64: String = row.get(0);
     let anchor_ecdsa_spki_b64: String = row.get(1);
+    // AUD-29: from the CANONICAL anchor store (ADR-078 B). Fail-CLOSED: a failed read
+    // is a 500, never a `null` that would widen the platform key's accepted range.
+    let workspace_key_since_seq: Option<i64> = match client
+        .query_one(
+            "SELECT MIN(batch_start_seq) FROM audit_anchor_records \
+             WHERE tenant_id = $1 AND ed25519_pubkey = $2",
+            &[&tenant_uuid, &ed25519_pubkey_b64],
+        )
+        .await
+    {
+        Ok(r) => r.get(0),
+        Err(err) => {
+            tracing::warn!(error = %err, "audit pubkey: workspace-key since-seq lookup failed");
+            return internal();
+        }
+    };
     let ed25519_fingerprint_sha256 = fingerprint_of_b64(&ed25519_pubkey_b64);
     let anchor_ecdsa_fingerprint_sha256 = if anchor_ecdsa_spki_b64.is_empty() {
         String::new()
@@ -155,6 +223,7 @@ async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>)
         ed25519_fingerprint_sha256,
         anchor_ecdsa_spki_b64,
         anchor_ecdsa_fingerprint_sha256,
+        workspace_key_since_seq,
     })
     .into_response()
 }
@@ -201,6 +270,32 @@ mod tests {
         assert_eq!(fp.len(), 64, "SHA-256 hex is 64 chars");
         // Deterministic.
         assert_eq!(fp, fingerprint_of_b64(&zeros));
+    }
+
+    #[tokio::test]
+    async fn platform_route_serves_the_configured_key_and_refuses_when_absent() {
+        use axum::body::Body;
+        use tower::ServiceExt as _;
+        let req = || {
+            axum::http::Request::builder()
+                .uri("/v1/audit/platform-pubkey")
+                .body(Body::empty())
+                .expect("request")
+        };
+        let key = B64.encode([7u8; 32]);
+        let app = routes().with_state(PubkeyState::new().with_platform_pubkey(Some(key.clone())));
+        let res = app.oneshot(req()).await.expect("response");
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 4096)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["ed25519_pubkey_b64"], key);
+        assert_eq!(v["fingerprint_sha256"], fingerprint_of_b64(&key));
+
+        let app = routes().with_state(PubkeyState::new());
+        let res = app.oneshot(req()).await.expect("response");
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

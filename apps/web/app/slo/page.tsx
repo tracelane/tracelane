@@ -1,3 +1,6 @@
+import { fmtBudget } from "@/lib/metrics/format";
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * SLO dashboard page — per-hour latency percentiles, error rate, and
  * token usage by provider and model.
@@ -43,6 +46,7 @@ import type { SloModelRow } from "@/app/slo/types";
 import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { MetricChart } from "@/components/metrics/MetricChart";
+import { OverheadContext } from "@/components/metrics/OverheadContext";
 import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
@@ -61,7 +65,7 @@ import {
 	fmtDurationMs,
 	fmtFraction,
 	fmtPercent,
-	fmtRatio,
+	fmtTarget,
 } from "@/lib/metrics/format";
 import { hintOf } from "@/lib/metrics/hint";
 import { METRICS } from "@/lib/metrics/registry";
@@ -106,13 +110,10 @@ export const metadata: Metadata = { title: "SLOs — Tracelane" };
 // absence (DSH-11 §3.1); both now go through `fmtDurationMs`.
 const formatDuration = fmtDurationMs;
 const formatTokens = fmtCompact;
-const formatBurnRate = fmtRatio;
+// Burn rate goes through `head.burn` (`sloHeadline`, B-511) — the same
+// small-sample dash rule the dashboard's copy of this card now applies too.
 
-function formatBudgetRemaining(pct: number): string {
-	if (!Number.isFinite(pct)) return "over budget";
-	if (pct < 0) return `${Math.abs(pct).toFixed(0)}% over`;
-	return `${pct.toFixed(0)}%`;
-}
+const formatBudgetRemaining = fmtBudget;
 
 /* ── Layout vocabulary, shared with the P0 dashboard ───────────────────────── */
 
@@ -178,6 +179,7 @@ function CardHead({
 /** One reading in a metric strip. `value` is a pre-formatted string — this
  *  component formats nothing and computes nothing. */
 type Kpi = {
+	danger?: boolean;
 	icon: MetricIconName;
 	label: string;
 	value: string;
@@ -246,8 +248,12 @@ function MetricStrip({
 							</span>
 						</span>
 						<span className="mt-auto flex flex-col gap-1.5 pt-2">
-							{/* GRAPHITE, always (P0.6). The tone lives in the sub-line. */}
-							<span className="t-metric text-ink">{k.value}</span>
+							{/* A depleted plan budget colours the value as well as its context. */}
+							<span
+								className={`t-metric ${k.danger ? "text-danger-ink" : "text-ink"}`}
+							>
+								{k.value}
+							</span>
 							<span className="flex min-h-4 items-center text-2xs">
 								{k.sub}
 							</span>
@@ -462,9 +468,9 @@ function SloTable({
 							<TH
 								numeric
 								className="text-action-ink"
-								title="Gateway overhead p95 — the time Tracelane adds, EXCLUDING upstream generation. Compare with the p95 to the left: our slice is tiny."
+								title="Gateway overhead p95 — the time Tracelane adds, EXCLUDING upstream generation. Authentication and workspace settings are included."
 							>
-								Gateway ovh
+								Gateway overhead
 							</TH>
 							<TH numeric>Input tokens</TH>
 							<TH numeric>Output tokens</TH>
@@ -541,9 +547,7 @@ function SloTable({
 									</TD>
 									<TD numeric muted>
 										{s.requests > 0
-											? Math.round(
-													s.total_output_tokens / s.requests,
-												).toLocaleString("en-US")
+											? fmtCount(Math.round(s.total_output_tokens / s.requests))
 											: "—"}
 									</TD>
 								</TR>
@@ -602,6 +606,7 @@ async function SloData({ range }: { range: TimeRange }) {
 				<WarmingBanner />
 				<SectionLabel>By provider &amp; model</SectionLabel>
 				<SloTable modelRows={[]} overheadByModel={new Map()} />
+				<OverheadContext data={latency} />
 			</div>
 		);
 	}
@@ -661,7 +666,7 @@ async function SloData({ range }: { range: TimeRange }) {
 		{
 			icon: "error-budget",
 			label: METRICS.slo_target.label,
-			value: `${budget.targetPct.toFixed(1)}%`,
+			value: fmtTarget(budget.target),
 			sub: <span className="text-ink-3">contracted availability</span>,
 		},
 		{
@@ -674,7 +679,7 @@ async function SloData({ range }: { range: TimeRange }) {
 			) : avail.belowFloor ? (
 				<span className="text-ink-3">
 					n = {fmtCount(totalRequests)} · below the {fmtCount(avail.floor)}
-					-request floor for a {budget.targetPct.toFixed(1)}% target
+					-request floor for a {fmtTarget(budget.target)} target
 				</span>
 			) : (
 				<span className={BAND_INK[budget.tone]}>
@@ -685,6 +690,7 @@ async function SloData({ range }: { range: TimeRange }) {
 		{
 			icon: "error-budget",
 			label: METRICS.budget_remaining.label,
+			danger: !noTraffic && !avail.belowFloor && budget.budgetRemainingPct < 0,
 			hint: hintOf(METRICS.budget_remaining),
 			value:
 				noTraffic || avail.belowFloor
@@ -763,7 +769,7 @@ async function SloData({ range }: { range: TimeRange }) {
 				<div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
 					<div className="min-w-0">
 						<h2 className="text-sm font-semibold text-ink">
-							Error budget — {label} vs a {budget.targetPct.toFixed(1)}%
+							Error budget — {label} vs a {fmtTarget(budget.target)}
 							availability target
 						</h2>
 						<p className="mt-0.5 text-xs text-ink-3">
@@ -773,18 +779,18 @@ async function SloData({ range }: { range: TimeRange }) {
 						</p>
 					</div>
 					{noTraffic ? (
-						<Badge tone="neutral">No traffic</Badge>
+						<StatusBadge status="no_traffic" />
 					) : avail.belowFloor ? (
-						<Badge
-							tone="neutral"
-							title={`n = ${totalRequests} — below the ${avail.floor}-request floor a ${budget.targetPct.toFixed(1)}% target needs`}
-						>
-							Small sample
-						</Badge>
+						<StatusBadge
+							status="small_sample"
+							title={`n = ${totalRequests} — below the ${avail.floor}-request floor a ${fmtTarget(budget.target)} target needs`}
+						/>
 					) : (
-						<Badge tone={health.tone} title={health.title}>
-							{health.label}
-						</Badge>
+						<StatusBadge
+							status={health.label}
+							tone={health.tone}
+							title={health.title}
+						/>
 					)}
 				</div>
 				<div className="grid grid-cols-1 gap-4 lg:grid-cols-12 lg:items-stretch">
@@ -848,21 +854,32 @@ async function SloData({ range }: { range: TimeRange }) {
 						 * so the 1.0× pace line lands at dead centre and "left of the tick"
 						 * / "right of the tick" is legible without reading a number. Above
 						 * 2× the arc pins full and the NUMERAL keeps counting; the centre
-						 * display is the real `formatBurnRate` value in every case, so a
+						 * display is the real `head.burn` value in every case, so a
 						 * pinned arc can never be mistaken for a 2× reading.
+						 *
+						 * Dashed on `noTraffic` (B-511), same as the dashboard's copy of
+						 * this exact card: a zero-request window is not "unreachable", but
+						 * an arc sitting dead centre reading '0.00×' still reads as a
+						 * healthy measurement of nothing.
 						 */}
 						<div className="flex flex-1 flex-col items-center justify-center pt-4">
-							<Gauge
-								onInverse
-								value={
-									Number.isFinite(budget.burnRate)
-										? Math.min(100, (budget.burnRate / 2) * 100)
-										: 100
-								}
-								marker={50}
-								display={formatBurnRate(budget.burnRate)}
-								label="burn rate"
-							/>
+							{noTraffic ? (
+								<div className="font-mono text-ramp-28 font-semibold leading-none tabular-nums text-ink-inverse">
+									—
+								</div>
+							) : (
+								<Gauge
+									onInverse
+									value={
+										Number.isFinite(budget.burnRate)
+											? Math.min(100, (budget.burnRate / 2) * 100)
+											: 100
+									}
+									marker={50}
+									display={head.burn}
+									label="burn rate"
+								/>
+							)}
 							<p className="mt-1 text-center text-2xs text-ink-inverse opacity-60">
 								1.0× = on pace
 							</p>
@@ -873,12 +890,12 @@ async function SloData({ range }: { range: TimeRange }) {
 				    / error budget to the same clarity the burn-rate line already has.
 				    It sits WITH the metrics it explains now, and collapsed it costs one
 				    row instead of a full-width block above the readings. */}
-				{/* A STRIP, NOT A CARD, so `rounded-lg` (the control band) rather than
+				{/* A STRIP, NOT A CARD, so `rounded-card` (the control band) rather than
 				    `--radius-card`, and the inert `--surface-2` well rather than the card
 				    fill — collapsed it is a 40px disclosure bar, and at card radius on
 				    card colour it read as a card that had failed to load its contents.
 				    Same reasoning `WarmingBanner` records for its own radius. */}
-				<details className="rounded-lg border border-line bg-surface-2 px-4 py-3 text-sm">
+				<details className="rounded-card border border-line bg-surface-2 px-4 py-3 text-sm">
 					<summary className="cursor-pointer text-xs font-medium text-ink">
 						What's measured here
 					</summary>
@@ -955,6 +972,7 @@ async function SloData({ range }: { range: TimeRange }) {
 					By provider &amp; model
 				</SectionLabel>
 				<SloTable modelRows={modelRows} overheadByModel={overheadByModel} />
+				<OverheadContext data={latency} />
 			</section>
 		</div>
 	);
@@ -981,7 +999,7 @@ export default async function SloPage({
 			    clickable while the three reads are still in flight. */}
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div>
-					<h1 className="t-h1">SLOs</h1>
+					<PageHeader title={<>SLOs</>} />
 					<p className="mt-2 text-sm text-ink-2">
 						Error budget, latency percentiles, and error rates by provider/model
 						— {range.label}

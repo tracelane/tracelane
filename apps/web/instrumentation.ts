@@ -21,3 +21,34 @@ export async function register(): Promise<void> {
 	const { setupE2EDb } = await import("@/lib/e2e-db");
 	await setupE2EDb();
 }
+
+/**
+ * Every error a request hits on the SERVER leaves one structured line in the Worker log,
+ * tagged `"tl":"server-error"` (2026-09-27, launch readiness) — counted by
+ * `scripts/ops/web-errors.sh`. Next 15 calls this for route handlers, server components,
+ * actions and middleware. Never throws.
+ */
+export async function onRequestError(
+	err: unknown,
+	request: { path: string; method: string },
+	context: { routePath?: string; routeType?: string },
+): Promise<void> {
+	try {
+		const e = err as { message?: unknown; digest?: unknown };
+		console.error(
+			JSON.stringify({
+				tl: "server-error",
+				message: String(e?.message ?? err).slice(0, 500),
+				digest:
+					typeof e?.digest === "string" ? e.digest.slice(0, 64) : undefined,
+				method: request.method,
+				// Path without the query string — a query can carry ids a person typed.
+				path: request.path.split("?")[0]?.slice(0, 300),
+				route: context.routePath,
+				type: context.routeType,
+			}),
+		);
+	} catch {
+		// Never throw from the error hook.
+	}
+}

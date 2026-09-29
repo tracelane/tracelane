@@ -191,12 +191,18 @@ impl VertexProvider {
         )
         .context("failed to sign service-account assertion")?;
 
-        crate::ssrf_guard::validate_url(&sa.token_uri)
+        // B-472 (REV-3): `token_uri` comes from the CUSTOMER's service-account JSON, so
+        // its DNS is customer-controlled — connect to the addresses the guard checked.
+        let pinned = crate::ssrf_guard::validate_url_pinned(&sa.token_uri)
             .await
             .context("SSRF guard rejected the token_uri")?;
+        let token_client = pinned
+            .pin(crate::ssrf_guard::safe_client_builder())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("token-exchange client build failed")?;
 
-        let resp = self
-            .client
+        let resp = token_client
             .post(&sa.token_uri)
             .form(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)])
             .send()
@@ -224,6 +230,34 @@ impl VertexProvider {
         let token: Arc<str> = Arc::from(parsed.access_token.as_str());
         self.tokens.insert(cache_key, Arc::clone(&token)).await;
         Ok(token)
+    }
+
+    /// Exchange this saved service account and build its project-scoped models list.
+    /// Validation constructs a fresh provider so an older cached token cannot mask
+    /// a replaced or revoked service-account key.
+    ///
+    /// # Errors
+    /// Fail CLOSED on malformed credentials, token exchange, or URL construction.
+    #[instrument(skip(self, sa_json), fields(tenant_id = %tenant_id))]
+    pub(crate) async fn models_probe(
+        &self,
+        sa_json: &str,
+        tenant_id: &TenantId,
+    ) -> Result<(String, SecretString)> {
+        let sa = ServiceAccount::parse(sa_json)?;
+        let token = self.access_token(&sa, tenant_id).await?;
+        let mut url = reqwest::Url::parse(&self.host())?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("invalid Vertex models host"))?
+            .extend([
+                "v1",
+                "projects",
+                &sa.project_id,
+                "locations",
+                &self.location,
+                "models",
+            ]);
+        Ok((url.into(), SecretString::from(token.as_ref())))
     }
 
     /// Dispatch a chat request to Vertex first-party Gemini.
@@ -306,6 +340,88 @@ fn strip_vertex_prefix(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
+    /// A THROWAWAY RSA key, generated in this process and never written to disk.
+    ///
+    /// The probe signs a real JWT assertion (`EncodingKey::from_rsa_pem`), so the
+    /// test needs a structurally valid PKCS#8 PEM — a `NOT-A-REAL-KEY` literal
+    /// cannot exercise the signing path. It is generated rather than committed
+    /// because `crates/` SHIPS PUBLICLY (`CLAUDE.md` §4a): a committed PEM is a
+    /// private key in a public repository, which every downstream secret scanner
+    /// reports and which `gitleaks` blocks in this repo's own gate. `aws-lc-rs`
+    /// is already in `Cargo.lock` (rustls + jsonwebtoken), so this adds no crate.
+    fn throwaway_service_account_pem() -> String {
+        use aws_lc_rs::encoding::AsDer as _;
+        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+            .expect("generate a test RSA key");
+        let der = key.as_der().expect("PKCS#8 DER");
+        let b64 = B64.encode(der.as_ref());
+        let body: String = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|line| format!("{}\n", std::str::from_utf8(line).expect("base64 is ascii")))
+            .collect();
+        format!("-----BEGIN PRIVATE KEY-----\n{body}-----END PRIVATE KEY-----\n")
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn models_probe_exchanges_the_saved_service_account_and_surfaces_rejection() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_string_contains, method, path},
+        };
+        struct LoopbackGuard;
+        impl Drop for LoopbackGuard {
+            fn drop(&mut self) {
+                crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+            }
+        }
+        crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+        let _guard = LoopbackGuard;
+        let server = MockServer::start().await;
+        let secret = serde_json::json!({
+            "client_email": "unit-test@example.test",
+            "project_id": "unit-test-project",
+            "private_key": throwaway_service_account_pem(),
+            "token_uri": format!("{}/token", server.uri()),
+        })
+        .to_string();
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("assertion="))
+            .and(body_string_contains("grant_type="))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "unit-test-access-token"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = VertexProvider::new().unwrap();
+        let (url, token) = provider.models_probe(&secret, &tenant).await.unwrap();
+        assert!(url.ends_with("/v1/projects/unit-test-project/locations/global/models"));
+        assert_eq!(token.expose_secret(), "unit-test-access-token");
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // New validation action must exchange again, even for the same SA identity.
+        let fresh = VertexProvider::new().unwrap();
+        let error = fresh.models_probe(&secret, &tenant).await.err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<ProviderHttpError>().unwrap().status,
+            401
+        );
+        assert!(fresh.models_probe("not-json", &tenant).await.is_err());
+        server.verify().await;
+    }
 
     /// A syntactically valid but obviously fake service account. Never a real
     /// credential — the PEM is not a parseable key, which is fine for the

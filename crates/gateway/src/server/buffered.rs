@@ -124,6 +124,67 @@ impl ToolCallAccumulator {
             })
             .collect()
     }
+
+    /// RI-05 / M19: bounded CALLED tool names, in call order — the SAME cap
+    /// `RequestConfig` applies to the OFFERED names
+    /// (`MAX_TOOL_NAMES`/`MAX_TOOL_NAME_BYTES`, `spans.rs`). Ungated: a
+    /// function name is developer-chosen, the same argument the offered-names
+    /// precedent already makes (`span.rs`, `tracelane_request_tool_names`).
+    /// `None` when no call was accumulated, matching every other
+    /// absent-means-nothing-sent field.
+    pub(crate) fn response_tool_names(&self) -> Option<Vec<String>> {
+        super::spans::bounded_tool_names(self.slots.iter().filter_map(|s| s.name.as_deref()))
+    }
+
+    /// `OBS-50`: argument byte sizes, index-aligned with `response_tool_names`.
+    /// Slots without a name are skipped in BOTH, so the alignment holds.
+    pub(crate) fn response_tool_arg_bytes(&self) -> Option<Vec<u32>> {
+        super::spans::bounded_tool_arg_bytes(
+            self.slots
+                .iter()
+                .filter(|s| s.name.is_some())
+                .map(|s| s.arguments.as_str()),
+        )
+    }
+
+    /// RI-05: `(id, name, raw accumulated arguments)` for every call, in call
+    /// order — the raw material `CapturedOutput::build` turns into `tool_call`
+    /// parts under the `trace_content:` gate. Arguments are the RAW
+    /// accumulated JSON text, never parsed here: a stream cancelled mid-call
+    /// leaves an incomplete fragment, and `CapturedOutput` truncates it the
+    /// same way it truncates message text.
+    pub(crate) fn for_span(&self) -> Vec<(Option<String>, Option<String>, String)> {
+        self.slots
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone(), s.arguments.clone()))
+            .collect()
+    }
+
+    /// Fold Bedrock's whole-response tool calls in (mirrors
+    /// `BufferedToolState::absorb_response`'s tail, reused by the STREAMING
+    /// path's `Done` arm, which has no separate `provider_finish` to update
+    /// here — the caller does that itself). Only when nothing has been
+    /// accumulated from stream deltas yet, so an adapter that emits both never
+    /// doubles the arguments.
+    pub(crate) fn absorb_response_calls(&mut self, response: &tracelane_shared::ChatResponse) {
+        if !self.is_empty() {
+            return;
+        }
+        let Some(choice) = response.choices.first() else {
+            return;
+        };
+        let Some(calls) = choice.message.tool_calls.as_ref() else {
+            return;
+        };
+        for (i, c) in calls.iter().enumerate() {
+            self.push(
+                i,
+                Some(c.id.clone()),
+                Some(c.name.clone()),
+                &c.input.to_string(),
+            );
+        }
+    }
 }
 
 /// The `finish_reason` an OpenAI client sees (B-354).
@@ -219,6 +280,23 @@ impl BufferedToolState {
     pub(crate) fn finish_reason(&self) -> &'static str {
         derive_finish_reason(!self.calls.is_empty(), self.provider_finish)
     }
+
+    /// RI-05 / M19: bounded CALLED tool names, ungated. See
+    /// `ToolCallAccumulator::response_tool_names`.
+    pub(crate) fn response_tool_names(&self) -> Option<Vec<String>> {
+        self.calls.response_tool_names()
+    }
+
+    /// `OBS-50`: see `ToolCallAccumulator::response_tool_arg_bytes`.
+    pub(crate) fn response_tool_arg_bytes(&self) -> Option<Vec<u32>> {
+        self.calls.response_tool_arg_bytes()
+    }
+
+    /// RI-05: raw `(id, name, arguments)` for `CapturedOutput::build`. See
+    /// `ToolCallAccumulator::for_span`.
+    pub(crate) fn calls_for_span(&self) -> Vec<(Option<String>, Option<String>, String)> {
+        self.calls.for_span()
+    }
 }
 
 /// Build the non-streaming `chat.completion` body.
@@ -294,13 +372,51 @@ fn content_filter_response(
 /// the actual `otlp_emit::spawn_publish` call site is singular even though the
 /// function now has two callers (§4/OBS-51 amendment moved the publish AFTER
 /// the response-side seam, replacing the old single unconditional call).
-fn finish_and_publish_span(state: &AppState, mut span: tracelane_shared::TracelaneSpan) {
+///
+/// Returns `sent`, the moment the span now ends at (B-568 I4).
+fn finish_and_publish_span(
+    state: &AppState,
+    mut span: tracelane_shared::TracelaneSpan,
+) -> chrono::DateTime<chrono::Utc> {
+    // B-568 I4: `sent` is NOW — after the response-side guardrail seam, the output
+    // capture and the body build, all of which the client waits for. Restamped
+    // BEFORE the byte stamp so the metered size covers the final values. What
+    // still runs after `sent`: that byte stamp and a `tokio::spawn` (µs), plus
+    // axum's JSON serialisation of the body once the handler returns.
+    let sent = chrono::Utc::now();
+    crate::server::spans::restamp_sent(&mut span, sent);
     crate::server::spans::stamp_and_meter_span_bytes(&mut span, state.meters.clone());
     #[cfg(test)]
     crate::otlp_emit::test_sink::record(&span);
     if let Some(ref nats_client) = state.nats {
         crate::otlp_emit::spawn_publish(Arc::clone(nats_client), span, "messages");
     }
+    sent
+}
+
+/// Publish through the one site above, then close and (maybe) emit the
+/// post-provider stage timer (B-568 I4) against the same interval the span's post
+/// segment now covers — `sent − provider_complete`. `publish` is the only stage
+/// that runs after `sent` (a size stamp and a spawn), so `accounted_us` can exceed
+/// the segment by those microseconds; it never under-counts.
+fn publish_and_time_post(
+    state: &AppState,
+    span: tracelane_shared::TracelaneSpan,
+    mut post: crate::hotpath::StageTimer,
+    provider_complete_ts: chrono::DateTime<chrono::Utc>,
+) {
+    let sent = finish_and_publish_span(state, span);
+    post.mark("publish");
+    post.emit_if_slow(
+        &state.hotpath,
+        u64::try_from(
+            (sent - provider_complete_ts)
+                .num_microseconds()
+                .unwrap_or(0)
+                .max(0),
+        )
+        .unwrap_or(0),
+    );
 }
 
 /// Buffers a `ProviderStream` into a single OpenAI `chat.completion` JSON response.
@@ -332,6 +448,11 @@ pub(super) async fn buffer_provider_stream(
     response_inputs: crate::guardrail::ResponseInputs,
     redaction_map: Vec<tracelane_policy::pii::RedactionEntry>,
     failover_from: Option<&str>,
+    // RI-05 M1 + M4: the request's full dispatch ledger — built by the caller
+    // (`server/chat.rs`) across the primary dispatch and any cross-provider
+    // failover hops/skips. Empty for a bench-mock call, a semantic-cache hit
+    // (neither reaches `dispatch_with_retry`), or a clean single attempt.
+    dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
     // GWY-43: the API key that authorised this request, for per-key cost
     // attribution and budget enforcement.
     api_key_id: Option<&str>,
@@ -348,6 +469,8 @@ pub(super) async fn buffer_provider_stream(
     request_config: RequestConfig,
     // EVL-28. `Some` means this request is in the online-eval sample.
     online_eval: Option<crate::online_eval::Pending>,
+    // GWY-53: the handler's ONE capture decision; `output` gates the response text.
+    capture: super::config::ContentCapture,
 ) -> impl IntoResponse {
     use tracelane_shared::model::MessageContent;
 
@@ -360,6 +483,11 @@ pub(super) async fn buffer_provider_stream(
     // Error (a buffered-collection failure must move the error-rate metric).
     let mut buffered_error: Option<&str> = None;
     let mut cost_usd: Option<f64> = None;
+    // RI-05 / M11: reasoning ("thinking") output tokens, last-write-wins —
+    // same idiom as `cache_read`/`cache_creation` below.
+    let mut reasoning_output_tokens: Option<u32> = None;
+    // RI-05 / B-444: the provider's identity claims, first one wins.
+    let mut served = super::spans::ServedMeta::default();
     // B-353 / B-354: the two facts the buffered path used to discard.
     let mut tool_state = BufferedToolState::default();
     // OBS-53. `tool_state.absorb` returns false for this variant, so the match
@@ -378,12 +506,19 @@ pub(super) async fn buffer_provider_stream(
         match event {
             Ok(ProviderEvent::StreamChunk { delta }) => text.push_str(&delta),
             Ok(ProviderEvent::LogprobsDelta { logprobs }) => logprobs_acc.absorb(&logprobs),
+            // RI-05 / B-444: wired BY HAND — the catch-all below would swallow it.
+            Ok(ProviderEvent::ResponseMeta {
+                id,
+                model,
+                system_fingerprint,
+            }) => served.absorb(id, model, system_fingerprint),
             Ok(ProviderEvent::UsageUpdate {
                 input_tokens: it,
                 output_tokens: ot,
                 cache_read: cr,
                 cache_creation: cc,
                 cost_usd: cost,
+                reasoning: r,
             }) => {
                 merge_usage_tokens(&mut input_tokens, &mut output_tokens, it, ot);
                 if cost.is_some() {
@@ -397,8 +532,19 @@ pub(super) async fn buffer_provider_stream(
                 if cc.is_some() {
                     cache_creation = cc;
                 }
+                // RI-05 / M11: same last-write-wins idiom as the two above.
+                if r.is_some() {
+                    reasoning_output_tokens = r;
+                }
             }
             Ok(ProviderEvent::Done { response }) => {
+                // RI-05 / B-444: a whole response (Bedrock) carries its id and
+                // served model as fields, not events.
+                served.absorb(
+                    (!response.id.is_empty()).then(|| response.id.clone()),
+                    (!response.model.is_empty()).then(|| response.model.clone()),
+                    None,
+                );
                 if let Some(choice) = response.choices.first()
                     && let MessageContent::Text(t) = &choice.message.content
                 {
@@ -446,6 +592,9 @@ pub(super) async fn buffer_provider_stream(
     // Provider round-trip complete (buffering finished). Everything after — JSON
     // serialization, the response-side seam, the return — is gateway overhead.
     let provider_complete_ts = chrono::Utc::now();
+    // B-568 I4: the post-provider stage timer. Same threshold, same rate limit as
+    // the pre-dispatch one; emits `segment=post` and nothing on a healthy request.
+    let mut post = crate::hotpath::StageTimer::post("chat");
 
     // GWY-45 / OBS-51 (amended 2026-09-13): `build_gateway_span(` must stay
     // textually BEFORE `content_filter_response(` in this function
@@ -474,6 +623,10 @@ pub(super) async fn buffer_provider_stream(
             cache_creation_input_tokens: cache_creation,
             stream: false,
             cost_usd,
+            served,
+            finish_reason: tool_state.provider_finish,
+            dispatch_attempts,
+            reasoning_output_tokens,
         },
         failover_from,
         Some(GatewayTiming {
@@ -484,6 +637,21 @@ pub(super) async fn buffer_provider_stream(
         buffered_error,
         api_key_id,
     );
+    // RI-05 / M19: the CALLED tool names — ungated, like the OFFERED names
+    // (`tracelane_request_tool_names`, `span.rs`): a function name is
+    // developer-chosen, not end-user text. `None` when no tool was called.
+    span.attributes.tracelane_response_tool_names = tool_state.response_tool_names();
+    span.attributes.tracelane_response_tool_arg_bytes = tool_state.response_tool_arg_bytes();
+    // B-447: the MISS half of the three-state attribute. This path only runs after
+    // `chat.rs` consulted the cache and found nothing (a hit returns before dispatch;
+    // a streaming request is never looked up), so "the cache was configured AND a key
+    // was derived" is exactly "consulted and missed". `Some(false)`, never `None` —
+    // `alerts/checker.rs` counts `JSONHas AND NOT JSONExtractBool` as the miss
+    // denominator, and until 2026-09-19 nothing wrote that state, so the hit-rate
+    // rule's miss side read zero forever.
+    if semantic_cache.is_some() && cache_key.is_some() {
+        span.attributes.tracelane_semantic_cache_hit = Some(false);
+    }
     // GWY-45: attach the captured REQUEST content, if the caller built any.
     if let Some(captured) = captured_input {
         captured.apply(&mut span.attributes);
@@ -512,6 +680,7 @@ pub(super) async fn buffer_provider_stream(
         // NATS disabled (no client) — never drop the span silently.
         crate::otlp_emit::note_span_dropped_no_nats();
     }
+    post.mark("span_build");
 
     // Response-side guardrail seam — the SAME ResponseGuard as the streaming
     // path (one seam, not two). The full response flows through it in one
@@ -532,27 +701,37 @@ pub(super) async fn buffer_provider_stream(
         let head = match guard.on_delta(&text, Some(&final_usage)).await {
             crate::guardrail::GuardStep::Emit(s) => s,
             crate::guardrail::GuardStep::Block { reason_code } => {
-                finish_and_publish_span(state, span);
+                post.mark("response_guard");
+                publish_and_time_post(state, span, post, provider_complete_ts);
                 return content_filter_response(model, reason_code, input_tokens, output_tokens);
             }
         };
         let tail = match guard.on_end(Some(&final_usage)).await {
             crate::guardrail::GuardStep::Emit(s) => s,
             crate::guardrail::GuardStep::Block { reason_code } => {
-                finish_and_publish_span(state, span);
+                post.mark("response_guard");
+                publish_and_time_post(state, span, post, provider_complete_ts);
                 return content_filter_response(model, reason_code, input_tokens, output_tokens);
             }
         };
         text = format!("{head}{tail}");
     }
+    post.mark("response_guard");
 
     // OBS-51: attach what the customer actually received — POST-redaction,
     // under the SAME capture policy as the request (`capture_decision`),
-    // never a second policy. Then publish exactly once.
-    if let Some(out) = crate::server::spans::CapturedOutput::build(tenant_id, &text) {
+    // never a second policy. RI-05 / M19: the CALLED tool ARGUMENTS ride the
+    // SAME gate and cap — customer content, exactly like the text above; the
+    // argument text itself is never redacted by the guardrail seam (which only
+    // ever saw `text`), unchanged from before this feature. Then publish
+    // exactly once — at the BOTTOM since B-568 I4, after the body is built, so
+    // the span's `sent` is the moment the handler hands the response back.
+    if let Some(out) =
+        crate::server::spans::CapturedOutput::build(capture, &text, &tool_state.calls_for_span())
+    {
         out.apply(&mut span.attributes);
     }
-    finish_and_publish_span(state, span);
+    post.mark("capture_output");
 
     // B1 auto-rollback drift feed (fire-and-forget, off the response path).
     // On objective drift in production the router flips the production pointer
@@ -650,6 +829,8 @@ pub(super) async fn buffer_provider_stream(
                 .await;
         });
     }
+    post.mark("payload");
+    publish_and_time_post(state, span, post, provider_complete_ts);
 
     (StatusCode::OK, Json(payload))
 }
@@ -658,6 +839,58 @@ pub(super) async fn buffer_provider_stream(
 mod tests {
     use super::super::stream::tests::tool_delta;
     use super::*;
+
+    /// B-568 I4, the WIRING half (the arithmetic is `spans::restamp_sent`'s own
+    /// test): the buffered path's ONE publish site stamps `sent` at publish time,
+    /// so a span built 5 ms before it is published ends at publish time and its
+    /// overhead carries those 5 ms. Before I4 the span ended where it was BUILT —
+    /// right after the provider — and the response guard, the output capture and
+    /// the bookkeeping were in neither segment.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_buffered_publish_site_stamps_sent_at_publish_time() {
+        let state =
+            crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(Uuid::new_v4());
+        let received = chrono::Utc::now() - chrono::Duration::milliseconds(50);
+        let built = chrono::Utc::now() - chrono::Duration::milliseconds(5);
+        let mut span = crate::server::spans::build_gateway_span(
+            &tenant,
+            Uuid::new_v4(),
+            None,
+            "claude-sonnet-4-6",
+            &CallerIdentity::default(),
+            received,
+            1,
+            1,
+            None,
+            super::super::spans::SpanUsageMeta::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        span.end_time = Some(built);
+        span.attributes.tracelane_gateway_overhead_us = Some(1_000);
+
+        let _sent = finish_and_publish_span(&state, span);
+
+        let published = crate::otlp_emit::test_sink::for_tenant(&tenant);
+        assert_eq!(published.len(), 1, "exactly one publish");
+        let p = &published[0];
+        let end = p.end_time.expect("end_time");
+        assert!(
+            (end - built).num_microseconds().unwrap_or(0) >= 5_000,
+            "end_time must be the publish moment, not the build moment: {end} vs {built}"
+        );
+        assert!(
+            p.attributes
+                .tracelane_gateway_overhead_us
+                .is_some_and(|us| us >= 6_000),
+            "the 5 ms between build and publish belongs to the gateway: {:?}",
+            p.attributes.tracelane_gateway_overhead_us
+        );
+    }
 
     /// GWY-24: the cache must store the CATALOG cost when the provider does not
     /// report one, or the feature built for cost reports zero saving.
@@ -857,5 +1090,118 @@ mod tests {
             "call_z"
         );
         assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    // ── RI-05 slice 4/5: M19 ─────────────────────────────────────────────────
+
+    /// M19: the CALLED tool's name reaches `tracelane_response_tool_names`,
+    /// ungated — the buffered path's own accumulator, fed the way
+    /// `the_accumulator_keeps_parallel_tool_calls_apart` above already proves
+    /// the fragments fold.
+    #[test]
+    fn a_called_tool_name_reaches_response_tool_names() {
+        let mut state = BufferedToolState::default();
+        assert!(state.absorb(&tool_delta(0, Some("call_1"), Some("get_weather"), "")));
+        assert!(state.absorb(&tool_delta(0, None, None, "{\"city\":\"Paris\"}")));
+        assert_eq!(
+            state.response_tool_names(),
+            Some(vec!["get_weather".to_owned()])
+        );
+        // The raw material `CapturedOutput::build` consumes: id, name, and the
+        // FULL accumulated (unparsed) argument string.
+        let spans = state.calls_for_span();
+        assert_eq!(
+            spans,
+            vec![(
+                Some("call_1".to_owned()),
+                Some("get_weather".to_owned()),
+                "{\"city\":\"Paris\"}".to_owned()
+            )]
+        );
+    }
+
+    /// M19: no call at all ⇒ `None`, never `Some(vec![])` — the same
+    /// "absent means nothing sent" rule as `tracelane_request_tool_names`.
+    /// `OBS-50`: the argument BYTE sizes ride index-aligned with the names — the
+    /// raw accumulated text's UTF-8 length (`{"city":"Paris"}` is 16 bytes; a
+    /// two-fragment `{"q":"héllo"}` is 14, not 13 — bytes, not chars), and a
+    /// second call keeps its own slot.
+    #[test]
+    fn called_tool_argument_sizes_are_index_aligned_bytes() {
+        let mut state = BufferedToolState::default();
+        assert!(state.absorb(&tool_delta(0, Some("call_1"), Some("get_weather"), "")));
+        assert!(state.absorb(&tool_delta(0, None, None, "{\"city\":\"Paris\"}")));
+        assert!(state.absorb(&tool_delta(1, Some("call_2"), Some("search"), "{\"q\":")));
+        assert!(state.absorb(&tool_delta(1, None, None, "\"héllo\"}")));
+        assert_eq!(
+            state.response_tool_names(),
+            Some(vec!["get_weather".to_owned(), "search".to_owned()])
+        );
+        assert_eq!(state.response_tool_arg_bytes(), Some(vec![16, 14]));
+        assert_eq!(BufferedToolState::default().response_tool_arg_bytes(), None);
+    }
+
+    #[test]
+    fn no_tool_call_leaves_response_tool_names_absent() {
+        let state = BufferedToolState::default();
+        assert_eq!(state.response_tool_names(), None);
+        assert!(state.calls_for_span().is_empty());
+    }
+
+    /// M19: a whole-response adapter's (Bedrock) tool calls reach
+    /// `response_tool_names` too, via `ToolCallAccumulator::absorb_response_calls`
+    /// — the streaming path's `Done` arm uses the SAME method.
+    #[test]
+    fn a_bedrock_style_done_response_also_populates_response_tool_names() {
+        let mut calls = ToolCallAccumulator::default();
+        calls.absorb_response_calls(&tracelane_shared::ChatResponse {
+            id: "x".into(),
+            model: "m".into(),
+            choices: vec![tracelane_shared::Choice {
+                index: 0,
+                message: tracelane_shared::Message {
+                    role: tracelane_shared::Role::Assistant,
+                    content: tracelane_shared::MessageContent::Text(String::new()),
+                    tool_call_id: None,
+                    tool_calls: Some(vec![tracelane_shared::ToolCall {
+                        id: "call_z".into(),
+                        name: "get_weather".into(),
+                        input: serde_json::json!({ "city": "Oslo" }),
+                    }]),
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        });
+        assert_eq!(
+            calls.response_tool_names(),
+            Some(vec!["get_weather".to_owned()])
+        );
+        // A second call (as if deltas had already arrived) is refused — the
+        // adapter that emits BOTH must never double the arguments.
+        calls.absorb_response_calls(&tracelane_shared::ChatResponse {
+            id: "x".into(),
+            model: "m".into(),
+            choices: vec![tracelane_shared::Choice {
+                index: 0,
+                message: tracelane_shared::Message {
+                    role: tracelane_shared::Role::Assistant,
+                    content: tracelane_shared::MessageContent::Text(String::new()),
+                    tool_call_id: None,
+                    tool_calls: Some(vec![tracelane_shared::ToolCall {
+                        id: "call_y".into(),
+                        name: "get_time".into(),
+                        input: serde_json::json!({}),
+                    }]),
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        });
+        assert_eq!(
+            calls.response_tool_names(),
+            Some(vec!["get_weather".to_owned()]),
+            "already non-empty ⇒ the second Done must not double the arguments"
+        );
     }
 }

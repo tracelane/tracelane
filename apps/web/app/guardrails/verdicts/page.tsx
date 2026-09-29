@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * Guardrail verdict-detail list — the click-through behind the decision-mix
  * counts on /guardrails ("N blocked" → here, filtered to `decision=block`).
@@ -187,8 +188,14 @@ async function VerdictsData({ sp, range }: { sp: SP; range: TimeRange }) {
 	// entirely in lookup mode: an id lookup's "M" would mean something else.
 	// B-335a: with a rail filter the summary's per-decision total is NOT the
 	// denominator (it counts every rail), so "N of M" is withheld rather than wrong.
-	const windowTotal =
+	const rawWindowTotal =
 		lookup || sp.rail ? null : windowVerdictTotal(stats, sp.decision);
+	// The stats summary and the row fetch are two separate reads (line 105-119)
+	// and can disagree — e.g. a row landing between the two calls. Never print
+	// a count larger than its own total ("Showing 2 of 1"): clamp the total up
+	// to at least what is actually shown.
+	const windowTotal =
+		rawWindowTotal !== null ? Math.max(rawWindowTotal, rows.length) : null;
 	return (
 		<>
 			{!lookup && (
@@ -266,7 +273,7 @@ export default async function GuardrailVerdictsPage({
 					>
 						← Guardrails
 					</Link>
-					<h1 className="mt-1 t-h1">Guardrail verdicts</h1>
+					<PageHeader title={<>Guardrail verdicts</>} />
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Why each request was allowed, blocked, redacted or warned. Click a
 						row for the full per-rail evidence. Times are UTC.
@@ -296,7 +303,7 @@ export default async function GuardrailVerdictsPage({
 					{sp.decision && (
 						<input type="hidden" name="decision" value={sp.decision} />
 					)}
-					{/* `rounded-md` (6px), not `rounded-sm` (2px): 2px is not a radius the
+					{/* `rounded-control` (6px), not `rounded-control` (2px): 2px is not a radius the
 					    system defines, and an input beside a `Button` at 6px was visibly
 					    squarer than the control it submits to. The height matches the
 					    `sm` button (h-8) so the pair reads as one control group. */}
@@ -306,7 +313,7 @@ export default async function GuardrailVerdictsPage({
 						defaultValue={sp.correlation_id ?? ""}
 						placeholder="Paste a correlation ID from a 403 response…"
 						aria-label="Correlation ID"
-						className="h-8 w-full max-w-md rounded-md border border-line bg-surface px-3 font-mono text-xs text-ink placeholder:font-sans placeholder:text-ink-3 focus:border-action-line"
+						className="h-8 w-full max-w-md rounded-control border border-line bg-surface px-3 font-mono text-xs text-ink placeholder:font-sans placeholder:text-ink-3 focus:border-action-line"
 					/>
 					<Button type="submit" variant="secondary" size="sm">
 						Find verdict

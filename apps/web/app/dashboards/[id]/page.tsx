@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { TBody, TD, TR, Table } from "@tracelanedev/ui";
 /**
  * /dashboards/[id] — a custom dashboard: a 12-column tile grid under RangeControl.
  *
@@ -27,8 +29,11 @@ import { dashboardTiles, dashboards } from "@/db/schema";
 import type { DashboardTile } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { availabilityTargetFor } from "@/lib/metrics/availability-target";
+import { fmtByKind, fmtCount } from "@/lib/metrics/format";
 import { METRICS, type MetricId, metric } from "@/lib/metrics/registry";
 import {
+	BREAKDOWN_FETCH_LIMIT,
+	BREAKDOWN_VISIBLE_ROWS,
 	type Limiter,
 	STAT_MIN_HEIGHT_CLASS,
 	type TileHeight,
@@ -52,18 +57,14 @@ import { TileSkeleton } from "./TileSkeleton";
 
 export const dynamic = "force-dynamic";
 
-export async function generateMetadata({
-	params,
-}: {
-	params: Promise<{ id: string }>;
-}): Promise<Metadata> {
-	const { id } = await params;
-	const row = await db
-		.select({ name: dashboards.name })
-		.from(dashboards)
-		.where(eq(dashboards.id, id))
-		.limit(1);
-	return { title: `${row[0]?.name ?? "Dashboard"} — Tracelane` };
+// B-503: this MUST NOT read the DB. Next serialises the resolved title into the
+// 404 page's flight stream (self.__next_f) even when the id belongs to another
+// tenant — an unscoped `eq(dashboards.id, id)` lookup here leaked a foreign
+// dashboard's name plus an existence oracle to any authenticated account. The
+// real name is still shown to the owner, from the tenant-scoped query below,
+// in the page's own <h1>.
+export function generateMetadata(): Metadata {
+	return { title: "Dashboard — Tracelane" };
 }
 
 interface Props {
@@ -107,7 +108,7 @@ export default async function DashboardPage({ params, searchParams }: Props) {
 		<div className="space-y-8 px-1 py-2 sm:px-2 sm:py-4 lg:px-3">
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div className="min-w-0 flex-1">
-					<h1 className="t-h1 truncate">{dashboard.name}</h1>
+					<PageHeader title={dashboard.name} />
 					<p className="mt-1 text-xs text-ink-3">
 						{tiles.length === 0
 							? "No tiles yet"
@@ -344,32 +345,51 @@ async function TileContainer({
 
 	// ── breakdown tile ──────────────────────────────────────────────────────────
 	if (data.kind === "breakdown") {
+		// B-506: every value is formatted by the metric's registry KIND — a sub-cent
+		// USD spend, `2.50%`, `1.2 s` — through the same `fmtByKind` the chart tooltips
+		// use (the pricing guard reads this file, so no dollar figure in a comment). One
+		// generic `toLocaleString(maximumFractionDigits: 2)` printed a sub-cent model
+		// spend as `0` and dropped the unit from every rate and latency row.
+		const hidden = Math.max(0, data.rows.length - BREAKDOWN_VISIBLE_ROWS);
 		return (
 			<TileShell title={title} heightPx={shellHeightPx}>
 				{data.rows.length === 0 ? (
 					<p className="text-xs text-ink-3">No data in this window.</p>
 				) : (
-					<table className="w-full text-xs">
-						<tbody>
-							{data.rows.slice(0, 10).map((row) => (
-								<tr
-									key={row.key}
-									className="border-b border-line last:border-0"
-								>
-									<td className="py-1.5 pr-4 text-ink-2 tabular-nums">
-										{row.key || "(empty)"}
-									</td>
-									<td className="py-1.5 text-right font-medium text-ink tabular-nums">
-										{typeof row.value === "number"
-											? row.value.toLocaleString("en-US", {
-													maximumFractionDigits: 2,
-												})
-											: "—"}
-									</td>
-								</tr>
-							))}
-						</tbody>
-					</table>
+					<>
+						<Table className="w-full text-xs">
+							<TBody>
+								{data.rows.slice(0, BREAKDOWN_VISIBLE_ROWS).map((row) => (
+									<TR
+										key={row.key}
+										className="border-b border-line last:border-0"
+									>
+										<TD className="py-1.5 pr-4 text-ink-2 tabular-nums">
+											{row.key || "(empty)"}
+											{row.unpriced !== undefined && row.unpriced > 0 && (
+												// The built-in `/gateway` table shows this column; a
+												// spend row that hides it reads as cheaper than it is.
+												<span className="ml-2 text-warn-ink">
+													{fmtCount(row.unpriced)} unpriced
+												</span>
+											)}
+										</TD>
+										<TD className="py-1.5 text-right font-medium text-ink tabular-nums">
+											{fmtByKind(data.metricKind, row.value)}
+										</TD>
+									</TR>
+								))}
+							</TBody>
+						</Table>
+						{hidden > 0 && (
+							// Never a silent cut: the fetch is the top `BREAKDOWN_FETCH_LIMIT`
+							// rows, so the remainder is exact for what was fetched and the copy
+							// says so — a 20-row cap must not read as the total.
+							<p className="mt-2 text-xs text-ink-3">
+								+{fmtCount(hidden)} more (of the top {BREAKDOWN_FETCH_LIMIT})
+							</p>
+						)}
+					</>
 				)}
 			</TileShell>
 		);

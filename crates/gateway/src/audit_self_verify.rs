@@ -1,6 +1,6 @@
 //! Free-tier audit self-verify endpoint (ADR-066).
 //!
-//! `GET /v1/audit/self-verify?limit=<u32>`
+//! `GET /v1/audit/self-verify?limit=<u32>&order=asc|desc`
 //!
 //! The FREE "see + verify your own chain" surface. It reads the caller's OWN
 //! recent audit chain (within their tier's retention window), runs the SAME
@@ -40,8 +40,8 @@
 //! The verdict surfaces `hash_chain_valid` (+ the first failing seq/kind),
 //! `signatures_valid`, `rekor_anchors_seen/resolved`, `anchors_included`, and
 //! `strip_detected` truthfully — a tampered chain returns RED. Anchoring is
-//! per-batch and best-effort: an unanchored chain still verifies its hash chain
-//! (green), and `rekor_anchors_resolved` / `anchors_included` report the REAL
+//! per-batch and best-effort: an unanchored genesis-rooted chain can be internally
+//! consistent but its verdict remains indeterminate, and `rekor_anchors_resolved` / `anchors_included` report the REAL
 //! coverage, so the response never implies universal anchoring.
 
 use axum::{
@@ -108,6 +108,7 @@ fn self_verify_verdict(
     trust_established: bool,
     truncated: bool,
     anchors_included: u64,
+    rows_uncovered_by_anchors: u64,
 ) -> &'static str {
     // R53 — THREE verdicts, because two were a lie in one direction.
     //
@@ -142,7 +143,7 @@ fn self_verify_verdict(
     // Consistency is not evidence; a publicly-included Rekor anchor is. Without one
     // the honest verdict is "internally consistent, not yet publicly anchored" —
     // which is INDETERMINATE (no positive evidence of tampering), never green.
-    if anchors_included == 0 {
+    if anchors_included == 0 || rows_uncovered_by_anchors > 0 {
         return "indeterminate";
     }
     "green"
@@ -156,7 +157,7 @@ const MAX_LIMIT: u32 = 50_000;
 /// non-positive (a floor below Free's 30-day ledger — ADR-076 `free_v1`).
 const RETENTION_FLOOR_DAYS: i64 = 7;
 
-/// Query params — `limit` ONLY. There is intentionally NO `tenant_id`, `since`,
+/// Query params — bounded `limit` and sequence `order`. There is intentionally NO `tenant_id`, `since`,
 /// or `until` field: the tenant comes from the validated claim and the window
 /// from entitlements, so a request-supplied tenant/window cannot influence the
 /// read. Unknown params (e.g. an injected `?tenant_id=`) are ignored by serde,
@@ -165,6 +166,16 @@ const RETENTION_FLOOR_DAYS: i64 = 7;
 pub struct SelfVerifyQuery {
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    order: ReadOrder,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReadOrder {
+    #[default]
+    Asc,
+    Desc,
 }
 
 /// The verification window actually used (derived, not request-supplied).
@@ -200,22 +211,17 @@ pub struct SelfVerifyResponse {
     /// Always `"v2.1"` (the export wire format).
     pub format: &'static str,
     pub window: SelfVerifyWindow,
-    /// Chain rows the server verified (== the verifier's `rows_seen`). Capped at
-    /// the render limit — NOT the ledger size; see `total_in_window`.
+    /// Legacy field name: rows parsed by the verifier (`rows_seen`), not necessarily
+    /// hash-checked. Consult `trust_established` and `verified_from_seq` for scope.
+    /// Capped at the read limit; never the ledger size.
     pub rows_verified: u64,
-    /// EXACT uncapped count of chain rows in the window (a cheap `count()`), so the
-    /// UI can say "Showing {rows_verified} of {total_in_window}" honestly instead
-    /// of letting the loaded cap read as the whole ledger. Always ≥ `rows_verified`.
-    pub total_in_window: u64,
-    /// `"green"` iff `hash_chain_valid && signatures_valid && !strip_detected &&
-    /// trust_established` (ADR-070 trust root) AND the response was not truncated
-    /// (0 rows verified out of a non-empty ledger). A genesis-rooted unanchored
-    /// chain is still GREEN (ADR-062 "unanchored-still-verifies"); a windowed view
-    /// with no public anchor, or a truncated one, is RED. See `self_verify_verdict`.
-    /// `green` | `red` | `indeterminate` (R53). A consumer that treats anything other
-    /// than `green` as an alarm keeps working, but SHOULD distinguish the third value:
-    /// `indeterminate` means verification could not be completed over this window, not
-    /// that the ledger is bad.
+    /// Exact retention-window count, or null when the inventory read failed.
+    /// It is independent of how many rows were returned and actually checked.
+    pub total_in_window: Option<u64>,
+    pub total_in_window_unavailable_reason: Option<&'static str>,
+    /// Green requires consistent rows, valid proof, a trust root, a public
+    /// witness and no buried batch-coverage holes. Unknown is indeterminate;
+    /// positive evidence of a mismatch is red. This verdict covers only this read.
     pub verdict: &'static str,
     pub hash_chain_valid: bool,
     pub signatures_valid: bool,
@@ -225,6 +231,8 @@ pub struct SelfVerifyResponse {
     pub rekor_anchors_seen: u64,
     pub rekor_anchors_resolved: u64,
     pub anchors_included: u64,
+    pub rows_uncovered_by_anchors: u64,
+    pub rows_unanchored_tail: u64,
     /// A batch committed to "anchored" but its bundle is absent (strip/downgrade).
     pub strip_detected: bool,
     /// ADR-070 — the seq the verified scope STARTS at. `0` = full genesis→tip;
@@ -232,7 +240,7 @@ pub struct SelfVerifyResponse {
     /// below it are present-but-unverified). The UI renders the honest scope.
     pub verified_from_seq: u64,
     /// ADR-070 — `false` for a windowed view with no public anchor to root it
-    /// (RED, never green). The `verdict` already reflects this.
+    /// (indeterminate, never green). The `verdict` already reflects this.
     pub trust_established: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_failure: Option<SelfVerifyFailure>,
@@ -324,27 +332,50 @@ async fn handler(
 
     // 4. Read the caller's OWN chain rows + anchor records. The reader binds
     //    `tenant` (= the validated claim) into `WHERE tenant_id = ? ... FINAL`.
-    let rows = match state.reader.read_range(&tenant, since, until, limit).await {
+    let row_read = match q.order {
+        ReadOrder::Asc => state.reader.read_range(&tenant, since, until, limit).await,
+        ReadOrder::Desc => {
+            state
+                .reader
+                .read_newest_range(&tenant, since, until, limit)
+                .await
+        }
+    };
+    let rows = match row_read {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(error = %err, "audit self-verify read_range failed");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "self-verify read failed");
         }
     };
-    // Anchor records are best-effort: their absence must not drop the chain
-    // verification (an unanchored chain still verifies — ADR-062).
-    let anchors = match state
-        .reader
-        .read_anchor_records(&tenant, since, until, limit)
-        .await
-    {
+    // A failed proof read is unknown evidence, never an unanchored success.
+    // Recent windows need anchors from their own sequence range; reading the
+    // oldest anchors by date would silently leave a recent window unrooted.
+    let anchor_read = match q.order {
+        ReadOrder::Asc => {
+            state
+                .reader
+                .read_anchor_records(&tenant, since, until, limit)
+                .await
+        }
+        ReadOrder::Desc => match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) => {
+                state
+                    .reader
+                    .read_anchors_for_sequences(&tenant, first.seq, last.seq, limit)
+                    .await
+            }
+            _ => Ok(Vec::new()),
+        },
+    };
+    let anchors = match anchor_read {
         Ok(a) => a,
         Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "audit self-verify anchor read failed — verifying chain rows only"
+            tracing::error!(error = %err, "audit self-verify anchor read failed");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "self-verify anchor read failed",
             );
-            Vec::new()
         }
     };
 
@@ -414,24 +445,17 @@ async fn handler(
         }
     };
 
-    // EXACT uncapped count of chain rows in the window, so the UI shows an HONEST
-    // total ("Showing N of {total}") instead of letting the loaded cap read as the
-    // whole ledger. Falls back to the loaded count if the count query fails (never
-    // implies a total smaller than what was loaded). Computed BEFORE the verdict —
-    // it also detects a TRUNCATED response (0 rows verified out of a non-empty
-    // ledger is an integrity failure, not an empty pass).
-    let total_in_window = state
-        .reader
-        .count_in_range(&tenant, since, until)
-        .await
-        .unwrap_or(report.rows_seen)
-        .max(report.rows_seen);
-
-    // 7. Build the truthful verdict (ADR-070 trust root + truncation guard + B-381
-    //    anchor requirement — see `self_verify_verdict`). GREEN needs a publicly
-    //    included anchor; a consistent-but-unanchored view is INDETERMINATE; a
-    //    windowed view with no root, or a response that verified 0 of N rows, RED.
-    let truncated = report.rows_seen == 0 && total_in_window > 0;
+    // An inventory failure cannot turn the bounded row count into an exact total.
+    let (total_in_window, total_in_window_unavailable_reason) =
+        match state.reader.count_in_range(&tenant, since, until).await {
+            Ok(total) if total >= report.rows_seen => (Some(total), None),
+            Ok(_) => (None, Some("count_smaller_than_evidence")),
+            Err(err) => {
+                tracing::warn!(error = %err, "audit self-verify count unavailable");
+                (None, Some("count_read_failed"))
+            }
+        };
+    let truncated = report.rows_seen == 0 && total_in_window.is_some_and(|total| total > 0);
     let unanchored = report.anchors_included == 0;
     let verdict = self_verify_verdict(
         report.hash_chain_valid,
@@ -440,6 +464,7 @@ async fn handler(
         report.trust_established,
         truncated,
         report.anchors_included,
+        report.rows_uncovered_by_anchors,
     );
     let first_failure = report
         .errors
@@ -456,8 +481,15 @@ async fn handler(
                 seq: None,
                 kind: "truncated_ledger".into(),
                 detail: format!(
-                    "loaded 0 rows but the ledger holds {total_in_window} in this window — response truncated"
+                    "loaded 0 rows but the ledger holds {} in this window — response truncated", total_in_window.unwrap_or_default()
                 ),
+            })
+        })
+        .or_else(|| {
+            (report.rows_uncovered_by_anchors > 0).then(|| SelfVerifyFailure {
+                seq: None,
+                kind: "anchor_coverage_hole".into(),
+                detail: format!("{} rows before a later batch have no recorded anchor coverage", report.rows_uncovered_by_anchors),
             })
         })
         .or_else(|| {
@@ -480,12 +512,15 @@ async fn handler(
         },
         rows_verified: report.rows_seen,
         total_in_window,
+        total_in_window_unavailable_reason,
         verdict,
         hash_chain_valid: report.hash_chain_valid,
         signatures_valid: report.signatures_valid,
         rekor_anchors_seen: report.rekor_anchors_seen,
         rekor_anchors_resolved: report.rekor_anchors_resolved,
         anchors_included: report.anchors_included,
+        rows_uncovered_by_anchors: report.rows_uncovered_by_anchors,
+        rows_unanchored_tail: report.rows_unanchored_tail,
         strip_detected: report.strip_detected,
         verified_from_seq: report.verified_from_seq,
         trust_established: report.trust_established,
@@ -598,6 +633,33 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn read_newest_range(
+            &self,
+            tenant: &TenantId,
+            since: DateTime<Utc>,
+            until: DateTime<Utc>,
+            limit: u32,
+        ) -> Result<Vec<ExportRow>> {
+            let mut rows = self.read_range(tenant, since, until, limit).await?;
+            rows.sort_by_key(|r| r.seq);
+            Ok(rows
+                .into_iter()
+                .rev()
+                .take(limit as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect())
+        }
+        async fn read_anchors_for_sequences(
+            &self,
+            _: &TenantId,
+            _: u64,
+            _: u64,
+            _: u32,
+        ) -> Result<Vec<AnchorExportRecord>> {
+            Ok(vec![])
+        }
     }
 
     /// Build a REAL, hash-valid v2.1 chain of `n` rows for `tenant`. Each row's
@@ -674,7 +736,15 @@ mod tests {
             reader,
             entitlements,
         };
-        let resp = handler(State(state), Query(SelfVerifyQuery { limit }), headers).await;
+        let resp = handler(
+            State(state),
+            Query(SelfVerifyQuery {
+                limit,
+                order: ReadOrder::Asc,
+            }),
+            headers,
+        )
+        .await;
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20)
             .await
@@ -683,6 +753,159 @@ mod tests {
             String::from_utf8_lossy(&bytes).into_owned(),
         ));
         (status, json)
+    }
+
+    #[test]
+    fn review_newest_window_keeps_the_cap_and_claims_tenant() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let tenant = TenantId::from_jwt_claim(uuid::Uuid::parse_str(TENANT_A).unwrap());
+            let mut rows = healthy_chain(&tenant, 4, "recent");
+            // Sparse fixture at a billion-row head; no billion-row allocation.
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.seq = 999_999_996 + i as u64;
+            }
+            let reader = Arc::new(TenantScopedMockReader {
+                rows_by_tenant: HashMap::from([(TENANT_A.into(), rows)]),
+            });
+            let uri = format!("/v1/audit/self-verify?limit=2&order=desc&tenant_id={TENANT_B}")
+                .parse()
+                .unwrap();
+            let resp = handler(
+                State(ExportState {
+                    reader,
+                    entitlements: Some(fixed_entitlement(true, 7)),
+                }),
+                Query::<SelfVerifyQuery>::try_from_uri(&uri).unwrap(),
+                dev_key_headers(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let rows: Vec<serde_json::Value> = body["chain_ndjson"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(
+                rows[0]["seq"], 999_999_998,
+                "must select the newest rows, not the oldest"
+            );
+            assert_eq!(rows.len(), 2, "newest query must honor the row cap");
+            assert_eq!(rows[1]["seq"], 999_999_999);
+            assert!(rows.iter().all(|r| r["tenant_id"] == TENANT_A));
+            assert_eq!(
+                body["verdict"], "indeterminate",
+                "no included anchor means unrooted, never green"
+            );
+            assert_eq!(body["trust_established"], false);
+        });
+    }
+
+    struct ReviewFailureReader {
+        anchor_fails: bool,
+        count_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditExportReader for ReviewFailureReader {
+        async fn read_range(
+            &self,
+            tenant: &TenantId,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: u32,
+        ) -> Result<Vec<ExportRow>> {
+            Ok(healthy_chain(tenant, 3, "review"))
+        }
+        async fn read_anchor_records(
+            &self,
+            _: &TenantId,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: u32,
+        ) -> Result<Vec<AnchorExportRecord>> {
+            if self.anchor_fails {
+                anyhow::bail!("planted anchor read failure");
+            }
+            Ok(vec![])
+        }
+        async fn count_in_range(
+            &self,
+            _: &TenantId,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> Result<u64> {
+            if self.count_fails {
+                anyhow::bail!("planted count failure");
+            }
+            Ok(3)
+        }
+    }
+
+    #[test]
+    fn review_anchor_read_failure_is_not_an_unanchored_success() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let (status, body) = call(
+                Arc::new(ReviewFailureReader {
+                    anchor_fails: true,
+                    count_fails: false,
+                }),
+                Some(fixed_entitlement(true, 7)),
+                dev_key_headers(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.to_string().contains("anchor read failed"));
+        });
+    }
+
+    #[test]
+    fn review_count_failure_is_null_with_a_reason() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let (status, body) = call(
+                Arc::new(ReviewFailureReader {
+                    anchor_fails: false,
+                    count_fails: true,
+                }),
+                Some(fixed_entitlement(true, 7)),
+                dev_key_headers(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body.get("total_in_window"),
+                Some(&serde_json::Value::Null),
+                "{body}"
+            );
+            assert_eq!(
+                body["total_in_window_unavailable_reason"],
+                "count_read_failed"
+            );
+        });
+    }
+
+    #[test]
+    fn review_uncovered_rows_prevent_a_green_verdict() {
+        assert_eq!(
+            self_verify_verdict(true, true, false, true, false, 1, 1),
+            "indeterminate"
+        );
+        assert_eq!(
+            self_verify_verdict(false, true, false, true, false, 1, 1),
+            "red"
+        );
     }
 
     // ---- Constraint 1: TENANT ISOLATION (written first) ------------------
@@ -846,21 +1069,24 @@ mod tests {
     #[test]
     fn self_verify_verdict_is_never_green_without_an_included_anchor() {
         assert_eq!(
-            self_verify_verdict(true, true, false, true, false, 0),
+            self_verify_verdict(true, true, false, true, false, 0, 0),
             "indeterminate",
             "consistent + rooted + ZERO included anchors must not be green"
         );
         assert_eq!(
-            self_verify_verdict(true, true, false, true, false, 1),
+            self_verify_verdict(true, true, false, true, false, 1, 0),
             "green",
             "one included anchor is what turns it green"
         );
         // Positive evidence of tampering still outranks the anchor question.
         assert_eq!(
-            self_verify_verdict(false, true, false, true, false, 0),
+            self_verify_verdict(false, true, false, true, false, 0, 0),
             "red"
         );
-        assert_eq!(self_verify_verdict(true, true, true, true, false, 0), "red");
+        assert_eq!(
+            self_verify_verdict(true, true, true, true, false, 0, 0),
+            "red"
+        );
     }
 
     #[test]
@@ -868,17 +1094,17 @@ mod tests {
         // GREEN requires the full conjunction; flipping ANY input to the bad value
         // must yield RED. Negative cases first (.claude/rules/testing.md).
         assert_eq!(
-            self_verify_verdict(false, true, false, true, false, 1),
+            self_verify_verdict(false, true, false, true, false, 1, 0),
             "red",
             "broken hash chain"
         );
         assert_eq!(
-            self_verify_verdict(true, false, false, true, false, 1),
+            self_verify_verdict(true, false, false, true, false, 1, 0),
             "red",
             "signature failure"
         );
         assert_eq!(
-            self_verify_verdict(true, true, true, true, false, 1),
+            self_verify_verdict(true, true, true, true, false, 1, 0),
             "red",
             "strip detected"
         );
@@ -886,36 +1112,36 @@ mod tests {
         // to be "red" and is now "indeterminate". Everything checkable passed; the only
         // absent thing is a trust root for this window.
         assert_eq!(
-            self_verify_verdict(true, true, false, false, false, 1),
+            self_verify_verdict(true, true, false, false, false, 1, 0),
             "indeterminate",
             "unrooted window: cannot verify is NOT verification failed"
         );
         // ADR-070's property SURVIVES — it said an unrooted window is never GREEN, and
         // it still is not. Reclassified, not reversed; assert the half that binds.
         assert_ne!(
-            self_verify_verdict(true, true, false, false, false, 1),
+            self_verify_verdict(true, true, false, false, false, 1, 0),
             "green",
             "an unrooted window must never be green (ADR-070)"
         );
         // And a REAL problem inside an unrooted window is still RED — positive evidence
         // outranks the window every time, so `indeterminate` can never mask a defect.
         assert_eq!(
-            self_verify_verdict(false, true, false, false, false, 1),
+            self_verify_verdict(false, true, false, false, false, 1, 0),
             "red",
             "broken chain in an unrooted window is RED, not indeterminate"
         );
         assert_eq!(
-            self_verify_verdict(true, true, true, false, false, 1),
+            self_verify_verdict(true, true, true, false, false, 1, 0),
             "red",
             "strip in an unrooted window is RED, not indeterminate"
         );
         assert_eq!(
-            self_verify_verdict(true, true, false, true, true, 1),
+            self_verify_verdict(true, true, false, true, true, 1, 0),
             "red",
             "truncated: 0 rows verified out of a non-empty ledger"
         );
         assert_eq!(
-            self_verify_verdict(true, true, false, true, false, 1),
+            self_verify_verdict(true, true, false, true, false, 1, 0),
             "green",
             "all invariants hold"
         );

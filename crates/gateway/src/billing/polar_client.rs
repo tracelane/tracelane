@@ -131,8 +131,19 @@ impl PolarClient {
 
     /// Record Polar usage events. Polar's events API replaces Stripe's
     /// `meter_events`. Events are organisation-scoped, customer-keyed,
-    /// and idempotent on `external_id` (we pass a deterministic key so
-    /// flush retries don't double-count).
+    /// and idempotent on `external_id` (we pass a deterministic key so a
+    /// retried emission does not double-count).
+    ///
+    /// **What "idempotent" means at Polar, MEASURED on the sandbox API
+    /// 2026-09-21 (founder batch A, item 3):** three `/events/ingest` POSTs under
+    /// one `external_id` — values 5.0, 5.0, then 7.0 — answered `{inserted:1,
+    /// duplicates:0}`, `{inserted:0, duplicates:1}`, `{inserted:0, duplicates:1}`;
+    /// `GET /events` then held ONE event with value **5.0**. So: a retry is
+    /// skipped, and **the first write wins — a corrected value under the same id
+    /// is skipped too, never updated.** A day that was emitted WRONG can only be
+    /// corrected under a new id (or by Polar support); the B-468 read-back found
+    /// no such day (the 2026-09-21 Polar read-back, REV-D2). The response body carries that
+    /// `inserted` / `duplicates` accounting and this method discards it (B-485).
     ///
     /// `value` is `f64` (`metadata.value` is a JSON NUMBER, not necessarily
     /// an integer) — BILL-01 / ADR-076's six meters are configured in GB with
@@ -151,8 +162,14 @@ impl PolarClient {
     /// Propagates the FIRST failed chunk's HTTP/network error and does not
     /// attempt later chunks — mirrors the single-event method's all-or-
     /// nothing-per-call shape. The caller (the daily metering job) treats a
-    /// failure as fail-open: logged + noted, retried whole at the next tick
-    /// (idempotent on `external_id`).
+    /// failure as fail-open for the run — logged + noted — and WITHHOLDS the
+    /// day's completion marker, so the next run's gap backfill recomputes the
+    /// day and re-emits it under the same `external_id`s (Polar dedupes — see
+    /// above; proven in both the refused-POST and the killed-mid-emission shape by
+    /// `metering_job::tests::rev1_a_*` on a real ClickHouse).
+    /// *(B-470, REV-1: until 2026-09-20 this said "retried whole at the next
+    /// tick" while the control flow marked the day complete before the POST —
+    /// a failed emission was never retried at all.)*
     #[instrument(skip(self, events), fields(count = events.len()))]
     pub async fn record_meter_events(&self, events: &[MeterEvent<'_>]) -> BillingResult<()> {
         for chunk in events.chunks(100) {

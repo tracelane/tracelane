@@ -37,6 +37,20 @@
     ]
   },
   "policy": {
+    "web_list_page_sizes": { "experiments": 25, "datasets": 100, "experiment_datasets": 100, "session_turns": 20, "dataset_items": 50 },
+    "playground_limits": {
+      "max_columns": 4,
+      "max_messages": 50,
+      "max_body_bytes": 262144,
+      "max_tokens_cap": 2048,
+      "timeout_ms": 45000,
+      "cost_poll_seconds": 20,
+      "history_entries": 10
+    },
+    "bulk_trace_action_max": 200,
+    "key_rotation_grace_hours": 24,
+    "model_aliases_max_per_workspace": 50,
+    "failover_models_max": 5,
     "annual_available": false,
     "annual_available_reason": "Annual billing is not offered yet (2026-09-15): the billing provider grants included allowances once per subscription cycle, so a yearly product would grant one month of allowance per year. While false, polar-sync archives the yearly products and clears their ids, the app hides the annual action and the checkout refuses interval=year. Flip to true only together with the decided annual shape.",
     "burst_multiple_of_trailing_30d_avg": 5,
@@ -74,7 +88,9 @@
     },
     "velocity_sigma": 2,
     "velocity_window_days": 7,
-    "velocity_interval_secs": 300
+    "velocity_interval_secs": 300,
+    "velocity_recheck_secs": 3600,
+    "blob_gc_grace_days": 14
   },
   "plans": {
     "free_v1": {
@@ -93,6 +109,8 @@
       "cold_archive_days": 7,
       "unlimited_seats": false,
       "f_sso": false,
+      "f_cache_control": false,
+      "cache_ttl_hours": 0,
       "overage_allowed": false,
       "rate_limit_rpm": 60,
       "cold_gb_included": null
@@ -113,6 +131,8 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": false,
+      "f_cache_control": true,
+      "cache_ttl_hours": 24,
       "overage_allowed": true,
       "rate_limit_rpm": 600,
       "cold_gb_included": 480
@@ -133,6 +153,8 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_cache_control": true,
+      "cache_ttl_hours": 168,
       "overage_allowed": true,
       "rate_limit_rpm": 6000,
       "cold_gb_included": 2400
@@ -153,6 +175,8 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_cache_control": true,
+      "cache_ttl_hours": 720,
       "overage_allowed": true,
       "rate_limit_rpm": 60000,
       "cold_gb_included": 4800
@@ -173,6 +197,8 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_cache_control": true,
+      "cache_ttl_hours": 2160,
       "overage_allowed": true,
       "rate_limit_rpm": null,
       "cold_gb_included": null

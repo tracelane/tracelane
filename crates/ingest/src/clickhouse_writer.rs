@@ -46,7 +46,7 @@
 //! `{"$ref":…, "missing": true}` on read (never an error), which is an
 //! acceptable degradation for a fault-tolerance path, not a data-loss one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -335,7 +335,8 @@ struct BlobRefRow<'a> {
 ///
 /// # Errors
 /// Returns `Err` only on unrecoverable ClickHouse errors. Transient errors
-/// are retried up to 3 times with 500ms backoff before propagating.
+/// are retried across the [`CH_INSERT_BACKOFF`] ladder (8 attempts, ≈ 63 s
+/// cumulative — B-493) before propagating.
 /// Build the ClickHouse client. Centralised so it ALWAYS authenticates as the
 /// configured `CLICKHOUSE_USER`, never the default user — connecting as default
 /// silently fails inserts against a credentialed server and crash-loops this
@@ -392,6 +393,10 @@ pub async fn run(
     // — see the module doc), unlike `pending_blobs`/`pending_refs` below which
     // are per-cycle and best-effort.
     let mut meter_buffer: HashMap<String, f64> = HashMap::new();
+    // B-469 (REV-1): batches whose INSERT did not report success, retried
+    // UNCHANGED with their own dedup token — never merged back into
+    // `meter_buffer` (see `flush_ingest_meter`).
+    let mut meter_pending: VecDeque<IngestMeterBatch> = VecDeque::new();
 
     loop {
         let mut batch: Vec<SpanRow> = Vec::with_capacity(batch_size);
@@ -511,14 +516,20 @@ pub async fn run(
                 Ok(None) => {
                     // Channel closed — flush remaining and exit
                     if !batch.is_empty() {
-                        match flush(&client, &batch).await {
+                        // B-445: blobs/refs are part of the record here too — ack only
+                        // after both landed; a failure leaves the batch for redelivery.
+                        match async {
+                            flush(&client, &batch, &pending_acks).await?;
+                            flush_blobs(&client, pending_blobs, pending_refs).await
+                        }
+                        .await
+                        {
                             Ok(()) => {
                                 ack_all(pending_acks).await;
                                 // Federation substrate (ADR-056 ·),
                                 // fail-open — same as the steady-state path.
                                 crate::federation::write_signals(&client, &federation_rows(&batch))
                                     .await;
-                                flush_blobs(&client, pending_blobs, pending_refs).await;
                             }
                             Err(err) => tracing::error!(
                                 error = %err,
@@ -530,7 +541,7 @@ pub async fn run(
                     // BILL-01 meter 1: flush whatever accumulated this cycle
                     // even if `batch` itself is empty (every sampled-OUT span
                     // still metered — see the module doc).
-                    flush_ingest_meter(&client, &mut meter_buffer).await;
+                    flush_ingest_meter(&client, &mut meter_buffer, &mut meter_pending).await;
                     tracing::info!("span channel closed; batch writer exiting");
                     return Ok(());
                 }
@@ -545,22 +556,29 @@ pub async fn run(
             // acks, so the messages stay unacked and JetStream redelivers them
             // (zero-loss, FT-03). A redelivered duplicate is idempotent — the
             // spans table collapses it on merge (ReplacingMergeTree).
-            flush(&client, &batch)
+            flush(&client, &batch, &pending_acks)
                 .await
                 .context("ClickHouse batch flush failed")?;
+            // B-445 (2026-09-19): the span's blobs and their refs are PART of the record —
+            // written before the ack, and a failure propagates exactly like a span
+            // write, so JetStream redelivers the batch (ReplacingMergeTree collapses the
+            // span and blob rows; a duplicate `blob_refs` row is harmless to a NOT IN).
+            // Until this, they were best-effort AFTER the ack: a failed ref insert left a
+            // live span pointing at a zero-ref blob the Sunday GC then deleted.
+            flush_blobs(&client, pending_blobs, pending_refs)
+                .await
+                .context("ClickHouse blobs/blob_refs flush failed")?;
             ack_all(pending_acks).await;
             // Federation substrate (ADR-056 ·): anonymized cross-customer
             // signal aggregates from the spans just durably written. Best-effort
             // + fail-open — never affects span durability or the acks above.
             crate::federation::write_signals(&client, &federation_rows(&batch)).await;
-            // BILL-01 / ADR-076 §2.3 — rides the SAME flush as the span batch.
-            flush_blobs(&client, pending_blobs, pending_refs).await;
             tracing::debug!(spans = n, dropped, "flushed batch to ClickHouse");
         }
         // BILL-01 meter 1 (ingest half) — rides the SAME flush cadence as the
         // span batch (spec §2.5b: never a row per span), regardless of
         // whether THIS cycle happened to keep any spans.
-        flush_ingest_meter(&client, &mut meter_buffer).await;
+        flush_ingest_meter(&client, &mut meter_buffer, &mut meter_pending).await;
 
         // Bound the sampler's sticky map. Cheap vs the flush and only every
         // SAMPLER_PRUNE_INTERVAL, so the O(n) sweep isn't paid per batch.
@@ -607,63 +625,129 @@ fn sample_one(
     kept.then(|| build_span_row(span, span_bytes, day, out_blobs, out_refs))
 }
 
-/// Drain `meter_buffer` and write ONE batched INSERT into `meter_counters`
-/// (`source = 'ingest'`) — meter 1's ingest half (spec §2.1). On failure the
-/// drained rows are RESTORED to the buffer (fail-open: a billing-meter outage
-/// must never affect span durability, which by the time this runs has
-/// already committed) and `Degradation::MeterFlushFailed` notes it — the same
-/// C1 shape `crate::billing::meters::MeterSink::flush` was fixed for on the
-/// gateway side.
-async fn flush_ingest_meter(client: &Client, meter_buffer: &mut HashMap<String, f64>) {
-    if meter_buffer.is_empty() {
-        return;
-    }
-    let day = days_since_epoch(chrono::Utc::now().date_naive());
-    let drained: Vec<(String, f64)> = meter_buffer.drain().collect();
-    let n = drained.len();
-    let result: Result<()> = async {
-        let mut insert = client
-            .insert("meter_counters")
-            .context("meter_counters insert init failed")?;
-        for (tenant_id, value) in &drained {
-            insert
-                .write(&MeterCounterRow {
-                    tenant_id,
-                    day,
-                    meter: "ingest_bytes",
-                    dim: "",
-                    value: *value,
-                    source: "ingest",
-                })
-                .await
-                .context("meter_counters row write failed")?;
-        }
-        insert
-            .end()
-            .await
-            .context("meter_counters insert commit failed")
-    }
-    .await;
+/// One drained ingest-meter flush, frozen: rows, the day it was drained on, and
+/// the `insert_deduplication_token` every retry carries (B-469, REV-1). Mirrors
+/// `crates/gateway/src/billing/meters.rs::MeterBatch` — kept per crate on
+/// purpose: the two writers' row types differ and a shared abstraction would
+/// hide the one line that matters (the token on the retry).
+#[derive(Debug, Clone)]
+struct IngestMeterBatch {
+    token: String,
+    day: u16,
+    rows: Vec<(String, f64)>,
+}
 
-    if let Err(e) = result {
-        tracing::warn!(error = %e, tenants = n, "ingest meter_counters flush failed; restoring buffer");
-        for (tenant_id, value) in drained {
-            *meter_buffer.entry(tenant_id).or_insert(0.0) += value;
+/// At most this many failed batches wait for retry (24 h of 200 ms cycles is
+/// far more; this is a memory bound, not a time budget). Beyond it the OLDEST
+/// is dropped and counted (`MeterBatchDropped`) — under-billed, never doubled.
+const INGEST_METER_PENDING_CAP: usize = 8_640;
+
+/// ONE INSERT for one immutable batch, carrying its dedup token so a retry of a
+/// batch whose first attempt COMMITTED but lost its response is discarded
+/// server-side (`meter_counters` `non_replicated_deduplication_window`,
+/// migration 28).
+async fn insert_ingest_meter_batch(client: &Client, batch: &IngestMeterBatch) -> Result<()> {
+    let mut insert = client
+        .insert("meter_counters")
+        .context("meter_counters insert init failed")?
+        .with_option("insert_deduplication_token", batch.token.as_str());
+    for (tenant_id, value) in &batch.rows {
+        insert
+            .write(&MeterCounterRow {
+                tenant_id,
+                day: batch.day,
+                meter: "ingest_bytes",
+                dim: "",
+                value: *value,
+                source: "ingest",
+            })
+            .await
+            .context("meter_counters row write failed")?;
+    }
+    insert
+        .end()
+        .await
+        .context("meter_counters insert commit failed")
+}
+
+/// Flush meter 1's ingest half (spec §2.1): retry every pending batch UNCHANGED
+/// (oldest first, stopping at the first failure), then drain `meter_buffer`
+/// into a NEW immutable batch and insert it. A failed batch joins `pending`
+/// as-is and `Degradation::MeterFlushFailed` notes it — fail-open: a
+/// billing-meter outage must never affect span durability, which by the time
+/// this runs has already committed.
+///
+/// **B-469 (REV-1, 2026-09-20):** until this, a failed batch's amounts were
+/// merged back into `meter_buffer` and re-sent with newer usage, so an insert
+/// that committed and lost its response (ClickHouse documents that window)
+/// counted the batch twice — the same C1-shaped restore the gateway sink had.
+async fn flush_ingest_meter(
+    client: &Client,
+    meter_buffer: &mut HashMap<String, f64>,
+    pending: &mut VecDeque<IngestMeterBatch>,
+) {
+    let mut failed: Option<anyhow::Error> = None;
+    while let Some(batch) = pending.front() {
+        match insert_ingest_meter_batch(client, batch).await {
+            Ok(()) => {
+                pending.pop_front();
+            }
+            Err(e) => {
+                failed = Some(e);
+                break; // keep order: nothing newer is sent past a stuck batch
+            }
         }
+    }
+    if !meter_buffer.is_empty() {
+        let batch = IngestMeterBatch {
+            token: uuid::Uuid::new_v4().to_string(),
+            day: days_since_epoch(chrono::Utc::now().date_naive()),
+            rows: meter_buffer.drain().collect(),
+        };
+        let result = if failed.is_some() {
+            Err(anyhow::anyhow!("pending batch retry failed first"))
+        } else {
+            insert_ingest_meter_batch(client, &batch).await
+        };
+        if let Err(e) = result {
+            if pending.len() >= INGEST_METER_PENDING_CAP {
+                pending.pop_front();
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::MeterBatchDropped,
+                );
+            }
+            pending.push_back(batch);
+            if failed.is_none() {
+                failed = Some(e);
+            }
+        }
+    }
+    if let Some(e) = failed {
+        tracing::warn!(error = %e, pending = pending.len(), "ingest meter_counters flush failed; batch held for an unchanged retry");
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::MeterFlushFailed,
         );
     }
 }
 
-/// Best-effort batched INSERT of this cycle's queued `blobs` + `blob_refs`
-/// rows (spec §2.3). Deliberately NOT retried on failure (see the module doc)
-/// — the span rows carrying the `$ref` placeholders are already durably
-/// written by the time this runs, and a missing blob renders
-/// `{"$ref":…, "missing": true}` on read rather than an error.
-async fn flush_blobs(client: &Client, blobs: Vec<PendingBlob>, refs: Vec<PendingBlobRef>) {
+/// Batched INSERT of this cycle's queued `blobs` + `blob_refs` rows (spec §2.3).
+///
+/// B-445 (2026-09-19): part of the DURABLE flush now — the caller runs it before the
+/// ack and propagates a failure, so JetStream redelivers the batch. Until then it was
+/// best-effort after the ack ("a missing blob renders `missing: true`"), which made a
+/// failed `blob_refs` insert manufacture exactly the zero-ref-but-referenced blob the
+/// Sunday GC deletes. A failure is still counted on `BlobStoreFailed` so the class stays
+/// visible on the watchdog even though it now also stops the ack.
+///
+/// # Errors
+/// Either insert failed; the caller treats it as a span-write failure.
+async fn flush_blobs(
+    client: &Client,
+    blobs: Vec<PendingBlob>,
+    refs: Vec<PendingBlobRef>,
+) -> Result<()> {
     if blobs.is_empty() && refs.is_empty() {
-        return;
+        return Ok(());
     }
     // In-cycle dedup: several spans in one flush can share the identical
     // blob (the same repeated system prompt); ReplacingMergeTree makes this
@@ -693,10 +777,11 @@ async fn flush_blobs(client: &Client, blobs: Vec<PendingBlob>, refs: Vec<Pending
         }
         .await;
         if let Err(e) = result {
-            tracing::warn!(error = %e, count = n, "blobs insert failed (best-effort, not retried)");
+            tracing::warn!(error = %e, count = n, "blobs insert failed — batch left for redelivery (B-445)");
             tracelane_shared::degradation::note(
                 tracelane_shared::degradation::Degradation::BlobStoreFailed,
             );
+            return Err(e);
         }
     }
 
@@ -721,12 +806,14 @@ async fn flush_blobs(client: &Client, blobs: Vec<PendingBlob>, refs: Vec<Pending
         }
         .await;
         if let Err(e) = result {
-            tracing::warn!(error = %e, count = n, "blob_refs insert failed (best-effort, not retried)");
+            tracing::warn!(error = %e, count = n, "blob_refs insert failed — batch left for redelivery (B-445)");
             tracelane_shared::degradation::note(
                 tracelane_shared::degradation::Degradation::BlobStoreFailed,
             );
+            return Err(e);
         }
     }
+    Ok(())
 }
 
 /// Extract the anonymized federation signals from a durably-flushed span batch
@@ -757,8 +844,14 @@ fn row_byte_estimate(row: &SpanRow) -> u64 {
 /// Ack one JetStream message (best-effort). A failed ack ⇒ redelivery ⇒ a
 /// duplicate insert, which the spans ReplacingMergeTree collapses on merge.
 async fn ack_one(msg: async_nats::jetstream::Message) {
+    let seq = msg.info().ok().map(|i| i.stream_sequence);
     if let Err(e) = msg.ack().await {
-        tracing::warn!(error = %e, "JetStream ack failed after durable write; message may redeliver (idempotent insert)");
+        tracing::warn!(error = %e, "JetStream ack failed after durable write; the message may redeliver — the span row collapses on merge (ReplacingMergeTree) but the mv_* views count the second INSERT");
+    }
+    // Acked (or the ack itself failed, in which case a redelivery is the real
+    // retry and must not be dropped as a duplicate): no longer held.
+    if let Some(seq) = seq {
+        crate::span_envelope::release(seq);
     }
 }
 
@@ -769,33 +862,164 @@ async fn ack_all(msgs: Vec<async_nats::jetstream::Message>) {
     }
 }
 
-/// Flush a batch of span rows to ClickHouse with up to 3 retries.
-///
-/// Treats the entire write phase (all `insert.write()` calls + `insert.end()`)
-/// as one atomic attempt so that a transient write failure is retried rather
-/// than propagating immediately via `?`.
-async fn flush(client: &Client, rows: &[SpanRow]) -> Result<()> {
-    for attempt in 0..3u32 {
-        let result: Result<()> = async {
+/// B-493 (2026-09-21): the back-off ladder between insert attempts. Cumulative
+/// ≈ 63 s — longer than the 30 s burst that exhausted the old 3-attempt / 1.5 s
+/// ladder and killed the process. A refusal such as
+/// `TOO_MANY_SIMULTANEOUS_QUERIES` or `MEMORY_LIMIT_EXCEEDED` is a TRANSIENT
+/// (the module doc's own word), and the spans behind it are safe in JetStream,
+/// unacked, for exactly as long as this writer keeps trying — the batch's
+/// messages get a `+WPI` progress ack before every rung so JetStream's 30 s
+/// `ack_wait` does not redeliver a batch this process still holds (a
+/// redelivered copy is written AGAIN, and the `mv_*` views count every INSERT).
+/// Exiting instead hands the batch to a container restart that the published
+/// bench compose never performs. Only after the whole ladder does `run`
+/// propagate (still loud, still recoverable by a restart); a PERMANENT error
+/// (`is_permanent_ch_error`) propagates at once — retrying a stale schema for
+/// a minute per batch would look like a transient and hide the cause.
+/// Pinned by `b493_the_production_backoff_ladder_outlasts_a_burst`.
+pub(crate) const CH_INSERT_BACKOFF: [std::time::Duration; 7] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+    std::time::Duration::from_secs(32),
+];
+
+/// One INSERT attempt is bounded: a ClickHouse that HANGS (paused, a wedged
+/// disk, a half-open socket) must become a failed attempt inside JetStream's
+/// 30 s `ack_wait`, or the batch is redelivered to this same process before the
+/// first progress ack could be sent — run 3 of the B-493 repro (a 40 s
+/// `docker pause`) showed exactly that: 4,000 redelivered. 20 s < 30 s.
+pub(crate) const CH_INSERT_ATTEMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// ClickHouse error codes no retry can fix: the schema, the row's types, the
+/// credentials or the SQL are wrong, and the same bytes will be refused every
+/// rung. Everything else (202 too many queries, 241 memory limit, 252 too many
+/// parts, network, timeout, an unknown code) is treated as transient.
+/// Codes: 6 CANNOT_PARSE_TEXT · 16 NO_SUCH_COLUMN_IN_TABLE · 33 CANNOT_READ_ALL_DATA
+/// · 47 UNKNOWN_IDENTIFIER · 53 TYPE_MISMATCH · 60 UNKNOWN_TABLE · 62 SYNTAX_ERROR
+/// · 81 UNKNOWN_DATABASE · 117 INCORRECT_DATA · 497 ACCESS_DENIED · 516 AUTHENTICATION_FAILED.
+pub(crate) fn is_permanent_ch_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    const PERMANENT: [u16; 11] = [6, 16, 33, 47, 53, 60, 62, 81, 117, 497, 516];
+    PERMANENT
+        .iter()
+        .any(|code| text.contains(&format!("Code: {code}.")))
+}
+
+/// Flush a batch of span rows to ClickHouse across the [`CH_INSERT_BACKOFF`]
+/// ladder. Treats the entire write phase (all `insert.write()` calls +
+/// `insert.end()`) as one atomic attempt so that a transient write failure is
+/// retried rather than propagating immediately via `?`. `held` are the
+/// JetStream handles of the rows in this batch (empty for OTLP-direct spans);
+/// each gets a progress ack before every rung's sleep.
+async fn flush(
+    client: &Client,
+    rows: &[SpanRow],
+    held: &[async_nats::jetstream::Message],
+) -> Result<()> {
+    // One token per BATCH, minted here and carried by every retry of these exact
+    // rows (B-469's shape for meter_counters, applied to spans — B-493 run 6): an
+    // attempt the client gave up on can still COMMIT server-side (a 20 s timeout
+    // against a paused server did), and the retry then inserted the same rows a
+    // second time. ReplacingMergeTree collapsed the span rows on merge, but the
+    // `mv_trace_summaries` / `mv_slo_hourly_stats` views fire per INSERT and
+    // counted 100 traces twice. With `non_replicated_deduplication_window` on
+    // `spans` (migration 29) the server drops the retry BY TOKEN before any view
+    // sees it. A token sent to a table without the window is accepted and ignored.
+    let token = uuid::Uuid::new_v4().to_string();
+    flush_with_backoff(client, rows, held, &token, &CH_INSERT_BACKOFF).await
+}
+
+/// One attempt per rung of `backoff` plus the first — `backoff.len() + 1` in all.
+/// A rung is slept AFTER the failed attempt it follows. Every attempt carries the
+/// same `dedup_token`.
+async fn flush_with_backoff(
+    client: &Client,
+    rows: &[SpanRow],
+    held: &[async_nats::jetstream::Message],
+    dedup_token: &str,
+    backoff: &[std::time::Duration],
+) -> Result<()> {
+    let attempts = backoff.len() + 1;
+    // `attempt` indexes `backoff` on the failure arm (rung N follows attempt N);
+    // the last attempt has no rung after it.
+    #[allow(clippy::needless_range_loop)]
+    for attempt in 0..attempts {
+        let attempt_fut = async {
             let mut insert = client
                 .insert("tracelane.spans")
-                .context("ClickHouse insert init")?;
+                .context("ClickHouse insert init")?
+                .with_option("insert_deduplication_token", dedup_token)
+                // The views fed by `spans` (`trace_summaries`, `slo_hourly_stats`)
+                // dedup on their OWN windows (migration 29) only when the INSERT
+                // asks for it — the source table's dedup alone does not stop a
+                // view from firing twice (proven on a real server, 2026-09-21).
+                .with_option("deduplicate_blocks_in_dependent_materialized_views", "1");
             for row in rows {
                 insert.write(row).await.context("ClickHouse row write")?;
             }
             insert.end().await.context("ClickHouse insert end")?;
-            Ok(())
-        }
-        .await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let result: Result<()> =
+            match tokio::time::timeout(CH_INSERT_ATTEMPT_TIMEOUT, attempt_fut).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "ClickHouse insert attempt timed out after {}s (the server hung)",
+                    CH_INSERT_ATTEMPT_TIMEOUT.as_secs()
+                )),
+            };
 
         match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 2 => {
-                tracing::warn!(attempt, error = %e, "ClickHouse insert failed, retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    500 * u64::from(attempt + 1),
-                ))
-                .await;
+            Ok(()) => {
+                if attempt > 0 {
+                    // The leave-transition (`.claude/rules/logging.md`): one line, and
+                    // the counter's `open_for_secs` stops growing.
+                    tracelane_shared::degradation::resolve(
+                        tracelane_shared::degradation::Degradation::SpanWriteRetrying,
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if is_permanent_ch_error(&e) => {
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    rows = rows.len(),
+                    attempt,
+                    "ClickHouse insert refused with a PERMANENT error (schema / types / \
+                     credentials) — not retrying; surfacing and propagating (messages stay \
+                     unacked for JetStream redelivery)"
+                );
+                return Err(e);
+            }
+            Err(e) if attempt + 1 < attempts => {
+                // One line per rung, bounded by the ladder's length — the
+                // repeating condition itself is the counter, which the watchdog
+                // reads (`.claude/rules/logging.md`). `{e:#}` prints the chain:
+                // the `Code: NNN` reason, not just "insert end".
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::SpanWriteRetrying,
+                );
+                tracing::warn!(
+                    attempt,
+                    attempts,
+                    next_backoff_ms = backoff[attempt].as_millis() as u64,
+                    error = format!("{e:#}"),
+                    "ClickHouse insert failed, retrying"
+                );
+                // Keep the hold inside the ack contract: `+WPI` resets each held
+                // message's ack_wait, so a batch this process still owns is not
+                // redelivered (and written twice) while it waits out the rung.
+                for m in held {
+                    if let Err(err) = m.ack_with(async_nats::jetstream::AckKind::Progress).await {
+                        tracing::warn!(error = %err, "JetStream progress ack failed; the message may redeliver during the back-off");
+                    }
+                }
+                tokio::time::sleep(backoff[attempt]).await;
             }
             // Surface the failure LOUDLY before propagating (#81 P0: a write that
             // dies must never be silent). The caller's `?` then crashes the
@@ -803,9 +1027,10 @@ async fn flush(client: &Client, rows: &[SpanRow]) -> Result<()> {
             // unacked and JetStream redelivers them — no span is lost.
             Err(e) => {
                 tracing::error!(
-                    error = %e,
+                    error = format!("{e:#}"),
                     rows = rows.len(),
-                    "ClickHouse insert FAILED after 3 attempts — spans NOT written; surfacing and propagating (messages stay unacked for JetStream redelivery)"
+                    attempts,
+                    "ClickHouse insert FAILED after every attempt — spans NOT written; surfacing and propagating (messages stay unacked for JetStream redelivery)"
                 );
                 return Err(e);
             }
@@ -1063,6 +1288,33 @@ mod tests {
         );
     }
 
+    /// B-445: a failed blobs/blob_refs insert is a span-write failure now — `flush_blobs`
+    /// returns the error so the writer leaves the batch UNACKED for redelivery instead of
+    /// acking a span whose blob never landed. Proven against a real ClickHouse by pointing
+    /// the client at a database that does not exist: the insert fails, the error propagates.
+    /// Before B-445 this function returned `()` and the failure was a warn + a counter.
+    #[tokio::test]
+    #[ignore = "needs a real ClickHouse; set CLICKHOUSE_TEST_URL"]
+    async fn flush_blobs_propagates_a_failed_insert_against_a_real_clickhouse() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL");
+        let bad = Client::default()
+            .with_url(url)
+            .with_database("tracelane_does_not_exist_b445");
+        let blob = PendingBlob {
+            tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+            hash: [7u8; 32],
+            bytes: "x".into(),
+            size: 1,
+        };
+        let err = flush_blobs(&bad, vec![blob], vec![]).await.expect_err(
+            "an insert into a missing database must fail, and the failure must propagate",
+        );
+        assert!(
+            format!("{err:#}").contains("blobs insert"),
+            "the error names the step: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn ch_client_sends_configured_user() {
         // Regression (ADR-042): the writer MUST authenticate as CLICKHOUSE_USER,
@@ -1122,7 +1374,7 @@ mod tests {
             .await;
 
         let client = client_for(&server.uri());
-        flush(&client, &[sample_row()])
+        flush(&client, &[sample_row()], &[])
             .await
             .expect("retry loop must recover the batch once ClickHouse is back");
 
@@ -1148,13 +1400,23 @@ mod tests {
             .await;
 
         let client = client_for(&server.uri());
-        let result = flush(&client, &[sample_row()]).await;
+        // B-493: the production ladder is ~1 min; drive the same loop with a
+        // millisecond ladder of the SAME length so the test proves the shape
+        // (every rung tried, then Err) without waiting it out.
+        let tiny: Vec<std::time::Duration> = (0..CH_INSERT_BACKOFF.len())
+            .map(|_| std::time::Duration::from_millis(2))
+            .collect();
+        let result = flush_with_backoff(&client, &[sample_row()], &[], "tok", &tiny).await;
         assert!(
             result.is_err(),
             "a persistent outage must surface as Err, not a silent drop",
         );
         let hits = server.received_requests().await.unwrap().len();
-        assert!(hits >= 3, "all 3 attempts must be made, saw {hits}");
+        assert_eq!(
+            hits,
+            CH_INSERT_BACKOFF.len() + 1,
+            "every rung of the ladder is tried before propagating"
+        );
     }
 
     /// Regression for #81 (the REAL cause): a consumed clean span must reach a
@@ -1335,6 +1597,266 @@ mod tests {
             0,
             "a clean span at the 0% baseline is tail-sampled out before any insert \
              — this is the silent drop that masquerades as a write failure (#81)"
+        );
+    }
+
+    /// B-493 (2026-09-21): a self-host ClickHouse (`max_concurrent_queries` 20)
+    /// under a 30 s burst refused this writer's batches with
+    /// `TOO_MANY_SIMULTANEOUS_QUERIES`; the 3-attempt / 1.5 s ladder ran out
+    /// inside the burst and `run` EXITED — the process died with ~5,900 spans
+    /// unacked in JetStream, and the published bench compose (no `restart:`)
+    /// never brought it back, so the read-back counted half. A refusal is a
+    /// transient, not "unrecoverable" (the doc comment's own word): the ladder
+    /// now outlasts a burst, and only a persistent outage propagates.
+    #[tokio::test]
+    async fn b493_a_transient_refusal_storm_is_outwaited_not_fatal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                "Code: 202. DB::Exception: Too many simultaneous queries. Maximum: 20. \
+                     (TOO_MANY_SIMULTANEOUS_QUERIES)",
+            ))
+            .up_to_n_times(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        let tiny: Vec<std::time::Duration> = (0..CH_INSERT_BACKOFF.len())
+            .map(|_| std::time::Duration::from_millis(5))
+            .collect();
+        flush_with_backoff(&client, &[sample_row()], &[], "tok", &tiny)
+            .await
+            .expect("five refusals in a row are outwaited, the batch lands on the sixth");
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
+    /// A PERMANENT ClickHouse error (here `NO_SUCH_COLUMN_IN_TABLE`, the B-482
+    /// stale-schema class) propagates on the FIRST attempt — one request, not a
+    /// minute of retries that reads like a transient.
+    #[tokio::test]
+    async fn b493_a_permanent_error_propagates_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "Code: 16. DB::Exception: No such column span_bytes in table tracelane.spans \
+                 (NO_SUCH_COLUMN_IN_TABLE)",
+            ))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        let tiny: Vec<std::time::Duration> = (0..CH_INSERT_BACKOFF.len())
+            .map(|_| std::time::Duration::from_millis(5))
+            .collect();
+        let r = flush_with_backoff(&client, &[sample_row()], &[], "tok", &tiny).await;
+        assert!(r.is_err(), "a permanent error propagates");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "exactly one attempt — no ladder for a schema error"
+        );
+        // And the run-2 refusal shape (memory cap, code 241) IS transient: retried.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 241. DB::Exception: (total) memory limit exceeded: would use 474.00 MiB \
+                 (MEMORY_LIMIT_EXCEEDED)",
+            ))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        flush_with_backoff(&client, &[sample_row()], &[], "tok", &tiny)
+            .await
+            .expect("241 is outwaited");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// Every attempt of one batch carries the SAME `insert_deduplication_token`
+    /// (the server dedups by it — migration 29), and two different batches carry
+    /// different ones.
+    #[tokio::test]
+    async fn b493_every_retry_of_a_batch_carries_the_same_dedup_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Code: 202. busy"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        flush(&client, &[sample_row()], &[])
+            .await
+            .expect("lands on attempt 3");
+        flush(&client, &[sample_row()], &[])
+            .await
+            .expect("a second batch");
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 4);
+        let tok = |i: usize| {
+            let q = reqs[i].url.query().unwrap_or_default().to_string();
+            q.split('&')
+                .find(|kv| kv.starts_with("insert_deduplication_token="))
+                .map(str::to_string)
+                .expect("token on the wire")
+        };
+        assert_eq!(tok(0), tok(1), "retry 1 reuses the batch token");
+        assert_eq!(tok(1), tok(2), "retry 2 reuses the batch token");
+        assert_ne!(tok(2), tok(3), "a new batch mints a new token");
+        assert_eq!(
+            reqs[0].body, reqs[2].body,
+            "and the retried body is byte-identical"
+        );
+    }
+
+    /// **B-493 proof on a real server, both directions.** The same batch flushed
+    /// twice under one `insert_deduplication_token` — the "committed behind a
+    /// client timeout, then retried" path run 6 of the repro hit — lands ONCE in
+    /// `spans` and fires `mv_trace_summaries` ONCE (migration 29's window on the
+    /// table), while a clone of `spans` without the window takes both inserts:
+    /// the table SETTING is the control, the token alone is not.
+    /// Run: `CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 cargo test -p ingest --bin ingest \
+    ///   b493_a_retried_span_batch_fires_the_views_once_against_a_real_clickhouse -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a real ClickHouse with schema.sql applied; set CLICKHOUSE_TEST_URL"]
+    async fn b493_a_retried_span_batch_fires_the_views_once_against_a_real_clickhouse() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL");
+        let ch = ch_client(
+            &url,
+            &std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
+            &std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
+            "tracelane",
+        );
+        // The window is ON the table — read from the server, never assumed from DDL.
+        let ddl: String = ch
+            .query("SHOW CREATE TABLE tracelane.spans")
+            .fetch_one()
+            .await
+            .expect("show create");
+        assert!(
+            ddl.contains("non_replicated_deduplication_window = 1000"),
+            "migration 29 must be applied on tracelane.spans: {ddl}"
+        );
+        let trace = format!("b493-{}", uuid::Uuid::new_v4());
+        let mut row = sample_row();
+        row.trace_id.clone_from(&trace);
+        row.span_id = format!("{trace}-span");
+        row.start_time = chrono::Utc::now().timestamp_micros();
+        row.end_time = row.start_time + 1;
+        let mut clone_row = sample_row();
+        clone_row.trace_id.clone_from(&trace);
+        clone_row.span_id = row.span_id.clone();
+        clone_row.start_time = row.start_time;
+        clone_row.end_time = row.end_time;
+        let rows = vec![row];
+        let token = uuid::Uuid::new_v4().to_string();
+        let tiny = [std::time::Duration::from_millis(1); 1];
+        flush_with_backoff(&ch, &rows, &[], &token, &tiny)
+            .await
+            .expect("first flush");
+        flush_with_backoff(&ch, &rows, &[], &token, &tiny)
+            .await
+            .expect("the retry is ACCEPTED (and discarded)");
+        // Both reads carry the tenant predicate a production query would (the
+        // tenant-isolation guard reads this file too, tests included).
+        let tenant = rows[0].tenant_id.clone();
+        let spans: u64 = ch
+            .query("SELECT count() FROM tracelane.spans WHERE tenant_id = ? AND trace_id = ?")
+            .bind(&tenant)
+            .bind(&trace)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(spans, 1, "the retried batch must not insert a second row");
+        let span_count: u64 = ch
+            .query("SELECT sum(span_count) FROM tracelane.trace_summaries FINAL WHERE tenant_id = ? AND trace_id = ?")
+            .bind(&tenant)
+            .bind(&trace)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(
+            span_count, 1,
+            "mv_trace_summaries fired ONCE — this is the double count B-493 run 6 found"
+        );
+        // Negative control: the clone without the window takes the same batch twice.
+        let clone = format!("spans_nowin_{}", uuid::Uuid::new_v4().simple());
+        ch.query(&format!(
+            "CREATE TABLE tracelane.{clone} AS tracelane.spans"
+        ))
+        .execute()
+        .await
+        .expect("clone");
+        ch.query(&format!(
+            "ALTER TABLE tracelane.{clone} MODIFY SETTING non_replicated_deduplication_window = 0"
+        ))
+        .execute()
+        .await
+        .expect("window off on the clone");
+        for _ in 0..2 {
+            let mut insert = ch
+                .insert(&format!("tracelane.{clone}"))
+                .expect("insert init")
+                .with_option("insert_deduplication_token", token.as_str());
+            insert.write(&clone_row).await.expect("write");
+            insert.end().await.expect("end");
+        }
+        let twice: u64 = ch
+            .query(&format!(
+                "SELECT count() FROM tracelane.{clone} WHERE tenant_id = ? AND trace_id = ?"
+            ))
+            .bind(&tenant)
+            .bind(&trace)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(
+            twice, 2,
+            "without the window the token is ignored: the setting is the control"
+        );
+        let _ = ch
+            .query(&format!("DROP TABLE tracelane.{clone}"))
+            .execute()
+            .await;
+    }
+
+    /// The production ladder must outlast the burst that killed the process:
+    /// the observed storm was a 30 s load window, so the cumulative back-off
+    /// is at least twice that before `run` gives up and exits.
+    #[test]
+    fn b493_the_production_backoff_ladder_outlasts_a_burst() {
+        let total: std::time::Duration = CH_INSERT_BACKOFF.iter().sum();
+        assert!(
+            total >= std::time::Duration::from_secs(60),
+            "cumulative back-off {total:?} must be >= 60 s"
+        );
+        assert!(
+            CH_INSERT_BACKOFF.windows(2).all(|w| w[1] >= w[0]),
+            "the ladder is non-decreasing (exponential back-off, never a tight loop)"
+        );
+        // The ladder outlasts JetStream's ack_wait, which is WHY every rung sends a
+        // progress ack (`+WPI`) for the held batch: without it the batch is redelivered
+        // to this same process mid-ladder and written twice. Pinned so a future edit
+        // to either number cannot silently re-open the double-write.
+        let ack_wait = crate::nats_consumer::ingest_consumer_config(2000).ack_wait;
+        assert!(
+            total > ack_wait,
+            "if this ever flips, the progress acks become unnecessary — not wrong"
+        );
+        // …and a HUNG attempt must fail inside the ack window so the first progress
+        // ack is sent before JetStream redelivers (run 3 of the repro: 4,000 redelivered).
+        assert!(
+            CH_INSERT_ATTEMPT_TIMEOUT + std::time::Duration::from_secs(2) < ack_wait,
+            "attempt timeout {CH_INSERT_ATTEMPT_TIMEOUT:?} must sit inside ack_wait {ack_wait:?}"
         );
     }
 }

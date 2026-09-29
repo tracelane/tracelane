@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * Sidebar — the app's primary navigation (ADR-074 §6). Replaces the 11-item
@@ -49,7 +50,7 @@
 import { Logo, cn } from "@tracelanedev/ui";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AccountMenu } from "./AccountMenu";
 import {
 	RAIL_GROUP_LABEL,
@@ -118,6 +119,46 @@ export function Sidebar({
 	const pathname = usePathname();
 	const [collapsed, setCollapsed] = useState(defaultCollapsed);
 	const [mobileOpen, setMobileOpen] = useState(false);
+	const drawerRef = useRef<HTMLElement>(null);
+	const openerRef = useRef<HTMLButtonElement>(null);
+
+	// Keep keyboard focus in the mobile drawer and restore it when dismissed.
+	useEffect(() => {
+		if (!mobileOpen) return;
+		const drawer = drawerRef.current;
+		const opener = openerRef.current;
+		if (!drawer) return;
+		const controls = () =>
+			Array.from(
+				drawer.querySelectorAll<HTMLElement>("a[href], button:not([disabled])"),
+			);
+		controls()[0]?.focus();
+		const previousOverflow = document.body.style.overflow;
+		document.body.style.overflow = "hidden";
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") {
+				event.preventDefault();
+				setMobileOpen(false);
+			}
+			if (event.key !== "Tab") return;
+			const items = controls();
+			const first = items[0];
+			const last = items[items.length - 1];
+			if (event.shiftKey && document.activeElement === first) {
+				event.preventDefault();
+				last?.focus();
+			} else if (!event.shiftKey && document.activeElement === last) {
+				event.preventDefault();
+				first?.focus();
+			}
+		};
+		document.addEventListener("keydown", onKeyDown);
+		return () => {
+			document.body.style.overflow = previousOverflow;
+			document.removeEventListener("keydown", onKeyDown);
+			opener?.focus();
+		};
+	}, [mobileOpen]);
 
 	// The trace-detail route defaults to collapsed (ADR-074 §6): 240px is ~16% of a
 	// 1440px viewport and it compresses the waterfall directly. Only applied on
@@ -194,7 +235,8 @@ export function Sidebar({
 		<>
 			{/* Mobile trigger lives in the top bar; this is the drawer it opens. */}
 			{mobileOpen && (
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					aria-label="Close navigation"
 					onClick={() => setMobileOpen(false)}
@@ -203,6 +245,10 @@ export function Sidebar({
 			)}
 
 			<aside
+				ref={drawerRef}
+				role={mobileOpen ? "dialog" : undefined}
+				aria-modal={mobileOpen ? true : undefined}
+				aria-label={mobileOpen ? "Workspace navigation" : undefined}
 				data-sidebar
 				data-collapsed={collapsed ? "true" : "false"}
 				className={cn(
@@ -263,7 +309,8 @@ export function Sidebar({
 
 				<div className="mt-auto flex shrink-0 flex-col gap-0.5 border-line border-t pt-2">
 					<AccountMenu collapsed={collapsed} />
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={toggle}
 						aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -278,28 +325,22 @@ export function Sidebar({
 							<ChevronIcon collapsed={collapsed} />
 						</span>
 						{!collapsed && <span>Collapse</span>}
-					</button>
+					</Button>
 				</div>
 			</aside>
 
 			{/* The lg-hidden opener, rendered here so the drawer state stays local. */}
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				aria-label="Open navigation"
 				onClick={() => setMobileOpen(true)}
-				/* `--shadow-overlay`, not the stock Tailwind drop this carried: the button
-				   is `fixed` over scrolling content, which is the one elevation the system
-				   paints a shadow for, and the token is the value that elevation is defined
-				   at in both themes. It replaces the default-scale class for the same
-				   reason that class replaced `shadow-rest` — a shadow that is not the
-				   system's shadow is a fourth elevation nobody declared. The old class name
-				   is DESCRIBED rather than quoted, because Tailwind extracts candidates from
-				   comments too and would keep emitting a rule nothing wears.
-
-				   It stays `rounded-full`: the chrome's other floating chips (the theme
-				   toggle, the workspace pill) are circles/pills, and a lone 8px-cornered
-				   square among them would read as a different component, not a tidier one. */
-				className="fixed bottom-4 left-4 z-30 flex h-11 w-11 items-center justify-center rounded-full border border-line bg-surface text-ink shadow-[var(--shadow-overlay)] lg:hidden"
+				ref={openerRef}
+				aria-expanded={mobileOpen}
+				className={cn(
+					"fixed top-2.5 left-4 z-50 flex h-9 w-9 items-center justify-center rounded-[var(--radius-control)] border border-line bg-surface text-ink lg:hidden",
+					mobileOpen && "hidden",
+				)}
 			>
 				<svg
 					viewBox="0 0 16 16"
@@ -313,7 +354,7 @@ export function Sidebar({
 				>
 					<path d="M2.5 4h11M2.5 8h11M2.5 12h11" />
 				</svg>
-			</button>
+			</Button>
 		</>
 	);
 }

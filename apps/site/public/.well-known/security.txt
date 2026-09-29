@@ -1,0 +1,5 @@
+Contact: mailto:security@tracelane.dev
+Expires: 2027-09-27T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://tracelane.dev/.well-known/security.txt
+Policy: https://github.com/tracelane/tracelane/blob/main/SECURITY.md

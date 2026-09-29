@@ -23,7 +23,10 @@
 pub mod api_keys;
 pub mod audit_chain_state;
 pub mod idle_evict;
+pub mod job_guard;
 pub mod keepalive;
+pub mod ledger;
+pub mod model_aliases;
 pub mod observed_tools;
 pub mod provider_keys;
 pub mod quota_notifications;
@@ -31,6 +34,8 @@ pub mod singleton;
 pub mod tenants;
 pub mod tool_capabilities;
 pub mod webhook_events;
+pub mod workspace_capture;
+pub mod workspace_failover;
 
 use anyhow::{Context as _, Result};
 use deadpool_postgres::{Config, Pool, PoolError, Runtime};
@@ -412,6 +417,26 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         // gateway reads none of them (test-database applier only).
         include_str!("../../../../apps/web/db/migrations/0044_bill02_annual_two_subscriptions.sql"),
         include_str!("../../../../apps/web/db/migrations/0045_b431_subscription_ends_at.sql"),
+        // GWY-49: the per-provider ZDR capability reference table the gateway's
+        // `zdr.rs` refresher reads. Prod gets it by hand BEFORE the deploy (S2).
+        include_str!("../../../../apps/web/db/migrations/0046_gwy49_provider_capabilities.sql"),
+        // ADR-078 (B): the canonical ledger rows + anchor records. Prod gets it by
+        // hand, then the CH → PG backfill, THEN the gateway that writes here (S2).
+        include_str!("../../../../apps/web/db/migrations/0047_adr078_ledger_canonical_pg.sql"),
+        include_str!(
+            "../../../../apps/web/db/migrations/0048_api_keys_scheduled_revoke_notify.sql"
+        ),
+        // P0-4: f_cache_control + the per-plan TTL ceiling. Registered here because a
+        // fresh database — and EVERY Postgres integration test — builds its schema from
+        // this list, so a migration that exists only as a file is a migration prod's
+        // tests never exercise. check-migration-list-complete.py caught the omission.
+        include_str!("../../../../apps/web/db/migrations/0049_request_cache_control.sql"),
+        // GWY-27: per-workspace model aliases (`crate::db::model_aliases`).
+        include_str!("../../../../apps/web/db/migrations/0050_model_aliases.sql"),
+        // GWY-52: per-workspace failover (`crate::db::workspace_failover`).
+        include_str!("../../../../apps/web/db/migrations/0051_workspace_failover.sql"),
+        // GWY-53: per-workspace content capture (`crate::db::workspace_capture`).
+        include_str!("../../../../apps/web/db/migrations/0052_workspace_content_capture.sql"),
     ];
     for migration in MIGRATIONS {
         client

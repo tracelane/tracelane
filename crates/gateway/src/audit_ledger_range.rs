@@ -17,10 +17,9 @@
 //! So the chip stayed unplaced rather than render a confident number the data does
 //! not support. This is the field that makes it truthful.
 //!
-//! THE QUERY IS CHEAP, WHICH IS WHY THIS IS A ROUTE AND NOT A BATCH JOB.
-//! `audit_log` is `ENGINE = ReplacingMergeTree(event_time) ORDER BY (tenant_id, seq)`
-//! with **no TTL**, so `min(seq)` / `max(seq)` for one tenant is served straight off
-//! the sort key, and the answer is genuinely the LIFETIME range rather than a window.
+//! The canonical Postgres reader returns an exact count and recorded activity
+//! times. Count work grows with the tenant's ledger size; this is an inventory
+//! read, not a cryptographic verification or a constant-time health check.
 //!
 //! GATE: free-tier, mirroring self-verify exactly — `Scope::Read` (an entitlement
 //! gate is not a scope gate, B-230) plus the default-granted `f_audit_selfverify`.
@@ -37,6 +36,7 @@ use axum::{
     response::Response,
     routing::get,
 };
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::audit_export::{ExportState, error_response};
@@ -56,6 +56,10 @@ pub struct LedgerRange {
     /// Exact row count. `0` here means measured-and-empty, which is why `from`/`to`
     /// are absent rather than zero.
     pub total: u64,
+    /// Most recent event timestamp in the ledger, absent for an empty ledger.
+    pub latest_event_at: Option<DateTime<Utc>>,
+    /// Most recent batch timestamp marked anchored; not an inclusion verdict.
+    pub latest_anchor_at: Option<DateTime<Utc>>,
 }
 
 pub fn routes() -> Router<ExportState> {
@@ -108,12 +112,14 @@ async fn handler(State(state): State<ExportState>, headers: HeaderMap) -> Respon
 
     // 4. The range itself.
     match state.reader.ledger_range(&tenant).await {
-        Ok((from, to, total)) => {
+        Ok(range) => {
             let body = LedgerRange {
                 tenant_id: tenant.to_string(),
-                from,
-                to,
-                total,
+                from: range.from,
+                to: range.to,
+                total: range.total,
+                latest_event_at: range.latest_event_at,
+                latest_anchor_at: range.latest_anchor_at,
             };
             match serde_json::to_string(&body) {
                 Ok(json) => Response::builder()
@@ -145,6 +151,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_missing_activity_times_are_explicitly_unknown() {
+        let v = serde_json::to_value(LedgerRange::default()).unwrap();
+        assert_eq!(v.get("latest_event_at"), Some(&serde_json::Value::Null));
+        assert_eq!(v.get("latest_anchor_at"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
     fn empty_ledger_omits_the_range_rather_than_sending_zero() {
         // `0–0` would read as "one row at seq 0", and seq 0 is a REAL genesis row —
         // `audit_chain_state` assigns from a `last_seq = -1` sentinel. Absent is the
@@ -154,6 +167,7 @@ mod tests {
             from: None,
             to: None,
             total: 0,
+            ..LedgerRange::default()
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("from").is_none(), "empty ledger must omit `from`");
@@ -168,11 +182,15 @@ mod tests {
             from: Some(15_700),
             to: Some(15_799),
             total: 100,
+            latest_event_at: Some("2026-09-24T12:00:00Z".parse().unwrap()),
+            latest_anchor_at: Some("2026-09-24T11:55:00Z".parse().unwrap()),
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["from"], 15_700);
         assert_eq!(v["to"], 15_799);
         assert_eq!(v["total"], 100);
+        assert_eq!(v["latest_event_at"], "2026-09-24T12:00:00Z");
+        assert_eq!(v["latest_anchor_at"], "2026-09-24T11:55:00Z");
     }
 
     #[test]
@@ -184,6 +202,7 @@ mod tests {
             from: Some(0),
             to: Some(0),
             total: 1,
+            ..LedgerRange::default()
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["from"], 0, "seq 0 is a real genesis row, not absent");

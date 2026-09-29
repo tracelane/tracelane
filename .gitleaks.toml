@@ -63,6 +63,9 @@ regexes = [
   '''AQ\.AbFAKEauthkeyshapedvaluefortesting00000''', # providers/mod.rs — safe_reason cannot admit a credential
   '''FAKEtestkeyDONOTUSE''',                         # provider-error redaction tests (server.rs poison, redact.rs xai/tlane) — clearly-fake `sk-proj…/AIza…/xai-…/tlane_…FAKEtestkeyDONOTUSE…`
   '''FAKEleakDONOTUSE''',                            # verbose-5xx smoke proof (smoke_tests.rs) — fake `sk-projFAKEleakDONOTUSE…`
+  '''\{body\}''',                                     # vertex.rs — the PEM TEMPLATE the test key is assembled into; the "key material" is the literal format placeholder `{body}`, and the key itself is generated in-process and never written to disk or committed (2026-09-22)
+  '''^llama-3\.3-70b-versatile$''',                   # kya-fixture.mjs (OBS-54) — a public MODEL NAME in a `{key: …}` identity row; `generic-api-key` fires on the field name `key` (2026-09-24)
+  '''^b483-fixture$''',                              # audit.rs B-483 dual-store test — the anchor record's `ed25519_pubkey`/`ed25519_sig` fixture literal; `generic-api-key` fires on the field name, the value is twelve plain characters (2026-09-22)
 
   # FALSE POSITIVE: a UI line that RENDERS the first 16 chars of a tenant's
   # PUBLIC audit key (`keyId = tenantPubkeyB64.slice(0, 16)`); the `generic-api-key`

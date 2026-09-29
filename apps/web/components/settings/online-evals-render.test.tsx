@@ -198,11 +198,11 @@ describe("online evals — an errored judge has no score, not a zero", () => {
 		);
 		const [, , goodScore, goodVerdict, goodCost] = cells(html, scored.trace_id);
 		expect(goodScore).toBe("0.87");
-		expect(goodVerdict).toBe("pass");
+		expect(goodVerdict).toBe("Pass");
 		expect(goodCost).toBe("$0.0001");
 
 		const [, , badScore, badVerdict, badCost] = cells(html, errored.trace_id);
-		expect(badVerdict).toBe("not judged");
+		expect(badVerdict).toBe("Not judged");
 		// A NUMBER in either cell would be fabricated: a grade from a judge that
 		// never produced one, or a price for a call we could not price. Both are
 		// the §21 failure this feature sits downstream of, and both must read as

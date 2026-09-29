@@ -66,7 +66,10 @@ command -v ruff  >/dev/null 2>&1 && run "ruff check"          ruff check scripts
 # Silent when nothing TS changed, which is most Rust and docs commits.
 _ts_format_check() {
     local files ws wsfiles bin rc=0
-    files="$( { git diff --name-only HEAD; git diff --name-only --cached
+    # --diff-filter=d: a DELETED file has nothing to format, and handing its path to biome
+    # fails the check with "No such file or directory" (2026-09-27: removing a route
+    # blocked every commit until this).
+    files="$( { git diff --name-only --diff-filter=d HEAD; git diff --name-only --diff-filter=d --cached
                 git ls-files --others --exclude-standard; } 2>/dev/null \
               | sort -u | grep -E '^(apps|packages)/[^/]+/.*\.(ts|tsx|js|jsx|mjs)$' || true )"
     [ -n "$files" ] || return 0
@@ -94,6 +97,9 @@ run "spec anchors"                python3 scripts/ci/check-spec-anchors.py
 run "data model (generated) current" python3 scripts/ci/build-data-model.py --check
 run "CLAUDE.md volatile anchors"  bash scripts/ci/check-claudemd-volatile-anchors.sh
 run "script exec bits"            python3 scripts/ci/check-script-exec-bits.py
+# 2026-09-20: a reboot mid-`--selftest` stranded a runner's PLANT in tracked source (the
+# canonical ledger insert replaced by a no-op) — a trap does not survive SIGKILL. 50 ms.
+run "no stranded selftest plant"   bash scripts/ci/check-no-stranded-selftest-plant.sh
 # B-384: the hooks are the only enforcement on a direct push; a clone that never
 # installed them gets a green gate and an ungated push. Refuse that here, first.
 run "git hooks installed"         python3 scripts/ci/check-hooks-installed.py

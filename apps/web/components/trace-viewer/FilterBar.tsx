@@ -57,16 +57,17 @@ function FilterChip({
 	onRemove: () => void;
 }) {
 	return (
-		<span className="inline-flex items-center gap-1 rounded-md border border-action-line bg-action-soft px-2 py-0.5 text-2xs font-semibold text-ink">
+		<span className="inline-flex items-center gap-1 rounded-control border border-action-line bg-action-soft px-2 py-0.5 text-2xs font-semibold text-ink">
 			{label}
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				aria-label={`Remove ${label} filter`}
 				onClick={onRemove}
 				className="ml-0.5 rounded text-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			>
 				×
-			</button>
+			</Button>
 		</span>
 	);
 }
@@ -101,6 +102,8 @@ export function FilterBar() {
 	const [signature, setSignature] = useState(sp.get("signature_id") ?? "");
 	// OBS-20: URL-derived, not local state — nothing in this bar SETS it.
 	const endUser = sp.get("end_user") ?? "";
+	const agent = sp.get("agent");
+	const modelFamily = sp.get("model_family");
 	const [q, setQ] = useState(sp.get("q") ?? "");
 	const searchRef = useRef<HTMLInputElement>(null);
 
@@ -212,11 +215,13 @@ export function FilterBar() {
 			signature ||
 			sp.get("q") ||
 			endUser ||
+			agent ||
+			modelFamily ||
 			group,
 	);
 
 	const inputCls =
-		"h-8 rounded-lg border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
+		"h-8 rounded-card border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
 
 	return (
 		<div className="mb-4 flex flex-wrap items-center gap-2">
@@ -329,6 +334,18 @@ export function FilterBar() {
 				/>
 			)}
 
+			{agent && (
+				<FilterChip
+					label={`agent: ${agent}`}
+					onRemove={() => setParam("agent", "")}
+				/>
+			)}
+			{modelFamily && (
+				<FilterChip
+					label={`model family: ${modelFamily}`}
+					onRemove={() => setParam("model_family", "")}
+				/>
+			)}
 			{active && (
 				<Button
 					variant="ghost"

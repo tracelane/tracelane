@@ -374,7 +374,7 @@ async function resolveVersionId(
 			throw new Unmeasurable(`--version-id is not a uuid: ${versionId}`, 2);
 		return versionId;
 	}
-	const path = `/v1/prompts/${encodeURIComponent(prompt)}?env=${encodeURIComponent(env)}`;
+	const path = `/v1/prompts/${encodeURIComponent(prompt)}/configuration?env=${encodeURIComponent(env)}`;
 	const res = await apiGet<{ prompt_version_id: string }>(conn, path);
 	if (!res.ok)
 		throw new Unmeasurable(renderApiError("GET", path, res).join("\n"), 3);

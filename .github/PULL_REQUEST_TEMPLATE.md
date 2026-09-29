@@ -9,7 +9,7 @@
 - [ ] New feature (non-breaking, adds functionality)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
 - [ ] Performance improvement (hot-path change — run the Benchmarks workflow; it is not a PR gate)
-- [ ] Security fix (security-reviewer subagent approval required)
+- [ ] Security fix (maintainer security review required)
 - [ ] Documentation only
 
 ## Checklist
@@ -25,7 +25,7 @@
 - [ ] No secrets added (pre-commit + Gitleaks CI enforce this)
 - [ ] New dependencies pass `cargo audit` / `pnpm audit`
 - [ ] Hot-path changes: `pnpm bench:gateway` / `pnpm bench:ingest` within budget (<10% regression)
-- [ ] Security-critical changes (auth, crypto, tenant isolation): security-reviewer subagent approved
+- [ ] Security-critical changes (auth, crypto, tenant isolation): maintainer security review completed
 
 ## Related issues
 

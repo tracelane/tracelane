@@ -395,6 +395,10 @@ declare -a NAMES STATUSES DURATIONS
 overall=0
 declare -a SCOPED_OUT=()
 declare -a WARNED=()
+declare -a NET_FAILED=()
+# The connectivity watcher runs for the whole gate (idempotent start, detached) so a
+# failing step can be told apart from a dropped connection — see run() below.
+bash scripts/ops/net-watch.sh start >/dev/null 2>&1 || true
 
 run() {
     local name="$1"; shift
@@ -414,7 +418,7 @@ run() {
     echo "──────────────────────────────────────────────────────────────"
     echo "▶ $name"
     echo "  \$ $*"
-    local _t0=$SECONDS _dur
+    local _t0=$SECONDS _dur _t0_epoch; _t0_epoch=$(date +%s)
     if "$@"; then
         _dur=$((SECONDS - _t0))
         NAMES+=("$name"); STATUSES+=("PASS"); DURATIONS+=("$_dur")
@@ -422,8 +426,26 @@ run() {
     else
         local rc=$?
         _dur=$((SECONDS - _t0))
-        NAMES+=("$name"); STATUSES+=("FAIL($rc)"); DURATIONS+=("$_dur")
-        echo "x $name FAILED (exit $rc, ${_dur}s)"
+        # Founder, 2026-09-21 (three internet drops in one evening): a step that failed
+        # WHILE THE BOX WAS OFFLINE is a network verdict, not a code verdict. Ask the
+        # watcher (`scripts/ops/net-watch.sh`, started at the top of this gate) whether a
+        # DOWN interval overlapped this step; if so say NETWORK OUTAGE, keep the run RED
+        # (a step that could not run is never a pass), and tell the operator to re-run
+        # instead of debugging. The first such drop (B-478) cost a 30-minute second gate
+        # to learn it was the connection.
+        local _net
+        _net=$(bash scripts/ops/net-watch.sh outages-between "$((_t0_epoch))" "$(date +%s)" 2>/dev/null)
+        if [[ -n "$_net" ]]; then
+            NAMES+=("$name"); STATUSES+=("NET-OUTAGE($rc)"); DURATIONS+=("$_dur")
+            NET_FAILED+=("$name")
+            echo "x $name FAILED (exit $rc, ${_dur}s) — ⚠ NETWORK OUTAGE overlapped this step:"
+            printf '      %s\n' "$_net"
+            echo "      This step's verdict is CANNOT DETERMINE (the box was offline), not a code failure."
+            echo "      Re-run the gate once the connection is back; do not debug this step as code."
+        else
+            NAMES+=("$name"); STATUSES+=("FAIL($rc)"); DURATIONS+=("$_dur")
+            echo "x $name FAILED (exit $rc, ${_dur}s)"
+        fi
         overall=1
     fi
 }
@@ -806,6 +828,9 @@ fi
 if [[ -f scripts/ci/check-migration-list-complete.py ]] && command -v python3 >/dev/null 2>&1; then
     area RUST
     run "migration-list complete"  python3 scripts/ci/check-migration-list-complete.py
+    # B-482 (2026-09-21): the self-host ClickHouse schema is a COPY of the dev schema and
+    # drifted for a week — every fresh self-host install crashed its ingest on `span_bytes`.
+    run "self-host schema parity"      python3 scripts/ci/check-self-host-schema-parity.py
 fi
 # GWY-42: the provider catalog and everything generated FROM it — the dashboard
 # dropdown module and the two published provider tables.
@@ -832,6 +857,16 @@ fi
 if [[ -f scripts/ci/check-page-fanout.py ]] && command -v python3 >/dev/null 2>&1; then
     area WEB
     run "page-fanout guard"        python3 scripts/ci/check-page-fanout.py
+fi
+# 2026-09-23. A Next route file may export ONLY Next's own contract fields. `tsc` does
+# not know that and this gate does not run `next build`, so the class reached the WEB
+# DEPLOY and killed it: /settings/gateway exported its view component so a test could
+# import it. 114 green checks and a clean typecheck said nothing. Selftest first — a
+# guard nobody has watched fail is assumed decorative.
+if [[ -f scripts/ci/check-next-page-exports.py ]] && command -v python3 >/dev/null 2>&1; then
+    area WEB
+    run "next page-export selftest" python3 scripts/ci/check-next-page-exports.py --selftest
+    run "next page-export contract" python3 scripts/ci/check-next-page-exports.py
 fi
 # R13 / B-245 §5.2. Past the audit publish the ledger asserts the request happened, so a
 # return with no span is a row the tamper-evident record names and the product cannot
@@ -865,6 +900,12 @@ if [[ "$COMMIT_STAGE" -eq 1 ]]; then
 else
     skip "metric single-source selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
 fi
+run "KYA catalog guard"   python3 scripts/ci/check-kya-catalog.py
+if [[ "$COMMIT_STAGE" -eq 1 ]]; then
+    run "KYA catalog selftest" python3 scripts/ci/check-kya-catalog.py --selftest
+else
+    skip "KYA catalog selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
+fi
 area INFRA
 run "prod-nats-wiring guard"       bash scripts/ci/check-span-publish-wiring.sh
 run "genai-attr-keys guard"        bash scripts/ci/check-genai-attr-keys.sh
@@ -896,6 +937,14 @@ if command -v python3 >/dev/null 2>&1; then
     # CONFIDENTIAL one and a bogus level, and proves each blocks.
     area DOCS SCRIPTS
     skip "doc-classification guard" "guard not exported to the public repo"
+    # B-479 (2026-09-22): the selftest's plant is verified before the gate is asked; a
+    # plant that cannot land exits 3 (CANNOT SELF-TEST HERE), never 0 and never the
+    # decorative-gate 1. This step proves THAT, with `git add -N` refused by a shim. The
+    # meta-gate runs the ordinary --selftest and never caches this guard (NEVER_CACHE).
+    skip "doc-classification selftest-of-selftest (B-479)" "guard not exported to the public repo"
+    # B-446 (2026-09-19): schema.ts (canonical, CLAUDE.md §5) vs the migration-derived
+    # tree — the drift tool compares migrations to LIVE Neon and cannot see this class.
+    run "schema.ts vs migrations"      python3 scripts/ci/check-schema-ts-vs-migrations.py
     # docs/archive/ is never read as current truth (founder ruling 2026-09-03 §4).
     # Every file there must carry a machine header naming what superseded it and
     # when, plus a human banner a reader sees even with HTML comments stripped —
@@ -1148,10 +1197,15 @@ if command -v python3 >/dev/null 2>&1; then
     fi
     area SCRIPTS
     run "script exec bits"             python3 scripts/ci/check-script-exec-bits.py
+    run "commit author identity"       bash .githooks/check-commit-author.sh
+    run "client bare fetch (B-561)"    python3 scripts/ci/check-client-bare-fetch.py
     # B-384 (2026-09-12): this clone must have `core.hooksPath = .githooks`, or the
     # pre-push hook that runs THIS gate on a direct push does not exist here.
     area ALWAYS
     run "git hooks installed"          python3 scripts/ci/check-hooks-installed.py
+    # 2026-09-20: two runners mutate tracked source under `--selftest` and restore on an
+    # EXIT trap; SIGKILL (reboot, OOM, the meta-gate timeout) strands the plant. Refuse it.
+    run "no stranded selftest plant"   bash scripts/ci/check-no-stranded-selftest-plant.sh
     # B-383 (e), 2026-09-12: security.md's "these patterns block merge" now does.
     area RUST
     run "banned security patterns"     python3 scripts/ci/check-banned-patterns.py
@@ -1192,6 +1246,14 @@ if command -v python3 >/dev/null 2>&1; then
     # classification). Verified directly before gating it the same as the others.
     if [[ "$COMMIT_STAGE" -eq 1 ]]; then
         skip "watchdog selftest" "guard not exported to the public repo"
+        # SRE-15 / launch readiness (2026-09-27). The public status feed's allowlist (a
+        # planted secret-shaped value never reaches the public file), the web-error
+        # summariser, the Proof-D session capture and the bounded load driver — all
+        # hermetic, no network.
+        skip "public status feed selftest" "guard not exported to the public repo"
+        skip "web-errors selftest" "guard not exported to the public repo"
+        skip "prod session capture selftest" "guard not exported to the public repo"
+        run "load driver selftest"         node scripts/ops/load-test.mjs --selftest
         # S8 (2026-09-04). The canary's FULL --selftest drives five real legs against
         # prod and needs TLANE_CANARY_KEY, which is why it has never been in a gate.
         # --selftest-offline is the hermetic half: it evals the REAL alert_on_change()
@@ -1221,6 +1283,11 @@ if command -v python3 >/dev/null 2>&1; then
     else
         skip "never-say-again selftest" "redundant at push — meta-gate (FULL) selftests this guard directly"
     fi
+    # 2026-09-21 (batch 1): the export's step-11 content check — shipped DOCUMENTS carry
+    # no tracker id / ADR number / private path / founder-ruling language. Listed here so
+    # the meta-gate owns its selftest; the real scan runs on the staging tree at export time.
+    area DOCS SCRIPTS
+    skip "internal-references selftest" "guard not exported to the public repo"
     area RUST WEB
     run "alert-metrics single-source"  python3 scripts/ci/check-alert-metrics-single-source.py
     # GWY-41: the API-key scope vocabulary is spelled in the Rust enum, the mint
@@ -1303,21 +1370,11 @@ run "plan-write single-source"          python3 scripts/ci/check-plan-write-sing
     # BLOCKS — planted drift, a refused reasonless acknowledgement, and an expired
     # PENDING. Without this the gate could rot to always-pass.
     #
-    # THE LIVE HALF HAS NO RUNNER — corrected 2026-08-13. This comment used to say
-    # it "runs in the deploy pre-flight (scripts/ops/tlane-migration-drift.sh)".
-    # That file has never existed, and no deploy script invokes
-    # `audit-migration-drift.py --live`, so nothing compares the catalog to a real
-    # database. The selftest below is therefore proof the DETECTOR works, not
-    # evidence that drift is being detected — and reading it as the latter is
-    # exactly the gap it was written to close, on the seam CLAUDE.md §5 names
-    # (migrations 0009+ are un-journaled; a column lands in Neon BEFORE the
-    # gateway that reads it deploys).
-    #
-    # Until it is wired, the live check is manual and needs DB credentials:
-    #   psql "$POSTGRES_URL" -Atc "$(python3 scripts/ci/audit-migration-drift.py \
-    #        --catalog-sql)" > /tmp/live.tsv
-    #   python3 scripts/ci/audit-migration-drift.py --live /tmp/live.tsv
-    # Tracked as a row in.
+    # THE LIVE HALF runs in the gateway deploy pre-flight (`scripts/deploy/gateway.sh`,
+    # the `audit-migration-drift.py --live` block) — ADVISORY there, beside the blocking
+    # `check-deploy-schema.py`. Corrected 2026-09-26 (B-215): this comment said it had no
+    # runner for six weeks after the deploy script gained one. The selftest below is the
+    # detector's own proof that it blocks; it is not evidence that live drift is absent.
     area WEB INFRA
     if [[ "$COMMIT_STAGE" -eq 1 ]]; then
         run "migration-drift selftest"     python3 scripts/ci/audit-migration-drift.py --selftest
@@ -1430,7 +1487,12 @@ if [[ "$EXPLAIN" -eq 1 ]]; then
     run "gitleaks (tracked snapshot)" true
 elif command -v gitleaks >/dev/null 2>&1; then
     _gl_tmp="$(mktemp -d)"
-    git archive HEAD | tar -x -C "$_gl_tmp"
+    # B-539 (2026-09-22): the STAGED tree (`git write-tree`), not `HEAD`. This scanned
+    # `git archive HEAD` for weeks, which is the commit BEFORE the one the gate certifies:
+    # a fixture string in a staged test rode a green full gate onto `main` and CI's
+    # secret-scan went red on the pushed commit — the local gate had never seen those
+    # bytes. The stamp is computed over the staged tree; the scan now reads the same tree.
+    git archive "$(git write-tree)" | tar -x -C "$_gl_tmp"
     area ALWAYS
     run "gitleaks (tracked snapshot)" gitleaks dir "$_gl_tmp" --no-banner --config .gitleaks.toml
     rm -rf "$_gl_tmp"
@@ -1539,9 +1601,16 @@ fi
 # same 24h outer bound via the nightly, same refusal to narrow by path.
 if [[ "$COMMIT_STAGE" -eq 1 ]]; then
     skip "dataset round trip (real ClickHouse)" "PUSH-ONLY (R142): 100s, runs unconditionally at push and nightly"
+    skip "ledger canonical store (real Postgres + real ClickHouse)" "PUSH-ONLY (R142): ~2 min, runs unconditionally at push"
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     area RUST
     run "dataset round trip (real ClickHouse)" bash scripts/ci/run-clickhouse-integration.sh
+    # ADR-078 (ruled B, 2026-09-20): the ledger's Tier-A proofs need BOTH stores at once
+    # — a copy failure leaves the chain green and the reconcile rebuilds the copy; the
+    # head-ahead-of-rows case is filled or left RED; a copy ahead of a restored head is
+    # adopted only while it chains. Neither single-store runner could run these (they
+    # self-skipped in every gate until this line). ~2 min; same docker precondition.
+    run "ledger canonical store (real Postgres + real ClickHouse)" bash scripts/ci/run-ledger-integration.sh
     # B-383 (c): the per-service ClickHouse grants, proven on the prod image with the
     # prod users file — the refusals (gateway cannot delete a ledger row, ingest cannot
     # read content) are observed, not assumed. ~40 s; same docker precondition.
@@ -1553,6 +1622,7 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     run "nats per-service users (real nats-server)" bash scripts/ci/check-nats-auth.sh
 else
     skip "dataset round trip (real ClickHouse)" "docker unavailable — this guard CANNOT run here"
+    skip "ledger canonical store (real Postgres + real ClickHouse)" "docker unavailable — this guard CANNOT run here"
     skip "clickhouse per-service grants (real ClickHouse)" "docker unavailable — this guard CANNOT run here"
     skip "nats per-service users (real nats-server)" "docker unavailable — this guard CANNOT run here"
 fi
@@ -1682,6 +1752,11 @@ if [[ "$overall" -eq 0 ]]; then
     fi
 else
     echo "FAILURES PRESENT ✗ — do not merge"
+    if (( ${#NET_FAILED[@]} > 0 )); then
+        echo "  ⚠ ${#NET_FAILED[@]} of the failures happened DURING A NETWORK OUTAGE (scripts/ops/net-watch.sh):"
+        for n in "${NET_FAILED[@]}"; do echo "    · $n"; done
+        echo "  Those are CANNOT DETERMINE, not defects — re-run the gate when the connection is back."
+    fi
 fi
 # WARN is not a FAILURE (overall stays 0 for it) and must not be folded into
 # either "ALL GREEN" above or the FAIL(rc) accounting — it is its own, separate

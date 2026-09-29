@@ -1,0 +1,961 @@
+{
+  "_comment": "GWY-49 reference data (CLAUDE.md \u00a723): the zero-data-retention capability of every provider the gateway can route to. `zdr` is one of none | default | enterprise. EVERY row ships as `none` with `verified_at: null` \u2014 a claim about a third party's data handling is not data until someone has read that provider's policy page and dated it (specs/GWY-49 \u00a79 Q1). A `default`/`enterprise` row MUST carry `policy_url` and `verified_at`; the seed refuses otherwise. Seeded into Neon `provider_capabilities` by apps/web/db/seed.mjs; read by the gateway through its refresher, never per request.",
+  "version": "v1",
+  "providers": {
+    "302ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "abacus": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "abliteration-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "above": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "agentrouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "agnes": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ai-router": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ai21": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "aiand": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "aixy": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "aki-io": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "aleph-alpha": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba-coding-plan-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba-token-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "alibaba-token-plan-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ambient": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "amd": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "anthropic": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "anyapi": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "anyscale": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "arcee": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "auriko": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "azure": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "bailing": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "baseten": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "bedrock": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "berget": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "blueclaw": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "bothub": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cerebras": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "chutes": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "clarifai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "claudinio": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cline-pass": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cloudferro-sherlock": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cloudflare": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cohere": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "coralbricks": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "cortecs": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "crof": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "crossmodel": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "crusoe": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "daoxe": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "deepinfra": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "deepseek": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "digitalocean": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "dinference": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "drun": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ebcloud": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "echo": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "edenai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "empiriolabs": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "evroc": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "fastrouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "fireworks": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "friendli": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "frogbot": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "github-copilot": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "gmicloud": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "google": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "greenpt": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "groq": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "helicone": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "hetzner": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "hpc-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "huggingface": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "hyper": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "hyperbolic": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "iflowcn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "impossibl": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "inception": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "inceptron": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "inference": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "inferx": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "io-net": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "iteracompute": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "jalapeno": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "jiekou": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "kenari": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "kilo": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "klokintegration": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "kosmik": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "kuae-cloud-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "lambda": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "lepton": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "lilac": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "llama": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "llmgateway": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "llmgateway-providers": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "llmtech": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "llmtr": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "longcat": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "lucidquery": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "meganova": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "mistral": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "mixlayer": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "moark": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "modal": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "model-oracle-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "modelis": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "modelscope": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "moonshot": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "moonshotai-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "morph": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nano-gpt": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nearai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nebius": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "neuralwatt": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nova": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "novita": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "nvidia": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ofox": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ollama": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ollama-cloud": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "openai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "opencode": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "opencode-go": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "openreason": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "openrouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "opper": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "orcarouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "ovhcloud": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "pendra": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "perplexity": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "pioneer": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "poe": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "poolside": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "predibase": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "qihang-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "qiniu-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "regolo-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "requesty": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "routing-run": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "runinfra": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "sakana": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "sambanova": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "sarvam": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "scaleway": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "scnet-token-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "scx": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "scx-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "sensenova": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "siliconflow": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "siliconflow-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "stackit": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "standardcompute": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "stepfun": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "stepfun-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "stepfun-ai-step-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "stepfun-step-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "submodel": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "synthetic": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tencent-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tencent-token-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tencent-tokenhub": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tensorx": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "the-grid-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tinfoil": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "together": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tokengo": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "tokenrouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "trustedrouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "umans-ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "umans-ai-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "unorouter": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "upstage": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "vancine": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "vertex": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "volcengine": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "volcengine-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "vultr": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "wafer.ai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "wandb": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xiaomi": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xiaomi-token-plan-ams": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xiaomi-token-plan-cn": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xiaomi-token-plan-sgp": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "xpersona": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "yi": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zai-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zeldoc": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zenifra": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zenmux": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zhipuai": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    },
+    "zhipuai-coding-plan": {
+      "zdr": "none",
+      "policy_url": null,
+      "verified_at": null
+    }
+  }
+}

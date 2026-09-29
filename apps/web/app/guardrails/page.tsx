@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * Guardrails — the pre-flight guardrail engine's verdicts for the authenticated
  * tenant, live from `GET /v1/guardrails/stats` over `guardrail_verdicts`.
@@ -137,10 +139,10 @@ async function GuardrailData({ range }: { range: TimeRange }) {
 	const failOpen = fmtPercent(stats.fail_open_rate_pct, { n, floor: 100 });
 	const failOpenTone =
 		zero || failOpen.belowFloor
-			? "default"
+			? "neutral"
 			: stats.fail_open_rate_pct > 0
 				? "danger"
-				: ("ok" as const);
+				: ("neutral" as const);
 	const sample = zero ? undefined : { n, floor: 100 };
 
 	/*
@@ -206,7 +208,7 @@ async function GuardrailData({ range }: { range: TimeRange }) {
 				   warming, at `px-4 py-3 text-sm` each, and differed only in radius.
 				   The tone stays neutral rather than `--warn-soft`: zero traffic on a
 				   new workspace is the normal first state, not a warning. */
-				<div className="rounded-lg border border-line bg-surface-2 px-4 py-3 text-sm text-ink-2">
+				<div className="rounded-card border border-line bg-surface-2 px-4 py-3 text-sm text-ink-2">
 					No guardrail verdicts in the last {label} yet — every request through
 					the gateway is evaluated pre-flight. Below is the full rail surface
 					and what a block looks like; your real verdicts appear here once
@@ -303,7 +305,7 @@ async function GuardrailData({ range }: { range: TimeRange }) {
 								href={verdictHref(d.decision, range)}
 								className="flex flex-col items-start gap-2 bg-surface px-5 py-4 transition-colors hover:bg-surface-hover"
 							>
-								<Badge tone={d.tone}>{d.label}</Badge>
+								<StatusBadge status={d.label} tone={d.tone} />
 								<span className="t-metric-sm text-ink">
 									{fmtCount(d.value)}
 								</span>
@@ -380,7 +382,7 @@ export default async function GuardrailsPage({
 			    what stopped these pages reading as one header system. */}
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div>
-					<h1 className="t-h1">Guardrails</h1>
+					<PageHeader title={<>Guardrails</>} />
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
 						Pre-flight verdicts across your traffic — blocked, redacted or
 						allowed, plus inline overhead. {range.label}.

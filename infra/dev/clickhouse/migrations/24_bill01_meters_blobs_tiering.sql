@@ -82,8 +82,9 @@ ENGINE = ReplacingMergeTree
 ORDER BY (tenant_id, hash)
 SETTINGS index_granularity = 8192;
 
--- One row per (span, blob) reference. Written in the SAME insert batch as the span, no
--- read-modify-write on the hot path. Its TTL equals the spans' queryable-history DELETE
+-- One row per (span, blob) reference. Written in the SAME durable flush as the span
+-- (before the ack — B-445, 2026-09-19; between 09-14 and 09-19 it was best-effort AFTER
+-- the ack, which this comment did not say), no read-modify-write on the hot path. Its TTL equals the spans' queryable-history DELETE
 -- (730 d) so a reference dies exactly when its span does; the GC (§2.3) deletes a blob whose
 -- (tenant_id, hash) has no surviving reference. `refcount` is a query, never a column.
 CREATE TABLE IF NOT EXISTS tracelane.blob_refs

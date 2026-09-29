@@ -1,4 +1,11 @@
 "use client";
+import { fmtCompact, fmtUsd } from "@/lib/metrics/format";
+
+import { Button } from "@tracelanedev/ui";
+
+import { StatusBadge } from "@tracelanedev/ui";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * TraceList — client component that renders a table of trace summaries.
@@ -37,7 +44,9 @@
  * and it uses no `Date.now()` at all — so there is no server/client hydration split.
  */
 
+import { IdentityAvatar } from "@/components/kya/IdentityAvatar";
 import { formatStartedUtc, parseUtcMs } from "@/lib/format-date";
+import { identityForKey, resolveIdentity } from "@/lib/kya/identity";
 import {
 	Badge,
 	EmptyState,
@@ -48,7 +57,8 @@ import {
 } from "@tracelanedev/ui";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { TraceBulkBar } from "./TraceBulkBar";
 
 export type TraceSummary = {
 	trace_id: string;
@@ -93,18 +103,10 @@ function traceWindow(
 }
 
 /** Cost as USD; `—` for zero/absent so the column reads honestly, not "$0.00". */
-function formatCost(usd: number): string {
-	if (!usd) return "—";
-	return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
-}
+const formatCost = (usd: number) => (usd ? fmtUsd(usd) : "—");
 
 /** Compact token count (1.2K / 1.4M); `—` for zero/absent. */
-function formatTokens(n: number): string {
-	if (!n) return "—";
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-	return `${n}`;
-}
+const formatTokens = (n: number) => (n ? fmtCompact(n) : "—");
 
 /**
  * Intervention / policy badge. Severity is deliberately distinct from runtime
@@ -117,7 +119,7 @@ function formatTokens(n: number): string {
  */
 function InterventionBadge({ level }: { level: number }) {
 	if (level === 0) return null;
-	return <Badge tone="warn">{level === 2 ? "blocked" : "warned"}</Badge>;
+	return <StatusBadge status={level === 2 ? "blocked" : "warned"} />;
 }
 
 /**
@@ -161,7 +163,7 @@ function TraceBar({
 			<span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line/60" />
 			<span
 				className={cn(
-					"absolute top-1/2 h-2 -translate-y-1/2 rounded-sm",
+					"absolute top-1/2 h-2 -translate-y-1/2 rounded-control",
 					// `--chart-secondary`, the declared "second series / de-emphasised
 					// mark" role, replaces `bg-ink-2/70`. It renders essentially the
 					// same value (dark: 119 vs the alpha's 120) without depending on
@@ -197,7 +199,7 @@ function SortHeader({
 	align?: string;
 }) {
 	return (
-		<th className={`px-3 py-1.5 t-metric-label ${align}`}>
+		<TH className={`px-3 py-1.5 t-metric-label ${align}`}>
 			<a
 				href={href}
 				className="inline-flex items-center gap-1 transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
@@ -207,7 +209,7 @@ function SortHeader({
 					{active ? (order === "asc" ? "↑" : "↓") : "↕"}
 				</span>
 			</a>
-		</th>
+		</TH>
 	);
 }
 
@@ -218,6 +220,9 @@ export function TraceList({
 	durationHref,
 	startedHref,
 	spansHref,
+	selectable = false,
+	selectionMax,
+	viewerRole,
 }: {
 	traces: TraceSummary[];
 	sort?: string;
@@ -225,8 +230,30 @@ export function TraceList({
 	durationHref?: string;
 	startedHref?: string;
 	spansHref?: string;
+	selectable?: boolean;
+	selectionMax?: number;
+	viewerRole?: string | null;
 }) {
 	const router = useRouter();
+	const [bulkBusy, setBulkBusy] = useState(false);
+	const [selected, setSelected] = useState(new Set<string>());
+	const [selectionError, setSelectionError] = useState("");
+	const anchor = useRef<string | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a newly loaded server page resets selection, including when its ids are unchanged.
+	useEffect(() => {
+		setSelected(new Set());
+		anchor.current = null;
+		setSelectionError("");
+	}, [traces]);
+	function changeSelection(next: Set<string>) {
+		if (selectionMax !== undefined && next.size > selectionMax) {
+			setSelectionError(`Up to ${selectionMax} at once`);
+			return;
+		}
+		setSelectionError("");
+		setSelected(next);
+	}
+
 	/*
 	 * INSTANT narrowing, on top of the server filters — founder, 2026-08-19:
 	 * "no realtime filters".
@@ -258,6 +285,25 @@ export function TraceList({
 			)
 		: traces;
 
+	function toggle(id: string, shift: boolean) {
+		if (bulkBusy) return;
+		const next = new Set(selected);
+		const start = shown.findIndex((r) => r.trace_id === anchor.current);
+		const end = shown.findIndex((r) => r.trace_id === id);
+		if (shift && start >= 0) {
+			for (const row of shown.slice(
+				Math.min(start, end),
+				Math.max(start, end) + 1,
+			))
+				next.add(row.trace_id);
+		} else if (next.has(id)) next.delete(id);
+		else next.add(id);
+		anchor.current = id;
+		changeSelection(next);
+	}
+	const allShown =
+		shown.length > 0 && shown.every((r) => selected.has(r.trace_id));
+	const someShown = shown.some((r) => selected.has(r.trace_id));
 	if (traces.length === 0) {
 		return (
 			<EmptyState
@@ -281,7 +327,7 @@ export function TraceList({
 	const win = traceWindow(traces);
 
 	return (
-		<div className="overflow-hidden rounded-lg border border-line bg-surface">
+		<div className="rounded-card border border-line bg-surface">
 			{/* Instant narrow. Sits INSIDE the card, above the table, so it reads as
 			    part of this table rather than as another page-level filter competing
 			    with the server-backed FilterBar above. */}
@@ -311,36 +357,58 @@ export function TraceList({
 						<span className="shrink-0 font-mono text-2xs text-ink-3 tabular-nums">
 							{shown.length} of {traces.length} loaded
 						</span>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setQ("")}
 							className="shrink-0 rounded px-1.5 py-0.5 text-2xs text-ink-3 hover:bg-surface-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring"
 						>
 							Clear
-						</button>
+						</Button>
 					</>
 				) : null}
 			</div>
 			<div className="overflow-x-auto">
-				<table className="w-full text-sm">
-					<thead>
-						<tr>
-							<th className="px-3 py-1.5 text-left t-metric-label">
+				<Table className="w-full text-sm">
+					<THead>
+						<TR>
+							{selectable && (
+								<TH className="px-3 py-3">
+									<input
+										type="checkbox"
+										disabled={bulkBusy}
+										aria-label="Select all on page"
+										checked={allShown}
+										ref={(node) => {
+											if (node) node.indeterminate = someShown && !allShown;
+										}}
+										onChange={() => {
+											const next = new Set(selected);
+											for (const row of shown) {
+												if (allShown) next.delete(row.trace_id);
+												else next.add(row.trace_id);
+											}
+											changeSelection(next);
+										}}
+									/>
+								</TH>
+							)}
+							<TH className="px-3 py-1.5 text-left t-metric-label">
 								Operation
-							</th>
-							<th
+							</TH>
+							<TH
 								className="px-3 py-1.5 text-left t-metric-label"
 								title="The first model seen in the trace. A trace that switches models mid-run shows every model in its detail view; the sessions list shows the latest model."
 							>
 								Model
-							</th>
+							</TH>
 							{win && (
 								// ADR-074 §7's ruler, inside the column whose bars it describes —
 								// see the header comment for why it cannot sit above the table.
 								// `w-[26%]` is a hint to the browser's automatic layout, not a
 								// correctness requirement: ruler and bars share this cell's box
 								// whatever width it ends up with.
-								<th
+								<TH
 									className="w-[26%] min-w-[10rem] px-3 py-1.5 align-bottom"
 									title={`Each bar is one trace, positioned by its real start and sized by its real duration, across the ${fmtDur((win.endMs - win.startMs) * 1000)} these ${traces.length} traces span. UTC.`}
 								>
@@ -367,7 +435,7 @@ export function TraceList({
 										ticks={4}
 										mode="absolute"
 									/>
-								</th>
+								</TH>
 							)}
 							{durationHref ? (
 								<SortHeader
@@ -378,9 +446,9 @@ export function TraceList({
 									align="text-right"
 								/>
 							) : (
-								<th className="px-3 py-1.5 text-right t-metric-label">
+								<TH className="px-3 py-1.5 text-right t-metric-label">
 									Duration
-								</th>
+								</TH>
 							)}
 							{spansHref ? (
 								<SortHeader
@@ -391,21 +459,21 @@ export function TraceList({
 									align="text-right"
 								/>
 							) : (
-								<th className="px-3 py-1.5 text-right t-metric-label">Spans</th>
+								<TH className="px-3 py-1.5 text-right t-metric-label">Spans</TH>
 							)}
-							<th
+							<TH
 								className="px-3 py-1.5 text-right t-metric-label"
 								title="Tokens/cost sum per span — may double-count when usage is recorded on both a wrapper and its inner span. '—' = unpriced or no usage, not necessarily zero."
 							>
 								Tokens
-							</th>
-							<th
+							</TH>
+							<TH
 								className="px-3 py-1.5 text-right t-metric-label"
 								title="Tokens/cost sum per span — may double-count when usage is recorded on both a wrapper and its inner span. '—' = unpriced or no usage, not necessarily zero."
 							>
 								Cost
-							</th>
-							<th className="px-3 py-1.5 text-left t-metric-label">Status</th>
+							</TH>
+							<TH className="px-3 py-1.5 text-left t-metric-label">Status</TH>
 							{startedHref ? (
 								<SortHeader
 									label="Started (UTC)"
@@ -414,16 +482,15 @@ export function TraceList({
 									order={order}
 								/>
 							) : (
-								<th className="px-3 py-1.5 text-left t-metric-label">
+								<TH className="px-3 py-1.5 text-left t-metric-label">
 									Started (UTC)
-								</th>
+								</TH>
 							)}
-						</tr>
-					</thead>
-					<tbody className="divide-y">
+						</TR>
+					</THead>
+					<TBody className="divide-y">
 						{shown.map((t) => (
-							// biome-ignore lint/a11y/useKeyWithClickEvents: keyboard users navigate via the focusable name Link below (same href); the row onClick is a mouse-only convenience, not the sole path.
-							<tr
+							<TR
 								key={t.trace_id}
 								// hover -> `--surface-hover` (the row role); press and
 								// keyboard-focus -> `--surface-3` (the press step). Both used to
@@ -431,9 +498,43 @@ export function TraceList({
 								// than the hover step, so pressing a row made it fade instead of
 								// deepen. `--surface-3` is louder than hover in both themes.
 								className="cursor-pointer transition-colors hover:bg-surface-hover active:bg-surface-3 focus-within:bg-surface-3"
+								tabIndex={0}
+								aria-selected={
+									selectable ? selected.has(t.trace_id) : undefined
+								}
+								onKeyDown={(e) => {
+									if (e.target !== e.currentTarget) return;
+									if (e.key === " " && selectable) {
+										e.preventDefault();
+										toggle(t.trace_id, e.shiftKey);
+									}
+									if (e.key === "Enter") router.push(`/traces/${t.trace_id}`);
+									if (["j", "k", "ArrowDown", "ArrowUp"].includes(e.key)) {
+										e.preventDefault();
+										const next = ["j", "ArrowDown"].includes(e.key)
+											? e.currentTarget.nextElementSibling
+											: e.currentTarget.previousElementSibling;
+										(next as HTMLElement | null)?.focus();
+									}
+								}}
 								onClick={() => router.push(`/traces/${t.trace_id}`)}
 							>
-								<td className="px-3 py-2">
+								{selectable && (
+									<TD className="px-3 py-3">
+										<input
+											type="checkbox"
+											disabled={bulkBusy}
+											aria-label={`Select ${t.trace_id}`}
+											checked={selected.has(t.trace_id)}
+											onChange={() => {}}
+											onClick={(e) => {
+												e.stopPropagation();
+												toggle(t.trace_id, e.shiftKey);
+											}}
+										/>
+									</TD>
+								)}
+								<TD className="px-3 py-2">
 									<Link
 										href={`/traces/${t.trace_id}`}
 										onClick={(e) => e.stopPropagation()}
@@ -451,49 +552,53 @@ export function TraceList({
 											{t.trace_id.slice(0, 8)}
 										</span>
 									</Tooltip>
-								</td>
-								<td className="px-3 py-2 font-mono text-xs text-ink-2">
-									{t.model || "—"}
-								</td>
+								</TD>
+								<TD className="px-3 py-2 font-mono text-xs text-ink-2">
+									<IdentityAvatar
+										identity={
+											resolveIdentity({ gen_ai_request_model: t.model })
+												.model ?? identityForKey("model", "~unidentified")
+										}
+										showLabel
+									/>
+								</TD>
 								{win && (
-									<td className="px-3 py-2">
+									<TD className="px-3 py-2">
 										<TraceBar trace={t} win={win} />
-									</td>
+									</TD>
 								)}
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDur(t.duration_us)}
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{t.span_count}
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{formatTokens(t.total_tokens)}
-								</td>
-								<td className="px-3 py-2 text-right font-mono text-xs tabular-nums">
+								</TD>
+								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{formatCost(t.cost_usd)}
-								</td>
-								<td className="px-3 py-2">
+								</TD>
+								<TD className="px-3 py-2">
 									<div className="flex items-center gap-1.5">
 										{t.error_count > 0 && (
-											<Badge tone="danger">
-												{t.error_count} error{t.error_count > 1 ? "s" : ""}
-											</Badge>
+											<StatusBadge status="error" detail={t.error_count} />
 										)}
 										<InterventionBadge level={t.intervention} />
 										{t.error_count === 0 && t.intervention === 0 && (
-											<Badge tone="ok">OK</Badge>
+											<StatusBadge status="ok" />
 										)}
 									</div>
-								</td>
-								<td className="px-3 py-2 tabular-nums text-xs text-ink-3">
+								</TD>
+								<TD className="px-3 py-2 tabular-nums text-xs text-ink-3">
 									<time dateTime={t.start_time} title={t.start_time}>
 										{formatStartedUtc(t.start_time)}
 									</time>
-								</td>
-							</tr>
+								</TD>
+							</TR>
 						))}
-					</tbody>
-				</table>
+					</TBody>
+				</Table>
 				{/* Filtered-to-nothing is a DIFFERENT state from "no traces yet", which
 			    the early return above handles. Rendering an empty table body for
 			    this case is the failure where an error and an empty result look
@@ -511,6 +616,25 @@ export function TraceList({
 					</div>
 				) : null}
 			</div>
+			{selectionError && (
+				<p role="alert" className="p-3 text-danger-ink">
+					{selectionError}
+				</p>
+			)}
+			{selectable && (
+				<TraceBulkBar
+					viewerRole={viewerRole}
+					onBusy={setBulkBusy}
+					busy={bulkBusy}
+					onSelection={(ids) => changeSelection(new Set(ids))}
+					rows={traces.filter((r) => selected.has(r.trace_id))}
+					hidden={
+						[...selected].filter((id) => !shown.some((r) => r.trace_id === id))
+							.length
+					}
+					onClear={() => changeSelection(new Set())}
+				/>
+			)}
 		</div>
 	);
 }

@@ -25,9 +25,12 @@ use super::{AuthMethod, Claims, DEV_TENANT_UUID};
 ///
 /// Key format: `tlane_<base62_32bytes>` (~43 base62 chars after prefix).
 ///
+/// Returns the claims and the branch that answered (B-568 I1) — the branch is
+/// timing metadata only and never widens or narrows the grant.
+///
 /// # Errors
 /// Returns `Err` if the key format is invalid, revoked, or not found.
-pub async fn validate(api_key: &str) -> Result<Claims> {
+pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
     if !api_key.starts_with("tlane_") {
         bail!("invalid API key format: must start with tlane_");
     }
@@ -48,8 +51,9 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     budget_usd_monthly,
                     rate_limit_rpm,
                     budget_reset,
+                    path,
                 } = auth;
-                return Ok(Claims {
+                let claims = Claims {
                     tenant_id,
                     // `sub` is the api_keys.id UUID — never a value derived from
                     // the secret key body (ADR-042 / security review M-2). For an
@@ -73,7 +77,8 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                     rate_limit_rpm,
                     // BILL-01 A3: same SELECT, same zero-extra-round-trip shape.
                     budget_reset,
-                });
+                };
+                return Ok((claims, super::AuthPath::ApiKey(path)));
             }
             Ok(None) => bail!("API key not found or revoked"),
             Err(err) => {
@@ -104,7 +109,7 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
             let tenant_id = TenantId::from_jwt_claim(
                 Uuid::parse_str(DEV_TENANT_UUID).expect("static UUID is valid"),
             );
-            return Ok(Claims {
+            let claims = Claims {
                 tenant_id,
                 sub: format!(
                     "apikey:{}",
@@ -118,7 +123,8 @@ pub async fn validate(api_key: &str) -> Result<Claims> {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
-            });
+            };
+            return Ok((claims, super::AuthPath::Static));
         }
     }
 
@@ -199,8 +205,10 @@ mod tests {
         }
         rt().block_on(async {
             let key = generate().unwrap();
-            let claims = validate(&key).await.unwrap();
+            let (claims, path) = validate(&key).await.unwrap();
             assert_eq!(claims.auth_method, AuthMethod::ApiKey);
+            // B-568 I1: the dev stub touches no store, so it is neither warm nor cold.
+            assert_eq!(path, crate::auth::AuthPath::Static);
             assert!(claims.sub.starts_with("apikey:"));
         });
         unsafe {

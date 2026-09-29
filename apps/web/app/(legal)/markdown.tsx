@@ -1,3 +1,4 @@
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * A deliberately tiny CommonMark subset renderer for the legal pages.
  *
@@ -177,39 +178,39 @@ export function renderMarkdown(markdown: string): ReactNode {
 			const hasHeader = header.some((c) => c.length > 0);
 			blocks.push(
 				<div key={key} className="my-6 overflow-x-auto">
-					<table className="w-full border-collapse text-sm">
+					<Table className="w-full border-collapse text-sm">
 						{hasHeader && (
-							<thead>
-								<tr className="border-line border-b">
+							<THead>
+								<TR className="border-line border-b">
 									{header.map((c) => {
 										const ck = nextKey();
 										return (
-											<th
+											<TH
 												key={ck}
 												className="px-3 py-1.5 text-left font-semibold text-ink"
 											>
 												{inline(c, ck)}
-											</th>
+											</TH>
 										);
 									})}
-								</tr>
-							</thead>
+								</TR>
+							</THead>
 						)}
-						<tbody>
+						<TBody>
 							{bodyRows.map((r) => (
-								<tr key={nextKey()} className="border-line border-b">
+								<TR key={nextKey()} className="border-line border-b">
 									{r.map((c) => {
 										const ck = nextKey();
 										return (
-											<td key={ck} className="px-3 py-2 align-top text-ink-2">
+											<TD key={ck} className="px-3 py-2 align-top text-ink-2">
 												{inline(c, ck)}
-											</td>
+											</TD>
 										);
 									})}
-								</tr>
+								</TR>
 							))}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>,
 			);
 			continue;

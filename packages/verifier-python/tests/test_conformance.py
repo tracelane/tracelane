@@ -315,3 +315,102 @@ def test_supplying_the_trusted_key_clears_anchors_unverified() -> None:
         "with a trusted key the anchor is checked, not skipped: "
         f"anchors_unverified={report.anchors_unverified}"
     )
+
+
+# AUD-29 — the platform-key trust root. Shared vectors (offline, deterministic):
+# evals/audit-ledger/generate_platform_key_vectors.py. TS and Rust assert the same.
+def _aud29_key(field: str) -> bytes:
+    meta = json.loads(_vector("platform-key-vectors.meta.json").read_text(encoding="utf-8"))
+    return base64.b64decode(meta[field])
+
+
+def _aud29(name: str, platform: bytes | None) -> VerifyReport:
+    return verify_ledger(
+        _vector(f"{name}.ndjson"),
+        VerifyOptions(
+            format_version=FormatVersion.V2_1,
+            tenant_pubkey=_aud29_key("workspace_ed25519_pubkey_b64"),
+            platform_pubkey=platform,
+        ),
+    )
+
+
+def _kinds(r: VerifyReport) -> list[str]:
+    return [e.kind for e in r.errors]
+
+
+def test_aud29_a_all_platform_signed_verify_and_count_apart() -> None:
+    r = _aud29("platform-only", _aud29_key("platform_ed25519_pubkey_b64"))
+    assert _kinds(r) == []
+    assert r.signatures_valid
+    assert r.platform_signed_batches == 2
+    assert r.platform_signed_ranges == [
+        {"start_seq": 0, "end_seq": 4},
+        {"start_seq": 5, "end_seq": 9},
+    ]
+
+
+def test_aud29_b_platform_prefix_then_workspace_verifies() -> None:
+    r = _aud29("platform-then-workspace", _aud29_key("platform_ed25519_pubkey_b64"))
+    assert _kinds(r) == []
+    assert r.signatures_valid
+    assert r.platform_signed_batches == 1
+
+
+def test_aud29_c_platform_after_workspace_is_red() -> None:
+    r = _aud29("workspace-then-platform", _aud29_key("platform_ed25519_pubkey_b64"))
+    assert _kinds(r) == ["platform_key_after_workspace_key"]
+    assert not r.signatures_valid
+
+
+def test_aud29_d_unrelated_platform_key_is_untrusted() -> None:
+    r = _aud29("platform-then-workspace", _aud29_key("unrelated_ed25519_pubkey_b64"))
+    assert _kinds(r) == ["untrusted_tenant_key"]
+    assert r.platform_signed_batches == 0
+
+
+def test_aud29_e_without_platform_key_is_untrusted_as_before() -> None:
+    r = _aud29("platform-then-workspace", None)
+    assert _kinds(r) == ["untrusted_tenant_key"]
+    assert not r.signatures_valid
+
+
+def _aud29_with(name: str, platform: list[bytes], since: int | None) -> VerifyReport:
+    return verify_ledger(
+        _vector(f"{name}.ndjson"),
+        VerifyOptions(
+            format_version=FormatVersion.V2_1,
+            tenant_pubkey=_aud29_key("workspace_ed25519_pubkey_b64"),
+            platform_pubkeys=tuple(platform),
+            workspace_key_since_seq=since,
+        ),
+    )
+
+
+def test_aud29_f_takeover_seq_holds_with_no_workspace_batch_in_view() -> None:
+    r = _aud29_with("platform-only", [_aud29_key("platform_ed25519_pubkey_b64")], 5)
+    assert _kinds(r) == ["platform_key_after_workspace_key"]
+    assert not r.signatures_valid
+    assert r.platform_signed_batches == 1
+
+
+def test_aud29_g_takeover_at_zero_trusts_no_platform_batch() -> None:
+    r = _aud29_with("platform-only", [_aud29_key("platform_ed25519_pubkey_b64")], 0)
+    assert len(_kinds(r)) == 2
+    assert r.platform_signed_batches == 0
+
+
+def test_aud29_h_platform_shadow_of_workspace_batch_is_red() -> None:
+    r = _aud29_with("platform-shadow", [_aud29_key("platform_ed25519_pubkey_b64")], None)
+    assert _kinds(r) == ["platform_key_after_workspace_key"]
+    assert r.platform_signed_batches == 0
+
+
+def test_aud29_i_platform_key_list_supports_rotation() -> None:
+    r = _aud29_with(
+        "platform-then-workspace",
+        [_aud29_key("unrelated_ed25519_pubkey_b64"), _aud29_key("platform_ed25519_pubkey_b64")],
+        None,
+    )
+    assert _kinds(r) == []
+    assert r.platform_signed_batches == 1

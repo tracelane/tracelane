@@ -1,3 +1,6 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * Dashboard — the overview-first landing surface (§1). New users and
  * returning users land here (not in raw trace rows); it answers "is my agent
@@ -27,6 +30,7 @@ import { RangeControl } from "@/components/RangeControl";
 import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { MetricChart } from "@/components/metrics/MetricChart";
+import { OverheadContext } from "@/components/metrics/OverheadContext";
 import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
@@ -43,13 +47,12 @@ import {
 	fetchToolAnalyticsFor,
 } from "@/lib/metrics/fetch";
 import {
-	fmtBudget,
 	fmtCompact,
 	fmtCount,
 	fmtDurationMs,
 	fmtFraction,
 	fmtPercent,
-	fmtRatio,
+	fmtTarget,
 	fmtUsd,
 } from "@/lib/metrics/format";
 import { hintOf } from "@/lib/metrics/hint";
@@ -80,7 +83,7 @@ import {
 	RequestFlow,
 	SparkBars,
 } from "@tracelanedev/ui";
-import { and, count, eq, isNull } from "drizzle-orm";
+import { and, count, eq, gt, isNull, or, sql } from "drizzle-orm";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { type ReactNode, Suspense } from "react";
@@ -94,15 +97,16 @@ export const dynamic = "force-dynamic";
 // The five local formatters that lived here (a fourth cost rule, a second
 // zero-duration glyph) are gone with the inventory that found them (DSH-11 §3.1).
 const fmtMs = fmtDurationMs;
-const fmtBurn = fmtRatio;
 
-// `fmtBudget` is the registry's too since B-341 (custom-dashboard tiles print the same string).
+// Burn rate / budget remaining go through `head.burn` / `head.budgetRemaining`
+// (`sloHeadline`, B-341 + B-511) — the same small-sample dash rule `avail`
+// already applies, computed once and shared with /slo and the DSH-13 tiles.
 
 /** Focus ring shared by every click-through card wrapper.
  *
  * The radius is NOT a taste call — it must equal `--radius-card`, or the focus
  * ring traces a different curve from the thing it is outlining. It used to say
- * `rounded-lg`, which was correct only while cards were 8px; P0.5 moved them to
+ * `rounded-card`, which was correct only while cards were 8px; P0.5 moved them to
  * the 16–20px band, so this reads the token directly and can no longer drift. */
 const TILE_LINK_CLS =
 	"block rounded-[var(--radius-card)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring";
@@ -145,8 +149,8 @@ function CardHead({
 	action?: { href: string; label: string };
 }) {
 	return (
-		<div className="mb-4 flex items-center justify-between gap-3">
-			<div className="flex min-w-0 items-center gap-2.5">
+		<div className="mb-4 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+			<div className="flex min-w-40 flex-1 items-center gap-2.5">
 				<MetricIcon name={icon} size={20} />
 				{/* NOT `truncate`. It was, and "Where the time goes" rendered as
 				    "Where the ti…" on a 3-column card while the optional `meta` beside
@@ -163,9 +167,7 @@ function CardHead({
 					{action.label} <span aria-hidden="true">→</span>
 				</Link>
 			) : meta ? (
-				<span className="hidden shrink-0 text-2xs text-ink-3 xl:inline">
-					{meta}
-				</span>
+				<span className="text-2xs text-ink-3">{meta}</span>
 			) : null}
 		</div>
 	);
@@ -457,6 +459,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 	);
 	const availAhead = budget.availabilityPct >= budget.targetPct;
 	const kpis: {
+		tone?: "danger" | "warn";
 		label: string;
 		value: string;
 		href: string;
@@ -487,20 +490,18 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			href: href("/slo"),
 			hint: hintOf(METRICS.availability),
 			sub: dash ? (
-				<span className="text-ink-3">
-					vs {budget.targetPct.toFixed(1)}% target
-				</span>
+				<span className="text-ink-3">vs {fmtTarget(budget.target)} target</span>
 			) : avail.noSample ? (
 				<span className="text-ink-3">{METRICS.availability.zeroCopy}</span>
 			) : avail.belowFloor ? (
 				<span className="text-ink-3">
 					n = {fmtCount(totalRequests)} · below the {fmtCount(avail.floor)}
-					-request floor for a {budget.targetPct.toFixed(1)}% target
+					-request floor for a {fmtTarget(budget.target)} target
 				</span>
 			) : (
 				<span className={availAhead ? "text-ok-ink" : "text-danger-ink"}>
 					<span aria-hidden="true">{availAhead ? "▲" : "▼"}</span>{" "}
-					{availAhead ? "above" : "below"} {budget.targetPct.toFixed(1)}% target
+					{availAhead ? "above" : "below"} {fmtTarget(budget.target)} target
 				</span>
 			),
 		},
@@ -543,6 +544,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 		},
 		{
 			label: METRICS.error_rate.label,
+			tone: !dash && totalErrors > 0 ? "danger" : undefined,
 			value: dash ? "—" : errRate.noSample ? "—" : errRate.text,
 			href: href("/traces", { status: "error" }),
 			hint: hintOf(METRICS.error_rate),
@@ -583,7 +585,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 				? undefined
 				: totalRequests === 0
 					? METRICS.llm_calls.zeroCopy
-					: `per ${bucketLabel(range.bucketMs)} bucket · ${rLabel}`,
+					: `total, ${rLabel} · chart per ${bucketLabel(range.bucketMs)} bucket`,
 		},
 		{
 			icon: "tokens",
@@ -592,7 +594,9 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			href: href("/slo"),
 			hint: hintOf(METRICS.tokens),
 			spark: dash ? undefined : tokensSpark,
-			sub: dash ? undefined : "in + out · per bucket",
+			sub: dash
+				? undefined
+				: `in + out, ${rLabel} · chart per ${bucketLabel(range.bucketMs)} bucket`,
 		},
 		{
 			icon: "spend",
@@ -728,9 +732,12 @@ async function DashboardData({ range }: { range: TimeRange }) {
 									</span>
 								)}
 							</span>
-							{/* The number is GRAPHITE (P0.6) — the semantic tone lives in the
-							    sub-line below it, never in the headline figure. */}
-							<span className="t-metric-sm text-ink">{k.value}</span>
+							{/* Error counts carry the failure signal into the headline. */}
+							<span
+								className={`t-metric-sm ${k.tone === "danger" ? "text-danger-ink" : "text-ink"}`}
+							>
+								{k.value}
+							</span>
 							<span className="flex min-h-4 items-center text-2xs">
 								{k.sub}
 							</span>
@@ -922,8 +929,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 										{latency.overhead_samples < 20 && (
 											<p className="pt-1 text-ink-3">
 												n = {latency.overhead_samples} — at this volume the p95
-												is the slowest single request (usually the first, cold
-												one).
+												is close to the slowest single request.
 											</p>
 										)}
 									</dl>
@@ -972,10 +978,15 @@ async function DashboardData({ range }: { range: TimeRange }) {
 						 * "right of the tick" is legible without reading a number. Above
 						 * 2× the arc pins full and the NUMERAL keeps counting — the arc
 						 * saturates, the datum does not. The centre display is the real
-						 * `fmtBurn` value in every case, so a pinned arc can never be
+						 * `head.burn` value in every case, so a pinned arc can never be
 						 * mistaken for a 2× reading.
+						 *
+						 * Dashed on `avail.noSample` too, not just `dash` (B-511): a
+						 * reachable summary with zero requests is not unreachable, but
+						 * an arc sitting dead centre reading '0.00×' still reads as a
+						 * healthy measurement of nothing.
 						 */}
-						{dash ? (
+						{dash || avail.noSample ? (
 							<div className="mt-4 font-mono text-ramp-28 font-semibold leading-none tabular-nums text-ink-inverse">
 								—
 							</div>
@@ -989,7 +1000,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 										: 100
 								}
 								marker={50}
-								display={fmtBurn(budget.burnRate)}
+								display={head.burn}
 								label="burn rate"
 							/>
 						)}
@@ -1008,7 +1019,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 									Target (your plan)
 								</dt>
 								<dd className="font-mono tabular-nums text-ink-inverse">
-									{budget.targetPct.toFixed(1)}%
+									{fmtTarget(budget.target)}
 								</dd>
 							</div>
 							<div className="flex items-center justify-between gap-3">
@@ -1016,12 +1027,17 @@ async function DashboardData({ range }: { range: TimeRange }) {
 									Budget remaining
 								</dt>
 								<dd className="font-mono tabular-nums text-ink-inverse">
-									{dash ? "—" : fmtBudget(budget.budgetRemainingPct)}
+									{/* Same rule as /slo: below the sample floor the remaining-budget
+										   figure is noise ("5002% over" on 4 requests) — 2026-09-27 audit. */}
+									{dash || avail.noSample || avail.belowFloor
+										? "—"
+										: head.budgetRemaining}
 								</dd>
 							</div>
 						</dl>
 					</div>
 				</div>
+				<OverheadContext data={latency} />
 			</section>
 
 			{/* ── Section 2 — LATENCY, ROUTING & SAFETY ───────────────────────── */}
@@ -1144,7 +1160,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 								<div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-line pt-4">
 									{[
 										{
-											v: guardrails.total_evaluations.toLocaleString(),
+											v: fmtCount(guardrails.total_evaluations),
 											l: "evaluations",
 										},
 										{
@@ -1154,9 +1170,9 @@ async function DashboardData({ range }: { range: TimeRange }) {
 											}).text,
 											l: "fail-open",
 										},
-										{ v: guardrails.blocks.toLocaleString(), l: "blocked" },
+										{ v: fmtCount(guardrails.blocks), l: "blocked" },
 										{
-											v: guardrails.fail_open_verdicts.toLocaleString(),
+											v: fmtCount(guardrails.fail_open_verdicts),
 											l: "fail-opens",
 										},
 									].map((s) => (
@@ -1220,27 +1236,27 @@ async function DashboardData({ range }: { range: TimeRange }) {
 									ariaLabel="request share by model"
 								/>
 								<div className="overflow-x-auto">
-									<table className="w-full text-sm">
-										<thead className="border-y border-line bg-canvas-sunken">
-											<tr>
-												<th className="t-metric-label px-4 py-2 text-left">
+									<Table className="w-full text-sm">
+										<THead className="border-y border-line bg-canvas-sunken">
+											<TR>
+												<TH className="t-metric-label px-4 py-2 text-left">
 													Model
-												</th>
-												<th className="t-metric-label px-4 py-2 text-right">
+												</TH>
+												<TH className="t-metric-label px-4 py-2 text-right">
 													Requests
-												</th>
-												<th className="t-metric-label px-4 py-2 text-right">
+												</TH>
+												<TH className="t-metric-label px-4 py-2 text-right">
 													Tokens
-												</th>
-											</tr>
-										</thead>
-										<tbody className="divide-y divide-line">
+												</TH>
+											</TR>
+										</THead>
+										<TBody className="divide-y divide-line">
 											{topModels.map((m) => (
-												<tr
+												<TR
 													key={`${m.provider}::${m.model}`}
 													className="transition-colors hover:bg-surface-hover"
 												>
-													<td className="px-4 py-3">
+													<TD className="px-4 py-3">
 														{m.model && m.model !== "—" ? (
 															<Link
 																href={href("/traces", { model: m.model })}
@@ -1265,17 +1281,17 @@ async function DashboardData({ range }: { range: TimeRange }) {
 																}}
 															/>
 														</div>
-													</td>
-													<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
-														{m.requests.toLocaleString()}
-													</td>
-													<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
+													</TD>
+													<TD className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
+														{fmtCount(m.requests)}
+													</TD>
+													<TD className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
 														{fmtCompact(m.tokens)}
-													</td>
-												</tr>
+													</TD>
+												</TR>
 											))}
-										</tbody>
-									</table>
+										</TBody>
+									</Table>
 								</div>
 							</>
 						) : (
@@ -1370,27 +1386,27 @@ async function DashboardData({ range }: { range: TimeRange }) {
 						</div>
 						{topSigs.length > 0 ? (
 							<div className="overflow-x-auto">
-								<table className="w-full text-sm">
-									<thead className="border-y border-line bg-canvas-sunken">
-										<tr>
-											<th className="t-metric-label px-4 py-2 text-left">
+								<Table className="w-full text-sm">
+									<THead className="border-y border-line bg-canvas-sunken">
+										<TR>
+											<TH className="t-metric-label px-4 py-2 text-left">
 												Signature
-											</th>
-											<th className="t-metric-label px-4 py-2 text-right">
+											</TH>
+											<TH className="t-metric-label px-4 py-2 text-right">
 												Hits ({range.short})
-											</th>
-											<th className="t-metric-label px-4 py-2 text-right">
+											</TH>
+											<TH className="t-metric-label px-4 py-2 text-right">
 												Action
-											</th>
-										</tr>
-									</thead>
-									<tbody className="divide-y divide-line">
+											</TH>
+										</TR>
+									</THead>
+									<TBody className="divide-y divide-line">
 										{topSigs.map((s) => (
-											<tr
+											<TR
 												key={s.signature_id}
 												className="transition-colors hover:bg-surface-hover"
 											>
-												<td className="px-4 py-3">
+												<TD className="px-4 py-3">
 													<Link
 														href={href("/traces", {
 															signature_id: s.signature_id,
@@ -1400,21 +1416,22 @@ async function DashboardData({ range }: { range: TimeRange }) {
 													>
 														{s.signature_id}
 													</Link>
-												</td>
-												<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
-													{s.your_hits.toLocaleString()}
-												</td>
-												<td className="px-4 py-3 text-right">
-													<Badge
+												</TD>
+												<TD className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
+													{fmtCount(s.your_hits)}
+												</TD>
+												<TD className="px-4 py-3 text-right">
+													<StatusBadge
+														status={
+															s.action === "blocking" ? "blocking" : "flag-only"
+														}
 														tone={s.action === "blocking" ? "danger" : "warn"}
-													>
-														{s.action === "blocking" ? "blocking" : "flag-only"}
-													</Badge>
-												</td>
-											</tr>
+													/>
+												</TD>
+											</TR>
 										))}
-									</tbody>
-								</table>
+									</TBody>
+								</Table>
 							</div>
 						) : (
 							<div className="px-6 pb-6">
@@ -1465,31 +1482,31 @@ async function DashboardData({ range }: { range: TimeRange }) {
 						</div>
 					) : (
 						<div className="overflow-x-auto">
-							<table className="w-full text-sm">
-								<thead className="border-y border-line bg-canvas-sunken">
-									<tr>
-										<th className="t-metric-label px-4 py-2 text-left">Tool</th>
-										<th className="t-metric-label px-4 py-2 text-right">
+							<Table className="w-full text-sm">
+								<THead className="border-y border-line bg-canvas-sunken">
+									<TR>
+										<TH className="t-metric-label px-4 py-2 text-left">Tool</TH>
+										<TH className="t-metric-label px-4 py-2 text-right">
 											Calls
-										</th>
-										<th className="t-metric-label px-4 py-2 text-right">
+										</TH>
+										<TH className="t-metric-label px-4 py-2 text-right">
 											Error rate
-										</th>
-										<th className="t-metric-label px-4 py-2 text-right">p95</th>
-									</tr>
-								</thead>
-								<tbody className="divide-y divide-line">
+										</TH>
+										<TH className="t-metric-label px-4 py-2 text-right">p95</TH>
+									</TR>
+								</THead>
+								<TBody className="divide-y divide-line">
 									{topTools.map((t) => {
 										const errPct =
 											t.calls > 0
 												? ((t.errors / t.calls) * 100).toFixed(1)
 												: "0.0";
 										return (
-											<tr
+											<TR
 												key={t.tool}
 												className="transition-colors hover:bg-surface-hover"
 											>
-												<td className="px-4 py-3">
+												<TD className="px-4 py-3">
 													<span
 														className="block truncate font-mono text-xs text-ink"
 														title={t.tool}
@@ -1504,25 +1521,25 @@ async function DashboardData({ range }: { range: TimeRange }) {
 															}}
 														/>
 													</div>
-												</td>
-												<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
-													{t.calls.toLocaleString()}
-												</td>
-												<td
+												</TD>
+												<TD className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink">
+													{fmtCount(t.calls)}
+												</TD>
+												<TD
 													className={`px-4 py-3 text-right font-mono text-xs tabular-nums ${
 														t.errors > 0 ? "text-danger-ink" : "text-ink-3"
 													}`}
 												>
 													{t.errors > 0 ? `${errPct}%` : "—"}
-												</td>
-												<td className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
+												</TD>
+												<TD className="px-4 py-3 text-right font-mono text-xs tabular-nums text-ink-2">
 													{fmtMs(t.p95_ms)}
-												</td>
-											</tr>
+												</TD>
+											</TR>
 										);
 									})}
-								</tbody>
-							</table>
+								</TBody>
+							</Table>
 						</div>
 					)}
 				</Card>
@@ -1558,7 +1575,12 @@ async function NoApiKeysBanner() {
 		const [keyCount] = await db
 			.select({ cnt: count() })
 			.from(apiKeys)
-			.where(and(eq(apiKeys.tenantId, tenant.id), isNull(apiKeys.revokedAt)));
+			.where(
+				and(
+					eq(apiKeys.tenantId, tenant.id),
+					or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+				),
+			);
 
 		if ((keyCount?.cnt ?? 0) > 0) return null;
 		return <NoApiKeysPanel workspaceId={tenant.id} />;
@@ -1601,7 +1623,7 @@ export default async function DashboardPage({
 					    large text only (checked at the 3:1 large/UI floor via
 					    accent-warm's own contrast-check.mjs pairs, not the 4.5:1 body
 					    floor `.t-h1`'s plain colour otherwise clears). */}
-					<h1 className="t-h1 heading-gradient-warm">Welcome back</h1>
+					<PageHeader title={<>Welcome back</>} />
 					<p className="mt-2 text-sm text-ink-2">
 						Your agent fleet, at a glance.
 					</p>

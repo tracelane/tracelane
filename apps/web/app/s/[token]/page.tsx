@@ -1,3 +1,4 @@
+import { fmtUsd } from "@/lib/metrics/format";
 /**
  * `/s/[token]` — OBS-48 public share page. UNAUTHENTICATED end to end: no
  * `requireSession`, no `withAuth`, no user JWT anywhere in this file. Fetches
@@ -102,12 +103,7 @@ function daysUntil(iso: string, nowMs = Date.now()): number {
 
 /** Same three-bucket cost format `TraceSummaryHeader` uses — kept local: that
  * component's copy is not exported and this file may not edit it (OBS-48 scope). */
-function fmtCost(usd: number): string {
-	if (usd === 0) return "$0";
-	if (usd < 0.01) return `$${usd.toFixed(4)}`;
-	if (usd < 1) return `$${usd.toFixed(3)}`;
-	return `$${usd.toFixed(2)}`;
-}
+const fmtCost = fmtUsd;
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
 	const { token } = await params;
@@ -144,8 +140,8 @@ function PublicMessageShell({
 	description: string;
 }) {
 	return (
-		<div className="flex min-h-screen flex-col">
-			<header className="flex items-center border-b border-line px-6 py-4">
+		<div className="flex min-h-screen flex-col px-4 sm:px-6 lg:px-10">
+			<header className="flex items-center border-b border-line py-4">
 				<Logo withWordmark height={22} />
 			</header>
 			<div className="flex flex-1 items-center justify-center p-6">
@@ -190,8 +186,8 @@ export default async function SharedTracePage({ params }: Props) {
 	const expiresIn = daysUntil(data.expires_at);
 
 	return (
-		<div className="flex min-h-screen flex-col">
-			<header className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-6 py-4">
+		<div className="flex min-h-screen flex-col px-4 sm:px-6 lg:px-10">
+			<header className="flex flex-wrap items-center justify-between gap-2 border-b border-line py-4">
 				<Logo withWordmark height={22} />
 				<p className="text-sm text-ink-2">
 					Shared trace · {data.workspace_name} · expires in {expiresIn} day
@@ -199,10 +195,12 @@ export default async function SharedTracePage({ params }: Props) {
 				</p>
 			</header>
 
-			<div className="mx-auto w-full max-w-6xl flex-1 p-6">
+			<div className="w-full flex-1 py-6">
 				<div className="mb-4 space-y-2 border-b border-line pb-4">
 					<div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-						<h1 className="t-h1 min-w-0 truncate">{data.root_name}</h1>
+						<h1 className="min-w-0 max-w-full truncate t-h1">
+							{data.root_name}
+						</h1>
 						<p className="shrink-0 text-sm text-ink-2">
 							{spanCount} span{spanCount === 1 ? "" : "s"} ·{" "}
 							{fmtDur(summary.totalDurationUs)}

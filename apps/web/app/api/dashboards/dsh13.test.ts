@@ -171,10 +171,15 @@ describe("DSH-13 tile input validation", () => {
 
 // ── 3. fetchTileData: stub gateway calls, check parity ─────────────────────────
 
-// Stub the @tracelanedev/ui workspace package — it is not resolvable from
-// the isolated worktree environment, but only fmtDurMs is needed here.
-vi.mock("@tracelanedev/ui", () => ({
-	fmtDurMs: (ms: number) => `${ms.toFixed(1)} ms`,
+// Exercise the shared metric formatters as part of tile parity.
+
+// `fetchBreakdownData` dynamically imports `@/lib/gateway` (→ `@/lib/auth`, the WorkOS
+// runtime, which does not resolve under vitest). The breakdown tests below never reach
+// `gatewayGet` — every asserted branch goes through the `./fetch` mock — so a stub
+// module is enough; `GatewayError` must still be a class, `instanceof` is checked.
+vi.mock("@/lib/gateway", () => ({
+	gatewayGet: vi.fn(),
+	GatewayError: class GatewayError extends Error {},
 }));
 
 // Stub the gateway fetchers so fetchTileData runs without a real HTTP call.
@@ -813,5 +818,386 @@ describe("DSH-13 §9 divider tiles — PATCH validation", () => {
 describe("DSH-13 §9 divider grid mechanics", () => {
 	it("a divider is ALWAYS width=12 — the same literal class every other full-width tile uses, so no new grid rule is needed", () => {
 		expect(WIDTH_CLASS[12]).toBe("col-span-12");
+	});
+});
+
+// ── Breakdown parity + formatting — B-501 / B-507 (CX-02 / CX-08) and B-506 (CX-07) ──
+//
+// The guardrail breakdowns ("Block rate" by rail, "Evaluations" by decision/rail)
+// used to aggregate the NEWEST ≤200 rows of `GET /v1/guardrails/verdicts` and credit
+// each verdict to its FIRST rail only — counts under a rate label, capped and
+// misattributed. The registry's own `source` names `GET /v1/guardrails/stats`, which
+// is what the built-in `/guardrails` page renders; a tile must read the same route.
+import { fmtByKind } from "@/lib/metrics/format";
+
+describe("breakdown parity — guardrails (B-501 / B-507)", () => {
+	const range = { sinceMs: 0, untilMs: 86_400_000, bucketMs: 3_600_000 };
+	const r1: GuardrailStats["rails"][number] = {
+		rail: "R1_cost",
+		evaluations: 1000,
+		blocks: 40,
+		block_rate_pct: 4.0,
+		fail_opens: 0,
+		fail_open_rate_pct: 0,
+		p95_ms: 1,
+	};
+	const stats: GuardrailStats = {
+		window_hours: 24,
+		total_evaluations: 1000,
+		block_rate_pct: 4.0,
+		redact_rate_pct: 0.5,
+		warn_rate_pct: 0.5,
+		fail_open_rate_pct: 0,
+		fail_open_verdicts: 0,
+		blocks: 40,
+		redacts: 5,
+		warns: 5,
+		allows: 950,
+		request_side: 1000,
+		response_side: 0,
+		p50_ms: 0.5,
+		p95_ms: 1,
+		p99_ms: 2,
+		rails: [r1],
+	};
+	const verdict = (decision: string, rails: string) => ({
+		correlation_id: "c",
+		side: "request",
+		decision,
+		event_time: "2026-09-21 00:00:00.000000",
+		total_latency_micros: 10,
+		rails,
+		fail_open_rails: [] as string[],
+	});
+
+	it("verdicts by decision reads the four summary counts from /v1/guardrails/stats — never the newest-200 verdict list", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		vi.mocked(fetchMod.fetchGuardrailStatsFor).mockResolvedValue(stats);
+		vi.mocked(fetchMod.fetchGuardrailVerdictsFor).mockResolvedValue([
+			verdict("allow", "[]"),
+			verdict("allow", "[]"),
+			verdict("block", "[]"),
+		]);
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{
+				id: "t",
+				metricId: "verdicts",
+				shape: "breakdown",
+				dimension: "decision",
+			},
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		// 40 blocks in the window — not the 1 block among three listed verdicts.
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "block", value: 40 }),
+		);
+		expect(fetchMod.fetchGuardrailVerdictsFor).not.toHaveBeenCalled();
+	});
+
+	it("block_rate by rail is the rail's block_rate_pct from /v1/guardrails/stats, carried as a percent", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		vi.mocked(fetchMod.fetchGuardrailStatsFor).mockResolvedValue(stats);
+		vi.mocked(fetchMod.fetchGuardrailVerdictsFor).mockResolvedValue([
+			verdict("allow", '[{"rail":"R1_cost"}]'),
+			verdict("allow", '[{"rail":"R1_cost"}]'),
+			verdict("block", '[{"rail":"R1_cost"}]'),
+		]);
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{
+				id: "t",
+				metricId: "block_rate",
+				shape: "breakdown",
+				dimension: "rail",
+			},
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "R1_cost", value: 4.0 }),
+		);
+		expect(out.metricKind).toBe("percent");
+		expect(fmtByKind(out.metricKind, out.rows[0]?.value)).toBe("4.00%");
+		expect(fetchMod.fetchGuardrailVerdictsFor).not.toHaveBeenCalled();
+	});
+
+	it("verdicts by rail credits EVERY rail a verdict evaluated, not only the first (B-507)", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		vi.mocked(fetchMod.fetchGuardrailStatsFor).mockResolvedValue({
+			...stats,
+			total_evaluations: 1,
+			rails: [
+				{ ...r1, rail: "R1_cost", evaluations: 1 },
+				{ ...r1, rail: "R4_trifecta", evaluations: 1 },
+			],
+		});
+		vi.mocked(fetchMod.fetchGuardrailVerdictsFor).mockResolvedValue([
+			verdict("allow", '[{"rail":"R1_cost"},{"rail":"R4_trifecta"}]'),
+		]);
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{ id: "t", metricId: "verdicts", shape: "breakdown", dimension: "rail" },
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "R4_trifecta", value: 1 }),
+		);
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "R1_cost", value: 1 }),
+		);
+		expect(out.metricKind).toBe("count");
+		expect(fetchMod.fetchGuardrailVerdictsFor).not.toHaveBeenCalled();
+	});
+
+	it("block_rate breaks down by rail ONLY — a per-decision block rate is 0 or 100 by construction, refused before any fetch", () => {
+		expect([...tileSupport("block_rate").breakdownDimensions]).toEqual([
+			"rail",
+		]);
+		expect(shapeSupported("block_rate", "breakdown", "decision")).toBe(false);
+		expect(shapeSupported("block_rate", "breakdown", "rail")).toBe(true);
+		// `verdicts` and `decision_mix` keep both dimensions.
+		expect([...tileSupport("verdicts").breakdownDimensions]).toEqual([
+			"decision",
+			"rail",
+		]);
+		expect([...tileSupport("decision_mix").breakdownDimensions]).toEqual([
+			"decision",
+			"rail",
+		]);
+	});
+});
+
+describe("breakdown formatting — B-506", () => {
+	const range = { sinceMs: 0, untilMs: 86_400_000, bucketMs: 3_600_000 };
+
+	it("a sub-cent spend row carries metricKind=currency and formats as $0.0012, never 0", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		// The route's real shape: `{ rows: [...] }`, not a bare array.
+		vi.mocked(fetchMod.fetchCostBreakdownFor).mockResolvedValue({
+			window_hours: 24,
+			by: "model",
+			total_cost_usd: 0.0012,
+			total_requests: 3,
+			priced_requests: 3,
+			unpriced_requests: 0,
+			attribution_begins_note: null,
+			scope: "all",
+			eval_cost_usd: 0,
+			eval_requests: 0,
+			production_cost_usd: 0.0012,
+			production_requests: 3,
+			eval_attribution_note: "",
+			rows: [
+				{
+					dimension: "claude-haiku-4-5",
+					requests: 3,
+					priced_requests: 3,
+					unpriced_requests: 0,
+					cost_usd: 0.0012,
+					input_tokens: 600,
+					output_tokens: 12,
+					eval_requests: 0,
+					eval_cost_usd: 0,
+				},
+			],
+		} as never);
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{
+				id: "t",
+				metricId: "spend_est",
+				shape: "breakdown",
+				dimension: "model",
+			},
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		expect(out.metricKind).toBe("currency");
+		expect(fmtByKind(out.metricKind, out.rows[0]?.value)).toBe("$0.0012");
+		// The old page formatter: what a customer saw for a model that cost money.
+		expect((0.0012).toLocaleString("en-US", { maximumFractionDigits: 2 })).toBe(
+			"0",
+		);
+	});
+});
+
+// ── B-502 (CX-03): /v1/traces/groups is a BARE ARRAY of `TraceGroup` rows ──────
+//
+// `gatewayGet<{ groups: {key,count}[] }>` expected an object wrapper with fields
+// that do not exist on the producer's row (`group_key`/`trace_count`, not
+// `key`/`count`) — every `traces_total`/`llm_calls`/`requests_routed` breakdown
+// by model/operation/status silently rendered "No data in this window."
+import type { TraceGroup } from "@/components/trace-viewer/TraceGroupTable";
+
+describe("breakdown parity — traces/groups (B-502 / CX-03)", () => {
+	const range = { sinceMs: 0, untilMs: 86_400_000, bucketMs: 3_600_000 };
+	const group = (key: string, traces: number): TraceGroup => ({
+		group_key: key,
+		trace_count: traces,
+		error_traces: 0,
+		avg_duration_us: 100,
+		p95_duration_us: 200,
+	});
+
+	it("traces_total by model reads the BARE ARRAY the gateway actually returns (group_key/trace_count), not a { groups } wrapper", async () => {
+		const gw = await import("@/lib/gateway");
+		vi.mocked(gw.gatewayGet).mockResolvedValue([
+			group("gpt-4o", 42),
+			group("claude-haiku-4-5", 7),
+		]);
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{
+				id: "t",
+				metricId: "traces_total",
+				shape: "breakdown",
+				dimension: "model",
+			},
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "gpt-4o", value: 42, n: 42 }),
+		);
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "claude-haiku-4-5", value: 7, n: 7 }),
+		);
+		const [url] = vi.mocked(gw.gatewayGet).mock.calls[0] ?? [];
+		expect(url).toContain("/v1/traces/groups");
+	});
+
+	it("llm_calls / requests_routed breakdowns never call /v1/traces/groups — TraceGroupBy has no `provider` variant (a 400 from the gateway), so they route through the generic /v1/metrics/breakdown fallback that already serves provider/api_key", async () => {
+		const gw = await import("@/lib/gateway");
+		vi.mocked(gw.gatewayGet).mockResolvedValue({
+			metric: "requests",
+			by: "provider",
+			rows: [{ key: "anthropic", value: 10, n: 10 }],
+			window: {
+				since: "2026-09-01T00:00:00Z",
+				until: "2026-09-02T00:00:00Z",
+				clamped: false,
+			},
+		});
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{
+				id: "t",
+				metricId: "llm_calls",
+				shape: "breakdown",
+				dimension: "provider",
+			},
+			range,
+		);
+		expect(out.kind).toBe("breakdown");
+		if (out.kind !== "breakdown") return;
+		expect(out.rows).toContainEqual(
+			expect.objectContaining({ key: "anthropic", value: 10, n: 10 }),
+		);
+		const [url] = vi.mocked(gw.gatewayGet).mock.calls[0] ?? [];
+		expect(url).toContain("/v1/metrics/breakdown");
+		expect(url).not.toContain("/v1/traces/groups");
+	});
+});
+
+// ── B-508 (CX-09): the DSH-13 tile must scope to LIVE_SIGNATURE_IDS, exactly ───
+// like the /signatures page already does (app/signatures/page.tsx:248) ─────────
+import { LIVE_SIGNATURE_IDS } from "@/lib/aft-taxonomy";
+
+describe("signatures tile — scoped to live detectors (B-508 / CX-09)", () => {
+	const range = { sinceMs: 0, untilMs: 86_400_000, bucketMs: 3_600_000 };
+
+	it("signatures_matched sends live_ids (LIVE_SIGNATURE_IDS) and counts only live-detector hits, never a roadmap entry", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		vi.mocked(fetchMod.fetchSignaturesFor).mockResolvedValue({
+			signatures: [
+				{
+					signature_id: "AFT-MCP-RUGPULL-001", // detectorStatus: "live"
+					your_hits: 3,
+					traces_affected: 2,
+					action: "flag-only",
+					first_seen: "2026-09-21T00:00:00Z",
+					last_seen: "2026-09-21T01:00:00Z",
+				},
+				{
+					signature_id: "AFT-CONTEXT-OVERFLOW-001", // detectorStatus: "roadmap"
+					your_hits: 9,
+					traces_affected: 4,
+					action: "flag-only",
+					first_seen: "2026-09-21T00:00:00Z",
+					last_seen: "2026-09-21T01:00:00Z",
+				},
+			],
+			total_traces_affected: 2,
+		});
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{ id: "t", metricId: "signatures_matched", shape: "stat" },
+			range,
+		);
+		expect(out.kind).toBe("stat");
+		if (out.kind !== "stat") return;
+		// One LIVE hit — the roadmap entry never counts toward "matched".
+		expect(out.value).toBe("1");
+		expect(out.n).toBe(1);
+		const call = vi.mocked(fetchMod.fetchSignaturesFor).mock.calls[0];
+		expect(call?.[1]).toEqual(LIVE_SIGNATURE_IDS);
+	});
+});
+
+// ── B-524 (CX-25) web half: the tile reads `total_calls` from the response, ────
+// which is now the TRUE window-wide total (the gateway's `sum(calls) OVER ()`
+// fix), never a client-side sum over the (still LIMIT-capped) `tools` rows. ────
+describe("tool_calls stat — reads total_calls from the response (B-524 / CX-25, web half)", () => {
+	const range = { sinceMs: 0, untilMs: 86_400_000, bucketMs: 3_600_000 };
+
+	it("formats and samples off `total_calls`, not a sum of the (capped) `tools` list", async () => {
+		const fetchMod = await import("@/lib/metrics/fetch");
+		vi.mocked(fetchMod.fetchToolAnalyticsFor).mockResolvedValue({
+			window_hours: 24,
+			// Deliberately larger than any sum over the single row below — this is
+			// the window's TRUE total, which only the gateway (over ALL tools, not
+			// just the ones returned) can compute.
+			total_calls: 9001,
+			tools: [{ tool: "web_search", calls: 5, errors: 0, p95_ms: 1 }],
+		});
+		const { fetchTileData } = await import("@/lib/metrics/tiles");
+		const out = await fetchTileData(
+			{ id: "t", metricId: "tool_calls", shape: "stat" },
+			range,
+		);
+		expect(out.kind).toBe("stat");
+		if (out.kind !== "stat") return;
+		expect(out.value).toBe("9,001");
+		expect(out.n).toBe(9001);
+	});
+});
+
+describe("B-503 dashboards/[id] metadata is tenant-scoped", () => {
+	it("generateMetadata performs no DB read (the only safe way to avoid leaking a foreign tenant's dashboard name into the 404 page's flight stream)", () => {
+		const src = readFileSync(
+			resolve(__dirname, "../../dashboards/[id]/page.tsx"),
+			"utf8",
+		);
+		const start = src.indexOf("function generateMetadata");
+		const end = src.indexOf("export default async function DashboardPage");
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		const genMetaSrc = src.slice(start, end);
+		// Before the fix this block ran `db.select({ name: dashboards.name })
+		// .from(dashboards).where(eq(dashboards.id, id))` with NO tenant filter —
+		// any authenticated tenant could read any other tenant's dashboard name
+		// through the title of the 404 page (CX-04). The fix removes every DB
+		// read from generateMetadata; the owner still sees the real name in the
+		// tenant-scoped <h1> below.
+		expect(genMetaSrc.includes(".select(")).toBe(false);
+		expect(genMetaSrc.includes("dashboards.name")).toBe(false);
 	});
 });

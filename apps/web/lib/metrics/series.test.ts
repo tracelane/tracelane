@@ -3,6 +3,7 @@ import {
 	bucketIndex,
 	drawableBuckets,
 	parseChTime,
+	sloErrorRateSeries,
 	sloLatencySeries,
 	sloTrafficSeries,
 	sparkOf,
@@ -99,5 +100,41 @@ describe("series — the grid is the window, not the data", () => {
 		expect(bucketIndex(g, Date.parse("2026-09-01T02:59:59Z"))).toBe(2);
 		expect(bucketIndex(g, Date.parse("2026-09-01T06:00:00Z"))).toBe(-1);
 		expect(bucketIndex([], 0)).toBe(-1);
+	});
+});
+
+// ── B-504 (CX-05): the "Error rate" tile drew three COUNT series (requests /
+// errors / tokens) under a percent label — no ratio anywhere. `sloErrorRateSeries`
+// is the one percent series the registry's `error_rate` kind promises.
+describe("sloErrorRateSeries — a real ratio, gapped like a quantile (B-504 / CX-05)", () => {
+	it("one percent series, errors/requests × 100, per bucket", () => {
+		const d = sloErrorRateSeries(range, [row(1, "anthropic", 200, 10)]);
+		expect(d.series).toHaveLength(1);
+		const s = d.series[0];
+		expect(s?.id).toBe("error_rate");
+		expect(s?.kind).toBe("percent");
+		expect(s?.fillZero).toBe(false);
+		expect(s?.mark).toBe("line");
+		// bucket 1 = 10/200*100 = 5; every other bucket has no requests → a GAP.
+		expect(s?.values).toEqual([null, 5, null, null, null, null]);
+	});
+
+	it("sums provider × model rows into the bucket before dividing", () => {
+		const d = sloErrorRateSeries(range, [
+			row(2, "openai", 100, 5),
+			row(2, "anthropic", 100, 15),
+		]);
+		// 20 errors / 200 requests = 10%, not the mean of two 5%/15% rows.
+		expect(d.series[0]?.values[2]).toBe(10);
+	});
+
+	it("a bucket with requests but ZERO errors is a true 0%, never a gap", () => {
+		const d = sloErrorRateSeries(range, [row(1, "anthropic", 50, 0)]);
+		expect(d.series[0]?.values[1]).toBe(0);
+	});
+
+	it("no rows → every bucket is a gap (never a false 0%)", () => {
+		const d = sloErrorRateSeries(range, []);
+		expect(d.series[0]?.values.every((v) => v === null)).toBe(true);
 	});
 });

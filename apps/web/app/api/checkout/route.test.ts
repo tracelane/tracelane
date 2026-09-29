@@ -47,10 +47,21 @@ import { POST } from "./route";
 
 const fetchMock = vi.fn();
 
-function req(tier: string, interval?: string): NextRequest {
+/**
+ * `json: true` simulates a fetch-based caller sending `Accept:
+ * application/json`; the default (no `json` option) simulates the real
+ * callers today — `PlanCard.tsx` / `PlanLadder.tsx`, both native
+ * `<form method="post">`s, which never send that header.
+ */
+function req(
+	tier: string,
+	interval?: string,
+	opts?: { json?: boolean },
+): NextRequest {
 	const qs = interval ? `tier=${tier}&interval=${interval}` : `tier=${tier}`;
 	return {
 		nextUrl: new URL(`http://localhost/api/checkout?${qs}`),
+		headers: new Headers(opts?.json ? { accept: "application/json" } : {}),
 	} as unknown as NextRequest;
 }
 
@@ -78,29 +89,53 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("POST /api/checkout", () => {
-	it("rejects an unknown tier with 400 and never touches the DB or the gateway", async () => {
+	it("rejects an unknown tier from a form POST with a 303 to the billing page's readable error state", async () => {
 		const res = await POST(req("wizard"));
+		expect(res.status).toBe(303);
+		expect(res.headers.get("location")).toBe(
+			"http://localhost/settings/billing?checkout_error=unknown_tier",
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("rejects an unknown tier with 400 JSON when the caller asks for JSON", async () => {
+		const res = await POST(req("wizard", undefined, { json: true }));
 		expect(res.status).toBe(400);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("Enterprise is sales-led — never a self-serve checkout target", async () => {
 		const res = await POST(req("enterprise"));
-		expect(res.status).toBe(400);
+		expect(res.status).toBe(303);
+		expect(res.headers.get("location")).toContain(
+			"checkout_error=unknown_tier",
+		);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("returns 501 when the tier has no configured Polar product id for this deployment", async () => {
+	it("returns a 303 to the billing page (not raw JSON) when the tier has no configured Polar product id", async () => {
 		setDb([
 			[{ polarSubscriptionId: null }], // tenant lookup: no active sub
 			[{ polarProductIdMonth: null, polarProductIdYear: null }], // planEntitlements row
 		]);
 		const res = await POST(req("business"));
-		expect(res.status).toBe(501);
+		expect(res.status).toBe(303);
+		expect(res.headers.get("location")).toBe(
+			"http://localhost/settings/billing?checkout_error=checkout_unconfigured",
+		);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("maps a gateway 5xx to 502 without leaking the upstream body", async () => {
+	it("returns 501 JSON when the caller asks for JSON", async () => {
+		setDb([
+			[{ polarSubscriptionId: null }],
+			[{ polarProductIdMonth: null, polarProductIdYear: null }],
+		]);
+		const res = await POST(req("business", undefined, { json: true }));
+		expect(res.status).toBe(501);
+	});
+
+	it("maps a gateway 5xx to a 303 (not raw JSON) for the form-post caller, never leaking the upstream body", async () => {
 		setDb([
 			[{ polarSubscriptionId: null }],
 			[
@@ -116,6 +151,30 @@ describe("POST /api/checkout", () => {
 			json: async () => ({ error: "polar said SECRET_REQUEST_ID" }),
 		});
 		const res = await POST(req("team"));
+		expect(res.status).toBe(303);
+		const location = res.headers.get("location") ?? "";
+		expect(location).toBe(
+			"http://localhost/settings/billing?checkout_error=checkout_unavailable",
+		);
+		expect(location).not.toContain("SECRET_REQUEST_ID");
+	});
+
+	it("maps a gateway 5xx to 502 JSON without leaking the upstream body, when the caller asks for JSON", async () => {
+		setDb([
+			[{ polarSubscriptionId: null }],
+			[
+				{
+					polarProductIdMonth: "polar_prod_team_uuid",
+					polarProductIdYear: null,
+				},
+			],
+		]);
+		fetchMock.mockResolvedValue({
+			ok: false,
+			status: 500,
+			json: async () => ({ error: "polar said SECRET_REQUEST_ID" }),
+		});
+		const res = await POST(req("team", undefined, { json: true }));
 		expect(res.status).toBe(502);
 		const body = (await res.json()) as { error: string };
 		expect(body.error).toBe("checkout unavailable");
@@ -178,12 +237,22 @@ describe("POST /api/checkout", () => {
 		// shipped reference table carries the switch OFF.
 		expect(PLANS_V3.policy.annual_available).toBe(false);
 		setDb([[{ polarSubscriptionId: null }]]);
-		const res = await POST(req("team", "year"));
+		const res = await POST(req("team", "year", { json: true }));
 		expect(res.status).toBe(400);
 		expect(await res.json()).toEqual({
 			error: "annual billing is not available yet",
 			reason: "annual_unavailable",
 		});
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("B14: the same refusal is a 303 to the billing page for the real (form-post) caller", async () => {
+		setDb([[{ polarSubscriptionId: null }]]);
+		const res = await POST(req("team", "year"));
+		expect(res.status).toBe(303);
+		expect(res.headers.get("location")).toBe(
+			"http://localhost/settings/billing?checkout_error=annual_unavailable",
+		);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
@@ -231,7 +300,7 @@ describe("POST /api/checkout", () => {
 		expect(url).not.toContain("/v1/billing/checkout");
 	});
 
-	it("B-140: the portal path never leaks the upstream error body either", async () => {
+	it("B-140: the portal path never leaks the upstream error body either (form-post → 303)", async () => {
 		setDb([[{ polarSubscriptionId: "sub_existing_123" }]]);
 		fetchMock.mockResolvedValue({
 			ok: false,
@@ -239,6 +308,22 @@ describe("POST /api/checkout", () => {
 			json: async () => ({ error: "polar said SECRET" }),
 		});
 		const res = await POST(req("business"));
+		expect(res.status).toBe(303);
+		const location = res.headers.get("location") ?? "";
+		expect(location).toBe(
+			"http://localhost/settings/billing?checkout_error=portal_unavailable",
+		);
+		expect(location).not.toContain("SECRET");
+	});
+
+	it("B-140: the portal path never leaks the upstream error body either, when the caller asks for JSON", async () => {
+		setDb([[{ polarSubscriptionId: "sub_existing_123" }]]);
+		fetchMock.mockResolvedValue({
+			ok: false,
+			status: 500,
+			json: async () => ({ error: "polar said SECRET" }),
+		});
+		const res = await POST(req("business", undefined, { json: true }));
 		expect(res.status).toBe(502);
 		const body = (await res.json()) as { error: string };
 		expect(JSON.stringify(body)).not.toContain("SECRET");

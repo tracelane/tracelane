@@ -1,4 +1,5 @@
 "use client";
+import { TD, TR } from "@tracelanedev/ui";
 
 /**
  * `EVL-29` — one row of the `/review` queue list, with its archive/un-archive
@@ -26,6 +27,7 @@
  */
 
 import type { AnnotationQueue } from "@/app/api/annotation-queues/shared";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { Button } from "@tracelanedev/ui";
 import Link from "next/link";
@@ -42,11 +44,14 @@ export async function patchQueueArchived(
 ): Promise<PatchOutcome> {
 	let res: Response;
 	try {
-		res = await fetch(`/api/annotation-queues/${encodeURIComponent(queueId)}`, {
-			method: "PATCH",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ archived }),
-		});
+		res = await apiFetchRaw(
+			`/api/annotation-queues/${encodeURIComponent(queueId)}`,
+			{
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ archived }),
+			},
+		);
 	} catch {
 		return {
 			ok: false,
@@ -116,8 +121,8 @@ export function QueueRow({
 	}
 
 	return (
-		<tr className="border-b last:border-0">
-			<td className="py-2 pr-4">
+		<TR className="border-b last:border-0">
+			<TD className="py-2 pr-4">
 				{isArchived ? (
 					<span className="opacity-60">{queue.name} (archived)</span>
 				) : (
@@ -125,18 +130,18 @@ export function QueueRow({
 						{queue.name}
 					</Link>
 				)}
-			</td>
-			<td className="py-2 pr-4">{sourceLabel}</td>
-			<td className="py-2 pr-4">{queue.filter.window_hours}h</td>
-			<td className="py-2 pr-4">
+			</TD>
+			<TD className="py-2 pr-4">{sourceLabel}</TD>
+			<TD className="py-2 pr-4">{queue.filter.window_hours}h</TD>
+			<TD className="py-2 pr-4">
 				<code>{queue.expected_output_field}</code>
-			</td>
-			<td className="py-2 pr-4">{formatDateTimeUtc(queue.created_at)}</td>
-			<td className="py-2 pr-4">
+			</TD>
+			<TD className="py-2 pr-4">{formatDateTimeUtc(queue.created_at)}</TD>
+			<TD className="py-2 pr-4">
 				<div className="flex flex-col items-start gap-1">
 					<Button
 						type="button"
-						variant="ghost"
+						variant="danger"
 						size="sm"
 						disabled={pending}
 						onClick={toggle}
@@ -155,7 +160,7 @@ export function QueueRow({
 						</p>
 					)}
 				</div>
-			</td>
-		</tr>
+			</TD>
+		</TR>
 	);
 }

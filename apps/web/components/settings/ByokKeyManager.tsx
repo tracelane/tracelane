@@ -1,4 +1,8 @@
 "use client";
+import { StatusBadge } from "@tracelanedev/ui";
+import { Button } from "@tracelanedev/ui";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * ByokKeyManager — self-service CMK/BYOK key management UI.
@@ -12,7 +16,7 @@
  */
 
 import { Modal } from "@/components/Modal";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, apiFetchRaw } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -41,7 +45,7 @@ async function fetchKeys(): Promise<CmkEntry[]> {
 }
 
 async function addKey(payload: AddKeyPayload): Promise<CmkEntry> {
-	const res = await fetch("/api/settings/cmk-keys", {
+	const res = await apiFetchRaw("/api/settings/cmk-keys", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(payload),
@@ -51,14 +55,17 @@ async function addKey(payload: AddKeyPayload): Promise<CmkEntry> {
 }
 
 async function revokeKey(id: string): Promise<void> {
-	const res = await fetch(`/api/settings/cmk-keys/${encodeURIComponent(id)}`, {
-		method: "DELETE",
-	});
+	const res = await apiFetchRaw(
+		`/api/settings/cmk-keys/${encodeURIComponent(id)}`,
+		{
+			method: "DELETE",
+		},
+	);
 	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
 async function rotateKey(id: string, publicKeyPem: string): Promise<CmkEntry> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/cmk-keys/${encodeURIComponent(id)}/rotate`,
 		{
 			method: "POST",
@@ -79,12 +86,6 @@ const STATUS_LABEL: Record<KeyStatus, string> = {
 	revoked: "Revoked",
 };
 
-const STATUS_BADGE: Record<KeyStatus, string> = {
-	active: "bg-surface-2 text-ink-2",
-	rotating: "bg-warn-soft text-warn-ink",
-	revoked: "bg-danger-soft text-danger-ink",
-};
-
 function KeyRow({
 	entry,
 	onRevoke,
@@ -95,33 +96,30 @@ function KeyRow({
 	onRotate: (id: string) => void;
 }) {
 	return (
-		<tr className="border-b border-line last:border-0">
-			<td className="py-2 pr-3 text-sm font-medium">{entry.alias}</td>
-			<td className="py-2 pr-3 font-mono text-xs text-ink-2">
+		<TR className="border-b border-line last:border-0">
+			<TD className="py-2 pr-3 text-sm font-medium">{entry.alias}</TD>
+			<TD className="py-2 pr-3 font-mono text-xs text-ink-2">
 				{entry.fingerprint.slice(0, 16)}…
-			</td>
-			<td className="py-2 pr-3 text-xs text-ink-2">{entry.algorithm}</td>
-			<td className="py-2 pr-3 text-xs text-ink-2">{entry.purpose}</td>
-			<td className="py-2 pr-3">
-				<span
-					className={`inline-block px-2 py-0.5 rounded text-2xs font-medium ${STATUS_BADGE[entry.status]}`}
-				>
-					{STATUS_LABEL[entry.status]}
-				</span>
-			</td>
-			<td className="py-2 pr-3 text-xs text-ink-2">
+			</TD>
+			<TD className="py-2 pr-3 text-xs text-ink-2">{entry.algorithm}</TD>
+			<TD className="py-2 pr-3 text-xs text-ink-2">{entry.purpose}</TD>
+			<TD className="py-2 pr-3">
+				<StatusBadge status={STATUS_LABEL[entry.status]} />
+			</TD>
+			<TD className="py-2 pr-3 text-xs text-ink-2">
 				{absoluteDate(entry.createdAt)}
-			</td>
-			<td className="px-3 py-2 flex gap-2">
+			</TD>
+			<TD className="px-3 py-2 flex gap-2">
 				{entry.status === "active" && (
 					<>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => onRotate(entry.id)}
 							className="text-xs px-2 py-1 rounded border border-line hover:bg-surface-2 transition-colors"
 						>
 							Rotate
-						</button>
+						</Button>
 						{/* DEAD CLASSES, FIXED 2026-08-22. This carried `border-destructive`
 						    and `hover:bg-destructive/10`. `--color-destructive` was one of the
 						    shadcn-compat aliases DELETED 2026-08-18, and tokens.css:115 records
@@ -137,17 +135,18 @@ function KeyRow({
 						    `border-danger/40` + `bg-danger-soft` are the tree's existing
 						    convention (9 and 25 uses); `text-danger-ink` is the text tone the
 						    contract requires on a card (5.49:1 vs `--danger`'s 4.45:1). */}
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => onRevoke(entry.id)}
 							className="text-xs px-2 py-1 rounded border border-danger/40 text-danger-ink hover:bg-danger-soft transition-colors"
 						>
 							Revoke
-						</button>
+						</Button>
 					</>
 				)}
-			</td>
-		</tr>
+			</TD>
+		</TR>
 	);
 }
 
@@ -228,19 +227,21 @@ function AddKeyModal({
 					the raw PEM is not retained after processing.
 				</p>
 				<div className="flex justify-end gap-2 pt-2">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						className="px-4 py-2 rounded text-sm border border-line hover:bg-surface-2 transition-colors"
 					>
 						Cancel
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="submit"
 						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 					>
 						Register Key
-					</button>
+					</Button>
 				</div>
 			</form>
 		</Modal>
@@ -292,13 +293,14 @@ export function ByokKeyManager() {
 				<div>
 					<h3 className="text-sm font-semibold text-ink">Registered keys</h3>
 				</div>
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => setShowAdd(true)}
 					className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ Add Key
-				</button>
+				</Button>
 			</div>
 
 			{isLoading && (
@@ -309,26 +311,26 @@ export function ByokKeyManager() {
 			)}
 
 			{!isLoading && !isError && keys.length === 0 && (
-				<div className="rounded-lg border border-dashed border-line p-8 text-center text-sm text-ink-2">
+				<div className="rounded-card border border-dashed border-line p-8 text-center text-sm text-ink-2">
 					No CMK keys registered. Add a key to enable BYOK encryption.
 				</div>
 			)}
 
 			{keys.length > 0 && (
-				<div className="overflow-x-auto rounded-lg border border-line">
-					<table className="w-full text-left">
-						<thead className="bg-surface-2 text-xs text-ink-2">
-							<tr>
-								<th className="py-1.5 pr-3 pl-3 font-medium">Alias</th>
-								<th className="py-1.5 pr-3 font-medium">Fingerprint</th>
-								<th className="py-1.5 pr-3 font-medium">Algorithm</th>
-								<th className="py-1.5 pr-3 font-medium">Purpose</th>
-								<th className="py-1.5 pr-3 font-medium">Status</th>
-								<th className="py-1.5 pr-3 font-medium">Created</th>
-								<th className="py-1.5 pr-3 font-medium">Actions</th>
-							</tr>
-						</thead>
-						<tbody className="pl-4">
+				<div className="overflow-x-auto rounded-card border border-line">
+					<Table className="w-full text-left">
+						<THead className="bg-surface-2 text-xs text-ink-2">
+							<TR>
+								<TH className="py-1.5 pr-3 pl-3 font-medium">Alias</TH>
+								<TH className="py-1.5 pr-3 font-medium">Fingerprint</TH>
+								<TH className="py-1.5 pr-3 font-medium">Algorithm</TH>
+								<TH className="py-1.5 pr-3 font-medium">Purpose</TH>
+								<TH className="py-1.5 pr-3 font-medium">Status</TH>
+								<TH className="py-1.5 pr-3 font-medium">Created</TH>
+								<TH className="py-1.5 pr-3 font-medium">Actions</TH>
+							</TR>
+						</THead>
+						<TBody className="pl-4">
 							{keys.map((key) => (
 								<KeyRow
 									key={key.id}
@@ -337,8 +339,8 @@ export function ByokKeyManager() {
 									onRotate={(id) => setRotateId(id)}
 								/>
 							))}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			)}
 
@@ -373,7 +375,8 @@ export function ByokKeyManager() {
 						className="w-full rounded border border-line bg-bg px-3 py-2 text-xs font-mono focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring resize-none"
 					/>
 					<div className="flex justify-end gap-2 pt-2">
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => {
 								setRotateId(null);
@@ -382,8 +385,9 @@ export function ByokKeyManager() {
 							className="px-4 py-2 rounded text-sm border border-line hover:bg-surface-2 transition-colors"
 						>
 							Cancel
-						</button>
-						<button
+						</Button>
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() =>
 								rotateMutation.mutate({ id: rotateId, pem: rotatePem })
@@ -392,7 +396,7 @@ export function ByokKeyManager() {
 							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-50 transition-colors"
 						>
 							Rotate Key
-						</button>
+						</Button>
 					</div>
 				</Modal>
 			)}

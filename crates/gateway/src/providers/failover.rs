@@ -279,6 +279,33 @@ pub fn cross_provider_candidates<'c>(
     }
 }
 
+/// GWY-52: the candidates for THIS request — the workspace's own ordered fallback models
+/// when it set any, else the operator chain ([`cross_provider_candidates`]), unchanged.
+/// A workspace hop's provider is derived from its model by the canonical map, so the
+/// id is the `'static` one every downstream site already uses; a model that no longer
+/// routes (validated on write — the catalog only grows) is dropped rather than guessed.
+/// The primary's own family is never a candidate, in either source.
+#[must_use]
+pub fn candidates_for(
+    primary_family: &str,
+    workspace_models: &[String],
+    operator: Option<&'static crate::server::config::FailoverConfig>,
+) -> Vec<(&'static str, String)> {
+    if workspace_models.is_empty() {
+        return cross_provider_candidates(primary_family, operator)
+            .into_iter()
+            .map(|(p, m)| (p, m.to_owned()))
+            .collect();
+    }
+    workspace_models
+        .iter()
+        .filter_map(|m| {
+            crate::providers::ProviderRegistry::provider_id_for_model(m).map(|p| (p, m.clone()))
+        })
+        .filter(|(p, _)| *p != primary_family)
+        .collect()
+}
+
 // `ProviderAttempt` (a trait for "provider executor closures") was deleted
 // 2026-09-12 (B-390) — zero implementors anywhere, including tests;
 // `execute_with_failover` below never actually took this trait, it uses a

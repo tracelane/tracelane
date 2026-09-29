@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * Gateway operations (§6) — per-provider router health for the authenticated
  * tenant, live from the gateway `/v1/gateway/stats` aggregate over `spans`.
@@ -34,11 +36,13 @@
 
 import { RangeControl } from "@/components/RangeControl";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
+import { OverheadContext } from "@/components/metrics/OverheadContext";
 import { WindowNotice } from "@/components/metrics/WindowNotice";
 import type { CostBreakdown } from "@/lib/gateway-ops";
 import {
 	fetchCostBreakdownFor,
 	fetchGatewayStatsFor,
+	fetchLatencyBreakdownFor,
 } from "@/lib/metrics/fetch";
 import { fmtCount, fmtDurationMs, fmtPercent } from "@/lib/metrics/format";
 import { hintOf } from "@/lib/metrics/hint";
@@ -73,6 +77,7 @@ import { SectionLabel } from "./SectionLabel";
 import { SpendAttribution } from "./SpendAttribution";
 import { TryItCurl } from "./TryItCurl";
 import { circuitLabel, circuitTone } from "./circuit";
+import { readKeyLabels } from "./key-labels";
 
 export const metadata: Metadata = { title: "Gateway — Tracelane" };
 export const dynamic = "force-dynamic";
@@ -98,30 +103,8 @@ const pct = (v: number, n?: number): string =>
  * nothing else — no health state is computed from error rate, failovers or
  * latency. Colour is never alone: the label is always rendered beside the dot.
  */
-const CIRCUIT_DOT: Record<ReturnType<typeof circuitTone>, string> = {
-	ok: "bg-ok",
-	warn: "bg-warn",
-	danger: "bg-danger",
-};
-/** Healthy is INK, not green text: the dot carries the state and a whole column
- *  of green words would spend the system's most rationed colour on "normal". */
-const CIRCUIT_TEXT: Record<ReturnType<typeof circuitTone>, string> = {
-	ok: "text-ink-2",
-	warn: "text-warn-ink",
-	danger: "text-danger-ink",
-};
-
 function CircuitStatus({ state }: { state: string }) {
-	const tone = circuitTone(state);
-	return (
-		<span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs">
-			<span
-				aria-hidden="true"
-				className={cn("h-1.5 w-1.5 shrink-0 rounded-full", CIRCUIT_DOT[tone])}
-			/>
-			<span className={CIRCUIT_TEXT[tone]}>{circuitLabel(state)}</span>
-		</span>
-	);
+	return <StatusBadge status={state} tone={circuitTone(state)} />;
 }
 
 async function GatewayData({
@@ -133,9 +116,10 @@ async function GatewayData({
 }) {
 	// Both reads in flight together, for ONE window, through lib/metrics — the
 	// spend panel must not serialize behind router health.
-	const [stats, costs] = await Promise.all([
+	const [stats, costs, keyLabels] = await Promise.all([
 		fetchGatewayStatsFor(range),
 		fetchCostBreakdownFor(range, by),
+		by === "key" ? readKeyLabels() : Promise.resolve(undefined),
 	]);
 	const href = (path: string, extra?: Record<string, string | undefined>) =>
 		withWindow(path, range, extra);
@@ -318,6 +302,7 @@ async function GatewayData({
 								label={METRICS.failed_routed.label}
 								hint={hintOf(METRICS.failed_routed)}
 								value={pct(stats.error_rate_pct, stats.total_requests)}
+								tone="danger"
 								sub={`${fmtCount(stats.total_errors)} of ${fmtCount(stats.total_requests)} · view them`}
 								sample={{ n: stats.total_requests, floor: 100 }}
 								interactive
@@ -413,7 +398,7 @@ async function GatewayData({
 									<TH numeric>Error rate</TH>
 									<TH
 										numeric
-										title="End-to-end p50 INCLUDING the provider's own generation time. It is dominated by how many tokens the model decoded, so it is not a like-for-like speed ranking between providers — see Out tok/req on the SLOs page. The column that is ours is Gateway ovh."
+										title="End-to-end p50 INCLUDING the provider's own generation time. It is dominated by how many tokens the model decoded, so it is not a like-for-like speed ranking between providers — see Out tok/req on the SLOs page. The column that is ours is Gateway overhead."
 									>
 										p50
 									</TH>
@@ -429,9 +414,9 @@ async function GatewayData({
 										// the two tokens resolve to the same ink, so this is a
 										// naming fix, not a visual change.
 										className="text-ink"
-										title="Gateway overhead p95 — the time Tracelane adds per request, EXCLUDING the upstream provider round-trip. Compare with the end-to-end p95 to the left: our slice is tiny."
+										title="Gateway overhead p95 — the time Tracelane adds per request, EXCLUDING the upstream provider round-trip. Authentication and workspace settings are included."
 									>
-										Gateway ovh
+										Gateway overhead
 									</TH>
 									<TH numeric>Cache hit</TH>
 									<TH numeric>Failover</TH>
@@ -505,6 +490,7 @@ async function GatewayData({
 				data={costs}
 				hrefFor={(v) => href("/gateway", { by: v })}
 				by={by}
+				keyLabels={keyLabels}
 			/>
 
 			{/* ── 4 · ROUTER EVENTS — the secondary group ─────────────────────────
@@ -616,7 +602,7 @@ export default async function GatewayPage({
 			    clickable while the data is still in flight. */}
 			<header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 				<div className="max-w-2xl">
-					<h1 className="t-h1">Gateway</h1>
+					<PageHeader title={<>Gateway</>} />
 					<p className="mt-2 text-sm text-ink-2">
 						Per-provider routing health — volume, errors, failover and breaker
 						state. Latency SLOs live on the{" "}
@@ -632,6 +618,9 @@ export default async function GatewayPage({
 				<RangeControl />
 			</header>
 			<WindowNotice range={range} />
+			<Suspense fallback={<OverheadContext />}>
+				<GatewayOverhead range={range} />
+			</Suspense>
 			<Suspense
 				fallback={
 					<div className="space-y-8">
@@ -651,4 +640,8 @@ export default async function GatewayPage({
 			</Suspense>
 		</div>
 	);
+}
+
+async function GatewayOverhead({ range }: { range: TimeRange }) {
+	return <OverheadContext data={await fetchLatencyBreakdownFor(range)} />;
 }

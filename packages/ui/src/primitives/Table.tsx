@@ -19,14 +19,8 @@ import { cn } from "../lib/cn";
  * two of them are on the same screen — the same blindness that let ten segmented
  * controls diverge.
  *
- * THIS HAS CONVERTED 7 OF THE 21, NOT ALL OF THEM — corrected here after the P1
- * verifier caught the original wording claiming otherwise. The P1 pass covered
- * `/gateway`, `/guardrails`, `/guardrails/verdicts`, `/slo` and `/signatures`; 14
- * files still hand-roll a table, **including `apps/web/app/dashboard/page.tsx`
- * (3 of them)** — the page that is the design reference for everything else. That is
- * the next conversion, and stating the real number is the only way the gap stays
- * visible: a primitive whose docstring claims a completed migration is how the
- * remaining call sites become invisible.
+ * Application tables use this system or DataTable, which composes it.
+ * The legal markdown renderer also composes the shared table primitives.
  *
  * ── THE ALIGNMENT RULE, WHICH IS THE WHOLE POINT OF A DATA TABLE ────────────
  * Text left. Numbers right, tabular, monospace. A column of figures that does not
@@ -62,7 +56,7 @@ export function Table({
 	...props
 }: HTMLAttributes<HTMLTableElement> & { children: ReactNode }) {
 	return (
-		<div className="w-full overflow-x-auto">
+		<div className="relative w-full overflow-x-auto">
 			<table
 				className={cn("w-full border-collapse text-sm", className)}
 				{...props}

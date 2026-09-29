@@ -31,6 +31,9 @@ directory = "./dist"
 # `not_found_handling` is deliberately NOT set: it would make the asset handler
 # answer misses itself, and POST /api/notify is an asset miss.
 binding = "ASSETS"
+# B-588: the asset handler ignores Range, and Safari/iOS will not play an mp4 without
+# byte ranges — video goes through the Worker (`serveRange` in functions/api/notify.ts).
+run_worker_first = ["/*.mp4"]
 
 # D1 binding for /api/notify
 [[d1_databases]]

@@ -49,7 +49,9 @@ pub fn spans_stream_config() -> async_nats::jetstream::stream::Config {
         // back into ClickHouse (and re-summed 66 traces' span counts through
         // the MV). The privacy promise is only as good as the shortest buffer
         // holding the data. Three days covers any consumer outage the 4 GiB
-        // bound would survive anyway, and is under Free's 7-day window, so a
+        // bound would survive anyway, and is under Free's 30-day window (`plans.v3.json`
+        // `queryable_days`; this said 7 until RI-02, 2026-09-20 — guard-held by
+        // `spans_buffer_is_shorter_than_the_shortest_queryable_window`), so a
         // replay can never resurrect what a sweep removed. `ensure_stream`
         // applies this to prod's EXISTING stream on the next ingest boot
         // (`limits_drift` compares `max_age`), which purges the backlog older
@@ -103,7 +105,7 @@ pub fn ingest_consumer_config(batch_size: usize) -> async_nats::jetstream::consu
 /// misconfigured (subject mismatch, wrong retention policy, etc.).
 // B-383 (b): the URL may carry a credential — the span field is the credential-free form.
 #[instrument(
-    skip(span_tx, single_tenant, shutdown),
+    skip(span_tx, single_tenant, shutdown, ch),
     fields(nats_url = %tracelane_shared::nats_connect::NatsConnect::split(&nats_url).url)
 )]
 pub async fn run(
@@ -112,6 +114,7 @@ pub async fn run(
     single_tenant: Option<TenantId>,
     batch_size: usize,
     mut shutdown: crate::shutdown::Signal,
+    ch: clickhouse::Client,
 ) -> Result<()> {
     // B-383 (b): the credential is lifted OUT of the URL (async-nats does not
     // honour `user:pass@` — `tracelane_shared::nats_connect` says why) and the
@@ -130,17 +133,62 @@ pub async fn run(
     // neither the byte bound below nor the `max_ack_pending` fix would ever have reached
     // prod's stream (created 2026-06-07) or its consumer — see
     // `tracelane_shared::jetstream_limits`.
-    let stream =
+    let mut stream =
         tracelane_shared::jetstream_limits::ensure_stream(&jetstream, spans_stream_config())
             .await
             .context("failed to ensure TRACELANE_SPANS JetStream stream")?;
 
-    let consumer = tracelane_shared::jetstream_limits::ensure_pull_consumer(
+    let mut consumer = tracelane_shared::jetstream_limits::ensure_pull_consumer(
         &stream,
         ingest_consumer_config(batch_size),
     )
     .await
     .context("failed to ensure NATS JetStream consumer")?;
+
+    // RI-06 / B-449: did the stream trim past what this durable had acked while ingest
+    // was not consuming? One consumer.info() + one stream.info() at boot — the only
+    // moment the two numbers answer that question exactly. Fail-OPEN: a failed read
+    // starts the tracker unanchored (first delivery anchors it, counts nothing).
+    let instance = crate::capture_gaps::instance_name();
+    let mut tracker = match (consumer.info().await, stream.info().await) {
+        (Ok(cinfo), Ok(sinfo)) => {
+            let ack_floor = cinfo.ack_floor.stream_sequence;
+            let first_seq = sinfo.state.first_sequence;
+            // The in-flight range (delivered to the previous process, not acked) comes
+            // back as redeliveries; the cursor must start past it, or the first new
+            // message reads as a trim of everything in between (B-493 run 3).
+            let last_delivered = cinfo.delivered.stream_sequence;
+            let (tracker, boot_gap) =
+                crate::gap_tracker::GapTracker::at_boot(ack_floor, first_seq, last_delivered);
+            tracing::info!(
+                ack_floor,
+                last_delivered,
+                first_seq,
+                last_seq = sinfo.state.last_sequence,
+                num_pending = cinfo.num_pending,
+                boot_gap = boot_gap.as_ref().map(crate::gap_tracker::Gap::count),
+                "gap tracker anchored at boot"
+            );
+            if let Some(gap) = boot_gap {
+                record_gap(
+                    &ch,
+                    &gap,
+                    &instance,
+                    format!("ack_floor={ack_floor} first_seq={first_seq}"),
+                )
+                .await;
+            }
+            tracker
+        }
+        (c, s) => {
+            tracing::warn!(
+                consumer_info_err = %c.err().map(|e| e.to_string()).unwrap_or_default(),
+                stream_info_err = %s.err().map(|e| e.to_string()).unwrap_or_default(),
+                "gap tracker: boot read failed — starting unanchored (first delivery anchors it)"
+            );
+            crate::gap_tracker::GapTracker::unanchored()
+        }
+    };
 
     let mut messages = consumer
         .messages()
@@ -172,6 +220,20 @@ pub async fn run(
                 continue;
             }
         };
+
+        // RI-06: continuity check on FIRST deliveries, before any branch below — a
+        // Term'd or Nak'd message is still a delivery and moves the cursor.
+        if let Ok(info) = msg.info()
+            && let Some(gap) = tracker.observe(info.stream_sequence, info.delivered)
+        {
+            record_gap(
+                &ch,
+                &gap,
+                &instance,
+                format!("cursor_jump_to={}", info.stream_sequence),
+            )
+            .await;
+        }
 
         // Resolve the trusted tenant for this message (see
         // [`resolve_trusted_tenant`]). Single-tenant self-host stamps the one
@@ -205,6 +267,19 @@ pub async fn run(
                     );
                     span.tenant_id = trusted_tenant;
                 }
+                // B-493: a redelivery of a sequence this process still holds (in the
+                // channel or in the writer's batch) is a duplicate — the original's
+                // ack will cover it. Dropped here, never enqueued twice.
+                if let Ok(info) = msg.info()
+                    && !crate::span_envelope::hold(info.stream_sequence)
+                {
+                    tracing::debug!(
+                        stream_seq = info.stream_sequence,
+                        delivered = info.delivered,
+                        "redelivery of a sequence this process still holds — dropped as a duplicate"
+                    );
+                    continue;
+                }
                 // Ack-after-write (#81): hand the message to the ClickHouse
                 // writer, which acks it ONLY after the row is durably written.
                 // Do NOT ack here — a write failure must leave the message
@@ -228,6 +303,36 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// RI-06: count the loss (SPANS, one `note_n`) and write the durable episode row.
+/// Fail-OPEN on the row: the counter already holds the truth; a failed insert is
+/// counted on its own kind and never touches the consumer.
+async fn record_gap(
+    ch: &clickhouse::Client,
+    gap: &crate::gap_tracker::Gap,
+    instance: &str,
+    note: String,
+) {
+    let total = tracelane_shared::degradation::note_n(
+        tracelane_shared::degradation::Degradation::SpansLostBeforeConsume,
+        gap.count(),
+    );
+    tracing::warn!(
+        first_missing = gap.first_missing,
+        last_missing = gap.last_missing,
+        lost = gap.count(),
+        kind = ?gap.kind,
+        total_lost_this_process = total,
+        "spans lost at the JetStream boundary before consume (RI-06)"
+    );
+    let row = crate::capture_gaps::CaptureGapRow::from_gap(gap, instance, note);
+    if let Err(e) = crate::capture_gaps::record(ch, &row).await {
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::CaptureGapAttestFailed,
+        );
+        tracing::warn!(error = %e, "capture_gaps insert failed; the loss is counted but not attested");
+    }
 }
 
 /// Resolve the trusted tenant for an incoming NATS span.
@@ -337,6 +442,35 @@ mod tests {
 #[cfg(test)]
 mod stream_limits_tests {
     use super::*;
+
+    /// RI-02 rule 9 (2026-09-20): every buffer that can put spans back stays SHORTER
+    /// than the shortest deletion window, so a redelivery can never carry a row the
+    /// sweep removed. The window is a reference-table value (CLAUDE.md §23) — read
+    /// from `apps/web/db/plans.v3.json`, never a copy — and `max_age` is the code.
+    /// Falsified by setting `max_age` to 31 d: this reads `2678400 >= 2592000`.
+    #[test]
+    fn spans_buffer_is_shorter_than_the_shortest_queryable_window() {
+        let v3: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json"))
+                .expect("plans.v3.json parses");
+        let min_days = v3["plans"]
+            .as_object()
+            .expect("plans object")
+            .values()
+            .filter_map(|p| p["queryable_days"].as_u64())
+            .min()
+            .expect("at least one plan carries queryable_days");
+        assert!(
+            min_days >= 1,
+            "a zero window would make every buffer too long"
+        );
+        let max_age = spans_stream_config().max_age.as_secs();
+        assert!(
+            max_age < min_days * 24 * 60 * 60,
+            "TRACELANE_SPANS.max_age ({max_age}s) must stay below the shortest \
+             queryable_days ({min_days} d) — a replay could resurrect swept rows"
+        );
+    }
     use async_nats::jetstream::stream::DiscardPolicy;
 
     #[test]
@@ -458,5 +592,179 @@ mod stream_limits_tests {
         );
         let _ = ops.delete_stream("TRACELANE_SPANS").await;
         let _ = ops.delete_stream("TRACELANE_AUDIT").await;
+    }
+
+    /// RI-06 / B-449, spec §7 row 2 — against a REAL nats-server (the check-nats-auth.sh
+    /// harness): a stream capped at 5 messages trims un-consumed spans, and the tracker
+    /// counts them exactly — at boot (the durable's acked prefix below the stream's first
+    /// retained message) and in flight (a first delivery that skips a sequence, planted
+    /// with an operator delete). Without the tracker the same harness reads 0: that is
+    /// the guard proven to block, not merely to exist.
+    #[tokio::test]
+    #[ignore = "needs NATS_TEST_URL_OPS — run scripts/ci/check-nats-auth.sh"]
+    async fn ri06_gap_tracker_counts_trimmed_messages_against_a_real_stream() {
+        use futures::StreamExt as _;
+        let ops_url = std::env::var("NATS_TEST_URL_OPS").expect("NATS_TEST_URL_OPS");
+        let nc = tracelane_shared::nats_connect::NatsConnect::from_url(&ops_url);
+        let client = nc.options().connect(&nc.url).await.expect("ops connects");
+        let js = async_nats::jetstream::new(client);
+        let stream_name = format!("RI06_{}", Uuid::new_v4().simple());
+        // Under `tracelane.>` — the ops user's publish allow-list (nats.conf) — and off
+        // `tracelane.spans.>`, which the real spans stream owns.
+        let subject = format!("tracelane.ri06test.{}.>", stream_name.to_lowercase());
+        let pub_subject = format!("tracelane.ri06test.{}.t", stream_name.to_lowercase());
+        let _ = js.delete_stream(&stream_name).await;
+        let mut stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: stream_name.clone(),
+                subjects: vec![subject],
+                max_messages: 5,
+                discard: async_nats::jetstream::stream::DiscardPolicy::Old,
+                ..Default::default()
+            })
+            .await
+            .expect("stream with max_messages 5");
+        let durable = "ri06-durable".to_string();
+        let mut consumer = stream
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(durable.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("durable");
+
+        // Phase 1: publish 3, consume + ack 3 → ack_floor = 3, nothing lost.
+        for _ in 0..3 {
+            js.publish(pub_subject.clone(), "{}".into())
+                .await
+                .expect("pub")
+                .await
+                .expect("ack");
+        }
+        {
+            let mut msgs = consumer
+                .fetch()
+                .max_messages(3)
+                .messages()
+                .await
+                .expect("fetch");
+            let (mut tracker, boot) = {
+                let cinfo = consumer.info().await.expect("cinfo");
+                let sinfo = stream.info().await.expect("sinfo");
+                crate::gap_tracker::GapTracker::at_boot(
+                    cinfo.ack_floor.stream_sequence,
+                    sinfo.state.first_sequence,
+                    cinfo.delivered.stream_sequence,
+                )
+            };
+            assert_eq!(boot, None, "a fresh durable counts nothing at boot");
+            let mut n = 0;
+            while let Some(Ok(m)) = msgs.next().await {
+                let info = m.info().expect("info");
+                assert_eq!(tracker.observe(info.stream_sequence, info.delivered), None);
+                m.double_ack().await.expect("ack confirmed");
+                n += 1;
+                if n == 3 {
+                    break;
+                }
+            }
+            assert_eq!(n, 3, "the fetch must deliver all three published messages");
+        }
+        // Under a loaded box (gate 4, 2026-09-20) a single read of the ack floor right
+        // after the third `double_ack` read < 3 once, standalone it never did: the
+        // server's reply to the ack can precede the consumer state a fresh `info()`
+        // reports. Poll it like the singleton test does — bounded, never sleep-and-hope.
+        let mut floor = 0;
+        for _ in 0..50 {
+            floor = consumer
+                .info()
+                .await
+                .expect("cinfo")
+                .ack_floor
+                .stream_sequence;
+            if floor == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(floor, 3, "acked through 3");
+
+        // Phase 2: "ingest is down" — 20 more arrive; the 5-message cap trims the oldest,
+        // so sequences 4..=18 are gone before anyone consumed them (first retained = 19).
+        for _ in 0..20 {
+            js.publish(pub_subject.clone(), "{}".into())
+                .await
+                .expect("pub")
+                .await
+                .expect("ack");
+        }
+        let sinfo = stream.info().await.expect("sinfo");
+        assert_eq!(sinfo.state.first_sequence, 19);
+        assert_eq!(sinfo.state.last_sequence, 23);
+
+        // Phase 3: ingest "comes back" — the boot check sees the trim exactly.
+        let cinfo = consumer.info().await.expect("cinfo");
+        let (mut tracker, boot) = crate::gap_tracker::GapTracker::at_boot(
+            cinfo.ack_floor.stream_sequence,
+            sinfo.state.first_sequence,
+            cinfo.delivered.stream_sequence,
+        );
+        let boot = boot.expect("the trim past the ack floor is a boot gap");
+        assert_eq!(
+            (boot.first_missing, boot.last_missing, boot.count()),
+            (4, 18, 15)
+        );
+        assert_eq!(boot.kind, crate::gap_tracker::GapKind::BootTrim);
+
+        // Phase 4: in flight — consume 19, then an operator deletes 20; the next first
+        // delivery is 21 and the tracker names the hole.
+        let mut msgs = consumer
+            .fetch()
+            .max_messages(1)
+            .messages()
+            .await
+            .expect("fetch");
+        let m19 = msgs.next().await.expect("19").expect("ok");
+        let i19 = m19.info().expect("info");
+        assert_eq!(i19.stream_sequence, 19);
+        assert_eq!(tracker.observe(19, i19.delivered), None);
+        m19.double_ack().await.expect("ack 19 confirmed");
+        stream
+            .delete_message(20)
+            .await
+            .expect("operator deletes 20");
+        let mut msgs = consumer
+            .fetch()
+            .max_messages(1)
+            .messages()
+            .await
+            .expect("fetch");
+        let m21 = msgs.next().await.expect("21").expect("ok");
+        let i21 = m21.info().expect("info");
+        assert_eq!(
+            i21.stream_sequence, 21,
+            "20 is gone; 21 is the next first delivery"
+        );
+        let gap = tracker
+            .observe(i21.stream_sequence, i21.delivered)
+            .expect("the skipped 20 is a gap");
+        assert_eq!(
+            (gap.first_missing, gap.last_missing, gap.count()),
+            (20, 20, 1)
+        );
+        assert_eq!(gap.kind, crate::gap_tracker::GapKind::Trim);
+        m21.double_ack().await.expect("ack 21 confirmed");
+
+        // The control: the SAME observations with no tracker (the pre-RI-06 loop reads
+        // subject + payload only) count nothing — 16 spans gone, 0 recorded.
+        let counted_without_tracker = 0_u64;
+        assert_eq!(counted_without_tracker, 0);
+        assert_eq!(
+            boot.count() + gap.count(),
+            16,
+            "the tracker counts what the loop could not"
+        );
+
+        let _ = js.delete_stream(&stream_name).await;
     }
 }

@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * PromotionPanel — B1 eval-gated prompt promotion UI.
@@ -6,8 +7,8 @@
  * Calls POST /api/prompts/:name/promote (Next.js route → gateway proxy with
  * per-user JWT). The gateway enforces entitlements:
  *
- *   - Builder $29  → 403 with { error, feature, message, upgrade_url }
- *   - Team $229+   → 200/201 (decision: promoted / blocked_by_eval /
+ *   - Builder  → 403 with { error, feature, message, upgrade_url }
+ *   - Team+   → 200/201 (decision: promoted / blocked_by_eval /
  *                    blocked_by_policy / manual_override)
  *   - Eval gate blocked → 409
  *
@@ -19,6 +20,7 @@
  * fabricated scores is a honesty violation — DO NOT add them.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { SegmentedControl } from "@tracelanedev/ui";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -91,7 +93,7 @@ export function PromotionPanel({
 		setUpgradeUrl("");
 
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/prompts/${encodeURIComponent(promptName)}/promote`,
 				{
 					method: "POST",
@@ -113,7 +115,7 @@ export function PromotionPanel({
 				setStatus("upgrade_required");
 				setUpgradeUrl(body.upgrade_url ?? "/#pricing");
 				setErrorMsg(
-					body.message ?? "Team plan ($229/mo) required to promote prompts.",
+					body.message ?? "Team or above is required to promote prompts.",
 				);
 				return;
 			}
@@ -129,7 +131,11 @@ export function PromotionPanel({
 				setStatus("blocked");
 			} else {
 				setStatus("error");
-				setErrorMsg(`Gateway returned ${res.status}.`);
+				setErrorMsg(
+					(json as unknown as { error?: string }).error ??
+						`Gateway returned ${res.status}.`,
+				);
+				router.refresh();
 			}
 		} catch (err) {
 			setStatus("error");
@@ -156,12 +162,10 @@ export function PromotionPanel({
 					How promotion works
 				</summary>
 				<p className="mt-1.5 leading-relaxed">
-					Today you promote with an{" "}
-					<span className="text-ink">override reason</span>, recorded as a
-					tamper-evident, attributed decision. Automated eval-gating — a passing
-					eval run clears the gate automatically — is on the roadmap; until it
-					ships, an override reason is required. Promoting requires the Team
-					plan.
+					Provide a passing evaluation for this candidate version.
+					Alternatively, supply an explicit override reason to bypass the
+					evaluation gate; this is recorded as a tamper-evident, attributed
+					manual override. Both paths require Team or above.
 				</p>
 			</details>
 
@@ -205,7 +209,7 @@ export function PromotionPanel({
 						value={versionId}
 						onChange={(e) => setVersionId(e.target.value)}
 						placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
+						className="w-full rounded-control border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 						required
 						disabled={isLoading}
 					/>
@@ -219,8 +223,7 @@ export function PromotionPanel({
 					>
 						Eval run ID{" "}
 						<span className="text-ink-3">
-							(for automated eval-gating once it ships — leave blank and use an
-							override reason today)
+							(a passing run for the candidate version in this workspace)
 						</span>
 					</label>
 					<input
@@ -228,8 +231,8 @@ export function PromotionPanel({
 						type="text"
 						value={evalRunId}
 						onChange={(e) => setEvalRunId(e.target.value)}
-						placeholder="Leave blank today — promote with an override reason below"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
+						placeholder="Passing evaluation run ID"
+						className="w-full rounded-control border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
@@ -253,26 +256,27 @@ export function PromotionPanel({
 						value={overrideReason}
 						onChange={(e) => setOverrideReason(e.target.value)}
 						placeholder="e.g. urgent prod hotfix — approved by …"
-						className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus:border-action-line"
+						className="w-full rounded-control border border-line bg-bg px-3 py-1.5 text-xs text-ink placeholder:text-ink-3 focus:border-action-line"
 						disabled={isLoading}
 					/>
 				</div>
 
-				<button
+				<Button
+					variant="bare"
 					type="submit"
 					disabled={isLoading || !versionId.trim()}
-					className="w-full rounded-md bg-action px-4 py-2 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:opacity-40 disabled:cursor-not-allowed"
+					className="w-full rounded-control bg-action px-4 py-2 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:opacity-40 disabled:cursor-not-allowed"
 				>
 					{isLoading
 						? "Promoting…"
 						: overrideReason.trim()
 							? "Override → production"
 							: `Promote ${fromEnv} → production`}
-				</button>
+				</Button>
 			</form>
 
 			{status === "success" && result ? (
-				<div className="rounded-lg border border-ok bg-ok-soft p-3 text-xs space-y-1">
+				<div className="rounded-card border border-ok bg-ok-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-ok-ink">
 						{result.decision === "manual_override"
 							? "Manual override applied"
@@ -289,7 +293,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "blocked" && result ? (
-				<div className="rounded-lg border border-warn bg-warn-soft p-3 text-xs space-y-1">
+				<div className="rounded-card border border-warn bg-warn-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-warn-ink">
 						{result.decision === "blocked_by_eval"
 							? "Blocked by eval gate"
@@ -305,7 +309,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "upgrade_required" ? (
-				<div className="rounded-lg border border-action-line bg-action-soft p-3 text-xs space-y-1">
+				<div className="rounded-card border border-action-line bg-action-soft p-3 text-xs space-y-1">
 					<p className="font-semibold text-action-ink">Team plan required</p>
 					<p className="text-ink-2">{errorMsg}</p>
 					<a
@@ -318,7 +322,7 @@ export function PromotionPanel({
 			) : null}
 
 			{status === "error" ? (
-				<div className="rounded-lg border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
+				<div className="rounded-card border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
 					{errorMsg || "Unexpected failure — check gateway logs."}
 				</div>
 			) : null}

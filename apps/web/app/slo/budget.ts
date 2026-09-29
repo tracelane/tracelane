@@ -56,6 +56,14 @@ export function availabilityTargetForPlanKey(
 }
 
 export interface SloBudget {
+	/**
+	 * Target availability as a fraction, e.g. 0.999 — the raw value `computeSloBudget`
+	 * was called with. Kept alongside `targetPct` so a caller that needs the exact
+	 * contracted figure (`fmtTarget`, B-510 / CX-11) reads the fraction directly
+	 * instead of round-tripping `targetPct / 100`, which reintroduces the float
+	 * noise `* 100` already produced.
+	 */
+	target: number;
 	/** Target availability as a percentage, e.g. 99.9. */
 	targetPct: number;
 	/** Actual availability over the window, e.g. 99.95. */
@@ -93,6 +101,7 @@ export function computeSloBudget(
 		: Number.NEGATIVE_INFINITY;
 	const tone = burnRate >= 2 ? "error" : burnRate >= 1 ? "warn" : "ok";
 	return {
+		target,
 		targetPct: target * 100,
 		availabilityPct: (1 - errorRate) * 100,
 		errorRatePct: errorRate * 100,

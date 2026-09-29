@@ -97,7 +97,7 @@ export function NoApiKeysPanel({ workspaceId }: NoApiKeysPanelProps) {
 				    size-sm exactly; if that primitive gains `asChild`, collapse this. */}
 				<Link
 					href="/settings/api-keys"
-					className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-selected px-3 text-xs font-medium text-selected-on transition-[color,background-color,border-color,opacity,scale] hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring active:scale-[0.98] active:opacity-80"
+					className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-control bg-selected px-3 text-xs font-medium text-selected-on transition-[color,background-color,border-color,opacity,scale] hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring active:scale-[0.98] active:opacity-80"
 				>
 					Create an API key
 				</Link>

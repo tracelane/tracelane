@@ -40,7 +40,7 @@ async function isOnlineEvalsEntitled(): Promise<boolean> {
 
 function OnlineEvalsUpsell() {
 	return (
-		<div className="rounded-lg border border-dashed border-line p-10 text-center space-y-3">
+		<div className="rounded-card border border-dashed border-line p-10 text-center space-y-3">
 			<h3 className="text-sm font-semibold text-ink">
 				Online evals are available on a higher plan
 			</h3>

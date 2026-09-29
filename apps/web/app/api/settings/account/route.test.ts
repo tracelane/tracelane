@@ -27,6 +27,12 @@ vi.mock("@/lib/auth", () => ({
 	invalidateOrgArchivedCache: vi.fn(),
 }));
 
+// Real lock and cross-route races are proved in owner-race.live.test.ts.
+vi.mock("../team/owner-lock", () => ({
+	withOwnerMutation: async (_org: string, work: () => Promise<unknown>) =>
+		work(),
+}));
+
 import { DELETE } from "./route";
 
 type M = {

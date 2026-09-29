@@ -50,6 +50,8 @@ export async function GET(req: NextRequest): Promise<Response> {
 		// OBS-20. Without this the live tail shows a SUPERSET while a user filter is
 		// active — new rows for every user arriving under a chip that says one name.
 		"end_user",
+		"agent",
+		"model_family",
 		"since",
 		"until",
 	]);

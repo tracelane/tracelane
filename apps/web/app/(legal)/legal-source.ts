@@ -1,39 +1,8 @@
 /**
- * PLT-36 — the legal web surface, and the gate that decides whether a legal
- * document is fit to be served at all.
- *
- * ## Why the source is NOT in this tree
- *
- * `docs/legal/*.md` is the canonical text and it is deliberately export-DENIED
- * (`scripts/export/export-deny.txt:52` — "never draft legal text to a public
- * repo"). Copying the text into `apps/web/` would ship an unexecuted legal
- * instrument, carrying `[COMPANY LEGAL ENTITY NAME]`, into the public mirror —
- * which is the exact harm the deny entry and the RESTRICTED classification
- * exist to prevent. So the page reads the canonical file and never mirrors it.
- *
- * In the public export the file is simply absent, the read returns `null`, and
- * the route 404s. Correct by construction in both trees, with no config.
- *
- * ## Fail-CLOSED, twice over
- *
- * `publicationBlockers()` is the gate, and it is the security-shaped kind: it
- * must refuse by default and only ever open on positive evidence. A document is
- * servable ONLY when BOTH of these clear:
- *
- *   1. the `DRAFT — … legal review required` marker is gone, and
- *   2. no `[UPPERCASE PLACEHOLDER]` token remains anywhere in the body.
- *
- * Either one present ⇒ 404. An unreadable or missing file ⇒ 404. An unknown
- * slug ⇒ 404. There is no branch that serves a document the gate did not clear,
- * and no environment variable that relaxes it.
- *
- * ## What is still founder-gated
- *
- * The three tokens are a founder/legal decision, not an engineering one, and
- * this file will not guess them. When `[COMPANY LEGAL ENTITY NAME]`,
- * `[EFFECTIVE DATE]` and `[CONTACT EMAIL]` are filled in `docs/legal/*.md` and
- * the DRAFT marker is struck, all three pages go live on the next build with no
- * code change.
+ * Legal source publication gate. Canonical drafts stay outside the web bundle.
+ * A known document that cannot pass the gate gets an interim page, never its
+ * draft text. Unknown slugs stay unavailable. Publication requires removal of
+ * both the DRAFT marker and every bracketed token after legal review.
  */
 
 import { readFileSync } from "node:fs";
@@ -85,12 +54,12 @@ const LEGAL_DIR = resolve(process.cwd(), "../../docs/legal");
 const DRAFT_MARKER = /DRAFT\s*—.*legal review required/i;
 
 /**
- * Any `[UPPERCASE TOKEN]` left in the body. Deliberately broader than the three
- * tokens we know about today, so a placeholder introduced tomorrow is caught
- * without editing this file. A false positive costs a 404, which is the safe
- * direction; a false negative would publish a blank in a contract.
+ * Any bracketed token, including lowercase, Unicode and multiline placeholders.
+ * Legal source must be free of unresolved brackets before publication. A false
+ * positive keeps the interim page; a false negative could publish a blank in a
+ * contract.
  */
-const PLACEHOLDER = /\[[A-Z][A-Z0-9 _/-]{2,}\]/g;
+const PLACEHOLDER = /\[[^\]]*\]/g;
 
 /** The tokens we know are founder-gated, named for the error message. */
 export const KNOWN_PLACEHOLDERS = [
@@ -103,7 +72,7 @@ export const KNOWN_PLACEHOLDERS = [
  * Every reason this text must NOT be served, most important first. Empty means
  * publishable.
  *
- * Fail-CLOSED: callers treat a non-empty result as "404", and treat an
+ * Fail-CLOSED: callers withhold document text on a non-empty result, and treat an
  * exception or an unreadable source the same way. Never invert this to a
  * "publishable" boolean with a default — a missing check would then read as
  * permission.
@@ -157,7 +126,7 @@ export function readLegalMarkdown(
  *
  * # Errors
  * Fails CLOSED. There is no partial success: a page either has fully approved,
- * placeholder-free text or it does not exist.
+ * placeholder-free text or its body is withheld.
  */
 export function loadPublishableDoc(
 	slug: string,

@@ -1,3 +1,5 @@
+import { fmtCount } from "@/lib/metrics/format";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * ShareLedgerBadge — OBS-48's ledger badge, rendered on the PUBLIC share page
  * (`app/s/[token]/page.tsx`) from the gateway's UNAUTHENTICATED
@@ -36,9 +38,12 @@ export function ShareLedgerBadge({
 }) {
 	if (!chain.chained) {
 		return (
-			<Badge tone="neutral">
-				Not in the audit ledger (SDK/OTLP traces are not ledgered)
-			</Badge>
+			<StatusBadge
+				className="min-w-0 max-w-full whitespace-normal"
+				status="ledger"
+				tone="neutral"
+				label={<>Not in the audit ledger (SDK/OTLP traces are not ledgered)</>}
+			/>
 		);
 	}
 
@@ -47,19 +52,24 @@ export function ShareLedgerBadge({
 	// invent a number). Should not occur in practice since `chained` implies a
 	// seq was assigned, but the type is `number | null` and this file does not
 	// assume the stronger invariant.
-	const seqText = chain.seq !== null ? `#${chain.seq.toLocaleString()}` : "#—";
+	const seqText = chain.seq !== null ? `#${fmtCount(chain.seq)}` : "#—";
 
 	if (!chain.anchored) {
 		return (
-			<span className="inline-flex items-center gap-1.5">
+			<span className="inline-flex max-w-full items-center gap-1.5">
 				{/* DSH-16: the recorder's amber — "this workspace is being recorded",
 				    a second, independent signal beside the green `seal` tone (which
 				    means "verified"). Decorative only; copy is exactly the OBS-48 §2
 				    text above, untouched. */}
 				<span aria-hidden="true" className="recorder-dot" />
-				<Badge tone="seal">
-					Recorded in the audit ledger · seq {seqText} · operator-signed
-				</Badge>
+				<StatusBadge
+					className="min-w-0 max-w-full whitespace-normal"
+					status="ledger"
+					tone="seal"
+					label={
+						<>Recorded in the audit ledger · seq {seqText} · operator-signed</>
+					}
+				/>
 			</span>
 		);
 	}
@@ -67,14 +77,21 @@ export function ShareLedgerBadge({
 	return (
 		<span className="inline-flex flex-wrap items-center gap-1.5">
 			<span aria-hidden="true" className="recorder-dot" />
-			<Badge tone="seal">
-				Recorded in the audit ledger · seq {seqText} · anchored to a public
-				transparency log
-			</Badge>
+			<StatusBadge
+				className="min-w-0 max-w-full whitespace-normal"
+				status="ledger"
+				tone="seal"
+				label={
+					<>
+						Recorded in the audit ledger · seq {seqText} · anchored to a public
+						transparency log
+					</>
+				}
+			/>
 			{rekorEntryId && (
 				<span
 					title={`Rekor v2 log index ${rekorEntryId}. Not a link — Rekor v2 has no per-entry web page, and a plausible-looking URL would resolve the wrong (legacy v1) log.`}
-					className="inline-flex items-center gap-1 rounded-md border border-seal-line bg-seal-soft px-1.5 py-0.5 font-mono text-2xs text-seal-ink"
+					className="inline-flex items-center gap-1 rounded-control border border-seal-line bg-seal-soft px-1.5 py-0.5 font-mono text-2xs text-seal-ink"
 				>
 					logIndex {rekorEntryId}
 				</span>

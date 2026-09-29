@@ -1,2125 +1,1216 @@
 "use client";
+import { fmtCount } from "@/lib/metrics/format";
+import {
+	type AuditKeyContext,
+	AuditWorkflow,
+	platformSummary,
+	workspaceKeyDate,
+} from "./AuditWorkflow";
 
 import {
+	type AuditVerdict,
 	deriveAuditVerdict,
 	humanizeVerdictKind,
 	isAlarm,
 } from "@/app/audit/verdict";
-import { anchoredRecords, auditTrustState } from "@/lib/audit-trust-state";
+import { anchoredRecords } from "@/lib/audit-trust-state";
+import { formatDateTimeUtc, parseUtcMs } from "@/lib/format-date";
 import type { VerifyReport } from "@tracelanedev/audit-verifier";
-import { Button, Card, StatCard, cn } from "@tracelanedev/ui";
-import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button, cn } from "@tracelanedev/ui";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-/** Lazy handle on the audit verifier — see the note in `verify` below for why it is
- * not a static import. Kept at module scope so the click path and the idle warm
- * share one `import()` (which the bundler already memoises). */
-const loadVerifier = () => import("@tracelanedev/audit-verifier");
-
+export interface LedgerRange {
+	total: number;
+	from?: number;
+	to?: number;
+	latest_event_at?: string | null;
+	latest_anchor_at?: string | null;
+}
+export interface AuditWindow {
+	since: string;
+	until: string;
+}
 interface Row {
 	seq: number;
-	event_type: string;
 	event_time: string;
-	/** Who/what emitted the event (e.g. "user1", "system"). */
-	actor?: string;
-	/** The event content the row hash actually covers. For "v2.1" exports this is a
-	 * JSON *string* (the verbatim canonical payload that was hashed); for older
-	 * formats it's the nested payload object. Shown so the hash is meaningful. */
-	payload?: unknown;
+	event_type: string;
 	row_hash: string;
 	prev_hash: string;
-	rekor_entry_id?: string | null;
+	payload?: unknown;
 }
-
-/** Parse the ledger rows, EXCLUDING the per-batch `type:"anchor"` records — those
- * are anchor metadata, not chain events. Including them (the old bug) inflated the
- * event count and rendered a phantom `# — ← —` row that also zeroed the chain head. */
-function parseRows(ndjson: string): Row[] {
-	const rows: Row[] = [];
-	for (const line of ndjson.split(/\r?\n/)) {
-		if (!line.trim()) continue;
-		try {
-			const rec = JSON.parse(line) as Row & { type?: string };
-			if (rec.type === "anchor") continue;
-			if (typeof rec.row_hash !== "string" || rec.row_hash === "") continue;
-			rows.push(rec);
-		} catch {
-			// the verifier surfaces parse errors authoritatively; the viz just skips
-		}
-	}
-	return rows;
-}
-
-const short = (h: string) => (h ? `${h.slice(0, 12)}…` : "—");
-
-/** Server-computed aggregate (matches the gateway `AuditSummary` JSON). Exact for
- * any ledger size — the export row cap does not apply. */
-export interface AuditSummary {
-	total: number;
-	first_event?: string;
-	last_event?: string;
-	by_day: Array<{ day: string; count: number }>;
-	by_type: Array<{ event_type: string; count: number }>;
-}
-
-/** Thousands-grouped integer, deterministic (no locale → no hydration drift). */
-const fmtCount = (n: number) =>
-	n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-
-/** Full unambiguous wall-clock datetime from ISO string (no locale → no hydration
- * drift). Shows "YYYY-MM-DD HH:MM:SS" so midnight timestamps are not confused
- * with relative offsets. */
-function fmtDateTime(iso: string): string {
-	const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/.exec(iso);
-	return m ? `${m[1]} ${m[2]}` : iso;
-}
-
-/** Pretty-print the exact content a row hash covers. v2.1 payloads are JSON
- * strings — parse then re-indent; non-JSON strings show raw; objects stringify. */
-function formatPayload(payload: unknown): string {
-	if (payload == null || payload === "") return "(no payload)";
-	let obj: unknown = payload;
-	if (typeof payload === "string") {
-		try {
-			obj = JSON.parse(payload);
-		} catch {
-			return payload;
-		}
-	}
-	try {
-		return JSON.stringify(obj, null, 2);
-	} catch {
-		return String(payload);
-	}
-}
-
-/** A compact one-line preview of the hashed content for the collapsed row. */
-function payloadPreview(payload: unknown): string {
-	if (payload == null || payload === "") return "";
-	const s = (typeof payload === "string" ? payload : JSON.stringify(payload))
-		.replace(/\s+/g, " ")
-		.trim();
-	return s.length > 60 ? `${s.slice(0, 60)}…` : s;
-}
-
-/** The public Sigstore Rekor v2 log this product anchors to (ADR-062). The docs
- * publish this exact host as "the public log". A logIndex is ONLY meaningful WITH
- * this log id — v2 (`log2025-1`) and the legacy v1 log have independent index
- * spaces, so a bare index quoted without its log is ambiguous/wrong. */
-const PUBLIC_LOG = "log2025-1.rekor.sigstore.dev";
-/** The log's signed checkpoint — the ONE independently-fetchable v2 artifact
- * (tree size + root + the log's signature over them). Rekor v2 is a tiled log with
- * NO per-entry web page (GET-by-index is 501/404), and search.sigstore.dev only
- * searches the legacy v1 log — so we NEVER link a v2 index there. Each root's
- * inclusion proof + this checkpoint travel in the exported evidence and verify
- * OFFLINE against the pinned log key. */
-const CHECKPOINT_URL = `https://${PUBLIC_LOG}/checkpoint`;
-
-/** Rows per page in the chain viz. The whole ledger is already in memory; we slice
- * so a 600-event chain renders ~50 nodes, not 600 — the "super fast" requirement. */
-const PAGE_SIZE = 50;
-/** Max anchor chips shown before the "Show N more" toggle in TrustPanel. */
-const ANCHOR_PREVIEW = 12;
-
-interface AnchorRec {
-	type?: string;
-	anchor_state?: string;
+interface Anchor {
+	type: "anchor";
+	batch_start_seq: number;
+	batch_end_seq: number;
+	anchor_state: string;
+	ed25519?: { pubkey: string };
+	merkle_root: string;
 	rekor?: { log_index?: string };
 }
+const fmt = (n: number) => fmtCount(n);
+const BATCH_PAGE = 8;
+const ROW_PAGE = 50;
+const PUBLIC_LOG = "log2025-1.rekor.sigstore.dev";
+const linkClass =
+	"text-sm font-medium underline underline-offset-4 hover:text-ink";
 
-/** The per-batch `type:"anchor"` records — used only to list Rekor log indices;
- * the verifier does the real cryptographic work over the full bundle. */
-function parseAnchors(ndjson: string): AnchorRec[] {
-	const out: AnchorRec[] = [];
+function parseEvidence(ndjson: string) {
+	const rows: Row[] = [];
+	const anchors: Anchor[] = [];
 	for (const line of ndjson.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		try {
-			const rec = JSON.parse(line) as AnchorRec;
-			if (rec.type === "anchor") out.push(rec);
+			const record = JSON.parse(line);
+			if (record.type === "anchor") anchors.push(record);
+			else if (Number.isSafeInteger(record.seq)) rows.push(record);
 		} catch {
-			// the verifier surfaces parse errors authoritatively; the viz skips
+			/* The verifier reports malformed evidence; never derive a pass here. */
 		}
 	}
-	return out;
+	return { rows, anchors };
 }
-
-/** base64 → bytes (browser). `undefined` on empty/invalid — the verifier then
- * runs chain-only (never a green signature/anchor claim). */
-function b64ToBytes(b64: string): Uint8Array | undefined {
-	if (!b64) return undefined;
+function publicKey(b64?: string) {
 	try {
-		const bin = atob(b64);
-		const out = new Uint8Array(bin.length);
-		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-		return out;
+		return b64 ? Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)) : undefined;
 	} catch {
 		return undefined;
 	}
 }
 
-// ---------------------------------------------------------------------------
-// CopyButton — clipboard affordance for short IDs / keys
-// ---------------------------------------------------------------------------
-function CopyButton({
-	value,
-	label = "Copy",
-}: { value: string; label?: string }) {
-	const [copied, setCopied] = useState(false);
-	const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-	function copy() {
-		navigator.clipboard.writeText(value).then(() => {
-			setCopied(true);
-			if (timerRef.current) clearTimeout(timerRef.current);
-			timerRef.current = setTimeout(() => setCopied(false), 1800);
-		});
+/** Each remedy follows the failing layer; an unknown cause never becomes an accusation. */
+function outcome(verdict: AuditVerdict, report: VerifyReport | null) {
+	const kinds = new Set(report?.errors.map((e) => e.kind));
+	switch (verdict.state) {
+		case "ready":
+			return {
+				title: "Checking this window…",
+				detail:
+					"Recomputing row hashes and checking the available batch proofs in your browser.",
+				next: "The result will apply only to the rows loaded below.",
+			};
+		case "empty":
+			return {
+				title: "No rows to check in this window",
+				detail: "No verification result is available.",
+				next: "Review the window dates or contact support if you expected records here.",
+			};
+		case "chain_broken":
+			if (
+				[
+					"parse_error",
+					"bad_tenant_id",
+					"bad_row_hash_encoding",
+					"v2_1_payload_not_string",
+				].some((k) => kinds.has(k))
+			)
+				return {
+					title: "Evidence could not be verified",
+					detail:
+						"The loaded evidence contains invalid data. This does not establish what happened to the stored ledger.",
+					next: "Ask support to investigate the invalid record identified in the check report.",
+				};
+			return {
+				title: "Record integrity check failed",
+				detail:
+					"A recorded hash, sequence or link does not match in this window. The check cannot determine the cause.",
+				next: "Treat a repeated mismatch as a potential integrity incident. Ask support to investigate the first failing sequence. Nothing in the app can repair a broken chain.",
+			};
+		case "stripped":
+			return {
+				title: "A public proof is missing",
+				detail:
+					"A batch claims public anchoring, but its proof is absent from this evidence.",
+				next: "Ask support to investigate the missing batch proof. Do not treat that batch as publicly verified.",
+			};
+		case "signature_failed":
+			if (kinds.has("platform_key_after_workspace_key"))
+				return {
+					title: "Platform key used after workspace signing began",
+					detail:
+						"A platform-signed batch follows a workspace-signed batch. This violates the signing-key trust order.",
+					next: "Ask support to investigate the later platform-signed batch. Do not treat it as a trusted continuation of your workspace ledger.",
+				};
+			if (
+				verdict.reasons.every(
+					(k) => k === "anchor_rows_missing" || k === "unrooted_window",
+				)
+			)
+				return {
+					title: "The proof needs rows outside this window",
+					detail:
+						"A batch refers to rows that were not loaded. Its proof cannot be checked here.",
+					next: "Request evidence covering the full batch range. A missing row in this view is not evidence that the stored row changed.",
+				};
+			if (kinds.has("untrusted_tenant_key") || kinds.has("bad_tenant_pubkey"))
+				return {
+					title: "Batch signing key does not match",
+					detail:
+						"A batch’s signing key could not be matched to this workspace’s trusted key.",
+					next: "Ask support to confirm the workspace signing key and its history. Do not replace your trusted key with a key taken from the evidence.",
+				};
+			if (kinds.has("merkle_root_mismatch") || kinds.has("bad_merkle_root"))
+				return {
+					title: "Batch fingerprint check failed",
+					detail:
+						"A batch fingerprint is invalid or does not match the row hashes in this window.",
+					next: "Ask support to compare the batch record with its covered rows. Keep the original report for the investigation.",
+				};
+			if (kinds.has("bad_attestation_sig") || kinds.has("attestation_invalid"))
+				return {
+					title: "Batch signature check failed",
+					detail:
+						"A batch’s signed attestation did not verify against the trusted workspace key.",
+					next: "Ask support to investigate the batch signature. Do not rely on that attestation until the mismatch is explained.",
+				};
+			return {
+				title: "Public proof check failed",
+				detail:
+					"A public-log entry, inclusion proof or signed checkpoint did not verify.",
+				next: "Ask support to investigate the batch’s public proof. A passing row-hash check does not make this proof valid.",
+			};
+		case "anchors_unverifiable":
+			return {
+				title: "A trusted signing key is missing",
+				detail:
+					"Batch records are present, but their signatures and public proofs could not be checked.",
+				next: "Ask your workspace administrator or support to check access to the trusted audit public key, then reload. Do not take the key from the evidence being checked.",
+			};
+		case "unrooted_window":
+			return {
+				title: "This window has no verified starting point",
+				detail:
+					"The first ledger row is outside this view, and no verified public anchor roots the loaded rows. Their hashes have not been established here.",
+				next: "Request a window containing the chain’s first row or a complete publicly anchored batch. Reloading the same bytes will not add that evidence.",
+			};
+		case "anchor_hole":
+			return {
+				title: "There is a gap in batch coverage",
+				detail: `${fmt(verdict.rows)} loaded rows fall outside every recorded batch before a later batch. Public coverage is not established for those rows.`,
+				next: "Reload to check whether anchoring has caught up. If the gap remains, send support the report so they can investigate the uncovered range.",
+			};
+		case "chain_only":
+			return {
+				title: "Hashes match. Public proof is not established.",
+				detail:
+					"The loaded chain is internally consistent, but this check verified no public anchor.",
+				next: "Reload later to check for public proofs. If you need evidence now, ask support to investigate anchoring for this window.",
+			};
+		case "verified":
+		case "verified_windowed":
+			return {
+				title: report?.rows_unanchored_tail
+					? "Hashes match. Some public proof is pending."
+					: verdict.state === "verified_windowed"
+						? "The anchored range passed"
+						: "This window passed",
+				detail:
+					"The checked row hashes match, and the included public proofs verified against the trusted workspace key.",
+				next: "Save this check report if you need a record of the result. Rows outside this check have no verdict here.",
+			};
 	}
-
-	return (
-		<button
-			type="button"
-			onClick={copy}
-			title={`Copy ${label}`}
-			aria-label={copied ? "Copied!" : `Copy ${label}`}
-			className="rounded px-1 py-0.5 text-2xs text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-		>
-			{copied ? "✓" : "⎘"}
-		</button>
-	);
 }
 
-// ---------------------------------------------------------------------------
-// LogIndexChip — a coordinate in log2025-1 (NOT a link: Rekor v2 has no per-entry
-// web viewer, and search.sigstore.dev resolves the WRONG log — the legacy v1). The
-// index is verified offline from the exported inclusion proof + checkpoint.
-// ---------------------------------------------------------------------------
-function LogIndexChip({ index }: { index: string }) {
-	return (
-		<span
-			title={`Index ${index} in Sigstore Rekor v2 (${PUBLIC_LOG}). Verified offline from your evidence bundle's inclusion proof + signed checkpoint — Rekor v2 is a tiled log with no per-entry web page.`}
-			className="inline-flex items-center gap-1 rounded-md border border-seal-line bg-seal-soft px-1.5 py-0.5 font-mono text-2xs text-seal-ink"
-		>
-			logIndex {index}
-		</span>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// CompactColumnChart — vertical bar chart (SQRT scale, weekly agg, click filter)
-// ---------------------------------------------------------------------------
-
-/** ISO week start (Monday) for a given day string "YYYY-MM-DD". */
-function weekStart(day: string): string {
-	const d = new Date(`${day}T00:00:00Z`);
-	const dow = d.getUTCDay(); // 0=Sun
-	const diff = dow === 0 ? -6 : 1 - dow;
-	d.setUTCDate(d.getUTCDate() + diff);
-	return d.toISOString().slice(0, 10);
-}
-
-function aggregateToWeeks(
-	byDay: Array<{ day: string; count: number }>,
-): Array<{ day: string; count: number; label: string }> {
-	const weeks = new Map<
-		string,
-		{ day: string; count: number; label: string }
-	>();
-	for (const { day, count } of byDay) {
-		const ws = weekStart(day);
-		const existing = weeks.get(ws);
-		if (existing) {
-			existing.count += count;
-		} else {
-			weeks.set(ws, { day: ws, count, label: `w/o ${ws}` });
-		}
-	}
-	return [...weeks.values()].sort((a, b) => (a.day < b.day ? -1 : 1));
-}
-
-/** Compact inline column chart for event volume. One slim vertical bar per
- * day (or per ISO week when window > 30 days). SQRT scale makes
- * 50 vs 200 vs 300k all distinguishable. Click a column to narrow the window
- * to that day (drives URL so the server refetches). Bars use the neutral chart
- * tokens — supporting context, never a coloured series. The previous wording
- * ("no purple/accent") named a hue the palette no longer holds; the rule it was
- * reaching for is the durable one: on this page colour means VERIFIED or FAILED,
- * so a volume bar gets none. */
-function CompactColumnChart({
-	byDay,
+function Pager({
+	page,
+	pages,
+	onChange,
+	label,
 }: {
-	byDay: Array<{ day: string; count: number }>;
+	page: number;
+	pages: number;
+	onChange: (n: number) => void;
+	label: string;
 }) {
-	const useWeeks = byDay.length > 30;
-	const buckets = useWeeks
-		? aggregateToWeeks(byDay)
-		: byDay.map((d) => ({ ...d, label: d.day }));
-
-	if (buckets.length === 0) return null;
-
-	const maxCount = Math.max(...buckets.map((b) => b.count), 1);
-	const maxH = 48; // px
-
+	if (pages <= 1) return null;
 	return (
-		<details className="group mt-3">
-			<summary className="flex cursor-pointer list-none items-center gap-1.5 t-metric-label hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
-				<span aria-hidden className="transition-transform group-open:rotate-90">
-					▸
-				</span>
-				Volume detail
-				{useWeeks && (
-					<span className="normal-case font-normal text-ink-3">(weekly)</span>
-				)}
-			</summary>
-
-			<div
-				className="mt-2 flex items-end gap-px overflow-x-auto pb-1"
-				style={{ minHeight: `${maxH + 16}px` }}
-				aria-label="Events per day chart"
+		<nav
+			aria-label={label}
+			className="mt-4 flex items-center justify-between gap-3 text-xs text-ink-2"
+		>
+			<Button
+				variant="secondary"
+				size="sm"
+				disabled={page === 0}
+				onClick={() => onChange(page - 1)}
 			>
-				{buckets.map((b) => {
-					const h = Math.max(
-						Math.round((Math.sqrt(b.count) / Math.sqrt(maxCount)) * maxH),
-						2,
-					);
-					return (
-						<div
-							key={b.day}
-							title={`${b.label}: ${fmtCount(b.count)} events (√-scaled)`}
-							// `--chart-secondary`, the declared "de-emphasised data mark" role.
-							// It was `--surface-3`, a SURFACE token: on the light card that is
-							// #ebebe9 against a #ffffff ground, so the columns were within a
-							// few values of the card they sat on and the chart read as empty.
-							// A data mark takes a chart role (P0.11); a surface role is for
-							// the thing behind it.
-							className="shrink-0 rounded-sm bg-chart-secondary"
-							style={{ width: "8px", height: `${h}px` }}
-						>
-							<span className="sr-only">
-								{b.label}: {fmtCount(b.count)} events
-							</span>
-						</div>
-					);
-				})}
-			</div>
-			<p className="mt-1 text-2xs text-ink-3">
-				One bar per {useWeeks ? "week" : "day"} · √-scaled. This is the complete
-				chain from genesis, so it is not date-filtered.
-			</p>
-		</details>
+				Previous
+			</Button>
+			<span>
+				Page {page + 1} of {pages}
+			</span>
+			<Button
+				variant="secondary"
+				size="sm"
+				disabled={page + 1 >= pages}
+				onClick={() => onChange(page + 1)}
+			>
+				Next
+			</Button>
+		</nav>
 	);
 }
 
-// ---------------------------------------------------------------------------
-// NegativeScenarioPanel — explains what a failed verification looks like.
-// Collapsible so it doesn't dominate the page but is always accessible.
-// ---------------------------------------------------------------------------
-function NegativeScenarioPanel() {
-	return (
-		<details className="group">
-			{/*
-			 * RADIUS RULE APPLIED THROUGHOUT THIS FILE, stated once here: a panel that
-			 * sits on the CANVAS is a card and takes `--radius-card` via
-			 * `.surface-card`; a panel NESTED INSIDE a card stays on the 8px control
-			 * radius. Concentric corners only look right when the inner one is
-			 * smaller, so a `p-3` claim tile inside an 18px card must not also be 18px.
-			 * This summary and the body below it are both on the canvas.
-			 */}
-			<summary className="surface-card flex cursor-pointer list-none items-center gap-2 border border-line bg-surface px-4 py-3 text-sm font-medium text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
-				<span
-					aria-hidden
-					className="shrink-0 text-ink-3 transition-transform group-open:rotate-90"
-				>
-					▸
-				</span>
-				What does a failed verification look like?
-			</summary>
-			<div className="surface-card mt-2 border border-line bg-surface p-5">
-				<p className="max-w-2xl text-sm text-ink-2">
-					The verifier runs entirely in your browser — nothing is trusted from
-					our servers. If any event in the ledger is tampered with or reordered
-					after recording, the verifier catches it:
-				</p>
-				<ul className="mt-3 space-y-3">
-					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
-						<div>
-							<span className="text-sm font-medium text-ink">
-								Row hash mismatch.
-							</span>{" "}
-							<span className="text-sm text-ink-2">
-								Recomputing a row&apos;s SHA-256 hash over its payload will not
-								match the stored hash. The verifier highlights that row in{" "}
-								<span className="font-medium text-danger-ink">loud red</span>{" "}
-								with the exact <code className="font-mono text-ink-2">seq</code>{" "}
-								number.
-							</span>
-						</div>
-					</li>
-					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
-						<div>
-							<span className="text-sm font-medium text-ink">Chain break.</span>{" "}
-							<span className="text-sm text-ink-2">
-								Every row&apos;s{" "}
-								<code className="font-mono text-ink-2">prev_hash</code> must
-								equal the previous row&apos;s{" "}
-								<code className="font-mono text-ink-2">row_hash</code>. A
-								tampered or reordered row breaks this link at that point — and
-								at every subsequent row.
-							</span>
-						</div>
-					</li>
-					<li className="flex gap-3">
-						<span className="mt-0.5 shrink-0 font-bold text-danger-ink">✗</span>
-						<div>
-							<span className="text-sm font-medium text-ink">
-								Verdict: Integrity check failed.
-							</span>{" "}
-							<span className="text-sm text-ink-2">
-								The &ldquo;Verify integrity&rdquo; result shows{" "}
-								<span className="font-medium text-danger-ink">red</span>, not
-								green — with the first broken seq number and the reason (hash
-								mismatch, chain break, or missing anchor proof).
-							</span>
-						</div>
-					</li>
-				</ul>
-				<p className="mt-3 text-xs text-ink-3">
-					<span className="font-medium text-ink-2">
-						The word &ldquo;evident&rdquo; is deliberate.
-					</span>{" "}
-					This is tamper-evident protection: a change is visible to any
-					independent verifier who recomputes the hashes offline. Altering an
-					event silently is not possible; getting away with it undetected is
-					what the chain makes hard. The verifier code is open-source and runs
-					locally — you do not need to trust our read-out.
-				</p>
-			</div>
-		</details>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// AboutLedger — self-documenting panel: scope, types, span, histogram
-// ---------------------------------------------------------------------------
-function AboutLedger({
-	total,
-	loadedCount,
-	eventTypeCounts,
-	byDay,
-	anchoredCount,
-	serverTotal,
-	loadCap,
-}: {
-	total: number;
-	loadedCount: number;
-	eventTypeCounts: Array<[string, number]>;
-	byDay: Array<{ day: string; count: number }>;
-	anchoredCount: number;
-	/** True when `total` is the gateway's exact window count (paid export path).
-	 * False on the free self-verify path, where `total` is a CLIENT count over the
-	 * capped fetch — used only for the honest "capped load" note below. */
-	serverTotal: boolean;
-	/** The self-verify fetch cap (rows) — for the honest free-path label. */
-	loadCap: number;
-}) {
-	// On the free path a full-cap load means the ledger may be larger than shown.
-	const cappedLoad = !serverTotal && loadedCount >= loadCap;
-	return (
-		<Card className="bg-surface p-5">
-			<div className="max-w-3xl">
-				<h2 className="text-sm font-semibold text-ink">About this ledger</h2>
-				<p className="mt-1 text-sm text-ink-2">
-					An <strong>append-only, tamper-evident</strong> record of what the
-					gateway did — every proxied request and every guardrail / eval verdict
-					— so you can prove to an auditor exactly what ran and that the record
-					was not altered. It covers <strong>gateway-proxied traffic</strong>
-					{"; full-fidelity spans sent via the SDK / OTLP live in "}
-					<Link
-						href="/traces"
-						className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-					>
-						Traces
-					</Link>{" "}
-					and are not part of this chain.
-				</p>
-			</div>
-
-			{/* Stat tiles — the two that PROVE something about the ledger: how much
-			    is publicly anchored, and that it never expires. (The confusing
-			    "First–last event (loaded)" and a redundant event count were removed
-			    — the event count already appears in the verify panel + chain header.) */}
-			{/* P0.17: one column below `sm`. Both tiles carry a full sentence of
-			    `sub` copy, which at ~160px wide wrapped to five lines each. */}
-			<div className="mt-4 grid grid-cols-1 gap-3 border-t border-line pt-3 sm:grid-cols-2">
-				<StatCard
-					label="Public anchoring"
-					value={
-						anchoredCount > 0 ? (
-							<span className="tabular-nums">{anchoredCount} anchored</span>
-						) : (
-							"best-effort"
-						)
-					}
-					tone={anchoredCount > 0 ? "ok" : "default"}
-					sub="batches within the events shown · Sigstore Rekor v2"
-					hint="Events are grouped into fixed-size batches (about 100 events each) as they accrue; each batch's Merkle root is anchored once to Sigstore's public transparency log, starting from your ledger's genesis. This count is the batches falling within the events loaded here — the full ledger has more, and every batch's proof travels in the export."
-				/>
-				<StatCard
-					label="Retention"
-					value="Append-only"
-					sub="no automatic expiry"
-					hint="The audit ledger is append-only — it has no TTL and outlives the trace-retention window"
-				/>
-			</div>
-
-			{/* This block used to render `retentionDays` — the plan's retention
-			    number — as "trace data expires after N days on your plan". That
-			    asserted a per-plan control that does not exist: `retention_days`
-			    is computed from the plan catalog and consumed by renderers only,
-			    and NO delete, reject or limit path reads it. Traces expire on one
-			    window for every tenant, the `spans` TTL, verified on prod as
-			    `toDate(start_time) + toIntervalDay(365)`. It was the only
-			    retention figure a customer ever saw, which is what made it worse
-			    than having none. */}
-			<p className="mt-2 text-2xs text-ink-3">
-				Full-fidelity trace data is kept up to 365 days; this evidence ledger
-				does not expire at all.
-			</p>
-
-			{/* Volume detail — demoted inside <details> so it doesn't fight the
-			    trust panel for attention. The About panel's message is TRUST. */}
-			<CompactColumnChart byDay={byDay} />
-
-			{eventTypeCounts.length > 0 && (
-				<div className="mt-3">
-					<div className="mb-1 t-metric-label">
-						Event types recorded (this window)
-					</div>
-					<div className="flex flex-wrap gap-1.5">
-						{eventTypeCounts.map(([t, c]) => (
-							<span
-								key={t}
-								className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-0.5 text-2xs"
-							>
-								<span className="font-mono text-ink-2">{t}</span>
-								<span className="tabular-nums font-medium text-ink">
-									{fmtCount(c)}
-								</span>
-							</span>
-						))}
-					</div>
-				</div>
-			)}
-
-			{total > loadedCount && (
-				<p className="mt-3 text-2xs text-ink-3">
-					The chain view below shows the first{" "}
-					<span className="tabular-nums">{fmtCount(loadedCount)}</span> of{" "}
-					<span className="tabular-nums">{fmtCount(total)}</span> events, from
-					your chain&apos;s genesis — enough to verify integrity in the browser.
-					The <strong>complete</strong> ledger is the export below.
-				</p>
-			)}
-
-			{/* Free-path truncation: a full-cap load means the ledger MAY hold more
-			    than shown. The paid-path `total > loadedCount` note can't fire here
-			    (total === loadedCount by construction), so disclose it explicitly. */}
-			{cappedLoad && (
-				<p className="mt-3 text-2xs text-ink-3">
-					Loaded the most recent{" "}
-					<span className="tabular-nums">{fmtCount(loadCap)}</span> events to
-					verify in your browser. Your ledger may hold more — this is a fetch
-					limit, not the full total. Narrow the range, or use the{" "}
-					<span className="font-mono">tlane verify</span> CLI, for the complete
-					chain.
-				</p>
-			)}
-		</Card>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// TrustPanel — the ONE dominant integrity surface (ADR-062)
-// Combines: anchor status + verify CTA + post-verify verdict + claim breakdown.
-// The ONLY primary CTA on the page, and the ONLY large green element is
-// "Verified". ("Lava" was the retired accent this line used to name — the primary
-// button is solid graphite now, so the rationing is about WEIGHT, not hue: one
-// filled button, one green verdict, everything else quiet.)
-// ---------------------------------------------------------------------------
-function TrustPanel({
-	anchoredIndices,
-	hasAnchorRecords,
-	report,
-	verifying,
-	onVerify,
-	rowCount,
-	windowTotal,
-	chainHead,
-	keyId,
+function EvidenceExport({
+	window,
 	tenantPubkeyB64,
-	anchorRecords,
-	isTruncated = false,
+	canExport,
+	platformPubkeyB64,
+	workspaceKeySinceSeq,
 }: {
-	anchoredIndices: string[];
-	hasAnchorRecords: boolean;
-	report: VerifyReport | null;
-	verifying: boolean;
-	onVerify: () => void;
-	rowCount: number;
-	/** EXACT total events in the window — so "Events" reads "Showing N of {total}"
-	 * and the loaded render-cap never reads as the whole ledger. */
-	windowTotal: number;
-	chainHead: string;
-	keyId: string;
+	window?: AuditWindow;
 	tenantPubkeyB64?: string;
-	anchorRecords: AnchorRec[];
-	/** The visible rows are a subset of the full ledger — the chain head shown is
-	 * the loaded page's tip, not the ledger tip (audit #10). */
-	isTruncated?: boolean;
+	canExport: boolean;
+	platformPubkeyB64?: string;
+	workspaceKeySinceSeq?: number;
 }) {
-	// ONE verdict drives the banner, the alarm styling, and the claim cards — so
-	// the headline can never be greener than the details (the green-while-broken
-	// bug: the old `verified` ignored `signatures_valid`). See app/audit/verdict.ts.
-	const verdict = deriveAuditVerdict(report);
-	const verified = verdict.state === "verified";
-	const stripped = verdict.state === "stripped";
-	const alarm = isAlarm(verdict);
-	// Collapsed by default: show first ANCHOR_PREVIEW chips only.
-	const [showAllAnchors, setShowAllAnchors] = useState(false);
-
+	const [since, setSince] = useState("");
+	const [until, setUntil] = useState(window?.until.slice(0, 10) ?? "");
+	const valid = Boolean(since && until && since <= until);
+	function download() {
+		if (!valid) return;
+		const params = new URLSearchParams({
+			since: `${since}T00:00:00Z`,
+			until: `${until}T23:59:59.999Z`,
+		});
+		globalThis.location.href = `/api/audit/export?${params}`;
+	}
 	return (
-		<Card
-			provenance={!alarm}
-			className={cn("p-5", alarm && "border border-danger/50 bg-danger-soft")}
-		>
-			{/* ── Status indicator ─────────────────────────────────────────── */}
-			{/* Column on narrow (the CTA sits BELOW the explainer, full-width, so the
-			    explainer never squeezes to one word per line); row from sm up. */}
-			<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between sm:gap-x-6">
-				<div className="flex-1 min-w-0">
-					{/* Pre-verify: neutral "ready" state */}
-					{verdict.state === "ready" && (
-						<div className="flex items-start gap-3">
-							<span aria-hidden className="mt-0.5 text-xl text-ink-3 shrink-0">
-								◆
-							</span>
-							<div>
-								<div className="text-base font-semibold text-ink">
-									Ready to verify
-								</div>
-								<p className="mt-0.5 text-sm text-ink-2">
-									<strong>What this does:</strong> re-hashes every event and
-									re-checks each link to the one before it, starting from your
-									chain&apos;s genesis — proving the events are intact and in
-									order (any change would break a hash). It runs entirely{" "}
-									<strong>in your browser</strong> over the ledger (SHA-256,
-									domain-separated) — nothing is trusted from our server, so a
-									green result is one you reproduced yourself.
-								</p>
-							</div>
+		<details className="surface-card p-5">
+			<summary className="cursor-pointer text-sm font-semibold">
+				Export evidence{" "}
+				<span className="ml-2 text-xs font-normal text-ink-3">Enterprise</span>
+			</summary>
+			<div className="mt-4 space-y-4 text-sm text-ink-2">
+				<p>
+					Viewing and checking the ledger is included on every plan. The
+					Article-12 bulk evidence export requires Enterprise.
+				</p>
+				{canExport ? (
+					<>
+						<p>
+							Select the UTC dates to download. This streams rows and batch
+							records for those dates; it does not verify the download. A date
+							boundary can exclude rows needed by a batch proof.
+						</p>
+						<div className="flex flex-wrap items-end gap-3">
+							<label className="min-w-0">
+								From (UTC)
+								<input
+									aria-label="Export from date"
+									type="date"
+									required
+									value={since}
+									onChange={(e) => setSince(e.target.value)}
+									className="mt-1 block w-full rounded-control border border-line bg-surface px-3 py-2 text-ink"
+								/>
+							</label>
+							<label className="min-w-0">
+								Through (UTC)
+								<input
+									aria-label="Export through date"
+									type="date"
+									required
+									value={until}
+									onChange={(e) => setUntil(e.target.value)}
+									className="mt-1 block w-full rounded-control border border-line bg-surface px-3 py-2 text-ink"
+								/>
+							</label>
+							<Button variant="secondary" disabled={!valid} onClick={download}>
+								Download selected dates (NDJSON)
+							</Button>
 						</div>
-					)}
-
-					{/* GREEN: chain + signatures + ≥1 public anchor all verified. */}
-					{verdict.state === "verified" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-seal-ink shrink-0 font-bold"
-							>
-								✓
-							</span>
-							<div>
-								<div className="text-xl font-bold text-seal-ink">Verified</div>
-								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
-									Hash chain intact · {verdict.rows} rows · off-platform
-									reproducible. Signed by your key, and {verdict.anchors} root
-									{verdict.anchors === 1 ? "" : "s"} anchored in Sigstore&apos;s{" "}
-									<span className="font-mono">{PUBLIC_LOG}</span> append-only
-									log, checkpoint verified.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* GREEN (ADR-070): windowed verify — genesis predates the retention
-					    window, so the chain is rooted at a public Rekor anchor and verified
-					    from that seq to the tip. Honest scope: earlier rows are unverified. */}
-					{verdict.state === "verified_windowed" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-seal-ink shrink-0 font-bold"
-							>
-								✓
-							</span>
-							<div>
-								<div className="text-xl font-bold text-seal-ink">Verified</div>
-								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
-									Hash chain intact from seq {verdict.fromSeq} to the latest
-									entry, rooted at {verdict.anchors} public Rekor anchor
-									{verdict.anchors === 1 ? "" : "s"} (Sigstore{" "}
-									<span className="font-mono">{PUBLIC_LOG}</span>, checkpoint
-									verified). Earlier entries predate your retention window — run{" "}
-									<span className="font-mono">tlane verify</span> over the full
-									export to verify from genesis.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* GREEN (qualified): chain intact + signed, but no public anchor fell
-					    inside this loaded view — still tamper-evident, just not anchored here. */}
-					{verdict.state === "chain_only" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-seal-ink shrink-0 font-bold"
-							>
-								✓
-							</span>
-							<div>
-								<div className="text-xl font-bold text-seal-ink">
-									Chain verified
-								</div>
-								<p className="mt-0.5 text-sm text-seal-ink/80 tabular-nums">
-									Hash chain intact · {verdict.rows} rows · off-platform
-									reproducible, signed by your key. No public anchor fell inside
-									this view — run{" "}
-									<span className="font-mono">tlane verify</span> over the full
-									export for the public-log proofs.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* NEUTRAL: no rows in this view — nothing to verify. Not green
-					    (verifying zero rows is not a pass) and not an alarm. */}
-					{verdict.state === "empty" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-seal-ink/50 shrink-0 font-bold"
-							>
-								—
-							</span>
-							<div>
-								<div className="text-xl font-bold text-seal-ink/70">
-									Nothing to verify
-								</div>
-								<p className="mt-0.5 text-sm text-seal-ink/60">
-									This view has no audit entries yet — there is nothing to
-									verify. Entries appear here as your workspace records events.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* RED: broken hash chain. */}
-					{verdict.state === "chain_broken" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
-							>
-								✗
-							</span>
-							<div>
-								<div className="text-xl font-bold text-danger-ink">
-									Integrity check failed
-								</div>
-								<p className="mt-0.5 text-sm text-danger-ink/80">
-									The hash chain is broken
-									{verdict.firstSeq != null
-										? ` at seq ${verdict.firstSeq}`
-										: ""}{" "}
-									— see the chain view below.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* RED (ADR-070): a windowed view with no public anchor inside it —
-					    nothing publicly trusted roots the loaded rows. */}
-					{/* INDETERMINATE (R53) — NOT an alarm. Measured on prod 2026-08-15: at
-					    ?limit=10 the coverage filter dropped all 161 of a4037bef's anchors,
-					    trust_established went false, and this panel told the operator their
-					    fully intact ledger had FAILED verification. Neutral tokens and a ◇,
-					    never danger-ink and a ✗ — the styling WAS the accusation. */}
-					{verdict.state === "unrooted_window" && (
-						<div className="flex items-start gap-3">
-							<span aria-hidden className="mt-0.5 text-2xl text-ink-3 shrink-0">
-								◇
-							</span>
-							<div>
-								<div className="text-xl font-bold text-ink">
-									Not verifiable in this view
-								</div>
-								<p className="mt-0.5 text-sm text-ink-2">
-									<strong>Nothing is wrong with your ledger</strong> — this view
-									simply has no public Rekor anchor inside it to verify against,
-									because it starts after your chain&apos;s genesis or loads too
-									few rows to contain a whole anchored batch. Widen the window,
-									or verify the complete export with{" "}
-									<code className="font-mono text-ink">tlane verify</code>,
-									which checks every anchor.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* INDETERMINATE (R53) — anchors exist but there was no trusted key to
-					    check them with. Split out of `signature_failed`: the 2026-08-07 P0
-					    kept it out of GREEN, and it stays out of green; what it must not be
-					    is an accusation. */}
-					{verdict.state === "anchors_unverifiable" && (
-						<div className="flex items-start gap-3">
-							<span aria-hidden className="mt-0.5 text-2xl text-ink-3 shrink-0">
-								◇
-							</span>
-							<div>
-								<div className="text-xl font-bold text-ink">
-									Anchors not checked — no verification key
-								</div>
-								<p className="mt-0.5 text-sm text-ink-2">
-									<strong>This is not a verification failure.</strong>{" "}
-									<span className="tabular-nums">{verdict.anchors}</span> anchor
-									{verdict.anchors === 1 ? "" : "s"} in this view were skipped
-									because your workspace has no per-workspace signing key to
-									check them against, so their inclusion proofs were neither
-									confirmed nor rejected. A per-workspace key is issued on every
-									plan with the first recorded batch.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* RED: a batch claims public anchoring but its proof is missing. */}
-					{verdict.state === "stripped" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
-							>
-								✗
-							</span>
-							<div>
-								<div className="text-xl font-bold text-danger-ink">
-									Anchor proof missing
-								</div>
-								<p className="mt-0.5 text-sm text-danger-ink/80">
-									A batch claims to be publicly anchored but its proof is absent
-									— a possible strip or downgrade.
-								</p>
-							</div>
-						</div>
-					)}
-
-					{/* RED: chain intact, but a real public-anchor check failed. */}
-					{verdict.state === "signature_failed" && (
-						<div className="flex items-start gap-3">
-							<span
-								aria-hidden
-								className="mt-0.5 text-2xl text-danger-ink shrink-0 font-bold"
-							>
-								✗
-							</span>
-							<div>
-								<div className="text-xl font-bold text-danger-ink">
-									Anchor verification failed
-								</div>
-								<p className="mt-0.5 text-sm text-danger-ink/80">
-									The hash chain is intact, but a public-anchor check did not
-									pass: {verdict.reasons.map(humanizeVerdictKind).join("; ")}.
-								</p>
-							</div>
-						</div>
-					)}
-				</div>
-
-				{/* The SINGLE primary CTA on this page — Verify integrity (full-width on
-				    narrow). Solid graphite; there is no accent colour to spend here. */}
-				<div className="shrink-0">
-					<Button
-						variant="primary"
-						onClick={onVerify}
-						disabled={verifying || rowCount === 0}
-						// className carries LAYOUT ONLY. It used to re-add `bg-surface-inverse
-						// text-ink-inverse`, which twMerge lets win over the variant — putting back,
-						// on top of the fix, the exact defect Button.tsx documents fixing: in DARK
-						// `--surface-inverse` is #0d0e10, the PAGE GROUND, so the primary CTA was a
-						// 1.07:1 rectangle on its own card. The variant's `bg-selected
-						// text-selected-on` is 17.93:1 light / 17.71:1 dark.
-						className="w-full sm:w-auto"
-					>
-						{verifying ? "Verifying…" : "Verify integrity"}
-					</Button>
-				</div>
-			</div>
-
-			{/* ── Anchor status line — THREE states, keyed on `anchoredIndices`
-			     (R48's single "publicly anchored" predicate), never on
-			     `hasAnchorRecords`. An anchor RECORD is written for every SIGNED
-			     batch, anchored or not, so record-presence claims public anchoring
-			     for batches that reached no log — which is what this comment used
-			     to describe and what R43 removed. `hasAnchorRecords` now selects
-			     only between "signed, not anchored" and "nothing yet".
-			     The Playwright e2e test checks the full text "Publicly anchored
-			     (Sigstore Rekor v2)" on the anchored fixture. */}
-			{/* What-to-do-next — shown ONLY on a real failure (alarm). The banner says
-			    WHAT broke; a user also needs to know it is not their config and what the
-			    remediation path is. */}
-			{alarm && (
-				<div className="mt-4 rounded-lg border border-danger/40 bg-danger-soft p-4">
-					<div className="text-xs font-semibold text-ink">
-						What this means &amp; what to do next
-					</div>
-					<ol className="mt-1.5 list-decimal space-y-1.5 pl-4 text-xs text-ink-2">
-						<li>
-							This is the check working, not a product bug: the verifier ran in
-							your browser and the ledger it saw does <strong>not</strong> match
-							its own hashes. Something altered the events after they were
-							recorded — most often the exported file was edited or truncated
-							after download.
-						</li>
-						<li>
-							Re-download a fresh copy from{" "}
-							<strong>Download the complete ledger</strong> below and verify
-							again. A clean export that still fails points at the stored
-							ledger, not your file.
-						</li>
-						<li>
-							If a fresh export still fails, treat it as a potential integrity
-							incident and{" "}
-							<a
-								href="/support"
-								className="font-medium text-danger-ink underline-offset-2 hover:underline"
-							>
-								contact Tracelane support
-							</a>{" "}
-							with the first failing <code className="font-mono">seq</code>{" "}
-							shown below and your export attached. Nothing in the app can
-							&ldquo;fix&rdquo; a broken chain — that is the point of
-							tamper-evidence.
-						</li>
-					</ol>
-				</div>
-			)}
-
-			<div className="mt-4 space-y-2 border-t border-line pt-3">
-				{/* Status line — wraps cleanly on narrow (no ml-auto orphaning). */}
-				<div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-					{/* R43. THREE states here too, and the middle one did not exist.
-					    This read `hasAnchorRecords ? "Publicly anchored" : "Not yet
-					    anchored — begins with your first gateway-proxied batch"`, but an
-					    anchor RECORD is written for every SIGNED batch, anchored or not
-					    (anchor_task persists the ADR-062 bundle on `is_signed()`, and
-					    `anchor_state` may be "unanchored"). So after R21 gave the
-					    sub-threshold tenants a record, this header would have claimed
-					    "Publicly anchored (Sigstore Rekor v2)" for batches that reached
-					    no public log at all — a worse falsehood than the one R21 fixed.
-					    The truthful predicate is `anchoredIndices`, which already
-					    filters on `anchor_state === "anchored" && rekor.log_index`. */}
-					{anchoredIndices.length > 0 ? (
-						<span className="flex items-center gap-1.5">
-							<span
-								aria-hidden
-								className={cn(
-									"text-sm",
-									verified
-										? "text-seal-ink"
-										: alarm
-											? "text-danger-ink"
-											: "text-ink-3",
-								)}
-							>
-								◆
-							</span>
-							<span className="text-xs font-medium text-ink">
-								Publicly anchored (Sigstore Rekor v2)
-							</span>
-						</span>
-					) : hasAnchorRecords ? (
-						<span className="flex items-center gap-1.5">
-							<span aria-hidden className="text-sm text-ink-3">
-								◇
-							</span>
-							<span className="text-xs text-ink-3">
-								Signed, not publicly anchored — anchoring is best-effort and
-								does not block the write path
-							</span>
-						</span>
-					) : (
-						<span className="flex items-center gap-1.5">
-							<span aria-hidden className="text-sm text-ink-3">
-								◇
-							</span>
-							<span className="text-xs text-ink-3">
-								Not yet anchored — begins with your first gateway-proxied batch
-							</span>
-						</span>
-					)}
-					{anchoredIndices.length > 0 && !alarm && (
-						<span className="text-xs text-ink-2 tabular-nums">
-							{anchoredIndices.length} batch
-							{anchoredIndices.length === 1 ? "" : "es"} anchored
-						</span>
-					)}
-					{alarm && stripped && (
-						<span className="text-xs font-medium text-danger-ink">
-							Anchor proof missing — possible strip/downgrade
-						</span>
-					)}
-				</div>
-
-				{/* Anchored roots — the indices are ALWAYS named with their log
-				    (v2 `log2025-1` and the legacy v1 log have independent index
-				    spaces; a bare index is ambiguous). They are NOT links: Rekor v2
-				    has no per-entry web page, and search.sigstore.dev resolves the
-				    WRONG (v1) log. Verification is offline from the exported bundle;
-				    the ONE fetchable public artifact is the signed checkpoint. */}
-				{anchoredIndices.length > 0 && (
-					<div>
-						<div className="mb-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-							<span className="t-metric-label">Anchored roots in</span>
-							<a
-								href={CHECKPOINT_URL}
-								target="_blank"
-								rel="noreferrer noopener"
-								title="Fetch this log's signed checkpoint — its independently-verifiable public state (tree size, root, log signature)."
-								className="break-all font-mono text-2xs text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-							>
-								{PUBLIC_LOG} · checkpoint ↗
-							</a>
-						</div>
-						{/* Count label — only shown when collapsed and there are hidden chips. */}
-						{anchoredIndices.length > ANCHOR_PREVIEW && !showAllAnchors && (
-							<p className="mb-1 text-2xs text-ink-3">
-								<span className="tabular-nums font-medium text-ink">
-									{anchoredIndices.length}
-								</span>{" "}
-								batches anchored — showing first{" "}
-								<span className="tabular-nums">{ANCHOR_PREVIEW}</span>
+						{since && until && since > until && (
+							<p role="alert" className="text-danger-ink">
+								The end date must be on or after the start date.
 							</p>
 						)}
-						<div className="flex flex-wrap gap-1.5">
-							{(showAllAnchors
-								? anchoredIndices
-								: anchoredIndices.slice(0, ANCHOR_PREVIEW)
-							).map((i) => (
-								<LogIndexChip key={i} index={i} />
-							))}
-						</div>
-						{/* Show-more toggle — only when there are more than ANCHOR_PREVIEW chips. */}
-						{anchoredIndices.length > ANCHOR_PREVIEW && (
-							<button
-								type="button"
-								onClick={() => setShowAllAnchors((v) => !v)}
-								className="mt-1.5 text-2xs text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-							>
-								{showAllAnchors
-									? "Show fewer ▴"
-									: `Show ${anchoredIndices.length - ANCHOR_PREVIEW} more ▾`}
-							</button>
-						)}
-						<p className="mt-1.5 text-2xs text-ink-3">
-							Clicking that link opens the log&apos;s signed checkpoint — raw
-							text showing the log origin, tree size, current root hash, and the
-							log&apos;s own signature over them. This is expected output, not
-							an error; it is the one independently-fetchable public artifact.
-							You verify each anchored batch root against it offline using the
-							inclusion proof bundled in your downloaded evidence.
+						<p>
+							For large ledgers, choose manageable date ranges. A successful
+							download alone does not prove completeness or integrity.
 						</p>
-						<p className="mt-1 text-2xs text-ink-3">
-							Rekor v2 is a tiled log with no per-entry web page. Each
-							root&apos;s inclusion proof + the log&apos;s signed checkpoint
-							travel in your downloaded evidence and verify offline against the
-							pinned log key — confirm the live log with{" "}
-							<code className="break-all font-mono text-ink-2">
-								curl {CHECKPOINT_URL}
-							</code>
-							.
-						</p>
-					</div>
-				)}
-			</div>
-
-			{/* ── Standing facts strip ─────────────────────────────────────── */}
-			<dl className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs">
-				<div className="flex items-center gap-1.5">
-					<dt
-						className="text-ink-3"
-						title={
-							windowTotal > rowCount
-								? "The verifier loads the most recent events (a render cap); the export streams the complete ledger."
-								: undefined
-						}
-					>
-						Events
-					</dt>
-					<dd className="font-mono tabular-nums text-ink">
-						{windowTotal > rowCount ? (
-							<>
-								<span title="loaded to verify in-browser">
-									{fmtCount(rowCount)}
-								</span>{" "}
-								<span className="text-ink-3">of {fmtCount(windowTotal)}</span>
-							</>
-						) : (
-							fmtCount(rowCount)
-						)}
-					</dd>
-				</div>
-				{chainHead && (
-					<div className="flex items-center gap-1.5">
-						<dt
-							className="text-ink-3"
-							title={
-								isTruncated
-									? "The tip of the LOADED page, not necessarily the ledger's latest row — more rows exist beyond what was loaded."
-									: undefined
-							}
-						>
-							{isTruncated ? "Chain head (loaded)" : "Chain head"}
-						</dt>
-						<dd className="font-mono text-ink" title={chainHead}>
-							{short(chainHead)}
-						</dd>
-						<CopyButton value={chainHead} label="chain head hash" />
-					</div>
-				)}
-				{keyId && (
-					<div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
-						{/* Identity, not a signing claim — presence of a key does not assert
-						    these rows are signed. Signing is established only by the
-						    in-browser "Verify integrity" report below (audit #10). */}
-						<dt className="text-ink-3">Audit signing key</dt>
-						<dd className="flex min-w-0 items-center gap-1">
-							<span
-								className="max-w-[9rem] truncate font-mono text-ink"
-								title={tenantPubkeyB64}
-							>
-								{keyId}
-							</span>
-							<CopyButton value={tenantPubkeyB64 ?? ""} label="signing key" />
-						</dd>
-						<a
-							href="/settings/audit"
-							className="text-ink-2 underline-offset-2 hover:underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-							title="Confirm this key out-of-band on Settings → Audit signing key"
-						>
-							verify this key ↗
-						</a>
-					</div>
-				)}
-			</dl>
-
-			{/* ── Post-verify: two-claim breakdown ─────────────────────────── */}
-			{report && (
-				<div className="mt-4 grid gap-3 sm:grid-cols-2">
-					{/* CLAIM 1 OF 2 — hash chain */}
-					<div
-						className={cn(
-							"rounded-lg border p-3",
-							report.hash_chain_valid
-								? "border-seal-line bg-seal-soft"
-								: "border-danger/40 bg-danger-soft",
-						)}
-					>
-						<div className="t-metric-label">
-							Claim 1 of 2 · what we recomputed
-						</div>
-						<div className="mt-0.5 t-card-title">Hash chain</div>
-						{report.hash_chain_valid ? (
-							<>
-								<div className="mt-1 text-sm font-medium text-seal-ink tabular-nums">
-									Verified · {report.rows_seen} rows · off-platform reproducible
-								</div>
-								<div className="mt-1 text-2xs text-ink-2">
-									Every row hash + the prev-hash chain recomputed and matched.
-								</div>
-							</>
-						) : (
-							<>
-								<div className="mt-1 text-sm font-medium text-danger-ink">
-									Chain broken — recomputed hashes do not match
-								</div>
-								{report.errors.slice(0, 4).map((e) => (
-									<div
-										key={`${e.seq}-${e.kind}`}
-										className="mt-1 font-mono text-2xs text-danger-ink"
-									>
-										at seq {e.seq ?? "?"}: {e.kind}
-									</div>
-								))}
-							</>
-						)}
-					</div>
-
-					{/* CLAIM 2 OF 2 — signature + public anchor */}
-					{(() => {
-						const label = (
-							<>
-								<div className="t-metric-label">
-									Claim 2 of 2 · what the public log proves
-								</div>
-								<div className="mt-0.5 t-card-title">
-									Signature &amp; public anchor
-								</div>
-							</>
-						);
-						if (!report.signatures_valid) {
-							const kinds = [
-								...new Set(report.errors.map((e) => e.kind)),
-							].slice(0, 4);
-							return (
-								<div className="rounded-lg border border-danger/40 bg-danger-soft p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-danger-ink">
-										Verification FAILED
-									</div>
-									<div className="mt-1 text-2xs text-danger-ink">
-										{report.strip_detected
-											? "An anchor claims to be publicly anchored but its proof is missing (stripped). "
-											: ""}
-										{kinds.length > 0
-											? `Reasons: ${kinds.map(humanizeVerdictKind).join("; ")}.`
-											: ""}
-									</div>
-								</div>
-							);
-						}
-						if (
-							report.anchors_included > 0 &&
-							!report.strip_detected &&
-							report.hash_chain_valid
-						) {
-							return (
-								<div className="rounded-lg border border-seal-line bg-seal-soft p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-seal-ink">
-										<span className="tabular-nums">
-											{report.anchors_included}
-										</span>{" "}
-										root
-										{report.anchors_included === 1 ? "" : "s"} independently
-										verified
-									</div>
-									<div className="mt-1 text-2xs text-ink-2">
-										Signed by your key, included in Sigstore&apos;s{" "}
-										<span className="font-mono">{PUBLIC_LOG}</span> append-only
-										log, checkpoint verified. Indices in the anchor strip above.
-									</div>
-								</div>
-							);
-						}
-						if (report.anchors_included > 0 && !report.hash_chain_valid) {
-							return (
-								<div className="rounded-lg border border-danger/40 bg-danger-soft p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-danger-ink">
-										Anchor in log, but rows changed
-									</div>
-									<div className="mt-1 text-2xs text-danger-ink">
-										The anchored root is still in the public log, but the
-										ledger&apos;s rows no longer match it — see the broken chain
-										(Claim 1).
-									</div>
-								</div>
-							);
-						}
-						// R43. THREE states, and none may borrow another's copy.
-						//
-						// This was ONE branch — `!tenantPubkeyB64 || anchorRecords.length === 0`
-						// — collapsing two unrelated facts: "you have no data yet" and "we
-						// cannot give you an out-of-band trust root". R21 gave five tenants a
-						// real `audit_anchor_records` row, so `anchorRecords.length` became 1,
-						// and the OR still short-circuited on the 404'd pubkey — the card kept
-						// saying "No signed batches yet" over 57 signed rows and a real anchor.
-						// A false sentence, shown to the customer, on the differentiated claim.
-						//
-						// Order matters: no-data is checked FIRST, so the trust-root state can
-						// never be mistaken for emptiness.
-						// The decision itself lives in `lib/audit-trust-state.ts` as a pure
-						// function with unit tests; this component RENDERS its result. Keeping
-						// the branching here too would leave those tests guarding a parallel
-						// implementation rather than the code that ships (`TRAPS.md` §22).
-						const trust = auditTrustState({
-							anchorRecordCount: anchorRecords.length,
-							anchoredCount: anchoredIndices.length,
-							tenantPubkeyB64,
-						});
-						if (trust === "no-batches") {
-							return (
-								<div className="rounded-lg border border-line bg-surface p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-ink">
-										No signed batches yet
-									</div>
-									<div className="mt-1 text-2xs text-ink-2">
-										Signing begins with your first gateway-proxied batch.
-									</div>
-								</div>
-							);
-						}
-						// Signed, but we cannot hand this tenant a trust root they can check
-						// us with: `/v1/audit/pubkey` 404s (no per-tenant key) or returns an
-						// EMPTY pubkey (a legacy row minted before the key's public half was
-						// persisted). Either way the batches were signed with Tracelane's
-						// OPERATOR key. That is a real control — it still detects a later edit
-						// — but it is not third-party verifiable, and this card must not imply
-						// that it is. Naming the limitation in the term is the point.
-						if (trust === "publicly-anchored") {
-							// The ledger CLAIMS Rekor inclusion, but this panel is only reached when
-							// the verifier did NOT confirm it (`anchors_included === 0`) — and without
-							// a trust root it cannot. Say exactly that. Borrowing the verified copy
-							// would overclaim; borrowing the not-anchored copy would deny a real
-							// public anchor. Neither is true, so this state gets its own sentence.
-							return (
-								<div className="rounded-lg border border-line bg-surface p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-ink">
-										Anchored in the public log — not verified here
-									</div>
-									<div className="mt-1 text-2xs text-ink-2">
-										{tenantPubkeyB64
-											? "Run Verify integrity to check the inclusion proof against your key."
-											: "We cannot check the inclusion proof without a per-workspace verification key, so this batch is not independently verifiable yet."}
-									</div>
-								</div>
-							);
-						}
-						if (trust === "operator-signed") {
-							return (
-								<div className="rounded-lg border border-line bg-surface p-3">
-									{label}
-									<div className="mt-1 text-sm font-medium text-ink">
-										Tamper-evident, operator-signed
-									</div>
-									<div className="mt-1 text-2xs text-ink-2">
-										These batches are signed with Tracelane&apos;s operator key,
-										not your own. That detects later tampering, but it cannot be
-										checked independently of us.{" "}
-										<span className="font-medium">
-											Independent verification uses your workspace&apos;s own
-											signing key
-										</span>
-										, issued on every plan with the first recorded batch.
-									</div>
-								</div>
-							);
-						}
-						return (
-							<div className="rounded-lg border border-line bg-surface p-3">
-								{label}
-								<div className="mt-1 text-sm font-medium text-ink">
-									Tenant-signed (Ed25519)
-								</div>
-								<div className="mt-1 text-2xs text-ink-2">
-									Signed with your workspace&apos;s own key and verified against
-									it. These batches are not yet publicly anchored (anchoring is
-									best-effort, gateway-path).
-								</div>
-							</div>
-						);
-					})()}
-				</div>
-			)}
-		</Card>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// ChainList — hash chain visualized with linkage highlighting + chain head.
-// Collapsed by default: shows a preview of the first CHAIN_PREVIEW rows so
-// the page remains fast at real volume. The "Show full chain" toggle reveals
-// the paginated list. Each row is a <details> (summary → full hash/payload).
-// ---------------------------------------------------------------------------
-
-const CHAIN_PREVIEW = 8;
-
-function ChainList({
-	rows,
-	brokenSeqs,
-	grandTotal,
-	verifiedFromSeq,
-}: {
-	rows: Row[];
-	brokenSeqs: Set<number>;
-	/** Server-computed total events in this window (may exceed rows.length). */
-	grandTotal?: number;
-	/** ADR-070: verified scope start; rows below it are present-but-unverified. */
-	verifiedFromSeq?: number;
-}) {
-	const [chainOpen, setChainOpen] = useState(false);
-	const [page, setPage] = useState(0);
-	const [hoveredSeq, setHoveredSeq] = useState<number | null>(null);
-
-	const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-	const clamped = Math.min(page, totalPages - 1);
-	const start = clamped * PAGE_SIZE;
-	const chainBroken = brokenSeqs.size > 0;
-	const firstBrokenSeq = chainBroken
-		? rows.find((r) => brokenSeqs.has(r.seq))?.seq
-		: undefined;
-	const chainHead = rows.length ? (rows[rows.length - 1]?.row_hash ?? "") : "";
-	const serverTotal = grandTotal ?? rows.length;
-
-	// Which rows to actually render: first CHAIN_PREVIEW when collapsed, or the
-	// current pagination page when expanded.
-	const visibleRows = chainOpen
-		? rows.slice(start, start + PAGE_SIZE)
-		: rows.slice(0, CHAIN_PREVIEW);
-
-	// Show the chain-head terminator on the true last row when either:
-	//   (a) expanded and on the last pagination page, or
-	//   (b) collapsed and the total rows fit within the preview.
-	const isLastPage = chainOpen
-		? clamped === totalPages - 1
-		: rows.length <= CHAIN_PREVIEW;
-
-	function jumpToBroken() {
-		if (firstBrokenSeq === undefined) return;
-		const idx = rows.findIndex((r) => r.seq === firstBrokenSeq);
-		if (idx >= 0) {
-			setPage(Math.floor(idx / PAGE_SIZE));
-			setChainOpen(true);
-		}
-	}
-
-	function toggleChain() {
-		if (chainOpen) setPage(0); // reset pagination when collapsing
-		setChainOpen((o) => !o);
-	}
-
-	return (
-		<div>
-			{/* ── Header ─────────────────────────────────────────────────── */}
-			<div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-				<h2 className="text-sm font-semibold text-ink">
-					Hash chain ·{" "}
-					<span className="tabular-nums">{fmtCount(rows.length)}</span> event
-					{rows.length === 1 ? "" : "s"} loaded
-				</h2>
-				<div className="flex flex-wrap items-center gap-2">
-					{firstBrokenSeq !== undefined && (
-						<button
-							type="button"
-							onClick={jumpToBroken}
-							className="rounded-md border border-danger/40 bg-danger-soft px-2 py-1 text-2xs font-medium text-danger-ink hover:bg-danger-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						>
-							Jump to first break (#{firstBrokenSeq})
-						</button>
-					)}
-					{rows.length > CHAIN_PREVIEW && (
-						<button
-							type="button"
-							onClick={toggleChain}
-							aria-expanded={chainOpen}
-							className="rounded-md border border-line px-2 py-1 text-2xs text-ink-2 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						>
-							{chainOpen
-								? "Collapse chain ▴"
-								: `Show full chain (first ${fmtCount(rows.length)} of ${fmtCount(serverTotal)} events) ▾`}
-						</button>
-					)}
-				</div>
-			</div>
-
-			{/* ── Honest scope note — always visible ──────────────────────── */}
-			<p className="mb-2 text-2xs text-ink-3">
-				{!chainOpen ? (
-					<>
-						Showing first{" "}
-						<span className="tabular-nums">
-							{fmtCount(Math.min(CHAIN_PREVIEW, rows.length))}
-						</span>{" "}
-						of <span className="tabular-nums">{fmtCount(serverTotal)}</span>{" "}
-						events, from genesis — the complete ledger is the export (or{" "}
-						<code className="font-mono text-ink-2">tlane verify</code> on it).
 					</>
 				) : (
-					<>
-						Showing{" "}
-						<span className="tabular-nums">
-							{start + 1}–{Math.min(start + PAGE_SIZE, rows.length)}
-						</span>{" "}
-						of <span className="tabular-nums">{fmtCount(rows.length)}</span>{" "}
-						loaded events
-						{serverTotal > rows.length && (
-							<>
-								{" "}
-								(full ledger:{" "}
-								<span className="tabular-nums">{fmtCount(serverTotal)}</span>)
-							</>
-						)}{" "}
-						— use <code className="font-mono text-ink-2">tlane verify</code> CLI
-						for the complete ledger.
-					</>
+					<a className={linkClass} href="/settings/billing">
+						View Enterprise plan
+					</a>
 				)}
-			</p>
-
-			{/* ── Row list ──────────────────────────────────────────────── */}
-			<ol className="space-y-0">
-				{visibleRows.map((r, idx) => {
-					const broken = brokenSeqs.has(r.seq);
-					// ADR-070: rows before the verified scope (a windowed root) are present
-					// but UNVERIFIED — shown dimmed, never hidden.
-					const preAnchor =
-						verifiedFromSeq !== undefined &&
-						verifiedFromSeq > 0 &&
-						r.seq < verifiedFromSeq;
-					// nextRow: the row immediately following in the full sorted set
-					// (not just the visible slice) so the hash linkage annotation works
-					// correctly at page/preview boundaries.
-					const nextRow = chainOpen ? rows[start + idx + 1] : rows[idx + 1];
-					// Hash linkage: when this row is hovered, its row_hash connects to
-					// the next row's prev_hash — highlight both to make the chain legible.
-					const isHovered = hoveredSeq === r.seq;
-					const prevRowHovered = hoveredSeq === r.seq - 1;
-					const hashLinked = isHovered && !!nextRow;
-
-					return (
-						<li
-							key={r.seq}
-							className={cn("flex gap-3", preAnchor && "opacity-45")}
-							title={
-								preAnchor
-									? `Present but unverified — before the verified scope (seq ${verifiedFromSeq})`
-									: undefined
-							}
-							onMouseEnter={() => setHoveredSeq(r.seq)}
-							onMouseLeave={() => setHoveredSeq(null)}
-						>
-							{/* Chain thread — a continuous dashed SEAL-GREEN spine (danger red when
-							    the link is broken). It was described as "teal"; the spine has always
-							    painted `--seal`, which is the provenance green, and teal is not a
-							    colour this system contains. Green here is load-bearing: it is the
-							    verified-provenance mark, one of the few coloured marks left. */}
-							<div className="relative flex w-3 shrink-0 justify-center">
-								<span
-									aria-hidden
-									className={cn(
-										"absolute inset-y-0 w-px border-l border-dashed",
-										broken ? "border-danger/60" : "border-seal/50",
-									)}
-								/>
-								<span
-									aria-hidden
-									className={cn(
-										"relative z-10 mt-3.5 h-1.5 w-1.5 rounded-full ring-2 ring-bg",
-										broken ? "bg-danger" : "bg-seal",
-									)}
-								/>
-							</div>
-							<details
-								className={cn(
-									"group mb-1.5 min-w-0 flex-1 rounded-lg border transition-colors",
-									broken
-										? "border-danger/50 bg-danger-soft"
-										: isHovered
-											? "border-seal/30 bg-seal-soft"
-											: "border-line bg-surface",
-								)}
-							>
-								{/* collapsed row — event + time + hash trailing */}
-								<summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-2xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring [&::-webkit-details-marker]:hidden">
-									<span
-										aria-hidden
-										className="shrink-0 text-ink-3 transition-transform group-open:rotate-90"
-									>
-										▸
-									</span>
-									<span className="shrink-0 font-mono tabular-nums text-ink-3">
-										#{r.seq}
-									</span>
-									<span className="shrink-0 font-medium text-ink-2">
-										{r.event_type}
-									</span>
-									{broken ? (
-										<span className="min-w-0 flex-1 truncate font-medium text-danger-ink">
-											⚠ hash mismatch — click to inspect
-										</span>
-									) : (
-										<span className="min-w-0 flex-1 truncate font-mono text-ink-3">
-											{payloadPreview(r.payload)}
-										</span>
-									)}
-									{/* Full date+time — unambiguous wall-clock (midnight ≠ offset) */}
-									<span className="shrink-0 font-mono tabular-nums text-ink-3 text-2xs">
-										{fmtDateTime(r.event_time)}
-									</span>
-									<span
-										className={cn(
-											"hidden shrink-0 font-mono sm:inline",
-											hashLinked ? "text-seal-ink" : "text-ink-3",
-										)}
-										title={r.row_hash}
-									>
-										{short(r.row_hash)}
-									</span>
-								</summary>
-
-								{/* expanded — data covered by this hash */}
-								<div className="space-y-2 border-t border-line px-3 pb-3 pt-2">
-									<div className="t-metric-label">
-										Data covered by this hash
-									</div>
-									<dl className="flex flex-wrap gap-x-5 gap-y-1 text-2xs">
-										<div className="flex gap-1.5">
-											<dt className="text-ink-3">seq</dt>
-											<dd className="font-mono tabular-nums text-ink">
-												{r.seq}
-											</dd>
-										</div>
-										<div className="flex gap-1.5">
-											<dt className="text-ink-3">type</dt>
-											<dd className="text-ink">{r.event_type}</dd>
-										</div>
-										{r.actor && (
-											<div className="flex gap-1.5">
-												<dt className="text-ink-3">actor</dt>
-												<dd className="font-mono text-ink">{r.actor}</dd>
-											</div>
-										)}
-										<div className="flex gap-1.5">
-											<dt className="text-ink-3">time</dt>
-											<dd className="font-mono text-ink">{r.event_time}</dd>
-										</div>
-									</dl>
-									<div>
-										<div className="mb-0.5 t-metric-label">payload</div>
-										<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-md bg-surface-2 p-2 font-mono text-2xs text-ink">
-											{formatPayload(r.payload)}
-										</pre>
-									</div>
-									{/* Hash linkage — show the chain connection explicitly */}
-									<div className="space-y-0.5 break-all font-mono text-2xs">
-										<div
-											className={cn(
-												"flex items-start gap-1.5",
-												hashLinked ? "text-seal-ink" : "text-ink-3",
-											)}
-										>
-											<span className="shrink-0 text-ink-2">row_hash</span>
-											<span className="break-all">{r.row_hash}</span>
-											{hashLinked && (
-												<span
-													className="shrink-0 text-seal-ink"
-													title="This hash becomes the prev_hash of the next row"
-												>
-													→ next
-												</span>
-											)}
-										</div>
-										<div
-											className={cn(
-												"flex items-start gap-1.5",
-												prevRowHovered ? "text-seal-ink" : "text-ink-3",
-											)}
-										>
-											<span className="shrink-0 text-ink-2">← prev</span>
-											<span className="break-all">{r.prev_hash}</span>
-											{prevRowHovered && (
-												<span className="shrink-0 text-seal-ink">
-													← from prev row
-												</span>
-											)}
-										</div>
-									</div>
-									{broken && (
-										<div className="text-2xs font-medium text-danger-ink">
-											row hash mismatch — recomputing this row&apos;s hash over
-											the data above does not match the stored hash.
-										</div>
-									)}
-								</div>
-							</details>
-						</li>
-					);
-				})}
-
-				{/* "… N more" prompt — only when collapsed and there are hidden rows */}
-				{!chainOpen && rows.length > CHAIN_PREVIEW && (
-					<li className="flex gap-3">
-						<div className="relative flex w-3 shrink-0 justify-center">
-							<span
-								aria-hidden
-								className="absolute inset-y-0 w-px border-l border-dashed border-line-2"
-							/>
-						</div>
-						<button
-							type="button"
-							onClick={() => setChainOpen(true)}
-							className="mb-1.5 flex-1 rounded-lg border border-dashed border-line bg-surface-2 px-3 py-2 text-left text-2xs text-ink-3 hover:bg-surface-2 hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						>
-							…{" "}
-							<span className="tabular-nums">
-								{fmtCount(rows.length - CHAIN_PREVIEW)}
-							</span>{" "}
-							more event{rows.length - CHAIN_PREVIEW === 1 ? "" : "s"} — click
-							to expand full chain
-						</button>
-					</li>
+				{tenantPubkeyB64 && (
+					<div>
+						<p className="mb-1">Workspace public key supplied to this check</p>
+						<code className="block select-all break-all rounded bg-surface-2 p-3 text-xs text-ink">
+							{tenantPubkeyB64}
+						</code>
+					</div>
 				)}
-
-				{/* Chain head terminator — final node. Neutral (not Verify-green)
-				    when the chain is broken — the head is a stored fact, not a
-				    verification claim, and green must never read as "verified" here.
-				    Shown on the last page when expanded, or when all rows fit in preview. */}
-				{isLastPage && rows.length > 0 && (
-					<li className="flex gap-3">
-						<div className="relative flex w-3 shrink-0 justify-center">
-							<span
-								aria-hidden
-								className={cn(
-									"absolute top-0 h-3.5 w-px border-l border-dashed",
-									chainBroken ? "border-line-2" : "border-seal/50",
-								)}
-							/>
-							<span
-								aria-hidden
-								className={cn(
-									"relative z-10 mt-3.5 h-2 w-2 rounded-sm ring-2 ring-bg",
-									chainBroken ? "bg-ink-3" : "bg-seal",
-								)}
-							/>
-						</div>
-						<div
-							className={cn(
-								"mb-1.5 flex min-w-0 flex-1 items-center gap-2 rounded-lg border px-3 py-2 text-2xs",
-								chainBroken
-									? "border-line bg-surface"
-									: "border-seal/30 bg-seal-soft",
-							)}
-						>
-							<span
-								className={cn(
-									"font-medium",
-									chainBroken ? "text-ink-2" : "text-seal-ink",
-								)}
-							>
-								chain head
-							</span>
-							<span className="font-mono text-ink-3" title={chainHead}>
-								{short(chainHead)}
-							</span>
-							<CopyButton value={chainHead} label="chain head hash" />
-						</div>
-					</li>
+				{tenantPubkeyB64 && platformPubkeyB64 && (
+					<div>
+						<p className="mb-1">
+							Verify the downloaded file offline (the platform key is pinned in
+							the verifier)
+						</p>
+						<code className="block select-all whitespace-pre-wrap break-all rounded bg-surface-2 p-3 text-xs text-ink">{`tlane verify ./audit.ndjson --tenant-pubkey '${tenantPubkeyB64}'${workspaceKeySinceSeq !== undefined ? ` --workspace-key-since-seq ${workspaceKeySinceSeq}` : ""}`}</code>
+					</div>
 				)}
-			</ol>
-
-			{/* Pagination — only visible when the full chain is expanded */}
-			{chainOpen && rows.length > PAGE_SIZE && (
-				<div className="mt-2 flex flex-wrap items-center justify-end gap-1.5 text-2xs text-ink-2">
-					<span className="tabular-nums">
-						{start + 1}–{Math.min(start + PAGE_SIZE, rows.length)} of{" "}
-						{fmtCount(rows.length)}
-					</span>
-					<button
-						type="button"
-						onClick={() => setPage(Math.max(0, clamped - 1))}
-						disabled={clamped === 0}
-						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-					>
-						Prev
-					</button>
-					<span className="tabular-nums">
-						{clamped + 1}/{totalPages}
-					</span>
-					<button
-						type="button"
-						onClick={() => setPage(Math.min(totalPages - 1, clamped + 1))}
-						disabled={clamped >= totalPages - 1}
-						className="rounded-md border border-line px-2 py-1 text-ink hover:bg-surface-2 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-					>
-						Next
-					</button>
-				</div>
-			)}
-		</div>
+				<a
+					className={linkClass}
+					href="https://docs.tracelane.dev/audit-ledger#verify"
+				>
+					How to verify exported evidence ↗
+				</a>
+			</div>
+		</details>
 	);
 }
 
-// ---------------------------------------------------------------------------
-// AuditLedgerView — main export
-// ---------------------------------------------------------------------------
+function ActivityTime({ at, now }: { at?: string | null; now: number | null }) {
+	const ms = at ? parseUtcMs(at) : Number.NaN;
+	if (!at || !Number.isFinite(ms)) return <span>Unknown</span>;
+	const seconds = now === null ? null : Math.floor((now - ms) / 1000);
+	const relative =
+		seconds === null
+			? formatDateTimeUtc(at)
+			: seconds < 0
+				? "Timestamp is in the future"
+				: seconds < 60
+					? "Less than a minute ago"
+					: seconds < 3600
+						? `${Math.floor(seconds / 60)} min ago`
+						: seconds < 86400
+							? `${Math.floor(seconds / 3600)} hr ago`
+							: `${Math.floor(seconds / 86400)} days ago`;
+	return (
+		<time dateTime={at} title={formatDateTimeUtc(at)}>
+			{relative}
+		</time>
+	);
+}
 
-/**
- * The audit-ledger surface. "Verify integrity" runs the SAME open-source verifier
- * IN THIS BROWSER over the exported ledger, and shows TWO DISTINCT claims, never
- * one blurred "integrity" status: (1) the hash chain (recompute every row hash +
- * prev-hash chain — strong, off-platform reproducible); (2) signature + public
- * anchor (ADR-062) — the verifier checks the bound Ed25519 attestation against
- * YOUR trusted key + the Rekor v2 inclusion proof + checkpoint OFFLINE. GREEN
- * only when `anchors_included > 0 && signatures_valid && !strip_detected`; RED on
- * any verification failure; honest neutral states otherwise. Never a vacuous check.
- */
 export function AuditLedgerView({
 	ndjson,
 	tenantPubkeyB64,
 	initialReport,
-	range,
-	summary,
-	since,
-	until,
-	windowSince,
-	windowUntil,
-	windowTotal,
-	canExport = true,
-}: {
+	ledgerRange,
+	window,
+	canExport = false,
+	platformPubkeyB64,
+	platformKeySource,
+	platformFingerprint,
+	workspaceFingerprint,
+	workspaceKeyCreatedAt,
+	workspaceKeySinceSeq,
+	platformCrossCheck,
+}: AuditKeyContext & {
 	ndjson: string;
-	/**
-	 * The tenant's TRUSTED Ed25519 audit pubkey (base64), resolved server-side
-	 * (ADR-062 C2). Passed to the verifier as the single external trust root; the
-	 * bundle's embedded key must match it or the anchor is rejected. Empty when
-	 * the tenant has no audit key yet (verification is chain-only).
-	 */
 	tenantPubkeyB64?: string;
-	/**
-	 * Pre-computed verify result to hydrate the verdict cards. Defaults to null —
-	 * the user clicks "Verify integrity" to run the in-browser verifier. Exists so
-	 * a test (or a future SSR pre-verify) can render the already-verified state
-	 * without driving a click; the verdict UI stays purely a function of this
-	 * report (green iff `hash_chain_valid`), never a static string.
-	 */
 	initialReport?: VerifyReport;
-	/** Active date-range window key (renders the range control). Absent on the
-	 * e2e fixture path (no live query to re-scope). */
-	range?: string;
-	/** Server-computed aggregate (total + per-day + per-type). Exact for a large
-	 * ledger. Absent on the fixture path (and if the summary fetch failed) — the
-	 * "About" panel then falls back to an approximate breakdown from loaded rows. */
-	summary?: AuditSummary;
-	/** Explicit since/until ISO strings — present when ?since=&until= in URL
-	 * (custom date range wins over ?range= preset). */
-	since?: string;
-	until?: string;
-	/** Server-computed window bounds (ISO) for CLIENT-SIDE filtering of the
-	 * browsable chain list — used on the free self-verify path, where the gateway
-	 * returns the whole retention window and the range control filters what's
-	 * shown in-browser. Deterministic (server-provided strings) → no hydration
-	 * drift. The verifier still runs over the FULL chain; only the displayed rows
-	 * are scoped. Absent on the export path (the server already windowed). */
-	windowSince?: string;
-	windowUntil?: string;
-	/** EXACT uncapped count of chain rows in the (retention) window, from the free
-	 * self-verify endpoint (`total_in_window`). Lets the tile read honestly —
-	 * "Showing N of {this}" — so the loaded render-cap never reads as the whole
-	 * ledger. Absent on the paid path (uses `summary.total`) + the fixture path. */
-	windowTotal?: number;
-	/** ADR-066: whether the paid Article-12 evidence-pack export is available
-	 * (f_audit_addon). Default true. When false (free self-verify tenants) the
-	 * export card is replaced by the upgrade CTA — the chain + in-browser verify
-	 * stay fully available; only the export is the upsell. */
+	ledgerRange?: LedgerRange;
+	window?: AuditWindow;
 	canExport?: boolean;
 }) {
-	const rows = useMemo(() => parseRows(ndjson), [ndjson]);
-	// CLIENT-SIDE window filter for the browsable chain list (free self-verify
-	// path). `windowSince`/`windowUntil` are server-provided ISO strings, so this
-	// is deterministic (no `Date.now()` → no hydration drift). Normalizes the
-	// ClickHouse "YYYY-MM-DD HH:MM:SS" and ISO forms before comparing. The verify
-	// pass below still runs over the FULL `ndjson`; only the DISPLAY is scoped.
-	const visibleRows = useMemo(() => {
-		if (!windowSince && !windowUntil) return rows;
-		const tsMs = (s: string): number =>
-			Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
-		const lo = windowSince ? Date.parse(windowSince) : Number.NEGATIVE_INFINITY;
-		const hi = windowUntil ? Date.parse(windowUntil) : Number.POSITIVE_INFINITY;
-		return rows.filter((r) => {
-			const t = tsMs(r.event_time);
-			return Number.isNaN(t) ? true : t >= lo && t <= hi;
-		});
-	}, [rows, windowSince, windowUntil]);
-	const anchorRecords = useMemo(() => parseAnchors(ndjson), [ndjson]);
-	const tenantPubkey = useMemo(
-		() => b64ToBytes(tenantPubkeyB64 ?? ""),
-		[tenantPubkeyB64],
+	const { rows, anchors } = useMemo(() => parseEvidence(ndjson), [ndjson]);
+	const [result, setResult] = useState<{
+		bytes: string;
+		key?: string;
+		platformKey?: string;
+		report: VerifyReport;
+		at?: string;
+	} | null>(
+		initialReport
+			? {
+					bytes: ndjson,
+					key: tenantPubkeyB64,
+					platformKey: platformPubkeyB64,
+					report: initialReport,
+				}
+			: null,
 	);
-	// R48. ONE predicate for "publicly anchored", defined in lib/audit-trust-state.
-	// This file previously had three, and two of them disagreed (1 vs 0) on exactly
-	// the tenant class R43 is about. `report.anchors_included` is deliberately NOT
-	// folded in here: it counts what the verifier CONFIRMED, which is a stronger
-	// fact and keeps its own word ("independently verified").
-	const anchoredIndices = useMemo(
-		() =>
-			anchoredRecords(anchorRecords).map((a) => a.rekor?.log_index as string),
-		[anchorRecords],
-	);
-	const [report, setReport] = useState<VerifyReport | null>(
-		initialReport ?? null,
-	);
+	const report =
+		result?.bytes === ndjson &&
+		result.key === tenantPubkeyB64 &&
+		result.platformKey === platformPubkeyB64
+			? result.report
+			: null;
 	const [verifying, setVerifying] = useState(false);
-
-	const brokenSeqs = useMemo(
-		() =>
-			new Set(
-				(report?.errors ?? [])
-					.map((e) => e.seq)
-					.filter((s): s is number => s !== null),
-			),
-		[report],
-	);
-	const chainHead = rows.length ? (rows[rows.length - 1]?.row_hash ?? "") : "";
-	const keyId = tenantPubkeyB64 ? `${tenantPubkeyB64.slice(0, 16)}…` : "";
-
-	// EVERY derived stat below reads `visibleRows` (the selected window), NOT the
-	// full loaded set — otherwise "First–last event" and "Events (window)" stay
-	// frozen while the date filter changes, which reads as hardcoded. On the paid
-	// path the server already windowed, so visibleRows === rows and this is a
-	// no-op; on the free path it is what makes the filter actually take effect.
-	const eventTypeCounts = useMemo<Array<[string, number]>>(() => {
-		const m = new Map<string, number>();
-		for (const r of visibleRows)
-			m.set(r.event_type, (m.get(r.event_type) ?? 0) + 1);
-		return [...m.entries()].sort((a, b) => b[1] - a[1]);
-	}, [visibleRows]);
-
-	// Per-day breakdown over the selected window — fallback when no server summary.
-	const clientByDay = useMemo(() => {
-		const m = new Map<string, number>();
-		for (const r of visibleRows) {
-			const d = r.event_time.slice(0, 10);
-			if (d) m.set(d, (m.get(d) ?? 0) + 1);
-		}
-		return [...m.entries()]
-			.sort((a, b) => (a[0] < b[0] ? -1 : 1))
-			.map(([day, count]) => ({ day, count }));
-	}, [visibleRows]);
-
-	// Prefer an EXACT server count (paid summary, or the free self-verify
-	// `windowTotal`), so the honest "N of {total}" label never lets the loaded cap
-	// read as the whole ledger. Fall back to the windowed client set only when no
-	// server count exists (fixture path). Never below what's actually loaded.
-	const total = Math.max(
-		summary?.total ?? windowTotal ?? visibleRows.length,
-		visibleRows.length,
-	);
-	/** True when we have an EXACT server-side total (not a loaded-count proxy). */
-	const hasServerTotal =
-		summary?.total !== undefined || windowTotal !== undefined;
-	const aboutByType: Array<[string, number]> = summary
-		? summary.by_type.map((t) => [t.event_type, t.count])
-		: eventTypeCounts;
-	const aboutByDay = summary?.by_day ?? clientByDay;
-
-	// Export scope label — states the window + the EXACT in-scope event count
-	// (server `total`, not the loaded-row count) on the download card.
-	const exportScopeLabel = useMemo(
-		() => `complete chain from genesis · ${fmtCount(total)} events`,
-		[total],
-	);
-
+	const [verifyError, setVerifyError] = useState(false);
+	const [batchPage, setBatchPage] = useState(0);
+	const [rowPage, setRowPage] = useState(0);
+	const [showRows, setShowRows] = useState(false);
+	const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+	const [now, setNow] = useState<number | null>(null);
+	useEffect(() => {
+		setNow(Date.now());
+		const timer = globalThis.setInterval(() => setNow(Date.now()), 60_000);
+		return () => globalThis.clearInterval(timer);
+	}, []);
+	const [saveError, setSaveError] = useState(false);
 	const verify = useCallback(async () => {
 		setVerifying(true);
+		setVerifyError(false);
+		setResult(null);
 		try {
-			// Runs the open-source verifier over bytes you can inspect — not a server
-			// boolean. With your trusted audit key it verifies signatures + public
-			// anchors offline (Rekor v2 needs no network — the proof is bundled).
-			//
-			// LOADED ON DEMAND, not with the route. As a static import the verifier
-			// was 44 kB of the /audit route's first-load JS (198,881 B of script
-			// transferred vs ~155,000 B on every other route, measured on a
-			// production build) for code that only ever runs from this click. The
-			// idle warm below pulls the chunk in ahead of time, so "verify offline"
-			// still holds for anyone who loaded the page and then lost the network.
-			const { verifyLedgerText } = await loadVerifier();
-			setReport(await verifyLedgerText(ndjson, { tenantPubkey }));
+			const { verifyLedgerText } = await import("@tracelanedev/audit-verifier");
+			const checked = await verifyLedgerText(ndjson, {
+				tenantPubkey: publicKey(tenantPubkeyB64),
+				platformPubkey: publicKey(platformPubkeyB64),
+				workspaceKeySinceSeq,
+			});
+			setResult({
+				bytes: ndjson,
+				key: tenantPubkeyB64,
+				platformKey: platformPubkeyB64,
+				report: checked,
+				at: new Date().toISOString(),
+			});
+		} catch {
+			setVerifyError(true);
 		} finally {
 			setVerifying(false);
 		}
-	}, [ndjson, tenantPubkey]);
-
-	// Warm the verifier chunk once the page is idle. This is what keeps the
-	// dynamic import from trading a first-load saving for an offline failure: the
-	// bytes are off the critical path, but they are in cache long before anyone
-	// reaches for the button. `import()` is idempotent, so a click that beats the
-	// idle callback simply awaits the same in-flight module.
+	}, [ndjson, tenantPubkeyB64, platformPubkeyB64, workspaceKeySinceSeq]);
 	useEffect(() => {
-		// A failed warm is deliberately swallowed: `verify` re-imports on click and
-		// surfaces the failure there, where the user is watching a spinner.
-		const warm = () => {
-			void loadVerifier().catch(() => {});
-		};
-		// Effects never run on the server, so `window` is safe to read directly.
-		if (typeof window.requestIdleCallback !== "function") {
-			const t = setTimeout(warm, 1500);
-			return () => clearTimeout(t);
+		if (!initialReport && ndjson.trim()) void verify();
+	}, [verify, initialReport, ndjson]);
+	const verdict = deriveAuditVerdict(report);
+	const platformVerified =
+		!!report &&
+		report.platform_signed_batches > 0 &&
+		report.hash_chain_valid &&
+		report.signatures_valid &&
+		report.anchors_unverified === 0 &&
+		report.trust_established &&
+		report.rows_uncovered_by_anchors === 0 &&
+		report.rows_unanchored_tail === 0;
+	const copy = platformVerified
+		? {
+				title:
+					report.platform_signed_batches === anchors.length
+						? "Verified — platform-signed"
+						: "Verified — part platform-signed",
+				detail: platformSummary(report, anchors.length, workspaceKeyCreatedAt),
+				next: "Save this check report. Platform signatures attest to unchanged rows under Tracelane’s shared key; public inclusion is checked separately below.",
+			}
+		: outcome(verdict, report);
+	const alarm = isAlarm(verdict);
+	const windowPassed =
+		(verdict.state === "verified" || verdict.state === "verified_windowed") &&
+		report?.rows_unanchored_tail === 0;
+	const hashChecked = Boolean(
+		report?.trust_established && report.hash_chain_valid,
+	);
+	const first = rows[0]?.seq;
+	const last = rows.at(-1)?.seq;
+	const rangeValid =
+		ledgerRange &&
+		Number.isSafeInteger(ledgerRange.total) &&
+		ledgerRange.total >= rows.length &&
+		(last === undefined ||
+			(ledgerRange.to !== undefined && ledgerRange.to >= last))
+			? ledgerRange
+			: undefined;
+	const checkedRows = report?.trust_established
+		? rows.filter((r) => r.seq >= report.verified_from_seq).length
+		: 0;
+	const passed =
+		windowPassed && rangeValid?.total === checkedRows && !platformVerified;
+	const coverageTitle =
+		windowPassed && !passed
+			? rangeValid
+				? `${fmt(checkedRows)} of ${fmt(rangeValid.total)} rows checked`
+				: `${fmt(checkedRows)} rows checked · total unknown`
+			: undefined;
+	const outside = rangeValid ? rangeValid.total - rows.length : undefined;
+	const empty = !ndjson.trim() && rangeValid?.total === 0;
+	const noWindowRows = !ndjson.trim() && !empty;
+	const publicBatches = anchoredRecords(anchors);
+	const firstFinding =
+		report?.errors.find((e) => e.seq !== null) ?? report?.errors[0];
+	const findingIndex =
+		firstFinding?.seq == null
+			? -1
+			: rows.findIndex((r) => r.seq === firstFinding.seq);
+	const anchoredRowsChanged =
+		report &&
+		!report.hash_chain_valid &&
+		publicBatches.length > 0 &&
+		report.anchors_included === publicBatches.length &&
+		report.errors.some(
+			(e) =>
+				e.kind === "row_hash_mismatch" &&
+				e.seq !== null &&
+				publicBatches.some(
+					(a) =>
+						e.seq !== null &&
+						e.seq >= a.batch_start_seq &&
+						e.seq <= a.batch_end_seq,
+				),
+		);
+	const firstBatch = firstFinding?.detail.match(/^batch (\d+-\d+):/)?.[1];
+	const batchPages = Math.max(1, Math.ceil(anchors.length / BATCH_PAGE));
+	const currentBatchPage = Math.min(batchPage, batchPages - 1);
+	const rowPages = Math.max(1, Math.ceil(rows.length / ROW_PAGE));
+	const currentRowPage = Math.min(rowPage, rowPages - 1);
+	const checkedFrom = report?.trust_established
+		? report.verified_from_seq
+		: undefined;
+	useEffect(() => {
+		if (
+			selectedSeq === null ||
+			!showRows ||
+			!rows
+				.slice(currentRowPage * ROW_PAGE, (currentRowPage + 1) * ROW_PAGE)
+				.some((r) => r.seq === selectedSeq)
+		)
+			return;
+		const event = document.getElementById(`audit-event-${selectedSeq}`);
+		event?.scrollIntoView({ block: "center" });
+		event?.focus({ preventScroll: true });
+	}, [selectedSeq, showRows, currentRowPage, rows]);
+	function openFinding() {
+		if (findingIndex < 0 || firstFinding?.seq == null) return;
+		setRowPage(Math.floor(findingIndex / ROW_PAGE));
+		setShowRows(true);
+		setSelectedSeq(firstFinding.seq);
+		// A repeated click can target an event already rendered on this page.
+		const event = document.getElementById(`audit-event-${firstFinding.seq}`);
+		if (event instanceof HTMLDetailsElement) event.open = true;
+		event?.scrollIntoView({ block: "center" });
+		event?.focus({ preventScroll: true });
+	}
+	function saveReport() {
+		if (!report) return;
+		try {
+			const blob = new Blob(
+				[
+					JSON.stringify(
+						{
+							checked_at: result?.at ?? null,
+							scope: {
+								loaded_from_seq: first,
+								loaded_through_seq: last,
+								loaded_rows: rows.length,
+								read_window: window,
+								workspace_inventory_snapshot: rangeValid,
+								workspace_integrity: "not_evaluated",
+								outside_loaded_window: outside ?? null,
+							},
+							verification: report,
+							trust_roots: {
+								workspace_pubkey_b64: tenantPubkeyB64 ?? null,
+								platform_pubkey_b64: platformPubkeyB64 ?? null,
+								platform_source: platformKeySource ?? null,
+								workspace_fingerprint_sha256: workspaceFingerprint ?? null,
+								platform_fingerprint_sha256: platformFingerprint ?? null,
+							},
+						},
+						null,
+						2,
+					),
+				],
+				{ type: "application/json" },
+			);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = "tracelane-audit-check.json";
+			a.click();
+			setTimeout(() => URL.revokeObjectURL(url), 0);
+			setSaveError(false);
+		} catch {
+			setSaveError(true);
 		}
-		const id = window.requestIdleCallback(warm);
-		return () => window.cancelIdleCallback(id);
-	}, []);
-
-	function download() {
-		// Download the COMPLETE, UNCAPPED ledger via the streaming proxy — NOT the
-		// in-memory `ndjson`, which is the capped RENDER set. No `limit` param → the
-		// gateway streams the whole chain (the compliance deliverable). The browser
-		// saves the streamed file; nothing is buffered in this component.
-		const p = new URLSearchParams();
-		const s = since ?? windowSince;
-		const u = until ?? windowUntil;
-		if (s) p.set("since", s);
-		if (u) p.set("until", u);
-		const qs = p.toString();
-		window.location.href = `/api/audit/export${qs ? `?${qs}` : ""}`;
 	}
 
 	return (
 		<div className="space-y-5">
-			{/* TRUST PANEL — dominant, top: anchor status + verify CTA + verdict.
-			    Holds the page's only primary CTA and its only large green element. */}
-			<TrustPanel
-				anchoredIndices={anchoredIndices}
-				hasAnchorRecords={anchorRecords.length > 0}
-				report={report}
-				verifying={verifying}
-				onVerify={verify}
-				rowCount={visibleRows.length}
-				windowTotal={total}
-				chainHead={chainHead}
-				keyId={keyId}
-				tenantPubkeyB64={tenantPubkeyB64}
-				anchorRecords={anchorRecords}
-				isTruncated={total > visibleRows.length}
-			/>
-
-			{/* EXPORT / UPSELL — moved directly under the verdict so the "how do I get
-			    the complete ledger" answer is impossible to miss (founder: the download
-			    was buried below a long chain view). Download (Enterprise) or the
-			    Enterprise upsell (every other plan). */}
-			{canExport ? (
-				<Card className="p-5">
-					<h2 className="text-sm font-semibold text-ink">
-						Download the complete ledger
-					</h2>
-					<p className="mt-0.5 max-w-2xl text-sm text-ink-2">
-						The chain above is a capped preview (first {fmtCount(rows.length)}
-						). This downloads the <strong>complete</strong>, uncapped ledger as
-						NDJSON — the EU AI Act Article 12 evidence pack — then verify it
-						yourself with the open-source CLI (no account, no network).
-					</p>
-					<div className="mt-1 text-2xs text-ink-3" data-testid="export-scope">
-						{exportScopeLabel}
-					</div>
-					<div className="mt-3 flex flex-wrap items-center gap-3">
-						<Button
-							variant="primary"
-							onClick={download}
-							// No className: the `primary` variant already paints `bg-selected
-							// text-selected-on hover:opacity-90`. The override that stood here
-							// (`bg-surface-inverse text-ink-inverse`) won through twMerge and put the
-							// dark-theme page-ground colour back on the CTA — see the Verify button
-							// above and Button.tsx.
-						>
-							Download evidence (NDJSON)
-						</Button>
-						<code className="font-mono text-2xs text-ink-2">
-							tlane verify --tenant-pubkey &lt;key&gt;
-						</code>
-					</div>
-				</Card>
-			) : (
+			<section
+				className={cn(
+					"surface-card overflow-hidden border",
+					alarm
+						? "border-danger/40"
+						: platformVerified
+							? "border-warn/40"
+							: passed
+								? "border-seal-line"
+								: "border-line",
+				)}
+				aria-label="Evidence check"
+			>
 				<div
-					// THE BORDER IS `border-ink-inverse/15`, NOT `border-line`, AND THE SWAP IS A
-					// CORRECTION rather than a restyle (2026-08-22 contrast audit). The comment
-					// that stood here claimed this was "the same DSH-08 finding as the dashboard's
-					// error-budget card" while spending a DIFFERENT token, and the dashboard's own
-					// comment (app/dashboard/page.tsx:1005-1012) states why `--line` cannot be used
-					// here: `--line` is a LIGHT-surface hairline (#e7e7e5), so on this near-black
-					// panel it painted a bright ring at 14.61:1 in light theme and a near-invisible
-					// 1.36:1 edge in dark — one panel, loud in one theme and edgeless in the other,
-					// which is exactly the P0.18 parity break a border here exists to prevent.
-					// `border-ink-inverse/15` composites to ~#37373a (light) / ~#303132 (dark) over
-					// the panel — 1.52:1 and 1.48:1, one expression correct twice.
-					// The edge is still load-bearing: in dark `--surface-inverse` IS the canvas
-					// colour, so a borderless inverse PANEL has no edge of any kind there.
-					// `.surface-card` — this div is the ELSE branch of a ternary whose IF
-					// branch renders a <Card>. Two radii in one slot meant the panel
-					// changed shape depending on entitlement, which is the drift the card
-					// primitive exists to prevent. `bg-surface-inverse` is a utility and
-					// therefore still wins over the class's own background.
-					className="surface-card flex flex-col gap-4 border border-ink-inverse/15 bg-surface-inverse p-5 sm:flex-row sm:items-center sm:justify-between"
-					data-testid="export-upsell"
+					className={cn(
+						"p-5 sm:p-7",
+						alarm
+							? "bg-danger-soft"
+							: platformVerified
+								? "bg-warn-soft"
+								: passed
+									? "bg-seal-soft"
+									: "bg-surface",
+					)}
 				>
-					<div>
-						<div className="t-card-title text-ink-inverse opacity-60">
-							Article-12 export · Enterprise plan
-						</div>
-						<h2 className="mt-1 text-sm font-semibold text-ink-inverse">
-							Download the complete ledger
+					<div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest">
+						<span
+							aria-hidden="true"
+							className={cn(
+								"h-2 w-2 rounded-full",
+								alarm
+									? "bg-danger"
+									: platformVerified
+										? "bg-warn"
+										: passed
+											? "bg-seal-ink"
+											: "bg-ink-3",
+							)}
+						/>
+						{empty
+							? "Start your evidence trail"
+							: alarm
+								? "Action required · these rows"
+								: passed
+									? "Verified · these rows only"
+									: "Evidence check · these rows"}
+					</div>
+					<div aria-live="polite" className="mt-3">
+						<h2
+							className={cn(
+								"text-2xl font-semibold tracking-tight sm:text-3xl",
+								alarm && "text-danger-ink",
+							)}
+						>
+							{empty
+								? "No events in this ledger"
+								: noWindowRows
+									? "No evidence loaded. Integrity is unknown."
+									: verifyError
+										? "CANNOT DETERMINE — the check could not finish"
+										: verifying
+											? "Checking this window…"
+											: platformVerified
+												? copy.title
+												: (coverageTitle ?? copy.title)}
 						</h2>
-						<p className="mt-0.5 max-w-2xl text-sm text-ink-inverse opacity-70">
-							Seeing and verifying the first {fmtCount(rows.length)} events of
-							your chain (from genesis) is{" "}
-							<strong>included on every plan</strong> — that is everything
-							above. The downloadable Article-12 export — the{" "}
-							<strong>complete</strong> chain as independently-verifiable NDJSON
-							with public-anchor proofs, for regulator hand-off — is included on
-							the Enterprise plan, with 7-year ledger retention.
+						<p className="mt-3 max-w-3xl text-sm leading-relaxed text-ink-2">
+							{empty
+								? "Send a call through the Tracelane gateway to start a tamper-evident record."
+								: noWindowRows
+									? "This read returned no rows. That does not establish that your workspace ledger is empty."
+									: verifyError
+										? "No new verdict is available. Retry the check, or reload the evidence if the problem continues."
+										: copy.detail}
 						</p>
 					</div>
-					{/*
-					 * `bg-ink-inverse text-surface-inverse`, NOT `bg-surface-inverse
-					 * text-ink-inverse`. THE BUG (2026-08-22 contrast audit): this CTA painted
-					 * itself in the SAME token as the panel behind it, so the button measured
-					 * 1.00:1 against its own container in BOTH themes — a floating label with no
-					 * button under it, and the only ink-on-ink pair in this tree that broke in
-					 * light AND dark at once. Both tokens here are theme-stable on an inverse
-					 * surface (`--ink-inverse` is #f5f5f5 in both themes, `--surface-inverse` is
-					 * near-black in both), so it reads as one light pill with a dark label
-					 * everywhere: 16.60:1 light / 17.71:1 dark for the fill against the panel,
-					 * and the same figures for the label against the fill.
-					 *
-					 * `focus-visible:outline-ink-inverse` is the per-site override tokens.css
-					 * (the `--focus-ring` note) says a focusable control inside a
-					 * `--surface-inverse` card "would still need" — and then asserts "there are
-					 * none". There is: this one. `--focus-ring` is `--ink`, which in LIGHT theme
-					 * is #171717 on a #151619 panel = 1.01:1, and `outline-offset: 2px` does not
-					 * save it here because the ring is painted over the PANEL, not over the
-					 * canvas. This overrides the base ring's COLOUR; it is not a second ring
-					 * mechanism and it does not use `outline-none`.
-					 */}
-					<Link
-						href="/settings/billing"
-						className="bg-ink-inverse text-surface-inverse hover:opacity-90 inline-flex h-9 shrink-0 items-center rounded-lg px-4 text-sm font-medium focus-visible:outline-ink-inverse"
-					>
-						Enterprise plan
-					</Link>
+					<details className="mt-3 text-xs text-ink-2">
+						<summary className="cursor-pointer">
+							Check scope and recorder activity
+						</summary>
+						{!empty && (
+							<div className="mt-4 border-t border-line pt-3 text-xs text-ink-2">
+								<p>
+									<strong className="text-ink">
+										{fmt(rows.length)} rows loaded
+									</strong>
+									{first !== undefined &&
+										last !== undefined &&
+										` · sequence ${fmt(first)}–${fmt(last)}`}
+								</p>
+								{report && (
+									<p className="mt-1">
+										Hash-check range:{" "}
+										{checkedFrom !== undefined && last !== undefined
+											? `sequence ${fmt(checkedFrom)}–${fmt(last)}`
+											: "Not established"}
+									</p>
+								)}
+								<p className="mt-1">
+									Total recorded rows:{" "}
+									<strong className="text-ink">
+										{rangeValid ? fmt(rangeValid.total) : "Unavailable"}
+									</strong>
+								</p>
+								<p className="mt-1">
+									{outside !== undefined
+										? `${fmt(outside)} rows outside this check`
+										: "Rows outside this window are not counted here"}
+								</p>
+							</div>
+						)}
+						<dl
+							className="mt-4 grid gap-3 border-t border-line pt-4 text-xs sm:grid-cols-2"
+							aria-label="Recorder activity"
+						>
+							<div>
+								<dt className="text-ink-3">Last event recorded</dt>
+								<dd className="mt-1 font-medium">
+									<ActivityTime at={ledgerRange?.latest_event_at} now={now} />
+								</dd>
+							</div>
+							<div>
+								<dt className="text-ink-3">Last anchored</dt>
+								<dd className="mt-1 font-medium">
+									<ActivityTime at={ledgerRange?.latest_anchor_at} now={now} />
+								</dd>
+							</div>
+						</dl>
+						<p className="mt-2 text-xs text-ink-3">
+							Activity as of this read. Refresh to check for new events and
+							anchors.
+						</p>
+					</details>
+					{alarm && firstFinding && (
+						<p className="mt-3 text-sm font-medium text-danger-ink">
+							{findingIndex >= 0 && firstFinding.seq !== null ? (
+								<a
+									href={`#audit-event-${firstFinding.seq}`}
+									className="underline underline-offset-4"
+									onClick={(event) => {
+										event.preventDefault();
+										openFinding();
+									}}
+								>
+									First finding · sequence {fmt(firstFinding.seq)}
+								</a>
+							) : (
+								<>
+									First finding
+									{firstFinding.seq !== null
+										? ` · sequence ${fmt(firstFinding.seq)} (not in this read)`
+										: firstBatch
+											? ` · batch ${firstBatch}`
+											: ""}
+								</>
+							)}
+							: {humanizeVerdictKind(firstFinding.kind)}
+						</p>
+					)}
+
+					{!empty && !noWindowRows && (
+						<div className="mt-5 flex flex-wrap gap-2">
+							{report && (
+								<Button
+									variant={alarm ? "primary" : "secondary"}
+									onClick={saveReport}
+									disabled={!report}
+								>
+									Save check report
+								</Button>
+							)}
+							<Button
+								variant={alarm ? "secondary" : "primary"}
+								onClick={() => globalThis.location.reload()}
+								disabled={verifying}
+							>
+								{verifying
+									? "Checking recent evidence…"
+									: "Refresh & check latest"}
+							</Button>
+						</div>
+					)}
+					{(empty || noWindowRows) && (
+						<div className="mt-5 flex flex-wrap gap-4">
+							{empty && (
+								<a
+									href="/onboarding"
+									className="inline-flex min-h-9 items-center rounded-control bg-selected px-4 text-sm font-medium text-selected-on"
+								>
+									Connect the gateway
+								</a>
+							)}
+							<a href="/audit" className={linkClass}>
+								Reload evidence
+							</a>
+							{noWindowRows && (
+								<a href="/support" className={linkClass}>
+									Contact support
+								</a>
+							)}
+						</div>
+					)}
 				</div>
+			</section>
+
+			<AuditWorkflow
+				report={report}
+				rows={rows.length}
+				first={first}
+				last={last}
+				batches={anchors.length}
+				ledgerRange={rangeValid}
+				window={window}
+				empty={empty}
+				readError={verifyError || noWindowRows}
+				platformPubkeyB64={platformPubkeyB64}
+				platformKeySource={platformKeySource}
+				platformFingerprint={platformFingerprint}
+				workspaceFingerprint={workspaceFingerprint}
+				workspaceKeyCreatedAt={workspaceKeyCreatedAt}
+				workspaceKeySinceSeq={workspaceKeySinceSeq}
+				platformCrossCheck={platformCrossCheck}
+			/>
+			<section className="space-y-3" aria-label="Your evidence">
+				<h2 className="text-base font-semibold">Your evidence</h2>
+				<Button variant="secondary" disabled={!report} onClick={saveReport}>
+					Save check report
+				</Button>
+				<EvidenceExport
+					window={window}
+					tenantPubkeyB64={tenantPubkeyB64}
+					platformPubkeyB64={platformPubkeyB64}
+					workspaceKeySinceSeq={workspaceKeySinceSeq}
+					canExport={canExport}
+				/>
+			</section>
+
+			{empty ? (
+				<section
+					className="grid gap-4 sm:grid-cols-2"
+					aria-label="Getting started"
+				>
+					<div className="surface-card p-5">
+						<p className="text-xs font-medium text-ink-3">01 · RECORD</p>
+						<h2 className="mt-2 font-semibold">
+							Route a call through the gateway
+						</h2>
+						<p className="mt-2 text-sm text-ink-2">
+							SDK or OTLP capture alone does not add a call to the hash chain.
+						</p>
+					</div>
+					<div className="surface-card p-5">
+						<p className="text-xs font-medium text-ink-3">02 · CHECK</p>
+						<h2 className="mt-2 font-semibold">
+							Return here to check the evidence
+						</h2>
+						<p className="mt-2 text-sm text-ink-2">
+							Row hashes and batch proofs have separate results. Public
+							anchoring is per batch and best-effort.
+						</p>
+					</div>
+				</section>
+			) : (
+				report && (
+					<details className="surface-card p-5 sm:p-6" aria-label="Next steps">
+						<summary className="cursor-pointer text-sm font-semibold">
+							Findings and next steps
+						</summary>
+						<h2 className="text-base font-semibold">
+							{alarm ? "What to do now" : "Your next step"}
+						</h2>
+						{alarm ? (
+							<ol className="mt-4 space-y-3 text-sm text-ink-2">
+								<li>
+									<strong className="text-ink">1. Preserve this result.</strong>{" "}
+									Save the check report before reloading. It includes the check
+									scope and failure details.
+								</li>
+								<li>
+									<strong className="text-ink">2. Check a fresh read.</strong>{" "}
+									Use “Refresh & check latest” and compare the new result with
+									this report.
+								</li>
+								<li>
+									<strong className="text-ink">
+										3. Investigate this failure.
+									</strong>{" "}
+									{copy.next}{" "}
+									<a className={linkClass} href="/support">
+										Contact support →
+									</a>
+								</li>
+							</ol>
+						) : (
+							<>
+								<p className="mt-2 max-w-3xl text-sm leading-relaxed text-ink-2">
+									{copy.next}
+								</p>
+								<div className="mt-4 flex flex-wrap gap-4">
+									<Button
+										variant="bare"
+										className={linkClass}
+										type="button"
+										onClick={saveReport}
+									>
+										Save check report
+									</Button>
+									{!windowPassed && !platformVerified && (
+										<a href="/support" className={linkClass}>
+											Contact support →
+										</a>
+									)}
+								</div>
+							</>
+						)}
+						{saveError && (
+							<p role="alert" className="mt-2 text-sm text-danger-ink">
+								The report could not be saved. Retry or copy the details below.
+							</p>
+						)}
+						<div className="mt-5 grid gap-3 border-t border-line pt-4 text-sm sm:grid-cols-2">
+							<p>
+								<span className="text-ink-3">Row hashes</span>
+								<br />
+								<strong>
+									{!report.hash_chain_valid
+										? "Check failed"
+										: hashChecked
+											? `Match from sequence ${fmt(report.verified_from_seq)}`
+											: "Not established in this window"}
+								</strong>
+							</p>
+							<p>
+								<span className="text-ink-3">Public proofs</span>
+								<br />
+								<strong>
+									{!report.hash_chain_valid
+										? anchoredRowsChanged
+											? "The anchored root no longer matches these rows"
+											: "Public proofs do not establish integrity for these rows"
+										: `${fmt(report.anchors_included)} verified in this window${report.signatures_valid && !report.strip_detected ? "" : " · a batch check failed"}`}
+								</strong>
+							</p>
+						</div>
+						{report.rows_unanchored_tail > 0 && (
+							<p className="mt-3 text-sm text-ink-2">
+								{fmt(report.rows_unanchored_tail)} loaded rows follow the last
+								recorded batch, or have no batch yet. Their public anchoring is
+								not established here.
+							</p>
+						)}
+						{report.errors.length > 0 && (
+							<details className="mt-4 text-sm">
+								<summary className="cursor-pointer font-medium">
+									Check details · {fmt(report.errors.length)} finding
+									{report.errors.length === 1 ? "" : "s"}
+								</summary>
+								<ul className="mt-3 space-y-3">
+									{report.errors.slice(0, ROW_PAGE).map((error, i) => (
+										<li
+											key={`${error.kind}-${error.seq}-${i}`}
+											className="break-words rounded-control bg-surface-2 p-3 text-xs text-ink-2"
+										>
+											<strong>{humanizeVerdictKind(error.kind)}</strong>
+											{error.seq !== null && (
+												<span> · sequence {fmt(error.seq)}</span>
+											)}
+											<pre className="mt-1 whitespace-pre-wrap break-all">
+												{error.detail}
+											</pre>
+										</li>
+									))}
+								</ul>
+								{report.errors.length > ROW_PAGE && (
+									<p className="mt-3 text-xs">
+										First {ROW_PAGE} findings shown. Save the check report for
+										all {fmt(report.errors.length)} findings.
+									</p>
+								)}
+							</details>
+						)}
+					</details>
+				)
 			)}
 
-			{/* ABOUT — supporting context: scope, types, time span, histogram.
-			    Demoted below the trust panel. */}
-			<AboutLedger
-				total={total}
-				loadedCount={rows.length}
-				eventTypeCounts={aboutByType}
-				byDay={aboutByDay}
-				anchoredCount={anchoredIndices.length}
-				serverTotal={hasServerTotal}
-				loadCap={1000}
-			/>
-
-			{/* NEGATIVE SCENARIO — what a failed verification looks like */}
-			<NegativeScenarioPanel />
-
-			{/* CHAIN VIEW — a `--surface` card so the chain spine renders on the card
-			    rather than on the page ground. The old note said "not the blue canvas";
-			    the canvas is `--canvas` (#fafaf9 light / #0d0e10 dark) and has not been
-			    blue since the P0 palette landed. The reason the card is still here is
-			    unchanged and is not about hue: the ground and the card are different
-			    VALUES, and the spine needs the card's value behind it to read.
-			    Collapsed by default. */}
-			<Card className="bg-surface p-5">
-				<ChainList
-					rows={visibleRows}
-					brokenSeqs={brokenSeqs}
-					grandTotal={total}
-					verifiedFromSeq={report?.verified_from_seq}
-				/>
-			</Card>
+			{!empty && (
+				<div className="surface-card p-5 sm:px-6">
+					<p className="text-xs text-ink-2">
+						Workspace-wide integrity:{" "}
+						<strong className="text-ink">Not established by this check</strong>.
+						No verdict for rows or proofs outside this window.
+					</p>
+					<details className="mt-4 text-xs text-ink-2">
+						<summary className="cursor-pointer underline underline-offset-4">
+							What exactly was checked?
+						</summary>
+						<div className="mt-3 space-y-2 leading-relaxed">
+							<p>
+								The browser receives at most 1,000 of the newest rows within
+								your plan’s ledger retention window, ordered by sequence. Only
+								complete batch records for those rows are returned. Hash
+								checking starts at genesis or a fully included public anchor.
+								Without either, these rows remain unrooted.
+							</p>
+							{window && (
+								<p>
+									Read window: {formatDateTimeUtc(window.since)} →{" "}
+									{formatDateTimeUtc(window.until)}.
+								</p>
+							)}
+							{checkedFrom !== undefined && last !== undefined && (
+								<p>
+									Row-hash verification starts at sequence {fmt(checkedFrom)}{" "}
+									and ends at {fmt(last)}. Loaded rows before that starting
+									point are not verified.
+								</p>
+							)}
+							<p>
+								Counts and evidence are separate reads and can change as new
+								events arrive. Refresh to read again.
+							</p>
+							{report && result?.at && (
+								<p>
+									Checked at {formatDateTimeUtc(result.at)}. This is a saved
+									view, not a live monitor.
+								</p>
+							)}
+						</div>
+					</details>
+				</div>
+			)}
+			{!empty && !noWindowRows && (
+				<section
+					className="surface-card p-5 sm:p-6"
+					aria-label="Batch evidence"
+				>
+					<div className="flex flex-wrap items-baseline justify-between gap-2">
+						<h2 className="text-base font-semibold">Batch evidence</h2>
+						<span className="text-xs text-ink-3">
+							{fmt(anchors.length)}{" "}
+							{anchors.length === 1 ? "record" : "records"} loaded ·{" "}
+							{fmt(publicBatches.length)} with public proof attached
+						</span>
+					</div>
+					<p className="mt-2 text-sm text-ink-2">
+						Each batch covers a range of events. These are the records available
+						in this window; attached proof is not a verification result.
+					</p>
+					{anchors.length === 0 ? (
+						<p className="mt-4 rounded-card bg-surface-2 p-4 text-sm text-ink-2">
+							No batch records were returned for these rows. This does not
+							establish whether other batches exist.
+						</p>
+					) : (
+						<>
+							<div className="mt-4 divide-y divide-line border-y border-line">
+								{anchors
+									.slice(
+										currentBatchPage * BATCH_PAGE,
+										(currentBatchPage + 1) * BATCH_PAGE,
+									)
+									.map((a, i) => (
+										<details key={`${a.batch_start_seq}-${i}`} className="py-3">
+											<summary className="cursor-pointer text-sm">
+												<span className="font-mono font-medium">
+													{fmt(a.batch_start_seq)}–{fmt(a.batch_end_seq)}
+												</span>
+												<span className="ml-3 text-xs text-ink-2">
+													{anchoredRecords([a]).length
+														? "Public proof attached"
+														: a.anchor_state === "anchored"
+															? "Claims anchoring · proof missing"
+															: "Signed record · no public anchor"}
+												</span>
+											</summary>
+											<dl className="mt-3 space-y-2 break-all rounded bg-surface-2 p-3 text-xs text-ink-2">
+												<div>
+													<dt>Signer</dt>
+													<dd>
+														{a.ed25519?.pubkey === tenantPubkeyB64 &&
+														tenantPubkeyB64
+															? "Your workspace key"
+															: a.ed25519?.pubkey === platformPubkeyB64 &&
+																	platformPubkeyB64
+																? `Tracelane platform key${platformVerified && workspaceKeyDate(workspaceKeyCreatedAt) ? ` (before your workspace key existed on ${workspaceKeyDate(workspaceKeyCreatedAt)})` : " (workspace key creation date unavailable)"}`
+																: "Unknown key"}
+														.{" "}
+														{report
+															? "See Sign above for the verification result."
+															: "Not yet checked."}
+													</dd>
+												</div>
+												<div>
+													<dt>Batch fingerprint</dt>
+													<dd className="font-mono">{a.merkle_root}</dd>
+												</div>
+												{a.rekor?.log_index && (
+													<div>
+														<dt>Public log coordinate</dt>
+														<dd>
+															{PUBLIC_LOG} · index {a.rekor.log_index}
+														</dd>
+													</div>
+												)}
+											</dl>
+											<details className="mt-3 text-xs text-ink-2">
+												<summary className="cursor-pointer">
+													Inspect batch proof record
+												</summary>
+												<pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-2 p-3">
+													{JSON.stringify(a, null, 2)}
+												</pre>
+											</details>
+										</details>
+									))}
+							</div>
+							<Pager
+								page={currentBatchPage}
+								pages={batchPages}
+								onChange={setBatchPage}
+								label="Loaded batches"
+							/>
+							<p className="mt-3 text-xs text-ink-3">
+								Showing {currentBatchPage * BATCH_PAGE + 1}–
+								{Math.min((currentBatchPage + 1) * BATCH_PAGE, anchors.length)}{" "}
+								of {fmt(anchors.length)} loaded batch records. Batches outside
+								this window are not listed or checked.
+							</p>
+						</>
+					)}
+					<details
+						className="mt-5 border-t border-line pt-4"
+						open={showRows}
+						onToggle={(e) => setShowRows(e.currentTarget.open)}
+					>
+						<summary className="cursor-pointer text-sm font-medium">
+							Inspect individual events · {fmt(rows.length)} loaded
+						</summary>
+						{showRows && (
+							<div className="mt-4">
+								<p className="mb-3 text-xs text-ink-3">
+									Only loaded events are browsable. No additional ledger rows
+									are fetched by pagination.
+								</p>
+								{rows
+									.slice(
+										currentRowPage * ROW_PAGE,
+										(currentRowPage + 1) * ROW_PAGE,
+									)
+									.map((r, i) => (
+										<details
+											key={`${r.seq}-${i}`}
+											id={`audit-event-${r.seq}`}
+											tabIndex={-1}
+											open={selectedSeq === r.seq ? true : undefined}
+											data-highlighted={
+												selectedSeq === r.seq ? "true" : undefined
+											}
+											className={cn(
+												"scroll-mt-24 border-b border-line p-3 text-xs",
+												selectedSeq === r.seq &&
+													"rounded-control bg-danger-soft ring-2 ring-danger/40",
+											)}
+										>
+											<summary className="cursor-pointer break-words">
+												<span className="font-mono">#{fmt(r.seq)}</span> ·{" "}
+												{r.event_type} · {formatDateTimeUtc(r.event_time)}
+												{report?.errors.some((e) => e.seq === r.seq) && (
+													<strong className="ml-2 text-danger-ink">
+														Finding
+													</strong>
+												)}
+											</summary>
+											<pre className="mt-3 whitespace-pre-wrap break-all rounded bg-surface-2 p-3">
+												{JSON.stringify(r, null, 2)}
+											</pre>
+										</details>
+									))}
+								<Pager
+									page={currentRowPage}
+									pages={rowPages}
+									onChange={setRowPage}
+									label="Loaded events"
+								/>
+							</div>
+						)}
+					</details>
+				</section>
+			)}
 		</div>
 	);
 }

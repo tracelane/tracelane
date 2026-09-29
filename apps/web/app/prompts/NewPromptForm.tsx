@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * NewPromptForm — the create-prompt entry point on the list page.
@@ -31,15 +32,16 @@ export function NewPromptForm() {
 				onChange={(e) => setName(e.target.value)}
 				placeholder="new-prompt-name"
 				aria-label="New prompt name"
-				className="w-full min-w-0 rounded-sm border border-line bg-bg px-3 py-1.5 font-mono text-xs text-ink placeholder:text-ink-3 focus:border-action-line sm:w-44"
+				className="w-full min-w-0 rounded-control border border-line bg-bg px-3 py-1.5 font-mono text-xs text-ink placeholder:text-ink-3 focus:border-action-line sm:w-44"
 			/>
-			<button
+			<Button
+				variant="bare"
 				type="submit"
 				disabled={!name.trim()}
-				className="shrink-0 whitespace-nowrap rounded-md bg-action px-3 py-1.5 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
+				className="shrink-0 whitespace-nowrap rounded-control bg-action px-3 py-1.5 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-40"
 			>
 				New prompt →
-			</button>
+			</Button>
 		</form>
 	);
 }

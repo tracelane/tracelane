@@ -1,3 +1,5 @@
+"use client";
+import { Button } from "@tracelanedev/ui";
 /**
  * EmptyTraces — zero-state for the traces page.
  *
@@ -5,7 +7,7 @@
  * install snippet so they can get their first trace without leaving the UI.
  *
  * ── THE DASHED BOX IS GONE (P0.9, 2026-08-22) ───────────────────────────────
- * This drew `rounded-xl border border-dashed border-line p-10`. A dashed
+ * This drew `rounded-card border border-dashed border-line p-10`. A dashed
  * rectangle is the universal idiom for "content failed to load" — a broken
  * image, an unmounted region, a drop target all look like that — so the first
  * screen a new tenant ever sees was telling them the product was broken. The
@@ -21,8 +23,6 @@
  * icon chip, the same statement/explanation pair, the same measure on the
  * explanation — and only the layout differs.
  */
-
-"use client";
 
 import Link from "next/link";
 import { useState } from "react";
@@ -69,7 +69,7 @@ export function EmptyTraces({ gatewayUrl }: { gatewayUrl?: string }) {
 			<div className="mb-6 flex flex-col items-center gap-3">
 				<span
 					aria-hidden="true"
-					className="relative grid h-9 w-9 place-items-center rounded-xl bg-surface-2 text-ink-2"
+					className="relative grid h-9 w-9 place-items-center rounded-card bg-surface-2 text-ink-2"
 				>
 					{/* DSH-16: same soft amber halo as the shared `EmptyState` primitive's
 					    full variant — this file hand-rolls the primitive's markup (see the
@@ -110,7 +110,8 @@ export function EmptyTraces({ gatewayUrl }: { gatewayUrl?: string }) {
 			<div className="surface-card surface-card--quiet mb-6 overflow-hidden border border-line text-left">
 				<div className="flex border-b border-line bg-canvas-sunken">
 					{(["python", "typescript"] as const).map((t) => (
-						<button
+						<Button
+							variant="bare"
 							key={t}
 							type="button"
 							onClick={() => setTab(t)}
@@ -121,7 +122,7 @@ export function EmptyTraces({ gatewayUrl }: { gatewayUrl?: string }) {
 							}`}
 						>
 							{t === "python" ? "Python" : "TypeScript"}
-						</button>
+						</Button>
 					))}
 				</div>
 				<pre className="overflow-x-auto p-4 font-mono text-xs leading-relaxed text-ink">

@@ -14,7 +14,7 @@ const DAY = 86_400_000;
 export function WindowNotice({ range }: { range: TimeRange }) {
 	if (range.invalid) {
 		return (
-			<p className="rounded-lg border border-line bg-surface-2 px-4 py-2 text-xs text-ink-2">
+			<p className="rounded-card border border-line bg-surface-2 px-4 py-2 text-xs text-ink-2">
 				The time window in the address could not be read, so this page shows{" "}
 				<span className="font-medium text-ink">{range.label}</span>.
 			</p>
@@ -23,7 +23,7 @@ export function WindowNotice({ range }: { range: TimeRange }) {
 	if (range.clamped) {
 		const capDays = Math.round(range.widthMs / DAY);
 		return (
-			<p className="rounded-lg border border-line bg-surface-2 px-4 py-2 text-xs text-ink-2">
+			<p className="rounded-card border border-line bg-surface-2 px-4 py-2 text-xs text-ink-2">
 				Showing the most recent{" "}
 				<span className="font-medium text-ink">{capDays} days</span> of the
 				range you asked for (limit {capDays} d):{" "}

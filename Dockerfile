@@ -35,6 +35,8 @@ COPY packages/verifier-rust/ packages/verifier-rust/
 # (crates/gateway/src/db include_str!("../../../../apps/web/db/migrations/*.sql")),
 # so they must be present in the build context at the same relative path.
 COPY apps/web/db/migrations/ apps/web/db/migrations/
+# Reviewed identity classifier, embedded at compile time.
+COPY apps/web/db/kya_catalog.v1.json apps/web/db/kya_catalog.v1.json
 # BuildKit cache mounts persist the cargo registry + target/ across builds. The
 # binary MUST be copied OUT of the target cache mount — cache-mount contents are
 # NOT in the layer the runtime COPY reads (that would `COPY … not found`).

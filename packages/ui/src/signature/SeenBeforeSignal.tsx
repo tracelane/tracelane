@@ -42,7 +42,7 @@ export function SeenBeforeSignal({
 		<span
 			title={title}
 			className={cn(
-				"inline-flex items-center gap-1.5 rounded-md bg-warn-soft px-1.5 py-0.5 text-2xs text-warn-ink underline decoration-warn decoration-wavy underline-offset-2",
+				"inline-flex items-center gap-1.5 rounded-control bg-warn-soft px-1.5 py-0.5 text-2xs text-warn-ink underline decoration-warn decoration-wavy underline-offset-2",
 				className,
 			)}
 		>

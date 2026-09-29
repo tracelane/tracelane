@@ -291,7 +291,12 @@ export function formatCompactCount(n: number): string {
 		const k = n / 1_000;
 		return `${Number.isInteger(k) ? k : k.toFixed(1)}K`;
 	}
-	return n.toLocaleString("en-US");
+	// Discrete units below 1,000 — round to the nearest whole unit. A
+	// projection (`block.projection_month_end`, a straight-line estimate over
+	// partial days) is never actually a fractional count of series or eval
+	// runs, but `toLocaleString` alone does not round — so the raw fraction
+	// reached the screen as "22.222 series" / "37.778 run" (item 9).
+	return Math.round(n).toLocaleString("en-US");
 }
 
 /**

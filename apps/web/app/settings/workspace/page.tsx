@@ -8,6 +8,7 @@
  * from the session server-side.
  */
 
+import { ContentCapture } from "@/components/settings/ContentCapture";
 import { WorkspaceManager } from "@/components/settings/WorkspaceManager";
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
@@ -60,7 +61,6 @@ export default async function WorkspacePage() {
 				id: tenants.id,
 				plan: tenants.plan,
 				createdAt: tenants.createdAt,
-				slackWebhookUrl: tenants.slackWebhookUrl,
 			})
 			.from(tenants)
 			.where(eq(tenants.workosOrgId, session.tenantId))
@@ -86,12 +86,10 @@ export default async function WorkspacePage() {
 			</p>
 
 			<div className="mb-6">
-				<WorkspaceManager
-					initialName={org?.name ?? ""}
-					initialNotifyWebhook={tenant?.slackWebhookUrl ?? ""}
-				/>
+				<WorkspaceManager initialName={org?.name ?? ""} />
 			</div>
 
+			<ContentCapture />
 			<Card>
 				<dl className="px-4">
 					{org?.name && <InfoRow label="Organization" value={org.name} />}

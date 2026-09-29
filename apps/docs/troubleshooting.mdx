@@ -80,8 +80,8 @@ default; when enabled it tries **500 / 502 / 503 / 504** along the configured
 chain. A
 429 is not eligible for failover — it is returned to you with `Retry-After`. If
 failover is exhausted, or the request targets a single provider with no
-downstream in the chain, the upstream error is proxied back. Per-model,
-config-driven failover chains are on the roadmap — see
+downstream in the chain, the upstream error is proxied back. A workspace
+can set its own ordered fallback models in settings — see
 [Failover](/providers#failover).
 
 ### `predictive.verdict = block` — request blocked by guardrail
@@ -97,8 +97,7 @@ config-driven failover chains are on the roadmap — see
 #   explain_guardrail_block(trace_id, span_id)
 ```
 
-Switching a guard from `block` to `warn` is a workspace policy setting;
-per-guard `tracelane.yaml` toggles are on the roadmap.
+Switching a guard from `block` to `warn` is a workspace policy setting.
 
 ### Traces not appearing in the dashboard
 

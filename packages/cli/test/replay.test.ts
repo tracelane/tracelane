@@ -7,11 +7,13 @@
  * server.
  */
 
+import { Command } from "commander";
 import { describe, expect, it } from "vitest";
 import {
 	type GatewaySpan,
 	fetchSpans,
 	mapSpansToSteps,
+	registerReplayCommand,
 } from "../src/commands/replay.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -121,4 +123,13 @@ describe("tlane replay — mapSpansToSteps", () => {
 		expect(steps[1].llmMessage).toBeUndefined();
 		expect(steps[1].attributes).toEqual({});
 	});
+});
+
+it("describes actual replay behavior in the command help", () => {
+	const program = new Command();
+	registerReplayCommand(program);
+	const help = program.commands[0]?.helpInformation().replace(/\s+/g, " ");
+	expect(help).toContain("recorded trace spans");
+	expect(help).toContain("no model or tool re-execution");
+	expect(help).not.toContain("time-travel debugging");
 });

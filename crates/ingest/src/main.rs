@@ -11,12 +11,14 @@ use anyhow::Context as _;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod auth;
+mod capture_gaps;
 mod cardinality;
 mod clickhouse_writer;
 mod config;
 mod db;
 mod disk_guard;
 mod federation;
+mod gap_tracker;
 mod health_probe;
 // `limits` and `otlp_decode` MOVED to `tracelane_shared::otlp` for GWY-41 — the
 // gateway's authenticated `POST /v1/traces` is a second OTLP entry point, and two
@@ -340,6 +342,12 @@ async fn main() -> anyhow::Result<()> {
                 single_tenant.clone(),
                 cfg.batch_size,
                 shutdown.clone(),
+                clickhouse_writer::ch_client(
+                    &cfg.clickhouse_url,
+                    &cfg.clickhouse_user,
+                    &cfg.clickhouse_password,
+                    &cfg.clickhouse_db,
+                ),
             )
         }),
         clickhouse_writer::run(

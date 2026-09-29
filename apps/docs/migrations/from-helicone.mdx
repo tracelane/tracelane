@@ -29,6 +29,13 @@ writes a `.env.tracelane` stanza. `--with-config` adds a **fixed two-provider
 starter scaffold** — it is a template, not derived from your code. `--src <dir>`
 only names a directory for you to review by hand; nothing is scanned.
 
+## Historical requests
+
+Use `tlane import-helicone --traces helicone-history.json --dry-run` to preview
+a saved request export, then omit `--dry-run` to send it. The local cursor makes
+the import resumable. See [Import Helicone history](/integrations/helicone-history)
+for the input format, counts, captured fields and retention behavior.
+
 ## Env var mapping
 
 | Helicone | Tracelane | Notes |
@@ -57,11 +64,13 @@ only names a directory for you to review by hand; nothing is scanned.
   nearest thing is `X-Business-Reference`, a single free-form identifier (a case
   or transaction id) — one value, not a bag of key/values. If you rely on
   multiple custom properties, tell us; it is not built
-- **Response caching is operator-configured, not per-request.** Helicone's
-  `Helicone-Cache-Enabled` is a client toggle; Tracelane's cache is set up once
-  by whoever runs the gateway, and a served hit is visible on the span as
-  `tracelane_semantic_cache_hit`. There is no header to turn it on or off per
-  call
+- **Response caching has request controls within operator bounds.** Send
+  `x-tracelane-cache: bypass` on any plan to skip lookup and storage. Eligible
+  paid plans can send `use` or `ttl=<hours>`; the effective reuse age is bounded
+  by the plan and operator. The response reports `x-tracelane-cache-ttl-hours`
+  and `x-tracelane-cache-bound`. Only buffered chat completions are supported;
+  explicit opt-in on streaming chat, embeddings or native messages is refused.
+  Inspect the active configuration at `/settings/gateway`.
 
 <Note>
   **Send an opaque id, not an email address.** The user id is stored on the span,

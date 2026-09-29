@@ -30,16 +30,16 @@ gateway: pinning compares a live tool definition against the hash you approved a
 divergence; the trifecta rail flags the untrusted-input + private-data + exfiltration-path
 combination. Observe-first, like every other rail.
 
-**On the roadmap, not shipped** — named here because they appear elsewhere in our docs
-and we would rather you learn it from us than from the source. These live in
-`crates/gateway/src/predictive/`, a separate layer from the rails above, and **none of them
+**Not shipped** — named here because they appear elsewhere in our docs
+and we would rather you learn it from us than from the source. These are part of the
+predictive layer, separate from the rails above, and **none of them
 fires on LLM traffic today** — for two different reasons:
 
 - **Browser stuck-loop prediction** and **A2UI catalog conformance** gate on payload fields
   (`mcp_server_name`, `tool_name`, `protocol`) that a `/v1/chat/completions` request does
   not carry, so they never reach their scoring path.
-- The **distilled SLM judge** runs on every request but is a **stub**: no trained model
-  ships, so it returns a constant score and can never flag anything.
+- The **distilled SLM judge** is **not enabled**: no trained model
+  ships, so it cannot flag anything.
 
 See [`apps/docs/predictive-guardrails.mdx`](apps/docs/predictive-guardrails.mdx) for
 per-rail status.
@@ -267,11 +267,9 @@ All binaries are Cosign-signed (keyless OIDC) with build provenance attested via
 `actions/attest-build-provenance`, and a CycloneDX SBOM is published with each release.
 We use Grype + Syft + OSV-Scanner (not Trivy) in CI.
 
-Honest note on this repository: it is a **one-way export** of a private monorepo, not
-the tree development happens in. Every commit here is a squashed publication, so `main`
-carries no branch protection and no review history you can inspect — the merge gating,
-the full test suite and the guard selftests run upstream before anything is exported.
-Judge the code and the releases, not the commit graph.
+Honest note on this repository: it is published from a separate development tree. Commits
+here are squashed publications, so `main` carries no branch protection and no review
+history you can inspect. Judge the code and the releases, not the commit graph.
 
 ## Migrating from Helicone
 

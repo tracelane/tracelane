@@ -82,21 +82,15 @@ The project's own CI runs 20 conformance evals — 10 fault-tolerance chaos scen
 prompt-injection.
 
 <Note>
-**In this public mirror the suite is reference-only and is not wired to CI.**
-Six of the twenty assert against fixtures the mirror deliberately withholds, so
-`pnpm eval:run` will not pass from a public clone. The eval sources ship so the
-assertions behind our claims are readable; running them is a canonical-repo
-activity.
+Six of the twenty assert against fixtures that are not part of the public
+repository, so `pnpm eval:run` will not pass from a public clone. The eval sources
+ship so the assertions behind our claims are readable.
 </Note>
 
-<Note>
-**These report; they do not block.** The suite is not wired as a blocking
-required status check, so a red eval does not automatically refuse a change —
-it is surfaced and acted on. Assertions that need a live gateway are reported
-as **skipped** in CI, never as a fabricated pass.
-</Note>
+Assertions that need a live gateway are reported as **skipped** in CI, never as a
+fabricated pass.
 
-In the canonical repository the suite runs as:
+From a checkout the suite runs as:
 
 ```bash
 pnpm eval:run --suite=all
@@ -112,11 +106,8 @@ gate at the top of this page runs *your* dataset against *your* prompt and fails
 *your* pull request.
 
 <Note>
-  **Changed 2026-08-30.** This section used to end "it is not a customer-facing eval
-  product", which was true of the whole page until the CI gate shipped and is now
-  true only of this harness. `tlane eval run` is customer-facing, and `tlane eval
-  run --suite` no longer drives this harness at all — it exits `2` pointing at
-  `pnpm eval:run`.
+  `tlane eval run` is customer-facing; `tlane eval run --suite` does not drive this
+  harness — it exits `2` pointing at `pnpm eval:run`.
 </Note>
 
 ## Related

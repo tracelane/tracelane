@@ -42,6 +42,8 @@
 						"group": "Integrations",
 						"pages": [
 							"integrations/langchain",
+							"integrations/langgraph",
+							"integrations/helicone-history",
 							"integrations/llamaindex",
 							"integrations/crewai",
 							"integrations/vercel-ai",
@@ -62,7 +64,7 @@
 					},
 					{
 						"group": "Features",
-						"pages": ["ask-tara", "prompt-promotion", "eval-gates", "slo", "time-travel"]
+						"pages": ["agent-identity", "ask-tara", "prompt-promotion", "eval-gates", "slo", "time-travel"]
 					},
 					{
 						"group": "Tools",

@@ -12,7 +12,10 @@ import { requireSession } from "@/lib/auth";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
 import { type Annotation, TraceFlag } from "./TraceFlag";
 
-export async function TraceFlagPanel({ traceId }: { traceId: string }) {
+export async function TraceFlagPanel({
+	traceId,
+	embedded = false,
+}: { traceId: string; embedded?: boolean }) {
 	const session = await requireSession();
 	// A viewer may READ verdicts and may not write them (IDENTITY_TEAM_SPEC §1).
 	const canWrite = session.role !== "viewer";
@@ -35,5 +38,12 @@ export async function TraceFlagPanel({ traceId }: { traceId: string }) {
 		mine = null;
 	}
 
-	return <TraceFlag traceId={traceId} initial={mine} canWrite={canWrite} />;
+	return (
+		<TraceFlag
+			embedded={embedded}
+			traceId={traceId}
+			initial={mine}
+			canWrite={canWrite}
+		/>
+	);
 }

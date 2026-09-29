@@ -1,3 +1,5 @@
+import { fmtCount } from "@/lib/metrics/format";
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * Traces list page — recent traces for the authenticated tenant, with the
  * filter bar (#1 surface gap). Server Component: the gateway owns the
@@ -20,12 +22,14 @@ import {
 	TraceList,
 	type TraceSummary,
 } from "@/components/trace-viewer/TraceList";
+import { requireSession } from "@/lib/auth";
 import {
 	GatewayError,
 	gatewayBaseUrl,
 	gatewayGet,
 	gatewayGetOrNull,
 } from "@/lib/gateway";
+import { getBulkSettings } from "@/lib/list-page-settings";
 import { fetchTraceCountFor } from "@/lib/metrics/fetch";
 import {
 	type TimeRange,
@@ -109,6 +113,8 @@ const PAGE_PARAMS = [
 	"failover",
 	// OBS-20 — "show me this person's traces".
 	"end_user",
+	"agent",
+	"model_family",
 	"sort",
 	"order",
 	"group",
@@ -168,6 +174,8 @@ function buildQuery(sp: SP, w: TimeRange | null): string {
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
+	if (sp.agent) q.set("agent", sp.agent);
+	if (sp.model_family) q.set("model_family", sp.model_family);
 	// OBS-01. Forwarded verbatim — the gateway is the ONE place the 4-char
 	// minimum is enforced (`trace_reads.rs::validate_search_term`); a term the
 	// FilterBar wouldn't have submitted itself (a hand-typed `?q=abc`) still
@@ -213,6 +221,8 @@ function buildExportBase(sp: SP): string {
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
+	if (sp.agent) q.set("agent", sp.agent);
+	if (sp.model_family) q.set("model_family", sp.model_family);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.sort) q.set("sort", sp.sort);
 	if (sp.order) q.set("order", sp.order);
@@ -227,6 +237,8 @@ function buildGroupQuery(sp: SP, w: TimeRange | null): string {
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
+	if (sp.agent) q.set("agent", sp.agent);
+	if (sp.model_family) q.set("model_family", sp.model_family);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.status === "error") q.set("has_error", "true");
 	else if (sp.status === "ok") q.set("has_error", "false");
@@ -246,10 +258,17 @@ function buildStreamParams(sp: SP, w: TimeRange | null): string {
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
+	if (sp.agent) q.set("agent", sp.agent);
+	if (sp.model_family) q.set("model_family", sp.model_family);
 	if (sp.failover === "true") q.set("failover", "true");
 	if (sp.status === "error") q.set("has_error", "true");
 	else if (sp.status === "ok") q.set("has_error", "false");
 	setWindow(q, w);
+	// A live tail reads UP TO NOW. The page's resolved `until` is frozen at render, so
+	// sending it made every reconnect re-read the same window and no new trace could
+	// ever appear (2026-09-27). A custom absolute window keeps its end — it is a
+	// deliberate slice of the past, not a tail.
+	if (!w || w.kind === "preset") q.delete("until");
 	return q.toString();
 }
 
@@ -282,7 +301,7 @@ function PaginationBar({
 			<span>
 				{total !== null ? (
 					<>
-						{count} of {total.toLocaleString()} trace{total === 1 ? "" : "s"}
+						{count} of {fmtCount(total)} trace{total === 1 ? "" : "s"}
 						{" · "}
 						{pageSize} per page
 					</>
@@ -426,7 +445,9 @@ async function TracesData({
 				sp.min_latency_ms ||
 				sp.signature_id ||
 				sp.q ||
-				sp.end_user,
+				sp.end_user ||
+				sp.agent ||
+				sp.model_family,
 		);
 		const allTime = sp.range === "all" || sp.range === "";
 		const windowPill = Boolean(sp.range) && !allTime;
@@ -478,10 +499,18 @@ async function TracesData({
 	// the SAME window as the list (lib/metrics), never a second computation. An
 	// unreachable count omits the total; it never fails the list render.
 	const total = await fetchTraceCountFor(w, new URLSearchParams(query));
+	const [bulk, session] = await Promise.all([
+		getBulkSettings(),
+		requireSession(),
+	]);
 
 	return (
 		<>
 			<TraceList
+				key={query}
+				selectable
+				selectionMax={bulk.max}
+				viewerRole={session.role}
 				traces={traces}
 				sort={sp.sort ?? "start_time"}
 				order={sp.order ?? "desc"}
@@ -489,6 +518,7 @@ async function TracesData({
 				startedHref={sortHref(sp, "start_time")}
 				spansHref={sortHref(sp, "spans")}
 			/>
+
 			<PaginationBar
 				sp={sp}
 				nextCursor={nextCursor}
@@ -543,7 +573,7 @@ export default async function TracesPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div className="flex items-baseline gap-3">
-					<h1 className="t-h1">Traces</h1>
+					<PageHeader title={<>Traces</>} />
 					<Suspense fallback={null}>
 						<LedgerChip />
 					</Suspense>
@@ -553,14 +583,14 @@ export default async function TracesPage({
 						<a
 							href={`/api/traces/export?${exportPrefix}format=csv`}
 							download
-							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							className="rounded-control border border-line px-2.5 py-1.5 font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							Export CSV
 						</a>
 						<a
 							href={`/api/traces/export?${exportPrefix}format=json`}
 							download
-							className="rounded-md border border-line px-2.5 py-1.5 font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							className="rounded-control border border-line px-2.5 py-1.5 font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							JSON
 						</a>
@@ -571,7 +601,7 @@ export default async function TracesPage({
 			<FilterBar />
 
 			{sp.failover === "true" && (
-				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
+				<div className="mt-2 flex items-center gap-2 rounded-control border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
 					<span className="font-medium text-ink">Failover only</span>
 					<span>— traces where a cross-provider failover fired.</span>
 					<Link
@@ -584,7 +614,7 @@ export default async function TracesPage({
 			)}
 
 			{(sp.since || sp.until) && (
-				<div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
+				<div className="mt-2 flex items-center gap-2 rounded-control border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">
 					<span className="font-medium text-ink">Custom time window</span>
 					<span>— traces within the period you drilled into.</span>
 					<Link

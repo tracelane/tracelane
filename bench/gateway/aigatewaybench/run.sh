@@ -43,6 +43,41 @@ HARNESS_REPO="https://github.com/BerriAI/ai-gateway-bench.git"
 HARNESS_DIR="${GWBENCH_HARNESS_DIR:-$HOME/.cache/tracelane/aigatewaybench-src}"
 VENV_DIR="${GWBENCH_VENV_DIR:-$HOME/.cache/tracelane/aigatewaybench-venv}"
 HOST_LABEL="${GWBENCH_HOST_LABEL:-dev-wsl2}"
+# REV-2 (2026-09-20): a comma list of the gateways to run (default: all). The
+# sync_interval measurement needs Tracelane + the direct baseline six times over;
+# re-running LiteLLM/Portkey/Bifrost each time measures nothing new. A gateway not
+# in the list is written to the CSV as SKIPPED with the reason — never silently absent.
+ONLY="${GWBENCH_ONLY:-direct,tracelane,litellm-python,portkey,bifrost}"
+wants() { [[ ",${ONLY}," == *",$1,"* ]]; }
+# REV-2: the NATS config the Tracelane bench stack runs under (see configs/nats-*.conf;
+# `nats-default.conf` is the published row's `-js -sd /data -m 8222` as a file). Stamped
+# into the CSV header so a row is never quoted without the policy it ran under.
+NATS_CONF="${GWBENCH_NATS_CONF:-$HERE/configs/nats-default.conf}"
+[ -f "$NATS_CONF" ] || { echo "REFUSING: GWBENCH_NATS_CONF=$NATS_CONF does not exist" >&2; exit 1; }
+NATS_CONF="$(readlink -f "$NATS_CONF")"
+export GWBENCH_NATS_CONF_ABS="$NATS_CONF"
+# Batch B (2026-09-21): the topology the Tracelane stack runs in. The PUBLISHED harness
+# (`tracelane.compose.yml`, `self-host`) has no control plane, so the gateway declines the
+# async audit path (`crates/gateway/src/server.rs:681`) and the acked JetStream ledger
+# publish is NOT on the measured path. `tracelane.prodtopo.compose.yml` (`prod-control-plane`)
+# adds Postgres + api-key auth + entitlements + the acked publish — prod's hot path. The
+# label is stamped into the CSV header AND every Tracelane row's note, so a number is never
+# quoted without the topology it was measured in. The three hooks are what the prod
+# topology needs and the published one does not: a bearer that is a minted tlane_ key
+# (never the master key), and a post-up step that installs the BYOK row + proves one
+# request lands one ledger row before anything is measured.
+TRACELANE_COMPOSE="${GWBENCH_TRACELANE_COMPOSE:-$HERE/tracelane.compose.yml}"
+[ -f "$TRACELANE_COMPOSE" ] || { echo "REFUSING: GWBENCH_TRACELANE_COMPOSE=$TRACELANE_COMPOSE does not exist" >&2; exit 1; }
+TRACELANE_BEARER_FILE="${GWBENCH_TRACELANE_BEARER_FILE:-}"
+TRACELANE_POST_UP="${GWBENCH_TRACELANE_POST_UP:-}"
+if [ "$(basename "$TRACELANE_COMPOSE")" = "tracelane.prodtopo.compose.yml" ]; then
+    TOPOLOGY="prod-control-plane"
+    [ -n "$TRACELANE_BEARER_FILE" ] && [ -s "$TRACELANE_BEARER_FILE" ] || { echo "REFUSING: the prod topology needs GWBENCH_TRACELANE_BEARER_FILE (prodtopo/prepare.sh writes it) — the master key is not a tenant" >&2; exit 1; }
+    [ -n "$TRACELANE_POST_UP" ] && [ -x "$TRACELANE_POST_UP" ] || { echo "REFUSING: the prod topology needs GWBENCH_TRACELANE_POST_UP (prodtopo/post-up.sh) — without the BYOK install every request is 'provider not configured'" >&2; exit 1; }
+else
+    TOPOLOGY="self-host"
+fi
+export GWBENCH_TOPOLOGY="$TOPOLOGY"
 RUN_LABEL="${1:-1}"
 
 RESULTS_DIR="$HERE/results"
@@ -79,7 +114,7 @@ cleanup() {
         [ -n "$pid" ] && kill -9 "$pid" >/dev/null 2>&1 || true
     done
     if [ "$COMPOSE_UP" = "1" ]; then
-        docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
+        docker compose -f "${TRACELANE_COMPOSE:-$HERE/tracelane.compose.yml}" -p "$COMPOSE_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
     fi
     pkill -9 -f "litellm --config $WORK_DIR" >/dev/null 2>&1 || true
     # Bifrost's actual server binary is a GRANDCHILD of the `npx` process we
@@ -225,6 +260,7 @@ log "mock-upstream up"
     echo "# date=${RUN_DATE} host_label=${HOST_LABEL} run_label=${RUN_LABEL} nproc=${NPROC} mem_gb=${FREE_G} kernel=${KERNEL} load1m=${LOAD_1M}${LOAD_NOTE}"
     echo "# tracelane_sha=${TRACELANE_SHA} litellm_python_version=${LITELLM_VERSION}"
     echo "# mock_url=${MOCK_URL} mock_bind=${MOCK_BIND} mock_ttft_ms=${MOCK_TTFT_MS:-0} mock_itl_ms=${MOCK_ITL_MS:-0}"
+    echo "# nats_conf=$(basename "$NATS_CONF") only=${ONLY} tracelane_topology=${GWBENCH_TOPOLOGY:-self-host}"
     echo "gateway,status,version,n,p50_ms,p95_ms,p99_ms,peak_rss_mb,notes"
 } >"$OUT_CSV"
 
@@ -332,6 +368,8 @@ PYEOF
 }
 
 # ── 2. direct-to-mock baseline ───────────────────────────────────────────────
+if wants direct; then
+
 
 log "running scenario: direct (baseline)"
 RESULT="$(run_scenario direct "$MOCK_URL" /v1/chat/completions mock gwbench "$MOCK_PID")"
@@ -342,26 +380,60 @@ if [[ "$RESULT" == OK* ]]; then
 else
     append_row direct "CANNOT_DETERMINE" "" "" "" "" "" "" "${RESULT#CANNOT DETERMINE — }"
 fi
+else
+    append_row direct SKIPPED "" "" "" "" "" "" "not in GWBENCH_ONLY=${ONLY} for this run"
+fi
 
 # ── 3. Tracelane self-host, capture ON ───────────────────────────────────────
+if wants tracelane; then
 
-log "starting Tracelane gateway (self-host, capture ON) via docker compose"
+
+log "starting Tracelane gateway (${TOPOLOGY}, capture ON) via docker compose: $(basename "$TRACELANE_COMPOSE")"
 TRACELANE_MASTER_KEY="$(openssl rand -base64 32)"
 export TRACELANE_MASTER_KEY
 export CLICKHOUSE_PASSWORD
 export GWBENCH_MOCK_URL="$MOCK_URL"
-if docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" up -d --build >"$WORK_DIR/tracelane_compose.log" 2>&1; then
+# The prod topology's compose reads the tenant id + secrets from prodtopo/generated/env
+# (prepare.sh); the published one has neither file nor need.
+if [ "$TOPOLOGY" = "prod-control-plane" ]; then
+    set -a; . "$(dirname "$TRACELANE_COMPOSE")/prodtopo/generated/env"; set +a
+fi
+if docker compose -f "$TRACELANE_COMPOSE" -p "$COMPOSE_PROJECT" up -d --build >"$WORK_DIR/tracelane_compose.log" 2>&1; then
     COMPOSE_UP=1
     if wait_http "http://127.0.0.1:${GATEWAY_PORT}/health" 180; then
-        GW_PID="$(docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" top gateway 2>/dev/null | awk 'NR==2{print $2}')"
+        GW_PID="$(docker compose -f "$TRACELANE_COMPOSE" -p "$COMPOSE_PROJECT" top gateway 2>/dev/null | awk 'NR==2{print $2}')"
         log "Tracelane gateway healthy (host PID ${GW_PID:-unknown})"
-        RESULT="$(run_scenario tracelane "http://127.0.0.1:${GATEWAY_PORT}" /v1/chat/completions claude-mock-gwbench "$TRACELANE_MASTER_KEY" "${GW_PID:--}")"
+        BEARER="$TRACELANE_MASTER_KEY"
+        [ -n "$TRACELANE_BEARER_FILE" ] && BEARER="$(cat "$TRACELANE_BEARER_FILE")"
+        POST_UP_NOTE=""; POST_UP_OK=1
+        if [ -n "$TRACELANE_POST_UP" ]; then
+            if POST_UP_OUT="$("$TRACELANE_POST_UP" "http://127.0.0.1:${GATEWAY_PORT}" 2>"$WORK_DIR/tracelane_post_up.log")"; then
+                POST_UP_NOTE="$(grep -o 'ledger head [0-9-]* -> [0-9-]*' "$WORK_DIR/tracelane_post_up.log" | head -1)"
+                HEAD_BEFORE="$(printf '%s\n' "$POST_UP_OUT" | sed -n 's/^HEAD_BEFORE=//p')"
+                log "post-up hook ok: ${POST_UP_NOTE:-see $WORK_DIR/tracelane_post_up.log}"
+            else
+                POST_UP_OK=0
+                log "post-up hook FAILED: $(tail -n2 "$WORK_DIR/tracelane_post_up.log" | tr '\n' ' ')"
+            fi
+        fi
+        if [ "$POST_UP_OK" = "1" ]; then
+            RESULT="$(run_scenario tracelane "http://127.0.0.1:${GATEWAY_PORT}" /v1/chat/completions claude-mock-gwbench "$BEARER" "${GW_PID:--}")"
+        else
+            RESULT="CANNOT DETERMINE — post-up hook failed: $(tail -n1 "$WORK_DIR/tracelane_post_up.log" | tr ',' ';')"
+        fi
         if [[ "$RESULT" == OK* ]]; then
             read -r _ n p50 p95 p99 <<<"$RESULT"
             RSS="$(peak_rss_mb "$WORK_DIR/tracelane_rss.csv")"
             SPAN_COUNT="$(curl -s -m5 -u "tracelane:${CLICKHOUSE_PASSWORD}" \
                 "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20tracelane.spans%20FORMAT%20TabSeparated" 2>/dev/null || echo "?")"
-            append_row tracelane ok "$TRACELANE_SHA" "$n" "$p50" "$p95" "$p99" "$RSS" "capture proof: ${SPAN_COUNT} rows in tracelane.spans after the run"
+            LEDGER_NOTE=""
+            if [ "$TOPOLOGY" = "prod-control-plane" ]; then
+                # The ledger proof for THIS run: the head moved by (about) the number of
+                # admitted requests, read from the canonical store, not from the gateway.
+                HEAD_AFTER="$(docker run --rm --network host postgres:17-alpine psql postgres://tracelane:tracelane_bench@127.0.0.1:5432/tracelane -Atc 'SELECT coalesce(max(last_seq),-1) FROM audit_chain_state' </dev/null 2>/dev/null || echo '?')"
+                LEDGER_NOTE="; ledger proof: head ${HEAD_BEFORE:-?} -> ${HEAD_AFTER} in audit_chain_state (Postgres) across the run (${POST_UP_NOTE})"
+            fi
+            append_row tracelane ok "$TRACELANE_SHA" "$n" "$p50" "$p95" "$p99" "$RSS" "topology=${TOPOLOGY}; capture proof: ${SPAN_COUNT} rows in tracelane.spans after the run${LEDGER_NOTE}"
         else
             # A release-build gateway pointed at a loopback ANTHROPIC_BASE_URL
             # hits its OWN SSRF guard (crates/gateway/src/ssrf_guard.rs) — the
@@ -369,28 +441,33 @@ if docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" up -d -
             # in release, by design (Opus-rereview M-4). Surface that specific
             # cause when it's the one present, instead of the generic
             # "N/M failed" from run_scenario.
-            SPECIFIC_REASON="$(docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" logs gateway 2>&1 \
+            SPECIFIC_REASON="$(docker compose -f "$TRACELANE_COMPOSE" -p "$COMPOSE_PROJECT" logs gateway 2>&1 \
                 | grep -o 'SSRF guard rejected [A-Za-z ]*' | head -1)"
             if [ -n "$SPECIFIC_REASON" ]; then
                 NOTE="CANNOT DETERMINE — ${SPECIFIC_REASON}: a release-build gateway cannot be pointed at a loopback ANTHROPIC_BASE_URL (crates/gateway/src/ssrf_guard.rs — the loopback bypass is debug-only by design, no release override exists). Every other gateway in this comparison has no equivalent guard."
             else
                 NOTE="${RESULT#CANNOT DETERMINE — }"
             fi
-            append_row tracelane "CANNOT_DETERMINE" "$TRACELANE_SHA" "" "" "" "" "" "$NOTE"
+            append_row tracelane "CANNOT_DETERMINE" "$TRACELANE_SHA" "" "" "" "" "" "topology=${TOPOLOGY}; $NOTE"
         fi
     else
         log "FATAL for this gateway: Tracelane /health never came up"
-        docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" logs gateway 2>&1 | tail -n40 >"$WORK_DIR/tracelane_health_fail.log"
-        append_row tracelane "CANNOT_DETERMINE" "$TRACELANE_SHA" "" "" "" "" "" "/health never returned 200 within 180s: $(tail -n3 "$WORK_DIR/tracelane_health_fail.log" | tr '\n' ' ' | tr ',' ';')"
+        docker compose -f "$TRACELANE_COMPOSE" -p "$COMPOSE_PROJECT" logs gateway 2>&1 | tail -n40 >"$WORK_DIR/tracelane_health_fail.log"
+        append_row tracelane "CANNOT_DETERMINE" "$TRACELANE_SHA" "" "" "" "" "" "topology=${TOPOLOGY}; /health never returned 200 within 180s: $(tail -n3 "$WORK_DIR/tracelane_health_fail.log" | tr '\n' ' ' | tr ',' ';')"
     fi
-    docker compose -f "$HERE/tracelane.compose.yml" -p "$COMPOSE_PROJECT" down -v --remove-orphans >/dev/null 2>&1
+    docker compose -f "$TRACELANE_COMPOSE" -p "$COMPOSE_PROJECT" down -v --remove-orphans >/dev/null 2>&1
     COMPOSE_UP=0
 else
     log "FATAL for this gateway: docker compose up failed"
     append_row tracelane "CANNOT_DETERMINE" "$TRACELANE_SHA" "" "" "" "" "" "docker compose up --build failed: $(tail -n5 "$WORK_DIR/tracelane_compose.log" | tr '\n' ' ' | tr ',' ';')"
 fi
+else
+    append_row tracelane SKIPPED "" "" "" "" "" "" "not in GWBENCH_ONLY=${ONLY} for this run"
+fi
 
 # ── 4. LiteLLM Python proxy ──────────────────────────────────────────────────
+if wants litellm-python; then
+
 
 log "starting LiteLLM Python proxy on :${LITELLM_PORT}"
 mkdir -p "$WORK_DIR/litellm-python"
@@ -415,8 +492,13 @@ else
     append_row litellm-python "CANNOT_DETERMINE" "$LITELLM_VERSION" "" "" "" "" "" "server never answered within 90s: $(tail -n5 "$WORK_DIR/litellm_python.log" | tr '\n' ' ' | tr ',' ';')"
 fi
 kill -9 "$LITELLM_PID" >/dev/null 2>&1 || true
+else
+    append_row litellm-python SKIPPED "" "" "" "" "" "" "not in GWBENCH_ONLY=${ONLY} for this run"
+fi
 
 # ── 5. Portkey OSS gateway (npx) ─────────────────────────────────────────────
+if wants portkey; then
+
 
 log "starting Portkey gateway on :${PORTKEY_PORT}"
 (npx -y @portkey-ai/gateway >"$WORK_DIR/portkey.log" 2>&1) &
@@ -441,8 +523,13 @@ else
     append_row portkey "CANNOT_DETERMINE" "unknown" "" "" "" "" "" "server never answered within 120s: $(tail -n5 "$WORK_DIR/portkey.log" | tr '\n' ' ' | tr ',' ';')"
 fi
 kill -9 "$PORTKEY_PID" >/dev/null 2>&1 || true
+else
+    append_row portkey SKIPPED "" "" "" "" "" "" "not in GWBENCH_ONLY=${ONLY} for this run"
+fi
 
 # ── 6. Bifrost (npx) ─────────────────────────────────────────────────────────
+if wants bifrost; then
+
 
 log "starting Bifrost on :${BIFROST_PORT}"
 mkdir -p "$WORK_DIR/bifrost-app-dir"
@@ -466,6 +553,9 @@ else
     append_row bifrost "CANNOT_DETERMINE" "unknown" "" "" "" "" "" "server never answered within 120s: $(tail -n5 "$WORK_DIR/bifrost.log" | tr '\n' ' ' | tr ',' ';')"
 fi
 kill -9 "$BIFROST_PID" >/dev/null 2>&1 || true
+else
+    append_row bifrost SKIPPED "" "" "" "" "" "" "not in GWBENCH_ONLY=${ONLY} for this run"
+fi
 
 # ── 7. LiteLLM Rust — no public build ────────────────────────────────────────
 

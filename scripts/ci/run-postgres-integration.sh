@@ -44,6 +44,23 @@ case "${1:-}" in
   ""|--selftest) ;;
   *) echo "usage: $(basename "$0") [--selftest]  (unknown argument: $1)" >&2; exit 2 ;;
 esac
+# B-494: the floors on tests this runner must DISCOVER (selftest, `--list`) and EXECUTE
+# (real run, summed `N passed`). Counted 2026-09-21 with `cargo test … -- --list
+# --ignored`: postgres_tenant_integration lists 14 `#[ignore]` tests; the three --bin
+# filters list 1 + 1 + 1. A lower reading is a suite that shrank, never a pass.
+# SET-38 / B-586 (2026-09-27): +7 in postgres_tenant_integration (set38_* ×5,
+# b586_* ×2 — edit in place, revoke through the gateway). Re-measured the same day
+# with the real run rather than added to the old floors: that crate now lists 31
+# (the db::* module tests compile into it too, which is why 14 was already below
+# reality) and the whole runner executed 38.
+# GWY-53 (2026-09-28): +1 discovered (db::workspace_capture's round trip compiles into
+# that crate too) and +3 --bin filters below. Re-measured with the real run: that crate
+# lists 32 and the whole runner executed 42.
+EXPECTED_PG_TESTS=32
+EXPECTED_PG_EXECUTED=42
+case "${1:-}" in
+  ""|--selftest) ;;
+esac
 
 CONTAINER=tlane-pg-integration-$$
 STARTED_CONTAINER=0
@@ -187,15 +204,45 @@ PY
     echo "SELFTEST BROKEN: the REAL tree's api_keys.rs CHANGED during the falsification — it must never be touched"
     exit 1
   fi
+  # ── B-494 (2026-09-21): THE FALSIFICATION RUNS ONLY THE TEST THE PLANT BREAKS. ──
+  # It used to re-run the whole runner in the worktree — four cargo invocations, every
+  # test against a fresh DB + 47 migrations — minutes after the gate had run the same
+  # suite green: 936 s, 56 % of an unnarrowed meta-gate, to learn one fact. The plant
+  # is `$9::numeric` on the key INSERT; `create_tenant_and_lookup_by_api_key` mints a
+  # key and is the test that goes RED. Running only it proves the same thing.
+  #
+  # What narrowing must NOT hide: a suite that silently SHRANK. So before the plant,
+  # the real tree's binary is asked to LIST the suite (no execution, warm compile) and
+  # the count is held to the floor below — a `#[ignore]` attribute typo, a deleted
+  # test, a module no longer compiled in, all read as fewer discovered tests and go
+  # RED here, while the real run (below, `run_and_count`) holds the EXECUTED count to
+  # the same floor. Falsified 2026-09-21 by setting the floor to 999: RED with the
+  # exact message; restored.
+  # A list that FAILS (a compile error in the tree) is not "zero tests" — it is CANNOT
+  # DETERMINE, said as such, so a red here is never misread as a shrunken suite.
+  LIST_LOG="$(mktemp)"
+  if ! cargo test -p gateway --test postgres_tenant_integration -- --list --ignored >"$LIST_LOG" 2>&1; then
+    echo "SELFTEST CANNOT DETERMINE — \`cargo test --list\` failed before any test was discovered (a compile error in the tree?):" >&2
+    grep -E '^error' "$LIST_LOG" | head -5 >&2
+    rm -f "$LIST_LOG"
+    exit 1
+  fi
+  DISCOVERED="$(grep -c ': test$' "$LIST_LOG" || true)"
+  rm -f "$LIST_LOG"
+  if [ "${DISCOVERED:-0}" -lt "$EXPECTED_PG_TESTS" ]; then
+    echo "SELFTEST FAILED — postgres_tenant_integration discovers $DISCOVERED test(s), floor is $EXPECTED_PG_TESTS: the suite SHRANK (a narrowed falsification would hide that). Fix the suite or the floor, with the reason."
+    exit 1
+  fi
+  echo "SELFTEST: postgres_tenant_integration discovers $DISCOVERED tests (floor $EXPECTED_PG_TESTS)."
   echo "SELFTEST: falsifying in an isolated worktree ($WT). The real tree is NOT touched."
-  echo "SELFTEST: reverted the cast to the shipped defect (\$9::numeric). Expecting RED."
-  if ( cd "$WT" && CARGO_TARGET_DIR="$WT_TARGET" bash "$WT/scripts/ci/run-postgres-integration.sh" ) >/dev/null 2>&1; then
-    echo "SELFTEST FAILED — the suite passed with the defect reintroduced. This runner proves nothing."
+  echo "SELFTEST: reverted the cast to the shipped defect (\$9::numeric). Expecting RED from the ONE test that mints a key."
+  if ( cd "$WT" && CARGO_TARGET_DIR="$WT_TARGET" TRACELANE_RUNNER_ONLY="create_tenant_and_lookup_by_api_key" bash "$WT/scripts/ci/run-postgres-integration.sh" ) >/dev/null 2>&1; then
+    echo "SELFTEST FAILED — the key-mint test passed with the defect reintroduced. This runner proves nothing."
     git_clean -C "$WT" reset --hard "$HEAD_SHA" >/dev/null 2>&1
     exit 1
   fi
   git_clean -C "$WT" reset --hard "$HEAD_SHA" >/dev/null 2>&1
-  echo "SELFTEST PASSED — the suite goes RED on the reintroduced defect, with the real tree untouched."
+  echo "SELFTEST PASSED — the key-mint test goes RED on the reintroduced defect, with the real tree untouched."
   exit 0
 fi
 
@@ -235,13 +282,56 @@ for f in apps/web/db/migrations/*.sql; do
 done
 
 RC=0
-cargo test -p gateway --test postgres_tenant_integration -- --ignored || RC=1
+# B-494: every cargo invocation goes through `run_and_count`, which adds its `N passed`
+# to EXECUTED so the floor below can refuse a run that executed fewer tests than the
+# suite holds — a runner silently skipping half its suite must go RED, not green.
+EXECUTED=0
+run_and_count() {
+  local out
+  out="$(cargo test "$@" 2>&1)"; local rc=$?
+  printf '%s\n' "$out" | grep -E '^test |panicked|test result' || true
+  local n
+  for n in $(printf '%s\n' "$out" | sed -n 's/^test result: [a-z]*\. \([0-9]*\) passed.*/\1/p'); do
+    EXECUTED=$((EXECUTED + n))
+  done
+  return $rc
+}
+if [ -n "${TRACELANE_RUNNER_ONLY:-}" ]; then
+  # The narrowed falsification (the --selftest above): ONE named test, nothing else,
+  # and no floor — the caller expects RED from that test alone.
+  run_and_count -p gateway --test postgres_tenant_integration -- --ignored "$TRACELANE_RUNNER_ONLY" || RC=1
+  exit $RC
+fi
+run_and_count -p gateway --test postgres_tenant_integration -- --ignored || RC=1
 # B-394 (BILL-01): the ceiling write binds an `Option<f64>` into `numeric(12,2)`.
 # Only a real server can refuse that bind (`error serializing parameter 1`) — it
 # answered 503 on every prod call, `null` included, with the full gate green.
-cargo test -p gateway --bin gateway billing::usage::tests::set_ceiling_sql -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::usage::tests::set_ceiling_sql -- --ignored || RC=1
 # B-418 / verifier R1 (2026-09-15): the boot schema check's REFUSAL had only ever been
 # falsified by hand. Against a real information_schema: complete → Ok(n), one dropped
 # column → Missing([that column]), no tables → Unavailable.
-cargo test -p gateway --bin gateway entitlement_cache::boot_schema_check_tests::verify_schema_refuses -- --ignored || RC=1
+run_and_count -p gateway --bin gateway entitlement_cache::boot_schema_check_tests::verify_schema_refuses -- --ignored || RC=1
+# RI-04 proof 4 (2026-09-19): the alerts ok→breach CAS admits exactly one of two
+# concurrent claimants — a property only a real server's row lock can show. (Proofs 2
+# and 3 — the job claim and `run_claimed` — ride the postgres_tenant_integration run above.)
+run_and_count -p gateway --bin gateway alerts::ri04_cas_tests -- --ignored || RC=1
+# GWY-27 (2026-09-26): per-workspace model aliases against a REAL Postgres — the
+# migration's CHECKs, create/exists/update, the cap enforced INSIDE the insert, the
+# entitlement resolver's second query actually loading the map, delete, and the cascade.
+run_and_count -p gateway --bin gateway db::model_aliases::tests::gwy27_model_aliases_round_trip -- --ignored || RC=1
+run_and_count -p gateway --bin gateway entitlement_cache::tests::gwy27_attach_model_aliases -- --ignored || RC=1
+# GWY-52: workspace failover — the DB round trip and the refresh step both ways.
+run_and_count -p gateway --bin gateway db::workspace_failover::tests::gwy52_workspace_failover_round_trip -- --ignored || RC=1
+run_and_count -p gateway --bin gateway entitlement_cache::tests::gwy52_attach_workspace_failover -- --ignored || RC=1
+# GWY-53: workspace content capture — the table round trip (a refused ledger rolls the
+# change back), the refresh through the FULL resolver (missing table → OFF + counted),
+# and the PUT handler appending exactly one ledger event per change.
+run_and_count -p gateway --bin gateway db::workspace_capture::tests::gwy53_workspace_capture_round_trip -- --ignored || RC=1
+run_and_count -p gateway --bin gateway entitlement_cache::tests::gwy53_attach_content_capture -- --ignored || RC=1
+run_and_count -p gateway --bin gateway workspace_capture_routes::tests::gwy53_put_records_the_change_on_the_ledger -- --ignored || RC=1
+if [ "$EXECUTED" -lt "$EXPECTED_PG_EXECUTED" ]; then
+  echo "postgres integration: FAIL — executed $EXECUTED test(s), floor is $EXPECTED_PG_EXECUTED: the suite shrank or a filter matched nothing (B-494)"
+  exit 1
+fi
+echo "postgres integration: executed $EXECUTED tests (floor $EXPECTED_PG_EXECUTED)"
 exit $RC

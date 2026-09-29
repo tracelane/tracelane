@@ -174,6 +174,11 @@ fn build_openai_stream(
 fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
 
+    // RI-05 / B-444: the provider's identity claims ride every OpenAI-compatible
+    // chunk (`id`, `model`, `system_fingerprint`). Emitted FIRST on any frame that
+    // carries at least one of them; consumers keep the first and ignore the rest.
+    let mut events: Vec<ProviderEvent> = response_meta(&v).into_iter().collect();
+
     // Usage chunk (stream_options.include_usage = true)
     if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
         let input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
@@ -181,13 +186,24 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
         // Wire-reported cost: OpenRouter (and some OpenAI-compatible
         // hosts) attach `usage.cost` in USD. Absent → None, never computed.
         let cost_usd = usage.get("cost").and_then(|c| c.as_f64());
-        return Ok(vec![ProviderEvent::UsageUpdate {
+        // RI-05 / M11: o-series reasoning tokens ride a NESTED object,
+        // disjoint from (and already counted inside) `completion_tokens` —
+        // `output_tokens` above stays inclusive. `.as_u64()` on a missing key
+        // is `None`, never a fabricated `0` for a non-reasoning model.
+        let reasoning = usage
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as u32);
+        events.push(ProviderEvent::UsageUpdate {
             input_tokens: input,
             output_tokens: output,
             cache_read: None,
             cache_creation: None,
             cost_usd,
-        }]);
+            reasoning,
+        });
+        return Ok(events);
     }
 
     // OBS-53. Collected BEFORE the content/tool/finish decision below and
@@ -195,7 +211,6 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     // legitimately be both a token and its logprob. Absent ⇒ nothing pushed, so
     // a stream from a client that did not ask for logprobs is byte-identical to
     // before this existed.
-    let mut events: Vec<ProviderEvent> = Vec::new();
     if let Some(entries) = v["choices"][0]["logprobs"]["content"].as_array() {
         let logprobs: Vec<f64> = entries
             .iter()
@@ -264,6 +279,25 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     }
 
     Ok(events)
+}
+
+/// RI-05 / B-444: `id` / `model` / `system_fingerprint` from one OpenAI-compatible
+/// frame, or `None` when the frame names none of them (a usage-only tail chunk from
+/// some hosts). Never fabricates: an absent field stays absent.
+fn response_meta(v: &Value) -> Option<ProviderEvent> {
+    let id = v.get("id").and_then(Value::as_str).map(str::to_owned);
+    let model = v.get("model").and_then(Value::as_str).map(str::to_owned);
+    let system_fingerprint = v
+        .get("system_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (id.is_some() || model.is_some() || system_fingerprint.is_some()).then_some(
+        ProviderEvent::ResponseMeta {
+            id,
+            model,
+            system_fingerprint,
+        },
+    )
 }
 
 // ── OpenAI request/response types ────────────────────────────────────────────
@@ -519,6 +553,75 @@ mod tests {
 
     /// OpenAI sends `finish_reason` on its OWN chunk with an empty delta. Before
     /// B-354 that chunk parsed to `None` and the reason was lost.
+    /// RI-05 / B-444: an OpenAI-compatible chunk names the response it belongs to.
+    #[test]
+    fn response_meta_rides_first_on_a_chunk_that_names_the_model_and_not_on_one_that_does_not() {
+        let chunk = r#"{"id":"chatcmpl-9x","object":"chat.completion.chunk","model":"gpt-4o-2024-08-06","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
+        let events = parse_openai_sse(chunk).unwrap();
+        match &events[0] {
+            ProviderEvent::ResponseMeta {
+                id,
+                model,
+                system_fingerprint,
+            } => {
+                assert_eq!(id.as_deref(), Some("chatcmpl-9x"));
+                assert_eq!(model.as_deref(), Some("gpt-4o-2024-08-06"));
+                assert_eq!(system_fingerprint.as_deref(), Some("fp_44709d6fcb"));
+            }
+            other => panic!("ResponseMeta must come first, got {other:?}"),
+        }
+        assert!(
+            matches!(events[1], ProviderEvent::StreamChunk { .. }),
+            "the token still follows"
+        );
+        // A frame with none of the three emits no meta and nothing else changes.
+        let bare = r#"{"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
+        let events = parse_openai_sse(bare).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ResponseMeta { .. }))
+        );
+        assert!(matches!(events[0], ProviderEvent::StreamChunk { .. }));
+    }
+
+    /// RI-05 / M11: an o-series `usage.completion_tokens_details.reasoning_tokens`
+    /// lands on `UsageUpdate.reasoning`, and `output_tokens` stays the SAME
+    /// inclusive total it always was — reasoning is broken out, not subtracted.
+    #[test]
+    fn reasoning_tokens_are_parsed_separately_and_output_tokens_stays_inclusive() {
+        let chunk = r#"{"choices":[],"usage":{"prompt_tokens":25,"completion_tokens":100,"completion_tokens_details":{"reasoning_tokens":7}}}"#;
+        let events = parse_openai_sse(chunk).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::UsageUpdate {
+                    input_tokens,
+                    output_tokens,
+                    reasoning,
+                    ..
+                } => Some((*input_tokens, *output_tokens, *reasoning)),
+                _ => None,
+            })
+            .expect("a UsageUpdate event");
+        assert_eq!(usage, (25, 100, Some(7)));
+
+        // A non-reasoning model's usage carries no such key ⇒ `None`, never `Some(0)`.
+        let plain = r#"{"choices":[],"usage":{"prompt_tokens":25,"completion_tokens":10}}"#;
+        let events = parse_openai_sse(plain).unwrap();
+        let reasoning = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::UsageUpdate { reasoning, .. } => Some(*reasoning),
+                _ => None,
+            })
+            .expect("a UsageUpdate event");
+        assert_eq!(
+            reasoning, None,
+            "no completion_tokens_details ⇒ absent, never a fabricated 0"
+        );
+    }
+
     #[test]
     fn the_terminal_chunks_finish_reason_is_parsed() {
         for (wire, want) in [

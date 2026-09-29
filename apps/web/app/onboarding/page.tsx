@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * /onboarding — new user setup wizard.
@@ -21,6 +22,7 @@
  */
 
 import { VerifyByTrace } from "@/components/onboarding/VerifyByTrace";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import {
 	Logo,
 	MetricIcon,
@@ -89,7 +91,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 		setLoading(true);
 		setError(null);
 		try {
-			const res = await fetch("/api/onboarding/organization", {
+			const res = await apiFetchRaw("/api/onboarding/organization", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ name: workspace.trim() }),
@@ -138,7 +140,7 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 				).map(({ icon, title, desc }) => (
 					<div
 						key={title}
-						className="flex items-start gap-3 rounded-lg border border-line bg-surface p-4"
+						className="flex items-start gap-3 rounded-card border border-line bg-surface p-4"
 					>
 						<MetricIcon name={icon} size={34} />
 						<div>
@@ -162,20 +164,21 @@ function StepWelcome({ onNext }: { onNext: () => void }) {
 					value={workspace}
 					onChange={(e) => setWorkspace(e.target.value)}
 					placeholder="Acme agents"
-					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					className="w-full rounded-control border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 			</div>
 
 			{error && <p className="text-sm text-danger-ink">{error}</p>}
 
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={start}
 				disabled={loading}
-				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-control text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating workspace…" : "Get started →"}
-			</button>
+			</Button>
 		</div>
 	);
 }
@@ -192,13 +195,14 @@ function CopyButton({ text }: { text: string }) {
 	};
 
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={copy}
-			className="shrink-0 text-xs px-3 py-1.5 rounded-lg border border-line text-ink-2 hover:text-ink hover:border-ink-3 transition-colors"
+			className="shrink-0 text-xs px-3 py-1.5 rounded-control border border-line text-ink-2 hover:text-ink hover:border-ink-3 transition-colors"
 		>
 			{copied ? "Copied!" : "Copy"}
-		</button>
+		</Button>
 	);
 }
 
@@ -223,7 +227,7 @@ function StepApiKey({
 		setLoading(true);
 		setError(null);
 		try {
-			const res = await fetch("/api/settings/api-keys", {
+			const res = await apiFetchRaw("/api/settings/api-keys", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ name: keyName.trim() || "my-agent" }),
@@ -252,7 +256,7 @@ function StepApiKey({
 					</p>
 				</div>
 
-				<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center gap-3">
+				<div className="rounded-card border border-line bg-surface-2 p-3 flex items-center gap-3">
 					<code className="text-sm font-mono text-action-ink break-all flex-1">
 						{rawKey}
 					</code>
@@ -284,14 +288,15 @@ function StepApiKey({
 					</span>
 				</label>
 
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={onNext}
 					disabled={!confirmed}
-					className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-40"
+					className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-control text-sm font-medium disabled:opacity-40"
 				>
 					Continue →
-				</button>
+				</Button>
 			</div>
 		);
 	}
@@ -307,7 +312,7 @@ function StepApiKey({
 			</div>
 
 			{priorKeyLost && (
-				<div className="rounded-lg border border-line bg-warn-soft p-4">
+				<div className="rounded-card border border-line bg-warn-soft p-4">
 					<p className="text-sm font-medium text-warn-ink">
 						Your earlier key can&apos;t be shown again
 					</p>
@@ -339,20 +344,21 @@ function StepApiKey({
 					value={keyName}
 					onChange={(e) => setKeyName(e.target.value)}
 					placeholder="my-agent"
-					className="w-full rounded-sm border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					className="w-full rounded-control border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 			</div>
 
 			{error && <p className="text-sm text-danger-ink">{error}</p>}
 
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={create}
 				disabled={loading}
-				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
+				className="bg-selected text-selected-on hover:opacity-90 w-full py-2.5 rounded-control text-sm font-medium disabled:opacity-50"
 			>
 				{loading ? "Creating…" : "Create API key →"}
-			</button>
+			</Button>
 		</div>
 	);
 }
@@ -466,14 +472,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "python" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							pip install tracelane anthropic
 						</code>
 						<CopyButton text="pip install tracelane anthropic" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{pythonSnippet}
 						</pre>
@@ -485,14 +491,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "typescript" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install @tracelanedev/sdk openai
 						</code>
 						<CopyButton text="npm install @tracelanedev/sdk openai" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{tsSnippet}
 						</pre>
@@ -504,7 +510,7 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "curl" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Run</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{curlSnippet}
 						</pre>
@@ -521,14 +527,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 			{lang === "cli" && (
 				<div className="space-y-2">
 					<p className="t-card-title">Install</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-center justify-between gap-3">
 						<code className="text-xs font-mono text-ink">
 							npm install -g @tracelanedev/cli
 						</code>
 						<CopyButton text="npm install -g @tracelanedev/cli" />
 					</div>
 					<p className="t-card-title mt-3">Use</p>
-					<div className="rounded-lg border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
+					<div className="rounded-card border border-line bg-surface-2 p-3 flex items-start justify-between gap-3">
 						<pre className="text-xs font-mono text-ink overflow-x-auto whitespace-pre">
 							{cliSnippet}
 						</pre>
@@ -539,13 +545,14 @@ tlane init --endpoint ${GATEWAY_URL}`;
 
 			<VerifyByTrace />
 
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={onDone}
 				className="text-sm text-ink-2 transition-colors hover:text-ink"
 			>
 				Skip for now → dashboard
-			</button>
+			</Button>
 		</div>
 	);
 }
@@ -616,7 +623,7 @@ export default function OnboardingPage() {
 		// route, so nothing above it paints the ground — but the reason is "the canvas is
 		// the ground every other card sits on", not "otherwise this card is invisible".
 		//
-		// The card now carries `.surface-card` rather than `rounded-2xl`, so its radius
+		// The card now carries `.surface-card` rather than `rounded-card`, so its radius
 		// and its (very light) elevation come from the same place as every other card
 		// instead of from a hardcoded Tailwind step that happened to be near the band.
 		<div className="app-canvas min-h-screen grid place-items-center p-4 sm:p-6">

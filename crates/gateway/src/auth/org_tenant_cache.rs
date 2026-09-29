@@ -54,6 +54,20 @@ fn cache() -> &'static Cache<String, Uuid> {
     })
 }
 
+/// [`resolve`], also reporting whether THIS call found the cache empty and so
+/// waited on the Postgres read (B-568 I5). A caller that coalesced onto another
+/// caller's in-flight miss also waited, and also reports `true` — which is right:
+/// it paid the round trip's latency whichever task issued it.
+///
+/// # Errors
+/// As [`resolve`] — fail-CLOSED.
+pub(crate) async fn resolve_traced(org_id: &str) -> Result<(Uuid, bool)> {
+    if let Some(uuid) = cache().get(org_id).await {
+        return Ok((uuid, false));
+    }
+    resolve(org_id).await.map(|uuid| (uuid, true))
+}
+
 /// Resolve a WorkOS `org_id` to the internal tenant UUID.
 ///
 /// Cached (30s TTL, positives only — errors and unknown orgs are never cached,
@@ -163,6 +177,20 @@ mod tests {
         let first = rt().block_on(resolve(org)).expect("first resolve");
         let second = rt().block_on(resolve(org)).expect("second resolve");
         assert_eq!(first, second);
+    }
+
+    /// B-568 I5: the FIRST resolve of an org went to the store and says so; the
+    /// second was answered by the cache and says so. Both directions, because a
+    /// `resolve_traced` that always answered `false` would pass the second half
+    /// alone and hide every JWT bridge miss from the cold-start attribute.
+    #[test]
+    fn resolve_traced_reports_the_miss_then_the_hit() {
+        let org = "org_unit_b568_traced";
+        let (first, missed) = rt().block_on(resolve_traced(org)).expect("first resolve");
+        assert!(missed, "an empty cache must report the store read");
+        let (second, missed_again) = rt().block_on(resolve_traced(org)).expect("second");
+        assert_eq!(first, second);
+        assert!(!missed_again, "a cached org must not report a store read");
     }
 
     #[test]

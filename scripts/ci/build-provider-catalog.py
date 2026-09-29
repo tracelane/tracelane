@@ -484,9 +484,28 @@ def parse_native_adapters(mod_src: str) -> list[tuple[str, list[str], str]]:
             "could not locate the `let native = match model {` arms in "
             f"{MOD_RS.relative_to(ROOT)} — no prefix column can be derived."
         )
+
+    # Two accepted shapes, because P0-4 (2026-09-23) lifted the literals out of the
+    # arms into shared `const <NAME>_PREFIXES` so the canonical match and the settings
+    # inventory read ONE source. That refactor is an improvement, and it blinded this
+    # parser: the arms still matched, `starts_with("...")` found nothing, and every
+    # adapter came back with an empty prefix list. The guard REFUSED rather than
+    # publishing a blank cell, which is the behaviour we want — but the fix belongs
+    # here, following the code to its new single source, not in the code.
+    def _literals_of_const(name: str) -> list[str]:
+        m = re.search(
+            rf"const {re.escape(name)}\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
+            mod_src,
+            re.DOTALL,
+        )
+        return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
     prefixes: dict[str, list[str]] = {}
     for guard, pid in re.findall(r'm if (.+?) => Some\("(\w+)"\)', arms.group(1)):
-        prefixes[pid] = re.findall(r'starts_with\("([^"]+)"\)', guard)
+        found = re.findall(r'starts_with\("([^"]+)"\)', guard)  # inline literals
+        for const_name in re.findall(r"\b([A-Z][A-Z0-9_]*_PREFIXES)\b", guard):
+            found.extend(_literals_of_const(const_name))  # via the shared const
+        prefixes[pid] = found
 
     envs_src = re.search(
         r"fn env_var_for_provider_id\b.*?match provider_id \{(.*?)\n\s*other\s*=>",

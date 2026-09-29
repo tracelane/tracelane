@@ -1,4 +1,7 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
+
+import { PageHeader } from "@tracelanedev/ui";
 
 /**
  * Route-segment error boundary — styled fallback for thrown Server/Client
@@ -8,6 +11,7 @@
  */
 
 import { reloadOnChunkError } from "@/lib/chunk-reload";
+import { reportClientError } from "@/lib/report-error";
 import { Logo } from "@tracelanedev/ui";
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -25,23 +29,24 @@ export default function RouteError({
 	const [updating, setUpdating] = useState(false);
 	useEffect(() => {
 		if (reloadOnChunkError(error)) setUpdating(true);
+		else reportClientError(error, "boundary", error.digest);
 	}, [error]);
 
 	if (updating) {
 		return (
-			<div className="min-h-screen bg-bg flex items-center justify-center p-6">
+			<div className="space-y-6">
 				<p className="text-sm text-ink-2">Updating to the latest version…</p>
 			</div>
 		);
 	}
 
 	return (
-		<div className="min-h-screen bg-bg flex items-center justify-center p-6">
-			<div className="w-full max-w-md text-center space-y-6">
+		<div className="space-y-6">
+			<div className="w-full max-w-md text-left space-y-6">
 				<div className="flex justify-center">
 					<Logo withWordmark />
 				</div>
-				<h1 className="t-h1">Something went wrong</h1>
+				<PageHeader title={<>Something went wrong</>} />
 				<p className="text-sm text-ink-2">
 					An unexpected error occurred. You can retry, or head back to your
 					dashboard.
@@ -52,7 +57,8 @@ export default function RouteError({
 					</p>
 				)}
 				<div className="flex items-center justify-center gap-3">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={reset}
 						// `bg-selected text-selected-on` — the theme-stable primary pair. This is a
@@ -63,13 +69,13 @@ export default function RouteError({
 						// with no visible button under it. Button.tsx made this exact swap for the
 						// primitive; these copies were missed. `--selected` flips per theme: 17.93:1 in
 						// light, 17.71:1 in dark, label included.
-						className="bg-selected text-selected-on hover:opacity-90 px-4 py-2 rounded-lg text-sm font-medium"
+						className="bg-selected text-selected-on hover:opacity-90 px-4 py-2 rounded-control text-sm font-medium"
 					>
 						Try again
-					</button>
+					</Button>
 					<Link
 						href="/"
-						className="px-4 py-2 rounded-lg text-sm font-medium border border-line text-ink hover:border-ink-3 transition-colors"
+						className="px-4 py-2 rounded-card text-sm font-medium border border-line text-ink hover:border-ink-3 transition-colors"
 					>
 						Back to dashboard
 					</Link>

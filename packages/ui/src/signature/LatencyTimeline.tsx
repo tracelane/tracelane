@@ -200,7 +200,7 @@ export function LatencyTimeline({
 				</span>
 				<span className="inline-flex items-center gap-1.5">
 					<span
-						className="inline-block h-2 w-3 rounded-sm bg-chart-primary/35"
+						className="inline-block h-2 w-3 rounded-control bg-chart-primary/35"
 						aria-hidden
 					/>
 					p50–p99 band

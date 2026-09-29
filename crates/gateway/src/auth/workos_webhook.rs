@@ -13,6 +13,7 @@
 //!      - organization.created  -> upsert tenants keyed on workos_org_id
 //!      - user.created          -> insert into users (tenant by LOOKUP)
 //!      - dsync.user.created    -> insert into users (SCIM provisioned)
+//!      - organization_membership.created -> fetch profile, upsert invited user
 //!      - other types           -> log only, ack 200
 //!   4. Response semantics: 200 only after dispatch succeeds; a dispatch
 //!      or dedup failure returns 503 so WorkOS redelivers (at-least-once,
@@ -59,18 +60,26 @@ const TOLERANCE_MILLIS: i64 = 300_000;
 #[derive(Debug, Clone)]
 pub struct WorkOsWebhookConfig {
     pub secret: SecretString,
+    pub management_api_key: Option<SecretString>,
+    // Only unit/integration fixtures can replace the fixed WorkOS origin.
+    #[cfg(test)]
+    management_api_url: Option<String>,
 }
 
 impl WorkOsWebhookConfig {
     pub fn from_env() -> Option<Self> {
         std::env::var("WORKOS_WEBHOOK_SECRET").ok().map(|s| Self {
             secret: SecretString::from(s),
+            management_api_key: std::env::var("WORKOS_API_KEY").ok().map(SecretString::from),
+            #[cfg(test)]
+            management_api_url: None,
         })
     }
 }
 
 #[derive(Clone)]
 pub struct WorkOsWebhookState {
+    pub pg: Option<crate::db::DbPool>,
     pub config: Arc<WorkOsWebhookConfig>,
     /// Global provisioning-rate cap, shared (via `Arc`) across every
     /// cloned per-request state so the token bucket is process-wide.
@@ -158,7 +167,10 @@ impl WebhookRateLimiter {
 fn is_provisioning_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        "organization.created" | "user.created" | "dsync.user.created"
+        "organization.created"
+            | "user.created"
+            | "dsync.user.created"
+            | "organization_membership.created"
     )
 }
 
@@ -330,7 +342,7 @@ pub async fn handler(
 
     //  + H-1: dedupe with record-on-success semantics.
     // See `billing/webhook.rs` for the rationale; same pattern here.
-    if let Some(pool) = crate::db::global_pool() {
+    if let Some(pool) = state.pg.as_ref() {
         match crate::db::webhook_events::already_processed(
             pool,
             crate::db::webhook_events::WebhookSource::WorkOs,
@@ -375,7 +387,7 @@ pub async fn handler(
         );
     }
 
-    if let Err(err) = dispatch(&event).await {
+    if let Err(err) = dispatch(&event, &state).await {
         tracing::warn!(
             error = %crate::db::pg_error_chain(&err),
             event_id = %event.id,
@@ -384,7 +396,7 @@ pub async fn handler(
         return (StatusCode::SERVICE_UNAVAILABLE, "dispatch failed");
     }
 
-    if let Some(pool) = crate::db::global_pool()
+    if let Some(pool) = state.pg.as_ref()
         && let Err(err) = crate::db::webhook_events::try_record_processed(
             pool,
             crate::db::webhook_events::WebhookSource::WorkOs,
@@ -397,14 +409,18 @@ pub async fn handler(
             event_id = %event.id,
             "post-dispatch dedup record failed (side effect already applied)"
         );
+        return (StatusCode::SERVICE_UNAVAILABLE, "dedup unavailable");
     }
     (StatusCode::OK, "ok")
 }
 
-async fn dispatch(event: &WorkOsEvent) -> Result<()> {
+async fn dispatch(event: &WorkOsEvent, state: &WorkOsWebhookState) -> Result<()> {
     match event.event.as_str() {
-        "organization.created" => handle_organization_created(event).await,
-        "user.created" | "dsync.user.created" => handle_user_created(event).await,
+        "organization.created" => handle_organization_created(event, state.pg.as_ref()).await,
+        "user.created" | "dsync.user.created" => {
+            handle_user_created(event, state.pg.as_ref()).await
+        }
+        "organization_membership.created" => handle_membership_created(event, state).await,
         _ => Ok(()),
     }
 }
@@ -439,11 +455,14 @@ fn user_uuid_from_workos_user(user_id: &str) -> Uuid {
     Uuid::from_bytes(out)
 }
 
-#[tracing::instrument(skip(event), fields(event_id = %event.id, event_type = %event.event))]
-async fn handle_organization_created(event: &WorkOsEvent) -> Result<()> {
+#[tracing::instrument(skip(event, pool), fields(event_id = %event.id, event_type = %event.event))]
+async fn handle_organization_created(
+    event: &WorkOsEvent,
+    pool: Option<&crate::db::DbPool>,
+) -> Result<()> {
     let org: OrganizationData = serde_json::from_value(event.data.clone())
         .context("organization.created data missing required fields")?;
-    let pool = match crate::db::global_pool() {
+    let pool = match pool {
         Some(p) => p,
         None => {
             tracing::warn!("organization.created: no Postgres pool — skipping");
@@ -521,10 +540,21 @@ const USER_UPSERT_SQL: &str = "INSERT INTO users (user_id, tenant_id, email, wor
                  SET workos_user_id = EXCLUDED.workos_user_id
                  WHERE users.tenant_id = EXCLUDED.tenant_id";
 
-#[tracing::instrument(skip(event), fields(event_id = %event.id, event_type = %event.event))]
-async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
+#[tracing::instrument(skip(event, pool), fields(event_id = %event.id, event_type = %event.event))]
+async fn handle_user_created(event: &WorkOsEvent, pool: Option<&crate::db::DbPool>) -> Result<()> {
     let user: UserData = serde_json::from_value(event.data.clone())
         .context("user.created data missing required fields")?;
+    let pool = match pool {
+        Some(p) => p,
+        None => {
+            tracing::warn!("user.created: no Postgres pool — skipping");
+            return Ok(());
+        }
+    };
+    provision_user(user, pool).await
+}
+
+async fn provision_user(user: UserData, pool: &crate::db::DbPool) -> Result<()> {
     let org_id = match user.organization_id.as_deref() {
         Some(o) => o,
         None => {
@@ -533,13 +563,6 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
         }
     };
     let user_id = user_uuid_from_workos_user(&user.id);
-    let pool = match crate::db::global_pool() {
-        Some(p) => p,
-        None => {
-            tracing::warn!("user.created: no Postgres pool — skipping");
-            return Ok(());
-        }
-    };
     // Lookup, never derivation. Unknown org → provision on demand
     // (free plan, random UUID) so a user event arriving before its
     // organization.created still lands on a real tenant.
@@ -558,7 +581,7 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
                 tracing::warn!(
                     tenant_id = %t.tenant_id,
                     workos_org = %org,
-                    "user.created for an org with no tenant — provisioned on demand"
+                    "WorkOS user provisioning for an org with no tenant — provisioned on demand"
                 );
             }
             Ok(t.map(|t| t.tenant_id))
@@ -569,7 +592,7 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
         // Archived tenant — ack without side effects (review F-2).
         tracing::warn!(
             workos_user = %user.id,
-            "user.created for an ARCHIVED tenant — user NOT provisioned (kill-switch stays cut)"
+            "WorkOS user provisioning for an ARCHIVED tenant — refused (kill-switch stays cut)"
         );
         return Ok(());
     };
@@ -595,7 +618,7 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
         tracing::warn!(
             workos_user = %user.id,
             tenant_id = %tenant_id,
-            "user.created email collision across tenants — rebind REFUSED (F-1)"
+            "WorkOS user provisioning email collision across tenants — rebind refused"
         );
         return Ok(());
     }
@@ -606,6 +629,85 @@ async fn handle_user_created(event: &WorkOsEvent) -> Result<()> {
         "user provisioned from WorkOS"
     );
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct MembershipData {
+    user_id: String,
+    organization_id: String,
+}
+
+/// Fail CLOSED: missing configuration, incomplete events and profile lookup
+/// failures return an error before the event is recorded, so WorkOS retries.
+#[tracing::instrument(skip(event, state), fields(event_id = %event.id, event_type = %event.event))]
+async fn handle_membership_created(event: &WorkOsEvent, state: &WorkOsWebhookState) -> Result<()> {
+    let membership: MembershipData = serde_json::from_value(event.data.clone())
+        .context("membership.created data missing required fields")?;
+    if membership.user_id.is_empty() || membership.organization_id.is_empty() {
+        bail!("membership.created identity fields must not be empty");
+    }
+    let pool = state
+        .pg
+        .as_ref()
+        .context("membership provisioning requires Postgres")?;
+    let key = state
+        .config
+        .management_api_key
+        .as_ref()
+        .context("membership provisioning requires WORKOS_API_KEY")?;
+    let mut user = fetch_membership_user(&membership.user_id, key, &state.config).await?;
+    // The verified event owns the organization link. Never accept an org from
+    // the profile response; profiles are global WorkOS identities.
+    user.organization_id = Some(membership.organization_id);
+    provision_user(user, pool).await
+}
+
+async fn fetch_membership_user(
+    user_id: &str,
+    key: &SecretString,
+    config: &WorkOsWebhookConfig,
+) -> Result<UserData> {
+    let base = "https://api.workos.com";
+    #[cfg(test)]
+    let base = config.management_api_url.as_deref().unwrap_or(base);
+    #[cfg(not(test))]
+    let _ = config;
+    let mut url = reqwest::Url::parse(base).context("WorkOS URL invalid")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("WorkOS URL cannot hold path"))?
+        .extend(["user_management", "users", user_id]);
+    // Transport deadline, not a customer entitlement. Bound DNS + request;
+    // never retry here (the signed webhook delivery is the retry mechanism).
+    let user = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let pinned = crate::ssrf_guard::validate_url_pinned(url.as_str()).await?;
+        let client = pinned
+            .pin(crate::ssrf_guard::safe_client_builder())
+            .build()?;
+        // `bearer_auth` is the repo's shape for a credential header (see
+        // `billing/polar_client.rs`): the copy happens inside reqwest at the
+        // last hop. `format!("Bearer {}", ..)` would leave the management key
+        // in an un-zeroized `String` we own — the `expose_secret().to_string()`
+        // class that `.claude/rules/security.md` bans.
+        let response = client
+            .get(url)
+            .bearer_auth(key.expose_secret())
+            .send()
+            .await
+            .map_err(|_| anyhow!("WorkOS profile transport failed"))?;
+        if !response.status().is_success() {
+            bail!("WorkOS profile request refused");
+        }
+        response
+            .json::<UserData>()
+            .await
+            .map_err(|_| anyhow!("WorkOS profile response invalid"))
+    })
+    .await
+    .context("WorkOS profile lookup timed out")??;
+    if user.id != user_id || user.email.trim().is_empty() {
+        bail!("WorkOS profile identity mismatch or missing email");
+    }
+    Ok(user)
 }
 
 #[cfg(test)]
@@ -630,6 +732,359 @@ mod tests {
     /// bug shipped green. Lesson pinned here: fixture timestamps match the
     /// provider's real wire format, not a convenient round number.
     const NOW_MILLIS: i64 = 1_780_000_000_000;
+
+    #[tokio::test]
+    async fn membership_created_is_dispatched_and_missing_fields_retry() {
+        let secret = "unit-test-membership-webhook-only";
+        let state = provisioning_state(secret, 10);
+        let body = br#"{"id":"evt_membership_missing","event":"organization_membership.created","data":{}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "workos-signature",
+            make_signature(body, secret, chrono::Utc::now().timestamp_millis())
+                .parse()
+                .unwrap(),
+        );
+        let response = handler(State(state), headers, Bytes::copy_from_slice(body))
+            .await
+            .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "membership.created must dispatch and retry incomplete data, never acknowledge a no-op"
+        );
+    }
+
+    #[test]
+    fn membership_created_consumes_provisioning_budget() {
+        assert!(
+            is_provisioning_event("organization_membership.created"),
+            "membership provisioning must share the control-plane growth cap"
+        );
+    }
+
+    // Synthetic identities in the documented WorkOS event shape:
+    // https://workos.com/docs/events#organization-membership-events
+    #[cfg(debug_assertions)]
+    const MEMBERSHIP_FIXTURE: &str =
+        include_str!("../../tests/fixtures/workos-membership-created.json");
+
+    #[cfg(debug_assertions)]
+    async fn deliver_membership(
+        state: &WorkOsWebhookState,
+        body: &serde_json::Value,
+        signing_key: &str,
+    ) -> StatusCode {
+        let body = serde_json::to_vec(body).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "workos-signature",
+            make_signature(&body, signing_key, chrono::Utc::now().timestamp_millis())
+                .parse()
+                .unwrap(),
+        );
+        handler(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .into_response()
+            .status()
+    }
+
+    #[cfg(debug_assertions)]
+    struct LocalWorkOsGuard;
+    #[cfg(debug_assertions)]
+    impl LocalWorkOsGuard {
+        fn new() -> Self {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(true);
+            Self
+        }
+    }
+    #[cfg(debug_assertions)]
+    impl Drop for LocalWorkOsGuard {
+        fn drop(&mut self) {
+            crate::ssrf_guard::set_loopback_bypass_for_tests(false);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    async fn membership_profile_refuses_redirects_mismatches_and_provider_errors() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let _guard = LocalWorkOsGuard::new();
+        let server = MockServer::start().await;
+        let mut config = WorkOsWebhookConfig {
+            secret: SecretString::from("unit-test-webhook-only"),
+            management_api_key: None,
+            management_api_url: Some(server.uri()),
+        };
+        let key = SecretString::from("unit-test-management-only");
+        for response in [
+            ResponseTemplate::new(401).set_body_string("DO_NOT_EXPOSE_PROVIDER_BODY"),
+            ResponseTemplate::new(302)
+                .insert_header("Location", "http://169.254.169.254/latest/meta-data"),
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id":"wrong_user","email":"other@example.invalid"}),
+            ),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/user_management/users/user_invited_fixture"))
+                .and(header("Authorization", "Bearer unit-test-management-only"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = fetch_membership_user("user_invited_fixture", &key, &config)
+                .await
+                .unwrap_err();
+            assert!(!format!("{error:#}").contains("DO_NOT_EXPOSE_PROVIDER_BODY"));
+            server.verify().await;
+        }
+        config.management_api_url = Some("http://169.254.169.254".into());
+        assert!(
+            fetch_membership_user("user_invited_fixture", &key, &config)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[ignore = "requires disposable local Postgres and local wiremock ports"]
+    async fn postgres_membership_webhook_provisions_once_and_retries_failures() -> Result<()> {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let _guard = LocalWorkOsGuard::new();
+        let database_url =
+            std::env::var("POSTGRES_TEST_URL").context("POSTGRES_TEST_URL required")?;
+        let mut pg_config: tokio_postgres::Config = database_url.parse()?;
+        assert!(pg_config.get_hosts().iter().all(|host| matches!(host, tokio_postgres::config::Host::Tcp(host) if host == "127.0.0.1" || host == "localhost")), "disposable local Postgres only");
+        let (admin, connection) = pg_config.connect(tokio_postgres::NoTls).await?;
+        let connection = tokio::spawn(connection);
+        // Generated identifier only; this is the existing disposable-test DB
+        // pattern. No application database is migrated or seeded.
+        let database = format!("tlane_membership_{}", Uuid::new_v4().simple());
+        admin
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .await?;
+        pg_config.dbname(&database);
+        let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
+        let pool = deadpool_postgres::Pool::builder(manager)
+            .max_size(4)
+            .build()?;
+        crate::db::apply_migrations(&pool).await?;
+        let client = pool.get().await?;
+        let tenant =
+            crate::db::tenants::create_or_get_by_workos_org(&pool, "org_invited_fixture", "free")
+                .await?
+                .unwrap();
+        let other =
+            crate::db::tenants::create_or_get_by_workos_org(&pool, "org_other_fixture", "free")
+                .await?
+                .unwrap();
+        let archived =
+            crate::db::tenants::create_or_get_by_workos_org(&pool, "org_archived_fixture", "free")
+                .await?
+                .unwrap();
+        client
+            .execute(
+                "UPDATE tenants SET archived_at = now() WHERE id = $1",
+                &[&archived.tenant_id],
+            )
+            .await?;
+        let server = MockServer::start().await;
+        let key = "unit-test-membership-webhook-only";
+        let state = WorkOsWebhookState {
+            pg: Some(pool.clone()),
+            config: Arc::new(WorkOsWebhookConfig {
+                secret: SecretString::from(key),
+                management_api_key: Some(SecretString::from("unit-test-management-only")),
+                management_api_url: Some(server.uri()),
+            }),
+            rate_limiter: Arc::new(WebhookRateLimiter::new(100)),
+        };
+        let fixture: serde_json::Value = serde_json::from_str(MEMBERSHIP_FIXTURE)?;
+        let count_users = || async {
+            client
+                .query_one("SELECT count(*) FROM users", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+        let mut no_key = state.clone();
+        Arc::make_mut(&mut no_key.config).management_api_key = None;
+        assert_eq!(
+            deliver_membership(&no_key, &fixture, key).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(count_users().await, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            deliver_membership(&state, &fixture, "wrong-unit-test-key").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(count_users().await, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        // A failed profile lookup must leave the event unrecorded, then recover
+        // on redelivery of the SAME id.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            deliver_membership(&state, &fixture, key).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(count_users().await, 0);
+        assert!(
+            !crate::db::webhook_events::already_processed(
+                &pool,
+                crate::db::webhook_events::WebhookSource::WorkOs,
+                "event_membership_fixture"
+            )
+            .await?
+        );
+        server.reset().await;
+        Mock::given(method("GET")).and(path("/user_management/users/user_invited_fixture"))
+            .and(header("Authorization", "Bearer unit-test-management-only"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"user_invited_fixture","email":"invited@example.invalid","first_name":"Invited","last_name":"Teammate","organization_id":"org_other_fixture"})))
+            .mount(&server).await;
+        assert_eq!(
+            deliver_membership(&state, &fixture, key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            count_users().await,
+            1,
+            "accepted membership must create the user mirror row"
+        );
+        let user = client
+            .query_one(
+                "SELECT tenant_id, workos_user_id, name FROM users WHERE email = $1",
+                &[&"invited@example.invalid"],
+            )
+            .await?;
+        assert_eq!(
+            user.get::<_, Uuid>(0),
+            tenant.tenant_id,
+            "organization must come from signed membership, not profile"
+        );
+        assert_eq!(user.get::<_, &str>(1), "user_invited_fixture");
+        assert_eq!(user.get::<_, &str>(2), "Invited Teammate");
+        assert_eq!(count_users().await, 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            deliver_membership(&state, &fixture, key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "duplicate must skip profile lookup"
+        );
+        // Concurrent redelivery converges to one user and one dedup row.
+        let mut concurrent = fixture.clone();
+        concurrent["id"] = "event_concurrent_fixture".into();
+        let (a, b) = tokio::join!(
+            deliver_membership(&state, &concurrent, key),
+            deliver_membership(&state, &concurrent, key)
+        );
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(count_users().await, 1);
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM webhook_events WHERE source = 'workos' AND event_id = $1",
+                    &[&"event_concurrent_fixture"]
+                )
+                .await?
+                .get::<_, i64>(0),
+            1
+        );
+        // Same email in a different org cannot move the existing mirror row.
+        let mut collision = fixture.clone();
+        collision["id"] = "event_collision_fixture".into();
+        collision["data"]["organization_id"] = "org_other_fixture".into();
+        assert_eq!(
+            deliver_membership(&state, &collision, key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM users WHERE tenant_id = $1",
+                    &[&other.tenant_id]
+                )
+                .await?
+                .get::<_, i64>(0),
+            0
+        );
+        let mut archived_event = fixture.clone();
+        archived_event["id"] = "event_archived_fixture".into();
+        archived_event["data"]["organization_id"] = "org_archived_fixture".into();
+        assert_eq!(
+            deliver_membership(&state, &archived_event, key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM users WHERE tenant_id = $1",
+                    &[&archived.tenant_id]
+                )
+                .await?
+                .get::<_, i64>(0),
+            0
+        );
+        // Record AFTER dispatch: a dedup insert failure returns 503. A retry
+        // repeats the idempotent upsert, then records the successful delivery.
+        client.batch_execute("CREATE FUNCTION fail_membership_dedup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'unit-test-dedup-outage'; END $$; CREATE TRIGGER membership_dedup_failure BEFORE INSERT ON webhook_events FOR EACH ROW EXECUTE FUNCTION fail_membership_dedup()").await?;
+        let mut retry = fixture.clone();
+        retry["id"] = "event_dedup_retry_fixture".into();
+        assert_eq!(
+            deliver_membership(&state, &retry, key).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(count_users().await, 1);
+        assert!(
+            !crate::db::webhook_events::already_processed(
+                &pool,
+                crate::db::webhook_events::WebhookSource::WorkOs,
+                "event_dedup_retry_fixture"
+            )
+            .await?
+        );
+        client
+            .batch_execute("DROP TRIGGER membership_dedup_failure ON webhook_events")
+            .await?;
+        assert_eq!(
+            deliver_membership(&state, &retry, key).await,
+            StatusCode::OK
+        );
+        assert!(
+            crate::db::webhook_events::already_processed(
+                &pool,
+                crate::db::webhook_events::WebhookSource::WorkOs,
+                "event_dedup_retry_fixture"
+            )
+            .await?
+        );
+        assert_eq!(count_users().await, 1);
+        drop(client);
+        pool.close();
+        drop(state);
+        drop(pool);
+        admin
+            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await?;
+        drop(admin);
+        connection.await??;
+        Ok(())
+    }
 
     #[test]
     fn verify_accepts_valid_signature() {
@@ -731,8 +1186,11 @@ mod tests {
         use axum::response::IntoResponse as _;
         let secret = "wh_handler_seam_secret";
         let state = WorkOsWebhookState {
+            pg: None,
             config: Arc::new(WorkOsWebhookConfig {
                 secret: SecretString::from(secret.to_string()),
+                management_api_key: None,
+                management_api_url: None,
             }),
             rate_limiter: Arc::new(WebhookRateLimiter::new(
                 DEFAULT_WEBHOOK_PROVISION_RATE_PER_MIN,
@@ -765,8 +1223,11 @@ mod tests {
 
     fn provisioning_state(secret: &str, per_min: u32) -> WorkOsWebhookState {
         WorkOsWebhookState {
+            pg: None,
             config: Arc::new(WorkOsWebhookConfig {
                 secret: SecretString::from(secret.to_string()),
+                management_api_key: None,
+                management_api_url: None,
             }),
             rate_limiter: Arc::new(WebhookRateLimiter::new(per_min)),
         }

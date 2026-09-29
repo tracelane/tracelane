@@ -10,10 +10,10 @@ classification: PUBLIC
 |---|---|---|
 | Spans (hot) | ClickHouse — **EU, Germany** (Hetzner, Falkenstein) | Parts stay on the hot volume for up to 365 days, then move to the cold volume below. The per-plan **indexed window** (Free 3 d, Builder 30 d, Team 90 d, Business 180 d, Enterprise 365 d) is the dashboard's fast-query boundary, not a deletion. Retention is not customer-configurable. |
 | Spans (cold) | ClickHouse cold volume on **Cloudflare R2 — EU jurisdiction** (`storage_policy = 'hot_cold'`) | Parts older than 365 days are moved here and stay queryable. **Queryable history** is Free 30 days, every paid tier 730 days: a per-plan sweep (enforced on Tracelane Cloud) deletes rows past that window, and the table's own TTL hard-deletes at 730 days. |
-| Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Until account deletion |
+| Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Workspace deletion archives first; eligible for purge after the 30-day recovery window. Ledger records are retained separately. |
 | Audit log | **Neon Postgres — EU, Germany (Frankfurt)** holds the canonical chain rows and anchor records; ClickHouse (EU, Germany) holds a derived copy for the dashboards. Export and verification read the canonical store. Tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in | Kept for the ledger's lifetime (no TTL) |
-| Provider API keys | Postgres (envelope-encrypted) | Within 60 seconds of revocation (a key idle for over a minute may be accepted once more on its next use while the gateway re-checks it) |
-| Prompt/completion text | ClickHouse spans | Same as spans (not captured unless an operator allowlists the workspace). Completion bodies are also held by the response cache for up to 7 days — see [Prompt content](#prompt-content) |
+| Provider API keys | Postgres (envelope-encrypted) | Stored until removed; workspace purge removes the credential rows. Access revocation and erasing stored data are separate operations. |
+| Prompt/completion text | ClickHouse spans — **EU, Germany** | Same as the trace it belongs to: your plan's queryable history (Free 30 days, every paid tier 730 days). Gateway capture is **off by default**; a workspace owner turns it on. OTLP instrumentation and history imports can send content independently. Completion bodies are also held by the response cache for up to 7 days — see [Prompt content](#prompt-content) |
 
 ### Sigstore Rekor — an external dependency, deliberately not a sub-processor
 
@@ -42,9 +42,23 @@ cannot be pinned to a region and no per-region isolation is claimed. If you need
 control the jurisdiction your data sits in, [self-host](/self-hosting) — you choose
 where ClickHouse and Postgres run.
 
-There is no self-serve erasure endpoint. Per-subject erasure requests are handled
-manually via support. Deleting a tenant in Postgres cascades that tenant's control-plane
-rows (API keys, CMK keys, billing records).
+### Workspace deletion and backups
+
+An owner can archive a workspace in Settings by confirming its name. The action
+marks its API keys revoked; authorization caches can delay enforcement. The
+scheduled purge selects workspaces archived for more than 30 days, then removes
+classified tenant rows from the online telemetry and control-plane stores.
+Failed purges need operator review and deletion-status confirmation. Audit ledger
+rows, chain state and anchors
+remain. Identity-provider deletion and subscription cancellation are best-effort
+steps that need separate confirmation if they fail.
+
+The online purge does not rewrite shared backups per tenant. Backups include an
+EU-jurisdiction copy and a secondary copy in Cloudflare's default jurisdiction; their pruning and lifecycle rules are separate from the
+workspace recovery window. Primary EU storage therefore does not mean EU-only
+processing or immediate erasure of every copy. For a deletion-status confirmation
+or per-subject erasure request, contact support@tracelane.dev. See the
+[service-provider inventory and deletion statement](https://tracelane.dev/security#subprocessors).
 
 ## Provider key handling
 
@@ -89,8 +103,8 @@ Tenant isolation is **structural**, not policy-enforced:
 
 - Every ClickHouse query starts `WHERE tenant_id = ?` — CI grep blocks any new
   SQL without it (see `scripts/ci/check-tenant-isolation.py`).
-- `tenant_id` always comes from the verified JWT claim (`organizationId` from
-  WorkOS), never from the request body, URL parameter, or MCP tool argument.
+- `tenant_id` is always resolved from the validated credential (the WorkOS
+  `organizationId` claim is mapped to the workspace's tenant UUID), never from the request body, URL parameter, or MCP tool argument.
 - Postgres tables use foreign-key cascades — deleting a tenant row deletes all
   associated API keys, CMK keys, and billing records atomically.
 - **Isolation is enforced in the query layer, not by a storage-engine policy.**
@@ -106,43 +120,90 @@ User-supplied span content (prompt/completion text) is wrapped in
 
 ### Prompt content
 
-**Prompt and completion text is not captured into your workspace's traces.** The
-gateway records the *shape* of a run — model, provider, token counts, latency,
-cost, status, tool-call structure — and not the message bodies. The first-party
-SDKs do not send message bodies either. The response cache, described below, is
-the one place completion bodies are retained.
+**The gateway records prompt and response text only when a workspace owner turns
+it on. It is off by default.** Recording the request and recording the response
+are two separate switches.
 
-Capture is not merely absent, it is **off unless an operator turns it on for a
-named workspace.** A self-hosted deployment can enable it with a `trace_content:`
-block in `tracelane.yaml`, which takes an explicit list of workspace ids and a
-maximum field size; with no such block, capture is off for everyone. On Tracelane
-Cloud no customer workspace is on that list, and a CI guard fails the build if one
-is added.
+**What is recorded when it is on:**
 
-**The response cache retains completion bodies, and it is on for every workspace
-on Tracelane Cloud.** For a non-streaming `POST /v1/chat/completions` request the
-gateway keeps the provider's completion body in process memory, keyed by a hash of
-the request, for up to 7 days, so a byte-identical repeat is served without a
-provider call. If your workspace holds a key for a provider with an embeddings
-API, the gateway also sends the request's message text to **your own** embedding
-provider and writes the completion body plus that embedding — not the message
-text — to a ClickHouse `semantic_cache` table with a 7-day TTL. A workspace whose
-only provider key has no embeddings API (Anthropic, for example) gets the
-in-memory tier alone, which empties on every gateway restart. There is no
-per-workspace or per-request opt-out today. `POST /v1/messages` and streaming
-requests are never cached. See `crates/gateway/src/semantic_cache.rs`.
+- **Request text** on `POST /v1/chat/completions` and `POST /v1/messages`: the
+  messages you send, and a top-level `system` field.
+- **Response text** on `POST /v1/chat/completions`, buffered and streamed — the
+  text your application actually received, including the arguments of any tool the
+  model called. It is recorded **after** the response guardrails run: text a
+  guardrail redacted is stored redacted, and a blocked response stores no response
+  text. `POST /v1/messages` does not record response text, and neither does an answer
+  served from the response cache (its request text is recorded).
+- Nothing from `POST /v1/embeddings`, and nothing from requests made before the
+  setting was turned on.
 
-The one path by which prompt text can reach your **stored traces** is your own
-OpenTelemetry instrumentation: if you emit the `gen_ai.input.messages` /
-`gen_ai.output.messages` semantic-convention attributes to `POST /v1/traces`, we
-store what you send. That is under your control, in your instrumentation.
+**Limits.** Each field is cut at the operator's maximum field size (64 KiB on
+Tracelane Cloud) and the cut is marked `…[truncated]`. For a long conversation the
+most recent messages that fit are kept, and the span records how many earlier
+messages were left out; a single message with many parts keeps its newest parts and
+says how many earlier ones were left out. Inline image data (a `data:` URL) is not
+kept, only its media type; an image link is kept like text. Before anything is
+stored, on every plan, known credential patterns (API keys, tokens, private keys) and
+personal-data patterns (email addresses, phone numbers, card and social-security
+numbers) are replaced with `[REDACTED:<type>]` markers.
+
+**Where and for how long.** The text is stored on the trace's span in ClickHouse
+(EU, Germany) and is deleted with the trace, at the end of your plan's queryable
+history (on Tracelane Cloud: Free 30 days, every paid tier 730 days; a self-hosted
+deployment deletes on the schedule its operator configures). Turning the setting off stops
+recording new text; text already recorded stays until its trace expires. Text you
+copy into a dataset stays there until you delete the item or the dataset; text
+copied into a review queue is kept for at most 30 days.
+
+**Who can change it, and the record of changes.** Only the workspace owner, signed
+in (an API key cannot). Every change is written to the workspace's tamper-evident
+audit ledger — event `workspace.content_capture.set`, with the old and new values
+and who made the change — so you can show when recording was on. The setting is
+`GET` / `PUT /v1/workspace/capture` on the gateway, and a control on the
+**Settings → Workspace** page.
+
+On a self-hosted deployment the operator can also turn recording on for named
+workspaces with a `trace_content:` block in `tracelane.yaml` (workspace IDs and the
+maximum field size). That block does not ask the workspace owner and writes no
+ledger event; Tracelane Cloud uses it only for its own test workspace. Neither
+setting governs content sent through OTLP.
+
+The SDK provider adapters normally record model, tokens and timing rather than
+message bodies. Framework instrumentation has its own capture settings; see
+[LangGraph](/integrations/langgraph). The historical
+[Helicone importer](/integrations/helicone-history) sends request and response
+bodies present in the export. Review instrumentation settings and export content
+before sending sensitive data.
+
+**An enabled response cache retains completion bodies.** For buffered
+`POST /v1/chat/completions`, the gateway can keep a completion in process memory
+and reuse it within the operator TTL. If your workspace has a usable embedding
+provider, it can also send message text to **your own** embedding provider and
+store the completion plus embedding in ClickHouse. The in-memory tier empties
+on gateway restart. Native messages, embeddings and streaming chat do not use
+this response cache.
+
+Send `x-tracelane-cache: bypass` on any plan to skip both lookup and storage.
+Eligible paid plans can request `use` or `ttl=<hours>`; the effective reuse age
+is the minimum of the requested value, plan ceiling and operator TTL, reported
+in `x-tracelane-cache-ttl-hours` and `x-tracelane-cache-bound`. Both exact and
+semantic lookup enforce that age. A reuse limit does not promise immediate
+physical deletion of stored rows or backups. These controls do not change a
+provider's own prompt-cache policy. `/settings/gateway` shows the active
+configuration; `GET /v1/gateway/settings` exposes the same authenticated read.
+
+OTLP clients, including the history importer, can send `gen_ai.input.messages` /
+`gen_ai.output.messages` to `POST /v1/traces`. These reach stored trace content
+through the ingestion pipeline; the gateway's content-capture setting does not
+govern this path. Retention and content processing still apply.
 
 <Note>
 Earlier revisions of this page documented a `TRACELANE_TRACE_CONTENT=false`
 setting. **No component reads that variable** — it was never implemented, so
-setting it has no effect in either direction. The operator-level `trace_content:`
-block described above is the real control. Corrected 2026-08-20; allowlist
-documented 2026-08-26.
+setting it has no effect in either direction. The workspace setting and the
+operator's `trace_content:` block described above are the real controls.
+Corrected 2026-08-20; operator block documented 2026-08-26; the owner's workspace
+setting documented 2026-09-27.
 </Note>
 
 An inline output PII-redaction pass (`[REDACTED:<type>]`) is on the roadmap.
@@ -153,8 +214,8 @@ always-on span-output scrubber.
 
 - **Dashboard:** WorkOS AuthKit — SSO (Google, Microsoft, GitHub), SAML, email OTP.
 - **Gateway:** `tlane_*` API keys (peppered HMAC-SHA256 lookup hash + Argon2id verifier stored; raw key shown once) or
-  WorkOS JWT (`organizationId` claim used as `tenant_id`).
-- **MCP server:** `tlane_*` API key via env var (V1); OAuth 2.1 PKCE (V2).
+  WorkOS JWT (the `organizationId` claim is resolved to the workspace's tenant UUID).
+- **MCP server:** `tlane_*` API key via env var.
 
 ## SSRF protection
 

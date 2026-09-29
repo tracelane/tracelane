@@ -6,7 +6,7 @@ Tracelane's Rust gateway — the performance-critical hot path.
 ## Responsibility
 
 - Proxy LLM requests from customer agents to 191 providers (BYOK, zero markup)
-- Run the predictive guardrail layer inline on every request (<50ms p99)
+- Run the predictive guardrail layer inline on every request
 - Emit OTLP spans to NATS JetStream for ingest
 - Maintain a tamper-evident SHA-256 audit log with Ed25519 Merkle commitments
 
@@ -19,17 +19,15 @@ Tracelane's Rust gateway — the performance-critical hot path.
 | `server/` | The request path, one file per concern — `chat.rs` (`POST /v1/chat/completions`), `embeddings.rs`, `dispatch.rs` (BYOK key + provider dispatch + retry), `stream.rs` (SSE), `buffered.rs`, `spans.rs`, `errors.rs`, `quota.rs` |
 | `admission.rs` | The ONE admission pipeline every inference route runs — auth → scope → parse → entitlements + rate limit → quota → budgets → predictive → audit publish |
 | `providers/` | Provider adapters (Anthropic, OpenAI, Gemini, Bedrock, Together, …) |
-| `predictive/` | 8-predictor guardrail layer — MCP hash watcher, taint tracker, A2UI, A2A, … |
+| `predictive/` | Predictive guardrail layer — MCP hash watcher, taint tracker, A2UI, A2A, … |
 | `audit.rs` | SHA-256 hash chain — compute_row_hash(), Rekor anchoring queue |
 | `auth/` | WorkOS JWKS, API key, SPIFFE mTLS — tenant_id always from JWT claim |
 | `rate_limiter.rs` | Per-tenant token bucket — free/builder/team/business RPM limits |
 | `otlp_emit.rs` | OTLP span emission to NATS — zero-copy on hot path |
 
-## Performance targets
+## Performance
 
-- Gateway overhead: <5ms p50, <15ms p95, <25ms p99
-- Predictive layer: <30ms p50, <50ms p99
-- Throughput: measured figures publish with the Reliability Benchmark v1.0. a live-perf eval is SKIPPED in CI (it needs a real gateway), so no throughput number here is currently backed by a measurement.
+No latency or throughput figure is published for this crate beyond what `apps/docs/benchmarks.mdx` reports; a live-perf eval is skipped in CI (it needs a real gateway).
 
 ## Security invariants
 

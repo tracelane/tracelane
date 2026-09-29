@@ -6,21 +6,21 @@ classification: PUBLIC
 
 LiteLLM is a widely-adopted open-source Python proxy, and a reasonable default for a lot of teams. This page is about one specific axis: what the request path is written in, and what you can verify about the artifact you deploy.
 
-Tracelane is a Rust gateway with Trusted Publishing OIDC, Cosign keyless signing, attested build provenance, and a vuln-scanning stack of OSV-Scanner + Grype + Syft.
+Tracelane is a Rust gateway. Every release since v0.2.3 ships Cosign keyless-signed binaries and a signed CycloneDX SBOM; the release workflows are also configured for Trusted Publishing OIDC and build provenance, and the repository runs a vuln-scanning stack of OSV-Scanner + Grype + Syft. Verify any artifact you download with `cosign` rather than taking this page's word for it.
 
 ## How we compare
 
 | Claim | Tracelane | LiteLLM |
 |---|---|---|
-| Language on request path | Rust (Apache 2.0) | Python (MIT core; `enterprise/` under a separate commercial licence) |
-| Supply-chain posture | Cosign keyless + attested build provenance + OSV-Scanner + Grype + Syft | PyPI install with transitive dependency surface |
-| Token model | Trusted Publishing OIDC (no long-lived registry tokens) | Registry token model per project policy |
+| Language on request path | Rust (Apache 2.0) | Python (MIT per its repository) |
+| Supply-chain posture | Cosign keyless-signed binaries and SBOM on every release since v0.2.3; OSV-Scanner + Grype + Syft | Not documented |
+| Token model | Trusted Publishing OIDC (no long-lived registry tokens) | Not documented |
 | Vuln scanning | OSV-Scanner + Grype + Syft | Not documented |
 | Gateway overhead | Low — no interpreter on the hot path: **2 ms p50 / 4 ms p95 / 5 ms p99 added**, measured with LiteLLM's own AIGatewayBench harness (4 vCPU, two runs, capture on) — see [benchmarks](/benchmarks) | Python interpreter on the hot path |
 | BYOK key custody | Envelope encryption, AAD bound to (tenant_id, provider_id) | Keys commonly supplied via proxy config / environment |
-| Audit ledger | Tamper-evident hash chain + Merkle + Ed25519 per-tenant signing (live); best-effort Rekor v2 inclusion proof on anchored batches (universal anchoring on the roadmap) | Not documented |
-| Inline guardrails | Heuristic rails at the gateway (R1–R8), verdicts written to the ledger | Guardrail hook framework with third-party integrations; no ledgered verdict |
-| Self-host complexity | Single-node Docker Compose (ClickHouse-backed) | Docker image or Python venv, plus Redis and Postgres for the stateful proxy |
+| Audit ledger | Tamper-evident hash chain + Merkle + Ed25519 per-tenant signing (live); best-effort Rekor v2 inclusion proof on anchored batches | Not documented |
+| Inline guardrails | Heuristic rails at the gateway (R1–R8), verdicts written to the ledger | Guardrail integrations documented; ledgered verdicts not documented |
+| Self-host complexity | Single-node Docker Compose (ClickHouse-backed) | Docker Compose documented ([BerriAI/litellm](https://github.com/BerriAI/litellm)) |
 | Migration tool | `tlane import-litellm` reads litellm_config.yaml | — |
 
 ## Migration
@@ -49,11 +49,11 @@ For the request-path features (multi-provider routing, failover, retry, usage/to
 </Accordion>
 
 <Accordion title="Is `tlane import-litellm` a complete migration?">
-It translates `litellm_config.yaml` 1:1 for provider routing, failover chains, and BYOK key references. Custom Python hooks in your LiteLLM proxy do not auto-port — you'll rewrite those as Tracelane gateway middleware or as separate services. For most teams the config translation is the only manual step.
+It translates the `model_list`, `router_settings` and callback entries of `litellm_config.yaml` into Tracelane gateway config; use `--dry-run` to review the output before writing it. Custom Python hooks in your LiteLLM proxy do not auto-port — you'll rewrite those as Tracelane gateway middleware or as separate services. Review the generated config before use.
 </Accordion>
 
 <Accordion title="What is Tracelane's vuln-scanning stack?">
-OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. Every tagged release ships a Cosign-signed CycloneDX SBOM (`sbom.cyclonedx.json` plus its `.cosign.bundle`) as of `v0.2.3`; the container image ships a signed CycloneDX SBOM as a Cosign attestation, and the repository SBOM is regenerated and signed weekly. See [Security](/security).
+OSV-Scanner (Google) for upstream advisories, Grype (Anchore) for container scanning, and Syft (Anchore) for CycloneDX SBOM generation. Tagged releases carry a Cosign-signed CycloneDX SBOM (`sbom.cyclonedx.json` plus its `.cosign.bundle`), as the v0.2.3 and v0.3.0 releases do. See [Security](/security).
 </Accordion>
 
 </AccordionGroup>

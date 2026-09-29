@@ -22,7 +22,7 @@ import { ipFromRequest, recordAdminAction } from "@/lib/admin-audit";
 import { requireSession } from "@/lib/auth";
 import { GatewayError, gatewayPost } from "@/lib/gateway";
 import { upsertTenantId } from "@/lib/tenant";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
 export async function GET(_req: NextRequest): Promise<NextResponse> {
@@ -52,9 +52,21 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 			// `rateLimitRpm` is `integer` and arrives as a number.
 			budgetUsdMonthly: apiKeys.budgetUsdMonthly,
 			rateLimitRpm: apiKeys.rateLimitRpm,
+			// SET-38 / BILL-01 A3 — the budget's reset cadence ("daily" | "weekly" |
+			// "monthly"). Without it the Limits cell labelled every budget "/mo",
+			// which is wrong for a daily or weekly key, and an edit form that changes
+			// the cadence could not show the current one.
+			budgetReset: apiKeys.budgetReset,
+			velocityBreaker: apiKeys.velocityBreaker,
+			revokedAt: apiKeys.revokedAt,
 		})
 		.from(apiKeys)
-		.where(and(eq(apiKeys.tenantId, tenantDbId), isNull(apiKeys.revokedAt)))
+		.where(
+			and(
+				eq(apiKeys.tenantId, tenantDbId),
+				or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+			),
+		)
 		.orderBy(apiKeys.createdAt);
 
 	return NextResponse.json(rows);

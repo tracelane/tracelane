@@ -1,3 +1,8 @@
+import { fmtCount } from "@tracelanedev/ui";
+import { PageHeader } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
+import { ObjectSurface } from "@tracelanedev/ui";
 /**
  * `EVL-02` — experiments, listed.
  *
@@ -38,6 +43,7 @@ import {
 } from "@/components/experiments/NewExperimentDialog";
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
+import { getListPageSettings } from "@/lib/list-page-settings";
 import { EmptyState } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -45,6 +51,7 @@ import Link from "next/link";
 export const metadata: Metadata = { title: "Experiments — Tracelane" };
 
 type DatasetListResponse = {
+	next_cursor: string | null;
 	datasets: { dataset_id: string; name: string; items: number | null }[];
 };
 
@@ -58,18 +65,30 @@ async function safeList<T>(path: string): Promise<T | null> {
 	}
 }
 
-export default async function ExperimentsPage() {
+export default async function ExperimentsPage({
+	searchParams,
+}: { searchParams: Promise<{ cursor?: string; dataset_cursor?: string }> }) {
+	const { cursor, dataset_cursor } = await searchParams;
+	const settings = await getListPageSettings();
+	const pageHref = (experimentCursor?: string, choiceCursor?: string) => {
+		const params = new URLSearchParams();
+		if (experimentCursor) params.set("cursor", experimentCursor);
+		if (choiceCursor) params.set("dataset_cursor", choiceCursor);
+		return `/experiments${params.size ? `?${params}` : ""}`;
+	};
+	const query = `limit=${settings.sizes.experiments}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+	const retryHref = pageHref(cursor, dataset_cursor);
 	let data: ExperimentListResponse;
 	try {
-		data = await gatewayGet<ExperimentListResponse>("/v1/experiments?limit=25");
+		data = await gatewayGet<ExperimentListResponse>(`/v1/experiments?${query}`);
 	} catch (err) {
 		const status = err instanceof GatewayError ? err.status : 0;
 		if (status === 403) {
 			// LOCKED, at HTTP 200. A hidden route that 403s is the invisible-
 			// entitlement bug; locked-with-a-reason is discoverable.
 			return (
-				<main className="mx-auto max-w-3xl px-6 py-10">
-					<h1 className="t-h1 mb-6">Experiments</h1>
+				<div className="mx-auto max-w-3xl px-6 py-10">
+					<PageHeader title={<>Experiments</>} />
 					<EmptyState
 						title="Experiments aren't included in this plan"
 						description="An experiment runs one frozen dataset against two to four prompt versions or models, then shows you exactly which items got worse — not that an average moved."
@@ -79,17 +98,30 @@ export default async function ExperimentsPage() {
 							See plans →
 						</Link>
 					</p>
-				</main>
+				</div>
 			);
 		}
 		return (
-			<main className="mx-auto max-w-3xl px-6 py-10">
-				<h1 className="t-h1 mb-6">Experiments</h1>
+			<div className="mx-auto max-w-3xl px-6 py-10">
+				<PageHeader title={<>Experiments</>} />
 				<EmptyState
 					title="Couldn't load experiments"
 					description="The gateway couldn't be reached. Nothing is wrong with your experiments — try again."
+					action={
+						<a className="underline" href={retryHref}>
+							Retry
+						</a>
+					}
 				/>
-			</main>
+				{cursor && (
+					<Link
+						className="underline"
+						href={pageHref(undefined, dataset_cursor)}
+					>
+						First page
+					</Link>
+				)}
+			</div>
 		);
 	}
 
@@ -98,7 +130,9 @@ export default async function ExperimentsPage() {
 	// `safeList` so a failure renders as "we could not check" instead of as
 	// "you have none" — the zero-vs-unknown rule, applied to a precondition.
 	const [datasetsRes, promptsRes] = await Promise.all([
-		safeList<DatasetListResponse>("/v1/datasets?limit=100"),
+		safeList<DatasetListResponse>(
+			`/v1/datasets?limit=${settings.sizes.experiment_datasets}${dataset_cursor ? `&cursor=${encodeURIComponent(dataset_cursor)}` : ""}`,
+		),
 		safeList<PromptOption[]>("/v1/prompts"),
 	]);
 	const datasets: DatasetOption[] = datasetsRes?.datasets ?? [];
@@ -108,88 +142,158 @@ export default async function ExperimentsPage() {
 		datasetsRes === null || promptsRes === null
 			? "Couldn't check your datasets and prompts just now — reload to try again."
 			: datasets.length === 0
-				? "Create a dataset first — an experiment runs a frozen set of cases."
+				? dataset_cursor
+					? "No datasets on this choice page — return to the first dataset choices."
+					: "Create a dataset first — an experiment runs a frozen set of cases."
 				: prompts.length === 0
 					? "Create a prompt first — an experiment compares versions of one prompt."
 					: null;
 
 	return (
-		<main className="p-6">
+		<div className="p-6">
 			<div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-				<h1 className="t-h1">Experiments</h1>
+				<PageHeader title={<>Experiments</>} />
 				<NewExperimentDialog
+					key={dataset_cursor ?? "first-dataset-page"}
 					datasets={datasets}
 					prompts={prompts}
 					disabledReason={disabledReason}
 				/>
 			</div>
 
+			{settings.defaulted && (
+				<p className="mb-3 text-sm text-ink-2">List settings unavailable.</p>
+			)}
+			<nav
+				aria-label="Dataset choices"
+				className="mb-4 flex flex-wrap gap-3 text-sm"
+			>
+				{datasetsRes && (
+					<span>Dataset choices: {datasets.length} on this page.</span>
+				)}
+				{dataset_cursor && (
+					<Link className="underline" href={pageHref(cursor)}>
+						First dataset choices
+					</Link>
+				)}
+				{datasetsRes?.next_cursor && (
+					<Link
+						className="underline"
+						href={pageHref(cursor, datasetsRes.next_cursor)}
+					>
+						Next dataset choices
+					</Link>
+				)}
+			</nav>
 			{data.experiments.length === 0 ? (
 				<EmptyState
-					title="No experiments yet"
-					description="An experiment runs a dataset against 2–4 arms and diffs the results, so a change ships only when it measurably wins."
+					title={cursor ? "No experiments on this page" : "No experiments yet"}
+					description={
+						cursor
+							? "Return to the first page to see your latest experiments."
+							: "An experiment runs a dataset against 2–4 arms and diffs the results, so a change ships only when it measurably wins."
+					}
 				/>
 			) : (
 				<>
 					<div className="overflow-x-auto">
-						<table className="w-full text-sm">
-							<thead>
-								<tr className="border-line border-b text-left">
-									<th className="px-3 py-1.5">Name</th>
-									<th className="px-3 py-1.5">Dataset</th>
-									<th className="px-3 py-1.5 text-right">Arms</th>
-									<th className="px-3 py-1.5 text-right">Items</th>
-									<th className="px-3 py-1.5">Status</th>
-									<th className="px-3 py-1.5">Created</th>
-								</tr>
-							</thead>
-							<tbody>
+						<Table className="w-full text-sm">
+							<THead>
+								<TR className="border-line border-b text-left">
+									<TH className="px-3 py-1.5">Name</TH>
+									<TH className="px-3 py-1.5">Dataset</TH>
+									<TH className="px-3 py-1.5 text-right">Arms</TH>
+									<TH className="px-3 py-1.5 text-right">Items</TH>
+									<TH className="px-3 py-1.5">Status</TH>
+									<TH className="px-3 py-1.5">Created</TH>
+									<TH className="px-3 py-2">
+										<span className="sr-only">Object actions</span>
+									</TH>
+								</TR>
+							</THead>
+							<TBody>
 								{data.experiments.map((e: ExperimentSummary) => (
-									<tr key={e.experiment_id} className="border-line border-b">
-										<td className="px-3 py-2">
+									<ObjectSurface
+										key={e.experiment_id}
+										objectId={e.experiment_id}
+										title={e.name || "Unnamed experiment"}
+										href={`/experiments/${encodeURIComponent(e.experiment_id)}`}
+										fields={[
+											{ label: "Dataset", value: e.dataset_id },
+											{ label: "Arms", value: fmtCount(e.arms) },
+											{ label: "Cases", value: fmtCount(e.item_count) },
+											{ label: "Status", value: e.status },
+										]}
+										links={[
+											{
+												label: "Open dataset",
+												href: `/datasets/${encodeURIComponent(e.dataset_id)}`,
+											},
+										]}
+										className="border-line border-b"
+									>
+										<TD className="px-3 py-2">
 											<Link
 												className="underline"
 												href={`/experiments/${encodeURIComponent(e.experiment_id)}`}
 											>
 												{e.name || "(unnamed)"}
 											</Link>
-										</td>
-										<td className="px-3 py-2 font-mono text-2xs text-ink-3">
+										</TD>
+										<TD className="px-3 py-2 font-mono text-2xs text-ink-3">
 											{e.dataset_id.slice(0, 8)}…
-										</td>
-										<td
+										</TD>
+										<TD
 											className="px-3 py-2 text-right"
 											style={{ fontVariantNumeric: "tabular-nums" }}
 										>
 											{e.arms}
-										</td>
-										<td
+										</TD>
+										<TD
 											className="px-3 py-2 text-right"
 											style={{ fontVariantNumeric: "tabular-nums" }}
 										>
 											{e.item_count}
-										</td>
-										<td className="px-3 py-2">{e.status}</td>
-										<td className="px-3 py-2 text-ink-3">
+										</TD>
+										<TD className="px-3 py-2">
+											<StatusBadge status={e.status} />
+										</TD>
+										<TD className="px-3 py-2 text-ink-3">
 											{formatDateTimeUtc(
 												new Date(e.created_at_ms).toISOString(),
 											)}
-										</td>
-									</tr>
+										</TD>
+									</ObjectSurface>
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
-					{/* NEVER a silent stop. A list that ends without saying whether more
-					    exists is the CSV lesson `specs/README.md` records. */}
 					<p className="mt-3 text-ink-3 text-xs">
-						showing {data.experiments.length}
-						{data.next_cursor
-							? " — more available; pagination lands with the next page control"
-							: ` of ${data.experiments.length}`}
+						Showing {data.experiments.length} on this page
 					</p>
 				</>
 			)}
-		</main>
+			<nav
+				aria-label="Experiment pages"
+				className="mt-4 flex flex-wrap gap-4 text-sm"
+			>
+				{cursor && (
+					<Link
+						className="underline"
+						href={pageHref(undefined, dataset_cursor)}
+					>
+						First page
+					</Link>
+				)}
+				{data.next_cursor && (
+					<Link
+						className="underline"
+						href={pageHref(data.next_cursor, dataset_cursor)}
+					>
+						Next page →
+					</Link>
+				)}
+			</nav>
+		</div>
 	);
 }

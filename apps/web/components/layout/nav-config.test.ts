@@ -43,3 +43,10 @@ describe("sidebar nav-config", () => {
 		expect(new Set(hrefs).size).toBe(hrefs.length);
 	});
 });
+
+it("gives each primary destination a distinct collapsed-rail icon", () => {
+	const primary = sections
+		.flatMap((section) => section.items)
+		.filter((item) => !item.href.startsWith("/settings"));
+	expect(new Set(primary.map((item) => item.Icon)).size).toBe(primary.length);
+});

@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::dispatch::{
-    DispatchGuard, ProviderKey, breaker_outcome, provider_name_from_model, resolve_provider_key,
+    DispatchGuard, ProviderKey, breaker_outcome, provider_name_from_model,
+    resolve_provider_key_traced,
 };
 use super::errors::{
     classify_dispatch_error, dispatch_failure_response, provider_error_response,
@@ -22,6 +23,18 @@ use super::errors::{
 use super::spans::{
     CallerIdentity, GatewayTiming, SpanUsageMeta, build_gateway_span, spawn_span_publish,
 };
+
+/// GWY-49: stamp the constraint's outcome on an embeddings span — `None` leaves it
+/// untouched (an unconstrained request), `Some(eligible)` records `zdr_required` and
+/// what the constraint left standing (empty on a refusal). Mirrors
+/// `RequestConfig::with_zdr` on the chat route, which this span builder does not use.
+fn with_zdr(mut span: TracelaneSpan, zdr_eligible: Option<Vec<String>>) -> TracelaneSpan {
+    if let Some(eligible) = zdr_eligible {
+        span.attributes.tracelane_zdr_required = Some(true);
+        span.attributes.tracelane_zdr_eligible_providers = Some(eligible);
+    }
+    span
+}
 
 /// Embeddings span. Same shape as the chat span (one definition of the
 /// attribute set) with the OTel GenAI `embeddings` operation name, so an
@@ -120,6 +133,10 @@ pub(crate) async fn embeddings_handler(
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use crate::admission::{Embeddings, Route as _};
+    let control = match crate::semantic_cache::CacheControl::parse(&headers) {
+        Ok(control) => control,
+        Err(err) => return err.response(false),
+    };
     // --- Step 1: ADMISSION. Nothing above this line resolves a credential. ---
     // The SAME pipeline as chat (`crate::admission`): auth → scope → parse →
     // entitlements + rate limit → monthly quota (the same tracker as chat: one
@@ -130,21 +147,49 @@ pub(crate) async fn embeddings_handler(
         Ok(a) => a,
         Err(refusal) => return Embeddings::refuse(refusal),
     };
+    let policy = match control.resolve(
+        admitted.entitlements.as_deref(),
+        state.semantic_cache.as_deref(),
+        false,
+    ) {
+        Ok(policy) => policy,
+        Err(err) => {
+            let mut guard = admitted.dispatch_guard;
+            guard.abort(err.code, None);
+            return err.response(false);
+        }
+    };
     let crate::admission::Admitted {
         claims,
-        identity,
+        mut identity,
         request_start,
         trace_id,
         inbound_parent,
         parsed,
+        entitlements,
         mut dispatch_guard,
+        // B-568 I1: the route label is `embeddings`; the timer is emitted at this
+        // route's dispatch boundary too, rather than discarded.
+        mut timer,
         ..
     } = admitted;
-    let request = parsed.request;
+    let mut request = parsed.request;
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
-    // The caller's model string — kept verbatim through routing, the span and
-    // the ledger even when a `tracelane.yaml` alias rewrites what goes upstream.
+    // GWY-27: a WORKSPACE alias resolves to its target at entry, as on the chat route
+    // (see `chat.rs` for why entry and not beside the operator rewrite). The caller's
+    // string survives on `identity.requested_model`; an unroutable target fails
+    // CLOSED below.
+    if let Some(target) = entitlements
+        .as_deref()
+        .and_then(|e| crate::db::model_aliases::resolve(&e.model_aliases, &request.model))
+    {
+        request.model = target.to_owned();
+        identity.tenant_alias_applied = true;
+    }
+    // The model string routing uses — the caller's own, or its workspace alias's
+    // target — kept verbatim through the span and the ledger even when a
+    // `tracelane.yaml` alias rewrites what goes upstream.
     let model = request.model.clone();
 
     // Every exit below this line has a ledger row behind it (R13). The armed
@@ -176,6 +221,49 @@ pub(crate) async fn embeddings_handler(
         refuse_with_span(&mut dispatch_guard, &state, "unroutable_model");
         return unroutable_model_response(&model);
     };
+    // GWY-49: the zero-data-retention constraint, judged the same way `chat.rs` does —
+    // after the provider is known, before any credential or byte reaches it; an
+    // unreadable header is refused, an ineligible provider is refused (fail-CLOSED).
+    // This route has no failover chain, so there is nothing to prune to: the eligible
+    // set is the provider or nothing. `zdr_eligible` is `Some` whenever the request was
+    // constrained and lands on every span below — refusal, dispatch failure, success.
+    let zdr_eligible: Option<Vec<String>> = match crate::zdr::constraint_from_headers(&headers) {
+        Ok(None) => None,
+        Ok(Some(crate::zdr::Constraint::Required)) => {
+            let caps = state.zdr.load();
+            if !caps.eligible(provider_id) {
+                spawn_span_publish(
+                    &state,
+                    with_zdr(
+                        build_embeddings_span(
+                            tenant_id,
+                            trace_id,
+                            inbound_parent,
+                            &model,
+                            &identity,
+                            request_start,
+                            0,
+                            None,
+                            Some("zdr_unsatisfiable"),
+                            claims.api_key_id(),
+                        ),
+                        Some(Vec::new()),
+                    ),
+                );
+                dispatch_guard.disarm();
+                return super::errors::zdr_unsatisfiable_response(
+                    &model,
+                    provider_id,
+                    caps.default_count(),
+                );
+            }
+            Some(vec![provider_id.to_string()])
+        }
+        Err(bad) => {
+            refuse_with_span(&mut dispatch_guard, &state, "invalid_zdr_constraint");
+            return super::errors::invalid_zdr_constraint_response(&bad);
+        }
+    };
     // Only providers speaking the OpenAI embeddings wire format can serve this.
     // Refuse by name rather than forward a shape the provider cannot parse and
     // relay its 400 as if it were ours.
@@ -204,7 +292,15 @@ pub(crate) async fn embeddings_handler(
     // --- Step 3: BYOK key. Fail-CLOSED, and the two failures need OPPOSITE
     // user actions (add a key vs rotate one) — never collapsed into one. ---
     let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
-    let provider_key = match resolve_provider_key(tenant_id, provider_id, key_env).await {
+    let (resolved_key, byok_round_trip) =
+        resolve_provider_key_traced(tenant_id, provider_id, key_env).await;
+    // B-568 I5: a BYOK cache miss read the control plane on the request path.
+    // `identity` is borrowed by `refuse_with_span` above, so the flag rides the
+    // timer and is applied to the success span below.
+    if byok_round_trip {
+        timer.note_cold();
+    }
+    let provider_key = match resolved_key {
         ProviderKey::Found(k) => k,
         outcome => {
             let (status, code, message) = match outcome {
@@ -277,7 +373,17 @@ pub(crate) async fn embeddings_handler(
     if let Some(a) = super::config::alias(&model) {
         upstream_request.model.clone_from(&a.upstream_model);
     }
+    timer.mark("route_byok_breaker");
     let dispatch_ts = chrono::Utc::now();
+    timer.emit_if_slow(
+        &state.hotpath,
+        u64::try_from(
+            (dispatch_ts - request_start)
+                .num_microseconds()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
+    );
     let result = adapter
         .embeddings(&upstream_request, provider_key.expose_secret(), tenant_id)
         .await;
@@ -306,17 +412,20 @@ pub(crate) async fn embeddings_handler(
             // error-rate metric is structurally pinned at 0% for this route.
             spawn_span_publish(
                 &state,
-                build_embeddings_span(
-                    tenant_id,
-                    trace_id,
-                    inbound_parent,
-                    &model,
-                    &identity,
-                    request_start,
-                    0,
-                    None,
-                    Some(failure.reason()),
-                    claims.api_key_id(),
+                with_zdr(
+                    build_embeddings_span(
+                        tenant_id,
+                        trace_id,
+                        inbound_parent,
+                        &model,
+                        &identity,
+                        request_start,
+                        0,
+                        None,
+                        Some(failure.reason()),
+                        claims.api_key_id(),
+                    ),
+                    zdr_eligible.clone(),
                 ),
             );
             tracing::warn!(
@@ -331,33 +440,36 @@ pub(crate) async fn embeddings_handler(
 
     // --- Step 6: Record, meter, respond ---
     let billable = response.billable_tokens();
-    spawn_span_publish(
-        &state,
-        build_embeddings_span(
-            tenant_id,
-            trace_id,
-            inbound_parent,
-            &model,
-            &identity,
-            request_start,
-            billable,
-            Some(GatewayTiming {
-                dispatch_ts,
-                provider_complete_ts,
-                // Embeddings are a single non-streamed round-trip: there is no
-                // first chunk distinct from the response.
-                ttft_us: None,
-            }),
-            None,
-            claims.api_key_id(),
-        ),
+    let mut ok_span = build_embeddings_span(
+        tenant_id,
+        trace_id,
+        inbound_parent,
+        &model,
+        &identity,
+        request_start,
+        billable,
+        Some(GatewayTiming {
+            dispatch_ts,
+            provider_complete_ts,
+            // Embeddings are a single non-streamed round-trip: there is no
+            // first chunk distinct from the response.
+            ttft_us: None,
+        }),
+        None,
+        claims.api_key_id(),
     );
+    // B-568 I5: admission's cold flag already rode `identity`; this adds this
+    // route's own BYOK miss, under the same present-only-beside-overhead rule.
+    if timer.is_cold() && ok_span.attributes.tracelane_gateway_overhead_us.is_some() {
+        ok_span.attributes.tracelane_gateway_cold_start = Some(true);
+    }
+    spawn_span_publish(&state, with_zdr(ok_span, zdr_eligible));
 
     // Echo the model the CALLER asked for. A `tracelane.yaml` alias is the
     // caller's own vocabulary; handing back the upstream name would break a
     // client that round-trips `response.model` into its next request.
     response.model = model;
-    (StatusCode::OK, Json(response)).into_response()
+    policy.response((StatusCode::OK, Json(response)).into_response())
 }
 
 #[cfg(all(test, debug_assertions))]

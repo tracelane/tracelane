@@ -34,7 +34,7 @@ await client.chat.completions.create({
   model: "claude-sonnet-4-6",
   messages: [{ role: "user", content: "Hello" }],
 });
-// → Trace visible at https://app.tracelane.dev/traces within ~1 second
+// → Trace visible at https://app.tracelane.dev/traces
 ```
 
 That captures the model call. Use this SDK when you want the **shape of your

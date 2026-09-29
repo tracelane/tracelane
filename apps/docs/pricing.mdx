@@ -19,10 +19,10 @@ Apache 2.0 core, predictive guardrails inline at the gateway, tamper-evident aud
 
 \* Annual billing is **not yet available** — the monthly plans are what you can buy today. The annual prices are published so they are known in advance; checkout offers monthly only until annual opens.
 
-- **OSS self-host** — 191 providers, single-node Docker Compose (ClickHouse-backed), rule-based predictive layer (PR1/PR2/PR4/PR5), community support. Apache 2.0 full stack.
-- **Free hosted** — no commercial use; the same rule-based predictive layer every tier runs (PR1/PR2/PR4/PR5).
-- **Builder** — predictive PR1+PR2+PR4+PR5 (rule-based), prompt history (read-only).
-- **Team** — SSO/SAML; predictive PR1+PR2+PR4+PR5 — the same set Builder runs — plus the data-governance and quality rails, and a tamper-evident promotion record.
+- **OSS self-host** — 191 providers, single-node Docker Compose (ClickHouse-backed), rule-based, observe-first predictive layer, community support. Apache 2.0 full stack.
+- **Free hosted** — no commercial use; the same rule-based, observe-first predictive layer every tier runs (on chat traffic: tool-definition drift and the tool-call schema validator; see [predictive guardrails](/predictive-guardrails)).
+- **Builder** — the rule-based, observe-first predictive layer, prompt history (read-only).
+- **Team** — SSO/SAML; the same predictive layer Builder runs, plus the data-governance and quality rails, and a tamper-evident promotion record.
 - **Business** — SSO/SAML; the data-governance and quality rails.
 - **Enterprise** — SSO/SAML, dedicated tenancy option, custom volume on every meter, 7-year ledger retention and the bulk audit export.
 
@@ -168,7 +168,7 @@ included on Enterprise.
 | Tamper-evident audit ledger | Included on every tier; hash chain + Ed25519 signing live; best-effort Rekor v2 anchoring (universal on the roadmap); 7-year retention + bulk export on Enterprise | no | no | not documented | no |
 | Self-host license | Apache 2.0 (full stack) | none | Cloud + Enterprise Self-Hosted SKU | MIT (4-DB stack) | hybrid, seats charged |
 | OTel GenAI semconv | canonical wire format | proprietary | proprietary | partial | proprietary |
-| Intervention timing | pre-flight (before model call) | post-failure | post-failure (cluster + draft PR) | post-failure | eval-time |
+| Intervention timing | pre-flight detection at the gateway; enforcement is opt-in | post-failure | post-failure (cluster + draft PR) | post-failure | eval-time |
 
 *Competitive pricing verified May 2026 against each vendor's public pricing page; the
 Gateway row was re-checked 2026-09-07. LangSmith Engine launched May 13, 2026 ([langchain.com/blog/interrupt-2026-overview](https://www.langchain.com/blog/interrupt-2026-overview)). See also [vs LangSmith Engine](/comparisons/vs-langsmith-engine) and the [full comparison matrix](/comparisons/index). We're wrong? Open an issue at [github.com/tracelane/tracelane](https://github.com/tracelane/tracelane).*

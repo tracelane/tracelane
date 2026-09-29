@@ -1,7 +1,7 @@
 /**
  * tlane import-helicone — rename a Helicone `.env` into its Tracelane
- * equivalent. This moves CONFIGURATION only: it does not read, import or
- * backfill any Helicone trace, request log or history.
+ * equivalent, or import saved historical request JSON with --traces <path>.
+ * Historical imports use OTLP and a resumable local cursor.
  *
  * Helicone is mostly a proxy with config-via-env + per-request headers,
  * not a YAML config like LiteLLM. So this CLI:
@@ -23,6 +23,7 @@
  * docs/migrations/from-helicone.md.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import process from "node:process";
@@ -152,9 +153,353 @@ function emitHeaderTable(): string {
 	].join("\n");
 }
 
+// Historical request import uses the documented Helicone request JSON fields.
+// https://docs.helicone.ai/rest/request/get-v1request
+export interface TraceImportOptions {
+	traces: string;
+	cursor: string;
+	endpoint: string;
+	apiKey: string;
+	dryRun?: boolean;
+}
+
+interface ImportCounts {
+	imported: number;
+	skipped: number;
+	reasons: Record<string, number>;
+}
+
+type JsonRecord = Record<string, unknown>;
+function record(value: unknown): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function timestampNanos(value: unknown): bigint | undefined {
+	if (typeof value !== "string") return undefined;
+	const match =
+		/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(
+			value,
+		);
+	if (!match) return undefined;
+	const millis = Date.parse(`${match[1]}${match[3]}`);
+	if (!Number.isSafeInteger(millis) || millis < 0) return undefined;
+	const nanos =
+		BigInt(millis) * 1000000n + BigInt((match[2] ?? "").padEnd(9, "0"));
+	return nanos <= 0xffffffffffffffffn ? nanos : undefined;
+}
+
+function requestSpan(value: unknown): {
+	span?: JsonRecord;
+	reason?: string;
+	id?: string;
+} {
+	if (
+		!record(value) ||
+		typeof value.request_id !== "string" ||
+		!value.request_id.trim()
+	)
+		return { reason: "missing_request_id" };
+	const id = value.request_id;
+	const start = timestampNanos(value.request_created_at);
+	let end = timestampNanos(value.response_created_at);
+	if (
+		value.response_created_at == null &&
+		start !== undefined &&
+		typeof value.delay_ms === "number" &&
+		value.delay_ms >= 0
+	) {
+		const durationNanos = Math.round(value.delay_ms * 1000000);
+		if (Number.isSafeInteger(durationNanos))
+			end = start + BigInt(durationNanos);
+	}
+	if (
+		start === undefined ||
+		end === undefined ||
+		end < start ||
+		end > 0xffffffffffffffffn
+	)
+		return { id, reason: "invalid_timestamp" };
+	const attributes: JsonRecord[] = [
+		{
+			key: "tracelane.business_reference",
+			value: { stringValue: `helicone:${id}` },
+		},
+	];
+	for (const [source, target] of [
+		["provider", "gen_ai.provider.name"],
+		["request_model", "gen_ai.request.model"],
+		["response_model", "gen_ai.response.model"],
+	] as const) {
+		const item = value[source];
+		if (typeof item === "string")
+			attributes.push({
+				key: target,
+				value: {
+					stringValue: source === "provider" ? item.toLowerCase() : item,
+				},
+			});
+	}
+	for (const [source, target] of [
+		["prompt_tokens", "gen_ai.usage.input_tokens"],
+		["completion_tokens", "gen_ai.usage.output_tokens"],
+	] as const) {
+		const item = value[source];
+		if (item == null) continue;
+		if (
+			typeof item !== "number" ||
+			!Number.isSafeInteger(item) ||
+			item < 0 ||
+			item > 0xffffffff
+		)
+			return { id, reason: "invalid_tokens" };
+		attributes.push({ key: target, value: { intValue: String(item) } });
+	}
+	for (const [source, target] of [
+		["request_body", "gen_ai.input.messages"],
+		["response_body", "gen_ai.output.messages"],
+	] as const) {
+		if (value[source] != null)
+			attributes.push({
+				key: target,
+				// Preserve the original JSON payload as a text part; do not guess
+				// provider-specific message/tool schemas or fabricate a span tree.
+				value: {
+					stringValue: JSON.stringify([
+						{
+							role: source === "request_body" ? "user" : "assistant",
+							parts: [{ type: "text", content: JSON.stringify(value[source]) }],
+						},
+					]),
+				},
+			});
+	}
+	const status = value.response_status;
+	if (
+		status != null &&
+		(typeof status !== "number" ||
+			!Number.isInteger(status) ||
+			status < 100 ||
+			status > 599)
+	)
+		return { id, reason: "invalid_status" };
+	if (typeof status === "number")
+		attributes.push({
+			key: "http.response.status_code",
+			value: { intValue: String(status) },
+		});
+	// Stable IDs survive an acknowledgement lost before the cursor is written.
+	const hash = createHash("sha256")
+		.update(`helicone:request:${id}`)
+		.digest("hex");
+	return {
+		id,
+		span: {
+			traceId: hash.slice(0, 32),
+			spanId: hash.slice(32, 48),
+			name: "helicone.request",
+			kind: 3,
+			startTimeUnixNano: String(start),
+			endTimeUnixNano: String(end),
+			attributes,
+			status: {
+				code: typeof status === "number" ? (status >= 400 ? 2 : 1) : 0,
+			},
+		},
+	};
+}
+
+export async function importHeliconeTraces(
+	opts: TraceImportOptions,
+): Promise<ImportCounts> {
+	const destination = new URL(opts.endpoint);
+	if (
+		destination.username ||
+		destination.password ||
+		destination.search ||
+		destination.hash ||
+		!["", "/"].includes(destination.pathname)
+	)
+		throw new Error(
+			"endpoint must be a gateway origin without credentials, path, query or fragment",
+		);
+	if (
+		destination.protocol !== "https:" &&
+		!(
+			destination.protocol === "http:" &&
+			["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname)
+		)
+	)
+		throw new Error("endpoint requires HTTPS (HTTP allowed only on loopback)");
+	if (!opts.apiKey)
+		throw new Error("Set TRACELANE_API_KEY to the destination workspace key");
+	if (path.resolve(opts.traces) === path.resolve(opts.cursor))
+		throw new Error("cursor must not overwrite the source export");
+	const bytes = fs.readFileSync(opts.traces);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		throw new Error("Helicone export is not valid JSON");
+	}
+	const requests = Array.isArray(parsed)
+		? parsed
+		: record(parsed) && parsed.error == null && Array.isArray(parsed.data)
+			? parsed.data
+			: null;
+	if (!requests)
+		throw new Error(
+			"Helicone export must be a request array or a successful {data: [...], error: null} response",
+		);
+	const fingerprint = createHash("sha256")
+		.update(bytes)
+		.update("\0")
+		.update(destination.origin)
+		.update("\0")
+		.update(opts.apiKey)
+		.digest("hex");
+	let lock: number | undefined;
+	try {
+		if (!opts.dryRun) {
+			try {
+				lock = fs.openSync(`${opts.cursor}.lock`, "wx", 0o600);
+			} catch {
+				throw new Error(
+					"Cannot acquire cursor lock; another import may be running. Check before removing a stale .lock file.",
+				);
+			}
+		}
+		let next = 0;
+		if (fs.existsSync(opts.cursor)) {
+			let saved: unknown;
+			try {
+				saved = JSON.parse(fs.readFileSync(opts.cursor, "utf8"));
+			} catch {
+				throw new Error("cursor is not valid JSON");
+			}
+			if (
+				!record(saved) ||
+				saved.version !== 1 ||
+				saved.fingerprint !== fingerprint ||
+				typeof saved.next !== "number" ||
+				!Number.isSafeInteger(saved.next) ||
+				saved.next < 0 ||
+				saved.next > requests.length
+			)
+				throw new Error(
+					"cursor does not match source, destination or key, or is invalid; use the original inputs or a separate cursor",
+				);
+			next = saved.next;
+		}
+		const counts: ImportCounts = {
+			imported: 0,
+			skipped: next,
+			reasons: next ? { already_processed: next } : {},
+		};
+		const seen = new Set<string>();
+		// Reconstruct duplicate IDs from the immutable prefix; no history lives in the cursor.
+		for (let i = 0; i < next; i++) {
+			const prior = requestSpan(requests[i]);
+			if (prior.span && prior.id) seen.add(prior.id);
+		}
+		for (let i = next; i < requests.length; i++) {
+			const converted = requestSpan(requests[i]);
+			const reason =
+				converted.reason ??
+				(converted.id && seen.has(converted.id)
+					? "duplicate_request_id"
+					: undefined);
+			if (reason) {
+				counts.skipped++;
+				counts.reasons[reason] = (counts.reasons[reason] ?? 0) + 1;
+			} else {
+				if (!opts.dryRun) {
+					let response: Response;
+					try {
+						response = await fetch(`${destination.origin}/v1/traces`, {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								Authorization: `Bearer ${opts.apiKey}`,
+							},
+							redirect: "error",
+							signal: AbortSignal.timeout(30000),
+							body: JSON.stringify({
+								resourceSpans: [
+									{
+										resource: {
+											attributes: [
+												{
+													key: "service.name",
+													value: { stringValue: "helicone-import" },
+												},
+											],
+										},
+										scopeSpans: [
+											{
+												scope: { name: "tracelane.import.helicone" },
+												spans: [converted.span],
+											},
+										],
+									},
+								],
+							}),
+						});
+					} catch {
+						throw new Error(
+							`Import stopped at row ${i + 1}: network/timeout/redirect failure; resume with the same cursor`,
+						);
+					}
+					if (response.status !== 200)
+						throw new Error(
+							`Import stopped at row ${i + 1}: HTTP ${response.status}; cursor retained for retry`,
+						);
+					let ack: unknown;
+					try {
+						ack = await response.json();
+					} catch {
+						throw new Error(
+							`Import stopped at row ${i + 1}: invalid ingest acknowledgement; cursor retained for retry`,
+						);
+					}
+					if (!record(ack) || Object.keys(ack).length !== 0)
+						throw new Error(
+							`Import stopped at row ${i + 1}: unexpected ingest acknowledgement; cursor retained for retry`,
+						);
+				}
+				counts.imported++;
+				if (converted.id) seen.add(converted.id);
+			}
+			if (!opts.dryRun) {
+				const temp = `${opts.cursor}.${process.pid}.tmp`;
+				let wroteTemp = false;
+				try {
+					fs.writeFileSync(
+						temp,
+						JSON.stringify({ version: 1, fingerprint, next: i + 1 }),
+						{ mode: 0o600, flag: "wx" },
+					);
+					wroteTemp = true;
+					fs.renameSync(temp, opts.cursor);
+				} finally {
+					if (wroteTemp && fs.existsSync(temp)) fs.unlinkSync(temp);
+				}
+			}
+		}
+		return counts;
+	} finally {
+		if (lock !== undefined) {
+			fs.closeSync(lock);
+			fs.unlinkSync(`${opts.cursor}.lock`);
+		}
+	}
+}
+
 // ── Command registration ────────────────────────────────────────────────────
 
 interface Opts {
+	traces?: string;
+	cursor?: string;
+	endpoint?: string;
 	env: string;
 	output?: string;
 	withConfig?: boolean;
@@ -166,7 +511,7 @@ export function registerImportHeliconeCommand(program: Command): void {
 	program
 		.command("import-helicone")
 		.description(
-			"Import Helicone env + headers and emit a Tracelane-flavoured stanza.",
+			"Import Helicone configuration, or historical request JSON with --traces.",
 		)
 		.option("--env <path>", "Path to .env file to read", ".env")
 		.option(
@@ -185,7 +530,42 @@ export function registerImportHeliconeCommand(program: Command): void {
 			"src/",
 		)
 		.option("--dry-run", "Print to stdout instead of writing files", false)
-		.action((opts: Opts) => {
+		.option(
+			"--traces <path>",
+			"Import a saved Helicone request JSON array or API response",
+		)
+		.option(
+			"--cursor <path>",
+			"Resume state (default: <traces>.tracelane-cursor.json)",
+		)
+		.option(
+			"--endpoint <url>",
+			"Destination gateway origin (or TRACELANE_GATEWAY_URL)",
+		)
+		.action(async (opts: Opts) => {
+			if (opts.traces) {
+				try {
+					const counts = await importHeliconeTraces({
+						traces: opts.traces,
+						cursor: opts.cursor ?? `${opts.traces}.tracelane-cursor.json`,
+						endpoint:
+							opts.endpoint ??
+							process.env.TRACELANE_GATEWAY_URL ??
+							"https://gateway.tracelane.dev",
+						apiKey: process.env.TRACELANE_API_KEY ?? "",
+						dryRun: opts.dryRun,
+					});
+					process.stdout.write(
+						`${opts.dryRun ? "Dry run: would import" : "Imported (accepted for ingest):"} ${counts.imported}; skipped ${counts.skipped}; reasons: ${JSON.stringify(counts.reasons)}\n`,
+					);
+				} catch (error) {
+					process.stderr.write(
+						`Trace import failed: ${error instanceof Error ? error.message : "unknown error"}\n`,
+					);
+					process.exitCode = 1;
+				}
+				return;
+			}
 			const envPath = path.resolve(opts.env);
 			const parsed = parseEnvFile(envPath);
 			if (parsed.heliconeVars.size === 0) {

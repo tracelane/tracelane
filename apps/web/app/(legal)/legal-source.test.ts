@@ -4,7 +4,7 @@
  * Two things have to be true at once, and they pull in opposite directions:
  *
  *   A. TODAY nothing is served. `docs/legal/*.md` still carry the DRAFT marker
- *      and three founder-gated tokens, so `/legal/*` must 404. Publishing a
+ *      and unresolved tokens, so their bodies must be withheld. Publishing a
  *      contract with `[COMPANY LEGAL ENTITY NAME]` in it is worse than having
  *      no page — that is why the documents are classified RESTRICTED and
  *      export-denied in the first place.
@@ -47,9 +47,17 @@ import { renderMarkdown } from "./markdown";
 const REPO = fileURLToPath(new URL("../../../../", import.meta.url));
 const REAL_DIR = resolve(REPO, "docs/legal");
 
-/** The founder's future edit, applied to the real text. */
-function asExecuted(markdown: string): string {
-	return markdown
+/** Test-only substitutions, never legal facts. The optional review-marker removal
+ * is confined to temporary fixtures; canonical drafts are never changed here. */
+function asExecuted(markdown: string, confirmReviewMarker = true): string {
+	return (
+		confirmReviewMarker
+			? markdown.replaceAll(
+					"[GOVERNING LAW JURISDICTION — confirm]",
+					"(test-only review marker removed)",
+				)
+			: markdown
+	)
 		.replace(/<!--\s*DRAFT[\s\S]*?-->/g, "")
 		.replaceAll("[COMPANY LEGAL ENTITY NAME]", "Tracelane Labs Private Limited")
 		.replaceAll("[EFFECTIVE DATE]", "1 January 2027")
@@ -122,7 +130,7 @@ describe("fail-closed: the gate refuses everything that is not executed text", (
 
 	it("refuses when the source tree is absent — the public export's state", () => {
 		// `docs/legal` is export-denied, so in the public mirror there is no file
-		// to read. That must be a 404, not a crash and not a blank page.
+		// to read. That must withhold the document body, not crash or leak a draft.
 		expect(
 			readLegalMarkdown("privacy-policy.md", "/nonexistent-legal"),
 		).toBeNull();
@@ -159,7 +167,7 @@ describe("once executed, the REAL documents publish", () => {
 	it("renders the DPA's SCC module and sub-processor table", () => {
 		const out = html(loadPublishableDoc("dpa", executedDir)?.markdown ?? "");
 		expect(out).toContain("Module Two");
-		expect(out).toContain("Polar.sh");
+		expect(out).toContain("Polar");
 		expect(out).toContain("<ol"); // the numbered processor obligations
 	});
 
@@ -172,6 +180,8 @@ describe("once executed, the REAL documents publish", () => {
 	it("NEVER leaks a placeholder or the DRAFT banner into rendered output", () => {
 		for (const d of LEGAL_DOCS) {
 			const out = html(loadPublishableDoc(d.slug, executedDir)?.markdown ?? "");
+			// Inspect rendered text, not CSS classes such as max-w-[...].
+			expect(out.replace(/<[^>]*>/g, "")).not.toMatch(/\[[\s\S]*?\]/);
 			for (const token of KNOWN_PLACEHOLDERS) expect(out).not.toContain(token);
 			expect(out).not.toMatch(/DRAFT/);
 			// The classification comment is metadata, not content.
@@ -239,4 +249,25 @@ describe("registry integrity", () => {
 			"terms",
 		]);
 	});
+});
+
+it.each([
+	"[GOVERNING LAW JURISDICTION — confirm]",
+	"[lowercase]",
+	"[x]",
+	"[]",
+	"[多言語]",
+	"[line\nbreak]",
+])("refuses residual placeholder %s", (token) => {
+	expect(publicationBlockers(`Clause ${token}`).join(" ")).toContain(token);
+});
+
+it("refuses the real terms when only the three known identity tokens are filled", () => {
+	const terms = asExecuted(
+		readFileSync(resolve(REAL_DIR, "terms-of-service.md"), "utf8"),
+		false,
+	);
+	expect(publicationBlockers(terms).join(" ")).toContain(
+		"[GOVERNING LAW JURISDICTION — confirm]",
+	);
 });

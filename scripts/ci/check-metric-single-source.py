@@ -75,13 +75,9 @@ RE_ID = re.compile(r"(?<![A-Za-z_])id:\s*\"([^\"]+)\"")
 
 # file -> (exact hit count, why). Shrink when a page migrates; delete at zero.
 # Pinned 2026-09-02 from the scan the day the guard landed — the pre-DSH-11 state.
-_MIGRATING = "pre-DSH-11 window computation; migrates to lib/metrics in the page batch"
-LEGACY: dict[str, tuple[int, str]] = {
-    "apps/web/app/audit/page.tsx": (
-        1,
-        'the ledger view deliberately has NO range control (forces "all"; audit/page.tsx:285) and keeps its own since/until export mapping — not a metric surface of the shared layer',
-    ),
-}
+# Empty since 2026-09-24: the audit page's own window arithmetic was deleted by
+# the /audit reinvention (it now reads a bounded, sequence-ordered window).
+LEGACY: dict[str, tuple[int, str]] = {}
 
 
 def iter_files(root: Path):

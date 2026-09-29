@@ -277,8 +277,62 @@ export async function gatewayDelete(path: string): Promise<void> {
 	}
 
 	if (!res.ok) {
-		throw new GatewayError(res.status, `gateway responded ${res.status}`);
+		// `EVL-31` fix: this used to throw with the status ONLY, so a `403
+		// role_forbidden` from a delete lost `required_role` and rendered as a
+		// generic failure — the exact shape every other verb here already
+		// guards against (see the class doc on `GatewayError` above).
+		throw new GatewayError(
+			res.status,
+			`gateway responded ${res.status}`,
+			await readErrorBody(res),
+		);
 	}
+}
+
+/**
+ * POST raw TEXT to the gateway with the per-user WorkOS JWT as the Bearer —
+ * for a body the caller must NOT re-encode, such as a JSONL import file.
+ * `gatewayPost` always `JSON.stringify`s its body, which would wrap the file
+ * text in a quoted JSON string and send the gateway one giant string instead
+ * of newline-delimited JSON objects.
+ *
+ * Same 10s timeout and error-body capture as {@link gatewayPost}.
+ */
+export async function gatewayPostText<T>(
+	path: string,
+	text: string,
+	contentType: string,
+): Promise<T> {
+	const { token } = await requireGatewayToken();
+	const base = gatewayBaseUrl();
+
+	let res: Response;
+	try {
+		res = await fetch(`${base}${path}`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${token}`,
+				"content-type": contentType,
+			},
+			body: text,
+			cache: "no-store",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+		});
+	} catch (err) {
+		throw new GatewayError(
+			503,
+			`gateway unreachable: ${err instanceof Error ? err.message : "fetch failed"}`,
+		);
+	}
+
+	if (!res.ok) {
+		throw new GatewayError(
+			res.status,
+			`gateway responded ${res.status}`,
+			await readErrorBody(res),
+		);
+	}
+	return (await res.json()) as T;
 }
 
 /**

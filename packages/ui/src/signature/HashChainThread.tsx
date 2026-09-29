@@ -90,7 +90,7 @@ export function ProvenanceChip({ verified, className }: ProvenanceChipProps) {
 	return (
 		<span
 			className={cn(
-				"inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-semibold",
+				"inline-flex items-center gap-1 rounded-control px-1.5 py-0.5 text-2xs font-semibold",
 				verified ? "bg-seal-soft text-seal-ink" : "bg-warn-soft text-warn-ink",
 				className,
 			)}

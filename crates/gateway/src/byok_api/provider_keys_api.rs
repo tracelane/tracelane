@@ -41,6 +41,10 @@ pub struct UploadRequest {
 pub struct ProviderKeySummary {
     pub provider_id: String,
     pub last4: String,
+    pub saved_at: chrono::DateTime<chrono::Utc>,
+    pub last_validation: Option<crate::db::provider_keys::KeyValidation>,
+    pub last_rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub rejection_history_available: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,7 +139,7 @@ async fn upload(
         .into_response()
 }
 
-async fn list(headers: HeaderMap, State(_state): State<AppState>) -> impl IntoResponse {
+async fn list(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
     let tenant = match authenticate_with(&headers, Access::Read).await {
         Ok(t) => t,
         Err(e) => return e,
@@ -151,11 +155,31 @@ async fn list(headers: HeaderMap, State(_state): State<AppState>) -> impl IntoRe
             return error(StatusCode::INTERNAL_SERVER_ERROR, "list failed");
         }
     };
+    let rejections = match state.quota_ch_url.as_deref() {
+        Some(url) => crate::provider_key_validate::rejections(
+            &crate::clickhouse_query::ch_client(url),
+            &tenant,
+            &rows,
+            crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant).await,
+        )
+        .await
+        .ok(),
+        None => None,
+    };
     let summaries: Vec<ProviderKeySummary> = rows
         .into_iter()
-        .map(|r| ProviderKeySummary {
-            provider_id: r.provider_id,
-            last4: r.last4,
+        .map(|r| {
+            let last_rejected_at = rejections
+                .as_ref()
+                .and_then(|history| crate::provider_key_validate::last_rejected(&r, history));
+            ProviderKeySummary {
+                provider_id: r.provider_id,
+                last4: r.last4,
+                saved_at: r.saved_at,
+                last_validation: r.last_validation,
+                last_rejected_at,
+                rejection_history_available: rejections.is_some(),
+            }
         })
         .collect();
     Json(summaries).into_response()
@@ -277,6 +301,24 @@ fn is_known_provider(p: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_summary_exposes_saved_timestamp_without_ciphertext() {
+        let summary = ProviderKeySummary {
+            provider_id: "anthropic".into(),
+            last4: "test".into(),
+            saved_at: chrono::Utc::now(),
+            last_validation: None,
+            last_rejected_at: None,
+            rejection_history_available: false,
+        };
+        let value = serde_json::to_value(summary).unwrap();
+        assert!(
+            value.get("saved_at").is_some(),
+            "provider summary must expose saved_at"
+        );
+        assert!(value.get("ciphertext_b64").is_none());
+    }
 
     #[test]
     fn is_known_provider_accepts_known_families() {

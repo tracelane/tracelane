@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { SparkBars } from "../charts/SparkBars";
 import { cn } from "../lib/cn";
 import { MetricIcon, type MetricIconName } from "./MetricIcon";
+import { Tooltip } from "./Tooltip";
 
 /**
  * StatCard — the ONE premium metric tile shared across every dashboard surface
@@ -18,7 +19,7 @@ import { MetricIcon, type MetricIconName } from "./MetricIcon";
  * THE SURFACE IS `.stat-tile` FOR ALL THREE VARIANTS — radius, hairline,
  * background and the ~2% contact shadow all live in tokens.css, so a tile and a
  * `<Card>` beside it are the same material. `inverse` and `action` used to
- * hardcode `rounded-lg` (8px, the CONTROL radius) while the default variant took
+ * hardcode `rounded-card` (8px, the CONTROL radius) while the default variant took
  * `--radius-card` (18px) from `.stat-tile`: three tiles in one row at two
  * different radii, which is exactly the "wireframe of rounded rectangles" tell
  * the brief opens by naming. They now share the class and override only the fill.
@@ -45,17 +46,14 @@ import { MetricIcon, type MetricIconName } from "./MetricIcon";
  * rather than as an affordance.
  */
 
-export type StatTone = "default" | "ok" | "warn" | "danger";
+export type StatTone = "neutral" | "warn" | "danger";
 
 /**
  * Card surface (app design system):
  *  - `default`  the standard tile — white sheet, hairline, 2% contact shadow.
  *  - `inverse`  the deliberate dark card (`--surface-inverse`) — the SLO
  *               error-budget / burn-rate hero. Its value paints in `--ink-inverse`.
- *  - `action`   the quiet well tile (`--action-soft`, which is the ink family's
- *               soft step, NOT a tint) — the block-rate / budget-remaining card.
- *               It was described as "a lava-soft tinted card"; lava is deleted and
- *               the token now resolves to the same neutral as `--surface-2`.
+ *  - `action`   the same neutral sheet; emphasis comes from the response tone.
  */
 export type StatVariant = "default" | "inverse" | "action";
 
@@ -64,7 +62,7 @@ export interface StatCardProps {
 	label: ReactNode;
 	/** The metric — rendered large (`.t-metric`), tabular-nums, tone-colored. */
 	value: ReactNode;
-	/** Tone for the value (color + meaning; never color alone — pair with copy). Applies to the `default` variant. */
+	/** Tone for the value (color + meaning; never color alone — pair with copy). Applies to every surface variant. */
 	tone?: StatTone;
 	/** Card surface — see StatVariant. */
 	variant?: StatVariant;
@@ -125,8 +123,7 @@ export interface StatCardProps {
 
 /** Tone → VALUE colour. `default` is primary ink: the reading is the point. */
 const TONE: Record<StatTone, string> = {
-	default: "text-ink",
-	ok: "text-ok-ink",
+	neutral: "text-ink",
 	warn: "text-warn-ink",
 	danger: "text-danger-ink",
 };
@@ -138,8 +135,7 @@ const TONE: Record<StatTone, string> = {
  * number and flatten the very hierarchy P0.6 is asking for.
  */
 const DELTA_TONE: Record<StatTone, string> = {
-	default: "text-ink-3",
-	ok: "text-ok-ink",
+	neutral: "text-ink-3",
 	warn: "text-warn-ink",
 	danger: "text-danger-ink",
 };
@@ -154,7 +150,7 @@ const DELTA_GLYPH: Record<
 export function StatCard({
 	label,
 	value,
-	tone = "default",
+	tone = "neutral",
 	variant = "default",
 	sub,
 	hint,
@@ -182,7 +178,7 @@ export function StatCard({
 				// is a 1px step the ground already almost matches, so it costs nothing.
 				"stat-tile relative bg-surface-inverse p-5"
 			: variant === "action"
-				? "stat-tile relative border-action-line bg-action-soft p-5"
+				? "stat-tile relative p-5"
 				: "stat-tile relative p-5";
 	// `.t-metric-label` already paints `--ink-2`, so `default` and `action` pass
 	// NOTHING here and inherit the one definition of what a metric label is. Only
@@ -190,18 +186,11 @@ export function StatCard({
 	const labelCls =
 		variant === "inverse" ? "text-ink-inverse opacity-70" : undefined;
 	const valueCls =
-		variant === "inverse"
-			? // INK ON INK. This was `text-action`, which was correct while --action was
-				// lava. The ink remap made --action monochrome, and --surface-inverse is
-				// ALSO ink — so in LIGHT theme the value rendered #0d0d0d on #0d0d0d: a
-				// 1:1 contrast ratio, completely invisible. Dark theme was fine (light
-				// action on dark card), which is why it survived review and shipped. The
-				// value on an inverse surface must use the token that EXISTS to be
-				// legible on it.
-				"text-ink-inverse"
-			: variant === "action"
-				? "text-ink"
-				: TONE[tone];
+		tone !== "neutral"
+			? TONE[tone]
+			: variant === "inverse"
+				? "text-ink-inverse"
+				: TONE.neutral;
 	const subCls =
 		variant === "inverse" ? "text-ink-inverse opacity-60" : "text-ink-3";
 
@@ -228,22 +217,10 @@ export function StatCard({
 				    devices and lags ~1s on desktop, so the `?` looked dead. This shows
 				    on hover, keyboard focus AND tap (focus-within). */}
 					{hint && (
-						<span className="group relative inline-flex">
+						<Tooltip content={hint} side="bottom">
 							<button
 								type="button"
-								aria-label={hint}
-								// The `variant === "inverse"` branch is the per-site focus override
-								// tokens.css's `--focus-ring` note says a focusable control inside a
-								// `--surface-inverse` card "would still need" — while asserting "there are
-								// none". This is one of them (2026-08-22 contrast audit). `--focus-ring` is
-								// `--ink`, so in LIGHT theme the ring paints #171717 on a #151619 tile =
-								// 1.01:1, and `outline-offset: 2px` cannot rescue it here because the ring
-								// lands on the TILE, not on the canvas behind it. `--ink-inverse` is the
-								// token defined to be legible on that surface: 16.60:1 / 17.71:1.
-								// Latent today — no call site passes `variant="inverse"` WITH a `hint` —
-								// which is precisely the state the ink-on-ink defects in this file shipped
-								// from. A colour override on the base ring; not `outline-none`, not a
-								// second ring mechanism.
+								aria-label={`${label} definition`}
 								className={cn(
 									"grid h-4 w-4 cursor-help place-items-center rounded-full border border-line-2 text-2xs leading-none text-ink-3 transition-colors hover:border-ink-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring",
 									variant === "inverse" && "focus-visible:outline-ink-inverse",
@@ -251,51 +228,7 @@ export function StatCard({
 							>
 								?
 							</button>
-							{/*
-							 * 2026-08-17 — three fixes to a tooltip that was correct in
-							 * mechanism and wrong in feel.
-							 *
-							 * ORIGIN-AWARE SCALE. It crossfaded opacity only, so it
-							 * appeared in place with no sense of coming FROM the `?`.
-							 * `scale-95` + `origin-top` grows it downward out of the
-							 * trigger it is anchored under. Not `scale-0` — nothing in the
-							 * real world appears from nothing.
-							 *
-							 * A SHOW DELAY, AND ONLY ON SHOW. It opened the instant the
-							 * pointer touched the `?`, so dragging the mouse across a
-							 * twelve-tile metric row strobed tooltips the user never asked
-							 * for. `group-hover:delay-300` delays the ENTER; the base
-							 * `delay-0` means the exit is still immediate — slow where the
-							 * user is deciding, fast where the system responds.
-							 *
-							 * NOT ANNOUNCED TWICE. `role="tooltip"` with no
-							 * `aria-describedby` pointing at it was doing no a11y work, but
-							 * its text was still in the accessibility tree — and the button
-							 * already carries the same string as `aria-label`, so a screen
-							 * reader read the hint, then read it again. The visual layer is
-							 * now `aria-hidden`; the `aria-label` is the accessible name.
-							 *
-							 * ELEVATION IS A TOKEN NOW (2026-08-22). It carried Tailwind's
-							 * stock `shadow-lg` — a 10px/15px drop that is heavier than
-							 * anything else in the system and is the one thing the brief
-							 * names as making a data surface feel cheap. `--shadow-overlay`
-							 * is the system's one overlay elevation, the same value the
-							 * `.tl-tooltip` primitive spends.
-							 *
-							 * Duration 125ms is the small-popover band (125–200ms) and the
-							 * easing is inherited: `--default-transition-timing-function`
-							 * is now the system ease-out (tokens.css). The property list names `scale`,
-							 * not `transform`: Tailwind v4 compiles `scale-95` to the individual
-							 * `scale` property, so a list saying `transform` would have transitioned
-							 * the opacity and SNAPPED the scale.
-							 */}
-							<span
-								aria-hidden="true"
-								className="pointer-events-none absolute left-1/2 top-full z-30 mt-1.5 w-56 origin-top -translate-x-1/2 scale-95 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-2xs font-normal normal-case leading-snug tracking-normal text-ink-2 opacity-0 shadow-[var(--shadow-overlay)] transition-[opacity,scale] duration-125 delay-0 group-hover:scale-100 group-hover:opacity-100 group-hover:delay-300 group-focus-within:scale-100 group-focus-within:opacity-100"
-							>
-								{hint}
-							</span>
-						</span>
+						</Tooltip>
 					)}
 				</p>
 			</div>
@@ -316,7 +249,7 @@ export function StatCard({
 								// spends the inverse ink and lets the glyph carry direction.
 								variant === "inverse"
 									? "text-ink-inverse opacity-70"
-									: DELTA_TONE[delta.tone ?? "default"],
+									: DELTA_TONE[delta.tone ?? "neutral"],
 							)}
 							style={{ fontVariantNumeric: "tabular-nums" }}
 						>

@@ -5,8 +5,9 @@ classification: PUBLIC
 ---
 
 LangChain and LangGraph are OpenTelemetry-native through the community instrumentors.
-Tracelane accepts OTLP directly, so the integration is **exporter configuration, not a
-Tracelane package** — and one instrumentor covers both libraries.
+Tracelane accepts OTLP directly, so you can configure the exporter yourself as
+shown below. Alternatively, the [Python SDK LangGraph integration](/integrations/langgraph)
+wires the same instrumentor through `auto_instrument()`; choose one setup.
 
 ## What you get
 

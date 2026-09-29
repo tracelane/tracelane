@@ -1,10 +1,14 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
+
+import { PageHeader } from "@tracelanedev/ui";
 
 /**
  * /dashboards/new — create a new dashboard.
  * Client component: form state + redirect.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -23,7 +27,7 @@ export default function NewDashboardPage() {
 		setCreating(true);
 		setError(null);
 		try {
-			const res = await fetch("/api/dashboards", {
+			const res = await apiFetchRaw("/api/dashboards", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ name: name.trim() }),
@@ -45,7 +49,7 @@ export default function NewDashboardPage() {
 	return (
 		<div className="space-y-8 px-1 py-2 sm:px-2 sm:py-4 lg:px-3">
 			<header>
-				<h1 className="t-h1">New dashboard</h1>
+				<PageHeader title={<>New dashboard</>} />
 				<p className="mt-2 text-sm text-ink-2">
 					Give it a name — you can rename it any time.
 				</p>
@@ -68,20 +72,22 @@ export default function NewDashboardPage() {
 						{error && <p className="text-xs text-danger-ink">{error}</p>}
 					</div>
 					<div className="flex items-center justify-end gap-3">
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => router.back()}
 							className="rounded-[var(--radius-control)] px-4 py-2 text-sm text-ink-2 hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							Cancel
-						</button>
-						<button
+						</Button>
+						<Button
+							variant="bare"
 							type="submit"
 							disabled={creating || !name.trim()}
 							className="rounded-[var(--radius-control)] bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
 							{creating ? "Creating…" : "Create dashboard"}
-						</button>
+						</Button>
 					</div>
 				</form>
 			</div>

@@ -72,10 +72,10 @@ export function SessionFilters() {
 				onChange={(e) => setModel(e.target.value)}
 				placeholder="model (exact)…"
 				aria-label="Filter sessions by model"
-				// `rounded-lg` (`--radius-control`, 8px) — the same as the traces FilterBar's
+				// `rounded-card` (`--radius-control`, 8px) — the same as the traces FilterBar's
 				// model input, which is literally the same control on the sibling surface.
-				// It was `rounded-sm` (4px), half the control radius.
-				className="h-8 w-44 rounded-lg border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+				// It was `rounded-control` (4px), half the control radius.
+				className="h-8 w-44 rounded-control border border-line bg-surface px-2.5 text-sm text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			/>
 		</div>
 	);

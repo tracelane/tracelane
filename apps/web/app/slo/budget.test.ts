@@ -68,6 +68,16 @@ describe("computeSloBudget", () => {
 	it("default target is three nines", () => {
 		expect(SLO_TARGET_AVAILABILITY).toBe(0.999);
 	});
+
+	it("exposes the raw fraction target, not just targetPct (B-510 / CX-11): fmtTarget needs the fraction to avoid a lossy *100 → /100 round trip", () => {
+		const b = computeSloBudget(
+			1000,
+			1,
+			availabilityTargetForPlanKey("enterprise_v1"),
+		);
+		expect(b.target).toBeCloseTo(0.9995, 10);
+		expect(b.target * 100).toBeCloseTo(b.targetPct, 10);
+	});
 });
 
 describe("availabilityTargetForPlanKey — MUST mirror the gateway", () => {

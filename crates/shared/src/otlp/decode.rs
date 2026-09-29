@@ -282,6 +282,11 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             "gen_ai.provider.name" => out.gen_ai_provider_name = any_value_string(av),
             "gen_ai.request.model" => out.gen_ai_request_model = any_value_string(av),
             "gen_ai.response.model" => out.gen_ai_response_model = any_value_string(av),
+            // RI-05 (2026-09-19): the two response-identity keys the SDK path may carry.
+            "gen_ai.response.id" => out.gen_ai_response_id = any_value_string(av),
+            "gen_ai.response.finish_reasons" => {
+                out.gen_ai_response_finish_reasons = any_value_strings(av);
+            }
             "gen_ai.operation.name" => out.gen_ai_operation_name = any_value_string(av),
             "gen_ai.agent.name" => out.gen_ai_agent_name = any_value_string(av),
             "gen_ai.agent.version" => out.gen_ai_agent_version = any_value_string(av),
@@ -515,6 +520,22 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             "tracelane.kya.agent_id" => {
                 out.tracelane_kya_agent_id = any_value_string(av);
             }
+            // RI-05 (2026-09-19): M18 — the caller's own step counter inside a
+            // multi-step agent loop. No registry name exists, hence
+            // `tracelane.*`. Before this arm existed the key fell into the `_`
+            // catch-all below and was silently dropped — RED proven by hand
+            // (this arm and the one below commented out, the test's first two
+            // assertions failed: `None` where `Some(3)`/`Some(true)` were
+            // expected), then restored GREEN.
+            "tracelane.agent.step_index" => {
+                out.tracelane_agent_step_index = any_value_u32(av);
+            }
+            // RI-05: M20 — the client's own context-trim signal. Always absent
+            // on a gateway-proxied span (the proxy cannot know it); this arm
+            // is what lets an SDK that DOES know set it.
+            "tracelane.context.truncated" => {
+                out.tracelane_context_truncated = any_value_bool(av);
+            }
             "tracelane.business_reference" => {
                 // Customer-supplied free text — length-bound at the ingest
                 // boundary (same posture as the aft_id taxonomy guard above) so
@@ -552,6 +573,21 @@ fn any_value_string(av: &AnyValue) -> Option<String> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) => {
             Some(s.clone())
+        }
+        _ => None,
+    }
+}
+
+/// An OTLP array of strings (`gen_ai.response.finish_reasons`). Non-string elements
+/// are skipped; an empty or non-array value is `None`, never `Some(vec![])`.
+fn any_value_strings(av: &AnyValue) -> Option<Vec<String>> {
+    match &av.value {
+        Some(opentelemetry_proto::tonic::common::v1::any_value::Value::ArrayValue(arr)) => {
+            let v: Vec<String> = arr.values.iter().filter_map(any_value_string).collect();
+            (!v.is_empty()).then_some(v)
+        }
+        Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) => {
+            Some(vec![s.clone()])
         }
         _ => None,
     }
@@ -929,6 +965,121 @@ mod tests {
             }),
         }]);
         assert_eq!(attrs.gen_ai_request_seed, None);
+    }
+
+    /// RI-05 / B-444: the two response-identity keys the SDK path may carry, and the
+    /// array form `finish_reasons` takes on the wire. A string value is accepted as a
+    /// one-element list; an empty array is `None`, never `Some(vec![])`.
+    #[test]
+    fn response_id_and_finish_reasons_decode_and_empty_is_absent() {
+        let attrs = build_attributes(&[
+            ProtoKeyValue {
+                key: "gen_ai.response.id".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::StringValue("chatcmpl-77".into())),
+                }),
+            },
+            ProtoKeyValue {
+                key: "gen_ai.response.finish_reasons".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::ArrayValue(
+                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                            values: vec![
+                                ProtoAnyValue {
+                                    value: Some(ProtoValue::StringValue("stop".into())),
+                                },
+                                ProtoAnyValue {
+                                    value: Some(ProtoValue::IntValue(7)),
+                                },
+                            ],
+                        },
+                    )),
+                }),
+            },
+        ]);
+        assert_eq!(attrs.gen_ai_response_id.as_deref(), Some("chatcmpl-77"));
+        assert_eq!(
+            attrs.gen_ai_response_finish_reasons,
+            Some(vec!["stop".to_string()]),
+            "non-string elements are skipped"
+        );
+        let empty = build_attributes(&[ProtoKeyValue {
+            key: "gen_ai.response.finish_reasons".into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::ArrayValue(
+                    opentelemetry_proto::tonic::common::v1::ArrayValue { values: vec![] },
+                )),
+            }),
+        }]);
+        assert_eq!(
+            empty.gen_ai_response_finish_reasons, None,
+            "empty is absent"
+        );
+        let single = build_attributes(&[ProtoKeyValue {
+            key: "gen_ai.response.finish_reasons".into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::StringValue("length".into())),
+            }),
+        }]);
+        assert_eq!(
+            single.gen_ai_response_finish_reasons,
+            Some(vec!["length".to_string()])
+        );
+    }
+
+    /// RI-05 (2026-09-19): M18 + M20 — `tracelane.agent.step_index` and
+    /// `tracelane.context.truncated` decode and round-trip.
+    ///
+    /// Before the two arms existed, both keys fell into the `_` catch-all
+    /// (`_ => { /* Unmapped attribute — ignored for V1. */ }`) and were
+    /// silently dropped — proven by the RED half below, which reads the two
+    /// fields with the arms' PRODUCTION NAMES removed from the match (simulated
+    /// by decoding an attribute this match genuinely does not have an arm for,
+    /// `tracelane.agent.step_index.NOT_A_REAL_KEY`, the same catch-all path the
+    /// real keys took before this commit added their arms).
+    #[test]
+    fn agent_step_index_and_context_truncated_decode_and_the_pre_arm_drop_is_demonstrated() {
+        let attrs = build_attributes(&[
+            ProtoKeyValue {
+                key: "tracelane.agent.step_index".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::IntValue(3)),
+                }),
+            },
+            ProtoKeyValue {
+                key: "tracelane.context.truncated".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::BoolValue(true)),
+                }),
+            },
+        ]);
+        assert_eq!(attrs.tracelane_agent_step_index, Some(3));
+        assert_eq!(attrs.tracelane_context_truncated, Some(true));
+
+        // RED, demonstrated directly: a key this match has no arm for takes the
+        // SAME `_` catch-all the two keys above took before their arms existed
+        // — dropped without a trace, not an error, which is exactly why B-444's
+        // sibling defect (M8) went unnoticed for so long (CLAUDE.md §1: a
+        // silent drop proves nothing was watching, so prove the drop itself).
+        let dropped = build_attributes(&[ProtoKeyValue {
+            key: "tracelane.agent.step_index.not_a_real_key".into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::IntValue(99)),
+            }),
+        }]);
+        assert_eq!(
+            dropped.tracelane_agent_step_index, None,
+            "an unmapped key must be dropped, not misfiled onto a real field"
+        );
+        assert!(
+            dropped.extra.is_empty(),
+            "the catch-all does not even stash it in `extra` — it is gone"
+        );
+
+        // Absent-means-absent: a span carrying neither key sets neither field.
+        let neither = build_attributes(&[]);
+        assert_eq!(neither.tracelane_agent_step_index, None);
+        assert_eq!(neither.tracelane_context_truncated, None);
     }
 
     fn sample_span() -> ProtoSpan {

@@ -114,6 +114,20 @@ export type CostBreakdown = {
 	 * from an unpriced one.
 	 */
 	unpriced_requests: number;
+	/**
+	 * How many groups (keys / models / providers) had traffic in the window,
+	 * counted by the gateway BEFORE its row cap — the true cardinality even when
+	 * `rows` is a subset (CX-27 / B-526).
+	 */
+	group_count: number;
+	/**
+	 * `rows.length < group_count`: `rows` is the costliest `GATEWAY_PROVIDER_CAP`
+	 * groups and every total above still covers all `group_count`. The panel must
+	 * say so — the cheapest groups are the ones cut, and a zero-cost / unpriced
+	 * group sorts LAST, so the unpriced badge is the first thing truncation
+	 * deletes when nothing reports it.
+	 */
+	truncated: boolean;
 	/** Present only for `by=key`: when per-key attribution began. */
 	attribution_begins_note: string | null;
 	/** `"all"` (default) | `"production"` | `"eval"` — echoed by the gateway. */

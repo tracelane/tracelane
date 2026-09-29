@@ -1,4 +1,7 @@
 "use client";
+import { fmtCount, fmtUsd } from "@/lib/metrics/format";
+
+import { StatusBadge } from "@tracelanedev/ui";
 
 /**
  * OnlineEvalsManager — configure and read online evals (`EVL-28`, item 11).
@@ -111,12 +114,10 @@ function pct(rate: number): string {
 
 /** "1 in 100" — the form people actually reason about coverage in. */
 function oneIn(rate: number): string {
-	return rate > 0 ? `1 in ${Math.round(1 / rate).toLocaleString()}` : "off";
+	return rate > 0 ? `1 in ${fmtCount(Math.round(1 / rate))}` : "off";
 }
 
-function usd(v: number): string {
-	return `$${v.toFixed(v < 1 ? 4 : 2)}`;
-}
+const usd = fmtUsd;
 
 // ── the summary strip ────────────────────────────────────────────────────────
 
@@ -160,19 +161,19 @@ export function SummaryStrip({ s }: { s: Summary }) {
 				sub={
 					s.achieved_sample_rate === null
 						? "no traffic in this window"
-						: `${s.sampled_traces.toLocaleString()} of ${s.eligible_spans.toLocaleString()} eligible traces (cached responses excluded)`
+						: `${fmtCount(s.sampled_traces)} of ${fmtCount(s.eligible_spans)} eligible traces (cached responses excluded)`
 				}
 				hint="What the sampler actually selected, counted from your traces. The denominator counts only requests it could have taken — responses served from the cache are excluded, because they never reach the judge. Sampling is a keyed hash, so this still differs from the setting over any finite window; that is expected, not drift."
 			/>
 			<StatCard
 				label="Scored"
-				value={s.scored.toLocaleString()}
+				value={fmtCount(s.scored)}
 				sub={
 					s.errored > 0
-						? `${s.errored.toLocaleString()} not judged`
+						? `${fmtCount(s.errored)} not judged`
 						: "none failed to judge"
 				}
-				tone={s.errored > s.scored ? "warn" : "default"}
+				tone={s.errored > 0 ? "warn" : "neutral"}
 				hint="Judge responses that passed schema and range validation. A response that did not is counted as 'not judged' and carries no score."
 			/>
 			<StatCard
@@ -255,12 +256,27 @@ function PolicyForm({
 		},
 	});
 
+	const [disableError, setDisableError] = useState<string | null>(null);
+
 	const disable = useMutation({
 		mutationFn: () =>
 			apiFetch<{ disabled: boolean }>("/api/online-evals/policy", {
 				method: "DELETE",
 			}),
-		onSuccess: onSaved,
+		onSuccess: () => {
+			setDisableError(null);
+			onSaved();
+		},
+		onError: (e: unknown) => {
+			// A failed Disable must be LOUD: the badge above only changes once
+			// the server confirms (via `onSaved`'s refetch), so a silent failure
+			// here would leave the customer believing spend stopped when the
+			// policy is still enabled and still sampling.
+			setDisableError(
+				(e as { message?: string }).message ??
+					"Could not disable the policy — it is still sampling.",
+			);
+		},
 	});
 
 	return (
@@ -278,7 +294,7 @@ function PolicyForm({
 						value={budget}
 						onChange={(e) => setBudget(e.target.value)}
 						placeholder="e.g. 25.00"
-						className="w-full rounded-md border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
+						className="w-full rounded-control border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
 					/>
 					{/*
 					 * The no-default rule, stated where the decision is made.
@@ -304,7 +320,7 @@ function PolicyForm({
 						step="0.01"
 						value={rate}
 						onChange={(e) => setRate(e.target.value)}
-						className="w-full rounded-md border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
+						className="w-full rounded-control border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
 					/>
 					<span className="text-2xs text-ink-2 block">
 						At most {pct(maxRate)} ({oneIn(maxRate)}). Sampling is a keyed hash
@@ -318,7 +334,7 @@ function PolicyForm({
 					<select
 						value={rubric}
 						onChange={(e) => setRubric(e.target.value)}
-						className="w-full rounded-md border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
+						className="w-full rounded-control border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
 					>
 						{rubrics.map((r) => (
 							<option key={r} value={r}>
@@ -334,7 +350,7 @@ function PolicyForm({
 						type="text"
 						value={model}
 						onChange={(e) => setModel(e.target.value)}
-						className="w-full rounded-md border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
+						className="w-full rounded-control border border-line bg-surface-1 px-3 py-2 text-sm text-ink"
 					/>
 					<span className="text-2xs text-ink-2 block">
 						Runs on your own provider key, so it appears in your traces and
@@ -346,7 +362,7 @@ function PolicyForm({
 			{error ? (
 				<p
 					role="alert"
-					className="rounded-md border border-danger-line bg-danger-surface px-3 py-2 text-xs text-danger-ink"
+					className="rounded-control border border-danger/30 bg-danger-soft px-3 py-2 text-xs text-danger-ink"
 				>
 					{error}
 				</p>
@@ -370,6 +386,12 @@ function PolicyForm({
 					</Button>
 				) : null}
 			</div>
+
+			{disableError ? (
+				<p role="alert" className="text-xs text-danger-ink">
+					{disableError}
+				</p>
+			) : null}
 		</Card>
 	);
 }
@@ -420,11 +442,12 @@ export function ScoresTable({ scores }: { scores: Score[] }) {
 						</TD>
 						<TD>
 							{s.status === "errored" ? (
-								<Badge tone="warn">not judged</Badge>
+								<StatusBadge status="not_judged" />
 							) : (
-								<Badge tone={s.verdict === "pass" ? "ok" : "danger"}>
-									{s.verdict || "—"}
-								</Badge>
+								<StatusBadge
+									status={s.verdict || "—"}
+									tone={s.verdict === "pass" ? "ok" : "danger"}
+								/>
 							)}
 						</TD>
 						<TD align="right" className="font-mono text-xs">
@@ -474,7 +497,7 @@ export function OnlineEvalsManager() {
 		return (
 			<p
 				role="alert"
-				className="rounded-md border border-danger-line bg-danger-surface px-3 py-2 text-xs text-danger-ink"
+				className="rounded-control border border-danger/30 bg-danger-soft px-3 py-2 text-xs text-danger-ink"
 			>
 				Could not load your online-eval policy. Retry, or check that the gateway
 				is reachable.
@@ -503,11 +526,9 @@ export function OnlineEvalsManager() {
 				<div className="flex items-center gap-2">
 					<h3 className="text-sm font-semibold text-ink">Policy</h3>
 					{policy ? (
-						<Badge tone={policy.enabled ? "ok" : "neutral"}>
-							{policy.enabled ? "sampling" : "disabled"}
-						</Badge>
+						<StatusBadge status={policy.enabled ? "sampling" : "disabled"} />
 					) : (
-						<Badge tone="neutral">not configured</Badge>
+						<StatusBadge status="not_configured" />
 					)}
 					{policy ? (
 						<span className="text-2xs text-ink-2">

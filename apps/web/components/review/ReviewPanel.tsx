@@ -31,6 +31,7 @@ import type {
 	AnnotationQueue,
 	RubricField,
 } from "@/app/api/annotation-queues/shared";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { Button } from "@tracelanedev/ui";
 import { useCallback, useMemo, useState } from "react";
 
@@ -67,7 +68,13 @@ export function ReviewPanel({
 	scanExhausted,
 }: Props) {
 	const [cursor, setCursor] = useState(0);
-	const [label, setLabel] = useState<"good" | "bad" | "needs_review">("bad");
+	// No default verdict: `null` means "not yet chosen", and submit stays
+	// disabled until the reviewer picks one. Defaulting to "bad" meant an
+	// inattentive reviewer who never touched the select shipped a "bad"
+	// verdict on every candidate — the worst possible silent default.
+	const [label, setLabel] = useState<"good" | "bad" | "needs_review" | null>(
+		null,
+	);
 	const [note, setNote] = useState("");
 	const [answers, setAnswers] = useState<Answers>(() =>
 		initialAnswers(queue.rubric),
@@ -80,27 +87,92 @@ export function ReviewPanel({
 		[queue],
 	);
 
+	// The rubric already has its own free-text field — the built-in Note would
+	// be a second place to write the same kind of answer, and the founder's
+	// done-when for this surface is ONE action, not two competing text boxes.
+	const hasRubricTextField = useMemo(
+		() => queue.rubric.some((f) => f.type === "text"),
+		[queue.rubric],
+	);
+
 	const reset = useCallback(() => {
 		setAnswers(initialAnswers(queue.rubric));
 		setNote("");
-		setLabel("bad");
+		setLabel(null);
 		setOutcome({ kind: "idle" });
 	}, [queue.rubric]);
 
+	function skip() {
+		setCursor(cursor + 1);
+		reset();
+	}
+
+	/**
+	 * Client-side courtesy only (module doc) — the gateway is the real
+	 * authority and re-checks every one of these, fail-closed. This exists so
+	 * a reviewer sees the missing field before a round trip, not instead of
+	 * the gateway's check.
+	 */
+	function firstInvalidField(): { field: string; message: string } | null {
+		if (!label) {
+			return { field: "label", message: "Choose a verdict before submitting." };
+		}
+		for (const f of queue.rubric) {
+			if (!f.required) continue;
+			const v = answers[f.key];
+			if (f.type === "boolean") continue; // a checkbox is always a valid answer
+			if (f.type === "score") {
+				const n = typeof v === "number" ? v : Number(v);
+				if (Number.isNaN(n)) {
+					return { field: f.key, message: `${f.label} is required.` };
+				}
+				if (f.min !== undefined && n < f.min) {
+					return {
+						field: f.key,
+						message: `${f.label} must be at least ${f.min}.`,
+					};
+				}
+				if (f.max !== undefined && n > f.max) {
+					return {
+						field: f.key,
+						message: `${f.label} must be at most ${f.max}.`,
+					};
+				}
+				continue;
+			}
+			if (typeof v !== "string" || v.trim() === "") {
+				return { field: f.key, message: `${f.label} is required.` };
+			}
+		}
+		return null;
+	}
+
 	async function submit() {
-		if (!current) return;
+		if (!current || !label) return;
+		const invalid = firstInvalidField();
+		if (invalid) {
+			setOutcome({
+				kind: "error",
+				message: invalid.message,
+				field: invalid.field,
+			});
+			return;
+		}
 		setOutcome({ kind: "saving" });
-		const res = await fetch(`/api/annotation-queues/${queue.id}/reviews`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				trace_id: current.trace_id,
-				span_id: current.span_id,
-				label,
-				note,
-				rubric: answers,
-			}),
-		});
+		const res = await apiFetchRaw(
+			`/api/annotation-queues/${queue.id}/reviews`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					trace_id: current.trace_id,
+					span_id: current.span_id,
+					label,
+					note,
+					rubric: answers,
+				}),
+			},
+		);
 		const body = (await res.json().catch(() => ({}))) as {
 			error?: string;
 			field?: string;
@@ -187,15 +259,27 @@ export function ReviewPanel({
 					<select
 						id="rv-label"
 						className="mt-1 rounded border px-2 py-1"
-						value={label}
+						value={label ?? ""}
 						onChange={(e) =>
-							setLabel(e.target.value as "good" | "bad" | "needs_review")
+							setLabel(
+								(e.target.value || null) as
+									| "good"
+									| "bad"
+									| "needs_review"
+									| null,
+							)
 						}
 					>
+						<option value="" disabled>
+							Choose a verdict…
+						</option>
 						<option value="good">good</option>
 						<option value="bad">bad</option>
 						<option value="needs_review">needs_review</option>
 					</select>
+					{outcome.kind === "error" && outcome.field === "label" && (
+						<p className="mt-1 text-sm text-danger-ink">{outcome.message}</p>
+					)}
 				</div>
 
 				{queue.rubric.map((f) => {
@@ -272,18 +356,24 @@ export function ReviewPanel({
 					);
 				})}
 
-				<div>
-					<label className="block text-sm font-medium" htmlFor="rv-note">
-						Note
-					</label>
-					<textarea
-						id="rv-note"
-						rows={2}
-						className="mt-1 block w-full rounded border px-2 py-1"
-						value={note}
-						onChange={(e) => setNote(e.target.value)}
-					/>
-				</div>
+				{/* The built-in Note duplicates a rubric free-text field when the
+				    queue already has one — two boxes for the same kind of answer.
+				    Hidden, not removed: a queue whose rubric is score/choice/
+				    boolean-only still has nowhere else to write a free-form note. */}
+				{!hasRubricTextField && (
+					<div>
+						<label className="block text-sm font-medium" htmlFor="rv-note">
+							Note
+						</label>
+						<textarea
+							id="rv-note"
+							rows={2}
+							className="mt-1 block w-full rounded border px-2 py-1"
+							value={note}
+							onChange={(e) => setNote(e.target.value)}
+						/>
+					</div>
+				)}
 			</div>
 
 			{outcome.kind === "error" && !outcome.field && (
@@ -313,16 +403,29 @@ export function ReviewPanel({
 					</Button>
 				</div>
 			) : (
-				<Button
-					type="button"
-					variant="primary"
-					disabled={outcome.kind === "saving" || !referenceField}
-					onClick={submit}
-				>
-					{outcome.kind === "saving"
-						? "Saving…"
-						: "Submit review and create the graded case"}
-				</Button>
+				<div className="flex items-center gap-2">
+					<Button
+						type="button"
+						variant="primary"
+						disabled={outcome.kind === "saving" || !referenceField || !label}
+						onClick={submit}
+					>
+						{outcome.kind === "saving"
+							? "Saving…"
+							: "Submit review and create the graded case"}
+					</Button>
+					{/* Advances to the next candidate WITHOUT writing anything —
+					    the same "next candidate" mechanism the post-submit state
+					    uses, just reached before a review is recorded. */}
+					<Button
+						type="button"
+						variant="secondary"
+						disabled={outcome.kind === "saving"}
+						onClick={skip}
+					>
+						Skip
+					</Button>
+				</div>
 			)}
 		</div>
 	);

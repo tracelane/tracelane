@@ -1,4 +1,5 @@
 "use client";
+import { Button, fmtCount } from "@tracelanedev/ui";
 
 /**
  * SwimlaneView — the multi-agent projection of a trace (OBS-49): one row group
@@ -17,6 +18,8 @@
  * than this component inventing extra agents that were never observed.
  */
 
+import { IdentityAvatar } from "@/components/kya/IdentityAvatar";
+import { identityForKey, spanIdentity } from "@/lib/kya/identity";
 import { inferSpanKind } from "@/lib/span-kind";
 import { barGeometry } from "@/lib/trace-summary";
 import type { Lane } from "@/lib/trace/lanes";
@@ -44,6 +47,9 @@ function LaneRow({
 	handoffFromLabel?: string;
 }) {
 	const stats = laneStats(lane);
+	const identity = lane.spans
+		.map((span) => spanIdentity(span.attributes).agent)
+		.find(Boolean);
 	// Chronological within the lane — the bars read left-to-right in the order
 	// the agent actually did the work, independent of tree-traversal order.
 	const spans = [...lane.spans].sort((a, b) => {
@@ -67,18 +73,21 @@ function LaneRow({
 		// Removing `overflow-hidden` restores the real scrolling ancestor — the
 		// page's `overflow-auto` region in TraceDetailView — so the header only
 		// sticks once THAT actually scrolls, which was always the intent.
-		<div className="surface-card rounded-md border border-line">
+		<div className="surface-card rounded-control border border-line">
 			{/* Sticky lane header: agent label · span count · error count ·
 			    active window. `rounded-t-md` replaces the corner-clipping the
 			    removed `overflow-hidden` used to do for free — this is the
 			    only child that paints flush to the card's top edge. */}
 			<div className="sticky top-6 z-[5] flex items-center gap-1.5 rounded-t-md border-line border-b bg-canvas-sunken px-3 py-1.5 text-xs">
+				<IdentityAvatar
+					identity={identity ?? identityForKey("agent", "~direct")}
+				/>
 				<span className="truncate font-medium text-ink">{lane.label}</span>
 				<span className="text-ink-3" aria-hidden>
 					·
 				</span>
 				<span className="tabular-nums text-ink-2">
-					{stats.spanCount} {stats.spanCount === 1 ? "span" : "spans"}
+					{fmtCount(stats.spanCount)} {stats.spanCount === 1 ? "span" : "spans"}
 				</span>
 				<span className="text-ink-3" aria-hidden>
 					·
@@ -89,7 +98,8 @@ function LaneRow({
 						stats.errorCount > 0 ? "text-danger-ink" : "text-ink-2",
 					)}
 				>
-					{stats.errorCount} {stats.errorCount === 1 ? "error" : "errors"}
+					{fmtCount(stats.errorCount)}{" "}
+					{stats.errorCount === 1 ? "error" : "errors"}
 				</span>
 				<span className="text-ink-3" aria-hidden>
 					·
@@ -122,8 +132,10 @@ function LaneRow({
 							data-span-row={s.span_id}
 							data-lane-key={lane.key}
 							className={cn(
-								"grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-md pr-2 transition-colors",
-								selected ? "bg-surface-3" : "hover:bg-surface-hover",
+								"grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-control pr-2 transition-colors",
+								selected
+									? "bg-action-soft ring-1 ring-inset ring-action/30"
+									: "hover:bg-surface-hover",
 							)}
 						>
 							<div className="flex min-w-0 items-center gap-1.5 py-1 pl-2">
@@ -135,25 +147,27 @@ function LaneRow({
 									)}
 									aria-hidden
 								/>
-								<button
+								<Button
+									variant="bare"
 									type="button"
 									onClick={() => onSelectSpan(s.span_id)}
 									className="truncate text-left text-ink text-sm hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 									title={s.name}
 								>
 									{s.name}
-								</button>
+								</Button>
 							</div>
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								onClick={() => onSelectSpan(s.span_id)}
-								className="relative flex h-6 items-center rounded-sm focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
+								className="relative flex h-6 items-center rounded-control focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 								title={`${fmtDur(s.duration_us)}${isError ? " · error" : ""}`}
 							>
 								<span className="-translate-y-1/2 absolute inset-x-0 top-1/2 h-px bg-line/60" />
 								<span
 									className={cn(
-										"-translate-y-1/2 absolute top-1/2 h-2.5 rounded-sm",
+										"-translate-y-1/2 absolute top-1/2 h-2.5 rounded-control",
 										isError ? "bg-danger" : SPAN_KIND_MARK[kind],
 										!isError && "opacity-85",
 									)}
@@ -162,7 +176,7 @@ function LaneRow({
 								<span className="absolute right-1 rounded bg-bg px-1 text-2xs text-ink-2 tabular-nums">
 									{fmtDur(s.duration_us)}
 								</span>
-							</button>
+							</Button>
 						</div>
 					);
 				})}
@@ -217,13 +231,14 @@ export function SwimlaneView({
 					/>
 				))}
 				{overflow > 0 && (
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => setExpanded(true)}
-						className="w-full rounded-md border border-line border-dashed px-3 py-2 text-center text-ink-2 text-xs hover:bg-surface-hover"
+						className="w-full rounded-control border border-line border-dashed px-3 py-2 text-center text-ink-2 text-xs hover:bg-surface-hover"
 					>
 						+{overflow} more {overflow === 1 ? "agent" : "agents"}
-					</button>
+					</Button>
 				)}
 			</div>
 		</div>

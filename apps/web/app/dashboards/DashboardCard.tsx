@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * DashboardCard — a single dashboard in the list, with rename + delete
@@ -18,6 +19,7 @@
  * (`PATCH /api/dashboards/[id]`) with no UI caller. This is the fix.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
@@ -62,7 +64,7 @@ export function DashboardCard({ dashboard: d, canEdit }: Props) {
 		}
 		setDeleting(true);
 		try {
-			await fetch(`/api/dashboards/${d.id}`, { method: "DELETE" });
+			await apiFetchRaw(`/api/dashboards/${d.id}`, { method: "DELETE" });
 			router.refresh();
 		} finally {
 			setDeleting(false);
@@ -95,7 +97,7 @@ export function DashboardCard({ dashboard: d, canEdit }: Props) {
 		setSaving(true);
 		setNameError(null);
 		try {
-			const res = await fetch(`/api/dashboards/${d.id}`, {
+			const res = await apiFetchRaw(`/api/dashboards/${d.id}`, {
 				method: "PATCH",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ name: trimmed }),
@@ -143,22 +145,24 @@ export function DashboardCard({ dashboard: d, canEdit }: Props) {
 							<p className="mt-1 text-2xs text-danger-ink">{nameError}</p>
 						)}
 						<div className="mt-1 flex gap-2">
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								onClick={saveRename}
 								disabled={saving}
 								className="text-2xs font-medium text-action hover:underline disabled:cursor-not-allowed disabled:opacity-50"
 							>
 								{saving ? "Saving…" : "Save"}
-							</button>
-							<button
+							</Button>
+							<Button
+								variant="bare"
 								type="button"
 								onClick={cancelRename}
 								disabled={saving}
 								className="text-2xs text-ink-3 hover:text-ink-2 disabled:cursor-not-allowed disabled:opacity-50"
 							>
 								Cancel
-							</button>
+							</Button>
 						</div>
 					</div>
 				) : (
@@ -171,15 +175,17 @@ export function DashboardCard({ dashboard: d, canEdit }: Props) {
 				)}
 				{canEdit && !renaming && (
 					<div className="flex shrink-0 items-center gap-1">
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={startRename}
 							className="rounded text-xs text-ink-3 opacity-0 transition-colors hover:text-ink-2 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring group-hover:opacity-100"
 							aria-label={`Rename dashboard ${name}`}
 						>
 							Rename
-						</button>
-						<button
+						</Button>
+						<Button
+							variant="bare"
 							type="button"
 							onClick={handleDelete}
 							disabled={deleting}
@@ -191,7 +197,7 @@ export function DashboardCard({ dashboard: d, canEdit }: Props) {
 							aria-label={`Delete dashboard ${name}`}
 						>
 							{deleting ? "…" : confirmDelete ? "Confirm" : "Delete"}
-						</button>
+						</Button>
 					</div>
 				)}
 			</div>

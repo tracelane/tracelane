@@ -1,3 +1,4 @@
+import { Button } from "@tracelanedev/ui";
 /**
  * PlanHeader (current plan, top of the page) + PlanCard (audit-ledger +
  * invoices, bottom) for `/settings/billing` (spec §8 `#plan-change`). Server component: every
@@ -123,13 +124,14 @@ export function PlanHeader({
 									action={`/api/checkout?tier=${plan}&interval=year`}
 									method="post"
 								>
-									<button
+									<Button
+										variant="bare"
 										type="submit"
 										className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 									>
 										Switch to annual {card.priceYear?.amount}
 										{card.priceYear?.suffix}
-									</button>
+									</Button>
 								</form>
 							)}
 						{idx >= 0 && idx < LADDER.length - 2 && LADDER[idx + 1] && (
@@ -137,12 +139,13 @@ export function PlanHeader({
 								action={`/api/checkout?tier=${LADDER[idx + 1]}&interval=${billingInterval ?? "month"}`}
 								method="post"
 							>
-								<button
+								<Button
+									variant="bare"
 									type="submit"
 									className="rounded bg-action px-3 py-1.5 text-xs font-medium text-action-on transition-colors hover:bg-action/90"
 								>
 									Upgrade to {buildCard(LADDER[idx + 1] as Plan).name}
-								</button>
+								</Button>
 							</form>
 						)}
 						{idx > 0 &&
@@ -153,12 +156,13 @@ export function PlanHeader({
 									action={`/api/checkout?tier=${LADDER[idx - 1]}&interval=${billingInterval ?? "month"}`}
 									method="post"
 								>
-									<button
+									<Button
+										variant="bare"
 										type="submit"
 										className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 									>
 										Downgrade to {buildCard(LADDER[idx - 1] as Plan).name}
-									</button>
+									</Button>
 								</form>
 							)}
 						{plan === "business" && (
@@ -175,7 +179,7 @@ export function PlanHeader({
 					// B-431: a cancel at period end is NOT a lapse. Say when it ends and
 					// that the plan runs until then — the state Polar itself reports.
 					<output
-						className="mt-3 block rounded-lg border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-warn-ink"
+						className="mt-3 block rounded-card border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-warn-ink"
 						data-testid="subscription-ends-note"
 					>
 						<span className="font-semibold">

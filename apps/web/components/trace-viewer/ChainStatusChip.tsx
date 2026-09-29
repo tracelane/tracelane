@@ -1,3 +1,4 @@
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * Per-trace tamper-evident-ledger chip (wedge item 4).
  *
@@ -87,30 +88,30 @@ export async function ChainStatusChip({ traceId }: { traceId: string }) {
 
 	// Gateway unreachable: show neutral "unavailable" badge so users know the
 	// ledger status couldn't be determined (vs. the chip simply not rendering).
-	if (gatewayUnreachable) {
+	if (gatewayUnreachable || status === null) {
 		return (
-			<Badge
+			<StatusBadge
+				status="ledger"
 				tone="neutral"
 				title="Ledger status is unavailable — the gateway could not be reached. The trace data is still intact. Try reloading or check gateway connectivity."
-			>
-				<SlashCircle />
-				Ledger status unavailable
-			</Badge>
+				label={
+					<>
+						<SlashCircle />
+						Ledger status unavailable
+					</>
+				}
+			/>
 		);
 	}
 
-	// Gateway returned null: /chain endpoint returned 404 (no chain record for
-	// this trace). This is a legitimate state (SDK/OTLP ingest, no gateway proxy).
-	if (status === null) return null;
-
 	if (!status.chained) {
 		return (
-			<Badge
+			<StatusBadge
+				status="ledger"
 				tone="neutral"
-				title="Captured via SDK/OTLP — full-fidelity trace, not gateway hash-chained. Route the call through the gateway for a tamper-evident record."
-			>
-				Full-fidelity capture
-			</Badge>
+				title="No matching gateway-call ledger record was found for this trace. SDK/OTLP-only spans and older traces without ledger correlation can have this status."
+				label={<>Captured, not chained</>}
+			/>
 		);
 	}
 
@@ -118,8 +119,8 @@ export async function ChainStatusChip({ traceId }: { traceId: string }) {
 	// entry id was recorded for this row's batch, but does NOT fetch the inclusion
 	// proof — that live verification is the Audit page's job. Honest B-scope.
 	const label = status.anchored
-		? "Anchor recorded"
-		: "In tamper-evident ledger";
+		? "In the ledger · Anchor recorded"
+		: "In the ledger";
 	const title = status.anchored
 		? "This call is a hash-chained ledger record with a transparency-log anchor recorded. Verify the full chain and anchor on the Audit page."
 		: "This call is a hash-chained record in the tamper-evident audit ledger. Verify the full chain on the Audit page.";
@@ -128,15 +129,21 @@ export async function ChainStatusChip({ traceId }: { traceId: string }) {
 		<Link
 			href="/audit"
 			title={title}
-			className="rounded-md no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+			className="rounded-control no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 		>
-			<Badge tone="seal">
-				<ShieldCheck />
-				{label}
-				{status.seq !== null && (
-					<span className="tabular-nums opacity-70">· #{status.seq}</span>
-				)}
-			</Badge>
+			<StatusBadge
+				status="ledger"
+				tone="seal"
+				label={
+					<>
+						<ShieldCheck />
+						{label}
+						{status.seq !== null && (
+							<span className="tabular-nums opacity-70">· #{status.seq}</span>
+						)}
+					</>
+				}
+			/>
 		</Link>
 	);
 }

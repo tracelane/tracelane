@@ -100,6 +100,8 @@ describe("NewQueueDialog — submit outcomes", () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			status: 201,
 			ok: true,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
 			json: async () => ({ id: "q-new" }),
 		});
 		vi.stubGlobal("fetch", fetchMock);
@@ -123,6 +125,8 @@ describe("NewQueueDialog — submit outcomes", () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			status: 409,
 			ok: false,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
 			json: async () => ({
 				error: "queue_name_taken",
 				field: "name",
@@ -153,6 +157,8 @@ describe("NewQueueDialog — submit outcomes", () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			status: 409,
 			ok: false,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
 			json: async () => ({
 				error: "queue_limit_reached",
 				message:
@@ -178,6 +184,8 @@ describe("NewQueueDialog — submit outcomes", () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			status: 502,
 			ok: false,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
 			json: async () => ({
 				error: "unavailable",
 				reason: "gateway_unreachable",
@@ -214,7 +222,13 @@ describe("NewQueueDialog — submit outcomes", () => {
 		fireEvent.click(screen.getByTestId("nq-submit")); // no-op while disabled
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 
-		resolveFetch({ status: 201, ok: true, json: async () => ({}) });
+		resolveFetch({
+			status: 201,
+			ok: true,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
+			json: async () => ({}),
+		});
 		await screen.findByTestId("nq-trigger");
 	});
 });

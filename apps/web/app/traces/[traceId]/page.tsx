@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * Trace detail page — full-fidelity view of a single trace.
  *
@@ -14,10 +15,9 @@
 
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { ChainStatusChip } from "@/components/trace-viewer/ChainStatusChip";
-import { CopyButton } from "@/components/trace-viewer/CopyButton";
-import { ShareDialog } from "@/components/trace-viewer/ShareDialog";
 import { TraceDetailView } from "@/components/trace-viewer/TraceDetailView";
 import { TraceFlagPanel } from "@/components/trace-viewer/TraceFlagPanel";
+import { TraceHeaderActions } from "@/components/trace-viewer/TraceHeaderActions";
 import type { Span } from "@/components/trace-viewer/types";
 import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
 import { fetchSignaturesFor } from "@/lib/metrics/fetch";
@@ -105,7 +105,9 @@ async function SpanData({ traceId }: { traceId: string }) {
 		hitCounts = undefined;
 	}
 
-	return <TraceDetailView spans={spans} hitCounts={hitCounts} />;
+	return (
+		<TraceDetailView traceId={traceId} spans={spans} hitCounts={hitCounts} />
+	);
 }
 
 // Queries ClickHouse at request time — never prerender.
@@ -116,7 +118,7 @@ export default async function TraceDetailPage({ params }: Props) {
 
 	return (
 		<div className="p-6">
-			<div className="mb-6 flex flex-wrap items-center gap-x-3 gap-y-2">
+			<div className="mb-6 space-y-3">
 				<Link
 					href="/traces"
 					className="shrink-0 text-sm text-ink-2 transition-colors hover:text-ink"
@@ -124,49 +126,18 @@ export default async function TraceDetailPage({ params }: Props) {
 					← Traces
 				</Link>
 				{/* Trace ID is a hex identifier — mono font is correct here. */}
-				<h1 className="min-w-0 flex-1 truncate font-mono text-xl font-semibold text-ink">
-					{traceId}
-				</h1>
-				{/* flex-wrap on the row (above) lets this action cluster drop to its
-				    own line on a narrow viewport instead of forcing horizontal
-				    scroll — six shrink-0 actions (ledger chip, 2 copy buttons,
-				    Compare, Flag, Share) never fit beside a full-width trace id
-				    under ~640px. Found by the qaA render-proof sweep, mobile
-				    (390px) viewport, both themes. */}
-				<div className="flex w-full flex-wrap items-center gap-1.5 sm:w-auto">
-					{/* ChainStatusChip is async (server fetch). Suspense fallback is a
-					    placeholder skeleton — sized to match the chip — so the header
-					    layout does not reflow when the ledger status resolves. */}
-					<Suspense fallback={<Skeleton className="h-6 w-40 rounded-md" />}>
-						<ChainStatusChip traceId={traceId} />
-					</Suspense>
-					<CopyButton value={traceId} label="Copy ID" />
-					<CopyButton copyLocation label="Copy link" />
-					{/* THE CONTROL THAT DID NOT EXIST. /traces/compare renders a working
-					    span-level diff, and its own empty state has always said "Open a
-					    trace and choose Compare" — but no Compare control existed anywhere
-					    in the app, so the route had ZERO inbound links and was reachable
-					    only by hand-typing both query params. The R12 before-inventory
-					    named it the one genuinely stranded surface; this is the entry
-					    point, and the compare page now offers a picker for the second
-					    trace. */}
-					<Link
-						href={`/traces/compare?a=${encodeURIComponent(traceId)}`}
-						className="inline-flex h-7 items-center rounded-md border border-line px-2 text-ink-2 text-xs transition-colors hover:border-line-2 hover:text-ink"
-					>
-						Compare
-					</Link>
-					{/* OBS-18. Async (reads the existing verdict + the session role
-					    server-side), so it gets its own Suspense boundary — the
-					    header must not wait on it to paint. */}
-					<Suspense fallback={<Skeleton className="h-7 w-28 rounded-md" />}>
-						<TraceFlagPanel traceId={traceId} />
-					</Suspense>
-					{/* OBS-48. Client component (mint/list/revoke state) — no server
-					    fetch needed to render the button itself, so no Suspense
-					    boundary; the active-links list loads only once the panel opens. */}
-					<ShareDialog traceId={traceId} />
-				</div>
+				<PageHeader title={traceId} />
+				<Suspense fallback={<Skeleton className="h-6 w-40 rounded-control" />}>
+					<ChainStatusChip traceId={traceId} />
+				</Suspense>
+				<TraceHeaderActions
+					traceId={traceId}
+					flag={
+						<Suspense fallback={<Skeleton className="h-9 w-full" />}>
+							<TraceFlagPanel traceId={traceId} embedded />
+						</Suspense>
+					}
+				/>
 			</div>
 			<Suspense
 				fallback={

@@ -4,9 +4,8 @@
 Technical operating manual for Claude Code (and humans) working in this repository.
 Read it before any non-trivial task.
 
-> **Rebuilt 2026-08-02 from a full-repo evidence pass.** Every claim carries a `file:line`.
 > **If this file disagrees with the code, the CODE wins** — and that is a bug in this file.
-> Where something is specified but not built, this file says so rather than implying it ships.
+> Where something is described but not built, this file says so rather than implying it ships.
 
 ---
 
@@ -20,71 +19,57 @@ agent is destructive, and a false-positive block is worse than the failure it pr
 Apache 2.0. Rust gateway + ClickHouse-backed observability + a detection layer that records
 and flags rather than intercepts.
 
-**Delivery standard.** *What we promise is delivered as premium — exceeding
-expectation, never lazily meeting it.* A change that merely satisfies its spec
-sentence is not done: the shipped version should leave margin in the user's favour.
-"Meets spec" is a finding, not a pass.
-
 ---
 
 ## 2. The system graph — what actually runs
 
-Every edge carries its invariant. Dotted boxes are **not built**.
+Every edge carries its invariant.
 
 ```
                     ┌───────────────────────────────────────────────────┐
    SDK / CLI /      │  RUST GATEWAY   crates/gateway  (ONE binary)       │
    OpenAI client ──►│                                                    │
-   Bearer tlane_…   │  chat_completions_handler in server/chat.rs        │
-   or WorkOS JWT    │  ── admission.rs: ONE typed pipeline, shared by ── │
-                    │     chat · embeddings · messages                   │
+   Bearer tlane_…   │  ── admission.rs: ONE typed pipeline, shared by ── │
+   or WorkOS JWT    │     chat · embeddings · messages                   │
                     │  1  auth → scope → parse (parse BEFORE any charge) │
                     │  2  entitlement resolve + rate limit               │
-                    │  2b monthly quota → 429; key + workspace budgets   │
+                    │  2b key + workspace budgets                        │
                     │  3  detection layer (OBSERVE-first)                │
                     │  4  audit publish  ── FAIL-CLOSED 503              │
                     │     ── then in server/chat.rs ──                   │
                     │     provider resolve + BYOK key                    │
                     │  4b inline guardrails ─ FAIL-CLOSED                │
-                    │     <UNTRUSTED_USER_DATA> wrap                     │
-                    │     circuit breaker (+ start-time kill flags)      │
+                    │     circuit breaker                                │
                     │     dispatch (server/dispatch.rs)                  │
                     └───┬──────────────┬──────────────┬─────────────┬────┘
                         │              │              │             │
         spans │ NATS    │      audit │ NATS          │ Postgres    │ HTTPS
         tracelane.      │      tracelane.            │ (control    │
         spans.{tenant}  │      audit.{tenant}        │  plane)     ▼
-                        ▼              ▼              │        30+ upstream
+                        ▼              ▼              │        191 upstream
               ┌──────────────┐  ┌─────────────┐       │        providers
               │ INGEST       │  │ audit head- │  ┌────┴─────┐  BYOK, AAD-bound
               │ crates/      │  │ writer      │  │ entitle- │  to (tenant,
               │ ingest       │  │ (consumer,  │  │ ments,   │   provider)
-              │ 5 tasks in   │  │  IN the     │  │ api_keys,│
-              │ try_join!    │  │  gateway    │  │ tenants, │
-              │ ANY Err      │  │  process)   │  │ chain    │
-              │ kills all    │  │             │  │ heads    │
-              └──────┬───────┘  └──────┬──────┘  └────┬─────┘
-                     │ ack AFTER write │              │ LISTEN/NOTIFY
-                     ▼                 ▼              │ (DIRECT endpoint —
-              ┌────────────────────────────────┐      │  a transaction pooler
-              │  CLICKHOUSE                    │◄─────┘  cannot carry NOTIFY)
+              │              │  │  IN the     │  │ api_keys,│
+              │ ack AFTER    │  │  gateway    │  │ tenants, │
+              │ the write    │  │  process)   │  │ chain    │
+              │              │  │             │  │ heads    │
+              └──────┬───────┘  └──────┬──────┘  └──────────┘
+                     ▼                 ▼
+              ┌────────────────────────────────┐
+              │  CLICKHOUSE                    │
               │  tracelane.spans (sole writer  │
               │   = ingest), trace_summaries,  │
               │   audit_log, guardrail_verdicts│
               └───────────┬────────────────────┘
-                          │  reads ONLY via gateway /v1/* (trace_reads.rs, 17 routes)
+                          │  reads ONLY via gateway /v1/*
                           ▼
               ┌────────────────────────────────┐        ┌──────────────────┐
-              │  apps/web  Next.js 15 on CF    │        │  Rekor v2        │
-              │  Workers. NO ClickHouse client.│        │  ECDSA-P256      │
+              │  apps/web  Next.js dashboard   │        │  Rekor v2        │
+              │  NO ClickHouse client.         │        │  ECDSA-P256      │
               │  Drizzle for Postgres only.    │        │  batch anchors   │
               └────────────────────────────────┘        └──────────────────┘
-
-   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-     R2 cold tier      ml/ ONNX models        ee/ license zone
-   │ batcher DELETED   3 predictors are     │ DOES NOT EXIST         │
-     2026-09-12        unconditional stubs    (whole tree Apache-2.0)
-   └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 
 ### Edge invariants
@@ -92,12 +77,12 @@ Every edge carries its invariant. Dotted boxes are **not built**.
 | Edge | Invariant | Evidence |
 |---|---|---|
 | client → gateway | `tenant_id` comes ONLY from `Claims.tenant_id`, never a request body. `TenantId` has three named constructors — `from_jwt_claim`, `from_spiffe_svid`, `from_self_host_config` | `grep -n 'pub fn from_' crates/shared/src/tenant.rs` |
-| client → gateway | **The identity-provider org id is NOT the internal tenant UUID.** It is bridged by `auth::resolve_tenant_id` via a 30s cache; if a JWT carries both, they must agree or the token is rejected | `grep -n 'fn resolve_tenant_id' crates/gateway/src/auth/mod.rs` |
+| client → gateway | **The identity-provider org id is NOT the internal tenant UUID.** It is bridged by `auth::resolve_tenant_id` via a short-lived cache; if a JWT carries both, they must agree or the token is rejected | `grep -n 'fn resolve_tenant_id' crates/gateway/src/auth/mod.rs` |
 | gateway → NATS (spans) | `NATS_URL` is **REQUIRED** — unset is a **boot refusal**; opt out explicitly with `TRACELANE_ALLOW_NO_CAPTURE=1`. A connect *failure* retries in the background rather than disabling capture for the process lifetime. `/health` reports `capture_enabled` / `spans_dropped` / `capture_healthy` | `grep -n 'ALLOW_NO_CAPTURE' crates/gateway/src/server.rs` |
 | gateway → NATS (audit) | ACKED JetStream publish, **fail-CLOSED** → `503 {"error":"audit_unavailable"}`. `seq` is assigned only by the durable consumer | `grep -n 'AuditUnavailable' crates/gateway/src/admission.rs` |
 | NATS → ingest | Ack **after** the ClickHouse flush. OTLP-direct spans carry **no ack** — 200 is returned on channel `try_send` | `grep -n 'Do NOT ack here' crates/ingest/src/nats_consumer.rs` |
 | ingest → ClickHouse | Ingest is the **sole** span writer. The gateway never writes spans | `grep -n 'insert("tracelane.spans")' crates/ingest/src/clickhouse_writer.rs` |
-| gateway ↔ Postgres | **Never per-request.** In-process cache, 15-min TTL, invalidated by `LISTEN/NOTIFY` | `grep -n 'LISTEN entitlements_changed' crates/gateway/src/entitlement_cache.rs` |
+| gateway ↔ Postgres | **Never per-request.** Entitlements are held in an in-process cache and refreshed on a TTL; changes land when the TTL expires | `grep -n 'control_plane_listen_enabled' crates/gateway/src/entitlement_cache.rs` |
 | web → data | apps/web has **no ClickHouse client**. Every ClickHouse read is a gateway `/v1/*` call | `grep -ci clickhouse apps/web/package.json` → **0** |
 | gateway → provider | Model→provider map **fails closed** (`_ => return None` → 400 `unroutable_model`). No default provider — defaulting would ship the wrong tenant's BYOK credential | `grep -n 'unroutable_model' crates/gateway/src/providers/mod.rs` |
 
@@ -194,59 +179,33 @@ says `free` — which then blocks them from buying anything else.
 - The webhook secret's HMAC key is the **raw UTF-8 bytes of the entire secret string**,
   prefix included. Do not strip the prefix and do not base64-decode.
 
-### 3.8 Migrations: Drizzle is canonical, but not everything is journaled
+### 3.8 Migrations: Drizzle is canonical
 
-`apps/web/db/schema.ts` is the canonical control-plane schema. **But `drizzle-kit migrate`
-applies only `0000`–`0008`** — the journal stops there; later migrations are applied out of
-band and are explicitly un-journaled (`apps/web/db/migrations/0010_…sql:16-19`). There is no
-`db:migrate` script and no automated production applier.
-`crates/gateway/src/db/mod.rs::apply_migrations()` is a **test-only** helper.
-
-A new entitlement column must land in the database **before** the gateway that reads it is
-deployed, or the resolver 500s on a missing column.
-
-### 3.9 Distroless containers have no shell
-
-Gateway and ingest run on `cgr.dev/chainguard/glibc-dynamic` (**not** `static` — the binary
-is glibc-linked). There is no shell, so `docker exec … printenv` returns nothing and reads as
-"the variable is unset". Use `docker inspect -f '{{json .Config.Env}}'`.
-
-### 3.10 `ponytail:` comments are a debt ledger — never delete one as "unclear"
-
-A `// ponytail:` comment is a marker in a documented protocol, not commentary. The convention
-is `ponytail: <ceiling>, <upgrade path>`, so each one is the written record of a **known,
-accepted limitation** — several are the only place a real concurrency ceiling is documented.
-
-- Never remove one as unclear, redundant, or restates-what.
-- Remove one only when the ceiling is genuinely gone — and say so in the commit message.
-- A marker naming no ceiling and no upgrade path is malformed: make it conform or drop it
-  deliberately.
-
-There are **10** in source today. Harvesting tools that anchor `ponytail:` to the start of a
-line **under-report by ~30%** — they miss mid-line markers, JSDoc-block markers, and Python
-docstring markers. Use a non-anchored pattern.
+`apps/web/db/schema.ts` is the canonical control-plane schema. `drizzle-kit migrate` applies
+the journalled migrations; later migrations under `apps/web/db/migrations/` are plain SQL
+files applied in numeric order. A new entitlement column must exist in the database
+**before** the gateway that reads it is deployed, or the resolver fails on a missing column.
 
 ---
 
-## 4. What is shipped vs. what is specified
+## 4. Known limitations
 
-Stated plainly, because several committed documents in this repository still overstate it.
-**Do not describe anything in this table as delivered.**
+Stated plainly, so nothing here is read as delivered:
 
-| Thing | Reality |
-|---|---|
-| 3 ML predictors (SLM judge, trajectory guard, prompt guard) | **Unconditional stubs.** `SlmJudge::judge` returns `1.0/1.0/1.0` on **both** branches — shipping a trained model would not switch it on (`grep -n 'fn judge' crates/gateway/src/predictive/slm_judge.rs`). No model weights are committed anywhere, and the gateway has **no ONNX runtime dependency**, so in-process inference is impossible as the crate stands |
-| Prompt-guard sidecar | Not in any compose file; its URL defaults to the gateway's own port (self-call → non-2xx → fail-open) |
-| A2UI / stuck-loop / MCP rug-pull / A2A / taint detection | Gated on payload fields **no live ingress produces** (`protocol`, `tool_name`, `mcp_server_name`, `tracelane_message_type`). The gateway has exactly one proxied route. `apps/docs/archive/predictive-guardrails.mdx (historical)` correctly labels these **Roadmap** |
-| Detection enforcement | **Observe-first by default** — a `Block` verdict is logged, not a 403, unless `TRACELANE_PREDICTIVE_ENFORCE` is set (`grep -n 'TRACELANE_PREDICTIVE_ENFORCE' crates/gateway/src/server.rs`). This is the intended posture, not a bug |
-| Tool-pinning and trifecta rails | No customer-facing write path for `tool_capabilities` yet, so these are inert for real tenants |
-| `crates/policy` | A Cedar **scaffold**, not wired, with no `cedar-policy` dependency. Every method returns `Deny` (fail-closed) |
-| R2 cold tier | **Does not exist.** The NDJSON batcher that nothing fed was DELETED on 2026-09-12, with its `r2_tx` channel — `grep -rn 'r2_tx' crates/ingest/src` returns nothing. Spans live in ClickHouse only |
-| `ee/` license zone | **Does not exist.** The whole tree is Apache-2.0 |
-| ClickHouse tiered storage | No `storage_policy` or `TTL … TO DISK` anywhere under `infra/` — retention tiers are not backed by a warm/cold tier |
-| Performance budgets (§6) | **Targets, not measurements.** `bench/gateway/RESULTS.md` is explicitly UNPOPULATED; `bench/predictive/RESULTS.md` is empty. Do not quote these as achieved numbers |
-| Eval suite as a merge gate | The gate runs with **mock providers**, so behavioral assertions **SKIP**. Only the separate live-stack job exercises real behaviour, and it currently runs one suite |
-| Provider coverage | **191 providers.** Routable = every row of `crates/gateway/providers.tsv` + 6 native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived, never written down — `scripts/ci/check-provider-count.py` computes it and fails any file that disagrees |
+- The ML-based predictors are not enabled; they cannot currently produce a verdict.
+- Most rule-based predictive detectors gate on payload fields a chat request does not
+  carry, so they do not fire on LLM traffic today. The guardrail rails do run inline.
+- Detection is **observe-first**: a `Block` verdict is logged, not a 403, unless
+  `TRACELANE_PREDICTIVE_ENFORCE=1` is set. This is the intended posture, not a bug.
+- There is no cold storage tier; spans live in ClickHouse.
+- End-to-end latency budgets are not published as measurements; see
+  `apps/docs/benchmarks.mdx` for what has been measured.
+- The eval suite's merge gate runs with mock providers, so behavioural assertions are skipped
+  there; only the live-stack job exercises real behaviour.
+- **Provider coverage:** 191 providers — every row of `crates/gateway/providers.tsv` plus 6
+  native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived,
+  never written down: `scripts/ci/check-provider-count.py` computes it and fails any file that
+  disagrees.
 
 ---
 
@@ -265,23 +224,16 @@ Only what differs from the ecosystem default or is otherwise non-obvious.
 - **Credentials are `secrecy::SecretString` with `Zeroize`-on-drop.** Never `String`.
 - **RPITIT, not `async-trait`, on the gateway hot path** — off the hot path `async-trait` is
   fine and is used in 20+ places.
-- Zero allocations past `accept()` on the hot path: `bytes::Bytes`, `arc-swap`, pre-sized
-  buffers.
-- `#[tracing::instrument]` on public async fns with a `tenant_id` field. **Measured adherence
-  is 42.2% and no CI guard exists** — treat this as an aspiration, honestly, not a satisfied
-  rule.
+- Keep hot-path allocations low: `bytes::Bytes`, `arc-swap`, pre-sized buffers.
+- `#[tracing::instrument]` on public async fns with a `tenant_id` field.
 - `tokio` only. Axum **0.8** — paths are `/{id}`, no `#[async_trait]` on extractors. Never
   hold a lock across `.await`. `tokio::spawn` on an accept loop must be bounded by a
   semaphore permit.
-- **`main.rs` and `lib.rs` both carry crate-wide `#![allow(dead_code, unused_imports, …)]`**,
-  so `clippy -D warnings` **cannot** catch dead code in the gateway. An unwired module
-  compiles clean.
 - **`crates/gateway/src/lib.rs` exposes only `rate_limiter` and `circuit_breaker`.** Use
-  `cargo test -p gateway --bin gateway` to target the bin's ~743 tests.
+  `cargo test -p gateway --bin gateway` to target the binary's tests.
 
 ### TypeScript
-- TS 5.5+ strict, `noUncheckedIndexedAccess`. **Biome**, not ESLint+Prettier — but **no biome
-  config file exists in the repo**, so only the recommended set applies.
+- TS 5.5+ strict, `noUncheckedIndexedAccess`. **Biome**, not ESLint+Prettier.
 - React 19 + Next.js 15 App Router, RSC by default. Tailwind 4, TanStack Query, Drizzle.
   UI primitives come from the workspace-internal `@tracelanedev/ui` package.
 - **Never write raw SQL strings.** Drizzle for Postgres; ClickHouse is reached only through
@@ -289,8 +241,7 @@ Only what differs from the ecosystem default or is otherwise non-obvious.
 - **Timestamps: UTC everywhere, always labeled.** Use `format-date.ts` — never
   `toLocaleString` for user-facing dates. Gateway `toString()` dates are **naive** (no `Z`),
   so `new Date()` parses them as local time and shifts per viewer. Test under a non-UTC `TZ`.
-- **No `console.log`.** *(51 exist; the rule is currently unenforced.)* The honoured
-  convention is to sanitise any customer-controlled value before interpolating it into a log.
+- **No `console.log`.** Sanitise any customer-controlled value before interpolating it into a log.
 - **Design tokens only — never hardcode hex.** `packages/ui/src/styles/tokens.css`.
 
 ### Python
@@ -313,32 +264,22 @@ Only what differs from the ecosystem default or is otherwise non-obvious.
 
 | Dep | Reason | Enforced? |
 |---|---|---|
-| `litellm` (as a dependency) | Known RCE advisory | **Yes** — `deny.toml`. *(It is a legitimate instrumentation TARGET; the ban is on depending on it)* |
-| `openssl` (Rust) | Use `rustls` + `aws-lc-rs` | Partial — a dedicated `cargo tree` job |
-| Trivy | Known advisory; use Grype + OSV-Scanner + Syft | **No check exists** |
-| `arize-phoenix` | ELv2, SaaS-blocked | **No check exists** |
-| Helicone `ai-gateway` code | GPL-3.0 viral copyleft | **No check exists** — study patterns, copy zero code |
-| `eslint`, `prettier` | Use Biome | **No check exists** |
+| `litellm` (as a dependency) | Known RCE advisory | `deny.toml`. *(It is a legitimate instrumentation TARGET; the ban is on depending on it)* |
+| `openssl` (Rust) | Use `rustls` + `aws-lc-rs` | a dedicated `cargo tree` job |
+| Trivy | Known advisory; use Grype + OSV-Scanner + Syft | review |
+| `arize-phoenix` | ELv2, SaaS-blocked | review |
+| Helicone `ai-gateway` code | GPL-3.0 viral copyleft | review — study patterns, copy zero code |
+| `eslint`, `prettier` | Use Biome | review |
 
 New dependencies must be Apache-2.0 / MIT / BSD / ISC / MPL-2.0 and clear `cargo audit` /
 `pnpm audit` / `pip-audit`.
 
 ---
 
-## 6. Performance budgets — targets, not measurements
+## 6. Performance
 
-| Surface | p99 target |
-|---|---|
-| Gateway overhead (excl. provider time) | <25ms |
-| Ingest end-to-end | <5s |
-| Dashboard 10K-span trace load | <1s |
-| MCP query | <300ms |
-| Detection layer (inline) | <100ms |
-
-**None of these is CI-enforced.** The only enforced budgets are 8 criterion microbenchmarks
-with nanosecond ceilings (`scripts/ci/bench-budgets.json`). No end-to-end p99 has been
-measured on production hardware — the results files are explicitly unpopulated. Do not
-publish these as achieved numbers.
+No end-to-end latency budget is published as an achieved number. Measured results live in
+`apps/docs/benchmarks.mdx`; do not quote a figure that is not published there.
 
 ---
 
@@ -363,11 +304,10 @@ publish these as achieved numbers.
   IPv6, and cloud metadata endpoints.
 - **Prompt-injection aware:** user-supplied span content is wrapped in an
   `<UNTRUSTED_USER_DATA>` sentinel before any model consumes it.
-- **Transport:** mTLS for ingest; TLS 1.3 minimum end-to-end. The gateway itself does not
-  terminate TLS — a sidecar does.
+- **Transport:** mTLS for ingest; TLS 1.3 minimum.
 - **Supply chain:** all GitHub Actions SHA-pinned; Sigstore Cosign keyless signing;
   CycloneDX SBOM; OIDC Trusted Publishing for npm and PyPI (no long-lived registry tokens);
-  Grype + OSV-Scanner + Syft for scanning; Chainguard Wolfi container bases.
+  Grype + OSV-Scanner + Syft for scanning.
 
 **Test bypasses** (`TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS`, `TRACELANE_AUTH_TEST_NO_AUDIENCE`,
 and the billing organisation-check bypass) are `#[cfg(debug_assertions)]`-gated. **A release
@@ -390,11 +330,8 @@ pnpm eval:run --suite=all      # valid suites: all, ft, gc, is, pp, pir, pi
 ```
 
 `scripts/verify-all.sh` runs the full local gate (fmt, clippy
-`--all-targets`, `cargo test --all-features`, cargo-deny/audit/machete, 19 guard scripts,
-biome, typecheck, vitest, knip, `pnpm audit`, gitleaks, ruff, pytest). Enable the pre-push
-hook with `git config core.hooksPath .githooks` — it runs that gate and blocks on failure.
-
-**Hot-path changes should go through a PR**: the bench job does not run on a direct push.
+`--all-targets`, `cargo test --all-features`, cargo-deny/audit/machete, the guard scripts,
+biome, typecheck, vitest, knip, `pnpm audit`, gitleaks, ruff, pytest).
 
 ---
 
@@ -410,7 +347,7 @@ hook with `git config core.hooksPath .githooks` — it runs that gate and blocks
 - **No sleeps for synchronisation** — use `tokio::sync::Notify` or poll-until-condition.
 - **No leaked state between runs.** Env mutation in tests holds a process `Mutex` *and* uses a
   `Drop` guard; tempdirs always.
-- Fault-tolerance chaos evals live in `evals/fault-tolerance/` (FT-01…FT-10). Note these are
+- Fault-tolerance chaos evals live in `evals/fault-tolerance/` Note these are
   currently structural assertions — the real chaos tests are the wiremock integration tests in
   `crates/gateway/tests/`.
 
@@ -420,7 +357,6 @@ hook with `git config core.hooksPath .githooks` — it runs that gate and blocks
 
 **DO**
 - Read `CONTRIBUTING.md` and `SECURITY.md` before contributing.
-- Cite `file:line` for every technical claim.
 - Test-first when fixing bugs — every fix commit carries a regression test that would have
   caught it.
 - Pin every external version.

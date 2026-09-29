@@ -4,6 +4,8 @@ import {
 	fmtDurationMs,
 	fmtFraction,
 	fmtPercent,
+	fmtSignedDeltaUs,
+	fmtTarget,
 	fmtUsd,
 	percentDecimals,
 	sampleFloor,
@@ -70,5 +72,35 @@ describe("one formatter per kind", () => {
 	it("count groups thousands", () => {
 		expect(fmtCount(1284)).toBe("1,284");
 		expect(fmtCount(Number.NaN)).toBe("—");
+	});
+});
+
+describe("fmtTarget — the fewest decimals that carry the contracted figure (B-510 / CX-11)", () => {
+	it("carries the 99.95% tier instead of rounding it away to 100.0%", () => {
+		expect(fmtTarget(0.9995)).toBe("99.95%");
+	});
+	it("keeps one decimal for the 99.9% default", () => {
+		expect(fmtTarget(0.999)).toBe("99.9%");
+	});
+	it("drops trailing zeros for a whole-number tier", () => {
+		expect(fmtTarget(0.99)).toBe("99%");
+	});
+});
+
+describe("fmtSignedDeltaUs — the sign comes from us, never lost on the absolute half (B-514 / CX-15)", () => {
+	it("a faster B keeps its minus sign on the absolute delta", () => {
+		expect(fmtSignedDeltaUs(-90_000, -90)).toBe("-90.0ms (-90%)");
+	});
+	it("a slower B keeps the plus sign on both halves", () => {
+		expect(fmtSignedDeltaUs(90_000, 90)).toBe("+90.0ms (+90%)");
+	});
+	it("nothing to compare is a dash", () => {
+		expect(fmtSignedDeltaUs(null, null)).toBe("—");
+	});
+	it("pct null (A-side was 0) omits the ratio but keeps the sign", () => {
+		expect(fmtSignedDeltaUs(-5_000, null)).toBe("-5.0ms");
+	});
+	it("zero delta carries no sign", () => {
+		expect(fmtSignedDeltaUs(0, 0)).toBe("0µs (0%)");
 	});
 });

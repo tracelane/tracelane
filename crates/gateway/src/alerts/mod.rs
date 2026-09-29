@@ -201,33 +201,49 @@ pub async fn delete_rule(pool: &DbPool, tenant: Uuid, id: Uuid) -> Result<u64> {
         .context("DELETE alert_rules failed")
 }
 
-/// Record the outcome of a check: the new state and (when it fired) the fire
-/// time. `bumped_fired` is true only when a notification was actually sent.
-pub async fn update_rule_state(
+/// RI-04 §3 (founder default Q1, 2026-09-19) — CAS the `ok` -> `breach` edge:
+/// fire ONLY when this call is the one that flips the row, never on a
+/// read-then-write race between two checker processes evaluating the same
+/// rule at once. Same shape as `billing::email`'s `meter_warnings` dedup
+/// (`email.rs`: "dedup is the INSERT's row count — never a read-then-write")
+/// except this is an UPDATE whose row count is the same signal: at most one of
+/// two concurrent callers gets `rows == 1`, and it is the winner's job to fire.
+///
+/// SUPERSEDED 2026-09-22: the former accepted ceiling
+/// lost a failed delivery. The checker now awaits a bounded send and resets
+/// a failed claim to ok. A claim itself does not record a delivery timestamp.
+///
+/// # Errors
+/// A Postgres failure. The caller's fail-safe reading (`alerts::checker`) is
+/// to skip firing this tick rather than guess who else may have already fired.
+pub async fn claim_breach(pool: &DbPool, id: Uuid) -> Result<bool> {
+    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    let rows = client
+        .execute(
+            "UPDATE alert_rules SET last_state = 'breach', \
+             updated_at = now() WHERE id = $1 AND last_state = 'ok'",
+            &[&id],
+        )
+        .await
+        .context("CAS alert_rules ok->breach failed")?;
+    Ok(rows == 1)
+}
+
+/// Release only a still-claimed breach; a concurrent recovery is already ok.
+pub async fn release_failed_breach(pool: &DbPool, id: Uuid) -> Result<()> {
+    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    client.execute("UPDATE alert_rules SET last_state = 'ok', updated_at = now() WHERE id = $1 AND last_state = 'breach'", &[&id]).await.context("reset failed alert delivery")?;
+    Ok(())
+}
+
+/// Record the confirmed delivery time without resurrecting a recovered state.
+pub async fn record_delivery(
     pool: &DbPool,
     id: Uuid,
-    state: &str,
-    bumped_fired: bool,
+    delivered_at: std::time::SystemTime,
 ) -> Result<()> {
     let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
-    if bumped_fired {
-        client
-            .execute(
-                "UPDATE alert_rules SET last_state = $1, last_fired_at = now(), \
-                 updated_at = now() WHERE id = $2",
-                &[&state, &id],
-            )
-            .await
-            .context("UPDATE alert_rules state+fired failed")?;
-    } else {
-        client
-            .execute(
-                "UPDATE alert_rules SET last_state = $1, updated_at = now() WHERE id = $2",
-                &[&state, &id],
-            )
-            .await
-            .context("UPDATE alert_rules state failed")?;
-    }
+    client.execute("UPDATE alert_rules SET last_fired_at = GREATEST(last_fired_at, $2::timestamptz), updated_at = now() WHERE id = $1", &[&id, &delivered_at]).await.context("record confirmed alert delivery")?;
     Ok(())
 }
 
@@ -405,39 +421,44 @@ async fn read_bounded_body(resp: reqwest::Response) -> String {
 /// **Fail-CLOSED on the report**: this returns `Err` unless the webhook itself
 /// answered 2xx. A transport error, an SSRF rejection, and a non-2xx answer are
 /// three distinct [`DeliveryError`] variants — none of them is reported as a
-/// delivery. (Whether a *caller* then fails open is the caller's choice:
-/// [`fire_alert_async`] logs and continues, so a dead webhook never wedges the
-/// background checker; the test-fire route surfaces the failure to the user.)
+/// delivery. The checker awaits this with a whole-operation deadline and
+/// retries failed delivery on its next tick; the test route surfaces the error.
 #[tracing::instrument(skip_all, fields(http_status = tracing::field::Empty))]
 pub async fn deliver_alert(webhook_url: &str, text: &str) -> Result<u16, DeliveryError> {
     // The webhook URL is itself a credential (a Slack URL embeds its token), so
     // it is never a tracing field and never part of an error string.
-    match tokio::time::timeout(
+    // B-472 (REV-3): the connection goes to the addresses the guard CHECKED, not to
+    // whatever the customer's DNS answers a second time (a rebinding record with a
+    // zero TTL flips between the two resolutions).
+    let pinned = match tokio::time::timeout(
         WEBHOOK_VALIDATE_TIMEOUT,
-        crate::ssrf_guard::validate_url(webhook_url),
+        crate::ssrf_guard::validate_url_pinned(webhook_url),
     )
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(p)) => p,
         Ok(Err(e)) => return Err(DeliveryError::Rejected(e.to_string())),
         Err(_) => {
             return Err(DeliveryError::Unreachable(
                 "URL validation (DNS) timed out".to_string(),
             ));
         }
-    }
+    };
 
-    let client = crate::ssrf_guard::safe_client_builder()
+    let client = pinned
+        .pin(crate::ssrf_guard::safe_client_builder())
         .timeout(WEBHOOK_TIMEOUT)
         .build()
         .map_err(|e| DeliveryError::Unreachable(format!("HTTP client build failed: {e}")))?;
 
+    // B-480 (Codex HA-11): reqwest's `Display` appends ` for url (…)` and the URL IS
+    // the credential — strip it before the error becomes a string anyone logs.
     let resp = client
         .post(webhook_url)
         .json(&serde_json::json!({ "text": text }))
         .send()
         .await
-        .map_err(|e| DeliveryError::Unreachable(e.to_string()))?;
+        .map_err(|e| DeliveryError::Unreachable(e.without_url().to_string()))?;
 
     let http_status = resp.status().as_u16();
     tracing::Span::current().record("http_status", http_status);
@@ -448,32 +469,6 @@ pub async fn deliver_alert(webhook_url: &str, text: &str) -> Result<u16, Deliver
         http_status,
         body: read_bounded_body(resp).await,
     })
-}
-
-/// Fire-and-forget wrapper over [`deliver_alert`] for the background checker.
-///
-/// Still fire-and-forget — a breach notification must not block or fail a check
-/// tick — but the outcome is now **observed**: a webhook that answers non-2xx
-/// produces a `warn` carrying the observed status instead of nothing at all.
-pub fn fire_alert_async(webhook_url: String, text: String) {
-    tokio::spawn(async move {
-        match deliver_alert(&webhook_url, &text).await {
-            Ok(http_status) => {
-                tracing::debug!(http_status, "alert webhook delivered");
-            }
-            Err(e) => {
-                let observed = match &e {
-                    DeliveryError::Status { http_status, .. } => Some(*http_status),
-                    _ => None,
-                };
-                tracing::warn!(
-                    error = %e,
-                    http_status = observed,
-                    "alert webhook delivery FAILED — the notification did not reach the destination"
-                );
-            }
-        }
-    });
 }
 
 /// Compose the alert message for a breach. Never includes trace contents or key
@@ -494,6 +489,101 @@ pub fn breach_message(rule: &AlertRule, value: f64) -> String {
          {scope}. https://app.tracelane.dev/settings/alerts",
         rule.threshold
     )
+}
+
+#[cfg(test)]
+mod ri04_cas_tests {
+    use super::claim_breach;
+
+    /// A deadpool over the runner's own database (`POSTGRES_TEST_URL`, migrations
+    /// already applied by `run-postgres-integration.sh`) — `claim_breach` takes the
+    /// pool type the checker hands it, so the test goes through the same door.
+    pub(super) fn pool_from_test_url(url: &str) -> crate::db::DbPool {
+        let pg_cfg: tokio_postgres::Config = url.parse().expect("parse POSTGRES_TEST_URL");
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = pg_cfg.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        });
+        cfg.port = pg_cfg.get_ports().first().copied();
+        cfg.user = pg_cfg.get_user().map(str::to_owned);
+        cfg.password = pg_cfg
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).to_string());
+        cfg.dbname = pg_cfg.get_dbname().map(str::to_owned);
+        cfg.create_pool(
+            Some(deadpool_postgres::Runtime::Tokio1),
+            tokio_postgres::NoTls,
+        )
+        .expect("create the test pool")
+    }
+
+    /// RI-04 proof 4 (the CAS half; the webhook/inbox observation is the checker's
+    /// existing fire path, unchanged): one rule at `ok`, two concurrent claimants →
+    /// exactly one `true`; the row reads `breach` without claiming delivery; a third
+    /// claim on the now-`breach` row is refused. Without the CAS (a read-then-write
+    /// on `last_state`) both callers fire — the RED this pins.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn claim_breach_admits_exactly_one_caller_on_the_ok_to_breach_edge() {
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let pool = pool_from_test_url(&url);
+        let client = pool.get().await.expect("pool");
+        let org = format!("org_ri04_{}", uuid::Uuid::new_v4().simple());
+        let tenant: uuid::Uuid = client
+            .query_one(
+                "INSERT INTO tenants (workos_org_id, name) VALUES ($1, $2) RETURNING id",
+                &[&org, &"ri04-cas-test"],
+            )
+            .await
+            .expect("insert a throwaway tenant")
+            .get(0);
+        let dest: uuid::Uuid = client
+            .query_one(
+                "INSERT INTO alert_destinations (tenant_id, name, kind, url) \
+                 VALUES ($1, 'ri04', 'slack', 'https://example.invalid/hook') RETURNING id",
+                &[&tenant],
+            )
+            .await
+            .expect("insert a destination")
+            .get(0);
+        let rule: uuid::Uuid = client
+            .query_one(
+                "INSERT INTO alert_rules (tenant_id, metric, comparator, threshold, window_minutes, destination_id) \
+                 VALUES ($1, 'error_rate', 'gt', 0.5, 60, $2) RETURNING id",
+                &[&tenant, &dest],
+            )
+            .await
+            .expect("insert a rule at last_state = ok (the default)")
+            .get(0);
+        drop(client);
+
+        let (first, second) = tokio::join!(claim_breach(&pool, rule), claim_breach(&pool, rule));
+        let (first, second) = (first.expect("cas 1"), second.expect("cas 2"));
+        assert!(
+            first ^ second,
+            "exactly one of two concurrent claimants may fire: {first} {second}"
+        );
+        let third = claim_breach(&pool, rule).await.expect("cas 3");
+        assert!(!third, "a rule already at breach must not re-claim");
+
+        let client = pool.get().await.expect("pool");
+        let row = client
+            .query_one(
+                "SELECT last_state, last_fired_at IS NOT NULL FROM alert_rules WHERE id = $1",
+                &[&rule],
+            )
+            .await
+            .expect("read back");
+        assert_eq!(row.get::<_, String>(0), "breach");
+        assert!(
+            !row.get::<_, bool>(1),
+            "a claim must not record last_fired_at"
+        );
+    }
 }
 
 // See the identical note in `alerts/routes.rs`: these tests drive
@@ -637,11 +727,18 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
 
-        let out = deliver_alert(&format!("http://127.0.0.1:{port}/hook"), "hello").await;
+        // B-480 (Codex HA-11): the path carries the token in a real Slack/Discord
+        // webhook URL. reqwest's `Display` appends ` for url (…)` to a transport
+        // error; `without_url()` strips it BEFORE the error becomes a string.
+        let url = format!("http://127.0.0.1:{port}/services/T000/B000/SECRETxyz123");
+        let out = deliver_alert(&url, "hello").await;
 
+        let Err(DeliveryError::Unreachable(msg)) = out else {
+            panic!("expected Unreachable, got {out:?}");
+        };
         assert!(
-            matches!(out, Err(DeliveryError::Unreachable(_))),
-            "expected Unreachable, got {out:?}"
+            !msg.contains("SECRETxyz123") && !msg.contains("for url"),
+            "the webhook URL (a credential) reached the error string: {msg}"
         );
     }
 

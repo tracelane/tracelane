@@ -119,6 +119,17 @@ struct StreamFinalizer {
     cost_usd: Option<f64>,
     saw_tool_call: bool,
     provider_finish: Option<FinishReason>,
+    /// RI-05 / B-444: the provider's first identity claim (id / served model /
+    /// fingerprint); `Default` until one arrives.
+    served: super::spans::ServedMeta,
+    /// RI-05 / M11: reasoning ("thinking") output tokens, last-write-wins —
+    /// same idiom as `cache_read`/`cache_creation`.
+    reasoning_output_tokens: Option<u32>,
+    /// RI-05 / M19: the CALLED tool names + raw arguments, accumulated the
+    /// SAME way the buffered path's `BufferedToolState` does (reused directly
+    /// — this is the streaming path's "equivalent" the spec asks for, not a
+    /// second implementation).
+    tool_calls: super::buffered::ToolCallAccumulator,
     logprobs_acc: LogprobAccumulator,
     /// EVL-28: the post-guardrail text, accumulated ONLY when sampled.
     online_answer: Option<String>,
@@ -132,6 +143,11 @@ struct StreamFinalizer {
     /// Cap for `output_ring`, in bytes (`TraceContentConfig::max_field_bytes`).
     /// `0` when `output_ring` is `None` — never consulted then.
     output_cap: usize,
+    /// GWY-53: the request's capture decision, re-applied by `CapturedOutput::build`
+    /// at finalize — the ONE gate the text and the tool arguments both go through.
+    capture: super::config::ContentCapture,
+    /// GWY-53: the captured request text, taken once at finalize.
+    captured_input: Option<super::spans::CapturedInput>,
     // ── captured context ─────────────────────────────────────────────────
     nats: Option<Arc<async_nats::Client>>,
     /// BILL-01 meter 1 (`ingest_bytes`). `None` when `CLICKHOUSE_URL` is
@@ -152,6 +168,10 @@ struct StreamFinalizer {
     identity: CallerIdentity,
     warn_aft_id: Option<&'static str>,
     failover_from: Option<&'static str>,
+    /// RI-05 M1 + M4: the request's full dispatch ledger, handed in from
+    /// `StreamContext` — built by the caller (`server/chat.rs`) across the
+    /// primary dispatch and any cross-provider failover hops/skips.
+    dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
     api_key_id: Option<String>,
     request_config: RequestConfig,
     online_eval: Option<crate::online_eval::Pending>,
@@ -207,6 +227,10 @@ impl StreamFinalizer {
                 cache_creation_input_tokens: self.cache_creation,
                 stream: true,
                 cost_usd: self.cost_usd,
+                served: std::mem::take(&mut self.served),
+                finish_reason: self.provider_finish,
+                dispatch_attempts: std::mem::take(&mut self.dispatch_attempts),
+                reasoning_output_tokens: self.reasoning_output_tokens,
             },
             self.failover_from,
             Some(GatewayTiming {
@@ -228,15 +252,31 @@ impl StreamFinalizer {
         request_config.apply(&mut span.attributes);
         // OBS-53: the response-side confidence summary, streaming path.
         self.logprobs_acc.apply(&mut span.attributes);
+        // RI-05 / M19: the CALLED tool names — ungated, like the OFFERED names.
+        // `None` when no tool was called.
+        span.attributes.tracelane_response_tool_names = self.tool_calls.response_tool_names();
+        span.attributes.tracelane_response_tool_arg_bytes =
+            self.tool_calls.response_tool_arg_bytes();
         // OBS-51 / GWY-45 amendment: the ring buffer holds the (capped, most
-        // recent) POST-GUARDRAIL text the client actually received. On
-        // `[DONE]`, a normal finish OR a cancel — every path through `run` —
-        // whatever accumulated becomes `gen_ai_output_messages`. A block
+        // recent) POST-GUARDRAIL text the client actually received. RI-05
+        // folds in the CALLED tool ARGUMENTS under the SAME gate —
+        // `CapturedOutput::build` re-checks the request's `capture_decision`
+        // (`self.capture.output`) rather than trusting `output_ring`'s presence,
+        // so this stays the ONE gate the arguments and the text both go through.
+        // On `[DONE]`, a normal finish OR a cancel — every path through `run`
+        // — whatever accumulated becomes `gen_ai_output_messages`. A block
         // mid-stream still leaves whatever text was emitted BEFORE the block,
         // which the customer genuinely received; nothing is added after it.
-        if let Some(text) = self.output_ring.take().filter(|t| !t.is_empty()) {
-            span.attributes.gen_ai_output_messages =
-                Some(super::spans::output_messages_json(&text));
+        // GWY-45 / GWY-53: the REQUEST half, under the same decision.
+        if let Some(captured) = self.captured_input.take() {
+            captured.apply(&mut span.attributes);
+        }
+        let output_text = self.output_ring.take().unwrap_or_default();
+        let tool_calls_for_span = self.tool_calls.for_span();
+        if let Some(out) =
+            super::spans::CapturedOutput::build(self.capture, &output_text, &tool_calls_for_span)
+        {
+            out.apply(&mut span.attributes);
         }
         // BILL-01 / OBS-51 step 3a: a stream that closed with NO upstream
         // usage event at all (Gemini never emits one) gets a DETERMINISTIC
@@ -351,6 +391,10 @@ pub(super) struct StreamContext {
     pub(super) response_inputs: crate::guardrail::ResponseInputs,
     pub(super) redaction_map: Vec<tracelane_policy::pii::RedactionEntry>,
     pub(super) failover_from: Option<&'static str>,
+    /// RI-05 M1 + M4: the request's full dispatch ledger, built by the caller
+    /// (`server/chat.rs`) across the primary dispatch and any cross-provider
+    /// failover hops/skips. Owned — the SSE stream is `'static`.
+    pub(super) dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
     /// GWY-43: the API key that authorised this request, for per-key cost
     /// attribution and budget enforcement. Owned rather than borrowed because
     /// the stream outlives the handler frame.
@@ -375,6 +419,16 @@ pub(super) struct StreamContext {
     /// messages, computed once by the caller (`chat.rs`) before the stream
     /// starts.
     pub(super) input_bytes_for_estimate: usize,
+    /// GWY-53: the handler's ONE `config::capture_decision` for this request
+    /// (operator allowlist OR the workspace opt-in). `output` decides whether the
+    /// post-guardrail text is kept at all; `max_field_bytes` caps it.
+    pub(super) capture: super::config::ContentCapture,
+    /// GWY-45 / GWY-53: the captured REQUEST text, built by the caller under the SAME
+    /// decision (`CapturedInput::build(capture, …)`); `None` unless `capture.input`.
+    /// Until GWY-53 the SSE path carried no request text at all — only the buffered
+    /// path and the cache hit did — so a streamed span of a capture-on workspace
+    /// showed the answer without the question.
+    pub(super) captured_input: Option<super::spans::CapturedInput>,
 }
 
 /// Converts a `ProviderStream` to an SSE stream of OpenAI `chat.completion.chunk` events.
@@ -407,12 +461,15 @@ pub(super) fn provider_stream_to_sse(
         response_inputs,
         redaction_map,
         failover_from,
+        dispatch_attempts,
         api_key_id,
         request_config,
         online_eval,
         handover,
         meters,
         input_bytes_for_estimate,
+        capture,
+        captured_input,
     } = ctx;
     // The finalizer records the span under the caller's model string; the
     // generator keeps `model` for the chunks it yields.
@@ -431,8 +488,8 @@ pub(super) fn provider_stream_to_sse(
         //
         // OBS-51: computed BEFORE the struct literal below moves `tenant_id`
         // into `fin` — a borrow of it after that move would not compile.
-        let output_cap = crate::server::config::trace_content().map_or(0, |c| c.max_field_bytes());
-        let output_ring = crate::server::config::content_capture_enabled(&tenant_id).then(String::new);
+        let output_cap = if capture.output { capture.max_field_bytes } else { 0 };
+        let output_ring = capture.output.then(String::new);
         let mut fin = StreamFinalizer {
             input_tokens: 0,
             output_tokens: 0,
@@ -442,6 +499,9 @@ pub(super) fn provider_stream_to_sse(
             cost_usd: None,
             saw_tool_call: false,
             provider_finish: None,
+            served: super::spans::ServedMeta::default(),
+            reasoning_output_tokens: None,
+            tool_calls: super::buffered::ToolCallAccumulator::default(),
             logprobs_acc: LogprobAccumulator::default(),
             online_answer: online_eval.as_ref().map(|_| String::new()),
             first_byte_ts: None,
@@ -455,6 +515,7 @@ pub(super) fn provider_stream_to_sse(
             identity,
             warn_aft_id,
             failover_from,
+            dispatch_attempts,
             api_key_id,
             request_config,
             online_eval,
@@ -463,6 +524,8 @@ pub(super) fn provider_stream_to_sse(
             input_bytes_for_estimate,
             output_ring,
             output_cap,
+            capture,
+            captured_input,
         };
         // The finalizer exists: the dispatch guard's job is done.
         if let Some(mut guard) = handover {
@@ -619,6 +682,11 @@ pub(super) fn provider_stream_to_sse(
                     }
                     ProviderEvent::ToolCallDelta { index, id, name, input_delta } => {
                         fin.saw_tool_call = true;
+                        // RI-05 / M19: accumulate the SAME way the buffered
+                        // path's `BufferedToolState` does, purely for the
+                        // eventual span — the client-facing chunk below is
+                        // unchanged.
+                        fin.tool_calls.push(index, id.clone(), name.clone(), &input_delta);
                         let data = serde_json::json!({
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -638,6 +706,10 @@ pub(super) fn provider_stream_to_sse(
                         yield Ok(Event::default().data(data.to_string()));
                     }
                     ProviderEvent::Finish { reason } => fin.provider_finish = Some(reason),
+                    // RI-05 / B-444: wired BY HAND (catch-all below would swallow it).
+                    ProviderEvent::ResponseMeta { id, model, system_fingerprint } => {
+                        fin.served.absorb(id, model, system_fingerprint);
+                    }
                     // OBS-53. Wired BY HAND, and it had to be: every match on
                     // `ProviderEvent` in this tree carries a catch-all, so a new
                     // variant compiles clean everywhere and is silently dropped —
@@ -653,10 +725,16 @@ pub(super) fn provider_stream_to_sse(
                         cache_read,
                         cache_creation,
                         cost_usd: cost,
+                        reasoning,
                     } => {
                         merge_usage_tokens(&mut fin.input_tokens, &mut fin.output_tokens, it, ot);
                         if cost.is_some() {
                             fin.cost_usd = cost;
+                        }
+                        // RI-05 / M11: same last-write-wins idiom as the cache
+                        // fields below.
+                        if reasoning.is_some() {
+                            fin.reasoning_output_tokens = reasoning;
                         }
                         // B-390 found this by deleting `#![allow(dead_code)]`: the
                         // adapter had carried Anthropic's `cache_read_input_tokens`
@@ -691,6 +769,9 @@ pub(super) fn provider_stream_to_sse(
                         {
                             fin.saw_tool_call = true;
                         }
+                        // RI-05 / M19: a whole-response adapter (Bedrock) carries
+                        // its tool calls as fields, not stream deltas.
+                        fin.tool_calls.absorb_response_calls(&response);
                         if let Some(usage) = response.usage {
                             merge_usage_tokens(
                                 &mut fin.input_tokens,
@@ -934,6 +1015,8 @@ pub(crate) mod tests {
             response_inputs: e2e_inputs(),
             redaction_map: Vec::new(),
             failover_from: None,
+            // RI-05: these harnesses drive the SSE shape, not the retry/failover ledger.
+            dispatch_attempts: Vec::new(),
             api_key_id: None, // not under test here
             // GWY-48: an empty config exercises the "client sent nothing" branch,
             // which is the one that must add NO attributes at all.
@@ -943,6 +1026,8 @@ pub(crate) mod tests {
             handover: None,
             meters,
             input_bytes_for_estimate: 0,
+            capture: super::super::config::ContentCapture::OFF,
+            captured_input: None,
         }
     }
 
@@ -1030,6 +1115,7 @@ pub(crate) mod tests {
             cache_read: Some(1000),
             cache_creation: Some(0),
             cost_usd: None,
+            reasoning: None,
         };
         let out = run_sse(vec![usage_event, chunk("hi"), done_event(3)]).await;
         let final_frame = out
@@ -1066,6 +1152,7 @@ pub(crate) mod tests {
             cache_read: None,
             cache_creation: None,
             cost_usd: None,
+            reasoning: None,
         };
         // Box::pin, NOT `std::pin::pin!` — the latter pins a LOCAL, and
         // `drop(sse)` would then drop only the `Pin<&mut _>` while the stream
@@ -1156,6 +1243,7 @@ pub(crate) mod tests {
             cache_read: None,
             cache_creation: None,
             cost_usd: None,
+            reasoning: None,
         };
         let (n, bytes) = meter_records_for(vec![chunk("hello"), usage_event]).await;
         assert_eq!(n, 1, "a Done-less stream end must meter exactly once");

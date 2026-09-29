@@ -79,7 +79,7 @@ This starts Postgres + ClickHouse + NATS + Grafana on local ports.
 
 ```bash
 ./scripts/apply-migration-pg.sh   # tenants, api_keys, users, admin_audit
-./scripts/apply-migration-03.sh   # B1 prompt-promotion schema in ClickHouse
+./scripts/apply-migration-03.sh   # prompt-promotion schema in ClickHouse
 ```
 
 The other ClickHouse migrations (audit_log, traces, spans) auto-apply
@@ -176,9 +176,8 @@ hood; we never call the Stripe API directly). In the Polar dashboard:
    - `eval_runs` — $0.005/judge run
 
    (Four base products — one per paid plan — plus six meters. There
-   is no paid audit product — `/v1/audit/export` does not yet meet the
-   evidence-pack bar we hold a paid audit product to, so 7-year ledger
-   retention folds into Enterprise instead of shipping as a paid SKU.)
+   is no paid audit product — 7-year ledger retention is part of
+   Enterprise.)
 3. Create a **Webhook** (Standard Webhooks spec) at
    `$YOUR_DASHBOARD/api/webhooks/polar` — the dashboard origin, NOT the gateway; the
    gateway has no Polar receiver and a webhook pointed there 404s, so no plan ever
@@ -233,7 +232,6 @@ Before flipping a tenant to a paid plan:
 - [ ] Audit anchoring keypair generated + `TRACELANE_REKOR_SIGNING_KEY` set, and `TRACELANE_REKOR_URL` set if batches are to be anchored (unset, they are signed locally and never anchored)
 - [ ] `CLICKHOUSE_URL` pointing at production cluster (not dev compose)
 - [ ] `POSTGRES_URL` pointing at Neon production branch
-- [ ] OpenSSF Scorecard ≥ 9.0 on the public repo
 - [ ] OSV-Scanner clean across Rust + TS + Python lockfiles
 - [ ] All 20 conformance evals green on the production gateway
 - [ ] Dashboard `/trust` page reviewed by procurement / legal counsel

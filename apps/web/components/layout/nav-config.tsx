@@ -387,6 +387,91 @@ const SETTINGS_ICONS: Partial<Record<string, () => React.JSX.Element>> = {
 	"/settings/account": UsersIcon,
 };
 
+function AgentIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M8 3h8v3H8z M5 8h14v12H5z M9 12h.01 M15 12h.01 M9 16h6 M2 11v5 M22 11v5" />
+		</svg>
+	);
+}
+function ReviewIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M5 3h14v18H5z M8 8l2 2 4-4 M8 14h8 M8 17h5" />
+		</svg>
+	);
+}
+function ExperimentIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10" />
+		</svg>
+	);
+}
+function PlaygroundIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M8 5l12 7-12 7z" />
+		</svg>
+	);
+}
+function DatasetIcon() {
+	return (
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.6}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			className="h-4 w-4 shrink-0"
+			aria-hidden="true"
+		>
+			<path d="M4 4h16v16H4z M4 9h16 M9 4v16 M14 9v11" />
+		</svg>
+	);
+}
 export const sections: NavSection[] = [
 	// ADR-074 §6 grouping. The SAME NINE hrefs as the previous Observe/Improve/
 	// Operate split — regrouped, never reduced, which is why the R12 after-proof
@@ -400,11 +485,12 @@ export const sections: NavSection[] = [
 			{ href: "/dashboards", label: "Dashboards", Icon: LayoutsIcon },
 			{ href: "/traces", label: "Traces", Icon: ActivityIcon },
 			{ href: "/sessions", label: "Sessions", Icon: SessionsIcon },
+			{ href: "/agents", label: "Agents", Icon: AgentIcon },
 			// EVL-29 review queues. Added only AFTER a real review produced rows
 			// on prod (BUILD_RUNBOOK S3, the same rule `/experiments` records):
 			// a queue is a live query, so an entry added before the loop closed
 			// would have led to a surface that could not populate.
-			{ href: "/review", label: "Review", Icon: SignatureIcon },
+			{ href: "/review", label: "Review", Icon: ReviewIcon },
 		],
 	},
 	{
@@ -432,11 +518,18 @@ export const sections: NavSection[] = [
 			// rows, all read back from ClickHouse. Adding it before that would have
 			// been the dead-entry shape: a nav item leading to a surface that
 			// cannot populate.
-			{ href: "/experiments", label: "Experiments", Icon: BarChartIcon },
+			{ href: "/experiments", label: "Experiments", Icon: ExperimentIcon },
 			// OBS-16 (2026-09-06). The form + `POST /api/playground` proxy are
 			// real, so the entry moves in with them — same rule as Experiments
 			// and /review: a nav link only after the page behind it is real.
-			{ href: "/playground", label: "Playground", Icon: GitBranchIcon },
+			{ href: "/playground", label: "Playground", Icon: PlaygroundIcon },
+			// B-527 (2026-09-22). `/datasets` is a real list page now (locked / could
+			// not load / the tenant's datasets — `app/datasets/page.tsx`), the API has
+			// been prod-proven since Sprint 3 and the review flow writes rows into it,
+			// so the same rule as Experiments and Playground puts the entry in: a nav
+			// link only after the page behind it is real. Placed beside Experiments,
+			// which reads the same datasets.
+			{ href: "/datasets", label: "Datasets", Icon: DatasetIcon },
 			// ── OUT OF THE NAV, AND THE REASON IS NOT THE SAME AS ABOVE ───────
 			//
 			// Experiments (EVL-02) was OUT of this list until 2026-08-24 (`968eb470`),
@@ -448,10 +541,10 @@ export const sections: NavSection[] = [
 			// form replaced the ComingSoon stub; the entry above is the result.
 			// (This comment called it "genuinely unbuilt" until the same day.)
 			//
-			// Datasets (EVL-04) has a shipped, prod-proven API and NO UI yet —
-			// `app/datasets/page.tsx` is still a ComingSoon stub. It is out of the
-			// nav because there is nothing to navigate TO, not because the feature
-			// is absent.
+			// Datasets (EVL-04) has a shipped, prod-proven API and, since 2026-09-22
+			// (B-527), a real list page at `app/datasets/page.tsx` — the last
+			// ComingSoon stub is gone and the component was deleted with it; its nav
+			// entry is above (the B-528 trace → dataset entry point is next).
 			//
 			// This comment was previously one line calling all three "V1.1
 			// ComingSoon stubs". A comment that misdescribes the code is the §17
@@ -543,7 +636,9 @@ export const RAIL_ITEM_IDLE = "text-ink-2 hover:bg-surface-2 hover:text-ink";
    accent's own soft tint — reusing the ONE hue that already means "this is
    what you're interacting with" rather than adding a second, unrelated grey
    step. No new hue, no per-group colour. */
-export const RAIL_ITEM_ACTIVE = "bg-action-soft font-medium text-ink";
+// Databricks look (2026-09-27): the row you are on takes the action blue in its
+// label and glyph, on the same soft tint.
+export const RAIL_ITEM_ACTIVE = "bg-action-soft font-medium text-action-ink";
 /**
  * The fixed icon column. Every label starts at the same x whether its glyph is a
  * 16px `viewBox="0 0 16 16"` outline (AccountMenu) or a 24px one (nav-config), and
@@ -558,5 +653,4 @@ export const RAIL_ICON = "flex w-4 shrink-0 items-center justify-center";
  * either, despite the identical metrics — that class hardcodes secondary ink and
  * names a metric, so borrowing it would make a nav label read as a data label.
  */
-export const RAIL_GROUP_LABEL =
-	"px-2 pb-1.5 text-2xs font-semibold uppercase tracking-[0.08em] text-ink-3";
+export const RAIL_GROUP_LABEL = "px-2 pb-1.5 text-xs font-semibold text-ink-3"; // sentence case, Databricks look (2026-09-27)

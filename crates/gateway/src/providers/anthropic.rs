@@ -249,12 +249,24 @@ fn parse_anthropic_sse_event(data: &str) -> Result<Vec<ProviderEvent>> {
                     cache_read: None,
                     cache_creation: None,
                     cost_usd: None,
+                    // RI-05 / M11: Anthropic has no reasoning-token field on the wire.
+                    reasoning: None,
                 })
             } else {
                 None
             }
         }
         "message_start" => {
+            // RI-05 / B-444: the served model and the message id live on this frame.
+            let id = v["message"]["id"].as_str().map(str::to_owned);
+            let model = v["message"]["model"].as_str().map(str::to_owned);
+            if id.is_some() || model.is_some() {
+                events.push(ProviderEvent::ResponseMeta {
+                    id,
+                    model,
+                    system_fingerprint: None,
+                });
+            }
             if let Some(usage) = v["message"]["usage"].as_object() {
                 let input_tokens = usage
                     .get("input_tokens")
@@ -274,6 +286,8 @@ fn parse_anthropic_sse_event(data: &str) -> Result<Vec<ProviderEvent>> {
                     cache_read,
                     cache_creation,
                     cost_usd: None,
+                    // RI-05 / M11: Anthropic has no reasoning-token field on the wire.
+                    reasoning: None,
                 })
             } else {
                 None
@@ -534,6 +548,32 @@ fn translate_content(content: MessageContent) -> AnthropicContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RI-05 / B-444: `message_start` carries the served model and the message id.
+    #[test]
+    fn message_start_emits_response_meta_before_its_usage() {
+        let frame = r#"{"type":"message_start","message":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","type":"message","role":"assistant","model":"claude-sonnet-4-6-20260301","usage":{"input_tokens":25,"output_tokens":1}}}"#;
+        let events = parse_anthropic_sse_event(frame).unwrap();
+        match &events[0] {
+            ProviderEvent::ResponseMeta {
+                id,
+                model,
+                system_fingerprint,
+            } => {
+                assert_eq!(id.as_deref(), Some("msg_01XFDUDYJgAACzvnptvVoYEL"));
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6-20260301"));
+                assert!(system_fingerprint.is_none(), "Anthropic has no such field");
+            }
+            other => panic!("ResponseMeta must come first, got {other:?}"),
+        }
+        assert!(matches!(
+            events[1],
+            ProviderEvent::UsageUpdate {
+                input_tokens: 25,
+                ..
+            }
+        ));
+    }
     use tracelane_shared::{ChatRequest, Message, MessageContent, Role};
 
     /// **The upstream request is ALWAYS `stream: true`, whatever the caller asked.**

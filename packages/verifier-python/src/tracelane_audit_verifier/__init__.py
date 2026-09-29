@@ -117,6 +117,28 @@ class VerifyOptions:
     # pubkey differs are REJECTED (fail closed). Absent -> chain-only mode:
     # signatures/anchors are reported UNVERIFIED (never green).
     tenant_pubkey: bytes | None = None
+    # AUD-29: Tracelane's shared PLATFORM Ed25519 pubkey — the key a workspace's
+    # batches are signed with before the workspace has its own. A batch signed by it
+    # verifies as PLATFORM-SIGNED (counted apart), accepted only as a PREFIX: a
+    # platform-signed batch after a workspace-signed one is
+    # ``platform_key_after_workspace_key``. None -> today's behaviour.
+    platform_pubkey: bytes | None = None
+    # AUD-29: further platform keys (a rotation keeps the retired key here so the
+    # batches it signed still verify). Union with ``platform_pubkey``.
+    platform_pubkeys: tuple[bytes, ...] = ()
+    # AUD-29: the first ledger seq the WORKSPACE key signed (``workspace_key_since_seq``
+    # from ``GET /v1/audit/pubkey``). Any platform-signed batch reaching it is
+    # ``platform_key_after_workspace_key`` even when the loaded view holds no
+    # workspace-signed batch (the windowed-export append).
+    workspace_key_since_seq: int | None = None
+
+
+#: AUD-29: every production platform signing key, pinned in this release so an auditor
+#: does not have to take them from Tracelane's API or from the evidence. A rotation
+#: APPENDS; a retired key stays so the batches it signed still verify.
+TRACELANE_PLATFORM_PUBKEYS_B64: tuple[str, ...] = ("fKMom1FbENpYSF/EVNCkd4sOEnHVlbsDf13CNfkewl8=",)
+#: AUD-29: the CURRENT platform key (the last pinned one).
+TRACELANE_PLATFORM_PUBKEY_B64 = TRACELANE_PLATFORM_PUBKEYS_B64[-1]
 
 
 # ---------------------------------------------------------------------
@@ -361,6 +383,10 @@ class VerifyReport:
     # never green): the loaded rows chain among themselves but nothing publicly
     # trusted holds them.
     trust_established: bool = True
+    # AUD-29: batches whose attestation verified against the PLATFORM key, not the
+    # workspace key — verified, but Tracelane (not the workspace key) vouches.
+    platform_signed_batches: int = 0
+    platform_signed_ranges: list[dict[str, int]] = field(default_factory=list)
     errors: list[VerifyError] = field(default_factory=list)
 
     def to_json(self) -> str:
@@ -416,7 +442,14 @@ def verify_ledger(path: Path, options: VerifyOptions | None = None) -> VerifyRep
     # needs the resolved anchor starts. ADR-062: OFFLINE verification
     # from the bundle (Rekor v2 has no online lookup); the trusted tenant pubkey is
     # the single external trust root; absent -> chain-only (anchors UNVERIFIED).
-    included_starts = _verify_anchors_offline(report, rows, anchors, opts.tenant_pubkey)
+    included_starts = _verify_anchors_offline(
+        report,
+        rows,
+        anchors,
+        opts.tenant_pubkey,
+        ([opts.platform_pubkey] if opts.platform_pubkey else []) + list(opts.platform_pubkeys),
+        opts.workspace_key_since_seq,
+    )
 
     _verify_chain(report, rows, opts, included_starts)
 
@@ -632,6 +665,8 @@ def _verify_anchors_offline(
     rows: list[dict[str, Any]],
     anchors: list[dict[str, Any]],
     tenant_pubkey: bytes | None,
+    platform_pubkeys: list[bytes] | None = None,
+    workspace_key_since_seq: int | None = None,
 ) -> dict[str, int]:
     """ADR-062 — OFFLINE anchor verification. For each anchor record:
 
@@ -653,6 +688,8 @@ def _verify_anchors_offline(
     if not anchors:
         return included_starts
 
+    # AUD-29: per tenant, [smallest workspace-signed batch start, platform-signed ranges].
+    signers_by_tenant: dict[str, list[Any]] = {}
     row_hash_by_key: dict[str, bytes] = {}
     for row in rows:
         try:
@@ -745,7 +782,15 @@ def _verify_anchors_offline(
             )
             report.signatures_valid = False
             continue
-        if bundle_pubkey != tenant_pubkey:
+        # AUD-29: the workspace key, else the platform key (verified, counted apart),
+        # else untrusted. Never a key taken from the evidence itself.
+        platform_signed = False
+        if bundle_pubkey == tenant_pubkey:
+            signing_key = tenant_pubkey
+        elif bundle_pubkey in (platform_pubkeys or []):
+            signing_key = bundle_pubkey
+            platform_signed = True
+        else:
             report.errors.append(
                 VerifyError(
                     seq=None,
@@ -815,7 +860,7 @@ def _verify_anchors_offline(
             report.signatures_valid = False
             continue
         try:
-            Ed25519PublicKey.from_public_bytes(tenant_pubkey).verify(att_sig, msg)
+            Ed25519PublicKey.from_public_bytes(signing_key).verify(att_sig, msg)
         except (InvalidSignature, ValueError):
             report.errors.append(
                 VerifyError(
@@ -826,6 +871,14 @@ def _verify_anchors_offline(
             )
             report.signatures_valid = False
             continue
+        # AUD-29: the attestation verified — record WHICH trust root vouched for it.
+        tenant_key = str(a.get("tenant_id", ""))
+        signers = signers_by_tenant.setdefault(tenant_key, [None, []])
+        start, end = int(a.get("batch_start_seq", 0)), int(a.get("batch_end_seq", 0))
+        if platform_signed:
+            signers[1].append({"start_seq": start, "end_seq": end})
+        elif signers[0] is None or start < signers[0]:
+            signers[0] = start
 
         if (
             not committed
@@ -881,7 +934,12 @@ def _verify_anchors_offline(
             _tid = str(a.get("tenant_id"))
             _start = int(a.get("batch_start_seq", 0))
             _prev = included_starts.get(_tid)
-            included_starts[_tid] = _start if _prev is None else min(_prev, _start)
+            # AUD-29: NEVER a platform-signed batch — the platform key is trusted only
+            # as a verified PREFIX of a chain, not as the root that makes a window
+            # trustworthy (a platform-key holder could otherwise anchor a forged
+            # window and have it rooted).
+            if not platform_signed:
+                included_starts[_tid] = _start if _prev is None else min(_prev, _start)
         except Exception as e:  # noqa: BLE001 — any proof defect fails the anchor
             report.errors.append(
                 VerifyError(
@@ -892,4 +950,31 @@ def _verify_anchors_offline(
             )
             report.signatures_valid = False
 
+    # AUD-29 downgrade rule: the platform key is accepted only as a PREFIX. Once the
+    # workspace key has signed a batch, a later platform-signed batch is what an
+    # attacker holding the platform key would append — RED, never amber.
+    # `>=`: a platform-signed batch starting WHERE a workspace-signed one starts is a
+    # shadow of it, not a prefix. `workspace_key_since_seq` (published out-of-band)
+    # holds the rule even when the loaded view contains no workspace-signed batch.
+    for workspace_min_start, platform in signers_by_tenant.values():
+        bounds = [b for b in (workspace_min_start, workspace_key_since_seq) if b is not None]
+        boundary = min(bounds) if bounds else None
+        for r in platform:
+            if boundary is not None and (r["start_seq"] >= boundary or r["end_seq"] >= boundary):
+                report.errors.append(
+                    VerifyError(
+                        seq=None,
+                        kind="platform_key_after_workspace_key",
+                        detail=(
+                            f"batch {r['start_seq']}-{r['end_seq']}: signed by the platform "
+                            f"key at or after seq {boundary}, where the workspace key had "
+                            "taken over"
+                        ),
+                    )
+                )
+                report.signatures_valid = False
+            else:
+                report.platform_signed_batches += 1
+                report.platform_signed_ranges.append(r)
+    report.platform_signed_ranges.sort(key=lambda r: r["start_seq"])
     return included_starts

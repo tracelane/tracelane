@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 import { useEffect, useState } from "react";
 
@@ -81,14 +82,15 @@ export function ThemeToggle({ compact = false }: { compact?: boolean } = {}) {
 	// workspace pill beside it: these are chips, not controls with a field.
 	if (compact) {
 		return (
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={toggle}
 				aria-label={`Switch to ${nextLabel} theme`}
 				className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-2 text-ink transition-colors hover:bg-surface-3 hover:text-ink"
 			>
 				{theme === "dark" ? <SunIcon /> : <MoonIcon />}
-			</button>
+			</Button>
 		);
 	}
 
@@ -100,7 +102,8 @@ export function ThemeToggle({ compact = false }: { compact?: boolean } = {}) {
 	// was a third value. Now: the control radius, and the same well hover step the
 	// chip and the rail use.
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={toggle}
 			aria-label={`Switch to ${nextLabel} theme`}
@@ -108,6 +111,6 @@ export function ThemeToggle({ compact = false }: { compact?: boolean } = {}) {
 		>
 			{theme === "dark" ? <SunIcon /> : <MoonIcon />}
 			<span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
-		</button>
+		</Button>
 	);
 }

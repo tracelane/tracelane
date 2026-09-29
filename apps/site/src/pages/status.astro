@@ -1,0 +1,162 @@
+---
+/**
+ * /status — public service status (SRE-15, specs/SRE-15-public-status-page.md, 2026-09-27).
+ *
+ * A static shell; the browser reads the feed the node's watchdog writes every tick
+ * (scripts/ops/tlane-public-status.py → Caddy /public-status/). Nothing here renders green
+ * before the feed has been read: loading, unreachable and stale are all stated as such,
+ * because a status page that defaults to "operational" is the failure it exists to catch.
+ */
+import Base from "../layouts/Base.astro";
+const FEED = "https://gateway.tracelane.dev/public-status/status.json";
+---
+
+<Base
+  title="Status — Tracelane"
+  description="Current state and 90-day history of the Tracelane API gateway, dashboard, trace recording and audit ledger."
+  canonical="/status"
+>
+  <section class="panel" style="padding-block:clamp(3.5rem,7vw,5.5rem) clamp(1.5rem,3vw,2rem)">
+    <p class="eyebrow">status</p>
+    <h1 class="display-lg mt-5" id="st-headline">Reading the status feed…</h1>
+    <p class="lede mt-4" id="st-age">&nbsp;</p>
+  </section>
+  <section class="panel" style="padding-bottom:clamp(3rem,6vw,5rem)">
+    <div class="st-list" id="st-list" data-feed={FEED}>
+      {["API gateway", "Dashboard", "Trace recording", "Audit ledger"].map((n) => (
+        <div class="st-row" data-state="loading">
+          <div class="st-head"><span class="st-dot" aria-hidden="true"></span><span class="st-name">{n}</span><span class="st-state">—</span></div>
+          <div class="st-bars" aria-hidden="true"></div>
+          <div class="st-foot"><span>90 days ago</span><span class="st-up"></span><span>today</span></div>
+        </div>
+      ))}
+    </div>
+    <p class="st-note">
+      Measured every 15 minutes by a watchdog on the production node itself. That makes this a
+      series of snapshots, not continuous monitoring — and if the whole node is down, this page
+      cannot reach its feed and will say so rather than show green. Uptime counts only the
+      intervals that were measured; unmeasured ones are shown, never counted as up.
+    </p>
+  </section>
+</Base>
+
+<script>
+  type Counts = [number, number, number]; // operational, degraded, unknown ticks
+  type Feed = {
+    schema: number;
+    generated_epoch: number;
+    tick_seconds: number;
+    overall: "operational" | "degraded" | "unknown";
+    components: { id: string; name: string; state: "operational" | "degraded" | "unknown" }[];
+    history: ({ date: string } & Record<string, Counts | string>)[];
+  };
+  const WORD: Record<string, string> = { operational: "Operational", degraded: "Degraded", unknown: "Not measured", stale: "Stale" };
+  const HEAD: Record<string, string> = {
+    operational: "All systems operational.",
+    degraded: "Some systems are degraded.",
+    unknown: "Some systems could not be measured.",
+  };
+  const list = document.getElementById("st-list") as HTMLElement;
+  const headline = document.getElementById("st-headline") as HTMLElement;
+  const age = document.getElementById("st-age") as HTMLElement;
+
+  function ago(secs: number): string {
+    if (secs < 90) return "just now";
+    const m = Math.round(secs / 60);
+    return m < 120 ? `${m} min ago` : `${Math.round(m / 60)} h ago`;
+  }
+  const MIN_DAYS = 7;
+  function fmtDay(iso: string | undefined): string {
+    if (!iso) return "today";
+    const d = new Date(`${iso}T00:00:00Z`);
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+  }
+  function lastNDays(n: number): string[] {
+    const out: string[] = [];
+    const d = new Date();
+    for (let i = n - 1; i >= 0; i--) out.push(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - i)).toISOString().slice(0, 10));
+    return out;
+  }
+
+  function render(feed: Feed) {
+    const now = Date.now() / 1000;
+    const stale = now - feed.generated_epoch > 3 * feed.tick_seconds;
+    headline.textContent = stale ? "The status feed is stale." : (HEAD[feed.overall] ?? "Some systems could not be measured.");
+    age.textContent = stale
+      ? `Last reading ${ago(now - feed.generated_epoch)} — later readings did not arrive, so the states below are not current.`
+      : `Updated ${ago(now - feed.generated_epoch)} · UTC days`;
+    const byDate = new Map(feed.history.map((h) => [h.date, h]));
+    const days = lastNDays(90);
+    const rows = list.querySelectorAll<HTMLElement>(".st-row");
+    feed.components.forEach((c, i) => {
+      const row = rows[i];
+      if (!row) return;
+      const state = stale ? "stale" : c.state;
+      row.dataset.state = state;
+      (row.querySelector(".st-name") as HTMLElement).textContent = c.name;
+      (row.querySelector(".st-state") as HTMLElement).textContent = WORD[state] ?? "Not measured";
+      let ok = 0, bad = 0, unk = 0;
+      const bars = row.querySelector(".st-bars") as HTMLElement;
+      bars.replaceChildren(
+        ...days.map((d) => {
+          const counts = (byDate.get(d)?.[c.id] as Counts | undefined) ?? [0, 0, 0];
+          ok += counts[0]; bad += counts[1]; unk += counts[2];
+          const b = document.createElement("i");
+          b.dataset.s = counts[1] > 0 ? "degraded" : counts[0] > 0 ? "operational" : counts[2] > 0 ? "unknown" : "none";
+          b.title = `${d}: ${counts[0]} up · ${counts[1]} degraded · ${counts[2]} not measured`;
+          return b;
+        }),
+      );
+      const up = row.querySelector(".st-up") as HTMLElement;
+      // A percentage from a handful of samples reads as a 90-day figure (review 2026-09-27:
+      // "100.00% up" from 4 checks). Until MIN_DAYS days are measured, show the count.
+      const measuredDays = days.filter((d) => {
+        const k = (byDate.get(d)?.[c.id] as Counts | undefined) ?? [0, 0, 0];
+        return k[0] + k[1] > 0;
+      });
+      const first = measuredDays[0];
+      if (ok + bad === 0) up.textContent = "no data yet";
+      else if (measuredDays.length < MIN_DAYS)
+        up.textContent = `${ok + bad} checks since ${fmtDay(first)} · ${bad} degraded${unk ? ` · ${unk} not measured` : ""}`;
+      else up.textContent = `${((100 * ok) / (ok + bad)).toFixed(2)}% up over ${measuredDays.length} days${unk ? ` · ${unk} not measured` : ""}`;
+    });
+  }
+
+  function unreachable(why: string) {
+    headline.textContent = "Can't reach the status feed.";
+    age.textContent = `That is not an all-clear — if the API is down, this feed is down with it. (${why})`;
+    list.querySelectorAll<HTMLElement>(".st-row").forEach((r) => {
+      r.dataset.state = "unknown";
+      (r.querySelector(".st-state") as HTMLElement).textContent = "Not measured";
+    });
+  }
+
+  fetch(`${list.dataset.feed}?t=${Date.now()}`, { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((j: unknown) => { const f = j as Feed; return f && f.schema === 1 && Array.isArray(f.components) ? render(f) : unreachable("unexpected feed shape"); })
+    .catch((e: unknown) => unreachable(e instanceof Error ? e.message : "network error"));
+</script>
+
+<style>
+  .st-list { display: flex; flex-direction: column; gap: 0.75rem; }
+  .st-row { border: 1px solid var(--color-border-strong); border-radius: 0; background: var(--color-bg-elevated); padding: 1rem 1.1rem; }
+  .st-head { display: flex; align-items: center; gap: 0.6rem; }
+  .st-name { font-weight: 600; color: var(--color-fg); }
+  .st-state { margin-left: auto; font-size: var(--text-sm); color: var(--color-fg-muted); }
+  .st-dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--color-fg-dim); flex: none; }
+  .st-row[data-state="operational"] .st-dot { background: var(--color-verify); }
+  .st-row[data-state="degraded"] .st-dot { background: var(--color-alarm); }
+  .st-row[data-state="degraded"] .st-state { color: var(--color-alarm); }
+  .st-row[data-state="loading"] .st-dot { animation: st-pulse 1.2s ease-in-out infinite; }
+  .st-bars { display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; margin-top: 0.8rem; height: 28px; }
+  .st-bars :global(i) { border-radius: 0; background: var(--color-border-subtle); }
+  .st-bars :global(i)[data-s="operational"] { background: var(--color-verify); opacity: 0.8; }
+  .st-bars :global(i)[data-s="degraded"] { background: var(--color-alarm); }
+  .st-bars :global(i)[data-s="unknown"] { background: var(--color-fg-dim); opacity: 0.5; }
+  .st-foot { display: flex; justify-content: space-between; gap: 0.5rem; margin-top: 0.45rem; font-size: 0.75rem; color: var(--color-fg-subtle); }
+  .st-up { color: var(--color-fg-muted); text-align: center; }
+  .st-note { margin-top: 1.5rem; max-width: 46rem; font-size: var(--text-sm); color: var(--color-fg-muted); line-height: 1.6; }
+  @keyframes st-pulse { 50% { opacity: 0.35; } }
+  @media (max-width: 560px) { .st-bars { gap: 1px; height: 24px; } }
+  @media (prefers-reduced-motion: reduce) { .st-row[data-state="loading"] .st-dot { animation: none; } }
+</style>

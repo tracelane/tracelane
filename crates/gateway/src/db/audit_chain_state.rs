@@ -163,6 +163,10 @@ pub struct AtomicBatchAppend {
     /// the caller passed, in order. Anything not listed was already appended
     /// (a redelivery) and consumed no seq.
     pub kept: Vec<usize>,
+    /// ADR-078 (B): the rows exactly as COMMITTED to the canonical Postgres
+    /// ledger in this transaction — handed back so the caller can write the
+    /// derived ClickHouse copy AFTER commit (fail-open, counted), never before.
+    pub rows: Vec<super::ledger::AuditLogRow>,
 }
 
 // B-390 (2026-09-12): the one-event `append_atomic` and its `AtomicAppend`
@@ -172,45 +176,51 @@ pub struct AtomicBatchAppend {
 // FOR UPDATE → durable CH write → head advance → COMMIT) is the batch's.
 
 /// **B-378 (2026-09-12) — the batched form: K events of ONE tenant in ONE
-/// transaction, ONE lock acquisition, ONE ClickHouse insert.**
+/// transaction, ONE lock acquisition, ONE ledger insert.**
 ///
-/// The head-writer used to run this once per event: a Postgres
-/// round-trip, a `FOR UPDATE` lock held across an awaited ClickHouse HTTP
-/// insert, and one MergeTree part, per ledger event, sequentially for the whole
-/// gateway. This keeps every invariant of the one-event form — the lock still
-/// spans the CH write (that is what makes `(seq, prev_hash)` globally
-/// serialized across processes), the CH rows are still durable before the head
-/// advances, a redelivery still consumes no seq — and amortises the fixed costs
-/// over the batch.
+/// **ADR-078 (ruled B, 2026-09-20): the rows are written HERE, into Postgres
+/// `audit_log_rows`, inside the same transaction that advances the head.** Until
+/// then the closure awaited a ClickHouse HTTP insert inside the `FOR UPDATE`
+/// window (ADR-065 F1, "CH-durable-before-PG"), which was both the correctness
+/// hole ADR-078 closes — two stores, two RPOs, a restore that leaves the head
+/// ahead of the rows — and the 2–3× serialization the independent review found
+/// (B-378). Now the lock spans one local INSERT; ClickHouse is a derived copy
+/// the caller writes after COMMIT, fail-open and counted (`LedgerCopyFailed`).
+///
+/// The head-writer used to run this once per event: a Postgres round-trip and a
+/// `FOR UPDATE` lock per ledger event, sequentially for the whole gateway. This
+/// keeps every invariant of the one-event form — `(seq, prev_hash)` stays
+/// globally serialized across processes by the row lock, the rows are durable
+/// (committed) before the head is visible, a redelivery still consumes no seq —
+/// and amortises the fixed costs over the batch.
 ///
 /// `dedup`: `Some(event_ids)` on the async consumer path — the ids are inserted
 /// into `audit_appended` in one statement and ONLY the ones that were new are
 /// appended (`kept`); an all-duplicate batch rolls back and returns `Ok(None)`.
 /// `None` on the sync path, which never dedups (byte-unchanged behaviour).
 ///
-/// `write_ch(first_seq, prev_hash, kept)` computes the K chained row hashes
-/// (`row_hash_i = H(prev_i, …)`, `prev_{i+1} = row_hash_i`), writes ALL K rows
-/// in one insert, awaited, and returns the K hashes in order. Returning a
-/// different count is a fail-closed error — the head would otherwise advance
-/// past rows that were never written.
+/// `build_rows(first_seq, prev_hash, kept)` is PURE: it computes the K chained
+/// rows (`row_hash_i = H(prev_i, …)`, `prev_{i+1} = row_hash_i`) and returns
+/// them in seq order, hashes filled in — no I/O. This function inserts them.
+/// Returning a different count is a fail-closed error — the head would otherwise
+/// advance past rows that were never written.
 ///
 /// # Errors
 ///
 /// Fails **closed** (this is a security path): any PG error, a malformed
-/// persisted `last_row_hash`, or a `write_ch` error aborts the transaction (no
-/// seq is consumed, no head advance). The caller propagates the error; the audit
-/// events are not recorded rather than recorded incorrectly.
-pub async fn append_atomic_batch<F, Fut>(
+/// persisted `last_row_hash`, or a `build_rows` error aborts the transaction (no
+/// seq is consumed, no head advance, no row). The caller propagates the error;
+/// the audit events are not recorded rather than recorded incorrectly.
+pub async fn append_atomic_batch<F>(
     pool: &Pool,
     tenant_id: &TenantId,
     genesis_prev_hash: [u8; 32],
     dedup: Option<&[String]>,
     count: usize,
-    write_ch: F,
+    build_rows: F,
 ) -> Result<Option<AtomicBatchAppend>>
 where
-    F: FnOnce(u64, [u8; 32], Vec<usize>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<[u8; 32]>>>,
+    F: FnOnce(u64, [u8; 32], &[usize]) -> Result<Vec<super::ledger::AuditLogRow>>,
 {
     if count == 0 {
         return Ok(None);
@@ -317,16 +327,24 @@ where
         .try_into()
         .context("audit_chain_state.last_seq is corrupt (negative)")?;
 
-    // (3) Durable CH write of ALL K rows BEFORE the head advances
-    //     (CH-durable-before-PG).
-    let row_hashes = write_ch(first_seq, prev_hash, kept.clone())
-        .await
-        .context("durable ClickHouse audit_log write")?;
+    // (3) The K chained rows, written into the CANONICAL ledger inside THIS
+    //     transaction (ADR-078 B) — durable together with the head, or not at all.
+    let rows = build_rows(first_seq, prev_hash, &kept).context("build chained ledger rows")?;
     anyhow::ensure!(
-        row_hashes.len() == n,
-        "append_atomic_batch: write_ch returned {} hashes for {n} events — refusing to advance the head",
-        row_hashes.len()
+        rows.len() == n,
+        "append_atomic_batch: build_rows returned {} rows for {n} events — refusing to advance the head",
+        rows.len()
     );
+    let mut row_hashes: Vec<[u8; 32]> = Vec::with_capacity(n);
+    for r in &rows {
+        row_hashes.push(
+            super::ledger::decode_hash_hex(&r.row_hash)
+                .context("built row_hash is not a 32-byte hex hash")?,
+        );
+    }
+    super::ledger::insert_rows_tx(&tx, &rows)
+        .await
+        .context("canonical audit_log_rows write")?;
     let last_seq_new = first_seq + (n as u64 - 1);
     let head = row_hashes[n - 1];
 
@@ -352,5 +370,6 @@ where
         prev_hash,
         row_hashes,
         kept,
+        rows,
     }))
 }

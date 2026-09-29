@@ -20,7 +20,7 @@ All commands respect these env vars:
 |---|---|---|
 | `TRACELANE_API_KEY` | Tenant API key (`tlane_<base62>`) | required for live commands |
 | `TRACELANE_GATEWAY_URL` | Gateway base URL | `https://gateway.tracelane.dev` |
-| ~~`TRACELANE_TRACE_CONTENT`~~ | **Not implemented — reads are ignored.** No component has ever read this variable. Prompt/response text is never captured by the CLI or the SDKs; the gateway captures it only for tenants an operator allowlists in `tracelane.yaml` | — |
+| ~~`TRACELANE_TRACE_CONTENT`~~ | **Not implemented — reads are ignored.** No component has ever read this variable. Prompt/response text is never captured by the CLI or the SDK provider adapters; the gateway records it only when a workspace owner turns recording on (or, self-hosted, for workspaces an operator names in `tracelane.yaml`) | — |
 
 `tlane --help` lists everything; this page is the prose tour.
 
@@ -115,7 +115,7 @@ There is no baseline, no history and no comparison: the same shape as a coverage
 threshold, which nobody considers broken for lacking a previous run. A run
 scoring 0.9 today and 0.85 tomorrow clears a 0.8 floor both times, and calling
 the second "no regression" would be a claim nothing checked. Comparing a run
-against an earlier one is a real gap and is filed, not built — what counts as
+against an earlier one is not supported — what counts as
 the baseline is a design decision, not a flag.
 
 Exit codes: `0` pass · `1` below the floor · `2` bad invocation · `3` could not
@@ -224,7 +224,7 @@ tlane migrate helicone --endpoint https://gateway.acme.internal --apply
 The flags are `--apply`, `--dir <path>` (default: cwd) and `--endpoint <url>`
 (default `https://gateway.tracelane.dev`, used in the printed next-steps).
 
-Mapping is documented by `tlane import-helicone --help`.
+Mapping is documented by `tlane migrate helicone --help`.
 
 ### `tlane import-litellm --config <path>`
 
@@ -257,8 +257,7 @@ tlane replay 9f2c8a1b... --endpoint https://gateway.tracelane.dev
 ```
 
 Useful for: stepping through a past run, inspecting tool inputs/outputs, and
-sharing a reproducible trace. Re-executing a captured trace against a different
-model or provider (cross-model shadow-fork replay) is on the roadmap.
+sharing a reproducible trace.
 
 ## Exit codes
 
@@ -267,9 +266,9 @@ model or provider (cross-model shadow-fork replay) is on the roadmap.
 | 0 | Success |
 | 1 | Logical failure — verification failed or `INCOMPLETE`, unknown pack, server error |
 | 2 | Bad invocation or I/O — missing file, missing required flag, unknown eval suite |
+| 3 | `tlane eval run` only — the run could not be evaluated (see above) |
 
-Those are the only codes the CLI emits; there is no separate divergence or
-incomplete-pack code. `tlane export` reports per-item `placeholder` / `missing`
+There is no separate divergence or incomplete-pack code. `tlane export` reports per-item `placeholder` / `missing`
 status in the printed manifest and still exits 0. `tlane eval run` is the one
 exception to the table: it passes through the underlying test runner's exit code.
 CI should gate on non-zero.

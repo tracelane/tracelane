@@ -1,20 +1,18 @@
 ---
-title: Tenant isolation — V1 guarantees
-description: Three independent isolation surfaces — ClickHouse resource caps, R2 per-tenant buckets, Postgres row-level scoping — scope every Tracelane read and write.
+title: Tenant isolation
+description: Two isolation surfaces — ClickHouse resource caps and tenant filters, Postgres tenant scoping — scope every Tracelane read and write.
 sidebarTitle: Tenant isolation
 classification: PUBLIC
 ---
 
-# Tenant isolation — V1 guarantees
+# Tenant isolation
 
 > **Composes with:** the tamper-evident agent ledger.
 
-Tracelane is multi-tenant from day one. Every read, every write, and
-every admin mutation is scoped to one workspace UUID at three
-independent layers — so a misconfigured query, a typo in a key
-prefix, or a regression in one layer cannot break the others.
+Tracelane is multi-tenant from day one. Reads and writes are scoped to one
+workspace UUID in ClickHouse and in Postgres, with a CI check on each.
 
-## Three independent isolation surfaces
+## Isolation surfaces
 
 ### 1. ClickHouse — per-tier resource caps
 
@@ -39,52 +37,17 @@ Wrapper file location:
 - Rust: [`crates/gateway/src/clickhouse_query.rs::TenantQuery`](https://github.com/tracelane/tracelane/blob/main/crates/gateway/src/clickhouse_query.rs)
 
 Read-path row and time-range caps are applied to every dashboard query.
-Per-tier differentiation of those caps is planned.
 
 The CI guard [`no-raw-ch-query.sh`](https://github.com/tracelane/tracelane/blob/main/scripts/ci/no-raw-ch-query.sh)
 fails the build if any new ClickHouse read is added outside these
-wrappers. A small number of call sites predate the wrappers and carry an explicit
-allow-list entry. Their queries are tenant-scoped and bounded; routing
-them through the wrapper is planned for consistency, not for correctness.
+wrappers.
 
 The existing [`tenant-isolation-check`](https://github.com/tracelane/tracelane/blob/main/.github/workflows/ci.yml)
 CI job (unchanged from prior releases) blocks any new ClickHouse
 query that references `FROM tracelane.<table>` without a `tenant_id`
 filter nearby.
 
-### 2. R2 — `tenants/<uuid>/` prefix invariant
-
-Every object key written by `crates/ingest/src/r2_batcher.rs` is
-prefixed `tenants/<workspace_uuid>/yyyy/mm/dd/<hash>.ndjson`. The
-fixed `tenants/` prefix lets bucket-level IAM policies pin a
-per-tenant role to the prefix (`s3:prefix=tenants/<uuid>/`) without
-matching unrelated objects in the same bucket.
-
-The invariant is enforced in code:
-
-```rust
-// crates/ingest/src/r2_batcher.rs
-pub const TENANT_KEY_PREFIX: &str = "tenants/";
-
-fn assert_tenant_prefix(key: &str) -> bool {
-    if !key.starts_with(TENANT_KEY_PREFIX) {
-        #[cfg(debug_assertions)]
-        { panic!("tenant isolation invariant violated"); }
-        #[cfg(not(debug_assertions))]
-        {
-            tracing::error!(/* … */);
-            return false; // PUT refused
-        }
-    }
-    true
-}
-```
-
-Debug builds panic the moment a key skips the prefix; release builds
-log at `tracing::error!` and refuse the R2 PUT. Either path defends
-against a future refactor accidentally regressing the layout.
-
-### 3. Postgres — `WHERE tenant_id = ?` + admin audit trail
+### 2. Postgres — `WHERE tenant_id = ?` + admin audit trail
 
 Every Postgres row-bearing table has a `tenant_id` (or `workspace_id`)
 column indexed for the tenant-scoped query path. The CI grep
@@ -95,7 +58,7 @@ Postgres-side queries is enforced by Drizzle's query-builder typing
 
 Adjacent to the row-level isolation, V1 ships
 [`admin_audit_log`](https://github.com/tracelane/tracelane/blob/main/infra/dev/postgres/migrations/11_admin_audit_log.sql):
-a durable trail of every mutating admin action with the actor user
+a durable trail of selected mutating admin actions with the actor user
 id, workspace id, target type / id, before / after JSON snapshots,
 IP, and user agent. Indexed for "show me everything I did to this
 workspace in the last 30 days" — see [Admin audit log](/admin/audit-log).
@@ -107,10 +70,10 @@ JWT-verified session claim or a SPIFFE-attested workload SVID — never
 from a request body, URL parameter, or header.**
 
 ```
-Request → WorkOS AuthKit middleware → session.tenantId (WorkOS orgId)
-        → upsertTenantId(orgId) → tenants.id (UUID)
-        → bound as `tenantId: String` query_param to ClickHouse
-        → ClickHouse server enforces WHERE tenant_id = ?
+Dashboard → gateway (validated credential; the WorkOS org id is resolved
+            to the workspace's tenant UUID)
+        → TenantQuery binds the tenant UUID as a query parameter
+        → every ClickHouse query filters WHERE tenant_id = ?
 ```
 
 For mTLS-only ingest (`crates/ingest/src/auth.rs`), the same value
@@ -126,19 +89,4 @@ compile-time-prove which path the identity took.
 | `MEMORY_LIMIT_EXCEEDED` from ClickHouse | Cap layer | Query exceeded the tier's `max_memory_usage`. Tighten the time window or upgrade. |
 | `TIMEOUT_EXCEEDED` from ClickHouse | Cap layer | Query exceeded `max_execution_time`. Same fix. |
 | `Too many rows to read` from ClickHouse | Cap layer | Query would scan past `max_rows_to_read`. Same fix. |
-| 500 Internal Server Error with `R2 key violates tenant prefix invariant` in logs | R2 layer | A regression slipped past the debug `assert!`. Open an incident. |
 | `no SPIFFE peer + no resource attribute` from ingest | Identity layer | Release-mode ingest received an unattributed connection. Misconfigured client, or SPIRE outage — see [SPIFFE ingest runbook](/security/spiffe-ingest). |
-
-## V1.1 follow-ups
-
-- A small number of audit-internal ClickHouse reads carry an explicit
-  allow-list entry rather than going through the TenantQuery wrapper.
-  They read tenant-scoped, bounded row sets; routing them through the
-  wrapper is planned for consistency.
-- Admin-action audit coverage is being extended across the remaining
-  administrative endpoints. The endpoints wired today establish the
-  record format and the verification contract.
-- A grep-based "every tenant-data Postgres table has a `workspace_id`
-  column" CI guard. Policy ambiguity (e.g., `webhook_events` is
-  global by design) means the V1.1 version ships with a curated
-  allow-list.

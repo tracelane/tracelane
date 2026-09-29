@@ -1,3 +1,5 @@
+import { fmtUsd } from "@/lib/metrics/format";
+import { Button } from "@tracelanedev/ui";
 /**
  * UsageBanner — the three banner variants on `/settings/billing` (spec §8):
  * warn (75%+), danger (90%+), and the ceiling-reached/auto-age-acted
@@ -9,7 +11,7 @@
  * customer running low on headroom.
  */
 
-import { Badge } from "@tracelanedev/ui";
+import { Badge, StatusBadge } from "@tracelanedev/ui";
 
 export function WarnBanner({
 	meterLabel,
@@ -48,32 +50,32 @@ export function WarnBanner({
 				{overageUsd !== null && overageUsd > 0 && rateText ? (
 					<>
 						{" "}
-						Overage ${overageUsd.toFixed(2)} at {rateText}.
+						Overage {fmtUsd(overageUsd)} at {rateText}.
 					</>
 				) : null}
 			</p>
 			<div className="flex flex-wrap items-center gap-3">
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={onOpenBreakdown}
 					className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 				>
 					What&apos;s using your window ▸
-				</button>
+				</Button>
 				<span className="flex items-center gap-2 text-xs text-ink-2">
 					Spend ceiling: {ceilingUsd === null ? "OFF" : `$${ceilingUsd}`}
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onOpenCeiling}
 						className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 					>
 						{ceilingUsd === null ? "Set a ceiling" : "Edit ceiling"}
-					</button>
+					</Button>
 				</span>
 			</div>
-			<Badge tone={tone} className="sr-only">
-				{tone}
-			</Badge>
+			<StatusBadge status={tone} tone={tone} className="sr-only" />
 		</div>
 	);
 }
@@ -115,13 +117,14 @@ export function CeilingResolvedBanner({
 					<Badge tone="neutral">Nothing was lost</Badge>
 				)}
 			</p>
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={onReview}
 				className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 			>
 				Review ceiling
-			</button>
+			</Button>
 		</div>
 	);
 }

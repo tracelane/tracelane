@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+	// No `x-powered-by: Next.js` fingerprint on responses (live review 2026-09-27).
+	poweredByHeader: false,
 	// App Router is on by default in Next.js 15
 	experimental: {
 		// React 19 + Server Components
@@ -54,10 +56,10 @@ const nextConfig: NextConfig = {
 						key: "Content-Security-Policy",
 						value: [
 							"default-src 'self'",
-							"script-src 'self' 'unsafe-eval' 'unsafe-inline'", // 'unsafe-eval' for WebGL shaders; nonce migration is a follow-up
+							"script-src 'self' 'unsafe-eval' 'unsafe-inline' https://static.cloudflareinsights.com", // 'unsafe-eval' for WebGL shaders; nonce migration is a follow-up. cloudflareinsights: the cookieless Web Analytics beacon Cloudflare injects — it was refused on every page (2026-09-27 audit), so analytics collected nothing
 							"style-src 'self' 'unsafe-inline'",
 							"img-src 'self' data: blob:",
-							"connect-src 'self' wss:",
+							"connect-src 'self' wss: https://cloudflareinsights.com",
 							"base-uri 'self'",
 							// `form-action` is enforced across the ENTIRE redirect chain of a
 							// form submission, not just its initial target. The billing

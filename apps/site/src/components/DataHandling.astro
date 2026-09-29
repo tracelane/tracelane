@@ -1,0 +1,81 @@
+---
+import { plan } from "../lib/plans";
+const free = plan("free_v1");
+const enterprise = plan("enterprise_v1");
+---
+
+<h2 class="text-fg" id="subprocessors">Service providers and storage</h2>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  Gateway compute and the primary trace and account databases are in Germany. This is not an EU-only processing
+  promise: the service also uses global edge services, a secondary backup outside the EU-jurisdiction bucket, and
+  identity, payment and email providers whose processing locations are provider-managed.
+  Customer-selectable region pinning is not offered.
+</p>
+<dl class="text-fg-muted">
+  <dt class="mt-5 font-semibold text-fg">Hetzner</dt>
+  <dd>Gateway and ingest compute, messaging, and ClickHouse hot storage. Falkenstein, Germany.</dd>
+  <dt class="mt-5 font-semibold text-fg">Cloudflare</dt>
+  <dd>CDN and Workers for the website and dashboard; D1 for the website updates list;
+    R2 for cold trace storage and backup archives. Edge and website processing is
+    global; cold storage and primary backups use the EU jurisdiction. The secondary
+    backup uses Cloudflare's default jurisdiction, without an EU-only restriction.</dd>
+  <dt class="mt-5 font-semibold text-fg">Neon</dt>
+  <dd>Postgres for accounts, workspace settings, encrypted provider credentials,
+    billing metadata, and the canonical audit ledger. Frankfurt, Germany.</dd>
+  <dt class="mt-5 font-semibold text-fg">WorkOS</dt>
+  <dd>Authentication, users, organizations and workspace membership. Provider-managed locations.</dd>
+  <dt class="mt-5 font-semibold text-fg">Polar</dt>
+  <dd>Subscriptions, payment processing and invoicing. Provider-managed locations.</dd>
+  <dt class="mt-5 font-semibold text-fg">Resend</dt>
+  <dd>Transactional billing and usage emails when email delivery is configured:
+    recipient address and notification content. Provider-managed locations.</dd>
+</dl>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  Model providers receive requests selected by your application using your own
+  provider credentials. Their retention and deletion policies apply to those requests.
+  Audit anchoring also uses the public Sigstore Rekor transparency log for hashes,
+  rather than trace payloads. See the
+  <a href="https://docs.tracelane.dev/security" class="link-accent">security documentation</a>
+  for that boundary.
+</p>
+
+<h2 class="text-fg" id="retention">Retention</h2>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  Captured traffic has a plan-defined queryable history: {free.queryable_days} days
+  on Free and {enterprise.queryable_days} days on paid plans. The indexed window
+  controls the recent range used for fast queries; it is not the deletion window.
+  The retention sweep removes traffic older than the workspace's effective
+  queryable window. Curated datasets and experiments are outside that traffic sweep.
+  See <a href="/pricing" class="link-accent">pricing</a> for the plan windows.
+</p>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  Audit ledger records and their verification anchors are retained separately,
+  including after workspace deletion. Deleting a workspace does not remove its
+  history from the tamper-evident ledger.
+</p>
+
+<h2 class="text-fg" id="deletion">Workspace deletion and recovery</h2>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  An owner can delete a workspace in Settings by confirming its name. This archives
+  the workspace and marks its API keys revoked; access checks take effect as
+  authorization caches refresh. Contact support during the 30-day recovery window
+  if the deletion was accidental. The purge job selects workspaces archived for
+  more than 30 days. Failed purges need operator review and deletion-status
+  confirmation; this is not an
+  immediate wipe or a guarantee that every copy disappears on day 30.
+</p>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  The purge removes classified tenant data from the online telemetry and account
+  stores, including stored provider-key rows, while retaining ledger records and
+  anchors. It checks the target rows and other tenants' row counts. An unclassified
+  tenant table stops the purge for review. Identity-provider deletion and subscription
+  cancellation are best-effort steps and need separate confirmation if they fail.
+</p>
+<p class="mt-4 text-fg-muted leading-relaxed">
+  Shared backup archives are not rewritten for each workspace deletion; backup
+  pruning and storage lifecycle rules are separate from the workspace purge.
+  Vendor-held billing records and data already sent to your model providers have
+  their own retention rules. For a deletion-status confirmation, a personal-data
+  request, or removal from the website updates list, contact
+  <a href="mailto:support@tracelane.dev" class="link-accent">support@tracelane.dev</a>.
+</p>

@@ -17,10 +17,9 @@ adopt without a legal review.
 
 **Rust gateway, not Go.** Low p95 overhead with full tracing on is a
 hot-path budget — measured at 2 ms p50 / 4 ms p95 / 5 ms p99 added latency on a 4 vCPU host with capture on ([benchmarks](/benchmarks)).
-Rust's zero-allocation request flow and tokio's runtime get us there without
-exotic tuning.
+Rust and tokio's runtime get us there without exotic tuning.
 
-**ClickHouse hot tier, R2 cold tier.** High-cardinality, high-throughput OLAP
+**ClickHouse for spans.** High-cardinality, high-throughput OLAP
 requirements rule out Postgres for spans. ClickHouse is the cheapest path to
 the throughput.
 
@@ -33,16 +32,12 @@ SDKs — they swap exporters.
 
 **Agent-tool safety inline, not async.** The point is to catch a
 compromised or hallucinated tool call at the gateway, inline, rather than
-reconstruct it from an incident after the fact. The latency budget for that
-inline work is tracked in the canonical repository's benchmark suite.
+reconstruct it from an incident after the fact.
 
 **Every claim carries an eval.** A claim that a guard exists is written
-down as an assertion in `evals/`, and the suite runs in the canonical
-repository's CI. The assertions ship here so they are readable.
+down as an assertion in `evals/`, and the suite runs in CI. The assertions ship here so they are readable.
 Behavioral assertions that need a live gateway report as **skipped**, never
-as a fabricated pass. The suite is not yet enforced as a blocking required
-check — it reports, and a red result is acted on rather than automatically
-refused.
+as a fabricated pass.
 
 ## Related
 

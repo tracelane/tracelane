@@ -17,9 +17,8 @@ trail, not turned into a 403, unless an operator sets
 `TRACELANE_PREDICTIVE_ENFORCE=1`. On a plain `/v1/chat/completions` body only
 `tool_definition_drift` and the tool-call schema validator do reachable work;
 the rest fire only on the specialised span shapes noted per-guard below. The
-internal latency target for the layer is `<30ms p50 / <50ms p95 / <100ms p99` —
-an engineering target, not yet measured on production-equivalent hardware
-(pending Reliability Benchmark v1.0).
+layer's latency has not been measured on production-equivalent hardware, so no
+latency figure is published for it.
 
 ## At a glance
 
@@ -68,7 +67,7 @@ never on LLM chat traffic.
 top-level `tool_output`/`content`; on a standard chat body the content is nested
 inside `messages[]`, so the heuristic is dormant there. The ML upgrade — Llama
 Prompt Guard 2 distilled to ONNX for low-latency CPU inference — is on the
-roadmap; the ONNX sidecar is undeployed and fails open. The PII/secret redaction
+roadmap and is not part of the shipped product. The PII/secret redaction
 that does fire on live traffic is guardrail rail R2, a separate system.
 
 ## PR5 — Browser stuck-loop prediction
@@ -109,7 +108,10 @@ is the tool-call schema validator, which validates each tool call against the
 Each guard has a per-tenant `policy` — `disabled`, `warn`, or `block`. Because
 the predictive layer is **observe-first by default**, a `block` policy records a
 block verdict in the audit trail but does not return a 403 unless an operator
-enables enforcement (`TRACELANE_PREDICTIVE_ENFORCE=1`). Defaults:
+enables enforcement (`TRACELANE_PREDICTIVE_ENFORCE=1`). Policy defaults are
+shown below; a policy only has an effect for a guard that runs on your traffic —
+PR2, PR3, PR5, PR6 and PR8 do not run on the gateway chat path (see the table
+above), so their policy has no effect there:
 
 ```yaml
 predictive:
@@ -138,10 +140,8 @@ mcp.traces.list({
 
 ## Performance
 
-The **combined** predictive-layer latency budget is tracked by the benchmark suite
-(`<30ms p50 / <50ms p95 / <100ms p99`, internal target). There are no per-guard
-measured numbers — the layer's latency is not yet measured on
-production-equivalent hardware (pending Reliability Benchmark v1.0).
+There are no measured latency numbers for the predictive layer, combined or per
+guard; it has not been measured on production-equivalent hardware.
 
 ## Related
 

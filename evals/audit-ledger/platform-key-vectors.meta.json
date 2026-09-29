@@ -1,0 +1,23 @@
+{
+  "platform_ed25519_pubkey_b64": "xSQj47+7u1i5gsUlK3lZ3g8sKxUXxUj64Wfp4z6rNXY=",
+  "workspace_ed25519_pubkey_b64": "tjuh0cksuYOE9PojI+ta7TVAu9aj/JzRtzfRdaZnbCg=",
+  "unrelated_ed25519_pubkey_b64": "6HBE/nNDzsYmVFwyVYOKFn9yTnpugBD3YrxCVfHAHW4=",
+  "expect": {
+    "platform-only": {
+      "ok": true,
+      "platform_signed_batches": 2
+    },
+    "platform-then-workspace": {
+      "ok": true,
+      "platform_signed_batches": 1
+    },
+    "workspace-then-platform": {
+      "ok": false,
+      "error_kind": "platform_key_after_workspace_key"
+    },
+    "platform-shadow": {
+      "ok": false,
+      "error_kind": "platform_key_after_workspace_key"
+    }
+  }
+}

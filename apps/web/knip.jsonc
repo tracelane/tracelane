@@ -30,6 +30,12 @@
 	// So removing them is a documentation change
 	// too, not a one-line delete.
 
-	"ignore": ["open-next.config.ts", "lib/e2e-db.stub.ts"],
+	// `e2e/refresh-session.mjs` is run by `scripts/deploy/web.sh` before Proof D (B-567),
+	// never imported — so no import graph reaches it.
+	"ignore": [
+		"open-next.config.ts",
+		"lib/e2e-db.stub.ts",
+		"e2e/refresh-session.mjs"
+	],
 	"ignoreDependencies": ["tailwindcss"]
 }

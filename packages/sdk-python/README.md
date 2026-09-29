@@ -38,7 +38,7 @@ client.chat.completions.create(
     model="claude-sonnet-4-6",
     messages=[{"role": "user", "content": "Hello"}],
 )
-# → Trace visible at https://app.tracelane.dev/traces within ~1 second
+# → Trace visible at https://app.tracelane.dev/traces
 ```
 
 That captures the model call. Use this SDK when you want the **shape of your
@@ -135,15 +135,20 @@ client.messages.create(
 ### Best-effort auto-instrumentation
 
 `auto_instrument()` wraps a **small, fixed set** of installed libraries —
-`anthropic`, `openai`, `litellm`, `claude_code` (and `langgraph` is a no-op, since
-graphs are user-constructed). Everything else needs an explicit `instrument_*`
-call.
+`anthropic`, `openai`, `litellm`, `langgraph`, and `claude_code`. Each attempt
+prints its outcome to stderr. Anthropic/OpenAI only wrap a new default client;
+wrap your own clients explicitly. With the `langgraph` extra, OpenInference
+LangChain callbacks capture graph and child runs through the existing exporter.
+Inputs/outputs are redacted; custom graph metadata can still be captured. Existing
+LangChain instrumentation keeps its configuration. If the optional integration is
+unavailable, call `instrument_langgraph(graph)` after compiling for graph-level
+spans. Other libraries need an explicit `instrument_*` call.
 
 ```python
 from tracelane import init, auto_instrument
 
 init(endpoint="http://localhost:4318", api_key="tlane_...")
-auto_instrument()  # wraps installed anthropic / openai / litellm / claude_code
+auto_instrument()  # prints attachment outcomes; LangGraph includes child runs
 ```
 
 ## Streaming (v1 limitation)
@@ -156,7 +161,7 @@ is not implemented. A once-per-process `UserWarning` says exactly this.
 ## Instrumented libraries
 
 Each library has its own `instrument_*` function — construct the object, then call
-it. `auto_instrument()` covers only the four above; the rest are explicit:
+it. `auto_instrument()` covers only the five above (including LangChain callbacks for LangGraph); the rest are explicit:
 
 **LLM providers:** `instrument_anthropic`, `instrument_openai`,
 `instrument_openai_async`, `instrument_azure_openai`, `instrument_bedrock`,

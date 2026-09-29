@@ -627,12 +627,96 @@ mod stream_limits_tests {
         let mut consumer = consumer;
         let pending = consumer.info().await.expect("consumer info").num_pending;
         assert_eq!(pending, 0);
-        // (4) And NOT: it cannot read the spans stream, delete its own stream, or
-        // touch the server's system account. Each is a JetStream API subject the
-        // list does not carry; the server answers with no responder.
+        // (4) RI-06 / B-449: it CAN read the spans stream's info and the ingest
+        // durable's info — the /health.spans_stream poller's two calls — and NOTHING
+        // else on that stream: no consumer create, no update, no MSG.NEXT, no delete.
+        // (Until 2026-09-19 this asserted the gateway could not read the spans stream
+        // at all; the grant is now deliberately read-only.)
+        ops.create_consumer_on_stream(
+            async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(crate::spans_stream::INGEST_DURABLE.into()),
+                ..Default::default()
+            },
+            crate::spans_stream::SPANS_STREAM,
+        )
+        .await
+        .expect("ops creates the ingest durable");
+        let mut spans = js
+            .get_stream(crate::spans_stream::SPANS_STREAM)
+            .await
+            .expect("gateway reads TRACELANE_SPANS info (RI-06)");
+        let sinfo = spans.info().await.expect("stream info");
+        assert!(sinfo.state.first_sequence >= 1 || sinfo.state.messages == 0);
+        let cinfo = spans
+            .consumer_info(crate::spans_stream::INGEST_DURABLE)
+            .await
+            .expect("gateway reads the ingest durable's info (RI-06)");
+        assert_eq!(
+            cinfo.ack_floor.stream_sequence, 0,
+            "a fresh durable has acked nothing"
+        );
         assert!(
-            js.get_stream("TRACELANE_SPANS").await.is_err(),
-            "gateway read TRACELANE_SPANS"
+            spans
+                .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                    durable_name: Some("gateway-must-not".into()),
+                    ..Default::default()
+                })
+                .await
+                .is_err(),
+            "gateway CREATED a consumer on the spans stream"
+        );
+        // MSG.NEXT must be refused — proven with a CONTROL, not an empty stream: one
+        // span published as the gateway (allowed), then the gateway's pull yields
+        // nothing while the ops user's pull on the same durable yields it.
+        js.publish(
+            "tracelane.spans.00000000-0000-4000-8000-000000000001",
+            "{}".into(),
+        )
+        .await
+        .expect("gateway publishes a span")
+        .await
+        .expect("acked");
+        let gw_bound = spans
+            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                crate::spans_stream::INGEST_DURABLE,
+            )
+            .await
+            .expect("binding is an INFO call — allowed");
+        let gw_pull = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut batch = gw_bound.fetch().max_messages(1).messages().await.ok()?;
+            batch.next().await.and_then(Result::ok)
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(gw_pull.is_none(), "gateway PULLED from the spans stream");
+        let ops_stream = ops
+            .get_stream(crate::spans_stream::SPANS_STREAM)
+            .await
+            .expect("ops stream");
+        let ops_bound = ops_stream
+            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                crate::spans_stream::INGEST_DURABLE,
+            )
+            .await
+            .expect("ops binds");
+        let ops_pull = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut batch = ops_bound.fetch().max_messages(1).messages().await.ok()?;
+            batch.next().await.and_then(Result::ok)
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            ops_pull.is_some(),
+            "the control failed: ops could not pull the span either"
+        );
+        ops_pull.unwrap().ack().await.expect("ops acks");
+        assert!(
+            js.delete_stream(crate::spans_stream::SPANS_STREAM)
+                .await
+                .is_err(),
+            "gateway DELETED the spans stream"
         );
         assert!(
             js.delete_stream("TRACELANE_AUDIT").await.is_err(),
@@ -647,6 +731,48 @@ mod stream_limits_tests {
             .map(|r| r.is_err())
             .unwrap_or(true),
             "gateway reached $SYS"
+        );
+        // (5) B-474 (REV-3): the gateway credential cannot passively read the INGEST
+        // user's inbox. The gateway subscribes `_INBOX_ingest.>`; the ingest client
+        // makes a JetStream request whose reply lands on ITS inbox (`_INBOX_ingest.<x>`
+        // — the prefix `NatsConnect::options` derives from the credential) — and the
+        // gateway's subscription receives NOTHING, while ingest's own reply arrived
+        // (the positive control: the subject carried traffic, only the permission
+        // stopped the observer). The bare `_INBOX.>` is refused to both services too.
+        let in_url = std::env::var("NATS_TEST_URL_INGEST").expect("NATS_TEST_URL_INGEST");
+        let in_nc = tracelane_shared::nats_connect::NatsConnect::from_url(&in_url);
+        assert_eq!(in_nc.inbox_prefix().as_deref(), Some("_INBOX_ingest"));
+        assert_eq!(nc.inbox_prefix().as_deref(), Some("_INBOX_gateway"));
+        let ingest_client = in_nc
+            .options()
+            .connect(&in_nc.url)
+            .await
+            .expect("ingest connects");
+        let mut gw_spy = client
+            .subscribe("_INBOX_ingest.>")
+            .await
+            .expect("subscribe call is client-side");
+        let mut gw_spy_bare = client
+            .subscribe("_INBOX.>")
+            .await
+            .expect("subscribe call is client-side");
+        client.flush().await.expect("flush");
+        let ingest_js = async_nats::jetstream::new(ingest_client.clone());
+        // A request/reply the ingest user is allowed: its own stream's info.
+        let info = ingest_js.get_stream("TRACELANE_SPANS").await;
+        assert!(
+            info.is_ok(),
+            "the control failed: ingest could not read its own stream ({info:?})"
+        );
+        let spied = tokio::time::timeout(Duration::from_secs(2), gw_spy.next()).await;
+        assert!(
+            spied.is_err(),
+            "the GATEWAY credential received a reply on the INGEST inbox — passive observation is possible: {spied:?}"
+        );
+        let spied_bare = tokio::time::timeout(Duration::from_secs(2), gw_spy_bare.next()).await;
+        assert!(
+            spied_bare.is_err(),
+            "the gateway received traffic on the bare `_INBOX.>`: {spied_bare:?}"
         );
         let _ = ops.delete_stream("TRACELANE_SPANS").await;
         let _ = ops.delete_stream("TRACELANE_AUDIT").await;

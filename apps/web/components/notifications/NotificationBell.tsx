@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * DSH-01 — the header bell: what happened while nobody was looking.
@@ -19,6 +20,7 @@
  * The panel says so rather than letting a user assume it is theirs alone.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useDismiss } from "@/lib/use-dismiss";
 import Link from "next/link";
@@ -87,7 +89,7 @@ export function NotificationBell() {
 		let live = true;
 		(async () => {
 			try {
-				const res = await fetch("/api/notifications");
+				const res = await apiFetchRaw("/api/notifications");
 				if (!res.ok) throw new Error(String(res.status));
 				const data = (await res.json()) as {
 					notifications: Notification[];
@@ -117,7 +119,7 @@ export function NotificationBell() {
 			),
 		);
 		setUnread((n) => Math.max(0, n - 1));
-		const res = await fetch(`/api/notifications/${id}/read`, {
+		const res = await apiFetchRaw(`/api/notifications/${id}/read`, {
 			method: "POST",
 		}).catch(() => null);
 		if (!res || (!res.ok && res.status !== 404)) {
@@ -146,7 +148,8 @@ export function NotificationBell() {
 			 * chip in both themes without introducing a colour. The badge renders ONLY
 			 * for a real positive count — see `showBadge` above.
 			 */}
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={() => setOpen((v) => !v)}
 				aria-label={
@@ -164,7 +167,7 @@ export function NotificationBell() {
 						{unread}
 					</span>
 				)}
-			</button>
+			</Button>
 
 			{open && (
 				/*
@@ -243,13 +246,14 @@ export function NotificationBell() {
 													</Link>
 												)}
 												{n.read_at === null && (
-													<button
+													<Button
+														variant="bare"
 														type="button"
 														onClick={() => markRead(n.id)}
 														className="underline"
 													>
 														Mark read
-													</button>
+													</Button>
 												)}
 											</div>
 										</div>

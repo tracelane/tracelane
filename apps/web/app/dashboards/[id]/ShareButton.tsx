@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * ShareButton — copies the current URL to the clipboard.
@@ -19,12 +20,13 @@ export function ShareButton() {
 	}
 
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={handleCopy}
 			className="rounded-[var(--radius-control)] border border-line px-3 py-1.5 text-xs text-ink-2 transition-colors hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 		>
 			{copied ? "Copied!" : "Share"}
-		</button>
+		</Button>
 	);
 }

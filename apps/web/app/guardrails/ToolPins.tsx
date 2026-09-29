@@ -1,4 +1,5 @@
 "use client";
+import { StatusBadge } from "@tracelanedev/ui";
 
 /**
  * Tool pinning — the approve surface for R3 rug-pull detection (/B).
@@ -32,6 +33,7 @@
  *    numbers — an empty grey bar cannot be misread as a value.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import {
 	Badge,
@@ -48,7 +50,7 @@ import {
 } from "@tracelanedev/ui";
 import { useCallback, useEffect, useState } from "react";
 
-type Observed = {
+export type Observed = {
 	tool_name: string;
 	def_hash: string;
 	first_seen: string;
@@ -56,6 +58,32 @@ type Observed = {
 	seen_count: number;
 	approved: boolean;
 };
+
+/**
+ * Which rows a bulk approval actually approves. `selected === null` means
+ * "select all". Two rules keep bulk approval from weakening the rug-pull check:
+ * a CHANGED definition (drift) is never bulk-approved — it is exactly what R3
+ * exists to catch, so it is reviewed one row at a time; and the gateway keeps ONE
+ * pin per tool, so several definitions of one tool approve only the latest.
+ */
+export function bulkApprovalTargets(
+	rows: Observed[],
+	selected: Set<string> | null,
+): Observed[] {
+	const approvedNames = new Set(
+		rows.filter((r) => r.approved).map((r) => r.tool_name),
+	);
+	const latest = new Map<string, Observed>();
+	for (const r of rows) {
+		if (r.approved || approvedNames.has(r.tool_name)) continue;
+		if (selected && !selected.has(`${r.tool_name}:${r.def_hash}`)) continue;
+		const prev = latest.get(r.tool_name);
+		if (!prev || r.last_seen > prev.last_seen) latest.set(r.tool_name, r);
+	}
+	return [...latest.values()].sort((a, b) =>
+		a.tool_name.localeCompare(b.tool_name),
+	);
+}
 
 type LoadState =
 	| { kind: "loading" }
@@ -66,10 +94,12 @@ type LoadState =
 export function ToolPins() {
 	const [state, setState] = useState<LoadState>({ kind: "loading" });
 	const [busy, setBusy] = useState<string | null>(null);
+	const [selected, setSelected] = useState<Set<string>>(new Set());
+	const [bulkNote, setBulkNote] = useState<string | null>(null);
 
 	const load = useCallback(async () => {
 		try {
-			const res = await fetch("/api/guardrails/observed-tools", {
+			const res = await apiFetchRaw("/api/guardrails/observed-tools", {
 				cache: "no-store",
 			});
 			if (res.status === 403) {
@@ -90,19 +120,51 @@ export function ToolPins() {
 		void load();
 	}, [load]);
 
+	function postApproval(row: Observed) {
+		return apiFetchRaw("/api/guardrails/approve-tool", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				tool_name: row.tool_name,
+				def_hash: row.def_hash,
+			}),
+		});
+	}
+
 	async function approve(row: Observed) {
 		setBusy(`${row.tool_name}:${row.def_hash}`);
 		try {
-			const res = await fetch("/api/guardrails/approve-tool", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					tool_name: row.tool_name,
-					def_hash: row.def_hash,
-				}),
-			});
+			const res = await postApproval(row);
 			if (res.ok) await load();
 			else if (res.status === 403) setState({ kind: "forbidden" });
+		} finally {
+			setBusy(null);
+		}
+	}
+
+	// Sequential, not parallel: the approve route is owner-gated and per tool, and
+	// a burst of N concurrent writes buys nothing for a list of tens.
+	async function approveMany(targets: Observed[]) {
+		if (targets.length === 0) return;
+		setBusy("bulk");
+		setBulkNote(null);
+		let failed = 0;
+		try {
+			for (const row of targets) {
+				const res = await postApproval(row).catch(() => null);
+				if (res?.status === 403) {
+					setState({ kind: "forbidden" });
+					return;
+				}
+				if (!res?.ok) failed += 1;
+			}
+			setSelected(new Set());
+			setBulkNote(
+				failed === 0
+					? `Approved ${targets.length} tool${targets.length === 1 ? "" : "s"}.`
+					: `Approved ${targets.length - failed} of ${targets.length}; ${failed} failed — try those again.`,
+			);
+			await load();
 		} finally {
 			setBusy(null);
 		}
@@ -114,7 +176,7 @@ export function ToolPins() {
 	async function unpin(row: Observed) {
 		setBusy(`${row.tool_name}:${row.def_hash}`);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/guardrails/tool-pins/${encodeURIComponent(row.tool_name)}`,
 				{ method: "DELETE" },
 			);
@@ -174,8 +236,47 @@ export function ToolPins() {
 	for (const r of state.rows)
 		if (r.approved) approvedByName.set(r.tool_name, r.def_hash);
 
+	const allTargets = bulkApprovalTargets(state.rows, null);
+	const selectedTargets = bulkApprovalTargets(state.rows, selected);
+	const driftCount = state.rows.filter(
+		(r) => !r.approved && approvedByName.has(r.tool_name),
+	).length;
+	const toggle = (key: string) =>
+		setSelected((prev) => {
+			const next = new Set(prev);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			return next;
+		});
+
 	return (
 		<div className="space-y-3">
+			<div className="flex flex-wrap items-center gap-2 text-sm">
+				<span className="text-ink-2">
+					{state.rows.length} definitions · {allTargets.length} tools awaiting
+					approval
+					{driftCount > 0 ? ` · ${driftCount} changed (review each)` : ""}
+				</span>
+				<span className="flex-1" />
+				{bulkNote ? <output className="text-ink-2">{bulkNote}</output> : null}
+				<Button
+					variant="secondary"
+					size="sm"
+					disabled={busy !== null || selectedTargets.length === 0}
+					onClick={() => void approveMany(selectedTargets)}
+				>
+					{busy === "bulk"
+						? "Approving…"
+						: `Approve selected (${selectedTargets.length})`}
+				</Button>
+				<Button
+					size="sm"
+					disabled={busy !== null || allTargets.length === 0}
+					onClick={() => void approveMany(allTargets)}
+				>
+					Approve all new ({allTargets.length})
+				</Button>
+			</div>
 			<Card quiet className="overflow-hidden p-0">
 				<Table>
 					{/* `border-t-0`: the shared `THead` is bordered top AND bottom so it holds
@@ -189,6 +290,27 @@ export function ToolPins() {
 					    shared change rather than three concurrent ones. */}
 					<THead className="border-t-0">
 						<TR>
+							<TH className="w-8">
+								<input
+									type="checkbox"
+									aria-label="Select every tool awaiting approval"
+									checked={
+										allTargets.length > 0 &&
+										selectedTargets.length === allTargets.length
+									}
+									onChange={(e) =>
+										setSelected(
+											e.target.checked
+												? new Set(
+														allTargets.map(
+															(r) => `${r.tool_name}:${r.def_hash}`,
+														),
+													)
+												: new Set(),
+										)
+									}
+								/>
+							</TH>
 							<TH>Tool</TH>
 							<TH>Definition</TH>
 							<TH>First seen (UTC)</TH>
@@ -204,6 +326,16 @@ export function ToolPins() {
 							const key = `${r.tool_name}:${r.def_hash}`;
 							return (
 								<TR key={key}>
+									<TD>
+										{r.approved || isDrift ? null : (
+											<input
+												type="checkbox"
+												aria-label={`Select ${r.tool_name}`}
+												checked={selected.has(key)}
+												onChange={() => toggle(key)}
+											/>
+										)}
+									</TD>
 									{/* Both are technical identifiers in LEFT columns, so both
 									    take `mono` rather than `numeric` — they are not numbers
 									    and right-aligning a hash next to a tool name would put
@@ -216,17 +348,17 @@ export function ToolPins() {
 									<TD muted>{absoluteDate(r.last_seen)}</TD>
 									<TD>
 										{r.approved ? (
-											<Badge tone="ok">Approved</Badge>
+											<StatusBadge status="approved" />
 										) : isDrift ? (
-											<Badge tone="danger">Definition changed</Badge>
+											<StatusBadge status="definition_changed" />
 										) : (
-											<Badge tone="neutral">Not approved</Badge>
+											<StatusBadge status="not_approved" />
 										)}
 									</TD>
 									<TD className="text-right">
 										{r.approved ? (
 											<Button
-												variant="secondary"
+												variant="danger"
 												size="sm"
 												onClick={() => void unpin(r)}
 												disabled={busy === key}

@@ -3,8 +3,10 @@
 //!
 //! # Why
 //!
-//! The rate limiter, the monthly quota, the key and workspace budgets and the
-//! online-eval cap are all process-local (`crates/gateway/CLAUDE.md`). They are
+//! The rate limiter, the key and workspace budgets and the online-eval cap are
+//! all process-local (`crates/gateway/CLAUDE.md`) — BILL-01 deleted the monthly
+//! trace-count quota this line used to name (RI-04 drift fix, 2026-09-19;
+//! `admission.rs`). They are
 //! correct on exactly ONE gateway per control plane. Nothing prevented a second
 //! one: a duplicate container, a blue-green stack, a laptop pointed at prod's
 //! `POSTGRES_URL` — and every cap silently became cap × instances, on the bill

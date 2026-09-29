@@ -43,6 +43,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 		// unfiltered list while the page itself (a Server Component using gatewayGet)
 		// filtered correctly — so the two disagreed silently.
 		"end_user",
+		"agent",
+		"model_family",
 		"cursor",
 		"since",
 		"until",

@@ -219,3 +219,159 @@ fn forged_anchor_without_trusted_key_reports_unverified() {
     assert_eq!(report.rekor_anchors_resolved, 0);
     assert_eq!(report.anchors_included, 0);
 }
+
+// ── AUD-29 — the platform-key trust root. Shared vectors (offline, deterministic):
+//    evals/audit-ledger/generate_platform_key_vectors.py. TS and Python assert the same.
+fn meta_key(field: &str) -> [u8; 32] {
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(vector("platform-key-vectors.meta.json")).expect("meta"),
+    )
+    .expect("meta json");
+    let raw = b64(meta[field].as_str().expect("field"));
+    raw.try_into().expect("32-byte key")
+}
+
+fn aud29(name: &str, platform: Option<[u8; 32]>) -> tracelane_audit_verifier::VerifyReport {
+    let mut opts = VerifyOptions::offline()
+        .with_format(tracelane_audit_verifier::FormatVersion::V2_1)
+        .with_tenant_pubkey(meta_key("workspace_ed25519_pubkey_b64"));
+    if let Some(p) = platform {
+        opts = opts.with_platform_pubkey(p);
+    }
+    verify_ledger(&vector(&format!("{name}.ndjson")), &opts).expect("io ok")
+}
+
+fn kinds(r: &tracelane_audit_verifier::VerifyReport) -> Vec<String> {
+    r.errors.iter().map(|e| e.kind.clone()).collect()
+}
+
+#[test]
+fn aud29_a_all_platform_signed_verify_and_count_apart() {
+    let r = aud29(
+        "platform-only",
+        Some(meta_key("platform_ed25519_pubkey_b64")),
+    );
+    assert!(kinds(&r).is_empty(), "{:?}", r.errors);
+    assert!(r.signatures_valid);
+    assert_eq!(r.platform_signed_batches, 2);
+    assert_eq!(r.platform_signed_ranges.len(), 2);
+    assert_eq!(
+        (
+            r.platform_signed_ranges[1].start_seq,
+            r.platform_signed_ranges[1].end_seq
+        ),
+        (5, 9)
+    );
+}
+
+#[test]
+fn aud29_b_platform_prefix_then_workspace_verifies() {
+    let r = aud29(
+        "platform-then-workspace",
+        Some(meta_key("platform_ed25519_pubkey_b64")),
+    );
+    assert!(kinds(&r).is_empty(), "{:?}", r.errors);
+    assert!(r.signatures_valid);
+    assert_eq!(r.platform_signed_batches, 1);
+}
+
+#[test]
+fn aud29_c_platform_after_workspace_is_red() {
+    let r = aud29(
+        "workspace-then-platform",
+        Some(meta_key("platform_ed25519_pubkey_b64")),
+    );
+    assert_eq!(
+        kinds(&r),
+        vec!["platform_key_after_workspace_key".to_string()]
+    );
+    assert!(!r.signatures_valid);
+}
+
+#[test]
+fn aud29_d_unrelated_platform_key_is_untrusted() {
+    let r = aud29(
+        "platform-then-workspace",
+        Some(meta_key("unrelated_ed25519_pubkey_b64")),
+    );
+    assert_eq!(kinds(&r), vec!["untrusted_tenant_key".to_string()]);
+    assert_eq!(r.platform_signed_batches, 0);
+}
+
+#[test]
+fn aud29_e_without_platform_key_is_untrusted_as_before() {
+    let r = aud29("platform-then-workspace", None);
+    assert_eq!(kinds(&r), vec!["untrusted_tenant_key".to_string()]);
+    assert!(!r.signatures_valid);
+}
+
+fn aud29_with(
+    name: &str,
+    platform: Vec<[u8; 32]>,
+    since: Option<u64>,
+) -> tracelane_audit_verifier::VerifyReport {
+    let mut opts = VerifyOptions::offline()
+        .with_format(tracelane_audit_verifier::FormatVersion::V2_1)
+        .with_tenant_pubkey(meta_key("workspace_ed25519_pubkey_b64"));
+    for p in platform {
+        opts = opts.with_platform_pubkey(p);
+    }
+    if let Some(s) = since {
+        opts = opts.with_workspace_key_since_seq(s);
+    }
+    verify_ledger(&vector(&format!("{name}.ndjson")), &opts).expect("io ok")
+}
+
+#[test]
+fn aud29_f_takeover_seq_holds_with_no_workspace_batch_in_view() {
+    let r = aud29_with(
+        "platform-only",
+        vec![meta_key("platform_ed25519_pubkey_b64")],
+        Some(5),
+    );
+    assert_eq!(
+        kinds(&r),
+        vec!["platform_key_after_workspace_key".to_string()]
+    );
+    assert!(!r.signatures_valid);
+    assert_eq!(r.platform_signed_batches, 1);
+}
+
+#[test]
+fn aud29_g_takeover_at_zero_trusts_no_platform_batch() {
+    let r = aud29_with(
+        "platform-only",
+        vec![meta_key("platform_ed25519_pubkey_b64")],
+        Some(0),
+    );
+    assert_eq!(kinds(&r).len(), 2);
+    assert_eq!(r.platform_signed_batches, 0);
+}
+
+#[test]
+fn aud29_h_platform_shadow_of_workspace_batch_is_red() {
+    let r = aud29_with(
+        "platform-shadow",
+        vec![meta_key("platform_ed25519_pubkey_b64")],
+        None,
+    );
+    assert_eq!(
+        kinds(&r),
+        vec!["platform_key_after_workspace_key".to_string()]
+    );
+    assert_eq!(r.platform_signed_batches, 0);
+}
+
+#[test]
+fn aud29_i_platform_key_list_supports_rotation() {
+    let r = aud29_with(
+        "platform-then-workspace",
+        vec![
+            meta_key("unrelated_ed25519_pubkey_b64"),
+            meta_key("platform_ed25519_pubkey_b64"),
+        ],
+        None,
+    );
+    assert!(kinds(&r).is_empty(), "{:?}", r.errors);
+    assert_eq!(r.platform_signed_batches, 1);
+}

@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * ProfileManager — display-name edit + email change + danger zone
@@ -15,12 +16,13 @@
  */
 
 import { EmailChangeForm } from "@/components/settings/EmailChangeForm";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useMutation } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 async function saveName(name: string): Promise<void> {
-	const res = await fetch("/api/settings/account", {
+	const res = await apiFetchRaw("/api/settings/account", {
 		method: "PATCH",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ name }),
@@ -32,7 +34,7 @@ async function saveName(name: string): Promise<void> {
 }
 
 async function deleteAccount(confirmEmail: string): Promise<void> {
-	const res = await fetch("/api/settings/account", {
+	const res = await apiFetchRaw("/api/settings/account", {
 		method: "DELETE",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ confirmEmail }),
@@ -47,7 +49,7 @@ async function deleteAccount(confirmEmail: string): Promise<void> {
 }
 
 async function deleteOrg(confirmName: string): Promise<void> {
-	const res = await fetch("/api/settings/workspace", {
+	const res = await apiFetchRaw("/api/settings/workspace", {
 		method: "DELETE",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ confirmName }),
@@ -94,7 +96,7 @@ export function ProfileManager({
 					value={name}
 					onChange={(e) => setName(e.target.value)}
 					placeholder="Your name"
-					className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					className="w-full rounded-control bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				/>
 				<label
 					htmlFor="profile-email"
@@ -106,20 +108,22 @@ export function ProfileManager({
 					id="profile-email"
 					value={email}
 					readOnly
-					className="w-full rounded-sm bg-surface border border-line px-3 py-2 text-sm text-ink-2 font-mono cursor-not-allowed"
+					className="w-full rounded-control bg-surface border border-line px-3 py-2 text-sm text-ink-2 font-mono cursor-not-allowed"
 				/>
 				<p className="text-xs text-ink-3">
-					Change it below — the name field here saves on its own.
+					Email can't be edited here — use the form below. A name change above
+					needs Save.
 				</p>
 				<div className="flex items-center gap-3 pt-1">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						disabled={!name.trim() || name === initialName || save.isPending}
 						onClick={() => save.mutate(name.trim())}
-						className="rounded-lg bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+						className="rounded-control bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{save.isPending ? "Saving…" : "Save"}
-					</button>
+					</Button>
 					{save.isSuccess && <span className="text-xs text-ok-ink">Saved</span>}
 					{save.error && (
 						<span className="text-xs text-danger-ink">
@@ -133,7 +137,7 @@ export function ProfileManager({
 			<EmailChangeForm email={email} />
 
 			{/* Danger zone */}
-			<section className="space-y-4 rounded-lg border border-danger/40 p-4">
+			<section className="space-y-4 rounded-card border border-danger/40 p-4">
 				<h3 className="text-xs font-semibold text-danger-ink">Danger zone</h3>
 
 				<div className="space-y-2">
@@ -147,19 +151,20 @@ export function ProfileManager({
 						value={confirmEmail}
 						onChange={(e) => setConfirmEmail(e.target.value)}
 						placeholder={email}
-						className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+						className="w-full rounded-control bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					/>
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						disabled={
 							confirmEmail.trim().toLowerCase() !== email.toLowerCase() ||
 							delAccount.isPending
 						}
 						onClick={() => delAccount.mutate(confirmEmail.trim())}
-						className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+						className="rounded-control border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{delAccount.isPending ? "Deleting…" : "Delete my account"}
-					</button>
+					</Button>
 					{delAccount.error && (
 						<p className="text-xs text-danger-ink">
 							{(delAccount.error as Error).message}
@@ -180,16 +185,17 @@ export function ProfileManager({
 							value={confirmOrg}
 							onChange={(e) => setConfirmOrg(e.target.value)}
 							placeholder="organization name"
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							className="w-full rounded-control bg-surface-2 border border-line px-3 py-2 text-xs text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						/>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							disabled={!confirmOrg.trim() || delOrg.isPending}
 							onClick={() => delOrg.mutate(confirmOrg.trim())}
-							className="rounded-lg border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+							className="rounded-control border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 						>
 							{delOrg.isPending ? "Deleting…" : "Delete organization"}
-						</button>
+						</Button>
 						{delOrg.error && (
 							<p className="text-xs text-danger-ink">
 								{(delOrg.error as Error).message}

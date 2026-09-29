@@ -1,5 +1,5 @@
 /**
- * tlane replay — time-travel debugger CLI.
+ * tlane replay — read-only inspection of recorded trace spans.
  *
  * Fetches a trace's spans from the Tracelane gateway and renders them in the
  * terminal as an ordered table. JSON output is also supported for piping into
@@ -152,7 +152,9 @@ function renderTable(traceId: string, steps: TraceStep[]): void {
 export function registerReplayCommand(program: Command): void {
 	program
 		.command("replay <traceId>")
-		.description("Replay a trace step-by-step (time-travel debugging)")
+		.description(
+			"Inspect recorded trace spans (read-only; no model or tool re-execution)",
+		)
 		.option("--format <fmt>", "Output format: table|json", "table")
 		.option(
 			"--endpoint <url>",

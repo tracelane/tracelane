@@ -406,7 +406,7 @@ export function TimeSeriesChart({
 		return (
 			<div
 				className={cn(
-					"flex items-center justify-center rounded-lg border border-line border-dashed text-ink-3 text-xs",
+					"flex items-center justify-center rounded-card border border-line border-dashed text-ink-3 text-xs",
 					className,
 				)}
 				style={{ height: height + AXIS_H }}
@@ -626,7 +626,7 @@ export function TimeSeriesChart({
 					<div
 						id={tipId}
 						role="tooltip"
-						className="pointer-events-none absolute top-1 z-30 w-56 rounded-lg border border-line bg-surface px-2.5 py-2 text-2xs text-ink-2 shadow-[var(--shadow-overlay)]"
+						className="pointer-events-none absolute top-1 z-30 w-56 rounded-card border border-line bg-surface px-2.5 py-2 text-2xs text-ink-2 shadow-[var(--shadow-overlay)]"
 						style={{ left: tooltipLeft }}
 					>
 						<div
@@ -648,7 +648,7 @@ export function TimeSeriesChart({
 										<dt className="flex items-center gap-1.5 text-ink-3">
 											<span
 												className={cn(
-													"inline-block h-1.5 w-1.5 rounded-sm",
+													"inline-block h-1.5 w-1.5 rounded-control",
 													SWATCH[s.tone ?? "data"],
 												)}
 												aria-hidden
@@ -709,7 +709,7 @@ export function TimeSeriesChart({
 							>
 								<span
 									className={cn(
-										"inline-block h-2 w-3 rounded-sm",
+										"inline-block h-2 w-3 rounded-control",
 										SWATCH[s.tone ?? "data"],
 									)}
 									aria-hidden

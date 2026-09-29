@@ -53,6 +53,7 @@ use crate::prompt_router::{DecisionKind, Env, PromotionDecision, PromptRouter};
 #[derive(Clone)]
 pub struct PromptRoutesState {
     pub router: Arc<PromptRouter>,
+    pub span_state: crate::server::AppState,
     /// `None` only when Postgres is unset (no entitlement source) — the write
     /// gate then FAILS CLOSED (503), same posture as the audit-export
     /// gate. In production the cache is always present.
@@ -118,6 +119,16 @@ pub fn routes() -> Router<PromptRoutesState> {
         .route(
             "/v1/prompts/{name}",
             get(get_active_handler).delete(delete_handler),
+        )
+        .route(
+            "/v1/prompts/{name}/configuration",
+            get(get_configuration_handler),
+        )
+        .route(
+            "/v1/prompts/{name}/canary",
+            get(get_canary_handler)
+                .put(put_canary_handler)
+                .delete(stop_canary_handler),
         )
         .route("/v1/prompts/{name}/versions", post(create_version_handler))
         .route("/v1/prompts/{name}/history", get(history_handler))
@@ -193,6 +204,11 @@ type WriteError = (StatusCode, Json<serde_json::Value>);
 /// version for this tenant", on a path a customer touches.
 fn router_err(e: anyhow::Error) -> WriteError {
     let status = if e
+        .downcast_ref::<crate::prompt_router::ResolutionRefusal>()
+        .is_some()
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if e
         .downcast_ref::<crate::prompt_router::ClientFault>()
         .is_some()
     {
@@ -319,6 +335,9 @@ struct PromptVersionDto {
     content: String,
     model_pin: Option<String>,
     sha256_hex: String,
+    arm: Option<String>,
+    canary_id: Option<Uuid>,
+    resolution_trace_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +557,53 @@ async fn get_active_handler(
     let tenant = tenant_from_auth(&headers).await?;
     tracing::Span::current().record("tenant_id", tenant.to_string());
     let env = parse_env(q.env.as_deref().unwrap_or("production"))?;
+    let identity = crate::server::CallerIdentity::from_headers(&headers);
+    let resolution = state
+        .router
+        .resolve(
+            tenant.clone(),
+            &name,
+            env,
+            identity.assignment_key().as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            let status = match e.downcast_ref::<crate::prompt_router::ResolutionRefusal>() {
+                Some(crate::prompt_router::ResolutionRefusal::IdentityRequired) => {
+                    StatusCode::BAD_REQUEST
+                }
+                Some(crate::prompt_router::ResolutionRefusal::Unavailable) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                None => StatusCode::NOT_FOUND,
+            };
+            (status, e.to_string())
+        })?;
+    let span = crate::server::build_prompt_resolution_span(&tenant, &name, &resolution, &identity);
+    let trace_id = span.trace_id;
+    crate::server::spawn_span_publish(&state.span_state, span);
+    let v = resolution.version;
+    Ok(Json(PromptVersionDto {
+        prompt_version_id: v.prompt_version_id,
+        prompt_id: v.prompt_id,
+        version_number: v.version_number,
+        content: v.content,
+        model_pin: v.model_pin,
+        sha256_hex: hex::encode(v.sha256),
+        arm: Some(resolution.arm.into()),
+        canary_id: resolution.canary_id,
+        resolution_trace_id: Some(trace_id),
+    }))
+}
+
+async fn get_configuration_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    Query(q): Query<EnvQuery>,
+    headers: HeaderMap,
+) -> Result<Json<PromptVersionDto>, (StatusCode, String)> {
+    let tenant = tenant_from_auth(&headers).await?;
+    let env = parse_env(q.env.as_deref().unwrap_or("production"))?;
     let v = state
         .router
         .route(tenant, &name, env)
@@ -550,7 +616,93 @@ async fn get_active_handler(
         content: v.content,
         model_pin: v.model_pin,
         sha256_hex: hex::encode(v.sha256),
+        arm: None,
+        canary_id: None,
+        resolution_trace_id: None,
     }))
+}
+async fn get_canary_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Option<crate::prompt_router::CanaryRecord>>, WriteError> {
+    let tenant = tenant_from_auth(&headers)
+        .await
+        .map_err(|(s, m)| write_err(s, m))?;
+    state
+        .router
+        .canary(&tenant, &name)
+        .map(Json)
+        .map_err(router_err)
+}
+#[derive(Deserialize)]
+struct CanaryBody {
+    candidate_version_id: Uuid,
+    candidate_percent: f64,
+}
+async fn put_canary_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CanaryBody>,
+) -> Result<Json<crate::prompt_router::CanaryRecord>, WriteError> {
+    let (tenant, actor) = actor_from_auth(&headers)
+        .await
+        .map_err(|(s, m)| write_err(s, m))?;
+    require_promotion_write(&state.entitlements, &tenant).await?;
+    require_not_promotion_frozen(&state.entitlements, &tenant).await?;
+    validate_prompt_name(&name).map_err(|(s, m)| write_err(s, m))?;
+    let record = state
+        .router
+        .configure_canary(
+            &tenant,
+            &name,
+            body.candidate_version_id,
+            body.candidate_percent,
+            &actor,
+        )
+        .await
+        .map_err(router_err)?;
+    chain_canary(&state, &tenant, &actor, &name, "start").await;
+    Ok(Json(record))
+}
+async fn stop_canary_handler(
+    State(state): State<PromptRoutesState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, WriteError> {
+    let (tenant, actor) = actor_from_auth(&headers)
+        .await
+        .map_err(|(s, m)| write_err(s, m))?;
+    require_promotion_write(&state.entitlements, &tenant).await?;
+    require_not_promotion_frozen(&state.entitlements, &tenant).await?;
+    state
+        .router
+        .stop_canary(&tenant, &name, &actor)
+        .await
+        .map_err(router_err)?;
+    chain_canary(&state, &tenant, &actor, &name, "stop").await;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn chain_canary(
+    state: &PromptRoutesState,
+    tenant: &TenantId,
+    actor: &str,
+    name: &str,
+    action: &str,
+) {
+    if let Err(error) = state
+        .audit_chain
+        .append(AuditEvent {
+            tenant_id: tenant.clone(),
+            event_type: "prompt.canary",
+            actor: actor.into(),
+            payload: serde_json::json!({"prompt":name,"action":action}),
+        })
+        .await
+    {
+        tracing::warn!(error=%error,"canary audit append failed; configuration persisted");
+    }
 }
 
 /// GET /v1/prompts — the tenant's prompts + activity (ADR-054). Builder-allowed
@@ -656,6 +808,9 @@ async fn create_version_handler(
             content: v.content,
             model_pin: v.model_pin,
             sha256_hex: hex::encode(v.sha256),
+            arm: None,
+            canary_id: None,
+            resolution_trace_id: None,
         }),
     ))
 }
@@ -707,10 +862,10 @@ async fn promote_handler(
     let from_env = parse_env(&body.from_env).map_err(|(s, m)| write_err(s, m))?;
     let to_env = parse_env(&body.to_env).map_err(|(s, m)| write_err(s, m))?;
 
-    // An explicit override reason bypasses the (currently producer-less)
-    // eval gate and records a tamper-evident ManualOverride attributed to the
-    // actor; otherwise the normal eval-gated path (which 409s until an eval run
-    // is supplied). The Team+ entitlement gate above covers both.
+    // An explicit override reason bypasses the candidate-bound evaluation
+    // gate and records a tamper-evident ManualOverride attributed to the actor.
+    // Otherwise a passing run for this tenant and candidate is required.
+    // The Team+ entitlement gate above covers both paths.
     let override_reason = body
         .override_reason
         .as_deref()
@@ -1188,11 +1343,18 @@ mod tests {
     async fn seeded_state(
         entitlements: Option<Arc<EntitlementCache>>,
     ) -> (PromptRoutesState, Uuid) {
-        let router = Arc::new(PromptRouter::new());
         let version_id = Uuid::from_u128(0xB074);
         let tenant = tenant_from_auth(&auth_headers())
             .await
             .expect("fixture credential must authenticate");
+        let router = Arc::new(PromptRouter::new().with_eval_gate(Arc::new(
+            crate::prompt_router::StaticEvalGate {
+                statuses: std::collections::HashMap::from([(
+                    (tenant.clone(), Uuid::from_u128(0xEA71), version_id),
+                    crate::prompt_router::EvalRunStatus::Passed,
+                )]),
+            },
+        )));
         router.register_version(
             &tenant,
             crate::prompt_router::PromptVersion {
@@ -1206,6 +1368,9 @@ mod tests {
         );
         (
             PromptRoutesState {
+                span_state: crate::handler_harness::test_state(
+                    crate::providers::ProviderRegistry::new().unwrap(),
+                ),
                 router,
                 entitlements,
                 audit_chain: Arc::new(AuditChain::new(100, None, None).unwrap()),
@@ -1216,6 +1381,95 @@ mod tests {
             },
             version_id,
         )
+    }
+
+    #[test]
+    fn canary_resolution_records_served_arm_and_requires_identity() {
+        let _serial = ENV_LOCK.lock().unwrap();
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let (mut state, _) = seeded_state(None).await;
+            let tenant = crate::handler_harness::dev_tenant();
+            let (router, _, candidate) =
+                crate::prompt_router::tests::canary_fixture(tenant.clone()).await;
+            router
+                .configure_canary(&tenant, "proof", candidate, 50.0, "tester")
+                .await
+                .unwrap();
+            state.router = router;
+            let no_id = get_active_handler(
+                State(state.clone()),
+                Path("proof".into()),
+                Query(EnvQuery { env: None }),
+                auth_headers(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(no_id.0, StatusCode::BAD_REQUEST);
+            assert_eq!(no_id.1, "canary_identity_required");
+            let mut headers = auth_headers();
+            headers.insert("x-tracelane-user-id", "repeatable-user".parse().unwrap());
+            let first = get_active_handler(
+                State(state.clone()),
+                Path("proof".into()),
+                Query(EnvQuery { env: None }),
+                headers.clone(),
+            )
+            .await
+            .unwrap()
+            .0;
+            let again = get_active_handler(
+                State(state),
+                Path("proof".into()),
+                Query(EnvQuery { env: None }),
+                headers,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(first.prompt_version_id, again.prompt_version_id);
+            assert_eq!(first.arm, again.arm);
+            let spans = crate::otlp_emit::test_sink::for_trace(first.resolution_trace_id.unwrap());
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+            assert_eq!(
+                span.attributes.extra["tracelane.prompt.arm"],
+                serde_json::json!(first.arm)
+            );
+            assert_eq!(
+                span.attributes.extra["tracelane.prompt.version_id"],
+                serde_json::json!(first.prompt_version_id)
+            );
+            assert_eq!(span.attributes.user_id.as_deref(), Some("repeatable-user"));
+            assert!(span.attributes.gen_ai_usage_cost.is_none());
+            assert!(span.attributes.gen_ai_usage_input_tokens.is_none());
+        });
+    }
+
+    #[test]
+    fn canary_write_requires_a_real_entitlement_source() {
+        use tower::ServiceExt as _;
+        let _serial = ENV_LOCK.lock().unwrap();
+        let _env = DevAuthEnv::enable();
+        rt().block_on(async {
+            let (state, candidate) = seeded_state(None).await;
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/v1/prompts/proof/canary")
+                .header("authorization", auth_headers()["authorization"].clone())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"candidate_version_id":candidate,"candidate_percent":25})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = routes().with_state(state).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "canary write must reach the fail-closed entitlement gate"
+            );
+        });
     }
 
     /// The prompt name is a UUIDv5 input (`prompt_id_for`), a routing-key
@@ -1273,7 +1527,7 @@ mod tests {
                 from_env: "staging".into(),
                 to_env: "production".into(),
                 to_version_id: version_id,
-                eval_run_id: Some(Uuid::from_u128(0xEA71)), // PermissiveGate → Passed
+                eval_run_id: Some(Uuid::from_u128(0xEA71)), // fixture evidence belongs to this tenant and candidate
                 override_reason: None,
             }),
         )

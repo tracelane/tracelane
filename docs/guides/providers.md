@@ -1,10 +1,9 @@
 <!-- tracelane:classification: PUBLIC -->
 # Providers
 
-Tracelane gateway speaks to **150+ routable providers** through a single API surface:
-the OpenAI-compatible `/v1/chat/completions`. There is no Anthropic-native
-`/v1/messages` on the gateway — Anthropic models are reached through the same
-OpenAI-shaped call and translated upstream. You point at
+Tracelane gateway speaks to **191 routable providers** through the OpenAI-compatible
+`/v1/chat/completions`, and also serves the Anthropic-native `/v1/messages`
+route for Claude clients. You point at
 `https://gateway.tracelane.dev`, set the model string, and we route for you
 (cross-provider failover is opt-in per request via the `X-Tracelane-Failover`
 header, not a default).
@@ -280,7 +279,7 @@ the gateway will not boot on a half-applied routing table.
 
 ## Failover
 
-Configure a fallback chain per logical model. If the primary returns 5xx,
+Configure a fallback chain. If the primary returns 5xx,
 429, or times out past the configured budget, we try the next provider in
 the chain — same request, translated to the target provider's wire format.
 
@@ -322,13 +321,13 @@ Bedrock and Azure OpenAI respectively.
 ## Provider-specific behavior
 
 ### Anthropic
-- Native `/v1/messages` is the canonical endpoint. We translate from OpenAI
+- The native `/v1/messages` route is supported. We also translate from OpenAI
   shape on `/v1/chat/completions` if the model is `claude-*`.
 - `prompt_caching` is preserved (`cache_control` blocks pass through).
 - `tool_use` blocks pass through unchanged.
 
 ### OpenAI
-- `/v1/chat/completions` is the only completion route.
+- Served on `/v1/chat/completions`.
 - Function calling preserved across the failover chain.
 
 ### Google Gemini (AI Studio)
@@ -395,8 +394,6 @@ catch wire-format drift before it reaches a customer.
    dashboard's BYOK dropdown all come from the same two sources, so this is the
    step that keeps them from disagreeing. **Do not hand-edit the table above** —
    anything between the markers is overwritten.
-5. ADR if the provider's wire format introduces a new edge case (e.g.,
-   non-JSON streaming, non-standard tool format).
 
 ## Related
 

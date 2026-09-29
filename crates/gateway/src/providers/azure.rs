@@ -46,6 +46,18 @@ impl AzureOpenAiProvider {
         })
     }
 
+    /// Resource-scoped models list; authentication uses the same api-key header.
+    ///
+    /// # Errors
+    /// Fail CLOSED if the configured resource URL cannot be parsed.
+    pub(crate) fn models_url(&self) -> Result<String> {
+        Ok(reqwest::Url::parse_with_params(
+            &format!("{}/openai/models", self.endpoint.trim_end_matches('/')),
+            &[("api-version", self.api_version.as_str())],
+        )?
+        .into())
+    }
+
     /// Construct against an explicit endpoint + API version, reading no process
     /// env. Used by `providers::smoke_tests` so the parallel suite never
     /// mutates env.
@@ -220,6 +232,14 @@ impl AzureOpenAiProvider {
                                     cache_read: None,
                                     cache_creation: None,
                                     cost_usd: None,
+                                    // RI-05 / M11 (follow-up, 2026-09-20): Azure is
+                                    // OpenAI-wire-compatible — an o-series deployment
+                                    // reports `completion_tokens_details.reasoning_tokens`
+                                    // in the same shape; absent → None, never a fabricated 0.
+                                    reasoning: usage["completion_tokens_details"]
+                                        ["reasoning_tokens"]
+                                        .as_u64()
+                                        .map(|n| n as u32),
                                 };
                             }
                         }
@@ -233,6 +253,19 @@ impl AzureOpenAiProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn models_list_uses_resource_root_and_configured_version() {
+        let provider = super::AzureOpenAiProvider::for_endpoint(
+            "https://unit-test.openai.azure.com/",
+            "2024-10-21",
+        )
+        .unwrap();
+        assert_eq!(
+            provider.models_url().unwrap(),
+            "https://unit-test.openai.azure.com/openai/models?api-version=2024-10-21"
+        );
+    }
+
     use tracelane_shared::{ChatRequest, Message, MessageContent, Role, Tool};
 
     /// Azure speaks the OPENAI wire format, so a tool must reach it as

@@ -17,6 +17,7 @@
  *   2. its OWN `gen_ai_agent_name`  — the canonical stored column (OTLP's
  *      dotted `gen_ai.agent.name` normalises into it at decode time; see
  *      `crates/shared/src/otlp/decode.rs`).
+ *      Recognised gateway clients supply the name when an SDK/header name is absent.
  *   3. INHERITED down the tree from the nearest ancestor that resolved to a
  *      lane — a span with no agent attribute of its own belongs to whichever
  *      agent context it was called from, never to a sibling's.
@@ -100,7 +101,9 @@ interface OwnIdentity {
 function ownIdentity(span: Span): OwnIdentity {
 	const attrs = parseAttributes(span.attributes);
 	const id = strAttr(attrs, "gen_ai.agent.id");
-	const name = strAttr(attrs, "gen_ai_agent_name");
+	const name =
+		strAttr(attrs, "gen_ai_agent_name") ??
+		strAttr(attrs, "tracelane_client_name");
 	return {
 		key: id ?? name,
 		name,

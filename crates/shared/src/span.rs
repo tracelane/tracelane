@@ -46,8 +46,33 @@ pub struct SpanAttributes {
     pub gen_ai_provider_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_response_model: Option<String>,
+    /// OTel `gen_ai.response.id` — the provider's own response id, the join key to
+    /// the provider's request logs and the strongest silent-substitution evidence
+    /// available (RI-05 / B-444, 2026-09-19). Absent when the provider sent none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_response_id: Option<String>,
+    /// OTel `gen_ai.response.finish_reasons`; one element on the gateway path
+    /// (`stop` · `length` · `tool_calls` · `content_filter`). `length` is the only
+    /// observable response-truncation signal (RI-05 M20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_response_finish_reasons: Option<Vec<String>>,
+    /// RI-05 / B-444: set ONLY when the served model (`gen_ai_response_model`) is
+    /// known AND differs from the caller's request: `alias` (a `tracelane.yaml`
+    /// alias rewrote it), `failover` (a cross-provider hop served it),
+    /// `alias+failover`, or `provider` — neither did, the silent-substitution
+    /// signal this product claims to catch. Absent when equal or when the served
+    /// model is unknown; never a default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_model_substitution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_agent_name: Option<String>,
+    /// Classified client id only. The gateway never stores the raw User-Agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_client_name: Option<String>,
+    /// `header` when the gateway received x-tracelane-agent-name. An SDK name
+    /// has no gateway provenance marker. This is display metadata, not authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_agent_name_source: Option<String>,
 
     // OTel GenAI semconv v1.40/v1.41 additions (ADR-032)
     /// Prompt-cache read tokens (`gen_ai.usage.cache_read.input_tokens`, v1.40).
@@ -79,6 +104,15 @@ pub struct SpanAttributes {
     /// budget is p99 < 15ms; total `duration_us` is dominated by provider gen time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_gateway_overhead_us: Option<u32>,
+    /// B-568 I5: `Some(true)` when the gateway made a control-plane round trip
+    /// before dispatching this request (an API-key cache miss, a BYOK key cache
+    /// miss, a blocking entitlement resolve, or a JWT org→tenant bridge miss).
+    /// PRESENT ONLY WHEN TRUE, and only beside a measured
+    /// `tracelane_gateway_overhead_us` — absent means warm (or pre-B-568), never
+    /// "unknown cold". The dashboard's "steady state" overhead is the quantile over
+    /// spans WITHOUT this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_gateway_cold_start: Option<bool>,
 
     // ── GWY-24 semantic cache ────────────────────────────────────────────────
     //
@@ -175,12 +209,49 @@ pub struct SpanAttributes {
     /// Argon2id verifier and nothing else).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_api_key_id: Option<String>,
+    /// RI-05 / M2 (`crates/gateway/src/rejection_metrics.rs`) — the admission-refusal
+    /// reason this AGGREGATE span rolls up, one of `rate_limited` |
+    /// `key_budget_exceeded` | `workspace_budget_exceeded`. Present ONLY on a
+    /// `tracelane.admission.rejected` span; absent on every ordinary request span,
+    /// same as `tracelane_rejection_count` below — the two are always present or
+    /// absent together.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_rejection_reason: Option<String>,
+    /// RI-05 / M2 — how many admission refusals this ONE aggregate span rolls up,
+    /// for the (tenant, `tracelane_api_key_id`, `tracelane_rejection_reason`) triple,
+    /// inside the one UTC minute `[start_time, end_time)` brackets. This is the
+    /// DoS-safe shape the spec requires (§2.2): a flood of refusals against one key
+    /// adds to this NUMBER, never to the number of spans/rows written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_rejection_count: Option<u32>,
     /// Agent version, for B1 prompt-promotion correlation (`gen_ai.agent.version`, v1.40).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_agent_version: Option<String>,
     /// Conversation/session correlation id (`gen_ai.conversation.id`, v1.36).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_conversation_id: Option<String>,
+    /// `tracelane.agent.step_index` (RI-05 / M18) — the CALLER's own step
+    /// counter inside a multi-step agent loop. No OTel registry name exists
+    /// for this, hence `tracelane.*`. **SDK-attribute only**: the OTLP decoder
+    /// (`otlp/decode.rs`) is the only writer. The gateway-proxied chat /
+    /// embeddings / `/v1/messages` routes have no concept of an agent step and
+    /// never set this — `CallerIdentity` (`crates/gateway/src/server/spans.rs`)
+    /// has no header-reading precedent for a NUMERIC value (every existing
+    /// reader there produces a bounded STRING), so a
+    /// `x-tracelane-step-index` proxy header is NOT implemented here; §2.3 of
+    /// the spec allows it, this is the documented gap. Absent when not sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_agent_step_index: Option<u32>,
+    /// `tracelane.context.truncated` (RI-05 / M20) — the CLIENT's own signal
+    /// that it dropped context before making this call (e.g. a context-window
+    /// trim inside the caller's agent loop). **SDK-attribute only, and always
+    /// absent on a gateway-proxied span, by design, not because nobody wired
+    /// it**: the gateway itself never trims a caller's context, so it can
+    /// never truthfully assert this about its own request. The only other
+    /// response-side truncation signal is `length` inside
+    /// `gen_ai_response_finish_reasons` above (RI-05 M20's own note).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_context_truncated: Option<bool>,
 
     // Structured message capture (v1.37+, replaces deprecated per-message events).
     // Populated only when content capture is enabled (TRACELANE_TRACE_CONTENT);
@@ -216,6 +287,17 @@ pub struct SpanAttributes {
     pub tracelane_failover_activated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_failover_from: Option<String>,
+
+    /// `RI-05` M1 + M4 — the per-request dispatch ledger: same-provider
+    /// retries (`server/dispatch.rs::retry_loop`) followed by cross-provider
+    /// failover hops and skips (`server/chat.rs`'s failover loop), in the
+    /// order they happened. **ABSENT — not an empty vec — when the request
+    /// made exactly one clean attempt and never failed over**:
+    /// [`dispatch_attempts_worth_recording`] is the write rule (spec §2.1).
+    /// This is a PROXY-SIDE field only — no OTLP decoder arm exists or is
+    /// planned for it (an SDK cannot see the gateway's own retries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_dispatch_attempts: Option<Vec<DispatchAttempt>>,
 
     // Lethal trifecta taint attributes
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,6 +448,32 @@ pub struct SpanAttributes {
     /// backstop for a customer who puts an address in a tool name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_request_tool_names: Option<Vec<String>>,
+    /// RI-05 / M19: the CALLED tools' names, in call order, bounded the SAME
+    /// way as `tracelane_request_tool_names` above (`MAX_TOOL_NAMES` /
+    /// `MAX_TOOL_NAME_BYTES`, `crates/gateway/src/server/spans.rs`). Ungated
+    /// for the identical reason: a function name is developer-chosen, not
+    /// text the end user wrote. `None` when no tool was called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_response_tool_names: Option<Vec<String>>,
+    /// `OBS-50` (2026-09-20): the BYTE size of each called tool's arguments,
+    /// index-aligned with `tracelane_response_tool_names` — UTF-8 length of the
+    /// raw accumulated `arguments` text BEFORE any truncation. Ungated: a size
+    /// reveals nothing about content, and it is what the trace page shows for a
+    /// tenant whose content capture is off instead of the arguments themselves
+    /// ("212 B you chose not to keep" is honest; an empty cell is not). Same
+    /// 32-call cap as the names. Absent when no tool was called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_response_tool_arg_bytes: Option<Vec<u32>>,
+    /// `GWY-49`: the request carried `x-tracelane-zdr: required`. Present (true) only
+    /// then — absent means no constraint was asked for, never "not required".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_zdr_required: Option<bool>,
+    /// `GWY-49`: the providers that passed the ZDR check for this request — the
+    /// primary first, then the failover candidates the chain would have accepted.
+    /// Present only under the constraint; empty never (a refused request has an error
+    /// span with reason `zdr_unsatisfiable` instead).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_zdr_eligible_providers: Option<Vec<String>>,
     /// `blake3` over the SORTED per-tool `def_hash` values, where `def_hash` is
     /// `guardrail::capability::def_hash` — the SAME function R3 pins against, so a
     /// customer can join this span to `observed_tools.def_hash` and get "which
@@ -408,6 +516,103 @@ pub struct SpanAttributes {
     /// Catch-all for additional attributes
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
+}
+
+/// `RI-05` M1 + M4 — one element of a request's dispatch ledger: a
+/// same-provider retry attempt, a cross-provider failover hop that was
+/// DISPATCHED, or a failover candidate that was SKIPPED without ever being
+/// dispatched. See [`SpanAttributes::tracelane_dispatch_attempts`] for the
+/// field this lives on and the write rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DispatchAttempt {
+    /// 0-based position in the FULL per-request sequence — same-provider
+    /// retries, then failover hops/skips, in the order they happened. This is
+    /// NOT the local index `retry_loop` assigns within one dispatch call —
+    /// see [`extend_dispatch_attempts`], which renumbers on merge.
+    pub attempt: u32,
+    pub provider: String,
+    pub model: String,
+    /// A CLOSED set: `"ok"` | `"error"` | `"skipped"`. `"skipped"` is a
+    /// failover candidate that was never dispatched at all (an open circuit
+    /// breaker, a kill switch, no BYOK key for that provider, or an
+    /// unroutable model) — its `status` is always `None` and its `took_ms`
+    /// always `0` because nothing left the gateway.
+    pub outcome: String,
+    /// `ProviderHttpError.status` for an attempt that reached the upstream
+    /// and got a non-2xx answer. `None` for a transport failure, a clean
+    /// success, or a skipped candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// The upstream's OWN safe token
+    /// (`providers::safe_reason` / `providers::reason_from_body` — already
+    /// validated at the point `ProviderHttpError` was constructed) when it
+    /// supplied one; otherwise the gateway's five-class dispatch-failure
+    /// label (`provider_key_rejected` | `provider_rate_limited` |
+    /// `model_not_found` | `provider_request_rejected` |
+    /// `provider_unavailable` — `server/errors.rs::DispatchFailure::reason`);
+    /// otherwise, for a SKIPPED failover candidate, one of `no_byok_key` |
+    /// `breaker_open` | `killed` | `unroutable`.
+    ///
+    /// **NEVER the upstream error body.** `.claude/rules/security.md` bans a
+    /// provider error body here (it routinely echoes the credential) — and
+    /// `ProviderHttpError` does not even carry one, so there is no field this
+    /// code could read to violate that rule even by accident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Wall-clock milliseconds spent on this attempt. `0` for a skipped
+    /// candidate — nothing was dispatched.
+    pub took_ms: u32,
+}
+
+/// `RI-05` §5: a generous ceiling on how long
+/// [`SpanAttributes::tracelane_dispatch_attempts`] may grow.
+///
+/// The spec's own bound is `(1 + retries) × (1 + chain hops)` — ≤ 6 with
+/// every default — but `retries` is operator-configurable up to
+/// `failover::MAX_RETRIES` (5) and a `failover:` `chain:` may name any subset
+/// of the ~191-provider catalog, so a pathological `tracelane.yaml` could in
+/// principle ask for far more than 6 hops, each itself retried. This is a
+/// defensive cap on the LEDGER, not on dispatch behaviour: it never stops a
+/// real attempt from being made, it only stops recording one past this
+/// point — which is why [`extend_dispatch_attempts`] truncates silently
+/// rather than logging (a real request under any bound this spec actually
+/// asks for can never reach it).
+pub const MAX_DISPATCH_ATTEMPTS: usize = 64;
+
+/// Append `new_attempts` onto `ledger`, renumbering each element's `attempt`
+/// field to its position in the FULL merged sequence.
+///
+/// `retry_loop` numbers its own ledger locally (0, 1, … within that one
+/// dispatch call), which is the right answer only until a failover hop
+/// follows the primary — the caller (`server/chat.rs`) merges every piece
+/// (the primary's attempts, then each skipped or dispatched failover
+/// candidate) through this one function so the final `attempt` values are a
+/// single ascending sequence rather than several restarts at 0. Truncates at
+/// [`MAX_DISPATCH_ATTEMPTS`] rather than growing without bound.
+pub fn extend_dispatch_attempts(
+    ledger: &mut Vec<DispatchAttempt>,
+    new_attempts: Vec<DispatchAttempt>,
+) {
+    for mut a in new_attempts {
+        if ledger.len() >= MAX_DISPATCH_ATTEMPTS {
+            return;
+        }
+        a.attempt = ledger.len() as u32;
+        ledger.push(a);
+    }
+}
+
+/// Whether the ledger should be WRITTEN onto a span, per spec §2.1: a clean
+/// single attempt writes nothing at all — its absence, together with
+/// `gen_ai_response_id`, is what distinguishes a verified-clean span from a
+/// pre-`RI-05` one that never carried this field. Pure, so the write rule is
+/// testable without building a whole span.
+#[must_use]
+pub fn dispatch_attempts_worth_recording(ledger: &[DispatchAttempt]) -> bool {
+    // Anything that is not a single clean `ok` is worth keeping — including a
+    // lone `skipped` (unreachable from today's call graph, which only skips after
+    // a primary error, but a future path must not lose it silently).
+    ledger.len() > 1 || ledger.iter().any(|a| a.outcome != "ok")
 }
 
 /// Max stored length of a customer-supplied `business_reference` (unicode

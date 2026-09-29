@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * DeletePromptButton — per-row soft-delete on the /prompts list.
@@ -8,6 +9,7 @@
  * the inverse of authoring; the gateway archives it + stops serving it.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -29,9 +31,12 @@ export function DeletePromptButton({ name }: { name: string }) {
 		setBusy(true);
 		setErr(null);
 		try {
-			const res = await fetch(`/api/prompts/${encodeURIComponent(name)}`, {
-				method: "DELETE",
-			});
+			const res = await apiFetchRaw(
+				`/api/prompts/${encodeURIComponent(name)}`,
+				{
+					method: "DELETE",
+				},
+			);
 			if (!res.ok) {
 				const body = (await res.json().catch(() => ({}))) as { error?: string };
 				throw new Error(body.error ?? `delete failed (${res.status})`);
@@ -44,15 +49,16 @@ export function DeletePromptButton({ name }: { name: string }) {
 	}
 
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={onDelete}
 			disabled={busy}
 			aria-label={`Delete prompt ${name}`}
 			title={err ?? "Delete prompt"}
-			className="rounded-md border border-line px-2 py-1 text-xs font-medium text-ink-3 transition-colors hover:border-danger hover:text-danger-ink disabled:cursor-not-allowed disabled:opacity-40"
+			className="rounded-control border border-line px-2 py-1 text-xs font-medium text-ink-3 transition-colors hover:border-danger hover:text-danger-ink disabled:cursor-not-allowed disabled:opacity-40"
 		>
 			{busy ? "Deleting…" : "Delete"}
-		</button>
+		</Button>
 	);
 }

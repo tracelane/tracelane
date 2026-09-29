@@ -1,5 +1,6 @@
 "use client";
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
@@ -38,7 +39,9 @@ export function VerifyByTrace() {
 		async function poll() {
 			if (cancelled || done.current) return;
 			try {
-				const res = await fetch("/api/traces?limit=1", { cache: "no-store" });
+				const res = await apiFetchRaw("/api/traces?limit=1", {
+					cache: "no-store",
+				});
 				if (res.ok) {
 					const data = (await res.json()) as {
 						traces?: { trace_id: string }[];
@@ -83,7 +86,7 @@ export function VerifyByTrace() {
 
 	if (state === "found") {
 		return (
-			<div className="flex items-center gap-3 rounded-lg border border-seal-line bg-seal-soft px-4 py-3">
+			<div className="flex items-center gap-3 rounded-card border border-seal-line bg-seal-soft px-4 py-3">
 				<span aria-hidden className="text-seal-ink">
 					●
 				</span>
@@ -101,7 +104,7 @@ export function VerifyByTrace() {
 		return (
 			<div
 				role="alert"
-				className="rounded-lg border border-danger/40 bg-danger-soft px-4 py-3"
+				className="rounded-card border border-danger/40 bg-danger-soft px-4 py-3"
 			>
 				<p className="text-sm font-medium text-ink">
 					{errKind === "auth"
@@ -138,7 +141,7 @@ export function VerifyByTrace() {
 				Run the snippet above — the moment a span lands, this opens your trace.
 			</p>
 			{elapsed >= SLOW_AFTER_S && (
-				<div className="mt-2 rounded-md border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-ink-2">
+				<div className="mt-2 rounded-control border border-warn/30 bg-warn-soft px-3 py-2 text-xs text-ink-2">
 					<p className="font-medium text-warn-ink">
 						Nothing yet after {SLOW_AFTER_S}s? Check:
 					</p>

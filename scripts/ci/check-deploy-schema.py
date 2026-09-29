@@ -46,6 +46,18 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ENTITLEMENTS = ROOT / "crates/gateway/src/entitlement_cache.rs"
 CH_MIGRATIONS = ROOT / "infra/dev/clickhouse/migrations"
+# ADR-078 (B, 2026-09-20): the Postgres half used to check ONLY the two entitlement
+# tables' f_* columns. The ledger now lives in Postgres, so a gateway deployed before
+# migration 0047 would refuse every append (503 audit_unavailable — fail-closed, but an
+# outage). Every table the gateway's `db/` modules name that a Postgres migration defines
+# must EXIST on the target. Existence, not columns: the migrations are hand-written and a
+# renamed column is a different class (the entitlement columns keep their own check).
+PG_MIGRATIONS = ROOT / "apps/web/db/migrations"
+PG_SOURCES = ROOT / "crates/gateway/src/db"
+_PG_CREATE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?\"?(\w+)\"?", re.IGNORECASE
+)
+_PG_REF = re.compile(r"\b(?:FROM|INTO|UPDATE)\s+(\w+)", re.IGNORECASE)
 
 # `Self::Datasets => "f_datasets",` — the `column()` mapping IS the authoritative list of
 # what the resolver selects. Deriving the requirement from the enum rather than from the
@@ -60,6 +72,16 @@ _COLUMN_ARM = re.compile(r'Self::\w+\s*=>\s*"(f_\w+)"')
 _SELECTED_COL = re.compile(
     r"\bAS\s+(f_\w+)|^\s*(?:COALESCE\()?(?:pe\.|we\.)?(f_\w+)\s*,", re.MULTILINE
 )
+# Flags the resolver actually overlays from `workspace_entitlements`, i.e. it writes
+# `we.f_x` somewhere. Added 2026-09-23 for the FIRST plan-only `f_*` flag,
+# `f_cache_control` (P0-4): the resolver reads it as `pe.f_cache_control` with NO
+# COALESCE, exactly like `pe.unlimited_seats` and the price columns — which this guard
+# never noticed only because they are not `f_*` and the regex above cannot see them.
+# Requiring a plan-only flag on `workspace_entitlements` refused a deploy for a column
+# the resolve never reads there, and the refusal text ("fails the resolve on EVERY
+# request") did not apply. This narrows the WORKSPACE side only; `plan_entitlements`
+# still requires every selected flag, and an overlaid flag still requires BOTH.
+_WE_OVERLAID_COL = re.compile(r"\bwe\.(f_\w+)")
 _CH_FROM = re.compile(r"\bFROM\s+(?:tracelane\.)?(\w+)", re.IGNORECASE)
 _CH_INSERT = re.compile(
     r'(?:INSERT\s+INTO\s+|\.insert\(")(?:tracelane\.)?(\w+)', re.IGNORECASE
@@ -143,6 +165,7 @@ def expected() -> dict:
         g for t in _SELECTED_COL.findall(src) for g in t if g
     }
     cols = sorted(cols)
+    we_cols = sorted(set(_WE_OVERLAID_COL.findall(src)) & set(cols))
     if not cols:
         # A vocabulary that reads as empty would make this guard certify everything.
         # An empty result here is a parse failure, not a clean bill of health.
@@ -214,9 +237,29 @@ def expected() -> dict:
         )
         raise SystemExit(2)
 
+    # Postgres tables the gateway's db/ modules touch AND a migration defines.
+    pg_defined: dict[str, str] = {}
+    for f in sorted(PG_MIGRATIONS.glob("*.sql")):
+        for t in _PG_CREATE.findall(f.read_text(encoding="utf-8")):
+            pg_defined.setdefault(t.lower(), f.name)
+    pg_referenced: set[str] = set()
+    for rs in PG_SOURCES.rglob("*.rs"):
+        txt = rs.read_text(encoding="utf-8", errors="replace")
+        pg_referenced |= {t.lower() for t in _PG_REF.findall(txt)}
+    pg_required = {t: f for t, f in pg_defined.items() if t in pg_referenced}
+    if not pg_required:
+        print(
+            "✗ CANNOT DETERMINE — no migration-defined Postgres table is referenced by "
+            f"any source under {PG_SOURCES}; the scan is broken.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     return {
         "postgres_columns": cols,
+        "postgres_workspace_columns": we_cols,
         "postgres_tables": ["plan_entitlements", "workspace_entitlements"],
+        "postgres_required_tables": dict(sorted(pg_required.items())),
         "clickhouse_tables": dict(sorted(tables.items())),
         "clickhouse_columns": {k: sorted(v) for k, v in sorted(ch_cols.items())},
     }
@@ -233,7 +276,16 @@ def compare(want: dict, have: dict) -> int:
         return 2
     for tbl in want["postgres_tables"]:
         present = set(have_pg.get(tbl, []))
-        missing = [c for c in want["postgres_columns"] if c not in present]
+        # `workspace_entitlements` is required to carry only the flags the resolver
+        # OVERLAYS from it (`we.f_x`). A plan-only flag lives on `plan_entitlements`
+        # alone and is not a gap there. Falls back to the full set when the key is
+        # absent, so an older target report cannot silently widen the exemption.
+        required = (
+            want.get("postgres_workspace_columns", want["postgres_columns"])
+            if tbl == "workspace_entitlements"
+            else want["postgres_columns"]
+        )
+        missing = [c for c in required if c not in present]
         if missing:
             problems.append(
                 f"  POSTGRES {tbl}: missing {', '.join(missing)}\n"
@@ -242,6 +294,35 @@ def compare(want: dict, have: dict) -> int:
                 f'    apply:  psql "$POSTGRES_DIRECT_URL" -v ON_ERROR_STOP=1 \\\n'
                 f"              -f apps/web/db/migrations/<the migration that adds them>.sql"
             )
+
+    # ADR-078 (B): every Postgres table the db/ modules name must exist on the target.
+    # `have_pg` maps table -> columns for EVERY public table the deploy read (a table
+    # with no columns listed does not exist). An older deploy script that reported only
+    # the two entitlement tables would make every other table look absent — so a
+    # requirement outside that pair is checked only when the report is clearly wide.
+    want_tables = want.get("postgres_required_tables") or {}
+    if want_tables:
+        wide = len(have_pg) > 2
+        if not wide:
+            print(
+                "✗ CANNOT DETERMINE — the target's postgres_columns names only "
+                f"{len(have_pg)} table(s); ADR-078 needs the whole public catalog to "
+                "check the ledger tables exist. Update scripts/deploy/gateway.sh's read."
+            )
+            return 2
+        missing_pg = [t for t in want_tables if t not in have_pg]
+        if missing_pg:
+            by_file: dict[str, list[str]] = {}
+            for t in missing_pg:
+                by_file.setdefault(want_tables[t], []).append(t)
+            for f, ts in sorted(by_file.items()):
+                problems.append(
+                    f"  POSTGRES: {len(ts)} table(s) from {f} are absent — {', '.join(sorted(ts))}\n"
+                    f"    the gateway's db/ modules read or write them; a binary deployed\n"
+                    f"    without them fails at the query (for the ledger: EVERY append\n"
+                    f"    refuses, 503 audit_unavailable).\n"
+                    f'    apply:  psql "$POSTGRES_DIRECT_URL" -v ON_ERROR_STOP=1 -f apps/web/db/migrations/{f}'
+                )
 
     have_ch = have.get("clickhouse_tables")
     if have_ch is None:
@@ -377,6 +458,33 @@ def selftest() -> int:
         "a target that reported NO clickhouse schema is rc=2, not 0",
         want,
         {"postgres_columns": full["postgres_columns"]},
+        2,
+    )
+
+    # ── ADR-078 (B): a REQUIRED Postgres table must EXIST on the target ─────────
+    want_pg = json.loads(json.dumps(want))
+    want_pg["postgres_required_tables"] = {
+        "audit_log_rows": "0047_adr078_ledger_canonical_pg.sql",
+        "tenants": "0000_initial_baseline.sql",
+    }
+    wide = json.loads(json.dumps(full))
+    wide["postgres_columns"]["tenants"] = ["id"]
+    wide["postgres_columns"]["audit_log_rows"] = ["tenant_id", "seq"]
+    case(
+        "a wide catalog holding every required Postgres table passes", want_pg, wide, 0
+    )
+    no_ledger = json.loads(json.dumps(wide))
+    del no_ledger["postgres_columns"]["audit_log_rows"]
+    case(
+        "a MISSING required Postgres table REFUSES (the ledger deployed before 0047)",
+        want_pg,
+        no_ledger,
+        1,
+    )
+    case(
+        "a NARROW catalog (only the two entitlement tables) is rc=2, not a pass",
+        want_pg,
+        full,
         2,
     )
 

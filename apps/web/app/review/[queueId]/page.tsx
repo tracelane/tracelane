@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * `EVL-29` — the reviewer, for one queue.
  *
@@ -77,7 +78,7 @@ export default async function ReviewQueuePage(ctx: {
 
 	if (res.kind === "locked") {
 		return (
-			<main className="p-8">
+			<div className="p-8">
 				<EmptyState
 					title="Review queues aren't included in this plan"
 					description="A reviewer answers a rubric once and that answer becomes a graded test case in the same action."
@@ -87,12 +88,12 @@ export default async function ReviewQueuePage(ctx: {
 						See plans →
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 	if (res.kind === "missing") {
 		return (
-			<main className="p-8">
+			<div className="p-8">
 				<EmptyState
 					title="This queue is not available"
 					description="It may have been archived, or it belongs to another workspace."
@@ -102,25 +103,25 @@ export default async function ReviewQueuePage(ctx: {
 						All review queues →
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 	if (res.kind === "failed") {
 		return (
-			<main className="p-8">
+			<div className="p-8">
 				<EmptyState
 					title="We could not load this queue"
 					description="This is a read failure, not an empty queue — nothing has been reviewed or lost. Retry in a moment."
 				/>
-			</main>
+			</div>
 		);
 	}
 
 	const { queue, items } = res;
 	return (
-		<main className="p-8 space-y-6">
+		<div className="p-8 space-y-6">
 			<div>
-				<h1 className="text-2xl font-semibold">{queue.name}</h1>
+				<PageHeader title={queue.name} />
 				<p className="text-sm opacity-70">
 					Answers to <code>{queue.expected_output_field}</code> become the
 					expected output of a new case in this queue&rsquo;s dataset.
@@ -132,6 +133,6 @@ export default async function ReviewQueuePage(ctx: {
 				scanTruncated={items.scan_truncated}
 				scanExhausted={items.scan_exhausted}
 			/>
-		</main>
+		</div>
 	);
 }

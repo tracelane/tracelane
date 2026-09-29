@@ -109,6 +109,26 @@ describe("/api/settings/api-keys", () => {
 		expect(eqCalls[0]?.[1]).toBe("org_SESSION");
 	});
 
+	// SET-38 B3: without the cadence the Limits cell labels a daily key "/mo", and
+	// an edit form that changes the cadence cannot show what it is changing.
+	it("GET selects the budget cadence and the velocity breaker from the real columns", async () => {
+		const { apiKeys } = await import("@/db/schema");
+		const m = setDb([
+			[{ id: "tenant-db-uuid" }],
+			[{ id: "k1", budgetReset: "daily", velocityBreaker: true }],
+		]);
+		await GET(req({}));
+		const listing = m.db.select.mock.calls.at(-1)?.[0] as Record<
+			string,
+			unknown
+		>;
+		expect(listing.budgetReset).toBe(apiKeys.budgetReset);
+		expect(listing.velocityBreaker).toBe(apiKeys.velocityBreaker);
+		// Never a secret-derived column in the list.
+		expect(Object.keys(listing)).not.toContain("lookupHash");
+		expect(Object.keys(listing)).not.toContain("argon2idPhc");
+	});
+
 	it("REJECT: POST with blank name → 422, never calls the gateway", async () => {
 		setDb([[{ id: "tenant-db-uuid" }]]);
 		const res = await POST(req({ name: "  " }));

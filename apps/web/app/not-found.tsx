@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * Root 404 — rendered for any unmatched URL and for any `notFound()` call.
  * Lives inside the dashboard shell (the sidebar stays) and always offers a way
@@ -13,15 +14,15 @@ import Link from "next/link";
 
 export default function NotFound() {
 	return (
-		<div className="flex min-h-[70vh] flex-1 items-center justify-center p-6">
-			<div className="w-full max-w-md text-center">
+		<div className="space-y-6">
+			<div className="w-full max-w-md text-left">
 				{/* `--ink-3`, not `--action-ink`. The numeral is decoration — not an
 				    action and not a datum — so under "colour is data" it takes the
 				    quietest tone in the ramp and the sentence beneath it leads. */}
 				<p className="font-mono text-6xl font-semibold leading-none text-ink-3">
 					404
 				</p>
-				<h1 className="t-h1 mt-3">This page doesn&apos;t exist</h1>
+				<PageHeader title={<>This page doesn&apos;t exist</>} />
 				<p className="mt-1.5 text-sm text-ink-2">
 					The page you&apos;re looking for moved or never existed. Check the
 					URL, or head back to your traces.
@@ -37,7 +38,7 @@ export default function NotFound() {
 						// with no visible button under it. Button.tsx made this exact swap for the
 						// primitive; these copies were missed. `--selected` flips per theme: 17.93:1 in
 						// light, 17.71:1 in dark, label included.
-						className="bg-selected text-selected-on hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-sm font-medium"
+						className="bg-selected text-selected-on hover:opacity-90 inline-flex h-9 items-center rounded-control px-4 text-sm font-medium"
 					>
 						Back to traces
 					</Link>

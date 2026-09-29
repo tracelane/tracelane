@@ -1,4 +1,7 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * TeamManager — org members + pending invitations (IDENTITY_TEAM_SPEC §1–§3).
@@ -12,7 +15,7 @@
  */
 
 import { Modal } from "@/components/Modal";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, apiFetchRaw } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Skeleton } from "@tracelanedev/ui";
@@ -51,6 +54,12 @@ const ERROR_COPY: Record<string, string> = {
 	already_member: "That person is already on the team.",
 	invalid_email: "That does not look like a valid email address.",
 	owner_required: "Only an owner can invite team members.",
+	role_forbidden:
+		"Only a current owner can change team members. Refresh the team to see your access.",
+	last_owner_protected:
+		"Keep at least one owner. Promote another member before removing or demoting this owner.",
+	membership_change_unavailable:
+		"Could not confirm the membership change. Refresh the team before retrying.",
 };
 
 /**
@@ -92,7 +101,7 @@ function isSeatCapError(e: unknown): boolean {
 }
 
 async function sendInvite(input: { email: string; role: Role }): Promise<void> {
-	const res = await fetch("/api/settings/team/invite", {
+	const res = await apiFetchRaw("/api/settings/team/invite", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(input),
@@ -101,7 +110,7 @@ async function sendInvite(input: { email: string; role: Role }): Promise<void> {
 }
 
 async function removeMember(membershipId: string): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/team/${encodeURIComponent(membershipId)}`,
 		{
 			method: "DELETE",
@@ -114,7 +123,7 @@ async function changeRole(input: {
 	membershipId: string;
 	role: Role;
 }): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/team/${encodeURIComponent(input.membershipId)}`,
 		{
 			method: "PATCH",
@@ -126,7 +135,7 @@ async function changeRole(input: {
 }
 
 async function revokeInvite(id: string): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/team/invitations/${encodeURIComponent(id)}`,
 		{
 			method: "DELETE",
@@ -136,7 +145,7 @@ async function revokeInvite(id: string): Promise<void> {
 }
 
 async function resendInvite(id: string): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/team/invitations/${encodeURIComponent(id)}/resend`,
 		{ method: "POST" },
 	);
@@ -186,13 +195,14 @@ function InviteModal({
 							An invitation email has been dispatched to{" "}
 							<span className="font-mono text-ink">{email}</span>.
 						</p>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={onClose}
-							className="w-full rounded-lg bg-surface-2 py-2 text-sm text-ink hover:bg-surface-3 transition-colors"
+							className="w-full rounded-control bg-surface-2 py-2 text-sm text-ink hover:bg-surface-3 transition-colors"
 						>
 							Done
-						</button>
+						</Button>
 					</>
 				) : (
 					<>
@@ -208,7 +218,7 @@ function InviteModal({
 							value={email}
 							onChange={(e) => setEmail(e.target.value)}
 							placeholder="colleague@company.com"
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-4"
+							className="w-full rounded-control bg-surface-2 border border-line px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-4"
 						/>
 						<label
 							htmlFor="team-invite-role"
@@ -220,7 +230,7 @@ function InviteModal({
 							id="team-invite-role"
 							value={role}
 							onChange={(e) => setRole(e.target.value as Role)}
-							className="w-full rounded-sm bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-1"
+							className="w-full rounded-control bg-surface-2 border border-line px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring mb-1"
 						>
 							<option value="member">Member — full product access</option>
 							<option value="viewer">Viewer — read-only</option>
@@ -247,23 +257,25 @@ function InviteModal({
 							</div>
 						)}
 						<div className="flex gap-2">
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								onClick={onClose}
-								className="flex-1 rounded-lg border border-line py-2 text-sm text-ink-2 hover:bg-surface-2 transition-colors"
+								className="flex-1 rounded-control border border-line py-2 text-sm text-ink-2 hover:bg-surface-2 transition-colors"
 							>
 								Cancel
-							</button>
-							<button
+							</Button>
+							<Button
+								variant="bare"
 								type="button"
 								disabled={!email.includes("@") || mutation.isPending}
 								onClick={() =>
 									mutation.mutate({ email: email.trim().toLowerCase(), role })
 								}
-								className="flex-1 rounded-lg bg-action py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+								className="flex-1 rounded-control bg-action py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 							>
 								{mutation.isPending ? "Sending…" : "Send invite"}
-							</button>
+							</Button>
 						</div>
 					</>
 				)}
@@ -340,29 +352,43 @@ export function TeamManager({
 	return (
 		<div className="space-y-4">
 			{notice && (
-				<output className="block rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ok-ink">
+				<output className="block rounded-card border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ok-ink">
 					✓ {notice}
 				</output>
 			)}
 			<div className="flex items-center justify-between gap-3">
-				<p className="text-xs text-ink-2">
-					{membersMax < 0
-						? `${seatsUsed} members · unlimited`
-						: `${seatsUsed} / ${membersMax} seats used`}
-				</p>
+				{/* Hide the count while the list is in error: `seatsUsed` is
+				    computed from `members`/`pending`, both `undefined` on a
+				    failed load, so this would otherwise read "0 members ·
+				    unlimited" right beside the error saying the count is
+				    unknown (item 12). */}
+				{!error && (
+					<p className="text-xs text-ink-2">
+						{membersMax < 0
+							? `${seatsUsed} members · unlimited`
+							: `${seatsUsed} / ${membersMax} seats used`}
+					</p>
+				)}
 				{canManage &&
 					(atLimit ? (
 						<span className="text-xs text-warn-ink">
-							Seat limit reached — upgrade to add more
+							Seat limit reached —{" "}
+							<Link
+								href="/settings/billing"
+								className="font-medium underline underline-offset-2 hover:text-warn-ink/80"
+							>
+								upgrade to add more
+							</Link>
 						</span>
 					) : (
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setShowInvite(true)}
-							className="rounded-lg bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors"
+							className="rounded-control bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:bg-action/90 transition-colors"
 						>
 							+ Invite member
-						</button>
+						</Button>
 					))}
 			</div>
 
@@ -377,31 +403,31 @@ export function TeamManager({
 			)}
 
 			{members && members.length > 0 && (
-				<div className="overflow-x-auto rounded-lg border border-line">
-					<table className="w-full text-sm">
-						<thead className="bg-surface">
-							<tr>
-								<th className="px-3 py-1.5 text-left t-metric-label">Member</th>
-								<th className="px-3 py-1.5 text-left t-metric-label">Role</th>
-								<th className="px-3 py-1.5 text-left t-metric-label">Joined</th>
-								<th className="px-3 py-1.5 text-right t-metric-label">
+				<div className="overflow-x-auto rounded-card border border-line">
+					<Table className="w-full text-sm">
+						<THead className="bg-surface">
+							<TR>
+								<TH className="px-3 py-1.5 text-left t-metric-label">Member</TH>
+								<TH className="px-3 py-1.5 text-left t-metric-label">Role</TH>
+								<TH className="px-3 py-1.5 text-left t-metric-label">Joined</TH>
+								<TH className="px-3 py-1.5 text-right t-metric-label">
 									<span className="sr-only">Actions</span>
-								</th>
-							</tr>
-						</thead>
-						<tbody className="divide-y divide-line">
+								</TH>
+							</TR>
+						</THead>
+						<TBody className="divide-y divide-line">
 							{members.map((m) => {
 								const isSelf = m.userId === currentUserId;
 								return (
-									<tr
+									<TR
 										key={m.id}
 										className="hover:bg-surface-hover transition-colors"
 									>
-										<td className="px-3 py-2">
+										<TD className="px-3 py-2">
 											<p className="text-xs font-medium text-ink">{m.name}</p>
 											<p className="text-xs text-ink-2 font-mono">{m.email}</p>
-										</td>
-										<td className="px-3 py-2">
+										</TD>
+										<TD className="px-3 py-2">
 											{canManage && !isSelf ? (
 												<div className="flex items-center gap-2">
 													<select
@@ -444,13 +470,14 @@ export function TeamManager({
 											) : (
 												<RoleBadge role={m.role} />
 											)}
-										</td>
-										<td className="px-3 py-2 text-xs text-ink-2">
+										</TD>
+										<TD className="px-3 py-2 text-xs text-ink-2">
 											{absoluteDate(m.joinedAt)}
-										</td>
-										<td className="px-3 py-2 text-right">
+										</TD>
+										<TD className="px-3 py-2 text-right">
 											{canManage && !isSelf && (
-												<button
+												<Button
+													variant="bare"
 													type="button"
 													disabled={remove.isPending}
 													onClick={() => {
@@ -465,14 +492,14 @@ export function TeamManager({
 													className="text-xs text-ink-2 transition-colors hover:text-danger-ink disabled:opacity-40"
 												>
 													Remove
-												</button>
+												</Button>
 											)}
-										</td>
-									</tr>
+										</TD>
+									</TR>
 								);
 							})}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			)}
 
@@ -492,49 +519,51 @@ export function TeamManager({
 			{pending && pending.length > 0 && (
 				<div className="space-y-2">
 					<p className="text-xs font-medium text-ink-2">Pending invitations</p>
-					<div className="overflow-x-auto rounded-lg border border-line">
-						<table className="w-full text-sm">
-							<tbody className="divide-y divide-line">
+					<div className="overflow-x-auto rounded-card border border-line">
+						<Table className="w-full text-sm">
+							<TBody className="divide-y divide-line">
 								{pending.map((p) => (
-									<tr
+									<TR
 										key={p.id}
 										className="hover:bg-surface-hover transition-colors"
 									>
-										<td className="px-3 py-2">
+										<TD className="px-3 py-2">
 											<p className="text-xs font-mono text-ink">{p.email}</p>
-										</td>
-										<td className="px-3 py-2">
+										</TD>
+										<TD className="px-3 py-2">
 											<RoleBadge role={p.role} />
-										</td>
-										<td className="px-3 py-2 text-xs text-ink-2">
+										</TD>
+										<TD className="px-3 py-2 text-xs text-ink-2">
 											invited {absoluteDate(p.invitedAt)}
-										</td>
-										<td className="px-3 py-2 text-right space-x-3">
+										</TD>
+										<TD className="px-3 py-2 text-right space-x-3">
 											{canManage && (
 												<>
-													<button
+													<Button
+														variant="bare"
 														type="button"
 														disabled={resend.isPending}
 														onClick={() => resend.mutate(p.id)}
 														className="text-xs text-ink-2 transition-colors hover:text-ink disabled:opacity-40"
 													>
 														Resend
-													</button>
-													<button
+													</Button>
+													<Button
+														variant="bare"
 														type="button"
 														disabled={revoke.isPending}
 														onClick={() => revoke.mutate(p.id)}
 														className="text-xs text-ink-2 transition-colors hover:text-danger-ink disabled:opacity-40"
 													>
 														Revoke
-													</button>
+													</Button>
 												</>
 											)}
-										</td>
-									</tr>
+										</TD>
+									</TR>
 								))}
-							</tbody>
-						</table>
+							</TBody>
+						</Table>
 					</div>
 				</div>
 			)}

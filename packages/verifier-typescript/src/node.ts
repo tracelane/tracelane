@@ -5,6 +5,9 @@ import {
 	verifyLedgerText,
 } from "./index.js";
 
+/** AUD-29 — re-exported so the CLI's `/node` import sees the pinned platform key. */
+export { TRACELANE_PLATFORM_PUBKEY_B64 } from "./index.js";
+
 /**
  * Verify an audit ledger from a FILE path (Node only). The package root
  * (`@tracelanedev/audit-verifier`) stays free of `node:fs` so `verifyLedgerText`

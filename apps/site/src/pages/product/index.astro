@@ -1,0 +1,135 @@
+---
+/**
+ * /product — the four parts of the recorder on ONE page (SITE-04, founder 2026-09-29:
+ * "too many sub-pages, include them in same page"). Supersedes the 2026-09-27 hub +
+ * four /product/<section> pages; those paths now 301 to `/product#<section>`
+ * (`functions/api/notify.ts` GONE_TO). ALL copy lives in src/data/product-data.ts.
+ */
+import Base from "../../layouts/Base.astro";
+import ProductDiagram from "../../components/ProductDiagram.astro";
+import { SECTIONS } from "../../data/product-data.ts";
+const total = SECTIONS.reduce((n, s) => n + s.features.length, 0);
+---
+
+<Base
+  title="Product — Tracelane"
+  description="The flight recorder for AI agents: a gateway, observability, a tamper-evident audit ledger and evals — what is built in each, today."
+  canonical="/product"
+>
+  <section class="panel hero-band px-hero">
+    <p class="eyebrow">product</p>
+    <h1 class="display-lg mt-5">The flight recorder for AI agents,<br class="hidden sm:block" /> in four parts.</h1>
+    <p class="lede mt-5">Route every call, see what your agents did, prove it to a third party, and ship changes you can defend. {total} capabilities you can use today.</p>
+    <div class="px-actions mt-8">
+      <a href="https://app.tracelane.dev/sign-in" class="btn-primary">Start free <span aria-hidden="true">→</span></a>
+      <a href="https://docs.tracelane.dev" class="btn-secondary" rel="noopener">Read the docs</a>
+    </div>
+  </section>
+
+  <nav class="px-nav" aria-label="Product sections">
+    <div class="panel px-nav-inner">
+      {SECTIONS.map((s) => (
+        <a href={`#${s.slug}`} class="px-nav-link">
+          {s.name}<span class="px-nav-count">{s.features.length}</span>
+        </a>
+      ))}
+    </div>
+  </nav>
+
+  {SECTIONS.map((section) => {
+    const proven = section.features.filter((f) => f.proven).length;
+    return (
+      <section class="panel px-section" id={section.slug} aria-labelledby={`${section.slug}-h`}>
+        <div class="px-section-grid">
+          <div>
+            <p class="eyebrow">{section.name.toLowerCase()}</p>
+            <h2 class="display-md mt-4" id={`${section.slug}-h`}>{section.headline}</h2>
+            <p class="lede mt-4">{section.lede}</p>
+            <p class="px-why mt-5">{section.why}</p>
+            <p class="px-doc mt-5"><a class="link-accent" href={section.doc} rel="noopener">{section.name} docs →</a></p>
+          </div>
+          <div class="glass px-visual">
+            <ProductDiagram kind={section.slug} />
+            <div class="px-stat">
+              <span class="px-stat-value">{section.stat.value}</span>
+              <span class="px-stat-label">{section.stat.label}</span>
+              <span class="px-stat-source">{section.stat.source}</span>
+            </div>
+          </div>
+        </div>
+        <p class="px-count mt-10">{section.features.length} capabilities · {proven} proven on production</p>
+        <div class="px-grid mt-4 cards-hover">
+          {section.features.map((f) => (
+            <article class="glass px-card">
+              <div class="px-card-title-row">
+                <h3 class="px-card-title">{f.title}</h3>
+                {f.proven && (
+                  <span class="px-proven" aria-label="proven on production" title="Proven on production">proven</span>
+                )}
+              </div>
+              <p class="card-body">{f.use}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+    );
+  })}
+
+  <section class="panel px-cta" aria-label="Get started">
+    <div class="px-cta-inner">
+      <a href="https://app.tracelane.dev/sign-in" class="btn-primary">Start free <span aria-hidden="true">→</span></a>
+      <a href="https://docs.tracelane.dev" class="btn-secondary" rel="noopener">Read the docs</a>
+      <p class="card-body">Everything shipped, dated and labelled: <a class="link-accent" href="/changelog">the changelog</a>.</p>
+    </div>
+  </section>
+</Base>
+
+<style>
+  .px-hero { padding-top: clamp(3rem, 6vw, 5rem); }
+  .px-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+  /* Sticky in-page nav, directly under the 5rem (4.5rem below lg) site header. */
+  .px-nav { position: sticky; top: 5rem; z-index: 20; background: var(--surface); border-bottom: 1px solid var(--line); }
+  @media (max-width: 1023px) { .px-nav { top: 4.5rem; } }
+  .px-nav-inner { display: flex; gap: 0.25rem; overflow-x: auto; padding-block: 0; scrollbar-width: none; }
+  .px-nav-link { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.9rem 0.85rem; font-size: 0.9375rem; font-weight: 500; color: var(--ink-2); text-decoration: none; white-space: nowrap; box-shadow: inset 0 -2px 0 transparent; }
+  .px-nav-link:hover, .px-nav-link[aria-current="true"] { color: var(--ink); box-shadow: inset 0 -2px 0 var(--action); }
+  .px-nav-count { font: 500 0.7rem var(--font-mono); color: var(--ink-3); }
+  /* Anchor jumps land below the header + the sticky nav. */
+  .px-section { scroll-margin-top: 8.5rem; padding-block: clamp(3rem, 6vw, 4.5rem); border-bottom: 1px solid var(--line); }
+  .px-section-grid { display: grid; gap: clamp(2rem, 4vw, 3.5rem); align-items: center; }
+  @media (min-width: 1024px) { .px-section-grid { grid-template-columns: 1.05fr 1fr; } }
+  .px-why { color: var(--ink-2); font-size: var(--text-sm); border-left: 2px solid var(--action); padding-left: 0.875rem; }
+  .px-doc { font-size: var(--text-sm); }
+  .px-visual { padding: clamp(1rem, 2.5vw, 1.75rem); display: grid; gap: 1.25rem; }
+  .px-stat { display: grid; gap: 0.15rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+  .px-stat-value { font-size: clamp(1.5rem, 2.6vw, 2rem); font-weight: 600; letter-spacing: -0.02em; color: var(--ink); }
+  .px-stat-label { color: var(--ink); font-size: var(--text-sm); }
+  .px-stat-source { color: var(--ink-3); font-size: 0.75rem; }
+  .px-count { font: 500 0.75rem var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); }
+  .px-grid { display: grid; gap: 0.875rem; grid-template-columns: 1fr; }
+  @media (min-width: 640px) { .px-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (min-width: 1140px) { .px-grid { grid-template-columns: repeat(4, 1fr); } }
+  .px-card { padding: 1.25rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  .px-card-title-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .px-card-title { font-weight: 600; font-size: 1rem; color: var(--ink); }
+  .px-proven { font: 500 0.68rem var(--font-mono); color: var(--action-ink); border: 1px solid var(--action-ink); padding: 0.05rem 0.45rem; }
+  .px-cta { padding-top: clamp(2rem, 4vw, 3rem); }
+  .px-cta-inner { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1rem; }
+</style>
+
+<script>
+  // Mark the section in view in the sticky nav. Progressive: the links work without it.
+  const links = new Map(
+    [...document.querySelectorAll<HTMLAnchorElement>(".px-nav-link")].map((a) => [a.hash.slice(1), a]),
+  );
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        links.forEach((a, id) => a.setAttribute("aria-current", String(id === e.target.id)));
+      }
+    },
+    { rootMargin: "-40% 0px -55% 0px" },
+  );
+  document.querySelectorAll(".px-section").forEach((s) => io.observe(s));
+</script>

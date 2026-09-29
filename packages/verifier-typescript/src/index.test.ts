@@ -13,6 +13,7 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { describe, expect, it } from "vitest";
 import {
 	type VerifyReport,
+	countAnchorCoverage,
 	genesisV2,
 	rowHashV2,
 	verifyChain,
@@ -118,9 +119,66 @@ function emptyReport(): VerifyReport {
 		strip_detected: false,
 		verified_from_seq: 0,
 		trust_established: true,
+		rows_uncovered_by_anchors: 0,
+		rows_unanchored_tail: 0,
+		platform_signed_batches: 0,
+		platform_signed_ranges: [],
 		errors: [],
 	};
 }
+
+describe("B-483 anchor coverage (mirrors the Rust verifier)", () => {
+	const T = "00000000-0000-0000-0000-00000000000a";
+	const rows = (n: number) =>
+		Array.from({ length: n }, (_, seq) => ({ tenant_id: T, seq }));
+	const anchor = (lo: number, hi: number) => ({
+		tenant_id: T,
+		batch_start_seq: lo,
+		batch_end_seq: hi,
+	});
+	it("counts a hole below the watermark and names its range", () => {
+		const report = emptyReport();
+		countAnchorCoverage(report, rows(300), [anchor(0, 99), anchor(200, 299)]);
+		expect(report.rows_uncovered_by_anchors).toBe(100);
+		expect(report.rows_unanchored_tail).toBe(0);
+		const gap = report.errors.find((e) => e.kind === "anchor_coverage_gap");
+		expect(gap?.seq).toBe(100);
+		expect(gap?.detail).toContain("100..199 (100 rows)");
+	});
+	it("a windowed view (ADR-070) never counts rows below its root as a hole", () => {
+		const report = emptyReport();
+		report.verified_from_seq = 100;
+		const windowRows = Array.from({ length: 300 }, (_, i) => ({
+			tenant_id: T,
+			seq: 50 + i,
+		}));
+		countAnchorCoverage(report, windowRows, [
+			anchor(100, 199),
+			anchor(200, 299),
+		]);
+		expect(report.rows_uncovered_by_anchors).toBe(0);
+		expect(report.rows_unanchored_tail).toBe(50);
+		expect(report.errors).toEqual([]);
+		// The same rows on a genesis-rooted claim ARE a hole.
+		const genesis = emptyReport();
+		countAnchorCoverage(genesis, windowRows, [
+			anchor(100, 199),
+			anchor(200, 299),
+		]);
+		expect(genesis.rows_uncovered_by_anchors).toBe(50);
+	});
+	it("a filled chain has no hole; rows past the last anchor are the tail", () => {
+		const report = emptyReport();
+		countAnchorCoverage(report, rows(350), [
+			anchor(0, 99),
+			anchor(100, 199),
+			anchor(200, 299),
+		]);
+		expect(report.rows_uncovered_by_anchors).toBe(0);
+		expect(report.rows_unanchored_tail).toBe(50);
+		expect(report.errors).toEqual([]);
+	});
+});
 
 function windowedRows(): ChainRows {
 	const rows = readFileSync(vectorPath("good.ndjson"), "utf-8")

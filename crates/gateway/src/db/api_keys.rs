@@ -200,6 +200,47 @@ pub struct KeyAuth {
     /// BILL-01 A3 — this key's budget reset cadence (`api_keys.budget_reset`).
     /// `Monthly` for every key minted before A3.
     pub budget_reset: tracelane_shared::spend::BudgetReset,
+    /// B-568 I1: which branch answered. Carries no secret and changes nothing
+    /// about the grant — it exists so the slow-request line can say `auth=cold`
+    /// and the span can say `tracelane_gateway_cold_start`.
+    pub path: LookupPath,
+}
+
+/// Which branch of [`lookup_tenant_by_key_body_at`] served a successful lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupPath {
+    /// The positive cache — no I/O.
+    Warm,
+    /// The last-known answer past the TTL, re-checked OFF the request path.
+    Stale,
+    /// A control-plane round trip (pool checkout, SELECT, Argon2id verify).
+    Cold,
+}
+
+impl LookupPath {
+    /// The `auth=` label on the slow-request line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Stale => "stale",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// `(hits, misses, stale_served, negative_hits)` since boot — `/health`'s
+/// `auth_cache` object (B-568 I6). A miss counts every lookup the positive cache
+/// did not answer, so it INCLUDES the stale-served and negative-cache answers;
+/// the control-plane round trips are `misses − stale_served − negative_hits`.
+#[must_use]
+pub fn auth_cache_counters() -> (u64, u64, u64, u64) {
+    (
+        AUTH_CACHE_HIT_TOTAL.load(Ordering::Relaxed),
+        AUTH_CACHE_MISS_TOTAL.load(Ordering::Relaxed),
+        AUTH_STALE_SERVED_TOTAL.load(Ordering::Relaxed),
+        AUTH_NEGATIVE_HIT_TOTAL.load(Ordering::Relaxed),
+    )
 }
 
 /// What the auth cache stores. Mirrors [`KeyAuth`] minus the `TenantId` wrapper,
@@ -212,7 +253,20 @@ type CachedAuth = (
     Option<f64>,
     Option<u32>,
     tracelane_shared::spend::BudgetReset,
+    Option<DateTime<Utc>>, // earlier of expiry and scheduled revocation
 );
+
+// Only cold lookups and refreshes lock cache writes. Rotation holds the write
+// lock across commit and invalidation, so a pre-rotation SELECT cannot restore
+// a cached grant without its new deadline. Warm hits remain lock-free.
+static AUTH_CACHE_WRITES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+fn auth_deadline(
+    expires_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    expires_at.into_iter().chain(revoked_at).min()
+}
 
 static AUTH_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AUTH_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -350,7 +404,7 @@ pub async fn forget_negative(lookup: &[u8; 32]) {
 //
 // WHAT IT DOES TO THE REVOCATION BOUND — it TIGHTENS it. Today the bound is the
 // 60s TTL: a revoked key keeps working until its cached entry expires. The
-// refresher re-runs the SAME `WHERE revoked_at IS NULL AND (expires_at IS NULL
+// refresher re-runs the SAME future-revocation and expiry predicate (expires_at IS NULL
 // OR expires_at > now())` predicate the miss path uses, every
 // `refresh_interval_secs()` (default 20s — A NO-OP ON PROD, which sets
 // TRACELANE_AUTH_REFRESH_SECS=0), and INVALIDATES on a row that no
@@ -631,16 +685,17 @@ fn select_due(mut due: Vec<([u8; 32], Duration)>, budget: usize) -> Vec<[u8; 32]
 /// Returns `Ok(true)` if the key is still valid.
 async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let _cache_write = AUTH_CACHE_WRITES.read().await;
     // The SAME predicate the miss path uses. Deliberately not a second copy of
     // the validity rule with its own drift risk — if the miss path's notion of
     // "valid" changes, this must change with it, and keeping the text identical
     // is what makes that obvious in review.
     let row = client
         .query_opt(
-            "SELECT tenant_id, id, scope, budget_usd_monthly::text, rate_limit_rpm, budget_reset
+            "SELECT tenant_id, id, scope, budget_usd_monthly::text, rate_limit_rpm, budget_reset, expires_at, revoked_at
              FROM api_keys
              WHERE lookup_hash = $1
-               AND revoked_at IS NULL
+               AND (revoked_at IS NULL OR revoked_at > now())
                AND (expires_at IS NULL OR expires_at > now())",
             &[&digest.as_slice()],
         )
@@ -681,6 +736,7 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
         budget_usd_monthly,
         rate_limit_rpm,
         budget_reset,
+        auth_deadline(row.get(6), row.get(7)),
     );
     auth_cache().insert(digest, entry.clone()).await;
     remember_last_known(digest, entry);
@@ -747,7 +803,8 @@ pub async fn invalidate(digest: [u8; 32]) {
 
 // `auth_cache_stats` (a `(hits, misses)` reader for the health/metrics
 // surface) was deleted 2026-09-12 (B-390) — zero callers anywhere, including
-// tests; nothing exports these two counters to the metrics endpoint yet.
+// tests. Superseded 2026-09-27 by `auth_cache_counters` (above), which B-568 I6
+// wires into `/health` — it has a caller from the day it exists.
 
 // ---------------------------------------------------------------------
 // Key material primitives
@@ -901,6 +958,137 @@ pub struct MintedKey {
     pub api_key: ApiKey,
     pub key_prefix: String,
     pub raw_key: String,
+}
+
+pub struct RotatedKey {
+    pub minted: MintedKey,
+    pub options: MintOptions,
+    pub revoked_at: DateTime<Utc>,
+}
+
+/// Read the rotation default off the traffic hot path. Fail CLOSED if unseeded.
+/// # Errors
+/// Missing, malformed or unreadable policy refuses the default; no literal fallback.
+#[tracing::instrument(skip(pool))]
+pub async fn rotation_grace_hours(pool: &Pool) -> Result<i64> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT value::text FROM billing_policy WHERE key = 'key_rotation_grace_hours'",
+            &[],
+        )
+        .await?
+        .ok_or_else(|| anyhow!("rotation policy unavailable"))?;
+    let hours: i64 = serde_json::from_str(row.get::<_, &str>(0))?;
+    if !valid_rotation_grace(hours) {
+        anyhow::bail!("invalid rotation policy");
+    }
+    Ok(hours)
+}
+
+pub fn valid_rotation_grace(hours: i64) -> bool {
+    hours >= 0
+        && chrono::Duration::try_hours(hours)
+            .and_then(|duration| Utc::now().checked_add_signed(duration))
+            .is_some()
+}
+
+/// Atomically create a successor, schedule the source's retirement and audit it.
+/// Source settings (including legacy NULL scope and the original minter) are
+/// copied in SQL. The source row lock makes concurrent rotations single-winner.
+/// # Errors
+/// Fail CLOSED: any failure rolls back all three writes; raw material is never logged.
+#[tracing::instrument(skip(pool, tenant, actor), fields(tenant_id = %tenant))]
+pub async fn rotate(
+    pool: &Pool,
+    tenant: &TenantId,
+    id: Uuid,
+    actor: &str,
+    grace_hours: i64,
+) -> Result<Option<RotatedKey>> {
+    if !valid_rotation_grace(grace_hours) {
+        anyhow::bail!("invalid rotation grace");
+    }
+    let body = secrecy::SecretString::from(generate_key_body()?);
+    let material = KeyMaterial::from_body(body.expose_secret())?;
+    let prefix: String = body.expose_secret().chars().take(KEY_PREFIX_LEN).collect();
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let source = tx.query_opt(
+        "SELECT lookup_hash FROM api_keys WHERE tenant_id = $1 AND id = $2
+         AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > clock_timestamp()) FOR UPDATE",
+        &[tenant.as_uuid(), &id],
+    ).await?;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let digest: Vec<u8> = source.get(0);
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| anyhow!("invalid lookup digest"))?;
+    let row = tx.query_one(
+        "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by,
+             scope, expires_at, budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker)
+         SELECT tenant_id, name, $3, $4, $5, minted_by, scope, expires_at, budget_usd_monthly,
+             rate_limit_rpm, budget_reset, velocity_breaker FROM api_keys WHERE tenant_id = $1 AND id = $2
+         RETURNING id, name, created_at, scope, expires_at, budget_usd_monthly::text,
+             rate_limit_rpm, budget_reset, velocity_breaker",
+        &[tenant.as_uuid(), &id, &material.lookup_hash.as_slice(), &material.argon2id_phc, &prefix],
+    ).await?;
+    let successor_id: Uuid = row.get(0);
+    // clock_timestamp avoids consuming the grace window while waiting for a lock.
+    let revoked_at: DateTime<Utc> = tx
+        .query_one(
+            "UPDATE api_keys SET revoked_at = clock_timestamp() + $3::bigint * interval '1 hour'
+         WHERE tenant_id = $1 AND id = $2 RETURNING revoked_at",
+            &[tenant.as_uuid(), &id, &grace_hours],
+        )
+        .await?
+        .get(0);
+    tx.execute(
+        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, after_json)
+         VALUES ($1, $2, 'api_key.rotate', 'api_key', $3,
+             jsonb_build_object('successorId', $4::text, 'revokedAt', $5::timestamptz))",
+        &[&actor, tenant.as_uuid(), &id.to_string(), &successor_id.to_string(), &revoked_at],
+    ).await?;
+    let options = MintOptions {
+        scope: row.get(3),
+        expires_at: row.get(4),
+        budget_usd_monthly: row
+            .get::<_, Option<String>>(5)
+            .map(|v| v.parse())
+            .transpose()?,
+        rate_limit_rpm: row.get(6),
+        budget_reset: Some(tracelane_shared::spend::BudgetReset::from_column(
+            row.get(7),
+        )),
+        velocity_breaker: row.get(8),
+    };
+    // A cold lookup that started before this transaction must finish populating
+    // before invalidation. No request can restore its pre-rotation cache entry.
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit().await?;
+    invalidate(digest).await;
+    forget_negative(&material.lookup_hash).await;
+    Ok(Some(RotatedKey {
+        minted: MintedKey {
+            api_key: ApiKey {
+                id: successor_id,
+                name: row.get(1),
+                created_at: row.get(2),
+                scope: options.scope.clone(),
+                expires_at: options.expires_at,
+            },
+            key_prefix: prefix,
+            // `MintedKey.raw_key` is the ONE-TIME reveal: `String` by design, because
+            // it is serialized straight into the response body. The owned copy IS the
+            // destination here, not an accident — the mint path does the same at the
+            // sibling site below. See the marker on the line itself.
+            raw_key: format!("tlane_{}", body.expose_secret()), // banned-pattern-allow: the one-time reveal is serialized to the response; String is the destination
+        },
+        options,
+        revoked_at,
+    }))
 }
 
 /// Mint a new API key end-to-end for `tenant_id`: generate the body, derive the
@@ -1138,13 +1326,32 @@ pub async fn create(
 /// so a NULL is a malformed/legacy row that must not authenticate without the
 /// KDF check. `last_used_at` is updated best-effort on success.
 pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Option<KeyAuth>> {
+    lookup_tenant_by_key_body_at(pool, key_body, Utc::now()).await
+}
+
+pub(crate) async fn lookup_tenant_by_key_body_at(
+    pool: &Pool,
+    key_body: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<KeyAuth>> {
     let lookup = peppered_lookup(key_body)?;
 
     // fix B: warm-cache hit — the peppered-HMAC digest matched a previously
     // authenticated key. Skip the PG SELECT + the ~50ms Argon2id verify.
-    if let Some((tenant, key_id, key_scope, budget_usd_monthly, rate_limit_rpm, budget_reset)) =
-        auth_cache().get(&lookup).await
+    if let Some((
+        tenant,
+        key_id,
+        key_scope,
+        budget_usd_monthly,
+        rate_limit_rpm,
+        budget_reset,
+        valid_until,
+    )) = auth_cache().get(&lookup).await
     {
+        // Fail CLOSED at the deadline even while the cache TTL is live.
+        if valid_until.is_some_and(|deadline| now >= deadline) {
+            return Ok(None);
+        }
         let hits = AUTH_CACHE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let miss = AUTH_CACHE_MISS_TOTAL.load(Ordering::Relaxed);
         // Loud, bounded hit-rate signal (once per 1000 lookups).
@@ -1167,6 +1374,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
             budget_usd_monthly,
             rate_limit_rpm,
             budget_reset,
+            path: LookupPath::Warm,
         }));
     }
     AUTH_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1176,9 +1384,20 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         AUTH_NEGATIVE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
-    if let Some((tenant, key_id, key_scope, budget_usd_monthly, rate_limit_rpm, budget_reset)) =
-        last_known_fresh_enough(lookup)
+    if let Some((
+        tenant,
+        key_id,
+        key_scope,
+        budget_usd_monthly,
+        rate_limit_rpm,
+        budget_reset,
+        valid_until,
+    )) = last_known_fresh_enough(lookup)
     {
+        // Stale grants never extend known expiry or scheduled revocation.
+        if valid_until.is_some_and(|deadline| now >= deadline) {
+            return Ok(None);
+        }
         // Serve the last-known answer NOW; re-check the row off the request path.
         AUTH_STALE_SERVED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let pool = pool.clone();
@@ -1195,10 +1414,13 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
             budget_usd_monthly,
             rate_limit_rpm,
             budget_reset,
+            path: LookupPath::Stale,
         }));
     }
 
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+
+    let cache_write = AUTH_CACHE_WRITES.read().await;
 
     // A13: `scope` and `expires_at` are read HERE, in the same round-trip that
     // already authenticates the key — not re-derived per route. `expires_at` is
@@ -1218,10 +1440,10 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
             // and parsed — the mirror image of the `::text::numeric` cast the
             // INSERT side needs, and for the same reason.
             "SELECT tenant_id, id, argon2id_phc, scope, expires_at,
-                    budget_usd_monthly::text, rate_limit_rpm, budget_reset
+                    budget_usd_monthly::text, rate_limit_rpm, budget_reset, revoked_at
              FROM api_keys
              WHERE lookup_hash = $1
-               AND revoked_at IS NULL
+               AND (revoked_at IS NULL OR revoked_at > now())
                AND (expires_at IS NULL OR expires_at > now())",
             &[&lookup.as_slice()],
         )
@@ -1283,6 +1505,10 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         return Ok(None);
     }
 
+    let valid_until = auth_deadline(row.get(4), row.get(8));
+    if valid_until.is_some_and(|deadline| now.max(Utc::now()) >= deadline) {
+        return Ok(None);
+    }
     // Populate the warm cache for subsequent requests with this key (fix B).
     // A13: the SCOPE is cached with the identity. Caching only (tenant, key_id)
     // would force the caller to re-derive a capability it cannot see on a warm
@@ -1295,6 +1521,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         budget_usd_monthly,
         rate_limit_rpm,
         budget_reset,
+        valid_until,
     );
     auth_cache().insert(lookup, entry.clone()).await;
     remember_last_known(lookup, entry);
@@ -1303,6 +1530,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
     // warm-cached key updates it at most every 15m (TTL refill). Fine for a
     // display field; a spawned touch per warm hit would put a PG write back on
     // every request, defeating the cache.
+    drop(cache_write); // Never wait on the source row while blocking rotation commit.
     touch_last_used(&client, id).await;
     Ok(Some(KeyAuth {
         tenant_id: TenantId::from_jwt_claim(tenant_uuid),
@@ -1311,6 +1539,7 @@ pub async fn lookup_tenant_by_key_body(pool: &Pool, key_body: &str) -> Result<Op
         budget_usd_monthly,
         rate_limit_rpm,
         budget_reset,
+        path: LookupPath::Cold,
     }))
 }
 
@@ -1334,12 +1563,440 @@ pub async fn revoke(pool: &Pool, id: Uuid) -> Result<()> {
     client
         .execute(
             "UPDATE api_keys SET revoked_at = NOW()
-             WHERE id = $1 AND revoked_at IS NULL",
+             WHERE id = $1 AND (revoked_at IS NULL OR revoked_at > NOW())",
             &[&id],
         )
         .await
         .context("UPDATE api_keys revoke failed")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// SET-38 — edit a key's limits in place, read one key, revoke through the gateway
+// ---------------------------------------------------------------------
+
+/// Who may edit a key. The ROUTE decides this from the validated claims; THIS
+/// module enforces it against the row's `minted_by`, under the row lock, so the
+/// check and the write see the same row.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyEditor<'a> {
+    /// A verified owner, or the self-host operator.
+    Any,
+    /// A member: only a key whose `minted_by` equals this subject.
+    MintedBy(&'a str),
+}
+
+/// A validated JSON Merge Patch (RFC 7396) of a key's editable columns.
+///
+/// Outer `None` = absent (unchanged). For the nullable columns the inner
+/// `Option` is the new value, `None` meaning "clear". `name`, `scope`,
+/// `budget_reset` and `velocity_breaker` cannot be cleared — the route refuses a
+/// `null` for them before this is built (a key may LEAVE the legacy NULL scope and
+/// never re-enter it).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeyPatch {
+    pub name: Option<String>,
+    pub scope: Option<Vec<String>>,
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub budget_usd_monthly: Option<Option<f64>>,
+    pub rate_limit_rpm: Option<Option<i32>>,
+    pub budget_reset: Option<tracelane_shared::spend::BudgetReset>,
+    pub velocity_breaker: Option<bool>,
+}
+
+/// One key as the settings surface reads it. No secret-derived column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub key_prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub minted_by: Option<String>,
+    pub scope: Option<Vec<String>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub budget_usd_monthly: Option<f64>,
+    pub rate_limit_rpm: Option<i32>,
+    pub budget_reset: tracelane_shared::spend::BudgetReset,
+    pub velocity_breaker: bool,
+    /// A FUTURE value means the key is retiring (rotated, in its grace window).
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// The result of [`update`]. Every refusal is decided under the row lock.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateOutcome {
+    /// Not in this tenant, already revoked, or expired — one answer for all
+    /// three, so the route cannot become an existence oracle across tenants.
+    NotFound,
+    /// A member editing a key someone else minted.
+    Forbidden,
+    /// Rotated and in its grace window: the successor is the key to edit.
+    Retiring { revoked_at: DateTime<Utc> },
+    /// Committed (or a no-op: `changed` is empty and nothing was written).
+    Updated {
+        record: Box<KeyRecord>,
+        changed: Vec<&'static str>,
+    },
+}
+
+/// The record columns, in [`record_from_row`]'s order. ONE list for the
+/// `SELECT … FOR UPDATE`, the `UPDATE … RETURNING` and [`get`], so they cannot
+/// disagree about positions.
+const RECORD_COLUMNS: &str = "id, name, key_prefix, created_at, last_used_at, minted_by, scope, \
+     expires_at, budget_usd_monthly::text, rate_limit_rpm, budget_reset, velocity_breaker, revoked_at";
+
+fn record_from_row(row: &tokio_postgres::Row) -> KeyRecord {
+    KeyRecord {
+        id: row.get(0),
+        name: row.get(1),
+        key_prefix: row.get(2),
+        created_at: row.get(3),
+        last_used_at: row.get(4),
+        minted_by: row.get(5),
+        scope: row.get(6),
+        expires_at: row.get(7),
+        budget_usd_monthly: row
+            .get::<_, Option<String>>(8)
+            .and_then(|t| t.parse::<f64>().ok()),
+        rate_limit_rpm: row.get(9),
+        budget_reset: tracelane_shared::spend::BudgetReset::from_column(row.get::<_, &str>(10)),
+        velocity_breaker: row.get(11),
+        revoked_at: row.get(12),
+    }
+}
+
+/// The canonical stored text of a budget: what `create`'s `{b:.4}` and the
+/// `numeric(12,4)` column agree on. Comparing THIS, not the f64, is what makes
+/// "set it to the value it already has" a no-op instead of an audit row.
+fn budget_text(v: Option<f64>) -> Option<String> {
+    v.map(|b| format!("{b:.4}"))
+}
+
+/// Postgres stores microseconds; compare and store at that precision so an
+/// unchanged `expires_at` never reads as a change.
+fn to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::SubsecRound as _;
+    t.trunc_subsecs(6)
+}
+
+fn same_scope(a: &[String], b: &[String]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
+fn json_time(t: Option<DateTime<Utc>>) -> serde_json::Value {
+    t.map_or(serde_json::Value::Null, |t| {
+        serde_json::Value::String(t.to_rfc3339())
+    })
+}
+
+/// The effective diff of `patch` against `current`: which fields REALLY change,
+/// with their before/after values for the audit row. Pure, so the no-op and the
+/// only-the-changed-fields rules are unit-testable without a database.
+#[allow(clippy::type_complexity)]
+fn diff_patch(
+    current: &KeyRecord,
+    patch: &KeyPatch,
+) -> (
+    KeyPatch,
+    Vec<&'static str>,
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+) {
+    use serde_json::{Value, json};
+    let mut eff = KeyPatch::default();
+    let mut changed = Vec::new();
+    let mut before = serde_json::Map::new();
+    let mut after = serde_json::Map::new();
+    let mut note = |field: &'static str, b: Value, a: Value| {
+        changed.push(field);
+        before.insert(field.to_string(), b);
+        after.insert(field.to_string(), a);
+    };
+    if let Some(name) = &patch.name
+        && *name != current.name
+    {
+        note("name", json!(current.name), json!(name));
+        eff.name = Some(name.clone());
+    }
+    if let Some(scope) = &patch.scope {
+        let unchanged = current
+            .scope
+            .as_deref()
+            .is_some_and(|cur| same_scope(cur, scope));
+        if !unchanged {
+            note("scope", json!(current.scope), json!(scope));
+            eff.scope = Some(scope.clone());
+        }
+    }
+    if let Some(exp) = patch.expires_at {
+        let exp = exp.map(to_micros);
+        if exp != current.expires_at.map(to_micros) {
+            note("expires_at", json_time(current.expires_at), json_time(exp));
+            eff.expires_at = Some(exp);
+        }
+    }
+    if let Some(budget) = patch.budget_usd_monthly
+        && budget_text(budget) != budget_text(current.budget_usd_monthly)
+    {
+        note(
+            "budget_usd_monthly",
+            json!(current.budget_usd_monthly),
+            json!(budget),
+        );
+        eff.budget_usd_monthly = Some(budget);
+    }
+    if let Some(rpm) = patch.rate_limit_rpm
+        && rpm != current.rate_limit_rpm
+    {
+        note("rate_limit_rpm", json!(current.rate_limit_rpm), json!(rpm));
+        eff.rate_limit_rpm = Some(rpm);
+    }
+    if let Some(reset) = patch.budget_reset
+        && reset != current.budget_reset
+    {
+        note(
+            "budget_reset",
+            json!(current.budget_reset.as_str()),
+            json!(reset.as_str()),
+        );
+        eff.budget_reset = Some(reset);
+    }
+    if let Some(vb) = patch.velocity_breaker
+        && vb != current.velocity_breaker
+    {
+        note(
+            "velocity_breaker",
+            json!(current.velocity_breaker),
+            json!(vb),
+        );
+        eff.velocity_breaker = Some(vb);
+    }
+    (eff, changed, before, after)
+}
+
+/// Read one key of `tenant` for the settings surface. `None` when the key is not
+/// in this tenant or is already revoked (a retiring key IS returned — the list
+/// shows it too).
+///
+/// # Errors
+/// A database failure. Fail CLOSED: the route answers 5xx, never a guessed row.
+#[tracing::instrument(skip(pool, tenant), fields(tenant_id = %tenant))]
+pub async fn get(pool: &Pool, tenant: &TenantId, id: Uuid) -> Result<Option<KeyRecord>> {
+    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let sql = format!(
+        "SELECT {RECORD_COLUMNS} FROM api_keys \
+         WHERE tenant_id = $1 AND id = $2 AND (revoked_at IS NULL OR revoked_at > clock_timestamp())"
+    );
+    let row = client
+        .query_opt(sql.as_str(), &[tenant.as_uuid(), &id])
+        .await
+        .context("SELECT api_keys by id failed")?;
+    Ok(row.as_ref().map(record_from_row))
+}
+
+/// SET-38 — edit a key's limits in place. `rotate`'s ordering exactly:
+/// `SELECT … FOR UPDATE` → authorize → `UPDATE` (only the changed columns) →
+/// `admin_audit_log` `api_key.update` (only the changed fields) → take the
+/// cache WRITE lock → `COMMIT` → [`invalidate`]. So a cold lookup that began
+/// before the commit cannot restore the old limits into the cache, and the key's
+/// NEXT authenticated request reads the new row.
+///
+/// # Errors
+/// Fail CLOSED: any failure — the UPDATE, the audit insert, the commit — rolls
+/// back every write, and the caller answers "not saved".
+#[tracing::instrument(skip(pool, tenant, editor, patch, actor), fields(tenant_id = %tenant))]
+pub async fn update(
+    pool: &Pool,
+    tenant: &TenantId,
+    id: Uuid,
+    editor: KeyEditor<'_>,
+    patch: &KeyPatch,
+    actor: &str,
+) -> Result<UpdateOutcome> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let select = format!(
+        "SELECT {RECORD_COLUMNS}, lookup_hash, \
+                COALESCE(revoked_at <= clock_timestamp(), false), \
+                COALESCE(expires_at <= clock_timestamp(), false) \
+         FROM api_keys WHERE tenant_id = $1 AND id = $2 FOR UPDATE"
+    );
+    let Some(row) = tx
+        .query_opt(select.as_str(), &[tenant.as_uuid(), &id])
+        .await
+        .context("SELECT api_keys FOR UPDATE failed")?
+    else {
+        return Ok(UpdateOutcome::NotFound);
+    };
+    let current = record_from_row(&row);
+    let digest: Option<Vec<u8>> = row.get(13);
+    let revoked_now: bool = row.get(14);
+    let expired_now: bool = row.get(15);
+    if revoked_now || expired_now {
+        return Ok(UpdateOutcome::NotFound);
+    }
+    if let KeyEditor::MintedBy(sub) = editor
+        && current.minted_by.as_deref() != Some(sub)
+    {
+        return Ok(UpdateOutcome::Forbidden);
+    }
+    if let Some(revoked_at) = current.revoked_at {
+        return Ok(UpdateOutcome::Retiring { revoked_at });
+    }
+    let (eff, changed, before, after) = diff_patch(&current, patch);
+    if changed.is_empty() {
+        // A no-op writes nothing: no UPDATE, no audit row, no invalidation.
+        return Ok(UpdateOutcome::Updated {
+            record: Box::new(current),
+            changed,
+        });
+    }
+    // A row with no (or a malformed) lookup digest can never authenticate — the
+    // cache and the lookup are both keyed on it — so there is nothing to clear.
+    let digest: Option<[u8; 32]> = digest.and_then(|d| <[u8; 32]>::try_from(d).ok());
+    let budget_reset = eff
+        .budget_reset
+        .map(tracelane_shared::spend::BudgetReset::as_str);
+    let expires_at: Option<DateTime<Utc>> = eff.expires_at.flatten();
+    let budget: Option<String> = eff.budget_usd_monthly.and_then(budget_text);
+    let rpm: Option<i32> = eff.rate_limit_rpm.flatten();
+    // ONE static statement: every column is `CASE WHEN <changed> THEN <new> ELSE
+    // <itself>`, so the unchanged columns are not touched in meaning and no SQL is
+    // ever assembled from values. The numeric bind routes through `text` for the
+    // reason `BUDGET_NUMERIC_CAST` records.
+    let sql = format!(
+        "UPDATE api_keys SET \
+           name = CASE WHEN $3 THEN $4::text ELSE name END, \
+           scope = CASE WHEN $5 THEN $6::text[] ELSE scope END, \
+           expires_at = CASE WHEN $7 THEN $8::timestamptz ELSE expires_at END, \
+           budget_usd_monthly = CASE WHEN $9 THEN $10{BUDGET_NUMERIC_CAST} ELSE budget_usd_monthly END, \
+           rate_limit_rpm = CASE WHEN $11 THEN $12::int4 ELSE rate_limit_rpm END, \
+           budget_reset = CASE WHEN $13 THEN $14::text ELSE budget_reset END, \
+           velocity_breaker = CASE WHEN $15 THEN $16::bool ELSE velocity_breaker END \
+         WHERE tenant_id = $1 AND id = $2 \
+         RETURNING {RECORD_COLUMNS}"
+    );
+    let updated = tx
+        .query_one(
+            sql.as_str(),
+            &[
+                tenant.as_uuid(),
+                &id,
+                &eff.name.is_some(),
+                &eff.name,
+                &eff.scope.is_some(),
+                &eff.scope,
+                &eff.expires_at.is_some(),
+                &expires_at,
+                &eff.budget_usd_monthly.is_some(),
+                &budget,
+                &eff.rate_limit_rpm.is_some(),
+                &rpm,
+                &eff.budget_reset.is_some(),
+                &budget_reset,
+                &eff.velocity_breaker.is_some(),
+                &eff.velocity_breaker,
+            ],
+        )
+        .await
+        .context("UPDATE api_keys failed")?;
+    let record = record_from_row(&updated);
+    let before = serde_json::Value::Object(before);
+    let after = serde_json::Value::Object(after);
+    tx.execute(
+        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, before_json, after_json)
+         VALUES ($1, $2, 'api_key.update', 'api_key', $3, $4, $5)",
+        &[&actor, tenant.as_uuid(), &id.to_string(), &before, &after],
+    )
+    .await
+    .context("admin_audit_log api_key.update insert failed")?;
+    // Same reason as `rotate`: a cold lookup that read the OLD row before this
+    // commit must finish populating before the invalidation, or it would put the
+    // old limits back into the cache after we cleared it.
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit().await.context("api_keys update commit failed")?;
+    if let Some(d) = digest {
+        invalidate(d).await;
+    }
+    Ok(UpdateOutcome::Updated {
+        record: Box::new(record),
+        changed,
+    })
+}
+
+/// B-586 — revoke through the gateway so the revocation reaches the in-process
+/// auth cache: `SELECT … FOR UPDATE` → `UPDATE revoked_at = clock_timestamp()` →
+/// `admin_audit_log` `api_key.revoke` → cache WRITE lock → `COMMIT` →
+/// [`invalidate`]. The key's next request takes the cold path and finds no row.
+///
+/// A retiring key (rotated, future `revoked_at`) is revoked NOW — ending its
+/// grace early, as the web revoke always did. Returns the new `revoked_at`;
+/// `Ok(None)` when the key is not in
+/// this tenant or is already revoked.
+///
+/// # Errors
+/// Fail CLOSED: an audit-insert or commit failure rolls the revocation back.
+#[tracing::instrument(skip(pool, tenant, actor), fields(tenant_id = %tenant))]
+pub async fn revoke_key(
+    pool: &Pool,
+    tenant: &TenantId,
+    id: Uuid,
+    actor: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let Some(row) = tx
+        .query_opt(
+            "SELECT lookup_hash, name, key_prefix, revoked_at FROM api_keys
+             WHERE tenant_id = $1 AND id = $2
+               AND (revoked_at IS NULL OR revoked_at > clock_timestamp())
+             FOR UPDATE",
+            &[tenant.as_uuid(), &id],
+        )
+        .await
+        .context("SELECT api_keys FOR UPDATE (revoke) failed")?
+    else {
+        return Ok(None);
+    };
+    let digest: Option<Vec<u8>> = row.get(0);
+    let name: String = row.get(1);
+    let key_prefix: String = row.get(2);
+    let scheduled: Option<DateTime<Utc>> = row.get(3);
+    let revoked_at: DateTime<Utc> = tx
+        .query_one(
+            "UPDATE api_keys SET revoked_at = clock_timestamp()
+             WHERE tenant_id = $1 AND id = $2 RETURNING revoked_at",
+            &[tenant.as_uuid(), &id],
+        )
+        .await
+        .context("UPDATE api_keys revoke failed")?
+        .get(0);
+    let before = serde_json::json!({
+        "name": name,
+        "keyPrefix": key_prefix,
+        "scheduledRevokedAt": json_time(scheduled),
+    });
+    let after = serde_json::json!({ "revokedAt": revoked_at.to_rfc3339() });
+    tx.execute(
+        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, before_json, after_json)
+         VALUES ($1, $2, 'api_key.revoke', 'api_key', $3, $4, $5)",
+        &[&actor, tenant.as_uuid(), &id.to_string(), &before, &after],
+    )
+    .await
+    .context("admin_audit_log api_key.revoke insert failed")?;
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit().await.context("api_keys revoke commit failed")?;
+    // A row minted before ADR-042 may carry no lookup digest; it cannot be in the
+    // cache (the cache is keyed on it), so there is nothing to clear.
+    if let Some(d) = digest.and_then(|d| <[u8; 32]>::try_from(d).ok()) {
+        invalidate(d).await;
+    }
+    Ok(Some(revoked_at))
 }
 
 #[cfg(test)]
@@ -1815,6 +2472,7 @@ mod stale_while_revalidate {
             None,
             None,
             tracelane_shared::spend::BudgetReset::Monthly,
+            None,
         );
         for n in 0..5u8 {
             m.insert(mk(n), (sample.clone(), Instant::now()));
@@ -1849,6 +2507,7 @@ mod stale_while_revalidate {
             None,
             None,
             tracelane_shared::spend::BudgetReset::Monthly,
+            None,
         );
         remember_last_known(digest, entry);
         assert!(
@@ -1860,5 +2519,79 @@ mod stale_while_revalidate {
             last_known_fresh_enough(digest).is_none(),
             "a revoked key is never served stale"
         );
+    }
+}
+
+#[cfg(test)]
+mod rotation_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_rotation_deadline_denies_at_boundary_without_database() {
+        let _ = init_pepper(&"11".repeat(32));
+        let body = "unit-test-rotation-cached-deadline";
+        let digest = peppered_lookup(body).unwrap();
+        let deadline = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entry: CachedAuth = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            tracelane_shared::api_scope::KeyScope::from_column(None),
+            None,
+            None,
+            tracelane_shared::spend::BudgetReset::Monthly,
+            Some(deadline),
+        );
+        let mut config = deadpool_postgres::Config::new();
+        config.host = Some("unused.invalid".into());
+        config.dbname = Some("unused".into());
+        let pool = config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .unwrap();
+        auth_cache().insert(digest, entry).await;
+        assert!(
+            lookup_tenant_by_key_body_at(&pool, body, deadline - chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            lookup_tenant_by_key_body_at(&pool, body, deadline)
+                .await
+                .unwrap()
+                .is_none(),
+            "a warm credential must fail at its scheduled revocation deadline"
+        );
+        let entry = auth_cache().get(&digest).await.unwrap();
+        remember_last_known(digest, entry);
+        auth_cache().invalidate(&digest).await;
+        assert!(
+            lookup_tenant_by_key_body_at(&pool, body, deadline)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale credential must fail at its scheduled revocation deadline"
+        );
+        invalidate(digest).await;
+    }
+
+    #[test]
+    fn rotation_deadline_uses_earlier_expiry_and_preserves_unbounded_keys() {
+        let early = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let late = early + chrono::Duration::hours(1);
+        assert_eq!(auth_deadline(Some(early), Some(late)), Some(early));
+        assert_eq!(auth_deadline(Some(late), Some(early)), Some(early));
+        assert_eq!(auth_deadline(None, Some(late)), Some(late));
+        assert_eq!(auth_deadline(Some(early), None), Some(early));
+        assert_eq!(auth_deadline(None, None), None);
+        assert!(valid_rotation_grace(0));
+        assert!(!valid_rotation_grace(-1));
+        assert!(!valid_rotation_grace(i64::MAX));
     }
 }

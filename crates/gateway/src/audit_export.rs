@@ -69,9 +69,12 @@ use std::sync::Arc;
 use tracelane_shared::TenantId;
 
 use crate::clickhouse_query::{PlanTier, TenantQuery};
+use crate::db::ledger::LedgerRangeStats;
 
 /// Rows per DB round-trip when the export pages the full ledger (bounded memory).
 const MAX_LIMIT: u32 = 50_000;
+// B-465: the canonical reader's own cap may never be smaller than a page we ask for.
+const _: () = assert!(crate::db::ledger::PAGE >= MAX_LIMIT as i64);
 
 /// Export wire-format marker (ADR-050). `v2.1` = `payload` is the verbatim
 /// stored canonical JSON string; verifiers hash it byte-for-byte, never
@@ -192,6 +195,31 @@ pub trait AuditExportReader: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ExportRow>>;
 
+    /// Newest `limit` rows in the retention window, returned in ascending order
+    /// for the verifier. A reader must implement this explicitly; never substitute
+    /// its oldest page when the caller requests recent evidence.
+    async fn read_newest_range(
+        &self,
+        _tenant: &TenantId,
+        _since: DateTime<Utc>,
+        _until: DateTime<Utc>,
+        _limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        anyhow::bail!("newest audit window unsupported by reader")
+    }
+
+    /// Candidate anchors wholly inside the selected sequence range. Unlike export
+    /// date filtering, this includes batches recorded after the events they cover.
+    async fn read_anchors_for_sequences(
+        &self,
+        _tenant: &TenantId,
+        _from: u64,
+        _through: u64,
+        _limit: u32,
+    ) -> Result<Vec<AnchorExportRecord>> {
+        anyhow::bail!("audit sequence anchors unsupported by reader")
+    }
+
     /// Return the per-batch anchor bundles (ADR-062) for the window. Default:
     /// none — dev/mock readers without an `audit_anchor_records` table export
     /// chain rows only (the hash chain still verifies; anchors are absent).
@@ -210,8 +238,8 @@ pub trait AuditExportReader: Send + Sync {
     /// bounds are how "no rows" is stated. Never `Some(0)`, which would claim a
     /// genesis row that does not exist. `audit_log` is `ORDER BY (tenant_id, seq)`
     /// with no TTL, so the ClickHouse impl reads this straight off the sort key.
-    async fn ledger_range(&self, _tenant_id: &TenantId) -> Result<(Option<u64>, Option<u64>, u64)> {
-        Ok((None, None, 0))
+    async fn ledger_range(&self, _tenant_id: &TenantId) -> Result<LedgerRangeStats> {
+        Ok(LedgerRangeStats::default())
     }
 
     /// Aggregate the window into totals + per-day + per-type counts. Default: an
@@ -242,8 +270,12 @@ pub trait AuditExportReader: Send + Sync {
     /// One page of chain rows with `seq > after_seq` (or from the start when
     /// `None`), ordered by seq — the primitive the UNCAPPED export pages over so a
     /// large ledger streams complete instead of truncating at the row cap. Default:
-    /// delegate to `read_range` (first page only) so mock readers keep working; the
-    /// ClickHouse impl adds the `AND seq > ?` cursor.
+    /// delegate to `read_range` and HONOUR the cursor by filtering — the handler pages
+    /// until an EMPTY page (B-465), so a default that ignored `after_seq` would make
+    /// every mock, and any future reader that forgot to override this, stream the
+    /// same first page forever (the handler aborts that as "did not advance", but a
+    /// default that is correct beats a guard that catches it). The ClickHouse and
+    /// Postgres impls add the `seq > ?` cursor in SQL.
     async fn read_range_page(
         &self,
         tenant_id: &TenantId,
@@ -252,13 +284,17 @@ pub trait AuditExportReader: Send + Sync {
         after_seq: Option<u64>,
         limit: u32,
     ) -> Result<Vec<ExportRow>> {
-        let _ = after_seq;
-        self.read_range(tenant_id, since, until, limit).await
+        let rows = self.read_range(tenant_id, since, until, limit).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| after_seq.is_none_or(|a| r.seq > a))
+            .collect())
     }
 
     /// One page of anchor records with `batch_start_seq > after` (or from the start
     /// when `None`) — mirrors `read_range_page` so the export streams ALL anchors,
-    /// not a capped subset. Default: delegate to `read_anchor_records` (first page).
+    /// not a capped subset. Default: delegate to `read_anchor_records` and honour the
+    /// cursor by filtering (see `read_range_page`).
     async fn read_anchor_page(
         &self,
         tenant_id: &TenantId,
@@ -267,9 +303,13 @@ pub trait AuditExportReader: Send + Sync {
         after: Option<u64>,
         limit: u32,
     ) -> Result<Vec<AnchorExportRecord>> {
-        let _ = after;
-        self.read_anchor_records(tenant_id, since, until, limit)
-            .await
+        let anchors = self
+            .read_anchor_records(tenant_id, since, until, limit)
+            .await?;
+        Ok(anchors
+            .into_iter()
+            .filter(|a| after.is_none_or(|x| a.batch_start_seq > x))
+            .collect())
     }
 }
 
@@ -324,6 +364,215 @@ impl ClickHouseExportReader {
     }
 }
 
+/// **ADR-078 (ruled B, 2026-09-20): the CANONICAL export reader.** Rows and anchor
+/// bundles come from Postgres (`audit_log_rows`, `audit_anchor_records`) — the store
+/// the head advances in — so what the evidence pack streams is what the chain IS,
+/// never a derived copy. Ruling Q2: this reader NEVER falls back to ClickHouse during
+/// a Neon outage; a failed read is a failed export (B-427 made the export fail closed
+/// for exactly this reason). Ruling Q3: the aggregate SUMMARY (a count, not a proof)
+/// is served from the ClickHouse copy when one is configured, else from Postgres.
+pub struct PgExportReader {
+    pool: deadpool_postgres::Pool,
+    /// The derived copy, for `summarize` only.
+    summary_copy: Option<ClickHouseExportReader>,
+}
+
+impl PgExportReader {
+    pub fn new(pool: deadpool_postgres::Pool) -> Self {
+        Self {
+            pool,
+            summary_copy: None,
+        }
+    }
+
+    /// Serve `summarize` (and only `summarize`) from the ClickHouse copy — ruling Q3.
+    #[must_use]
+    pub fn with_summary_copy(mut self, copy: ClickHouseExportReader) -> Self {
+        self.summary_copy = Some(copy);
+        self
+    }
+
+    fn export_row(r: crate::audit::AuditLogRow) -> ExportRow {
+        ExportRow {
+            format: EXPORT_FORMAT.to_string(),
+            tenant_id: r.tenant_id,
+            seq: r.seq,
+            event_time: micros_to_iso8601(r.event_time),
+            event_type: r.event_type,
+            actor: r.actor,
+            payload: r.payload,
+            prev_hash: r.prev_hash,
+            row_hash: r.row_hash,
+            rekor_entry_id: r.rekor_entry_id,
+        }
+    }
+
+    fn anchor_record(r: crate::audit::AuditAnchorRecordRow) -> AnchorExportRecord {
+        let rekor = if r.anchor_state == "anchored" && !r.rekor_log_index.is_empty() {
+            Some(RekorBlock {
+                log_url: r.rekor_log_url,
+                log_index: r.rekor_log_index,
+                canonicalized_body: r.canonicalized_body,
+                inclusion_proof: serde_json::from_str(&r.inclusion_proof)
+                    .unwrap_or(serde_json::Value::Null),
+                checkpoint: CheckpointBlock {
+                    envelope: r.checkpoint_envelope,
+                },
+            })
+        } else {
+            None
+        };
+        AnchorExportRecord {
+            kind: "anchor",
+            tenant_id: r.tenant_id,
+            batch_start_seq: r.batch_start_seq,
+            batch_end_seq: r.batch_end_seq,
+            merkle_root: r.merkle_root,
+            anchor_state: r.anchor_state,
+            ed25519: Ed25519Block {
+                signature: r.ed25519_sig,
+                pubkey: r.ed25519_pubkey,
+            },
+            rekor,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditExportReader for PgExportReader {
+    async fn read_range(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        self.read_range_page(tenant_id, since, until, None, limit)
+            .await
+    }
+
+    async fn read_newest_range(
+        &self,
+        tenant: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        let rows = crate::db::ledger::read_newest_rows_in_window(
+            &self.pool,
+            tenant,
+            since,
+            until,
+            i64::from(limit.clamp(1, MAX_LIMIT)),
+        )
+        .await?;
+        Ok(rows.into_iter().map(Self::export_row).collect())
+    }
+
+    async fn read_anchors_for_sequences(
+        &self,
+        tenant: &TenantId,
+        from: u64,
+        through: u64,
+        limit: u32,
+    ) -> Result<Vec<AnchorExportRecord>> {
+        let rows = crate::db::ledger::read_anchors_for_sequences(
+            &self.pool,
+            tenant,
+            from,
+            through,
+            i64::from(limit.clamp(1, MAX_LIMIT)),
+        )
+        .await?;
+        Ok(rows.into_iter().map(Self::anchor_record).collect())
+    }
+
+    async fn read_anchor_records(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<AnchorExportRecord>> {
+        self.read_anchor_page(tenant_id, since, until, None, limit)
+            .await
+    }
+
+    async fn ledger_range(&self, tenant_id: &TenantId) -> Result<LedgerRangeStats> {
+        crate::db::ledger::ledger_range(&self.pool, tenant_id)
+            .await
+            .context("canonical ledger range read failed")
+    }
+
+    async fn summarize(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<AuditSummary> {
+        match &self.summary_copy {
+            // Ruling Q3: a count from the derived copy is fine — it is not a proof.
+            Some(copy) => copy.summarize(tenant_id, since, until).await,
+            None => {
+                let total =
+                    crate::db::ledger::count_rows_in_window(&self.pool, tenant_id, since, until)
+                        .await
+                        .context("canonical ledger count failed")?;
+                Ok(AuditSummary {
+                    total,
+                    ..AuditSummary::default()
+                })
+            }
+        }
+    }
+
+    async fn count_in_range(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<u64> {
+        // The self-verify surface's REAL total — canonical, never the copy (Q2).
+        crate::db::ledger::count_rows_in_window(&self.pool, tenant_id, since, until)
+            .await
+            .context("canonical ledger count_in_range failed")
+    }
+
+    async fn read_range_page(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        after_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        let limit = i64::from(limit.clamp(1, MAX_LIMIT));
+        let rows = crate::db::ledger::read_rows_in_window(
+            &self.pool, tenant_id, since, until, after_seq, limit,
+        )
+        .await
+        .context("canonical audit_log_rows read failed")?;
+        Ok(rows.into_iter().map(Self::export_row).collect())
+    }
+
+    async fn read_anchor_page(
+        &self,
+        tenant_id: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<AnchorExportRecord>> {
+        let limit = i64::from(limit.clamp(1, MAX_LIMIT));
+        let rows = crate::db::ledger::read_anchor_records_in_window(
+            &self.pool, tenant_id, since, until, after, limit,
+        )
+        .await
+        .context("canonical audit_anchor_records read failed")?;
+        Ok(rows.into_iter().map(Self::anchor_record).collect())
+    }
+}
+
 // SERIALIZATION-INTEGRITY INVARIANT (class): this reader deserializes via
 // `clickhouse::Row` (RowBinary), so `seq` / the batch seqs come back as REAL u64
 // integers and serde emits them to the verifier NDJSON as JSON NUMBERS. A
@@ -364,15 +613,51 @@ struct AuditAnchorRow {
     checkpoint_envelope: String,
 }
 
-#[async_trait::async_trait]
-impl AuditExportReader for ClickHouseExportReader {
-    async fn read_range(
+impl From<AuditAnchorRow> for AnchorExportRecord {
+    fn from(r: AuditAnchorRow) -> Self {
+        let rekor = if r.anchor_state == "anchored" && !r.rekor_log_index.is_empty() {
+            Some(RekorBlock {
+                log_url: r.rekor_log_url,
+                log_index: r.rekor_log_index,
+                canonicalized_body: r.canonicalized_body,
+                // Stored as a JSON string; re-parse for the export. A corrupt
+                // blob degrades to Null (the verifier then fails the anchor,
+                // never silently passes).
+                inclusion_proof: serde_json::from_str(&r.inclusion_proof)
+                    .unwrap_or(serde_json::Value::Null),
+                checkpoint: CheckpointBlock {
+                    envelope: r.checkpoint_envelope,
+                },
+            })
+        } else {
+            None
+        };
+        AnchorExportRecord {
+            kind: "anchor",
+            tenant_id: r.tenant_id,
+            batch_start_seq: r.batch_start_seq,
+            batch_end_seq: r.batch_end_seq,
+            merkle_root: r.merkle_root,
+            anchor_state: r.anchor_state,
+            ed25519: Ed25519Block {
+                signature: r.ed25519_sig,
+                pubkey: r.ed25519_pubkey,
+            },
+            rekor,
+        }
+    }
+}
+
+impl ClickHouseExportReader {
+    async fn read_rows_ordered(
         &self,
         tenant_id: &TenantId,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
         limit: u32,
+        newest: bool,
     ) -> Result<Vec<ExportRow>> {
+        let order = if newest { "DESC" } else { "ASC" };
         let since_us = since.timestamp_micros();
         let until_us = until.timestamp_micros();
         let limit = limit.clamp(1, MAX_LIMIT);
@@ -398,14 +683,14 @@ impl AuditExportReader for ClickHouseExportReader {
                 // orphan is never exported and the verifier's strict
                 // consecutive-seq walk stays clean. The race window is BEFORE
                 // the background merge — FINAL, not a reliance on merge timing.
-                "SELECT tenant_id, seq, toUnixTimestamp64Micro(event_time) AS event_time_us, \
+                &format!("SELECT tenant_id, seq, toUnixTimestamp64Micro(event_time) AS event_time_us, \
                         event_type, actor, payload, prev_hash, row_hash, rekor_entry_id \
                  FROM audit_log FINAL \
                  WHERE tenant_id = ? \
                    AND toUnixTimestamp64Micro(event_time) >= ? \
                    AND toUnixTimestamp64Micro(event_time) <= ? \
-                 ORDER BY seq ASC \
-                 LIMIT ?", tenant_id).await)
+                 ORDER BY seq {order} \
+                 LIMIT ?"), tenant_id).await)
             .bind(tenant_id.to_string())
             .bind(since_us)
             .bind(until_us)
@@ -435,7 +720,52 @@ impl AuditExportReader for ClickHouseExportReader {
                 rekor_entry_id: r.rekor_entry_id,
             });
         }
+        if newest {
+            out.reverse();
+        }
         Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditExportReader for ClickHouseExportReader {
+    async fn read_range(
+        &self,
+        tenant: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        self.read_rows_ordered(tenant, since, until, limit, false)
+            .await
+    }
+
+    async fn read_newest_range(
+        &self,
+        tenant: &TenantId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ExportRow>> {
+        self.read_rows_ordered(tenant, since, until, limit, true)
+            .await
+    }
+
+    async fn read_anchors_for_sequences(
+        &self,
+        tenant: &TenantId,
+        from: u64,
+        through: u64,
+        limit: u32,
+    ) -> Result<Vec<AnchorExportRecord>> {
+        let rows = self.client.query(&self.capped(
+            "SELECT tenant_id, batch_start_seq, batch_end_seq, merkle_root, anchor_state, \
+             ed25519_sig, ed25519_pubkey, rekor_log_url, rekor_log_index, canonicalized_body, inclusion_proof, checkpoint_envelope \
+             FROM audit_anchor_records WHERE tenant_id = ? AND batch_start_seq >= ? \
+             AND batch_start_seq <= ? AND batch_end_seq <= ? ORDER BY batch_start_seq ASC LIMIT ?", tenant).await)
+            .bind(tenant.to_string()).bind(from).bind(through).bind(through).bind(limit.clamp(1, MAX_LIMIT))
+            .fetch_all::<AuditAnchorRow>().await.context("audit sequence anchors SELECT failed")?;
+        Ok(rows.into_iter().map(AnchorExportRecord::from).collect())
     }
 
     async fn read_anchor_records(
@@ -471,43 +801,10 @@ impl AuditExportReader for ClickHouseExportReader {
             .await
             .context("audit_anchor_records SELECT failed")?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let rekor = if r.anchor_state == "anchored" && !r.rekor_log_index.is_empty() {
-                Some(RekorBlock {
-                    log_url: r.rekor_log_url,
-                    log_index: r.rekor_log_index,
-                    canonicalized_body: r.canonicalized_body,
-                    // Stored as a JSON string; re-parse for the export. A corrupt
-                    // blob degrades to Null (the verifier then fails the anchor,
-                    // never silently passes).
-                    inclusion_proof: serde_json::from_str(&r.inclusion_proof)
-                        .unwrap_or(serde_json::Value::Null),
-                    checkpoint: CheckpointBlock {
-                        envelope: r.checkpoint_envelope,
-                    },
-                })
-            } else {
-                None
-            };
-            out.push(AnchorExportRecord {
-                kind: "anchor",
-                tenant_id: r.tenant_id,
-                batch_start_seq: r.batch_start_seq,
-                batch_end_seq: r.batch_end_seq,
-                merkle_root: r.merkle_root,
-                anchor_state: r.anchor_state,
-                ed25519: Ed25519Block {
-                    signature: r.ed25519_sig,
-                    pubkey: r.ed25519_pubkey,
-                },
-                rekor,
-            });
-        }
-        Ok(out)
+        Ok(rows.into_iter().map(AnchorExportRecord::from).collect())
     }
 
-    async fn ledger_range(&self, tenant_id: &TenantId) -> Result<(Option<u64>, Option<u64>, u64)> {
+    async fn ledger_range(&self, tenant_id: &TenantId) -> Result<LedgerRangeStats> {
         // FINAL so a crash-retry duplicate (ADR-065) is counted once. No time bound:
         // audit_log has no TTL and is append-only, so this IS the lifetime range —
         // which is what "▸ 15700-15799 for this workspace" claims.
@@ -516,18 +813,24 @@ impl AuditExportReader for ClickHouseExportReader {
             lo: u64,
             hi: u64,
             total: u64,
+            latest_event_us: Option<i64>,
+            latest_anchor_us: Option<i64>,
         }
         let r = self
             .client
             .query(
                 &self
                     .capped(
-                        "SELECT min(seq) AS lo, max(seq) AS hi, count() AS total \
+                        "SELECT min(seq) AS lo, max(seq) AS hi, count() AS total, \
+                 maxOrNull(toUnixTimestamp64Micro(event_time)) AS latest_event_us, \
+                 (SELECT maxOrNull(toUnixTimestamp64Micro(anchored_at)) FROM audit_anchor_records \
+                  WHERE tenant_id = ? AND anchor_state = 'anchored') AS latest_anchor_us \
                  FROM audit_log FINAL WHERE tenant_id = ?",
                         tenant_id,
                     )
                     .await,
             )
+            .bind(tenant_id.to_string())
             .bind(tenant_id.to_string())
             .fetch_one::<RangeRow>()
             .await
@@ -535,10 +838,13 @@ impl AuditExportReader for ClickHouseExportReader {
         // ClickHouse returns min/max = 0 over an EMPTY set, and seq 0 is a REAL
         // genesis row — so the count is the only thing that distinguishes them.
         // Reading 0/0 as a range would tell an empty workspace it has one row.
-        if r.total == 0 {
-            return Ok((None, None, 0));
-        }
-        Ok((Some(r.lo), Some(r.hi), r.total))
+        Ok(LedgerRangeStats {
+            from: (r.total > 0).then_some(r.lo),
+            to: (r.total > 0).then_some(r.hi),
+            total: r.total,
+            latest_event_at: r.latest_event_us.and_then(DateTime::from_timestamp_micros),
+            latest_anchor_at: r.latest_anchor_us.and_then(DateTime::from_timestamp_micros),
+        })
     }
 
     async fn summarize(
@@ -825,38 +1131,7 @@ impl AuditExportReader for ClickHouseExportReader {
             }
         }
         .context("audit_anchor_records page SELECT failed")?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let rekor = if r.anchor_state == "anchored" && !r.rekor_log_index.is_empty() {
-                    Some(RekorBlock {
-                        log_url: r.rekor_log_url,
-                        log_index: r.rekor_log_index,
-                        canonicalized_body: r.canonicalized_body,
-                        inclusion_proof: serde_json::from_str(&r.inclusion_proof)
-                            .unwrap_or(serde_json::Value::Null),
-                        checkpoint: CheckpointBlock {
-                            envelope: r.checkpoint_envelope,
-                        },
-                    })
-                } else {
-                    None
-                };
-                AnchorExportRecord {
-                    kind: "anchor",
-                    tenant_id: r.tenant_id,
-                    batch_start_seq: r.batch_start_seq,
-                    batch_end_seq: r.batch_end_seq,
-                    merkle_root: r.merkle_root,
-                    anchor_state: r.anchor_state,
-                    ed25519: Ed25519Block {
-                        signature: r.ed25519_sig,
-                        pubkey: r.ed25519_pubkey,
-                    },
-                    rekor,
-                }
-            })
-            .collect())
+        Ok(rows.into_iter().map(AnchorExportRecord::from).collect())
     }
 }
 
@@ -1142,11 +1417,25 @@ async fn handler(
                 if page.is_empty() {
                     return None;
                 }
-                let next: Option<Option<u64>> = if (page.len() as u32) < PAGE {
-                    None
-                } else {
-                    page.last().map(|r| Some(r.seq))
-                };
+                // B-465: stop on an EMPTY page only. A short page is not proof of the
+                // end — a reader with a smaller private cap returns short pages while
+                // rows remain, and treating that as the end exported 10,000 of 29,691
+                // rows on prod behind a green verifier exit. One extra round trip per
+                // export is the price of never handing a verifier a partial ledger.
+                let last = page.last().map(|r| r.seq);
+                if let (Some(a), Some(l)) = (after, last)
+                    && l <= a
+                {
+                    // A reader that returns rows at or before the cursor would page
+                    // forever; an infinite export is worse than an aborted one.
+                    let err = abort_export(
+                        &tenant,
+                        "audit_log page did not advance past the cursor",
+                        anyhow::anyhow!("cursor {a}, page ends at {l}"),
+                    );
+                    return Some((Err(err), None));
+                }
+                let next: Option<Option<u64>> = last.map(Some);
                 Some((Ok(page), next))
             }
         })
@@ -1180,11 +1469,19 @@ async fn handler(
                 if page.is_empty() {
                     return None;
                 }
-                let next: Option<Option<u64>> = if (page.len() as u32) < PAGE {
-                    None
-                } else {
-                    page.last().map(|a| Some(a.batch_start_seq))
-                };
+                // B-465: empty page ends the stream; a short one does not (see rows).
+                let last = page.last().map(|a| a.batch_start_seq);
+                if let (Some(a), Some(l)) = (after, last)
+                    && l <= a
+                {
+                    let err = abort_export(
+                        &tenant,
+                        "audit_anchor_records page did not advance past the cursor",
+                        anyhow::anyhow!("cursor {a}, page ends at {l}"),
+                    );
+                    return Some((Err(err), None));
+                }
+                let next: Option<Option<u64>> = last.map(Some);
                 Some((Ok(page), next))
             }
         })
@@ -1341,6 +1638,153 @@ mod tests {
             row_hash: format!("{seq}-hash"),
             rekor_entry_id: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local CLICKHOUSE_TEST_URL; SELECT-only against a fresh tenant"]
+    async fn recent_window_local_clickhouse_query_shapes_execute() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("local CLICKHOUSE_TEST_URL");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert!(
+            matches!(parsed.host_str(), Some("localhost" | "127.0.0.1")),
+            "local proof only"
+        );
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let reader = ClickHouseExportReader::new(
+            ClickhouseClient::default()
+                .with_url(url)
+                .with_database("tracelane"),
+        );
+        let until = Utc::now();
+        let since = until - chrono::Duration::days(7);
+        assert!(
+            reader
+                .read_newest_range(&tenant, since, until, 1000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reader
+                .read_anchors_for_sequences(&tenant, 999_999_000, 999_999_999, 1000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let range = reader.ledger_range(&tenant).await.unwrap();
+        assert_eq!((range.from, range.to, range.total), (None, None, 0));
+        assert_eq!(range.latest_event_at, None);
+        assert_eq!(range.latest_anchor_at, None);
+    }
+
+    #[tokio::test]
+    async fn recent_window_clickhouse_reads_are_bounded_scoped_and_forward_ordered() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        fn request_sql(request: &wiremock::Request) -> String {
+            request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "query")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_else(|| String::from_utf8_lossy(&request.body).into_owned())
+        }
+        fn string(out: &mut Vec<u8>, value: &str) {
+            assert!(value.len() < 128);
+            out.push(value.len() as u8);
+            out.extend(value.as_bytes());
+        }
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let server = MockServer::start().await;
+        let mut rows = Vec::new();
+        for seq in [999_999_999_u64, 999_999_998] {
+            string(&mut rows, &tenant.to_string());
+            rows.extend(seq.to_le_bytes());
+            rows.extend(1_790_208_000_000_000_i64.to_le_bytes());
+            for value in ["request", "actor", "{}", "prev", "hash"] {
+                string(&mut rows, value);
+            }
+            rows.push(1); // nullable rekor_entry_id = NULL
+        }
+        Mock::given(|r: &wiremock::Request| request_sql(r).contains("ORDER BY seq DESC"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(rows))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(|r: &wiremock::Request| request_sql(r).contains("AND batch_end_seq <="))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut stats = Vec::new();
+        for n in [0_u64, 999_999_999, 1_000_000_000] {
+            stats.extend(n.to_le_bytes());
+        }
+        stats.push(0);
+        stats.extend(1_790_208_000_000_000_i64.to_le_bytes());
+        stats.push(1); // no batch marked anchored
+        Mock::given(|r: &wiremock::Request| request_sql(r).contains("count() AS total"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(stats))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reader = ClickHouseExportReader::new(
+            ClickhouseClient::default()
+                .with_url(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        );
+        let since = Utc::now() - chrono::Duration::days(7);
+        let until = Utc::now();
+        let rows = reader
+            .read_newest_range(&tenant, since, until, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            [999_999_998, 999_999_999]
+        );
+        assert!(rows.iter().all(|r| r.tenant_id == tenant.to_string()));
+        assert!(
+            reader
+                .read_anchors_for_sequences(&tenant, rows[0].seq, rows[1].seq, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let range = reader.ledger_range(&tenant).await.unwrap();
+        assert_eq!(range.total, 1_000_000_000);
+        assert_eq!(
+            range.latest_event_at.unwrap().timestamp_micros(),
+            1_790_208_000_000_000
+        );
+        assert_eq!(range.latest_anchor_at, None);
+        let requests = server.received_requests().await.unwrap();
+        for request in &requests {
+            let sql = request_sql(request);
+            assert!(sql.contains(&format!("tenant_id = '{}'", tenant)), "{sql}");
+            assert!(sql.contains("SETTINGS"), "resource caps missing: {sql}");
+        }
+        let row_sql = request_sql(&requests[0]);
+        assert!(row_sql.contains("ORDER BY seq DESC LIMIT 2"), "{row_sql}");
+        assert!(row_sql.contains(&since.timestamp_micros().to_string()));
+        assert!(row_sql.contains(&until.timestamp_micros().to_string()));
+        let anchor_sql = request_sql(&requests[1]);
+        assert!(
+            anchor_sql.contains("batch_start_seq >= 999999998"),
+            "{anchor_sql}"
+        );
+        assert!(
+            anchor_sql.contains("batch_end_seq <= 999999999"),
+            "{anchor_sql}"
+        );
+        let activity_sql = request_sql(&requests[2]);
+        assert_eq!(
+            activity_sql
+                .matches(&format!("tenant_id = '{}'", tenant))
+                .count(),
+            2,
+            "both activity sources must be tenant scoped"
+        );
+        assert!(activity_sql.contains("anchor_state = 'anchored'"));
     }
 
     #[test]
@@ -1995,12 +2439,19 @@ mod tests {
                 _tenant_id: &TenantId,
                 _since: DateTime<Utc>,
                 _until: DateTime<Utc>,
-                _after_seq: Option<u64>,
+                after_seq: Option<u64>,
                 _limit: u32,
             ) -> Result<Vec<ExportRow>> {
                 match self.plant {
                     Plant::RowPage => anyhow::bail!("planted: audit_log page read failed"),
-                    _ => Ok(self.rows.clone()),
+                    // Honour the cursor like a real reader (B-465: the handler pages
+                    // until an EMPTY page).
+                    _ => Ok(self
+                        .rows
+                        .iter()
+                        .filter(|r| after_seq.is_none_or(|a| r.seq > a))
+                        .cloned()
+                        .collect()),
                 }
             }
             async fn read_anchor_page(
@@ -2112,6 +2563,100 @@ mod tests {
                 assert!(
                     degradation::count(Degradation::AuditExportIncomplete) > before,
                     "the abort must be counted"
+                );
+            });
+        }
+
+        /// A reader that honours `after_seq` but returns SHORT pages — fewer rows
+        /// than the handler asked for while more remain. That is exactly what the
+        /// canonical Postgres reader did on prod (B-465, 2026-09-20): `ledger.rs`
+        /// clamped every read to 10,000 while the handler paged by 50,000 and
+        /// treated a short page as the end, so a 29,691-row ledger exported as
+        /// 10,000 rows and the deploy's Proof C called it green. The export must
+        /// stop on an EMPTY page, never on a short one.
+        struct ShortPageReader {
+            rows: Vec<ExportRow>,
+            page_cap: usize,
+        }
+
+        #[async_trait::async_trait]
+        impl AuditExportReader for ShortPageReader {
+            async fn read_range(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                limit: u32,
+            ) -> Result<Vec<ExportRow>> {
+                Ok(self.rows.iter().take(limit as usize).cloned().collect())
+            }
+            async fn read_anchor_records(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _limit: u32,
+            ) -> Result<Vec<AnchorExportRecord>> {
+                Ok(Vec::new())
+            }
+            async fn read_range_page(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                after_seq: Option<u64>,
+                _limit: u32,
+            ) -> Result<Vec<ExportRow>> {
+                Ok(self
+                    .rows
+                    .iter()
+                    .filter(|r| after_seq.is_none_or(|a| r.seq > a))
+                    .take(self.page_cap)
+                    .cloned()
+                    .collect())
+            }
+            async fn read_anchor_page(
+                &self,
+                _tenant_id: &TenantId,
+                _since: DateTime<Utc>,
+                _until: DateTime<Utc>,
+                _after: Option<u64>,
+                _limit: u32,
+            ) -> Result<Vec<AnchorExportRecord>> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[test]
+        fn b465_the_uncapped_export_streams_every_row_when_the_reader_pages_short() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            let rows: Vec<ExportRow> = (0..20).map(fixture_row).collect();
+            let state = ExportState {
+                reader: Arc::new(ShortPageReader { rows, page_cap: 7 }),
+                entitlements: Some(fixed_entitlement(true)),
+            };
+            let query = ExportQuery {
+                since: None,
+                until: None,
+                limit: None,
+            };
+            rt().block_on(async {
+                let resp = handler(State(state), Query(query), entitled_headers()).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("a short-paging reader is not a failure — the transfer completes");
+                let body = String::from_utf8(bytes.to_vec()).unwrap();
+                let seqs: Vec<u64> = body
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter_map(|v| v.get("seq").and_then(|s| s.as_u64()))
+                    .collect();
+                assert_eq!(
+                    seqs,
+                    (0..20).collect::<Vec<u64>>(),
+                    "every row must be streamed, in order, across short pages (7,7,6,0)"
                 );
             });
         }

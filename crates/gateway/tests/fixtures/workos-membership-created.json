@@ -1,0 +1,15 @@
+{
+  "id": "event_membership_fixture",
+  "event": "organization_membership.created",
+  "data": {
+    "id": "om_invited_fixture",
+    "object": "organization_membership",
+    "user_id": "user_invited_fixture",
+    "organization_id": "org_invited_fixture",
+    "status": "active",
+    "role": { "slug": "member" },
+    "created_at": "2026-09-22T00:00:00.000Z",
+    "updated_at": "2026-09-22T00:00:00.000Z"
+  },
+  "created_at": "2026-09-22T00:00:00.000Z"
+}

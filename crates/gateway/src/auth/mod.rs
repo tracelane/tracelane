@@ -541,6 +541,62 @@ pub fn failure_code(err: &anyhow::Error) -> &'static str {
 /// Returns `Err` if the header is malformed, the token is expired, the
 /// signature is invalid, or no tenant can be resolved.
 pub async fn validate_authorization(authorization: &str) -> Result<Claims> {
+    validate_authorization_traced(authorization)
+        .await
+        .map(|(claims, _)| claims)
+}
+
+/// Which branch of credential validation answered a request (B-568 I1). Timing
+/// metadata ONLY — it never widens or narrows what the credential may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPath {
+    /// A `tlane_` key, and which cache branch served it.
+    ApiKey(crate::db::api_keys::LookupPath),
+    /// A WorkOS JWT whose tenant resolved without a control-plane read.
+    Jwt,
+    /// A WorkOS JWT whose `org_id` → tenant bridge missed its cache and read Postgres.
+    JwtCold,
+    /// Self-host master key, the debug dev stub, or a test override — no store touched.
+    Static,
+}
+
+impl AuthPath {
+    /// The `auth=` label on the slow-request line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ApiKey(p) => p.label(),
+            Self::Jwt => "jwt",
+            Self::JwtCold => "jwt_cold",
+            Self::Static => "static",
+        }
+    }
+
+    /// Whether answering it made a control-plane round trip — one of the four
+    /// sources of `tracelane_gateway_cold_start` (B-568 I5).
+    #[must_use]
+    pub fn is_cold(self) -> bool {
+        matches!(
+            self,
+            Self::ApiKey(crate::db::api_keys::LookupPath::Cold) | Self::JwtCold
+        )
+    }
+}
+
+/// [`validate_authorization`], also reporting the branch that answered — the
+/// admission pipeline's entry point, so the slow-request line can say
+/// `auth=cold` and the span can say `tracelane_gateway_cold_start`.
+///
+/// # Errors
+/// Exactly as [`validate_authorization`]: fail-CLOSED, 401 on a bad credential,
+/// 503 when the store behind it is unreachable.
+pub async fn validate_authorization_traced(authorization: &str) -> Result<(Claims, AuthPath)> {
+    // Test-only: a scoped credential for route-level scope tests (B-207). Compiled out of
+    // every non-test build; thread-local, so a test sets it for its own task only.
+    #[cfg(test)]
+    if let Some(claims) = test_claims::get() {
+        return Ok((claims, AuthPath::Static));
+    }
     let token = authorization
         .strip_prefix("Bearer ")
         .context("Authorization header must use Bearer scheme")?;
@@ -553,7 +609,7 @@ pub async fn validate_authorization(authorization: &str) -> Result<Claims> {
     // paths — there is no Postgres/WorkOS in that deployment. Installed only
     // when the multi-tenant guard passed, so this branch is dead in hosted.
     if let Some(sh) = SELF_HOST_AUTH.get() {
-        return validate_self_host(token, sh);
+        return validate_self_host(token, sh).map(|c| (c, AuthPath::Static));
     }
 
     if token.starts_with("tlane_") {
@@ -576,7 +632,7 @@ pub async fn validate_authorization(authorization: &str) -> Result<Claims> {
 /// (and the test escape hatch isn't disabling it), return the fixed
 /// dev tenant so local workflow without WorkOS still works. Release
 /// builds without `WORKOS_CLIENT_ID` always refuse.
-async fn validate_jwt(token: &str) -> Result<Claims> {
+async fn validate_jwt(token: &str) -> Result<(Claims, AuthPath)> {
     let workos_configured = std::env::var("WORKOS_CLIENT_ID").is_ok();
     let dev_auth_disabled = std::env::var("TRACELANE_DEV_AUTH").as_deref() == Ok("0");
 
@@ -584,7 +640,7 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
         #[cfg(debug_assertions)]
         {
             tracing::debug!("auth: dev-stub claims (WORKOS_CLIENT_ID unset)");
-            return Ok(dev_stub_claims(AuthMethod::JwtBearer));
+            return Ok((dev_stub_claims(AuthMethod::JwtBearer), AuthPath::Static));
         }
         #[cfg(not(debug_assertions))]
         bail!(
@@ -616,20 +672,28 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
     //    tenant identity (direct UUID claim, or WorkOS org_id bridge).
     let claims = decode_and_validate(token, decoding_key, header.alg)?;
     let role = role_from_claim(claims.role.as_deref());
-    let tenant_id = resolve_tenant_id(&claims).await?;
-    Ok(Claims {
-        tenant_id,
-        sub: claims.sub,
-        auth_method: AuthMethod::JwtBearer,
-        role,
-        // A JWT is governed by Role, not by scopes — see the field's invariant.
-        key_scope: scope::KeyScope::LegacyFullSurface,
-        // GWY-43: no budget and no per-key rate override on this credential.
-        budget_usd_monthly: None,
-        rate_limit_rpm: None,
-        // BILL-01 A3: a JWT carries no per-key budget cadence either.
-        budget_reset: crate::spend::BudgetReset::Monthly,
-    })
+    let (tenant_id, bridge_missed) = resolve_tenant_id_traced(&claims).await?;
+    let path = if bridge_missed {
+        AuthPath::JwtCold
+    } else {
+        AuthPath::Jwt
+    };
+    Ok((
+        Claims {
+            tenant_id,
+            sub: claims.sub,
+            auth_method: AuthMethod::JwtBearer,
+            role,
+            // A JWT is governed by Role, not by scopes — see the field's invariant.
+            key_scope: scope::KeyScope::LegacyFullSurface,
+            // GWY-43: no budget and no per-key rate override on this credential.
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
+            // BILL-01 A3: a JWT carries no per-key budget cadence either.
+            budget_reset: crate::spend::BudgetReset::Monthly,
+        },
+        path,
+    ))
 }
 
 /// Resolve a `TenantId` from validated WorkOS claims.
@@ -652,7 +716,18 @@ async fn validate_jwt(token: &str) -> Result<Claims> {
 /// `org_id`, or a `tenant_id`/`org_id` that disagree, returns `Err` — which the
 /// caller turns into a 401. The bridge does not log `org_id` (kept out of
 /// structured fields); only the resolved `tenant_id` flows downstream.
+#[cfg(test)]
 async fn resolve_tenant_id(claims: &WorkOsClaims) -> Result<TenantId> {
+    resolve_tenant_id_traced(claims).await.map(|(t, _)| t)
+}
+
+/// [`resolve_tenant_id`]'s production form: also reports whether the `org_id`
+/// bridge missed its 30 s cache and read Postgres (B-568 I5 — a JWT bridge miss is
+/// one of the four control-plane round trips that make a request cold).
+///
+/// # Errors
+/// As [`resolve_tenant_id`] — fail-CLOSED.
+async fn resolve_tenant_id_traced(claims: &WorkOsClaims) -> Result<(TenantId, bool)> {
     let direct = match claims.tenant_id.as_deref().filter(|s| !s.is_empty()) {
         Some(tid) => Some(
             Uuid::parse_str(tid)
@@ -665,20 +740,20 @@ async fn resolve_tenant_id(claims: &WorkOsClaims) -> Result<TenantId> {
     match (direct, org) {
         // Both present: the org bridge MUST agree with the direct claim.
         (Some(uuid), Some(org)) => {
-            let resolved = org_tenant_cache::resolve(org)
+            let (resolved, missed) = org_tenant_cache::resolve_traced(org)
                 .await
                 .context("could not resolve WorkOS org_id to a tenant")?;
             if resolved != uuid {
                 bail!("JWT tenant_id claim does not match the tenant resolved from org_id");
             }
-            Ok(TenantId::from_jwt_claim(uuid))
+            Ok((TenantId::from_jwt_claim(uuid), missed))
         }
-        (Some(uuid), None) => Ok(TenantId::from_jwt_claim(uuid)),
+        (Some(uuid), None) => Ok((TenantId::from_jwt_claim(uuid), false)),
         (None, Some(org)) => {
-            let uuid = org_tenant_cache::resolve(org)
+            let (uuid, missed) = org_tenant_cache::resolve_traced(org)
                 .await
                 .context("could not resolve WorkOS org_id to a tenant")?;
-            Ok(TenantId::from_jwt_claim(uuid))
+            Ok((TenantId::from_jwt_claim(uuid), missed))
         }
         (None, None) => {
             bail!("JWT carries neither a tenant_id UUID nor an org_id claim; cannot resolve tenant")
@@ -784,6 +859,37 @@ fn decode_and_validate(
 /// Build dev-stub claims for the dev tenant. Used when WorkOS isn't
 /// configured in debug builds, and by `api_key::validate` for the same
 /// reason (Postgres lookup not yet wired).
+/// B-207 — test-only claims override for `validate_authorization`, so a route-level test
+/// can present a SCOPED key without minting one. Thread-local + guard-restored: a
+/// `#[tokio::test]` runs on one thread, and nothing leaks into another test.
+#[cfg(test)]
+pub(crate) mod test_claims {
+    use super::Claims;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OVERRIDE: RefCell<Option<Claims>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Claims> {
+        OVERRIDE.with(|o| o.borrow().clone())
+    }
+
+    /// Present `claims` for every `validate_authorization` on this thread until dropped.
+    pub(crate) struct Guard;
+    impl Guard {
+        pub(crate) fn set(claims: Claims) -> Self {
+            OVERRIDE.with(|o| *o.borrow_mut() = Some(claims));
+            Self
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|o| *o.borrow_mut() = None);
+        }
+    }
+}
+
 pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
     let tenant_id =
         TenantId::from_jwt_claim(Uuid::parse_str(DEV_TENANT_UUID).expect("static UUID is valid"));

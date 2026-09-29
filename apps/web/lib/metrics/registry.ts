@@ -13,8 +13,16 @@
  * The dedup class matters because ingest is at-least-once: `spans FINAL` and
  * `trace_summaries FINAL` collapse a redelivered span; `slo_hourly_stats`
  * (`countMerge` over the MV, which counts at insert time) does NOT, and
- * `guardrail_verdicts` is a plain MergeTree. So the SLO family's "LLM calls" and
- * the spans family's "Requests routed" are two definitions — and two labels.
+ * `guardrail_verdicts` is a plain MergeTree. The SLO family reads BOTH, by
+ * window (B-500, 2026-09-21): a window of 24 h or less carries a sub-hour
+ * bucket and every `/v1/slo*` route then reads `spans FINAL` bounded by
+ * `start_time`; wider than that, every route reads `slo_hourly_stats` bounded by
+ * `bucket_hour`. The whole family switches together — the headline, the table
+ * and the chart count the same spans under one window, which they did not when
+ * only the two series routes carried the bucket. The SLO family's "LLM calls"
+ * and the spans family's "Requests routed" stay two definitions — and two
+ * labels — because the SLO scope is the MV's four-key provider derivation and
+ * the spans family's is `gen_ai_provider_name` alone.
  *
  * `docs/product/*.md` tables must carry every label here
  * (`scripts/ci/check-metric-docs.py` reads this file as well as `<StatCard>`).
@@ -32,6 +40,7 @@ export type MetricFamily =
 	| "tools"
 	| "evals"
 	| "audit"
+	| "kya"
 	| "gateway-process";
 
 export type WindowKind =
@@ -44,11 +53,12 @@ export type WindowKind =
 export type DedupClass =
 	| "spans FINAL"
 	| "trace_summaries FINAL"
-	| "slo MV (not deduplicated)"
+	| "spans FINAL ≤ 24 h · slo MV (not deduplicated) above"
 	| "guardrail_verdicts (no dedup)"
 	| "online_eval_scores FINAL"
 	| "audit_log FINAL"
 	| "in-process"
+	| "eval_run_items FINAL"
 	| "none";
 
 export interface MetricDef {
@@ -77,7 +87,483 @@ const NO_VERDICTS = "no verdicts in this window";
 
 /** `satisfies` keeps the ids literal AND checks every entry against MetricDef. */
 export const METRICS = {
-	// ── SLO family — slo_hourly_stats via /v1/slo*, NOT deduplicated ───────────
+	kya_calls: {
+		id: "kya_calls",
+		label: "Calls",
+		kind: "count",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].calls (same definition on the profile route)",
+		numerator:
+			"LLM-call spans with operation chat, embeddings or messages under this identity.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_traces: {
+		id: "kya_traces",
+		label: "Traces with calls",
+		kind: "count",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].traces (same definition on the profile route)",
+		numerator: "uniqExact(trace_id) among those LLM-call spans.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_tokens_in: {
+		id: "kya_tokens_in",
+		label: "Tokens in",
+		kind: "tokens",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].tokens_in (same definition on the profile route)",
+		numerator:
+			"Sum of recorded input tokens; null when every call lacks input usage.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_tokens_out: {
+		id: "kya_tokens_out",
+		label: "Tokens out",
+		kind: "tokens",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].tokens_out (same definition on the profile route)",
+		numerator:
+			"Sum of recorded output tokens; null when every call lacks output usage.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_cost: {
+		id: "kya_cost",
+		label: "Cost",
+		kind: "currency",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].cost_usd (same definition on the profile route)",
+		numerator:
+			"Sum of cost_usd where cost_usd_present = 1; null when all calls are unpriced.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_error_rate: {
+		id: "kya_error_rate",
+		label: "Call errors",
+		kind: "percent",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].error_rate (same definition on the profile route)",
+		numerator: "Calls with status_code = 2.",
+		denominator: "Calls for the same identity and window.",
+		dedup: "spans FINAL",
+		floor: 1,
+		hint: "An observed fraction of recorded calls, not a reliability forecast.",
+	},
+
+	kya_p50: {
+		id: "kya_p50",
+		label: "Median latency",
+		kind: "duration_ms",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].p50_us (same definition on the profile route)",
+		numerator:
+			"quantiles(0.5,0.95)(duration_us), p50 converted from microseconds to milliseconds.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_p95: {
+		id: "kya_p95",
+		label: "p95 call latency",
+		kind: "duration_ms",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].p95_us (same definition on the profile route)",
+		numerator:
+			"quantiles(0.5,0.95)(duration_us), p95 converted from microseconds to milliseconds.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	kya_share: {
+		id: "kya_share",
+		label: "Share of workspace",
+		kind: "percent",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].share_of_workspace (same definition on the profile route)",
+		numerator: "Calls for this identity.",
+		denominator:
+			"All LLM calls in the same workspace and window, before the identity limit.",
+		dedup: "spans FINAL",
+		floor: 1,
+		hint: "An observed fraction of recorded calls, not a reliability forecast.",
+	},
+
+	kya_tool_calls: {
+		id: "kya_tool_calls",
+		label: "Recorded tool calls",
+		kind: "count",
+		family: "kya",
+		window: "windowed",
+		source:
+			"GET /v1/kya/identities · identities[].tools[].calls (same definition on the profile route)",
+		numerator:
+			"Occurrences in recorded response tool-name arrays and gen_ai.tool.name attributes; not offered tool definitions.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	// Experiment comparison: gateway computes every value; no client-side rescoring.
+	experiment_case_score: {
+		id: "experiment_case_score",
+		label: "Case score",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 rows[].a.score / rows[].b.score",
+		numerator: "Stored case score; null means no score.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_case_latency: {
+		id: "experiment_case_latency",
+		label: "Case latency",
+		kind: "duration_ms",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 rows[].a.latency_ms / rows[].b.latency_ms",
+		numerator: "Stored case execution latency in milliseconds.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_case_cost: {
+		id: "experiment_case_cost",
+		label: "Case cost",
+		kind: "currency",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 rows[].a.cost_usd / rows[].b.cost_usd",
+		numerator: "Stored priced case cost; null means unpriced.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_score_delta: {
+		id: "experiment_score_delta",
+		label: "Case score change",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 rows[].delta_score",
+		numerator: "Candidate score minus baseline; null when either is unknown.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_latency_delta: {
+		id: "experiment_latency_delta",
+		label: "Case latency change",
+		kind: "duration_ms",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 rows[].delta_latency_ms",
+		numerator:
+			"Candidate latency minus baseline in milliseconds; null when a side is absent.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_latency_ratio: {
+		id: "experiment_latency_ratio",
+		label: "Case latency change percent",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 rows[].delta_latency_pct",
+		numerator:
+			"100 times latency change divided by baseline latency; null at zero baseline.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_cost_delta: {
+		id: "experiment_cost_delta",
+		label: "Case cost change",
+		kind: "currency",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 rows[].delta_cost_usd",
+		numerator:
+			"Candidate priced cost minus baseline; null when either is unpriced.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_pass_rate: {
+		id: "experiment_pass_rate",
+		label: "Experiment pass rate",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 a.pass_rate / b.pass_rate",
+		numerator:
+			"100 times passed divided by passed plus failed over matched cases; null if none scored.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_passed: {
+		id: "experiment_passed",
+		label: "Experiment cases passed",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 a.passed / b.passed",
+		numerator: "Matched cases whose stored status is passed.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_scored: {
+		id: "experiment_scored",
+		label: "Experiment cases scored",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.passed + a.failed / b.passed + b.failed",
+		numerator: "Matched passed plus failed cases; excludes errored.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_mean: {
+		id: "experiment_mean",
+		label: "Experiment mean score",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.mean_score / b.mean_score",
+		numerator:
+			"Mean of non-null scores over matched cases; null if none scored.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_p95: {
+		id: "experiment_p95",
+		label: "Experiment p95 latency",
+		kind: "duration_ms",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.p95_latency_ms / b.p95_latency_ms",
+		numerator:
+			"Nearest-rank p95 over non-errored matched cases; null if none completed.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_cost: {
+		id: "experiment_cost",
+		label: "Experiment total priced cost",
+		kind: "currency",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.total_cost_usd / b.total_cost_usd",
+		numerator: "Sum of known matched case costs; shown with unpriced count.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_unpriced: {
+		id: "experiment_unpriced",
+		label: "Experiment unpriced cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.unpriced_items / b.unpriced_items",
+		numerator: "Matched cases without a known price.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_matched: {
+		id: "experiment_matched",
+		label: "Experiment matched cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 a.items_matched / b.items_matched",
+		numerator: "Cases aligned across both arms.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_run: {
+		id: "experiment_run",
+		label: "Experiment cases run",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 a.items_run / b.items_run",
+		numerator: "Case rows produced by each arm, including unmatched rows.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_errored: {
+		id: "experiment_errored",
+		label: "Experiment errored cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 a.errored / b.errored",
+		numerator: "Matched cases whose stored status is errored.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_snapshot: {
+		id: "experiment_snapshot",
+		label: "Experiment snapshot cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 item_count",
+		numerator: "Case count in the shared frozen dataset snapshot.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_worse: {
+		id: "experiment_worse",
+		label: "Experiment worse cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 regressed_count",
+		numerator:
+			"Cases classified regressed by gateway score threshold or pass-to-fail rule.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_better: {
+		id: "experiment_better",
+		label: "Experiment better cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 improved_count",
+		numerator:
+			"Cases classified improved by gateway score threshold or fail-to-pass rule.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_unchanged: {
+		id: "experiment_unchanged",
+		label: "Experiment unchanged cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 unchanged_count",
+		numerator: "Cases classified unchanged by the gateway.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_unknown: {
+		id: "experiment_unknown",
+		label: "Experiment unknown cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 unknown_count",
+		numerator:
+			"Cases with no comparison verdict because a score is unavailable.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_only_a: {
+		id: "experiment_only_a",
+		label: "Experiment baseline-only cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 only_in_a",
+		numerator: "Cases appearing only in baseline.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_only_b: {
+		id: "experiment_only_b",
+		label: "Experiment candidate-only cases",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 only_in_b",
+		numerator: "Cases appearing only in candidate.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_rows: {
+		id: "experiment_rows",
+		label: "Experiment comparison rows",
+		kind: "count",
+		family: "evals",
+		window: "entity",
+		source: "GET /v1/experiments/{id}/compare \u00b7 rows.length",
+		numerator: "Total aligned and one-sided case rows.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_score_threshold: {
+		id: "experiment_score_threshold",
+		label: "Experiment score threshold",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 thresholds.score_delta_min",
+		numerator:
+			"Gateway score-delta threshold used to classify better or worse.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_latency_threshold: {
+		id: "experiment_latency_threshold",
+		label: "Experiment latency threshold",
+		kind: "duration_ms",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 thresholds.latency_delta_min_ms",
+		numerator:
+			"Gateway absolute latency margin; both absolute and relative margins must be exceeded.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+	experiment_latency_percent_threshold: {
+		id: "experiment_latency_percent_threshold",
+		label: "Experiment relative latency threshold",
+		kind: "ratio",
+		family: "evals",
+		window: "entity",
+		source:
+			"GET /v1/experiments/{id}/compare \u00b7 thresholds.latency_delta_min_pct",
+		numerator:
+			"Gateway relative latency margin in percent, paired with absolute margin.",
+		denominator: null,
+		dedup: "eval_run_items FINAL",
+	},
+
+	// ── SLO family — /v1/slo*: spans FINAL for windows ≤ 24 h, slo_hourly_stats above ──
 	llm_calls: {
 		id: "llm_calls",
 		label: "LLM calls",
@@ -85,10 +571,11 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/summary · requests",
-		numerator: "Σ countMerge(request_count) over rows with provider ≠ ''",
+		numerator:
+			"count() over spans FINAL (≤ 24 h) or Σ countMerge(request_count) (above), provider ≠ ''",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
-		hint: "Model requests — one agent run can make several. Not the trace/conversation count (see Traces). Counted by the hourly SLO view, which counts a redelivered span twice.",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
+		hint: "Model requests — one agent run can make several. Not the trace/conversation count (see Traces). Windows of 24 hours or less are counted from the spans themselves; wider windows from the hourly SLO view, which counts a redelivered span twice.",
 		zeroCopy: NO_TRAFFIC,
 	},
 	error_rate: {
@@ -98,9 +585,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/summary · errors / requests",
-		numerator: "Σ countMerge(error_count) — spans with status_code = 2",
+		numerator:
+			"countIf(status_code = 2) over spans FINAL (≤ 24 h) or Σ countMerge(error_count) (above)",
 		denominator: "Σ requests (same rows, provider ≠ '')",
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		hint: "Share of LLM requests that failed, over the selected window.",
 		floor: 100,
 		zeroCopy: NO_TRAFFIC,
@@ -115,7 +603,7 @@ export const METRICS = {
 			"GET /v1/slo/summary · (requests − errors) / requests; target from tenants.plan",
 		numerator: "requests − errors",
 		denominator: "requests",
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		hint: "Success rate over the window, judged against your plan's contracted target once the sample is large enough to resolve it.",
 		floor: "target",
 		zeroCopy: NO_TRAFFIC,
@@ -129,7 +617,7 @@ export const METRICS = {
 		source: "derived · error_rate / (1 − target)",
 		numerator: "error rate",
 		denominator: "1 − target (the error budget)",
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		hint: "How fast the error budget is being spent. 1.0× = exactly on pace for the window.",
 		floor: "target",
 		zeroCopy: NO_TRAFFIC,
@@ -143,7 +631,7 @@ export const METRICS = {
 		source: "derived · (1 − burn_rate) × 100",
 		numerator: "1 − burn rate",
 		denominator: "the error budget (1 − target), through burn rate",
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		floor: "target",
 		zeroCopy: NO_TRAFFIC,
 		hint: "Share of the error budget left, from (1 - burn rate) x 100. 100% means no budget spent yet this window.",
@@ -168,9 +656,9 @@ export const METRICS = {
 		window: "windowed",
 		source: "GET /v1/slo/models · total_input_tokens + total_output_tokens",
 		numerator:
-			"Σ sumMerge(input) + Σ sumMerge(output) — excludes prompt-cache read/creation tokens",
+			"Σ input + Σ output tokens (spans FINAL ≤ 24 h, sumMerge above) — excludes prompt-cache read/creation tokens",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		hint: "Input + output tokens. Excludes prompt-cache read and creation tokens, so a cached workload reads low here.",
 		zeroCopy: NO_TRAFFIC,
 	},
@@ -181,9 +669,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/models · total_input_tokens",
-		numerator: "Σ sumMerge(input_tokens), provider ≠ ''",
+		numerator:
+			"Σ input tokens (spans FINAL ≤ 24 h, sumMerge above), provider ≠ ''",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		zeroCopy: NO_TRAFFIC,
 		hint: "Prompt tokens sent to providers this window. Excludes prompt-cache read/creation tokens.",
 	},
@@ -194,9 +683,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/models · total_output_tokens",
-		numerator: "Σ sumMerge(output_tokens), provider ≠ ''",
+		numerator:
+			"Σ output tokens (spans FINAL ≤ 24 h, sumMerge above), provider ≠ ''",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		zeroCopy: NO_TRAFFIC,
 		hint: "Completion tokens returned by providers this window.",
 	},
@@ -208,9 +698,9 @@ export const METRICS = {
 		window: "windowed",
 		source: "GET /v1/slo/summary · p50_ms",
 		numerator:
-			"quantileMerge(0.5) over the whole window — a true window percentile",
+			"quantile(0.5) over spans FINAL (≤ 24 h) or quantileMerge (above), over the whole window — a true window percentile",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		floor: 100,
 		zeroCopy: NO_TRAFFIC,
 	},
@@ -222,9 +712,9 @@ export const METRICS = {
 		window: "windowed",
 		source: "GET /v1/slo/summary · p95_ms",
 		numerator:
-			"quantileMerge(0.95) over the whole window — never a mean of bucket percentiles",
+			"quantile(0.95) over spans FINAL (≤ 24 h) or quantileMerge (above), over the whole window — never a mean of bucket percentiles",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		hint: "End-to-end p95 over the window — the true server-side quantile, not a mean of hourly percentiles.",
 		floor: 100,
 		zeroCopy: NO_TRAFFIC,
@@ -236,9 +726,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/summary · p99_ms",
-		numerator: "quantileMerge(0.99) over the whole window",
+		numerator:
+			"quantile(0.99) over spans FINAL (≤ 24 h) or quantileMerge (above), over the whole window",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		floor: 100,
 		zeroCopy: NO_TRAFFIC,
 	},
@@ -250,9 +741,9 @@ export const METRICS = {
 		window: "windowed",
 		source: "GET /v1/slo/timeseries · requests per bucket",
 		numerator:
-			"countMerge per epoch-aligned bucket (≥ 1 h from the hourly view; < 1 h from spans FINAL)",
+			"count() per epoch-aligned bucket over spans FINAL (≤ 24 h) or countMerge from the hourly view (above)",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 	},
 	errors_series: {
 		id: "errors_series",
@@ -261,9 +752,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/timeseries · errors per bucket",
-		numerator: "countMerge(error_count) per bucket",
+		numerator:
+			"countIf(status_code = 2) per bucket (spans FINAL ≤ 24 h, countMerge above)",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 	},
 	latency_series: {
 		id: "latency_series",
@@ -272,9 +764,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/timeseries · p50_ms / p95_ms / p99_ms per bucket",
-		numerator: "quantileMerge per bucket — a missing bucket is a gap, never 0",
+		numerator:
+			"quantile per bucket (spans FINAL ≤ 24 h, quantileMerge above) — a missing bucket is a gap, never 0",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 	},
 	traffic_by_model: {
 		id: "traffic_by_model",
@@ -283,9 +776,10 @@ export const METRICS = {
 		family: "slo",
 		window: "windowed",
 		source: "GET /v1/slo/models · requests per (provider, model)",
-		numerator: "countMerge per (provider, model), provider ≠ ''",
+		numerator:
+			"count() per (provider, model) over spans FINAL (≤ 24 h) or countMerge (above), provider ≠ ''",
 		denominator: null,
-		dedup: "slo MV (not deduplicated)",
+		dedup: "spans FINAL ≤ 24 h · slo MV (not deduplicated) above",
 		zeroCopy: NO_TRAFFIC,
 	},
 
@@ -595,6 +1089,10 @@ export const METRICS = {
 		numerator: "count() over spans FINAL carrying gen_ai.tool.name",
 		denominator: null,
 		dedup: "spans FINAL",
+		// B-524 (CX-25): the count is the window's TRUE total (a window function, evaluated
+		// before the per-tool LIMIT); only the per-tool breakdown is capped — the response's
+		// `truncated` says when the tool list was cut.
+		hint: "Every tool call in the window. The per-tool breakdown lists the most-called tools up to the route's cap and says when it was cut; this total is never capped.",
 	},
 } as const satisfies Record<string, MetricDef>;
 

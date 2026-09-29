@@ -1,16 +1,6 @@
-/**
- * Audit "Verify integrity" verdict — a single pure derivation from the
- * in-browser {@link VerifyReport}, so the headline banner, the red-card styling,
- * and the two-claim breakdown all read the SAME state. Extracted (and unit-
- * tested) because a prior inline version let the big green "Verified" banner
- * show while CLAIM 2 said "Verification FAILED" — the banner was computed
- * WITHOUT `signatures_valid`, so it could be greener than the claims. Here the
- * green states are the ONLY non-alarm states and both require `signatures_valid`.
- *
- * Honesty model (ADR-062): the hash chain is the tamper-evidence; public
- * anchoring is per-batch + best-effort, so "chain intact, no anchor in this
- * view" is a GREEN (qualified) outcome, not a failure. A real anchor/signature
- * problem (merkle mismatch, untrusted key, strip) is RED.
+/** Classifies the reference verifier report. The page adds the loaded-window
+ * scope and a remedy for the failing layer; this is never a workspace verdict.
+ * A true hash_chain_valid alone is insufficient: unrooted rows may be skipped.
  */
 
 import type { VerifyReport } from "@tracelanedev/audit-verifier";
@@ -29,8 +19,8 @@ export type AuditVerdict =
 			anchors: number;
 			fromSeq: number;
 	  }
-	/** GREEN (qualified): chain intact + signed, but no public anchor fell inside
-	 *  the loaded window — tamper-evident, just not publicly anchored in this view.
+	/** QUALIFIED: chain consistent, but no public anchor verified inside
+	 *  the loaded window — the page keeps this neutral.
 	 *  Only reachable on a genesis-rooted verify (seq 0 present). */
 	| { state: "chain_only"; rows: number }
 	/** NEUTRAL: the loaded view has zero rows — nothing to verify (a brand-new
@@ -60,6 +50,14 @@ export type AuditVerdict =
 	 *  evidence; reporting it as a signature FAILURE is an accusation we cannot
 	 *  support. */
 	| { state: "anchors_unverifiable"; anchors: number }
+	/** INDETERMINATE (B-483, 2026-09-21): `rows` rows sit inside NO anchor batch although
+	 *  a LATER batch of the chain exists — a hole below the anchor watermark. They are
+	 *  unsigned and un-anchored, so nothing public holds them; the chain over them may
+	 *  still hash. Not an accusation (the anchoring process, not the ledger, failed —
+	 *  the shape a restart mid-anchor leaves), and never green: `tlane verify` and the
+	 *  Rust CLI read the same count as FAIL. The gateway's hole-aware sweep anchors the
+	 *  rows late, with the real time on the record. */
+	| { state: "anchor_hole"; rows: number }
 	/** RED: an anchor committed to "anchored" but its public proof is absent. */
 	| { state: "stripped" }
 	/** RED: a real anchor/signature failure (fingerprint mismatch, untrusted key). */
@@ -84,9 +82,9 @@ export function deriveAuditVerdict(report: VerifyReport | null): AuditVerdict {
 	}
 	if (report.strip_detected) return { state: "stripped" };
 
-	// Chain is intact from here. A false `signatures_valid` now means a GENUINE
-	// anchor/signature failure (the server-side coverage filter removed the
-	// `anchor_rows_missing` false-alarm before the verifier ever saw it).
+	// A false `signatures_valid` means an anchor/signature check failed.
+	// The server-side coverage filter removes the
+	// `anchor_rows_missing` window artifact on the normal self-verify read.
 	if (!report.signatures_valid) {
 		const reasons = [...new Set(report.errors.map((e) => e.kind))];
 		return { state: "signature_failed", reasons };
@@ -108,6 +106,13 @@ export function deriveAuditVerdict(report: VerifyReport | null): AuditVerdict {
 	// a pass). A truncated response (0 loaded out of a non-empty ledger) is caught
 	// and reddened server-side; from the chain bytes alone this reads as "empty".
 	if (report.rows_seen === 0) return { state: "empty" };
+
+	// B-483: rows no anchor batch covers, below the watermark — unsigned, un-anchored.
+	// Sits after the positive-evidence states (a broken chain or a strip still wins) and
+	// before every green one. `?? 0` only for a report from an older verifier build.
+	if ((report.rows_uncovered_by_anchors ?? 0) > 0) {
+		return { state: "anchor_hole", rows: report.rows_uncovered_by_anchors };
+	}
 
 	// ADR-070: a windowed view (genesis retention-truncated) with no public Rekor
 	// anchor to root it is RED — nothing publicly trusted holds the loaded rows.
@@ -163,12 +168,30 @@ export function isAlarm(v: AuditVerdict): boolean {
  * The rule this restores is CLAUDE.md §14 read in reverse: "I cannot see" is never
  * "nothing is wrong" — and it is never "something IS wrong" either. */
 export function isIndeterminate(v: AuditVerdict): boolean {
-	return v.state === "unrooted_window" || v.state === "anchors_unverifiable";
+	return (
+		v.state === "unrooted_window" ||
+		v.state === "anchors_unverifiable" ||
+		v.state === "anchor_hole"
+	);
 }
 
 /** Machine failure `kind` → plain English an operator can read to an auditor.
  * Unknown kinds degrade to the de-underscored raw kind (never a blank). */
 const KIND_HUMAN: Record<string, string> = {
+	platform_key_after_workspace_key:
+		"a platform key signed a batch after workspace signing began",
+	parse_error: "the evidence contains an unreadable record",
+	seq_out_of_order: "the row sequence is not in order",
+	bad_row_hash_encoding: "a recorded row hash is malformed",
+	bad_tenant_id: "a record has an invalid workspace identifier",
+	v2_1_payload_not_string: "an event payload is not in the required format",
+	bad_attestation_sig: "a batch signature did not verify",
+	attestation_invalid: "a batch attestation is invalid",
+	anchor_body_invalid: "a public-log entry is invalid",
+	entry_signature_invalid: "a public-log entry signature did not verify",
+	inclusion_proof_invalid:
+		"a public inclusion proof or checkpoint did not verify",
+
 	anchor_rows_missing:
 		"an anchored batch referenced rows outside the loaded view (coverage, not tampering)",
 	anchor_stripped:
@@ -181,8 +204,9 @@ const KIND_HUMAN: Record<string, string> = {
 	row_hash_mismatch: "a row's contents no longer match its recorded hash",
 	chain_break: "a row's link to the previous row is broken",
 	prev_hash_mismatch: "a row's link to the previous row is broken",
+	anchor_coverage_gap: "rows outside all recorded batches before a later batch",
 	unrooted_window:
-		"this view starts after your chain's genesis (older rows are past your retention window) and has no public Rekor anchor inside it to establish trust — configure your tenant audit public key so an anchor in this view can root the chain",
+		"the loaded window has neither the chain’s first row nor a verified public anchor to establish a starting point",
 };
 
 export function humanizeVerdictKind(kind: string): string {

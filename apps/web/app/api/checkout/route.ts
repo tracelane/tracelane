@@ -47,8 +47,45 @@ const SELF_SERVE_LOOKUP_KEY: Record<string, string> = {
 	business: "business_v1",
 };
 
+/**
+ * True when the caller wants a JSON error body rather than a browser
+ * navigation — an explicit `Accept: application/json`, the shape every
+ * fetch-based caller sends when it wants to branch on the body. Every
+ * caller of this route today (`PlanCard.tsx`, `PlanLadder.tsx`) is a native
+ * `<form method="post">`, which never sends this header, so they all take
+ * the redirect branch.
+ */
+function wantsJson(req: NextRequest): boolean {
+	return (req.headers.get("accept") ?? "").includes("application/json");
+}
+
+/**
+ * A failure response that a native `<form method="post">` can actually show
+ * the customer. Before this, every failure returned raw JSON, which the
+ * browser renders as an unstyled page of `{"error":"..."}` — the ONLY thing
+ * a form POST's non-2xx JSON response can do. A 303 (not 302: this always
+ * follows as a GET, matching a form POST's own semantics) sends the browser
+ * back to the billing page with a `checkout_error` code it knows how to
+ * render as a sentence. `Accept: application/json` callers keep the JSON
+ * body unchanged, in case a future fetch-based caller needs to branch on it.
+ */
+function failure(
+	req: NextRequest,
+	status: number,
+	code: string,
+	message: string,
+): NextResponse {
+	if (wantsJson(req)) {
+		return NextResponse.json({ error: message }, { status });
+	}
+	return NextResponse.redirect(
+		new URL(`/settings/billing?checkout_error=${code}`, req.nextUrl.origin),
+		303,
+	);
+}
+
 async function portalRedirect(
-	origin: string,
+	req: NextRequest,
 	token: string,
 ): Promise<NextResponse> {
 	const base = gatewayBaseUrl();
@@ -61,9 +98,11 @@ async function portalRedirect(
 		body: JSON.stringify({}),
 	});
 	if (!upstream.ok) {
-		return NextResponse.json(
-			{ error: "billing portal unavailable" },
-			{ status: upstream.status >= 500 ? 502 : upstream.status },
+		return failure(
+			req,
+			upstream.status >= 500 ? 502 : upstream.status,
+			"portal_unavailable",
+			"billing portal unavailable",
 		);
 	}
 	const data = (await upstream.json()) as { url: string };
@@ -71,15 +110,19 @@ async function portalRedirect(
 	try {
 		dest = new URL(data.url);
 	} catch {
-		return NextResponse.json(
-			{ error: "billing portal unavailable" },
-			{ status: 502 },
+		return failure(
+			req,
+			502,
+			"portal_unavailable",
+			"billing portal unavailable",
 		);
 	}
 	if (dest.hostname !== "polar.sh" && !dest.hostname.endsWith(".polar.sh")) {
-		return NextResponse.json(
-			{ error: "billing portal unavailable" },
-			{ status: 502 },
+		return failure(
+			req,
+			502,
+			"portal_unavailable",
+			"billing portal unavailable",
 		);
 	}
 	return NextResponse.redirect(dest, 302);
@@ -96,7 +139,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	const tier = (req.nextUrl.searchParams.get("tier") ?? "").toLowerCase();
 	const lookupKey = SELF_SERVE_LOOKUP_KEY[tier];
 	if (!lookupKey) {
-		return NextResponse.json({ error: "unknown tier" }, { status: 400 });
+		return failure(req, 400, "unknown_tier", "unknown tier");
 	}
 	const interval =
 		req.nextUrl.searchParams.get("interval") === "year" ? "year" : "month";
@@ -104,12 +147,20 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		// B14: a yearly Polar product grants its meter credits ONCE per year
 		// (B-411); nothing annual is sold until the founder rules the shape.
 		// Refused here, before any Neon read, with the reason from the table.
-		return NextResponse.json(
-			{
-				error: "annual billing is not available yet",
-				reason: "annual_unavailable",
-			},
-			{ status: 400 },
+		if (wantsJson(req)) {
+			return NextResponse.json(
+				{
+					error: "annual billing is not available yet",
+					reason: "annual_unavailable",
+				},
+				{ status: 400 },
+			);
+		}
+		return failure(
+			req,
+			400,
+			"annual_unavailable",
+			"annual billing is not available yet",
 		);
 	}
 
@@ -124,7 +175,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		.where(eq(tenants.workosOrgId, session.tenantId))
 		.limit(1);
 	if (tenantRow?.polarSubscriptionId || tenantRow?.polarBaseSubscriptionId) {
-		return portalRedirect(req.nextUrl.origin, token);
+		return portalRedirect(req, token);
 	}
 
 	// BILL-02 (B14 → option (c)): an annual plan is bought as its yearly BASE
@@ -149,9 +200,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		// interval yet (`scripts/ops/polar-sync.mjs` has not run, or Enterprise
 		// has no annual product by design). Fail loud instead of POSTing an
 		// empty product_id (the gateway 400s anyway).
-		return NextResponse.json(
-			{ error: "checkout not configured for this tier" },
-			{ status: 501 },
+		return failure(
+			req,
+			501,
+			"checkout_unconfigured",
+			"checkout not configured for this tier",
 		);
 	}
 
@@ -185,9 +238,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		// Never propagate the upstream body — Polar/gateway error JSON can carry
 		// request ids hinting at the org-scoped access token (mirror the portal
 		// route's A3/A27 redaction).
-		return NextResponse.json(
-			{ error: "checkout unavailable" },
-			{ status: upstream.status >= 500 ? 502 : upstream.status },
+		return failure(
+			req,
+			upstream.status >= 500 ? 502 : upstream.status,
+			"checkout_unavailable",
+			"checkout unavailable",
 		);
 	}
 
@@ -199,16 +254,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	try {
 		dest = new URL(data.url);
 	} catch {
-		return NextResponse.json(
-			{ error: "checkout unavailable" },
-			{ status: 502 },
-		);
+		return failure(req, 502, "checkout_unavailable", "checkout unavailable");
 	}
 	if (dest.hostname !== "polar.sh" && !dest.hostname.endsWith(".polar.sh")) {
-		return NextResponse.json(
-			{ error: "checkout unavailable" },
-			{ status: 502 },
-		);
+		return failure(req, 502, "checkout_unavailable", "checkout unavailable");
 	}
 	// 302 to the Polar-hosted checkout; the browser follows to Polar's page.
 	return NextResponse.redirect(dest, 302);

@@ -66,9 +66,180 @@ use uuid::Uuid;
 use crate::providers::ProviderRegistry;
 use crate::server::config::SemanticCacheConfig;
 
+/// Caller control of Tracelane response reuse; provider prompt caching is separate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheControl {
+    #[default]
+    Default,
+    Bypass,
+    Use,
+    Ttl(u32),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CacheRefusal {
+    pub status: axum::http::StatusCode,
+    pub code: &'static str,
+}
+impl CacheRefusal {
+    pub fn response(self, anthropic: bool) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        let kind = if self.status == axum::http::StatusCode::FORBIDDEN {
+            "permission_error"
+        } else {
+            "invalid_request_error"
+        };
+        let error = serde_json::json!({"type":kind,"code":self.code,"message":self.code});
+        let body = if anthropic {
+            serde_json::json!({"type":"error","error":error})
+        } else {
+            serde_json::json!({"error":error})
+        };
+        (self.status, axum::Json(body)).into_response()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CachePolicy {
+    bypass: bool,
+    ttl_hours: Option<u32>,
+    binding: &'static str,
+}
+impl CacheControl {
+    pub fn parse(headers: &axum::http::HeaderMap) -> std::result::Result<Self, CacheRefusal> {
+        let bad = CacheRefusal {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "invalid_cache_control",
+        };
+        let mut values = headers.get_all("x-tracelane-cache").iter();
+        let Some(value) = values.next() else {
+            return Ok(Self::Default);
+        };
+        if values.next().is_some() {
+            return Err(bad);
+        }
+        let value = value.to_str().map_err(|_| bad)?.trim();
+        match value {
+            "bypass" => Ok(Self::Bypass),
+            "use" => Ok(Self::Use),
+            _ => {
+                let raw = value.strip_prefix("ttl=").ok_or(bad)?;
+                if raw.is_empty() || !raw.bytes().all(|c| c.is_ascii_digit()) {
+                    return Err(bad);
+                }
+                let hours = raw.parse::<u32>().map_err(|_| bad)?;
+                if hours == 0 {
+                    return Err(bad);
+                }
+                Ok(Self::Ttl(hours))
+            }
+        }
+    }
+    pub fn resolve(
+        self,
+        entitlements: Option<&crate::entitlement_cache::ResolvedEntitlements>,
+        cache: Option<&SemanticCache>,
+        supported: bool,
+    ) -> std::result::Result<CachePolicy, CacheRefusal> {
+        use axum::http::StatusCode;
+        if self == Self::Default {
+            return Ok(CachePolicy::default());
+        }
+        if self == Self::Bypass {
+            return Ok(CachePolicy {
+                bypass: true,
+                ..CachePolicy::default()
+            });
+        }
+        let plan = entitlements
+            .filter(|e| e.f_cache_control && e.cache_ttl_hours > 0)
+            .ok_or(CacheRefusal {
+                status: StatusCode::FORBIDDEN,
+                code: "cache_control_not_entitled",
+            })?
+            .cache_ttl_hours;
+        if !supported {
+            return Err(CacheRefusal {
+                status: StatusCode::CONFLICT,
+                code: "cache_control_unsupported_route",
+            });
+        }
+        let operator = cache
+            .ok_or(CacheRefusal {
+                status: StatusCode::CONFLICT,
+                code: "response_cache_disabled",
+            })?
+            .config()
+            .ttl_hours();
+        let requested = match self {
+            Self::Ttl(n) => n,
+            _ => plan.min(operator),
+        };
+        let effective = requested.min(plan).min(operator);
+        let binding = match (
+            plan <= requested && plan == effective,
+            operator <= requested && operator == effective,
+        ) {
+            (true, true) => "plan,operator",
+            (true, false) => "plan",
+            (false, true) => "operator",
+            (false, false) => "requested",
+        };
+        Ok(CachePolicy {
+            bypass: false,
+            ttl_hours: Some(effective),
+            binding,
+        })
+    }
+}
+impl CachePolicy {
+    pub fn suspend(mut self) -> Self {
+        self.bypass = true;
+        self
+    }
+    pub fn key(self, mut key: RequestKey) -> RequestKey {
+        key.bypass = self.bypass;
+        key.ttl_hours = self.ttl_hours;
+        // Different age policies cannot share either tier's compatibility key.
+        if let Some(ttl) = self.ttl_hours {
+            for digest in [&mut key.exact_hash, &mut key.params_hash] {
+                let mut h = blake3::Hasher::new();
+                hash_field(&mut h, digest.as_bytes());
+                hash_field(&mut h, &ttl.to_le_bytes());
+                *digest = h.finalize().to_hex().to_string();
+            }
+        }
+        key
+    }
+    pub fn response(self, mut response: axum::response::Response) -> axum::response::Response {
+        use axum::http::HeaderValue;
+        if self.bypass {
+            response
+                .headers_mut()
+                .insert("x-tracelane-cache", HeaderValue::from_static("bypass"));
+        }
+        if let Some(ttl) = self.ttl_hours {
+            response
+                .headers_mut()
+                .entry("x-tracelane-cache")
+                .or_insert(HeaderValue::from_static("miss"));
+            response.headers_mut().insert(
+                "x-tracelane-cache-ttl-hours",
+                HeaderValue::from_str(&ttl.to_string()).expect("integer header"),
+            );
+            response.headers_mut().insert(
+                "x-tracelane-cache-bound",
+                HeaderValue::from_static(self.binding),
+            );
+        }
+        response
+    }
+}
+
 /// A served hit, and everything the span needs to record it honestly.
 #[derive(Debug, Clone)]
 pub struct CacheHit {
+    created_at_ms: i64,
     /// The stored provider response, verbatim.
     pub response_json: String,
     /// `exact` or `semantic` — a byte match and a 1.000 similarity are different
@@ -125,6 +296,9 @@ struct CacheRow {
 /// parts of it.
 #[derive(Debug, Clone)]
 pub struct RequestKey {
+    canary_namespace: String,
+    bypass: bool,
+    ttl_hours: Option<u32>,
     /// blake3 of params + normalised messages. The exact tier's key.
     pub exact_hash: String,
     /// sha256-shaped hex of the NON-message parameters. An exact match on this
@@ -144,6 +318,44 @@ pub struct RequestKey {
 /// therefore redact to a BYTE-IDENTICAL string, so hashing after redaction would
 /// treat two genuinely different requests as the same one and serve the wrong
 /// answer.
+/// One length-prefixed field into the exact-key hasher (B-476): `u64 LE` byte
+/// length, then the bytes. A field can therefore never masquerade as a delimiter.
+fn hash_field(h: &mut blake3::Hasher, bytes: &[u8]) {
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// A digest of the conversation's TOOL HISTORY — every message's `tool_call_id`
+/// and `tool_calls` (name + arguments), length-prefixed — or `None` when no
+/// message carries either (B-476). Feeds `params_hash`, so the semantic tier's
+/// compatibility filter never offers an entry from a conversation whose tool
+/// history differs.
+fn tool_history_digest(messages: &[tracelane_shared::model::Message]) -> Option<String> {
+    let any = messages
+        .iter()
+        .any(|m| m.tool_call_id.is_some() || m.tool_calls.as_ref().is_some_and(|t| !t.is_empty()));
+    if !any {
+        return None;
+    }
+    let mut h = blake3::Hasher::new();
+    for m in messages {
+        h.update(b"\x01msg");
+        hash_field(
+            &mut h,
+            m.tool_call_id.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_field(
+            &mut h,
+            m.tool_calls
+                .as_ref()
+                .map(|tc| serde_json::to_string(tc).unwrap_or_default())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
 #[must_use]
 pub fn request_key(req: &ChatRequest) -> RequestKey {
     let mut params = blake3::Hasher::new();
@@ -207,8 +419,23 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
     if let Some(sys) = &req.system {
         params.update(sys.as_bytes());
     }
+    // B-476 (REV-4, 2026-09-21): the TOOL HISTORY — every message's `tool_calls`
+    // (function names AND arguments) and `tool_call_id` — is part of the
+    // compatibility hash. Two conversations with identical text but different
+    // prior tool calls are different questions; until this they shared one
+    // entry on both tiers, because `embed_text` carried role + content only.
+    // Length-tagged and only hashed when any message carries tool state, so a
+    // request with no tool history keeps the key shape it had (the semantic tier's
+    // stored `params_hash` rows stay reachable for those).
+    let tool_history = tool_history_digest(&req.messages);
+    if let Some(d) = &tool_history {
+        params.update(b"tool_history=");
+        params.update(d.as_bytes());
+    }
     let params_hash = params.finalize().to_hex().to_string();
 
+    // The text the SEMANTIC tier embeds: readable, role-prefixed — an embedding
+    // model wants prose, not framing bytes. It is NOT the exact key any more.
     let mut embed_text = String::new();
     for m in &req.messages {
         embed_text.push_str(&format!("{:?}:", m.role));
@@ -221,12 +448,54 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
         embed_text.push('\n');
     }
 
+    // B-476: the EXACT key hashes an UNAMBIGUOUS serialization of every message —
+    // each field length-prefixed (`u64 LE` + bytes) under a per-message record
+    // marker — so no delimiter can be forged from inside a field. Until this the
+    // exact key hashed `embed_text`, where a single user message reading
+    // `"hello\nAssistant:world"` produced the same bytes as user `"hello"` followed
+    // by assistant `"world"`, and `tool_calls` / `tool_call_id` were absent. Every
+    // pre-B-476 exact key changes by construction — that IS the invalidation: an
+    // entry stored under an ambiguous key could be served to the wrong request, so
+    // none of them is trusted; the in-memory tier restarts empty on deploy anyway
+    // and the ClickHouse rows keyed on old hashes expire by TTL.
     let mut exact = blake3::Hasher::new();
+    exact.update(b"tracelane.semantic-cache.exact.v2\0");
     exact.update(params_hash.as_bytes());
-    exact.update(embed_text.as_bytes());
+    for m in &req.messages {
+        exact.update(b"\x01msg");
+        hash_field(&mut exact, format!("{:?}", m.role).as_bytes());
+        match &m.content {
+            MessageContent::Text(t) => {
+                hash_field(&mut exact, b"text");
+                hash_field(&mut exact, t.as_bytes());
+            }
+            MessageContent::Parts(parts) => {
+                hash_field(&mut exact, b"parts");
+                hash_field(
+                    &mut exact,
+                    serde_json::to_string(parts).unwrap_or_default().as_bytes(),
+                );
+            }
+        }
+        hash_field(
+            &mut exact,
+            m.tool_call_id.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_field(
+            &mut exact,
+            m.tool_calls
+                .as_ref()
+                .map(|tc| serde_json::to_string(tc).unwrap_or_default())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
     let exact_hash = exact.finalize().to_hex().to_string();
 
     RequestKey {
+        canary_namespace: String::new(),
+        bypass: false,
+        ttl_hours: None,
         exact_hash,
         params_hash,
         embed_text,
@@ -235,6 +504,7 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
 
 /// The cache.
 pub struct SemanticCache {
+    prompt_router: Option<Arc<crate::prompt_router::PromptRouter>>,
     /// SRE #20: the entitlement cache, so cache reads run at the tenant's OWN cap tier.
     entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ch: ClickhouseClient,
@@ -313,6 +583,7 @@ impl SemanticCache {
     ) -> Self {
         let ttl = std::time::Duration::from_secs(u64::from(cfg.ttl_hours()) * 3600);
         Self {
+            prompt_router: None,
             entitlements: None,
             ch,
             providers,
@@ -337,8 +608,40 @@ impl SemanticCache {
         }
     }
 
-    // `config(&self) -> &SemanticCacheConfig` (a plain field accessor) was
-    // deleted 2026-09-12 (B-390) — zero callers anywhere, including tests.
+    pub fn with_prompt_router(mut self, router: Arc<crate::prompt_router::PromptRouter>) -> Self {
+        self.prompt_router = Some(router);
+        self
+    }
+    pub fn bind_key(&self, tenant: &TenantId, mut key: RequestKey) -> RequestKey {
+        let context = self
+            .prompt_router
+            .as_ref()
+            .map(|r| r.canary_cache_context(tenant))
+            .unwrap_or_default();
+        key.canary_namespace = context.namespace;
+        key.bypass |= context.suspended;
+        if !key.canary_namespace.is_empty() {
+            for hash in [&mut key.exact_hash, &mut key.params_hash] {
+                let mut h = blake3::Hasher::new();
+                hash_field(&mut h, hash.as_bytes());
+                hash_field(&mut h, key.canary_namespace.as_bytes());
+                *hash = h.finalize().to_hex().to_string();
+            }
+        }
+        key
+    }
+    fn reusable(&self, tenant: &TenantId, key: &RequestKey) -> bool {
+        let context = self
+            .prompt_router
+            .as_ref()
+            .map(|r| r.canary_cache_context(tenant))
+            .unwrap_or_default();
+        !key.bypass && !context.suspended && key.canary_namespace == context.namespace
+    }
+
+    pub fn config(&self) -> &SemanticCacheConfig {
+        &self.cfg
+    }
 }
 
 impl SemanticCache {
@@ -356,6 +659,11 @@ impl SemanticCache {
         model: &str,
         key: &RequestKey,
     ) -> Option<CacheHit> {
+        if !self.reusable(tenant_id, key) {
+            return None;
+        }
+        let cutoff_ms = crate::clickhouse_query::datetime64_millis_now()
+            - i64::from(key.ttl_hours.unwrap_or(self.cfg.ttl_hours())) * 3_600_000;
         let started = Instant::now();
 
         // ── Tier 1: exact. No network, no embedding, no ClickHouse. ──────────
@@ -363,6 +671,8 @@ impl SemanticCache {
             .exact
             .get(&(tenant_id.clone(), key.exact_hash.clone()))
             .await
+            && hit.created_at_ms >= cutoff_ms
+            && self.reusable(tenant_id, key)
         {
             let mut h = (*hit).clone();
             h.lookup_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -412,10 +722,10 @@ impl SemanticCache {
         // workspace. The `LIMIT` is applied to the SCAN, so the cap is real.
         let sql = crate::clickhouse_query::TenantQuery::new(
             "SELECT response_json, source_trace_id, cost_usd, prompt_tokens, \
-                    completion_tokens, cosineDistance(embedding, ?) AS distance \
+                    completion_tokens, toFloat64(cosineDistance(embedding, ?)) AS distance \
              FROM semantic_cache \
              WHERE tenant_id = ? AND model = ? AND params_hash = ? \
-               AND embedding_dims = ? \
+               AND embedding_dims = ? AND created_at >= fromUnixTimestamp64Milli(?) \
              ORDER BY created_at DESC \
              LIMIT ?",
             self.tier_for(tenant_id).await,
@@ -430,6 +740,7 @@ impl SemanticCache {
             .bind(model)
             .bind(key.params_hash.as_str())
             .bind(u16::try_from(embedding.len()).unwrap_or(u16::MAX))
+            .bind(cutoff_ms)
             .bind(self.cfg.max_scan_entries())
             .fetch_all::<Candidate>()
             .await;
@@ -456,7 +767,11 @@ impl SemanticCache {
 
         #[allow(clippy::cast_possible_truncation)]
         let similarity = (1.0 - best.distance) as f32;
+        if !self.reusable(tenant_id, key) {
+            return None;
+        }
         Some(CacheHit {
+            created_at_ms: cutoff_ms,
             response_json: best.response_json,
             tier: "semantic",
             similarity: Some(similarity),
@@ -514,15 +829,24 @@ impl SemanticCache {
                     }
                     last_err = Some(anyhow::anyhow!("{model}: empty embedding response"));
                 }
+                // B-454 (2026-09-19): the provider REJECTED the tenant's key (401/403).
+                // That is the same fact as "no usable credential for this provider" —
+                // a stable property of the tenant's configuration — so it is skipped
+                // like a missing key, never remembered as a fault. Found on prod: one
+                // tenant's stale Mistral key noted `SemanticCacheUnavailable` twice per
+                // non-streaming request and re-tried the 401 on every one.
+                Err(e) if credential_rejected(&e) => {
+                    tracing::debug!(model = %model, "semantic cache: embedding credential rejected by the provider — treated as not configured");
+                }
                 Err(e) => last_err = Some(e),
             }
         }
-        // NO CREDENTIAL AT ALL is different from "the embedder errored", and only
-        // the first is worth remembering. `last_err` is `None` exactly when every
-        // model was skipped for lack of a usable key — a stable property of this
-        // tenant's configuration, not a transient fault — so that is the case
-        // that populates the negative cache. A provider OUTAGE must keep
-        // retrying, because it will come back.
+        // NO CREDENTIAL AT ALL — absent, or rejected by its provider (B-454) — is
+        // different from "the embedder errored", and only the first is worth
+        // remembering. `last_err` is `None` exactly when every model was skipped for
+        // lack of a usable key — a stable property of this tenant's configuration,
+        // not a transient fault — so that is the case that populates the negative
+        // cache. A provider OUTAGE must keep retrying, because it will come back.
         if last_err.is_none() {
             self.no_embedder.insert(tenant_id.clone(), ()).await;
         }
@@ -537,6 +861,18 @@ impl SemanticCache {
 }
 
 /// B-347 (2026-09-05). `embed()` fails for two reasons that must NOT be counted the
+/// B-454: is this embedding failure the provider refusing the tenant's credential?
+/// Reuses [`crate::providers::ProviderHttpError::is_auth_rejection`] — the ONE
+/// classifier that already knows 401, 403 AND Google's `400 API_KEY_INVALID` — so
+/// the chat path and the cache agree on what "your key is dead" looks like. A
+/// rejected key is the customer's configuration, exactly as "no key" is, and NOT a
+/// cache fault; any other status (429, 5xx, a transport error) stays a fault that
+/// keeps retrying.
+pub(crate) fn credential_rejected(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::providers::ProviderHttpError>()
+        .is_some_and(crate::providers::ProviderHttpError::is_auth_rejection)
+}
+
 /// same way: a tenant with NO embedding-capable credential (a stable fact of its
 /// configuration — prod is 94% Anthropic, which has no embeddings API) and an
 /// embedder that actually ERRORED (a fault). `embed()` records the first in the
@@ -604,7 +940,7 @@ impl SemanticCache {
         trace_id: Uuid,
     ) {
         const MAX_RESPONSE_BYTES: usize = 256 * 1024;
-        if response_json.len() > MAX_RESPONSE_BYTES {
+        if !self.reusable(tenant_id, key) || response_json.len() > MAX_RESPONSE_BYTES {
             return;
         }
 
@@ -622,6 +958,7 @@ impl SemanticCache {
         // all. Embedding first would have silently excluded every Anthropic-only
         // workspace from a cache that costs them nothing to use.
         let hit = CacheHit {
+            created_at_ms: crate::clickhouse_query::datetime64_millis_now(),
             response_json: response_json.to_owned(),
             tier: "exact",
             similarity: None,
@@ -809,6 +1146,39 @@ mod clickhouse_roundtrip {
 }
 
 #[cfg(test)]
+mod b454_tests {
+    use super::credential_rejected;
+
+    fn http(status: u16, reason: Option<&str>) -> anyhow::Error {
+        crate::providers::ProviderHttpError {
+            provider: "mistral",
+            status,
+            reason: reason.map(str::to_owned),
+        }
+        .into()
+    }
+
+    /// B-454: a rejected credential is configuration (negative-cached, not counted);
+    /// everything else stays a fault that retries. Both directions pinned.
+    #[test]
+    fn a_401_or_403_is_a_rejected_credential_and_nothing_else_is() {
+        assert!(credential_rejected(&http(401, None)));
+        assert!(credential_rejected(&http(403, None)));
+        assert!(
+            credential_rejected(&http(400, Some("API_KEY_INVALID"))),
+            "Google's shape"
+        );
+        assert!(
+            !credential_rejected(&http(400, None)),
+            "a bare 400 is ambiguous — a fault"
+        );
+        assert!(!credential_rejected(&http(429, None)));
+        assert!(!credential_rejected(&http(500, None)));
+        assert!(!credential_rejected(&anyhow::anyhow!("connection reset")));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -851,6 +1221,94 @@ mod tests {
             system: None,
             metadata: None,
         }
+    }
+
+    /// **B-476 (REV-4) — the delimiter ambiguity.** One user message whose text is
+    /// `"hello\nAssistant:world"` used to produce the same exact-key bytes as user
+    /// `"hello"` followed by assistant `"world"`. Length-prefixed fields cannot be
+    /// forged from inside a field.
+    #[test]
+    fn b476_a_message_containing_a_role_prefix_does_not_collide_with_two_messages() {
+        let one = req("m", "hello\nAssistant:world", None);
+        let mut two = req("m", "hello", None);
+        two.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("world".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        // The embedded text is identical by construction (that IS the ambiguity)…
+        assert_eq!(request_key(&one).embed_text, request_key(&two).embed_text);
+        // …and the exact keys are not.
+        assert_ne!(request_key(&one).exact_hash, request_key(&two).exact_hash);
+    }
+
+    /// **B-476 — tool history is identity.** Identical text with different prior
+    /// tool-call ARGUMENTS (or ids) is a different conversation: different exact
+    /// keys AND different compatibility (`params_hash`), so neither tier can serve
+    /// one to the other. Requests with no tool history keep the params_hash they had.
+    #[test]
+    fn b476_tool_call_history_is_part_of_both_keys() {
+        use tracelane_shared::model::ToolCall;
+        let mk = |args: serde_json::Value, id: &str| {
+            let mut r = req("m", "look it up", None);
+            r.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: id.into(),
+                    name: "search".into(),
+                    input: args,
+                }]),
+            });
+            r.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::Text("result".into()),
+                tool_call_id: Some(id.into()),
+                tool_calls: None,
+            });
+            r
+        };
+        let a = request_key(&mk(serde_json::json!({"q": "cats"}), "c1"));
+        let b = request_key(&mk(serde_json::json!({"q": "dogs"}), "c1"));
+        assert_eq!(
+            a.embed_text, b.embed_text,
+            "the TEXT is identical — that is the finding"
+        );
+        assert_ne!(
+            a.exact_hash, b.exact_hash,
+            "different arguments ⇒ different exact key"
+        );
+        assert_ne!(
+            a.params_hash, b.params_hash,
+            "different arguments ⇒ not semantically compatible either"
+        );
+        let c = request_key(&mk(serde_json::json!({"q": "cats"}), "c2"));
+        assert_ne!(
+            a.exact_hash, c.exact_hash,
+            "a different tool_call_id is a different history"
+        );
+        // No tool history: the compatibility hash is untouched by this change.
+        let plain = request_key(&req("m", "look it up", None));
+        let mut plain_h = blake3::Hasher::new();
+        plain_h.update(b"m");
+        plain_h.update(&0u32.to_le_bytes());
+        plain_h.update(&(-1.0f32).to_le_bytes());
+        assert_eq!(plain.params_hash, plain_h.finalize().to_hex().to_string());
+    }
+
+    /// **B-476 — the invalidation is by construction.** The exact key of a fixture
+    /// request under the pre-B-476 scheme (params_hash + embed_text) is NOT the key
+    /// the code computes now, so no entry written before this change can be served.
+    #[test]
+    fn b476_every_pre_change_exact_key_is_unreachable() {
+        let r = req("m", "hello", None);
+        let k = request_key(&r);
+        let mut old = blake3::Hasher::new();
+        old.update(k.params_hash.as_bytes());
+        old.update(k.embed_text.as_bytes());
+        assert_ne!(k.exact_hash, old.finalize().to_hex().to_string());
     }
 
     #[test]
@@ -1005,6 +1463,381 @@ mod tests {
         assert!(
             !embed_failure_is_configuration(&cache, &faulted).await,
             "a tenant NOT in the negative cache errored for real — that IS a degradation"
+        );
+    }
+}
+#[cfg(all(test, debug_assertions))]
+mod request_policy_tests {
+    use super::*;
+    use crate::entitlement_cache::ResolvedEntitlements;
+    use crate::handler_harness::{LoopbackBypassGuard, registry_pointing_ollama_at};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    fn cache(url: String) -> SemanticCache {
+        let cfg = crate::server::config::parse(
+            "semantic_cache:\n  embedding_models: ollama/embed\n  ttl_hours: 168\n",
+        )
+        .unwrap();
+        SemanticCache::new(
+            crate::clickhouse_query::ch_client(url.clone()),
+            Arc::new(registry_pointing_ollama_at(url)),
+            cfg.semantic_cache().unwrap().clone(),
+        )
+    }
+    fn key() -> RequestKey {
+        request_key(&serde_json::from_value(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"test"}]})).unwrap())
+    }
+    #[tokio::test]
+    async fn cache_control_refuses_invalid_and_unentitled_requests_on_all_three_routes() {
+        use crate::handler_harness::{authed, body_json, test_state};
+        use axum::{Json, extract::State};
+        let state = test_state(ProviderRegistry::new().unwrap());
+        for (value, status) in [
+            ("ttl=0", axum::http::StatusCode::BAD_REQUEST),
+            ("use", axum::http::StatusCode::FORBIDDEN),
+        ] {
+            let mut headers = authed();
+            headers.insert("x-tracelane-cache", value.parse().unwrap());
+            let chat = crate::server::chat_completions_handler(State(state.clone()),headers.clone(),Json(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}))).await;
+            assert_eq!(chat.status(), status);
+            assert!(
+                body_json(chat).await["error"]["code"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cache_control")
+            );
+            let embeddings = crate::server::embeddings_handler(
+                State(state.clone()),
+                headers.clone(),
+                Json(serde_json::json!({"model":"ollama/embed","input":"hi"})),
+            )
+            .await;
+            assert_eq!(embeddings.status(), status);
+            assert!(
+                body_json(embeddings).await["error"]["code"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cache_control")
+            );
+            let messages = crate::anthropic_messages::messages_handler(State(state.clone()),headers,axum::body::Bytes::from_static(br#"{"model":"claude-test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)).await;
+            assert_eq!(messages.status(), status);
+            let body = body_json(messages).await;
+            assert_eq!(body["type"], "error");
+            assert!(
+                body["error"]["code"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cache_control")
+            );
+        }
+    }
+    #[test]
+    fn cache_header_validation_and_every_binding() {
+        let cache = cache("http://127.0.0.1:1".into());
+        let mut grant = ResolvedEntitlements::deny_all();
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            CacheControl::parse(&headers).unwrap(),
+            CacheControl::Default
+        );
+        for raw in [
+            "",
+            "yes",
+            "ttl=0",
+            "ttl=-1",
+            "ttl=+1",
+            "ttl=1.5",
+            "ttl=9999999999999",
+            "use,bypass",
+        ] {
+            headers.insert("x-tracelane-cache", raw.parse().unwrap());
+            assert!(CacheControl::parse(&headers).is_err(), "{raw}");
+        }
+        headers.insert("x-tracelane-cache", "use".parse().unwrap());
+        headers.append("x-tracelane-cache", "bypass".parse().unwrap());
+        assert!(CacheControl::parse(&headers).is_err());
+        assert!(
+            CacheControl::Bypass
+                .resolve(None, None, false)
+                .unwrap()
+                .bypass
+        );
+        assert_eq!(
+            CacheControl::Use
+                .resolve(Some(&grant), Some(&cache), true)
+                .unwrap_err()
+                .code,
+            "cache_control_not_entitled"
+        );
+        grant.f_cache_control = true;
+        for (plan, requested, effective, binding) in [
+            (24, 200, 24, "plan"),
+            (720, 200, 168, "operator"),
+            (168, 200, 168, "plan,operator"),
+            (24, 1, 1, "requested"),
+        ] {
+            grant.cache_ttl_hours = plan;
+            let policy = CacheControl::Ttl(requested)
+                .resolve(Some(&grant), Some(&cache), true)
+                .unwrap();
+            assert_eq!(policy.ttl_hours, Some(effective));
+            assert_eq!(policy.binding, binding);
+            let response =
+                policy.response(axum::response::Response::new(axum::body::Body::empty()));
+            assert_eq!(
+                response.headers()["x-tracelane-cache-ttl-hours"],
+                effective.to_string()
+            );
+        }
+        assert_eq!(
+            CacheControl::Use
+                .resolve(Some(&grant), Some(&cache), false)
+                .unwrap_err()
+                .code,
+            "cache_control_unsupported_route"
+        );
+        assert_eq!(
+            CacheControl::Use
+                .resolve(Some(&grant), None, true)
+                .unwrap_err()
+                .code,
+            "response_cache_disabled"
+        );
+    }
+    #[tokio::test]
+    async fn canary_never_reuses_another_arm_or_lifecycle() {
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let (router, _, candidate) =
+            crate::prompt_router::tests::canary_fixture(tenant.clone()).await;
+        let cache = cache("http://127.0.0.1:1".into()).with_prompt_router(router.clone());
+        cache.no_embedder.insert(tenant.clone(), ()).await;
+        let request:ChatRequest=serde_json::from_value(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"same model input"}]})).unwrap();
+        let before = cache.bind_key(&tenant, request_key(&request));
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &before,
+                "arm A",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert_eq!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &before)
+                .await
+                .unwrap()
+                .response_json,
+            "arm A"
+        );
+        router
+            .configure_canary(&tenant, "proof", candidate, 50.0, "tester")
+            .await
+            .unwrap();
+        let active = cache.bind_key(&tenant, request_key(&request));
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &before)
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &active)
+                .await
+                .is_none()
+        );
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &active,
+                "arm B",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(
+            cache
+                .exact
+                .get(&(tenant.clone(), active.exact_hash.clone()))
+                .await
+                .is_none()
+        );
+        router
+            .stop_canary(&tenant, "proof", "tester")
+            .await
+            .unwrap();
+        let after = cache.bind_key(&tenant, request_key(&request));
+        assert_ne!(after.params_hash, before.params_hash);
+        assert_ne!(after.params_hash, active.params_hash);
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &before,
+                "late arm A",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &before)
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &after)
+                .await
+                .is_none()
+        );
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &after,
+                "current",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert_eq!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &after)
+                .await
+                .unwrap()
+                .response_json,
+            "current"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_policy_age_and_bypass_store_are_enforced() {
+        let cache = cache("http://127.0.0.1:1".into());
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        cache.no_embedder.insert(tenant.clone(), ()).await;
+        let policy = CachePolicy {
+            ttl_hours: Some(1),
+            ..CachePolicy::default()
+        };
+        let k = policy.key(key());
+        assert_ne!(k.params_hash, key().params_hash);
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &k,
+                "cached",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(cache.lookup(&tenant, "ollama/llama3", &k).await.is_some());
+        let mut expired = (*cache
+            .exact
+            .get(&(tenant.clone(), k.exact_hash.clone()))
+            .await
+            .unwrap())
+        .clone();
+        expired.created_at_ms -= 3_600_001;
+        cache
+            .exact
+            .insert((tenant.clone(), k.exact_hash.clone()), Arc::new(expired))
+            .await;
+        assert!(cache.lookup(&tenant, "ollama/llama3", &k).await.is_none());
+        let bypass = CacheControl::Bypass
+            .resolve(None, None, true)
+            .unwrap()
+            .key(key());
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &bypass,
+                "must not store",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(cache.exact.get(&(tenant, key().exact_hash)).await.is_none());
+    }
+    #[tokio::test]
+    #[ignore = "local initialized ClickHouse only; no schema applied"]
+    async fn cache_policy_real_clickhouse_age_and_tenant_proof() {
+        let _guard = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/embeddings")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"model":"ollama/embed","usage":{"prompt_tokens":1,"total_tokens":1}}))).mount(&server).await;
+        let mut cache = cache(server.uri());
+        cache.ch = crate::clickhouse_query::ch_client(
+            std::env::var("CLICKHOUSE_TEST_URL").expect("local proof URL"),
+        );
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let k = CachePolicy {
+            ttl_hours: Some(1),
+            ..CachePolicy::default()
+        }
+        .key(key());
+        let row = |age_ms, response: &str| CacheRow {
+            tenant_id: tenant.to_string(),
+            cache_id: Uuid::new_v4(),
+            model: "ollama/llama3".into(),
+            params_hash: crate::prompt_router::FixedHex64::from_hex_str(&k.params_hash).unwrap(),
+            exact_hash: crate::prompt_router::FixedHex64::from_hex_str(&k.exact_hash).unwrap(),
+            embedding: vec![1.0, 0.0, 0.0],
+            embedding_model: "ollama/embed".into(),
+            embedding_dims: 3,
+            response_json: response.into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cost_usd: 0.0,
+            source_trace_id: Uuid::new_v4(),
+            created_at: crate::clickhouse_query::datetime64_millis_now() - age_ms,
+        };
+        cache.insert_row(&row(7_200_000, "expired")).await.unwrap();
+        assert!(
+            cache.lookup(&tenant, "ollama/llama3", &k).await.is_none(),
+            "semantic tier must exclude an expired row still present in ClickHouse"
+        );
+        cache.insert_row(&row(0, "fresh")).await.unwrap();
+        let hit = cache.lookup(&tenant, "ollama/llama3", &k).await.unwrap();
+        assert_eq!(hit.tier, "semantic");
+        assert_eq!(hit.response_json, "fresh");
+        assert!(
+            cache
+                .lookup(
+                    &TenantId::from_jwt_claim(Uuid::new_v4()),
+                    "ollama/llama3",
+                    &k
+                )
+                .await
+                .is_none()
+        );
+        let bypass = CacheControl::Bypass
+            .resolve(None, None, true)
+            .unwrap()
+            .key(k);
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &bypass)
+                .await
+                .is_none()
         );
     }
 }

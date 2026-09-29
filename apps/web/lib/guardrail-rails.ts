@@ -120,7 +120,7 @@ export const RAIL_ROSTER: RailMeta[] = [
 		side: "both",
 		gated: true,
 		blurb:
-			"Blocks configured denied-topic keywords and redacts competitor mentions — active only once a workspace has loaded its term lists.",
+			"Blocks denied-topic keywords and redacts competitor mentions from term lists. Term lists are not yet configurable, so today this rail matches nothing (verified: production builds it with empty lists).",
 	},
 	{
 		id: "R8_injection",

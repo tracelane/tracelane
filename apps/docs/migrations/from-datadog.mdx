@@ -57,11 +57,12 @@ tracelane.init(
     endpoint="https://gateway.tracelane.dev",  # or an OTLP receiver you run
     api_key="tlane_...",                       # needs the `ingest` scope
 )
-tracelane.auto_instrument()  # best-effort: anthropic, openai, litellm, claude_code
+tracelane.auto_instrument()  # prints attachment outcomes for supported integrations
 ```
 
-`auto_instrument()` covers those four libraries when installed; for anything
-else, call its explicit `instrument_*` function after you construct the object
+`auto_instrument()` attempts Anthropic, OpenAI, LiteLLM, LangGraph, and Claude Code.
+The `langgraph` extra enables graph and child capture through LangChain callbacks.
+For other adapters, call the explicit `instrument_*` function after constructing the object
 (see the [Python SDK](/sdk-python)). On Tracelane Cloud the OTLP endpoint is the
 gateway itself and the key needs the `ingest` scope; self-hosting, it is the
 receiver you run.

@@ -93,3 +93,35 @@
 		opacity: 0.55;
 	}
 }
+
+/* Keyboard users can bypass the full navigation rail. */
+.workspace-skip-link {
+	position: fixed;
+	top: 0.75rem;
+	left: 0.75rem;
+	z-index: 100;
+	transform: translateY(-200%);
+	padding: 0.75rem 1rem;
+	border-radius: var(--radius-control);
+	background: var(--selected);
+	color: var(--selected-on);
+}
+.workspace-skip-link:focus {
+	transform: none;
+}
+/* Keep input text readable without iOS focus zoom. */
+@media (max-width: 767px) {
+	input,
+	select,
+	textarea {
+		font-size: 1rem;
+	}
+}
+
+/* Databricks look (founder, 2026-09-27): column headers read as sentence-case labels,
+   not spaced capitals. Unlayered on purpose — it outranks the `uppercase tracking-*`
+   utilities the tables carry, in one place instead of forty. */
+table th {
+	text-transform: none;
+	letter-spacing: 0;
+}

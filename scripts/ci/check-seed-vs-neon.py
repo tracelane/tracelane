@@ -64,7 +64,8 @@ CATALOG_SQL = r"""
 SELECT json_build_object(
   'plan_entitlements', (SELECT COALESCE(json_agg(row_to_json(p)), '[]'::json) FROM plan_entitlements p),
   'pricing_rates',     (SELECT COALESCE(json_agg(row_to_json(r)), '[]'::json) FROM pricing_rates r WHERE r.is_current),
-  'billing_policy',    (SELECT COALESCE(json_agg(json_build_object('key', b.key, 'value', b.value)), '[]'::json) FROM billing_policy b)
+  'billing_policy',    (SELECT COALESCE(json_agg(json_build_object('key', b.key, 'value', b.value)), '[]'::json) FROM billing_policy b),
+  'provider_capabilities', (SELECT COALESCE(json_agg(json_build_object('provider_id', c.provider_id, 'zdr', c.zdr)), '[]'::json) FROM provider_capabilities c)
 );
 """
 
@@ -193,7 +194,14 @@ def expected() -> dict:
     }
     for lo, _hi, usd in m["hot_window_usd_per_gb_month_ladder"]:
         rates[f"hot_gb_month@{lo}"] = usd
-    return {"plans": plans, "rates": rates, "policy": _policy_rows(v3)}
+    # GWY-49: the provider ZDR capabilities, seeded from their own JSON (every row `none`
+    # until a policy page has been read and dated — the seed refuses otherwise).
+    caps_path = PLANS_JSON.with_name("provider_capabilities.v1.json")
+    caps: dict[str, str] = {}
+    if caps_path.is_file():
+        cj = json.loads(caps_path.read_text(encoding="utf-8"))
+        caps = {pid: c["zdr"] for pid, c in cj.get("providers", {}).items()}
+    return {"plans": plans, "rates": rates, "policy": _policy_rows(v3), "caps": caps}
 
 
 # ── the comparison ─────────────────────────────────────────────────────────────
@@ -218,7 +226,12 @@ def _norm(v):
 
 
 def compare(want: dict, have: dict) -> int:
-    for k in ("plan_entitlements", "pricing_rates", "billing_policy"):
+    for k in (
+        "plan_entitlements",
+        "pricing_rates",
+        "billing_policy",
+        "provider_capabilities",
+    ):
         if not isinstance(have.get(k), list):
             print(
                 f"✗ CANNOT DETERMINE — the live dump carries no `{k}` array. An unread table is not an equal one (CLAUDE.md §1)."
@@ -230,6 +243,9 @@ def compare(want: dict, have: dict) -> int:
         for r in have["pricing_rates"]
     }
     live_pol = {r.get("key"): r.get("value") for r in have["billing_policy"]}
+    live_caps = {
+        r.get("provider_id"): r.get("zdr") for r in have["provider_capabilities"]
+    }
     problems: list[str] = []
     for key, cols in want["plans"].items():
         row = live_plans.get(key)
@@ -267,6 +283,13 @@ def compare(want: dict, have: dict) -> int:
             problems.append(f"  billing_policy[{k}]: NO ROW on Neon")
         elif _norm(v) != _norm(live_pol[k]):
             problems.append(f"  billing_policy[{k}]: seed={v!r} neon={live_pol[k]!r}")
+    for pid, zdr in want.get("caps", {}).items():
+        if pid not in live_caps:
+            problems.append(f"  provider_capabilities[{pid}]: NO ROW on Neon")
+        elif live_caps[pid] != zdr:
+            problems.append(
+                f"  provider_capabilities[{pid}]: seed={zdr!r} neon={live_caps[pid]!r}"
+            )
     if problems:
         print("✗ THE LIVE REFERENCE TABLES DO NOT EQUAL apps/web/db/plans.v3.json:\n")
         print("\n".join(problems))
@@ -281,7 +304,7 @@ def compare(want: dict, have: dict) -> int:
     print(
         f"OK — Neon equals plans.v3.json: {len(want['plans'])} plan rows × "
         f"{len(next(iter(want['plans'].values())))} columns, {len(want['rates'])} current "
-        f"rate bands, {len(want['policy'])} policy keys."
+        f"rate bands, {len(want['policy'])} policy keys, {len(want.get('caps', {}))} provider capabilities."
     )
     return 0
 
@@ -311,7 +334,13 @@ def _live_from(want: dict) -> dict:
             }
         )
     pol = [{"key": k, "value": v} for k, v in want["policy"].items()]
-    return {"plan_entitlements": plans, "pricing_rates": rates, "billing_policy": pol}
+    caps = [{"provider_id": pid, "zdr": z} for pid, z in want.get("caps", {}).items()]
+    return {
+        "plan_entitlements": plans,
+        "pricing_rates": rates,
+        "billing_policy": pol,
+        "provider_capabilities": caps,
+    }
 
 
 def selftest() -> int:
@@ -405,6 +434,21 @@ def selftest() -> int:
         }
     )
     case("a retired band still is_current on Neon REFUSES", want, extra, 1)
+
+    # GWY-49: a provider whose ZDR capability on Neon differs from the JSON REFUSES —
+    # the gateway routes a regulated customer's request on that row.
+    cap = copy.deepcopy(ok)
+    if cap["provider_capabilities"]:
+        cap["provider_capabilities"][0]["zdr"] = "default"
+        case("a drifted provider_capabilities.zdr on Neon REFUSES", want, cap, 1)
+    missing_caps = copy.deepcopy(ok)
+    missing_caps.pop("provider_capabilities")
+    case(
+        "a live dump without provider_capabilities is CANNOT DETERMINE (rc=2)",
+        want,
+        missing_caps,
+        2,
+    )
 
     pol = copy.deepcopy(ok)
     for r in pol["billing_policy"]:

@@ -1,19 +1,34 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * Playground — run a prompt through the gateway and land on its trace
- * (`specs/OBS-16-playground.md`). Server shell: proves a provider is
- * connected and computes the model dropdown, then hands off to the client
- * form (`PlaygroundForm`), which is the only thing that talks to
+ * (`specs/EVL-03-playground-v2-and-open-in-playground.md`, extends the v1
+ * `OBS-16-playground.md` surface). Server shell: proves a provider is
+ * connected, computes the model dropdown and the reference-table limits, and
+ * — when opened as `?trace=&span=` from a span's "Open in playground" button
+ * (A3, Codex) — resolves the ONE prefill this button exists for (§2). The
+ * client form (`PlaygroundForm`) is the only thing that talks to
  * `POST /api/playground`.
  *
- * WHO WRITES THE DATA THIS READS: the gateway writes the span for the run
- * (the existing `/v1/chat/completions` path); this page reads nothing else.
+ * WHO WRITES THE DATA THIS READS: the gateway writes the span for a run (the
+ * existing `/v1/chat/completions` path) and the span this page prefills FROM.
+ * This page reads nothing else.
+ *
+ * TENANT ISOLATION (§2 "Tenant scoping"): `GET /v1/traces/{id}/spans` binds
+ * `tenant_id` from the caller's OWN JWT first
+ * (`crates/gateway/src/trace_reads.rs:2393-2400`); a trace id from another
+ * tenant 404s exactly like one that never existed — this page renders the
+ * SAME "span not found" state either way (spec §2, never distinguished).
  */
 
 import { defaultModelFor } from "@/app/playground/default-models";
+import { ReadFailure } from "@/components/empty-states/ReadFailure";
 import { PlaygroundForm } from "@/components/playground/PlaygroundForm";
 import { PROVIDER_LABEL } from "@/components/settings/provider-catalog.generated";
+import type { Span } from "@/components/trace-viewer/types";
 import { canAdmin, requireSession } from "@/lib/auth";
-import { GatewayError, gatewayGet } from "@/lib/gateway";
+import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
+import { type PrefillResult, prefillFromSpan } from "@/lib/playground-prefill";
+import { getPlaygroundSettings } from "@/lib/playground-settings";
 import { EmptyState } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -22,6 +37,8 @@ export const metadata: Metadata = { title: "Playground — Tracelane" };
 
 // Reads the tenant's connected providers at request time — never prerender.
 export const dynamic = "force-dynamic";
+
+type SearchParams = Record<string, string | string[] | undefined>;
 
 interface ProviderKeySummary {
 	provider_id: string;
@@ -40,7 +57,7 @@ interface ProviderKeySummary {
 type ProviderState =
 	| { kind: "keys"; keys: ProviderKeySummary[] }
 	| { kind: "locked" } // member/viewer — cannot list, cannot say either way
-	| { kind: "unreachable" };
+	| { kind: "unreachable"; status: number };
 
 async function loadProviderState(canList: boolean): Promise<ProviderState> {
 	if (!canList) return { kind: "locked" };
@@ -50,9 +67,41 @@ async function loadProviderState(canList: boolean): Promise<ProviderState> {
 		);
 		return { kind: "keys", keys };
 	} catch (err) {
-		if (err instanceof GatewayError) return { kind: "unreachable" };
+		if (err instanceof GatewayError)
+			return { kind: "unreachable", status: err.status };
 		throw err;
 	}
+}
+
+/** The one place "Open in playground" resolves its span (§2). A single
+ * `GET /v1/traces/{trace}/spans` read — never a per-span endpoint, since the
+ * gateway does not have one and this list is small. */
+type PrefillOutcome =
+	| { kind: "none" }
+	| { kind: "ok"; result: PrefillResult }
+	| { kind: "not_found"; traceId: string }
+	| { kind: "unreachable"; status: number };
+
+async function loadPrefill(
+	traceId: string,
+	spanId: string,
+): Promise<PrefillOutcome> {
+	let spans: Span[] | null;
+	try {
+		spans = await gatewayGetOrNull<Span[]>(
+			`/v1/traces/${encodeURIComponent(traceId)}/spans`,
+		);
+	} catch (err) {
+		if (err instanceof GatewayError)
+			return { kind: "unreachable", status: err.status };
+		throw err;
+	}
+	// 404 (gatewayGetOrNull → null) and "trace exists but this span id isn't in
+	// it" render the SAME state — a trace from another tenant already reads as
+	// 404 at the gateway, so this page never distinguishes the two (spec §2).
+	const span = spans?.find((s) => s.span_id === spanId);
+	if (!span) return { kind: "not_found", traceId };
+	return { kind: "ok", result: prefillFromSpan(span, traceId) };
 }
 
 function NoProviderPanel() {
@@ -72,37 +121,67 @@ function NoProviderPanel() {
 	);
 }
 
-function LockedPanel() {
+/** §4 "Span not found / other tenant" — the form still renders, empty, per
+ * the spec: a missing source span is not an error the user can fix. */
+function SpanNotFoundBanner({ traceId }: { traceId: string }) {
 	return (
-		<EmptyState
-			title="Provider visibility is owner-only"
-			description="Whether your workspace has a connected provider isn't visible to your role — ask an owner to check Settings → LLM Providers, or to run this for you."
-			action={
-				<Link
-					href="/settings/providers"
-					className="text-sm font-medium text-action-ink underline underline-offset-2 hover:opacity-80"
-				>
-					Settings → LLM Providers
-				</Link>
-			}
-		/>
+		<div className="rounded-card border border-line bg-canvas-sunken p-3 text-xs text-ink-2">
+			That span isn&apos;t in this workspace (or no longer exists). Opened an
+			empty playground.{" "}
+			<Link
+				href={`/traces/${encodeURIComponent(traceId)}`}
+				className="font-medium text-action-ink underline underline-offset-2 hover:opacity-80"
+			>
+				Back to the trace →
+			</Link>
+		</div>
 	);
 }
 
-export default async function PlaygroundPage() {
+/** §4 "Span read failed (5xx / network)" — retryable, and the form beneath it
+ * stays usable (never dressed up as "no data", TRAPS §18). */
+function SpanReadFailedBanner({ retryHref }: { retryHref: string }) {
+	return (
+		<div className="rounded-card border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
+			Couldn&apos;t load the source span.{" "}
+			<Link
+				href={retryHref}
+				className="font-medium underline underline-offset-2 hover:opacity-80"
+			>
+				Retry
+			</Link>
+		</div>
+	);
+}
+
+export default async function PlaygroundPage({
+	searchParams,
+}: {
+	searchParams: Promise<SearchParams>;
+}) {
 	const session = await requireSession();
-	const providerState = await loadProviderState(canAdmin(session.role));
+	const sp = await searchParams;
+	const traceParam = typeof sp.trace === "string" ? sp.trace.trim() : "";
+	const spanParam = typeof sp.span === "string" ? sp.span.trim() : "";
+
+	const [providerState, { limits }] = await Promise.all([
+		loadProviderState(canAdmin(session.role)),
+		getPlaygroundSettings(),
+	]);
 
 	let body: React.ReactNode;
-	if (providerState.kind === "locked") {
-		body = <LockedPanel />;
-	} else if (
-		providerState.kind === "unreachable" ||
-		providerState.keys.length === 0
-	) {
+	if (providerState.kind === "unreachable") {
+		body = (
+			<ReadFailure
+				status={providerState.status}
+				resource="connected providers"
+				retryHref="/playground"
+			/>
+		);
+	} else if (providerState.kind === "keys" && providerState.keys.length === 0) {
 		body = <NoProviderPanel />;
 	} else {
-		const models = providerState.keys
+		const models = (providerState.kind === "keys" ? providerState.keys : [])
 			.map((k) => ({
 				value: defaultModelFor(k.provider_id),
 				label: `${PROVIDER_LABEL.get(k.provider_id) ?? k.provider_id} (${defaultModelFor(k.provider_id)})`,
@@ -112,13 +191,47 @@ export default async function PlaygroundPage() {
 			// mapped default (rare) — de-dupe on the model value so the <select>
 			// never repeats an option.
 			.filter((m, i, arr) => arr.findIndex((o) => o.value === m.value) === i);
-		body = <PlaygroundForm models={models} />;
+
+		let prefill: PrefillResult | undefined;
+		let banner: React.ReactNode = null;
+		if (traceParam && spanParam) {
+			const outcome = await loadPrefill(traceParam, spanParam);
+			if (outcome.kind === "ok") {
+				prefill = outcome.result;
+			} else if (outcome.kind === "not_found") {
+				banner = <SpanNotFoundBanner traceId={outcome.traceId} />;
+			} else if (outcome.kind === "unreachable") {
+				banner = (
+					<SpanReadFailedBanner
+						retryHref={`/playground?trace=${encodeURIComponent(traceParam)}&span=${encodeURIComponent(spanParam)}`}
+					/>
+				);
+			}
+		}
+
+		body = (
+			<div className="space-y-3">
+				{banner}
+				{providerState.kind === "locked" && (
+					<p className="text-sm text-ink-2">
+						Your role can't list connected providers — type a model id
+					</p>
+				)}
+				<PlaygroundForm
+					models={models}
+					limits={limits}
+					prefill={prefill}
+					canRun={["owner", "admin", "member"].includes(session.role ?? "")}
+					canSave={canAdmin(session.role)}
+				/>
+			</div>
+		);
 	}
 
 	return (
-		<div className="mx-auto max-w-3xl space-y-4 px-6 py-10">
+		<div className="mx-auto max-w-7xl space-y-4 px-6 py-10">
 			<div>
-				<h1 className="t-h1">Playground</h1>
+				<PageHeader title={<>Playground</>} />
 				<p className="mt-1 text-sm text-ink-2">
 					Prototype prompts against your connected providers through the gateway
 					— every run is captured as a trace.

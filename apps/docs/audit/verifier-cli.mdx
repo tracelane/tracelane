@@ -93,7 +93,17 @@ tracelane-audit verify
   [--tenant-pubkey <pubkey>]   Workspace Ed25519 pubkey — the anchor TRUST ROOT.
                                base64 (44 chars) or hex (64 chars). Required to
                                verify Rekor anchors. From /settings/audit or
-                               GET /v1/audit/pubkey.
+                               GET /v1/audit/pubkey?tenant_id=<workspace-id>.
+  [--platform-pubkey <pubkey>] Tracelane's platform Ed25519 pubkey — signs a
+                               workspace's batches before it has its own key.
+                               Accepted only as a prefix; those batches are
+                               reported platform-signed. Default: the key pinned
+                               in this release (recommended; the endpoint
+                               GET /v1/audit/platform-pubkey is for a fingerprint
+                               cross-check).
+  [--workspace-key-since-seq <seq>]  The seq your workspace key took over
+                               (workspace_key_since_seq from GET /v1/audit/pubkey).
+                               A platform-signed batch at or past it fails.
   [--rekor-url <url>]          Default: https://log2025-1.rekor.sigstore.dev (public v2 log)
   [--offline]                  Skip anchor (inclusion-proof) verification entirely
   [--pinned-pubkey <hex32>]    Legacy pin of the log's own signing key (self-hosted Rekor)
@@ -228,13 +238,6 @@ fi
 |---|---|---|
 | Exit 2, `error: HTTP 401` | Missing or expired `--read-key` | Request a new audit-read key via Tracelane support |
 | Exit 1, `row_hash mismatch` at `seq N` | Single-event tampering at seq N | Investigate — this is the live check the verifier exists to detect |
-| Exit 1, `untrusted_tenant_key` | An anchor's batch signature did not verify against your `--tenant-pubkey` | Either the chain/anchor was tampered (a forged entry), or you passed the wrong key. Re-fetch the pubkey from `/settings/audit` or `GET /v1/audit/pubkey` and confirm it matches the workspace under audit |
+| Exit 1, `untrusted_tenant_key` | An anchor's batch signature did not verify against your `--tenant-pubkey` | Either the chain/anchor was tampered (a forged entry), or you passed the wrong key. Re-fetch the pubkey from `/settings/audit` or `GET /v1/audit/pubkey` and confirm it matches the workspace under audit. Batches signed before your workspace had its own key carry Tracelane's platform key — a current verifier accepts those as platform-signed; an older one reports them here |
+| Exit 1, `platform_key_after_workspace_key` | A batch signed by Tracelane's platform key comes AFTER a batch your workspace key signed | The platform key is only trusted before your workspace key existed. Treat it as a real finding: contact security@tracelane.dev with the report |
 | `anchors_included: 0` on a chain you expected to be anchored | `--tenant-pubkey` not passed, or the batches were captured before anchoring, or the log was unreachable at capture (best-effort) | Pass `--tenant-pubkey` to enable anchor verification. Anchoring covers gateway-proxied batches; unanchored batches still verify via the hash chain + Ed25519 signature |
-
-## V1.1 follow-ups
-
-- `tracelane-audit export --format pdf` (regulator-ready conformance
-  packet PDF).
-- Type-system-level export retention enforcement (the
-  `audit_retention.rs` resolver is in place; the V1.1 cleanup job
-  will be the first caller).

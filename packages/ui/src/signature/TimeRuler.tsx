@@ -1,4 +1,5 @@
 import { cn } from "../lib/cn";
+import { fmtCount } from "../lib/fmt-count";
 import { fmtDurMs } from "../lib/fmt-dur";
 
 /**
@@ -377,10 +378,10 @@ export function LedgerSeqChip({
 				className,
 			)}
 			style={{ fontVariantNumeric: "tabular-nums" }}
-			title={`Audit ledger sequence ${from}–${to} for this workspace`}
+			title={`Audit ledger sequence ${fmtCount(from)}–${fmtCount(to)} for this workspace`}
 		>
 			<span aria-hidden="true">▸</span>
-			{from}–{to}
+			{fmtCount(from)}–{fmtCount(to)}
 		</span>
 	);
 }

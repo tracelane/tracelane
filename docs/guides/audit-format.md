@@ -191,12 +191,12 @@ Files:
 > `queryable_days`, `ledger_days`; `apps/web/db/schema.ts:330-332`) — sourced
 > from `apps/web/db/plans.v3.json`. See [pricing](https://docs.tracelane.dev/pricing).
 
-| Tier | Ledger/audit-log retention (ruled) |
+| Tier | Ledger/audit-log retention |
 |---|---|
 | Free ($0) | 30 days queryable |
-| Builder ($29/mo, $24 annual) | 2 years queryable |
-| Team ($229/mo, $190 annual) | 2 years queryable |
-| Business ($799/mo, $665 annual) | 2 years queryable |
+| Builder ($29/mo) | 2 years queryable |
+| Team ($229/mo) | 2 years queryable |
+| Business ($799/mo) | 2 years queryable |
 | Enterprise (from $2,499/mo) | 7 years queryable |
 
 Source: `apps/web/db/plans.v3.json` (`ledger_days` per plan) — the single
@@ -241,5 +241,5 @@ there is no QTSP integration.
   `#[deprecated]`** (`audit.rs:148,156,173`) — "vulnerable to field-boundary attacks". Do not
   implement against them.
 - `packages/cli/src/commands/export.ts` — `tlane export --pack eu-ai-act-art12`
-- `apps/web/db/migrations/0047_adr078_ledger_canonical_pg.sql` — `audit_log_rows` / `audit_anchor_records`, the canonical ledger when Postgres is configured (`apps/web/db/schema.ts` is the Drizzle source)
+- `apps/web/db/schema.ts` — `audit_log_rows` / `audit_anchor_records`, the canonical ledger when Postgres is configured (Drizzle source)
 - `infra/dev/clickhouse/schema.sql` — `tracelane.audit_log` table: the ledger's ClickHouse copy, or its only home on a no-Postgres self-host

@@ -4,7 +4,7 @@ description: Tamper-evident SHA-256 hash chain over every gateway call and guard
 classification: PUBLIC
 ---
 
-Every request through the Tracelane gateway is appended to a per-tenant,
+Gateway-admitted calls and their recorded guardrail verdicts enter a per-tenant,
 append-only SHA-256 **hash chain**. The chain is **tamper-evident**: any change
 to a past event — deletion, insertion, reorder, or modification — breaks the
 recomputed hash, and anyone holding an export can detect it without trusting
@@ -19,28 +19,23 @@ Rekor anchor: an anchored batch's Merkle root sits in an append-only public log 
 a timestamp nobody can backdate, so rewriting history would leave the old root on the
 record. **Against a third party, the chain plus the signature is the guarantee on
 every batch; against Tracelane itself, the guarantee is the Rekor anchor, and it
-covers only the batches that are anchored.** Keys you hold yourself (a KMS key we can
-sign with but never read) are on the roadmap for Enterprise; universal per-batch
-anchoring, which would extend the against-us guarantee to the whole chain, is the
-nearer fix and is on the roadmap for every tier.
+covers only the batches that are anchored.** Signing keys are held by Tracelane, not
+by you.
 
 <Note>
-**What the chain covers.** The chain records **every gateway-proxied call and
-guardrail verdict**. Spans captured via the OTLP/SDK path (self-host
-instrumentation — tool calls, agent steps, LLM calls not proxied through the
-gateway) are **full-fidelity in your trace store but not yet in the hash
-chain**; chaining them is on the roadmap.
+The ledger covers gateway-admitted calls and their recorded guardrail verdicts; SDK/OTLP-only spans are captured, not chained; the trace ledger badge shows whether that trace has a ledger record.
+
+On a trace, **In the ledger** means a ledger record was found; **Captured, not chained** means none was found. Ledger membership is not a cryptographic verification result. **Anchor recorded** identifies a recorded anchor, not a verified inclusion proof. Use the Audit page to check these rows.
 
 **What is live.** The SHA-256 hash chain is **appended for every tenant** (the
 chain itself is universal). On **every tier**, each batch's Merkle
 root is additionally **Ed25519-signed and best-effort anchored to the public
-Sigstore Rekor v2 log** (`log2025-1.rekor.sigstore.dev`; first production anchor:
-log index `19398597`, 2026-07-13). Anchoring is **per Merkle batch (every 100
+Sigstore Rekor v2 log** (`log2025-1.rekor.sigstore.dev`). Anchoring is **per Merkle batch (every 100
 events) — never per-event or per-trace**, and coverage is **not yet universal**:
 it grows as each batch closes and anchors. Anchoring is **best-effort** — if the
 public log is unreachable a batch stays signed-locally-but-not-yet-anchored, and
-the hash chain + Ed25519 signature still verify. **eIDAS QTSP timestamping remains
-on the roadmap.** Self-verification (`tlane verify` against your own export of
+the hash chain + Ed25519 signature still verify. eIDAS QTSP timestamping is not
+provided. Self-verification (`tlane verify` against your own export of
 the chain) is included on every tier. The bulk regulatory export
 (`/v1/audit/export`, the Article-12-style evidence package) is an **Enterprise**
 capability (fail-closed on other tiers).
@@ -49,6 +44,75 @@ capability (fail-closed on other tiers).
 The cryptographic-anchoring layer (Ed25519 + Rekor) and self-verification are
 included on every tier. Seven-year ledger retention and the bulk
 `/v1/audit/export` regulatory package are included on Enterprise.
+
+## Read the Audit page
+
+The Audit page checks **a bounded window**, not the integrity of the entire workspace.
+It loads up to **1,000 of the newest rows within your plan’s ledger retention window**
+and runs the open verifier in your browser. The headline names that scope. A passing
+check never establishes the integrity of rows outside it.
+
+- **Chained:** gateway-admitted calls and recorded guardrail verdicts.
+- **Captured, not chained:** SDK/OTLP-only spans.
+- **Row hashes:** checked from the chain’s first row, or from a verified public anchor
+  when earlier rows are absent. Loaded rows before that starting point are not verified.
+- **Public proofs:** checked separately against the trusted workspace key. Hashes can
+  match while a public proof fails.
+
+The workspace count is a separate inventory snapshot, not a verification result. If that
+read fails, the page shows **Unavailable**; it does not substitute the number of loaded
+rows. The page names how many rows lie outside these rows when the count is known.
+Both reads can change as events arrive. A successful subset has a neutral headline naming
+the number checked and the total. **Last event recorded** and **Last anchored** show the
+latest recorded event time and the latest batch time marked anchored. Missing times are
+**Unknown**. These timestamps are activity evidence, not a recorder health guarantee.
+
+**Batch evidence** lists the loaded batch ranges, eight at a time. A proof attached to a
+record is not itself a passing check. Individual events are behind a disclosure, with
+50 loaded rows per page. Pagination does not fetch or check the rest of the ledger.
+
+At a billion rows the browser still receives the bounded window. The page does not offer
+a whole-ledger verification button, a current-chain-head claim, or a full-ledger coverage
+percentage. The current API does not provide a paged batch inventory or an independently
+verified workspace-wide status. Database counting and export processing still depend on
+ledger size; this is not a billion-row performance guarantee.
+
+{/* Sources: apps/web/app/audit/page.tsx:79 (newest bounded read); crates/gateway/src/audit_self_verify.rs:335 (selection), :63 (complete batches); crates/gateway/src/db/ledger.rs:573 (inventory and activity); crates/gateway/src/audit_ledger_range.rs:114 (response); packages/verifier-typescript/src/index.ts:590 (verifyChain), :809 (verifyAnchorsOffline); apps/web/components/audit/AuditLedgerView.tsx:333 (activity), :445 (coverage headline), :43 (pagination). */}
+
+### When a check needs attention
+
+Save the **check report** before reloading. This JSON download is available on every
+plan and records the check scope and findings. **Refresh & check latest** fetches fresh
+evidence and runs verification again. Select **First finding · sequence N** to open the
+event list at the highlighted record.
+
+| Result | What to do next |
+| --- | --- |
+| Record integrity check failed | Compare a fresh read with the saved result. If the mismatch repeats, treat it as a potential integrity incident and ask support to investigate the first failing sequence. Nothing in the app can repair a broken chain. The check alone does not determine the cause. |
+| Public proof is missing | Ask support to investigate the batch that claims anchoring but lacks its proof. Do not treat it as publicly verified. |
+| Batch fingerprint check failed | Ask support to compare the batch record with the rows it covers. |
+| Batch signing key does not match | Ask support to confirm the workspace key and its history. Do not replace a trusted key with one taken from the evidence. |
+| Batch signature check failed | Ask support to investigate the signed attestation. |
+| Public proof check failed | Ask support to investigate the public-log entry, inclusion proof or checkpoint. A passing row-hash check does not validate that proof. |
+| Trusted signing key is missing | Restore access to the trusted workspace public key through your administrator or support, then reload. This is a skipped check, not a failed signature. |
+| No verified starting point / proof needs more rows | Request evidence containing the chain’s first row or a complete publicly anchored batch. This read cannot establish the result. |
+| Gap in batch coverage | Reload to see whether anchoring has caught up. If the gap remains, send support the uncovered range from the report. The verifier counts rows outside all recorded batches before a later batch separately from rows after the last batch. |
+| Invalid evidence / unavailable read | Retry or reload, then ask support to investigate if it persists. No passing verdict is available. |
+
+A new workspace with an empty ledger gets a gateway setup action, not a green check.
+No loaded rows with a nonempty or unavailable inventory is **unknown**, not an empty
+workspace.
+
+### Export from the page
+
+Viewing and checking the ledger is included on every plan. **The Article-12 bulk
+export requires Enterprise.** Select explicit UTC dates under **Export evidence**.
+The download streams the requested date range without the browser preview’s row cap.
+It does not verify the file. A date boundary may exclude rows that a batch proof needs;
+use an adequate range and check the resulting evidence. A successful download alone is
+not proof of completeness or integrity.
+
+{/* Sources: crates/gateway/src/audit_export.rs:1252 (handler streaming); the web export proxy route.ts:20 (GET); apps/web/components/audit/AuditLedgerView.tsx:238 (EvidenceExport), :510 (saveReport), :499 (finding navigation), :700 (refresh); packages/verifier-typescript/src/index.ts:533 (countAnchorCoverage). */}
 
 ## How it works
 
@@ -243,19 +307,51 @@ The per-tenant Ed25519 audit keypair is live. Fetch the public key from
 verifier uses to accept anchors. The private key is generated and held by
 Tracelane, envelope-encrypted at rest under a server-held master key
 (`crates/gateway/src/audit_keys.rs`); it is not encrypted under a
-customer-managed key, and rotation of the audit signing key is not yet
-offered. Keys you hold yourself are on the roadmap for Enterprise, as stated
-at the top of this page.
+customer-managed key, and rotation of the audit signing key is not
+offered.
 
 ```bash
-# Fetch your current audit public key
-curl -s -H "Authorization: Bearer tlane_..." \
-  https://gateway.tracelane.dev/v1/audit/pubkey > audit-pubkey.txt
+# Fetch your workspace's audit public key (public by design — no API key needed;
+# your workspace id is on Settings → Workspace)
+curl -s "https://gateway.tracelane.dev/v1/audit/pubkey?tenant_id=<workspace-id>" \
+  | jq -r .ed25519_pubkey_b64 > audit-pubkey.txt
 
-# Verify a specific export with an explicit public key
-tlane verify audit.ndjson --tenant-pubkey "$(curl -s \
-  -H "Authorization: Bearer tlane_..." \
-  https://gateway.tracelane.dev/v1/audit/pubkey)"
+# Verify an export against it
+tlane verify audit.ndjson --tenant-pubkey "$(cat audit-pubkey.txt)"
+```
+
+## Platform-signed batches
+
+A workspace without its own audit key yet has its batches signed by **Tracelane's
+platform key** — one key shared across workspaces. When the workspace key is
+created, every later batch is signed with it. The verifier trusts both, and
+never confuses them:
+
+- A batch signed by the platform key verifies as **platform-signed**: the rows are
+  unchanged since signing, but Tracelane vouches for them, not your workspace key.
+  The report counts them (`platform_signed_batches`) and names their ranges.
+- The platform key is accepted **only before** your workspace key took over. A
+  platform-signed batch at or after that point fails verification
+  (`platform_key_after_workspace_key`), because that is exactly what someone
+  holding the platform key would have to append. `GET /v1/audit/pubkey` publishes
+  the takeover point as `workspace_key_since_seq`; pass it as
+  `--workspace-key-since-seq` so the rule holds even when the range you verify
+  contains no batch signed by your own key.
+- A platform-signed batch never becomes the starting point a partial (windowed)
+  verification is trusted from — only your workspace key's anchored batches can.
+- The platform key is **pinned in each verifier release**, and the verifier uses the
+  pinned key unless you override it. It is also published at
+  `GET /v1/audit/platform-pubkey` — use that to cross-check the fingerprint, not as
+  the trust root. Neither key is ever taken from the export.
+
+```bash
+# Your workspace key and the point it took over
+curl -s "https://gateway.tracelane.dev/v1/audit/pubkey?tenant_id=<workspace-id>" \
+  | jq '{ed25519_pubkey_b64, workspace_key_since_seq}'
+
+# Verify: the pinned platform key is used automatically
+tlane verify audit.ndjson --tenant-pubkey "$(cat audit-pubkey.txt)" \
+  --workspace-key-since-seq <workspace_key_since_seq>
 ```
 
 ## Related

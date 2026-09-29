@@ -1,0 +1,84 @@
+---
+title: Import Helicone history
+description: Move a saved Helicone request export into Tracelane with a dry run and resumable cursor.
+classification: PUBLIC
+---
+
+`tlane import-helicone --traces <path>` imports historical requests from a saved
+JSON array, or a successful [bulk request query](https://docs.helicone.ai/rest/request/post-v1requestquery-clickhouse) response shaped as
+`{"data": [...], "error": null}`. Save all pages you want to migrate into one
+array before starting. For single-request responses, collect each `data` object
+into that array; a single object is not a bulk export. The importer reads a local file; it does not fetch your
+Helicone account or follow pagination itself.
+
+Use the request fields documented by Helicone's
+[request API](https://docs.helicone.ai/rest/request/get-v1request):
+`request_id`, `request_created_at`, and either `response_created_at` or
+`delay_ms` (including fractional milliseconds). Timestamps must be ISO 8601
+with a timezone. Provider/model, prompt/completion token counts, response status,
+and `request_body` / `response_body` are optional. Review the export's bodies
+before importing: they are sent as content, including any sensitive data they
+contain. Do not include credentials in them.
+
+```bash
+# Set a Tracelane destination key with ingest scope, not a Helicone key.
+export TRACELANE_API_KEY='tlane_...'
+
+tlane import-helicone --traces helicone-history.json --dry-run
+tlane import-helicone --traces helicone-history.json
+# Resume an interrupted run, or confirm there is nothing left to import:
+tlane import-helicone --traces helicone-history.json
+```
+
+The default destination is `https://gateway.tracelane.dev`. Use `--endpoint`
+(or `TRACELANE_GATEWAY_URL`) for another gateway **origin**, without `/v1`.
+HTTPS is required except for a receiver on localhost. The command refuses redirects.
+
+### What the counts mean
+
+The dry run validates the same rows and cursor as a real run, prints the number
+it would import and skip, and sends and writes nothing. A real run prints
+`Imported (accepted for ingest)`, a skipped count, and counts by reason.
+Acknowledgement means the gateway accepted the spans for ingest; confirm storage
+in the trace viewer. Sampling, retention and content-processing policies still apply.
+
+Missing IDs, invalid timestamps, invalid token counts and invalid response status
+are skipped with named reasons. Duplicate request IDs in the file are imported
+once. A resumed prefix is counted as `already_processed`, including any rows
+previously skipped. Network errors, rejected payloads and unexpected responses
+stop the command with exit code 1 at the current row. Fix the cause, then run the
+same command again.
+
+### Resume safely
+
+The default cursor is `<path>.tracelane-cursor.json`; `--cursor <path>` selects a
+different location. It records progress after each acknowledged request or skipped
+row, binds to the exact source bytes, gateway origin and destination key, and
+contains no key or request bodies. Keep the source file and key unchanged while
+resuming. A changed source, destination or key is refused with that cursor.
+
+One process can hold a cursor at a time. After a killed process, check that it has
+stopped before removing its stale `.lock` file. The cursor and export are local
+files; keep them together until you have verified the migration. Re-running with
+the same cursor sends no processed rows. Stable trace/span IDs allow the receiver
+to deduplicate a retry when an acknowledgement was lost before the cursor write;
+this is not a guarantee of exactly-once metering across arbitrary new cursors.
+
+### What reaches the trace
+
+Each request becomes one `helicone.request` span at its original timestamps
+(stored with microsecond precision),
+with provider/model and token fields when supplied, and success/error status.
+Its business reference is `helicone:<request_id>`. Request and response bodies
+are preserved as JSON text parts in the input and output messages, independently
+of the provider's payload shape. Missing bodies stay absent. This does not
+reconstruct sessions, tool subspans, or Helicone feedback and scores. Other export
+fields are not copied. Helicone's cost is not imported; Tracelane may calculate
+cost from the imported model and tokens using its own pricing reference.
+
+Imported spans are captured, not chained in the gateway audit ledger. Historical
+timestamps remain historical: data outside the destination's retention window
+may be removed by its normal retention process.
+
+Without `--traces`, `import-helicone` continues to emit configuration files;
+`tlane migrate helicone` continues to rewrite project configuration and source.

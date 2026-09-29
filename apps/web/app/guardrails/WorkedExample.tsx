@@ -1,3 +1,5 @@
+"use client";
+import { Button } from "@tracelanedev/ui";
 /**
  * WorkedExample — the "show me" moment. A real, worked example of a pre-flight
  * block: the request that trips R8, and the exact 403 the gateway returns
@@ -6,7 +8,6 @@
  * tenant. (A one-click LIVE test — send this through the gateway and watch the
  * block land in the table — is filed as a fast-follow; it needs a demo endpoint.)
  */
-"use client";
 
 import { Card } from "@tracelanedev/ui";
 import { useState } from "react";
@@ -16,11 +17,12 @@ export function WorkedExample() {
 
 	return (
 		<Card>
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				aria-expanded={open}
 				onClick={() => setOpen((v) => !v)}
-				className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+				className="flex w-full whitespace-normal items-center justify-between gap-2 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 			>
 				<span className="text-sm font-medium text-ink">
 					Show me a block — what pre-flight prevention looks like
@@ -28,7 +30,7 @@ export function WorkedExample() {
 				<span aria-hidden className="text-2xs text-ink-3">
 					{open ? "▲ hide" : "▼ example"}
 				</span>
-			</button>
+			</Button>
 			{open && (
 				<div className="space-y-3 border-t border-line px-4 py-3 text-sm">
 					<p className="text-ink-2">
@@ -40,7 +42,7 @@ export function WorkedExample() {
 						<span className="font-medium text-ink">block</span> verdict that
 						shows up in the table above.
 					</p>
-					<div className="overflow-x-auto rounded-lg bg-surface-2 p-3">
+					<div className="overflow-x-auto rounded-card bg-surface-2 p-3">
 						<pre className="font-mono text-xs leading-relaxed text-ink-2">
 							{`# a request that trips the prompt-injection rail
 POST /v1/chat/completions

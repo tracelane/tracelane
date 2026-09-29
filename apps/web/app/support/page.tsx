@@ -1,3 +1,4 @@
+import { PageHeader } from "@tracelanedev/ui";
 /**
  * /support — the in-product support page. Replaces the old right-hand slide-out
  * (founder: "make it a proper page"). Renders the shared <SupportForm> inside the
@@ -13,12 +14,12 @@ export const metadata: Metadata = { title: "Support — Tracelane" };
 export default function SupportPage() {
 	return (
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
-			<div className="mx-auto max-w-2xl space-y-5">
+			<div className="max-w-2xl space-y-5">
 				<header>
-					<h1 className="t-h1">Support</h1>
+					<PageHeader title={<>Support</>} />
 					<p className="mt-1 text-sm text-ink-2">
-						Ask a question, share feedback, or report a bug. We follow up by
-						email — include as much detail as you can.
+						Ask a question, share feedback, or report a bug. Your submission is
+						saved with a reference when available. Replies are not guaranteed.
 					</p>
 				</header>
 				<Card className="p-5">

@@ -102,6 +102,18 @@ const GENERIC_DIMS: readonly TileDimension[] = [
 	"operation",
 ];
 
+/**
+ * Rows a `breakdown` tile FETCHES (the `limit=` every breakdown read passes, and the
+ * cut applied to the two routes that take none — `/v1/costs` returns up to the gateway's
+ * `GATEWAY_PROVIDER_CAP`, `/v1/guardrails/stats.rails` up to `GUARDRAIL_RAIL_CAP`) and
+ * the rows it SHOWS before the "+N more" line (B-506). Every route sorts by the value
+ * descending, so the fetched set is the top `BREAKDOWN_FETCH_LIMIT` and the page's
+ * "(of the top 20)" copy is exact for every branch — a 20-row cap must never read as
+ * a total. Named here (CLAUDE.md §23) so `tiles.ts` and `page.tsx` cannot disagree.
+ */
+export const BREAKDOWN_FETCH_LIMIT = 20;
+export const BREAKDOWN_VISIBLE_ROWS = 10;
+
 export interface TileSupport {
 	readonly stat: boolean;
 	readonly series: boolean;
@@ -115,8 +127,12 @@ export function tileSupport(metricId: string): TileSupport {
 	const dims = new Set<TileDimension>();
 	if (id === "spend_est")
 		for (const d of ["model", "provider", "api_key"] as const) dims.add(d);
-	if (id === "verdicts" || id === "block_rate" || id === "decision_mix")
+	if (id === "verdicts" || id === "decision_mix")
 		for (const d of ["decision", "rail"] as const) dims.add(d);
+	// B-501: a block rate broken down BY DECISION is 0 or 100 by construction (every
+	// `block` verdict blocked; no other decision did). Per rail it is a real figure —
+	// `GET /v1/guardrails/stats · rails[].block_rate_pct`, the built-in page's number.
+	if (id === "block_rate") dims.add("rail");
 	if (id === "traces_total" || id === "requests_routed" || id === "llm_calls")
 		for (const d of ["model", "operation", "status"] as const) dims.add(d);
 	if (GENERIC_BREAKDOWN_IDS.has(id)) for (const d of GENERIC_DIMS) dims.add(d);

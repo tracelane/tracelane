@@ -83,7 +83,14 @@ struct VerifyArgs {
     to: Option<String>,
 
     /// Tracelane API base URL.
-    #[arg(long, value_name = "URL", default_value = "https://api.tracelane.dev")]
+    // 2026-09-21: was `https://api.tracelane.dev`, a host that does not resolve —
+    // the documented independent-verification quick-start failed at step 2 for
+    // anyone who followed it. The production gateway is gateway.tracelane.dev.
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = "https://gateway.tracelane.dev"
+    )]
     api_url: String,
 
     /// Workspace API key used for the online fetch. NOTE: API keys are
@@ -119,6 +126,21 @@ struct VerifyArgs {
     /// reported unverified.
     #[arg(long, value_name = "PUBKEY")]
     tenant_pubkey: Option<String>,
+
+    /// AUD-29: Tracelane's PLATFORM Ed25519 pubkey (base64) — the key a
+    /// workspace's batches are signed with before the workspace has its own
+    /// (`GET /v1/audit/platform-pubkey`). Batches it signed verify as
+    /// platform-signed and are counted apart; a platform-signed batch after a
+    /// workspace-signed one FAILS. Defaults to the key pinned in this release.
+    #[arg(long, value_name = "PUBKEY")]
+    platform_pubkey: Option<String>,
+
+    /// AUD-29: the first ledger seq your workspace key signed —
+    /// `workspace_key_since_seq` from `GET /v1/audit/pubkey?tenant_id=…`. With it, a
+    /// platform-signed batch at or past that seq FAILS even when the range you
+    /// verify contains no workspace-signed batch.
+    #[arg(long, value_name = "SEQ")]
+    workspace_key_since_seq: Option<u64>,
 
     /// Skip anchor (inclusion-proof) verification entirely. Useful for
     /// air-gapped verification of the chain + Merkle structure only —
@@ -208,10 +230,15 @@ impl Verdict {
     /// The ONE place the report becomes a verdict. Kept pure so the fabricated-
     /// ledger case is a unit test rather than a regulator's discovery.
     fn of(report: &VerifyReport) -> Self {
+        // B-483 (2026-09-21): rows inside no anchor batch below the anchor watermark
+        // are unsigned and un-anchored — a hole every other counter reads green over.
+        // Stated explicitly, though the verifier also emits an `anchor_coverage_gap`
+        // error per hole, so `errors.is_empty()` would already refuse.
         let clean = report.anchors_unverified == 0
             && report.hash_chain_valid
             && report.signatures_valid
             && !report.strip_detected
+            && report.rows_uncovered_by_anchors == 0
             && report.errors.is_empty();
         if !clean {
             return Verdict::Fail;
@@ -275,6 +302,21 @@ fn run_verify(args: VerifyArgs) -> Result<VerifyReport> {
     if let Some(tp) = args.tenant_pubkey.as_deref() {
         opts.tenant_pubkey = Some(decode_pubkey32(tp).context("--tenant-pubkey")?);
     }
+    // AUD-29: an explicit flag wins; otherwise EVERY key pinned in this release (a
+    // rotation keeps the retired key). Never a key read from the ledger itself.
+    let platform_source = if let Some(pk) = args.platform_pubkey.as_deref() {
+        opts.platform_pubkeys = vec![decode_pubkey32(pk).context("--platform-pubkey")?];
+        "--platform-pubkey"
+    } else {
+        for pk in tracelane_audit_verifier::TRACELANE_PLATFORM_PUBKEYS_B64 {
+            opts.platform_pubkeys
+                .push(decode_pubkey32(pk).context("pinned platform key")?);
+        }
+        "pinned in this release"
+    };
+    if let Some(seq) = args.workspace_key_since_seq {
+        opts.workspace_key_since_seq = Some(seq);
+    }
 
     // ── Verify ────────────────────────────────────────────────────────
     let report = verify_ledger(&ledger_path, &opts).context("verify_ledger")?;
@@ -282,7 +324,7 @@ fn run_verify(args: VerifyArgs) -> Result<VerifyReport> {
     // ── Render ────────────────────────────────────────────────────────
     match args.format {
         OutputFormat::Json => print_json(&report)?,
-        OutputFormat::Text => print_text(&report),
+        OutputFormat::Text => print_text(&report, platform_source),
     }
 
     Ok(report)
@@ -375,7 +417,7 @@ fn print_json(report: &VerifyReport) -> Result<()> {
     Ok(())
 }
 
-fn print_text(report: &VerifyReport) {
+fn print_text(report: &VerifyReport, platform_source: &str) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let _ = writeln!(out, "Tracelane audit verification report");
@@ -397,6 +439,15 @@ fn print_text(report: &VerifyReport) {
         "Rekor anchors seen:    {} (resolved {})",
         report.rekor_anchors_seen, report.rekor_anchors_resolved
     );
+    if report.platform_signed_batches > 0 {
+        let _ = writeln!(
+            out,
+            "Platform-signed:       {} batch(es) verified against Tracelane's platform key \
+             ({platform_source}) — before this workspace had its own key; Tracelane vouches \
+             for these, not your key",
+            report.platform_signed_batches
+        );
+    }
     let _ = writeln!(out);
 
     if report.anchors_unverified > 0 {
@@ -523,6 +574,8 @@ mod tests {
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
             tenant_pubkey: None,
+            platform_pubkey: None,
+            workspace_key_since_seq: None,
             offline: true,
             pinned_pubkey: None,
             format: OutputFormat::Json,
@@ -562,10 +615,30 @@ mod tests {
                 strip_detected: false,
                 verified_from_seq: 0,
                 trust_established: true,
+                rows_uncovered_by_anchors: 0,
+                rows_unanchored_tail: 0,
+                platform_signed_batches: 0,
+                platform_signed_ranges: Vec::new(),
                 errors: Vec::new(),
             }
         }
         assert_eq!(Verdict::of(&base()), Verdict::Pass);
+        // B-483: a hole below the anchor watermark is never green — even with every
+        // other counter clean and an included anchor present, as prod had.
+        let mut r = base();
+        r.rows_uncovered_by_anchors = 100;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::Fail,
+            "100 rows inside no anchor batch → fail, whatever anchors_included says"
+        );
+        let mut r = base();
+        r.rows_unanchored_tail = 37;
+        assert_eq!(
+            Verdict::of(&r),
+            Verdict::Pass,
+            "the un-anchored TAIL past the last anchor is expected, not a hole"
+        );
         let mut r = base();
         r.anchors_included = 0;
         assert_eq!(
@@ -614,6 +687,8 @@ mod tests {
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
             tenant_pubkey: None,
+            platform_pubkey: None,
+            workspace_key_since_seq: None,
             offline: true,
             pinned_pubkey: None,
             format: OutputFormat::Json,
@@ -668,6 +743,8 @@ mod tests {
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
             tenant_pubkey: None,
+            platform_pubkey: None,
+            workspace_key_since_seq: None,
             offline: true,
             pinned_pubkey: None,
             format: OutputFormat::Json,
@@ -693,6 +770,8 @@ mod tests {
             file: Some(PathBuf::from("/dev/null")),
             rekor_url: "http://localhost:0".into(),
             tenant_pubkey: None,
+            platform_pubkey: None,
+            workspace_key_since_seq: None,
             offline: true,
             pinned_pubkey: Some("dead".into()), // 2 bytes; not 32
             format: OutputFormat::Json,

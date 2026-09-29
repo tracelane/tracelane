@@ -26,6 +26,14 @@ your bill all read the same way.
   </Card>
 </CardGroup>
 
+**A gateway span carries no prompt or response text by default.** A request
+through the gateway records model, tokens, cost, latency and status (spans your own
+OpenTelemetry instrumentation sends carry whatever it sends). If a workspace owner turns
+on recording, the span also carries the messages you sent and — on
+`POST /v1/chat/completions` — the response your application received, kept for as
+long as the trace. What is recorded, the limits, and the audit record of the setting
+are on [Security → Prompt content](/security#prompt-content).
+
 **A trace is not a span.** A single agent run that makes 6 LLM calls and 3 tool
 calls is **one trace** containing **~10 spans**. The list views count traces; the
 detail view (the transcript spine) renders the spans inside one trace.

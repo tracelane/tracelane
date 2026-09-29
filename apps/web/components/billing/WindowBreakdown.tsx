@@ -7,6 +7,7 @@
  * the usage board's initial load, only when this panel is open.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import type { GatewayWindowBreakdownResponse } from "@/lib/billing-usage";
 import { SegmentedControl } from "@tracelanedev/ui";
 import { useEffect, useState } from "react";
@@ -30,7 +31,7 @@ export function WindowBreakdown() {
 		let cancelled = false;
 		setLoading(true);
 		setError(false);
-		fetch(`/api/billing/window-breakdown?by=${by}`)
+		apiFetchRaw(`/api/billing/window-breakdown?by=${by}`)
 			.then((res) => {
 				if (!res.ok) throw new Error(String(res.status));
 				return res.json() as Promise<GatewayWindowBreakdownResponse>;

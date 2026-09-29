@@ -4,7 +4,7 @@ description: Ship prompts like code — version, gate, and promote staging to pr
 classification: PUBLIC
 ---
 
-Prompt Promotion is the B1 workflow that lets you move prompt versions from
+Prompt Promotion lets you move prompt versions from
 `staging` to `production` through automated eval checks, with drift-based
 rollback when the post-promotion metrics **you post** regress. Rollback is not
 autonomous — see [Auto-rollback](#auto-rollback) for exactly what fires it.
@@ -123,7 +123,7 @@ See [Eval gates](/eval-gates).
    promotion record** is written. _(The **panel** does not run or stream an eval
    yet, so a promotion made from this button is a recorded manual-override. The
    gate itself is live over the API — supply an `eval_run_id` to `promote` and a
-   non-passing run refuses with `409`. Streaming it into the panel is V1.1.)_
+   non-passing run refuses with `409`. The panel does not stream an eval.)_
 
 ## Promote via API
 
@@ -147,11 +147,11 @@ curl -X POST https://gateway.tracelane.dev/v1/prompts/my-agent-system/promote \
 ```
 
 <Note>
-  `override_reason` is shown instead of `eval_run_id` because **nothing produces
-  eval runs yet** — supplying an `eval_run_id` returns `409` today. The override
-  path records an explicit, attributed bypass in the tamper-evident chain, which
-  is the honest way to promote until eval runs exist. The key needs the `admin`
-  scope; keys minted before scoping (`scope` unset) are unaffected.
+  This example uses `override_reason`, which records an explicit, attributed
+  bypass in the tamper-evident chain. To promote through the eval gate instead,
+  run `POST /v1/prompts/{name}/evals` and pass the returned `eval_run_id` in place
+  of `override_reason`. The key needs the `admin` scope; keys minted before
+  scoping (`scope` unset) are unaffected.
 </Note>
 
 Response on success — every id is a UUID:
@@ -170,10 +170,10 @@ Response on success — every id is a UUID:
 ```
 
 If you supply an `eval_run_id` instead of an `override_reason`, the gate
-resolves it and **blocks** — `409 Conflict`, and the routing pointer does not
-move. This is the shape you get today, and it is what makes an `eval_run_id`
-unusable until eval runs are produced: the gate cannot find the run, and a gate
-that cannot resolve its run fails **closed**.
+resolves the run: a run recorded `passed` promotes, and any other outcome —
+`failed`, `errored`, still `running`, or an id the gate cannot resolve — **blocks**
+with `409 Conflict` and the routing pointer does not move. A gate that cannot
+resolve its run fails **closed**. A blocked promotion looks like this:
 
 ```json
 {
@@ -200,7 +200,7 @@ compares it to the pre-promotion baseline and, if it drifts more than
 `sigma_threshold` standard deviations within the observation window, returns a
 rollback decision (and reverts, under `rollback_mode: auto`). **Autonomous
 background monitoring** — Tracelane firing a rollback with no observation pushed
-to it — is on the **V1.1 roadmap**; today the drift math runs on the observations
+to it — is **not built**; today the drift math runs on the observations
 you feed it, not on a standalone monitor loop.
 </Note>
 
@@ -222,31 +222,51 @@ value, sigma drift, and the version pair:
 Auto-rollback fired (eval_score)  — 2.3σ drift, value 0.71 — v→a3b2c1 from v→d4e5f6
 ```
 
-## Canary splits (Team+) — roadmap (V1.1)
+## Canary splits (Team+)
 
-<Warning>
-**Not yet shipped.** Prompt-version traffic splitting — routing a percentage of
-requests to a candidate version — is on the V1.1 roadmap. There is no
-`traffic_pct` splitter in the current gateway. A `canary` **environment pointer**
-exists (you can pin and read a `canary` version), but traffic is **not** split by
-percentage today; promote/rollback operate on the full environment.
-</Warning>
+A split assigns a **percentage of prompt resolutions** to a candidate version.
+Fetching once at process boot and reusing that prompt counts as one resolution.
+The configured percentage is a deterministic bucket threshold, not a measured
+outcome; repeated identities and small populations can produce different proportions.
 
-When it ships, you will route a percentage of traffic to a candidate version
-before full promotion:
+Start or update a split from the prompt detail page, or send:
 
-```yaml
-# V1.1 (roadmap) — no traffic_pct splitter in the current gateway.
-prompts:
-  my-agent-system:
-    canary:
-      version_id: v_new
-      traffic_pct: 10     # 10% → canary, 90% → production
-      min_requests: 500   # don't evaluate until enough data
+```sh
+curl -X PUT "$GATEWAY_URL/v1/prompts/my-agent-system/canary" \
+  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d "{\"candidate_version_id\":\"$CANDIDATE_VERSION_ID\",\"candidate_percent\":$CANDIDATE_PERCENT}"
 ```
 
-After sufficient traffic, you will promote the canary to production via the same
-promote endpoint with `from_env: "canary"`.
+Supply your chosen percentage, greater than zero and at most 100; there is no
+default. The candidate must be a different version of this prompt and production
+must already have a stable version. Writes require Team+, an admin-capable key or
+workspace role, available entitlement verification, and no promotion freeze.
+`GET /v1/prompts/{name}/canary` reads the split; `DELETE` stops it.
+
+Resolution uses the first bounded identity available: `x-tracelane-user-id`
+(alias `x-user-id`), then `x-conversation-id` (alias `x-session-id`), then
+`x-agent-id`. Missing usable identity during an active split returns
+`400 canary_identity_required`. The same identity stays in the same arm until
+the configuration changes. The response includes `arm`, `canary_id`, and
+`resolution_trace_id`; its `prompt.resolve` span records the same arm and version.
+There are no automatic graduation thresholds or inferred per-arm model outcomes.
+
+<Warning>
+Workspace response caching is suspended while any split is active. The gateway
+cannot observe how your application uses a resolved prompt, so it cannot safely
+reuse a similar response across arms. Explicit cache opt-in then returns
+`409 response_cache_suspended_for_canary`; default calls continue to providers.
+Stopping a split, promoting, rolling back or deleting invalidates prior cache
+namespaces, including responses still in flight. Provider-native caching is separate.
+</Warning>
+
+Splits persist across restarts. A production move or deletion durably stops the
+split first. If the following move fails, the error says the split was stopped;
+reload before retrying. If startup cannot load valid lifecycle state, production
+resolution returns `503 canary_state_unavailable` and response caching stays
+suspended. Operators must apply the canary schema before enabling this release.
+The dashboard reads `/v1/prompts/{name}/configuration` to inspect environment
+pointers without drawing an assignment.
 
 ## Read the active version from your agent
 
@@ -256,20 +276,20 @@ import httpx
 res = httpx.get(
     "https://gateway.tracelane.dev/v1/prompts/my-agent-system",
     params={"env": "production"},
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers={"Authorization": f"Bearer {api_key}", "x-tracelane-user-id": user_id},
 )
 prompt = res.json()["content"]
 ```
 
 ```typescript
 const res = await fetch(`${GATEWAY_URL}/v1/prompts/my-agent-system?env=production`, {
-  headers: { Authorization: `Bearer ${apiKey}` },
+  headers: { Authorization: `Bearer ${apiKey}`, "x-tracelane-user-id": userId },
 });
 const { content } = await res.json();
 ```
 
-The gateway caches prompt versions in memory — the hot path latency to resolve
-a prompt is `<1ms` p95.
+The gateway caches prompt versions in memory, so resolving a prompt does not
+query the database on each request.
 
 ## Audit trail
 

@@ -1,70 +1,46 @@
 ---
 import Base from "../layouts/Base.astro";
+import DataHandling from "../components/DataHandling.astro";
 ---
 
 <Base
   title="Security · Tracelane"
-  description="Security posture, release integrity, vulnerability scanning, and compliance roadmap for Tracelane."
+  description="Security controls, service providers, retention and workspace deletion for Tracelane."
 >
   <section class="container-prose prose-page" style="padding-block:clamp(3.5rem,8vw,6.5rem) clamp(5rem,9vw,8.5rem)">
     <p class="eyebrow mb-5">security</p>
     <h1 class="display-lg text-fg">Security posture.</h1>
     <p class="mt-6 lede">
-      Tracelane is designed for procurement reviews at regulated buyers. This page documents what's verifiable today and what's on the roadmap.
+      Tracelane is designed for procurement reviews at regulated buyers. This page describes the service's controls, data handling and deletion boundaries.
     </p>
 
-    <h2 class="text-fg">Release integrity</h2>
+    <h2 class="text-fg">Security controls</h2>
     <ul class="text-fg-muted">
-      <li>Sigstore Cosign keyless signing on every release artifact.</li>
-      <li>Build provenance attested with GitHub attest-build-provenance. Every GitHub Action pinned by commit SHA. A verified SLSA Level 3 attestation is not claimed.</li>
-      <li>Trusted Publishing OIDC for PyPI and npm. No long-lived registry tokens in CI.</li>
-      <li>CycloneDX SBOM published with every release, verifiable from GitHub release artifacts.</li>
+      <li>Workspace authorization and tenant-scoped database queries separate customer data.</li>
+      <li>Provider keys use envelope encryption bound to the workspace and provider.</li>
+      <li>The gateway origin is configured for TLS 1.3. The public edge and the internal messaging path have different transport boundaries; see the <a href="https://docs.tracelane.dev/security" class="link-accent">security documentation</a>.</li>
+      <li>Release controls include Cosign signatures, build provenance and CycloneDX software bills of materials. Dependency and secret scanning are automated checks.</li>
     </ul>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      The ledger covers gateway-admitted calls and their recorded guardrail verdicts; SDK/OTLP-only spans are captured, not chained; the trace ledger badge shows whether that trace has a ledger record.
+      See <a href="https://docs.tracelane.dev/audit-ledger" class="link-accent">ledger coverage and verification</a>.
+    </p>
 
-    <h2 class="text-fg">Vulnerability management</h2>
-    <ul class="text-fg-muted">
-      <li>gitleaks, cargo-deny and a critical-level dependency audit on every push; OSV-Scanner and Grype nightly and a Syft SBOM weekly on the public repository.</li>
-      <li>gitleaks on every commit to block secret leaks.</li>
-      <li>GitHub Security Advisories enabled for coordinated disclosure.</li>
-      <li>cargo-deny enforces the dependency and license allow-list on every build.</li>
-    </ul>
+    <DataHandling />
 
-    <h2 class="text-fg">Transport + isolation</h2>
-    <ul class="text-fg-muted">
-      <li>TLS 1.3 minimum.</li>
-      <li>mTLS via SPIFFE/SPIRE for ingest workers.</li>
-      <li>SSRF defense — RFC1918, 100.64/10, 169.254/16, ::1, fc00::/7 all denied. file:// and gopher:// schemes blocked. Redirects are disabled entirely on the hardened client, so a validated host cannot hand off to an unvalidated one.</li>
-      <li>rustls + aws-lc-rs + ring crypto stack. No openssl.</li>
-    </ul>
-
-    <h2 class="text-fg">Tenant isolation</h2>
-    <ul class="text-fg-muted">
-      <li>BYOK only. Provider keys envelope-encrypted at rest. Never written to logs or spans.</li>
-      <li>secrecy::SecretString + Zeroize-on-drop for all in-memory credentials.</li>
-      <li>Every ClickHouse query enforces WHERE tenant_id = ? from JWT claim, never request body.</li>
-      <li>Enforced in the query layer and checked in CI: a query without the tenant filter fails the build.</li>
-    </ul>
-
-    <h2 class="text-fg">Containers + supply chain</h2>
-    <ul class="text-fg-muted">
-      <li>Chainguard Wolfi base images only. Distroless. No shell, no package manager in runtime image.</li>
-      <li>GitHub Actions pinned by SHA, never by tag.</li>
-      <li>Custom tracing redaction layer scrubs secrets before they hit any log sink.</li>
-    </ul>
-
-    <h2 class="text-fg">Compliance roadmap</h2>
-    <ul class="text-fg-muted">
-      <li>SOC 2 — Tracelane holds no SOC 2 report today and none is in progress.</li>
-      <li>HIPAA — Tracelane does not sign BAAs today. Hetzner, our infrastructure provider, does not sign them either.</li>
-      <li>EU AI Act Article 12 — an Article 12 documentation pack ships on the Enterprise plan (the ledger, signing and anchoring are on every tier). It generates evidence templates locally; it is not a conformance assessment and Tracelane makes no representation that deploying it satisfies any obligation. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="underline decoration-fg-subtle hover:decoration-fg transition-colors" rel="noopener">details</a>).</li>
-      <li>India DPDP Phase II — Tracelane enforces no per-tenant storage region today; region pinning is on the roadmap. Enforcement Nov 13, 2026.</li>
-    </ul>
+    <h2 class="text-fg">Procurement review</h2>
+    <p class="mt-4 text-fg-muted leading-relaxed">
+      Request the current data-processing terms and supporting security information
+      from <a href="mailto:support@tracelane.dev" class="link-accent">support@tracelane.dev</a>.
+      The controls and ledger exports described here support your review; they do
+      not establish that your application meets a regulatory obligation.
+    </p>
 
     <h2 class="text-fg">Responsible disclosure</h2>
     <p class="mt-4 text-fg-muted">
-      Report security issues to <code class="font-mono text-fg">security@tracelane.dev</code>. We respond within 24 hours. Bug bounty program within 30 days of the V1 release.
+      Report security issues to <code class="font-mono text-fg">security@tracelane.dev</code>. We acknowledge within 72 hours and target a 30-day patch for critical vulnerabilities.
     </p>
 
-    <p class="mt-16 text-sm text-fg-subtle">Last updated: May 20, 2026.</p>
+    <p class="mt-16 text-sm text-fg-subtle">Last updated: September 22, 2026.</p>
   </section>
 </Base>

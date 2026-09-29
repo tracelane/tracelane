@@ -1,3 +1,5 @@
+"use client";
+import { Button } from "@tracelanedev/ui";
 /**
  * TryItCurl — the "try it" moment on the Gateway page. A copyable curl that
  * sends a real request through the user's gateway, so a newcomer can watch a
@@ -11,20 +13,19 @@
  * before. What changed is the surface it is served on.
  *
  * THE SNIPPET NOW SITS ON A REAL CODE SURFACE. It was `--surface` inside a
- * `rounded-lg` outline, i.e. the same plane as the page around it, which made a
+ * `rounded-card` outline, i.e. the same plane as the page around it, which made a
  * command a reader is meant to copy read as a paragraph that happened to be
  * monospace. `--canvas-sunken` is the token for a recessed plane (it is what the
  * table headers and `<kbd>` use), bordered top and bottom so it holds its own
  * edge — which matters most in DARK, where the step between a card and the plane
  * under it is small and a borderless well would dissolve into the card.
  *
- * The panel is a quiet `<Card>` rather than a bare `rounded-lg` `<section>`: the
+ * The panel is a quiet `<Card>` rather than a bare `rounded-card` `<section>`: the
  * radius was the 8px CONTROL radius on a full-width PANEL, so it sat beside 18px
  * cards looking like an oversized button. `<Card>` renders a `<div>`, and nothing
  * is lost — the old `<section>` carried no accessible name, so it was never
  * exposed as a landmark; the `<h2>` inside is what names this block either way.
  */
-"use client";
 
 import { Card } from "@tracelanedev/ui";
 import { useState } from "react";
@@ -63,13 +64,14 @@ export function TryItCurl() {
 						gateway proxying, capturing, and guarding the call.
 					</p>
 				</div>
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={copy}
-					className="shrink-0 rounded-md border border-line px-2.5 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+					className="shrink-0 rounded-control border border-line px-2.5 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 				>
 					{copied ? "Copied ✓" : "Copy"}
-				</button>
+				</Button>
 			</div>
 			{/* The code surface. `border-y` is not decoration: in dark theme the step
 			    from `--surface` to `--canvas-sunken` is a couple of percent, so without

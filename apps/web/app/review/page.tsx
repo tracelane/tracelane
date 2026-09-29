@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { TBody, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * `EVL-29` — golden-case authoring queues, listed.
  *
@@ -122,7 +124,7 @@ function sourceLabel(q: AnnotationQueue): string {
 function createDisabledReason(
 	datasets: DatasetListResponse | null,
 	atCap: boolean,
-	maxQueues: number,
+	activeCount: number,
 ): ReactNode | null {
 	if (datasets === null) {
 		return "We couldn't confirm your datasets — reload and try again.";
@@ -138,7 +140,13 @@ function createDisabledReason(
 		);
 	}
 	if (atCap) {
-		return `You have ${maxQueues} active queues (the maximum). Archive one to create another.`;
+		// The real ACTIVE count (B-520), never `max_queues` — the list response
+		// includes archived rows (ordered NULLS FIRST, filling the remainder of
+		// its 50-row LIMIT), so `queues.length` can equal `max_queues` while the
+		// tenant has far fewer active queues than that, and the gateway's own
+		// create cap (`crates/gateway/src/annotation_routes.rs:644`) counts
+		// active queues only.
+		return `You have ${activeCount} active queues (the maximum). Archive one to create another.`;
 	}
 	return null;
 }
@@ -148,8 +156,8 @@ export default async function ReviewQueuesPage() {
 
 	if (load.kind === "locked") {
 		return (
-			<main className="p-8">
-				<h1 className="text-2xl font-semibold">Review queues</h1>
+			<div className="p-8">
+				<PageHeader title={<>Review queues</>} />
 				<EmptyState
 					title="Review queues aren't included in this plan"
 					description="A review queue turns low-scoring production traces into graded test cases: a reviewer answers a rubric once, and that answer becomes a dataset item's expected output in the same action."
@@ -159,7 +167,7 @@ export default async function ReviewQueuesPage() {
 						See plans →
 					</Link>
 				</p>
-			</main>
+			</div>
 		);
 	}
 
@@ -171,9 +179,9 @@ export default async function ReviewQueuesPage() {
 
 	if (load.kind === "failed") {
 		return (
-			<main className="p-8 space-y-6">
+			<div className="p-8 space-y-6">
 				<div className="flex items-center justify-between gap-3">
-					<h1 className="text-2xl font-semibold">Review queues</h1>
+					<PageHeader title={<>Review queues</>} />
 					<NewQueueDialog
 						datasets={datasetOptions}
 						disabledReason={createDisabledReason(datasetsResp, false, 0)}
@@ -183,7 +191,7 @@ export default async function ReviewQueuesPage() {
 					title="We could not load your review queues"
 					description="This is a problem reading them, not an empty list — your queues are unaffected. Retry in a moment."
 				/>
-			</main>
+			</div>
 		);
 	}
 
@@ -193,15 +201,11 @@ export default async function ReviewQueuesPage() {
 		// `null` = the dataset read FAILED. Treating that as "no datasets" would
 		// tell the user to create something they may already have.
 		const hasDatasets = datasetsResp ? datasetsResp.datasets.length > 0 : true;
-		const disabledReason = createDisabledReason(
-			datasetsResp,
-			false,
-			max_queues,
-		);
+		const disabledReason = createDisabledReason(datasetsResp, false, 0);
 		return (
-			<main className="p-8 space-y-6">
+			<div className="p-8 space-y-6">
 				<div className="flex items-center justify-between gap-3">
-					<h1 className="text-2xl font-semibold">Review queues</h1>
+					<PageHeader title={<>Review queues</>} />
 					<NewQueueDialog
 						datasets={datasetOptions}
 						disabledReason={disabledReason}
@@ -225,41 +229,47 @@ export default async function ReviewQueuesPage() {
 						/>
 					}
 				/>
-			</main>
+			</div>
 		);
 	}
 
-	const atCap = queues.length >= max_queues;
-	const disabledReason = createDisabledReason(datasetsResp, atCap, max_queues);
+	// B-520: `queues` is the raw list response, which includes ARCHIVED rows
+	// (ordered NULLS FIRST, filling the remainder of the 50-row LIMIT after
+	// every active one) — the gateway's own create cap
+	// (`crates/gateway/src/annotation_routes.rs:644`) counts active queues
+	// only, so the cap check and the message it renders must too.
+	const activeCount = queues.filter((q) => !q.archived_at).length;
+	const atCap = activeCount >= max_queues;
+	const disabledReason = createDisabledReason(datasetsResp, atCap, activeCount);
 
 	return (
-		<main className="p-8 space-y-6">
+		<div className="p-8 space-y-6">
 			<div className="flex items-center justify-between gap-3">
-				<h1 className="text-2xl font-semibold">Review queues</h1>
+				<PageHeader title={<>Review queues</>} />
 				<NewQueueDialog
 					datasets={datasetOptions}
 					disabledReason={disabledReason}
 				/>
 			</div>
 			<div className="overflow-x-auto">
-				<table className="w-full text-sm">
-					<thead>
-						<tr className="text-left border-b">
-							<th className="py-2 pr-4">Queue</th>
-							<th className="py-2 pr-4">Source</th>
-							<th className="py-2 pr-4">Window</th>
-							<th className="py-2 pr-4">Reference field</th>
-							<th className="py-2 pr-4">Created</th>
-							<th className="py-2 pr-4">Actions</th>
-						</tr>
-					</thead>
-					<tbody>
+				<Table className="w-full text-sm">
+					<THead>
+						<TR className="text-left border-b">
+							<TH className="py-2 pr-4">Queue</TH>
+							<TH className="py-2 pr-4">Source</TH>
+							<TH className="py-2 pr-4">Window</TH>
+							<TH className="py-2 pr-4">Reference field</TH>
+							<TH className="py-2 pr-4">Created</TH>
+							<TH className="py-2 pr-4">Actions</TH>
+						</TR>
+					</THead>
+					<TBody>
 						{queues.map((q) => (
 							<QueueRow key={q.id} queue={q} sourceLabel={sourceLabel(q)} />
 						))}
-					</tbody>
-				</table>
+					</TBody>
+				</Table>
 			</div>
-		</main>
+		</div>
 	);
 }

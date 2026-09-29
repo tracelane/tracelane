@@ -1,20 +1,7 @@
-/**
- * `/legal/privacy` · `/legal/terms` · `/legal/dpa` — PLT-36's web surface.
- *
- * Prerendered at BUILD time (`force-static` + `generateStaticParams`), which is
- * what lets the canonical text stay in `docs/legal/` instead of being mirrored
- * into this public-exporting tree: the file read happens on the build machine,
- * never on the Worker. See `../../legal-source.ts` for why that matters.
- *
- * No `withAuth` — a privacy policy the reader must sign in to read is not
- * published. `authkitMiddleware()` runs with `middlewareAuth.enabled = false`,
- * so it refreshes a session if there is one and lets anonymous requests through.
- *
- * FAIL-CLOSED: a document that is missing, still marked DRAFT, or still carrying
- * an unfilled `[PLACEHOLDER]` is `notFound()`, not a page with a blank in a
- * contract. Until the founder fills the entity name, effective date and contact
- * email in `docs/legal/*.md` and strikes the DRAFT marker, all three URLs 404 —
- * by design. Nothing else has to change for them to go live.
+import { PageHeader } from "@tracelanedev/ui";
+/** Public legal document routes. Known unavailable documents show an interim
+ * page; their draft bodies remain behind the publication gate. Unknown slugs 404.
+ * Static generation reads canonical source only on the build machine.
  */
 
 import type { Metadata } from "next";
@@ -44,21 +31,49 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function LegalDocPage({ params }: Props) {
 	const { doc } = await params;
+	const meta = legalDoc(doc);
+	if (!meta) notFound();
+	const navigation = (
+		<nav
+			aria-label="Legal documents"
+			className="mt-8 flex flex-wrap gap-4 text-sm underline"
+		>
+			<a href="/privacy">Privacy Policy</a>
+			<a href="/terms">Terms of Service</a>
+			<a href="/dpa">Data Processing Addendum</a>
+		</nav>
+	);
 	const loaded = loadPublishableDoc(doc);
-	if (!loaded) notFound();
+	if (!loaded) {
+		return (
+			<article className="mx-auto max-w-3xl px-4 py-10">
+				<PageHeader title={meta.title} />
+				<p className="mt-4 text-ink-2">
+					This document is being finalised. The draft is not published here.
+				</p>
+				<p className="mt-4 text-ink-2">
+					You can request the current terms through in-app support (sign-in
+					required).
+				</p>
+				<a className="mt-4 inline-block underline" href="/support">
+					Open support
+				</a>
+				{navigation}
+			</article>
+		);
+	}
 
 	return (
 		<article className="mx-auto max-w-3xl px-4 py-10">
 			<header className="border-line border-b pb-6">
-				<h1 className="font-semibold text-3xl text-ink tracking-tight">
-					{loaded.doc.title}
-				</h1>
+				<PageHeader title={loaded.doc.title} />
 				<p className="mt-2 text-ink-3 text-sm">{loaded.doc.summary}</p>
 			</header>
 			{/* The document's own `# Title` is dropped — the header above is it. */}
 			<div className="pb-16">
 				{renderMarkdown(loaded.markdown.replace(/^#\s+.*$/m, ""))}
 			</div>
+			{navigation}
 		</article>
 	);
 }

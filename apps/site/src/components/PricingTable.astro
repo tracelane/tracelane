@@ -24,8 +24,12 @@ interface Props {
 	/** Heading level. The homepage renders this as a SECTION (h2); /pricing is a PAGE
 	 *  and must lead with an h1. */
 	as?: "h1" | "h2";
+	/** Homepage: plan cards only, with a link to /pricing for how the meters work
+	 *  (founder 2026-09-27: "a lot of text details users don't read on the landing
+	 *  page"). /pricing keeps every word. */
+	compact?: boolean;
 }
-const { as: Heading = "h2" } = Astro.props;
+const { as: Heading = "h2", compact = false } = Astro.props;
 const signIn = "https://app.tracelane.dev/sign-in";
 const selfHost = "https://docs.tracelane.dev/self-hosting";
 const talk = "mailto:sales@tracelane.dev?subject=Tracelane%20Enterprise";
@@ -73,12 +77,12 @@ const meters = [
 	{
 		label: "Cold archive",
 		rate: "$0.08 / GB-month",
-		body: `Everything past your indexed window, kept queryable for two years. Metered, not unlimited: every paid plan includes a cold allowance of 24× its monthly ingest (${formatGb(plan("builder_v1").cold_gb_included)}-month on Builder, ${formatGb(plan("team_v1").cold_gb_included)}-month on Team, ${formatGb(plan("business_v1").cold_gb_included)}-month on Business); the rate above applies beyond it.`,
+		body: `Everything past your indexed window, kept queryable for two years. Metered, not unlimited: Builder, Team and Business include a cold allowance of 24× their monthly ingest (${formatGb(plan("builder_v1").cold_gb_included)}-month, ${formatGb(plan("team_v1").cold_gb_included)}-month, ${formatGb(plan("business_v1").cold_gb_included)}-month); the rate applies beyond it. Enterprise allowances are contracted.`,
 	},
 	{
 		label: "Evaluations",
 		rate: "$0.005 / judge run",
-		body: "Each automated judge run scored against your traces.",
+		body: "Each LLM-judge call, whether an online eval on your traces or a judged eval run on your datasets; a call that reaches the provider counts even when it errors.",
 	},
 ];
 ---
@@ -102,9 +106,9 @@ const meters = [
         </div>
         <ul class="tier-list">
           <li>Full Rust gateway · 191 providers — 6 native adapters plus any OpenAI-compatible endpoint</li>
-          <li>ClickHouse + R2 storage</li>
-          <li>Tamper-evident audit ledger</li>
-          <li>Community Discord support</li>
+          <li>ClickHouse + NATS JetStream storage on your own node</li>
+          <li>Hash-chained audit log with Ed25519 batch signatures — Rekor anchoring and the durable, restart-safe ledger need the Postgres control plane</li>
+          <li>Community support on GitHub Discussions</li>
         </ul>
         <div class="tier-cta"><a href={selfHost} class="btn-secondary btn-block" rel="noopener">Self-hosting guide</a></div>
       </article>
@@ -124,11 +128,11 @@ const meters = [
             </div>
           </div>
           <ul class="tier-list">
-            <li>{formatGb(row.ingest_gb_included)} ingest / mo</li>
+            <li>{formatGb(row.ingest_gb_included)} ingest included / mo</li>
             <li>{row.rate_limit_rpm === null ? "Uncapped RPM" : `${row.rate_limit_rpm.toLocaleString("en-US")} RPM`}</li>
             {row.f_sso && <li>WorkOS SSO</li>}
             {key === "enterprise_v1" && <li>7-year ledger retention (included)</li>}
-            {key === "free_v1" && <li>No credit card · ages out after 14 idle days, never a 429</li>}
+            {key === "free_v1" && <li>No credit card · never cut off by billing state</li>}
           </ul>
           <div class={`tier-cta ${key === "team_v1" ? "on-dark" : ""}`}>
             {key === "enterprise_v1" ? (
@@ -143,6 +147,11 @@ const meters = [
       ))}
     </div>
 
+    <p class="tier-start-note">Every workspace starts on Free — no card. Upgrade to a paid plan inside the app when you need it.</p>
+
+    {compact ? (
+      <p class="mt-6 text-center text-sm"><a class="link-accent" href="/pricing">How the six usage meters work, and what is never metered →</a></p>
+    ) : (<>
     <div id="site-pricing" class="mt-10 reveal">
       <p class="card-title mb-4 text-center">How the six meters work</p>
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -167,6 +176,7 @@ const meters = [
     </div>
 
     <p class="mt-10 text-center text-sm text-fg-subtle max-w-3xl mx-auto" style="text-wrap:pretty">
-      "Resident GB" is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. No rollover of unused allowance. Never metered: per host or peak host, per seat on any paid tier, a separate egress line, retention as a multiplier, or OTel attributes reclassified as premium metrics. Free ages out after 14 idle days — it never returns a 429, and ingest is never blocked by billing state on any tier.
+      "Resident GB" is the logical size of what you sent, averaged daily across the month — not peak, not compressed bytes on disk. No rollover of unused allowance. Never metered: per host or peak host, per seat on any paid tier, a separate egress line, retention as a multiplier, or OTel attributes reclassified as premium metrics. Free carries a 60-requests-per-minute limit and no overage; ingest is never blocked by billing state on any tier.
     </p>
+    </>)}
   </section>

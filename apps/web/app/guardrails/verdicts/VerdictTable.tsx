@@ -1,4 +1,9 @@
 "use client";
+import { fmtDur } from "@tracelanedev/ui";
+
+import { Button } from "@tracelanedev/ui";
+
+import { StatusBadge } from "@tracelanedev/ui";
 
 /**
  * Expandable verdict table — the honest detail behind each guardrail decision.
@@ -17,7 +22,6 @@
 import { formatDateTimeUtc } from "@/lib/format-date";
 import type { GuardrailVerdict } from "@/lib/guardrails";
 import {
-	Badge,
 	type BadgeProps,
 	TBody,
 	TD,
@@ -104,19 +108,7 @@ function parseRails(json: string): RailEntry[] {
 	}
 }
 
-/** ClickHouse "YYYY-MM-DD HH:MM:SS.ffffff" or ISO → a UTC Date. */
-function parseDate(s: string): Date {
-	// A "…T08:45:53" with a T but NO zone parses as LOCAL — anchor to UTC unless
-	// the string already carries a zone (the naive-timestamp class; see parseUtcMs).
-	const hasZone = /([zZ]|[+-]\d{2}:?\d{2})$/.test(s);
-	return new Date(hasZone ? s : `${s.replace(" ", "T")}Z`);
-}
-
-function fmtLatency(us: number | undefined): string {
-	if (us === undefined || us <= 0) return "—";
-	if (us < 1000) return `${us}µs`;
-	return `${(us / 1000).toFixed(1)}ms`;
-}
+const fmtLatency = (us: number) => (us == null || us <= 0 ? "—" : fmtDur(us));
 
 function reasonText(code: string | null | undefined): string | null {
 	if (!code) return null;
@@ -152,7 +144,8 @@ function DetailPayload({ details }: { details: unknown }) {
 function CopyButton({ value }: { value: string }) {
 	const [copied, setCopied] = useState(false);
 	return (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={() => {
 				navigator.clipboard?.writeText(value).then(
@@ -166,7 +159,7 @@ function CopyButton({ value }: { value: string }) {
 			className="rounded border border-line px-1.5 py-0.5 text-2xs text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink"
 		>
 			{copied ? "Copied" : "Copy"}
-		</button>
+		</Button>
 	);
 }
 
@@ -175,16 +168,15 @@ function RailDetail({ r }: { r: RailEntry }) {
 	const gloss = reasonText(r.reason_code);
 	const isAllow = !r.outcome || r.outcome === "allow";
 	return (
-		<div className="rounded-lg border border-line bg-surface px-3 py-2.5">
+		<div className="rounded-card border border-line bg-surface px-3 py-2.5">
 			<div className="flex flex-wrap items-center gap-2">
 				<span className="font-mono text-xs font-medium text-ink">
 					{r.rail ?? "—"}
 				</span>
-				<Badge
+				<StatusBadge
+					status={r.outcome ?? "—"}
 					tone={isAllow ? "ok" : (DECISION_TONE[r.outcome ?? ""] ?? "warn")}
-				>
-					{r.outcome ?? "—"}
-				</Badge>
+				/>
 				{r.reason_code && (
 					<span className="font-mono text-2xs text-ink-3">{r.reason_code}</span>
 				)}
@@ -280,7 +272,11 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 					const isOpen = openKey === key;
 					const rails = parseRails(v.rails);
 					const fired = rails.filter((r) => r.outcome && r.outcome !== "allow");
-					const primary = fired[0];
+					// Name the rail that MADE the decision: a blocked row whose first non-allow
+					// rail was a warn-only one (R3 pinning warns on every request) headlined
+					// the warner, not the blocker (2026-09-27 audit: R3 shown, R8 blocked).
+					const primary =
+						fired.find((r) => r.outcome === v.decision) ?? fired[0];
 					const gloss = reasonText(primary?.reason_code);
 					const failedOpen = v.fail_open_rails.length > 0;
 
@@ -313,15 +309,16 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 								    digits is what lets a reader scan for the minute a burst
 								    happened instead of reading every row. */}
 								<TD mono muted className="whitespace-nowrap text-xs">
-									{formatDateTimeUtc(parseDate(v.event_time).toISOString())}
+									{formatDateTimeUtc(v.event_time)}
 								</TD>
 								<TD className="text-2xs uppercase tracking-wide text-ink-3">
 									{v.side}
 								</TD>
 								<TD>
-									<Badge tone={DECISION_TONE[v.decision] ?? "neutral"}>
-										{v.decision}
-									</Badge>
+									<StatusBadge
+										status={v.decision}
+										tone={DECISION_TONE[v.decision] ?? "neutral"}
+									/>
 								</TD>
 								{/* The substance: which rail + WHY, in plain language. */}
 								<TD>
@@ -387,12 +384,19 @@ export function VerdictTable({ verdicts }: { verdicts: GuardrailVerdict[] }) {
 											<CopyButton value={v.correlation_id} />
 										</div>
 
-										<p className="text-2xs text-ink-3">
-											A blocked request is stopped pre-flight, before any span
-											is written — so the prompt body is not retained and there
-											is no trace to open. The rail records above are the
-											complete stored evidence for this decision.
-										</p>
+										{/* Non-block decisions (allow / warn / redact) DO reach the
+										    model and are captured as a span, but `GuardrailVerdict`
+										    carries no trace/span id (lib/guardrails.ts) — so there is
+										    nothing to link to. Omit the sentence rather than repeat
+										    the block-only claim or fabricate a link. */}
+										{v.decision === "block" ? (
+											<p className="text-2xs text-ink-3">
+												A blocked request is stopped pre-flight, before any span
+												is written — so the prompt body is not retained and
+												there is no trace to open. The rail records above are
+												the complete stored evidence for this decision.
+											</p>
+										) : null}
 									</div>
 								</TDetail>
 							)}

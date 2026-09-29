@@ -42,6 +42,7 @@ import type {
 	RubricFieldType as GatewayRubricFieldType,
 } from "@/app/api/annotation-queues/shared";
 import { Modal } from "@/components/Modal";
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { Button } from "@tracelanedev/ui";
 import { useRouter } from "next/navigation";
 import type { ReactNode } from "react";
@@ -465,7 +466,7 @@ async function submitCreateQueue(
 ): Promise<{ ok: true } | { ok: false; error: SubmitError }> {
 	let res: Response;
 	try {
-		res = await fetch("/api/annotation-queues", {
+		res = await apiFetchRaw("/api/annotation-queues", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
@@ -515,7 +516,7 @@ async function submitCreateQueue(
 
 function fieldClass(invalid: boolean): string {
 	return [
-		"w-full rounded-md border bg-surface px-2 py-1 text-sm",
+		"w-full rounded-control border bg-surface px-2 py-1 text-sm",
 		invalid ? "border-danger" : "border-line",
 	].join(" ");
 }
@@ -666,7 +667,7 @@ export function NewQueueDialog({
 		>
 			<div className="space-y-4">
 				{bannerError && (
-					<div className="rounded-md border border-danger bg-danger-soft p-2">
+					<div className="rounded-control border border-danger bg-danger-soft p-2">
 						<p
 							role="alert"
 							data-testid="nq-banner-error"
@@ -853,7 +854,7 @@ export function NewQueueDialog({
 					)}
 				</label>
 
-				<fieldset className="space-y-2 rounded-md border border-line p-3">
+				<fieldset className="space-y-2 rounded-control border border-line p-3">
 					<legend className="px-1 text-ink-3 text-sm">
 						Rubric — what the reviewer answers
 					</legend>
@@ -866,7 +867,7 @@ export function NewQueueDialog({
 							<div
 								// biome-ignore lint/suspicious/noArrayIndexKey: rubric fields are positional, same pattern as NewExperimentDialog's arms/scorers
 								key={i}
-								className="space-y-1.5 rounded-md border border-line/60 p-2"
+								className="space-y-1.5 rounded-control border border-line/60 p-2"
 							>
 								<div className="flex flex-wrap items-center gap-2">
 									<input
@@ -936,7 +937,8 @@ export function NewQueueDialog({
 										required
 									</label>
 									<div className="flex items-center gap-1">
-										<button
+										<Button
+											variant="bare"
 											type="button"
 											className="text-xs underline disabled:no-underline disabled:opacity-40"
 											disabled={i === 0}
@@ -949,8 +951,9 @@ export function NewQueueDialog({
 											}
 										>
 											↑
-										</button>
-										<button
+										</Button>
+										<Button
+											variant="bare"
 											type="button"
 											className="text-xs underline disabled:no-underline disabled:opacity-40"
 											disabled={i === form.rubric.length - 1}
@@ -963,8 +966,9 @@ export function NewQueueDialog({
 											}
 										>
 											↓
-										</button>
-										<button
+										</Button>
+										<Button
+											variant="bare"
 											type="button"
 											className="text-xs underline disabled:no-underline disabled:opacity-40"
 											disabled={form.rubric.length <= 1}
@@ -976,7 +980,7 @@ export function NewQueueDialog({
 											}
 										>
 											remove
-										</button>
+										</Button>
 									</div>
 								</div>
 								{f.type === "choice" && (
@@ -1038,7 +1042,8 @@ export function NewQueueDialog({
 							</div>
 						);
 					})}
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						className="text-sm underline disabled:no-underline disabled:opacity-50"
 						disabled={form.rubric.length >= MAX_RUBRIC_FIELDS}
@@ -1049,7 +1054,7 @@ export function NewQueueDialog({
 						{form.rubric.length >= MAX_RUBRIC_FIELDS
 							? `Up to ${MAX_RUBRIC_FIELDS} fields per queue.`
 							: "+ Add field"}
-					</button>
+					</Button>
 				</fieldset>
 
 				<label className="block text-sm" htmlFor={`${baseId}-reference`}>
@@ -1092,7 +1097,7 @@ export function NewQueueDialog({
 					)}
 				</label>
 
-				<p className="rounded-md bg-surface-2 p-2 text-ink-2 text-xs">
+				<p className="rounded-control bg-surface-2 p-2 text-ink-2 text-xs">
 					Every trace matching <strong>{sourceSummary}</strong> in the last{" "}
 					<strong>{form.windowHours || "?"}h</strong>, reviewed against{" "}
 					<strong>

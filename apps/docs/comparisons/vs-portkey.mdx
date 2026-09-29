@@ -10,10 +10,10 @@ Customers who want a neutral, framework-agnostic AI gateway under a permissive A
 
 | Claim | Tracelane | Portkey |
 |---|---|---|
-| License | Apache 2.0 (full stack, including predictive layer) | Portkey OSS + paid hybrid |
-| Self-host | Apache 2.0 full stack; single-node Docker Compose | OSS gateway; paid hosted observability |
+| License | Apache 2.0 (full stack, including predictive layer) | MIT-licensed gateway repository ([portkey-ai/gateway](https://github.com/portkey-ai/gateway)); paid hosted product |
+| Self-host | Apache 2.0 full stack; single-node Docker Compose | Gateway self-hostable via `npx` or Docker ([portkey-ai/gateway](https://github.com/portkey-ai/gateway)) |
 | Wire format | OTel GenAI semconv (canonical) | Portkey's own schema; OpenTelemetry support documented as partial |
-| Predictive guardrails | Inline heuristic guardrails (multi-model ML ensemble on the roadmap) | Guardrails library (Portkey markets realtime guardrails; verify fit for your policy) |
+| Predictive guardrails | Inline heuristic guardrails | Guardrails library (Portkey markets realtime guardrails; verify fit for your policy) |
 | Tamper-evident audit ledger | Included on every tier (hash chain + Ed25519 per-tenant signing live; resolved Sigstore Rekor v2 inclusion proof on anchored batches, best-effort; universal per-run anchoring on the roadmap); 7-year retention + bulk export on Enterprise | — |
 | BYOK key custody | Envelope encryption, AAD bound to (tenant_id, provider_id) | BYOK supported |
 | Auto-rollback on objective metrics | EWMA drift on metrics you post; not autonomous | Manual prompt promotion |
@@ -23,11 +23,11 @@ Customers who want a neutral, framework-agnostic AI gateway under a permissive A
 <AccordionGroup>
 
 <Accordion title="Does Tracelane have feature parity with Portkey?">
-On the gateway feature set (191 providers, failover, retry, BYOK, usage/token tracking) yes. Tracelane adds inline heuristic predictive guardrails (a multi-model ML ensemble is on the roadmap), tamper-evident audit ledger for EU AI Act Article 12, and OTel GenAI semconv as the canonical wire format. Portkey ships a guardrails library; Tracelane ships inline heuristic guardrails that run on every request.
+On the gateway feature set (191 providers, failover, retry, BYOK, usage/token tracking) yes. Tracelane adds inline heuristic predictive guardrails, an audit ledger with an EU AI Act Article 12 control mapping, and OTel GenAI semconv as the canonical wire format. Portkey ships a guardrails library; Tracelane ships inline heuristic guardrails that run on every request.
 </Accordion>
 
 <Accordion title="How long does migration take?">
-Tracelane reads OpenAI-, Anthropic-, and Google-shaped requests directly. Most Portkey configs map 1:1 — provider list, fallback chain, BYOK keys. Cutover is typically an afternoon.
+Tracelane reads OpenAI-, Anthropic-, and Google-shaped requests directly. There is no Portkey config importer; you re-create your provider list, fallback chain and BYOK keys in Tracelane.
 </Accordion>
 
 </AccordionGroup>

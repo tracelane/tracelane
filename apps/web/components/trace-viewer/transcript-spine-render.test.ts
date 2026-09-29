@@ -242,28 +242,11 @@ describe("TranscriptSpine — 10-span render proof (full visual language)", () =
 
 	it("marks every span kind with a design token, never a hardcoded hex", () => {
 		const html = render(TEN_SPANS);
-		/*
-		 * SPAN KIND IS SEPARATED BY VALUE, NOT HUE, AND THE MAP IS NOW SHARED.
-		 *
-		 * These assertions used to pin `bg-info` / `bg-info/50` and said so
-		 * deliberately: the spine kept its OWN copy of the kind map, and when the
-		 * 2026-08-22 palette retargeted `--info` from violet to `--chart-primary`,
-		 * the `/50` alpha composited to ~#8d8e90 — within a few points of `--ink-3`
-		 * #828280 — so `llm` and `unknown` rendered as the same grey. Six kinds,
-		 * five distinguishable marks, and this file was green throughout because
-		 * both classes were present and correct in the DOM.
-		 *
-		 * The fix was not a repaint, it was a DELETION: the duplicate map is gone and
-		 * both surfaces now spend `SPAN_KIND_MARK` from `@tracelanedev/ui`. So these
-		 * assertions no longer describe "what the spine renders today, pending a fix"
-		 * — they describe the one ramp, and they would fail if either consumer
-		 * drifted off it again.
-		 */
-		expect(html).toContain("bg-chart-primary"); // tool → the data mark (the trajectory)
-		expect(html).toContain("bg-ink-2"); // llm → secondary ink, one step down
-		expect(html).toContain("bg-ink-3"); // agent / retrieval / chain / unknown → the UI floor
-		// The retired violet must not come back through an alpha step.
-		expect(html).not.toContain("bg-info");
+		// Categories use a shared palette; unknown remains neutral.
+		for (const kind of ["tool", "llm", "agent", "retrieval"]) {
+			expect(html).toContain(`bg-span-${kind}`);
+		}
+		expect(html).toContain("bg-ink-3");
 		// The primary-action fill and the provenance green must NOT be spent as a
 		// decorative span-kind fill: one means "do this", the other means "verified".
 		expect(html).not.toContain("bg-action-ink");

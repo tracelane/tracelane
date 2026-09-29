@@ -242,3 +242,9 @@ describe("PATCH /api/settings/team/[membershipId] — role change", () => {
 		expect(spy.mock.calls.some((c) => methodOf(c) === "PUT")).toBe(true);
 	});
 });
+
+// Lock behavior is covered against real Postgres in owner-race.live.test.ts.
+vi.mock("../owner-lock", () => ({
+	withOwnerMutation: async (_org: string, work: () => Promise<unknown>) =>
+		work(),
+}));

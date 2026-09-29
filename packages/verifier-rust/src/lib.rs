@@ -13,11 +13,14 @@
 //!
 //! 3. **Merkle anchor verification** — for each contiguous run of rows
 //!    sharing the same `rekor_entry_id`, recompute the Merkle root over
-//!    those rows' `row_hash`es. Fetch the Rekor entry by UUID, parse
-//!    the embedded `hashedrekord` body, and **verify the Ed25519
-//!    signature against the recomputed root using the public key the
-//!    Rekor body carries**. This is the real cryptographic check that
-//!    was a stub in an earlier revision.
+//!    those rows' `row_hash`es and check it against the anchor record
+//!    bundled IN the export (ADR-062: Rekor v2 has no online lookup, so
+//!    nothing is fetched by UUID). The bundle carries the tenant's
+//!    Ed25519 attestation over the root, the ECDSA-P256 `hashedrekord`
+//!    entry, the log's inclusion proof and its signed checkpoint; the
+//!    checkpoint is verified against the HARDCODED `log2025-1` key, never
+//!    one the bundle supplies. (This paragraph described the v1 "fetch by
+//!    UUID" flow until 2026-09-19 — B-448 site 5.)
 //!
 //! 4. **Pinned root pubkey** *(optional)* — when [`VerifyOptions::pinned_pubkey`]
 //!    is set, every anchor's pubkey must match. Defends against a
@@ -137,7 +140,26 @@ pub struct VerifyOptions {
     /// embedded pubkey differs are REJECTED (fail closed). `None` → chain-only:
     /// signatures/anchors are reported UNVERIFIED (never green).
     pub tenant_pubkey: Option<[u8; 32]>,
+    /// AUD-29: Tracelane's shared PLATFORM Ed25519 pubkey — the key a workspace's
+    /// batches are signed with before the workspace has its own. A batch signed by it
+    /// verifies as PLATFORM-SIGNED (counted apart), accepted only as a PREFIX: a
+    /// platform-signed batch after a workspace-signed one is
+    /// `platform_key_after_workspace_key`. `None` → today's behaviour.
+    pub platform_pubkeys: Vec<[u8; 32]>,
+    /// AUD-29: the first ledger seq the WORKSPACE key signed (`workspace_key_since_seq`
+    /// from `GET /v1/audit/pubkey`). Any platform-signed batch reaching it is
+    /// `platform_key_after_workspace_key` even when the loaded view holds no
+    /// workspace-signed batch (the windowed-export append).
+    pub workspace_key_since_seq: Option<u64>,
 }
+
+/// AUD-29: every production platform signing key, pinned in this release so an
+/// auditor does not have to take them from Tracelane's API or from the evidence. A
+/// rotation APPENDS; a retired key stays so the batches it signed still verify.
+pub const TRACELANE_PLATFORM_PUBKEYS_B64: &[&str] =
+    &["fKMom1FbENpYSF/EVNCkd4sOEnHVlbsDf13CNfkewl8="];
+/// AUD-29: the CURRENT platform key (the last pinned one).
+pub const TRACELANE_PLATFORM_PUBKEY_B64: &str = "fKMom1FbENpYSF/EVNCkd4sOEnHVlbsDf13CNfkewl8=";
 
 impl Default for VerifyOptions {
     fn default() -> Self {
@@ -148,6 +170,8 @@ impl Default for VerifyOptions {
             rekor_timeout: std::time::Duration::from_secs(10),
             pinned_pubkey: None,
             tenant_pubkey: None,
+            platform_pubkeys: Vec::new(),
+            workspace_key_since_seq: None,
         }
     }
 }
@@ -179,6 +203,18 @@ impl VerifyOptions {
     /// trust root for signature + anchor verification.
     pub fn with_tenant_pubkey(mut self, pubkey: [u8; 32]) -> Self {
         self.tenant_pubkey = Some(pubkey);
+        self
+    }
+
+    /// AUD-29: set the PLATFORM Ed25519 pubkey — the second, labelled trust root.
+    pub fn with_platform_pubkey(mut self, pubkey: [u8; 32]) -> Self {
+        self.platform_pubkeys.push(pubkey);
+        self
+    }
+
+    /// AUD-29: the out-of-band takeover seq (`workspace_key_since_seq`).
+    pub fn with_workspace_key_since_seq(mut self, seq: u64) -> Self {
+        self.workspace_key_since_seq = Some(seq);
         self
     }
 }
@@ -262,7 +298,33 @@ pub struct VerifyReport {
     /// them, so it is never green.
     #[serde(default = "default_true")]
     pub trust_established: bool,
+    /// B-483 (2026-09-21) — rows that sit inside NO anchor record's range although a
+    /// LATER batch of the same tenant exists: a HOLE below the anchor watermark.
+    /// Contiguous batches are not covered rows — the gateway once lost a batch's
+    /// anchor to a reboot mid-Rekor while every proof read green over it, because
+    /// nothing counted the rows no anchor covered. **A nonzero count is never
+    /// green.** Summed over every tenant in the export.
+    #[serde(default)]
+    pub rows_uncovered_by_anchors: u64,
+    /// Rows past the LAST anchor of their tenant — the ordinary un-anchored tail (the
+    /// next batch is still filling, or the age sweep has not reached it). Reported so
+    /// a reader can tell "not yet" from "never"; it does not by itself fail a verify.
+    #[serde(default)]
+    pub rows_unanchored_tail: u64,
+    /// AUD-29: batches whose attestation verified against the PLATFORM key, not the
+    /// workspace key — verified, but Tracelane (not the workspace key) vouches.
+    #[serde(default)]
+    pub platform_signed_batches: u64,
+    #[serde(default)]
+    pub platform_signed_ranges: Vec<SeqRange>,
     pub errors: Vec<VerifyError>,
+}
+
+/// AUD-29: an inclusive `[start_seq, end_seq]` batch range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeqRange {
+    pub start_seq: u64,
+    pub end_seq: u64,
 }
 
 fn default_true() -> bool {
@@ -283,6 +345,10 @@ impl VerifyReport {
             strip_detected: false,
             verified_from_seq: 0,
             trust_established: true,
+            rows_uncovered_by_anchors: 0,
+            rows_unanchored_tail: 0,
+            platform_signed_batches: 0,
+            platform_signed_ranges: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -866,7 +932,88 @@ pub fn verify_ledger_reader<R: BufRead>(
     // Pass 2: hash-chain replay + sequence check, rooted per the trust roots.
     verify_chain(&mut report, &rows, opts, &included_starts);
 
+    // Pass 3 (B-483): anchor COVERAGE per row. Neither pass above asks whether every
+    // row is inside some anchor batch — pass 1 verifies the anchors that exist, pass 2
+    // the chain — so a batch whose anchor never landed reads green.
+    count_anchor_coverage(&mut report, &rows, &anchors);
+
     Ok(report)
+}
+
+/// B-483: per tenant, every row with `seq <= max(batch_end_seq)` that no anchor
+/// record's `[batch_start_seq, batch_end_seq]` contains is a HOLE
+/// (`rows_uncovered_by_anchors`); rows above the tenant's last anchor are the TAIL
+/// (`rows_unanchored_tail`). A tenant with no anchor at all has only a tail.
+/// Emits one `anchor_coverage_gap` error per contiguous hole, naming its range.
+///
+/// Rows below `report.verified_from_seq` are skipped: on a WINDOWED verify (ADR-070)
+/// the loaded rows begin before the rooting anchor, the anchor that covered them was
+/// dropped because its rows are not all loaded, and those rows are already declared
+/// present-but-unverified — counting them would report a hole the view cannot see.
+/// Runs AFTER `verify_chain`, which sets the root.
+fn count_anchor_coverage(report: &mut VerifyReport, rows: &[AuditRow], anchors: &[AnchorRecord]) {
+    let mut ranges: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+    for a in anchors {
+        ranges
+            .entry(a.tenant_id.as_str())
+            .or_default()
+            .push((a.batch_start_seq, a.batch_end_seq));
+    }
+    for r in ranges.values_mut() {
+        r.sort_unstable();
+    }
+    let mut by_tenant: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for row in rows.iter().filter(|r| r.seq >= report.verified_from_seq) {
+        by_tenant
+            .entry(row.tenant_id.as_str())
+            .or_default()
+            .push(row.seq);
+    }
+    for (tenant, seqs) in by_tenant {
+        let anchor_ranges = ranges.get(tenant).map(Vec::as_slice).unwrap_or(&[]);
+        let watermark = anchor_ranges.iter().map(|(_, e)| *e).max();
+        let mut hole: Option<(u64, u64)> = None;
+        let mut seqs = seqs;
+        seqs.sort_unstable();
+        seqs.dedup();
+        for seq in seqs {
+            let covered = anchor_ranges.iter().any(|(s, e)| *s <= seq && seq <= *e);
+            if covered {
+                if let Some((lo, hi)) = hole.take() {
+                    push_coverage_gap(report, tenant, lo, hi);
+                }
+                continue;
+            }
+            match watermark {
+                Some(w) if seq <= w => {
+                    report.rows_uncovered_by_anchors += 1;
+                    hole = match hole {
+                        Some((lo, hi)) if hi + 1 == seq => Some((lo, seq)),
+                        Some((lo, hi)) => {
+                            push_coverage_gap(report, tenant, lo, hi);
+                            Some((seq, seq))
+                        }
+                        None => Some((seq, seq)),
+                    };
+                }
+                _ => report.rows_unanchored_tail += 1,
+            }
+        }
+        if let Some((lo, hi)) = hole {
+            push_coverage_gap(report, tenant, lo, hi);
+        }
+    }
+}
+
+fn push_coverage_gap(report: &mut VerifyReport, tenant: &str, lo: u64, hi: u64) {
+    report.errors.push(VerifyError {
+        seq: Some(lo),
+        kind: "anchor_coverage_gap".into(),
+        detail: format!(
+            "tenant {tenant}: rows {lo}..{hi} ({} rows) are inside no anchor batch although a later batch exists — unsigned and un-anchored, a hole below the anchor watermark",
+            hi - lo + 1
+        ),
+    });
 }
 
 fn verify_chain(
@@ -1245,6 +1392,8 @@ fn verify_anchors_offline(
         }
     }
 
+    // AUD-29: per tenant, (smallest workspace-signed batch start, platform-signed ranges).
+    let mut signers_by_tenant: BTreeMap<String, (u64, Vec<SeqRange>)> = BTreeMap::new();
     for a in anchors {
         let committed = a.anchor_state == "anchored";
         let label = format!("batch {}-{}", a.batch_start_seq, a.batch_end_seq);
@@ -1324,7 +1473,17 @@ fn verify_anchors_offline(
                 continue;
             }
         };
-        if bundle_pubkey[..] != tenant_pubkey[..] {
+        // AUD-29: the workspace key, else the platform key (verified, counted apart),
+        // else untrusted. Never a key taken from the evidence itself.
+        let (signing_key, platform_signed) = if bundle_pubkey[..] == tenant_pubkey[..] {
+            (tenant_pubkey, false)
+        } else if let Some(platform) = opts
+            .platform_pubkeys
+            .iter()
+            .find(|p| bundle_pubkey[..] == p[..])
+        {
+            (*platform, true)
+        } else {
             report.errors.push(VerifyError {
                 seq: None,
                 kind: "untrusted_tenant_key".into(),
@@ -1334,7 +1493,7 @@ fn verify_anchors_offline(
             });
             report.signatures_valid = false;
             continue;
-        }
+        };
 
         // Extract ECDSA material from the canonicalized body (anchored only).
         let mut anchored_meta: Option<(Vec<u8>, String, u64)> = None;
@@ -1388,7 +1547,7 @@ fn verify_anchors_offline(
                 continue;
             }
         };
-        if verify_ed25519_raw(&tenant_pubkey, &msg, &att_sig).is_err() {
+        if verify_ed25519_raw(&signing_key, &msg, &att_sig).is_err() {
             report.errors.push(VerifyError {
                 seq: None,
                 kind: "attestation_invalid".into(),
@@ -1398,6 +1557,18 @@ fn verify_anchors_offline(
             });
             report.signatures_valid = false;
             continue;
+        }
+        // AUD-29: the attestation verified — record WHICH trust root vouched for it.
+        let signers = signers_by_tenant
+            .entry(a.tenant_id.clone())
+            .or_insert((u64::MAX, Vec::new()));
+        if platform_signed {
+            signers.1.push(SeqRange {
+                start_seq: a.batch_start_seq,
+                end_seq: a.batch_end_seq,
+            });
+        } else if a.batch_start_seq < signers.0 {
+            signers.0 = a.batch_start_seq;
         }
 
         // Honest signed-but-unanchored batch: attestation verified, nothing more.
@@ -1428,10 +1599,16 @@ fn verify_anchors_offline(
                 report.anchors_included += 1;
                 // ADR-070: this fully-covered batch is publicly included → it can
                 // root a windowed verify. Track the earliest such start per tenant.
-                included_starts
-                    .entry(a.tenant_id.clone())
-                    .and_modify(|s| *s = (*s).min(a.batch_start_seq))
-                    .or_insert(a.batch_start_seq);
+                // AUD-29: NEVER a platform-signed batch — the platform key is trusted
+                // only as a verified PREFIX of a chain, not as the root that makes a
+                // window trustworthy (a platform-key holder could otherwise anchor a
+                // forged window and have it rooted).
+                if !platform_signed {
+                    included_starts
+                        .entry(a.tenant_id.clone())
+                        .and_modify(|s| *s = (*s).min(a.batch_start_seq))
+                        .or_insert(a.batch_start_seq);
+                }
             }
             Err(e) => {
                 report.errors.push(VerifyError {
@@ -1443,6 +1620,36 @@ fn verify_anchors_offline(
             }
         }
     }
+    // AUD-29 downgrade rule: the platform key is accepted only as a PREFIX. Once the
+    // workspace key has signed a batch, a later platform-signed batch is what an
+    // attacker holding the platform key would append — RED, never amber.
+    // `>=`: a platform-signed batch starting WHERE a workspace-signed one starts is a
+    // shadow of it, not a prefix. `workspace_key_since_seq` (published out-of-band)
+    // holds the rule even when the loaded view contains no workspace-signed batch.
+    for (workspace_min_start, platform) in signers_by_tenant.values() {
+        let boundary = opts
+            .workspace_key_since_seq
+            .map_or(*workspace_min_start, |since| {
+                since.min(*workspace_min_start)
+            });
+        for r in platform {
+            if r.start_seq >= boundary || r.end_seq >= boundary {
+                report.errors.push(VerifyError {
+                    seq: None,
+                    kind: "platform_key_after_workspace_key".into(),
+                    detail: format!(
+                        "batch {}-{}: signed by the platform key at or after seq {}, where the workspace key had taken over",
+                        r.start_seq, r.end_seq, boundary
+                    ),
+                });
+                report.signatures_valid = false;
+            } else {
+                report.platform_signed_batches += 1;
+                report.platform_signed_ranges.push(*r);
+            }
+        }
+    }
+    report.platform_signed_ranges.sort_by_key(|r| r.start_seq);
     included_starts
 }
 
@@ -1572,6 +1779,131 @@ mod tests {
         let (h13, r13) = make_v2_row(13, &h12, "response", "u1", r#"{"n":13}"#);
         let (_h14, r14) = make_v2_row(14, &h13, "request", "u1", r#"{"n":14}"#);
         vec![r10, r11, r12, r13, r14]
+    }
+
+    /// B-483 — anchor COVERAGE is counted per row, and a hole below the watermark is
+    /// never green. Prod's shape after the 2026-09-20 reboot: batches `[0..99]` and
+    /// `[200..299]` present, `[100..199]` never anchored; `rekor_anchors_resolved`,
+    /// `anchors_included` and the chain all read green over it. Fill the hole → 0.
+    /// Rows past the last anchor are the ordinary TAIL, reported separately.
+    #[test]
+    fn b483_rows_inside_no_anchor_batch_are_counted_and_a_hole_is_red() {
+        fn rows_for(tenant: &str, seqs: std::ops::Range<u64>) -> Vec<AuditRow> {
+            seqs.map(|seq| AuditRow {
+                format: None,
+                tenant_id: tenant.to_string(),
+                seq,
+                event_time: "2026-09-20T18:07:58Z".into(),
+                event_type: "request".into(),
+                actor: "u".into(),
+                payload: serde_json::json!({}),
+                prev_hash: String::new(),
+                row_hash: String::new(),
+                rekor_entry_id: None,
+            })
+            .collect()
+        }
+        fn anchor(tenant: &str, lo: u64, hi: u64) -> AnchorRecord {
+            AnchorRecord {
+                tenant_id: tenant.to_string(),
+                batch_start_seq: lo,
+                batch_end_seq: hi,
+                merkle_root: String::new(),
+                anchor_state: "unanchored".into(),
+                ed25519: Ed25519Block {
+                    signature: String::new(),
+                    pubkey: String::new(),
+                },
+                rekor: None,
+            }
+        }
+        let rows = rows_for(tenant_a(), 0..300);
+        // The hole.
+        let mut report = VerifyReport::empty_labeled("t");
+        count_anchor_coverage(
+            &mut report,
+            &rows,
+            &[anchor(tenant_a(), 0, 99), anchor(tenant_a(), 200, 299)],
+        );
+        assert_eq!(report.rows_uncovered_by_anchors, 100, "{:?}", report.errors);
+        assert_eq!(report.rows_unanchored_tail, 0);
+        let gap = report
+            .errors
+            .iter()
+            .find(|e| e.kind == "anchor_coverage_gap")
+            .expect("one anchor_coverage_gap error");
+        assert_eq!(gap.seq, Some(100));
+        assert!(gap.detail.contains("100..199 (100 rows)"), "{}", gap.detail);
+        // Filled: nothing uncovered.
+        let mut report = VerifyReport::empty_labeled("t");
+        count_anchor_coverage(
+            &mut report,
+            &rows,
+            &[
+                anchor(tenant_a(), 0, 99),
+                anchor(tenant_a(), 100, 199),
+                anchor(tenant_a(), 200, 299),
+            ],
+        );
+        assert_eq!(report.rows_uncovered_by_anchors, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // The tail: rows past the last anchor are not a hole.
+        let mut report = VerifyReport::empty_labeled("t");
+        count_anchor_coverage(
+            &mut report,
+            &rows_for(tenant_a(), 0..350),
+            &[
+                anchor(tenant_a(), 0, 99),
+                anchor(tenant_a(), 100, 199),
+                anchor(tenant_a(), 200, 299),
+            ],
+        );
+        assert_eq!(report.rows_uncovered_by_anchors, 0);
+        assert_eq!(report.rows_unanchored_tail, 50);
+        // A WINDOWED view (ADR-070): the loaded rows start at 50, the anchor that covered
+        // 0..99 was dropped by the server's coverage filter (its rows are not all loaded),
+        // and the chain is rooted at the anchor starting at 100 — rows 50..99 are outside
+        // the verified scope, NOT a hole. Counting them would accuse every windowed
+        // self-verify of a hole it cannot see (the dashboard's /audit page loads a window).
+        let mut report = VerifyReport::empty_labeled("t");
+        report.verified_from_seq = 100;
+        count_anchor_coverage(
+            &mut report,
+            &rows_for(tenant_a(), 50..350),
+            &[anchor(tenant_a(), 100, 199), anchor(tenant_a(), 200, 299)],
+        );
+        assert_eq!(report.rows_uncovered_by_anchors, 0, "{:?}", report.errors);
+        assert_eq!(report.rows_unanchored_tail, 50);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // ...and the same rows on a GENESIS-rooted claim (verified_from_seq 0) ARE a hole.
+        let mut report = VerifyReport::empty_labeled("t");
+        count_anchor_coverage(
+            &mut report,
+            &rows_for(tenant_a(), 50..350),
+            &[anchor(tenant_a(), 100, 199), anchor(tenant_a(), 200, 299)],
+        );
+        assert_eq!(report.rows_uncovered_by_anchors, 50);
+        // Two tenants: a hole in one never leaks into the other; no anchors = all tail.
+        let mut both = rows_for(tenant_a(), 0..200);
+        both.extend(rows_for(tenant_b(), 0..40));
+        let mut report = VerifyReport::empty_labeled("t");
+        count_anchor_coverage(&mut report, &both, &[anchor(tenant_a(), 100, 199)]);
+        assert_eq!(
+            report.rows_uncovered_by_anchors, 100,
+            "tenant A's 0..99 hole"
+        );
+        assert_eq!(
+            report.rows_unanchored_tail, 40,
+            "tenant B has no anchor: tail only"
+        );
+        // Serde: an OLD report JSON without the fields still parses (default 0).
+        let old = serde_json::json!({
+            "ledger_path": "x", "rows_seen": 1, "hash_chain_valid": true, "signatures_valid": true,
+            "rekor_anchors_seen": 0, "rekor_anchors_resolved": 0, "anchors_included": 0,
+            "anchors_unverified": 0, "strip_detected": false, "errors": []
+        });
+        let r: VerifyReport = serde_json::from_value(old).unwrap();
+        assert_eq!(r.rows_uncovered_by_anchors, 0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * WaterfallView — the span timeline (Gantt/waterfall), the observability-standard
@@ -123,13 +124,15 @@ export function WaterfallView({
 							// that token (#1c1d20) is QUIETER than `--surface-hover` (#202125),
 							// so hovering any other row out-shouted the row you had selected.
 							className={cn(
-								"group grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-md pr-2 transition-colors",
-								selected ? "bg-surface-3" : "hover:bg-surface-hover",
+								"group grid grid-cols-[minmax(0,2fr)_3fr] items-center gap-2 rounded-control pr-2 transition-colors",
+								selected
+									? "bg-action-soft ring-1 ring-inset ring-action/30"
+									: "hover:bg-surface-hover",
 							)}
 						>
 							{/* Tree cell: depth guide rails · indent · disclosure · kind dot · name. */}
 							<div
-								className="relative flex min-w-0 items-center gap-1.5 py-1"
+								className="relative flex min-w-0 items-center gap-1.5 py-0.5"
 								// Cap indent so a very deep tree keeps the name readable
 								// (the title tooltip still carries the full name).
 								style={{ paddingLeft: `${guideCount * 14 + 4}px` }}
@@ -152,7 +155,8 @@ export function WaterfallView({
 									})}
 
 								{row.hasChildren ? (
-									<button
+									<Button
+										variant="bare"
 										type="button"
 										onClick={() => onToggleCollapse(s.span_id)}
 										aria-label={row.collapsed ? "Expand" : "Collapse"}
@@ -160,7 +164,7 @@ export function WaterfallView({
 										className="grid h-4 w-4 shrink-0 place-items-center rounded text-2xs leading-none text-ink-3 hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 									>
 										{row.collapsed ? "▶" : "▼"}
-									</button>
+									</Button>
 								) : (
 									<span className="h-4 w-4 shrink-0" aria-hidden />
 								)}
@@ -172,28 +176,30 @@ export function WaterfallView({
 									)}
 									aria-hidden
 								/>
-								<button
+								<Button
+									variant="bare"
 									type="button"
 									onClick={() => onSelectSpan(s.span_id)}
 									className="truncate text-left text-sm text-ink hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2"
 									title={s.name}
 								>
 									{s.name}
-								</button>
+								</Button>
 							</div>
 
 							{/* Timeline cell: the bar, positioned by real offset/width. */}
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								onClick={() => onSelectSpan(s.span_id)}
-								className="relative flex h-6 items-center focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2 rounded-sm"
+								className="relative flex h-6 items-center focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-2 rounded-control"
 								title={`start +${fmtDur(offsetUs)} · ${fmtDur(s.duration_us)}${isError ? " · error" : ""}`}
 							>
 								{/* faint baseline so empty rows still read as a track */}
 								<span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line/60" />
 								<span
 									className={cn(
-										"absolute top-1/2 h-2.5 -translate-y-1/2 rounded-sm",
+										"absolute top-1/2 h-2.5 -translate-y-1/2 rounded-control",
 										isError ? "bg-danger" : KIND_BAR[kind],
 										!isError && "opacity-85",
 									)}
@@ -206,7 +212,7 @@ export function WaterfallView({
 								>
 									{fmtDur(s.duration_us)}
 								</span>
-							</button>
+							</Button>
 						</div>
 					);
 				})}

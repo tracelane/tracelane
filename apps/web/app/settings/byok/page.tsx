@@ -39,19 +39,19 @@ export default async function ByokPage() {
 					Encryption Keys (CMK)
 				</h2>
 				<p className="mb-4 max-w-2xl text-xs text-ink-2">
-					Customer-managed keys (CMK) for regulated environments are part of the
-					Business plan and above.
+					The CMK fingerprint registry is available on Business and Enterprise.
+					Registration does not enable customer-managed encryption; enforcement
+					is not yet available.
 				</p>
-				<div className="max-w-2xl rounded-lg border border-action-line bg-action-soft px-4 py-3 text-sm text-action-ink">
+				<div className="max-w-2xl rounded-card border border-action-line bg-action-soft px-4 py-3 text-sm text-ink">
 					<span className="font-semibold">
-						Customer-managed encryption is available on Business ($799/mo) and
-						Enterprise.
+						Register a key fingerprint for your workspace.
 					</span>{" "}
 					<Link
 						href="/settings/billing"
-						className="font-medium underline underline-offset-2"
+						className="font-medium text-action-ink underline underline-offset-2"
 					>
-						Upgrade →
+						View plan details →
 					</Link>
 				</div>
 			</div>
@@ -67,7 +67,7 @@ export default async function ByokPage() {
 				for regulated environments. Stored as a fingerprint only.
 			</p>
 			{/* Honest state — this registry is not yet enforced. */}
-			<div className="mb-4 max-w-2xl rounded-lg border border-line bg-surface-2 p-3 text-xs text-ink-2">
+			<div className="mb-4 max-w-2xl rounded-card border border-line bg-surface-2 p-3 text-xs text-ink-2">
 				<div className="mb-1 font-medium text-ink">
 					Registered now · enforcement in a later release
 				</div>

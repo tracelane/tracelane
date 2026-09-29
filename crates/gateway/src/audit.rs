@@ -207,24 +207,7 @@ pub(crate) fn compute_merkle_root(hashes: &[String]) -> String {
 // AuditLogRow — ClickHouse row matching tracelane.audit_log schema
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, serde::Serialize, clickhouse::Row)]
-pub struct AuditLogRow {
-    pub tenant_id: String,
-    pub seq: u64,
-    /// Microseconds since Unix epoch (DateTime64(6, 'UTC')).
-    pub event_time: i64,
-    pub event_type: String,
-    pub actor: String,
-    pub payload: String,
-    pub prev_hash: String,
-    pub row_hash: String,
-    pub rekor_entry_id: Option<String>,
-    /// base64 Ed25519 signature over the batch Merkle root (ADR-057); `""` until
-    /// the batch anchors. Empty for unsigned deployments.
-    pub signature: String,
-    /// base64 Ed25519 public key that produced `signature`; `""` until anchored.
-    pub signing_pubkey: String,
-}
+pub use crate::db::ledger::AuditLogRow;
 
 // ---------------------------------------------------------------------------
 // ADR-062 Amendment 1 — anchor crypto. The byte formats below are FROZEN: do NOT
@@ -390,6 +373,324 @@ pub struct AuditChain {
     /// ADR-069/ADR-038: kill-switch handle so [`publish`](Self::publish) honours
     /// `kill.audit.async` — force the synchronous path fleet-wide, no redeploy.
     kill_switch: OnceLock<Arc<crate::kill_switch::KillSwitch>>,
+    /// B-493: the self-host (no Postgres) ledger writer — ONE task, a bounded
+    /// queue, batched INSERTs retried until they land. Started lazily by the
+    /// first in-memory append (inside the runtime); never on the Postgres path.
+    ledger_writer: OnceLock<LedgerWriter>,
+}
+
+// ---------------------------------------------------------------------------
+// B-493 — the self-host ledger writer
+// ---------------------------------------------------------------------------
+//
+// Reproduced 2026-09-21 with the published self-host ClickHouse config
+// (`max_concurrent_queries` 20): the in-memory path spawned one single-row
+// INSERT per ledger event and `warn!`ed when ClickHouse refused it, so a 30 s
+// burst at ~200 rps (16 users) left 9,114 of 11,875 ledger rows unwritten while
+// the chain state had advanced for every one — permanent holes in a chain the
+// product calls tamper-evident — and the same storm refused ingest's span
+// batches until the ingest process exited. Prod is untouched: with a control
+// plane the ledger is canonical in Postgres and written by the head-writer in
+// batches (ADR-078 B).
+//
+// The shape is the ingest writer's: rows ride a bounded queue to one task
+// that batches them into ONE insert (B-378 `write_audit_rows`), retries a
+// refused batch with back-off until it lands (never drops), and runs an
+// anchor only after the rows it covers have landed — the signature backfill
+// is an `ALTER … UPDATE` that finds nothing if it outruns them. When the
+// queue is full the APPEND is refused (fail-closed, ADR-069 — the same 503
+// `audit_unavailable` prod answers when its acked publish fails), and the
+// refused event consumes no seq: the slot is reserved BEFORE the chain moves.
+
+/// Rows the queue holds before an append is refused. ≈ 4 s of the burst that
+/// found this (2,000 rows/s), ≈ 40 s at a self-hoster's 100 rps.
+pub(crate) const LEDGER_WRITER_QUEUE_ROWS: usize = 8_192;
+/// Rows per INSERT — the ingest writer's batch size, an upper bound: an anchor
+/// request closes the batch early, so with the default `anchor_every` of 100
+/// the effective batch is 100 rows (one INSERT per anchor batch).
+pub(crate) const LEDGER_WRITER_BATCH_ROWS: usize = 2_000;
+/// A partial batch flushes after this long — the ingest writer's cadence.
+const LEDGER_WRITER_FLUSH_EVERY: Duration = Duration::from_millis(200);
+/// Back-off between attempts on a refused batch: 100 ms doubling to this cap,
+/// then flat, forever — the rows are the ledger and are never dropped.
+const LEDGER_WRITER_BACKOFF_CAP: Duration = Duration::from_secs(8);
+/// One INSERT attempt is bounded, so a ClickHouse that HANGS (paused, a wedged
+/// disk) becomes a failed, retried attempt instead of a writer stuck forever
+/// behind one request (run 3 of the B-493 repro, a 40 s `docker pause`).
+const LEDGER_WRITER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+enum LedgerWrite {
+    Row(AuditLogRow),
+    /// Run [`anchor_task`] for this batch once every row queued before it has
+    /// landed (the queue is FIFO, so ordering is the writer's).
+    Anchor {
+        tenant_id: TenantId,
+        hashes: Vec<audit_format::Hash>,
+        start_seq: u64,
+        end_seq: u64,
+    },
+}
+
+/// Counters the writer maintains; read by `/health` (`ledger_writer`) and tests.
+#[derive(Default)]
+struct LedgerWriterShared {
+    queued: std::sync::atomic::AtomicU64,
+    landed: std::sync::atomic::AtomicU64,
+    batches: std::sync::atomic::AtomicU64,
+    retried_batches: std::sync::atomic::AtomicU64,
+    refused_appends: std::sync::atomic::AtomicU64,
+    /// Set by a queue-full refusal, cleared (and `AuditAppendFailed` RESOLVED) by
+    /// the next accepted append — so a queue that filled while ClickHouse was
+    /// slow-but-accepting does not read "degraded" until restart (verifier, 2026-09-21).
+    refused_open: std::sync::atomic::AtomicBool,
+    /// Anchors the writer dispatched while a row they cover had NOT landed. The
+    /// FIFO discipline in `append_in_memory` makes this impossible by construction;
+    /// the writer checks anyway, because an ordering bug here is silent (the
+    /// signature backfill just misses the row) and a counter is a discriminating
+    /// field a test can read (0 with the fix, > 0 with the old shape planted).
+    anchors_before_rows: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`LedgerWriterShared`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LedgerWriterStats {
+    /// Rows accepted into the queue (every accepted in-memory append).
+    pub queued: u64,
+    /// Rows whose INSERT ClickHouse acknowledged.
+    pub landed: u64,
+    /// INSERTs acknowledged.
+    pub batches: u64,
+    /// Batches that were refused at least once before landing.
+    pub retried_batches: u64,
+    /// Appends refused because the queue was full (each was a 503 upstream).
+    pub refused_appends: u64,
+    /// Anchors dispatched before every row they cover had landed (an invariant
+    /// violation; always 0 unless the FIFO discipline is broken).
+    pub anchors_before_rows: u64,
+}
+
+impl LedgerWriterShared {
+    fn snapshot(&self) -> LedgerWriterStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        LedgerWriterStats {
+            queued: self.queued.load(Relaxed),
+            landed: self.landed.load(Relaxed),
+            batches: self.batches.load(Relaxed),
+            retried_batches: self.retried_batches.load(Relaxed),
+            refused_appends: self.refused_appends.load(Relaxed),
+            anchors_before_rows: self.anchors_before_rows.load(Relaxed),
+        }
+    }
+}
+
+struct LedgerWriter {
+    tx: tokio::sync::mpsc::Sender<LedgerWrite>,
+    shared: Arc<LedgerWriterShared>,
+}
+
+/// The process-wide writer's counters for `/health` — set by the first writer
+/// started in this process (production has one chain). `None` = no self-host
+/// writer runs here (the Postgres path, or no ClickHouse).
+static LEDGER_WRITER_HEALTH: OnceLock<Arc<LedgerWriterShared>> = OnceLock::new();
+
+/// Shutdown (B-377's contract, applied to the ledger — verifier, 2026-09-21): the
+/// server drains this chain's writer with `drain_ledger_writer` under a bound and,
+/// when that times out, logs the rows still unlanded — each a seq the chain
+/// consumed whose row is now LOST — rather than assuming they were written.
+impl AuditChain {
+    /// Rows this chain's self-host ledger writer has accepted but ClickHouse has
+    /// not acknowledged — `0` on the hosted path (no writer). Read by the shutdown
+    /// drain after `drain_ledger_writer` times out, so the loss is a number.
+    ///
+    /// Per chain, never the process-global `/health` slot: in the test binary that
+    /// slot belongs to whichever test started a writer first (one leaves a refusing
+    /// mock with rows queued forever), and an unrelated shutdown test waited the
+    /// whole bound on it. Production has one chain and one writer.
+    pub(crate) fn ledger_writer_unlanded(&self) -> u64 {
+        self.ledger_writer
+            .get()
+            .map(|w| {
+                let s = w.shared.snapshot();
+                s.queued.saturating_sub(s.landed)
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// The `ledger_writer` object on `/health`, or `null` off the self-host path.
+pub(crate) fn ledger_writer_health_json() -> serde_json::Value {
+    match LEDGER_WRITER_HEALTH.get() {
+        Some(shared) => {
+            let s = shared.snapshot();
+            json!({
+                "queued": s.queued,
+                "landed": s.landed,
+                "in_flight": s.queued.saturating_sub(s.landed),
+                "batches": s.batches,
+                "retried_batches": s.retried_batches,
+                "refused_appends": s.refused_appends,
+                "anchors_before_rows": s.anchors_before_rows,
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+impl LedgerWriter {
+    fn start(ch: ClickhouseClient, rekor: RekorClient) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(LEDGER_WRITER_QUEUE_ROWS);
+        let shared = Arc::new(LedgerWriterShared::default());
+        let _ = LEDGER_WRITER_HEALTH.set(Arc::clone(&shared));
+        tokio::spawn(ledger_writer_task(ch, rekor, rx, Arc::clone(&shared)));
+        Self { tx, shared }
+    }
+}
+
+/// The writer loop: fill a batch (up to [`LEDGER_WRITER_BATCH_ROWS`] rows or
+/// [`LEDGER_WRITER_FLUSH_EVERY`], whichever first; an anchor request closes the
+/// batch early), write it until it lands, then dispatch the anchors that were
+/// queued behind those rows.
+async fn ledger_writer_task(
+    ch: ClickhouseClient,
+    rekor: RekorClient,
+    mut rx: tokio::sync::mpsc::Receiver<LedgerWrite>,
+    shared: Arc<LedgerWriterShared>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut pending: Vec<AuditLogRow> = Vec::with_capacity(LEDGER_WRITER_BATCH_ROWS);
+    let mut anchors: Vec<LedgerWrite> = Vec::new();
+    // Next seq expected per tenant — rows arrive in seq order by construction, so
+    // this is a contiguous landed watermark; the anchor check below reads it.
+    let mut landed_next: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    loop {
+        let Some(first) = rx.recv().await else {
+            // Every sender dropped: flush what is held, then exit.
+            if !pending.is_empty() {
+                write_until_landed(&ch, &pending, &shared).await;
+            }
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + LEDGER_WRITER_FLUSH_EVERY;
+        fn take(msg: LedgerWrite, pending: &mut Vec<AuditLogRow>, anchors: &mut Vec<LedgerWrite>) {
+            match msg {
+                LedgerWrite::Row(row) => pending.push(row),
+                anchor @ LedgerWrite::Anchor { .. } => anchors.push(anchor),
+            }
+        }
+        take(first, &mut pending, &mut anchors);
+        while pending.len() < LEDGER_WRITER_BATCH_ROWS && anchors.is_empty() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => take(msg, &mut pending, &mut anchors),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if !pending.is_empty() {
+            write_until_landed(&ch, &pending, &shared).await;
+            shared.landed.fetch_add(pending.len() as u64, Relaxed);
+            for row in &pending {
+                let next = landed_next.entry(row.tenant_id.clone()).or_insert(0);
+                // The watermark only ever moves past what landed, so an anchor
+                // for a range with a hole still trips the check below.
+                *next = (*next).max(row.seq.saturating_add(1));
+            }
+            pending.clear();
+        }
+        // Only now — the rows an anchor covers are in ClickHouse, so the
+        // signature/Rekor backfill mutations inside `anchor_task` find them.
+        for anchor in anchors.drain(..) {
+            if let LedgerWrite::Anchor {
+                tenant_id,
+                hashes,
+                start_seq,
+                end_seq,
+            } = anchor
+            {
+                if landed_next
+                    .get(&tenant_id.to_string())
+                    .is_none_or(|next| *next <= end_seq)
+                {
+                    shared.anchors_before_rows.fetch_add(1, Relaxed);
+                    tracing::error!(
+                        tenant_id = %tenant_id, start_seq, end_seq,
+                        "self-host ledger writer: an anchor reached the writer BEFORE every row it covers \
+                         landed — the queue is no longer in seq order (an invariant violation; the \
+                         signature backfill will miss rows)"
+                    );
+                }
+                let rekor = rekor.clone();
+                let ch = ch.clone();
+                tokio::spawn(async move {
+                    anchor_task(rekor, None, Some(ch), tenant_id, hashes, start_seq, end_seq).await;
+                });
+            }
+        }
+    }
+}
+
+/// ONE insert for the batch, retried with back-off until ClickHouse accepts it.
+/// Never returns without the rows landed: on the self-host path these rows ARE
+/// the ledger and there is no canonical store to re-copy them from.
+async fn write_until_landed(
+    ch: &ClickhouseClient,
+    rows: &[AuditLogRow],
+    shared: &LedgerWriterShared,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut backoff = Duration::from_millis(100);
+    let mut attempt: u64 = 0;
+    loop {
+        let attempt_result = match tokio::time::timeout(
+            LEDGER_WRITER_ATTEMPT_TIMEOUT,
+            write_audit_rows(ch, rows.to_vec()),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "audit_log insert attempt timed out after {}s (the server hung)",
+                LEDGER_WRITER_ATTEMPT_TIMEOUT.as_secs()
+            )),
+        };
+        match attempt_result {
+            Ok(()) => {
+                shared.batches.fetch_add(1, Relaxed);
+                if attempt > 0 {
+                    shared.retried_batches.fetch_add(1, Relaxed);
+                    tracelane_shared::degradation::resolve(
+                        tracelane_shared::degradation::Degradation::AuditAppendFailed,
+                    );
+                    tracing::warn!(
+                        rows = rows.len(),
+                        attempts = attempt + 1,
+                        "RECOVERED: self-host ledger batch landed after ClickHouse refused it"
+                    );
+                }
+                return;
+            }
+            Err(err) => {
+                attempt += 1;
+                // The registry is the counter; the log line is the transition
+                // (first refusal) plus a heartbeat every 10th attempt.
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::AuditAppendFailed,
+                );
+                if attempt == 1 || attempt.is_multiple_of(10) {
+                    tracing::warn!(
+                        rows = rows.len(),
+                        attempt,
+                        next_backoff_ms = backoff.as_millis() as u64,
+                        // `{err:#}` prints the anyhow CHAIN — the ClickHouse `Code: NNN …`
+                        // reason sits one level below "insert end", and the operator of a
+                        // wedged ledger needs that line, not the outer context.
+                        error = format!("{err:#}"),
+                        "self-host ledger batch refused by ClickHouse — holding the rows and retrying"
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(LEDGER_WRITER_BACKOFF_CAP);
+            }
+        }
+    }
 }
 
 impl AuditChain {
@@ -442,7 +743,43 @@ impl AuditChain {
             pg_pool,
             jetstream: OnceLock::new(),
             kill_switch: OnceLock::new(),
+            ledger_writer: OnceLock::new(),
         })
+    }
+
+    /// B-493: the self-host ledger writer's counters (zero before the first
+    /// in-memory append starts it). Production reads them on `/health`
+    /// (`ledger_writer_health_json`); this per-chain view is for tests.
+    #[cfg(test)]
+    pub(crate) fn ledger_writer_stats(&self) -> LedgerWriterStats {
+        self.ledger_writer
+            .get()
+            .map(|w| w.shared.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// B-493: wait until every row accepted into the self-host ledger queue has
+    /// landed in ClickHouse, or `timeout` elapses. `Ok` = drained. Used by the
+    /// server's shutdown drain (`server::drain_on_shutdown`) and the B-493 tests.
+    pub(crate) async fn drain_ledger_writer(&self, timeout: Duration) -> Result<()> {
+        let Some(w) = self.ledger_writer.get() else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let s = w.shared.snapshot();
+            if s.landed >= s.queued {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "self-host ledger writer did not drain: {} queued, {} landed",
+                    s.queued,
+                    s.landed
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// R21 — read this tenant's anchor watermark. `None` = never anchored, or the
@@ -499,9 +836,8 @@ impl AuditChain {
     /// that cannot read ClickHouse logs and skips that tenant; it must never take down
     /// the append path it runs beside.
     pub async fn flush_aged_batches(&self, max_age: Duration) -> usize {
-        let Some(ref ch) = self.clickhouse_client else {
-            return 0;
-        };
+        // ADR-078 (B): every question about what is and is not anchored is answered by
+        // the CANONICAL store — Postgres. ClickHouse is not consulted here at all.
         // PG-PATH ONLY, and this is a correctness gate rather than a configuration nicety.
         // The sweep's whole model is the PG-serialized append's: the durable watermark
         // lives in `audit_anchor_records` and the leaf set is read back from ClickHouse.
@@ -514,6 +850,11 @@ impl AuditChain {
             return 0;
         };
         let max_age_secs = max_age.as_secs();
+        // B-559: the skip count at the START of this pass. A pass that ends with the same
+        // count read every tenant without a skip, which is proof the condition ended.
+        let skips_before = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+        );
 
         // Enumerate from the DURABLE store, never from `self.states`.
         //
@@ -523,7 +864,7 @@ impl AuditChain {
         // every tenant onboarded since the last restart, i.e. exactly the new low-volume
         // customer this feature is for. It is a `GROUP BY` over one column every 15
         // minutes, which is nothing next to being wrong about who is covered.
-        let tenants = match read_tenants_with_audit_rows(ch).await {
+        let tenants = match crate::db::ledger::tenants_with_rows(pool).await {
             Ok(t) => t,
             Err(err) => {
                 Self::note_sweep_skip(&err, None);
@@ -533,49 +874,74 @@ impl AuditChain {
 
         let mut anchored = 0usize;
         for tenant_id in tenants {
-            // DURABLE watermark, re-read every sweep — NOT `self.last_anchored_end`.
-            // `warm_from_postgres` degrades a failed watermark read to `None`, so the
-            // in-memory value can be `None` for a fully-anchored tenant; trusting it
-            // would make the first sweep re-anchor an already-anchored range, rewriting
-            // signatures and double-metering. Re-reading also means a failed anchor is
-            // simply retried next sweep instead of being remembered as done.
-            let watermark = match read_last_anchored_end(ch, &tenant_id).await {
-                Ok(w) => w,
-                Err(err) => {
-                    Self::note_sweep_skip(&err, Some(&tenant_id));
-                    continue;
-                }
-            };
-            let probe = read_oldest_unanchored_age_secs(ch, &tenant_id, watermark).await;
-            let Ok(Some((age_secs, head))) = probe else {
+            // Everything the sweep decides on is read from the DURABLE store, every sweep
+            // — never `self.last_anchored_end`. `warm_from_postgres` degrades a failed
+            // watermark read to `None`, so the in-memory value can be `None` for a
+            // fully-anchored tenant; trusting it would make the first sweep re-anchor an
+            // already-anchored range, rewriting signatures and double-metering.
+            // Re-reading also means a failed anchor is simply retried next sweep instead
+            // of being remembered as done. (The watermark itself now rides inside the
+            // probe below.)
+            // B-483 (2026-09-21): the probe is HOLE-AWARE — the lowest seq inside NO anchor
+            // batch, wherever it sits. Until this it was `seq > watermark`, and a batch
+            // whose anchor task died mid-Rekor (rows 29700..29799 of the deploy-proof
+            // tenant, a reboot two seconds in) sat BELOW the watermark the next batch
+            // advanced past: the threshold floor skipped it by design and this sweep
+            // never looked beneath the watermark. 100 rows, unsigned and un-anchored,
+            // with every proof green over them.
+            let probe = crate::db::ledger::oldest_uncovered(pool, &tenant_id).await;
+            let Ok(Some(uncovered)) = probe else {
                 if let Err(ref err) = probe {
                     Self::note_sweep_skip(err, Some(&tenant_id));
                 }
-                continue; // nothing un-anchored, or unreadable
+                continue; // every row is inside an anchor batch, or unreadable
             };
-            if age_secs < max_age_secs {
+            let head = uncovered.head;
+            let age_secs = uncovered.age_secs;
+            // A HOLE — rows below the watermark that no batch covers — is an anomaly,
+            // never the ordinary tail: it is anchored on the NEXT sweep regardless of
+            // age. The tail above the watermark keeps the age rule.
+            let is_hole = uncovered.watermark.is_some_and(|w| uncovered.seq <= w);
+            if !is_hole && age_secs < max_age_secs {
                 continue;
             }
 
-            // "Everything not yet anchored, up to here" — deliberately NOT
+            // The floor is the ACTUAL uncovered row — deliberately NOT
             // `anchor_batch_start`. That rule takes `max(watermark + 1, end + 1 - n)`,
             // whose second term is a floor the THRESHOLD path needs and the sweep must
             // never apply: with a backlog larger than `anchor_every` it starts the batch
             // partway in, and the watermark then advances past the rows it skipped —
             // burying them, permanently, in the one mechanism that would have caught them.
-            let batch_start = watermark.map_or(0, |w| w.saturating_add(1));
+            let batch_start = uncovered.seq;
             if batch_start > head {
-                continue; // already covered; nothing to anchor
+                continue; // cannot happen (the probe read the row); stated, not assumed
             }
             // Bound the batch, and CHUNK FORWARD rather than skip: a backlog bigger than
-            // this anchors its oldest rows now and the rest on subsequent sweeps.
-            let batch_end = head.min(batch_start.saturating_add(MAX_SWEEP_BATCH - 1));
+            // this anchors its oldest rows now and the rest on subsequent sweeps. A hole
+            // is additionally bounded by the NEXT existing batch's start, so the range is
+            // by construction outside every existing batch (R34's no-overlap property).
+            let mut batch_end = head.min(batch_start.saturating_add(MAX_SWEEP_BATCH - 1));
+            match crate::db::ledger::next_anchor_start_after(pool, &tenant_id, batch_start).await {
+                Ok(Some(next_start)) => {
+                    batch_end = batch_end.min(next_start.saturating_sub(1));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    Self::note_sweep_skip(&err, Some(&tenant_id));
+                    continue;
+                }
+            }
+            if batch_end < batch_start {
+                continue; // an adjacent batch starts right at the uncovered seq — cannot happen, stated
+            }
 
             // Cross-process claim. The threshold path is serialized by the per-tenant
             // `SELECT … FOR UPDATE` on the chain head; the sweep touches no such row, so
-            // without this two gateways sweep the same tenant and both anchor it. That is
-            // not hypothetical: `infra/prod/blue-green-deploy.sh:84-85` deliberately
-            // LEAVES BLUE RUNNING after the cutover, so two processes co-run by design.
+            // without this two gateways sweep the same tenant and both anchor it. Two
+            // processes co-ran by design under the blue-green deploy until 2026-09-12
+            // (`docs/deploy/blue-green-superseded.md`); today's deploy runs ONE gateway
+            // and this lock is what makes a second one (RI-04's replicas) safe — an
+            // argument, not an observation, until that spec's guard is built (B-448 site 1).
             // A `try` lock, never a blocking one — losing the race means the other process
             // is already doing it, which is the outcome we wanted anyway. The transaction
             // exists ONLY to scope the lock; nothing is written through it.
@@ -628,7 +994,10 @@ impl AuditChain {
 
             tracing::info!(
                 tenant_id = %tenant_id, batch_start, batch_end, head, age_secs, max_age_secs,
-                "audit age-sweep: flushing an un-anchored batch past max_age"
+                hole = is_hole,
+                watermark = uncovered.watermark,
+                "audit age-sweep: flushing an un-anchored batch (a HOLE below the watermark is \
+                 anchored on sight; the tail past max_age)"
             );
             // AWAITED, not spawned. Sequential dispatch bounds the fan-out to one
             // in-flight anchor per process (the Postgres pool this shares is 16
@@ -636,9 +1005,10 @@ impl AuditChain {
             // process against itself, and — the reason that matters — lets a REFUSED
             // batch be observed, so the watermark cache below is advanced only for a
             // batch that was really anchored.
-            let ok = anchor_batch_from_ch(
+            let ok = anchor_batch_from_store(
                 self.rekor_client.clone(),
-                ch.clone(),
+                Some(pool.clone()),
+                self.clickhouse_client.clone(),
                 tenant_id.clone(),
                 batch_start,
                 batch_end,
@@ -658,7 +1028,23 @@ impl AuditChain {
                 anchored += 1;
             }
         }
+        Self::settle_sweep_skips(skips_before);
         anchored
+    }
+
+    /// B-559 — close `AuditAgeSweepSkipped` after a pass that skipped nothing.
+    ///
+    /// A skip is transient by construction: every pass re-reads the durable store and
+    /// retries whatever the last one could not see. So a pass that got through every
+    /// tenant without adding a skip proves the condition ended, and the kind must say so.
+    /// Without this, one Postgres error (prod 2026-09-25 03:48, a Neon suspend) held
+    /// `audit_attestation_healthy` false and the status page CRITICAL for 24 h+ over a
+    /// ledger with no hole. A pass that DID skip leaves the kind open.
+    fn settle_sweep_skips(skips_before: u64) {
+        use tracelane_shared::degradation::{Degradation, count, resolve};
+        if count(Degradation::AuditAgeSweepSkipped) == skips_before {
+            resolve(Degradation::AuditAgeSweepSkipped);
+        }
     }
 
     /// One place for "the sweep could not see, so it skipped" — counted, not just logged.
@@ -735,17 +1121,23 @@ impl AuditChain {
             // The lever may still DEFER (force the synchronous path fleet-wide). It can
             // no longer SUPPRESS: whichever path runs, an unrecorded request is refused.
             //
-            // This does not brick dev / OSS self-host, which was the reason the
-            // fallback was fail-open in the first place. Verified rather than assumed:
-            // with no Postgres pool `append` takes `append_in_memory`, whose ClickHouse
-            // write is spawned and warn-only, so it does not return `Err` — those
-            // deployments keep serving exactly as before. What now 503s is the case
-            // that should: a control plane IS configured and the ledger write failed.
+            // Dev / OSS self-host (no Postgres pool): `append` takes
+            // `append_in_memory`. Until B-493 (2026-09-21) its ClickHouse write was
+            // spawned and warn-only and never returned `Err`, so this arm could not
+            // 503 there — and a self-host ClickHouse refusing writes left silent
+            // holes in the chain. Now the row rides a bounded writer queue that
+            // batches and retries until it lands, and an append is refused ONLY
+            // when that queue is full — the same fail-closed answer as the hosted
+            // path, for the same reason: the audit product does not serve
+            // unrecorded requests.
             //
-            // Honest limit: in the no-Postgres case the "record" is a process-local
-            // hash chain plus a fire-and-forget ClickHouse write. Fail-closed there is
-            // thin, and nothing in this fix makes that tier durable — it is the dev /
-            // self-host tier and must not be described as a tamper-evident ledger.
+            // Honest limit, unchanged: the no-Postgres "record" is a process-local
+            // hash chain plus a ClickHouse table. A graceful shutdown drains the
+            // writer with a bound (`AuditChain::drain_ledger_writer`) and logs what
+            // it could not land; a crash, or ClickHouse refusing past that bound,
+            // loses the queued rows (no canonical store to re-copy from), and a
+            // batch ClickHouse will NEVER accept (schema drift, a full disk) wedges
+            // the writer — every request 503s until the operator fixes the store.
             return self.append(event).await.inspect_err(|err| {
                 tracing::error!(
                     error = %err,
@@ -885,6 +1277,9 @@ impl AuditChain {
         self.states.get(tenant_id).map_or(0, |cell| cell.lock().seq)
     }
 
+    /// Boot: seed every tenant's in-memory chain state from the persisted head, and
+    /// reconcile the CANONICAL ledger rows (Postgres, ADR-078 B) with their ClickHouse
+    /// copy in both directions. See [`Self::reconcile_ledger`] for the rules.
     pub async fn warm_from_postgres(&self) -> Result<()> {
         let Some(ref pool) = self.pg_pool else {
             tracing::info!("no pg pool — skipping audit_chain_state warm");
@@ -898,38 +1293,33 @@ impl AuditChain {
         for r in rows {
             let mut head_seq = r.last_seq;
             let mut head_hash = r.last_row_hash;
-            if let Some(ref ch) = self.clickhouse_client {
-                match self
-                    .reconcile_head_from_ch(pool, ch, &r.tenant_id, head_seq, head_hash)
-                    .await
-                {
-                    Ok(Some((adopted_seq, adopted_hash))) => {
-                        reconciled_tenants += 1;
-                        head_seq = adopted_seq;
-                        head_hash = adopted_hash;
-                    }
-                    Ok(None) => {}
-                    Err(err) => tracing::warn!(
-                        error = %err, tenant_id = %r.tenant_id,
-                        "audit warm-reconcile failed — resuming from persisted head"
-                    ),
+            match self
+                .reconcile_ledger(pool, &r.tenant_id, head_seq, head_hash)
+                .await
+            {
+                Ok(Some((adopted_seq, adopted_hash))) => {
+                    reconciled_tenants += 1;
+                    head_seq = adopted_seq;
+                    head_hash = adopted_hash;
                 }
-            }
-            // R21: seed the anchor watermark from the DURABLE record, never from memory.
-            // A failure here yields `None`, which is the safe direction: the threshold
-            // path then falls back to `seq + 1 - n`, i.e. exactly today's behaviour.
-            let anchored_end = match self.clickhouse_client {
-                Some(ref ch) => read_last_anchored_end(ch, &r.tenant_id).await.unwrap_or_else(
-                    |err| {
-                        tracing::warn!(
-                            error = %err, tenant_id = %r.tenant_id,
-                            "audit warm: could not read last anchored batch — anchor watermark unset"
-                        );
-                        None
-                    },
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    error = %err, tenant_id = %r.tenant_id,
+                    "audit warm-reconcile failed — resuming from persisted head"
                 ),
-                None => None,
-            };
+            }
+            // R21: seed the anchor watermark from the DURABLE record — the canonical
+            // store — never from memory. A failure here yields `None`, which is the
+            // safe direction: the threshold path then falls back to `seq + 1 - n`.
+            let anchored_end = crate::db::ledger::last_anchored_end(pool, &r.tenant_id)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        error = %err, tenant_id = %r.tenant_id,
+                        "audit warm: could not read last anchored batch — anchor watermark unset"
+                    );
+                    None
+                });
             self.states.entry(r.tenant_id.clone()).or_insert_with(|| {
                 Mutex::new(TenantChainState {
                     seq: head_seq + 1,
@@ -948,54 +1338,239 @@ impl AuditChain {
         Ok(())
     }
 
-    /// Adopt any durable ClickHouse rows written ahead of the persisted head for
-    /// one tenant (ADR-065 HOLE C). Walks CH rows with `seq > head_seq` (deduped
-    /// via `FINAL`), adopting each strictly-next, correctly-chaining row; stops
-    /// at the first gap or chain break (never adopts an unverified row). If any
-    /// row is adopted, advances the persisted head (monotonic `upsert`) and
-    /// returns the new `(seq, row_hash)`; otherwise `Ok(None)`.
-    async fn reconcile_head_from_ch(
+    /// **B-475 (REV-4, 2026-09-21): a copy row chains only if its CONTENT hashes to
+    /// its stored `row_hash`.** Returns the verified row hash when `row.prev_hash`
+    /// equals `running_prev` AND `row_hash_v2(prev, tenant, seq, event_type, actor,
+    /// payload)` equals `row.row_hash`; `None` otherwise. Until this, both reconcile
+    /// rules decoded the SUPPLIED hashes, compared `prev` to the running hash, and
+    /// adopted — a copy row whose `payload` (or `actor`, or `event_type`) had been
+    /// altered while its two hash fields were left intact chained perfectly and
+    /// entered the canonical Postgres ledger, logged as "the gap was filled … and
+    /// chains to the persisted head". The offline verifier would have caught it
+    /// later; a recovery that imports unverified content into the evidence store is
+    /// the wrong property for this product. `payload` is the verbatim canonical
+    /// string in both stores (`apps/web/db/schema.ts`: TEXT, not jsonb, for exactly
+    /// this reason) and every prod row is v2 (the v1 hasher is `dead_code`; the export
+    /// self-verify recomputes v2 over the whole chain green), so the recomputation is
+    /// byte-exact. A mismatch is logged ONCE at `error!` with the seq and the reason,
+    /// so the RCA knows WHY the copy was refused.
+    fn copy_row_chains(
+        row: &AuditLogRow,
+        tenant_id: &TenantId,
+        running_prev: &audit_format::Hash,
+    ) -> Option<audit_format::Hash> {
+        let (Ok(prev), Ok(stored)) = (
+            audit_format::hex_decode(&row.prev_hash),
+            audit_format::hex_decode(&row.row_hash),
+        ) else {
+            tracing::error!(
+                tenant_id = %tenant_id, seq = row.seq,
+                "audit reconcile: copy row REFUSED — malformed hash field (not hex)"
+            );
+            return None;
+        };
+        if prev != *running_prev {
+            return None; // a chain break, not tampering: the walk ends here, quietly
+        }
+        let recomputed = audit_format::row_hash_v2(
+            &prev,
+            tenant_id,
+            row.seq,
+            &row.event_type,
+            &row.actor,
+            &row.payload,
+        );
+        if recomputed != stored {
+            tracing::error!(
+                tenant_id = %tenant_id, seq = row.seq, reason = "content_hash_mismatch",
+                "audit reconcile: copy row REFUSED — its content does not hash to its stored row_hash (the row was altered after it was hashed); nothing past it is adopted"
+            );
+            return None;
+        }
+        Some(stored)
+    }
+
+    /// **ADR-078 (B) — the boot reconcile between the canonical ledger (Postgres) and
+    /// its ClickHouse copy, for one tenant.** Three rules, in this order, each of
+    /// which only ever adopts a row that CHAINS (`prev_hash` equals the running hash
+    /// AND, since B-475, whose content re-hashes to its stored `row_hash`)
+    /// and is strictly the next `seq`:
+    ///
+    /// 1. **Canonical rows behind the head** (`max(seq)` in Postgres `<` the persisted
+    ///    head): the head-ahead-of-rows case the ruling names. It arises from a
+    ///    Postgres restore to an earlier point — and, once, from the migration window
+    ///    (the previous binary wrote rows to ClickHouse only). The gap is filled FROM
+    ///    THE COPY, row by row, only while each row chains and only up to the head;
+    ///    if the copy cannot fill it, or the recovered row at the head does not hash
+    ///    to the persisted `last_row_hash`, the head is **never reset** and no gap row
+    ///    is written: `LedgerHeadAheadOfRows` is noted and that tenant's chain stays
+    ///    RED for verifiers until the rows are recovered — an incident, not a repair.
+    /// 2. **Copy ahead of the head** (ClickHouse rows with `seq >` head): the
+    ///    direction the pre-B reconcile already adopted (ADR-065 HOLE C). Rows that
+    ///    chain are written into Postgres and the head advances to them
+    ///    (monotonic `upsert`). Returns the new `(seq, row_hash)`.
+    /// 3. **Copy behind the canonical rows**: Postgres rows the copy lacks are
+    ///    written to ClickHouse in pages (the derived copy rebuilt), and anchor
+    ///    bundles the copy lacks likewise. Fail-open: a ClickHouse failure here is
+    ///    `LedgerCopyFailed`, never a reason not to boot.
+    async fn reconcile_ledger(
         &self,
         pool: &deadpool_postgres::Pool,
-        ch: &ClickhouseClient,
         tenant_id: &TenantId,
         head_seq: u64,
         head_hash: audit_format::Hash,
     ) -> Result<Option<(u64, audit_format::Hash)>> {
         const RECONCILE_LIMIT: u32 = 10_000;
-        let rows = read_rows_after(ch, tenant_id, head_seq, RECONCILE_LIMIT).await?;
-        if rows.is_empty() {
-            return Ok(None);
+        let pg_max = crate::db::ledger::max_seq(pool, tenant_id).await?;
+
+        // ── Rule 1: canonical rows behind the head → fill from the copy, or RED. ──
+        let rows_behind_head = pg_max.is_none_or(|m| m < head_seq);
+        if rows_behind_head {
+            // The row we chain FROM: the canonical row at pg_max, or genesis.
+            let (mut from_seq, mut running_prev) = match pg_max {
+                Some(m) => {
+                    let last = crate::db::ledger::read_rows_from(pool, tenant_id, m, 1).await?;
+                    let h = last
+                        .first()
+                        .map(|r| audit_format::hex_decode(&r.row_hash))
+                        .transpose()
+                        .map_err(|e| anyhow::anyhow!("canonical row_hash at seq {m}: {e}"))?
+                        .context("canonical max row vanished between reads")?;
+                    (m as i64, h)
+                }
+                None => (-1i64, audit_format::genesis_prev_hash(tenant_id)),
+            };
+            let mut recovered: Vec<AuditLogRow> = Vec::new();
+            if let Some(ref ch) = self.clickhouse_client {
+                loop {
+                    let after = u64::try_from(from_seq).unwrap_or(0);
+                    let page = if from_seq < 0 {
+                        // `seq > -1` is not expressible as u64; genesis walks from 0.
+                        read_full_rows_from(ch, tenant_id, 0, RECONCILE_LIMIT).await?
+                    } else {
+                        read_full_rows_after(ch, tenant_id, after, RECONCILE_LIMIT).await?
+                    };
+                    if page.is_empty() {
+                        break;
+                    }
+                    let mut stop = false;
+                    for r in page {
+                        let expected = u64::try_from(from_seq + 1).unwrap_or(0);
+                        if r.seq != expected || r.seq > head_seq {
+                            stop = true;
+                            break;
+                        }
+                        // A copy row that does not chain — malformed hashes, a
+                        // prev_hash off the running hash, or (B-475) content that
+                        // does not re-hash to its own row_hash — ends the walk; it
+                        // never aborts the adoption of the rows that DID chain
+                        // before it.
+                        let Some(rh) = Self::copy_row_chains(&r, tenant_id, &running_prev) else {
+                            stop = true;
+                            break;
+                        };
+                        running_prev = rh;
+                        from_seq = r.seq as i64;
+                        recovered.push(r);
+                        if from_seq as u64 == head_seq {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    if stop {
+                        break;
+                    }
+                }
+            }
+            let filled = from_seq >= 0 && from_seq as u64 == head_seq && running_prev == head_hash;
+            if !recovered.is_empty() {
+                // Adopt what chained, even partially: every adopted row is a row the
+                // verifier can now read from the canonical store.
+                crate::db::ledger::insert_rows(pool, &recovered)
+                    .await
+                    .context("adopt copy rows into the canonical ledger")?;
+            }
+            if filled {
+                tracing::warn!(
+                    tenant_id = %tenant_id, from = pg_max, to = head_seq, rows = recovered.len(),
+                    "audit reconcile: canonical rows were BEHIND the head; the gap was filled from the ClickHouse copy and chains to the persisted head"
+                );
+            } else if !crate::db::tenants::exists(pool, *tenant_id.as_uuid()).await? {
+                // A tenant Neon no longer knows was PURGED. Its head is retained on
+                // purpose (the ledger outlives the tenant) and its rows may be gone by
+                // the same purge or by an earlier sweep — that is the expected end
+                // state of a purged tenant, not an incident, and it must not hold the
+                // platform DEGRADED forever. Found on the first ADR-078 boot on prod:
+                // two ownerless heads (a purged tenant, a bench tenant) lit
+                // `ledger_head_ahead_of_rows` for a chain nobody can export.
+                tracing::info!(
+                    tenant_id = %tenant_id, head_seq, canonical_max = ?pg_max,
+                    "audit reconcile: a purged tenant's head is retained without rows — frozen as-is, not an incident"
+                );
+                return Ok(None);
+            } else {
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::LedgerHeadAheadOfRows,
+                );
+                tracing::error!(
+                    tenant_id = %tenant_id, head_seq, canonical_max = ?pg_max, recovered = recovered.len(),
+                    "audit reconcile: the persisted head is AHEAD of the canonical rows and the copy could not fill the gap with rows that chain — head NOT reset, no gap row written; this tenant's chain is RED for verifiers until the rows are recovered (the head-ahead rule; file an RCA)"
+                );
+                return Ok(None);
+            }
         }
+
+        // ── Rule 2: copy ahead of the head → adopt what chains, advance the head. ──
         let mut adopted_seq = head_seq;
         let mut running_prev = head_hash;
-        for r in rows {
-            if r.seq != adopted_seq + 1 {
-                break; // gap or reorder — stop adopting
+        let mut adopted: Vec<AuditLogRow> = Vec::new();
+        if let Some(ref ch) = self.clickhouse_client {
+            let rows = read_full_rows_after(ch, tenant_id, head_seq, RECONCILE_LIMIT).await?;
+            for r in rows {
+                if r.seq != adopted_seq + 1 {
+                    break; // gap or reorder — stop adopting
+                }
+                // Malformed hashes, a chain break, or (B-475) content that does not
+                // re-hash to its row_hash: stop, keep what chained so far.
+                let Some(rh) = Self::copy_row_chains(&r, tenant_id, &running_prev) else {
+                    break;
+                };
+                adopted_seq = r.seq;
+                running_prev = rh;
+                adopted.push(r);
             }
-            let prev = audit_format::hex_decode(&r.prev_hash)
-                .map_err(|e| anyhow::anyhow!("reconcile prev_hash at seq {}: {e}", r.seq))?;
-            if prev != running_prev {
-                break; // chain break — never adopt a row that does not chain
-            }
-            let rh = audit_format::hex_decode(&r.row_hash)
-                .map_err(|e| anyhow::anyhow!("reconcile row_hash at seq {}: {e}", r.seq))?;
-            adopted_seq = r.seq;
-            running_prev = rh;
         }
-        if adopted_seq == head_seq {
-            return Ok(None);
+        let outcome = if adopted_seq == head_seq {
+            None
+        } else {
+            crate::db::ledger::insert_rows(pool, &adopted)
+                .await
+                .context("adopt ahead-of-head copy rows into the canonical ledger")?;
+            crate::db::audit_chain_state::upsert(pool, tenant_id, adopted_seq, &running_prev)
+                .await
+                .context("reconcile upsert of adopted head")?;
+            tracing::info!(
+                tenant_id = %tenant_id,
+                from_seq = head_seq,
+                to_seq = adopted_seq,
+                "audit reconcile adopted ClickHouse copy rows ahead of the persisted head into the canonical ledger"
+            );
+            Some((adopted_seq, running_prev))
+        };
+
+        // ── Rule 3: copy behind the canonical rows → rebuild the copy (fail-open). ──
+        if let Some(ref ch) = self.clickhouse_client
+            && let Err(err) = rebuild_copy_for_tenant(pool, ch, tenant_id, RECONCILE_LIMIT).await
+        {
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::LedgerCopyFailed,
+            );
+            tracing::warn!(
+                error = %err, tenant_id = %tenant_id,
+                "audit reconcile: rebuilding the ClickHouse ledger copy failed — canonical rows are intact; retried at the next boot"
+            );
         }
-        crate::db::audit_chain_state::upsert(pool, tenant_id, adopted_seq, &running_prev)
-            .await
-            .context("reconcile upsert of adopted head")?;
-        tracing::info!(
-            tenant_id = %tenant_id,
-            from_seq = head_seq,
-            to_seq = adopted_seq,
-            "audit warm-reconcile adopted durable CH rows ahead of persisted head"
-        );
-        Ok(Some((adopted_seq, running_prev)))
+        Ok(outcome)
     }
 
     /// Append one audit event, advancing the tenant's tamper-evident hash chain.
@@ -1016,7 +1591,9 @@ impl AuditChain {
     ///
     /// Fail-closed on the PG path (a PG or durable-CH-write failure aborts the
     /// append — the event is not recorded rather than recorded with a forked
-    /// seq). The in-memory path only errors on a malformed payload.
+    /// seq). The in-memory path errors on a malformed payload and — B-493 —
+    /// when its ledger writer's queue is full (ClickHouse not accepting
+    /// `audit_log` writes): the event is refused and consumes no seq.
     #[instrument(skip(self, event), fields(
         tenant_id = %event.tenant_id,
         event_type = %event.event_type,
@@ -1051,7 +1628,7 @@ impl AuditChain {
                 )
                 .await
             }
-            None => self.append_in_memory(event, payload_json),
+            None => self.append_in_memory(event, payload_json).await,
         }
     }
 
@@ -1081,13 +1658,13 @@ impl AuditChain {
     ) -> Result<()> {
         let tenant_id = tenant_id.clone();
         let genesis = audit_format::genesis_prev_hash(&tenant_id);
-        let ch_for_write = self.clickhouse_client.clone();
         let count = items.len();
 
-        // The closure is the durable-CH-write step, run INSIDE the PG tx between
-        // the FOR UPDATE read and the head advance. It chains the row hashes over
-        // the seqs the lock just claimed, then writes (and awaits) ALL the rows
-        // in one insert. `kept` names which of `items` survived dedup.
+        // ADR-078 (B): the closure is PURE — it chains the row hashes over the
+        // seqs the lock just claimed and returns the rows; `append_atomic_batch`
+        // writes them into the canonical Postgres ledger INSIDE the head
+        // transaction. `kept` names which of `items` survived dedup. The
+        // ClickHouse copy happens below, after COMMIT, fail-open and counted.
         let outcome = crate::db::audit_chain_state::append_atomic_batch(
             pool,
             &tenant_id,
@@ -1095,50 +1672,37 @@ impl AuditChain {
             event_ids,
             count,
             |first_seq, prev_hash, kept| {
-                let ch = ch_for_write.clone();
-                let tenant_id = tenant_id.clone();
-                async move {
-                    let mut prev = prev_hash;
-                    let mut hashes = Vec::with_capacity(kept.len());
-                    let mut rows = Vec::with_capacity(kept.len());
-                    let event_time = Utc::now().timestamp_micros();
-                    for (i, idx) in kept.iter().enumerate() {
-                        let item = &items[*idx];
-                        let seq = first_seq + i as u64;
-                        let row_hash = audit_format::row_hash_v2(
-                            &prev,
-                            &tenant_id,
-                            seq,
-                            &item.event_type,
-                            &item.actor,
-                            &item.payload_json,
-                        );
-                        rows.push(AuditLogRow {
-                            tenant_id: tenant_id.to_string(),
-                            seq,
-                            event_time,
-                            event_type: item.event_type.clone(),
-                            actor: item.actor.clone(),
-                            payload: item.payload_json.clone(),
-                            prev_hash: audit_format::hex_encode(&prev),
-                            row_hash: audit_format::hex_encode(&row_hash),
-                            rekor_entry_id: None,
-                            // Backfilled per anchor batch by `backfill_signature`.
-                            signature: String::new(),
-                            signing_pubkey: String::new(),
-                        });
-                        hashes.push(row_hash);
-                        prev = row_hash;
-                    }
-                    if let Some(ch) = ch {
-                        // Awaited — durable before the head advances (F1). ONE
-                        // insert for the batch: one part, not K.
-                        write_audit_rows(&ch, rows)
-                            .await
-                            .context("durable audit_log rows write")?;
-                    }
-                    Ok(hashes)
+                let mut prev = prev_hash;
+                let mut rows = Vec::with_capacity(kept.len());
+                let event_time = Utc::now().timestamp_micros();
+                for (i, idx) in kept.iter().enumerate() {
+                    let item = &items[*idx];
+                    let seq = first_seq + i as u64;
+                    let row_hash = audit_format::row_hash_v2(
+                        &prev,
+                        &tenant_id,
+                        seq,
+                        &item.event_type,
+                        &item.actor,
+                        &item.payload_json,
+                    );
+                    rows.push(AuditLogRow {
+                        tenant_id: tenant_id.to_string(),
+                        seq,
+                        event_time,
+                        event_type: item.event_type.clone(),
+                        actor: item.actor.clone(),
+                        payload: item.payload_json.clone(),
+                        prev_hash: audit_format::hex_encode(&prev),
+                        row_hash: audit_format::hex_encode(&row_hash),
+                        rekor_entry_id: None,
+                        // Backfilled per anchor batch by `backfill_signature`.
+                        signature: String::new(),
+                        signing_pubkey: String::new(),
+                    });
+                    prev = row_hash;
                 }
+                Ok(rows)
             },
         )
         .await?;
@@ -1149,6 +1713,23 @@ impl AuditChain {
         let Some(outcome) = outcome else {
             return Ok(());
         };
+        // ADR-078 (B): the DERIVED copy — ClickHouse `audit_log`, which the
+        // dashboards and the per-trace chain view read. After COMMIT, so the
+        // canonical row exists whatever happens here; fail-OPEN and COUNTED, never
+        // a reason to refuse the append (the chain is already durable). The boot
+        // reconcile rebuilds whatever this misses (`reconcile_ledger_copy`).
+        if let Some(ch) = self.clickhouse_client.clone()
+            && let Err(err) = write_audit_rows(&ch, outcome.rows.clone()).await
+        {
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::LedgerCopyFailed,
+            );
+            tracing::debug!(
+                error = %err, tenant_id = %tenant_id, first_seq = outcome.first_seq,
+                n = outcome.rows.len(),
+                "ledger copy to ClickHouse failed — the canonical rows are committed; the boot reconcile will rebuild the copy"
+            );
+        }
         let n_appended = outcome.row_hashes.len() as u64;
         let last_seq = outcome.first_seq + n_appended - 1;
         tracing::debug!(
@@ -1173,32 +1754,101 @@ impl AuditChain {
                 if !(seq + 1).is_multiple_of(n) {
                     continue;
                 }
-                if let Some(ch) = self.clickhouse_client.clone() {
-                    // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n`
-                    // directly — that is correct only if no batch was ever closed
-                    // early by age.
-                    let prev_end = self.last_anchored_end(&tenant_id);
-                    let batch_start = anchor_batch_start(prev_end, seq, n);
-                    self.set_last_anchored_end(&tenant_id, seq);
-                    let rekor = self.rekor_client.clone();
-                    let tid = tenant_id.clone();
-                    tokio::spawn(async move {
-                        anchor_batch_from_ch(rekor, ch, tid, batch_start, seq).await;
-                    });
-                }
+                // ADR-078 (B): the leaf set comes from the canonical store, so
+                // anchoring no longer needs ClickHouse at all.
+                // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n`
+                // directly — that is correct only if no batch was ever closed
+                // early by age.
+                let prev_end = self.last_anchored_end(&tenant_id);
+                let batch_start = anchor_batch_start(prev_end, seq, n);
+                self.set_last_anchored_end(&tenant_id, seq);
+                let rekor = self.rekor_client.clone();
+                let tid = tenant_id.clone();
+                let pg = pool.clone();
+                let ch = self.clickhouse_client.clone();
+                tokio::spawn(async move {
+                    anchor_batch_from_store(rekor, Some(pg), ch, tid, batch_start, seq).await;
+                });
             }
         }
 
         Ok(())
     }
 
-    /// Legacy in-memory append (no Postgres pool → single-process dev / OSS
+    /// In-memory append (no Postgres pool → single-process dev / OSS
     /// self-host). Advances the per-tenant `DashMap` chain state under a
-    /// `parking_lot::Mutex` and fires the CH write + anchor as fire-and-forget
-    /// tasks. The cross-process race cannot arise without a shared
-    /// Postgres, so this path is unchanged. **Not used when `pg_pool` is set.**
-    fn append_in_memory(&self, event: AuditEvent, payload_json: String) -> Result<()> {
-        let (row_hash, seq, prev_hash_snapshot, should_anchor, pending_snapshot, batch_start) = {
+    /// `parking_lot::Mutex`; the `audit_log` row and the anchor ride the B-493
+    /// ledger writer's bounded FIFO queue (batched, retried until landed, the
+    /// anchor after its rows). The cross-process race cannot arise without a
+    /// shared Postgres. **Not used when `pg_pool` is set.**
+    ///
+    /// # Errors
+    ///
+    /// Fail-CLOSED when the writer's queue is full: TWO slots (the row and, in
+    /// case this seq closes an anchor batch, its anchor) are reserved BEFORE the
+    /// chain state moves, so a refused event consumes no seq (a seq without a
+    /// row is the hole B-493 found) and an anchor-closing append never waits on
+    /// the queue. Refused appends are counted (`refused_appends`) and noted as
+    /// `AuditAppendFailed`, which the next accepted append resolves.
+    async fn append_in_memory(&self, event: AuditEvent, payload_json: String) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Started lazily so `AuditChain` construction needs no runtime; `append`
+        // is async, so this runs inside one.
+        let writer = self.clickhouse_client.as_ref().map(|ch| {
+            self.ledger_writer
+                .get_or_init(|| LedgerWriter::start(ch.clone(), self.rekor_client.clone()))
+        });
+        let permits = match writer {
+            Some(w) => {
+                let reserved =
+                    w.tx.try_reserve()
+                        .and_then(|row| w.tx.try_reserve().map(|anchor| (row, anchor)));
+                match reserved {
+                    Ok(pair) => {
+                        if w.shared.refused_open.swap(false, Relaxed) {
+                            tracelane_shared::degradation::resolve(
+                                tracelane_shared::degradation::Degradation::AuditAppendFailed,
+                            );
+                        }
+                        Some(pair)
+                    }
+                    Err(err) => {
+                        w.shared.refused_appends.fetch_add(1, Relaxed);
+                        w.shared.refused_open.store(true, Relaxed);
+                        tracelane_shared::degradation::note(
+                            tracelane_shared::degradation::Degradation::AuditAppendFailed,
+                        );
+                        // A closed channel is the writer task having died — a different
+                        // fact from a full queue, and it says so (verifier, 2026-09-21).
+                        // Both refusals are ADR-069's fail-closed rule; the ADR id stays
+                        // here, not in the message a self-host operator reads.
+                        if matches!(err, tokio::sync::mpsc::error::TrySendError::Closed(())) {
+                            anyhow::bail!(
+                                "self-host ledger writer task is GONE (its queue is closed) — \
+                                 refusing the append (fail-closed); restart the gateway"
+                            );
+                        }
+                        anyhow::bail!(
+                            "self-host ledger writer saturated ({LEDGER_WRITER_QUEUE_ROWS} rows \
+                             queued and ClickHouse is not accepting audit_log writes) — refusing \
+                             the append (fail-closed)"
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // Everything that orders the ledger happens UNDER the per-tenant lock: the seq
+        // is taken, the row and (when this seq closes a batch) its anchor are pushed onto
+        // the writer's FIFO through the pre-reserved permits (`Permit::send` is
+        // synchronous and cannot block). Queue order therefore equals seq order per
+        // tenant, an anchor always sits behind every row it covers, and no request
+        // future awaits the queue after its seq is consumed — the hand-off cannot be
+        // lost to a client hang-up or the router timeout. (Verifier, 2026-09-21: with
+        // the sends outside the lock a preempted request could enqueue row N behind
+        // the anchor for [..N], and an awaited anchor send was cancellable.)
+        let (row_hash, seq, no_ch_anchor) = {
             let state_ref = self
                 .states
                 .entry(event.tenant_id.clone())
@@ -1233,14 +1883,41 @@ impl AuditChain {
                 vec![]
             };
 
-            (
-                hash,
-                seq,
-                prev_hash_snapshot,
-                should_anchor,
-                snapshot,
-                batch_start,
-            )
+            let mut no_ch_anchor = None;
+            match (permits, writer) {
+                (Some((row_permit, anchor_permit)), Some(w)) => {
+                    row_permit.send(LedgerWrite::Row(AuditLogRow {
+                        tenant_id: event.tenant_id.to_string(),
+                        seq,
+                        event_time: Utc::now().timestamp_micros(),
+                        event_type: event.event_type.to_string(),
+                        actor: event.actor.clone(),
+                        payload: payload_json,
+                        prev_hash: audit_format::hex_encode(&prev_hash_snapshot),
+                        row_hash: audit_format::hex_encode(&hash),
+                        rekor_entry_id: None,
+                        // Backfilled per anchor batch by `backfill_signature` (ADR-057).
+                        signature: String::new(),
+                        signing_pubkey: String::new(),
+                    }));
+                    w.shared.queued.fetch_add(1, Relaxed);
+                    if should_anchor {
+                        anchor_permit.send(LedgerWrite::Anchor {
+                            tenant_id: event.tenant_id.clone(),
+                            hashes: snapshot,
+                            start_seq: batch_start,
+                            end_seq: seq,
+                        });
+                    }
+                    // else: `anchor_permit` drops here and its slot is released.
+                }
+                _ => {
+                    if should_anchor {
+                        no_ch_anchor = Some((snapshot, batch_start));
+                    }
+                }
+            }
+            (hash, seq, no_ch_anchor)
         };
 
         tracing::debug!(
@@ -1249,36 +1926,21 @@ impl AuditChain {
             "audit event hashed (in-memory)"
         );
 
-        // Persist row to ClickHouse — non-blocking.
-        if let Some(ref ch) = self.clickhouse_client {
-            let row = AuditLogRow {
-                tenant_id: event.tenant_id.to_string(),
-                seq,
-                event_time: Utc::now().timestamp_micros(),
-                event_type: event.event_type.to_string(),
-                actor: event.actor.clone(),
-                payload: payload_json,
-                prev_hash: audit_format::hex_encode(&prev_hash_snapshot),
-                row_hash: audit_format::hex_encode(&row_hash),
-                rekor_entry_id: None,
-                // Backfilled per anchor batch by `backfill_signature` (ADR-057).
-                signature: String::new(),
-                signing_pubkey: String::new(),
-            };
-            let ch = ch.clone();
-            tokio::spawn(async move {
-                if let Err(err) = write_audit_row(&ch, row).await {
-                    tracing::warn!(error = %err, "ClickHouse audit_log write failed");
-                }
-            });
-        }
-
-        if should_anchor {
+        if let Some((pending_snapshot, batch_start)) = no_ch_anchor {
+            // No ClickHouse at all (dev): the anchor still signs in memory.
             let rekor = self.rekor_client.clone();
-            let ch = self.clickhouse_client.clone();
             let tenant_id = event.tenant_id.clone();
             tokio::spawn(async move {
-                anchor_task(rekor, ch, tenant_id, pending_snapshot, batch_start, seq).await;
+                anchor_task(
+                    rekor,
+                    None,
+                    None,
+                    tenant_id,
+                    pending_snapshot,
+                    batch_start,
+                    seq,
+                )
+                .await;
             });
         }
 
@@ -1298,12 +1960,15 @@ impl AuditChain {
 // and propagate the `Result`. The compiler now enforces this; a
 // future `Default::default()` would be a compile error.
 
+/// One row in one insert — test fixtures only since B-493 (one spawned insert
+/// per in-memory append was the storm; the self-host writer batches).
+#[cfg(test)]
 async fn write_audit_row(client: &ClickhouseClient, row: AuditLogRow) -> anyhow::Result<()> {
     write_audit_rows(client, vec![row]).await
 }
 
 /// B-378: K rows in ONE insert — one MergeTree part per batch instead of per
-/// event. The single-row form above is this with K = 1.
+/// event.
 async fn write_audit_rows(client: &ClickhouseClient, rows: Vec<AuditLogRow>) -> anyhow::Result<()> {
     let mut insert = client
         .insert("audit_log")
@@ -1330,35 +1995,7 @@ struct PendingLedgerRow {
     payload_json: String,
 }
 
-/// One per-batch anchor bundle (ADR-062 Amendment 1) — the offline-verifiable
-/// record the export streams and the three verifiers check. Written once per
-/// signed batch, anchored or not.
-#[derive(Debug, serde::Serialize, clickhouse::Row)]
-pub(crate) struct AuditAnchorRecordRow {
-    pub tenant_id: String,
-    pub batch_start_seq: u64,
-    pub batch_end_seq: u64,
-    /// hex of the RFC6962 Merkle root over the batch rows.
-    pub merkle_root: String,
-    /// `anchored` | `unanchored` — matches the byte the Ed25519 sig committed to.
-    pub anchor_state: String,
-    /// base64 Ed25519 sig over `LOCAL_ATTEST_MSG`.
-    pub ed25519_sig: String,
-    /// base64 raw 32-byte Ed25519 pubkey (reference; verifier uses the trusted key).
-    pub ed25519_pubkey: String,
-    /// base64 ECDSA anchor SPKI (empty when unanchored).
-    pub ecdsa_pubkey_spki: String,
-    pub rekor_log_url: String,
-    pub rekor_log_index: String,
-    /// base64 canonicalized hashedrekord body (empty when unanchored).
-    pub canonicalized_body: String,
-    /// JSON `{log_index, tree_size, hashes[]}` (empty when unanchored).
-    pub inclusion_proof: String,
-    /// C2SP signed-note checkpoint (empty when unanchored).
-    pub checkpoint_envelope: String,
-    /// Microseconds since Unix epoch (DateTime64(6, 'UTC')).
-    pub anchored_at: i64,
-}
+pub(crate) use crate::db::ledger::AuditAnchorRecordRow;
 
 /// Build the anchor-record row from a batch outcome. Reads the full receipt so
 /// the offline bundle is durable (Rekor v2 cannot be re-queried later).
@@ -1506,8 +2143,120 @@ pub(crate) fn is_real_rekor_entry(entry_id: &str) -> bool {
     !matches!(entry_id, "(no-key)" | "(no-rekor)" | "(unknown-uuid)")
 }
 
+/// B-493 (verifier, 2026-09-21): the three ClickHouse ops an anchor spawns — the
+/// anchor record and the two row backfills — were one-shot, so the same refusal
+/// that lost ledger rows left a batch permanently unsigned. Each now retries across
+/// this ladder (≈ 63 s, the ingest writer's) before it is counted as lost; on the
+/// self-host path these ARE the store, on the hosted path the boot reconcile
+/// re-copies whatever still failed.
+#[cfg_attr(test, allow(dead_code))]
+const ANCHOR_COPY_BACKOFF: [Duration; 7] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(32),
+];
+
+/// The ladder `retry_copy_op` walks: production's above; in the test binary a
+/// millisecond ladder of the SAME length, so a failing-write test still sees every
+/// rung tried and the failure counted without waiting a minute.
+fn anchor_copy_backoff() -> &'static [Duration] {
+    #[cfg(test)]
+    {
+        static TINY: [Duration; 7] = [Duration::from_millis(2); 7];
+        &TINY
+    }
+    #[cfg(not(test))]
+    {
+        &ANCHOR_COPY_BACKOFF
+    }
+}
+
+async fn retry_copy_op<F, Fut>(what: &'static str, mut op: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut last = None;
+    for (attempt, wait) in anchor_copy_backoff()
+        .iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if let Some(wait) = wait {
+                    tracing::debug!(
+                        what,
+                        attempt,
+                        error = format!("{err:#}"),
+                        "anchor copy op refused; retrying"
+                    );
+                    tokio::time::sleep(*wait).await;
+                }
+                last = Some(err);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("{what}: no attempt ran")))
+}
+
+/// ADR-078 (B): `pg_pool` is the CANONICAL store for the anchor bundle and the row
+/// backfills (signature, Rekor entry id); `clickhouse_client` receives the derived
+/// COPY afterwards. A stack without Postgres (dev / OSS self-host) keeps its
+/// ClickHouse-only behaviour — there is no canonical store to prefer.
+/// AUD-29 — load the tenant's Ed25519 key, retrying a TRANSIENT failure on the same
+/// ladder as the canonical anchor writes before giving up. `NotEntitledToTenantKey`
+/// is not transient: the platform key is that tenant's signer, so `None` at once.
+/// Only when every rung fails does the batch fall back to the platform key — counted
+/// (`AuditPlatformKeyFallback`), because for a tenant that already has a key that
+/// batch reads `platform_key_after_workspace_key` in every verifier, forever. The
+/// anchor task is off the hot path; waiting here costs no request anything.
+async fn tenant_key_with_retry(
+    store: &TenantAuditKeyStore,
+    tenant_id: &TenantId,
+) -> Option<crate::audit_keys::TenantAuditKeypair> {
+    let mut rungs = anchor_copy_backoff().iter();
+    loop {
+        match store.get_or_create(tenant_id).await {
+            Ok(kp) => return Some(kp),
+            Err(err)
+                if err
+                    .downcast_ref::<crate::audit_keys::NotEntitledToTenantKey>()
+                    .is_some() =>
+            {
+                return None;
+            }
+            Err(err) => {
+                if let Some(wait) = rungs.next() {
+                    tracing::debug!(
+                        error = format!("{err:#}"), tenant_id = %tenant_id,
+                        "per-tenant Ed25519 lookup failed; retrying"
+                    );
+                    tokio::time::sleep(*wait).await;
+                } else {
+                    tracelane_shared::degradation::note(
+                        tracelane_shared::degradation::Degradation::AuditPlatformKeyFallback,
+                    );
+                    tracing::warn!(
+                        error = format!("{err:#}"), tenant_id = %tenant_id,
+                        "per-tenant Ed25519 lookup failed on every retry; signing with the platform key"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 async fn anchor_task(
     rekor_client: RekorClient,
+    pg_pool: Option<deadpool_postgres::Pool>,
     clickhouse_client: Option<ClickhouseClient>,
     tenant_id: TenantId,
     hashes: Vec<audit_format::Hash>,
@@ -1534,6 +2283,66 @@ async fn anchor_task(
         "audit batch anchor outcome"
     );
 
+    // ADR-078 (B): the CANONICAL half first — the anchor bundle and the two row
+    // backfills into Postgres. Awaited, not spawned: this task already runs off the
+    // hot path, and a bundle that never reaches the canonical store is the ADR-062
+    // loss (`AuditBackfillFailed`) whatever the copy does.
+    if let Some(ref pool) = pg_pool {
+        if outcome.is_signed() {
+            let row = build_anchor_record(&tenant_id, &root, start_seq, end_seq, &outcome);
+            if let Err(err) = crate::db::ledger::insert_anchor_record(pool, &row).await {
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+                );
+                tracing::warn!(
+                    tenant_id = %tenant_id, start_seq, end_seq, error = %err,
+                    "canonical audit_anchor_records write failed"
+                );
+            }
+            if let Err(err) = crate::db::ledger::backfill_signature(
+                pool,
+                &tenant_id,
+                &outcome.ed25519_sig_b64,
+                &outcome.ed25519_pubkey_b64,
+                start_seq,
+                end_seq,
+            )
+            .await
+            {
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+                );
+                tracing::warn!(
+                    tenant_id = %tenant_id, start_seq, end_seq, error = %err,
+                    "canonical audit signature backfill failed"
+                );
+            }
+        }
+        if is_real_rekor_entry(&entry_id)
+            && let Err(err) = crate::db::ledger::backfill_rekor_entry_id(
+                pool, &tenant_id, &entry_id, start_seq, end_seq,
+            )
+            .await
+        {
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::AuditBackfillFailed,
+            );
+            tracing::warn!(
+                rekor_entry_id = %entry_id, tenant_id = %tenant_id, start_seq, end_seq,
+                error = %err, "canonical rekor_entry_id backfill failed"
+            );
+        }
+    }
+
+    // The derived COPY (or, with no Postgres, the only store — unchanged behaviour).
+    // Under B a failure here is `LedgerCopyFailed`: the bundle is safe in Postgres
+    // and the boot reconcile re-copies it; without Postgres it stays the ADR-062
+    // loss it always was (`AuditBackfillFailed`).
+    let copy_kind = if pg_pool.is_some() {
+        tracelane_shared::degradation::Degradation::LedgerCopyFailed
+    } else {
+        tracelane_shared::degradation::Degradation::AuditBackfillFailed
+    };
     if let Some(ch) = clickhouse_client {
         // Persist the full offline-verifiable bundle (ADR-062) once per SIGNED
         // batch — anchored or not: the bound Ed25519 attestation verifies either
@@ -1546,7 +2355,11 @@ async fn anchor_task(
             let ch = ch.clone();
             let tid = tenant_id.clone();
             tokio::spawn(async move {
-                if let Err(err) = write_anchor_record(&ch, row).await {
+                if let Err(err) = retry_copy_op("audit_anchor_records", || {
+                    write_anchor_record(&ch, row.clone())
+                })
+                .await
+                {
                     // R17. The founder's ruling named the two backfills; this is the
                     // THIRD spawned fail-open in the same function with the same shape
                     // and the same consequence, and instrumenting two of three would
@@ -1556,15 +2369,13 @@ async fn anchor_task(
                     // the ONLY offline-verification source, because Rekor v2 has no
                     // online lookup. So the batch anchored and cannot be proven to
                     // have anchored, which is the same customer-visible outcome.
-                    tracelane_shared::degradation::note(
-                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
-                    );
+                    tracelane_shared::degradation::note(copy_kind);
                     tracing::warn!(
                         tenant_id = %tid,
                         start_seq,
                         end_seq,
-                        error = %err,
-                        "ClickHouse audit_anchor_records write failed"
+                        error = format!("{err:#}"),
+                        "ClickHouse audit_anchor_records write failed after every retry"
                     );
                 }
             });
@@ -1577,22 +2388,23 @@ async fn anchor_task(
             let sig = outcome.ed25519_sig_b64.clone();
             let pk = outcome.ed25519_pubkey_b64.clone();
             tokio::spawn(async move {
-                if let Err(err) = backfill_signature(&ch, &tid, &sig, &pk, start_seq, end_seq).await
+                if let Err(err) = retry_copy_op("signature backfill", || {
+                    backfill_signature(&ch, &tid, &sig, &pk, start_seq, end_seq)
+                })
+                .await
                 {
                     // R17. This runs detached, so its Err reaches nobody: the append
                     // already reported success and `/health` is green. Left uncounted,
                     // the batch stays UNSIGNED forever with nothing to retry it — the
                     // ledger keeps its hash chain and quietly loses the property we
                     // actually sell. Count it so `open_for_secs` can answer TRAPS §16.
-                    tracelane_shared::degradation::note(
-                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
-                    );
+                    tracelane_shared::degradation::note(copy_kind);
                     tracing::warn!(
                         tenant_id = %tid,
                         start_seq,
                         end_seq,
-                        error = %err,
-                        "ClickHouse audit signature backfill failed"
+                        error = format!("{err:#}"),
+                        "ClickHouse audit signature backfill failed after every retry"
                     );
                 }
             });
@@ -1603,23 +2415,24 @@ async fn anchor_task(
             let tid = tenant_id.clone();
             let id = entry_id.clone();
             tokio::spawn(async move {
-                if let Err(err) = backfill_rekor_entry_id(&ch, &tid, &id, start_seq, end_seq).await
+                if let Err(err) = retry_copy_op("rekor_entry_id backfill", || {
+                    backfill_rekor_entry_id(&ch, &tid, &id, start_seq, end_seq)
+                })
+                .await
                 {
                     // R17, same class as the signature backfill above: a REAL Rekor
                     // entry exists in the public log, and the rows that entry attests
                     // to will never name it. The anchor is not lost — it is
                     // unreachable from the product, which is indistinguishable from
                     // never having anchored for anyone reading the ledger.
-                    tracelane_shared::degradation::note(
-                        tracelane_shared::degradation::Degradation::AuditBackfillFailed,
-                    );
+                    tracelane_shared::degradation::note(copy_kind);
                     tracing::warn!(
                         rekor_entry_id = %id,
                         tenant_id = %tid,
                         start_seq,
                         end_seq,
-                        error = %err,
-                        "ClickHouse rekor_entry_id backfill failed"
+                        error = format!("{err:#}"),
+                        "ClickHouse rekor_entry_id backfill failed after every retry"
                     );
                 }
             });
@@ -1657,6 +2470,16 @@ pub const ANCHOR_MAX_BATCH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// flush latency is the age, not the interval.
 pub const ANCHOR_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// How long after boot the FIRST sweep runs (B-483, 2026-09-22). It used to be one full
+/// [`ANCHOR_SWEEP_INTERVAL`] — fifteen minutes in which a hole the last process left
+/// (a batch whose anchor died mid-Rekor on a restart, the shape found on prod) stayed
+/// unsigned, and in which the deploy's own ledger proof would read it and roll the
+/// deploy back. The settle this used to buy is already guaranteed by ordering:
+/// `warm_from_postgres` runs to completion before the sweeper is spawned, and the
+/// hole probe reads Postgres, not the in-memory watermark. Ten seconds is for the
+/// boot to finish its own logging, nothing more.
+pub const ANCHOR_SWEEP_FIRST_PASS_DELAY: Duration = Duration::from_secs(10);
+
 /// R21 — spawn the background age sweep.
 ///
 /// A background task rather than a check inside `publish` **because an append-triggered
@@ -1666,10 +2489,10 @@ pub const ANCHOR_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// which will ever reach the 100-event threshold.
 pub fn spawn_anchor_age_sweeper(chain: Arc<AuditChain>) {
     tokio::spawn(async move {
-        // Settle first: a fresh node should not sweep before `warm_from_postgres` has
-        // seeded the anchor watermarks, or the first sweep would compute batch starts
-        // from `None` and could re-anchor an already-anchored range.
-        tokio::time::sleep(ANCHOR_SWEEP_INTERVAL).await;
+        // `warm_from_postgres` has already seeded the anchor watermarks by the time the
+        // server spawns this (it runs synchronously, earlier in boot), so the first pass
+        // no longer waits a whole interval — see `ANCHOR_SWEEP_FIRST_PASS_DELAY`.
+        tokio::time::sleep(ANCHOR_SWEEP_FIRST_PASS_DELAY).await;
         loop {
             let n = chain.flush_aged_batches(ANCHOR_MAX_BATCH_AGE).await;
             if n > 0 {
@@ -1717,24 +2540,35 @@ fn anchor_batch_start(last_anchored_end: Option<u64>, end_seq: u64, anchor_every
 /// it was refused. **R21 depends on this distinction:** the age sweep must not advance
 /// its watermark cache for a batch that was never anchored, or those rows are buried —
 /// the sweep is the only thing that would ever have come back for them.
-async fn anchor_batch_from_ch(
+/// ADR-078 (B): the leaf set is read from the CANONICAL store when there is one
+/// (Postgres), else from ClickHouse (a stack with no control plane).
+async fn anchor_batch_from_store(
     rekor_client: RekorClient,
-    clickhouse_client: ClickhouseClient,
+    pg_pool: Option<deadpool_postgres::Pool>,
+    clickhouse_client: Option<ClickhouseClient>,
     tenant_id: TenantId,
     start_seq: u64,
     end_seq: u64,
 ) -> bool {
-    let hashes =
-        match read_batch_row_hashes(&clickhouse_client, &tenant_id, start_seq, end_seq).await {
-            Ok(h) => h,
-            Err(err) => {
-                tracing::error!(
-                    error = %err, tenant_id = %tenant_id, start_seq, end_seq,
-                    "audit anchor: reading batch leaf set from ClickHouse failed — skipping anchor"
-                );
-                return false;
-            }
-        };
+    let read = match (&pg_pool, &clickhouse_client) {
+        (Some(pool), _) => {
+            crate::db::ledger::read_row_hashes(pool, &tenant_id, start_seq, end_seq).await
+        }
+        (None, Some(ch)) => read_batch_row_hashes(ch, &tenant_id, start_seq, end_seq).await,
+        (None, None) => Err(anyhow::anyhow!(
+            "no ledger store to read the batch leaf set from"
+        )),
+    };
+    let hashes = match read {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(
+                error = %err, tenant_id = %tenant_id, start_seq, end_seq,
+                "audit anchor: reading batch leaf set from the ledger store failed — skipping anchor"
+            );
+            return false;
+        }
+    };
     let expected = (end_seq - start_seq + 1) as usize;
     if hashes.len() != expected {
         // read_batch_row_hashes already enforces contiguity; a length mismatch
@@ -1748,7 +2582,8 @@ async fn anchor_batch_from_ch(
     }
     anchor_task(
         rekor_client,
-        Some(clickhouse_client),
+        pg_pool,
+        clickhouse_client,
         tenant_id,
         hashes,
         start_seq,
@@ -1764,34 +2599,6 @@ async fn anchor_batch_from_ch(
 /// passed over. Sized to bound the leaf set held in memory and the `ALTER … UPDATE`
 /// signature backfill's row count, not to match `anchor_every`.
 const MAX_SWEEP_BATCH: u64 = 10_000;
-
-/// R21 — every tenant with at least one `audit_log` row, read from the DURABLE store.
-///
-/// The sweep cannot enumerate from `AuditChain::states`: on the PG path that map is only
-/// ever written by `warm_from_postgres` at boot, so it is a snapshot that omits every
-/// tenant onboarded since the last restart.
-async fn read_tenants_with_audit_rows(client: &ClickhouseClient) -> anyhow::Result<Vec<TenantId>> {
-    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
-    struct TenantRow {
-        tenant_id: String,
-    }
-    // `GROUP BY` over one low-cardinality column on a columnar store, once per sweep
-    // interval. audit.rs is allow-listed in no-raw-ch-query.sh; this is the one query
-    // here that is deliberately NOT tenant-scoped, because producing the tenant list is
-    // its entire purpose.
-    let rows = client
-        .query(&crate::clickhouse_query::ceiling(
-            "SELECT tenant_id FROM audit_log GROUP BY tenant_id",
-        ))
-        .fetch_all::<TenantRow>()
-        .await
-        .context("enumerate tenants with audit_log rows")?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| r.tenant_id.parse::<uuid::Uuid>().ok())
-        .map(TenantId::from_jwt_claim)
-        .collect())
-}
 
 /// R21 — a per-tenant Postgres advisory lock held for the duration of one age flush,
 /// released on drop.
@@ -1851,48 +2658,6 @@ async fn read_last_anchored_end(
     Ok((row.present == 1).then_some(row.n))
 }
 
-/// R21 — the oldest un-anchored row's age for this tenant, or `None` if nothing is
-/// un-anchored. Drives the age flush.
-async fn read_oldest_unanchored_age_secs(
-    client: &ClickhouseClient,
-    tenant_id: &TenantId,
-    after_seq: Option<u64>,
-) -> anyhow::Result<Option<(u64, u64)>> {
-    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
-    struct AgeRow {
-        age_secs: u64,
-        head: u64,
-        present: u8,
-    }
-    // INCLUSIVE lower bound, always a real `UInt64` — **never a sentinel.**
-    //
-    // `after_seq` is the last ANCHORED seq, so the first un-anchored one is `+ 1`;
-    // a tenant that has never anchored starts at genesis, seq 0.
-    //
-    // This was `seq > ?` bound to the STRING "-1" when `after_seq` was `None`, to dodge
-    // the fact that `-1 as u64` wraps. ClickHouse rejects it outright —
-    // `Code 53 TYPE_MISMATCH: Cannot convert string '-1' to type UInt64` — and
-    // `flush_aged_batches` turns that `Err` into a `warn!` + `continue`, so **every
-    // tenant that had never anchored was silently skipped**: precisely the 92-row,
-    // 5-tenant population R21 exists to fix. Dodging the wrap with a string moved the
-    // bug from an arithmetic one to a type one and made it invisible.
-    //
-    // Caught only by running this function against a live ClickHouse. Every other R21
-    // test is pure arithmetic or a hand-built fixture, and all of them stayed green.
-    let from_seq = after_seq.map_or(0, |s| s.saturating_add(1));
-    let row = client
-        .query(&crate::clickhouse_query::ceiling(
-            "SELECT toUInt64(greatest(0, dateDiff('second', min(event_time), now()))) AS age_secs, \
-                    toUInt64(max(seq)) AS head, toUInt8(count() > 0) AS present \
-             FROM audit_log FINAL WHERE tenant_id = ? AND seq >= ?",
-        ))
-        .bind(tenant_id.to_string())
-        .bind(from_seq)
-        .fetch_one::<AgeRow>()
-        .await?;
-    Ok((row.present == 1).then_some((row.age_secs, row.head)))
-}
-
 /// Read the contiguous canonical `row_hash` leaf set for `[start … end]` from
 /// ClickHouse, deduped via `FINAL` (GATE 1: the `ReplacingMergeTree` version
 /// winner per `(tenant_id, seq)`, on an un-merged table). Fails if any seq in
@@ -1939,38 +2704,123 @@ async fn read_batch_row_hashes(
     Ok(out)
 }
 
-/// One `(seq, prev_hash, row_hash)` triple read back from ClickHouse during
-/// warm-reconcile. `prev_hash` / `row_hash` are hex.
-#[derive(Debug, serde::Deserialize, clickhouse::Row)]
-struct ReconcileRow {
-    seq: u64,
-    prev_hash: String,
-    row_hash: String,
-}
-
 /// Read up to `limit` deduped rows with `seq > after_seq` for `tenant_id`,
 /// ordered ascending, for warm-reconcile (HOLE C). `FINAL` picks the version
 /// winner so a crash-retry orphan never masks the canonical row.
-async fn read_rows_after(
+/// Full copy rows with `seq > after_seq`, seq-ascending, deduped by `FINAL` — the
+/// reconcile's read of the ClickHouse copy (ADR-078 B). Column order is the
+/// `AuditLogRow` field order: RowBinary is positional.
+const COPY_ROW_COLUMNS: &str = "tenant_id, seq, event_time, event_type, actor, payload, \
+                                prev_hash, row_hash, rekor_entry_id, signature, signing_pubkey";
+
+async fn read_full_rows_after(
     client: &ClickhouseClient,
     tenant_id: &TenantId,
     after_seq: u64,
     limit: u32,
-) -> anyhow::Result<Vec<ReconcileRow>> {
-    let rows = client
-        .query(&crate::clickhouse_query::ceiling(
-            "SELECT seq, prev_hash, row_hash FROM audit_log FINAL \
-             WHERE tenant_id = ? AND seq > ? \
-             ORDER BY seq ASC \
-             LIMIT ?",
-        ))
+) -> anyhow::Result<Vec<AuditLogRow>> {
+    client
+        .query(&crate::clickhouse_query::ceiling(&format!(
+            "SELECT {COPY_ROW_COLUMNS} FROM audit_log FINAL \
+             WHERE tenant_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?"
+        )))
         .bind(tenant_id.to_string())
         .bind(after_seq)
         .bind(limit)
-        .fetch_all::<ReconcileRow>()
+        .fetch_all::<AuditLogRow>()
         .await
-        .context("read audit_log rows after head for reconcile")?;
-    Ok(rows)
+        .context("read audit_log copy rows after seq")
+}
+
+/// Same, inclusive of `from_seq` (the genesis walk).
+async fn read_full_rows_from(
+    client: &ClickhouseClient,
+    tenant_id: &TenantId,
+    from_seq: u64,
+    limit: u32,
+) -> anyhow::Result<Vec<AuditLogRow>> {
+    client
+        .query(&crate::clickhouse_query::ceiling(&format!(
+            "SELECT {COPY_ROW_COLUMNS} FROM audit_log FINAL \
+             WHERE tenant_id = ? AND seq >= ? ORDER BY seq ASC LIMIT ?"
+        )))
+        .bind(tenant_id.to_string())
+        .bind(from_seq)
+        .bind(limit)
+        .fetch_all::<AuditLogRow>()
+        .await
+        .context("read audit_log copy rows from seq")
+}
+
+/// `max(seq)` the ClickHouse copy holds for a tenant; `None` when it has none.
+async fn read_ch_max_seq(
+    client: &ClickhouseClient,
+    tenant_id: &TenantId,
+) -> anyhow::Result<Option<u64>> {
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct MaxRow {
+        n: u64,
+        hi: u64,
+    }
+    let r = client
+        .query(&crate::clickhouse_query::ceiling(
+            "SELECT count() AS n, max(seq) AS hi FROM audit_log FINAL WHERE tenant_id = ?",
+        ))
+        .bind(tenant_id.to_string())
+        .fetch_one::<MaxRow>()
+        .await
+        .context("read audit_log copy max seq")?;
+    Ok((r.n > 0).then_some(r.hi))
+}
+
+/// ADR-078 (B), reconcile rule 3: write every canonical row and anchor bundle the
+/// ClickHouse copy lacks, in pages. Rows: `seq > max(seq in copy)`. Anchors:
+/// `batch_start_seq > max(batch_end_seq in copy)`. Idempotent on the copy side —
+/// `audit_log` is a ReplacingMergeTree keyed `(tenant_id, seq)`.
+async fn rebuild_copy_for_tenant(
+    pool: &deadpool_postgres::Pool,
+    ch: &ClickhouseClient,
+    tenant_id: &TenantId,
+    page: u32,
+) -> anyhow::Result<u64> {
+    let mut copied = 0u64;
+    let mut from = match read_ch_max_seq(ch, tenant_id).await? {
+        Some(hi) => hi.saturating_add(1),
+        None => 0,
+    };
+    loop {
+        let rows =
+            crate::db::ledger::read_rows_from(pool, tenant_id, from, i64::from(page)).await?;
+        let Some(last) = rows.last() else { break };
+        let next = last.seq.saturating_add(1);
+        copied += rows.len() as u64;
+        write_audit_rows(ch, rows)
+            .await
+            .context("copy rows to ClickHouse")?;
+        if next == from {
+            break;
+        }
+        from = next;
+    }
+    // Anchor bundles the copy lacks.
+    let ch_anchored_end = read_last_anchored_end(ch, tenant_id).await?;
+    let anchors = crate::db::ledger::read_anchor_records_after(
+        pool,
+        tenant_id,
+        ch_anchored_end,
+        i64::from(page),
+    )
+    .await?;
+    for a in anchors {
+        write_anchor_record(ch, a)
+            .await
+            .context("copy anchor record to ClickHouse")?;
+        copied += 1;
+    }
+    if copied > 0 {
+        tracing::info!(tenant_id = %tenant_id, copied, "audit reconcile: ClickHouse ledger copy rebuilt from the canonical store");
+    }
+    Ok(copied)
 }
 
 /// Submits hashedrekord entries to Sigstore Rekor v2.
@@ -2002,6 +2852,28 @@ struct RekorClient {
     rekor_url: Option<String>,
 }
 
+/// AUD-29 — the public half of the global (PLATFORM) signing key, base64 raw 32
+/// bytes, for `GET /v1/audit/platform-pubkey`. Parsed exactly as [`RekorClient::new`]
+/// parses it, then PROVEN before it is published (the R47 pattern,
+/// `audit_keys.rs` `derived_pubkey_verified`): a fixed probe is signed with the
+/// private key and verified with the derived public one. A key that fails either
+/// step publishes nothing — a wrong trust root is worse than an absent one.
+#[must_use]
+pub fn platform_pubkey_b64(signing_key_b64: &str) -> Option<String> {
+    const PROBE: &[u8] = b"tracelane:aud29:platform-pubkey-selfcheck:v1";
+    let mut der = B64.decode(signing_key_b64.trim()).ok()?;
+    let parsed = signature::Ed25519KeyPair::from_pkcs8(&der)
+        .or_else(|_| signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der));
+    der.zeroize();
+    let kp = parsed.ok()?;
+    let public = kp.public_key().as_ref().to_vec();
+    let sig = kp.sign(PROBE);
+    signature::UnparsedPublicKey::new(&signature::ED25519, &public)
+        .verify(PROBE, sig.as_ref())
+        .ok()?;
+    Some(B64.encode(public))
+}
+
 struct SigningMaterial {
     key_pair: signature::Ed25519KeyPair,
     /// PKCS#8 DER bytes; zeroes on drop.
@@ -2016,7 +2888,15 @@ impl RekorClient {
         let signing = signing_key_b64
             .map(|b64| {
                 let mut der = B64.decode(b64).context("base64-decode signing key")?;
+                // `from_pkcs8` wants PKCS#8 v2 (RFC 5958, seed + public key — what
+                // ring generates). `openssl genpkey -algorithm ed25519`, the procedure
+                // the self-hosting guide gave for two months, emits v1 (seed only),
+                // which v2-only parsing refused with `VersionNotSupported` — a
+                // documented setup that could not boot (2026-09-21). v1 carries the
+                // same seed; ring derives the public key from it, and "unchecked"
+                // means only that there is no embedded public key to cross-check.
                 let kp = signature::Ed25519KeyPair::from_pkcs8(&der)
+                    .or_else(|_| signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der))
                     .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 key: {e:?}"))?;
                 let pkcs8 = SecretBox::new(Box::new(der.clone()));
                 der.zeroize();
@@ -2077,16 +2957,7 @@ impl RekorClient {
         //     (security-review MED #2). Global-key fallback keeps the
         //     no-per-tenant-store / unentitled / Postgres-blip paths working.
         let ed_keypair = match self.tenant_keys.as_ref() {
-            Some(store) => match store.get_or_create(tenant_id).await {
-                Ok(kp) => Some(kp),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err, tenant_id = %tenant_id,
-                        "per-tenant Ed25519 lookup failed; falling back to global signing key"
-                    );
-                    None
-                }
-            },
+            Some(store) => tenant_key_with_retry(store, tenant_id).await,
             None => None,
         };
 
@@ -2290,6 +3161,24 @@ mod tests {
         B64.encode(doc.as_ref())
     }
 
+    /// AUD-29: the published platform pubkey is the public half of the configured
+    /// key (it verifies a signature made with it), and garbage publishes nothing.
+    #[test]
+    fn platform_pubkey_is_the_verified_public_half_or_nothing() {
+        let key = fresh_signing_key_b64();
+        let published = platform_pubkey_b64(&key).expect("a valid key publishes");
+        let der = B64.decode(&key).expect("b64");
+        let kp = signature::Ed25519KeyPair::from_pkcs8(&der).expect("pkcs8");
+        assert_eq!(published, B64.encode(kp.public_key().as_ref()));
+        let sig = kp.sign(b"any message");
+        let pk = B64.decode(&published).expect("b64");
+        signature::UnparsedPublicKey::new(&signature::ED25519, &pk)
+            .verify(b"any message", sig.as_ref())
+            .expect("the published key verifies the configured key's signatures");
+        assert_eq!(platform_pubkey_b64("not a key"), None);
+        assert_eq!(platform_pubkey_b64(&B64.encode([0u8; 16])), None);
+    }
+
     /// R17 FALSIFICATION — force REAL backfill failures and require the counter to move.
     ///
     /// The `health_body` unit test proves the FIELD is wired to the counter. It cannot
@@ -2332,8 +3221,12 @@ mod tests {
         // so this test cannot become the slow one everybody disables.
         let ch = ClickhouseClient::default().with_url("http://127.0.0.1:1");
 
+        // No Postgres here, so ClickHouse is the ONLY store and its failures keep
+        // the ADR-062 meaning (`AuditBackfillFailed`); with a pool they would be
+        // `LedgerCopyFailed` instead (ADR-078 B) — a separate claim, not this test's.
         anchor_task(
             rekor,
+            None,
             Some(ch),
             TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap()),
             vec![[9u8; 32]],
@@ -2448,6 +3341,622 @@ mod tests {
         assert_eq!(anchor_batch_start(Some(1), 4, 100), 2);
     }
 
+    // ── ADR-078 (ruled B, 2026-09-20) — the Tier-A proofs the ruling names ──────
+    //
+    // Both stores are REAL: `scripts/ci/run-ledger-integration.sh` starts a throwaway
+    // Postgres AND a throwaway ClickHouse and runs `adr078_` with both URLs set. Until
+    // that runner existed, the two `r21_*` tests below (also dual-store) had skipped in
+    // EVERY gate — neither the Postgres nor the ClickHouse runner set both variables
+    // (the founder's question B, 2026-09-20).
+
+    async fn adr078_env() -> Option<(String, deadpool_postgres::Pool)> {
+        let url = ch_test_url()?;
+        std::env::var("POSTGRES_TEST_URL").ok()?;
+        // The database first, with a client that names none — `ch_test_client`
+        // targets `tracelane`, which does not exist on a fresh throwaway.
+        ClickhouseClient::default()
+            .with_url(&url)
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        Some((url, pg_test_pool()))
+    }
+
+    async fn adr078_append_n(chain: &AuditChain, tenant: &TenantId, n: usize) {
+        for i in 0..n {
+            chain
+                .append(AuditEvent {
+                    tenant_id: tenant.clone(),
+                    event_type: "request",
+                    actor: "it".into(),
+                    payload: json!({ "i": i }),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct CopyCount {
+        n: u64,
+    }
+    async fn ch_copy_count(ch: &ClickhouseClient, tenant: &TenantId) -> u64 {
+        ch.query("SELECT count() AS n FROM audit_log FINAL WHERE tenant_id = ?")
+            .bind(tenant.to_string())
+            .fetch_one::<CopyCount>()
+            .await
+            .unwrap()
+            .n
+    }
+
+    /// The ruling's first proof: a "kill" between the Postgres COMMIT and the
+    /// ClickHouse copy — simulated by a copy client that cannot connect — leaves the
+    /// chain GREEN and complete in the canonical store, counts `LedgerCopyFailed`,
+    /// serves the export from Postgres with ClickHouse dead, and the next boot's
+    /// reconcile catches the copy up row for row.
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn adr078_a_copy_failure_leaves_the_chain_green_and_the_reconcile_rebuilds_the_copy() {
+        let Some((url, pool)) = adr078_env().await else {
+            eprintln!("skip adr078_copy_failure: needs CLICKHOUSE_TEST_URL + POSTGRES_TEST_URL");
+            return;
+        };
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+
+        // Port 1 refuses at once: every copy write fails, every canonical write lands.
+        let dead =
+            AuditChain::with_pg_pool(1000, None, Some("http://127.0.0.1:1"), Some(pool.clone()))
+                .unwrap();
+        let before = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerCopyFailed,
+        );
+        adr078_append_n(&dead, &tenant, 5).await;
+        let after = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerCopyFailed,
+        );
+        // exact-delta-ok: `run-ledger-integration.sh` runs this binary's ignored
+        // dual-store tests with `--test-threads=1`, and `LedgerCopyFailed` has exactly
+        // two noters — `append_pg_batch`'s copy (this path) and the anchor task's copy,
+        // which cannot fire here (anchor_every is 1000). Five appends, five counts.
+        assert_eq!(
+            after - before,
+            5,
+            "every failed copy is COUNTED, none refused the append"
+        );
+
+        // Canonical: 5 rows, head at 4, the leaf set chains to the head.
+        let range = crate::db::ledger::ledger_range(&pool, &tenant)
+            .await
+            .unwrap();
+        assert_eq!((range.from, range.to, range.total), (Some(0), Some(4), 5));
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        let head = heads.iter().find(|h| h.tenant_id == tenant).unwrap();
+        assert_eq!(head.last_seq, 4);
+        let leaves = crate::db::ledger::read_row_hashes(&pool, &tenant, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves[4], head.last_row_hash,
+            "the canonical row at the head IS the head"
+        );
+        assert_eq!(
+            ch_copy_count(&ch, &tenant).await,
+            0,
+            "the copy has nothing yet"
+        );
+
+        // The export streams every row from the canonical store with the copy dead (Q2).
+        let reader = crate::audit_export::PgExportReader::new(pool.clone());
+        let rows = crate::audit_export::AuditExportReader::read_range(
+            &reader,
+            &tenant,
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::hours(1),
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "export = the canonical rows, ClickHouse never consulted"
+        );
+        assert_eq!(
+            rows[4].row_hash,
+            audit_format::hex_encode(&head.last_row_hash)
+        );
+
+        // Next boot, with the copy reachable: rule 3 rebuilds it.
+        let live = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        live.warm_from_postgres().await.unwrap();
+        assert_eq!(
+            ch_copy_count(&ch, &tenant).await,
+            5,
+            "the copy caught up row for row"
+        );
+        let copy = read_full_rows_from(&ch, &tenant, 0, 100).await.unwrap();
+        for (i, r) in copy.iter().enumerate() {
+            assert_eq!(r.seq, i as u64);
+            assert_eq!(
+                r.row_hash,
+                audit_format::hex_encode(&leaves[i]),
+                "byte-identical hash in the copy"
+            );
+        }
+    }
+
+    /// B-513 / CX-14 (Codex dashboard-page review, 2026-09-21): the per-trace
+    /// chain-status read (`ClickHouseTraceReader::trace_chain_status`, the
+    /// trace-detail "in tamper-evident ledger" chip's data source) used to query
+    /// ONLY the derived ClickHouse `audit_log` copy. That copy write is fail-open
+    /// AFTER the canonical Postgres commit (`append_pg_batch`, this same kill —
+    /// a copy client on `http://127.0.0.1:1` — as `adr078_a_copy_failure…`
+    /// above) and repaired only by the next boot's reconcile, so for the whole
+    /// `LedgerCopyFailed` window the chip told a customer a call was never
+    /// proxied when the canonical ledger already held it. ADR-078 B made
+    /// Postgres canonical; this proves the read now follows that store rather
+    /// than the copy it demoted.
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn adr078_b_trace_chain_status_reads_canonical_when_the_copy_write_failed() {
+        use crate::trace_reads::{ClickHouseTraceReader, TraceReader as _};
+
+        let Some((url, pool)) = adr078_env().await else {
+            eprintln!(
+                "skip adr078_b_trace_chain_status: needs CLICKHOUSE_TEST_URL + POSTGRES_TEST_URL"
+            );
+            return;
+        };
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let trace_id = Uuid::new_v4().to_string();
+
+        // Port 1 refuses at once: the copy write fails, the canonical write lands —
+        // identical setup to `adr078_a_copy_failure…`.
+        let dead =
+            AuditChain::with_pg_pool(1000, None, Some("http://127.0.0.1:1"), Some(pool.clone()))
+                .unwrap();
+        dead.append(AuditEvent {
+            tenant_id: tenant.clone(),
+            event_type: "chat.completions.request",
+            actor: "it".into(),
+            payload: json!({ "trace_id": trace_id }),
+        })
+        .await
+        .unwrap();
+
+        // Precondition: the copy genuinely has nothing — a passing assertion below
+        // must come from the canonical store, not a copy that happened to land.
+        assert_eq!(
+            ch_copy_count(&ch, &tenant).await,
+            0,
+            "precondition: the copy write failed, nothing landed in ClickHouse"
+        );
+
+        // A reader wired to the SAME canonical pool as the write — the ClickHouse
+        // client is the real (working) test URL, which must never be consulted
+        // for presence once a pg_pool is wired: the copy is empty and a read
+        // against it would still say not-chained.
+        let reader =
+            ClickHouseTraceReader::new(ch_test_client(&url)).with_pg_pool(Some(pool.clone()));
+        let status = reader
+            .trace_chain_status(&tenant, &trace_id)
+            .await
+            .unwrap()
+            .expect(
+                "chained — the canonical Postgres ledger holds this trace_id's row \
+                 even though the ClickHouse copy write failed",
+            );
+        assert!(status.chained);
+        assert_eq!(status.seq, Some(0));
+        assert!(
+            !status.anchored,
+            "written before any batch anchored — anchor_every is 1000"
+        );
+    }
+
+    /// Rule 1 — the head-ahead-of-rows case the ruling names, in both outcomes:
+    /// canonical rows lost behind the head are filled from a copy that chains; when
+    /// the copy cannot fill them, the head is NOT reset, no gap row is written, and
+    /// `LedgerHeadAheadOfRows` is noted (RED, an incident).
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn adr078_head_ahead_of_rows_is_filled_from_the_copy_or_left_red() {
+        let Some((url, pool)) = adr078_env().await else {
+            eprintln!("skip adr078_head_ahead: needs CLICKHOUSE_TEST_URL + POSTGRES_TEST_URL");
+            return;
+        };
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        // A LIVE tenant — Neon knows it. The RED verdict below is for live tenants
+        // only; a purged tenant's head-without-rows is frozen instead (second half).
+        seed_tenant(&pool, &tenant).await;
+        let chain = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        adr078_append_n(&chain, &tenant, 6).await;
+        assert_eq!(ch_copy_count(&ch, &tenant).await, 6);
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        let head = heads
+            .iter()
+            .find(|h| h.tenant_id == tenant)
+            .unwrap()
+            .clone();
+        assert_eq!(head.last_seq, 5);
+
+        // Lose the canonical rows 3..=5 while the head stays at 5 (the migration
+        // window's shape; a Postgres restore of rows without the head cannot happen
+        // under B, but the reconcile must still be correct if it did).
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM audit_log_rows WHERE tenant_id = $1 AND seq >= 3",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(2)
+        );
+
+        let boot = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot.warm_from_postgres().await.unwrap();
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(5),
+            "the gap 3..=5 was filled from the copy"
+        );
+        let leaves = crate::db::ledger::read_row_hashes(&pool, &tenant, 0, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves[5], head.last_row_hash,
+            "and the recovered row at the head hashes to the head"
+        );
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .find(|h| h.tenant_id == tenant)
+                .unwrap()
+                .last_seq,
+            5,
+            "the head was never touched"
+        );
+
+        // Now lose them in BOTH stores: nothing can fill the gap → RED, head untouched.
+        client
+            .execute(
+                "DELETE FROM audit_log_rows WHERE tenant_id = $1 AND seq >= 3",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap();
+        ch.query("ALTER TABLE audit_log DELETE WHERE tenant_id = ? AND seq >= 3 SETTINGS mutations_sync = 2")
+            .bind(tenant.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let before = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerHeadAheadOfRows,
+        );
+        let boot2 = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot2.warm_from_postgres().await.unwrap();
+        let after = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerHeadAheadOfRows,
+        );
+        // exact-delta-ok: single-threaded under the ledger runner, and this is the only
+        // tenant with a head ahead of its rows in that database at this point.
+        assert_eq!(after - before, 1, "RED is COUNTED, once, for this tenant");
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(2),
+            "no gap row was written"
+        );
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .find(|h| h.tenant_id == tenant)
+                .unwrap()
+                .last_seq,
+            5,
+            "the head is NEVER reset downward"
+        );
+
+        // A PURGED tenant in the same shape — head at 5, rows gone from both stores,
+        // and NO `tenants` row (the purge deleted it). Frozen, not RED: the count
+        // does not move, the head is untouched, no gap row is written. The live
+        // tenant above is still head-ahead and would be counted AGAIN by this boot
+        // (the registry counts per occurrence), so retire its head first — the
+        // purged tenant must be the only head this boot reconciles.
+        client
+            .execute(
+                "DELETE FROM audit_chain_state WHERE tenant_id = $1",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap();
+        let purged = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        adr078_append_n(&chain, &purged, 6).await;
+        client
+            .execute(
+                "DELETE FROM audit_log_rows WHERE tenant_id = $1",
+                &[purged.as_uuid()],
+            )
+            .await
+            .unwrap();
+        ch.query("ALTER TABLE audit_log DELETE WHERE tenant_id = ? SETTINGS mutations_sync = 2")
+            .bind(purged.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let before = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerHeadAheadOfRows,
+        );
+        let boot3 = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot3.warm_from_postgres().await.unwrap();
+        let after = tracelane_shared::degradation::count(
+            tracelane_shared::degradation::Degradation::LedgerHeadAheadOfRows,
+        );
+        // exact-delta-ok: single-threaded under the ledger runner, and the purged
+        // tenant is the only head-ahead head left in this database (see above).
+        assert_eq!(
+            after - before,
+            0,
+            "a purged tenant's frozen head is NOT an incident"
+        );
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &purged).await.unwrap(),
+            None,
+            "no gap row was written for the purged tenant"
+        );
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .find(|h| h.tenant_id == purged)
+                .unwrap()
+                .last_seq,
+            5,
+            "the purged tenant's head is retained as-is"
+        );
+    }
+
+    /// Rule 2 — open question 7, confirmed rather than assumed: a Postgres restore to an
+    /// earlier point (head AND rows back at seq 2) while the ClickHouse copy still holds
+    /// 0..=5 → the copy rows that chain are adopted into the canonical store and the
+    /// head advances to them. A row that does NOT chain is never adopted.
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn adr078_a_copy_ahead_of_a_restored_head_is_adopted_only_while_it_chains() {
+        let Some((url, pool)) = adr078_env().await else {
+            eprintln!("skip adr078_copy_ahead: needs CLICKHOUSE_TEST_URL + POSTGRES_TEST_URL");
+            return;
+        };
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        adr078_append_n(&chain, &tenant, 6).await;
+        let full = crate::db::ledger::read_row_hashes(&pool, &tenant, 0, 5)
+            .await
+            .unwrap();
+
+        // "PITR to seq 2": rows AND head go back together.
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM audit_log_rows WHERE tenant_id = $1 AND seq >= 3",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap();
+        crate::db::audit_chain_state::upsert(&pool, &tenant, 2, &full[2])
+            .await
+            .unwrap();
+        // Rewrite the head in place (upsert is monotonic, so set it directly).
+        client
+            .execute(
+                "UPDATE audit_chain_state SET last_seq = 2, last_row_hash = $2 WHERE tenant_id = $1",
+                &[tenant.as_uuid(), &full[2].as_slice()],
+            )
+            .await
+            .unwrap();
+        // Corrupt the copy's row 5 so it does NOT chain: only 3 and 4 may be adopted.
+        ch.query("ALTER TABLE audit_log UPDATE prev_hash = 'ff' WHERE tenant_id = ? AND seq = 5 SETTINGS mutations_sync = 2")
+            .bind(tenant.to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        let boot = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot.warm_from_postgres().await.unwrap();
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        let head = heads.iter().find(|h| h.tenant_id == tenant).unwrap();
+        assert_eq!(
+            head.last_seq, 4,
+            "adopted 3 and 4 from the copy; 5 did not chain"
+        );
+        assert_eq!(head.last_row_hash, full[4]);
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(4)
+        );
+        let leaves = crate::db::ledger::read_row_hashes(&pool, &tenant, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves,
+            full[..5].to_vec(),
+            "byte-identical hashes, seq 0..=4"
+        );
+    }
+
+    /// **B-475 (REV-4), unit.** A row whose content re-hashes to its `row_hash` chains;
+    /// the SAME row with one byte of payload changed — hash fields untouched — does not;
+    /// a row whose `prev_hash` is off the running hash does not.
+    #[test]
+    fn b475_copy_row_chains_only_when_its_content_rehashes_to_its_row_hash() {
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let genesis = audit_format::genesis_prev_hash(&tenant);
+        let payload =
+            audit_format::canonical_payload(&serde_json::json!({"model": "m", "trace_id": "t"}));
+        let rh = audit_format::row_hash_v2(&genesis, &tenant, 0, "request", "u", &payload);
+        let row = AuditLogRow {
+            tenant_id: tenant.to_string(),
+            seq: 0,
+            event_time: 0,
+            event_type: "request".into(),
+            actor: "u".into(),
+            payload: payload.clone(),
+            prev_hash: audit_format::hex_encode(&genesis),
+            row_hash: audit_format::hex_encode(&rh),
+            rekor_entry_id: None,
+            signature: String::new(),
+            signing_pubkey: String::new(),
+        };
+        assert_eq!(
+            AuditChain::copy_row_chains(&row, &tenant, &genesis),
+            Some(rh)
+        );
+        let mut altered = row.clone();
+        altered.payload = payload.replace("\"m\"", "\"n\""); // one byte of CONTENT
+        assert_ne!(altered.payload, payload);
+        assert_eq!(
+            AuditChain::copy_row_chains(&altered, &tenant, &genesis),
+            None,
+            "altered content with intact hash fields must be REFUSED — this is B-475"
+        );
+        let mut off = row.clone();
+        off.prev_hash = audit_format::hex_encode(&rh);
+        assert_eq!(AuditChain::copy_row_chains(&off, &tenant, &genesis), None);
+    }
+
+    /// **B-475 (REV-4), dual-store — Rule 1.** Canonical rows 3..=5 deleted behind a
+    /// head at 5; the copy's row 4 has its `payload` ALTERED with both hash fields
+    /// intact (the exact tamper the old reconcile adopted). Now: row 3 is adopted,
+    /// 4 is refused, the head is NOT reset, `LedgerHeadAheadOfRows` is noted — an
+    /// incident, not a repair. Then Rule 2: rows 6..=7 exist only in the copy with
+    /// row 7's `actor` altered → 6 adopted, 7 refused, head 6.
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn b475_the_reconcile_refuses_a_copy_row_whose_content_was_altered() {
+        use tracelane_shared::degradation::{Degradation, count};
+        let Some((url, pool)) = adr078_env().await else {
+            eprintln!("skip b475: needs CLICKHOUSE_TEST_URL + POSTGRES_TEST_URL");
+            return;
+        };
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let chain = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        adr078_append_n(&chain, &tenant, 6).await;
+        let full = crate::db::ledger::read_row_hashes(&pool, &tenant, 0, 5)
+            .await
+            .unwrap();
+        // Seed a live tenant row so a refusal is RED (B-466 classifies an unknown
+        // tenant as purged/frozen instead).
+        seed_tenant(&pool, &tenant).await;
+        let client = pool.get().await.unwrap();
+        // Rule 1 setup: canonical rows 3..=5 gone, head stays at 5.
+        client
+            .execute(
+                "DELETE FROM audit_log_rows WHERE tenant_id = $1 AND seq >= 3",
+                &[tenant.as_uuid()],
+            )
+            .await
+            .unwrap();
+        // Tamper the COPY's row 4: payload altered, hash fields intact.
+        ch.query("ALTER TABLE audit_log UPDATE payload = concat(payload, ' ') WHERE tenant_id = ? AND seq = 4 SETTINGS mutations_sync = 2")
+            .bind(tenant.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let before = count(Degradation::LedgerHeadAheadOfRows);
+        let boot = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot.warm_from_postgres().await.unwrap();
+        assert!(
+            count(Degradation::LedgerHeadAheadOfRows) > before,
+            "an altered copy row must leave the gap OPEN and RED — this is B-475"
+        );
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(3),
+            "row 3 (intact) adopted, row 4 (altered) refused, nothing past it"
+        );
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        let head = heads.iter().find(|h| h.tenant_id == tenant).unwrap();
+        assert_eq!(head.last_seq, 5, "the head is never reset");
+        assert_eq!(head.last_row_hash, full[5]);
+
+        // Rule 2 setup: restore the canonical rows and head to 5 from the (now
+        // untampered) copy rows 4..=5 by re-appending the copy's original content —
+        // simplest: put the copy's row 4 back and let the reconcile fill, then add
+        // copy rows 6..=7 with row 7's actor altered.
+        ch.query("ALTER TABLE audit_log UPDATE payload = substring(payload, 1, length(payload) - 1) WHERE tenant_id = ? AND seq = 4 SETTINGS mutations_sync = 2")
+            .bind(tenant.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let boot2 = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot2.warm_from_postgres().await.unwrap();
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(5),
+            "restored copy fills the gap"
+        );
+        // Two more rows the copy has and the canonical store does not (head at 5).
+        let payload6 = audit_format::canonical_payload(&serde_json::json!({"model": "m6"}));
+        let h6 = audit_format::row_hash_v2(&full[5], &tenant, 6, "request", "u", &payload6);
+        let payload7 = audit_format::canonical_payload(&serde_json::json!({"model": "m7"}));
+        let h7 = audit_format::row_hash_v2(&h6, &tenant, 7, "request", "u", &payload7);
+        for (seq, prev, rh, payload, actor) in [
+            (6u64, full[5], h6, payload6.clone(), "u"),
+            (7u64, h6, h7, payload7.clone(), "ALTERED"), // hashes computed for actor "u"
+        ] {
+            ch.query(
+                "INSERT INTO audit_log (tenant_id, seq, event_time, event_type, actor, payload, prev_hash, row_hash, signature, signing_pubkey) \
+                 VALUES (?, ?, now64(6), 'request', ?, ?, ?, ?, '', '')",
+            )
+            .bind(tenant.to_string())
+            .bind(seq)
+            .bind(actor)
+            .bind(payload)
+            .bind(audit_format::hex_encode(&prev))
+            .bind(audit_format::hex_encode(&rh))
+            .execute()
+            .await
+            .unwrap();
+        }
+        let boot3 = AuditChain::with_pg_pool(1000, None, Some(&url), Some(pool.clone())).unwrap();
+        boot3.warm_from_postgres().await.unwrap();
+        let heads = crate::db::audit_chain_state::load_all(&pool).await.unwrap();
+        let head = heads.iter().find(|h| h.tenant_id == tenant).unwrap();
+        assert_eq!(
+            head.last_seq, 6,
+            "row 6 adopted; row 7 (actor altered, hashes intact) refused"
+        );
+        assert_eq!(head.last_row_hash, h6);
+        assert_eq!(
+            crate::db::ledger::max_seq(&pool, &tenant).await.unwrap(),
+            Some(6)
+        );
+        let _ = client
+            .execute("DELETE FROM tenants WHERE id = $1", &[tenant.as_uuid()])
+            .await;
+    }
+
     /// R21 — **a backlog larger than `anchor_every` must anchor from GENESIS, not from
     /// `head + 1 - anchor_every`.**
     ///
@@ -2485,12 +3994,13 @@ mod tests {
         // 250: comfortably more than `anchor_every` (100), so the threshold floor and the
         // correct answer differ by a wide, unmistakable margin.
         const BACKLOG: u64 = 250;
+        let pool = pg_test_pool();
         let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
-        seed_aged_rows(&ch, &tenant, BACKLOG, 2 * 24 * 60 * 60).await;
+        seed_aged_rows(&pool, &ch, &tenant, BACKLOG, 2 * 24 * 60 * 60).await;
 
         let key = fresh_signing_key_b64();
         let chain =
-            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pg_test_pool())).unwrap();
+            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pool.clone())).unwrap();
         let anchored = chain
             .flush_aged_batches(Duration::from_secs(24 * 60 * 60))
             .await;
@@ -2577,32 +4087,175 @@ mod tests {
 
     /// Seed `n` correctly-chained `audit_log` rows for `tenant`, all stamped
     /// `age_secs` in the past, through the PRODUCTION row writer.
-    async fn seed_aged_rows(ch: &ClickhouseClient, tenant: &TenantId, n: u64, age_secs: i64) {
+    /// Seed `n` chained rows aged `age_secs` into BOTH stores — the canonical
+    /// Postgres ledger (ADR-078 B, which the age sweep reads) and the ClickHouse
+    /// copy — plus the persisted head, exactly as `append_pg_batch` leaves them.
+    async fn seed_aged_rows(
+        pool: &deadpool_postgres::Pool,
+        ch: &ClickhouseClient,
+        tenant: &TenantId,
+        n: u64,
+        age_secs: i64,
+    ) {
         let base_us = Utc::now().timestamp_micros() - age_secs * 1_000_000;
         let mut prev = audit_format::genesis_prev_hash(tenant);
+        let mut rows = Vec::with_capacity(n as usize);
         for seq in 0..n {
             let payload = audit_format::canonical_payload(&json!({ "i": seq }));
             let rh = audit_format::row_hash_v2(&prev, tenant, seq, "request", "u", &payload);
-            write_audit_row(
-                ch,
-                AuditLogRow {
-                    tenant_id: tenant.to_string(),
-                    seq,
-                    event_time: base_us + seq as i64,
-                    event_type: "request".to_string(),
-                    actor: "u".to_string(),
-                    payload,
-                    prev_hash: audit_format::hex_encode(&prev),
-                    row_hash: audit_format::hex_encode(&rh),
-                    rekor_entry_id: None,
-                    signature: String::new(),
-                    signing_pubkey: String::new(),
-                },
-            )
-            .await
-            .unwrap();
+            rows.push(AuditLogRow {
+                tenant_id: tenant.to_string(),
+                seq,
+                event_time: base_us + seq as i64,
+                event_type: "request".to_string(),
+                actor: "u".to_string(),
+                payload,
+                prev_hash: audit_format::hex_encode(&prev),
+                row_hash: audit_format::hex_encode(&rh),
+                rekor_entry_id: None,
+                signature: String::new(),
+                signing_pubkey: String::new(),
+            });
             prev = rh;
         }
+        crate::db::ledger::insert_rows(pool, &rows).await.unwrap();
+        crate::db::audit_chain_state::upsert(pool, tenant, n - 1, &prev)
+            .await
+            .unwrap();
+        write_audit_rows(ch, rows).await.unwrap();
+    }
+
+    /// **B-483 (2026-09-21) — the sweep recovers a HOLE below the watermark, and the old
+    /// probe is the control that cannot see it.** Seeded: 300 aged rows; anchor records
+    /// for `[0..99]` and `[200..299]` — the shape prod carried after the 09-20 reboot
+    /// killed the anchor task for `29700..29799` two seconds in, with the next batch
+    /// then advancing the watermark past the hole. The old probe (`seq > watermark`)
+    /// returns `None` here — every row is "above nothing"; the hole-aware probe returns
+    /// seq 100. The sweep must anchor EXACTLY `[100..199]` (the floor is the actual
+    /// uncovered row, the ceiling the next existing batch's start — never overlapping
+    /// either neighbour), stamp it with the REAL current time (never the rows' age —
+    /// "anchored late" is evidence, not something to hide), and a second sweep must
+    /// find nothing left.
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse + Postgres (CLICKHOUSE_TEST_URL, POSTGRES_TEST_URL)"]
+    async fn b483_the_sweep_recovers_a_hole_below_the_watermark() {
+        let Some(url) = ch_test_url() else {
+            eprintln!("skip b483: CLICKHOUSE_TEST_URL unset");
+            return;
+        };
+        if std::env::var("POSTGRES_TEST_URL").is_err() {
+            eprintln!("skip b483: POSTGRES_TEST_URL unset");
+            return;
+        }
+        ClickhouseClient::default()
+            .with_url(&url)
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        let ch = ch_test_client(&url);
+        ch_reset_replacing_audit_log(&ch).await;
+        ch_reset_anchor_records(&ch).await;
+
+        const N: u64 = 300;
+        const DAY: i64 = 24 * 60 * 60;
+        let pool = pg_test_pool();
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        seed_aged_rows(&pool, &ch, &tenant, N, 2 * DAY).await;
+        let fixture_anchor = |start: u64, end: u64| AuditAnchorRecordRow {
+            tenant_id: tenant.to_string(),
+            batch_start_seq: start,
+            batch_end_seq: end,
+            merkle_root: "b483-fixture".repeat(4),
+            anchor_state: "unanchored".to_string(),
+            ed25519_sig: "b483-fixture".to_string(),
+            ed25519_pubkey: "b483-fixture".to_string(),
+            ecdsa_pubkey_spki: String::new(),
+            rekor_log_url: String::new(),
+            rekor_log_index: String::new(),
+            canonicalized_body: String::new(),
+            inclusion_proof: String::new(),
+            checkpoint_envelope: String::new(),
+            anchored_at: Utc::now().timestamp_micros() - 2 * DAY * 1_000_000,
+        };
+        for (a, b) in [(0u64, 99u64), (200, 299)] {
+            crate::db::ledger::insert_anchor_record(&pool, &fixture_anchor(a, b))
+                .await
+                .unwrap();
+        }
+
+        // The CONTROL: the pre-B-483 probe sees nothing to do — the watermark is 299
+        // and no row sits above it. This is exactly why the 100 rows on prod were
+        // buried; a probe that returned Some here would mean the class was never real.
+        let old = crate::db::ledger::oldest_unanchored(&pool, &tenant, Some(299))
+            .await
+            .unwrap();
+        assert!(
+            old.is_none(),
+            "the old probe cannot see a hole below the watermark: {old:?}"
+        );
+        // The hole-aware probe sees the hole, and knows it IS a hole.
+        let probe = crate::db::ledger::oldest_uncovered(&pool, &tenant)
+            .await
+            .unwrap()
+            .expect("the hole-aware probe finds the uncovered row");
+        assert_eq!(
+            (probe.seq, probe.head, probe.watermark),
+            (100, 299, Some(299))
+        );
+
+        let key = fresh_signing_key_b64();
+        let chain =
+            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pool.clone())).unwrap();
+        // A hole is anchored regardless of max_age — pass a HUGE max_age so a pass
+        // here cannot come from the age rule.
+        let before = Utc::now().timestamp_micros();
+        let anchored = chain
+            .flush_aged_batches(Duration::from_secs(365 * DAY as u64))
+            .await;
+        assert_eq!(anchored, 1, "exactly one batch: the hole");
+
+        let records = crate::db::ledger::read_anchor_records_after(&pool, &tenant, None, 100)
+            .await
+            .unwrap();
+        let mut ranges: Vec<(u64, u64)> = records
+            .iter()
+            .map(|r| (r.batch_start_seq, r.batch_end_seq))
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges,
+            vec![(0, 99), (100, 199), (200, 299)],
+            "the hole is filled EXACTLY, overlapping neither neighbour"
+        );
+        let filled = records
+            .iter()
+            .find(|r| r.batch_start_seq == 100)
+            .expect("the filled batch");
+        assert!(
+            filled.anchored_at >= before,
+            "anchored_at is the REAL time of the late anchor ({}), never backdated to the rows' age",
+            filled.anchored_at
+        );
+        assert!(
+            !filled.ed25519_sig.is_empty() && filled.ed25519_sig != "b483-fixture",
+            "the filled batch is really signed"
+        );
+        // Coverage is complete: a second sweep finds nothing, and the probe agrees.
+        assert_eq!(
+            chain
+                .flush_aged_batches(Duration::from_secs(365 * DAY as u64))
+                .await,
+            0,
+            "nothing left to anchor"
+        );
+        assert!(
+            crate::db::ledger::oldest_uncovered(&pool, &tenant)
+                .await
+                .unwrap()
+                .is_none(),
+            "every row is inside an anchor batch"
+        );
     }
 
     /// R21 — **`flush_aged_batches` itself, against a live ClickHouse, in BOTH
@@ -2669,17 +4322,18 @@ mod tests {
         const WIDTH: u64 = 37;
         const DAY: i64 = 24 * 60 * 60;
 
+        let pool = pg_test_pool();
         let aged = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
         let fresh = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
-        seed_aged_rows(&ch, &aged, WIDTH, 2 * DAY).await; // 48 h old — must flush
-        seed_aged_rows(&ch, &fresh, WIDTH, 0).await; // just now  — must NOT flush
+        seed_aged_rows(&pool, &ch, &aged, WIDTH, 2 * DAY).await; // 48 h old — must flush
+        seed_aged_rows(&pool, &ch, &fresh, WIDTH, 0).await; // just now  — must NOT flush
 
         // A signing key, because every write in `anchor_task` is gated on
         // `outcome.is_signed()`; with no key the batch produces no record and the
         // end-state assertions below would pass vacuously against a no-op.
         let key = fresh_signing_key_b64();
         let chain =
-            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pg_test_pool())).unwrap();
+            AuditChain::with_pg_pool(100, Some(&key), Some(&url), Some(pool.clone())).unwrap();
 
         // NEITHER tenant is seeded into `chain.states`, and that is the point.
         // `states` is written at exactly one non-test site — `warm_from_postgres`, at
@@ -2691,9 +4345,33 @@ mod tests {
             "precondition: the sweep must find these tenants without any in-memory state"
         );
 
+        // B-559: a skip from an EARLIER pass (prod 2026-09-25 03:48: one transient
+        // Postgres error on the tenant enumeration) must be closed by the next pass that
+        // reads every tenant cleanly. Until the fix nothing resolved it, so
+        // `audit_attestation_healthy` read false — and the status page CRITICAL — for
+        // 24 h+ over a ledger whose only uncovered rows were the ordinary tail.
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped,
+        );
+        assert!(
+            tracelane_shared::degradation::is_open(
+                tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped
+            ),
+            "precondition: the planted earlier skip is open"
+        );
+
         let anchored = chain
             .flush_aged_batches(Duration::from_secs(DAY as u64))
             .await;
+
+        assert!(
+            !tracelane_shared::degradation::is_open(
+                tracelane_shared::degradation::Degradation::AuditAgeSweepSkipped
+            ),
+            "B-559: a sweep pass that read every tenant without a skip must RESOLVE the \
+             earlier skip — otherwise one transient read error holds the ledger's \
+             attestation health red until the process restarts"
+        );
 
         assert_eq!(
             anchored, 1,
@@ -3078,9 +4756,29 @@ mod tests {
         assert!(parse_v2_receipt(&v, "https://log").is_err());
     }
 
+    /// An `openssl genpkey -algorithm ed25519` key (PKCS#8 **v1**: seed only, no
+    /// public key) is accepted — the self-hosting guide's own procedure produced
+    /// one, and `RekorClient::new` refused it with `VersionNotSupported` until
+    /// 2026-09-21. The vector is the v1 DER prefix (`OneAsymmetricKey` v0,
+    /// `id-Ed25519`, `CurvePrivateKey` OCTET STRING) over a fixed 32-byte seed.
+    #[test]
+    fn an_openssl_v1_pkcs8_ed25519_key_is_accepted() {
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&[0x5a; 32]);
+        let b64 = B64.encode(&der);
+        let client = RekorClient::new(Some(&b64), None).expect("a v1 PKCS#8 key boots");
+        assert!(client.signing.is_some(), "the key was loaded");
+        // A truncated DER is still refused — leniency is about the VERSION, not the bytes.
+        let broken = B64.encode(&der[..20]);
+        assert!(RekorClient::new(Some(&broken), None).is_err());
+    }
+
     /// Keygen utility — prints a fresh ring-generated **v2** PKCS#8 Ed25519 key for
-    /// provisioning `TRACELANE_REKOR_SIGNING_KEY`. `openssl genpkey` emits v1 PKCS#8
-    /// which `RekorClient::new`'s `from_pkcs8` rejects; this is the reliable source.
+    /// provisioning `TRACELANE_REKOR_SIGNING_KEY`. `openssl genpkey` emits v1 PKCS#8,
+    /// accepted since 2026-09-21; this remains the reliable source for a v2 key.
     /// Run explicitly:
     ///   cargo test -p gateway --bin gateway print_signing_key -- --ignored --nocapture
     #[test]
@@ -4155,5 +5853,339 @@ mod tests {
             .await
             .expect("chain keeps advancing after the Rekor outage");
         assert_eq!(chain.states.get(&t).unwrap().lock().seq, 8);
+    }
+
+    // — B-493: the self-host (no Postgres) ledger writer ----------------------
+    //
+    // Reproduced 2026-09-21 on this box with the published self-host ClickHouse
+    // config (`max_concurrent_queries` 20): 16 users for 30 s admitted 5,941
+    // requests; the in-memory path spawned ONE single-row INSERT per ledger
+    // event (~11,875 of them), ClickHouse refused them by the thousand
+    // (`TOO_MANY_SIMULTANEOUS_QUERIES`), each refusal was a `warn!` — and
+    // 9,114 of 11,875 ledger rows never landed. The chain state had advanced
+    // for every one of them. The same storm refused ingest's span batches and
+    // the ingest process exited (its own test is in `clickhouse_writer.rs`).
+    //
+    // These three tests pin the fix: rows ride a bounded queue to ONE writer
+    // that batches, retries a refused batch until it lands, and refuses the
+    // APPEND (fail-closed, ADR-069) when the queue is full — never dropping a
+    // row whose seq the chain already consumed.
+
+    /// A ClickHouse stand-in that refuses the first `refuse` requests with the
+    /// exact error prod's self-host config produces, then accepts everything.
+    struct RefuseFirst {
+        seen: std::sync::atomic::AtomicUsize,
+        refuse: usize,
+    }
+
+    impl wiremock::Respond for RefuseFirst {
+        fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.refuse {
+                wiremock::ResponseTemplate::new(503).set_body_string(
+                    "Code: 202. DB::Exception: Too many simultaneous queries. Maximum: 20. \
+                     (TOO_MANY_SIMULTANEOUS_QUERIES)",
+                )
+            } else {
+                wiremock::ResponseTemplate::new(200)
+            }
+        }
+    }
+
+    /// Seqs in one `audit_log` INSERT body (inflated RowBinary, the `AuditLogRow`
+    /// column order): `tenant_id` String · `seq` u64 · `event_time` i64 ·
+    /// `event_type` · `actor` · `payload` · `prev_hash` · `row_hash` (Strings) ·
+    /// `rekor_entry_id` Nullable(String) · `signature` · `signing_pubkey`.
+    fn b493_seqs_in(body: &[u8]) -> Vec<u64> {
+        let raw = b493_inflate(body);
+        let mut at = 0usize;
+        let mut seqs = Vec::new();
+        fn varint(raw: &[u8], at: &mut usize) -> usize {
+            let (mut n, mut shift) = (0usize, 0u32);
+            loop {
+                let b = raw[*at];
+                *at += 1;
+                n |= usize::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    return n;
+                }
+                shift += 7;
+            }
+        }
+        fn skip_string(raw: &[u8], at: &mut usize) {
+            let n = varint(raw, at);
+            *at += n;
+        }
+        while at < raw.len() {
+            skip_string(&raw, &mut at); // tenant_id
+            seqs.push(u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()));
+            at += 8 + 8; // seq, event_time
+            for _ in 0..5 {
+                skip_string(&raw, &mut at); // event_type, actor, payload, prev_hash, row_hash
+            }
+            let null_flag = raw[at];
+            at += 1;
+            if null_flag == 0 {
+                skip_string(&raw, &mut at); // rekor_entry_id
+            }
+            skip_string(&raw, &mut at); // signature
+            skip_string(&raw, &mut at); // signing_pubkey
+        }
+        seqs
+    }
+
+    fn b493_event(i: usize) -> AuditEvent {
+        AuditEvent {
+            tenant_id: tenant(),
+            event_type: "chat.completions.request",
+            actor: "b493".into(),
+            payload: json!({ "i": i }),
+        }
+    }
+
+    /// The clickhouse crate ships INSERT bodies as ClickHouse compressed blocks
+    /// (`[16 B checksum][0x82][u32 compressed incl. 9 B header][u32 raw][LZ4 block]`,
+    /// repeated). Inflate them so the RowBinary is readable.
+    fn b493_inflate(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 25 <= body.len() {
+            let method = body[at + 16];
+            let comp = u32::from_le_bytes(body[at + 17..at + 21].try_into().unwrap()) as usize;
+            let raw = u32::from_le_bytes(body[at + 21..at + 25].try_into().unwrap()) as usize;
+            assert_eq!(method, 0x82, "LZ4 block expected");
+            let data = &body[at + 25..at + 16 + comp];
+            out.extend(lz4_flex::block::decompress(data, raw).expect("lz4 block"));
+            at += 16 + comp;
+        }
+        out
+    }
+
+    /// Rows per INSERT body = occurrences of the tenant id string (once per
+    /// row; the payload `{"i":n}` never contains it).
+    fn b493_rows_in(body: &[u8]) -> usize {
+        let raw = b493_inflate(body);
+        let needle = tenant().to_string();
+        let needle = needle.as_bytes();
+        raw.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    #[tokio::test]
+    async fn b493_self_host_ledger_rows_are_batched_retried_and_never_dropped() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(RefuseFirst {
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                refuse: 2,
+            })
+            .mount(&server)
+            .await;
+        let chain = AuditChain::new(1_000_000, None, Some(&server.uri())).unwrap();
+        const N: usize = 500;
+        for i in 0..N {
+            chain.append(b493_event(i)).await.expect("append");
+        }
+        assert_eq!(chain.in_memory_seq(&tenant()), N as u64);
+        chain
+            .drain_ledger_writer(std::time::Duration::from_secs(20))
+            .await
+            .expect("every queued row lands within the drain window");
+        let stats = chain.ledger_writer_stats();
+        assert_eq!(
+            stats.landed, N as u64,
+            "every row the chain consumed landed"
+        );
+        assert!(
+            stats.retried_batches >= 1,
+            "a refused batch was retried, not dropped: {stats:?}"
+        );
+        // The wire: the retried body is byte-identical to the refused one, so
+        // distinct bodies × their rows = N, and no row appears in two distinct
+        // bodies (each seq is in exactly one batch).
+        let reqs = server.received_requests().await.expect("recorded");
+        let mut distinct: Vec<&[u8]> = Vec::new();
+        for r in &reqs {
+            if !distinct.contains(&r.body.as_slice()) {
+                distinct.push(&r.body);
+            }
+        }
+        let rows_on_the_wire: usize = distinct.iter().map(|b| b493_rows_in(b)).sum();
+        assert_eq!(
+            rows_on_the_wire, N,
+            "each seq reached ClickHouse in exactly one batch"
+        );
+        assert!(
+            reqs.len() <= N / 10,
+            "rows were BATCHED: {} inserts for {N} rows (was one insert per row)",
+            reqs.len()
+        );
+    }
+
+    /// Every anchor record reaches ClickHouse only AFTER every row it covers was
+    /// ACCEPTED (a 200, not merely attempted) — the signature backfill is an
+    /// `ALTER … UPDATE` that finds nothing if it outruns them. Refused attempts
+    /// are excluded from the count (the retried body is byte-identical), so a
+    /// writer that dispatched the anchor after a REFUSED attempt would fail here.
+    /// Then the same property under 16 CONCURRENT appenders with a signing key:
+    /// queue order must equal seq order per tenant (the sends happen under the
+    /// chain lock), so no row can land behind the anchor that covers it.
+    #[tokio::test]
+    async fn b493_a_refused_batch_is_retried_until_it_lands_and_the_anchor_waits_for_it() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(RefuseFirst {
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                refuse: 3,
+            })
+            .mount(&server)
+            .await;
+        let key_b64 = fresh_signing_key_b64();
+        let chain = AuditChain::new(4, Some(&key_b64), Some(&server.uri())).unwrap();
+        for i in 0..8 {
+            chain.append(b493_event(i)).await.expect("append");
+        }
+        chain
+            .drain_ledger_writer(std::time::Duration::from_secs(20))
+            .await
+            .expect("drained");
+        let stats = chain.ledger_writer_stats();
+        assert_eq!(stats.landed, 8);
+        assert!(stats.retried_batches >= 1, "{stats:?}");
+        b493_assert_anchors_follow_their_rows(&server, 3, 4).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b493_concurrent_appends_keep_every_anchor_behind_its_rows() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(RefuseFirst {
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                refuse: 2,
+            })
+            .mount(&server)
+            .await;
+        let key_b64 = fresh_signing_key_b64();
+        let chain = Arc::new(AuditChain::new(10, Some(&key_b64), Some(&server.uri())).unwrap());
+        const USERS: usize = 16;
+        const PER_USER: usize = 50;
+        let mut tasks = Vec::new();
+        for u in 0..USERS {
+            let chain = Arc::clone(&chain);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..PER_USER {
+                    chain
+                        .append(b493_event(u * PER_USER + i))
+                        .await
+                        .expect("append");
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        chain
+            .drain_ledger_writer(std::time::Duration::from_secs(30))
+            .await
+            .expect("drained");
+        assert_eq!(
+            chain.ledger_writer_stats().landed,
+            (USERS * PER_USER) as u64
+        );
+        b493_assert_anchors_follow_their_rows(&server, 2, 10).await;
+        assert_eq!(
+            chain.ledger_writer_stats().anchors_before_rows,
+            0,
+            "the writer never saw an anchor ahead of a row it covers"
+        );
+    }
+
+    /// The first `refused` recorded requests are the ones `RefuseFirst` refused
+    /// (arrival order = record order). Walk the ACCEPTED requests in order: before
+    /// the k-th anchor record, the accepted `audit_log` bodies must together hold
+    /// every seq of batch k (`[k·n .. k·n+n-1]`), and the rows landed in seq order.
+    async fn b493_assert_anchors_follow_their_rows(
+        server: &wiremock::MockServer,
+        refused: usize,
+        anchor_every: u64,
+    ) {
+        let reqs = server.received_requests().await.expect("recorded");
+        let q = |r: &wiremock::Request| r.url.query().unwrap_or_default().to_string();
+        let mut landed: Vec<u64> = Vec::new();
+        let mut anchors_seen = 0u64;
+        for (i, r) in reqs.iter().enumerate() {
+            if i < refused {
+                continue;
+            }
+            let query = q(r);
+            if query.contains("audit_anchor_records") {
+                let (lo, hi) = (
+                    anchors_seen * anchor_every,
+                    anchors_seen * anchor_every + anchor_every - 1,
+                );
+                for seq in lo..=hi {
+                    assert!(
+                        landed.contains(&seq),
+                        "anchor #{anchors_seen} for [{lo}..{hi}] reached ClickHouse before row {seq} was ACCEPTED \
+                         (landed so far: {} rows)",
+                        landed.len()
+                    );
+                }
+                anchors_seen += 1;
+            } else if query.contains("audit_log") {
+                landed.extend(b493_seqs_in(&r.body));
+            }
+        }
+        assert!(anchors_seen >= 1, "at least one anchor record was written");
+        assert!(
+            landed.windows(2).all(|w| w[1] == w[0] + 1),
+            "rows reached ClickHouse in seq order: {landed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn b493_a_saturated_self_host_ledger_writer_refuses_the_append_fail_closed() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        // ClickHouse never answers: the writer's in-flight batch never lands and
+        // the queue fills. The append must then FAIL (503 upstream), and the chain
+        // must not have consumed a seq for the refused event — a seq without a
+        // row is the hole this test exists to forbid.
+        wiremock::Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(300)),
+            )
+            .mount(&server)
+            .await;
+        let chain = AuditChain::new(1_000_000, None, Some(&server.uri())).unwrap();
+        let mut ok = 0u64;
+        let mut refused = false;
+        for i in 0..(LEDGER_WRITER_QUEUE_ROWS + LEDGER_WRITER_BATCH_ROWS + 10) {
+            match chain.append(b493_event(i)).await {
+                Ok(()) => ok += 1,
+                Err(err) => {
+                    refused = true;
+                    assert!(
+                        err.to_string().contains("ledger writer"),
+                        "the refusal names the writer: {err}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(refused, "a full queue REFUSES the append (fail-closed)");
+        assert_eq!(
+            chain.in_memory_seq(&tenant()),
+            ok,
+            "the chain consumed a seq for every ACCEPTED append and none for the refused one"
+        );
+        // Two slots are reserved per append (row + a possible anchor), so the
+        // refusal comes when ONE slot is left: capacity − 1 accepted at least.
+        assert!(
+            ok + 1 >= LEDGER_WRITER_QUEUE_ROWS as u64,
+            "the queue holds its capacity before refusing: {ok}"
+        );
     }
 }

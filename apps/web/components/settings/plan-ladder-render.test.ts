@@ -95,6 +95,23 @@ describe("SET-15 — honesty locks hold in the rendered copy", () => {
 	});
 });
 
+describe("item 5 — the Annual toggle and 'or annually' wording never outrun plans.v3.json", () => {
+	const html = renderLadder("team");
+
+	it("plans.v3.json currently carries annual_available: false (the premise of this fix)", () => {
+		expect(PLANS_V3.policy.annual_available).toBe(false);
+	});
+
+	it("hides the Monthly/Annual toggle while annual_available is false", () => {
+		expect(html).not.toContain('aria-label="Billing interval"');
+	});
+
+	it('never says "or annually" while annual_available is false', () => {
+		expect(html).not.toContain("or annually");
+		expect(html).toContain("billed monthly");
+	});
+});
+
 // ---------------------------------------------------------------------------
 // POSITIVE — what the customer can now read and do
 // ---------------------------------------------------------------------------

@@ -1,0 +1,390 @@
+{
+  "version": "v1",
+  "limits": {
+    "identities": 200,
+    "cross_list": 10,
+    "recent_traces": 20,
+    "agent_name_chars": 64
+  },
+  "makers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "mark": "makers/openai.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "mark": "makers/anthropic.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "google",
+      "label": "Google",
+      "mark": "makers/google.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "meta",
+      "label": "Meta",
+      "mark": "makers/meta.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "xai",
+      "label": "xAI",
+      "mark": "makers/xai.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "mistral",
+      "label": "Mistral",
+      "mark": "makers/mistral.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "mark": "makers/deepseek.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "cognition",
+      "label": "Cognition",
+      "mark": "makers/cognition.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "microsoft",
+      "label": "Microsoft",
+      "mark": "makers/microsoft.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "anysphere",
+      "label": "Anysphere",
+      "mark": "makers/anysphere.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    }
+  ],
+  "models": [
+    {
+      "family": "gpt-6-sol",
+      "match": "^gpt-6-sol$",
+      "maker": "openai",
+      "label": "GPT-6 Sol",
+      "avatar": {
+        "kind": "motif",
+        "glyph": "sun"
+      },
+      "motif_source": "https://openai.com/index/gpt-6-astra/"
+    },
+    {
+      "family": "gpt-6-luna",
+      "match": "^gpt-6-luna$",
+      "maker": "openai",
+      "label": "GPT-6 Luna",
+      "avatar": {
+        "kind": "motif",
+        "glyph": "moon"
+      },
+      "motif_source": "https://openai.com/index/gpt-6-astra/"
+    },
+    {
+      "family": "gpt-6-astra",
+      "match": "^gpt-6-astra$",
+      "maker": "openai",
+      "label": "GPT-6 Astra",
+      "avatar": {
+        "kind": "motif",
+        "glyph": "star"
+      },
+      "motif_source": "https://openai.com/index/gpt-6-astra/"
+    },
+    {
+      "family": "claude-haiku-4-5",
+      "match": "^claude-haiku-4-5$",
+      "maker": "anthropic",
+      "label": "Claude Haiku 4.5",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "claude-sonnet-4-6",
+      "match": "^claude-sonnet-4-6$",
+      "maker": "anthropic",
+      "label": "Claude Sonnet 4.6",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "claude-opus-4-6",
+      "match": "^claude-opus-4-6$",
+      "maker": "anthropic",
+      "label": "Claude Opus 4.6",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "claude-fable-5-1",
+      "match": "^claude-fable-5-1$",
+      "maker": "anthropic",
+      "label": "Claude Fable 5.1",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "gemini-2.5-flash-lite",
+      "match": "^gemini-2\\.5-flash-lite$",
+      "maker": "google",
+      "label": "Gemini 2.5 Flash Lite",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "gemini-2.5-flash",
+      "match": "^gemini-2\\.5-flash$",
+      "maker": "google",
+      "label": "Gemini 2.5 Flash",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "gemini-2.5-pro",
+      "match": "^gemini-2\\.5-pro$",
+      "maker": "google",
+      "label": "Gemini 2.5 Pro",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "grok-3",
+      "match": "^grok-3$",
+      "maker": "xai",
+      "label": "Grok 3",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "grok-3-mini",
+      "match": "^grok-3-mini$",
+      "maker": "xai",
+      "label": "Grok 3 Mini",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "grok-4",
+      "match": "^grok-4$",
+      "maker": "xai",
+      "label": "Grok 4",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "gpt-4o-mini",
+      "match": "^gpt-4o-mini$",
+      "maker": "openai",
+      "label": "GPT-4o mini",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "gpt-4o",
+      "match": "^gpt-4o$",
+      "maker": "openai",
+      "label": "GPT-4o",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "llama-3.3-70b-versatile",
+      "match": "^llama-3\\.3-70b-versatile$",
+      "maker": "meta",
+      "label": "Llama 3.3 70B Versatile",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "deepseek-chat",
+      "match": "^deepseek-chat$",
+      "maker": "deepseek",
+      "label": "DeepSeek Chat",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "deepseek-reasoner",
+      "match": "^deepseek-reasoner$",
+      "maker": "deepseek",
+      "label": "DeepSeek Reasoner",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "mistral-large-latest",
+      "match": "^mistral-large-latest$",
+      "maker": "mistral",
+      "label": "Mistral Large",
+      "avatar": {
+        "kind": "maker_mark"
+      }
+    },
+    {
+      "family": "text-embedding-3-small",
+      "match": "^text-embedding-3-small$",
+      "maker": "openai",
+      "label": "text-embedding-3-small",
+      "avatar": {
+        "kind": "maker_mark"
+      },
+      "motif_source": "https://openai.com/index/gpt-6-astra/"
+    }
+  ],
+  "agents": [
+    {
+      "id": "claude-code",
+      "label": "Claude Code",
+      "kind": "coding agent",
+      "maker": "anthropic",
+      "mark": "agents/claude-code.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "kind": "coding agent",
+      "maker": "openai",
+      "mark": "agents/codex.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "devin",
+      "label": "Devin",
+      "kind": "coding agent",
+      "maker": "cognition",
+      "mark": "agents/devin.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "cursor",
+      "label": "Cursor",
+      "kind": "coding agent",
+      "maker": "anysphere",
+      "mark": "agents/cursor.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "gemini-cli",
+      "label": "Gemini CLI",
+      "kind": "coding agent",
+      "maker": "google",
+      "mark": "agents/gemini-cli.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "copilot",
+      "label": "Copilot",
+      "kind": "coding agent",
+      "maker": "microsoft",
+      "mark": "agents/copilot.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "aider",
+      "label": "Aider",
+      "kind": "coding agent"
+    },
+    {
+      "id": "cline",
+      "label": "Cline",
+      "kind": "coding agent",
+      "mark": "agents/cline.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "openhands",
+      "label": "OpenHands",
+      "kind": "coding agent",
+      "mark": "agents/openhands.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "goose",
+      "label": "Goose",
+      "kind": "coding agent",
+      "mark": "agents/goose.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    },
+    {
+      "id": "amp",
+      "label": "Amp",
+      "kind": "coding agent",
+      "mark": "agents/amp.svg",
+      "mark_source": "https://github.com/lobehub/lobe-icons (@lobehub/icons-static-svg 1.95.1)",
+      "mark_license": "MIT (icon set); logo is the owner's trademark — nominative use"
+    }
+  ],
+  "clients": [
+    {
+      "id": "claude-code",
+      "ua_pattern": "^claude-cli/",
+      "label": "Claude Code",
+      "observed": {
+        "date": "2026-09-24",
+        "client_version": "2.1.281",
+        "request_path": "/v1/messages?beta=true",
+        "method": "local HTTP request from the installed CLI"
+      }
+    },
+    {
+      "id": "codex",
+      "ua_pattern": "^codex_exec/",
+      "label": "Codex",
+      "observed": {
+        "date": "2026-09-24",
+        "client_version": "0.155.1",
+        "request_path": "/v1/responses",
+        "method": "local HTTP request from the installed CLI"
+      }
+    }
+  ],
+  "fallback": {
+    "kind": "monogram"
+  }
+}

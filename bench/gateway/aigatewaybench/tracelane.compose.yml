@@ -72,9 +72,14 @@ services:
     image: nats:2.10-alpine
     network_mode: host
     # Default client port 4222 is free on this box; monitoring on 8222 too.
-    command: ["-js", "-sd", "/data", "-m", "8222"]
+    # REV-2 (2026-09-20): the config comes from a FILE so the sync policy is a
+    # one-line variant beside the published default (run.sh: GWBENCH_NATS_CONF →
+    # GWBENCH_NATS_CONF_ABS). `configs/nats-default.conf` is exactly the old
+    # `-js -sd /data -m 8222`.
+    command: ["-c", "/etc/nats/nats.conf"]
     volumes:
       - tracelane_bench_nats_data:/data
+      - ${GWBENCH_NATS_CONF_ABS:?run.sh sets this}:/etc/nats/nats.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
       interval: 5s

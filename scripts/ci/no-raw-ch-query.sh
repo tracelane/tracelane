@@ -169,6 +169,12 @@ scan_tree() {
             # every other entry here, that the grep matches `.query(` regardless
             # of the wrapper. The selftest still blocks a planted raw call.
             crates/gateway/src/online_eval_routes.rs) continue ;;
+            # SET-38 B2 (2026-09-28) — `GET /v1/keys/{id}`'s `recorded_usd`. COMPLIANT,
+            # NOT EXEMPT: the one SELECT is built by `TenantQuery::new(key_spend_sql(..),
+            # tier).sql_with_settings()` at the tenant's own tier, binds the tenant from
+            # the validated claim first, and is human-triggered (a drawer opening).
+            # Listed because the grep matches `.query(` regardless of the wrapper.
+            crates/gateway/src/key_routes.rs) continue ;;
             # EVL-29 item 12 — annotation queues. COMPLIANT, NOT EXEMPT.
             #
             # ONE SELECT: the read-time candidate query behind a queue (founder
@@ -267,6 +273,12 @@ scan_tree() {
             #   grep -c '\.query(' crates/gateway/src/tool_analytics.rs       # 1
             #   grep -c 'TenantQuery::new(' crates/gateway/src/tool_analytics.rs # 1
             crates/gateway/src/tool_analytics.rs) continue ;;
+            # OBS-54 KYA identities. COMPLIANT, NOT EXEMPT: every `.query` site
+            # passes `TenantQuery::new(build_sql(..), tier).sql_with_settings()` —
+            # the prod read with the tenant's OWN tier, the two test sites with Free.
+            #   grep -c 'TenantQuery::new(' crates/gateway/src/kya_routes.rs  # 3
+            #   grep -c '\.query(' crates/gateway/src/kya_routes.rs           # 3
+            crates/gateway/src/kya_routes.rs) continue ;;
             # ── SURFACED 2026-08-13 by widening the trigger; DECLARED, not silent ──
             # These became visible only when the trigger stopped requiring a
             # direct `use clickhouse::` import. Each was checked rather than waved

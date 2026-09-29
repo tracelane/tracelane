@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tracelane_shared::{TenantId, TracelaneSpan};
+use tracelane_shared::{DispatchAttempt, TenantId, TracelaneSpan};
 use uuid::Uuid;
 
 use super::AppState;
@@ -73,8 +73,16 @@ pub(crate) fn emit_post_ledger_error_span(
     request_start: chrono::DateTime<chrono::Utc>,
     reason: &str,
     aft_id: Option<&str>,
+    // RI-05 M1: the attempts that led here. The terminal FAILURE span is exactly the
+    // one an operator opens, so the ledger lands on it too — not only on a success.
+    dispatch_attempts: Vec<DispatchAttempt>,
+    // GWY-49: `Some(eligible)` when the request carried `x-tracelane-zdr: required` —
+    // the providers the constraint left standing (EMPTY on a `zdr_unsatisfiable`
+    // refusal). On the error span too, so an auditor filtering
+    // `tracelane_zdr_required = true` sees the refusals, not only the served requests.
+    zdr_eligible: Option<Vec<String>>,
 ) {
-    let span = build_error_span(
+    let mut span = build_error_span(
         tenant_id,
         trace_id,
         parent_span_id,
@@ -83,7 +91,12 @@ pub(crate) fn emit_post_ledger_error_span(
         request_start,
         reason,
         aft_id,
+        dispatch_attempts,
     );
+    if let Some(eligible) = zdr_eligible {
+        span.attributes.tracelane_zdr_required = Some(true);
+        span.attributes.tracelane_zdr_eligible_providers = Some(eligible);
+    }
     // Test seam (B-385 2c): observable to a test whether or not NATS is wired.
     #[cfg(test)]
     crate::otlp_emit::test_sink::record(&span);
@@ -126,6 +139,7 @@ pub(super) fn build_error_span(
     // function differing only in passing `Some(aft_id)` here. Its sole caller already
     // branched on `Option<&str>` and then chose between two identical bodies.
     aft_id: Option<&str>,
+    dispatch_attempts: Vec<DispatchAttempt>,
 ) -> TracelaneSpan {
     build_gateway_span(
         tenant_id,
@@ -145,6 +159,15 @@ pub(super) fn build_error_span(
             cache_creation_input_tokens: None,
             stream: false,
             cost_usd: None,
+            served: crate::server::ServedMeta::default(),
+            finish_reason: None,
+            // RI-05 M1: the ledger the caller collected before giving up — a
+            // pre-dispatch refusal or a guardrail block passes an empty one; the
+            // dispatch-exhausted path passes every attempt and skip. The write
+            // rule (`dispatch_attempts_worth_recording`) still applies, so an
+            // empty ledger stays absent.
+            dispatch_attempts,
+            reasoning_output_tokens: None,
         },
         None,
         None, // timing: no measured provider round-trip on a failure/block span
@@ -222,8 +245,80 @@ pub(crate) fn env_fallback_allowed(has_control_plane: bool, has_master_key: bool
     !(has_control_plane && has_master_key)
 }
 
+/// One read of a `(tenant, provider)` BYOK row, decrypted under its AAD. Shared
+/// by the inline path and the B-568 F2 background refresh, so the two can never
+/// disagree about what "usable" means.
+enum ByokFetch {
+    Key(std::sync::Arc<secrecy::SecretString>),
+    NoRow,
+    Undecryptable(anyhow::Error),
+    LookupError(anyhow::Error),
+}
+
+async fn fetch_byok(
+    pool: &deadpool_postgres::Pool,
+    master: &crate::byok::ByokMasterKey,
+    tenant_id: &TenantId,
+    provider_id: &str,
+) -> ByokFetch {
+    match crate::db::provider_keys::get(pool, tenant_id, provider_id).await {
+        Ok(Some(row)) => {
+            let aad = crate::byok::provider_key_aad(tenant_id, provider_id);
+            match master.decrypt_with_context(&row.ciphertext_b64, &aad) {
+                Ok(plaintext) => ByokFetch::Key(std::sync::Arc::new(plaintext)),
+                Err(e) => ByokFetch::Undecryptable(e),
+            }
+        }
+        Ok(None) => ByokFetch::NoRow,
+        Err(e) => ByokFetch::LookupError(e),
+    }
+}
+
+/// What a background refresh does with what it read. Pure, so the fail-CLOSED
+/// mapping is asserted directly: a missing or undecryptable row EVICTS; only a
+/// failure to READ keeps the stale key (inside the bound).
+fn refresh_outcome(fetch: ByokFetch) -> crate::db::provider_keys::RefreshOutcome {
+    use crate::db::provider_keys::RefreshOutcome;
+    match fetch {
+        ByokFetch::Key(k) => RefreshOutcome::Renewed(k),
+        ByokFetch::NoRow | ByokFetch::Undecryptable(_) => RefreshOutcome::Gone,
+        ByokFetch::LookupError(_) => RefreshOutcome::Failed,
+    }
+}
+
+/// B-568 F2: re-read a stale BYOK entry OFF the request path. Exactly one of
+/// these runs per stale entry at a time (the `lookup_swr` claim). A failure is
+/// DEBUG, not WARN: the entry keeps serving inside its bound and the next request
+/// retries, and `/health`'s `byok_cache` counters carry the rate
+/// (`.claude/rules/logging.md` — a repeating condition is a counter).
+fn spawn_byok_refresh(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    served: std::sync::Arc<secrecy::SecretString>,
+) {
+    let tenant = tenant_id.clone();
+    let provider = provider_id.to_owned();
+    tokio::spawn(async move {
+        let outcome = match (crate::db::global_pool(), crate::byok::master_key()) {
+            (Some(pool), Some(master)) => {
+                let fetch = fetch_byok(pool, master, &tenant, &provider).await;
+                if let ByokFetch::LookupError(ref e) | ByokFetch::Undecryptable(ref e) = fetch {
+                    tracing::debug!(error = %e, provider_id = %provider, "BYOK off-path re-check did not renew the key");
+                }
+                refresh_outcome(fetch)
+            }
+            // Unreachable in practice (only the BYOK path fills the cache), and
+            // "cannot tell" either way — keep the bound, release the claim.
+            _ => crate::db::provider_keys::RefreshOutcome::Failed,
+        };
+        crate::db::provider_keys::complete_refresh(&tenant, &provider, &served, outcome);
+    });
+}
+
 /// A4: resolve the provider-API plaintext key. Order:
-///   1. Hot-path cache (`db::provider_keys::lookup_cached`).
+///   1. Hot-path cache (`db::provider_keys::lookup_swr`) — fresh, or (B-568 F2)
+///      stale-while-revalidate: a key past its TTL is served while ONE background
+///      refresh re-reads it; a key the refresh finds gone is evicted (fail-CLOSED).
 ///   2. Per-tenant BYOK row from `provider_keys` (decrypted with AAD).
 ///   3. Process env var (legacy single-tenant fallback).
 ///   4. Empty string (Ollama / no-key providers).
@@ -242,61 +337,78 @@ pub(crate) async fn resolve_provider_key(
     provider_id: &str,
     env_var: &str,
 ) -> ProviderKey {
+    resolve_provider_key_traced(tenant_id, provider_id, env_var)
+        .await
+        .0
+}
+
+/// [`resolve_provider_key`], also reporting whether THIS request waited on a
+/// control-plane read (B-568 I5: a BYOK cache miss makes the request cold). A
+/// stale-served key is NOT cold — its re-read runs off the request path.
+pub(crate) async fn resolve_provider_key_traced(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    env_var: &str,
+) -> (ProviderKey, bool) {
+    use crate::db::provider_keys::CachedLookup;
     use std::sync::Arc;
 
-    if let Some(secret) = crate::db::provider_keys::lookup_cached(tenant_id, provider_id) {
-        return ProviderKey::Found(secret);
+    match crate::db::provider_keys::lookup_swr(tenant_id, provider_id) {
+        CachedLookup::Fresh(secret) => return (ProviderKey::Found(secret), false),
+        CachedLookup::Stale { secret, refresh } => {
+            if refresh {
+                spawn_byok_refresh(tenant_id, provider_id, Arc::clone(&secret));
+            }
+            return (ProviderKey::Found(secret), false);
+        }
+        CachedLookup::Miss => {}
     }
 
     let pool = crate::db::global_pool();
     let master = crate::byok::master_key();
     if let (Some(pool), Some(master)) = (pool, master) {
-        match crate::db::provider_keys::get(pool, tenant_id, provider_id).await {
-            Ok(Some(row)) => {
-                let aad = crate::byok::provider_key_aad(tenant_id, provider_id);
-                match master.decrypt_with_context(&row.ciphertext_b64, &aad) {
-                    Ok(plaintext) => {
-                        let secret = Arc::new(plaintext);
-                        crate::db::provider_keys::cache_decrypted(
-                            tenant_id,
-                            provider_id,
-                            Arc::clone(&secret),
-                        );
-                        return ProviderKey::Found(secret);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            tenant_id = %tenant_id,
-                            provider_id,
-                            "BYOK decrypt failed — refusing env fallback (auth-fail safer)"
-                        );
-                        return ProviderKey::Unusable;
-                    }
-                }
+        let key = match fetch_byok(pool, master, tenant_id, provider_id).await {
+            ByokFetch::Key(secret) => {
+                crate::db::provider_keys::cache_decrypted(
+                    tenant_id,
+                    provider_id,
+                    Arc::clone(&secret),
+                );
+                ProviderKey::Found(secret)
+            }
+            ByokFetch::Undecryptable(e) => {
+                tracing::error!(
+                    error = %e,
+                    tenant_id = %tenant_id,
+                    provider_id,
+                    "BYOK decrypt failed — refusing env fallback (auth-fail safer)"
+                );
+                ProviderKey::Unusable
             }
             // B-380: with a control plane present, "no row" is the tenant's answer,
             // not an invitation to spend the operator's key.
-            Ok(None) => {
+            ByokFetch::NoRow => {
                 if env_var.is_empty() {
-                    return ProviderKey::Found(Arc::new(
-                        secrecy::SecretString::from(String::new()),
-                    )); // Ollama / no-key providers
+                    // Ollama / no-key providers
+                    ProviderKey::Found(Arc::new(secrecy::SecretString::from(String::new())))
+                } else {
+                    ProviderKey::NotConfigured
                 }
-                return ProviderKey::NotConfigured;
             }
             // B-380: a lookup ERROR is not "no key" and is not "use the env". It is
             // "we cannot tell", and the only safe answer to that is to refuse.
-            Err(e) => {
+            ByokFetch::LookupError(e) => {
                 tracing::error!(
                     error = %e,
                     tenant_id = %tenant_id,
                     provider_id,
                     "provider_keys lookup failed — REFUSING (503), no env fallback"
                 );
-                return ProviderKey::LookupFailed;
+                ProviderKey::LookupFailed
             }
-        }
+        };
+        // A control-plane read happened on the request path, whatever it found.
+        return (key, true);
     }
     debug_assert!(
         env_fallback_allowed(pool.is_some(), master.is_some()),
@@ -304,12 +416,16 @@ pub(crate) async fn resolve_provider_key(
     );
 
     if env_var.is_empty() {
-        return ProviderKey::Found(Arc::new(secrecy::SecretString::from(String::new()))); // Ollama
+        return (
+            ProviderKey::Found(Arc::new(secrecy::SecretString::from(String::new()))),
+            false,
+        ); // Ollama
     }
-    match std::env::var(env_var) {
+    let key = match std::env::var(env_var) {
         Ok(k) => ProviderKey::Found(Arc::new(secrecy::SecretString::from(k))),
         Err(_) => ProviderKey::NotConfigured,
-    }
+    };
+    (key, false)
 }
 
 /// True for the reserved benchmark-only model names that, when
@@ -363,10 +479,21 @@ pub(crate) fn bench_mock_active(flag: bool, model: &str) -> bool {
 ///    `failover.rs` policy already defines the budget as
 ///    `planned_backoff_ms() < FAILOVER_BUDGET_MS`, i.e. the sum of pauses; the
 ///    loop now measures exactly that.
+///
+/// RI-05 M1: returns the per-attempt LEDGER alongside the result — one
+/// element per attempt this call made, numbered locally (0, 1, … within this
+/// one call). The caller (`server/chat.rs`) merges it into the request's full
+/// dispatch sequence via `tracelane_shared::span::extend_dispatch_attempts`,
+/// which renumbers on merge.
 pub(super) async fn dispatch_with_retry(
     registry: &crate::providers::ProviderRegistry,
     chat_request: &tracelane_shared::ChatRequest,
     provider_key: &str,
+    // RI-05 M1: the provider this dispatch call is against — the caller
+    // (`server/chat.rs`) already computed this (`upstream` for the primary
+    // call, `fo_provider` for a failover hop) to resolve the BYOK key, so it
+    // costs nothing new to pass it through for the ledger.
+    provider: &str,
     model: &str,
     tenant_id: &tracelane_shared::TenantId,
     // GWY-44: the retry count and backoff come from the operator's
@@ -376,9 +503,12 @@ pub(super) async fn dispatch_with_retry(
     // the caller from `AppState::failover` (read once at boot), not from a
     // process global here.
     policy: crate::providers::failover::RetryPolicy,
-) -> anyhow::Result<crate::providers::ProviderStream> {
+) -> (
+    anyhow::Result<crate::providers::ProviderStream>,
+    Vec<DispatchAttempt>,
+) {
     let budget = std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS);
-    retry_loop(policy, budget, model, || {
+    retry_loop(policy, budget, provider, model, || {
         dispatch_to_provider(
             registry,
             chat_request.clone(),
@@ -417,16 +547,63 @@ fn retry_worthwhile(err: &anyhow::Error, attempt_took: std::time::Duration) -> b
     }
 }
 
+/// Wall-clock milliseconds for one dispatch attempt, saturating rather than
+/// panicking on an implausible (> u32::MAX ms, ~49 days) duration — this only
+/// ever measures a single HTTP round trip.
+fn attempt_took_ms(d: std::time::Duration) -> u32 {
+    u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// RI-05 M1 + M4 — the ledger-recording decision for a FAILED attempt,
+/// factored out as a PURE function so it is unit-testable without a live
+/// provider or even a mock HTTP server: given the typed error `retry_loop`
+/// already holds, decide `status` and `reason` exactly per spec §2.1.
+///
+/// `status`/`reason` never touch an upstream error BODY — `ProviderHttpError`
+/// does not even carry one (`.claude/rules/security.md`; `providers/mod.rs`'s
+/// own doc comment on the struct). The upstream's own safe token (already
+/// validated where `ProviderHttpError` was constructed — see
+/// `providers::safe_reason` / `providers::reason_from_body`) wins when
+/// present; otherwise the gateway's five-class dispatch-failure label
+/// (`server/errors.rs::DispatchFailure::reason`) — `provider_key_rejected` |
+/// `provider_rate_limited` | `model_not_found` | `provider_request_rejected`
+/// | `provider_unavailable`.
+fn dispatch_attempt_for_error(
+    attempt: u32,
+    provider: &str,
+    model: &str,
+    err: &anyhow::Error,
+    took_ms: u32,
+) -> DispatchAttempt {
+    let http = err.downcast_ref::<crate::providers::ProviderHttpError>();
+    DispatchAttempt {
+        attempt,
+        provider: provider.to_string(),
+        model: model.to_string(),
+        outcome: "error".to_string(),
+        status: http.map(|e| e.status),
+        reason: http
+            .and_then(|e| e.reason.clone())
+            .or_else(|| Some(classify_dispatch_error(err).reason().to_string())),
+        took_ms,
+    }
+}
+
 /// The retry loop, generic over the attempt so it can be driven by a closure
 /// in tests. `budget` bounds the SUM of backoff pauses (see
 /// [`dispatch_with_retry`]); each attempt's own duration is bounded by the
 /// adapter's client timeout, not by this loop.
+///
+/// RI-05 M1: also returns the per-attempt ledger — one element per attempt
+/// THIS call made, numbered locally (0, 1, … within this call only; see
+/// [`dispatch_with_retry`]'s doc for how the caller renumbers on merge).
 async fn retry_loop<T, F, Fut>(
     policy: crate::providers::failover::RetryPolicy,
     budget: std::time::Duration,
+    provider: &str,
     model: &str,
     mut attempt_fn: F,
-) -> anyhow::Result<T>
+) -> (anyhow::Result<T>, Vec<DispatchAttempt>)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
@@ -434,6 +611,7 @@ where
     let backoff = std::time::Duration::from_millis(policy.backoff_ms);
     let loop_started = std::time::Instant::now();
     let mut backoff_spent = std::time::Duration::ZERO;
+    let mut ledger: Vec<DispatchAttempt> = Vec::new();
 
     let mut attempt: u32 = 0;
     let mut first_err: Option<anyhow::Error> = None;
@@ -441,6 +619,15 @@ where
         let attempt_started = std::time::Instant::now();
         match attempt_fn().await {
             Ok(s) => {
+                ledger.push(DispatchAttempt {
+                    attempt,
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    outcome: "ok".to_string(),
+                    status: None,
+                    reason: None,
+                    took_ms: attempt_took_ms(attempt_started.elapsed()),
+                });
                 if attempt > 0 {
                     tracing::info!(
                         model = %model,
@@ -449,10 +636,17 @@ where
                         "tracelane.failover.activated=true (same-provider retry succeeded)"
                     );
                 }
-                return Ok(s);
+                return (Ok(s), ledger);
             }
             Err(err) => {
                 let attempt_took = attempt_started.elapsed();
+                ledger.push(dispatch_attempt_for_error(
+                    attempt,
+                    provider,
+                    model,
+                    &err,
+                    attempt_took_ms(attempt_took),
+                ));
                 let give_up = |err: anyhow::Error, first_err: Option<anyhow::Error>| match first_err
                 {
                     Some(first) => err.context(first.to_string()),
@@ -460,7 +654,7 @@ where
                 };
                 // Out of attempts.
                 if attempt >= policy.retries {
-                    return Err(give_up(err, first_err));
+                    return (Err(give_up(err, first_err)), ledger);
                 }
                 // Not a transient failure: the same request gets the same
                 // answer, so return the honest error now.
@@ -471,7 +665,7 @@ where
                         attempt_took_ms = attempt_took.as_millis(),
                         "provider failed with a non-transient error; not retrying"
                     );
-                    return Err(give_up(err, first_err));
+                    return (Err(give_up(err, first_err)), ledger);
                 }
                 // Out of backoff budget. Checked BEFORE sleeping, so the sleep
                 // itself can never be what breaches the ceiling.
@@ -481,7 +675,7 @@ where
                         attempt,
                         "provider failed; retry budget exhausted, no further attempt"
                     );
-                    return Err(give_up(err, first_err));
+                    return (Err(give_up(err, first_err)), ledger);
                 }
                 tracing::warn!(
                     error = %err,
@@ -580,9 +774,28 @@ pub(crate) struct DispatchGuard {
     model: String,
     identity: CallerIdentity,
     request_start: chrono::DateTime<chrono::Utc>,
+    /// RI-05 M1: the attempts made before the request ended in a refusal or a
+    /// cancellation, handed to the error span by `abort` / `Drop`. Set by the
+    /// handler once dispatch has failed (`record_attempts`); empty until then.
+    dispatch_attempts: Vec<DispatchAttempt>,
+    /// GWY-49: the ZDR constraint's outcome so far, for the terminal error span —
+    /// `None` until the handler judged the constraint (or when there was none).
+    zdr_eligible: Option<Vec<String>>,
 }
 
 impl DispatchGuard {
+    /// GWY-49: the request is constrained; `eligible` is what the constraint left
+    /// standing (empty when nothing did). Lands on the error span if the request
+    /// ends in a refusal, a dispatch failure or a client cancellation.
+    pub(crate) fn record_zdr(&mut self, eligible: Vec<String>) {
+        self.zdr_eligible = Some(eligible);
+    }
+
+    /// RI-05 M1: attach the attempt ledger so the terminal error span carries it.
+    pub(crate) fn record_attempts(&mut self, ledger: Vec<DispatchAttempt>) {
+        self.dispatch_attempts = ledger;
+    }
+
     pub(crate) fn arm(
         state: &AppState,
         tenant_id: &TenantId,
@@ -601,6 +814,8 @@ impl DispatchGuard {
             model: model.to_owned(),
             identity: identity.clone(),
             request_start,
+            dispatch_attempts: Vec::new(),
+            zdr_eligible: None,
         }
     }
 
@@ -626,6 +841,8 @@ impl DispatchGuard {
             self.request_start,
             reason,
             aft_id,
+            std::mem::take(&mut self.dispatch_attempts),
+            self.zdr_eligible.take(),
         );
         self.armed = false;
     }
@@ -649,6 +866,8 @@ impl Drop for DispatchGuard {
             self.request_start,
             "client_cancelled",
             None,
+            std::mem::take(&mut self.dispatch_attempts),
+            self.zdr_eligible.take(),
         );
     }
 }
@@ -658,6 +877,31 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret as _;
     use tracelane_shared::SpanStatusCode;
+
+    /// B-568 F2, fail-CLOSED: a refresh that finds the row GONE or no longer
+    /// decryptable evicts (the next request is refused inline); only a failure to
+    /// READ the store keeps the stale key — "cannot tell" is not "revoked".
+    #[test]
+    fn a_byok_refresh_evicts_on_gone_or_undecryptable_and_keeps_only_on_a_read_error() {
+        use crate::db::provider_keys::RefreshOutcome;
+        assert!(matches!(
+            refresh_outcome(ByokFetch::NoRow),
+            RefreshOutcome::Gone
+        ));
+        assert!(matches!(
+            refresh_outcome(ByokFetch::Undecryptable(anyhow::anyhow!("aad mismatch"))),
+            RefreshOutcome::Gone
+        ));
+        assert!(matches!(
+            refresh_outcome(ByokFetch::LookupError(anyhow::anyhow!("neon resuming"))),
+            RefreshOutcome::Failed
+        ));
+        let k = std::sync::Arc::new(secrecy::SecretString::from("sk-x".to_string()));
+        assert!(matches!(
+            refresh_outcome(ByokFetch::Key(k)),
+            RefreshOutcome::Renewed(ref s) if s.expose_secret() == "sk-x"
+        ));
+    }
 
     /// R13 — a guardrail block whose reason has NO AFT mapping must still be visible.
     ///
@@ -699,6 +943,7 @@ mod tests {
             chrono::Utc::now(),
             "guardrail_block",
             None,
+            Vec::new(),
         );
         assert_eq!(
             span.attributes.user_id.as_deref(),
@@ -734,6 +979,7 @@ mod tests {
             chrono::Utc::now(),
             "guardrail_block",
             Some("AFT-TOOL-POISON-001"),
+            Vec::new(),
         );
         assert_eq!(
             poisoned.attributes.tracelane_aft_id.as_deref(),
@@ -852,6 +1098,10 @@ mod tests {
                 cache_creation_input_tokens: None,
                 stream: true,
                 cost_usd: None,
+                served: crate::server::ServedMeta::default(),
+                finish_reason: None,
+                dispatch_attempts: Vec::new(),
+                reasoning_output_tokens: None,
             },
             None,
             None, // timing (not under test here)
@@ -869,6 +1119,7 @@ mod tests {
             chrono::Utc::now(),
             "provider_stream_error",
             None,
+            Vec::new(),
         );
         assert_eq!(severed.status.code, SpanStatusCode::Error);
         assert_eq!(
@@ -886,6 +1137,7 @@ mod tests {
             chrono::Utc::now(),
             "guardrail_block",
             Some("AFT-TOOL-POISON-001"),
+            Vec::new(),
         );
         assert_eq!(poison.status.code, SpanStatusCode::Error);
         assert_eq!(
@@ -1077,6 +1329,172 @@ mod tests {
         ));
     }
 
+    // ── RI-05 M1: the ledger-recording decision, as a pure function ──
+
+    /// The upstream's OWN safe token wins over the gateway's five-class
+    /// label — spec §2.1's stated rule, in the direction that matters: a
+    /// provider that DOES tell us something specific must not be flattened
+    /// into the generic bucket.
+    #[test]
+    fn dispatch_attempt_for_error_prefers_the_upstream_safe_token() {
+        let err: anyhow::Error = crate::providers::ProviderHttpError {
+            provider: "google",
+            status: 429,
+            reason: Some("RESOURCE_EXHAUSTED".to_string()),
+        }
+        .into();
+        let a = dispatch_attempt_for_error(0, "google", "gemini-1.5-pro", &err, 12);
+        assert_eq!(a.status, Some(429));
+        assert_eq!(a.reason.as_deref(), Some("RESOURCE_EXHAUSTED"));
+        assert_eq!(a.outcome, "error");
+        assert_eq!(a.took_ms, 12);
+    }
+
+    /// No safe token on the wire → the five-class label
+    /// (`server/errors.rs::DispatchFailure::reason`), never the raw error's
+    /// own `Display`/`Debug` text. Falsified against a version of
+    /// `dispatch_attempt_for_error` that read `err.to_string()` as a
+    /// fallback — see the RED/GREEN note in this test's body for how it was
+    /// proven, not merely asserted.
+    #[test]
+    fn dispatch_attempt_for_error_falls_back_to_the_five_class_label_never_the_body() {
+        // A transport failure whose message is deliberately shaped like a
+        // credential — nothing here has an HTTP status at all, which is
+        // exactly the case `.reason` cannot help with.
+        let planted = "sk-live-PLANTED-CREDENTIAL-4471";
+        let err = anyhow::anyhow!("connection reset while talking to {planted}");
+        let a = dispatch_attempt_for_error(0, "openai", "gpt-4o", &err, 3);
+        assert_eq!(a.status, None, "no ProviderHttpError, so no typed status");
+        assert_eq!(
+            a.reason.as_deref(),
+            Some("provider_unavailable"),
+            "a transport failure with no typed status classifies as Unavailable"
+        );
+        // THE PROOF: serialize the whole element and confirm the planted
+        // text is not merely absent from `.reason` but absent from the
+        // JSON this actually ships in a span attribute.
+        let json = serde_json::to_string(&a).expect("DispatchAttempt serializes");
+        assert!(
+            !json.contains(planted),
+            "the planted credential-shaped string leaked into the ledger element: {json}"
+        );
+
+        // A 4xx WITH a status but no safe token: same rule, different label.
+        let http_err: anyhow::Error = crate::providers::ProviderHttpError {
+            provider: "openai",
+            status: 429,
+            reason: None, // OpenAI-shape bodies never pass `safe_reason`
+        }
+        .into();
+        let b = dispatch_attempt_for_error(1, "openai", "gpt-4o", &http_err, 5);
+        assert_eq!(b.status, Some(429));
+        assert_eq!(b.reason.as_deref(), Some("provider_rate_limited"));
+    }
+
+    /// RI-05 §2.1's write rule (`tracelane_shared::span::dispatch_attempts_worth_recording`):
+    /// a clean single attempt writes nothing; anything else does.
+    #[test]
+    fn dispatch_attempts_worth_recording_matches_the_write_rule() {
+        use tracelane_shared::span::dispatch_attempts_worth_recording as worth;
+        let ok = |attempt: u32| DispatchAttempt {
+            attempt,
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: "ok".to_string(),
+            status: None,
+            reason: None,
+            took_ms: 1,
+        };
+        assert!(
+            !worth(&[ok(0)]),
+            "one clean attempt must write NOTHING (a pre-RI-05 span has no field at all)"
+        );
+        assert!(!worth(&[]), "an empty ledger is never worth recording");
+        let err = DispatchAttempt {
+            outcome: "error".to_string(),
+            status: Some(429),
+            reason: Some("provider_rate_limited".to_string()),
+            ..ok(0)
+        };
+        assert!(worth(&[err.clone(), ok(1)]), "len > 1 → write");
+        assert!(
+            worth(&[err]),
+            "a single ERRORED attempt is still worth recording"
+        );
+        // Verifier finding (2026-09-20): a lone `skipped` is unreachable today but
+        // must never be dropped silently if a future path produces one.
+        let skipped = DispatchAttempt {
+            outcome: "skipped".to_string(),
+            reason: Some("breaker_open".to_string()),
+            ..ok(0)
+        };
+        assert!(
+            worth(&[skipped]),
+            "any non-ok single element is worth recording"
+        );
+    }
+
+    /// RI-05 M1 on the FAILURE span (verifier finding, 2026-09-20): when every
+    /// attempt fails, the error span the guard emits carries the ledger — that is
+    /// the span an operator opens. Empty ledger → field absent (the write rule).
+    #[test]
+    fn the_terminal_error_span_carries_the_attempt_ledger() {
+        let tenant =
+            TenantId::from_jwt_claim("a4037bef-e786-44e3-bfb6-88c93ba9d381".parse().unwrap());
+        let ledger = vec![
+            DispatchAttempt {
+                attempt: 0,
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                outcome: "error".to_string(),
+                status: Some(503),
+                reason: Some("provider_unavailable".to_string()),
+                took_ms: 12,
+            },
+            DispatchAttempt {
+                attempt: 1,
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                outcome: "error".to_string(),
+                status: Some(503),
+                reason: Some("provider_unavailable".to_string()),
+                took_ms: 9,
+            },
+        ];
+        let span = build_error_span(
+            &tenant,
+            Uuid::new_v4(),
+            None,
+            "claude-haiku-4-5",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+            "provider_unavailable",
+            None,
+            ledger.clone(),
+        );
+        assert_eq!(span.status.code, SpanStatusCode::Error);
+        assert_eq!(
+            span.attributes.tracelane_dispatch_attempts.as_deref(),
+            Some(ledger.as_slice()),
+            "both failed attempts land on the terminal error span"
+        );
+        let bare = build_error_span(
+            &tenant,
+            Uuid::new_v4(),
+            None,
+            "claude-haiku-4-5",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+            "guardrail_block",
+            None,
+            Vec::new(),
+        );
+        assert!(
+            bare.attributes.tracelane_dispatch_attempts.is_none(),
+            "a pre-dispatch refusal has no attempts and writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn retry_loop_retries_a_5xx_that_surfaced_after_the_old_budget_had_expired() {
         // The pre-B-391 loop measured its 200 ms budget from the FIRST attempt's
@@ -1087,23 +1505,28 @@ mod tests {
         let policy = crate::providers::failover::RetryPolicy::BUILTIN; // 1 retry, 100 ms
         let budget =
             std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS);
-        let out: anyhow::Result<&'static str> = retry_loop(policy, budget, "m", || {
-            let n = calls.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if n == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    Err(http_err(503))
-                } else {
-                    Ok("second attempt")
+        let (out, ledger): (anyhow::Result<&'static str>, Vec<DispatchAttempt>) =
+            retry_loop(policy, budget, "test-provider", "m", || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        Err(http_err(503))
+                    } else {
+                        Ok("second attempt")
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
         assert_eq!(
             out.expect("the retry must fire and succeed"),
             "second attempt"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ledger.len(), 2, "one element per attempt made");
+        assert_eq!(ledger[0].outcome, "error");
+        assert_eq!(ledger[0].status, Some(503));
+        assert_eq!(ledger[1].outcome, "ok");
     }
 
     #[tokio::test]
@@ -1114,18 +1537,30 @@ mod tests {
             retries: 5,
             backoff_ms: 1,
         };
-        let out: anyhow::Result<()> =
-            retry_loop(policy, std::time::Duration::from_millis(200), "m", || {
+        let (out, ledger): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop(
+            policy,
+            std::time::Duration::from_millis(200),
+            "test-provider",
+            "m",
+            || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async { Err(http_err(401)) }
-            })
-            .await;
+            },
+        )
+        .await;
         let err = out.expect_err("a 401 is an error");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a 401 must not be retried");
         assert!(
             err.downcast_ref::<crate::providers::ProviderHttpError>()
                 .is_some_and(|h| h.status == 401),
             "the typed 401 must survive the loop so the handler classifies it"
+        );
+        assert_eq!(ledger.len(), 1, "a non-retried failure is a single attempt");
+        assert_eq!(ledger[0].status, Some(401));
+        assert_eq!(
+            ledger[0].reason.as_deref(),
+            Some("provider_key_rejected"),
+            "no safe token on this synthetic error, so the five-class label applies"
         );
     }
 
@@ -1139,14 +1574,21 @@ mod tests {
             retries: 5,
             backoff_ms: 150,
         };
-        let out: anyhow::Result<()> =
-            retry_loop(policy, std::time::Duration::from_millis(200), "m", || {
+        let (out, ledger): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop(
+            policy,
+            std::time::Duration::from_millis(200),
+            "test-provider",
+            "m",
+            || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async { Err(http_err(503)) }
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(out.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ledger.len(), 2, "one element per attempt made, both errors");
+        assert!(ledger.iter().all(|a| a.outcome == "error"));
     }
 
     #[test]

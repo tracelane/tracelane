@@ -80,7 +80,7 @@ pub async fn send_plain_text(
     });
     let resp = http
         .post(url)
-        .header("authorization", format!("Bearer {}", key.expose_secret()))
+        .bearer_auth(key.expose_secret())
         .json(&body)
         .send()
         .await?;

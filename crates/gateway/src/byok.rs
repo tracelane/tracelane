@@ -426,6 +426,43 @@ pub fn anchor_key_aad(tenant_id: &tracelane_shared::TenantId) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// The prod-topology bench seed (`bench/gateway/aigatewaybench/prodtopo/prepare.sh`)
+    /// writes a `provider_keys` row whose blob a Python recipe produced — because the
+    /// BYOK route refuses every API key by design. This proves that recipe against the
+    /// REAL decrypt path, AAD and all, before a box is spent on it. Env-gated: run as
+    ///   BENCH_MASTER_B64=… BENCH_TENANT=<uuid> BENCH_BLOB=… cargo test … -- --ignored
+    /// (prepare.sh's `generated/env` + `generated/30-seed.sql` carry the three values).
+    #[test]
+    #[ignore = "env-gated: proves the bench seed's BYOK envelope against the real path"]
+    fn prodtopo_seed_envelope_decrypts_under_the_real_path() {
+        // Not a proof when the seed is absent: an `--ignored` sweep (the api-key mint
+        // step runs one) must not turn "no bench seed on this box" into a red gate.
+        let (Ok(master), Ok(tenant), Ok(blob)) = (
+            std::env::var("BENCH_MASTER_B64"),
+            std::env::var("BENCH_TENANT"),
+            std::env::var("BENCH_BLOB"),
+        ) else {
+            eprintln!(
+                "prodtopo_seed_envelope: BENCH_MASTER_B64 / BENCH_TENANT / BENCH_BLOB not set — nothing proven, nothing failed"
+            );
+            return;
+        };
+        let ring = super::ByokMasterKey::from_values(Some(&master), None, None)
+            .expect("master key parses")
+            .expect("a key");
+        let tid = tracelane_shared::TenantId::from_self_host_config(
+            uuid::Uuid::parse_str(&tenant).expect("tenant uuid"),
+        );
+        let aad = super::provider_key_aad(&tid, "anthropic");
+        let pt = ring
+            .decrypt_with_context(&blob, &aad)
+            .expect("the seeded blob decrypts");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&pt), "bench-mock-key");
+        // AAD binding is real: the same blob under another provider id is refused.
+        let wrong = super::provider_key_aad(&tid, "openai");
+        assert!(ring.decrypt_with_context(&blob, &wrong).is_err());
+    }
+
     use super::*;
     use tracelane_shared::TenantId;
     use uuid::Uuid;
@@ -689,17 +726,12 @@ mod tests {
         // Build a v1 wire blob inline (the deleted legacy `encrypt()`
         // behavior) — the ONLY sanctioned `Aad::empty()` use, constructing
         // the attack artifact this test proves is now rejected.
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        k.rng.fill(&mut nonce_bytes).unwrap();
-        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-        let mut buf = b"legacy-secret".to_vec();
-        k.keys[&0]
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
-            .unwrap();
-        let mut raw = Vec::with_capacity(NONCE_LEN + buf.len());
-        raw.extend_from_slice(&nonce_bytes);
-        raw.extend_from_slice(&buf);
-        let v1_ct = B64.encode(&raw);
+        //
+        // B-308: the nonce's FIRST byte is pinned. A v1 blob has no version byte, so a
+        // random nonce starting 0x02/0x03 reads as a v2/v3 header and fails on a
+        // different (still fail-closed) error — the ~2-in-256 flake. The collision
+        // itself is pinned by `v1_blob_colliding_with_a_version_byte_still_fails_closed`.
+        let v1_ct = v1_blob(&k, 0x00);
 
         let err = k
             .decrypt_with_context(&v1_ct, &provider_key_aad(&tenant_a(), "openai"))
@@ -708,6 +740,38 @@ mod tests {
             err.to_string().contains("v1 ciphertext rejected"),
             "error names the v1 rejection: {err}"
         );
+    }
+
+    /// A v1 wire blob (nonce || ct+tag, EMPTY AAD) whose nonce starts with `first`.
+    fn v1_blob(k: &ByokMasterKey, first: u8) -> String {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        k.rng.fill(&mut nonce_bytes).unwrap();
+        nonce_bytes[0] = first;
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut buf = b"legacy-secret".to_vec();
+        k.keys[&0]
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+            .unwrap();
+        let mut raw = Vec::with_capacity(NONCE_LEN + buf.len());
+        raw.extend_from_slice(&nonce_bytes);
+        raw.extend_from_slice(&buf);
+        B64.encode(&raw)
+    }
+
+    #[test]
+    fn v1_blob_colliding_with_a_version_byte_still_fails_closed() {
+        // B-308: the header detect cannot tell a v1 nonce starting 0x02/0x03 from a
+        // v2/v3 header. What matters is the DIRECTION: the blob must never decrypt —
+        // it was sealed under EMPTY AAD, so the AAD-bound open fails whichever arm reads it.
+        let k = test_key();
+        for first in [0x02u8, 0x03] {
+            let ct = v1_blob(&k, first);
+            let res = k.decrypt_with_context(&ct, &provider_key_aad(&tenant_a(), "openai"));
+            assert!(
+                res.is_err(),
+                "a v1 blob whose nonce starts {first:#04x} must still be refused"
+            );
+        }
     }
 
     #[test]

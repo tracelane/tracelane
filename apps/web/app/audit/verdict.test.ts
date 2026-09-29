@@ -29,6 +29,10 @@ function report(over: Partial<VerifyReport>): VerifyReport {
 		strip_detected: false,
 		verified_from_seq: 0,
 		trust_established: true,
+		rows_uncovered_by_anchors: 0,
+		rows_unanchored_tail: 0,
+		platform_signed_batches: 0,
+		platform_signed_ranges: [],
 		errors: [],
 		...over,
 	};
@@ -197,6 +201,32 @@ describe("R53 — indeterminate is neither green nor an alarm", () => {
 		expect(v.state).toBe("anchors_unverifiable");
 		expect(isAlarm(v)).toBe(false);
 		expect(isIndeterminate(v)).toBe(true);
+	});
+
+	// B-483 (2026-09-21): rows inside NO anchor batch although a later batch exists are
+	// unsigned and un-anchored — never green, whatever the anchors around them say.
+	it("a coverage hole is INDETERMINATE and never green, even with anchors included", () => {
+		const v = deriveAuditVerdict({
+			...base,
+			anchors_included: 9,
+			rekor_anchors_resolved: 9,
+			rows_uncovered_by_anchors: 100,
+		});
+		expect(v.state).toBe("anchor_hole");
+		expect(v.state === "anchor_hole" && v.rows).toBe(100);
+		expect(isAlarm(v)).toBe(false);
+		expect(isIndeterminate(v)).toBe(true);
+	});
+
+	it("a coverage hole outranks the green states but not positive evidence", () => {
+		const green = deriveAuditVerdict({ ...base, anchors_included: 9 });
+		expect(green.state).toBe("verified");
+		const broken = deriveAuditVerdict({
+			...base,
+			hash_chain_valid: false,
+			rows_uncovered_by_anchors: 100,
+		});
+		expect(broken.state).toBe("chain_broken");
 	});
 
 	// THE FALSIFICATION, both directions. Positive evidence must still be RED, and it

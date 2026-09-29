@@ -71,8 +71,7 @@ any other proxy's security history — check that against its own advisories.
 - **`.pth` supply-chain scan.** CI fails the step on any stray `.pth` file in the
   tree (`.github/workflows/ci.yml`, `secret-scan` job).
 
-The first two are structural. The `.pth` scan is a CI step that exits non-zero on
-a hit; it is not yet wired as a blocking required status check.
+The first two are structural. The `.pth` scan is a CI step that exits non-zero on a hit.
 
 ## Related
 

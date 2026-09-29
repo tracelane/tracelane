@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * Global error boundary — last resort when the root layout itself throws.
@@ -9,6 +10,7 @@
  */
 
 import { reloadOnChunkError } from "@/lib/chunk-reload";
+import { reportClientError } from "@/lib/report-error";
 import { useEffect, useState } from "react";
 
 /**
@@ -61,6 +63,7 @@ export default function GlobalError({
 	const [updating, setUpdating] = useState(false);
 	useEffect(() => {
 		if (reloadOnChunkError(error)) setUpdating(true);
+		else reportClientError(error, "global", error.digest);
 	}, [error]);
 
 	return (
@@ -179,7 +182,7 @@ export default function GlobalError({
 								Reference: {error.digest}
 							</p>
 						)}
-						<button
+						<Button
 							type="button"
 							onClick={reset}
 							style={{
@@ -194,7 +197,7 @@ export default function GlobalError({
 							}}
 						>
 							Try again
-						</button>
+						</Button>
 					</div>
 				)}
 			</body>

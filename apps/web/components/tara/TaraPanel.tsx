@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * OBS-40 "Ask Tara" — the TopBar launcher + the panel itself, self-contained
@@ -17,6 +18,7 @@
  * point of checking `GET /api/settings/provider-keys` first.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { pickDefaultTaraModel } from "@/lib/tara/models";
 import { loadVoices, pickTaraVoice } from "@/lib/tara/voice";
 import { useDismiss } from "@/lib/use-dismiss";
@@ -140,7 +142,7 @@ export function TaraPanel() {
 		let live = true;
 		(async () => {
 			try {
-				const res = await fetch("/api/settings/provider-keys");
+				const res = await apiFetchRaw("/api/settings/provider-keys");
 				if (!res.ok) {
 					if (live) setProviderStatus("provider-error");
 					return;
@@ -189,7 +191,7 @@ export function TaraPanel() {
 		setPhase("thinking");
 		setErrorMessage(null);
 		try {
-			const res = await fetch("/api/tara", {
+			const res = await apiFetchRaw("/api/tara", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -306,7 +308,8 @@ export function TaraPanel() {
 	}
 
 	const trigger = (
-		<button
+		<Button
+			variant="bare"
 			type="button"
 			onClick={() => setOpen((v) => !v)}
 			aria-label="Ask Tara"
@@ -315,7 +318,7 @@ export function TaraPanel() {
 		>
 			<MicIcon />
 			<span className="max-sm:hidden">Ask Tara</span>
-		</button>
+		</Button>
 	);
 
 	return (
@@ -331,14 +334,15 @@ export function TaraPanel() {
 				<div className="absolute right-0 z-50 mt-2 w-[26rem] rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-[var(--shadow-overlay)]">
 					<div className="mb-3 flex items-center justify-between">
 						<span className="font-medium text-ink">Ask Tara</span>
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setOpen(false)}
 							aria-label="Close"
 							className="text-ink-3 hover:text-ink"
 						>
 							✕
-						</button>
+						</Button>
 					</div>
 
 					{providerStatus === "loading" && (
@@ -424,7 +428,8 @@ export function TaraPanel() {
 											Boolean(
 												(window as unknown as SpeechWindow).speechSynthesis,
 											) && (
-												<button
+												<Button
+													variant="bare"
 													type="button"
 													onClick={toggleReadAloud}
 													aria-pressed={speaking}
@@ -438,7 +443,7 @@ export function TaraPanel() {
 												>
 													<SpeakerIcon active={speaking} />{" "}
 													{speaking ? "stop" : "read aloud"}
-												</button>
+												</Button>
 											)}
 									</div>
 									<p className="text-2xs text-ink-3">
@@ -469,7 +474,8 @@ export function TaraPanel() {
 									className="h-9 flex-1 rounded-[var(--radius-control)] border border-line bg-canvas-sunken px-3 text-ink text-sm focus-visible:border-line-2"
 								/>
 								{micSupported ? (
-									<button
+									<Button
+										variant="bare"
 										type="button"
 										onClick={listening ? stopListening : startListening}
 										disabled={phase === "thinking"}
@@ -486,7 +492,7 @@ export function TaraPanel() {
 										)}
 									>
 										<MicIcon />
-									</button>
+									</Button>
 								) : (
 									<Tooltip content="Voice input needs Chrome or Edge">
 										<span
@@ -497,7 +503,8 @@ export function TaraPanel() {
 										</span>
 									</Tooltip>
 								)}
-								<button
+								<Button
+									variant="bare"
 									type="submit"
 									disabled={
 										phase === "thinking" ||
@@ -508,7 +515,7 @@ export function TaraPanel() {
 									className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-action text-action-on disabled:opacity-40"
 								>
 									↵
-								</button>
+								</Button>
 							</form>
 						</div>
 					)}

@@ -1,3 +1,10 @@
+"use client";
+import { fmtDurationMs } from "@/lib/metrics/format";
+
+import { fmtCount } from "@/lib/metrics/format";
+
+import { Button } from "@tracelanedev/ui";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * RailRoster — the full 9-rail guardrail surface, live stats merged onto the
  * honest roster (lib/guardrail-rails). Every rail shows its plain name, the exact
@@ -24,7 +31,6 @@
  * and title string is the one that was already rendering; only the class strings
  * and the row/detail markup moved.
  */
-"use client";
 
 import {
 	ACTION_LABEL,
@@ -109,7 +115,8 @@ function SortTh({
 				active ? (sort?.dir === "desc" ? "descending" : "ascending") : "none"
 			}
 		>
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={() => onSort(col)}
 				// `tracking-wide` was dropped, `uppercase` deliberately KEPT, and the
@@ -130,7 +137,7 @@ function SortTh({
 				<span aria-hidden className="text-ink-3">
 					{active ? (sort?.dir === "desc" ? "▼" : "▲") : "↕"}
 				</span>
-			</button>
+			</Button>
 		</TH>
 	);
 }
@@ -279,7 +286,8 @@ function RailRow({
 					    20px box to 24px so it is a usable touch target, and the glyph is
 					    now the ONE chevron the verdict table also uses — rotating rather
 					    than swapping ▶/▼, so the two guardrail tables open the same way. */}
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						aria-expanded={open}
 						aria-controls={detailId}
@@ -288,7 +296,7 @@ function RailRow({
 							e.stopPropagation();
 							setOpen((v) => !v);
 						}}
-						className="grid h-6 w-6 place-items-center rounded-md text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+						className="grid h-6 w-6 place-items-center rounded-control text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 					>
 						<span
 							aria-hidden
@@ -296,7 +304,7 @@ function RailRow({
 						>
 							▸
 						</span>
-					</button>
+					</Button>
 				</TD>
 				<TD>
 					<div className="flex items-center gap-2">
@@ -338,12 +346,15 @@ function RailRow({
 					<span className="font-mono text-2xs text-ink-3">{m.id}</span>
 				</TD>
 				<TD>
-					<Badge tone={ACTION_TONE[m.action]}>{ACTION_LABEL[m.action]}</Badge>
+					<StatusBadge
+						status={ACTION_LABEL[m.action]}
+						tone={ACTION_TONE[m.action]}
+					/>
 					<span className="ml-1 text-2xs uppercase tracking-wide text-ink-3">
 						{m.side === "both" ? "req+resp" : m.side}
 					</span>
 				</TD>
-				<TD numeric>{live ? live.evaluations.toLocaleString() : "—"}</TD>
+				<TD numeric>{live ? fmtCount(live.evaluations) : "—"}</TD>
 				<TD numeric>
 					{/* The link inherits mono + tabular-nums from the `numeric` cell, so
 					    it no longer restates them and cannot drift from its column. */}
@@ -354,7 +365,7 @@ function RailRow({
 							title="See the blocked verdicts →"
 							className="text-danger-ink underline decoration-danger/30 underline-offset-2 hover:decoration-danger focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 						>
-							{live.blocks.toLocaleString()}
+							{fmtCount(live.blocks)}
 						</Link>
 					) : live ? (
 						<span className="text-ink-3">0</span>
@@ -363,7 +374,7 @@ function RailRow({
 					)}
 				</TD>
 				<TD numeric muted>
-					{live ? `${live.p95_ms.toLocaleString()} ms` : "—"}
+					{live ? fmtDurationMs(live.p95_ms) : "—"}
 				</TD>
 			</TR>
 
@@ -379,7 +390,7 @@ function RailRow({
 						)}
 						{live && live.fail_opens > 0 && (
 							<p className="text-xs text-warn-ink">
-								{live.fail_opens.toLocaleString()} verdict
+								{fmtCount(live.fail_opens)} verdict
 								{live.fail_opens === 1 ? "" : "s"} failed open (the rail errored
 								and the request proceeded).
 							</p>

@@ -27,17 +27,16 @@ timeline within 7 days; we target a **30-day patch** for critical
 vulnerabilities. We follow responsible disclosure: 90-day embargo before public
 disclosure, coordinated with reporter.
 
-## Security guarantees
+## Security properties
 
-### What Tracelane guarantees
+### What Tracelane provides
 
 - **BYOK only:** Provider API keys are envelope-encrypted at rest with
   **AES-256-GCM via `ring`**. Each ciphertext is bound to its
   `(tenant_id, provider_id)` via AAD — a row swap across tenants
   fails GCM authentication. Master key (32 bytes) is loaded from
-  `TRACELANE_BYOK_MASTER_KEY` at startup; production deployments
-  source the env var from a KMS (AWS KMS / GCP KMS / Vault) at
-  process launch. Keys never appear in logs, spans, or errors — the
+  `TRACELANE_BYOK_MASTER_KEY` at startup; KMS-backed master-key
+  management is not available yet. Keys never appear in logs, spans, or errors — the
   tracing redaction filter scrubs OpenAI `sk-`, Anthropic `sk-ant-`,
   Google `AIza`, Stripe / Polar `sk_live_/whsec_/rk_`, AWS `AKIA`,
   bare `Bearer`, and JWT-shaped tokens.
@@ -66,8 +65,8 @@ disclosure, coordinated with reporter.
   private-IP TOCTOU attacks, so every caller now talks to a fixed
   endpoint. Future callers wanting redirects must re-validate each
   `Location:` via the async `validate_url`.
-- **mTLS for ingest:** SPIFFE/SPIRE-issued X.509-SVIDs with 1-hour
-  rotation, hot-reloaded via the SPIRE Workload API into an
+- **mTLS for ingest:** SPIFFE-issued X.509-SVIDs with automatic
+  rotation, hot-reloaded into an
   `arc-swap`-installed trust bundle (per-connection cache; new
   handshakes pick up rotated bundles, in-flight requests complete
   on old bundles). TLS 1.3 minimum; client auth mandatory; rustls
@@ -83,8 +82,8 @@ disclosure, coordinated with reporter.
   RFC 6962 §2.1 (leaf prefix `0x00`, node prefix `0x01`, raw bytes;
   lone-odd-leaf promoted, not duplicated — closes second-preimage).
   Every 100 events the Merkle root is signed with a per-tenant
-  Ed25519 key (envelope-encrypted via BYOK; Enterprise tier) or the
-  global key (lower tiers), and submitted to Sigstore Rekor v2 as a
+  Ed25519 key (envelope-encrypted via BYOK; minted on every tier, with a
+  process-global fallback key when a tenant has none), and submitted to Sigstore Rekor v2 as a
   `hashedrekord`. Chain state persists across restarts via the
   `audit_chain_state` Postgres table with monotonic UPSERT
   semantics.
@@ -92,7 +91,8 @@ disclosure, coordinated with reporter.
   wrapped in `<UNTRUSTED_USER_DATA>` sentinel before any agent reads
   it. PII redaction (`crates/policy/src/pii.rs`) runs over audit
   payloads before they enter the chain — secrets that leak past a
-  caller cannot reach ClickHouse or Rekor anchor batches.
+  caller cannot reach the Postgres ledger, its ClickHouse copy, or Rekor
+  anchor batches.
 - **Supply chain:** Trusted Publishing OIDC only (no long-lived
   tokens). Sigstore Cosign keyless signatures on all releases.
   CycloneDX SBOM attached. Build provenance is attested via GitHub
@@ -104,9 +104,9 @@ disclosure, coordinated with reporter.
   configuration.
 - **Dependency hygiene:** `cargo audit` and `pnpm audit` run on
   every PR. No new dependencies from publishers under 6 months
-  tenure or under 100 stars without security-reviewer approval.
+  tenure or under 100 stars without maintainer review.
 
-### Known gaps vs the published guarantees
+### Known gaps vs the properties above
 
 Re-verified against the code on 2026-08-06. Three items previously listed
 here had already been closed and are removed below; what remains is what is
@@ -131,9 +131,7 @@ code on 2026-08-06, not against a changelog):
   plus an Argon2id PHC string with a per-row salt
   (`crates/gateway/src/db/api_keys.rs:204-209`, `:417-496`). There is no
   bare-SHA-256 fallback: a row whose Argon2id PHC is absent or fails is
-  rejected (`:480-486`). Note the auth-result cache (`:158-169`, 900s TTL):
-  Argon2id runs on the cold path, and a warm-cache hit re-authenticates on the
-  peppered digest alone. At rest, a DB dump yields peppered + Argon2id-hashed
+  rejected (`:480-486`). At rest, a DB dump yields peppered + Argon2id-hashed
   material, not confirmable digests.
 - **JWKS fetch** — `WORKOS_JWKS_URL` passes a host allowlist (`workos.com`
   exact plus `.workos.com` suffix) and the SSRF guard before any request is
@@ -179,10 +177,10 @@ because the property is the *absence*, which is easy to miss in a feature list.
   cross-tenant ciphertext swap this format exists to prevent
   (`crates/gateway/src/byok.rs:39`, `:171-182`).
 - **Asymmetric (audit-ledger signing):** Ed25519 via `ring`.
-  Per-tenant keypairs (Enterprise tier, gated by
-  `entitlements::F_AUDIT_KEYPAIR`) generated and stored
-  envelope-encrypted in `tenant_audit_keys` Postgres rows; lower
-  tiers fall back to a process-global key from
+  Per-tenant keypairs (available on every tier, gated by the
+  `f_audit_selfverify` entitlement, default-on) generated and stored
+  envelope-encrypted in `tenant_audit_keys` Postgres rows; a tenant
+  without one falls back to a process-global key from
   `TRACELANE_REKOR_SIGNING_KEY`. Private-key PKCS#8 bytes are
   wrapped in `secrecy::SecretBox` and zeroized on drop.
 - **Hashing:** SHA-256 (audit row hash, RFC 6962 Merkle tree,
@@ -192,12 +190,8 @@ because the property is the *absence*, which is easy to miss in a feature list.
 ## Known limitations
 
 - Free-tier rate limits (60 RPM) reduce abuse surface but do not eliminate it
-- SLM judge inference latency (<50ms p99) means there is a brief window between
-  request arrival and predictive decision — this is inherent to inline ML
-- The ML tier is **not running**. `predictive/trajectory_guard.rs` and
-  `predictive/slm_judge.rs` are registered but return a constant score with the
-  `ort` inference call commented out, so they cannot currently produce a verdict.
-  The rule-based detectors in `crates/gateway/src/predictive/` are registered, but
+- The ML-based predictors are **not enabled** and cannot currently produce a
+  verdict. The rule-based predictive detectors are registered, but
   most gate on payload fields (`mcp_server_name`, `tool_name`, `a2a_handoff`,
   `protocol`) that a `/v1/chat/completions` request does not carry, so **they do not
   fire on LLM traffic today** — the same disclosure as `README.md`. What does run

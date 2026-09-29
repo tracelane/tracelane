@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * OBS-18 — flag a trace `good` / `bad` / `needs review`, with an optional note.
@@ -14,8 +15,16 @@
  * mirror of a gate that is enforced server-side.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { absoluteDate } from "@/lib/format-date";
-import { useState } from "react";
+import {
+	announcePopoverOpen,
+	onOtherPopoverOpen,
+} from "@/lib/popover-coordination";
+import { useEffect, useState } from "react";
+
+/** This popover's id — see `lib/popover-coordination.ts`. */
+const POPOVER_ID = "trace-flag";
 
 export type Annotation = {
 	trace_id: string;
@@ -41,23 +50,36 @@ export function TraceFlag({
 	traceId,
 	initial,
 	canWrite,
+	embedded = false,
 }: {
+	embedded?: boolean;
 	traceId: string;
 	initial: Annotation | null;
 	/** False for a viewer. The gateway enforces it too; this only reflects it. */
 	canWrite: boolean;
 }) {
 	const [current, setCurrent] = useState<Annotation | null>(initial);
-	const [open, setOpen] = useState(false);
+	const [open, setOpen] = useState(embedded);
 	const [note, setNote] = useState(initial?.note ?? "");
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+
+	// Close THIS popover when a sibling (Share) announces it opened, and
+	// announce our own opens the same way — item 8.
+	useEffect(() => onOtherPopoverOpen(POPOVER_ID, () => setOpen(false)), []);
+	function toggleOpen(): void {
+		setOpen((v) => {
+			const next = !v;
+			if (next) announcePopoverOpen(POPOVER_ID);
+			return next;
+		});
+	}
 
 	async function save(label: Annotation["label"]) {
 		setBusy(true);
 		setError(null);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/traces/${encodeURIComponent(traceId)}/annotations`,
 				{
 					method: "POST",
@@ -89,7 +111,7 @@ export function TraceFlag({
 		setBusy(true);
 		setError(null);
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/traces/${encodeURIComponent(traceId)}/annotations`,
 				{ method: "DELETE" },
 			);
@@ -108,10 +130,10 @@ export function TraceFlag({
 	}
 
 	return (
-		<div className="inline-flex flex-col items-start gap-1">
+		<div className="relative inline-flex flex-col items-start gap-1">
 			<div className="inline-flex items-center gap-2">
 				{current ? (
-					<span className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface-2 px-2 py-1 text-sm">
+					<span className="inline-flex items-center gap-1.5 rounded-card border border-line bg-surface-2 px-2 py-1 text-sm">
 						{/* Glyph AND text: state must never be conveyed by symbol or
 						    colour alone — a screen reader has to get the same answer. */}
 						<span aria-hidden="true">⚑</span>
@@ -124,27 +146,29 @@ export function TraceFlag({
 					<span className="text-sm text-ink-3">Not flagged</span>
 				)}
 
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					disabled={!canWrite || busy}
-					onClick={() => setOpen((v) => !v)}
+					onClick={toggleOpen}
 					title={
 						canWrite ? undefined : "Your role can view flags but not set them."
 					}
-					className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
+					className="rounded-control border border-line px-2 py-1 text-sm disabled:opacity-50"
 				>
 					{busy ? "Saving…" : current ? "Edit" : "⚑ Flag"}
-				</button>
+				</Button>
 
 				{current && canWrite && (
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						disabled={busy}
 						onClick={remove}
-						className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
+						className="rounded-control border border-line px-2 py-1 text-sm disabled:opacity-50"
 					>
 						Remove
-					</button>
+					</Button>
 				)}
 			</div>
 
@@ -156,21 +180,33 @@ export function TraceFlag({
 				</p>
 			)}
 
+			{/* Anchored popover, same shape as `ShareDialog` — `absolute`, out of
+			    flow, so opening this never grows the header's height (item 8:
+			    it used to add ~200px inline). `onOtherPopoverOpen`/
+			    `announcePopoverOpen` above keep this and Share mutually
+			    exclusive so their popovers never overlap. */}
 			{open && canWrite && (
-				<div className="mt-1 rounded-lg border border-line bg-surface-2 p-3">
+				<div
+					className={
+						embedded
+							? "mt-3 space-y-2"
+							: "absolute left-0 top-full z-10 mt-1.5 w-72 space-y-2 rounded-card border border-line bg-surface p-3 shadow-[var(--shadow-card)]"
+					}
+				>
 					<div className="flex gap-2">
 						{LABELS.map((l) => (
-							<button
+							<Button
+								variant="bare"
 								key={l.value}
 								type="button"
 								disabled={busy}
 								aria-pressed={current?.label === l.value}
 								onClick={() => save(l.value)}
-								className="rounded-lg border border-line px-2 py-1 text-sm disabled:opacity-50"
+								className="rounded-control border border-line px-2 py-1 text-sm disabled:opacity-50"
 							>
 								{current?.label === l.value ? "✓ " : ""}
 								{l.text}
-							</button>
+							</Button>
 						))}
 					</div>
 					<label className="mt-2 block text-sm text-ink-3" htmlFor="flag-note">
@@ -182,7 +218,7 @@ export function TraceFlag({
 						onChange={(e) => setNote(e.target.value)}
 						maxLength={2000}
 						rows={2}
-						className="mt-1 w-full rounded-sm border border-line bg-transparent p-2 text-sm"
+						className="mt-1 w-full rounded-control border border-line bg-transparent p-2 text-sm"
 					/>
 				</div>
 			)}

@@ -18,8 +18,10 @@ import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
+
+import { withOwnerMutation } from "../owner-lock";
 
 const WORKOS = "https://api.workos.com";
 const ASSIGNABLE_ROLES = new Set(["owner", "member", "viewer"]);
@@ -39,90 +41,99 @@ export async function DELETE(
 	const session = await requireSession();
 	const { membershipId } = await params;
 
-	const members = await listMemberships(key, session.tenantId);
-	if (members === null) {
-		return NextResponse.json(
-			{ error: "could not verify membership" },
-			{ status: 502 },
-		);
-	}
-
-	// Owner check FIRST — a non-owner gets an identical 403 whether or not the id
-	// exists in this org, so a plain member can't probe which ids are in-tenant.
-	const caller = members.find((m) => m.user_id === session.userId);
-	if (!caller || !isPrivilegedRole(caller.role.slug)) {
-		return NextResponse.json(
-			{ error: "role_forbidden", required_role: "owner" },
-			{ status: 403 },
-		);
-	}
-
-	const target = members.find((m) => m.id === membershipId);
-	if (!target) {
-		return NextResponse.json({ error: "member not found" }, { status: 404 });
-	}
-	if (target.user_id === session.userId) {
-		return NextResponse.json(
-			{ error: "cannot remove yourself" },
-			{ status: 400 },
-		);
-	}
-
-	// Last-owner protection (§1).
-	// ponytail: bound = the 2-owner concurrent race (both remove the OTHER of
-	// the last two, each sees 2, both pass → 0 privileged members, which the
-	// customer CANNOT recover from — see). Owner-initiated +
-	// low-frequency; add a Postgres advisory lock on (tenant,"owners") if it
-	// must be exact.
-	const privilegedCount = members.filter((m) =>
-		isPrivilegedRole(m.role.slug),
-	).length;
-	if (isPrivilegedRole(target.role.slug) && privilegedCount <= 1) {
-		return NextResponse.json(
-			{ error: "last_owner_protected" },
-			{ status: 409 },
-		);
-	}
-
-	const del = await fetch(
-		`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
-		{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
-	);
-	if (!del.ok) {
-		return NextResponse.json(
-			{ error: "WorkOS removal failed" },
-			{ status: 502 },
-		);
-	}
-
-	// Revoke the removed member's `tlane_` keys (§3) so their next gateway
-	// request 401s. Best-effort: the membership + its sessions are already gone
-	// via WorkOS, so a revoke failure must not fail the removal (log + move on).
-	// Only keys minted by THIS user (minted_by = their WorkOS user id) are
-	// touched; pre-0011 keys with a NULL minter are unattributable and untouched.
-	try {
-		const [t] = await db
-			.select({ id: tenants.id })
-			.from(tenants)
-			.where(eq(tenants.workosOrgId, session.tenantId))
-			.limit(1);
-		if (t) {
-			await db
-				.update(apiKeys)
-				.set({ revokedAt: new Date() })
-				.where(
-					and(
-						eq(apiKeys.tenantId, t.id),
-						eq(apiKeys.mintedBy, target.user_id),
-						isNull(apiKeys.revokedAt),
-					),
-				);
+	return withOwnerMutation(session.tenantId, async () => {
+		const members = await listMemberships(key, session.tenantId);
+		if (members === null) {
+			return NextResponse.json(
+				{ error: "could not verify membership" },
+				{ status: 502 },
+			);
 		}
-	} catch {
-		console.error("[team/remove] api-key revoke failed for removed member");
-	}
 
-	return NextResponse.json({ removed: membershipId }, { status: 200 });
+		// Owner check FIRST — a non-owner gets an identical 403 whether or not the id
+		// exists in this org, so a plain member can't probe which ids are in-tenant.
+		const caller = members.find((m) => m.user_id === session.userId);
+		if (!caller || !isPrivilegedRole(caller.role.slug)) {
+			return NextResponse.json(
+				{
+					error: "role_forbidden",
+					required_role: "owner",
+					message:
+						"Only a current owner can change team members. Refresh the team to see your access.",
+				},
+				{ status: 403 },
+			);
+		}
+
+		const target = members.find((m) => m.id === membershipId);
+		if (!target) {
+			return NextResponse.json({ error: "member not found" }, { status: 404 });
+		}
+		if (target.user_id === session.userId) {
+			return NextResponse.json(
+				{ error: "cannot remove yourself" },
+				{ status: 400 },
+			);
+		}
+
+		// Last-owner protection (§1).
+		// ponytail: the concurrent route race is superseded by withOwnerMutation
+		// (2026-09-22). Remaining boundary: WorkOS writes outside these routes and
+		// ambiguous external failures cannot be rolled back by the Postgres lock.
+		const privilegedCount = members.filter((m) =>
+			isPrivilegedRole(m.role.slug),
+		).length;
+		if (isPrivilegedRole(target.role.slug) && privilegedCount <= 1) {
+			return NextResponse.json(
+				{
+					error: "last_owner_protected",
+					message:
+						"Keep at least one owner. Promote another member before removing or demoting this owner.",
+				},
+				{ status: 409 },
+			);
+		}
+
+		const del = await fetch(
+			`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
+			{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
+		);
+		if (!del.ok) {
+			return NextResponse.json(
+				{ error: "WorkOS removal failed" },
+				{ status: 502 },
+			);
+		}
+
+		// Revoke the removed member's `tlane_` keys (§3) so their next gateway
+		// request 401s. Best-effort: the membership + its sessions are already gone
+		// via WorkOS, so a revoke failure must not fail the removal (log + move on).
+		// Only keys minted by THIS user (minted_by = their WorkOS user id) are
+		// touched; pre-0011 keys with a NULL minter are unattributable and untouched.
+		try {
+			const [t] = await db
+				.select({ id: tenants.id })
+				.from(tenants)
+				.where(eq(tenants.workosOrgId, session.tenantId))
+				.limit(1);
+			if (t) {
+				await db
+					.update(apiKeys)
+					.set({ revokedAt: new Date() })
+					.where(
+						and(
+							eq(apiKeys.tenantId, t.id),
+							eq(apiKeys.mintedBy, target.user_id),
+							or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+						),
+					);
+			}
+		} catch {
+			console.error("[team/remove] api-key revoke failed for removed member");
+		}
+
+		return NextResponse.json({ removed: membershipId }, { status: 200 });
+	});
 }
 
 interface RoleChangeBody {
@@ -157,61 +168,75 @@ export async function PATCH(
 		);
 	}
 
-	const members = await listMemberships(key, session.tenantId);
-	if (members === null) {
-		return NextResponse.json(
-			{ error: "could not verify membership" },
-			{ status: 502 },
-		);
-	}
+	return withOwnerMutation(session.tenantId, async () => {
+		const members = await listMemberships(key, session.tenantId);
+		if (members === null) {
+			return NextResponse.json(
+				{ error: "could not verify membership" },
+				{ status: 502 },
+			);
+		}
 
-	const caller = members.find((m) => m.user_id === session.userId);
-	if (!caller || !isPrivilegedRole(caller.role.slug)) {
-		return NextResponse.json(
-			{ error: "role_forbidden", required_role: "owner" },
-			{ status: 403 },
-		);
-	}
+		const caller = members.find((m) => m.user_id === session.userId);
+		if (!caller || !isPrivilegedRole(caller.role.slug)) {
+			return NextResponse.json(
+				{
+					error: "role_forbidden",
+					required_role: "owner",
+					message:
+						"Only a current owner can change team members. Refresh the team to see your access.",
+				},
+				{ status: 403 },
+			);
+		}
 
-	const target = members.find((m) => m.id === membershipId);
-	if (!target) {
-		return NextResponse.json({ error: "member not found" }, { status: 404 });
-	}
+		const target = members.find((m) => m.id === membershipId);
+		if (!target) {
+			return NextResponse.json({ error: "member not found" }, { status: 404 });
+		}
 
-	// Last-owner protection (§1): demoting the last owner to a non-owner role is
-	// refused. Granting owner (member/viewer → owner) is always allowed.
-	const demotesOwner =
-		isPrivilegedRole(target.role.slug) && body.role !== "owner";
-	const privilegedCount = members.filter((m) =>
-		isPrivilegedRole(m.role.slug),
-	).length;
-	if (demotesOwner && privilegedCount <= 1) {
-		return NextResponse.json(
-			{ error: "last_owner_protected" },
-			{ status: 409 },
-		);
-	}
+		// Last-owner protection (§1): demoting the last owner to a non-owner role is
+		// refused. Granting owner (member/viewer → owner) is always allowed.
+		const demotesOwner =
+			isPrivilegedRole(target.role.slug) && body.role !== "owner";
+		const privilegedCount = members.filter((m) =>
+			isPrivilegedRole(m.role.slug),
+		).length;
+		if (demotesOwner && privilegedCount <= 1) {
+			return NextResponse.json(
+				{
+					error: "last_owner_protected",
+					message:
+						"Keep at least one owner. Promote another member before removing or demoting this owner.",
+				},
+				{ status: 409 },
+			);
+		}
 
-	const res = await fetch(
-		`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
-		{
-			method: "PUT",
-			headers: {
-				Authorization: `Bearer ${key}`,
-				"Content-Type": "application/json",
+		const res = await fetch(
+			`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
+			{
+				method: "PUT",
+				headers: {
+					Authorization: `Bearer ${key}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ role_slug: body.role }),
 			},
-			body: JSON.stringify({ role_slug: body.role }),
-		},
-	);
-	if (!res.ok) {
-		console.error(`[team/role] WorkOS role change failed: ${res.status}`);
-		return NextResponse.json(
-			{ error: "workos_role_change_failed" },
-			{ status: 502 },
 		);
-	}
+		if (!res.ok) {
+			console.error(`[team/role] WorkOS role change failed: ${res.status}`);
+			return NextResponse.json(
+				{ error: "workos_role_change_failed" },
+				{ status: 502 },
+			);
+		}
 
-	// The new role takes effect in the member's NEXT session JWT (WorkOS reissues
-	// on refresh) — surfaced in the UI copy per §3.
-	return NextResponse.json({ membershipId, role: body.role }, { status: 200 });
+		// The new role takes effect in the member's NEXT session JWT (WorkOS reissues
+		// on refresh) — surfaced in the UI copy per §3.
+		return NextResponse.json(
+			{ membershipId, role: body.role },
+			{ status: 200 },
+		);
+	});
 }

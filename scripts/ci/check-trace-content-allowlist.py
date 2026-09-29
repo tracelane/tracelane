@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
-"""The GWY-45 content-capture allowlist may name ONLY the internal tenant.
+"""The OPERATOR content-capture allowlist may name ONLY the internal tenant.
 
-WHY THIS EXISTS — a retention precondition that would otherwise be prose.
+WHAT THIS MEANS SINCE GWY-53 (2026-09-27) — read this first; the history below is
+the record of why the guard was written, and its precondition has changed.
+
+A CUSTOMER workspace now captures prompt/response text ONLY through the workspace
+setting (`PUT /v1/workspace/capture`, `specs/GWY-53-self-serve-content-capture.md`):
+the workspace OWNER opts in, the change is written to the tamper-evident ledger in
+the same transaction, and the text is kept for the trace's plan retention (the
+per-plan retention sweep enforces it; the `spans` TTL hard-deletes at 730 days).
+
+The operator list in `tracelane.yaml` (`trace_content: tenants:`) is a DIFFERENT
+door: it turns capture on for a tenant with NO owner consent and NO ledger event —
+the operator's own edit, invisible to the customer. So it stays dogfood-only, and
+that is what this guard now holds: a customer's text is recorded because the
+customer chose it, never because someone edited a config file. Widening `ALLOWED`
+would reopen exactly that door; a lone change to it is the finding.
+
+WHAT CHANGED IN THE RATIONALE: the precondition below ("no customer until a 30-day
+column TTL exists") was about retention outliving the customer's stated window.
+GWY-53 closed that harm by stating the window (the trace's) instead of shortening
+it — spec §0. The guard's BEHAVIOUR is unchanged; its reason is now consent and
+the ledger, not retention.
+
+HISTORY — why this was first written (GWY-45, 2026-08-20):
 
 GWY-45 captures customer prompt text into the span's `attributes` blob. Content
 placed there inherits the GLOBAL row TTL and **cannot be expired separately**,
@@ -30,10 +52,10 @@ WHAT IT ALLOWS, and why exactly one id:
   the internal dogfood/canary tenant, whose traffic is a fixed 15-prompt array
   we wrote (`/opt/tracelane/dogfood/dogfood.sh`). Nobody's private text.
 
-TO ADD A REAL TENANT you must first land the dedicated-column + 30-day column
-TTL work, then widen `ALLOWED` here in the same change. Editing this list on its
-own is the thing the guard exists to stop, and reviewers should treat a lone
-change to `ALLOWED` as the finding.
+TO CAPTURE A REAL TENANT'S TEXT (since GWY-53): the workspace owner turns it on
+in the workspace setting. Do NOT add the tenant here. Editing this list is the
+thing the guard exists to stop, and reviewers should treat a lone change to
+`ALLOWED` as the finding.
 
 USAGE
   check-trace-content-allowlist.py            # scan the shipped prod config
@@ -133,11 +155,11 @@ def main() -> int:
         for t in bad:
             print(f"    {t}")
         print(
-            "\n  Capturing a customer's prompt text requires content-specific\n"
-            "  retention FIRST: dedicated columns with a 30-day ClickHouse column\n"
-            "  TTL. Content in `attributes` inherits the global 365-day row TTL\n"
-            "  cannot be expired separately — `spans.attributes` is one String\n"
-            "  column. Land that work, then widen ALLOWED in the same change."
+            "\n  The operator list captures a tenant's text with NO owner consent and\n"
+            "  NO ledger event. A customer workspace captures through its own setting\n"
+            "  instead — the owner opts in with PUT /v1/workspace/capture, and the\n"
+            "  change is recorded on the tamper-evident ledger (GWY-53). Remove the\n"
+            "  tenant from `trace_content: tenants:`; the owner turns capture on."
         )
         return 1
     print(f"OK — {CONFIG} allowlists no tenant beyond the internal one.")

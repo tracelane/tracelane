@@ -33,9 +33,6 @@ Use the pinned versions in `rust-toolchain.toml` and `package.json` (`engines`, 
 git clone https://github.com/tracelane/tracelane
 cd tracelane
 
-# Enable the repo's git hooks. DO THIS FIRST — see the note below.
-git config core.hooksPath .githooks
-
 # Node dependencies
 pnpm install
 
@@ -50,11 +47,9 @@ docker compose -f infra/dev/docker-compose.yml up -d
 # 17 legacy .sql files under infra/dev/postgres/migrations/ would give you the pre-Drizzle
 # schema, and the schema has since moved to Drizzle — an incomplete control plane fails at runtime, not here.
 #
-# READ THIS BEFORE YOU ASSUME THE SCHEMA IS COMPLETE. `drizzle-kit migrate` applies
-# only the 9 JOURNALLED migrations (`meta/_journal.json` ends at 0008). There are 45
-# .sql files on disk; 0009+ are hand-written Neon migrations applied out-of-band and
-# deliberately un-journaled, so this command gives you 9 of 45. That is enough for the
-# gateway to boot and for most local work, and it is NOT the production schema.
+# `drizzle-kit migrate` applies the journalled migrations, which is enough for the
+# gateway to boot and for most local work. Later migrations under apps/web/db/migrations/
+# are plain SQL files; apply them in numeric order with `psql` if your work needs those columns.
 pnpm --filter @tracelanedev/web exec drizzle-kit migrate
 
 # infra/dev/postgres/migrations/ is RETAINED FOR REFERENCE, not for applying: several
@@ -70,20 +65,6 @@ pip install -e evals/
 # Copy env template and fill in required vars
 cp .env.example .env.local
 ```
-
-> **`git config core.hooksPath .githooks` is not optional, and nothing will remind you.**
-> **On the PUBLIC mirror `.githooks/` is not present** — it is withheld from the export,
-> so this command silently configures a path that does not exist and no hook runs. The
-> gating described here happens in the canonical repo before anything is exported.
->
-> `core.hooksPath` is per-clone local config — it is not carried by the clone and there is no
-> `postinstall` that sets it. Until you run it, `.githooks/pre-commit` and `.githooks/pre-push`
-> do not execute, so the checks below never run on your machine and nothing reports that they
-> did not. Verify with:
->
-> ```bash
-> git config --get core.hooksPath   # must print: .githooks
-> ```
 
 Required env vars in `.env.local`:
 
@@ -166,7 +147,7 @@ pnpm bench:ingest
 pnpm bench:gateway
 ```
 
-The benchmark job is NOT on the PR path — it runs only on a founder-approved `workflow_dispatch` (hosted runners are billed). The budgets it measures against:
+The benchmark job is NOT on the PR path — it runs only on manual dispatch. The budgets it measures against:
 
 | Surface | p99 |
 |---|---|
@@ -213,13 +194,13 @@ Open a GitHub issue using the feature request template. Before doing so:
 
 ### Conventions (non-negotiable)
 
-- No `unwrap()` or `expect()` outside `#[cfg(test)]` — a review rule (`.claude/rules/rust.md`); clippy runs `-D warnings` but no `unwrap_used` lint is configured
+- No `unwrap()` or `expect()` outside `#[cfg(test)]` — a review rule; clippy runs `-D warnings` but no `unwrap_used` lint is configured
 - `tracing::instrument` on every new public async fn with `tenant_id` as a default field
 - Every new ClickHouse query must have `WHERE tenant_id = ?` — CI rejects queries without it
 - `tenant_id` comes from the JWT claim, never the request body
 - No raw SQL strings in TypeScript — use `@clickhouse/client` parameter binding
 - No `console.log` in committed code — use the structured logger
-- No secrets in code — `gitleaks` runs in CI and in the pre-push gate
+- No secrets in code — `gitleaks` runs in CI
 - `secrecy::SecretString` for any Rust field named `*_key`, `*_token`, `*_secret`
 - Pin every external dependency version
 - No new deps without `cargo audit` / `pnpm audit` / `pip-audit` clean

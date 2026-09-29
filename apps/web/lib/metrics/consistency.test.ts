@@ -62,4 +62,15 @@ describe("consistency — one headline for every page", () => {
 		expect(quiet.availability.text).toBe("—");
 		expect(fmtPercent(100, { n: 0 }).text).toBe("—");
 	});
+
+	it("B-511: zero traffic dashes the burn rate and budget remaining too — never '0.00×' / '100%'", () => {
+		const quiet = sloHeadline({
+			summary: { p50_ms: 0, p95_ms: 0, p99_ms: 0, requests: 0, errors: 0 },
+			fallback: { requests: 0, errors: 0 },
+			target: 0.999,
+			unreachable: false,
+		});
+		expect(quiet.burn).toBe("—");
+		expect(quiet.budgetRemaining).toBe("—");
+	});
 });

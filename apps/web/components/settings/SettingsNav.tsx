@@ -33,9 +33,9 @@ import { SETTINGS_GROUPS, activeSettingsHref } from "./settings-nav-config";
  * swap.
  */
 const ITEM_ACTIVE =
-	"block rounded-md px-3 py-1.5 text-sm font-medium text-ink bg-surface-3 whitespace-nowrap";
+	"block rounded-control px-3 py-1.5 text-sm font-medium text-ink bg-surface-3 whitespace-nowrap";
 const ITEM_IDLE =
-	"block rounded-md px-3 py-1.5 text-sm text-ink-2 whitespace-nowrap hover:text-ink hover:bg-surface-hover transition-colors";
+	"block rounded-control px-3 py-1.5 text-sm text-ink-2 whitespace-nowrap hover:text-ink hover:bg-surface-hover transition-colors";
 
 export function SettingsNav() {
 	const pathname = usePathname();
@@ -51,7 +51,7 @@ export function SettingsNav() {
 				<select
 					value={active ?? ""}
 					onChange={(e) => router.push(e.target.value)}
-					className="w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink"
+					className="w-full rounded-control border border-line bg-surface px-3 py-2 text-sm text-ink"
 				>
 					{SETTINGS_GROUPS.map((group) => (
 						<optgroup key={group.label} label={group.label}>

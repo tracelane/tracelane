@@ -99,13 +99,18 @@ PARTITION BY toYYYYMM(start_time)
 -- Replacing dedup key. HOUR is the finest bucket that keeps a trace's spans adjacent.
 ORDER BY (tenant_id, toStartOfHour(start_time), trace_id, span_id)
 -- 365d = the MAX plan retention (Enterprise) — a fail-safe BACKSTOP, not the
--- per-plan window. Per-tenant retention (Free 7 / Builder 30 / Team 90 / Business 180
--- / Enterprise 365) is enforced by the entitlement-driven sweep job
--- (crates/gateway/src/retention_sweep.rs, reads plan_entitlements.retention_days).
+-- per-plan window. Per-tenant retention (Free 30 / every paid tier 730 —
+-- `plans.v3.json` `queryable_days`, BILL-01; this comment said "Free 7 … Enterprise 365"
+-- and `retention_days` until RI-02, 2026-09-20) is enforced by the entitlement-driven
+-- sweep job (crates/gateway/src/retention_sweep.rs, reads plan_entitlements.queryable_days),
+-- which since RI-02 also deletes rows of tenants with no `tenants` row (a purged tenant).
 -- Flat 365d here can only OVER-retain (never delete a paying tenant's data early);
 -- the previous flat 90d silently deleted Business/Enterprise data despite 180/365d sold.
 TTL toDate(start_time) + INTERVAL 365 DAY
-SETTINGS index_granularity = 8192;
+-- B-493 (migration 29): a span batch retried with the same insert_deduplication_token is
+-- discarded server-side — a retry of a batch that committed behind a client timeout
+-- fired the mv_* views a second time. Ingest sends one token per batch.
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 
 -- ── Materialized view: per-trace aggregates ─────────────────────────────────
 -- Pre-aggregated at write time; used by dashboard /v1/traces list endpoint.
@@ -155,7 +160,9 @@ TTL toDate(start_time) + INTERVAL 365 DAY
 -- the retention sweep had removed. The sweep deletes from this table with a HEAVY
 -- `ALTER TABLE … DELETE` (`retention_sweep.rs`), which rewrites part and projection
 -- from the same surviving rows; `throw` is what stops the unsafe form coming back.
-SETTINGS index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild';
+-- B-493 (migration 29): this view target dedups a retried span batch by its token too —
+-- the source table's window alone does not stop a view from firing twice.
+SETTINGS index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild', non_replicated_deduplication_window = 1000;
 
 -- NOTE: source columns are qualified with the table alias `s` (e.g.
 -- `min(s.start_time)`) so they resolve to the spans COLUMN, not the output
@@ -262,7 +269,7 @@ SETTINGS index_granularity = 8192;
 CREATE TABLE IF NOT EXISTS tracelane.guardrail_verdicts
 (
     tenant_id            String,
-    correlation_id       String,                  -- ULID minted per gateway request; returned to the caller in the 403 block body and copied onto the audit-ledger entry. NOT a column on `spans` — a blocked request 403s pre-span, so there is no trace to join to.
+    correlation_id       String,                  -- ULID minted per gateway request; returned to the caller in the 403 block body and copied onto the audit-ledger entry. NOT a column on `spans` — a blocked request 403s before dispatch; since R13 it DOES emit a block span, but that span carries no correlation_id, so there is still no join key (B-448 site 3).
     side                 LowCardinality(String),  -- request | response
     event_time           DateTime64(6, 'UTC'),    -- micros since epoch
     decision             LowCardinality(String),  -- allow | block | redact | warn
@@ -379,7 +386,7 @@ TTL toDate(bucket_hour) + INTERVAL 365 DAY;
 -- Read from prod with `SELECT create_table_query FROM system.tables`; only the
 -- `IF NOT EXISTS` guards were added.
 
-CREATE TABLE IF NOT EXISTS tracelane.slo_hourly_stats (`tenant_id` String, `bucket_hour` DateTime, `provider` String, `model` String, `latency_p50` AggregateFunction(quantile(0.5), Int64), `latency_p95` AggregateFunction(quantile(0.95), Int64), `latency_p99` AggregateFunction(quantile(0.99), Int64), `request_count` AggregateFunction(count, UInt8), `error_count` AggregateFunction(countIf, UInt8), `input_tokens` AggregateFunction(sum, Int64), `output_tokens` AggregateFunction(sum, Int64)) ENGINE = AggregatingMergeTree PARTITION BY toYYYYMM(bucket_hour) ORDER BY (tenant_id, bucket_hour, provider, model) TTL toDate(bucket_hour) + toIntervalDay(365) SETTINGS index_granularity = 8192;
+CREATE TABLE IF NOT EXISTS tracelane.slo_hourly_stats (`tenant_id` String, `bucket_hour` DateTime, `provider` String, `model` String, `latency_p50` AggregateFunction(quantile(0.5), Int64), `latency_p95` AggregateFunction(quantile(0.95), Int64), `latency_p99` AggregateFunction(quantile(0.99), Int64), `request_count` AggregateFunction(count, UInt8), `error_count` AggregateFunction(countIf, UInt8), `input_tokens` AggregateFunction(sum, Int64), `output_tokens` AggregateFunction(sum, Int64)) ENGINE = AggregatingMergeTree PARTITION BY toYYYYMM(bucket_hour) ORDER BY (tenant_id, bucket_hour, provider, model) TTL toDate(bucket_hour) + toIntervalDay(365) SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS tracelane.mv_slo_hourly_stats TO tracelane.slo_hourly_stats (`tenant_id` String, `bucket_hour` DateTime('UTC'), `provider` String, `model` String, `latency_p50` AggregateFunction(quantile(0.5), Int64), `latency_p95` AggregateFunction(quantile(0.95), Int64), `latency_p99` AggregateFunction(quantile(0.99), Int64), `request_count` AggregateFunction(count), `error_count` AggregateFunction(countIf, UInt8), `input_tokens` AggregateFunction(sum, Int64), `output_tokens` AggregateFunction(sum, Int64)) AS SELECT tenant_id, toStartOfHour(start_time) AS bucket_hour, coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider')) AS provider, coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name')) AS model, quantileState(0.5)(duration_us) AS latency_p50, quantileState(0.95)(duration_us) AS latency_p95, quantileState(0.99)(duration_us) AS latency_p99, countState() AS request_count, countIfState(status_code = 2) AS error_count, sumState(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_input_tokens'))) AS input_tokens, sumState(toInt64(JSONExtractInt(attributes, 'gen_ai_usage_output_tokens'))) AS output_tokens FROM tracelane.spans GROUP BY tenant_id, bucket_hour, provider, model;
 
@@ -405,7 +412,9 @@ ENGINE = SummingMergeTree(value)
 PARTITION BY toYYYYMM(day)
 ORDER BY (tenant_id, day, meter, dim, source)
 TTL day + INTERVAL 800 DAY
-SETTINGS index_granularity = 8192;
+-- REV-1 / B-469 (migration 28): a retried batch carrying the same insert_deduplication_token
+-- is discarded server-side instead of summed twice. Both writers send one per batch.
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 
 CREATE TABLE IF NOT EXISTS tracelane.meter_gauges
 (
@@ -444,4 +453,30 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(day)
 ORDER BY (tenant_id, hash, day)
 TTL day + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+-- RI-06 / B-449 (2026-09-19): spans lost at the JetStream boundary — one row per
+-- detected episode, written by ingest (the sole span writer records its own gaps).
+-- FLEET-LEVEL BY NECESSITY: a trimmed message's tenant went with its subject, so there
+-- is no tenant_id column and this table is NEVER served by a tenant read route. It is
+-- operator evidence and the input to a chained gap attestation once the operator-chain
+-- decision exists (ADR-078 / ADR-077 Part III R2). TTL 730 d = the longest queryable
+-- window: evidence outlives the data it describes, by design (RI-06 §5).
+-- The Rust row (crates/ingest/src/capture_gaps.rs) mirrors these columns EXACTLY —
+-- RowBinary is positional and typed (the B-292…B-297 class); the real-server test in
+-- scripts/ci/run-clickhouse-integration.sh is the control.
+CREATE TABLE IF NOT EXISTS tracelane.capture_gaps
+(
+    detected_at        DateTime64(6, 'UTC'),
+    source             LowCardinality(String),
+    kind               LowCardinality(String),
+    first_missing_seq  UInt64,
+    last_missing_seq   UInt64,
+    lost               UInt64,
+    ingest_instance    String,
+    note               String
+)
+ENGINE = MergeTree
+ORDER BY (detected_at)
+TTL toDateTime(detected_at) + INTERVAL 730 DAY
 SETTINGS index_granularity = 8192;

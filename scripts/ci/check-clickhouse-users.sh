@@ -113,6 +113,9 @@ run_proof() {
   local T="2026-09-12 00:00:00.000000"
   local SPAN="INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, parent_span_id, name, start_time, end_time, status_code) VALUES ('00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'a1b2c3d4e5f60718', NULL, 'gen_ai.chat', '$T', '$T', 1)"
   local AUDIT="INSERT INTO tracelane.audit_log (tenant_id, seq, event_time, event_type, actor, row_hash, prev_hash) VALUES ('00000000-0000-0000-0000-000000000001', 1, '$T', 'chat.completions.request', 'proof', '0000000000000000000000000000000000000000000000000000000000000001', '')"
+  # RI-06 / B-449 (2026-09-19): ingest writes its own detected span losses and never reads
+  # them back; the gateway reads them (its standing SELECT + INSERT wildcards on tracelane.*
+  # — RI-06 does not narrow that policy). The refusal that matters is ingest's SELECT.
   while IFS='|' read -r user expect sql; do
     [ -z "$user" ] && continue
     case "$user" in tl_ingest) pw=$INGEST_PW ;; tl_gateway) pw=$GATEWAY_PW ;; esac
@@ -132,6 +135,10 @@ tl_ingest|OK|INSERT INTO tracelane.blobs (tenant_id, hash, bytes, size) VALUES (
 tl_ingest|OK|INSERT INTO tracelane.blob_refs (tenant_id, hash, span_id, day) VALUES ('00000000-0000-0000-0000-000000000001', unhex('$(printf '00%.0s' $(seq 1 32))'), 'a1b2c3d4e5f60718', '2026-09-12')
 tl_ingest|DENIED|SELECT count() FROM tracelane.meter_counters
 tl_ingest|DENIED|SELECT count() FROM tracelane.blobs
+tl_ingest|OK|INSERT INTO tracelane.capture_gaps (detected_at, source, kind, first_missing_seq, last_missing_seq, lost, ingest_instance, note) VALUES ('$T', 'jetstream:TRACELANE_SPANS', 'trim', 4, 18, 15, 'proof', 'grant proof')
+tl_ingest|DENIED|SELECT count() FROM tracelane.capture_gaps
+tl_gateway|OK|INSERT INTO tracelane.capture_gaps (detected_at, source, kind, first_missing_seq, last_missing_seq, lost, ingest_instance, note) VALUES ('$T', 'jetstream:TRACELANE_SPANS', 'trim', 4, 18, 15, 'proof', 'grant proof')
+tl_gateway|OK|SELECT count() FROM tracelane.capture_gaps
 tl_gateway|OK|$AUDIT
 tl_gateway|OK|SELECT count() FROM tracelane.meter_counters
 tl_gateway|OK|SELECT count() FROM tracelane.meter_gauges

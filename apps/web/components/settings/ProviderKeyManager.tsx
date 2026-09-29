@@ -1,4 +1,7 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * ProviderKeyManager — self-service LLM **provider** key management (BYOK).
@@ -15,7 +18,8 @@
  */
 
 import { Modal } from "@/components/Modal";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, apiFetchRaw } from "@/lib/api-fetch";
+import { formatDateTimeUtc } from "@/lib/format-date";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import {
@@ -24,9 +28,24 @@ import {
 	PROVIDER_LABEL,
 } from "./provider-catalog.generated";
 
+interface KeyValidation {
+	status:
+		| "valid"
+		| "rejected"
+		| "unavailable"
+		| "cannot_validate"
+		| "unsupported";
+	reason: string;
+	checked_at: string;
+}
+
 interface ProviderKeySummary {
 	provider_id: string;
 	last4: string;
+	saved_at?: string;
+	last_validation?: KeyValidation | null;
+	last_rejected_at?: string | null;
+	rejection_history_available?: boolean;
 }
 
 /**
@@ -81,7 +100,7 @@ async function uploadProviderKey(input: {
 	provider_id: string;
 	plaintext: string;
 }): Promise<ProviderKeySummary> {
-	const res = await fetch("/api/settings/provider-keys", {
+	const res = await apiFetchRaw("/api/settings/provider-keys", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(input),
@@ -94,7 +113,7 @@ async function uploadProviderKey(input: {
 }
 
 async function revokeProviderKey(providerId: string): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/settings/provider-keys/${encodeURIComponent(providerId)}`,
 		{ method: "DELETE" },
 	);
@@ -121,7 +140,7 @@ function AddKeyDialog({
 			<form
 				onSubmit={(e) => {
 					e.preventDefault();
-					if (providerId && plaintext.trim()) {
+					if (providerId !== "bedrock" && providerId && plaintext.trim()) {
 						// Submit the TRIMMED key. A trailing/leading newline or
 						// space (a common paste artifact) was sent verbatim and then
 						// rejected upstream as a 401. The gateway also trims on save,
@@ -166,44 +185,53 @@ function AddKeyDialog({
 						</optgroup>
 					</select>
 				</div>
-				<div>
-					<label
-						htmlFor="provider-key"
-						className="text-xs font-medium text-ink-2 block mb-1"
-					>
-						API key
-					</label>
-					<input
-						id="provider-key"
-						type="password"
-						autoComplete="off"
-						value={plaintext}
-						onChange={(e) => setPlaintext(e.target.value)}
-						placeholder={hint ? `${hint}` : "paste your provider API key"}
-						className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						required
-					/>
-					<p className="text-2xs text-ink-2 mt-1">
-						Encrypted at rest (AES-256-GCM, bound to your tenant). Stored once —
-						we show only the last 4 characters afterward.
+				{providerId === "bedrock" ? (
+					<p className="text-xs text-ink-2">
+						No tenant credential to validate. Bedrock uses the gateway’s AWS
+						credentials.
 					</p>
-				</div>
+				) : (
+					<div>
+						<label
+							htmlFor="provider-key"
+							className="text-xs font-medium text-ink-2 block mb-1"
+						>
+							API key
+						</label>
+						<input
+							id="provider-key"
+							type="password"
+							autoComplete="off"
+							value={plaintext}
+							onChange={(e) => setPlaintext(e.target.value)}
+							placeholder={hint ? `${hint}` : "paste your provider API key"}
+							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm font-mono text-ink placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
+							required
+						/>
+						<p className="text-2xs text-ink-2 mt-1">
+							Encrypted at rest (AES-256-GCM, bound to your tenant). Stored once
+							— we show only the last 4 characters afterward.
+						</p>
+					</div>
+				)}
 				{error && <p className="text-xs text-danger-ink">{error}</p>}
 				<div className="flex justify-end gap-2 pt-1">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
 					>
 						Cancel
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="submit"
-						disabled={!plaintext.trim() || pending}
+						disabled={providerId === "bedrock" || !plaintext.trim() || pending}
 						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 					>
 						{pending ? "Saving…" : "Save key"}
-					</button>
+					</Button>
 				</div>
 			</form>
 		</Modal>
@@ -267,6 +295,37 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 		onSuccess: () => void qc.invalidateQueries({ queryKey: ["provider-keys"] }),
 	});
 
+	const validationMutation = useMutation({
+		mutationFn: async ({
+			providerId,
+		}: { providerId: string; savedAt?: string }): Promise<
+			KeyValidation & { saved_at: string }
+		> => {
+			const response = await apiFetchRaw(
+				`/api/settings/provider-keys/${encodeURIComponent(providerId)}/validate`,
+				{ method: "POST" },
+			);
+			if (!response.ok) {
+				const body = (await response.json().catch(() => ({}))) as {
+					error?: string;
+				};
+				throw new Error(body.error ?? "Could not validate this key");
+			}
+			return response.json();
+		},
+		onSuccess: (result, { providerId, savedAt }) => {
+			qc.setQueryData<ProviderKeySummary[]>(["provider-keys"], (previous) =>
+				previous?.map((key) =>
+					key.provider_id === providerId &&
+					key.saved_at === savedAt &&
+					key.saved_at === result.saved_at
+						? { ...key, last_validation: result }
+						: key,
+				),
+			);
+		},
+	});
+
 	// All hooks above this line — the locked branch is a render-time choice only.
 	if (locked) {
 		return (
@@ -283,7 +342,8 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 				<div>
 					<h3 className="text-sm font-semibold text-ink">Your keys</h3>
 				</div>
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					onClick={() => {
 						uploadMutation.reset();
@@ -292,9 +352,13 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 					className="px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 				>
 					+ Add provider key
-				</button>
+				</Button>
 			</div>
 
+			<p className="text-xs text-ink-2">
+				Saved is not validated. A successful check confirms access at that time;
+				model permissions and quota may differ.
+			</p>
 			{isLoading && (
 				<p className="text-sm text-ink-2 animate-pulse">Loading…</p>
 			)}
@@ -314,39 +378,113 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 
 			{keys.length > 0 && (
 				<div className="surface-card overflow-x-auto border border-line">
-					<table className="w-full text-left">
-						<thead className="bg-surface text-xs text-ink-2">
-							<tr>
-								<th className="py-1.5 px-3 font-medium">Provider</th>
-								<th className="py-1.5 pr-3 font-medium">Key</th>
-								<th className="py-1.5 pr-3 font-medium" />
-							</tr>
-						</thead>
-						<tbody>
+					<Table className="w-full text-left">
+						<THead className="bg-surface text-xs text-ink-2">
+							<TR>
+								<TH className="py-1.5 px-3 font-medium">Provider</TH>
+								<TH className="py-1.5 pr-3 font-medium">Key</TH>
+								<TH className="py-1.5 pr-3 font-medium">Status</TH>
+								<TH className="py-1.5 pr-3 font-medium" />
+							</TR>
+						</THead>
+						<TBody>
 							{keys.map((key) => (
-								<tr
+								<TR
 									key={key.provider_id}
 									className="border-t border-line last:border-0"
 								>
-									<td className="py-2 px-3 text-sm text-ink">
+									<TD className="py-2 px-3 text-sm text-ink">
 										{PROVIDER_LABEL.get(key.provider_id) ?? key.provider_id}
-									</td>
-									<td className="py-2 pr-3 font-mono text-xs text-ink-2">
+										{key.saved_at && (
+											<p className="text-xs text-ink-2">
+												Saved {formatDateTimeUtc(key.saved_at)}
+											</p>
+										)}
+									</TD>
+									<TD className="py-2 pr-3 font-mono text-xs text-ink-2">
 										••••••••{key.last4}
-									</td>
-									<td className="py-2 pr-3">
-										<button
+									</TD>
+									<TD className="py-2 pr-3 text-xs text-ink-2">
+										{key.provider_id === "bedrock" ? (
+											<p>No tenant credential to validate</p>
+										) : key.last_validation ? (
+											<p>
+												{
+													{
+														valid: "Valid",
+														rejected: "Rejected",
+														unavailable: "Could not validate",
+														cannot_validate: "Cannot validate",
+														unsupported: "Cannot validate",
+													}[key.last_validation.status]
+												}{" "}
+												{formatDateTimeUtc(key.last_validation.checked_at)} ·{" "}
+												{validationReason(key.last_validation.reason)}
+											</p>
+										) : (
+											<p>Not validated</p>
+										)}
+										{key.provider_id !== "bedrock" && key.last_rejected_at && (
+											<p>
+												Last rejected {formatDateTimeUtc(key.last_rejected_at)}{" "}
+												· provider rejected the credential
+											</p>
+										)}
+										{key.provider_id !== "bedrock" &&
+											key.rejection_history_available === false && (
+												<p>Rejection history unavailable</p>
+											)}
+										{key.provider_id !== "bedrock" &&
+											key.rejection_history_available &&
+											!key.last_rejected_at && (
+												<p>
+													No rejection observed in retained traces since this
+													save
+												</p>
+											)}
+										{validationMutation.isError &&
+											validationMutation.variables?.providerId ===
+												key.provider_id && (
+												<p role="alert" className="text-danger-ink">
+													{validationMutation.error.message}
+												</p>
+											)}
+									</TD>
+									<TD className="py-2 pr-3">
+										<Button
+											variant="bare"
+											type="button"
+											disabled={
+												validationMutation.isPending ||
+												key.provider_id === "bedrock"
+											}
+											onClick={() =>
+												validationMutation.mutate({
+													providerId: key.provider_id,
+													savedAt: key.saved_at,
+												})
+											}
+											className="text-xs px-2 py-1 mr-2 rounded border border-line text-ink disabled:opacity-40"
+										>
+											{validationMutation.isPending &&
+											validationMutation.variables?.providerId ===
+												key.provider_id
+												? "Validating…"
+												: "Validate now"}
+										</Button>
+										<Button
+											variant="bare"
 											type="button"
 											onClick={() => revokeMutation.mutate(key.provider_id)}
 											className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 										>
 											Revoke
-										</button>
-									</td>
-								</tr>
+										</Button>
+									</TD>
+								</TR>
 							))}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			)}
 
@@ -364,4 +502,33 @@ export function ProviderKeyManager({ canManage }: { canManage: boolean }) {
 			)}
 		</div>
 	);
+}
+
+function validationReason(reason: string): string {
+	switch (reason) {
+		case "authenticated":
+			return "provider accepted the credential";
+		case "authentication_rejected":
+			return "provider rejected the credential";
+		case "rate_limited":
+			return "provider rate limit";
+		case "public_catalog":
+			return "public model catalog accepts invalid credentials";
+		case "no_tenant_credential":
+			return "no tenant credential to validate";
+		case "inconclusive_probe":
+			return "model catalog responses could not establish credential validity";
+		case "credential_malformed":
+			return "credential format is invalid";
+		case "token_exchange_failed":
+			return "service-account token exchange did not succeed";
+		case "probe_not_supported":
+			return "run a new check to validate this saved credential";
+		case "target_blocked":
+			return "provider endpoint could not be verified";
+		case "transport_failed":
+			return "provider could not be reached";
+		default:
+			return "provider did not confirm credential validity";
+	}
 }

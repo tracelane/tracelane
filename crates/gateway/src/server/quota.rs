@@ -61,7 +61,10 @@ pub const KEY_SPEND_THIS_WEEK_SQL: &str = "SELECT toFloat64(sum(cost_usd)) AS us
 
 /// Pick the baseline SQL for a key's budget cadence. One query either way —
 /// this only chooses WHICH window it reads, never adds a second read.
-const fn key_spend_sql(cadence: crate::spend::BudgetReset) -> &'static str {
+///
+/// SET-38: `GET /v1/keys/{id}` reads `recorded_usd` through THIS function, so
+/// the number the edit drawer shows is the number the budget seeds from.
+pub(crate) const fn key_spend_sql(cadence: crate::spend::BudgetReset) -> &'static str {
     match cadence {
         crate::spend::BudgetReset::Daily => KEY_SPEND_THIS_DAY_SQL,
         crate::spend::BudgetReset::Weekly => KEY_SPEND_THIS_WEEK_SQL,

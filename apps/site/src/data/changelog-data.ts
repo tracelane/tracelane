@@ -9,7 +9,9 @@
  * HOW THIS WAS DERIVED, AND WHERE IT IS THIN
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * WINDOW: 2026-05-02 → 2026-09-07.
+ * WINDOW: 2026-05-02 → 2026-09-26. (Extended 2026-09-27 with the 09-08 → 09-26 shipments,
+ * each checked against the deployed code and the internal ledger's deploy records;
+ * built-but-not-deployed work is absent.)
  *
  *   The brief asked for 2026-04-07 → 2026-09-07. The repository's FIRST COMMIT
  *   is `811b22d5`, dated 2026-04-29 (`git log --reverse --date=short`), so
@@ -103,7 +105,17 @@ export type EntryType =
 	| "observability"
 	| "evals"
 	| "trust"
+	| "security"
 	| "platform";
+
+export type EntryKind = "feature" | "improvement" | "fix";
+
+/** The three headings inside each month, in the order they render. */
+export const KIND_LABEL: Record<EntryKind, string> = {
+	feature: "New features",
+	improvement: "Improvements",
+	fix: "Fixes",
+};
 
 export type Entry = {
 	/** ISO date. The day it became real for a customer, not the commit date. */
@@ -121,6 +133,14 @@ export type Entry = {
 	 * "shipped" — built and deployed; no independent production proof recorded.
 	 */
 	state: "shipped" | "proven";
+	/**
+	 * SITE-04 (founder 2026-09-29): the heading the entry sits under inside its month.
+	 *   "feature"     — a capability a customer did not have before.
+	 *   "improvement" — an existing capability made better, safer or more visible.
+	 *   "fix"         — something that did not work, and now does.
+	 * Required, so a new entry cannot skip the decision.
+	 */
+	kind: EntryKind;
 	/** Internal id where one exists. Rendered as a small monospace tag, nothing more. */
 	id?: string;
 	/**
@@ -140,21 +160,198 @@ export type Entry = {
 };
 
 export const TYPE_LABEL: Record<EntryType, string> = {
-	gateway: "Gateway",
-	observability: "Observability",
-	evals: "Evals",
-	trust: "Trust",
-	platform: "Platform",
+	gateway: "Control",
+	observability: "Visibility",
+	evals: "Quality",
+	trust: "Proof",
+	security: "Safety",
+	platform: "Adoption",
 };
+
+/*
+ * THE SIX PILLARS (2026-09-27) structured the page until SITE-04 (2026-09-29), which
+ * replaced them with New features · Improvements · Fixes. The pillar survives only as
+ * `type` + TYPE_LABEL, the small label on each entry. The PILLARS array, the CADENCE
+ * bars and the STATS cards were deleted with the layout that rendered them
+ * (`git show aae781765:apps/site/src/data/changelog-data.ts` holds them).
+ */
 
 /** Newest first. The page groups by month; it does not re-sort. */
 export const ENTRIES: Entry[] = [
+	{
+		date: "2026-09-26",
+		title: "Jump anywhere with ⌘K",
+		use: "Press ⌘K to reach any screen, run a common action, or paste a trace id and land on that trace.",
+		type: "platform",
+		kind: "feature",
+		state: "shipped",
+		id: "OBS-02",
+	},
+	{
+		date: "2026-09-26",
+		title: "Your own fallback models",
+		use: "Turn cross-provider failover on for every request in your workspace and choose the fallback models, in order — one call can still opt out with a header.",
+		type: "gateway",
+		kind: "feature",
+		state: "shipped",
+		id: "GWY-52",
+	},
+	{
+		date: "2026-09-26",
+		title: "Name your own models",
+		use: "Call a model by a name you control, like \"fast\", and repoint it in settings without touching code; the trace records both the name and the model that answered.",
+		type: "gateway",
+		kind: "feature",
+		state: "proven",
+		id: "GWY-27",
+	},
+	{
+		date: "2026-09-24",
+		title: "Know every agent calling you",
+		use: "See which agents and clients are calling your gateway, each with its own profile and history, from the name they send or the client they run.",
+		type: "observability",
+		kind: "feature",
+		state: "proven",
+		id: "OBS-54",
+	},
+	{
+		date: "2026-09-24",
+		title: "An audit page with one answer",
+		use: "Open the audit page and see, first, whether your evidence verifies — and what to do next if it does not.",
+		type: "trust",
+		kind: "improvement",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-24",
+		title: "Secrets masked before storage",
+		use: "Credentials that appear in a prompt, a response or an evaluation note are masked before anything is stored.",
+		type: "security",
+		kind: "improvement",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-24",
+		title: "Approve tool changes in bulk",
+		use: "Approve every new tool definition at once — while a CHANGED definition still needs its own review.",
+		type: "security",
+		kind: "improvement",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-24",
+		title: "Canary a prompt to a share of users",
+		use: "Send a new prompt version to a percentage of your users, with each user kept on the same version, before promoting it to everyone.",
+		type: "evals",
+		kind: "feature",
+		state: "proven",
+	},
+	{
+		date: "2026-09-22",
+		title: "Rotate keys without downtime",
+		use: "Rotate an API key with a grace window you choose, so the old key keeps working until your deploy has picked up the new one.",
+		type: "security",
+		kind: "feature",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-22",
+		title: "Check a provider key works",
+		use: "Validate a saved provider key on demand and see when it last passed or was rejected, separately from when it was saved.",
+		type: "gateway",
+		kind: "feature",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-22",
+		title: "Compare against a baseline",
+		use: "Pick a baseline run and compare an experiment against it case by case, not only on the average.",
+		type: "evals",
+		kind: "feature",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-22",
+		title: "A trace becomes a test case",
+		use: "Save a production trace's input into a dataset from the trace page in one click.",
+		type: "evals",
+		kind: "feature",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-20",
+		title: "Tool calls in full",
+		use: "See each tool call on the trace page — its arguments where you capture content, and their size where you do not.",
+		type: "observability",
+		kind: "improvement",
+		state: "proven",
+		id: "OBS-50",
+	},
+	{
+		date: "2026-09-20",
+		title: "Every retry on the trace",
+		use: "See every attempt a request made — each retry and failover hop, with its status and timing — on the trace, not only the one that succeeded.",
+		type: "observability",
+		kind: "improvement",
+		state: "proven",
+	},
+	{
+		date: "2026-09-20",
+		title: "Ledger written in one transaction",
+		use: "Every ledger row is committed in the same database transaction as the chain it extends, and archived every hour.",
+		type: "trust",
+		kind: "improvement",
+		state: "proven",
+	},
+	{
+		date: "2026-09-19",
+		title: "The model that actually answered",
+		use: "See the exact model version the provider says served each call, next to the name you asked for.",
+		type: "observability",
+		kind: "improvement",
+		state: "proven",
+	},
+	{
+		date: "2026-09-19",
+		title: "Exports that never arrive half-done",
+		use: "An evidence export that cannot be completed fails loudly instead of handing you a partial file.",
+		type: "trust",
+		kind: "fix",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-14",
+		title: "Usage-based plans",
+		use: "Pay by usage meters on five plans — and capture never stops because of a billing limit.",
+		type: "platform",
+		kind: "feature",
+		state: "shipped",
+	},
+	{
+		date: "2026-09-10",
+		title: "Know which user a trace belongs to",
+		use: "Send your own user id and filter sessions and traces by the person who started them.",
+		type: "observability",
+		kind: "feature",
+		state: "proven",
+		id: "OBS-20",
+	},
+	{
+		date: "2026-09-08",
+		title: "Every setting on the span",
+		use: "See the temperature, token limits, tool list and deployment each call used, recorded on its span.",
+		type: "observability",
+		kind: "improvement",
+		state: "shipped",
+		id: "GWY-48",
+	},
 	// ─── September 2026 ────────────────────────────────────────────────────────
 	{
 		date: "2026-09-07",
 		title: "Gateway overhead, measured",
 		use: "See exactly what the gateway costs you in latency — 2 ms at the median, 5 ms at the 99th — measured on LiteLLM's open benchmark harness rather than one we wrote.",
 		type: "gateway",
+		kind: "improvement",
 		state: "proven",
 		id: "PLT-23",
 	},
@@ -163,6 +360,7 @@ export const ENTRIES: Entry[] = [
 		title: "OpenAI tool calling, end to end",
 		use: "Run an agent that calls tools through the gateway with the OpenAI SDK unchanged — real tool calls come back, the finish reason is the true one, and you can replay the model's own tool call in the next turn.",
 		type: "gateway",
+		kind: "feature",
 		state: "proven",
 	},
 	{
@@ -170,6 +368,7 @@ export const ENTRIES: Entry[] = [
 		title: "Dashboards you build yourself",
 		use: "Assemble your own dashboard from a palette of metric tiles, then resize, move and remove them — the layout persists across a reload.",
 		type: "observability",
+		kind: "feature",
 		state: "proven",
 		id: "DSH-13",
 	},
@@ -178,6 +377,7 @@ export const ENTRIES: Entry[] = [
 		title: "Truncated answers are never cached",
 		use: "Ask again after a reply was cut short by a token limit and you get a fresh, complete answer instead of the truncated one served back from cache.",
 		type: "gateway",
+		kind: "fix",
 		state: "proven",
 	},
 	{
@@ -185,6 +385,7 @@ export const ENTRIES: Entry[] = [
 		title: "Self-hosting runs unmetered",
 		use: "Run the gateway on your own hardware with no control plane and it no longer applies the hosted free tier's request limit to your traffic.",
 		type: "platform",
+		kind: "fix",
 		state: "proven",
 		doc: "/self-hosting",
 	},
@@ -193,6 +394,7 @@ export const ENTRIES: Entry[] = [
 		title: "Anthropic-native endpoint",
 		use: "Point Claude Code, or any Anthropic-native client, straight at the gateway and get full tracing, token counts and cost with no OpenAI-shape translation in between.",
 		type: "gateway",
+		kind: "feature",
 		state: "proven",
 		id: "GWY-47",
 	},
@@ -201,6 +403,7 @@ export const ENTRIES: Entry[] = [
 		title: "Ask your traces a question",
 		use: "Type a question about your own runs in plain English and get an answer, instead of writing the query yourself.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 		id: "OBS-40",
 	},
@@ -209,6 +412,7 @@ export const ENTRIES: Entry[] = [
 		title: "Multi-agent runs, as swim lanes",
 		use: "Read a run with sub-agents as one labelled lane per agent, with a failures-only filter, rather than as a single flat timeline.",
 		type: "observability",
+		kind: "feature",
 		state: "proven",
 		id: "OBS-49",
 	},
@@ -217,6 +421,7 @@ export const ENTRIES: Entry[] = [
 		title: "Shareable trace links",
 		use: "Send someone a link to one trace, carrying its ledger badge, that they can open without an account — and revoke it when you are done.",
 		type: "observability",
+		kind: "feature",
 		state: "proven",
 		id: "OBS-48",
 	},
@@ -225,6 +430,7 @@ export const ENTRIES: Entry[] = [
 		title: "Search the trace list",
 		use: "Find a trace by span name or content from a search box on the traces page, instead of paging until you spot it.",
 		type: "observability",
+		kind: "feature",
 		state: "proven",
 		id: "OBS-01",
 	},
@@ -233,6 +439,7 @@ export const ENTRIES: Entry[] = [
 		title: "A playground inside the app",
 		use: "Try a prompt against a provider you have connected and land straight on the trace it produced.",
 		type: "evals",
+		kind: "feature",
 		state: "proven",
 		id: "EVL-03",
 	},
@@ -241,6 +448,7 @@ export const ENTRIES: Entry[] = [
 		title: "Claude Code sessions record fully",
 		use: "See real token counts, computed cost, tool names and session grouping for a Claude Code session — all four were previously blank.",
 		type: "observability",
+		kind: "fix",
 		state: "proven",
 		id: "PLT-46",
 	},
@@ -249,6 +457,7 @@ export const ENTRIES: Entry[] = [
 		title: "MCP for hosted workspaces",
 		use: "Query your own traces from any MCP client using your bearer token — this previously needed a self-hosted deployment with a direct database connection.",
 		type: "platform",
+		kind: "feature",
 		state: "proven",
 		id: "PLT-22",
 		doc: "/mcp-server",
@@ -258,6 +467,7 @@ export const ENTRIES: Entry[] = [
 		title: "Your trace ids survive the gateway",
 		use: "Call the gateway from your own instrumented app and the two halves join into one trace, instead of appearing as two disconnected ones.",
 		type: "platform",
+		kind: "fix",
 		state: "proven",
 		id: "GWY-46",
 	},
@@ -266,6 +476,7 @@ export const ENTRIES: Entry[] = [
 		title: "Line and area charts",
 		use: "Read latency percentiles, availability and error rate as a continuous line rather than as bars, which is the right shape for a level instead of a count.",
 		type: "observability",
+		kind: "improvement",
 		state: "shipped",
 		id: "DSH-14",
 	},
@@ -274,6 +485,7 @@ export const ENTRIES: Entry[] = [
 		title: "One time range for the dashboard",
 		use: "Move one control and every chart on the dashboard answers to it, drawing a real interactive chart — several displays used to disagree with each other.",
 		type: "observability",
+		kind: "improvement",
 		state: "proven",
 		id: "DSH-11",
 	},
@@ -284,6 +496,7 @@ export const ENTRIES: Entry[] = [
 		title: "Guides for the agent frameworks",
 		use: "Get traces out of LangChain, LangGraph, CrewAI or LlamaIndex by pointing their existing OpenTelemetry exporter at us — no Tracelane-specific code, and each guide states exactly what you get.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 		doc: "/integrations/langchain",
 	},
@@ -292,6 +505,7 @@ export const ENTRIES: Entry[] = [
 		title: "An eval gate for your CI",
 		use: 'Run a dataset through your prompt on every pull request and fail the build when the score falls below a floor you set, with a separate exit code for "it got worse" and "we could not measure it".',
 		type: "evals",
+		kind: "feature",
 		state: "proven",
 		id: "EVL-30",
 		doc: "/eval-gates",
@@ -301,6 +515,7 @@ export const ENTRIES: Entry[] = [
 		title: "Review queues for failures",
 		use: "Route a trace an automated judge scored as failing to a review queue, write the correct answer by hand, and keep it as a reusable test case.",
 		type: "evals",
+		kind: "feature",
 		state: "proven",
 		id: "EVL-29",
 	},
@@ -309,6 +524,7 @@ export const ENTRIES: Entry[] = [
 		title: "Score live traffic automatically",
 		use: "Have an automated judge score a share of your production traffic against a rubric you choose, at a sample rate you set, under a spend limit that survives a restart.",
 		type: "evals",
+		kind: "feature",
 		state: "proven",
 		id: "EVL-28",
 	},
@@ -317,6 +533,7 @@ export const ENTRIES: Entry[] = [
 		title: "Nine ways to assert an eval",
 		use: "Assert on contains, regex, JSON schema, an LLM judge, and cost and latency ceilings through the API — and a judge answer that does not match its schema errors instead of quietly scoring.",
 		type: "evals",
+		kind: "improvement",
 		state: "shipped",
 		id: "EVL-23",
 		doc: "/eval-gates",
@@ -326,6 +543,7 @@ export const ENTRIES: Entry[] = [
 		title: "Datasets that persist",
 		use: "Save a collection of test cases and have it still be there afterwards — every dataset write had been failing silently.",
 		type: "evals",
+		kind: "fix",
 		state: "shipped",
 		id: "EVL-04",
 	},
@@ -334,6 +552,7 @@ export const ENTRIES: Entry[] = [
 		title: "Repeat requests served from cache",
 		use: "Send the same request twice and the second is answered from the gateway's own cache instead of the provider, with a response header naming the tier that served it.",
 		type: "gateway",
+		kind: "feature",
 		state: "proven",
 		id: "GWY-25",
 	},
@@ -342,6 +561,7 @@ export const ENTRIES: Entry[] = [
 		title: "Failover honours your config",
 		use: "Set a fallback provider in `tracelane.yaml` and it is actually used — the setting had been read and then ignored.",
 		type: "gateway",
+		kind: "fix",
 		state: "shipped",
 		id: "GWY-44",
 	},
@@ -350,6 +570,7 @@ export const ENTRIES: Entry[] = [
 		title: "Send OpenTelemetry traces directly",
 		use: "Export a nested agent trace straight from your own instrumentation with your API key, and see the whole tree — planner step, each tool call, the retry — without proxying the model call.",
 		type: "platform",
+		kind: "feature",
 		state: "proven",
 		id: "GWY-41",
 		doc: "/sdk-typescript",
@@ -359,6 +580,7 @@ export const ENTRIES: Entry[] = [
 		title: "Compare two traces",
 		use: "Open two runs side by side and see what differs between them.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 		id: "OBS-10",
 	},
@@ -366,14 +588,16 @@ export const ENTRIES: Entry[] = [
 		date: "2026-08-11",
 		title: "Three permission gaps closed",
 		use: "A viewer can no longer promote or delete a production prompt, SSO and directory-sync setup is limited to the plan that includes it, and a billing-portal return address is checked against an allowlist.",
-		type: "platform",
+		type: "security",
+		kind: "fix",
 		state: "shipped",
 	},
 	{
 		date: "2026-08-01",
 		title: "Releases you can verify",
 		use: "Check any release binary yourself — 0.2.3 is the first to publish a Cosign keyless signature and a CycloneDX SBOM per artifact, with build provenance attested by GitHub.",
-		type: "trust",
+		type: "security",
+		kind: "feature",
 		state: "shipped",
 		doc: "/security",
 	},
@@ -384,6 +608,7 @@ export const ENTRIES: Entry[] = [
 		title: "Gemini through Vertex AI",
 		use: "Route Gemini models via Google's Vertex AI endpoint with your own project credentials.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 		doc: "/providers",
 	},
@@ -392,6 +617,7 @@ export const ENTRIES: Entry[] = [
 		title: "Self-host without a certificate authority",
 		use: "Run a single-tenant deployment without standing up SPIRE first, which removes the heaviest prerequisite from the self-host path.",
 		type: "platform",
+		kind: "improvement",
 		state: "shipped",
 		doc: "/self-hosting",
 	},
@@ -401,6 +627,7 @@ export const ENTRIES: Entry[] = [
 		// pricing-guard: allow "audit add-on" historical — a dated changelog entry (CLAUDE.md §19); the add-on was retired 2026-09-12
 		use: "Check your workspace's hash chain from inside the product without paying for the audit add-on; the exportable, offline-verifiable bundle stays part of that add-on.",
 		type: "trust",
+		kind: "improvement",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -409,6 +636,7 @@ export const ENTRIES: Entry[] = [
 		title: "Slice the trace list",
 		use: "Filter, group by model, operation or status, sort by any column, set one date range for the page, and export what you are looking at to CSV or JSON.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -416,6 +644,7 @@ export const ENTRIES: Entry[] = [
 		title: "Anchored to a public log",
 		use: "Prove to a third party that a batch of your records existed when you say it did — the first Merkle root reached the public Sigstore transparency log at index 19398597, and anyone can look it up without asking us.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -424,6 +653,7 @@ export const ENTRIES: Entry[] = [
 		title: "Failure signatures from your traces",
 		use: "See the failure shapes actually detected in your own runs, each with a first-seen and last-seen, rather than a catalogue of failures in the abstract.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -431,6 +661,7 @@ export const ENTRIES: Entry[] = [
 		title: "Offline verification, three languages",
 		use: "Hand an exported bundle to someone with no network access and let them verify it in Rust, Python or TypeScript against your own public key, served from a public endpoint so the trust root is not us.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -439,6 +670,7 @@ export const ENTRIES: Entry[] = [
 		title: "Promotions are signed records",
 		use: "Promote or roll back a prompt and the decision is appended to the tamper-evident chain as a signed verdict you can hand to someone else.",
 		type: "evals",
+		kind: "feature",
 		state: "shipped",
 		doc: "/prompt-promotion",
 	},
@@ -447,6 +679,7 @@ export const ENTRIES: Entry[] = [
 		title: "Alerts you configure and test",
 		use: "Write your own alert rules, send them to Slack, Discord or an HTTP endpoint, and fire a test to confirm the route works before you rely on it.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -454,6 +687,7 @@ export const ENTRIES: Entry[] = [
 		title: "Teams, roles and seats",
 		use: "Invite members, assign roles, stay inside the seat count your plan includes, and delete your own account or organisation without asking us.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -461,6 +695,7 @@ export const ENTRIES: Entry[] = [
 		title: "Real cost on every call",
 		use: "See the USD cost of a call on its span, in the trace list, and rolled into a spend card — computed from a model price catalogue rather than estimated.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -468,6 +703,7 @@ export const ENTRIES: Entry[] = [
 		title: "Sessions group a multi-turn run",
 		use: "Follow a conversation across its turns as one session, with its own list and detail view, instead of as unrelated calls.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -475,6 +711,7 @@ export const ENTRIES: Entry[] = [
 		title: "Prompts with durable versions",
 		use: "Author a prompt, keep its versions, and promote one to production from the app — rather than keeping the text in your application code.",
 		type: "evals",
+		kind: "feature",
 		state: "shipped",
 		doc: "/prompt-promotion",
 	},
@@ -483,6 +720,7 @@ export const ENTRIES: Entry[] = [
 		title: "A gateway operations page",
 		use: "Watch per-provider health, failover state, circuit-breaker state and quota status from one page, with nothing on it that is not a measured signal.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 	},
 
@@ -492,6 +730,7 @@ export const ENTRIES: Entry[] = [
 		title: "Sampling and quotas per workspace",
 		use: "Set a sampling policy, an ingest quota and a per-trace ceiling for each workspace — and an over-quota batch is refused with the reason, never accepted and quietly dropped.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -499,6 +738,7 @@ export const ENTRIES: Entry[] = [
 		title: "Spans acknowledged only after storage",
 		use: "A restart mid-flight replays your span instead of losing it, because the queue is only acknowledged once the write has landed.",
 		type: "platform",
+		kind: "improvement",
 		state: "shipped",
 	},
 	{
@@ -506,6 +746,7 @@ export const ENTRIES: Entry[] = [
 		title: "Pre-flight policy at the gateway",
 		use: "Apply your own policy to a request before it leaves — cost and step caps, secret and PII patterns, tool pinning, response format and topic scope — and have it allowed, redacted or refused.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 		doc: "/predictive-guardrails",
 	},
@@ -514,6 +755,7 @@ export const ENTRIES: Entry[] = [
 		title: "A transcript-spine trace viewer",
 		use: "Read a trace top to bottom as the conversation it was, with the span tree and an inspector beside it, and filter the list down to the run you are looking for.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -521,6 +763,7 @@ export const ENTRIES: Entry[] = [
 		title: "Verify the ledger in your browser",
 		use: "Watch your own browser recompute the chain and report the chain and signature verdicts separately — a passing badge is something your machine worked out, not something we asserted.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -529,6 +772,7 @@ export const ENTRIES: Entry[] = [
 		title: "Onboarding ends in your own trace",
 		use: "Finish setup by looking at the first trace your key actually produced, so the confirmation is your data rather than a checkmark.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 		doc: "/onboarding",
 	},
@@ -537,6 +781,7 @@ export const ENTRIES: Entry[] = [
 		title: "A dropped span is loud",
 		use: "Know when capture is broken: a span the gateway cannot record is counted, warned once and reported on the health endpoint, and an unset queue address refuses to start at all.",
 		type: "observability",
+		kind: "improvement",
 		state: "shipped",
 	},
 	{
@@ -544,6 +789,7 @@ export const ENTRIES: Entry[] = [
 		title: "Tracelane Cloud is live",
 		use: "Point a client at the hosted gateway and start capturing, instead of running the stack yourself first.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 		doc: "/quickstart",
 	},
@@ -552,13 +798,15 @@ export const ENTRIES: Entry[] = [
 		title: "Cross-provider failover",
 		use: "Name a fallback provider and a failing upstream is retried there, rather than the request ending at the first error.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
 		date: "2026-06-02",
 		title: "Tool-definition drift detection",
 		use: "Find out when a tool's description or input schema changes underneath a running agent — the silent rug-pull an agent has no other way to notice.",
-		type: "trust",
+		type: "security",
+		kind: "feature",
 		state: "shipped",
 		doc: "/predictive-guardrails",
 	},
@@ -569,6 +817,7 @@ export const ENTRIES: Entry[] = [
 		title: "Breakers, canaries and a kill switch",
 		use: "Give each upstream its own circuit breaker, split traffic to a candidate prompt version, and turn a predictor off by name without a deploy.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -576,6 +825,7 @@ export const ENTRIES: Entry[] = [
 		title: "Ingest limits answered on the spot",
 		use: "Send an oversized batch, span or attribute and get a synchronous refusal with the reason in a response header — nothing is accepted and then discarded behind your back.",
 		type: "platform",
+		kind: "improvement",
 		state: "shipped",
 	},
 	{
@@ -583,6 +833,7 @@ export const ENTRIES: Entry[] = [
 		title: "A verifier a regulator can run",
 		use: "Hand an auditor a single signed binary that verifies an exported ledger offline against a public key they pin themselves, and exits non-zero when the chain does not hold.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -595,6 +846,7 @@ export const ENTRIES: Entry[] = [
 		// <!-- pricing-guard: allow "hard cap" -->
 		use: "Read each plan's included volume, its per-unit overage with a hard cap, its seat ladder and its retention window on the page, instead of inferring them.",
 		type: "platform",
+		kind: "improvement",
 		state: "shipped",
 		doc: "/pricing",
 	},
@@ -602,7 +854,8 @@ export const ENTRIES: Entry[] = [
 		date: "2026-05-23",
 		title: "Keys hashed, ledgers signed per workspace",
 		use: "Your API keys are stored as Argon2id hashes behind a peppered lookup, and your ledger is signed with a key belonging to your workspace rather than a shared one.",
-		type: "trust",
+		type: "security",
+		kind: "improvement",
 		state: "shipped",
 	},
 	{
@@ -610,6 +863,7 @@ export const ENTRIES: Entry[] = [
 		title: "Auto-instrumentation for Python and TypeScript",
 		use: "Install the SDK and it attaches to the agent frameworks and provider clients you already use, so spans arrive without hand-written instrumentation.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
 		doc: "/sdk-python",
 	},
@@ -618,6 +872,7 @@ export const ENTRIES: Entry[] = [
 		title: "Traces, trace detail and SLO",
 		use: "Browse your traces, open one to a span tree with an inspector, and read latency percentiles, error rate and token usage on an SLO page.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 		doc: "/slo",
 	},
@@ -626,6 +881,7 @@ export const ENTRIES: Entry[] = [
 		title: "Prompt promotion with rollback",
 		use: "Promote a prompt version to production atomically and have a drift detector roll it back — suggested, automatic or human-confirmed, your choice.",
 		type: "evals",
+		kind: "feature",
 		state: "shipped",
 		doc: "/prompt-promotion",
 	},
@@ -634,6 +890,7 @@ export const ENTRIES: Entry[] = [
 		title: "Three independent verifiers",
 		use: "Check an exported ledger in Rust, Python or TypeScript against shared conformance vectors, so whoever has to verify it can do so in a language they already run.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -642,6 +899,7 @@ export const ENTRIES: Entry[] = [
 		title: "The gateway, in one binary",
 		use: "Point any OpenAI-compatible client at one endpoint and your call is routed to your provider with your own key, traced and recorded — a model matching no provider is refused rather than sent somewhere by default.",
 		type: "gateway",
+		kind: "feature",
 		state: "shipped",
 		doc: "/quickstart",
 	},
@@ -650,6 +908,7 @@ export const ENTRIES: Entry[] = [
 		title: "A tamper-evident audit ledger",
 		use: "Prove after the fact that your record was not altered: every gateway-proxied call and policy verdict is appended to a per-workspace hash chain, so a later deletion, insertion, reorder or edit is detectable by anyone holding an export.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 		doc: "/audit-ledger",
 	},
@@ -658,6 +917,7 @@ export const ENTRIES: Entry[] = [
 		title: "OpenTelemetry-native capture",
 		use: "Take your traces elsewhere whenever you want — spans are written in the OpenTelemetry GenAI conventions rather than a private schema.",
 		type: "observability",
+		kind: "feature",
 		state: "shipped",
 		doc: "/concepts",
 	},
@@ -666,6 +926,7 @@ export const ENTRIES: Entry[] = [
 		title: "EU AI Act Article 12 export",
 		use: "Export the record-keeping pack Article 12 asks for, mapped obligation by obligation, and hand it to whoever has to check it.",
 		type: "trust",
+		kind: "feature",
 		state: "shipped",
 	},
 	{
@@ -673,89 +934,8 @@ export const ENTRIES: Entry[] = [
 		title: "Apache 2.0, no relicensing",
 		use: "Self-host it, fork it, or run the hosted version — the whole project is Apache 2.0 with a written no-relicensing pledge and no separate enterprise tree.",
 		type: "platform",
+		kind: "feature",
 		state: "shipped",
-	},
-];
-
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * CADENCE — one bar per month, DERIVED, never written down
- * ─────────────────────────────────────────────────────────────────────────────
- * A count that is computed from the rows it counts cannot disagree with them.
- * That is the entire reason this is a reduce and not a literal: this repo has
- * shipped a hand-written count that drifted from its source and leaked into
- * published copy (`scripts/ci/check-provider-count.py`'s own docstring, B-068).
- */
-export type CadenceBar = { month: string; label: string; count: number };
-
-export const CADENCE: CadenceBar[] = (() => {
-	const byMonth = new Map<string, number>();
-	for (const e of ENTRIES) {
-		const m = e.date.slice(0, 7);
-		byMonth.set(m, (byMonth.get(m) ?? 0) + 1);
-	}
-	const fmt = new Intl.DateTimeFormat("en", { month: "short" });
-	return [...byMonth.entries()]
-		.sort(([a], [b]) => a.localeCompare(b))
-		.map(([month, count]) => ({
-			month,
-			label: fmt.format(new Date(`${month}-01T00:00:00Z`)),
-			count,
-		}));
-})();
-
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * HERO STAT CARDS
- * ─────────────────────────────────────────────────────────────────────────────
- * Five numbers. `source` is RENDERED under each card, not kept in a comment — a
- * number on a marketing page without its provenance is how this repo has
- * shipped a wrong count before.
- *
- * `value` is a string on purpose. One is hedged ("150+") and one is a triple
- * ("2 / 4 / 5"); typing them as numbers invites a future edit that un-hedges a
- * claim the provider-count guard then refuses.
- *
- * Rejected candidates, and why each was refused, are in `stats-rationale.md`.
- */
-export type Stat = {
-	value: string;
-	unit?: string;
-	label: string;
-	/** Rendered under the card. Names where the number came from, in the customer's terms. */
-	source: string;
-};
-
-export const STATS: Stat[] = [
-	{
-		// Derived, not typed. See CADENCE's note.
-		value: String(ENTRIES.length),
-		label: "changes shipped",
-		source: "every entry below, May 2026 to today",
-	},
-	{
-		value: String(CADENCE.length),
-		unit: "months",
-		label: "of continuous shipping",
-		source: `${CADENCE[0]?.label ?? ""} to ${CADENCE[CADENCE.length - 1]?.label ?? ""} 2026`,
-	},
-	{
-		value: "2 / 4 / 5",
-		unit: "ms",
-		label: "gateway overhead, p50 / p95 / p99",
-		source: "AIGatewayBench, 2026-09-07, two runs on a 4-vCPU host",
-	},
-	{
-		value: "14",
-		unit: "MB",
-		label: "peak memory in that run",
-		source: "same run; the next-lightest gateway measured 101 MB",
-	},
-	{
-		value: "150+",
-		label: "providers, one endpoint",
-		source:
-			"the compiled provider catalogue, held equal to this claim by a repo check",
 	},
 ];
 
@@ -785,19 +965,9 @@ export type Next = { theme: string; blurb: string };
 
 export const NEXT: Next[] = [
 	{
-		theme: "Every setting on the span",
+		theme: "Prompts and responses, your choice",
 		blurb:
-			'Temperature, top-p, token limits, the tool list and the exact deployment the call reached — recorded and filterable, so "what were we actually running" is a query.',
-	},
-	{
-		theme: "Tool calls in full",
-		blurb:
-			"Per-call arguments, result, status and latency on the trace page where you capture content, and name, status, latency and sizes where you do not — rather than a count standing in for detail.",
-	},
-	{
-		theme: "Who started this run",
-		blurb:
-			"A human identity on sessions and traces, so an investigation can answer who initiated a run and not only which session it belonged to.",
+			"Record the text your app sends and the answer it gets back — switched on by a workspace owner, off by default, and kept only as long as the trace it belongs to.",
 	},
 	{
 		theme: "More ways to cut the list",

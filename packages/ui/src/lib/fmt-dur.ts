@@ -1,7 +1,7 @@
 /**
  * fmt-dur — the canonical duration formatter for every surface that shows one.
  *
- * ONE implementation: adaptive unit (µs → ms → s), whole for µs, 1 decimal for ms,
+ * ONE implementation: adaptive unit (µs → ms → s → m), whole for µs, 1 decimal for ms,
  * 2 decimals for s.
  *
  * WHY IT LIVES HERE AND NOT IN `apps/web`. It was written in `apps/web/lib/fmt-dur.ts`
@@ -24,9 +24,13 @@
  * @param us - Duration in microseconds (must be ≥ 0).
  */
 export function fmtDur(us: number): string {
-	if (us < 1_000) return `${us}µs`;
-	if (us < 1_000_000) return `${(us / 1_000).toFixed(1)}ms`;
-	return `${(us / 1_000_000).toFixed(2)}s`;
+	if (!Number.isFinite(us) || us < 0) return "—";
+	if (Math.round(us) < 1_000) return `${Math.round(us)}µs`;
+	const ms = Math.round(us / 100) / 10;
+	if (ms < 1_000) return `${ms.toFixed(1)}ms`;
+	const seconds = Math.round(us / 10_000) / 100;
+	if (seconds < 60) return `${seconds.toFixed(2)}s`;
+	return `${(us / 60_000_000).toFixed(1)}m`;
 }
 
 /** Same rules, taking MILLISECONDS — what `TimeRuler` works in. */

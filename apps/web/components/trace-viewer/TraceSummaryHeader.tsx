@@ -1,3 +1,5 @@
+import { fmtCompact, fmtCount, fmtUsd } from "@/lib/metrics/format";
+import { StatusBadge } from "@tracelanedev/ui";
 /**
  * TraceSummaryHeader — the at-a-glance rollup strip above the span view. Every
  * stat is summed from the real span set (`computeTraceSummary`); a metric with
@@ -15,29 +17,20 @@
  * a colour system this file no longer uses (CLAUDE.md §17).
  */
 
+import { IdentityAvatar } from "@/components/kya/IdentityAvatar";
 import type { Span } from "@/components/trace-viewer/types";
+import { type IdentityRef, spanIdentity } from "@/lib/kya/identity";
 
 import { isRedactedEndUser } from "@/lib/end-user";
 import { countToolCallSpans, detectToolLoop } from "@/lib/tool-loop";
 import { computeTraceSummary } from "@/lib/trace-summary";
 import { Badge, StatCard, fmtDur } from "@tracelanedev/ui";
 
-function fmtInt(n: number): string {
-	return n.toLocaleString();
-}
+const fmtInt = fmtCount;
 
-function fmtTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-	return String(n);
-}
+const fmtTokens = fmtCompact;
 
-function fmtCost(usd: number): string {
-	if (usd === 0) return "$0";
-	if (usd < 0.01) return `$${usd.toFixed(4)}`;
-	if (usd < 1) return `$${usd.toFixed(3)}`;
-	return `$${usd.toFixed(2)}`;
-}
+const fmtCost = fmtUsd;
 
 /** Warn triangle SVG — consistent with the app's glyph style; replaces raw ⚠ emoji. */
 function WarnTriangle() {
@@ -72,12 +65,27 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 				? fmtTokens(s.totalTokens)
 				: "—";
 
-	const firstModel = s.models[0] ?? "—";
-	const modelLabel =
-		s.models.length <= 1 ? firstModel : `${firstModel} +${s.models.length - 1}`;
+	const identities = new Map<string, IdentityRef>();
+	for (const span of spans) {
+		const resolved = spanIdentity(span.attributes);
+		for (const identity of [resolved.agent, resolved.model])
+			if (identity)
+				identities.set(`${identity.kind}:${identity.key}`, identity);
+	}
 
 	return (
 		<div className="space-y-3">
+			{identities.size > 0 && (
+				<div className="flex flex-wrap gap-4" aria-label="Observed identities">
+					{[...identities.values()].map((identity) => (
+						<IdentityAvatar
+							key={`${identity.kind}:${identity.key}`}
+							identity={identity}
+							showLabel
+						/>
+					))}
+				</div>
+			)}
 			{/* Premium metric tiles — one stat-card per KPI so each reads as first-class
 			    data, not a flat label strip. Grid: 2 cols on mobile, 3 on sm, then
 			    auto-fit at lg+ so all tiles always fill the available row width evenly.
@@ -101,7 +109,7 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 				<StatCard
 					label="Errors"
 					value={fmtInt(s.errorCount)}
-					tone={s.errorCount > 0 ? "danger" : "default"}
+					tone={s.errorCount > 0 ? "danger" : "neutral"}
 				/>
 
 				<StatCard label="Spans" value={fmtInt(s.spanCount)} />
@@ -139,14 +147,6 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 				/>
 
 				{/* Model/Provider — prose values; text-sm to keep long names legible. */}
-				<StatCard
-					label={s.models.length > 1 ? "Models" : "Model"}
-					value={
-						<span className="text-sm font-semibold leading-snug">
-							{modelLabel}
-						</span>
-					}
-				/>
 
 				{/* OBS-20 — "who initiated this". Rendered only when the caller sent
 				    one: an always-present tile reading "—" on every trace would
@@ -193,13 +193,17 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 			    runtime error per se. Sits below the tile grid rather than inside it. */}
 			{loop && (
 				<div className="flex items-center gap-2 px-1">
-					<Badge
+					<StatusBadge
+						status="loop"
 						tone="warn"
 						title={`Tool call loop detected (AFT-1 G-3): "${loop.toolName}" called ${loop.count} times with no circuit breaker. This pattern is a pre-flight guardrail target — apply a loop-depth cap or deduplicate the tool inputs.`}
-					>
-						<WarnTriangle />
-						loop — {loop.toolName} ×{loop.count}
-					</Badge>
+						label={
+							<>
+								<WarnTriangle />
+								loop — {loop.toolName} ×{loop.count}
+							</>
+						}
+					/>
 				</div>
 			)}
 		</div>

@@ -1,71 +1,20 @@
-import { Card } from "@tracelanedev/ui";
-import Link from "next/link";
-
-/**
- * Shown to tenants WITHOUT the Article-12 export entitlement (f_audit_addon,
- * Enterprise) — the page exists + what it does (a sales surface), never a
- * fake/empty render implying they have it. The paid Article-12 add-on is NOT sold
- * (BILL-01 §10.4 / B-392): the upsell is the Enterprise plan.
- */
+/** Retains the existing component entry point for the workspace override state. */
 export function AuditSalesSurface() {
 	return (
-		<Card provenance className="p-6">
-			<div className="t-card-title text-seal-ink">
-				Audit ledger · included on every plan
-			</div>
-			<h2 className="mt-1 text-md font-semibold text-ink">
-				A provable record of every gateway call and guardrail verdict
+		<section className="surface-card p-6" aria-live="polite">
+			<h2 className="text-xl font-semibold">
+				Ledger viewing is disabled for this workspace
 			</h2>
-			<p className="mt-2 max-w-2xl text-sm text-ink-2">
-				Every gateway-proxied call and guardrail verdict is appended to a
-				SHA-256 hash chain. The chain is <strong>tamper-evident</strong>: any
-				change to a past event breaks the recomputed hash. You — or a regulator
-				— can download the ledger and verify it independently with our
-				open-source CLI{" "}
-				<code className="font-mono text-ink">tlane verify --offline</code> (
-				<code className="font-mono text-ink">npm i -g @tracelanedev/cli</code>),
-				without trusting Tracelane. Built for EU AI Act Article 12
-				record-keeping.
+			<p className="mt-3 max-w-2xl text-sm text-ink-2">
+				Viewing and checking the ledger is included on every plan, but access is
+				switched off here. No integrity verdict is available.
 			</p>
-			<ul className="mt-3 space-y-1.5 text-sm text-ink-2">
-				<li>
-					• Tamper-evident SHA-256 hash chain over every gateway call and
-					guardrail verdict (OTLP/SDK-captured spans are full-fidelity; chaining
-					them is on the roadmap)
-				</li>
-				<li>
-					• Browser-side "Verify integrity" — recompute the chain yourself and
-					see exactly where any break is
-				</li>
-				<li>
-					• Article-12 evidence export (NDJSON), independently verifiable
-					off-platform
-				</li>
-				<li>
-					• Ed25519 signing on every batch, plus public-transparency anchoring
-					to Sigstore Rekor v2 — live today. Anchoring is{" "}
-					<strong>per batch, not per event</strong>, and is{" "}
-					<strong>best-effort</strong>: it never blocks the write path, so a
-					batch that is signed but not yet anchored is still valid. Coverage is
-					partial and growing.
-				</li>
-			</ul>
-			<div className="mt-5">
-				<Link
-					href="/settings/billing"
-					// `bg-selected text-selected-on` — the theme-stable primary pair. This is a
-					// hand-rolled primary CTA (a <Link>/<button>, not the <Button> primitive), and it
-					// carried `bg-surface-inverse text-ink-inverse` until the 2026-08-22 contrast
-					// audit: in DARK `--surface-inverse` is #0d0e10 — the PAGE GROUND — so the fill
-					// sat at 1.00:1 against the canvas and 1.07:1 against a card, leaving a label
-					// with no visible button under it. Button.tsx made this exact swap for the
-					// primitive; these copies were missed. `--selected` flips per theme: 17.93:1 in
-					// light, 17.71:1 in dark, label included.
-					className="bg-selected text-selected-on hover:opacity-90 inline-flex h-9 items-center rounded-lg px-4 text-sm font-medium"
-				>
-					Enterprise plan
-				</Link>
-			</div>
-		</Card>
+			<a
+				href="/support"
+				className="mt-5 inline-block text-sm font-medium underline underline-offset-4"
+			>
+				Ask support about workspace access →
+			</a>
+		</section>
 	);
 }

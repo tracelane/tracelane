@@ -1,4 +1,7 @@
 "use client";
+import { fmtUsd } from "@/lib/metrics/format";
+
+import { Button } from "@tracelanedev/ui";
 
 /**
  * UsageBoard — `/settings/billing`'s usage section (spec §8 `#usage`).
@@ -16,6 +19,7 @@
  * `canManage`, passed through from the server.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import {
 	type GatewayUsageResponse,
 	METER_KEYS,
@@ -46,7 +50,7 @@ interface UsageFetchResult {
 
 async function fetchUsage(): Promise<UsageFetchResult> {
 	try {
-		const res = await fetch("/api/billing/usage");
+		const res = await apiFetchRaw("/api/billing/usage");
 		if (!res.ok) return { httpOk: false, data: null };
 		return { httpOk: true, data: (await res.json()) as GatewayUsageResponse };
 	} catch {
@@ -132,13 +136,14 @@ export function UsageBoard({
 				title="Usage metering is unavailable"
 				description="Your traces are still being recorded."
 				action={
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => refetch()}
 						className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 					>
 						Retry
-					</button>
+					</Button>
 				}
 			/>
 		);
@@ -268,7 +273,7 @@ export function UsageBoard({
 					}
 					extra={
 						cold.overage_usd != null
-							? `$${cold.overage_usd.toFixed(2)} so far`
+							? `${fmtUsd(cold.overage_usd)} so far`
 							: undefined
 					}
 				/>
@@ -322,13 +327,14 @@ export function UsageBoard({
 			    already showing the same two affordances. */}
 			{!isFree && !(worst && worst.level !== "ok") && (
 				<div className="flex items-center justify-between">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={() => setShowBreakdown((v) => !v)}
 						className="text-xs font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 					>
 						{showBreakdown ? "Hide" : "Show"} what&apos;s using your window
-					</button>
+					</Button>
 					<span className="flex items-center gap-2 text-xs text-ink-2">
 						Spend ceiling:{" "}
 						{ceilingUsd === null ? (
@@ -336,13 +342,14 @@ export function UsageBoard({
 						) : (
 							<Badge tone="action">${ceilingUsd}</Badge>
 						)}
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={() => setShowCeiling(true)}
 							className="rounded border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
 						>
 							{ceilingUsd === null ? "Set a ceiling" : "Edit ceiling"}
-						</button>
+						</Button>
 					</span>
 				</div>
 			)}

@@ -18,6 +18,22 @@
 //! this comment any more, deliberately: the number is `catalog::providers()`
 //! plus six, and a comment nobody checks is a claim waiting to rot.
 
+// Prefix data is shared by the canonical match and the settings inventory.
+const ANTHROPIC_PREFIXES: &[&str] = &["claude", "anthropic/"];
+const VERTEX_PREFIXES: &[&str] = &["vertex/"];
+const GOOGLE_PREFIXES: &[&str] = &["gemini", "google/"];
+const BEDROCK_PREFIXES: &[&str] = &["bedrock/"];
+const AZURE_PREFIXES: &[&str] = &["azure/"];
+const COHERE_PREFIXES: &[&str] = &["command", "cohere/"];
+pub const NATIVE_PREFIXES: &[(&str, &[&str])] = &[
+    ("anthropic", ANTHROPIC_PREFIXES),
+    ("vertex", VERTEX_PREFIXES),
+    ("google", GOOGLE_PREFIXES),
+    ("bedrock", BEDROCK_PREFIXES),
+    ("azure", AZURE_PREFIXES),
+    ("cohere", COHERE_PREFIXES),
+];
+
 pub mod catalog;
 
 use anyhow::Result;
@@ -476,6 +492,16 @@ pub enum ProviderEvent {
         /// `None` otherwise — we never fabricate a price from a hardcoded
         /// model→price table. Threaded to the span as `gen_ai.usage.cost`.
         cost_usd: Option<f64>,
+        /// RI-05 / M11: reasoning ("thinking") output tokens, when the
+        /// provider reports them SEPARATELY from `output_tokens` — OpenAI's
+        /// `usage.completion_tokens_details.reasoning_tokens`, Gemini's
+        /// `usageMetadata.thoughtsTokenCount`. `output_tokens` above stays
+        /// INCLUSIVE of these (cost/billing parity, unchanged); this is the
+        /// same total broken out for `gen_ai.usage.reasoning.output_tokens`.
+        /// `None` when the provider sent no such field — never a fabricated
+        /// zero. Anthropic has no such field on the wire and always reports
+        /// `None` here.
+        reasoning: Option<u32>,
     },
     /// The provider's own stop reason, normalised (B-354). Emitted at most
     /// once per stream, before the stream ends. Consumers that do not care
@@ -493,6 +519,23 @@ pub enum ProviderEvent {
     /// buffered fold, both in `server.rs`. If you add a third stream consumer,
     /// nothing will remind you.
     LogprobsDelta { logprobs: Vec<f64> },
+    /// RI-05 / B-444 (2026-09-19): the provider's identity claims about the
+    /// response — its own `id`, the model string it says it SERVED, and (OpenAI
+    /// wire) `system_fingerprint`. Emitted from the first frame that carries them
+    /// (OpenAI-compatible SSE chunks carry `id`/`model` on every chunk; Anthropic's
+    /// `message_start.message`; Bedrock's whole `ChatResponse`). Consumers keep the
+    /// FIRST and ignore later ones.
+    ///
+    /// **Silently dropped by every match site that carries a catch-all** — the same
+    /// warning as `LogprobsDelta` above. The two consumers that matter, the SSE loop
+    /// (`server/stream.rs`) and the buffered fold (`server/buffered.rs`), were wired
+    /// by hand; `prompt_eval.rs` and `online_eval.rs` do not record spans from these
+    /// events and need nothing.
+    ResponseMeta {
+        id: Option<String>,
+        model: Option<String>,
+        system_fingerprint: Option<String>,
+    },
     /// Final non-streaming response (used for non-streaming calls)
     Done { response: ChatResponse },
 }
@@ -633,12 +676,12 @@ impl ProviderRegistry {
         // `native_prefixes_are_not_shadowed_by_the_catalog` test proves it, so
         // the split cannot silently start stealing traffic.
         let native = match model {
-            m if m.starts_with("claude") || m.starts_with("anthropic/") => Some("anthropic"),
-            m if m.starts_with("vertex/") => Some("vertex"),
-            m if m.starts_with("gemini") || m.starts_with("google/") => Some("google"),
-            m if m.starts_with("bedrock/") => Some("bedrock"),
-            m if m.starts_with("azure/") => Some("azure"),
-            m if m.starts_with("command") || m.starts_with("cohere/") => Some("cohere"),
+            m if ANTHROPIC_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("anthropic"),
+            m if VERTEX_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("vertex"),
+            m if GOOGLE_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("google"),
+            m if BEDROCK_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("bedrock"),
+            m if AZURE_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("azure"),
+            m if COHERE_PREFIXES.iter().any(|p| m.starts_with(p)) => Some("cohere"),
             _ => None,
         };
         if native.is_some() {
@@ -729,6 +772,7 @@ impl MockProvider {
                 cache_read: None,
                 cache_creation: None,
                 cost_usd: None,
+                reasoning: None,
             };
         };
         Ok(Box::pin(stream))

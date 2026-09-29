@@ -109,6 +109,37 @@ pub trait AnnotationStore: Send + Sync {
         author_sub: &str,
     ) -> Result<u64>;
 
+    // ── OBS-56: bulk trace-level flag. Same table, same author-scoped PK —
+    // a batch write is N single upserts collapsed into one statement. ──────
+
+    /// Insert or replace THIS author's trace-level (`span_id = ''`) verdict on
+    /// every id in `trace_ids`, in ONE statement (all-or-nothing: either every
+    /// id lands or the call errors and NOTHING does — never a partial write
+    /// from a mid-batch SQL failure). Callers dedupe `trace_ids` first: a
+    /// duplicate in the same `INSERT … SELECT … FROM UNNEST` would make
+    /// `ON CONFLICT DO UPDATE` touch one row twice, which Postgres refuses
+    /// (`ON CONFLICT DO UPDATE command cannot affect row a second time`).
+    /// Returns the number of rows written.
+    async fn upsert_batch(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+        label: &str,
+        note: &str,
+        author_sub: &str,
+    ) -> Result<u64>;
+
+    /// The tenant's trace-level (`span_id = ''`) annotations for these ids,
+    /// from EVERY author — the bulk-bar / transcript flag-chip read. Bounded
+    /// by the caller to `bulk_trace_action_max`.
+    async fn list_batch(&self, tenant: &TenantId, trace_ids: &[String]) -> Result<Vec<Annotation>>;
+
+    /// `OBS-56` — `billing_policy.bulk_trace_action_max`, read on the WRITE
+    /// path (the `model_aliases::read_cap` pattern). `None` when the row is
+    /// absent or unparsable; the caller fails CLOSED (503) rather than guess
+    /// a limit — refusing a batch beats silently admitting an unbounded one.
+    async fn bulk_action_cap(&self) -> Result<Option<u32>>;
+
     // ── EVL-29 queues. Same trait on purpose: one seam, one table. ────────
 
     async fn create_queue(&self, tenant: &TenantId, q: &QueueWrite<'_>) -> Result<()>;
@@ -247,6 +278,93 @@ impl AnnotationStore for PgAnnotationStore {
             )
             .await?;
         Ok(n)
+    }
+
+    // ── OBS-56: bulk trace-level flag ────────────────────────────────────
+
+    async fn upsert_batch(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+        label: &str,
+        note: &str,
+        author_sub: &str,
+    ) -> Result<u64> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+        // ONE statement, all-or-nothing: `UNNEST` expands the id array into
+        // rows and the SAME `ON CONFLICT … DO UPDATE` shape the single-trace
+        // `upsert` uses applies to each. The caller has already deduped
+        // `trace_ids` — see the trait doc for why a duplicate here is a
+        // Postgres error, not a second write.
+        let n = client
+            .execute(
+                "INSERT INTO trace_annotations
+                   (tenant_id, trace_id, span_id, label, note, author_sub)
+                 SELECT $1, t, '', $2, $3, $4
+                   FROM unnest($5::text[]) AS t
+                 ON CONFLICT (tenant_id, trace_id, span_id, author_sub)
+                 DO UPDATE SET label = EXCLUDED.label,
+                               note = EXCLUDED.note,
+                               updated_at = now()",
+                &[tenant.as_uuid(), &label, &note, &author_sub, &trace_ids],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    async fn list_batch(&self, tenant: &TenantId, trace_ids: &[String]) -> Result<Vec<Annotation>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+        let rows = client
+            .query(
+                "SELECT trace_id, span_id, label, note, author_sub,
+                        created_at::text, updated_at::text
+                   FROM trace_annotations
+                  WHERE tenant_id = $1 AND span_id = '' AND trace_id = ANY($2::text[])
+                  ORDER BY trace_id, author_sub",
+                &[tenant.as_uuid(), &trace_ids],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Annotation {
+                trace_id: r.get(0),
+                span_id: r.get(1),
+                label: r.get(2),
+                note: r.get(3),
+                author_sub: r.get(4),
+                created_at: r.get(5),
+                updated_at: r.get(6),
+            })
+            .collect())
+    }
+
+    async fn bulk_action_cap(&self) -> Result<Option<u32>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+        let row = client
+            .query_opt(
+                "SELECT value::text FROM billing_policy WHERE key = 'bulk_trace_action_max'",
+                &[],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<_, String>(0).trim().parse::<u32>().ok()))
     }
 
     // ── EVL-29 queues ────────────────────────────────────────────────────
@@ -409,6 +527,14 @@ pub fn routes() -> Router<AnnotationRoutesState> {
                 .post(upsert_handler)
                 .delete(delete_handler),
         )
+        // OBS-56 — bulk trace-level flag. A literal path ahead of the dynamic
+        // `{trace_id}` segment above would collide were it under
+        // `/v1/traces/...`; it is deliberately not, so no ordering hazard.
+        .route(
+            "/v1/annotations/batch",
+            axum::routing::post(upsert_batch_handler),
+        )
+        .route("/v1/annotations", get(list_batch_handler))
         // EVL-29 — same module, same store, same table. Extending OBS-18 is
         // the whole point of the item: a trace flagged from the trace header
         // and one reviewed in a queue are the SAME row.
@@ -478,8 +604,13 @@ async fn claims_from_auth(headers: &HeaderMap) -> Result<Claims, (StatusCode, St
     Ok(claims)
 }
 
+/// Upper bound on a trace id's byte length. A trace id is 32 hex chars or a 36-char
+/// UUID; 128 leaves room for any SDK's format while refusing a multi-megabyte string
+/// bound into Postgres (security review 2026-09-27). A format bound, not a tunable.
+const MAX_TRACE_ID_LEN: usize = 128;
+
 fn check_trace_id(t: &str) -> Result<(), (StatusCode, String)> {
-    if t.len() < 8 {
+    if t.len() < 8 || t.len() > MAX_TRACE_ID_LEN {
         return Err((StatusCode::BAD_REQUEST, "invalid trace id".into()));
     }
     Ok(())
@@ -599,6 +730,220 @@ async fn delete_handler(
     } else {
         StatusCode::NO_CONTENT
     })
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// OBS-56 — bulk trace-level flag (`POST /v1/annotations/batch`,
+// `GET /v1/annotations?trace_id=…`)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// `deny_unknown_fields`: the batch admits no field the single-trace route
+/// does not.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchUpsertBody {
+    trace_ids: Vec<String>,
+    label: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RefusedTrace {
+    trace_id: String,
+    reason: &'static str,
+}
+
+/// Per-id validation, THEN dedupe (order-preserving). Pure — no IO, no auth —
+/// so the refusal shape is unit-testable directly. A duplicate id surviving
+/// into the same `INSERT … FROM UNNEST` would make the store's `ON CONFLICT
+/// DO UPDATE` touch one row twice, which Postgres refuses outright (proven by
+/// `MockStore::upsert_batch` reproducing the same refusal in-memory).
+fn validate_batch_trace_ids(trace_ids: &[String]) -> (Vec<String>, Vec<RefusedTrace>) {
+    let mut refused = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut valid = Vec::new();
+    for id in trace_ids {
+        if check_trace_id(id).is_err() {
+            refused.push(RefusedTrace {
+                trace_id: id.clone(),
+                reason: "invalid_trace_id",
+            });
+            continue;
+        }
+        if seen.insert(id.clone()) {
+            valid.push(id.clone());
+        }
+    }
+    (valid, refused)
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchUpsertResponse {
+    written: u64,
+    refused: Vec<RefusedTrace>,
+}
+
+/// `POST /v1/annotations/batch`. Same auth as the single upsert (validated
+/// claim, `read` scope, `may_write`) — a viewer gets the SAME 403 shape. The
+/// cap is read on the WRITE path, BEFORE any span/annotation is touched:
+/// `Ok(Some(max))` with `trace_ids.len() > max` is a `400 bulk_too_large`;
+/// `Ok(None)` / `Err` (the row is missing or unparsable) is a `503
+/// bulk_limit_unavailable` — refusing beats guessing a limit, and nothing is
+/// written either way.
+#[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn upsert_batch_handler(
+    State(state): State<AnnotationRoutesState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchUpsertBody>,
+) -> Result<Json<BatchUpsertResponse>, (StatusCode, String)> {
+    let claims = claims_from_auth(&headers).await?;
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+    if !may_write(&claims) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("member"),
+        ));
+    }
+
+    if body.trace_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "trace_ids must not be empty".into(),
+        ));
+    }
+
+    let max = match state.store.bulk_action_cap().await {
+        Ok(Some(m)) => m,
+        Ok(None) | Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error": "bulk_limit_unavailable",
+                    "message": "the bulk-action limit could not be read; try again shortly",
+                })
+                .to_string(),
+            ));
+        }
+    };
+    if body.trace_ids.len() > max as usize {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "bulk_too_large", "max": max }).to_string(),
+        ));
+    }
+
+    let label = body.label.trim().to_ascii_lowercase();
+    if !valid_label(&label) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown label {:?} — known labels: {}",
+                body.label,
+                LABELS.join(", ")
+            ),
+        ));
+    }
+    let note = body.note.unwrap_or_default();
+    if note.chars().count() > MAX_NOTE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("note must be at most {MAX_NOTE_LEN} characters"),
+        ));
+    }
+
+    let (valid, refused) = validate_batch_trace_ids(&body.trace_ids);
+
+    let written = if valid.is_empty() {
+        0
+    } else {
+        state
+            .store
+            .upsert_batch(&claims.tenant_id, &valid, &label, &note, &claims.sub)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "annotation batch upsert failed");
+                (StatusCode::BAD_GATEWAY, "annotation write failed".into())
+            })?
+    };
+
+    Ok(Json(BatchUpsertResponse { written, refused }))
+}
+
+/// The `trace_id` values of a raw query string, in order, percent-decoded (B-589).
+///
+/// axum's `Query<Vec<String>>` cannot deserialize a repeated key — `serde_urlencoded`
+/// has no sequence support, so it refused EVERY call, even a single id. Parsed by
+/// hand instead of adding a dependency: split on `&`, keep `trace_id=` pairs, decode
+/// `%XX` and `+`. A malformed escape is kept literally and then refused by
+/// `check_trace_id`; nothing here can panic.
+fn parse_trace_id_query(raw: Option<&str>) -> Vec<String> {
+    fn decode(v: &str) -> String {
+        let b = v.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < b.len() => {
+                    let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                    match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                        Some(byte) => {
+                            out.push(byte);
+                            i += 2;
+                        }
+                        None => out.push(b'%'),
+                    }
+                }
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    raw.unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("trace_id="))
+        .map(decode)
+        .collect()
+}
+
+/// `GET /v1/annotations?trace_id=…` (repeated). Read is open to every role
+/// including viewer, same as the single-trace list. Bounded by
+/// `bulk_trace_action_max` when that row can be read; a display/read surface
+/// fails OPEN (no limit applied) rather than 503 when it cannot — the write
+/// path is where an unreadable cap must refuse (CLAUDE.md §10).
+#[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn list_batch_handler(
+    State(state): State<AnnotationRoutesState>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Annotation>>, (StatusCode, String)> {
+    let trace_ids = parse_trace_id_query(raw.as_deref());
+    let claims = claims_from_auth(&headers).await?;
+    tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
+
+    for id in &trace_ids {
+        check_trace_id(id)?;
+    }
+    if let Ok(Some(max)) = state.store.bulk_action_cap().await
+        && trace_ids.len() > max as usize
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "bulk_too_large", "max": max }).to_string(),
+        ));
+    }
+
+    state
+        .store
+        .list_batch(&claims.tenant_id, &trace_ids)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "annotation batch list failed");
+            (StatusCode::BAD_GATEWAY, "annotation read failed".into())
+        })
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -875,6 +1220,31 @@ fn qerr_field(status: StatusCode, code: &str, field: &str, message: impl Into<St
             "error": code, "field": field, "message": message.into(),
         })),
     )
+}
+
+/// `EVL-31` §6a — the one gateway behaviour that spec must change.
+///
+/// Before EVL-31 there was no UI to delete a dataset, so a queue's
+/// `default_dataset_id` pointing at a tombstoned dataset was unreachable from
+/// the product; only queue CREATION checked the dataset existed
+/// (`create_queue_handler`, `crates/gateway/src/annotation_routes.rs:1379`).
+/// Shipping Delete makes it reachable: without this guard, a review submitted
+/// to a queue whose dataset was deleted would write a `dataset_items` row
+/// that traces back to nothing — the review-loop's DONE marker firing for a
+/// case nobody can see. Pure so the refusal shape is unit-testable without a
+/// store: `dataset_still_live` is the ONE fact the caller passes in
+/// (`datasets.get_dataset(...).is_some()`), decided at the write point.
+fn refuse_if_dataset_deleted(dataset_still_live: bool) -> Result<(), QueueErr> {
+    if dataset_still_live {
+        Ok(())
+    } else {
+        Err(qerr(
+            StatusCode::CONFLICT,
+            "dataset_deleted",
+            "This queue's default dataset was deleted. The review was NOT recorded — pick a \
+             different queue, or point this one at a dataset that still exists.",
+        ))
+    }
 }
 
 /// Validate a rubric DEFINITION at queue create/update time, and prove the
@@ -2109,6 +2479,25 @@ async fn submit_review_handler(
     })?;
     let dataset_id = queue.default_dataset_id;
 
+    // EVL-31 §6a — refuse BEFORE any span read or content copy: a tombstoned
+    // dataset must never turn a review into a silent sink. Cheap (one
+    // `get_dataset` the handler would otherwise skip) and first, so nothing
+    // else in this handler does wasted work on a review that cannot land.
+    refuse_if_dataset_deleted(
+        datasets
+            .get_dataset(&tenant, dataset_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %format!("{e:#}"), "review: dataset existence check failed");
+                qerr(
+                    StatusCode::BAD_GATEWAY,
+                    "dataset_write_failed",
+                    "Could not verify this queue's dataset. The review was NOT recorded.",
+                )
+            })?
+            .is_some(),
+    )?;
+
     // R228 — THE SNAPSHOT IS THE SOURCE OF TRUTH, and the live span is only the
     // fallback. This is the whole point of copying at queue-entry: the bytes the
     // reviewer READ when the queue listed this trace are the bytes the dataset
@@ -2386,6 +2775,9 @@ mod tests {
         /// assert the REFERENCE and the FROZEN RUBRIC actually landed, rather
         /// than that the call returned Ok.
         reviews: Mutex<Vec<(String, String)>>,
+        /// OBS-56. `None` (the `Default`) reproduces the "cap unavailable"
+        /// 503 path; a test that wants the happy path sets this explicitly.
+        bulk_cap: Mutex<Option<u32>>,
     }
 
     #[async_trait::async_trait]
@@ -2443,6 +2835,57 @@ mod tests {
                 !(x.trace_id == trace_id && x.span_id == span_id && x.author_sub == author_sub)
             });
             Ok((before - r.len()) as u64)
+        }
+
+        // ── OBS-56: bulk trace-level flag. Real in-memory behaviour, so the
+        // handler's dedupe / cap / refusal logic is exercised for real. ─────
+
+        async fn upsert_batch(
+            &self,
+            tenant: &TenantId,
+            trace_ids: &[String],
+            label: &str,
+            note: &str,
+            author_sub: &str,
+        ) -> Result<u64> {
+            self.seen_tenant.lock().unwrap().push(tenant.to_string());
+            // Mirrors the real store's Postgres constraint: two IDENTICAL ids
+            // in one call would make a single `ON CONFLICT DO UPDATE` touch
+            // the same row twice, which Postgres refuses — the caller (the
+            // handler) must dedupe before calling, and this mock proves it by
+            // failing the same way if it does not.
+            let mut seen = std::collections::HashSet::new();
+            for id in trace_ids {
+                if !seen.insert(id.clone()) {
+                    anyhow::bail!(
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time (duplicate {id})"
+                    );
+                }
+            }
+            for id in trace_ids {
+                self.upsert(tenant, id, "", label, note, author_sub).await?;
+            }
+            Ok(trace_ids.len() as u64)
+        }
+
+        async fn list_batch(
+            &self,
+            tenant: &TenantId,
+            trace_ids: &[String],
+        ) -> Result<Vec<Annotation>> {
+            self.seen_tenant.lock().unwrap().push(tenant.to_string());
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|x| x.span_id.is_empty() && trace_ids.iter().any(|t| t == &x.trace_id))
+                .cloned()
+                .collect())
+        }
+
+        async fn bulk_action_cap(&self) -> Result<Option<u32>> {
+            Ok(*self.bulk_cap.lock().unwrap())
         }
 
         // ── EVL-29. Real in-memory behaviour, not stubs: a mock that always
@@ -2595,6 +3038,28 @@ mod tests {
         assert!(may_write(&claims(None)));
     }
 
+    // `EVL-31` §6a — the review-into-a-tombstoned-dataset guard. Written
+    // before `refuse_if_dataset_deleted` existed: the first compile of this
+    // pair of assertions printed "cannot find function `refuse_if_dataset_deleted`
+    // in this scope" (E0425) — confirmed RED — then the function above was
+    // added to turn it GREEN.
+    #[test]
+    fn a_live_dataset_is_not_refused() {
+        assert!(refuse_if_dataset_deleted(true).is_ok());
+    }
+
+    #[test]
+    fn a_deleted_dataset_refuses_with_409_dataset_deleted_and_writes_nothing() {
+        let (status, body) =
+            refuse_if_dataset_deleted(false).expect_err("a tombstoned dataset must refuse");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.0.get("error").and_then(|v| v.as_str()),
+            Some("dataset_deleted"),
+            "the code must be the one the spec names, so the UI can render it"
+        );
+    }
+
     #[test]
     fn label_vocabulary_is_closed() {
         for good in LABELS {
@@ -2688,6 +3153,143 @@ mod tests {
         let seen = s.seen_tenant.lock().unwrap();
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|x| *x == t.to_string()));
+    }
+
+    // ══════════════════════ OBS-56 — bulk trace-level flag ═════════════════
+
+    #[test]
+    fn validate_batch_trace_ids_dedupes_and_flags_invalid_ids() {
+        let (valid, refused) = validate_batch_trace_ids(&[
+            "tr-full-1".to_string(),
+            "bad".to_string(),       // < 8 chars, check_trace_id rejects it
+            "tr-full-1".to_string(), // duplicate of a VALID id — dropped silently
+            "tr-full-2".to_string(),
+        ]);
+        assert_eq!(
+            valid,
+            vec!["tr-full-1".to_string(), "tr-full-2".to_string()]
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].trace_id, "bad");
+        assert_eq!(refused[0].reason, "invalid_trace_id");
+    }
+
+    // B-589 (found on prod 2026-09-28): `GET /v1/annotations?trace_id=…` used axum's
+    // `Query<Vec<String>>`, which `serde_urlencoded` cannot build — every call was a 400,
+    // one id or many ("expected a sequence", reproduced). Handler tests built the struct
+    // directly, so no test ever went through the parser.
+    #[test]
+    fn b589_repeated_trace_id_keys_parse_in_order() {
+        assert_eq!(
+            parse_trace_id_query(Some("trace_id=abc12345&trace_id=def67890")),
+            vec!["abc12345".to_string(), "def67890".to_string()]
+        );
+        assert_eq!(
+            parse_trace_id_query(Some("trace_id=abc12345")),
+            vec!["abc12345".to_string()]
+        );
+    }
+
+    #[test]
+    fn b589_values_are_percent_decoded_and_other_keys_ignored() {
+        assert_eq!(
+            parse_trace_id_query(Some("x=1&trace_id=abc%2D1234%2d5&trace_id=&y")),
+            vec!["abc-1234-5".to_string(), String::new()]
+        );
+        assert!(parse_trace_id_query(None).is_empty());
+        assert!(parse_trace_id_query(Some("")).is_empty());
+        // A malformed escape is kept literally, then refused by check_trace_id — never a panic.
+        assert_eq!(
+            parse_trace_id_query(Some("trace_id=ab%zz1234")),
+            vec!["ab%zz1234".to_string()]
+        );
+    }
+
+    #[test]
+    fn check_trace_id_refuses_an_oversized_id() {
+        // Security review 2026-09-27: only a MINIMUM was enforced, so one multi-megabyte
+        // id passed and was bound into Postgres. A trace id is 32 hex or a 36-char UUID.
+        assert!(check_trace_id(&"a".repeat(MAX_TRACE_ID_LEN)).is_ok());
+        assert!(check_trace_id(&"a".repeat(MAX_TRACE_ID_LEN + 1)).is_err());
+        assert!(check_trace_id(&"a".repeat(10 * 1024 * 1024)).is_err());
+    }
+
+    #[test]
+    fn validate_batch_trace_ids_accepts_the_all_good_case() {
+        let (valid, refused) =
+            validate_batch_trace_ids(&["tr-full-1".to_string(), "tr-full-2".to_string()]);
+        assert_eq!(valid.len(), 2);
+        assert!(refused.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_batch_writes_every_valid_id_under_one_author() {
+        let s = MockStore::default();
+        let t = tenant();
+        let ids = vec!["tr-full-1".to_string(), "tr-full-2".to_string()];
+        let written = s
+            .upsert_batch(&t, &ids, "bad", "triage sweep", "user-a")
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+        for id in &ids {
+            let rows = s.list(&t, id).await.unwrap();
+            assert_eq!(rows.len(), 1, "{id} must carry exactly one trace-level row");
+            assert_eq!(rows[0].label, "bad");
+            assert_eq!(rows[0].span_id, "", "a batch flag is trace-level");
+            assert_eq!(rows[0].author_sub, "user-a");
+        }
+    }
+
+    /// The store-level protection `validate_batch_trace_ids` exists to make
+    /// unreachable in the handler: a call that skips the dedupe reproduces
+    /// Postgres's own refusal rather than silently double-writing.
+    #[tokio::test]
+    async fn upsert_batch_refuses_a_duplicate_id_the_way_postgres_would() {
+        let s = MockStore::default();
+        let t = tenant();
+        let ids = vec!["tr-full-1".to_string(), "tr-full-1".to_string()];
+        let err = s
+            .upsert_batch(&t, &ids, "bad", "", "user-a")
+            .await
+            .expect_err("a duplicate id in one batch must be refused, not double-written");
+        assert!(
+            err.to_string().contains("cannot affect row a second time"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_batch_returns_only_trace_level_rows_for_the_requested_ids() {
+        let s = MockStore::default();
+        let t = tenant();
+        s.upsert(&t, "tr-full-1", "", "bad", "", "user-a")
+            .await
+            .unwrap();
+        // A SPAN-level flag on the same trace must not appear in the batch read.
+        s.upsert(&t, "tr-full-1", "span-9", "good", "", "user-a")
+            .await
+            .unwrap();
+        // A trace NOT in the requested set must not appear either.
+        s.upsert(&t, "tr-full-9", "", "bad", "", "user-a")
+            .await
+            .unwrap();
+        let rows = s.list_batch(&t, &["tr-full-1".to_string()]).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].trace_id, "tr-full-1");
+        assert_eq!(rows[0].span_id, "");
+    }
+
+    #[tokio::test]
+    async fn bulk_action_cap_defaults_to_unavailable_and_reflects_a_configured_value() {
+        let s = MockStore::default();
+        assert_eq!(
+            s.bulk_action_cap().await.unwrap(),
+            None,
+            "the mock's Default must reproduce the fail-closed 503 path by default"
+        );
+        *s.bulk_cap.lock().unwrap() = Some(200);
+        assert_eq!(s.bulk_action_cap().await.unwrap(), Some(200));
     }
 
     // ══════════════════ EVL-29 — the controls must REFUSE ═════════════════

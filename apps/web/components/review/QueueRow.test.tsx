@@ -69,9 +69,12 @@ describe("QueueRow — archive/un-archive", () => {
 
 	it("archives optimistically, PATCHes {archived:true}, and refreshes on success", async () => {
 		vi.spyOn(window, "confirm").mockReturnValue(true);
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValue({ ok: true, json: async () => ({}) });
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
+			json: async () => ({}),
+		});
 		vi.stubGlobal("fetch", fetchMock);
 
 		renderRow(queue());
@@ -98,6 +101,8 @@ describe("QueueRow — archive/un-archive", () => {
 		vi.spyOn(window, "confirm").mockReturnValue(true);
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: false,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
 			status: 502,
 			json: async () => ({ message: "Could not update the queue." }),
 		});
@@ -118,9 +123,12 @@ describe("QueueRow — archive/un-archive", () => {
 
 	it("un-archives an already-archived queue with {archived:false}", async () => {
 		vi.spyOn(window, "confirm").mockReturnValue(true);
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValue({ ok: true, json: async () => ({}) });
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			// A real Response always carries headers — the signed-out check reads content-type.
+			headers: new Headers({ "content-type": "application/json" }),
+			json: async () => ({}),
+		});
 		vi.stubGlobal("fetch", fetchMock);
 
 		renderRow(queue({ archived_at: "2026-08-01T00:00:00Z" }));

@@ -24,7 +24,8 @@ vi.mock("@/lib/auth", () => ({
 }));
 
 import { fetchSessionsFor } from "@/lib/metrics/fetch";
-import { fetchSessionTraces } from "./sessions";
+import { fetchSessionTraces, fetchSessionTranscript } from "./sessions";
+import type { SessionTranscriptResponse } from "./sessions";
 
 // The list window every read is asked for — the shared grammar (DSH-11).
 const WIN = {
@@ -82,6 +83,52 @@ const STORE = {
 				}[];
 			}
 		>,
+		transcript: {
+			"sess-A-001": {
+				totals: {
+					turns: 1,
+					spans: 1,
+					input_tokens: 100,
+					output_tokens: 20,
+					cost_usd: 0.003,
+					priced_spans: 1,
+					first_start: "2026-06-10 00:05:00.000000",
+					last_end: "2026-06-10 00:05:01.200000",
+					duration_us: 1_200_000,
+					error_spans: 0,
+					models: ["gpt-4o-mini"],
+					end_user: "",
+					agent_name: "",
+				},
+				capture: { workspace_policy: "on" },
+				turns: [
+					{
+						trace_id: "trace-A-001",
+						ordinal: 1,
+						start_time: "2026-06-10 00:05:00.000000",
+						duration_us: 1_200_000,
+						span_count: 1,
+						error_spans: 0,
+						status_message: "",
+						intervention: 0,
+						input_tokens: 100,
+						output_tokens: 20,
+						cost_usd: 0.003,
+						model: "gpt-4o-mini",
+						exchange: {
+							span_id: "span-A-1",
+							input_tail: [],
+							input_message_count: 1,
+							output: null,
+							finish_reasons: [],
+							tool_attrs: "{}",
+							content: "captured",
+						},
+					},
+				],
+				next_cursor: null,
+			} satisfies SessionTranscriptResponse,
+		} as Record<string, SessionTranscriptResponse>,
 	},
 	"jwt-tenant-b": {
 		sessions: [
@@ -99,6 +146,7 @@ const STORE = {
 			},
 		],
 		traces: {} as Record<string, { session_id: string; traces: unknown[] }>,
+		transcript: {} as Record<string, SessionTranscriptResponse>,
 	},
 } as const;
 
@@ -159,6 +207,32 @@ beforeEach(() => {
 				ok: true,
 				status: 200,
 				json: async () => sessionData,
+			} as Response;
+		}
+
+		// Detect /v1/sessions/:id/transcript
+		const transcriptMatch = /\/v1\/sessions\/([^/]+)\/transcript/.exec(url);
+		if (transcriptMatch !== null) {
+			const sid = decodeURIComponent(transcriptMatch[1] ?? "");
+			if (sid === "sess-upstream-502") {
+				return {
+					ok: false,
+					status: 502,
+					json: async () => ({ error: "bad_gateway" }),
+				} as Response;
+			}
+			const data = store.transcript[sid as keyof typeof store.transcript];
+			if (data === undefined) {
+				return {
+					ok: false,
+					status: 404,
+					json: async () => ({}),
+				} as Response;
+			}
+			return {
+				ok: true,
+				status: 200,
+				json: async () => data,
 			} as Response;
 		}
 
@@ -278,6 +352,78 @@ describe("fetchSessionTraces — per-user JWT tenant isolation", () => {
 			new Error("NEXT_REDIRECT"),
 		);
 		await expect(fetchSessionTraces("sess-A-001")).rejects.toThrow(
+			"NEXT_REDIRECT",
+		);
+	});
+});
+
+describe("fetchSessionTranscript — OBS-55", () => {
+	it("returns ONLY tenant A's transcript — never tenant B's", async () => {
+		h.token = "jwt-tenant-a";
+		const result = await fetchSessionTranscript("sess-A-001");
+		expect(result).not.toBeNull();
+		expect(result?.totals.turns).toBe(1);
+		expect(result?.turns[0]?.trace_id).toBe("trace-A-001");
+		expect(result?.turns[0]?.exchange?.content).toBe("captured");
+		const serialized = JSON.stringify(result);
+		expect(serialized).not.toContain("claude-3-5-haiku");
+	});
+
+	it("returns null on 404 — same 404 for 'not found' and 'not this tenant's'", async () => {
+		h.token = "jwt-tenant-a";
+		// sess-001 exists in tenant B's store but tenant A has no such session.
+		const result = await fetchSessionTranscript("sess-001");
+		expect(result).toBeNull();
+	});
+
+	it("throws (never null) on a non-404 GatewayError — a 401 is a real failure, not 'not found'", async () => {
+		h.token = "unknown-tenant-xyz" as StoreKey;
+		await expect(fetchSessionTranscript("sess-A-001")).rejects.toMatchObject({
+			status: 401,
+		});
+	});
+
+	it("throws on a 502 upstream failure — must not read as 'not found' (B-335d)", async () => {
+		h.token = "jwt-tenant-a";
+		await expect(
+			fetchSessionTranscript("sess-upstream-502"),
+		).rejects.toMatchObject({ status: 502 });
+	});
+
+	it("forwards the per-user JWT as Bearer", async () => {
+		h.token = "jwt-tenant-a";
+		await fetchSessionTranscript("sess-A-001");
+		expect(bearerOf()).toBe("Bearer jwt-tenant-a");
+	});
+
+	it("URL-encodes the session id in the gateway path", async () => {
+		h.token = "jwt-tenant-a";
+		await fetchSessionTranscript("conv/slash");
+		const calledUrl = fetchMock.mock.calls[0]?.[0] as string | undefined;
+		expect(calledUrl).toContain("conv%2Fslash");
+	});
+
+	it("forwards limit and cursor as query params when given", async () => {
+		h.token = "jwt-tenant-a";
+		await fetchSessionTranscript("sess-A-001", { limit: 20, cursor: "1:abc" });
+		const calledUrl = fetchMock.mock.calls[0]?.[0] as string | undefined;
+		expect(calledUrl).toContain("limit=20");
+		expect(calledUrl).toContain("cursor=1%3Aabc");
+	});
+
+	it("omits the query string entirely when no options are given", async () => {
+		h.token = "jwt-tenant-a";
+		await fetchSessionTranscript("sess-A-001");
+		const calledUrl = fetchMock.mock.calls[0]?.[0] as string | undefined;
+		expect(calledUrl).not.toContain("?");
+	});
+
+	it("propagates NEXT_REDIRECT rather than swallowing it", async () => {
+		const { requireGatewayToken } = await import("@/lib/auth");
+		vi.mocked(requireGatewayToken).mockRejectedValueOnce(
+			new Error("NEXT_REDIRECT"),
+		);
+		await expect(fetchSessionTranscript("sess-A-001")).rejects.toThrow(
 			"NEXT_REDIRECT",
 		);
 	});

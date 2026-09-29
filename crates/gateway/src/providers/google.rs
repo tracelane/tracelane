@@ -217,12 +217,18 @@ fn parse_gemini_sse(data: &str) -> Result<Vec<ProviderEvent>> {
         // any cached prefix, so input is not adjusted here.
         let output = (meta["candidatesTokenCount"].as_u64().unwrap_or(0)
             + meta["thoughtsTokenCount"].as_u64().unwrap_or(0)) as u32;
+        // RI-05 / M11: the SAME `thoughtsTokenCount`, broken out on its own
+        // attribute rather than folded into `output`. `.as_u64()` on an absent
+        // key (non-thinking models omit it) is `None` — never a fabricated `0`
+        // for a model that has no reasoning concept at all.
+        let reasoning = meta["thoughtsTokenCount"].as_u64().map(|n| n as u32);
         events.push(ProviderEvent::UsageUpdate {
             input_tokens: input,
             output_tokens: output,
             cache_read: None,
             cache_creation: None,
             cost_usd: None,
+            reasoning,
         });
     }
 
@@ -506,5 +512,35 @@ mod tests {
         );
         assert_eq!(input, 1767);
         assert_eq!(output, 1259, "no thoughtsTokenCount → output unchanged");
+    }
+
+    /// RI-05 / M11: the SAME `thoughtsTokenCount` also lands on
+    /// `UsageUpdate.reasoning`, broken out — `output_tokens` stays the folded
+    /// (inclusive) total from the two tests above, unchanged by this field.
+    #[test]
+    fn thoughts_token_count_also_lands_on_reasoning_and_absence_stays_absent() {
+        let reasoning_of = |chunk: &str| {
+            parse_gemini_sse(chunk)
+                .unwrap()
+                .iter()
+                .find_map(|e| match e {
+                    ProviderEvent::UsageUpdate { reasoning, .. } => Some(*reasoning),
+                    _ => None,
+                })
+                .expect("a UsageUpdate event")
+        };
+        assert_eq!(
+            reasoning_of(
+                r#"{"usageMetadata":{"promptTokenCount":677,"candidatesTokenCount":175,"thoughtsTokenCount":400,"totalTokenCount":1252}}"#
+            ),
+            Some(400)
+        );
+        assert_eq!(
+            reasoning_of(
+                r#"{"usageMetadata":{"promptTokenCount":1767,"candidatesTokenCount":1259,"totalTokenCount":3026}}"#
+            ),
+            None,
+            "a non-thinking model omits the key entirely ⇒ absent, never a fabricated 0"
+        );
     }
 }

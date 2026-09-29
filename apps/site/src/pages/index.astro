@@ -1,6 +1,7 @@
 ---
 import CompareTable from "../components/CompareTable.astro";
 import Icon from "../components/Icon.astro";
+import Logo from "../components/Logo.astro";
 /**
  * tracelane.dev homepage.
  *
@@ -23,6 +24,7 @@ import Icon from "../components/Icon.astro";
  */
 import Base from "../layouts/Base.astro";
 import PricingTable from "../components/PricingTable.astro";
+import { SECTIONS } from "../data/product-data";
 
 const providers = [
   "OpenAI",
@@ -105,43 +107,61 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 ---
 
 <Base>
-  {/* ===== Hero ===== */}
-  <section class="panel hero" style="padding-top:clamp(3.5rem,8vw,6.5rem)">
-    <div class="max-w-3xl text-left">
-      <span class="badge hero-rise" style="--d:0s"><span class="dot"></span>open source · self-host · your keys, 0% markup</span>
-
-      <h1 class="mt-7 display-xl text-fg headline-in" style="--d:0.06s">
-        The <span class="grad-text">flight recorder</span><br class="hidden sm:block" /> for AI agents
-      </h1>
-
-      <p class="mt-6 lede hero-rise" style="--d:0.12s">
-        Every gateway call, recorded. Every record, verifiable.
-      </p>
-
-      <div class="mt-9 flex flex-wrap items-center gap-3 hero-rise" style="--d:0.18s">
-        <a href="https://app.tracelane.dev/sign-in" class="btn-primary">Start free <span aria-hidden="true">→</span></a>
-        <a href="https://github.com/tracelane" class="btn-secondary" rel="me noopener">GitHub</a>
-        <span class="text-sm text-fg-dim sm:ml-1">no credit card · apache-2.0 core</span>
-      </div>
-
-      <div class="mt-8 fact-strip hero-rise" style="--d:0.22s" aria-label="At a glance">
-        <span>sha-256 hash chain</span>
-        <span>ed25519-signed merkle root</span>
-        <span>191 providers</span>
-        <span>one rust binary</span>
+  <section class="panel recorder-hero">
+    <div class="hero-intro">
+      <p class="hero-kicker"><span aria-hidden="true"></span> OPEN SOURCE INFRASTRUCTURE / AI AGENTS</p>
+      <h1>The flight recorder<br /><span>for AI agents.</span></h1>
+      <div class="hero-intro-copy">
+        <p>Every call the hosted gateway admits, recorded in the ledger before it is dispatched. Every ledger record, verifiable.</p>
+        <div class="hero-actions"><a href="https://app.tracelane.dev/sign-in" class="btn-primary">Start free <span aria-hidden="true">↗</span></a><a href="https://github.com/tracelane" class="hero-github" rel="me noopener">Explore the code <span aria-hidden="true">↗</span></a></div>
+        <p class="hero-fineprint">No credit card · Apache-2.0 core<span class="hero-fineprint-sep" aria-hidden="true"> · </span><br /> Self-host · your keys, 0% markup</p>
       </div>
     </div>
+      <div class="hero-film frame frame--media" id="hero-stage">
+        <div class="frame-bar">
+          <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="frame-title">tracelane — product tour</span>
+        </div>
+        <div class="frame-body" style="position:relative">
+          <video id="hero-video" class="stage-video" width="1920" height="1080" playsinline preload="none">
+            <source src="/tracelane-intro-v7.mp4" type="video/mp4" />
+          </video>
+          <button class="stage-overlay" id="hero-play" type="button" aria-label="Play the Tracelane tour with sound">
+            <span class="film-cover-brand" aria-hidden="true"><Logo size={64} /></span>
+            <span class="film-cover-title" aria-hidden="true">See the flight recorder in action.</span>
+            <span class="play" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+            </span>
+            <span class="film-cover-label" aria-hidden="true">Watch the product tour</span>
+          </button>
+        </div>
+      </div>
 
-    {/* The stage: an animated, hover-reactive request-flow diagram, then the
-        product tour underneath it. Both are visuals, not prose. */}
-    <div class="mt-14 stage-well stage-well--scenic hero-rise" style="--d:0.28s">
+    <div class="hero-specs" aria-label="At a glance"><span><b>SHA-256</b> Hash chain</span><span><b>Ed25519</b> Signed Merkle root</span><span><b>191</b> Providers</span><span>Two Rust services — gateway and ingest — with ClickHouse and NATS.</span></div>
+  </section>
+
+  {/* ===== Provider rail ===== */}
+  <section class="panel provider-section">
+    <h2 class="eyebrow eyebrow--center w-full mb-6">191 providers, one canonical wire format</h2>
+    <div class="provider-rail reveal">
+      {providers.map((p) => <div class="tile">{p}</div>)}
+    </div>
+  </section>
+
+  <section class="panel architecture-section" aria-label="Recording architecture">
+    <div class="recorder-console">
+      <div class="console-toolbar"><span><span class="console-mark" aria-hidden="true">◎</span> TRACELANE / RECORDING ARCHITECTURE</span><span>01 — ADMIT / RECORD / DISPATCH</span></div>
+      <div class="console-body">
+        <div class="console-pipeline">
+          <div class="console-label">THE REQUEST PATH</div>
+          <h2>From admitted call<br />to verifiable record.</h2>
       <div class="hero-flow" id="hero-flow" aria-label="A request flowing through the gateway to a provider, then hash-chained into the audit ledger">
         <button class="flow-node" type="button" data-state="Every call enters through one gateway.">
           <span class="flow-node-glyph" aria-hidden="true"><Icon name="agent" /></span>
           <span class="flow-node-label">Agent</span>
         </button>
         <div class="flow-line"><span class="flow-pulse" style="--delay:0s"></span></div>
-        <button class="flow-node flow-node--gw" type="button" data-state="Recorded in full fidelity — your keys, 0% markup.">
+        <button class="flow-node flow-node--gw" type="button" data-state="Recorded — model, tokens, cost and tool calls on every call; prompt and response text once capture is enabled for your workspace. Your keys, 0% markup.">
           <span class="flow-node-glyph" aria-hidden="true"><Icon name="gateway" /></span>
           <span class="flow-node-label">Gateway</span>
         </button>
@@ -151,32 +171,21 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
           <span class="flow-node-label">Provider</span>
         </button>
       </div>
-      <p class="hero-flow-readout" id="hero-flow-readout" aria-live="polite">Hover a step to see it recorded.</p>
+      <p class="hero-flow-readout" id="hero-flow-readout" aria-live="polite">Hover or tap a step to see it recorded.</p>
 
-      <div class="mt-6 frame frame--media" id="hero-stage">
-        <div class="frame-bar">
-          <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-          <span class="frame-title">tracelane — replay</span>
         </div>
-        <div class="frame-body" style="position:relative">
-          <video id="hero-video" class="stage-video" poster="/tracelane-intro-v6-poster.jpg" playsinline preload="none">
-            <source src="/tracelane-intro-v6.mp4" type="video/mp4" />
-          </video>
-          <button class="stage-overlay" id="hero-play" type="button" aria-label="Play the Tracelane tour with sound">
-            <span class="play" aria-hidden="true">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
-            </span>
-          </button>
+        <div class="console-ledger">
+      <div class="ledger-illustration" aria-label="Schematic ledger: recorded metadata is hash-chained and signed. This is an architecture illustration, not live data.">
+        <div class="ledger-heading"><span>THE AUDIT LEDGER</span><span>Hash-chained</span></div>
+        <div class="ledger-row"><span class="ledger-pin ledger-pin--model"></span><strong>Model calls</strong><span>Model · tokens · cost</span></div>
+        <div class="ledger-row"><span class="ledger-pin ledger-pin--tool"></span><strong>Tool calls</strong><span>Recorded metadata</span></div>
+        <div class="ledger-row"><span class="ledger-pin ledger-pin--agent"></span><strong>Signed Merkle root</strong><span>Ed25519</span></div>
+        <div class="ledger-footer"><span aria-hidden="true">↳</span> Verify the record. Independently.</div>
+      </div>
+          <p class="console-note">A record you can inspect. A chain you can verify offline.</p>
         </div>
       </div>
-    </div>
-  </section>
 
-  {/* ===== Provider rail ===== */}
-  <section class="panel">
-    <h2 class="eyebrow eyebrow--center w-full mb-6">191 providers, one canonical wire format</h2>
-    <div class="provider-rail reveal">
-      {providers.map((p) => <div class="tile">{p}</div>)}
     </div>
   </section>
 
@@ -207,43 +216,54 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
     <div class="reveal section-head">
       <p class="eyebrow mb-4">How it works</p>
       <h2 class="display-lg text-fg">Record. Replay. Prove.</h2>
-      <p class="lede">One Rust binary. Open core, Apache 2.0.</p>
+      <p class="lede">Two Rust services. Open core, Apache 2.0.</p>
     </div>
-    <div class="mt-12 grid gap-4 md:grid-cols-3 reveal-group cards-hover">
+    <div class="workflow-grid reveal-group">
       <article class="glass p-7 step-card">
-        <span class="step-num" aria-hidden="true">1</span>
+        <span class="workflow-index">01 / CAPTURE</span><div class="workflow-art capture-art" aria-hidden="true"><i>model</i><i>tokens</i><i>cost</i><span>Metadata → recorded</span></div>
         <div class="feat-glyph" aria-hidden="true"><Icon name="record" size={20} /></div>
         <h3 class="card-title">Record</h3>
-        <p class="card-body">Full fidelity by default, on your own provider keys.</p>
+        <p class="card-body">Metadata on every call by default; full prompt and response capture once it is enabled for your workspace — always on your own provider keys.</p>
       </article>
       <article class="glass p-7 step-card">
-        <span class="step-num" aria-hidden="true">2</span>
+        <span class="workflow-index">02 / INSPECT</span><div class="workflow-art inspect-art" aria-hidden="true"><span>Stored spans</span><i></i><i></i><i></i></div>
         <div class="feat-glyph" aria-hidden="true"><Icon name="replay" size={20} dot={false} /></div>
         <h3 class="card-title">Replay</h3>
-        <p class="card-body">Step to the exact call that broke.</p>
+        <p class="card-body">Inspect the recorded calls to find what broke. Replay reads stored spans; it does not re-execute models or tools.</p>
       </article>
       <article class="glass p-7 step-card">
-        <span class="step-num" aria-hidden="true">3</span>
+        <span class="workflow-index">03 / VERIFY</span><div class="workflow-art verify-art" aria-hidden="true"><span>Hash</span><i>→</i><span>Sign</span><i>→</i><span>Verify</span></div>
         <div class="feat-glyph" aria-hidden="true"><Icon name="prove" size={20} dot={false} /></div>
         <h3 class="card-title">Prove</h3>
         <p class="card-body">Hash-chained, signed, verifiable offline.</p>
       </article>
     </div>
+    <nav class="explore reveal" aria-label="Explore the product">
+      {SECTIONS.map((sec) => (
+        <a href={`/product#${sec.slug}`} class="explore-link">
+          <span class="explore-name">{sec.name} →</span>
+          <span class="explore-head">{sec.headline}</span>
+        </a>
+      ))}
+    </nav>
   </section>
 
   {/* ===== Benchmarks — measured gateway overhead, not a claimed number ===== */}
   <section id="benchmarks" class="panel">
     <div class="reveal section-head">
       <p class="eyebrow mb-4">Measured, not claimed</p>
-      <h2 class="display-lg text-fg">2ms added at p50. 4ms at p95. 5ms at p99.</h2>
+      <h2 class="display-lg text-fg">2&nbsp;ms added at p50, 4&nbsp;ms at p95, 5&nbsp;ms at p99.</h2>
       <p class="lede">
-        Gateway overhead on top of the model call, with capture on — measured with
-        LiteLLM's own open <a href="https://github.com/BerriAI/ai-gateway-bench" class="link-accent" rel="noopener">AIGatewayBench</a> harness,
-        not one we wrote ourselves.
+        Gateway overhead on top of the model call, with span capture on — measured with
+        LiteLLM's open <a href="https://github.com/BerriAI/ai-gateway-bench" class="link-accent" rel="noopener">AIGatewayBench</a> harness
+        at a pinned commit, plus three published patches of ours (an OpenAI-route scenario and
+        two mock-upstream timing fixes). Measured again with the production topology — a
+        Postgres control plane, API-key authentication and the acknowledged audit-ledger write
+        on every request — and within the same table.
       </p>
     </div>
 
-    <div class="mt-10 reveal">
+    <div class="benchmark-visual reveal">
       <div class="bench-chart" aria-hidden="true">
         {benchRows.map((g) => (
           <div class={`bench-row${g.highlight ? " bench-row--highlight" : ""}`}>
@@ -322,7 +342,9 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       </div>
     </div>
 
-    <p class="mt-8 text-sm text-fg-dim bench-footnotes">
+    <details class="mt-8 bench-details">
+      <summary class="text-sm text-fg-muted">Method and caveats</summary>
+    <p class="mt-3 text-sm text-fg-dim bench-footnotes">
       Direct-to-mock baseline (already subtracted from every figure above): 1 / 2 / 3 ms p50/p95/p99.
       Host: one Hetzner CCX23 (4 vCPU, 16 GB). 16 concurrent clients, 30 seconds, two runs.<br />
       † Bifrost via <code>npx -y @maximhq/bifrost</code>, both runs — its version string is only
@@ -330,6 +352,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       ‡ LiteLLM Rust: as of 2026-09-07 no public build exists — the harness's own notes build it
       from a private branch on LiteLLM's machine. We'll run it when one is published.
     </p>
+    </details>
 
     <div class="mt-8 flex flex-wrap items-center gap-4">
       <code class="bench-repro">bash bench/gateway/aigatewaybench/run.sh</code>
@@ -341,18 +364,19 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
   <CompareTable />
 
-  {/* ===== Audit ledger — the dark band: copy left, terminal frame right ===== */}
-  <section id="audit" class="band band--dark">
+  {/* ===== Audit ledger — copy left, terminal frame right ===== */}
+  <section id="audit" class="band">
     <div class="band-inner">
       <div class="grid gap-10 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:gap-16 lg:items-center reveal">
         <div>
           <p class="eyebrow mb-4">The audit ledger</p>
-          <h2 class="display-lg text-fg">Every run. On the record. <span class="grad-text-warm">Provably.</span></h2>
+          <h2 class="display-lg text-fg">Every run. On the record. <span class="link-accent">Provably.</span></h2>
           <p class="mt-5 text-fg-muted leading-relaxed" style="text-wrap:pretty">
-            SHA-256 hash-chained, Ed25519-signed — verify any trace offline.
+            SHA-256 hash-chained, Ed25519-signed — verify your ledger offline with the open verifier.
           </p>
           <p class="mt-6"><a href="/security" class="link-accent">Full security posture →</a></p>
 
+          <p class="mt-5 text-fg-muted leading-relaxed">The ledger covers gateway-admitted calls and their recorded guardrail verdicts; SDK/OTLP-only spans are captured, not chained; the trace ledger badge shows whether that trace has a ledger record.</p>
           <div class="chain" aria-hidden="true">
             <div class="chain-node"><b>event</b><span>sha-256</span></div>
             <div class="chain-link"></div>
@@ -364,37 +388,40 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
           </div>
         </div>
 
-        <div class="stage-well stage-well--dark">
-          <div class="frame frame--dark">
+        <div class="stage-well">
+          <div class="frame">
             <div class="frame-bar">
               <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
               <span class="frame-title">tlane — verify</span>
             </div>
             <div class="frame-body">
 <pre class="term"><code><span class="c"># verify any trace offline — no trust in us required</span>
-<span class="p">$</span> tlane verify &lt;trace-id&gt;
-<span class="ok">✓</span> signature valid (Ed25519, Merkle root)
-<span class="ok">✓</span> hash chain unbroken (SHA-256)
-<span class="ok">✓</span> tamper-evident: yes <span class="caret">&nbsp;</span></code></pre>
+<span class="p">$</span> tlane verify ./audit.ndjson --tenant-pubkey &lt;b64&gt;
+<span class="ok">✓</span> tlane verify: PASS
+<span class="ok">✓</span> hash_chain_valid: true · signatures_valid: true
+<span class="ok">✓</span> anchors_included: 12 (Sigstore Rekor v2) <span class="caret">&nbsp;</span></code></pre>
             </div>
           </div>
         </div>
       </div>
 
-      <div class="mt-12 grid gap-4 md:grid-cols-3 text-sm reveal-group cards-hover">
+      <details class="mt-12 audit-details">
+        <summary class="text-sm">EU AI Act, India DPDP and HIPAA — what the ledger does and does not cover</summary>
+      <div class="mt-4 grid gap-4 md:grid-cols-3 text-sm reveal-group cards-hover">
         <div class="glass p-6">
           <p class="card-index">eu ai act</p>
-          <p class="card-body text-sm">Article 12 export pack — full audit trail for high-risk AI systems. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>); the ledger is available today.</p>
+          <p class="card-body text-sm">Article 12: the tamper-evident ledger, signing and anchoring are on every tier today; the Article 12 export ships on Enterprise and does not yet carry per-record inclusion proofs or a signed completeness attestation. Annex III enforcement provisionally deferred to Dec 2, 2027 (Digital Omnibus political agreement, May 7, 2026; pending formal adoption — <a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>).</p>
         </div>
         <div class="glass p-6">
           <p class="card-index">india dpdp</p>
-          <p class="card-body text-sm">Phase II enforcement Nov 13, 2026. Tracelane enforces no per-tenant storage region today; region pinning is on the roadmap. The audit ledger has no expiry clock — it is kept for the life of the ledger.</p>
+          <p class="card-body text-sm">Tracelane enforces no per-tenant storage region today; traces and the ledger are stored in the EU (Germany), with the cold tier in EU-jurisdiction object storage. The audit ledger has no expiry clock — it is kept for the life of the ledger.</p>
         </div>
         <div class="glass p-6">
           <p class="card-index">hipaa</p>
-          <p class="card-body text-sm">No signed BAA today, so do not route PHI through the hosted gateway. Prompt and response text is not stored unless we enable capture for your workspace. Inline redaction (Team and above) masks structured identifiers only — card numbers, SSNs, emails, E.164 phone numbers and secret-shaped strings — never names, addresses or free-text clinical detail. Provider keys are envelope-encrypted.</p>
+          <p class="card-body text-sm">No signed BAA today, so do not route PHI through the hosted gateway. Prompt and response text is not written to your traces unless we enable capture for your workspace; the response cache holds cacheable responses in memory for up to 7 days, and durably when your workspace has an embedding key. Inline redaction (Team and above) masks structured identifiers only — card numbers, SSNs, emails, E.164 phone numbers and secret-shaped strings — never names, addresses or free-text clinical detail. Provider keys are AES-256-GCM encrypted at rest, bound to your workspace and provider, under a rotatable master key.</p>
         </div>
       </div>
+      </details>
     </div>
   </section>
 
@@ -411,7 +438,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
       <div class="stage-well stage-well--scenic">
         <div class="frame-stack">
-          <div class="frame frame--dark">
+          <div class="frame">
             <div class="frame-bar">
               <span class="frame-lights" aria-hidden="true"><i></i><i></i><i></i></span>
               <span class="frame-title">tlane — migrate helicone</span>
@@ -430,8 +457,8 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
               <span class="frame-title">tlane — import-litellm</span>
             </div>
             <div class="frame-body">
-<pre class="term" style="color:var(--color-fg)"><code><span class="c" style="color:var(--color-fg-dim)"># reads litellm_config.yaml, emits the</span>
-<span class="c" style="color:var(--color-fg-dim)"># equivalent Tracelane config</span>
+<pre class="term" style="color:var(--color-fg)"><code><span class="c" style="color:var(--color-fg-dim)"># reads litellm_config.yaml and prints your providers,</span>
+<span class="c" style="color:var(--color-fg-dim)"># routing and callbacks translated into Tracelane terms for review</span>
 <span class="p">$</span> tlane import-litellm</code></pre>
             </div>
           </div>
@@ -440,7 +467,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
     </div>
   </section>
 
-  <PricingTable />
+  <PricingTable compact />
 
   {/* ===== Trust ===== */}
   <section id="trust" class="panel">
@@ -459,15 +486,15 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       </div>
       <div class="glass p-6">
         <p class="card-index">vuln scanning</p>
-        <p class="card-body text-sm">gitleaks, cargo-deny and a critical-level dependency audit on every push; OSV-Scanner and Grype nightly and a Syft SBOM weekly on the public repository.</p>
+        <p class="card-body text-sm">gitleaks and a high-severity dependency audit on every push; cargo-deny in the pre-push gate; OSV-Scanner, Grype and cargo-deny nightly and a Syft SBOM weekly on the public repository.</p>
       </div>
       <div class="glass p-6">
         <p class="card-index">pre-flight policy</p>
-        <p class="card-body text-sm">Policy checks run inline at the gateway before the call leaves. Today: schema-violation + tool-definition-drift, fail-open. More on a published roadmap.</p>
+        <p class="card-body text-sm">Policy checks run inline at the gateway before the call leaves. Today: schema-violation + tool-definition-drift on the Anthropic Messages route, fail-open. More on a published roadmap.</p>
       </div>
       <div class="glass p-6">
         <p class="card-index">transport</p>
-        <p class="card-body text-sm">TLS 1.3 minimum. mTLS via SPIFFE/SPIRE for ingest. SSRF defense — RFC1918 + link-local denied.</p>
+        <p class="card-body text-sm">TLS 1.3 from the edge to the origin and on the internal ingest leg, which is mTLS via SPIFFE/SPIRE; the public edge accepts TLS 1.2. SSRF defense — RFC1918, link-local and CGNAT denied.</p>
       </div>
       <div class="glass p-6">
         <p class="card-index">standards</p>
@@ -486,32 +513,32 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       <div class="reveal">
         <details class="faq-row">
           <summary class="text-fg">What is Tracelane?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">An open-source (Apache 2.0) flight recorder for AI agents: a universal Rust LLM gateway, full-fidelity OpenTelemetry observability, and a tamper-evident audit ledger. Each event is SHA-256 hash-chained and the Merkle root is Ed25519-signed every 100 events, so any trace can be verified offline.</p>
+          <p class="text-fg-muted leading-relaxed">An open-source (Apache 2.0) flight recorder for AI agents: a universal Rust LLM gateway, full-fidelity OpenTelemetry observability, and a tamper-evident audit ledger. Each ledger event is SHA-256 hash-chained and, every 100 events per tenant, the Merkle root is Ed25519-signed, so any gateway call's record can be verified offline. OTLP/SDK traces are not yet in the chain.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">How is it different from Helicone, LangSmith or Langfuse?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one Rust binary. Helicone, Langfuse and LangSmith are observability-first — you bring your own gateway and guardrails. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's gateway is GPL-3.0, Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. The audit ledger is hash-chained and Ed25519-signed — we are not aware of another product in this category that offers cryptographic audit-log integrity at the trace level.</p>
+          <p class="text-fg-muted leading-relaxed">Tracelane unifies the gateway, observability, pre-flight policy and a tamper-evident audit ledger in one stack: a Rust gateway and a Rust ingest service. Licensing: Tracelane is Apache 2.0 core with a published self-host path; Helicone's AI gateway is GPL-3.0, Arize Phoenix is ELv2 (no SaaS resale), LangSmith is closed-source. Langfuse has no gateway; Helicone and LangSmith ship theirs separately from their observability products. The audit ledger is hash-chained and Ed25519-signed.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">What about LangSmith Engine?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">LangSmith Engine (May 13, 2026) clusters production failures after they happen and drafts pull requests to fix them; Tracelane's pre-flight policy checks flag failure modes at the gateway. Engine is locked to the LangSmith trace surface and LangChain-managed inference keys per LangChain's terms of service; Tracelane is neutral OTel ingest with 0% BYOK markup across 191 providers. Different layer of the agent reliability stack.</p>
+          <p class="text-fg-muted leading-relaxed">LangSmith Engine (announced May 2026) clusters production failures after they happen and drafts pull requests to fix them, inside the LangSmith trace surface; Tracelane's pre-flight policy checks flag failure modes at the gateway and its ingest is neutral OTel with 0% BYOK markup across 191 providers. Different layer of the agent reliability stack.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">Is Tracelane really open source?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Yes. The core (Rust gateway, ingest workers, observability backend, pre-flight layer, CLI, SDKs, audit verifiers) is Apache 2.0. The <code class="font-mono text-sm">/spec</code> directory is CC0. Paid features are gated by the workspace_entitlements table at the application layer, not by a license-string compare.</p>
+          <p class="text-fg-muted leading-relaxed">Yes. The core (Rust gateway, ingest workers, observability backend, pre-flight layer, CLI, SDKs, audit verifiers) is Apache 2.0. The AFT-1 spec under <code class="font-mono text-sm">/spec/aft-1</code> is CC0. Paid features are gated by the workspace_entitlements table at the application layer, not by a license-string compare.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">Which providers are supported?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">191 providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus OpenAI and any OpenAI-compatible endpoint, including Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI, and Mistral. One canonical wire format across all of them.</p>
+          <p class="text-fg-muted leading-relaxed">191 providers today — 6 native adapters (Anthropic, Google Gemini, Google Vertex, AWS Bedrock, Azure OpenAI, Cohere) plus 185 catalogued OpenAI-compatible providers including OpenAI, Together, Fireworks, Groq, OpenRouter, DeepSeek, xAI and Mistral; self-hosters can point any catalog entry at their own base URL. One canonical wire format across all of them.</p>
         </details>
 
         <details class="faq-row">
           <summary class="text-fg">Does Tracelane support EU AI Act Article 12?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">The Tamper-Evident Agent Ledger (SHA-256 hash chain, Ed25519-signed Merkle root, Rekor anchoring, self-verification) is included on every tier, free and paid — no add-on to buy. The Article 12 evidence export and seven-year ledger retention are included on Enterprise. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim. EU AI Act Annex III obligations were originally scheduled for Aug 2, 2026; the Digital Omnibus political agreement (May 7, 2026) provisionally deferred enforcement to Dec 2, 2027, pending formal adoption (<a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>). The ledger ships now so regulated buyers can build audit history before binding enforcement.</p>
+          <p class="text-fg-muted leading-relaxed">The Tamper-Evident Agent Ledger (SHA-256 hash chain, Ed25519-signed Merkle root, Rekor anchoring, self-verification) is included on every tier, free and paid — no add-on to buy. Enterprise includes a seven-year ledger window and the ledger export (/v1/audit/export); the Article 12 evidence pack — per-record inclusion proofs and a signed completeness attestation — is on the roadmap. Tracelane enforces no per-tenant storage region, signs no BAA, and makes no regulatory-conformance claim. EU AI Act Annex III obligations were originally scheduled for Aug 2, 2026; the Digital Omnibus political agreement (May 7, 2026) provisionally deferred enforcement to Dec 2, 2027, pending formal adoption (<a href="https://www.whitecase.com/insight-alert/eu-agrees-digital-omnibus-deal-simplify-ai-rules" class="link-accent" rel="noopener">details</a>). The ledger ships now so regulated buyers can build audit history before binding enforcement.</p>
         </details>
 
         <details class="faq-row">
@@ -521,7 +548,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
 
         <details class="faq-row">
           <summary class="text-fg">Can I self-host?<span class="sign" aria-hidden="true">+</span></summary>
-          <p class="text-fg-muted leading-relaxed">Yes. Docker Compose for development, Helm chart for production. The full ClickHouse + R2 stack runs on a single small Hetzner node. See the <a href="https://docs.tracelane.dev/self-hosting" class="link-accent" rel="noopener">self-hosting guide</a>.</p>
+          <p class="text-fg-muted leading-relaxed">Yes. One Docker Compose file (infra/self-host/docker-compose.yml) runs the gateway, ingest, NATS and ClickHouse; a Helm chart is on the roadmap. Tracelane's own production — ClickHouse with an R2 cold tier — runs on one Hetzner node. The self-host Compose runs ClickHouse on local disk; an S3/R2 cold tier is a by-hand step. See the <a href="https://docs.tracelane.dev/self-hosting" class="link-accent" rel="noopener">self-hosting guide</a>.</p>
         </details>
 
         <details class="faq-row">
@@ -538,7 +565,7 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
       <div class="max-w-2xl mx-auto text-center">
         <p class="eyebrow eyebrow--center w-full mb-4">Stay close</p>
         <h2 class="display-md text-fg">Get product updates.</h2>
-        <p class="mt-4 lede mx-auto text-center">One email when something ships. Unsubscribe in one click.</p>
+        <p class="mt-4 lede mx-auto text-center">One email when something ships — no drip, no list sharing. Reply to any message and you are removed.</p>
         <form id="notify-form" class="mt-8 flex flex-col sm:flex-row gap-2.5 max-w-lg mx-auto" method="POST" action="/api/notify">
           <label for="email" class="sr-only">email address</label>
           <input id="email" type="email" name="email" required autocomplete="email" placeholder="you@company.com" class="field" />
@@ -549,6 +576,21 @@ const benchPct = (ms: number) => `${((ms / benchScaleMax) * 100).toFixed(1)}%`;
     </div>
   </section>
 </Base>
+
+<style>
+  /* Mirrors global.css's `.hero-fineprint br { display: none }` at the same
+     mobile breakpoint (max-width: 767px). When the <br> is hidden there is no
+     separator left between "Apache-2.0 core" and "Self-host", so this span
+     supplies one on mobile only, keeping the two-line desktop layout intact. */
+  .hero-fineprint-sep {
+    display: none;
+  }
+  @media (max-width: 767px) {
+    .hero-fineprint-sep {
+      display: inline;
+    }
+  }
+</style>
 
 <script is:inline>
   // hero video stage — reveal native player on click

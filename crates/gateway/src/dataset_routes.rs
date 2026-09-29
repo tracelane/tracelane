@@ -387,20 +387,17 @@ async fn actor_from_auth(
 
 // ── Content-capture decision (spec §4) ───────────────────────────────────────
 
-/// Is this workspace recording prompt content?
+/// Is this workspace recording prompt (REQUEST) content?
 ///
-/// **Decided from the allowlist, NEVER inferred from an empty result.** The two
+/// **Decided from the policy, NEVER inferred from an empty result.** The two
 /// are indistinguishable in the data and have different remedies — one is "your
 /// filter matched nothing", the other is "no filter you can type will ever
-/// match". `server::config::trace_content()` is `None` when the block is absent, which
-/// means capture is off for everyone; it is fail-CLOSED by construction and
-/// refuses to boot on anything ambiguous.
-fn capture_enabled(
-    cfg: Option<&crate::server::config::TraceContentConfig>,
-    tenant: &TenantId,
-) -> bool {
-    // B-299: the ONE policy. Not re-derived here.
-    crate::server::config::capture_decision(cfg, tenant)
+/// match". The policy is the operator allowlist OR the workspace owner's opt-in
+/// (GWY-53); no block and no control plane is OFF, fail-CLOSED by construction.
+/// A dataset case is built from the recorded request, so this reads `input`.
+fn capture_enabled(capture: crate::server::config::ContentCapture) -> bool {
+    // B-299: the ONE policy, decided by `config::capture_decision`. Not re-derived here.
+    capture.input
 }
 
 /// What a span lookup produced. Four outcomes, four different things to tell the
@@ -471,6 +468,43 @@ pub(crate) fn input_hash(messages: &[Message], system: &str) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// `OBS-56` S4 — what a batch item's AUTO span resolution produced, from a
+/// SET-BASED query already grouped by `trace_id`. Pure so the 0/1/2+ decision
+/// is unit-testable without a ClickHouse: `add_item` refuses to guess which of
+/// a trace's several LLM-call spans holds the content the caller meant
+/// (`span_id_required`), and a batch resolving on the caller's behalf must
+/// hold the identical refusal — guessing N times is not a weaker version of
+/// guessing once, it is the same defect at volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutoSpanResolution {
+    /// No span row at all under `(tenant, trace)` — unknown trace, or another
+    /// tenant's. Same remedy as `add_item`'s `not_found`.
+    NotFound,
+    /// The trace exists but no span of it carries recorded content — it
+    /// predates capture, or capture never ran for it.
+    NoContent,
+    /// More than one span carries content. Naming ONE would be a guess.
+    Ambiguous,
+    /// Exactly one content-bearing span — the id to copy.
+    One(String),
+}
+
+/// `trace_exists` comes from a SEPARATE existence query
+/// ([`DatasetStore::traces_exist`]) — `content_span_ids` alone cannot tell
+/// "this trace has zero LLM-call spans" from "this trace does not exist",
+/// and the two have different remedies (`span_has_no_content` vs `not_found`).
+pub(crate) fn resolve_auto_span(
+    trace_exists: bool,
+    content_span_ids: &[String],
+) -> AutoSpanResolution {
+    match content_span_ids {
+        [] if trace_exists => AutoSpanResolution::NoContent,
+        [] => AutoSpanResolution::NotFound,
+        [only] => AutoSpanResolution::One(only.clone()),
+        _ => AutoSpanResolution::Ambiguous,
+    }
+}
+
 // ── Storage seam ─────────────────────────────────────────────────────────────
 
 /// One row of `datasets`.
@@ -538,6 +572,19 @@ pub struct SpanContentRow {
     pub system_instructions: String,
 }
 
+/// `OBS-56` S4 — one resolved `(trace, span)` content row from a SET-BASED
+/// batch read. Carries the ids alongside the content because a batch read
+/// answers for MANY traces at once and the caller must know which row is
+/// which — [`SpanContentRow`] is the single-item shape and deliberately does
+/// not carry ids, because a single-item read already knows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceSpanContent {
+    pub trace_id: String,
+    pub span_id: String,
+    pub input_messages: String,
+    pub system_instructions: String,
+}
+
 /// Storage seam. Off the request hot path, so `async_trait` is fine (the ban is
 /// on the gateway hot path only). It exists so the refusal policy above can be
 /// driven in a unit test without a ClickHouse — a control never observed
@@ -581,6 +628,44 @@ pub trait DatasetStore: Send + Sync {
         dataset_id: Uuid,
         hash: &str,
     ) -> Result<Option<Uuid>>;
+    /// `OBS-56` S4 — set-based dedupe: of these hashes, which already exist LIVE
+    /// in this dataset. Mirrors [`Self::find_by_hash`], batched so a 200-item
+    /// batch add does ONE dedupe round trip, not two hundred (spec §2 rule 4).
+    async fn find_by_hashes(
+        &self,
+        tenant: &TenantId,
+        dataset_id: Uuid,
+        hashes: &[String],
+    ) -> Result<Vec<String>>;
+    /// `OBS-56` S4 — set-based existence: of these trace ids, which have AT
+    /// LEAST ONE recorded span under this tenant, regardless of content. Used
+    /// only to distinguish `not_found` (unknown trace, or another tenant's)
+    /// from `span_has_no_content` (the trace exists but predates capture) when
+    /// a batch item auto-resolves its span rather than naming one.
+    async fn traces_exist(&self, tenant: &TenantId, trace_ids: &[String]) -> Result<Vec<String>>;
+    /// `OBS-56` S4 — set-based span AUTO-resolution: every content-bearing span
+    /// of each of these traces, in ONE query over `trace_id IN (…)`. The caller
+    /// groups the result by `trace_id`: zero rows decides `not_found` /
+    /// `span_has_no_content` (via [`Self::traces_exist`]), exactly one is the
+    /// span to copy, two or more is `ambiguous_span` — the batch route refuses
+    /// to guess which of a trace's several LLM calls the caller meant, the same
+    /// discipline `add_item` already holds for one item at a time.
+    async fn batch_auto_resolve_spans(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<TraceSpanContent>>;
+    /// `OBS-56` S4 — set-based content read for EXPLICIT `(trace_id, span_id)`
+    /// pairs (the caller named the span, so no ambiguity is possible). Returns
+    /// every row matching trace_id IN (…) AND span_id IN (…) as two INDEPENDENT
+    /// sets — the caller MUST post-filter to the exact pairs it asked for,
+    /// because a row for trace A's span colliding with trace B's requested span
+    /// id would otherwise cross-match.
+    async fn batch_explicit_spans(
+        &self,
+        tenant: &TenantId,
+        pairs: &[(String, String)],
+    ) -> Result<Vec<TraceSpanContent>>;
     async fn insert_items(
         &self,
         tenant: &TenantId,
@@ -1240,6 +1325,192 @@ impl DatasetStore for ClickHouseDatasetStore {
         Ok(row.and_then(|r| Uuid::parse_str(&r.id).ok()))
     }
 
+    async fn find_by_hashes(
+        &self,
+        tenant: &TenantId,
+        dataset_id: Uuid,
+        hashes: &[String],
+    ) -> Result<Vec<String>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `toString(input_hash)`, NOT a bare `input_hash` — the column is
+        // `FixedString(64)` and reading it straight into a `String` field is
+        // the read-side twin of the B-273 class this module's header warns
+        // about: the cast forces the wire type clickhouse-rs actually expects.
+        let sql = self
+            .capped(
+                "SELECT DISTINCT toString(input_hash) AS input_hash FROM dataset_items FINAL \
+             WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND input_hash IN ? \
+               AND deleted = 0",
+                tenant,
+            )
+            .await;
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            input_hash: String,
+        }
+        let rows = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(dataset_id.to_string())
+            .bind(hashes)
+            .fetch_all::<R>()
+            .await
+            .context("batch dataset dedupe SELECT failed")?;
+        Ok(rows.into_iter().map(|r| r.input_hash).collect())
+    }
+
+    async fn traces_exist(&self, tenant: &TenantId, trace_ids: &[String]) -> Result<Vec<String>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `FINAL` for the same reason every other read of `spans` in this file
+        // uses it: a half-merged duplicate must not decide whether a trace
+        // "exists" for the purpose of a refusal message.
+        let sql = self
+            .capped(
+                "SELECT DISTINCT trace_id FROM spans FINAL WHERE tenant_id = ? AND trace_id IN ?",
+                tenant,
+            )
+            .await;
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            trace_id: String,
+        }
+        let rows = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_ids)
+            .fetch_all::<R>()
+            .await
+            .context("batch trace existence SELECT failed")?;
+        Ok(rows.into_iter().map(|r| r.trace_id).collect())
+    }
+
+    async fn batch_auto_resolve_spans(
+        &self,
+        tenant: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<TraceSpanContent>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // This binds `trace_ids` itself rather than going through `.capped()`
+        // + a separate bind call, because the query needs the LIST bound
+        // between `tenant_id` and the rest — done inline here to keep the bind
+        // order visually adjacent to the placeholders it fills, the same
+        // discipline `list_datasets`' comment names for its own dynamic SQL.
+        let sql = self
+            .capped(
+                "SELECT trace_id, span_id, \
+                    JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, \
+                    JSONExtractRaw(attributes, 'gen_ai_system_instructions') \
+                      AS system_instructions \
+             FROM spans FINAL \
+             WHERE tenant_id = ? AND trace_id IN ? \
+               AND JSONHas(attributes, 'gen_ai_input_messages')",
+                tenant,
+            )
+            .await;
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            trace_id: String,
+            span_id: String,
+            input_messages: String,
+            system_instructions: String,
+        }
+        let rows: Vec<R> = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_ids)
+            .fetch_all::<R>()
+            .await
+            .context("batch auto span resolve SELECT failed")?;
+        let mut out: Vec<TraceSpanContent> = rows
+            .into_iter()
+            .map(|r| TraceSpanContent {
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                input_messages: r.input_messages,
+                system_instructions: r.system_instructions,
+            })
+            .collect();
+        for row in &mut out {
+            let mut fields: Vec<&mut String> =
+                vec![&mut row.input_messages, &mut row.system_instructions];
+            if let Err(e) = crate::billing::blobs::rehydrate(&self.ch, tenant, &mut fields).await {
+                tracing::warn!(error = %e, "blob rehydration failed for batch dataset span_content");
+            }
+        }
+        Ok(out)
+    }
+
+    async fn batch_explicit_spans(
+        &self,
+        tenant: &TenantId,
+        pairs: &[(String, String)],
+    ) -> Result<Vec<TraceSpanContent>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let trace_ids: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+        let span_ids: Vec<String> = pairs.iter().map(|(_, s)| s.clone()).collect();
+        // `trace_id IN (…) AND span_id IN (…)` as two INDEPENDENT sets — a
+        // cross-match (trace A's span happening to equal trace B's requested
+        // span id) is possible in principle, so the caller post-filters to the
+        // exact pairs it asked for. Documented on the trait method.
+        let sql = self
+            .capped(
+                "SELECT trace_id, span_id, \
+                    JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, \
+                    JSONExtractRaw(attributes, 'gen_ai_system_instructions') \
+                      AS system_instructions \
+             FROM spans FINAL \
+             WHERE tenant_id = ? AND trace_id IN ? AND span_id IN ?",
+                tenant,
+            )
+            .await;
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct R {
+            trace_id: String,
+            span_id: String,
+            input_messages: String,
+            system_instructions: String,
+        }
+        let rows: Vec<R> = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(&trace_ids)
+            .bind(&span_ids)
+            .fetch_all::<R>()
+            .await
+            .context("batch explicit span read SELECT failed")?;
+        let wanted: std::collections::HashSet<(String, String)> = pairs.iter().cloned().collect();
+        let mut out: Vec<TraceSpanContent> = rows
+            .into_iter()
+            .filter(|r| wanted.contains(&(r.trace_id.clone(), r.span_id.clone())))
+            .map(|r| TraceSpanContent {
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                input_messages: r.input_messages,
+                system_instructions: r.system_instructions,
+            })
+            .collect();
+        for row in &mut out {
+            let mut fields: Vec<&mut String> =
+                vec![&mut row.input_messages, &mut row.system_instructions];
+            if let Err(e) = crate::billing::blobs::rehydrate(&self.ch, tenant, &mut fields).await {
+                tracing::warn!(error = %e, "blob rehydration failed for batch dataset span_content");
+            }
+        }
+        Ok(out)
+    }
+
     async fn insert_items(
         &self,
         tenant: &TenantId,
@@ -1673,6 +1944,12 @@ pub fn routes() -> Router<DatasetRoutesState> {
         .route("/v1/datasets", get(list_datasets).post(create_dataset))
         .route("/v1/datasets/{id}", get(get_dataset).delete(delete_dataset))
         .route("/v1/datasets/{id}/items", get(list_items).post(add_item))
+        // `OBS-56` S4. A static segment, `batch`, beside the dynamic
+        // `{item_id}` below — axum's router (matchit) prefers a literal
+        // segment over a parameter for the same position, so a dataset item
+        // literally named "batch" can never exist to collide with this (item
+        // ids are server-generated UUIDs, never user-supplied strings).
+        .route("/v1/datasets/{id}/items/batch", post(batch_add_items))
         .route(
             "/v1/datasets/{id}/items/{item_id}",
             axum::routing::patch(patch_item).delete(delete_item),
@@ -1706,6 +1983,34 @@ struct DatasetDto {
     items: Option<u64>,
     with_reference: Option<u64>,
     from_traces: Option<u64>,
+    limits: LimitsDto,
+}
+
+/// `EVL-31` §2 — the caps the UI needs to pre-flight WITHOUT a second copy of
+/// them in TypeScript. Every field here is a PRE-EXISTING gateway constant
+/// (`limits` module docs) — spec §5's ruling is that these stay in code, not
+/// a reference table, because `ITEMS_PER_DATASET` is pinned at compile time
+/// to `prompt_eval::limits::MAX_CASES` and a table value cannot be asserted
+/// at compile time. This DTO exists so the UI reads them, never hardcodes them.
+#[derive(Debug, Serialize)]
+struct LimitsDto {
+    items_max: usize,
+    import_bytes_max: usize,
+    item_input_bytes_max: usize,
+    expected_output_bytes_max: usize,
+    metadata_bytes_max: usize,
+}
+
+impl Default for LimitsDto {
+    fn default() -> Self {
+        Self {
+            items_max: limits::ITEMS_PER_DATASET,
+            import_bytes_max: limits::IMPORT_BYTES,
+            item_input_bytes_max: limits::ITEM_INPUT_BYTES,
+            expected_output_bytes_max: limits::EXPECTED_OUTPUT_BYTES,
+            metadata_bytes_max: limits::METADATA_BYTES,
+        }
+    }
 }
 
 /// Reason code for a NULL reference on a trace-derived item.
@@ -1956,6 +2261,7 @@ async fn list_datasets(
             items: stats.map(|s| s.items),
             with_reference: stats.map(|s| s.with_reference),
             from_traces: stats.map(|s| s.from_traces),
+            limits: LimitsDto::default(),
         });
     }
 
@@ -1993,6 +2299,7 @@ async fn get_dataset(
         items: stats.map(|s| s.items),
         with_reference: stats.map(|s| s.with_reference),
         from_traces: stats.map(|s| s.from_traces),
+        limits: LimitsDto::default(),
     }))
 }
 
@@ -2122,13 +2429,15 @@ async fn add_item(
     //    apart from "nothing matched", and the remedies differ. Reading only
     //    process-global config also means this refusal leaks nothing about which
     //    traces exist.
-    if !capture_enabled(crate::server::config::trace_content(), &tenant) {
+    if !capture_enabled(
+        crate::server::config::content_capture_for(state.entitlements.as_deref(), &tenant).await,
+    ) {
         return Err(coded_err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "content_capture_disabled",
             "This workspace does not record prompt content, so a trace cannot become a \
              test case. Traces keep model, tokens, cost and latency — not the messages.",
-            serde_json::json!({ "setting": "trace_content" }),
+            serde_json::json!({ "setting": "workspace_content_capture", "route": "/v1/workspace/capture" }),
         ));
     }
 
@@ -2325,6 +2634,394 @@ async fn add_item(
             "expected_output_reason": OUTPUT_NOT_CAPTURED,
         })),
     ))
+}
+
+// ── Handlers: batch add (`OBS-56` S4) ───────────────────────────────────────
+
+/// One entry of a batch add. `span_id` explicit ⇒ used as-is (unambiguous, the
+/// caller already picked); absent ⇒ the gateway resolves the trace's ONE
+/// content-bearing span, refusing rather than guessing if there is not exactly
+/// one (spec §2 "batch add semantics" rule 2).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchTraceRef {
+    trace_id: String,
+    #[serde(default)]
+    span_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchAddItemsBody {
+    traces: Vec<BatchTraceRef>,
+}
+
+/// A per-item refusal in the batch response — reported, never collapsed into a
+/// count (spec §2 rule 3: "Per-item refusals reported, never collapsed").
+struct Refusal {
+    trace_id: String,
+    reason: &'static str,
+    message: String,
+}
+
+impl Refusal {
+    fn new(trace_id: impl Into<String>, reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+            reason,
+            message: message.into(),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "trace_id": self.trace_id,
+            "reason": self.reason,
+            "message": self.message,
+        })
+    }
+}
+
+/// `POST /v1/datasets/{id}/items/batch` — `OBS-56` S4. Set-based: one
+/// resolution query for every auto-resolve item, one content read, one
+/// dedupe read, regardless of how many traces are in the request (spec §2
+/// rule 4) — so a 200-trace batch does not cost 200 ClickHouse round trips.
+#[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn batch_add_items(
+    State(state): State<DatasetRoutesState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BatchAddItemsBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Same two-capability gate as `add_item`: a batch add reads recorded span
+    // content and writes dataset rows.
+    let claims = claims_from_auth(&headers).await?;
+    authorize_write(&claims)?;
+    authorize_read(&claims)?;
+    require_datasets(&state.entitlements, &claims.tenant_id).await?;
+    let (tenant, actor) = (claims.tenant_id, claims.sub);
+    tracing::Span::current().record("tenant_id", tenant.to_string());
+    let dataset_id = parse_id(&id)?;
+
+    if body.traces.is_empty() {
+        return Err(coded_err(
+            StatusCode::BAD_REQUEST,
+            "traces_required",
+            "Send at least one trace to add.",
+            serde_json::json!({}),
+        ));
+    }
+
+    if state
+        .store
+        .get_dataset(&tenant, dataset_id)
+        .await
+        .map_err(|e| store_failed("dataset get", &e))?
+        .is_none()
+    {
+        return Err(not_found());
+    }
+
+    // Whole-batch refusal 1: capture must be on for this workspace AT ALL,
+    // decided BEFORE any span is read — same rule as `add_item`.
+    if !capture_enabled(
+        crate::server::config::content_capture_for(state.entitlements.as_deref(), &tenant).await,
+    ) {
+        return Err(coded_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content_capture_disabled",
+            "This workspace does not record prompt content, so nothing was added.",
+            serde_json::json!({ "setting": "workspace_content_capture", "route": "/v1/workspace/capture" }),
+        ));
+    }
+
+    // Whole-batch refusal 2: the cap, before any span read — "this dataset is
+    // full" is the more actionable fact when both are true, and nothing may be
+    // written when it fires (spec §2 rule 1, mirrors the import route).
+    let stats = state
+        .store
+        .item_stats(&tenant, dataset_id)
+        .await
+        .map_err(|e| store_failed("item stats", &e))?;
+    let requested = body.traces.len() as u64;
+    if stats.items + requested > limits::ITEMS_PER_DATASET as u64 {
+        return Err(coded_err(
+            StatusCode::CONFLICT,
+            "dataset_full",
+            "Nothing was added — this dataset does not have enough room for the whole batch.",
+            serde_json::json!({
+                "limit": limits::ITEMS_PER_DATASET,
+                "current": stats.items,
+                "requested": requested,
+                "headroom": (limits::ITEMS_PER_DATASET as u64).saturating_sub(stats.items),
+            }),
+        ));
+    }
+
+    // Validate + partition. An unparseable trace id is `not_found` — naming
+    // which id was malformed vs. missing would confirm the other exists.
+    struct Parsed {
+        trace_id: String,
+        explicit_span: Option<String>,
+    }
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(body.traces.len());
+    let mut refused: Vec<Refusal> = Vec::new();
+    for t in &body.traces {
+        let raw_trace = t.trace_id.trim().to_string();
+        let Ok(trace_uuid) = Uuid::parse_str(&raw_trace) else {
+            refused.push(Refusal::new(
+                raw_trace,
+                "not_found",
+                "No such trace in this workspace.",
+            ));
+            continue;
+        };
+        let span = t
+            .span_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = span
+            && s.len() > limits::SPAN_ID_BYTES
+        {
+            refused.push(Refusal::new(
+                trace_uuid.to_string(),
+                "not_found",
+                "span_id is longer than any span id we record.",
+            ));
+            continue;
+        }
+        parsed.push(Parsed {
+            trace_id: trace_uuid.to_string(),
+            explicit_span: span.map(str::to_string),
+        });
+    }
+
+    // Set-based resolution — ONE query per subset, not one per item.
+    let explicit_pairs: Vec<(String, String)> = parsed
+        .iter()
+        .filter_map(|p| p.explicit_span.clone().map(|s| (p.trace_id.clone(), s)))
+        .collect();
+    let auto_trace_ids: Vec<String> = parsed
+        .iter()
+        .filter(|p| p.explicit_span.is_none())
+        .map(|p| p.trace_id.clone())
+        .collect();
+
+    let explicit_rows = state
+        .store
+        .batch_explicit_spans(&tenant, &explicit_pairs)
+        .await
+        .map_err(|e| store_failed("batch explicit span read", &e))?;
+    let auto_rows = state
+        .store
+        .batch_auto_resolve_spans(&tenant, &auto_trace_ids)
+        .await
+        .map_err(|e| store_failed("batch auto span resolve", &e))?;
+    let existing_traces = state
+        .store
+        .traces_exist(&tenant, &auto_trace_ids)
+        .await
+        .map_err(|e| store_failed("batch trace existence", &e))?;
+
+    // Group the auto-resolve rows by trace_id.
+    let mut auto_by_trace: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in &auto_rows {
+        auto_by_trace
+            .entry(row.trace_id.clone())
+            .or_default()
+            .push(row.span_id.clone());
+    }
+
+    // Resolve each parsed item to a `(span_id, input_messages, system)` triple,
+    // or a refusal — reusing `classify_span` so "content there but unreadable"
+    // never collapses into "no content", the same distinction `add_item` holds.
+    struct Resolved {
+        trace_id: String,
+        span_id: String,
+        messages: Vec<Message>,
+        system: String,
+    }
+    let mut resolved: Vec<Resolved> = Vec::new();
+    for p in &parsed {
+        let (span_id_used, row) = if let Some(explicit) = &p.explicit_span {
+            (
+                explicit.clone(),
+                explicit_rows
+                    .iter()
+                    .find(|r| r.trace_id == p.trace_id && r.span_id == *explicit)
+                    .map(|r| SpanContentRow {
+                        input_messages: r.input_messages.clone(),
+                        system_instructions: r.system_instructions.clone(),
+                    }),
+            )
+        } else {
+            let exists = existing_traces.contains(&p.trace_id);
+            let candidates = auto_by_trace.get(&p.trace_id).cloned().unwrap_or_default();
+            match resolve_auto_span(exists, &candidates) {
+                AutoSpanResolution::NotFound => {
+                    refused.push(Refusal::new(
+                        p.trace_id.clone(),
+                        "not_found",
+                        "No such trace in this workspace.",
+                    ));
+                    continue;
+                }
+                AutoSpanResolution::NoContent => {
+                    refused.push(Refusal::new(
+                        p.trace_id.clone(),
+                        "span_has_no_content",
+                        "This trace predates content capture, so there is nothing to copy.",
+                    ));
+                    continue;
+                }
+                AutoSpanResolution::Ambiguous => {
+                    refused.push(Refusal::new(
+                        p.trace_id.clone(),
+                        "ambiguous_span",
+                        format!(
+                            "This trace has {} LLM calls — add it from the trace page and \
+                             pick one.",
+                            candidates.len()
+                        ),
+                    ));
+                    continue;
+                }
+                AutoSpanResolution::One(span_id) => {
+                    let row = auto_rows
+                        .iter()
+                        .find(|r| r.trace_id == p.trace_id && r.span_id == span_id)
+                        .map(|r| SpanContentRow {
+                            input_messages: r.input_messages.clone(),
+                            system_instructions: r.system_instructions.clone(),
+                        });
+                    (span_id, row)
+                }
+            }
+        };
+
+        match classify_span(row) {
+            SpanVerdict::NotFound => refused.push(Refusal::new(
+                p.trace_id.clone(),
+                "not_found",
+                "No such trace or span in this workspace.",
+            )),
+            SpanVerdict::NoContent => refused.push(Refusal::new(
+                p.trace_id.clone(),
+                "span_has_no_content",
+                "This span predates content capture, so there is nothing to copy.",
+            )),
+            SpanVerdict::Unreadable => refused.push(Refusal::new(
+                p.trace_id.clone(),
+                "span_content_unreadable",
+                "This span recorded content in a shape this gateway cannot read.",
+            )),
+            SpanVerdict::Content(messages, system) => resolved.push(Resolved {
+                trace_id: p.trace_id.clone(),
+                span_id: span_id_used,
+                messages,
+                system,
+            }),
+        }
+    }
+
+    // Size cap + hash, per resolved item.
+    struct Candidate {
+        trace_id: String,
+        span_id: String,
+        input: String,
+        system: String,
+        hash: String,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for r in resolved {
+        let Ok(input) = serde_json::to_string(&r.messages) else {
+            refused.push(Refusal::new(
+                r.trace_id.clone(),
+                "span_content_unreadable",
+                "This span's content could not be re-serialized.",
+            ));
+            continue;
+        };
+        let size = input.len() + r.system.len();
+        if size > limits::ITEM_INPUT_BYTES {
+            refused.push(Refusal::new(
+                r.trace_id.clone(),
+                "item_too_large",
+                format!(
+                    "This span's recorded content is {size} bytes; the limit is {}.",
+                    limits::ITEM_INPUT_BYTES
+                ),
+            ));
+            continue;
+        }
+        let Ok(hash) = input_hash(&r.messages, &r.system) else {
+            refused.push(Refusal::new(
+                r.trace_id.clone(),
+                "span_content_unreadable",
+                "Could not compute the dedupe hash for this span.",
+            ));
+            continue;
+        };
+        candidates.push(Candidate {
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            input,
+            system: r.system,
+            hash,
+        });
+    }
+
+    // ONE set-based dedupe read against the store, plus within-batch dedupe —
+    // a file/selection that repeats a trace must not land it twice either.
+    let all_hashes: Vec<String> = candidates.iter().map(|c| c.hash.clone()).collect();
+    let already_stored: std::collections::HashSet<String> = state
+        .store
+        .find_by_hashes(&tenant, dataset_id, &all_hashes)
+        .await
+        .map_err(|e| store_failed("batch dedupe lookup", &e))?
+        .into_iter()
+        .collect();
+
+    let now = datetime64_millis_now();
+    let mut to_write: Vec<DatasetItem> = Vec::new();
+    let mut seen_in_batch: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped = 0u64;
+    for c in candidates {
+        if already_stored.contains(&c.hash) || !seen_in_batch.insert(c.hash.clone()) {
+            deduped += 1;
+            continue;
+        }
+        to_write.push(DatasetItem {
+            item_id: Uuid::new_v4(),
+            name: String::new(),
+            input: c.input,
+            system: c.system,
+            expected_output: None,
+            metadata: "{}".to_string(),
+            source_trace_id: Uuid::parse_str(&c.trace_id).ok(),
+            source_span_id: c.span_id,
+            input_hash: c.hash,
+            created_at_ms: now,
+            created_by: actor.clone(),
+        });
+    }
+
+    let added = to_write.len();
+    state
+        .store
+        .insert_items(&tenant, dataset_id, &to_write)
+        .await
+        .map_err(|e| store_failed("batch item insert", &e))?;
+
+    let refused_count = refused.len();
+    Ok(Json(serde_json::json!({
+        "added": added,
+        "deduped": deduped,
+        "refused_count": refused_count,
+        "refused": refused.iter().map(Refusal::to_json).collect::<Vec<_>>(),
+    })))
 }
 
 /// `expected_output` and `metadata` ONLY.
@@ -3018,6 +3715,54 @@ mod clickhouse_roundtrip {
         }
     }
 
+    /// The `spans` table, applied from the CHECKED-IN schema — same pattern as
+    /// `tool_analytics::clickhouse_roundtrip::ensure_spans` — needed by the
+    /// `OBS-56` S4 batch resolution methods, which read `spans` directly.
+    async fn ensure_spans(c: &clickhouse::Client) {
+        let schema = include_str!("../../../infra/dev/clickhouse/schema.sql");
+        for stmt in crate::clickhouse_query::split_migration_statements(schema) {
+            let _ = c.query(&stmt).execute().await;
+        }
+        let exists: u64 = c
+            .query("SELECT count() FROM system.tables WHERE database='tracelane' AND name='spans'")
+            .fetch_one()
+            .await
+            .expect("system.tables read");
+        assert_eq!(
+            exists, 1,
+            "`spans` was not created — the rest of this test would pass by querying nothing"
+        );
+    }
+
+    /// Insert one span with the given content. `content_json` is the raw
+    /// `gen_ai_input_messages` attribute value; `None` means the span carries
+    /// NO such key (predates capture) — the exact ambiguity `classify_span` /
+    /// `resolve_auto_span` exist to resolve correctly.
+    async fn insert_span(
+        c: &clickhouse::Client,
+        tenant: &str,
+        trace_id: &str,
+        span_id: &str,
+        content_json: Option<&str>,
+    ) {
+        let attrs = match content_json {
+            Some(msgs) => format!(r#"{{"gen_ai_input_messages":{msgs}}}"#),
+            None => "{}".to_string(),
+        };
+        c.query(
+            "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, \
+             start_time, end_time, status_code, attributes) VALUES \
+             (?, ?, ?, 'llm.call', now64(6), now64(6) + toIntervalMillisecond(10), 0, ?)",
+        )
+        .bind(tenant)
+        .bind(trace_id)
+        .bind(span_id)
+        .bind(attrs)
+        .execute()
+        .await
+        .expect("insert span");
+    }
+
     fn item(hash: &str) -> DatasetItem {
         DatasetItem {
             item_id: Uuid::new_v4(),
@@ -3298,6 +4043,165 @@ mod clickhouse_roundtrip {
             "TENANT LEAK: B read A's items by dataset id"
         );
     }
+
+    /// `OBS-56` S4 — the batch resolution SQL against a REAL ClickHouse.
+    ///
+    /// Nothing above this line runs `JSONHas`/`JSONExtractRaw` over `spans` or
+    /// `input_hash IN (…)` against the wire — a mock returns a `String` it was
+    /// handed and never round-trips the `FixedString(64)` cast this test adds
+    /// (`toString(input_hash)`, the read-side twin of B-273's write-side trap).
+    /// Covers three real behaviours in one pass: `traces_exist` distinguishing
+    /// "no such trace" from "trace exists, no content"; `batch_auto_resolve_spans`
+    /// grouping 0/1/2+ candidates per trace (the exact shape
+    /// `resolve_auto_span` decides, unit-tested in isolation above); and
+    /// `find_by_hashes` reading the dedupe column back correctly.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn batch_span_resolution_and_dedupe_against_a_real_clickhouse() {
+        let Some(c) = ch() else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        ensure_schema(&c).await;
+        ensure_spans(&c).await;
+        let store = ClickHouseDatasetStore::new(c.clone());
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+
+        let trace_one = Uuid::new_v4().to_string(); // exactly one content span
+        let trace_two = Uuid::new_v4().to_string(); // two content spans — ambiguous
+        let trace_three = Uuid::new_v4().to_string(); // exists, no content
+        let trace_missing = Uuid::new_v4().to_string(); // never written at all
+
+        insert_span(
+            &c,
+            &tenant.to_string(),
+            &trace_one,
+            "span-one",
+            Some(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .await;
+        insert_span(
+            &c,
+            &tenant.to_string(),
+            &trace_two,
+            "span-two-a",
+            Some(r#"[{"role":"user","content":"a"}]"#),
+        )
+        .await;
+        insert_span(
+            &c,
+            &tenant.to_string(),
+            &trace_two,
+            "span-two-b",
+            Some(r#"[{"role":"user","content":"b"}]"#),
+        )
+        .await;
+        insert_span(&c, &tenant.to_string(), &trace_three, "span-three", None).await;
+
+        // ── traces_exist: distinguishes "not found" from "no content" ──────
+        let auto_ids = vec![
+            trace_one.clone(),
+            trace_two.clone(),
+            trace_three.clone(),
+            trace_missing.clone(),
+        ];
+        let mut existing = store
+            .traces_exist(&tenant, &auto_ids)
+            .await
+            .expect("traces_exist");
+        existing.sort();
+        let mut expected_existing = vec![trace_one.clone(), trace_two.clone(), trace_three.clone()];
+        expected_existing.sort();
+        assert_eq!(
+            existing, expected_existing,
+            "trace_missing must NOT report as existing, and every real trace must"
+        );
+
+        // ── batch_auto_resolve_spans: grouped 0/1/2+ per trace ──────────────
+        let auto_rows = store
+            .batch_auto_resolve_spans(&tenant, &auto_ids)
+            .await
+            .expect("batch_auto_resolve_spans");
+        let for_trace = |t: &str| -> Vec<String> {
+            auto_rows
+                .iter()
+                .filter(|r| r.trace_id == t)
+                .map(|r| r.span_id.clone())
+                .collect()
+        };
+        assert_eq!(
+            resolve_auto_span(true, &for_trace(&trace_one)),
+            AutoSpanResolution::One("span-one".to_string()),
+            "exactly one content-bearing span must resolve to it"
+        );
+        assert_eq!(
+            resolve_auto_span(true, &for_trace(&trace_two)),
+            AutoSpanResolution::Ambiguous,
+            "two content-bearing spans must refuse rather than guess — the real \
+             JSONHas/JSONExtractRaw query, not a mock, is what proves this"
+        );
+        assert_eq!(
+            resolve_auto_span(true, &for_trace(&trace_three)),
+            AutoSpanResolution::NoContent,
+            "a span with no gen_ai_input_messages key must not appear as a candidate"
+        );
+
+        // ── batch_explicit_spans: the caller already named the span ────────
+        let explicit = store
+            .batch_explicit_spans(&tenant, &[(trace_one.clone(), "span-one".to_string())])
+            .await
+            .expect("batch_explicit_spans");
+        assert_eq!(explicit.len(), 1, "the exact pair must resolve");
+        assert_eq!(
+            explicit[0].input_messages,
+            r#"[{"role":"user","content":"hi"}]"#
+        );
+        let wrong_pair = store
+            .batch_explicit_spans(&tenant, &[(trace_one.clone(), "no-such-span".to_string())])
+            .await
+            .expect("batch_explicit_spans (wrong pair)");
+        assert!(
+            wrong_pair.is_empty(),
+            "a span id that does not belong to the named trace must not resolve"
+        );
+
+        // ── find_by_hashes: the FixedString(64) read-side cast ──────────────
+        let dataset_id = Uuid::new_v4();
+        store
+            .create_dataset(
+                &tenant,
+                &Dataset {
+                    dataset_id,
+                    name: "batch-dedupe".into(),
+                    description: String::new(),
+                    created_at_ms: crate::clickhouse_query::datetime64_millis_now(),
+                    created_by: "user_test".into(),
+                    updated_at_ms: crate::clickhouse_query::datetime64_millis_now(),
+                },
+            )
+            .await
+            .expect("create dataset");
+        let stored_hash = "c".repeat(64);
+        let absent_hash = "d".repeat(64);
+        store
+            .insert_items(&tenant, dataset_id, &[item(&stored_hash)])
+            .await
+            .expect("insert item");
+        let found = store
+            .find_by_hashes(
+                &tenant,
+                dataset_id,
+                &[stored_hash.clone(), absent_hash.clone()],
+            )
+            .await
+            .expect("find_by_hashes");
+        assert_eq!(
+            found,
+            vec![stored_hash],
+            "must report exactly the hash that is actually stored — a FixedString(64) \
+             read into a String field that decoded wrong would silently return \
+             nothing or the wrong bytes here, not an error"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3382,9 +4286,23 @@ mod tests {
     #[test]
     fn absent_trace_content_config_means_capture_is_off() {
         assert!(
-            !capture_enabled(None, &tenant()),
+            !capture_enabled(crate::server::config::capture_decision(
+                None,
+                None,
+                &tenant()
+            )),
             "no config MUST mean no capture — an absent block is the unprivileged state"
         );
+        // GWY-53: an OUTPUT-only opt-in records no request, so no test case.
+        let output_only = crate::server::config::capture_decision(
+            None,
+            Some(crate::db::workspace_capture::WorkspaceCapture {
+                input: false,
+                output: true,
+            }),
+            &tenant(),
+        );
+        assert!(!capture_enabled(output_only));
     }
 
     #[test]
@@ -3438,6 +4356,51 @@ mod tests {
             ),
             "content that IS there but unreadable must NOT report as absent — the remedy \
              differs"
+        );
+    }
+
+    // ── `OBS-56` S4 — the batch auto-resolve decision, RED before it existed ──
+    //
+    // Written before `resolve_auto_span` was wired into the handler: it printed
+    // "cannot find function `resolve_auto_span` in this scope" (E0425) the
+    // first time this module was compiled with only these four assertions
+    // present and no implementation — confirmed RED, then the function above
+    // was added to turn it GREEN.
+
+    #[test]
+    fn resolve_auto_span_no_rows_and_no_trace_is_not_found() {
+        assert_eq!(resolve_auto_span(false, &[]), AutoSpanResolution::NotFound);
+    }
+
+    #[test]
+    fn resolve_auto_span_no_rows_but_trace_exists_is_no_content() {
+        assert_eq!(resolve_auto_span(true, &[]), AutoSpanResolution::NoContent);
+    }
+
+    #[test]
+    fn resolve_auto_span_exactly_one_candidate_is_used() {
+        assert_eq!(
+            resolve_auto_span(true, &["span-1".to_string()]),
+            AutoSpanResolution::One("span-1".to_string())
+        );
+        // `trace_exists` is irrelevant once a candidate exists — a span row IS
+        // proof the trace exists, so a caller passing `false` here would be
+        // internally inconsistent, but the function must not let that
+        // inconsistency silently produce the wrong verdict.
+        assert_eq!(
+            resolve_auto_span(false, &["span-1".to_string()]),
+            AutoSpanResolution::One("span-1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_auto_span_two_or_more_candidates_is_ambiguous_never_a_guess() {
+        assert_eq!(
+            resolve_auto_span(true, &["span-1".to_string(), "span-2".to_string()]),
+            AutoSpanResolution::Ambiguous,
+            "add_item refuses to guess which span holds the content — a batch \
+             resolving on the caller's behalf must refuse the same way, not \
+             silently pick 'latest wins'"
         );
     }
 
@@ -4048,6 +5011,45 @@ mod tests {
                 .iter()
                 .find(|(d, i)| *d == id && i.input_hash == hash)
                 .map(|(_, i)| i.item_id))
+        }
+        async fn find_by_hashes(
+            &self,
+            t: &TenantId,
+            id: Uuid,
+            hashes: &[String],
+        ) -> Result<Vec<String>> {
+            self.note(t);
+            let items = self.items.lock().expect("poisoned");
+            Ok(hashes
+                .iter()
+                .filter(|h| items.iter().any(|(d, i)| *d == id && &i.input_hash == *h))
+                .cloned()
+                .collect())
+        }
+        // The mock does not simulate `spans` — same reason `span_content` above
+        // always answers `Ok(None)`: MockStore proves tenant-scoping, not
+        // ClickHouse behaviour. The real 0/1/2+ resolution is covered by
+        // `resolve_auto_span` (a pure function, unit-tested directly below) and
+        // by `scripts/ci/run-clickhouse-integration.sh` against a real server.
+        async fn traces_exist(&self, t: &TenantId, _trace_ids: &[String]) -> Result<Vec<String>> {
+            self.note(t);
+            Ok(Vec::new())
+        }
+        async fn batch_auto_resolve_spans(
+            &self,
+            t: &TenantId,
+            _trace_ids: &[String],
+        ) -> Result<Vec<TraceSpanContent>> {
+            self.note(t);
+            Ok(Vec::new())
+        }
+        async fn batch_explicit_spans(
+            &self,
+            t: &TenantId,
+            _pairs: &[(String, String)],
+        ) -> Result<Vec<TraceSpanContent>> {
+            self.note(t);
+            Ok(Vec::new())
         }
         async fn insert_items(&self, t: &TenantId, id: Uuid, rows: &[DatasetItem]) -> Result<()> {
             self.note(t);

@@ -147,6 +147,19 @@ impl NotificationStore for PgNotificationStore {
     }
 }
 
+// Test-only observation of producer calls, not proof that a database row landed.
+#[cfg(test)]
+static NOTIFICATION_ATTEMPTS: std::sync::Mutex<Vec<Uuid>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn notification_attempts(tenant: Uuid) -> usize {
+    NOTIFICATION_ATTEMPTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|id| **id == tenant)
+        .count()
+}
+
 /// Write one notification. **Producer-facing**, called from the alert checker
 /// and (later) the quota and promotion paths.
 ///
@@ -171,6 +184,8 @@ pub async fn notify(
         );
         return;
     }
+    #[cfg(test)]
+    NOTIFICATION_ATTEMPTS.lock().unwrap().push(tenant);
     let res = async {
         let c = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
         c.execute(

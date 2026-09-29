@@ -27,6 +27,7 @@
  * gateway's own `message` and never replaces it with a generic one.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { Button } from "@tracelanedev/ui";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -50,7 +51,9 @@ type AssertionKind =
 	| "json_schema"
 	| "exact_match"
 	| "max_latency_ms"
-	| "max_cost_usd";
+	| "max_cost_usd"
+	| "llm_judge"
+	| "length_bounds";
 
 /**
  * Which kinds carry a value, and how it is typed on the wire.
@@ -65,14 +68,13 @@ type AssertionKind =
  * `json_schema` is its replacement and takes the schema as JSON; `{}` accepts
  * anything that parses, which is `json_valid`'s old behaviour stated honestly.
  *
- * **`llm_judge` and `length_bounds` are deliberately NOT here.** A judge needs a
- * rubric selector, a judging-model field and a threshold, and it is entitlement
- * gated (Team+) so this dialog would also need the 403 branch — that is a real
- * control, not a dropdown entry, and it is filed as item 11 scope rather than
- * half-built here. Both are reachable today through
- * `POST /v1/prompts/{name}/evals`.
  */
-const ASSERTION_VALUE: Record<AssertionKind, "string" | "number" | "json"> = {
+const ASSERTION_VALUE: Record<
+	AssertionKind,
+	"string" | "number" | "json" | "judge" | "bounds"
+> = {
+	llm_judge: "judge",
+	length_bounds: "bounds",
 	contains: "string",
 	not_contains: "string",
 	regex: "string",
@@ -82,7 +84,16 @@ const ASSERTION_VALUE: Record<AssertionKind, "string" | "number" | "json"> = {
 	max_cost_usd: "number",
 };
 
-type AssertionDraft = { kind: AssertionKind; value: string };
+type AssertionDraft = {
+	kind: AssertionKind;
+	value: string;
+	min?: string;
+	max?: string;
+	rubric?: string;
+	rubricPrompt?: string;
+	rubricEnv?: string;
+	judgeModel?: string;
+};
 type ArmDraft = { label: string; env: string; model: string };
 
 const MAX_ARMS = 4;
@@ -128,7 +139,7 @@ export function NewExperimentDialog({
 	}
 
 	async function resolveVersion(prompt: string, env: string): Promise<string> {
-		const res = await fetch(
+		const res = await apiFetchRaw(
 			`/api/prompts/${encodeURIComponent(prompt)}?env=${encodeURIComponent(env)}`,
 			{ cache: "no-store" },
 		);
@@ -171,32 +182,90 @@ export function NewExperimentDialog({
 				name: name.trim(),
 				prompt_name: promptName,
 				dataset_id: datasetId,
-				assertions: assertions
-					.filter((a) => a.value.trim().length > 0)
-					.map((a) => {
-						const shape = ASSERTION_VALUE[a.kind];
-						if (shape === "number")
-							return { kind: a.kind, value: Number(a.value) };
-						// `json_schema` carries a SCHEMA, not a value — and a schema
-						// that will not parse is refused HERE rather than sent as a
-						// string the gateway rejects with a shape error naming
-						// nothing the user typed. The message names WHICH scorer,
-						// because a bare "Unexpected token }" in a form with four
-						// scorers does not tell you which box to look in.
-						if (shape === "json") {
-							try {
-								return { kind: a.kind, schema: JSON.parse(a.value) };
-							} catch {
-								throw new Error(
-									`Scorer ${assertions.indexOf(a) + 1} (json_schema): that is not valid JSON. A schema of {} accepts anything that parses.`,
-								);
+				assertions: await Promise.all(
+					assertions
+						.filter(
+							(a) =>
+								a.kind === "llm_judge" ||
+								a.kind === "length_bounds" ||
+								a.value.trim().length > 0,
+						)
+						.map(async (a) => {
+							if (a.kind === "length_bounds") {
+								const min = a.min?.trim() ? Number(a.min) : undefined;
+								const max = a.max?.trim() ? Number(a.max) : undefined;
+								if (min === undefined && max === undefined)
+									throw new Error("Length bounds needs a minimum or maximum.");
+								if (
+									[min, max].some(
+										(n) =>
+											n !== undefined && (!Number.isSafeInteger(n) || n < 0),
+									)
+								)
+									throw new Error(
+										"Character bounds must be non-negative whole numbers.",
+									);
+								if (min !== undefined && max !== undefined && min > max)
+									throw new Error(
+										"Character minimum cannot exceed the maximum.",
+									);
+								return { kind: a.kind, min_chars: min, max_chars: max };
 							}
-						}
-						return { kind: a.kind, value: a.value };
-					}),
+							if (a.kind === "llm_judge") {
+								const minScore = Number(a.value);
+								if (
+									!a.value.trim() ||
+									!Number.isFinite(minScore) ||
+									minScore < 0 ||
+									minScore > 1
+								)
+									throw new Error(
+										"Judge minimum score must be between 0 and 1.",
+									);
+								const rubric =
+									a.rubric === "prompt_version"
+										? {
+												source: "prompt_version",
+												prompt_version_id: await resolveVersion(
+													a.rubricPrompt ?? prompts[0]?.name ?? "",
+													a.rubricEnv ?? "production",
+												),
+											}
+										: {
+												source: "built_in",
+												name: a.rubric ?? "answers_the_question",
+											};
+								return {
+									kind: a.kind,
+									rubric,
+									model: a.judgeModel?.trim() || undefined,
+									min_score: minScore,
+								};
+							}
+							const shape = ASSERTION_VALUE[a.kind];
+							if (shape === "number")
+								return { kind: a.kind, value: Number(a.value) };
+							// `json_schema` carries a SCHEMA, not a value — and a schema
+							// that will not parse is refused HERE rather than sent as a
+							// string the gateway rejects with a shape error naming
+							// nothing the user typed. The message names WHICH scorer,
+							// because a bare "Unexpected token }" in a form with four
+							// scorers does not tell you which box to look in.
+							if (shape === "json") {
+								try {
+									return { kind: a.kind, schema: JSON.parse(a.value) };
+								} catch {
+									throw new Error(
+										`Scorer ${assertions.indexOf(a) + 1} (json_schema): that is not valid JSON. A schema of {} accepts anything that parses.`,
+									);
+								}
+							}
+							return { kind: a.kind, value: a.value };
+						}),
+				),
 				arms: resolved,
 			};
-			const res = await fetch("/api/experiments", {
+			const res = await apiFetchRaw("/api/experiments", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify(body),
@@ -228,10 +297,15 @@ export function NewExperimentDialog({
 		}
 	}
 
+	function updateAssertion(index: number, patch: Partial<AssertionDraft>) {
+		setAssertions((old) =>
+			old.map((a, i) => (i === index ? { ...a, ...patch } : a)),
+		);
+	}
 	const dataset = datasets.find((d) => d.dataset_id === datasetId);
 
 	return (
-		<div className="rounded-lg border border-line bg-surface-2 p-4">
+		<div className="rounded-card border border-line bg-surface-2 p-4">
 			<h2 className="t-h2 mb-1">New experiment</h2>
 			{/* Stated UP FRONT, because it is what makes the wait explicable and it
 			    is the safety property the whole design rests on. */}
@@ -239,13 +313,14 @@ export function NewExperimentDialog({
 				Arms run one after another, not in parallel — that is what makes the
 				progress count true and the budget cap exact. Estimated: {arms.length}{" "}
 				arm{arms.length === 1 ? "" : "s"} × {dataset?.items ?? "—"} item
-				{dataset?.items === 1 ? "" : "s"} provider calls.
+				{dataset?.items === 1 ? "" : "s"} generation calls, plus any judge
+				calls. Provider usage is charged separately.
 			</p>
 
 			<label className="mb-2 block text-sm">
 				<span className="mb-1 block text-ink-3">Name</span>
 				<input
-					className="w-full rounded-md border border-line bg-surface px-2 py-1"
+					className="w-full rounded-control border border-line bg-surface px-2 py-1"
 					value={name}
 					onChange={(e) => setName(e.target.value)}
 					placeholder="tone-v4-vs-v3"
@@ -255,7 +330,7 @@ export function NewExperimentDialog({
 			<label className="mb-2 block text-sm">
 				<span className="mb-1 block text-ink-3">Dataset</span>
 				<select
-					className="w-full rounded-md border border-line bg-surface px-2 py-1"
+					className="w-full rounded-control border border-line bg-surface px-2 py-1"
 					value={datasetId}
 					onChange={(e) => setDatasetId(e.target.value)}
 				>
@@ -270,7 +345,7 @@ export function NewExperimentDialog({
 			<label className="mb-3 block text-sm">
 				<span className="mb-1 block text-ink-3">Prompt</span>
 				<select
-					className="w-full rounded-md border border-line bg-surface px-2 py-1"
+					className="w-full rounded-control border border-line bg-surface px-2 py-1"
 					value={promptName}
 					onChange={(e) => setPromptName(e.target.value)}
 				>
@@ -291,7 +366,7 @@ export function NewExperimentDialog({
 					// biome-ignore lint/suspicious/noArrayIndexKey: arms are positional
 					<div key={i} className="mb-2 flex flex-wrap items-center gap-2">
 						<input
-							className="w-16 rounded-md border border-line bg-surface px-2 py-1 text-sm"
+							className="w-16 rounded-control border border-line bg-surface px-2 py-1 text-sm"
 							value={a.label}
 							aria-label={`Arm ${i + 1} label`}
 							onChange={(e) =>
@@ -303,7 +378,7 @@ export function NewExperimentDialog({
 							}
 						/>
 						<select
-							className="rounded-md border border-line bg-surface px-2 py-1 text-sm"
+							className="rounded-control border border-line bg-surface px-2 py-1 text-sm"
 							value={a.env}
 							aria-label={`Arm ${i + 1} environment`}
 							onChange={(e) =>
@@ -318,7 +393,7 @@ export function NewExperimentDialog({
 							<option value="staging">staging</option>
 						</select>
 						<input
-							className="min-w-[12rem] flex-1 rounded-md border border-line bg-surface px-2 py-1 text-sm"
+							className="min-w-[12rem] flex-1 rounded-control border border-line bg-surface px-2 py-1 text-sm"
 							value={a.model}
 							aria-label={`Arm ${i + 1} model override`}
 							placeholder="model (blank = the version's pin)"
@@ -331,18 +406,20 @@ export function NewExperimentDialog({
 							}
 						/>
 						{arms.length > 2 && (
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								className="text-sm underline"
 								onClick={() => setArms(arms.filter((_, j) => j !== i))}
 							>
 								remove
-							</button>
+							</Button>
 						)}
 					</div>
 				))}
 				{/* The control DISABLES at the ceiling and says what the ceiling is. */}
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					className="text-sm underline disabled:no-underline disabled:opacity-50"
 					disabled={arms.length >= MAX_ARMS}
@@ -360,7 +437,7 @@ export function NewExperimentDialog({
 					{arms.length >= MAX_ARMS
 						? `Up to ${MAX_ARMS} arms per experiment.`
 						: "+ Add arm"}
-				</button>
+				</Button>
 			</div>
 
 			<div className="mb-3">
@@ -371,14 +448,14 @@ export function NewExperimentDialog({
 					// biome-ignore lint/suspicious/noArrayIndexKey: scorers are positional
 					<div key={i} className="mb-2 flex flex-wrap items-center gap-2">
 						<select
-							className="rounded-md border border-line bg-surface px-2 py-1 text-sm"
+							className="rounded-control border border-line bg-surface px-2 py-1 text-sm"
 							value={a.kind}
 							aria-label={`Scorer ${i + 1} kind`}
 							onChange={(e) =>
 								setAssertions(
 									assertions.map((x, j) =>
 										j === i
-											? { ...x, kind: e.target.value as AssertionKind }
+											? { kind: e.target.value as AssertionKind, value: "" }
 											: x,
 									),
 								)
@@ -390,28 +467,156 @@ export function NewExperimentDialog({
 								</option>
 							))}
 						</select>
-						<input
-							className="min-w-[12rem] flex-1 rounded-md border border-line bg-surface px-2 py-1 text-sm"
-							value={a.value}
-							aria-label={`Scorer ${i + 1} value`}
-							inputMode={
-								ASSERTION_VALUE[a.kind] === "number" ? "decimal" : "text"
-							}
-							placeholder={
-								ASSERTION_VALUE[a.kind] === "json"
-									? '{"type":"object","required":["order"]}'
-									: undefined
-							}
-							onChange={(e) =>
-								setAssertions(
-									assertions.map((x, j) =>
-										j === i ? { ...x, value: e.target.value } : x,
-									),
-								)
-							}
-						/>
+						{a.kind === "llm_judge" ? (
+							<div className="w-full space-y-2">
+								<p className="text-xs text-ink-3">
+									Each judge call that reaches a provider is one metered
+									eval_runs unit, including errored calls. Provider usage also
+									applies. Malformed judge output is errored with no score.
+								</p>
+								<label className="block">
+									Scorer {i + 1} rubric
+									<select
+										className="block w-full border border-line bg-surface p-2"
+										value={a.rubric ?? "answers_the_question"}
+										onChange={(e) =>
+											updateAssertion(i, { rubric: e.target.value })
+										}
+									>
+										<option value="answers_the_question">
+											Answers the question
+										</option>
+										<option value="groundedness">Groundedness</option>
+										<option value="instruction_following">
+											Instruction following
+										</option>
+										<option value="prompt_version">Workspace prompt</option>
+									</select>
+								</label>
+								{a.rubric === "prompt_version" && (
+									<>
+										<label className="block">
+											Scorer {i + 1} rubric prompt
+											<select
+												className="block w-full border border-line bg-surface p-2"
+												value={a.rubricPrompt ?? prompts[0]?.name ?? ""}
+												onChange={(e) =>
+													updateAssertion(i, { rubricPrompt: e.target.value })
+												}
+											>
+												{prompts.map((p) => (
+													<option key={p.name} value={p.name}>
+														{p.name}
+													</option>
+												))}
+											</select>
+										</label>
+										<label className="block">
+											Scorer {i + 1} rubric environment
+											<select
+												className="block w-full border border-line bg-surface p-2"
+												value={a.rubricEnv ?? "production"}
+												onChange={(e) =>
+													updateAssertion(i, { rubricEnv: e.target.value })
+												}
+											>
+												<option value="production">production</option>
+												<option value="staging">staging</option>
+											</select>
+										</label>
+									</>
+								)}
+								<label className="block">
+									Scorer {i + 1} judging model
+									<input
+										className="block w-full border border-line bg-surface p-2"
+										value={a.judgeModel ?? ""}
+										placeholder="Blank uses the model under test"
+										onChange={(e) =>
+											updateAssertion(i, { judgeModel: e.target.value })
+										}
+									/>
+								</label>
+								<label className="block">
+									Scorer {i + 1} minimum score
+									<input
+										className="block w-full border border-line bg-surface p-2"
+										type="number"
+										min="0"
+										max="1"
+										step="any"
+										value={a.value}
+										onChange={(e) =>
+											updateAssertion(i, { value: e.target.value })
+										}
+									/>
+								</label>
+							</div>
+						) : a.kind === "length_bounds" ? (
+							<div className="w-full space-y-2">
+								<p className="text-xs text-ink-3">
+									Counts characters, not bytes. No judge call or eval_runs unit;
+									generation usage still applies. Leave either bound blank for
+									no bound on that side.
+								</p>
+								<label className="block">
+									Scorer {i + 1} minimum characters
+									<input
+										className="block w-full border border-line bg-surface p-2"
+										type="number"
+										min="0"
+										step="1"
+										value={a.min ?? ""}
+										onChange={(e) =>
+											updateAssertion(i, { min: e.target.value })
+										}
+									/>
+								</label>
+								<label className="block">
+									Scorer {i + 1} maximum characters
+									<input
+										className="block w-full border border-line bg-surface p-2"
+										type="number"
+										min="0"
+										step="1"
+										value={a.max ?? ""}
+										onChange={(e) =>
+											updateAssertion(i, { max: e.target.value })
+										}
+									/>
+								</label>
+							</div>
+						) : (
+							<>
+								{" "}
+								<input
+									className="min-w-[12rem] flex-1 rounded-control border border-line bg-surface px-2 py-1 text-sm"
+									value={a.value}
+									aria-label={`Scorer ${i + 1} value`}
+									inputMode={
+										ASSERTION_VALUE[a.kind] === "number" ? "decimal" : "text"
+									}
+									placeholder={
+										ASSERTION_VALUE[a.kind] === "json"
+											? '{"type":"object","required":["order"]}'
+											: undefined
+									}
+									onChange={(e) =>
+										setAssertions(
+											assertions.map((x, j) =>
+												j === i ? { ...x, value: e.target.value } : x,
+											),
+										)
+									}
+								/>
+								<p className="text-xs text-ink-3">
+									Local scorer: no judge call. Generation usage still applies.
+								</p>
+							</>
+						)}
 						{assertions.length > 1 && (
-							<button
+							<Button
+								variant="bare"
 								type="button"
 								className="text-sm underline"
 								onClick={() =>
@@ -419,11 +624,12 @@ export function NewExperimentDialog({
 								}
 							>
 								remove
-							</button>
+							</Button>
 						)}
 					</div>
 				))}
-				<button
+				<Button
+					variant="bare"
 					type="button"
 					className="text-sm underline"
 					onClick={() =>
@@ -431,11 +637,11 @@ export function NewExperimentDialog({
 					}
 				>
 					+ Add scorer
-				</button>
+				</Button>
 			</div>
 
 			{error && (
-				<p className="mb-3 rounded-md border border-line bg-surface p-2 text-sm">
+				<p className="mb-3 rounded-control border border-line bg-surface p-2 text-sm">
 					{error}
 				</p>
 			)}

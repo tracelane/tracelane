@@ -1,6 +1,6 @@
 {
   "name": "@tracelanedev/cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Tracelane CLI \u2014 tlane command-line tool",
   "repository": {
     "type": "git",

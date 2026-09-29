@@ -468,10 +468,16 @@ fn series_sql(periods_lit: &str, as_of: Option<NaiveDate>) -> String {
          FROM tracelane.spans AS s \
          INNER JOIN periods AS p ON s.tenant_id = p.tenant_id \
          WHERE s.start_time >= toDateTime(p.period_start, 'UTC') AND s.start_time <= {now}{ingested} \
+           AND s.name != '{rejected}' \
          GROUP BY s.tenant_id",
         cte = periods_cte(periods_lit),
         now = now_expr(as_of),
-        ingested = ingested_filter(as_of, "s.")
+        ingested = ingested_filter(as_of, "s."),
+        // RI-05 slice 3 (2026-09-20): the aggregate refusal span is a RECORD of
+        // load that was shed, not usage — counting it would bill one extra
+        // "series" per (tenant, key) that ever hit a limit. Proven against a real
+        // ClickHouse in `meter_reads_run_against_a_real_clickhouse`.
+        rejected = crate::rejection_metrics::REJECTED_SPAN_NAME,
     ))
 }
 
@@ -544,9 +550,10 @@ async fn query_cold_bytes(
 #[derive(serde::Deserialize, clickhouse::Row)]
 struct DailyTenantValueRow {
     tenant_id: String,
-    // Unread — see `SpanRow`'s / `DailyRow`'s own comment on this exact
-    // shape in `usage.rs`: `clickhouse::Row` decodes RowBinary POSITIONALLY,
-    // so removing this field would desync the 3-column SELECT (B-274 class).
+    // READ since B-468 (REV-1): `densify_trailing` places the value at this
+    // day's index. It was unread — and the series was therefore sparse — from
+    // BILL-01 until 2026-09-20. `clickhouse::Row` decodes RowBinary
+    // POSITIONALLY, so the field order must stay tenant_id, day, value.
     //
     // Two rules every SELECT feeding this (or `TenantValueRow`) follows,
     // both learned from prod on 2026-09-16 and both invisible to a unit test:
@@ -562,14 +569,68 @@ struct DailyTenantValueRow {
     //   emitted to Polar as ~0. `series` was right only because it already
     //   said `toFloat64(uniqExact(…))`.
     // `meter_reads_run_against_a_real_clickhouse` holds both.
-    #[allow(dead_code)]
     day: String,
     value: f64,
 }
 
+/// The trailing window every burst-netted meter is rated over: 30 days of
+/// history + yesterday. A dense series has EXACTLY this many entries.
+pub(crate) const TRAILING_DAYS: usize = 31;
+
+/// **B-468 (REV-1, 2026-09-20): the daily series is DENSE and indexed by DATE.**
+/// Per tenant, exactly [`TRAILING_DAYS`] entries where index `i` is the day
+/// `until_excl - TRAILING_DAYS + i`; a day with no rows is an explicit `0.0`,
+/// so the LAST entry is `until_excl - 1` — "yesterday" — by construction.
+///
+/// Until this, the queries below discarded `day_iso` and pushed values in row
+/// order, so the series ended in the last day THAT HAD ROWS: a tenant busy on
+/// day D and idle afterwards was billed D's `ingest_gb` / `scan_units` /
+/// `eval_runs` on every idle day for 31 days, each under a fresh `external_id`
+/// Polar could not dedupe, and the burst average ignored every zero day. A
+/// tenant with no rows in the window is ABSENT from the map (unchanged: absent
+/// means "nothing to emit"), never a vector of zeros. A row outside the window
+/// is a query defect and is dropped with a `debug_assert!` — it must not shift
+/// the series.
+fn densify_trailing(
+    rows: Vec<DailyTenantValueRow>,
+    until_excl: NaiveDate,
+) -> HashMap<String, Vec<f64>> {
+    let start = until_excl - chrono::Duration::days(TRAILING_DAYS as i64);
+    let mut out: HashMap<String, Vec<f64>> = HashMap::new();
+    for r in rows {
+        let Ok(day) = r.day.parse::<NaiveDate>() else {
+            debug_assert!(
+                false,
+                "trailing read projected an unparseable day: {}",
+                r.day
+            );
+            continue;
+        };
+        let offset = (day - start).num_days();
+        let Ok(idx) = usize::try_from(offset) else {
+            debug_assert!(
+                false,
+                "trailing read returned a day before the window: {day}"
+            );
+            continue;
+        };
+        if idx >= TRAILING_DAYS {
+            debug_assert!(
+                false,
+                "trailing read returned a day at/after until_excl: {day}"
+            );
+            continue;
+        }
+        out.entry(r.tenant_id)
+            .or_insert_with(|| vec![0.0; TRAILING_DAYS])[idx] += r.value;
+    }
+    out
+}
+
 /// Trailing 31 days (30 history + yesterday) of `meter_counters` for one
-/// `meter`, per tenant, as a day-ordered `Vec<f64>` ending in yesterday — the
-/// shape `net_of_burst` consumes. ONE query, `GROUP BY tenant_id, day`.
+/// `meter`, per tenant, as a DENSE day-indexed `Vec<f64>` ending in yesterday
+/// (see [`densify_trailing`]) — the shape `net_of_burst` consumes. ONE query,
+/// `GROUP BY tenant_id, day`.
 async fn query_trailing_daily_meter_counter(
     ch: &clickhouse::Client,
     meter: &str,
@@ -578,19 +639,16 @@ async fn query_trailing_daily_meter_counter(
     let sql = meter_query(format!(
         "SELECT tenant_id AS tenant_id, toString(day) AS day_iso, sum(value) AS value \
          FROM tracelane.meter_counters \
-         WHERE meter = '{meter}' AND day >= toDate('{until_excl}') - 31 AND day < toDate('{until_excl}') \
+         WHERE meter = '{meter}' AND day >= toDate('{until_excl}') - {TRAILING_DAYS} AND day < toDate('{until_excl}') \
          GROUP BY tenant_id, day ORDER BY tenant_id, day"
     ));
     let rows: Vec<DailyTenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
-    let mut out: HashMap<String, Vec<f64>> = HashMap::new();
-    for r in rows {
-        out.entry(r.tenant_id).or_default().push(r.value);
-    }
-    Ok(out)
+    Ok(densify_trailing(rows, until_excl))
 }
 
 /// Trailing 31 days of `system.query_log.read_bytes`, per tenant — the
-/// `scan_bytes` analogue of [`query_trailing_daily_meter_counter`].
+/// `scan_bytes` analogue of [`query_trailing_daily_meter_counter`], dense the
+/// same way.
 async fn query_trailing_daily_scan_bytes(
     ch: &clickhouse::Client,
     until_excl: NaiveDate,
@@ -600,15 +658,11 @@ async fn query_trailing_daily_scan_bytes(
             toString(event_date) AS day_iso, toFloat64(sum(read_bytes)) AS value \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND log_comment LIKE 'tenant_id=%' \
-           AND event_date >= toDate('{until_excl}') - 31 AND event_date < toDate('{until_excl}') \
+           AND event_date >= toDate('{until_excl}') - {TRAILING_DAYS} AND event_date < toDate('{until_excl}') \
          GROUP BY tenant_id, event_date ORDER BY tenant_id, event_date"
     ));
     let rows: Vec<DailyTenantValueRow> = ch.query(&capped(&sql)).fetch_all().await?;
-    let mut out: HashMap<String, Vec<f64>> = HashMap::new();
-    for r in rows {
-        out.entry(r.tenant_id).or_default().push(r.value);
-    }
-    Ok(out)
+    Ok(densify_trailing(rows, until_excl))
 }
 
 // ── The batched INSERT into meter_gauges ────────────────────────────────────
@@ -627,11 +681,18 @@ struct MeterGaugeRow<'a> {
 /// elapsed). A re-run for the same day REPLACES on the next merge
 /// (`ReplacingMergeTree(computed_at)`), never doubles.
 ///
+/// **B-470 (REV-1, 2026-09-20): this no longer writes the day's completion
+/// marker.** It used to land in the same batch, BEFORE the Polar events were
+/// sent, so a failed POST left a marked day the gap backfill would never
+/// revisit — that day's revenue events were lost for good, behind one WARN.
+/// The marker is now [`write_completion_marker`], written by the caller only
+/// after every read AND every emission for the day succeeded.
+///
 /// # Errors
 /// Propagates a ClickHouse failure; the caller notes
-/// [`tracelane_shared::degradation::Degradation::MeteringJobFailed`] and
-/// retries at the next scheduled tick — no partial-write recovery is
-/// attempted here (the whole run failed, not one row of it).
+/// [`tracelane_shared::degradation::Degradation::MeteringJobFailed`], withholds
+/// the marker, and the next scheduled run recomputes the day — no partial-write
+/// recovery is attempted here (the whole run failed, not one row of it).
 async fn write_gauges(
     ch: &clickhouse::Client,
     today: NaiveDate,
@@ -643,8 +704,6 @@ async fn write_gauges(
 ) -> anyhow::Result<usize> {
     let today_u16 = days_since_epoch(today);
     let yesterday_u16 = days_since_epoch(yesterday);
-    // Declared BEFORE the inserter: a row borrows for the inserter's lifetime.
-    let marker_tenant = JOB_MARKER_TENANT.to_string();
     let mut n = 0usize;
     let mut insert = ch
         .insert("meter_gauges")
@@ -668,14 +727,33 @@ async fn write_gauges(
             n += 1;
         }
     }
-    // The run's completion marker — one row under the reserved tenant id, in the SAME
-    // batch as the gauges, so "the marker exists" ⇔ "every gauge above landed". The
-    // boot catch-up probe reads exactly this row; the usage route never can (it reads
-    // by a real tenant id).
+    insert
+        .end()
+        .await
+        .map_err(|e| anyhow::anyhow!("meter_gauges insert commit failed: {e}"))?;
+    Ok(n)
+}
+
+/// The day's completion marker — one row under the reserved tenant id. **"The
+/// marker exists" ⇔ "every gauge for `day` landed AND every Polar event for it
+/// was accepted"** (B-470). The gap backfill skips marked days and the boot
+/// catch-up trusts the marker, so it is written LAST, after the emissions, and
+/// never when any of them failed. The usage route can never read it (it reads
+/// by a real tenant id).
+///
+/// # Errors
+/// Propagates a ClickHouse failure; the caller notes `MeteringJobFailed`. An
+/// unmarked completed day is recomputed by the next run — gauges REPLACE and
+/// events dedupe on `external_id`, so the retry is idempotent.
+async fn write_completion_marker(ch: &clickhouse::Client, day: NaiveDate) -> anyhow::Result<()> {
+    let marker_tenant = JOB_MARKER_TENANT.to_string();
+    let mut insert = ch
+        .insert("meter_gauges")
+        .map_err(|e| anyhow::anyhow!("meter_gauges marker insert init failed: {e}"))?;
     insert
         .write(&MeterGaugeRow {
             tenant_id: &marker_tenant,
-            day: today_u16,
+            day: days_since_epoch(day),
             meter: JOB_MARKER_METER,
             value: 1.0,
         })
@@ -684,8 +762,7 @@ async fn write_gauges(
     insert
         .end()
         .await
-        .map_err(|e| anyhow::anyhow!("meter_gauges insert commit failed: {e}"))?;
-    Ok(n)
+        .map_err(|e| anyhow::anyhow!("meter_gauges marker commit failed: {e}"))
 }
 
 // ── Polar emission ───────────────────────────────────────────────────────
@@ -779,17 +856,24 @@ fn tenant_polar_events(
 /// operator reading `/events` has to mentally discard.
 ///
 /// `external_id = "<meter>-<customer>-<period>"` makes a retried run
-/// idempotent (Polar dedupes on it) — a failed POST here is simply retried
-/// whole next scheduled tick, never partially.
+/// idempotent (Polar dedupes on it). **A failed POST returns `Err(())`** so the
+/// caller withholds the day's completion marker (B-470) and the next run's
+/// gap backfill recomputes and re-emits the WHOLE day under the same ids —
+/// that, not "the next tick", is the retry.
+///
+/// # Errors
+/// `Err(())` when Polar did not accept the batch; the failure is already
+/// logged and counted here (`PolarMeterEmissionFailed`), the caller only
+/// decides about the marker.
 async fn emit_polar_events(
     polar: &PolarClient,
     customer_id: &str,
     period: NaiveDate,
     events: &[PolarEvent],
-) {
+) -> Result<(), ()> {
     let billable: Vec<&PolarEvent> = events.iter().filter(|ev| ev.value > 0.0).collect();
     if billable.is_empty() {
-        return;
+        return Ok(());
     }
     let customer = PolarCustomerId(customer_id.to_string());
     let external_ids: Vec<String> = billable
@@ -813,12 +897,14 @@ async fn emit_polar_events(
             customer_id,
             count = batch.len(),
             error = %e,
-            "Polar meter events batch POST failed"
+            "Polar meter events batch POST failed — the day's completion marker is withheld and the gap backfill re-emits it"
         );
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::PolarMeterEmissionFailed,
         );
+        return Err(());
     }
+    Ok(())
 }
 
 // ── AUTO-AGE (spec §0.4) ─────────────────────────────────────────────────
@@ -1242,6 +1328,10 @@ async fn backfill_missed_days(
         let scan = query_scan_bytes_for_day(ch, prev).await?;
         let cold = query_cold_bytes(ch, metas, Some(day)).await?;
         write_gauges(ch, day, prev, &hot, &series, &scan, &cold).await?;
+        // B-470: the marker is written only when EVERY tenant's events for this
+        // day were accepted. A day with a refused POST stays unmarked and is
+        // retried, oldest first, by the next run — under the same external ids.
+        let mut all_emitted = true;
         if let Some(polar) = polar {
             let ingest_trailing =
                 query_trailing_daily_meter_counter(ch, "ingest_bytes", day).await?;
@@ -1274,14 +1364,26 @@ async fn backfill_missed_days(
                     ingest_trailing.get(&key).map(Vec::as_slice),
                     scan_trailing.get(&key).map(Vec::as_slice),
                 );
-                if !events.is_empty() {
+                if !events.is_empty()
+                    && emit_polar_events(polar, customer_id, prev, &events)
+                        .await
+                        .is_err()
+                {
                     // Keyed on `prev`, exactly as the live run keys on
                     // yesterday, so a re-run never double-emits a day.
-                    emit_polar_events(polar, customer_id, prev, &events).await;
+                    all_emitted = false;
                 }
             }
         }
-        tracing::warn!(%day, "metering job: missed day recomputed as of that day and written");
+        if all_emitted {
+            write_completion_marker(ch, day).await?;
+            tracing::warn!(%day, "metering job: missed day recomputed as of that day, written and emitted");
+        } else {
+            tracing::warn!(
+                %day,
+                "metering job: missed day recomputed and written, but a Polar emission failed — marker withheld, retried next run"
+            );
+        }
         n += 1;
     }
     Ok(n)
@@ -1321,15 +1423,23 @@ pub async fn run_once(
     let today = now.date_naive();
     let yesterday = today - chrono::Duration::days(1);
 
+    // B-470: `true` only while every read and every Polar emission of this run
+    // succeeded. The day's completion marker is written iff it is still true at
+    // the end — a run that lost a read or a POST proceeds (fail-open for the
+    // meters it did read) but leaves the day UNMARKED so the next run's gap
+    // backfill recomputes and re-emits it. Before this, the marker landed
+    // before the first POST and a Polar outage lost the day's events for good.
+    let mut run_clean = true;
     macro_rules! try_query {
         ($fut:expr, $name:literal) => {
             match $fut.await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, meter = $name, "metering job: query failed for this run");
+                    tracing::warn!(error = %e, meter = $name, "metering job: query failed for this run — the day's completion marker will be withheld");
                     tracelane_shared::degradation::note(
                         tracelane_shared::degradation::Degradation::MeteringJobFailed,
                     );
+                    run_clean = false;
                     HashMap::new()
                 }
             }
@@ -1375,10 +1485,11 @@ pub async fn run_once(
     );
 
     if let Err(e) = write_gauges(&ch, today, yesterday, &hot, &series, &scan, &cold).await {
-        tracing::warn!(error = %e, "metering job: meter_gauges write failed for this run");
+        tracing::warn!(error = %e, "metering job: meter_gauges write failed for this run — the day's completion marker will be withheld");
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::MeteringJobFailed,
         );
+        run_clean = false;
     }
     // Founder, 2026-09-14 (B6 audit item D): an outage spanning 04:10 used to
     // lose a day's revenue silently — a missed sample is absent (never zero)
@@ -1442,8 +1553,11 @@ pub async fn run_once(
         );
         if let (Some(polar), Some(customer_id)) = (polar, meta.polar_customer_id.as_deref())
             && !events.is_empty()
+            && emit_polar_events(polar, customer_id, yesterday, &events)
+                .await
+                .is_err()
         {
-            emit_polar_events(polar, customer_id, yesterday, &events).await;
+            run_clean = false;
         }
 
         let ingest_period_val = ingest_period.get(&key).copied();
@@ -1526,22 +1640,77 @@ pub async fn run_once(
         }
     }
 
+    // B-470: the marker LAST, and only for a clean run. The boot catch-up and the
+    // gap backfill both read it as "this day is done" — which is only true now.
+    if run_clean {
+        if let Err(e) = write_completion_marker(&ch, today).await {
+            tracing::warn!(error = %e, "metering job: completion marker write failed — the day is recomputed by the next run");
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::MeteringJobFailed,
+            );
+        }
+    } else {
+        tracing::warn!(
+            %today,
+            "metering job: a read or a Polar emission failed this run — completion marker WITHHELD; the next run's gap backfill recomputes and re-emits this day"
+        );
+    }
+
     Ok(())
 }
 
-/// The weekly blob GC: `blobs` rows with no surviving `blob_refs` reference
-/// (spec §2.3). One mutation, off-peak (Sunday 04:40 UTC — see [`spawn`]).
-async fn run_gc(ch_url: &str) {
+/// The GC mutation (B-445, 2026-09-19): delete a blob only when it has no surviving
+/// `blob_refs` reference AND it is older than the grace window — a blob younger than
+/// `grace_days` is never touched, whatever its refcount says. Before this, a span whose
+/// `blob_refs` insert failed (best-effort, after the ack) pointed at a zero-ref blob the
+/// next Sunday destroyed; the quarantine makes that race a window, and ingest now writes
+/// blobs and refs INSIDE the durable flush so the window closes on redelivery.
+/// `mutations_sync = 1` so the weekly job (and the real-ClickHouse test) observes the
+/// deletion it issued rather than a queued mutation.
+#[must_use]
+pub(crate) fn gc_sql(grace_days: i64) -> String {
+    // NO `SETTINGS` clause here — deliberately. [`capped`] appends the plan caps as ITS
+    // `SETTINGS …`, and ClickHouse accepts exactly one such clause per statement; the
+    // first cut ended `SETTINGS mutations_sync = 1` and the real-server falsification
+    // run failed on `Syntax error … ('SETTINGS')` — the mutation could never have
+    // executed on prod. `mutations_sync` rides as a query OPTION in [`run_gc`] instead
+    // (the B-295 class: a redundant clause changes the statement, it does not reinforce it).
+    format!(
+        "ALTER TABLE tracelane.blobs DELETE WHERE first_seen < now() - INTERVAL {} DAY \
+         AND (tenant_id, hash) NOT IN (SELECT tenant_id, hash FROM tracelane.blob_refs)",
+        grace_days.max(0)
+    )
+}
+
+/// The weekly blob GC: `blobs` rows with no surviving `blob_refs` reference and past
+/// the grace window (spec §2.3, B-445). One mutation, off-peak (Sunday 04:40 UTC — see
+/// [`spawn`]). `grace_days` is `billing_policy.blob_gc_grace_days`, read from the rate
+/// card at tick time so a policy change lands on the next Sunday without a redeploy.
+///
+/// # Errors
+/// The mutation was refused or the server unreachable — counted on
+/// `MeteringJobFailed`, retried next week. Returned so the real-server test can assert it.
+pub(crate) async fn run_gc(ch_url: &str, grace_days: i64) -> anyhow::Result<()> {
     let ch = crate::clickhouse_query::ch_client(ch_url.to_string());
-    let sql = "ALTER TABLE tracelane.blobs DELETE WHERE (tenant_id, hash) NOT IN \
-               (SELECT tenant_id, hash FROM tracelane.blob_refs)";
-    if let Err(e) = ch.query(&capped(sql)).execute().await {
-        tracing::warn!(error = %e, "blob GC mutation failed; retried next week");
-        tracelane_shared::degradation::note(
-            tracelane_shared::degradation::Degradation::MeteringJobFailed,
-        );
-    } else {
-        tracing::info!("blob GC mutation issued");
+    // `mutations_sync = 1`: the ALTER returns only once the mutation has applied, so the
+    // tick's log line (and the real-server test) describe a finished delete, not a queued one.
+    match ch
+        .query(&capped(&gc_sql(grace_days)))
+        .with_option("mutations_sync", "1")
+        .execute()
+        .await
+    {
+        Err(e) => {
+            tracing::warn!(error = %e, grace_days, "blob GC mutation failed; retried next week");
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::MeteringJobFailed,
+            );
+            Err(e.into())
+        }
+        Ok(()) => {
+            tracing::info!(grace_days, "blob GC mutation issued");
+            Ok(())
+        }
     }
 }
 
@@ -1565,6 +1734,13 @@ pub fn spawn(
     entitlements: Option<Arc<EntitlementCache>>,
 ) {
     let ch_url2 = ch_url.clone();
+    // B-445: the GC tick reads the grace window from the SAME rate card the daily job
+    // uses; cloned here, before the daily task moves `card`.
+    let gc_card = Arc::clone(&card);
+    // RI-04: the GC tick's own claim needs a pooled client too; cloned here for
+    // the same reason as `gc_card` — the daily task's `tokio::spawn` below moves
+    // `pool`.
+    let gc_pool = pool.clone();
     tokio::spawn(async move {
         // Boot catch-up: run immediately if today has no gauges at all.
         let ch = crate::clickhouse_query::ch_client(ch_url.clone());
@@ -1583,56 +1759,78 @@ pub fn spawn(
                 true
             }
         };
-        if !has_today
-            && let Err(e) = run_once(
-                &pool,
-                &ch_url,
-                &card.load(),
-                polar.as_deref(),
-                resend.as_deref(),
-                entitlements.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "metering job: boot catch-up run failed");
-            tracelane_shared::degradation::note(
-                tracelane_shared::degradation::Degradation::MeteringJobFailed,
-            );
-        }
-        loop {
-            let secs = secs_until_next_daily(Utc::now(), DAILY_HOUR, DAILY_MINUTE);
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            let failed_before = tracelane_shared::degradation::count(
-                tracelane_shared::degradation::Degradation::MeteringJobFailed,
-            );
-            let gaps_before = tracelane_shared::degradation::count(
-                tracelane_shared::degradation::Degradation::MeteringGaugeGapBackfilled,
-            );
-            match run_once(
-                &pool,
-                &ch_url,
-                &card.load(),
-                polar.as_deref(),
-                resend.as_deref(),
-                entitlements.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => resolve_after_clean_run(failed_before, gaps_before),
-                Err(e) => {
-                    tracing::warn!(error = %e, "metering job: scheduled run failed; retried next tick");
+        if !has_today {
+            // RI-04 (2026-09-19): the boot catch-up is claimed like the scheduled
+            // tick — a redeploy racing an already-running gateway must not run it
+            // twice. `run_claimed` skips (logged + counted) on a lost or unprovable
+            // claim; nothing is written through the claim transaction.
+            crate::db::job_guard::run_claimed(&pool, "metering_daily", || async {
+                if let Err(e) = run_once(
+                    &pool,
+                    &ch_url,
+                    &card.load(),
+                    polar.as_deref(),
+                    resend.as_deref(),
+                    entitlements.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "metering job: boot catch-up run failed");
                     tracelane_shared::degradation::note(
                         tracelane_shared::degradation::Degradation::MeteringJobFailed,
                     );
                 }
-            }
+            })
+            .await;
+        }
+        loop {
+            let secs = secs_until_next_daily(Utc::now(), DAILY_HOUR, DAILY_MINUTE);
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            // RI-04: the claim wraps the run. A lost or unprovable claim means
+            // "nothing happened here this tick" — neither a clean run nor a
+            // failure — so `resolve_after_clean_run` must not move on it, which is
+            // why the bookkeeping lives INSIDE the claimed closure.
+            crate::db::job_guard::run_claimed(&pool, "metering_daily", || async {
+                let failed_before = tracelane_shared::degradation::count(
+                    tracelane_shared::degradation::Degradation::MeteringJobFailed,
+                );
+                let gaps_before = tracelane_shared::degradation::count(
+                    tracelane_shared::degradation::Degradation::MeteringGaugeGapBackfilled,
+                );
+                match run_once(
+                    &pool,
+                    &ch_url,
+                    &card.load(),
+                    polar.as_deref(),
+                    resend.as_deref(),
+                    entitlements.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => resolve_after_clean_run(failed_before, gaps_before),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "metering job: scheduled run failed; retried next tick");
+                        tracelane_shared::degradation::note(
+                            tracelane_shared::degradation::Degradation::MeteringJobFailed,
+                        );
+                    }
+                }
+            })
+            .await;
         }
     });
     tokio::spawn(async move {
         loop {
             let secs = secs_until_next_weekly(Utc::now(), GC_WEEKDAY, GC_HOUR, GC_MINUTE);
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            run_gc(&ch_url2).await;
+            // RI-04: claimed — a weekly `ALTER … DELETE` doubled by a second process
+            // widens B-445's grace window for no reason; the claim costs one extra
+            // query a WEEK (spec §5).
+            crate::db::job_guard::run_claimed(&gc_pool, "blob_gc", || async {
+                let grace = gc_card.load().policy.blob_gc_grace_days;
+                let _ = run_gc(&ch_url2, grace).await; // counted + logged inside
+            })
+            .await;
         }
     });
 }
@@ -1848,6 +2046,569 @@ mod tests {
         }
     }
 
+    fn day_row(tid: &str, day: NaiveDate, value: f64) -> DailyTenantValueRow {
+        DailyTenantValueRow {
+            tenant_id: tid.to_string(),
+            day: day.to_string(),
+            value,
+        }
+    }
+
+    /// The OLD shape, kept here as the falsification's control: values pushed
+    /// in row order, dates discarded — the series ends in the last day that
+    /// HAD rows, and `net_of_burst` reads that day as "yesterday".
+    fn sparse_trailing_pre_b468(rows: Vec<DailyTenantValueRow>) -> HashMap<String, Vec<f64>> {
+        let mut out: HashMap<String, Vec<f64>> = HashMap::new();
+        for r in rows {
+            out.entry(r.tenant_id).or_default().push(r.value);
+        }
+        out
+    }
+
+    /// B-468: an idle yesterday is a ZERO at the end of the series, and the
+    /// busy day sits at its own date's index — not at the end.
+    #[test]
+    fn densify_trailing_places_values_by_date_with_explicit_zeros() {
+        let until = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let busy = until - chrono::Duration::days(5); // 2026-09-15
+        let rows = vec![
+            day_row("t1", busy, 7.0),
+            day_row("t1", busy, 3.0), // a second row the same day SUMS
+            day_row("t2", until - chrono::Duration::days(1), 4.0),
+        ];
+        let dense = densify_trailing(rows, until);
+        let t1 = dense.get("t1").expect("t1 present");
+        assert_eq!(t1.len(), TRAILING_DAYS);
+        assert_eq!(t1[TRAILING_DAYS - 5], 10.0, "busy day at its date's index");
+        assert_eq!(
+            *t1.last().unwrap(),
+            0.0,
+            "yesterday was idle: an explicit zero LAST"
+        );
+        assert_eq!(t1.iter().filter(|v| **v != 0.0).count(), 1);
+        let t2 = dense.get("t2").expect("t2 present");
+        assert_eq!(*t2.last().unwrap(), 4.0, "a busy yesterday is last");
+        assert_eq!(t2.iter().sum::<f64>(), 4.0);
+        assert!(
+            !dense.contains_key("t3"),
+            "no rows ⇒ absent, never a zero vector"
+        );
+    }
+
+    /// The consequence the review named, shown both ways on the same rows: the
+    /// sparse series bills the last ACTIVE day on an idle day; the dense one
+    /// bills nothing. `net_of_burst` is unchanged — the series contract is what
+    /// changed.
+    #[test]
+    fn an_idle_yesterday_nets_to_zero_only_with_the_dense_series() {
+        let until = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let rows = || vec![day_row("t1", until - chrono::Duration::days(9), 5e9)];
+        let sparse = sparse_trailing_pre_b468(rows());
+        let dense = densify_trailing(rows(), until);
+        let old = net_of_burst(sparse.get("t1").unwrap(), 5.0);
+        let new = net_of_burst(dense.get("t1").unwrap(), 5.0);
+        assert_eq!(
+            old, 5e9,
+            "the OLD series billed the 9-day-old value again on an idle day"
+        );
+        assert_eq!(
+            new, 0.0,
+            "the DENSE series bills nothing for an idle yesterday"
+        );
+        // And on the busy day itself both agree: a first-ever day has no history
+        // (sparse) / thirty zeros (dense) ⇒ avg 0 ⇒ billed in full.
+        let busy_until = until - chrono::Duration::days(8);
+        assert_eq!(
+            net_of_burst(densify_trailing(rows(), busy_until).get("t1").unwrap(), 5.0),
+            5e9
+        );
+    }
+
+    /// `until_excl` is EXCLUSIVE: a row dated `until_excl` is outside the
+    /// window and a query defect — refused loudly in a debug build (the
+    /// release build drops it without shifting the series).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at/after until_excl")]
+    fn densify_trailing_refuses_a_row_at_or_after_until_excl() {
+        let until = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let _ = densify_trailing(vec![day_row("t1", until, 9.0)], until);
+    }
+
+    // ── REV-1 real-ClickHouse proofs (scripts/ci/run-clickhouse-integration.sh) ──
+
+    /// Apply the checked-in schema + BILL-01 migrations to a throwaway ClickHouse
+    /// and hand back a client on `tracelane`. Shared by the REV-1 proofs.
+    async fn rev1_clickhouse() -> (clickhouse::Client, clickhouse::Client) {
+        let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+            panic!("CLICKHOUSE_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let root = clickhouse::Client::default().with_url(&url);
+        root.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create database");
+        let ch = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database("tracelane");
+        for sql in [
+            include_str!("../../../../infra/dev/clickhouse/schema.sql"),
+            include_str!(
+                "../../../../infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql"
+            ),
+            include_str!(
+                "../../../../infra/dev/clickhouse/migrations/28_rev1_meter_counters_dedup_window.sql"
+            ),
+        ] {
+            for stmt in crate::clickhouse_query::split_migration_statements(sql) {
+                let _ = ch.query(&stmt).execute().await;
+            }
+        }
+        for t in ["meter_counters", "meter_gauges"] {
+            let n: u64 = ch
+                .query(
+                    "SELECT count() FROM system.tables WHERE database = 'tracelane' AND name = ?",
+                )
+                .bind(t)
+                .fetch_one()
+                .await
+                .expect("system.tables read");
+            assert_eq!(
+                n, 1,
+                "`{t}` was not created — every read below would pass on nothing"
+            );
+        }
+        (root, ch)
+    }
+
+    /// A recording Polar: every `/events/ingest` POST is answered `status` and
+    /// kept, so the test reads back exactly which `external_id`s were emitted.
+    async fn recording_polar(status: u16) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({"inserted": 1})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Every `external_id` the mock Polar received, in order.
+    async fn received_external_ids(server: &wiremock::MockServer) -> Vec<String> {
+        let mut ids = Vec::new();
+        for req in server.received_requests().await.unwrap_or_default() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+            for ev in body["events"].as_array().cloned().unwrap_or_default() {
+                ids.push(ev["external_id"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        ids
+    }
+
+    /// Drop-guard for the two env vars the Polar client needs to reach a mock
+    /// on loopback. The real-ClickHouse proofs run one at a time from the
+    /// runner (`--ignored`, one test name per invocation), so no other test
+    /// races these variables inside the same process.
+    struct PolarEnvGuard;
+    impl PolarEnvGuard {
+        fn new(base_url: &str) -> Self {
+            unsafe {
+                std::env::set_var("POLAR_BASE_URL", base_url);
+                std::env::set_var("TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS", "1");
+            }
+            Self
+        }
+    }
+    impl Drop for PolarEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("POLAR_BASE_URL");
+                std::env::remove_var("TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS");
+            }
+        }
+    }
+
+    async fn seed_counter(
+        ch: &clickhouse::Client,
+        tid: &str,
+        day: NaiveDate,
+        meter: &str,
+        value: f64,
+    ) {
+        ch.query(
+            "INSERT INTO tracelane.meter_counters (tenant_id, day, meter, value) VALUES (?, toDate(?), ?, ?)",
+        )
+        .bind(tid)
+        .bind(day.to_string())
+        .bind(meter)
+        .bind(value)
+        .execute()
+        .await
+        .expect("seed counter");
+    }
+
+    async fn mark_done(ch: &clickhouse::Client, day: NaiveDate) {
+        write_completion_marker(ch, day).await.expect("marker");
+    }
+
+    /// The marker table is GLOBAL (one reserved tenant id), and the runner
+    /// reuses one container across tests — an earlier test's marker would make
+    /// "this day is missing" false here. Clear it, synchronously.
+    async fn clear_markers(ch: &clickhouse::Client) {
+        ch.query(
+            "ALTER TABLE tracelane.meter_gauges DELETE WHERE tenant_id = ? SETTINGS mutations_sync = 2",
+        )
+        .bind(JOB_MARKER_TENANT)
+        .execute()
+        .await
+        .expect("clear markers");
+    }
+
+    /// **B-468 proof.** A tenant busy on D-6 and D-3, idle every other day of the
+    /// lookback: the backfill over D-7…D-1 emits `ingest_gb` / `eval_runs` for
+    /// periods D-6 and D-3 ONLY — read back from the recording Polar, not from
+    /// the job's own log. Under the pre-fix sparse series the same seed emitted
+    /// the D-6 value on every idle day (`an_idle_yesterday_nets_to_zero_only_with_the_dense_series`
+    /// is the unit-level half of the same falsification).
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn rev1_idle_days_are_not_billed_against_a_real_clickhouse() {
+        let (_root, ch) = rev1_clickhouse().await;
+        clear_markers(&ch).await;
+        let polar = recording_polar(200).await;
+        let _env = PolarEnvGuard::new(&polar.uri());
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+
+        let tenant = Uuid::new_v4();
+        let tid = tenant.to_string();
+        let today = Utc::now().date_naive();
+        let d = |n: i64| today - chrono::Duration::days(n);
+        seed_counter(&ch, &tid, d(6), "ingest_bytes", 5e9).await;
+        seed_counter(&ch, &tid, d(6), "eval_runs", 3.0).await;
+        seed_counter(&ch, &tid, d(3), "ingest_bytes", 2e9).await;
+        seed_counter(&ch, &tid, d(3), "eval_runs", 1.0).await;
+
+        let mut m = meta(tenant, 30, 730);
+        m.polar_customer_id = Some("cust_rev1".to_string());
+        let metas = vec![m];
+        let card = RateCard::unavailable();
+
+        let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+            .await
+            .expect("backfill runs");
+        assert_eq!(
+            n, GAP_LOOKBACK_DAYS as usize,
+            "every lookback day was missing"
+        );
+
+        let ids = received_external_ids(&polar).await;
+        let expect = |meter: &str, day: NaiveDate| format!("{meter}-cust_rev1-{day}");
+        assert!(
+            ids.contains(&expect("ingest_gb", d(6))),
+            "D-6 ingest emitted: {ids:?}"
+        );
+        assert!(
+            ids.contains(&expect("eval_runs", d(6))),
+            "D-6 evals emitted: {ids:?}"
+        );
+        assert!(
+            ids.contains(&expect("ingest_gb", d(3))),
+            "D-3 ingest emitted: {ids:?}"
+        );
+        assert!(
+            ids.contains(&expect("eval_runs", d(3))),
+            "D-3 evals emitted: {ids:?}"
+        );
+        for idle in [8, 7, 5, 4, 2] {
+            assert!(
+                !ids.iter().any(|id| id.ends_with(&d(idle).to_string())),
+                "idle day D-{idle} must emit NOTHING — this is the B-468 double charge: {ids:?}"
+            );
+        }
+        assert_eq!(
+            ids.len(),
+            4,
+            "exactly the two busy days' four events: {ids:?}"
+        );
+        // The D-6 value was the tenant's first ever day: thirty zero days of
+        // history ⇒ no burst average ⇒ billed in full, 5 GB exactly.
+        let bodies: Vec<serde_json::Value> = polar
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let d6_ingest = bodies
+            .iter()
+            .flat_map(|b| b["events"].as_array().cloned().unwrap_or_default())
+            .find(|e| e["external_id"] == expect("ingest_gb", d(6)))
+            .expect("D-6 ingest event");
+        assert_eq!(d6_ingest["metadata"]["value"].as_f64(), Some(5.0));
+        // And every day is now marked — the emissions all succeeded.
+        let done = query_completed_days(&ch, d(GAP_LOOKBACK_DAYS), today)
+            .await
+            .unwrap();
+        assert_eq!(done.len(), GAP_LOOKBACK_DAYS as usize, "{done:?}");
+    }
+
+    /// **B-470 proof.** Polar refuses the day's events: the gauges land, the
+    /// marker does NOT, the failure is counted; Polar recovers: the next run
+    /// re-emits the day under the SAME `external_id`s and marks it; a third run
+    /// has nothing left to do.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn rev1_a_failed_emission_withholds_the_marker_and_the_day_is_retried() {
+        use tracelane_shared::degradation::{Degradation, count};
+        let (_root, ch) = rev1_clickhouse().await;
+        clear_markers(&ch).await;
+        let tenant = Uuid::new_v4();
+        let tid = tenant.to_string();
+        let today = Utc::now().date_naive();
+        let d = |n: i64| today - chrono::Duration::days(n);
+        // Only D-1 is missing; its period is D-2, which was busy.
+        for n in 2..=GAP_LOOKBACK_DAYS {
+            mark_done(&ch, d(n)).await;
+        }
+        seed_counter(&ch, &tid, d(2), "ingest_bytes", 3e9).await;
+        let mut m = meta(tenant, 30, 730);
+        m.polar_customer_id = Some("cust_rev1b".to_string());
+        let metas = vec![m];
+        let card = RateCard::unavailable();
+
+        // Run 1: Polar is down (500).
+        let down = recording_polar(500).await;
+        let before = count(Degradation::PolarMeterEmissionFailed);
+        {
+            let _env = PolarEnvGuard::new(&down.uri());
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+                .await
+                .expect("backfill runs even when Polar refuses");
+            assert_eq!(n, 1);
+        }
+        assert!(
+            count(Degradation::PolarMeterEmissionFailed) > before,
+            "the refusal is counted"
+        );
+        assert_eq!(
+            received_external_ids(&down).await,
+            vec![format!("ingest_gb-cust_rev1b-{}", d(2))]
+        );
+        assert!(
+            !job_completed_on(&ch, d(1)).await.unwrap(),
+            "the marker must be WITHHELD when an emission failed — this is B-470"
+        );
+        // The gauges themselves did land (a stale-gauge day is visible on the
+        // usage page; only the marker says "delivered").
+        let gauge_rows: u64 = ch
+            .query("SELECT count() FROM tracelane.meter_gauges WHERE tenant_id = ? AND day = toDate(?)")
+            .bind(&tid)
+            .bind(d(1).to_string())
+            .fetch_one()
+            .await
+            .unwrap();
+        // hot/series/cold are absent (no spans) — the row count may be 0; the
+        // point is the MARKER's absence above, asserted independently.
+        let _ = gauge_rows;
+
+        // Run 2: Polar is back (200). The same day is retried, same external id.
+        let up = recording_polar(200).await;
+        {
+            let _env = PolarEnvGuard::new(&up.uri());
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+                .await
+                .expect("backfill runs");
+            assert_eq!(n, 1, "the unmarked day is retried");
+        }
+        assert_eq!(
+            received_external_ids(&up).await,
+            vec![format!("ingest_gb-cust_rev1b-{}", d(2))],
+            "re-emitted under the SAME external_id — Polar dedupes, nothing doubles"
+        );
+        assert!(
+            job_completed_on(&ch, d(1)).await.unwrap(),
+            "delivered ⇒ marked"
+        );
+
+        // Run 3: nothing left.
+        {
+            let _env = PolarEnvGuard::new(&up.uri());
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+                .await
+                .expect("backfill runs");
+            assert_eq!(n, 0, "a marked day is not revisited");
+        }
+    }
+
+    /// **B-470 proof, the founder's 1c shape (2026-09-21): a KILL MID-EMISSION.** Two
+    /// tenants emit for the same day. Polar ACCEPTS tenant A's batch, then tenant
+    /// B's POST is in flight when the process dies — modelled as aborting the job's
+    /// future while the mock holds B's request open. On disk: gauges written, A's
+    /// event accepted by Polar, NO marker. The next tick recomputes the day and
+    /// re-emits BOTH tenants under the SAME external ids — A's a second time, byte
+    /// for byte. That Polar then holds exactly ONE event per id is the vendor's
+    /// contract, not the mock's: proven on the real sandbox API 2026-09-21 — three
+    /// POSTs under one `external_id` (5.0, 5.0, 7.0) answered `inserted 1`,
+    /// `duplicates 1`, `duplicates 1`; `GET /events` `total_count 1`, value 5.0.
+    /// **First write wins — a corrected value under the same id is skipped, never
+    /// updated.** A mock that deduped would prove nothing about Polar.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL — run scripts/ci/run-clickhouse-integration.sh"]
+    async fn rev1_a_kill_mid_emission_retries_the_day_under_the_same_external_ids() {
+        use wiremock::matchers::{method, path};
+        let (_root, ch) = rev1_clickhouse().await;
+        clear_markers(&ch).await;
+        let (ta, tb) = (Uuid::new_v4(), Uuid::new_v4());
+        let today = Utc::now().date_naive();
+        let d = |n: i64| today - chrono::Duration::days(n);
+        for n in 2..=GAP_LOOKBACK_DAYS {
+            mark_done(&ch, d(n)).await;
+        }
+        seed_counter(&ch, &ta.to_string(), d(2), "ingest_bytes", 3e9).await;
+        seed_counter(&ch, &tb.to_string(), d(2), "ingest_bytes", 4e9).await;
+        // Built by a closure: `TenantMeta` is not `Clone` and the killed run owns its copy.
+        let metas_of = || {
+            let mut ma = meta(ta, 30, 730);
+            ma.polar_customer_id = Some("cust_kill_a".to_string());
+            let mut mb = meta(tb, 30, 730);
+            mb.polar_customer_id = Some("cust_kill_b".to_string());
+            vec![ma, mb]
+        };
+        let metas = metas_of();
+        let id_a = format!("ingest_gb-cust_kill_a-{}", d(2));
+        let id_b = format!("ingest_gb-cust_kill_b-{}", d(2));
+
+        // Run 1: the first POST (tenant A) is accepted at once; the second (tenant
+        // B) is held open for 30 s — long enough to abort the job while it waits.
+        let polar = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"inserted": 1})),
+            )
+            .up_to_n_times(1)
+            .mount(&polar)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"inserted": 1}))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&polar)
+            .await;
+        {
+            let _env = PolarEnvGuard::new(&polar.uri());
+            let ch2 = ch.clone();
+            let metas2 = metas_of();
+            let job = tokio::spawn(async move {
+                let card = RateCard::unavailable();
+                let client =
+                    PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+                backfill_missed_days(&ch2, &metas2, today, &card, Some(&client)).await
+            });
+            // Wait until Polar has A's batch AND B's is in flight, then kill the job.
+            let mut seen = 0usize;
+            for _ in 0..200 {
+                seen = polar.received_requests().await.unwrap_or_default().len();
+                if seen >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert_eq!(seen, 2, "A accepted and B in flight before the kill");
+            job.abort();
+            assert!(
+                job.await.unwrap_err().is_cancelled(),
+                "the job died mid-emission"
+            );
+        }
+        assert_eq!(
+            received_external_ids(&polar).await,
+            vec![id_a.clone(), id_b.clone()],
+            "run 1: A's batch reached Polar, B's was in flight"
+        );
+        assert!(
+            !job_completed_on(&ch, d(1)).await.unwrap(),
+            "the marker was never written — the job died before it"
+        );
+        // The gauges DID land before the emission loop (write_gauges runs first).
+        let gauge_rows: u64 = ch
+            .query("SELECT count() FROM tracelane.meter_gauges WHERE day = toDate(?) AND tenant_id != ?")
+            .bind(d(1).to_string())
+            .bind(JOB_MARKER_TENANT)
+            .fetch_one()
+            .await
+            .unwrap();
+        let _ = gauge_rows; // may be 0 with no spans; the MARKER is the assertion
+
+        // Run 2 (the next tick): a fresh recorder, no kill. The unmarked day is
+        // recomputed and BOTH tenants re-emitted — A under the identical id.
+        let card = RateCard::unavailable();
+        let up = recording_polar(200).await;
+        {
+            let _env = PolarEnvGuard::new(&up.uri());
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+                .await
+                .expect("backfill runs");
+            assert_eq!(n, 1, "the unmarked day is retried");
+        }
+        let run2 = received_external_ids(&up).await;
+        assert_eq!(
+            run2,
+            vec![id_a.clone(), id_b.clone()],
+            "run 2 re-emits the WHOLE day: A again (Polar dedupes it) and B"
+        );
+        assert_eq!(
+            run2[0], id_a,
+            "A's external_id is byte-identical across the retry"
+        );
+        // The retried bodies are byte-identical too — same tenant, same period, same
+        // recomputed value — which is what makes the vendor-side dedup honest.
+        async fn first_body(srv: &wiremock::MockServer) -> Vec<u8> {
+            srv.received_requests()
+                .await
+                .unwrap_or_default()
+                .first()
+                .map(|r| r.body.clone())
+                .unwrap_or_default()
+        }
+        assert_eq!(
+            first_body(&polar).await,
+            first_body(&up).await,
+            "A's retried POST body is byte-identical to the accepted one"
+        );
+        assert!(
+            job_completed_on(&ch, d(1)).await.unwrap(),
+            "every emission accepted ⇒ marked"
+        );
+
+        // Run 3: nothing left.
+        {
+            let _env = PolarEnvGuard::new(&up.uri());
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let n = backfill_missed_days(&ch, &metas, today, &card, Some(&client))
+                .await
+                .expect("backfill runs");
+            assert_eq!(n, 0, "a marked day is not revisited");
+        }
+    }
+
     fn cycle(start: (i32, u32, u32), end: (i32, u32, u32)) -> crate::billing::period::Cycle {
         (
             dt(start.0, start.1, start.2, 0, 0),
@@ -2054,13 +2815,72 @@ mod tests {
         }
     }
 
+    /// B-445: the SQL the GC actually runs (not a copy of it) carries the grace
+    /// window and the reference check, and a negative grace clamps to 0.
     #[test]
-    fn gc_mutation_targets_blobs_not_referenced_by_blob_refs() {
-        let sql = "ALTER TABLE tracelane.blobs DELETE WHERE (tenant_id, hash) NOT IN \
-                   (SELECT tenant_id, hash FROM tracelane.blob_refs)";
-        assert!(sql.contains("tracelane.blobs"));
-        assert!(sql.contains("tracelane.blob_refs"));
-        assert!(sql.contains("NOT IN"));
+    fn gc_sql_deletes_only_unreferenced_blobs_older_than_the_grace_window() {
+        let sql = gc_sql(14);
+        assert!(sql.contains("first_seen < now() - INTERVAL 14 DAY"));
+        assert!(sql.contains("NOT IN (SELECT tenant_id, hash FROM tracelane.blob_refs)"));
+        // One SETTINGS clause per statement — `capped()` owns it (see `gc_sql`).
+        assert!(!sql.contains("SETTINGS"), "{sql}");
+        assert!(capped(&sql).matches("SETTINGS").count() == 1);
+        assert!(gc_sql(-3).contains("INTERVAL 0 DAY"));
+    }
+
+    /// B-445, against a REAL ClickHouse (`run-clickhouse-integration.sh`): behaviour,
+    /// not SQL text. Three blobs — referenced and old, unreferenced and YOUNG,
+    /// unreferenced and old — and only the third is deleted. Before B-445 the second
+    /// died too; that is the RED this test was written against.
+    ///
+    /// Run: `CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 cargo test -p gateway --bin gateway \
+    ///   billing::metering_job::tests::gc_leaves_referenced_and_young_blobs_against_a_real_clickhouse -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a real ClickHouse with schema.sql + migration 24 applied; set CLICKHOUSE_TEST_URL"]
+    async fn gc_leaves_referenced_and_young_blobs_against_a_real_clickhouse() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL");
+        let ch = crate::clickhouse_query::ch_client(url.clone());
+        let tenant = uuid::Uuid::new_v4().to_string();
+        let h = |i: u8| format!("{:02x}{}", i, "00".repeat(31));
+        // referenced + old · unreferenced + young · unreferenced + old
+        let rows = [
+            (h(1), "now() - INTERVAL 40 DAY", true),
+            (h(2), "now() - INTERVAL 1 DAY", false),
+            (h(3), "now() - INTERVAL 40 DAY", false),
+        ];
+        for (hash, first_seen, referenced) in &rows {
+            ch.query(&format!(
+                "INSERT INTO tracelane.blobs (tenant_id, hash, bytes, size, first_seen) \
+                 VALUES ('{tenant}', unhex('{hash}'), 'x', 1, {first_seen})"
+            ))
+            .execute()
+            .await
+            .expect("plant blob");
+            if *referenced {
+                ch.query(&format!(
+                    "INSERT INTO tracelane.blob_refs (tenant_id, hash, span_id, day) \
+                     VALUES ('{tenant}', unhex('{hash}'), 'span-1', today())"
+                ))
+                .execute()
+                .await
+                .expect("plant ref");
+            }
+        }
+        run_gc(&url, 14).await.expect("gc runs");
+        let remaining: Vec<String> = ch
+            .query("SELECT hex(hash) FROM tracelane.blobs WHERE tenant_id = ? ORDER BY hash")
+            .bind(&tenant)
+            .fetch_all()
+            .await
+            .expect("read back");
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect::<Vec<_>>(),
+            vec![h(1), h(2)],
+            "the referenced blob and the young blob survive; only the old unreferenced one is gone"
+        );
     }
 
     /// B-424 + B-425, against a REAL ClickHouse — neither defect is visible to
@@ -2225,10 +3045,27 @@ mod tests {
         assert_eq!(scan_period.get(&tid).copied(), Some(scanned));
         // …and the series read runs with the same join (this tenant's one
         // fixture span is one series, started an hour ago — inside any window).
+        // RI-05 slice 3: a planted refusal AGGREGATE for the same tenant (a different
+        // name, empty model/provider — a distinct tuple) must NOT become a second
+        // billable series. Before the `name != REJECTED_SPAN_NAME` filter this read 2.
+        ch.query(
+            "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) \
+             VALUES (?, 'ri05-rej-trace', 'ri05-rej-span', ?, now64(6) - INTERVAL 30 MINUTE, now64(6) - INTERVAL 29 MINUTE, \
+                     '{\"tracelane_rejection_reason\":\"rate_limited\",\"tracelane_rejection_count\":200}')",
+        )
+        .bind(&tid)
+        .bind(crate::rejection_metrics::REJECTED_SPAN_NAME)
+        .execute()
+        .await
+        .expect("insert the refusal aggregate");
         let series = query_series(&ch, &metas, None)
             .await
             .expect("series query must run");
-        assert_eq!(series.get(&tid).copied(), Some(1.0), "{series:?}");
+        assert_eq!(
+            series.get(&tid).copied(),
+            Some(1.0),
+            "a refusal aggregate is not a billable series: {series:?}"
+        );
         let ingest_period =
             query_period_to_date_meter_counter(&ch, "ingest_bytes", &metas, Utc::now())
                 .await
@@ -2244,20 +3081,28 @@ mod tests {
         );
 
         // B-424: the trailing reads and the gap-backfill read run at all, and
-        // the per-day series is the SUM of that day's counter rows.
+        // the per-day series is the SUM of that day's counter rows. B-468: the
+        // series is DENSE — 31 entries, yesterday LAST, every other day an
+        // explicit zero.
         let trailing = query_trailing_daily_meter_counter(&ch, "ingest_bytes", today)
             .await
             .expect("trailing ingest read must run (B-424: NO_COMMON_TYPE until fixed)");
-        assert_eq!(trailing.get(&tid), Some(&vec![12.0]), "{trailing:?}");
+        let mut expected = vec![0.0; TRAILING_DAYS];
+        expected[TRAILING_DAYS - 1] = 12.0;
+        assert_eq!(trailing.get(&tid), Some(&expected), "{trailing:?}");
         let evals = query_trailing_daily_meter_counter(&ch, "eval_runs", today)
             .await
             .expect("trailing eval read must run");
-        assert_eq!(evals.get(&tid), Some(&vec![1.0]));
+        let mut expected = vec![0.0; TRAILING_DAYS];
+        expected[TRAILING_DAYS - 1] = 1.0;
+        assert_eq!(evals.get(&tid), Some(&expected));
         let scan_trailing =
             query_trailing_daily_scan_bytes(&ch, today.succ_opt().expect("tomorrow"))
                 .await
                 .expect("trailing scan read must run");
-        assert_eq!(scan_trailing.get(&tid), Some(&vec![scanned]));
+        let mut expected = vec![0.0; TRAILING_DAYS];
+        expected[TRAILING_DAYS - 1] = scanned;
+        assert_eq!(scan_trailing.get(&tid), Some(&expected));
         let done = query_completed_days(&ch, yesterday, today)
             .await
             .expect("completed-days read must run (B-424: NO_COMMON_TYPE until fixed)");

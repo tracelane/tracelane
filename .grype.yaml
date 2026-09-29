@@ -19,6 +19,14 @@
 # this file with `--config .grype.yaml` (v0.112 does not auto-discover it).
 
 ignore:
+  # SRE-40 (2026-09-22): glibc 2.43-r11 in the gateway/ingest runtime base —
+  # CVE-2026-19499, `strfmon`/`strfmon_l` right-justified width-padding overflow. NVD:
+  # "no network-facing application impact is known"; no fixed package is published
+  # (grype fix versions: none). A Rust binary never calls strfmon — ring/aws-lc/tokio
+  # do not, and the gateway has no libc formatting call site. Pinned by VULN ID, not by
+  # package: a different glibc CVE must fail this scan.
+  # REVIEW: 2026-11-07 — drop this the day the base image ships a fixed glibc.
+  - vulnerability: CVE-2026-19499
   # All Go stdlib CVEs come from the vendored esbuild dev-tool binary.
   # REVIEW: 2026-11-07
   - package:

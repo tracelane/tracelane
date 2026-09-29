@@ -1328,6 +1328,27 @@ mod tests {
         ) -> Result<Vec<crate::trace_reads::SessionTraceRow>> {
             unimplemented!()
         }
+        async fn session_totals(
+            &self,
+            _t: &TenantId,
+            _session_id: &str,
+        ) -> Result<Option<crate::trace_reads::SessionTotalsRow>> {
+            unimplemented!()
+        }
+        async fn session_turns(
+            &self,
+            _t: &TenantId,
+            _session_id: &str,
+            _cursor: Option<(i64, String)>,
+            _limit: u32,
+        ) -> Result<
+            Vec<(
+                crate::trace_reads::SessionTurnRow,
+                Option<crate::trace_reads::SessionExchange>,
+            )>,
+        > {
+            unimplemented!()
+        }
     }
 
     /// In-memory `ShareStore` — mirrors `PgShareStore`'s semantics (the cap,

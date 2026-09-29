@@ -54,7 +54,7 @@ the gateway answers `403 insufficient_scope` and names `ingest` in the body. Tic
 
 Constructing a client does not patch it. After `init()`, you have two options.
 
-### Option A — `auto_instrument()` (best-effort, 4 libraries)
+### Option A — `auto_instrument()` (best-effort, 5 libraries)
 
 ```python
 from tracelane import init, auto_instrument
@@ -63,11 +63,15 @@ init(endpoint="http://localhost:4318", api_key="tlane_...")
 auto_instrument()
 ```
 
-`auto_instrument()` attempts **only** `anthropic`, `openai`, `litellm`, and
-`claude_code`, and only if each is installed. `langgraph` is a no-op here (call
-`instrument_langgraph(graph)` yourself after compiling). **Every other library —
-LangChain, LlamaIndex, CrewAI, AutoGen, Pinecone, MCP, … — is NOT touched by
-`auto_instrument()`**; use the explicit calls below.
+`auto_instrument()` attempts `anthropic`, `openai`, `litellm`, `langgraph`, and
+`claude_code`, printing each outcome to stderr. Anthropic/OpenAI only wrap a new
+default client; wrap your own clients explicitly. Install `tracelane[langgraph]`
+to capture graph and child runs via OpenInference's LangChain callbacks and your
+existing exporter. Inputs/outputs are redacted; custom metadata may still be
+captured. Existing LangChain instrumentation keeps its configuration. If the
+integration is unavailable, call `instrument_langgraph(graph)` after compilation
+for graph-level spans. See [LangGraph](/integrations/langgraph) for a runnable
+example. All other adapters need explicit calls.
 
 ### Option B — explicit `instrument_*` calls
 
@@ -135,7 +139,7 @@ instrument_langchain(model)
 # LangGraph
 from langgraph.graph import StateGraph
 graph = build_graph().compile()
-instrument_langgraph(graph)      # graph steps emit spans
+instrument_langgraph(graph)      # manual fallback: graph-level spans
 
 # LlamaIndex
 from llama_index.core import VectorStoreIndex

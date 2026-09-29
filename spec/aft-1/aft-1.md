@@ -190,7 +190,7 @@ maps to a subset of these entries.
 |---|---|
 | **Name** | Trajectory-level anomaly |
 | **Description** | The sequence of spans in an agent trace is statistically anomalous compared to a learned distribution of normal traces — a catch-all for novel failure modes not covered by rule-based entries. |
-| **Detection** | A learned sequence model (e.g. a recurrent autoencoder) flags a reconstruction error above threshold. This is a model-based, roadmap-class detector, not a rule. |
+| **Detection** | A learned sequence model (e.g. a recurrent autoencoder) flags a reconstruction error above threshold. This is a model-based detector, not a rule; there is no reference implementation. |
 | **Intervention** | `Warn` initially; escalates to `Block` above a higher threshold. |
 | **References** | Sequence-anomaly / autoencoder approaches to trace-level outlier detection. |
 
@@ -241,4 +241,4 @@ AFT is CC0 and open to extension. To propose an entry:
 |---|---|---|
 | v0.1 | 2026-04-29 | Initial taxonomy — 9 entries across 5 domains. |
 | v0.2 | 2026-07-10 | Relicensed to CC0 1.0 for public-domain publication; made vendor-neutral (detection/intervention described independently of any one implementation); observe-first intervention model; added the tool-definition-drift (silent rug-pull) entry; removed unverifiable model-training figures. |
-| v0.3 | 2026-07-14 | Added AFT-CONTEXT-OVERFLOW-001 (context-window overflow, new Context domain) and AFT-TRAJ-RETRYLOOP-001 (retry storm, Trajectory domain). Reference-implementation detectors for both are roadmap, not yet shipped (see *Reference implementation* — coverage is a subset and expanding). |
+| v0.3 | 2026-07-14 | Added AFT-CONTEXT-OVERFLOW-001 (context-window overflow, new Context domain) and AFT-TRAJ-RETRYLOOP-001 (retry storm, Trajectory domain). There is no reference detector in the gateway yet for either (see *Reference implementation* — coverage is a subset and expanding). |

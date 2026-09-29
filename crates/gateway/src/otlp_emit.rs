@@ -205,9 +205,13 @@ fn unix_now_secs() -> u64 {
 ///
 /// The stream's `DiscardPolicy::Old` (`crates/ingest/src/nats_consumer.rs`)
 /// is unchanged: at the byte cap the server drops the OLDEST spans and still
-/// acks this one. That is a declared delivery-buffer tradeoff, bounded and
-/// counted on the ingest side; it is not the silent per-publish loss this
-/// change closes.
+/// acks this one. That is a declared delivery-buffer tradeoff — and since
+/// RI-06 / B-449 (2026-09-19) it IS counted: ingest's `GapTracker` notes
+/// `SpansLostBeforeConsume` by the exact number and writes a
+/// `tracelane.capture_gaps` row, and this gateway's `/health.spans_stream`
+/// gauges the visible gap. (This comment claimed "counted on the ingest side"
+/// for a month while nothing counted it — B-448 site 8.) It is not the silent
+/// per-publish loss this change closes.
 ///
 /// Parameters:
 /// - `nats`  — connected NATS client (from `AppState::nats`)
@@ -224,13 +228,7 @@ fn unix_now_secs() -> u64 {
 pub async fn publish_span(nats: &async_nats::Client, span: &TracelaneSpan) -> anyhow::Result<()> {
     let subject = span_subject(span);
     let payload = serde_json::to_vec(span).context("span serialize")?;
-    // `jetstream::new` is a cheap context wrapper around the (Arc-backed) client;
-    // building it per call keeps the signature the six call sites already use.
-    let js = async_nats::jetstream::new(nats.clone());
-    let ack = js
-        .publish(subject, payload.into())
-        .await
-        .context("JetStream publish")?;
+    let ack = publish_span_bytes(nats, subject, payload, msg_id_for(span)).await?;
     // Fail-OPEN, bounded: a slow-but-alive JetStream must not hold one task per
     // request for the length of the outage. After ACK_TIMEOUT the span is counted
     // as a publish failure (it may still land — the stream may ack late — but the
@@ -240,6 +238,40 @@ pub async fn publish_span(nats: &async_nats::Client, span: &TracelaneSpan) -> an
         .context("JetStream ack timed out")?
         .context("JetStream ack")?;
     Ok(())
+}
+
+/// RI-07 / B-443: the JetStream `Nats-Msg-Id` for a span — `tenant:trace:span`. The
+/// server's duplicate window on the spans stream (2 min, `jetstream_limits.rs`) drops a
+/// second publish with the same id, so an SDK batch retried after a `503`, or a duplicate
+/// export, lands ONCE at the boundary instead of twice-then-collapsed at the table. The
+/// tenant prefix keeps two tenants' equal ids apart: an OTLP `span_id` is 8 client-chosen
+/// bytes. Under the NATS header limit by a wide margin (≤ 36 + 1 + 36 + 1 + 32 chars).
+#[must_use]
+pub fn msg_id_for(span: &TracelaneSpan) -> String {
+    format!("{}:{}:{}", span.tenant_id, span.trace_id, span.span_id)
+}
+
+/// The one publish both callers use: an acked JetStream publish carrying `Nats-Msg-Id`,
+/// returning the ack future UN-AWAITED so a batch caller (`POST /v1/traces`) can await
+/// many acks under ONE `ACK_TIMEOUT` instead of `N × ACK_TIMEOUT` during an outage.
+///
+/// # Errors
+/// Serialization is the caller's; this fails only on the publish itself (the client
+/// could not hand the bytes to the server).
+pub async fn publish_span_bytes(
+    nats: &async_nats::Client,
+    subject: String,
+    payload: Vec<u8>,
+    msg_id: String,
+) -> anyhow::Result<async_nats::jetstream::context::PublishAckFuture> {
+    // `jetstream::new` is a cheap context wrapper around the (Arc-backed) client;
+    // building it per call keeps the signature the call sites already use.
+    let js = async_nats::jetstream::new(nats.clone());
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Nats-Msg-Id", msg_id.as_str());
+    js.publish_with_headers(subject, headers, payload.into())
+        .await
+        .context("JetStream publish")
 }
 
 /// How long a span publish waits for its JetStream ack before it is counted as
@@ -562,6 +594,84 @@ mod shutdown_drain_tests {
     use tracelane_shared::degradation::{Degradation, count};
 
     use super::DRAIN_TEST_LOCK as DRAIN_LOCK;
+
+    #[test]
+    fn msg_id_is_tenant_trace_span_so_two_tenants_equal_ids_differ() {
+        let mut a = super::span_publish_tests::test_span("00000000-0000-0000-0000-000000000001");
+        a.trace_id = uuid::Uuid::from_u128(0x1111);
+        a.span_id = uuid::Uuid::from_u128(0x2222);
+        let mut b = a.clone();
+        b.tenant_id = TenantId::from_self_host_config(uuid::Uuid::from_u128(2));
+        let id = msg_id_for(&a);
+        let parts: Vec<&str> = id.split(':').collect();
+        assert_eq!(parts.len(), 3, "tenant:trace:span");
+        assert_eq!(parts[0], a.tenant_id.to_string());
+        assert_eq!(parts[1], a.trace_id.to_string());
+        assert_eq!(parts[2], a.span_id.to_string());
+        assert_ne!(
+            id,
+            msg_id_for(&b),
+            "the tenant prefix keeps equal ids apart"
+        );
+        assert!(id.len() <= 128);
+    }
+
+    /// RI-07 §7 row 2, against a REAL nats-server (check-nats-auth.sh): the same span
+    /// published twice through `publish_span_bytes` inside the duplicate window lands
+    /// ONCE; a different tenant's equal ids land as a second message. Without the header
+    /// the same stream reads 2 — that is the RED this test was written against.
+    #[tokio::test]
+    #[ignore = "needs NATS_TEST_URL_OPS — run scripts/ci/check-nats-auth.sh"]
+    async fn ri07_nats_msg_id_dedups_a_republished_span_at_the_boundary() {
+        let ops_url = std::env::var("NATS_TEST_URL_OPS").expect("NATS_TEST_URL_OPS");
+        let nc = tracelane_shared::nats_connect::NatsConnect::from_url(&ops_url);
+        let client = nc.options().connect(&nc.url).await.expect("ops connects");
+        let js = async_nats::jetstream::new(client.clone());
+        let name = format!("RI07_{}", uuid::Uuid::new_v4().simple());
+        let subject = format!("tracelane.ri07test.{}.t", name.to_lowercase());
+        let mut stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("tracelane.ri07test.{}.>", name.to_lowercase())],
+                ..Default::default()
+            })
+            .await
+            .expect("stream (server default duplicate window, 2 min)");
+        let mut a = super::span_publish_tests::test_span("00000000-0000-0000-0000-000000000001");
+        a.trace_id = uuid::Uuid::new_v4();
+        a.span_id = uuid::Uuid::new_v4();
+        let payload = serde_json::to_vec(&a).unwrap();
+        for _ in 0..2 {
+            publish_span_bytes(&client, subject.clone(), payload.clone(), msg_id_for(&a))
+                .await
+                .expect("publish")
+                .await
+                .expect("ack");
+        }
+        assert_eq!(
+            stream.info().await.expect("info").state.messages,
+            1,
+            "the second publish carried the same Nats-Msg-Id and was dropped at the boundary"
+        );
+        let mut b = a.clone();
+        b.tenant_id = TenantId::from_self_host_config(uuid::Uuid::from_u128(2));
+        publish_span_bytes(
+            &client,
+            subject.clone(),
+            serde_json::to_vec(&b).unwrap(),
+            msg_id_for(&b),
+        )
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+        assert_eq!(
+            stream.info().await.expect("info").state.messages,
+            2,
+            "a different tenant is a different id"
+        );
+        let _ = js.delete_stream(&name).await;
+    }
 
     #[tokio::test]
     async fn drain_waits_for_in_flight_publishes_to_finish() {

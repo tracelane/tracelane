@@ -28,6 +28,13 @@ export type LatencyModelRow = {
 /** `GET /v1/query/latency-breakdown` response. */
 export type LatencyBreakdown = {
 	window_hours: number;
+	cache_hit_samples?: number;
+	cache_hit_served_p50_ms?: number;
+	cache_hit_served_p95_ms?: number;
+	cold_start_samples?: number;
+	warm_samples?: number;
+	overhead_warm_p50_ms?: number;
+	overhead_warm_p95_ms?: number;
 	overhead_p50_ms: number;
 	overhead_p95_ms: number;
 	overhead_p99_ms: number;

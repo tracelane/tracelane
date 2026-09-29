@@ -152,9 +152,8 @@ discover it:
   Postgres is present at all, so it always resolves to the free five.
 - **Multi-tenant self-host** (leave `TRACELANE_SELF_HOST` unset and run your own
   Postgres) **can**: the gate reads `plan_entitlements` / `workspace_entitlements`
-  from *your* database. There is no license key, no signature check and no
-  phone-home anywhere in the entitlement path — a single `UPDATE
-  plan_entitlements SET f_guardrail_r2 = true …` enables all four.
+  from *your* database. There is no license key or phone-home in the entitlement path — the gates are
+  database-driven, so you control them on your own deployment.
 
 So the gate binds **hosted** customers commercially, not self-hosters
 technically. Making it bind self-hosters would need a license boundary this
@@ -250,10 +249,10 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
 ### Added
 
 - **Rust gateway** — OpenAI-, Anthropic-, and Google-shaped request proxying across
-  30+ providers (7 native adapters plus any OpenAI-compatible endpoint), with
+  its provider catalog (native adapters plus any OpenAI-compatible endpoint), with
   provider failover, a single bounded retry, and per-`(provider, region)`
   circuit breakers. Low, bounded overhead on the hot path.
-- **BYOK key custody** — provider keys are envelope-encrypted at rest (`aws-lc-rs`
+- **BYOK key custody** — provider keys are envelope-encrypted at rest (`ring`
   AEAD), with AAD bound to `(tenant_id, provider_id)`. Keys never appear in logs,
   spans, or error bodies.
 - **Full-fidelity observability** — OTel GenAI + OpenInference semantic conventions
@@ -261,14 +260,14 @@ gate. Prefer 0.2.3: it carries the same code with a verifiable release.
   in the Next.js dashboard.
 - **Tamper-evident audit ledger** — per-tenant Merkle-batched hash chain with an
   offline, no-account verifier (`@tracelanedev/cli` `tlane verify --offline`) for EU AI
-  Act Article 12 record-keeping. Sigstore Rekor anchoring is **(roadmap)**.
+  Act Article 12 record-keeping. Sigstore Rekor anchoring was not yet available at this release and has since shipped.
 - **Inline guardrails** — heuristic pre-flight policy enforcement at the gateway
   (cost, secret/PII, tool-safety, lethal-trifecta taint, format, system-prompt-leak,
   topic). A multi-model ML ensemble and async judge are **(roadmap)**.
 - **Predictive signatures** — live failure-signature detection surfaced on the
-  Signatures page; additional predictors ship progressively behind entitlement flags.
+  Signatures page.
 - **MCP server** — read-only, tenant-scoped, bearer-token auth (Stdio + Streamable
-  HTTP). Runs from a clone; the npm package is **not published yet**. OAuth 2.1 PKCE
+  HTTP). Runs from a clone at this release; it is now published to npm as `@tracelanedev/mcp`. OAuth 2.1 PKCE
   is **(roadmap)**.
 - **SDKs + CLI** — Python and TypeScript instrumentation SDKs (40+ framework
   adapters, never capture keys or content), and the `tlane` CLI (`init`, `verify`,

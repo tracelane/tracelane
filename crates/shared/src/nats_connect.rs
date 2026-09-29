@@ -87,11 +87,31 @@ impl NatsConnect {
         self.user.is_some()
     }
 
-    /// The `ConnectOptions` with the credential applied (if any). Callers chain
-    /// their own `retry_on_initial_connect()` etc. on the result.
+    /// The inbox prefix this credential's connection uses for every request
+    /// reply and pull-consumer delivery: `_INBOX_<user>` when a user is present,
+    /// async-nats's default `_INBOX` otherwise. **B-474 (REV-3, 2026-09-21):**
+    /// both service users were granted `subscribe: _INBOX.>`, so a process holding
+    /// the ingest credential could subscribe `_INBOX.>` and passively receive the
+    /// gateway's audit head-writer deliveries (and vice versa) — refusing the other
+    /// stream's `MSG.NEXT` does not stop a reply from landing on a shared inbox
+    /// subject. Deriving the prefix from the credential (never from a second
+    /// setting) means `nats.conf` can grant each user exactly its own prefix and
+    /// the two can never drift apart.
+    #[must_use]
+    pub fn inbox_prefix(&self) -> Option<String> {
+        self.user.as_deref().map(|u| format!("_INBOX_{u}"))
+    }
+
+    /// The `ConnectOptions` with the credential applied (if any) and, for an
+    /// authenticated user, the per-user inbox prefix ([`Self::inbox_prefix`]).
+    /// Callers chain their own `retry_on_initial_connect()` etc. on the result.
     #[must_use]
     pub fn options(&self) -> async_nats::ConnectOptions {
         let o = async_nats::ConnectOptions::new();
+        let o = match self.inbox_prefix() {
+            Some(prefix) => o.custom_inbox_prefix(prefix),
+            None => o,
+        };
         match (&self.user, &self.password) {
             // async-nats 0.42's `user_and_password(String, String)` owns the
             // password for the connection's lifetime (it re-sends CONNECT on
@@ -108,6 +128,25 @@ impl NatsConnect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-474: the inbox prefix follows the credential — `_INBOX_<user>` for an
+    /// authenticated connection, nothing (async-nats's default) for anonymous.
+    #[test]
+    fn the_inbox_prefix_is_derived_from_the_user_and_absent_without_one() {
+        assert_eq!(
+            NatsConnect::split("nats://gateway:pw@nats:4222")
+                .inbox_prefix()
+                .as_deref(),
+            Some("_INBOX_gateway")
+        );
+        assert_eq!(
+            NatsConnect::split("nats://ingest:pw@nats:4222")
+                .inbox_prefix()
+                .as_deref(),
+            Some("_INBOX_ingest")
+        );
+        assert_eq!(NatsConnect::split("nats://nats:4222").inbox_prefix(), None);
+    }
 
     #[test]
     fn credentials_are_lifted_out_of_the_url_and_the_dial_url_is_clean() {

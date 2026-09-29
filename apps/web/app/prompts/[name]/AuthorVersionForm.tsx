@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
 
 /**
  * AuthorVersionForm — in-dashboard form to author a new prompt version.
@@ -18,6 +19,7 @@
  * in the create response and must not be fabricated.
  */
 
+import { apiFetchRaw } from "@/lib/api-fetch";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -68,7 +70,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 		if (vars.length > 0) body.template_variables = vars;
 
 		try {
-			const res = await fetch(
+			const res = await apiFetchRaw(
 				`/api/prompts/${encodeURIComponent(promptName)}/versions`,
 				{
 					method: "POST",
@@ -116,7 +118,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 
 	return (
 		// `.surface-card`: this is the page's authoring panel — a bordered surface
-		// with padding and content — so it takes `--radius-card`. `rounded-lg` is the
+		// with padding and content — so it takes `--radius-card`. `rounded-card` is the
 		// CONTROL radius and belongs on the inputs and buttons inside it, not on the
 		// panel around them.
 		<div className="surface-card space-y-4 border border-line bg-surface p-5">
@@ -124,7 +126,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 
 			{status === "success" && result ? (
 				<div className="space-y-3">
-					<div className="rounded-lg border border-ok bg-ok-soft p-3 text-xs space-y-1">
+					<div className="rounded-card border border-ok bg-ok-soft p-3 text-xs space-y-1">
 						<p className="font-semibold text-ok-ink">
 							Version {result.version_number} authored
 						</p>
@@ -151,13 +153,14 @@ export function AuthorVersionForm({ promptName }: Props) {
 						To promote this version to production, copy the ID above and use the
 						Promote panel below.
 					</p>
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={handleReset}
 						className="text-xs text-action-ink underline underline-offset-2 hover:opacity-80 transition-opacity"
 					>
 						Author another version
-					</button>
+					</Button>
 				</div>
 			) : (
 				<form onSubmit={handleSubmit} className="space-y-3">
@@ -176,7 +179,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 							placeholder={
 								"You are a helpful assistant.\n\nUser query: {{user_query}}"
 							}
-							className="w-full rounded-sm border border-line bg-bg px-3 py-2 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line resize-y"
+							className="w-full rounded-control border border-line bg-bg px-3 py-2 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line resize-y"
 							required
 							disabled={isLoading}
 						/>
@@ -196,7 +199,7 @@ export function AuthorVersionForm({ promptName }: Props) {
 							value={modelPin}
 							onChange={(e) => setModelPin(e.target.value)}
 							placeholder="gpt-4o-mini"
-							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
+							className="w-full rounded-control border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 							disabled={isLoading}
 						/>
 					</div>
@@ -215,24 +218,25 @@ export function AuthorVersionForm({ promptName }: Props) {
 							value={templateVars}
 							onChange={(e) => setTemplateVars(e.target.value)}
 							placeholder="user_query, context"
-							className="w-full rounded-sm border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
+							className="w-full rounded-control border border-line bg-bg px-3 py-1.5 text-xs font-mono text-ink placeholder:text-ink-3 focus:border-action-line"
 							disabled={isLoading}
 						/>
 					</div>
 
 					{status === "error" ? (
-						<div className="rounded-lg border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
+						<div className="rounded-card border border-danger bg-danger-soft p-3 text-xs text-danger-ink">
 							{errorMsg || "Unexpected failure — check gateway logs."}
 						</div>
 					) : null}
 
-					<button
+					<Button
+						variant="bare"
 						type="submit"
 						disabled={isLoading || !content.trim()}
-						className="w-full rounded-md bg-action px-4 py-2 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:opacity-40 disabled:cursor-not-allowed"
+						className="w-full rounded-control bg-action px-4 py-2 text-xs font-semibold text-action-on transition-colors hover:bg-action/90 disabled:opacity-40 disabled:cursor-not-allowed"
 					>
 						{isLoading ? "Authoring…" : "Author version"}
-					</button>
+					</Button>
 				</form>
 			)}
 		</div>

@@ -18,7 +18,7 @@ Example (explicit — traces exactly what you wrap)::
     client = anthropic.Anthropic()
     instrument_anthropic(client)   # now client.messages.create() emits spans
 
-Best-effort auto-instrumentation (only anthropic, openai, litellm, claude_code
+Best-effort auto-instrumentation (only anthropic, openai, litellm, langgraph, claude_code
 that are installed; everything else needs an explicit ``instrument_*`` call)::
 
     from tracelane import init, auto_instrument
@@ -27,7 +27,7 @@ that are installed; everything else needs an explicit ``instrument_*`` call)::
     auto_instrument()
 """
 
-import contextlib
+import sys
 
 # Individual instrument_* re-exports for explicit single-library usage
 from tracelane.instrumentations.anthropic import instrument_anthropic
@@ -75,15 +75,17 @@ from tracelane.tracer import TracelaneConfig, init, shutdown
 def auto_instrument() -> None:
     """Best-effort auto-instrumentation for a small, fixed set of libraries.
 
-    Attempts exactly these, and only if the library is installed (missing ones
-    are skipped silently): **anthropic, openai, litellm, langgraph, claude_code**.
-    Of those, ``anthropic``/``openai`` are wrapped on a freshly-constructed
-    default client, ``litellm``/``claude_code`` patch the module/subprocess, and
-    ``langgraph`` is a **no-op here** (graphs are user-constructed — call
-    ``instrument_langgraph(graph)`` yourself after compiling).
+    Attempts anthropic, openai, litellm, langgraph and claude_code. Prints an
+    outcome for each to stderr, including missing dependencies or attach errors.
+    Anthropic/OpenAI wrap a newly constructed default client only; use explicit
+    instrumentation for clients you create. LangGraph uses OpenInference's
+    LangChain callbacks with the existing OTel provider (install the langgraph
+    extra). This also captures LangChain runs used by the graph. Inputs, outputs,
+    prompts and invocation parameters are hidden; graph structure is preserved.
+    If unavailable, call ``instrument_langgraph(graph)`` for graph-level spans.
 
     EVERY other adapter (composio, pinecone, qdrant, mem0, letta, firecrawl,
-    langchain, llamaindex, crewai, autogen, pydantic_ai, bedrock, vertexai,
+    llamaindex, crewai, autogen, pydantic_ai, bedrock, vertexai,
     azure_openai, magentic_one, smolagents, haystack, browserbase, e2b, mcp,
     openai_agents, openrouter) is NOT touched by auto_instrument — construct the
     object and call its ``instrument_*`` function directly. Call after ``init()``.
@@ -93,55 +95,75 @@ def auto_instrument() -> None:
         from tracelane import init, auto_instrument
 
         init(endpoint="http://localhost:4318", api_key="...")
-        auto_instrument()   # wraps installed anthropic/openai/litellm/claude_code
+        auto_instrument()   # prints attachment outcomes to stderr
     """
-    _try_instrument_anthropic()
-    _try_instrument_openai()
-    _try_instrument_litellm()
-    _try_instrument_langgraph()
-    _try_instrument_claude_code()
+    for name, instrument in (
+        ("anthropic", _try_instrument_anthropic),
+        ("openai", _try_instrument_openai),
+        ("litellm", _try_instrument_litellm),
+        ("langgraph", _try_instrument_langgraph),
+        ("claude_code", _try_instrument_claude_code),
+    ):
+        try:
+            outcome = instrument()
+        except ImportError:
+            outcome = "unavailable (optional dependency missing)"
+        except Exception as exc:  # best-effort; never print potentially secret exception text
+            outcome = f"could not instrument ({type(exc).__name__})"
+        if name == "langgraph" and not outcome.startswith("instrumented"):
+            outcome += "; manual fallback: instrument_langgraph(graph) after compile"
+        print(f"tracelane auto_instrument: {name}: {outcome}", file=sys.stderr)
 
 
-def _try_instrument_anthropic() -> None:
-    try:
-        import anthropic as _anthro  # noqa: PLC0415
+def _try_instrument_anthropic() -> str:
+    import anthropic as _anthro
 
-        client = _anthro.Anthropic()
-        instrument_anthropic(client)
-    except Exception:  # noqa: BLE001
-        pass
+    client = _anthro.Anthropic()
+    instrument_anthropic(client)
+    return "instrumented a new default client only; wrap your own clients explicitly"
 
 
-def _try_instrument_openai() -> None:
-    try:
-        import openai as _oai  # noqa: PLC0415
+def _try_instrument_openai() -> str:
+    import openai as _oai
 
-        client = _oai.OpenAI()
-        instrument_openai(client)
-    except Exception:  # noqa: BLE001
-        pass
+    client = _oai.OpenAI()
+    instrument_openai(client)
+    return "instrumented a new default client only; wrap your own clients explicitly"
 
 
-def _try_instrument_litellm() -> None:
-    try:
-        instrument_litellm()
-    except ImportError:
-        pass
-    except Exception:  # noqa: BLE001
-        pass
+def _try_instrument_litellm() -> str:
+    instrument_litellm()
+    return "instrumented"
 
 
-def _try_instrument_langgraph() -> None:
-    # LangGraph graphs are user-constructed, so auto-instrument is a no-op here.
-    # Users call instrument_langgraph(graph) after graph compilation.
-    pass
+def _try_instrument_langgraph() -> str:
+    import langgraph  # noqa: F401 — only activate when the framework is installed
+    from openinference.instrumentation import TraceConfig
+    from openinference.instrumentation.langchain import LangChainInstrumentor
+
+    instrumentor = LangChainInstrumentor()
+    if instrumentor.is_instrumented_by_opentelemetry:
+        return "instrumented already (existing LangChain instrumentation/configuration retained)"
+    instrumentor.instrument(
+        config=TraceConfig(
+            hide_inputs=True,
+            hide_outputs=True,
+            hide_llm_invocation_parameters=True,
+            hide_llm_tools=True,
+            hide_prompts=True,
+            hide_choices=True,
+            hide_embedding_vectors=True,
+            hide_embeddings_text=True,
+        ),
+    )
+    if not instrumentor.is_instrumented_by_opentelemetry:
+        raise RuntimeError("LangChain instrumentation did not attach")
+    return "instrumented (LangChain callbacks; input/output content hidden)"
 
 
-def _try_instrument_claude_code() -> None:
-    # `with` is fine here — claude_code instrumentation is best-effort;
-    # any exception during attach is intentionally swallowed.
-    with contextlib.suppress(Exception):
-        instrument_claude_code()
+def _try_instrument_claude_code() -> str:
+    instrument_claude_code()
+    return "instrumented subprocess hooks"
 
 
 __all__ = [

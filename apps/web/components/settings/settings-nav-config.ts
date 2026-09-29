@@ -53,6 +53,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
 		items: [
 			{ href: "/settings/alerts", label: "Alerts" },
 			{ href: "/settings/evals", label: "Online Evals" },
+			{ href: "/settings/gateway", label: "Gateway" },
 		],
 	},
 	{

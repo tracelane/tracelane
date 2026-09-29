@@ -10,7 +10,7 @@
 
 import { AlertsManager } from "@/components/settings/AlertsManager";
 import { db } from "@/db";
-import { tenants } from "@/db/schema";
+import { planEntitlements, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { eq } from "drizzle-orm";
@@ -31,11 +31,34 @@ async function isAlertsEntitled(): Promise<boolean> {
 	return entitlements.f_alerts;
 }
 
+/**
+ * Whether ANY plan row currently grants alerts — read from the same
+ * `plan_entitlements` table `resolveEntitlements` reads, not hardcoded, so
+ * the day the founder flips it at DoD close this updates with it.
+ *
+ * Today it is always `false`: `db/schema.ts` (`fAlerts` on `planEntitlements`)
+ * declares the column `NOT NULL DEFAULT false` ("DARK on every plan until the
+ * founder flips it at DoD close" — ADR-059), and `db/seed.mjs` never writes
+ * it, so every plan row resolves to `false`. Fails closed (no upsell CTA) if
+ * the table can't be read — an unreachable Postgres should never show a
+ * "Upgrade" button for a feature we cannot confirm exists.
+ */
+async function anyPlanGrantsAlerts(): Promise<boolean> {
+	try {
+		const rows = await db
+			.select({ fAlerts: planEntitlements.fAlerts })
+			.from(planEntitlements);
+		return rows.some((r) => r.fAlerts);
+	} catch {
+		return false;
+	}
+}
+
 // Free tenants see an honest upsell (not an error): alerting is a Builder+
 // feature, so surface the value + the upgrade path rather than a dead gate.
 function AlertsUpsell() {
 	return (
-		<div className="rounded-lg border border-dashed border-line p-10 text-center space-y-3">
+		<div className="rounded-card border border-dashed border-line p-10 text-center space-y-3">
 			<h3 className="text-sm font-semibold text-ink">
 				Alerts is available on Builder and above
 			</h3>
@@ -54,8 +77,28 @@ function AlertsUpsell() {
 	);
 }
 
+// No plan grants alerts yet — an honest "not yet available" state, with no
+// upgrade CTA (there is nothing to upgrade TO that would turn this on).
+function AlertsNotYetAvailable() {
+	return (
+		<div className="rounded-card border border-dashed border-line p-10 text-center space-y-3">
+			<h3 className="text-sm font-semibold text-ink">
+				Alerts are not yet available on any plan
+			</h3>
+			<p className="text-xs text-ink-2 max-w-sm mx-auto">
+				Threshold rules on error rate, latency, cost, and quota — notified in
+				Slack or Discord the moment one fires — are built but not yet turned on
+				for any plan.
+			</p>
+		</div>
+	);
+}
+
 export default async function AlertsPage() {
-	const entitled = await isAlertsEntitled();
+	const [entitled, anyPlan] = await Promise.all([
+		isAlertsEntitled(),
+		anyPlanGrantsAlerts(),
+	]);
 
 	return (
 		<div className="space-y-1">
@@ -64,7 +107,13 @@ export default async function AlertsPage() {
 				Configure webhook destinations and metric threshold rules. When a rule
 				fires, Tracelane sends a notification to the configured destination.
 			</p>
-			{entitled ? <AlertsManager /> : <AlertsUpsell />}
+			{entitled ? (
+				<AlertsManager />
+			) : anyPlan ? (
+				<AlertsUpsell />
+			) : (
+				<AlertsNotYetAvailable />
+			)}
 		</div>
 	);
 }

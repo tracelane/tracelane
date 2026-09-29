@@ -1,6 +1,6 @@
 ---
 title: Trace replay & time-travel
-description: Step through any recorded Tracelane trace span-by-span from the CLI or MCP server, with shadow-fork replay across models, prompts, and tools on the roadmap.
+description: Inspect recorded Tracelane spans from the CLI or MCP server. Replay is read-only and does not re-execute models or tools.
 classification: PUBLIC
 ---
 
@@ -9,13 +9,13 @@ span sequence** — every LLM call, tool call, and guardrail verdict, in order �
 for offline inspection and debugging.
 
 <Note>
-**What is live vs. roadmap.** Stepping through a **recorded** trace
+**What replay does.** Stepping through a **recorded** trace
 (`tlane replay <traceId>` and the MCP `replay_trace` tool) is **live** — it
 reads the stored spans as-is and does **not** re-execute any model or tool.
 **Shadow-fork replay** — re-running a trace against a *different* model,
 prompt version, or tool response and diffing the outputs, plus the dashboard
-"Time-travel" UI — is **on the roadmap** and not yet available. This page marks
-the roadmap surface explicitly.
+"Time-travel" UI — is **not available**. Inspecting stored evidence is not a
+fresh execution or a guarantee that the original behavior can be reproduced.
 </Note>
 
 ## From the CLI (live)
@@ -66,25 +66,16 @@ mcp.tracelane.replay_trace({
 }
 ```
 
-## Shadow-fork replay (roadmap)
+## Executable replay is not available
 
-The following capabilities are **on the roadmap and not yet available**. They
-re-execute a trace against the gateway with overrides and require real provider
-calls:
+Earlier versions of this page described shadow forks and a time-travel scrubber
+as roadmap capabilities. They are not delivered by `tlane replay` or
+`replay_trace`. Neither accepts model overrides, prompt overrides or injected
+tool responses, and neither creates a new execution to compare.
 
-- **Model override** — replay the same input sequence against a different model
-  and diff the outputs.
-- **Prompt-version override** — replay against a different prompt version from
-  your prompt history.
-- **Tool-response injection** — override a tool's return value to reproduce a
-  scenario.
-- **Side-by-side diff** — output text, latency, token-cost, and
-  guardrail-verdict deltas between the original and the shadow run.
-- **Dashboard "Time-travel"** — the in-app scrubber UI for the above.
-
-When shadow-fork ships, it will run against the gateway with your API key
-(same guardrails apply) and will never write to your production trace store —
-each run is stored as a separate `replay_id` linked to the original `trace_id`.
+For a fresh test of a prompt change, use [evaluation runs](/eval-gates) with
+captured inputs or a curated dataset. Review the case source and reference
+coverage before treating a passing evaluation as evidence of improvement.
 
 ## Related
 

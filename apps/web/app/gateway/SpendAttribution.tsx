@@ -1,3 +1,4 @@
+import { fmtCount, fmtUsd } from "@/lib/metrics/format";
 /**
  * Spend attribution (GWY-43, Sprint 1 item 5) — where the money went, by API
  * key, model or provider.
@@ -47,36 +48,75 @@ const DIMENSIONS = [
 	{ by: "provider", label: "Provider" },
 ] as const;
 
+/** Plural noun for the truncation badge: "keys" / "models" / "providers". */
+const PLURAL: Record<CostBreakdown["by"], string> = {
+	key: "keys",
+	model: "models",
+	provider: "providers",
+};
+
 /** USD with enough precision to be useful at agent scale, where a request can
  *  cost a fraction of a cent. Never rounded to `$0.00` — see `usd` below. */
-function usd(v: number): string {
-	if (v <= 0) return "—";
-	if (v < 0.01) return `$${v.toFixed(4)}`;
-	return `$${v.toLocaleString(undefined, {
-		minimumFractionDigits: 2,
-		maximumFractionDigits: 2,
-	})}`;
-}
+const usd = (v: number) => (v > 0 ? fmtUsd(v) : "—");
 
-/** A key id is a UUID; showing all 36 characters buys nothing in a table. */
-function label(by: CostBreakdown["by"], dimension: string): string {
+/**
+ * SET-38 B5: a key's human label, read on the page from Postgres for THIS tenant.
+ * `state` is the lifecycle suffix (`revoked_at` past / future, `expires_at` past).
+ */
+export type KeyLabel = {
+	name: string;
+	prefix: string;
+	state: "revoked" | "retiring" | "expired" | null;
+};
+
+/**
+ * The row label and its tooltip. A key row reads `name · prefix…` — the public
+ * prefix, never the internal id (B-586). With the label map unavailable the short
+ * id is shown as before; with the map loaded but no match, the short id is shown
+ * AND the tooltip says the key is not in this workspace.
+ */
+function label(
+	by: CostBreakdown["by"],
+	dimension: string,
+	keyLabels: Record<string, KeyLabel> | undefined,
+): { text: string; title: string | undefined } {
 	if (dimension === "") {
 		// NOT "unattributed": a session-authenticated request genuinely has no
 		// API key, and calling that a gap would send someone hunting a bug.
-		return by === "key" ? "Dashboard session (no key)" : "(not recorded)";
+		return {
+			text: by === "key" ? "Dashboard session (no key)" : "(not recorded)",
+			title: undefined,
+		};
 	}
-	return by === "key" ? `${dimension.slice(0, 8)}…` : dimension;
+	if (by !== "key") return { text: dimension, title: dimension };
+	const known = keyLabels?.[dimension];
+	if (known) {
+		const suffix = known.state ? ` (${known.state})` : "";
+		return {
+			text: `${known.name} · ${known.prefix}…${suffix}`,
+			title: dimension,
+		};
+	}
+	return {
+		text: `${dimension.slice(0, 8)}…`,
+		title: keyLabels
+			? `${dimension} — key not found in this workspace`
+			: dimension,
+	};
 }
 
 export function SpendAttribution({
 	data,
 	hrefFor,
 	by,
+	keyLabels,
 }: {
 	data: CostBreakdown | null;
 	/** The `?by=` href for a dimension, carrying the page's window (built by the page). */
 	hrefFor: (by: CostBreakdown["by"]) => string;
 	by: CostBreakdown["by"];
+	/** Key id → label for this tenant; `undefined` when the Postgres read failed. */
+	keyLabels?: Record<string, KeyLabel>;
 }) {
 	/**
 	 * Link mode: this is a Server Component and the dimension is a `?by=` URL
@@ -157,7 +197,7 @@ export function SpendAttribution({
 					</span>{" "}
 					across{" "}
 					<span className="font-mono tabular-nums">
-						{data.total_requests.toLocaleString()}
+						{fmtCount(data.total_requests)}
 					</span>{" "}
 					requests
 				</span>
@@ -165,8 +205,21 @@ export function SpendAttribution({
 				    hidden, because a big unpriced count means the total is a FLOOR. */}
 				{data.unpriced_requests > 0 && (
 					<Badge tone="warn">
-						{data.unpriced_requests.toLocaleString()} unpriced — total is a
-						lower bound
+						{fmtCount(data.unpriced_requests)} unpriced — total is a lower bound
+					</Badge>
+				)}
+				{/* CX-27 / B-526. The table is capped at the gateway's row cap and the
+				    totals above it are NOT: they are computed before the cap, over every
+				    group. Said out loud whenever the rows are a subset, because a reader
+				    who adds the visible rows would otherwise get a different number
+				    than the total and conclude one of them is wrong — and because the
+				    cheapest groups are the ones cut, which is where the unpriced
+				    requests live. */}
+				{data.truncated && (
+					<Badge tone="info">
+						Showing the {fmtCount(data.rows.length)} costliest of{" "}
+						{fmtCount(data.group_count)} {PLURAL[by]} — totals cover all{" "}
+						{fmtCount(data.group_count)}
 					</Badge>
 				)}
 				{/* R94. An experiment is DELIBERATELY expensive, so leaving its spend
@@ -179,7 +232,7 @@ export function SpendAttribution({
 				{data.eval_requests > 0 && (
 					<Badge tone="info">
 						{usd(data.eval_cost_usd)} eval / experiment (
-						{data.eval_requests.toLocaleString()} req)
+						{fmtCount(data.eval_requests)} req)
 					</Badge>
 				)}
 			</div>
@@ -211,27 +264,38 @@ export function SpendAttribution({
 									    identifier in a left column: mono, not right-aligned.
 									    The `title` carries the untruncated value. */}
 									<TD mono>
-										<span title={r.dimension || undefined}>
-											{label(by, r.dimension)}
-										</span>
+										{(() => {
+											const l = label(by, r.dimension, keyLabels);
+											return by === "key" && r.dimension ? (
+												<Link
+													className="underline underline-offset-2"
+													href={`/settings/api-keys?key=${encodeURIComponent(r.dimension)}`}
+													title={l.title}
+												>
+													{l.text}
+												</Link>
+											) : (
+												<span title={l.title}>{l.text}</span>
+											);
+										})()}
 									</TD>
 									<TD numeric muted>
-										{r.requests.toLocaleString()}
+										{fmtCount(r.requests)}
 									</TD>
 									<TD numeric>
 										{r.unpriced_requests > 0 ? (
 											<span className="text-warn-ink">
-												{r.unpriced_requests.toLocaleString()}
+												{fmtCount(r.unpriced_requests)}
 											</span>
 										) : (
 											<span className="text-ink-3">—</span>
 										)}
 									</TD>
 									<TD numeric muted>
-										{r.input_tokens.toLocaleString()}
+										{fmtCount(r.input_tokens)}
 									</TD>
 									<TD numeric muted>
-										{r.output_tokens.toLocaleString()}
+										{fmtCount(r.output_tokens)}
 									</TD>
 									{/* Cost is the column this table exists for, so it keeps
 									    primary ink and medium weight while its neighbours are

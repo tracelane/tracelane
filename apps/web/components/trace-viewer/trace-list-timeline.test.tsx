@@ -79,7 +79,7 @@ describe("TraceList — the timeline column gives the ruler something to align t
 		// A <div> is invalid inside <thead>/<tr>; the only lawful in-table mount that
 		// tracks the bars is the column's own <th>. Assert the ruler sits between the
 		// <th> that opens the column and the </th> that closes it.
-		const th = html.indexOf('<th class="w-[26%]');
+		const th = html.search(/<th\b[^>]*class="[^"]*w-\[26%\]/);
 		expect(th).toBeGreaterThan(-1);
 		const ruler = html.indexOf("data-time-ruler");
 		const close = html.indexOf("</th>", th);
@@ -97,7 +97,7 @@ describe("TraceList — the timeline column gives the ruler something to align t
 			}),
 		]);
 		expect(withErr).toContain("bg-danger");
-		expect(withErr).toContain("2 errors"); // never colour alone
+		expect(withErr).toContain("Error · 2"); // never colour alone
 	});
 });
 

@@ -1,3 +1,5 @@
+import { PageHeader } from "@tracelanedev/ui";
+import { TBody, TH, THead, TR, Table } from "@tracelanedev/ui";
 /**
  * Sessions list page — multi-turn agent conversation view (PRD §5.2.3).
  *
@@ -97,7 +99,7 @@ function SortHeader({
 	const active = (sp.sort ?? "last_activity") === col;
 	const order = sp.order ?? "desc";
 	return (
-		<th className="px-3 py-1.5 text-right t-metric-label">
+		<TH className="px-3 py-1.5 text-right t-metric-label">
 			<Link
 				href={sortHref(sp, col)}
 				className="inline-flex items-center gap-1 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
@@ -107,7 +109,7 @@ function SortHeader({
 					{active ? (order === "desc" ? "▼" : "▲") : "↕"}
 				</span>
 			</Link>
-		</th>
+		</TH>
 	);
 }
 
@@ -164,29 +166,29 @@ async function SessionsData({ sp, range }: { sp: SP; range: TimeRange }) {
 
 	return (
 		<div className="space-y-2">
-			<Card className="overflow-x-auto">
-				<table className="w-full text-sm">
-					<thead>
-						<tr className="border-b border-line">
-							<th className="px-3 py-1.5 text-left t-metric-label">Session</th>
+			<Card className="relative overflow-x-auto">
+				<Table className="w-full text-sm">
+					<THead>
+						<TR className="border-b border-line">
+							<TH className="px-3 py-1.5 text-left t-metric-label">Session</TH>
 							{/* OBS-20. Not sortable: sorting is an allowlisted ORDER BY on
 							    the aggregate (`SessionSort`), and an identity column is a
 							    thing you filter to, not a thing you rank by. */}
-							<th
+							<TH
 								className="px-3 py-1.5 text-left t-metric-label"
 								title="Who initiated the session — the end-user id your application sent via the x-tracelane-user-id header. Empty when none was sent."
 							>
 								User
-							</th>
+							</TH>
 							<SortHeader sp={sp} col="turns" label="Turns" />
-							<th
+							<TH
 								className="px-3 py-1.5 text-left t-metric-label"
 								title="The latest model in the session. A session that switched models shows only the most recent — open the session to see every turn."
 							>
 								Model
-							</th>
+							</TH>
 							{win && (
-								<th
+								<TH
 									className="w-[24%] min-w-[9rem] px-3 pt-1.5 pb-0.5 align-bottom"
 									title="Each bar is one session, positioned by its real first→last span. UTC."
 								>
@@ -197,21 +199,22 @@ async function SessionsData({ sp, range }: { sp: SP; range: TimeRange }) {
 										ticks={4}
 										mode="absolute"
 									/>
-								</th>
+								</TH>
 							)}
 							<SortHeader sp={sp} col="tokens" label="Tokens" />
 							<SortHeader sp={sp} col="duration" label="First → last" />
 							<SortHeader sp={sp} col="cost" label="Cost" />
-							<th className="px-3 py-1.5 text-left t-metric-label">Status</th>
+							<TH className="px-3 py-1.5 text-left t-metric-label">Status</TH>
 							<SortHeader sp={sp} col="last_activity" label="Last activity" />
-						</tr>
-					</thead>
-					<tbody>
+							<TH>Actions</TH>
+						</TR>
+					</THead>
+					<TBody>
 						{sessions.map((s) => (
 							<SessionRow key={s.session_id} s={s} win={win} />
 						))}
-					</tbody>
-				</table>
+					</TBody>
+				</Table>
 			</Card>
 			{atCap && (
 				<p className="px-1 text-xs text-ink-3">
@@ -265,7 +268,7 @@ export default async function SessionsPage({
 		<div className="px-2 py-3 sm:px-4 sm:py-4">
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div>
-					<h1 className="t-h1">Sessions</h1>
+					<PageHeader title={<>Sessions</>} />
 					<p className="mt-1 text-sm text-ink-2">
 						Multi-turn conversations grouped from related traces — {range.label}
 						.

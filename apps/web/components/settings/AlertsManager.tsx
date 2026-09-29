@@ -1,4 +1,9 @@
 "use client";
+import { Button } from "@tracelanedev/ui";
+
+import { StatusBadge } from "@tracelanedev/ui";
+
+import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
  * AlertsManager — self-service alert destinations + rules UI.
@@ -13,9 +18,9 @@
  */
 
 import { Modal } from "@/components/Modal";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, apiFetchRaw } from "@/lib/api-fetch";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Badge, EmptyState, Skeleton } from "@tracelanedev/ui";
+import { Badge, EmptyState, ObjectSurface, Skeleton } from "@tracelanedev/ui";
 import { useState } from "react";
 
 // ─────────────────────────────────────────────
@@ -44,13 +49,16 @@ export interface AlertRule {
 // Label maps
 // ─────────────────────────────────────────────
 
-const METRIC_META: Record<string, { label: string; unit: string }> = {
+export const METRIC_META: Record<string, { label: string; unit: string }> = {
 	error_rate: { label: "Error rate", unit: "%" },
 	burn_rate: { label: "SLO burn rate", unit: "×" },
 	latency_p95: { label: "p95 latency", unit: "ms" },
 	overhead_p99: { label: "Gateway overhead p99", unit: "ms" },
 	cost_usd: { label: "Cost", unit: "USD" },
-	quota_pct: { label: "Quota used", unit: "%" },
+	// BILL-01/ADR-076 (2026-09-13) redefined this to ingest bytes ÷
+	// `ingest_bytes_included` — "Quota used" predates that and no longer says
+	// what the number is (B-521).
+	quota_pct: { label: "Ingest used (% of monthly allowance)", unit: "%" },
 };
 
 const KIND_LABELS: Record<string, string> = {
@@ -63,6 +71,24 @@ function formatWindow(minutes: number): string {
 	if (minutes < 60) return `${String(minutes)}m`;
 	if (minutes < 1440) return `${String(Math.round(minutes / 60))}h`;
 	return `${String(Math.round(minutes / 1440))}d`;
+}
+
+/**
+ * What the rules table's Window column prints for one rule.
+ *
+ * `quota_pct` is evaluated MONTH-TO-DATE — `checker.rs:406` dispatches it to
+ * `quota_pct(tenant_id)`, a function that takes only the tenant id, so
+ * `rule.window_minutes` is never read for it (only the windowed metrics
+ * consume it, at `checker.rs:561`). Printing `formatWindow` for it anyway
+ * showed a real-looking window ("5m", "1h") for a rule the checker does not
+ * apply one to (B-521).
+ */
+export function windowCellText(rule: {
+	metric: string;
+	window_minutes: number;
+}): string {
+	if (rule.metric === "quota_pct") return "month to date";
+	return formatWindow(rule.window_minutes);
 }
 
 // ─────────────────────────────────────────────
@@ -82,7 +108,7 @@ async function createDestination(body: {
 	kind: string;
 	url: string;
 }): Promise<{ id: string }> {
-	const res = await fetch("/api/alerts/destinations", {
+	const res = await apiFetchRaw("/api/alerts/destinations", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
@@ -95,7 +121,7 @@ async function createDestination(body: {
 }
 
 async function deleteDestination(id: string): Promise<void> {
-	const res = await fetch(
+	const res = await apiFetchRaw(
 		`/api/alerts/destinations/${encodeURIComponent(id)}`,
 		{ method: "DELETE" },
 	);
@@ -103,7 +129,7 @@ async function deleteDestination(id: string): Promise<void> {
 }
 
 async function testDestination(destination_id: string): Promise<void> {
-	const res = await fetch("/api/alerts/test", {
+	const res = await apiFetchRaw("/api/alerts/test", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ destination_id }),
@@ -122,10 +148,10 @@ async function createRule(body: {
 	metric: string;
 	comparator: string;
 	threshold: number;
-	window_minutes: number;
+	window_minutes?: number;
 	destination_id: string;
 }): Promise<{ id: string }> {
-	const res = await fetch("/api/alerts/rules", {
+	const res = await apiFetchRaw("/api/alerts/rules", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
@@ -138,7 +164,7 @@ async function createRule(body: {
 }
 
 async function deleteRule(id: string): Promise<void> {
-	const res = await fetch(`/api/alerts/rules/${encodeURIComponent(id)}`, {
+	const res = await apiFetchRaw(`/api/alerts/rules/${encodeURIComponent(id)}`, {
 		method: "DELETE",
 	});
 	if (!res.ok) throw new Error(`HTTP ${String(res.status)}`);
@@ -165,13 +191,14 @@ function SectionHeader({
 				<h2 className="text-sm font-semibold text-ink">{title}</h2>
 				<p className="text-xs text-ink-2 mt-0.5">{description}</p>
 			</div>
-			<button
+			<Button
+				variant="bare"
 				type="button"
 				onClick={onAdd}
 				className="shrink-0 px-3 py-1.5 rounded text-sm bg-action text-action-on hover:bg-action/90 transition-colors"
 			>
 				{addLabel}
-			</button>
+			</Button>
 		</div>
 	);
 }
@@ -196,12 +223,12 @@ function LastStateBadge({ state }: { state: string | null }) {
 		return <span className="text-xs text-ink-3">—</span>;
 	}
 	if (state === "ok") {
-		return <Badge tone="ok">OK</Badge>;
+		return <StatusBadge status="ok" />;
 	}
 	if (state === "firing") {
-		return <Badge tone="danger">Firing</Badge>;
+		return <StatusBadge status="firing" />;
 	}
-	return <Badge tone="neutral">{state}</Badge>;
+	return <StatusBadge status={state} />;
 }
 
 // ─────────────────────────────────────────────
@@ -314,21 +341,23 @@ function AddDestinationDialog({
 					</p>
 				)}
 				<div className="flex justify-end gap-2 pt-1">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						disabled={pending}
 						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
 					>
 						Cancel
-					</button>
-					<button
+					</Button>
+					<Button
+						variant="bare"
 						type="submit"
 						disabled={!name.trim() || !url.trim() || pending}
 						className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 					>
 						{pending ? "Adding…" : "Add"}
-					</button>
+					</Button>
 				</div>
 			</form>
 		</Modal>
@@ -417,55 +446,81 @@ function DestinationsSection() {
 			)}
 
 			{destinations.length > 0 && (
-				<div className="overflow-x-auto rounded-lg border border-line">
-					<table className="w-full text-left">
-						<thead className="bg-surface">
-							<tr>
-								<th className="py-1.5 px-3 t-metric-label">Name</th>
-								<th className="py-1.5 pr-3 t-metric-label">Type</th>
-								<th className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
+				<div className="overflow-x-auto rounded-card border border-line">
+					<Table className="w-full text-left">
+						<THead className="bg-surface">
+							<TR>
+								<TH className="py-1.5 px-3 t-metric-label">Name</TH>
+								<TH className="py-1.5 pr-3 t-metric-label">Type</TH>
+								<TH className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
 									URL
-								</th>
-								<th className="py-1.5 pr-3" />
-							</tr>
-						</thead>
-						<tbody>
+								</TH>
+								<TH className="py-1.5 pr-3" />
+								<TH className="px-3 py-2">
+									<span className="sr-only">Object actions</span>
+								</TH>
+							</TR>
+						</THead>
+						<TBody>
 							{destinations.map((dest) => (
-								<tr
+								<ObjectSurface
 									key={dest.id}
+									objectId={`dest-${dest.id}`}
+									title={dest.name}
+									href={`/settings/alerts?peek=dest-${encodeURIComponent(dest.id)}`}
+									fields={[
+										{
+											label: "Kind",
+											value: KIND_LABELS[dest.kind] ?? dest.kind,
+										},
+										{ label: "URL", value: dest.url },
+									]}
+									actions={[
+										{
+											label: "Delete",
+											danger: true,
+											onSelect: () => {
+												setPendingDeleteId(dest.id);
+												deleteMutation.reset();
+											},
+										},
+									]}
 									className="border-t border-line last:border-0"
 								>
-									<td className="py-2 px-3 text-sm text-ink">{dest.name}</td>
-									<td className="py-2 pr-3 text-xs text-ink-2">
+									<TD className="py-2 px-3 text-sm text-ink">{dest.name}</TD>
+									<TD className="py-2 pr-3 text-xs text-ink-2">
 										{KIND_LABELS[dest.kind] ?? dest.kind}
-									</td>
-									<td className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell max-w-[14rem] truncate">
+									</TD>
+									<TD className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell max-w-[14rem] truncate">
 										{dest.url}
-									</td>
-									<td className="py-2 pr-3">
+									</TD>
+									<TD className="py-2 pr-3">
 										{pendingDeleteId === dest.id ? (
 											<div className="flex items-center gap-2">
 												<span className="text-xs text-ink-2">Delete?</span>
-												<button
+												<Button
+													variant="bare"
 													type="button"
 													onClick={() => deleteMutation.mutate(dest.id)}
 													disabled={deleteMutation.isPending}
 													className="text-xs px-2 py-1 rounded bg-danger text-danger-on hover:bg-danger/90 disabled:opacity-50 transition-colors"
 												>
 													{deleteMutation.isPending ? "Deleting…" : "Confirm"}
-												</button>
-												<button
+												</Button>
+												<Button
+													variant="bare"
 													type="button"
 													onClick={() => setPendingDeleteId(null)}
 													disabled={deleteMutation.isPending}
 													className="text-xs px-2 py-1 rounded border border-line text-ink-2 hover:bg-surface-2 disabled:opacity-50 transition-colors"
 												>
 													Cancel
-												</button>
+												</Button>
 											</div>
 										) : (
 											<div className="flex items-center gap-2">
-												<button
+												<Button
+													variant="bare"
 													type="button"
 													onClick={() => {
 														setTestingId(dest.id);
@@ -480,8 +535,9 @@ function DestinationsSection() {
 													{testMutation.isPending && testingId === dest.id
 														? "Sending…"
 														: "Test"}
-												</button>
-												<button
+												</Button>
+												<Button
+													variant="bare"
 													type="button"
 													onClick={() => {
 														setPendingDeleteId(dest.id);
@@ -490,14 +546,14 @@ function DestinationsSection() {
 													className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 												>
 													Delete
-												</button>
+												</Button>
 											</div>
 										)}
-									</td>
-								</tr>
+									</TD>
+								</ObjectSurface>
 							))}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			)}
 
@@ -533,7 +589,7 @@ function AddRuleDialog({
 		metric: string;
 		comparator: string;
 		threshold: number;
-		window_minutes: number;
+		window_minutes?: number;
 		destination_id: string;
 	}) => void;
 	pending: boolean;
@@ -546,15 +602,19 @@ function AddRuleDialog({
 	const [destinationId, setDestinationId] = useState(destinations[0]?.id ?? "");
 
 	const metricMeta = METRIC_META[metric] ?? { label: metric, unit: "" };
+	// quota_pct is evaluated month-to-date — the checker never reads a window
+	// for it (checker.rs:406,561), so there is nothing to validate or send.
+	const isMonthToDate = metric === "quota_pct";
 
 	const canSubmit =
 		!pending &&
 		threshold.trim() !== "" &&
 		!Number.isNaN(Number(threshold)) &&
 		destinationId !== "" &&
-		windowMinutes.trim() !== "" &&
-		Number(windowMinutes) >= 1 &&
-		Number(windowMinutes) <= 44640;
+		(isMonthToDate ||
+			(windowMinutes.trim() !== "" &&
+				Number(windowMinutes) >= 1 &&
+				Number(windowMinutes) <= 44640));
 
 	return (
 		<Modal title="Add alert rule" onClose={onClose}>
@@ -572,7 +632,13 @@ function AddRuleDialog({
 								metric,
 								comparator,
 								threshold: Number(threshold),
-								window_minutes: Number(windowMinutes),
+								// Omitted, never a placeholder number, for quota_pct — the
+								// checker does not read it (checker.rs:406,561), and the
+								// gateway's own create route already treats this field as
+								// optional (`alerts/routes.rs`, defaults to 60 unread).
+								...(isMonthToDate
+									? {}
+									: { window_minutes: Number(windowMinutes) }),
 								destination_id: destinationId,
 							});
 						}
@@ -598,7 +664,9 @@ function AddRuleDialog({
 							<option value="latency_p95">p95 latency (ms)</option>
 							<option value="overhead_p99">Gateway overhead p99 (ms)</option>
 							<option value="cost_usd">Cost (USD)</option>
-							<option value="quota_pct">Quota used (%)</option>
+							<option value="quota_pct">
+								Ingest used (% of monthly allowance)
+							</option>
 						</select>
 					</div>
 					<div className="flex gap-3">
@@ -640,28 +708,39 @@ function AddRuleDialog({
 							/>
 						</div>
 					</div>
-					<div>
-						<label
-							htmlFor="rule-window"
-							className="text-xs font-medium text-ink-2 block mb-1"
-						>
-							Evaluation window (minutes)
-						</label>
-						<input
-							id="rule-window"
-							type="number"
-							value={windowMinutes}
-							onChange={(e) => setWindowMinutes(e.target.value)}
-							min="1"
-							max="44640"
-							disabled={pending}
-							required
-							className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
-						/>
-						<p className="text-2xs text-ink-3 mt-1">
-							1 – 44,640 minutes (up to 31 days)
-						</p>
-					</div>
+					{isMonthToDate ? (
+						<div>
+							<span className="text-xs font-medium text-ink-2 block mb-1">
+								Evaluation window
+							</span>
+							<p className="text-sm text-ink-2" data-testid="rule-window-fixed">
+								Evaluated month-to-date — no window.
+							</p>
+						</div>
+					) : (
+						<div>
+							<label
+								htmlFor="rule-window"
+								className="text-xs font-medium text-ink-2 block mb-1"
+							>
+								Evaluation window (minutes)
+							</label>
+							<input
+								id="rule-window"
+								type="number"
+								value={windowMinutes}
+								onChange={(e) => setWindowMinutes(e.target.value)}
+								min="1"
+								max="44640"
+								disabled={pending}
+								required
+								className="w-full rounded border border-line bg-bg px-3 py-2 text-sm text-ink font-mono tabular-nums placeholder:text-ink-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring disabled:opacity-50"
+							/>
+							<p className="text-2xs text-ink-3 mt-1">
+								1 – 44,640 minutes (up to 31 days)
+							</p>
+						</div>
+					)}
 					<div>
 						<label
 							htmlFor="rule-destination"
@@ -692,33 +771,36 @@ function AddRuleDialog({
 						</p>
 					)}
 					<div className="flex justify-end gap-2 pt-1">
-						<button
+						<Button
+							variant="bare"
 							type="button"
 							onClick={onClose}
 							disabled={pending}
 							className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors disabled:opacity-50"
 						>
 							Cancel
-						</button>
-						<button
+						</Button>
+						<Button
+							variant="bare"
 							type="submit"
 							disabled={!canSubmit}
 							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-40 transition-colors"
 						>
 							{pending ? "Adding…" : "Add rule"}
-						</button>
+						</Button>
 					</div>
 				</form>
 			)}
 			{destinations.length === 0 && (
 				<div className="flex justify-end">
-					<button
+					<Button
+						variant="bare"
 						type="button"
 						onClick={onClose}
 						className="px-4 py-2 rounded text-sm border border-line text-ink-2 hover:bg-surface-2 transition-colors"
 					>
 						Close
-					</button>
+					</Button>
 				</div>
 			)}
 		</Modal>
@@ -788,23 +870,26 @@ function RulesSection({
 			)}
 
 			{rules.length > 0 && (
-				<div className="overflow-x-auto rounded-lg border border-line">
-					<table className="w-full text-left">
-						<thead className="bg-surface">
-							<tr>
-								<th className="py-1.5 px-3 t-metric-label">Metric</th>
-								<th className="py-1.5 pr-3 t-metric-label">Condition</th>
-								<th className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
+				<div className="overflow-x-auto rounded-card border border-line">
+					<Table className="w-full text-left">
+						<THead className="bg-surface">
+							<TR>
+								<TH className="py-1.5 px-3 t-metric-label">Metric</TH>
+								<TH className="py-1.5 pr-3 t-metric-label">Condition</TH>
+								<TH className="py-1.5 pr-3 t-metric-label hidden sm:table-cell">
 									Window
-								</th>
-								<th className="py-1.5 pr-3 t-metric-label hidden md:table-cell">
+								</TH>
+								<TH className="py-1.5 pr-3 t-metric-label hidden md:table-cell">
 									Destination
-								</th>
-								<th className="py-1.5 pr-3 t-metric-label">State</th>
-								<th className="py-1.5 pr-3" />
-							</tr>
-						</thead>
-						<tbody>
+								</TH>
+								<TH className="py-1.5 pr-3 t-metric-label">State</TH>
+								<TH className="py-1.5 pr-3" />
+								<TH className="px-3 py-2">
+									<span className="sr-only">Object actions</span>
+								</TH>
+							</TR>
+						</THead>
+						<TBody>
 							{rules.map((rule) => {
 								const meta = METRIC_META[rule.metric] ?? {
 									label: rule.metric,
@@ -812,47 +897,72 @@ function RulesSection({
 								};
 								const dest = destById.get(rule.destination_id);
 								return (
-									<tr
+									<ObjectSurface
 										key={rule.id}
+										objectId={`rule-${rule.id}`}
+										title={meta.label}
+										href={`/settings/alerts?peek=rule-${encodeURIComponent(rule.id)}`}
+										fields={[
+											{
+												label: "Condition",
+												value: `${rule.comparator === "gt" ? ">" : "<"} ${rule.threshold} ${meta.unit}`,
+											},
+											{ label: "Window", value: windowCellText(rule) },
+											{ label: "Destination", value: dest?.name ?? "—" },
+											{ label: "State", value: rule.last_state ?? "Unknown" },
+										]}
+										actions={[
+											{
+												label: "Delete",
+												danger: true,
+												onSelect: () => {
+													setPendingDeleteId(rule.id);
+													deleteMutation.reset();
+												},
+											},
+										]}
 										className="border-t border-line last:border-0"
 									>
-										<td className="py-2 px-3 text-sm text-ink">{meta.label}</td>
-										<td className="py-2 pr-3 text-xs text-ink-2 font-mono tabular-nums whitespace-nowrap">
+										<TD className="py-2 px-3 text-sm text-ink">{meta.label}</TD>
+										<TD className="py-2 pr-3 text-xs text-ink-2 font-mono tabular-nums whitespace-nowrap">
 											{rule.comparator === "gt" ? ">" : "<"}{" "}
 											{String(rule.threshold)} {meta.unit}
-										</td>
-										<td className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell font-mono tabular-nums">
-											{formatWindow(rule.window_minutes)}
-										</td>
-										<td className="py-2 pr-3 text-xs text-ink-2 hidden md:table-cell truncate max-w-[10rem]">
+										</TD>
+										<TD className="py-2 pr-3 text-xs text-ink-2 hidden sm:table-cell font-mono tabular-nums">
+											{windowCellText(rule)}
+										</TD>
+										<TD className="py-2 pr-3 text-xs text-ink-2 hidden md:table-cell truncate max-w-[10rem]">
 											{dest ? dest.name : <span className="text-ink-3">—</span>}
-										</td>
-										<td className="py-2 pr-3">
+										</TD>
+										<TD className="py-2 pr-3">
 											<LastStateBadge state={rule.last_state} />
-										</td>
-										<td className="py-2 pr-3">
+										</TD>
+										<TD className="py-2 pr-3">
 											{pendingDeleteId === rule.id ? (
 												<div className="flex items-center gap-2">
 													<span className="text-xs text-ink-2">Delete?</span>
-													<button
+													<Button
+														variant="bare"
 														type="button"
 														onClick={() => deleteMutation.mutate(rule.id)}
 														disabled={deleteMutation.isPending}
 														className="text-xs px-2 py-1 rounded bg-danger text-danger-on hover:bg-danger/90 disabled:opacity-50 transition-colors"
 													>
 														{deleteMutation.isPending ? "Deleting…" : "Confirm"}
-													</button>
-													<button
+													</Button>
+													<Button
+														variant="bare"
 														type="button"
 														onClick={() => setPendingDeleteId(null)}
 														disabled={deleteMutation.isPending}
 														className="text-xs px-2 py-1 rounded border border-line text-ink-2 hover:bg-surface-2 disabled:opacity-50 transition-colors"
 													>
 														Cancel
-													</button>
+													</Button>
 												</div>
 											) : (
-												<button
+												<Button
+													variant="bare"
 													type="button"
 													onClick={() => {
 														setPendingDeleteId(rule.id);
@@ -861,14 +971,14 @@ function RulesSection({
 													className="text-xs px-2 py-1 rounded border border-danger text-danger-ink hover:bg-danger-soft transition-colors"
 												>
 													Delete
-												</button>
+												</Button>
 											)}
-										</td>
-									</tr>
+										</TD>
+									</ObjectSurface>
 								);
 							})}
-						</tbody>
-					</table>
+						</TBody>
+					</Table>
 				</div>
 			)}
 
