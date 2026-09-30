@@ -103,7 +103,8 @@ export function ContentCapture() {
 						</p>
 					) : (
 						<p className="text-sm text-ink-2">
-							New requests through the gateway keep{" "}
+							New requests through the gateway or your OpenTelemetry exporter
+							keep{" "}
 							{data.effective.input && data.effective.output
 								? "the messages you send and the model's reply"
 								: data.effective.input

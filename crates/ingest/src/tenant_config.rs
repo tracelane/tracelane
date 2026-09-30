@@ -86,6 +86,7 @@ use uuid::Uuid;
 
 use crate::db::DbPool;
 use crate::tail_sampler::SamplingPolicy;
+use tracelane_shared::otlp::content::{CaptureHalves, OtlpCapturePolicy};
 
 /// Resolved per-tenant ingest config. Carries the sampling policy; the design
 /// reserves room for `retention_days` (the TTL task shares this one cache).
@@ -94,9 +95,23 @@ use crate::tail_sampler::SamplingPolicy;
 /// and the OTLP-receiver 429 it fed outright — "ingest is NEVER blocked by
 /// billing state, on any tier." A fault or a real overage both resolve
 /// through [`SamplingPolicy`] alone now; there is nothing left here to cap.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantConfig {
     pub policy: SamplingPolicy,
+    pub content: CaptureHalves,
+    pub otlp_capture: OtlpCapturePolicy,
+    pub request_labels: tracelane_shared::labels::LabelCaps,
+}
+
+impl Default for TenantConfig {
+    fn default() -> Self {
+        Self {
+            policy: SamplingPolicy::Tail,
+            content: CaptureHalves::closed(),
+            otlp_capture: OtlpCapturePolicy::embedded(),
+            request_labels: tracelane_shared::labels::LabelCaps::embedded(),
+        }
+    }
 }
 
 impl TenantConfig {
@@ -116,6 +131,9 @@ impl TenantConfig {
     pub fn fault_keep_all() -> Self {
         Self {
             policy: SamplingPolicy::Full,
+            content: CaptureHalves::closed(),
+            otlp_capture: OtlpCapturePolicy::embedded(),
+            request_labels: tracelane_shared::labels::LabelCaps::embedded(),
         }
     }
 }
@@ -197,6 +215,9 @@ impl TenantConfigCache {
                 Box::pin(async move {
                     TenantConfig {
                         policy: SamplingPolicy::Tail,
+                        content: CaptureHalves::closed(),
+                        otlp_capture: OtlpCapturePolicy::embedded(),
+                        request_labels: tracelane_shared::labels::LabelCaps::embedded(),
                     }
                 })
             }),
@@ -207,7 +228,7 @@ impl TenantConfigCache {
     /// Resolve+cache a tenant's full config (fresh entry or re-resolve past the
     /// TTL). The resolver is responsible for fail-safe (Tail) on error, so this
     /// never surfaces an error to the hot path.
-    async fn resolve_into_cache(&self, tenant: Uuid) -> TenantConfig {
+    pub async fn resolve_into_cache(&self, tenant: Uuid) -> TenantConfig {
         if let Some(e) = self.entries.get(&tenant)
             && e.fetched_at.elapsed() < self.ttl
         {
@@ -225,6 +246,7 @@ impl TenantConfigCache {
     }
 
     /// Resolve a tenant's sampling policy (writer hot path).
+    #[cfg(test)]
     pub async fn policy_for(&self, tenant: Uuid) -> SamplingPolicy {
         self.resolve_into_cache(tenant).await.policy
     }
@@ -281,10 +303,14 @@ pub fn pg_tenant_config_resolver(pool: DbPool) -> ResolveFn {
 const RESOLVE_SQL: &str = "\
     SELECT t.sampling_policy, t.force_tail, \
       COALESCE(we.f_full_capture, pe.f_full_capture, FALSE), \
-      COALESCE(we.f_audit_addon, pe.f_audit_addon, FALSE) \
+      COALESCE(we.f_audit_addon, pe.f_audit_addon, FALSE), \
+      COALESCE(wc.input, FALSE), COALESCE(wc.output, FALSE), \
+      (SELECT value::text FROM billing_policy WHERE key = 'otlp_capture'), \
+      (SELECT value::text FROM billing_policy WHERE key = 'request_labels') \
     FROM tenants t \
     LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
     LEFT JOIN plan_entitlements pe ON pe.plan_lookup_key = we.plan_lookup_key \
+    LEFT JOIN workspace_content_capture wc ON wc.tenant_id = t.id \
     WHERE t.id = $1";
 
 async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig> {
@@ -304,7 +330,24 @@ async fn resolve_one(pool: &DbPool, tenant: Uuid) -> anyhow::Result<TenantConfig
         audit_active: f_audit_addon,
         force_tail,
     });
-    Ok(TenantConfig { policy })
+    let otlp_capture = row
+        .get::<_, Option<String>>(6)
+        .and_then(|v| serde_json::from_str::<OtlpCapturePolicy>(&v).ok())
+        .unwrap_or_else(OtlpCapturePolicy::embedded);
+    let max_field_bytes = otlp_capture.default_max_field_bytes;
+    Ok(TenantConfig {
+        policy,
+        otlp_capture,
+        request_labels: row
+            .get::<_, Option<String>>(7)
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_else(tracelane_shared::labels::LabelCaps::embedded),
+        content: CaptureHalves {
+            input: row.get::<_, bool>(4) && max_field_bytes > 0,
+            output: row.get::<_, bool>(5) && max_field_bytes > 0,
+            max_field_bytes,
+        },
+    })
 }
 
 /// Spawn the long-lived LISTEN task that evicts cache entries on control-plane
@@ -525,9 +568,67 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    #[ignore = "needs disposable POSTGRES_TEST_URL; never run against a live database"]
+    async fn postgres_content_capture_left_join_keeps_absent_choices_closed() {
+        let url = std::env::var("POSTGRES_TEST_URL").expect("POSTGRES_TEST_URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        client.batch_execute("CREATE TEMP TABLE billing_policy(key text, value jsonb);
+            CREATE TEMP TABLE tenants(id uuid, sampling_policy text, force_tail boolean);
+            CREATE TEMP TABLE workspace_entitlements(tenant_id uuid, plan_lookup_key text, f_full_capture boolean, f_audit_addon boolean);
+            CREATE TEMP TABLE plan_entitlements(plan_lookup_key text, f_full_capture boolean, f_audit_addon boolean);
+            CREATE TEMP TABLE workspace_content_capture(tenant_id uuid, input boolean, output boolean);").await.unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        for tenant in [a, b] {
+            client
+                .execute("INSERT INTO tenants VALUES ($1, 'tail', FALSE)", &[&tenant])
+                .await
+                .unwrap();
+        }
+        client
+            .execute(
+                "INSERT INTO workspace_content_capture VALUES ($1, TRUE, FALSE)",
+                &[&a],
+            )
+            .await
+            .unwrap();
+        let a_row = client.query_one(RESOLVE_SQL, &[&a]).await.unwrap();
+        let b_row = client.query_one(RESOLVE_SQL, &[&b]).await.unwrap();
+        assert!(a_row.get::<_, bool>(4));
+        assert!(!a_row.get::<_, bool>(5));
+        assert!(!b_row.get::<_, bool>(4));
+        assert!(!b_row.get::<_, bool>(5));
+        assert!(
+            client
+                .query_opt(RESOLVE_SQL, &[&Uuid::new_v4()])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn content_capture_join_is_tenant_bound_and_optional() {
+        assert!(
+            RESOLVE_SQL.contains("LEFT JOIN workspace_content_capture wc ON wc.tenant_id = t.id")
+        );
+        assert!(RESOLVE_SQL.contains("COALESCE(wc.input, FALSE)"));
+        assert!(RESOLVE_SQL.contains("COALESCE(wc.output, FALSE)"));
+        assert!(RESOLVE_SQL.contains("WHERE t.id = $1"));
+    }
+
     fn full() -> TenantConfig {
         TenantConfig {
             policy: SamplingPolicy::Full,
+            content: CaptureHalves::closed(),
+            otlp_capture: OtlpCapturePolicy::embedded(),
+            request_labels: tracelane_shared::labels::LabelCaps::embedded(),
         }
     }
 
@@ -568,6 +669,11 @@ mod tests {
         let before = count(Degradation::TenantConfigFault);
         let cfg_out = resolver(uuid::Uuid::from_u128(0xB187)).await;
         let after = count(Degradation::TenantConfigFault);
+        assert_eq!(
+            cfg_out.content,
+            CaptureHalves::closed(),
+            "resolver faults keep spans but never content"
+        );
 
         assert_eq!(
             cfg_out.policy,

@@ -45,6 +45,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 		"end_user",
 		"agent",
 		"model_family",
+		"issue",
+		"include_issues",
 		"cursor",
 		"since",
 		"until",

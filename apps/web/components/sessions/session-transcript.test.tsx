@@ -120,3 +120,43 @@ it("shows SDK text despite capture off and distinguishes unloaded content", () =
 		),
 	).toContain("Text is stored but could not be loaded");
 });
+it("renders recorded generation issues independently of every content state", () => {
+	const turn = data.turns[0];
+	if (!turn?.exchange) throw new Error("fixture");
+	for (const content of [
+		"captured",
+		"absent",
+		"unloaded",
+		"unreadable",
+	] as const) {
+		const withIssue = {
+			...data,
+			turns: [
+				{
+					...turn,
+					exchange: {
+						...turn.exchange,
+						content,
+						issues: [
+							{
+								kind: "truncated" as const,
+								severity: "warn" as const,
+								detail: "gen_ai_response_finish_reasons contains length",
+								affected_spans: 1,
+							},
+						],
+					},
+				},
+			],
+		};
+		const html = renderToStaticMarkup(
+			<SessionTranscript
+				data={withIssue}
+				sessionId="s"
+				viewerRole="viewer"
+				userId="u"
+			/>,
+		);
+		expect(html).toContain(">Truncated</span>");
+	}
+});

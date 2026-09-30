@@ -116,17 +116,16 @@ fn build_openai_stream(
 ) -> impl Stream<Item = Result<ProviderEvent>> + Send {
     try_stream! {
         let mut byte_stream = response.bytes_stream();
-        let mut buffer = String::new();
+        // Bytes, not text: a chunk boundary can fall inside a character.
+        let mut lines = super::sse_lines::LineBuffer::default();
 
         use futures::StreamExt as _;
         while let Some(chunk) = byte_stream.next().await {
             let chunk: Bytes = chunk.context("error reading response chunk")?;
-            let text = std::str::from_utf8(&chunk).context("non-UTF8 chunk")?;
-            buffer.push_str(text);
+            lines.push(&chunk);
 
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim_end_matches('\r').to_owned();
-                buffer = buffer[pos + 1..].to_owned();
+            while let Some(line) = lines.next_line() {
+                let line = line.context("non-UTF8 SSE line")?;
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
@@ -1157,5 +1156,27 @@ mod embeddings_tests {
             format!("{err:#}").contains("not an embeddings response"),
             "{err:#}"
         );
+    }
+
+    /// A `€` cut across two network chunks must reach the client whole. The
+    /// per-chunk `from_utf8(&chunk)?` this replaced ended the stream instead.
+    #[tokio::test]
+    async fn a_character_split_across_network_chunks_survives() {
+        use futures::StreamExt as _;
+        let resp = crate::providers::sse_lines::response_from_chunks(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"price \xE2\x82",
+            b"\xAC5\"}}]}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        let events: Vec<_> = build_openai_stream(resp).collect().await;
+        let text: String = events
+            .into_iter()
+            .map(|e| e.expect("stream must not error on a split character"))
+            .filter_map(|e| match e {
+                ProviderEvent::StreamChunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "price €5");
     }
 }

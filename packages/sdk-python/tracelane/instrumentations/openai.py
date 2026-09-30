@@ -124,6 +124,7 @@ def _record_response(span: Any, result: Any) -> None:
     if usage:
         prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
         completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        span.set_attribute("tracelane.usage.input_includes_cache", True)
         span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
         span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
         span.set_attribute("llm.token_count.prompt", prompt_tokens)
@@ -145,7 +146,7 @@ def _record_response(span: Any, result: Any) -> None:
         first = choices[0]
         finish_reason = getattr(first, "finish_reason", None)
         if finish_reason:
-            span.set_attribute("gen_ai.response.finish_reason", finish_reason)
+            span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
 
     model = getattr(result, "model", None)
     if model:

@@ -29,6 +29,7 @@ import { extractToolCalls, formatBytes } from "@/lib/tool-calls";
 import { extractGenAi } from "@/lib/trace-tree";
 import { fmtDur } from "@tracelanedev/ui";
 import { CopyButton } from "./CopyButton";
+import { GenerationEvidence } from "./GenerationEvidence";
 import type { Span } from "./types";
 
 const STATUS_LABELS: Record<number, string> = {
@@ -264,6 +265,7 @@ export function SpanInspector({
 				</div>
 			</div>
 
+			<GenerationEvidence evidence={span} attributes={attrs} />
 			{businessRef && (
 				<div className="rounded-card border border-line bg-surface-2 p-3">
 					<div className="mb-1 flex items-center justify-between gap-2">

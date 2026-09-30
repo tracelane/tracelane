@@ -82,6 +82,7 @@ mod dispatch;
 mod embeddings;
 mod errors;
 mod quota;
+pub(crate) mod request_labels;
 mod spans;
 mod stream;
 
@@ -1228,6 +1229,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // canonical store held it. No pool (self-host) → the copy, as before.
         let trace_reader: std::sync::Arc<dyn crate::trace_reads::TraceReader> = std::sync::Arc::new(
             crate::trace_reads::ClickHouseTraceReader::new(trace_ch)
+                .with_rate_card(state.rate_card.clone())
                 .with_entitlements(state.entitlements.clone())
                 .with_pg_pool(state.pg.clone()),
         );

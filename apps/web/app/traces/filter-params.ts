@@ -34,3 +34,16 @@ export function nextFilterParams(
 	}
 	return next.toString();
 }
+
+/** Toggle one OR-ed issue while retaining every unrelated URL filter. */
+export function nextIssueFilterParams(
+	current: URLSearchParams,
+	kind: string,
+): string {
+	const kinds = new Set(
+		(current.get("issue") ?? "").split(",").filter(Boolean),
+	);
+	if (kinds.has(kind)) kinds.delete(kind);
+	else kinds.add(kind);
+	return nextFilterParams(current, "issue", [...kinds].join(","));
+}

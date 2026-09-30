@@ -69,7 +69,11 @@ pub(crate) fn agent_key_sql() -> String {
         "substringUTF8(lowerUTF8(trimBoth(coalesce(nullIf(trimBoth(JSONExtractString(attributes, 'gen_ai_agent_name')), ''), JSONExtractString(attributes, 'tracelane_client_name')))), 1, {cap})"
     )
 }
-pub(crate) const MODEL_KEY_SQL: &str = r"replaceRegexpOne(replaceRegexpOne(lowerUTF8(trimBoth(coalesce(nullIf(trimBoth(JSONExtractString(attributes, 'gen_ai_response_model')), ''), JSONExtractString(attributes, 'gen_ai_request_model')))), '^([^/]+/)+', ''), '-[0-9]{8}$', '')";
+pub(crate) fn model_key_sql() -> String {
+    crate::generation_issues::model_family_sql(
+        "coalesce(nullIf(trimBoth(JSONExtractString(attributes, 'gen_ai_response_model')), ''), JSONExtractString(attributes, 'gen_ai_request_model'))",
+    )
+}
 pub(crate) const CALL_SQL: &str =
     "JSONExtractString(attributes, 'gen_ai_operation_name') IN ('chat', 'embeddings', 'messages')";
 
@@ -107,9 +111,10 @@ fn encode_key(kind: Kind, key: &str) -> String {
 /// Dates/prefixes normalize generically; labels, makers and artwork are web catalog data.
 fn build_sql(kind: Kind, detail: bool) -> String {
     let agent = agent_key_sql();
+    let model = model_key_sql();
     let (key, cross) = match kind {
-        Kind::Agent => (agent.as_str(), MODEL_KEY_SQL),
-        Kind::Model => (MODEL_KEY_SQL, agent.as_str()),
+        Kind::Agent => (agent.as_str(), model.as_str()),
+        Kind::Model => (model.as_str(), agent.as_str()),
     };
     let limits = crate::kya_identity::limits();
     let cap = limits.map_or(0, |l| l.identities);

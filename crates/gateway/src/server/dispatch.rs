@@ -784,6 +784,10 @@ pub(crate) struct DispatchGuard {
 }
 
 impl DispatchGuard {
+    pub(crate) fn record_labels(&mut self, labels: super::request_labels::BoundedLabels) {
+        self.identity.labels = labels;
+    }
+
     /// GWY-49: the request is constrained; `eligible` is what the constraint left
     /// standing (empty when nothing did). Lands on the error span if the request
     /// ends in a refusal, a dispatch failure or a client cancellation.

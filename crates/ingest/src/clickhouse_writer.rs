@@ -414,14 +414,20 @@ pub async fn run(
         // Collect spans until batch is full or timeout fires
         loop {
             match tokio::time::timeout_at(deadline, span_rx.recv()).await {
-                Ok(Some(crate::span_envelope::SpanEnvelope { span, ack })) => {
+                Ok(Some(crate::span_envelope::SpanEnvelope {
+                    mut span,
+                    ack,
+                    source,
+                })) => {
                     // ADR-048: resolve the tenant's capture policy. `Full` keeps
                     // every span (Business/Enterprise/Audit-SKU); `Tail`
                     // rate-samples. Cache hit is in-memory; a miss costs one
                     // resolve then caches. Fail-safe to Tail.
                     let trace_id = span.trace_id; // Copy before `span` is moved
                     let tenant_uuid = *span.tenant_id.as_uuid(); // Copy before move
-                    let policy = tenant_cfg.policy_for(tenant_uuid).await;
+                    let cfg = tenant_cfg.resolve_into_cache(tenant_uuid).await;
+                    let policy = cfg.policy;
+                    capture_direct_span(&mut span, source, &cfg.content);
 
                     // BILL-01 / ADR-076 meter 1 (ingest half) — resolved BEFORE
                     // the sampling decision (spec §2.1: "before storage"; the
@@ -587,6 +593,18 @@ pub async fn run(
             ceiling.prune(SAMPLER_MAX_TRACE_WINDOW);
             last_prune = Instant::now();
         }
+    }
+}
+
+fn capture_direct_span(
+    span: &mut TracelaneSpan,
+    source: crate::span_envelope::SpanSource,
+    content: &tracelane_shared::otlp::content::CaptureHalves,
+) {
+    // Fail CLOSED for direct OTLP content. NATS already carries the gateway's
+    // operator/workspace decision and must not be re-gated here.
+    if source == crate::span_envelope::SpanSource::OtlpDirect {
+        tracelane_shared::otlp::content::apply_capture(span, content);
     }
 }
 
@@ -1085,6 +1103,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_content_is_gated_but_nats_content_is_not_regated() {
+        use crate::span_envelope::SpanSource;
+        use tracelane_shared::otlp::content::CaptureHalves;
+        let mut original = tspan(tracelane_shared::SpanStatusCode::Ok);
+        original.attributes.gen_ai_input_messages =
+            Some(serde_json::json!([{"content": "private"}]));
+        let mut direct = original.clone();
+        capture_direct_span(
+            &mut direct,
+            SpanSource::OtlpDirect,
+            &CaptureHalves::closed(),
+        );
+        assert!(
+            direct.attributes.gen_ai_input_messages.is_none(),
+            "direct OTLP must obey capture OFF"
+        );
+        let mut nats = original.clone();
+        capture_direct_span(&mut nats, SpanSource::Nats, &CaptureHalves::closed());
+        assert_eq!(
+            nats.attributes.gen_ai_input_messages,
+            original.attributes.gen_ai_input_messages
+        );
+        let mut direct_on = original.clone();
+        capture_direct_span(
+            &mut direct_on,
+            SpanSource::OtlpDirect,
+            &CaptureHalves {
+                input: true,
+                output: true,
+                max_field_bytes: 1024,
+            },
+        );
+        assert_eq!(
+            direct_on.attributes.gen_ai_input_messages,
+            original.attributes.gen_ai_input_messages
+        );
+    }
+
     // ── BILL-01 / ADR-076 — span_bytes resolution + blob substitution (pure) ──
 
     #[test]
@@ -1496,7 +1553,10 @@ mod tests {
         let resolver: ResolveFn = Arc::new(move |t: uuid::Uuid| {
             Box::pin(async move {
                 if t == tenant {
-                    TenantConfig { policy }
+                    TenantConfig {
+                        policy,
+                        ..TenantConfig::default()
+                    }
                 } else {
                     TenantConfig::default() // Tail
                 }

@@ -26,6 +26,7 @@ pub mod degradation;
 /// emails (step 8) reuse ONE implementation rather than a second copy.
 pub mod email;
 pub mod jetstream_limits;
+pub mod labels;
 pub mod listen_dsn;
 pub mod model;
 pub mod nats_connect;

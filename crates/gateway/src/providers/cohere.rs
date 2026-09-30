@@ -174,16 +174,14 @@ impl CohereProvider {
         let mut byte_stream = response.bytes_stream();
         let stream = try_stream! {
             use futures::StreamExt as _;
-            let mut buf = String::new();
+            // Bytes, not text: a chunk boundary can fall inside a character.
+            let mut lines = super::sse_lines::LineBuffer::default();
             while let Some(chunk) = byte_stream.next().await {
                 use bytes::Bytes;
                 let chunk: Bytes = chunk.context("stream chunk")?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                lines.push(&chunk);
                 // Cohere streams newline-delimited JSON
-                let lines: Vec<String> = buf.split('\n').map(str::to_owned).collect();
-                let last = lines.len().saturating_sub(1);
-                buf = lines[last].clone();
-                for line in &lines[..last] {
+                while let Some(line) = lines.next_line_lossy() {
                     let line = line.trim();
                     if line.is_empty() { continue; }
                     if let Ok(v) = serde_json::from_str::<Value>(line) {

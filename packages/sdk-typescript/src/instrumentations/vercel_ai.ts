@@ -193,7 +193,7 @@ export function tracelaneTelemetry(): Record<string, (event: never) => void> {
 			const span = state?.modelCall;
 			if (!state || !span) return;
 			const finish = unifiedFinishReason(event.finishReason);
-			if (finish) span.setAttribute("gen_ai.response.finish_reason", finish);
+			if (finish) span.setAttribute("gen_ai.response.finish_reasons", [finish]);
 			if (typeof event.usage?.inputTokens === "number")
 				span.setAttribute("gen_ai.usage.input_tokens", event.usage.inputTokens);
 			if (typeof event.usage?.outputTokens === "number")

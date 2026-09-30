@@ -1015,6 +1015,30 @@ struct BreakdownRawRow {
     bytes: u64,
 }
 
+fn breakdown_group_expr(by: &str) -> Option<&'static str> {
+    match by {
+        "key" => Some("api_key_id"),
+        "service" => Some("service"),
+        "capture" => {
+            Some("if(JSONHas(attributes, 'gen_ai_input_messages'), 'content', 'metadata')")
+        }
+        "shape" => Some({
+            "if((SELECT span_count FROM tracelane.trace_summaries ts \
+             WHERE ts.tenant_id = spans.tenant_id AND ts.trace_id = spans.trace_id \
+             ORDER BY ts.start_time DESC LIMIT 1) > 1, 'multi-span', 'single-span')"
+        }),
+        _ => None,
+    }
+}
+
+fn window_breakdown_sql(group_expr: &str, window_days: i32, max_rows: usize) -> String {
+    format!(
+        "SELECT {group_expr} AS key, sum(span_bytes) AS bytes FROM tracelane.spans \
+             WHERE tenant_id = ? AND start_time >= now() - INTERVAL {window_days} DAY \
+             GROUP BY key ORDER BY bytes DESC LIMIT {max_rows}"
+    )
+}
+
 #[tracing::instrument(skip(state, headers), fields(tenant_id = tracing::field::Empty))]
 async fn window_breakdown_handler(
     State(state): State<AppState>,
@@ -1027,27 +1051,12 @@ async fn window_breakdown_handler(
     };
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
-    let by = q.by.as_deref().unwrap_or("project");
-    let group_expr = match by {
-        "project" => {
-            "coalesce(nullIf(JSONExtractString(attributes, 'tracelane_project'), ''), \
-             coalesce(nullIf(tracelane_api_key_id, ''), 'unattributed'))"
-        }
-        "service" => {
-            "coalesce(nullIf(JSONExtractString(attributes, 'service_name'), ''), 'unattributed')"
-        }
-        "capture" => "if(JSONHas(attributes, 'gen_ai_input_messages'), 'content', 'metadata')",
-        "shape" => {
-            "if((SELECT span_count FROM tracelane.trace_summaries ts \
-             WHERE ts.tenant_id = spans.tenant_id AND ts.trace_id = spans.trace_id \
-             ORDER BY ts.start_time DESC LIMIT 1) > 1, 'multi-span', 'single-span')"
-        }
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "by must be one of: project, service, capture, shape",
-            );
-        }
+    let by = q.by.as_deref().unwrap_or("capture");
+    let Some(group_expr) = breakdown_group_expr(by) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "by must be one of: key, service, capture, shape",
+        );
     };
 
     let Some(url) = state.quota_ch_url.clone() else {
@@ -1067,30 +1076,36 @@ async fn window_breakdown_handler(
     // indexed window, never the plan's nominal one — a tenant aged down to
     // 10 days would otherwise see a "top consumers" table sourced from data
     // that has already left the indexed window.
-    let window_days = resolved.as_ref().map_or(3, |e| e.effective_window_days());
+    let window_days = resolved.as_ref().map_or_else(
+        || rating::breakdown_defaults().1,
+        |e| e.effective_window_days(),
+    );
+    let max_rows = state.rate_card.load().policy.window_breakdown_max_rows;
     let tier =
         crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant_id).await;
     let sql = crate::clickhouse_query::TenantQuery::new(
-        format!(
-            "SELECT {group_expr} AS key, sum(span_bytes) AS bytes FROM tracelane.spans \
-             WHERE tenant_id = ? AND start_time >= now() - INTERVAL {window_days} DAY \
-             GROUP BY key ORDER BY bytes DESC LIMIT 200"
-        ),
+        window_breakdown_sql(group_expr, window_days, max_rows),
         tier,
     )
     .with_log_comment(format!("tenant_id={tenant_id}"))
     .sql_with_settings();
-    let rows: Vec<BreakdownRawRow> = crate::clickhouse_query::ch_client(url)
+    let rows: Vec<BreakdownRawRow> = match crate::clickhouse_query::ch_client(url)
         .query(&sql)
         .bind(tenant_id.to_string())
         .fetch_all()
         .await
-        .unwrap_or_else(|e| {
+    {
+        Ok(rows) => rows,
+        Err(e) => {
             tracing::warn!(error = %e, by, "window-breakdown query failed");
-            Vec::new()
-        });
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "window breakdown unavailable",
+            );
+        }
+    };
     let total_bytes: u64 = rows.iter().map(|r| r.bytes).sum();
-    let truncated = rows.len() >= 200;
+    let truncated = rows.len() >= max_rows;
     axum::Json(BreakdownResponse {
         by: by.to_string(),
         rows: rows
@@ -1240,6 +1255,77 @@ fn _band_type_is_public(_b: Band) {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_label_queries_are_tenant_first_and_use_reference_bounds() {
+        for dimension in ["key", "service"] {
+            let expr = super::breakdown_group_expr(dimension).unwrap();
+            let sql = super::window_breakdown_sql(expr, 17, 7);
+            assert!(sql.contains("FROM tracelane.spans WHERE tenant_id = ? AND start_time >="));
+            assert_eq!(sql.matches('?').count(), 1);
+            assert!(sql.contains("INTERVAL 17 DAY"));
+            assert!(sql.ends_with("LIMIT 7"));
+            assert!(!sql.contains("JSONExtract"));
+        }
+    }
+    #[tokio::test]
+    async fn window_project_refusal_names_key() {
+        let state =
+            crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
+        let result = super::window_breakdown_handler(
+            axum::extract::State(state),
+            crate::handler_harness::authed(),
+            axum::extract::Query(super::BreakdownQuery {
+                by: Some("project".into()),
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            crate::handler_harness::body_json(result).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("key")
+        );
+    }
+
+    #[tokio::test]
+    async fn window_query_failure_is_unavailable_instead_of_empty_usage() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("proof query failure"))
+            .mount(&server)
+            .await;
+        let mut state =
+            crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
+        state.quota_ch_url = Some(server.uri());
+        let result = super::window_breakdown_handler(
+            axum::extract::State(state),
+            crate::handler_harness::authed(),
+            axum::extract::Query(super::BreakdownQuery {
+                by: Some("capture".into()),
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let requests = server.received_requests().await.unwrap();
+        let sql = requests[0]
+            .url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "query").then(|| value.into_owned()))
+            .unwrap_or_else(|| String::from_utf8_lossy(&requests[0].body).into_owned());
+        assert!(sql.contains("WHERE tenant_id = "));
+        assert!(sql.contains(&crate::handler_harness::dev_tenant().to_string()));
+    }
+
+    #[test]
+    fn billing_labels_use_materialized_columns_and_reject_project() {
+        assert!(super::breakdown_group_expr("project").is_none());
+        assert_eq!(super::breakdown_group_expr("service"), Some("service"));
+        assert_eq!(super::breakdown_group_expr("key"), Some("api_key_id"));
+        assert!(super::breakdown_group_expr("capture").is_some());
+        assert!(super::breakdown_group_expr("shape").is_some());
+    }
 
     /// B-436: a steady 0.25 GB resident for a whole period is 0.25 GB-month —
     /// the number Polar's cycle sum produces — never 0.25 × the period length.

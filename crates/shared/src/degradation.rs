@@ -316,6 +316,8 @@ pub enum Degradation {
     /// wedge that looks exactly like an insider append. It should never happen; when
     /// it does, someone must know the same hour. `crates/gateway/src/audit.rs`.
     AuditPlatformKeyFallback = 33,
+    /// The trace list remains available but generation-issue enrichment failed.
+    TraceIssueReadFailed = 34,
 }
 
 impl Degradation {
@@ -359,6 +361,7 @@ impl Degradation {
             Self::SpanWriteRetrying => "span_write_retrying",
             Self::WorkspaceGatewayConfigUnreadable => "workspace_gateway_config_unreadable",
             Self::AuditPlatformKeyFallback => "audit_platform_key_fallback",
+            Self::TraceIssueReadFailed => "trace_issue_read_failed",
         }
     }
 
@@ -554,6 +557,9 @@ impl Degradation {
                  to the operator default — until the next entitlement refresh. Check the \
                  control-plane connection and that migrations 0050/0051 are applied."
             }
+            Self::TraceIssueReadFailed => {
+                "generation-issue badges are unavailable; the trace list remains usable. Check ClickHouse query failures."
+            }
             Self::AuditPlatformKeyFallback => {
                 "an audit batch was signed with the shared PLATFORM key because the \
                  workspace's own audit key could not be loaded after every retry. If that \
@@ -601,13 +607,14 @@ impl Degradation {
             Self::SpanWriteRetrying,
             Self::WorkspaceGatewayConfigUnreadable,
             Self::AuditPlatformKeyFallback,
+            Self::TraceIssueReadFailed,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 34;
+pub const COUNT: usize = 35;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -658,6 +665,7 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

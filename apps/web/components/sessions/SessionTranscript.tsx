@@ -1,4 +1,5 @@
 import { ObjectPageCommands } from "@/components/command-palette/object-commands";
+import { IssueChip } from "@/components/trace-viewer/IssueChip";
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { fmtUsd } from "@/lib/metrics/format";
 import type { SessionTranscriptResponse } from "@/lib/sessions";
@@ -164,6 +165,9 @@ export function SessionTranscript({
 								</time>
 								<span className="font-mono text-xs">{turn.model || "—"}</span>
 								<StatusBadge status={turn.error_spans ? "error" : "ok"} />
+								{exchange?.issues?.map((issue) => (
+									<IssueChip key={issue.kind} issue={issue} />
+								))}
 								{turn.intervention > 0 && (
 									<StatusBadge
 										status={

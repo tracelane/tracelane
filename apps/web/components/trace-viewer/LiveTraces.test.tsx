@@ -16,7 +16,10 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { LiveTraces } from "./LiveTraces";
 
-vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
+vi.mock("next/navigation", () => ({
+	useRouter: () => ({ refresh: vi.fn() }),
+	useSearchParams: () => new URLSearchParams("issue=truncated&range=7d"),
+}));
 
 class FakeEventSource {
 	static last: FakeEventSource | null = null;
@@ -72,4 +75,23 @@ it("says Reconnecting when the connection drops before any fresh frame", () => {
 	const es = FakeEventSource.last as FakeEventSource;
 	act(() => es.emit("error"));
 	expect(screen.getByText(/Reconnecting/i)).toBeTruthy();
+});
+
+it("keeps the issue-filtered empty live view distinct and offers a window-preserving clear", () => {
+	render(
+		<LiveTraces streamParams="issue=truncated">
+			<p>static list</p>
+		</LiveTraces>,
+	);
+	fireEvent.click(screen.getByRole("button", { name: /live/i }));
+	const es = FakeEventSource.last as FakeEventSource;
+	act(() =>
+		es.emit("full", JSON.stringify({ rows: [], stale: false, servedAt: 0 })),
+	);
+	expect(
+		screen.getByText("No traces in this window have Truncated."),
+	).toBeTruthy();
+	expect(
+		screen.getByRole("link", { name: "Clear filter" }).getAttribute("href"),
+	).toBe("/traces?range=7d");
 });

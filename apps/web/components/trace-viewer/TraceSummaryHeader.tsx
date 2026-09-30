@@ -1,5 +1,7 @@
+import type { IssueChip as RecordedIssue } from "@/lib/generation-issues";
 import { fmtCompact, fmtCount, fmtUsd } from "@/lib/metrics/format";
 import { StatusBadge } from "@tracelanedev/ui";
+import { IssueChip } from "./IssueChip";
 /**
  * TraceSummaryHeader — the at-a-glance rollup strip above the span view. Every
  * stat is summed from the real span set (`computeTraceSummary`); a metric with
@@ -55,6 +57,19 @@ function WarnTriangle() {
 
 export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 	const s = computeTraceSummary(spans);
+	const issues = new Map<
+		string,
+		{ issue: RecordedIssue; spans: Set<string> }
+	>();
+	for (const span of spans)
+		for (const issue of span.issues ?? []) {
+			const entry = issues.get(issue.kind) ?? {
+				issue,
+				spans: new Set<string>(),
+			};
+			entry.spans.add(span.span_id);
+			issues.set(issue.kind, entry);
+		}
 	const toolCount = countToolCallSpans(spans);
 	const loop = detectToolLoop(spans);
 
@@ -75,6 +90,24 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 
 	return (
 		<div className="space-y-3">
+			{issues.size > 0 && (
+				<div
+					aria-label="Generation issues across this trace"
+					className="flex flex-wrap gap-3"
+				>
+					{[...issues.values()].map(({ issue, spans: affected }) => (
+						<div
+							key={issue.kind}
+							className="flex items-center gap-1 text-xs text-ink-2"
+						>
+							<IssueChip issue={{ ...issue, affected_spans: affected.size }} />
+							<span>
+								{affected.size} of {s.spanCount} spans
+							</span>
+						</div>
+					))}
+				</div>
+			)}
 			{identities.size > 0 && (
 				<div className="flex flex-wrap gap-4" aria-label="Observed identities">
 					{[...identities.values()].map((identity) => (

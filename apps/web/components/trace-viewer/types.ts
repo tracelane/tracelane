@@ -1,8 +1,9 @@
+import type { GenerationDetails } from "@/lib/generation-issues";
 /**
  * Shared span shape returned by the gateway `/v1/traces/{id}/spans` read.
  * (Moved out of the retired SpanTree component; rendered by the transcript spine.)
  */
-export type Span = {
+export type Span = GenerationDetails & {
 	span_id: string;
 	parent_span_id: string | null;
 	name: string;

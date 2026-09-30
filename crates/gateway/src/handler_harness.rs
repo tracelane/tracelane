@@ -210,6 +210,80 @@ mod tests {
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
 
+    #[tokio::test]
+    async fn request_labels_reach_all_proxy_wires_and_warn_without_refusing() {
+        let _bypass = LoopbackBypassGuard::new();
+        let mock = chat_ok_mock().await;
+        Mock::given(method("POST")).and(path("/v1/embeddings")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"nomic-embed-text","usage":{"prompt_tokens":1,"total_tokens":1}}))).mount(&mock).await;
+        Mock::given(method("POST")).and(path("/v1/messages")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"msg_labels","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}))).mount(&mock).await;
+        let mut registry = registry_pointing_ollama_at(mock.uri());
+        registry.anthropic = crate::providers::AnthropicProvider::for_base_url(mock.uri()).unwrap();
+        let state = test_state(registry);
+        let mut card = (**state.rate_card.load()).clone();
+        card.policy.request_labels.max_tags = 1;
+        state.rate_card.store(Arc::new(card));
+        crate::db::provider_keys::cache_decrypted(
+            &dev_tenant(),
+            "anthropic",
+            Arc::new(secrecy::SecretString::from("test-key-labels".to_owned())),
+        );
+        for route in ["chat", "chat-stream", "embeddings", "messages", "refused"] {
+            let trace = uuid::Uuid::new_v4();
+            let mut headers = authed_with_trace(trace);
+            headers.insert(
+                "x-tracelane-metadata",
+                r#"{"feature":"checkout","nested":{}}"#.parse().unwrap(),
+            );
+            headers.insert("x-tracelane-tags", " beta,beta,gamma ".parse().unwrap());
+            headers.insert("x-tracelane-environment", " Production ".parse().unwrap());
+            headers.insert("x-tracelane-release", "v1".parse().unwrap());
+            headers.insert("x-tracelane-service", "checkout".parse().unwrap());
+            if route == "refused" {
+                headers.insert("x-tracelane-zdr", "required".parse().unwrap());
+                with_zdr_caps(&state, &[("ollama", "none")]);
+            }
+            let response=match route {
+                "chat" | "chat-stream" | "refused"=>chat_completions_handler(State(state.clone()),headers,Json(json!({"model":"ollama/llama3","stream":route=="chat-stream","messages":[{"role":"user","content":"hi"}]}))).await,
+                "embeddings"=>embeddings_handler(State(state.clone()),headers,Json(json!({"model":"ollama/nomic-embed-text","input":"hi"}))).await,
+                _=>crate::anthropic_messages::messages_handler(State(state.clone()),headers,axum::body::Bytes::from(json!({"model":"claude-sonnet-4-6","max_tokens":20,"messages":[{"role":"user","content":"hi"}]}).to_string())).await,
+            };
+            assert_eq!(
+                response.status(),
+                if route == "refused" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                },
+                "{route}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get_all("tracelane-warning")
+                    .iter()
+                    .any(|v| v.to_str().unwrap().contains("metadata_keys=1")),
+                "{route}: missing warning"
+            );
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let spans = crate::otlp_emit::test_sink::for_trace(trace);
+            assert_eq!(spans.len(), 1, "{route}");
+            let a = serde_json::to_value(&spans[0].attributes).unwrap();
+            assert_eq!(
+                a["tracelane_metadata"],
+                json!({"feature":"checkout"}),
+                "{route}"
+            );
+            assert_eq!(a["tracelane_tags"], json!(["beta"]));
+            assert_eq!(a["deployment_environment"], "production");
+            assert_eq!(a["service_version"], "v1");
+            assert_eq!(a["service_name"], "checkout");
+            assert_eq!(a["tracelane_labels_dropped"]["metadata_keys"], 1);
+            assert_eq!(a["tracelane_labels_dropped"]["tags"], 1);
+        }
+    }
+
     // ── GWY-49 — zero-data-retention routing, spec §7 rows 3–4 ──────────────
     //
     // The whole feature is one decision (`zdr::ZdrCapabilities::eligible`) sitting in

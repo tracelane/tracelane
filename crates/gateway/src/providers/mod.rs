@@ -362,6 +362,7 @@ pub mod cohere;
 pub mod failover;
 pub mod google;
 pub mod openai;
+pub(crate) mod sse_lines;
 pub mod vertex;
 
 // `all(test, debug_assertions)`, NOT just `test`: smoke_tests calls the

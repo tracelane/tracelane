@@ -285,6 +285,11 @@ for (const [meter, lo, hi, usd, unit] of rateRows) {
 }
 const pol = v3.policy;
 const policyRows = {
+	generation_issues: pol.generation_issues,
+	otlp_capture: pol.otlp_capture,
+	request_labels: pol.request_labels,
+	output_speed: pol.output_speed,
+	window_breakdown_max_rows: pol.window_breakdown_max_rows,
 	web_list_page_sizes: pol.web_list_page_sizes,
 	// EVL-03 §5: every playground cap/window/poll-interval lives here, never as
 	// a literal in the route or the form (CLAUDE.md §23).

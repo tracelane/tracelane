@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     -- OTel + OpenInference attributes (JSON blob)
     attributes       String DEFAULT '{}',  -- JSON: llm.*, gen_ai.*, tracelane.*
 
+    -- Developer labels, materialized from the same attributes on both ingress paths.
+    environment LowCardinality(String) MATERIALIZED JSONExtractString(attributes, 'deployment_environment'),
+    release String MATERIALIZED JSONExtractString(attributes, 'service_version'),
+    service LowCardinality(String) MATERIALIZED JSONExtractString(attributes, 'service_name'),
+    tags Array(LowCardinality(String)) MATERIALIZED JSONExtract(attributes, 'tracelane_tags', 'Array(String)'),
+    INDEX idx_tags tags TYPE bloom_filter(0.01) GRANULARITY 4,
+
     -- Predictive layer annotations
     aft_ids          Array(String) DEFAULT [],
     intervention     UInt8 DEFAULT 0,      -- 0=none, 1=warn, 2=block

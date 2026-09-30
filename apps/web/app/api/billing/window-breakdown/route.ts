@@ -1,5 +1,5 @@
 /**
- * GET /api/billing/window-breakdown?by=project|service|capture|shape —
+ * GET /api/billing/window-breakdown?by=key|service|capture|shape —
  * proxies `GET /v1/billing/window-breakdown` (spec `BILL-01` §2.6) — the
  * "what's using your window" panel. A SEPARATE on-demand call from
  * `/api/billing/usage` (spec §2.5b lists it as its own gateway round trip):
@@ -12,13 +12,13 @@ import type { GatewayWindowBreakdownResponse } from "@/lib/billing-usage";
 import { gatewayBaseUrl } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
-const VALID_BY = new Set(["project", "service", "capture", "shape"]);
+const VALID_BY = new Set(["key", "service", "capture", "shape"]);
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-	const by = req.nextUrl.searchParams.get("by") ?? "project";
+	const by = req.nextUrl.searchParams.get("by") ?? "capture";
 	if (!VALID_BY.has(by)) {
 		return NextResponse.json(
-			{ error: "invalid 'by' dimension" },
+			{ error: "invalid 'by' dimension; use key, service, capture, or shape" },
 			{ status: 400 },
 		);
 	}

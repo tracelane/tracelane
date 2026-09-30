@@ -257,12 +257,20 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let receiver_disk = disk.clone();
+    let receiver_tenant_cfg = tenant_cfg.clone();
     let receiver_single_tenant = single_tenant.clone();
     let otlp_task = async {
         match mtls_state {
             Some(sc) => {
-                otlp_receiver::run_mtls(cfg.otlp_port, otlp_tx, sc, receiver_disk, shutdown.clone())
-                    .await
+                otlp_receiver::run_mtls(
+                    cfg.otlp_port,
+                    otlp_tx,
+                    sc,
+                    receiver_disk,
+                    receiver_tenant_cfg,
+                    shutdown.clone(),
+                )
+                .await
             }
             None => {
                 otlp_receiver::run(
@@ -270,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
                     otlp_tx,
                     receiver_disk,
                     receiver_single_tenant,
+                    receiver_tenant_cfg,
                     shutdown.clone(),
                 )
                 .await

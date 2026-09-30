@@ -24,6 +24,7 @@ import {
 	cn,
 	fmtDur,
 } from "@tracelanedev/ui";
+import { IssueChip } from "./IssueChip";
 
 /**
  * The span-kind mark, re-exported from the design system.
@@ -213,6 +214,14 @@ export function WaterfallView({
 									{fmtDur(s.duration_us)}
 								</span>
 							</Button>
+							{/* Full evidence stays next to the span it describes, without changing its hierarchy. */}
+							{s.issues && s.issues.length > 0 && (
+								<div className="col-span-2 flex flex-wrap gap-1 px-5 pb-1">
+									{s.issues.map((issue) => (
+										<IssueChip key={issue.kind} issue={issue} />
+									))}
+								</div>
+							)}
 						</div>
 					);
 				})}

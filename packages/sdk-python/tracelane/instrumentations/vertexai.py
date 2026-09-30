@@ -77,7 +77,7 @@ def _record_usage(span: Any, response: Any) -> None:
     if candidates:
         finish = getattr(candidates[0], "finish_reason", None)
         if finish is not None:
-            span.set_attribute("gen_ai.response.finish_reason", str(finish))
+            span.set_attribute("gen_ai.response.finish_reasons", [str(finish)])
 
 
 def _patch_generate_content(model: Any, model_name: str) -> None:

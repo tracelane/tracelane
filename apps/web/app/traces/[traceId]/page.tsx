@@ -22,7 +22,7 @@ import type { Span } from "@/components/trace-viewer/types";
 import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
 import { fetchSignaturesFor } from "@/lib/metrics/fetch";
 import { parseTimeRange } from "@/lib/metrics/time-range";
-import { EmptyState, Skeleton } from "@tracelanedev/ui";
+import { EmptyState, ErrorState, Skeleton } from "@tracelanedev/ui";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -57,6 +57,13 @@ async function SpanData({ traceId }: { traceId: string }) {
 		// Gateway unreachable → warming banner instead of the error card.
 		// Re-throw anything else (incl. NEXT_REDIRECT from the auth helper).
 		if (err instanceof GatewayError) {
+			if (err.status === 403)
+				return (
+					<ErrorState
+						title="You don't have access to trace data"
+						description="Ask a workspace administrator for access."
+					/>
+				);
 			return (
 				<>
 					<WarmingBanner />

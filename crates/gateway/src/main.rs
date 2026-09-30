@@ -65,6 +65,7 @@ mod workspace_capture_routes;
 // can install the same byte-scan layer (A10). Local alias keeps existing
 // call sites stable.
 use tracelane_shared::redact;
+mod generation_issues;
 mod server;
 mod spans_stream;
 mod spend;
@@ -74,6 +75,7 @@ mod trace_context;
 mod trace_ingest;
 mod trace_reads;
 mod untrusted_data;
+mod usage_breakdown;
 
 // B1 Prompt Promotion + Eval Gates + Auto-Rollback (ADR-009).
 // Always compiled in V1 — product access is gated at runtime via

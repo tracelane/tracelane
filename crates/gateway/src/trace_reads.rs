@@ -49,6 +49,10 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::clickhouse_query::{PlanTier, TenantQuery};
+use crate::generation_issues::{
+    ISSUES, Issue, IssueChip, IssueSummary, SummaryCacheKey, SummaryExpiry, SummaryRow,
+    issue_predicate_sql,
+};
 use tracelane_shared::{Message, TenantId};
 
 /// Default trace-list page size when `limit` is absent.
@@ -342,6 +346,9 @@ pub struct TraceSummary {
     /// Summed `input + output` tokens over this trace's spans (read-time rollup).
     /// `0` when the spans carry no usage or the rollup fails.
     pub total_tokens: i64,
+    /// Absent when this surface did not run issue enrichment (for example exports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issues: Option<Vec<IssueChip>>,
 }
 
 /// `{ traces, next_cursor }` — matches the legacy dashboard `/api/traces` shape.
@@ -351,6 +358,8 @@ pub struct TraceSummary {
 pub struct TraceListResponse {
     pub traces: Vec<TraceSummary>,
     pub next_cursor: Option<String>,
+    pub issues_available: bool,
+    pub issues_deferred: bool,
 }
 
 /// Internal ClickHouse row for the trace list. Carries `start_time_us` so the
@@ -404,6 +413,7 @@ impl From<TraceSummaryRow> for TraceSummary {
             // carries no cost/token columns, so From defaults to zero.
             cost_usd: 0.0,
             total_tokens: 0,
+            issues: None,
         }
     }
 }
@@ -427,6 +437,28 @@ pub struct SpanRow {
     pub attributes: String,
     pub aft_ids: Vec<String>,
     pub intervention: u8,
+}
+
+/// Authenticated detail response only. The stored row and public-share response
+/// retain their existing shape; derived signals are not database columns.
+#[derive(Debug, Serialize)]
+struct SpanResponse {
+    #[serde(flatten)]
+    span: SpanRow,
+    #[serde(flatten)]
+    generation: crate::generation_issues::GenerationDetails,
+}
+
+impl From<SpanRow> for SpanResponse {
+    fn from(span: SpanRow) -> Self {
+        let attrs = serde_json::from_str(&span.attributes).unwrap_or(serde_json::Value::Null);
+        let generation =
+            crate::generation_issues::details(&crate::generation_issues::SpanAttrsView {
+                attributes: &attrs,
+                status_code: span.status_code,
+            });
+        Self { span, generation }
+    }
 }
 
 // ── OBS-10: trace compare ────────────────────────────────────────────────────
@@ -2035,6 +2067,8 @@ pub struct SessionTurnRow {
 /// or by a route that does not capture input on this trace).
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionExchange {
+    #[serde(flatten)]
+    pub generation: crate::generation_issues::GenerationDetails,
     pub span_id: String,
     /// The input messages AFTER the last `assistant` message — the NEW
     /// user/tool input of this turn. The full history is the trace page's job.
@@ -2147,6 +2181,7 @@ impl SessionSort {
 /// Validated trace-list filters. All optional except `limit`.
 #[derive(Debug, Clone, Default)]
 pub struct TraceListFilters {
+    pub issues: Vec<Issue>,
     pub agent: Option<String>,
     pub model_family: Option<String>,
     pub model: Option<String>,
@@ -2371,7 +2406,7 @@ GROUP BY tenant_id, trace_id)";
 /// ONE function so the three cannot drift (they had, once: the B-368 identity
 /// fix landed in one copy). Appended after `WHERE tenant_id = ?`; the `?` order
 /// is `[model], [min_duration_us], [sig_tenant, sig_id], [q_tenant, q, q_lower,
-/// q, q_lower], [failover_tenant], [end_user_tenant, end_user]`, which
+/// q, q_lower], [failover_tenant], [issue_tenant], [end_user_tenant, end_user]`, which
 /// [`bind_trace_filters`] mirrors. Every `spans` subquery carries the window
 /// (`w_since`/`w_until`) so it prunes on the time-first key of migration 22
 /// instead of scanning the tenant's history.
@@ -2413,6 +2448,20 @@ WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
 AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
         );
     }
+    if !f.issues.is_empty() {
+        // Kinds are parsed into a closed enum before reaching this builder.
+        // OR is scoped inside the tenant/window subquery, never outside it.
+        let predicates = f
+            .issues
+            .iter()
+            .map(|issue| format!("({})", issue_predicate_sql(*issue)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        sql.push_str(&format!(
+            " AND trace_id IN (SELECT trace_id FROM spans FINAL \
+WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND ({predicates}))"
+        ));
+    }
     if f.end_user.is_some() {
         // OBS-20. Same tenant-scoped-subquery shape as the failover filter above,
         // and it inherits the same isolation invariant: the subquery is itself
@@ -2426,7 +2475,7 @@ AND JSONExtractString(attributes, 'user_id') = ?)",
     }
     for (value, expr) in [
         (&f.agent, crate::kya_routes::agent_key_sql()),
-        (&f.model_family, crate::kya_routes::MODEL_KEY_SQL.to_owned()),
+        (&f.model_family, crate::kya_routes::model_key_sql()),
     ] {
         if value.is_some() {
             sql.push_str(&format!(
@@ -2650,6 +2699,26 @@ toInt64(sum(toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens')) \
 FROM spans FINAL \
 WHERE tenant_id = ? AND trace_id IN ({placeholders}) \
 GROUP BY trace_id"
+    )
+}
+
+#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+pub struct TraceIssueRow {
+    pub trace_id: String,
+    pub issue_counts: Vec<u64>,
+}
+
+/// Only the current page's ids; all spans of each trace, deduplicated first.
+fn build_trace_issue_rollup_sql(n_ids: usize) -> String {
+    let placeholders = vec!["?"; n_ids].join(", ");
+    let counts = ISSUES
+        .into_iter()
+        .map(|issue| format!("toUInt64(countIf({}))", issue_predicate_sql(issue)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT trace_id, [{counts}] AS issue_counts FROM spans FINAL \
+WHERE tenant_id = ? AND trace_id IN ({placeholders}) GROUP BY trace_id"
     )
 }
 
@@ -3457,7 +3526,7 @@ LIMIT ?"
 fn build_session_exchange_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(
-        "SELECT trace_id, span_id, attributes \
+        "SELECT trace_id, span_id, attributes, status_code \
 FROM spans FINAL \
 WHERE tenant_id = ? AND trace_id IN ({placeholders}) AND {MV_MODEL_EXPR} != '' \
 ORDER BY trace_id ASC, start_time DESC \
@@ -3471,6 +3540,10 @@ LIMIT 1 BY trace_id"
 /// [`ClickHouseTraceReader`]; tests use the in-module `MockTraceReader`.
 #[async_trait::async_trait]
 pub trait TraceReader: Send + Sync {
+    fn generation_issue_policy(&self) -> crate::generation_issues::SummaryPolicy {
+        crate::generation_issues::SummaryPolicy::embedded()
+    }
+    async fn generation_issue_summary(&self, tenant_id: &TenantId) -> Result<Arc<IssueSummary>>;
     async fn list_traces(
         &self,
         tenant_id: &TenantId,
@@ -3501,6 +3574,11 @@ pub trait TraceReader: Send + Sync {
         tenant_id: &TenantId,
         trace_ids: &[String],
     ) -> Result<Vec<TraceCostRow>>;
+    async fn trace_issue_rollup(
+        &self,
+        tenant_id: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<TraceIssueRow>>;
     async fn slo(&self, tenant_id: &TenantId, filters: &SloFilters) -> Result<Vec<SloRow>>;
     async fn slo_summary(&self, tenant_id: &TenantId, filters: &SloFilters) -> Result<SloSummary>;
     /// Per-(provider, model) window-wide SLO rows with TRUE merged percentiles
@@ -3617,6 +3695,8 @@ pub trait TraceReader: Send + Sync {
 /// ClickHouse-backed reader. Every query is tenant-first, parameter-bound, and
 /// wrapped by [`TenantQuery`] for ADR-031 resource caps.
 pub struct ClickHouseTraceReader {
+    rate_card: Arc<arc_swap::ArcSwap<crate::billing::RateCard>>,
+    issue_summary_cache: moka::future::Cache<SummaryCacheKey, Arc<IssueSummary>>,
     client: ClickhouseClient,
     /// The same cache the hot path reads — no Postgres per request. `None` on a
     /// stack with no control plane, which resolves to the FREE tier (fail-closed,
@@ -3634,6 +3714,12 @@ pub struct ClickHouseTraceReader {
 impl ClickHouseTraceReader {
     pub fn new(client: ClickhouseClient) -> Self {
         Self {
+            rate_card: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::billing::RateCard::unavailable(),
+            )),
+            issue_summary_cache: moka::future::Cache::builder()
+                .expire_after(SummaryExpiry)
+                .build(),
             client,
             entitlements: None,
             pg_pool: None,
@@ -3646,6 +3732,15 @@ impl ClickHouseTraceReader {
         entitlements: Option<Arc<crate::entitlement_cache::EntitlementCache>>,
     ) -> Self {
         self.entitlements = entitlements;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_card(
+        mut self,
+        rate_card: Arc<arc_swap::ArcSwap<crate::billing::RateCard>>,
+    ) -> Self {
+        self.rate_card = rate_card;
         self
     }
 
@@ -3754,6 +3849,9 @@ fn bind_trace_prefix_and_filters(
         // Failover subquery binds tenant_id (tenant-scoped).
         q = q.bind(tenant_id.to_string());
     }
+    if !f.issues.is_empty() {
+        q = q.bind(tenant_id.to_string());
+    }
     if let Some(u) = &f.end_user {
         // OBS-20 subquery binds tenant_id THEN the id — the two `?` in
         // `WHERE tenant_id = ? AND … = ?`, in that order (TRAPS §58).
@@ -3774,6 +3872,79 @@ fn bind_trace_prefix_and_filters(
 
 #[async_trait::async_trait]
 impl TraceReader for ClickHouseTraceReader {
+    fn generation_issue_policy(&self) -> crate::generation_issues::SummaryPolicy {
+        self.rate_card.load().policy.generation_issues
+    }
+    async fn generation_issue_summary(&self, tenant_id: &TenantId) -> Result<Arc<IssueSummary>> {
+        let policy = self.generation_issue_policy();
+        anyhow::ensure!(policy.valid(), "generation issue policy unavailable");
+        let effective_days = match &self.entitlements {
+            Some(cache) => cache
+                .resolved(*tenant_id.as_uuid())
+                .await
+                .effective_window_days(),
+            None => crate::billing::rating::breakdown_defaults().1,
+        };
+        let window_days = policy.window_days(effective_days);
+        anyhow::ensure!(window_days > 0, "generation issue window unavailable");
+        let content_capture = self.content_capture(tenant_id).await.input;
+        let key = SummaryCacheKey {
+            tenant: tenant_id.clone(),
+            window_days,
+            ttl_seconds: policy.summary_cache_ttl_seconds,
+            content_capture,
+        };
+        self.issue_summary_cache
+            .try_get_with(key, async {
+                let until = chrono::Utc::now();
+                let since = chrono::TimeDelta::try_days(i64::from(window_days))
+                    .and_then(|delta| until.checked_sub_signed(delta))
+                    .context("invalid generation issue window")?;
+                let sql = TenantQuery::new(
+                    crate::generation_issues::summary_sql(),
+                    self.tier_for(tenant_id).await,
+                )
+                .sql_with_settings();
+                let row = self
+                    .client
+                    .query(&sql)
+                    .bind(tenant_id.to_string())
+                    .bind(since.timestamp_micros())
+                    .bind(until.timestamp_micros())
+                    .fetch_one::<SummaryRow>()
+                    .await
+                    .context("generation issue summary read failed")?;
+                anyhow::ensure!(
+                    row.issue_counts.len() == ISSUES.len(),
+                    "generation issue summary shape mismatch"
+                );
+                Ok::<_, anyhow::Error>(Arc::new(IssueSummary {
+                    total_traces: row.total_traces,
+                    llm_calls: row.llm_calls,
+                    no_served_model_calls: row.no_served_model_calls,
+                    no_finish_reason_calls: row.no_finish_reason_calls,
+                    gateway_signal_calls: row.gateway_signal_calls,
+                    counts: ISSUES
+                        .into_iter()
+                        .zip(row.issue_counts)
+                        .map(
+                            |(kind, trace_count)| crate::generation_issues::IssueTraceCount {
+                                kind,
+                                trace_count,
+                            },
+                        )
+                        .collect(),
+                    window_days,
+                    since: since.to_rfc3339(),
+                    until: until.to_rfc3339(),
+                    as_of: until.to_rfc3339(),
+                    content_capture,
+                }))
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     /// GWY-53: the workspace half from the SAME entitlement cache the hot path reads
     /// (never Postgres per request); `None` cache = no control plane = the
     /// workspace half OFF.
@@ -3916,6 +4087,29 @@ impl TraceReader for ClickHouseTraceReader {
         q.fetch_all::<TraceCostRow>()
             .await
             .context("trace cost rollup SELECT failed")
+    }
+
+    async fn trace_issue_rollup(
+        &self,
+        tenant_id: &TenantId,
+        trace_ids: &[String],
+    ) -> Result<Vec<TraceIssueRow>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = TenantQuery::new(
+            build_trace_issue_rollup_sql(trace_ids.len()),
+            self.tier_for(tenant_id).await,
+        )
+        .sql_with_settings();
+        let mut query = self.client.query(&sql).bind(tenant_id.to_string());
+        for id in trace_ids {
+            query = query.bind(id);
+        }
+        query
+            .fetch_all::<TraceIssueRow>()
+            .await
+            .context("trace issue rollup SELECT failed")
     }
 
     async fn slo(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<Vec<SloRow>> {
@@ -4387,7 +4581,7 @@ impl TraceReader for ClickHouseTraceReader {
             .map(|t| {
                 let exchange = by_trace
                     .remove(&t.trace_id)
-                    .map(|s| build_session_exchange(s.span_id, &s.attributes));
+                    .map(|s| build_session_exchange(s.span_id, &s.attributes, s.status_code));
                 (t, exchange)
             })
             .collect())
@@ -4400,14 +4594,25 @@ struct ExchangeSpanRow {
     trace_id: String,
     span_id: String,
     attributes: String,
+    status_code: u8,
 }
 
 /// `OBS-55` — build one turn's [`SessionExchange`] from its exchange span's id
 /// and (already rehydrated) `attributes` JSON string. Pure, so the four
 /// `content` outcomes are unit-testable without ClickHouse.
-fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExchange {
+fn build_session_exchange(
+    span_id: String,
+    attributes_json: &str,
+    status_code: u8,
+) -> SessionExchange {
     let Ok(attrs) = serde_json::from_str::<serde_json::Value>(attributes_json) else {
         return SessionExchange {
+            generation: crate::generation_issues::details(
+                &crate::generation_issues::SpanAttrsView {
+                    attributes: &serde_json::Value::Null,
+                    status_code,
+                },
+            ),
             span_id,
             input_tail: Vec::new(),
             input_message_count: 0,
@@ -4417,6 +4622,10 @@ fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExch
             content: "unreadable",
         };
     };
+    let generation = crate::generation_issues::details(&crate::generation_issues::SpanAttrsView {
+        attributes: &attrs,
+        status_code,
+    });
     let tool_attrs = {
         let mut m = serde_json::Map::new();
         for key in [
@@ -4447,6 +4656,7 @@ fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExch
 
     let Some(raw_input) = attrs.get("gen_ai_input_messages") else {
         return SessionExchange {
+            generation,
             span_id,
             input_tail: Vec::new(),
             input_message_count: 0,
@@ -4464,6 +4674,7 @@ fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExch
         == Some(true)
     {
         return SessionExchange {
+            generation,
             span_id,
             input_tail: Vec::new(),
             input_message_count: 0,
@@ -4475,6 +4686,7 @@ fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExch
     }
     let Ok(messages) = serde_json::from_value::<Vec<Message>>(raw_input.clone()) else {
         return SessionExchange {
+            generation,
             span_id,
             input_tail: Vec::new(),
             input_message_count: 0,
@@ -4494,6 +4706,7 @@ fn build_session_exchange(span_id: String, attributes_json: &str) -> SessionExch
         .map_or(0, |idx| idx + 1);
     let input_tail = messages[tail_start..].to_vec();
     SessionExchange {
+        generation,
         span_id,
         input_tail,
         input_message_count,
@@ -4519,6 +4732,8 @@ pub struct TraceReadState {
 
 #[derive(Debug, Deserialize)]
 pub struct TraceListQuery {
+    include_issues: Option<bool>,
+    issue: Option<String>,
     agent: Option<String>,
     model_family: Option<String>,
     limit: Option<u32>,
@@ -4555,6 +4770,7 @@ pub struct TraceListQuery {
 /// no page limit) plus the output `format`.
 #[derive(Debug, Deserialize)]
 pub struct TraceExportQuery {
+    issue: Option<String>,
     agent: Option<String>,
     model_family: Option<String>,
     /// `"csv"` (default) | `"json"`.
@@ -4578,6 +4794,7 @@ pub struct TraceExportQuery {
 /// Query for `GET /v1/traces/groups` — the grouping dimension + the same filters.
 #[derive(Debug, Deserialize)]
 pub struct TraceGroupsQuery {
+    issue: Option<String>,
     agent: Option<String>,
     model_family: Option<String>,
     /// `model` | `operation` | `status` (required — grouping has no default).
@@ -4763,6 +4980,11 @@ pub struct SessionTranscriptQuery {
 /// Mount the three read routes. Mounted only when `CLICKHOUSE_URL` is set.
 pub fn routes() -> Router<TraceReadState> {
     Router::new()
+        .route(
+            "/v1/traces/issues/summary",
+            get(generation_issue_summary_handler),
+        )
+        .route("/v1/traces/issues/rollup", get(trace_issue_rollup_handler))
         .route("/v1/traces", get(list_traces_handler))
         .route("/v1/traces/count", get(trace_count_handler))
         .route("/v1/traces/export", get(export_traces_handler))
@@ -4798,6 +5020,32 @@ pub fn routes() -> Router<TraceReadState> {
         )
 }
 
+#[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn generation_issue_summary_handler(
+    State(state): State<TraceReadState>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    match state
+        .reader
+        .generation_issue_summary(&claims.tenant_id)
+        .await
+    {
+        Ok(summary) => Json(summary.as_ref()).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "generation issue summary unavailable");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "generation issue summary unavailable",
+            )
+        }
+    }
+}
+
 /// `{ total }` — the tenant trace total for the "50 of N" footer.
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceCountResponse {
@@ -4817,6 +5065,16 @@ async fn trace_count_handler(
         Err(resp) => return resp,
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    let issues = match parse_issue_filter(q.issue.as_deref()) {
+        Ok(issues) => issues,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown_issue", "allowed": ISSUES})),
+            )
+                .into_response();
+        }
+    };
     let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
@@ -4836,6 +5094,7 @@ async fn trace_count_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        issues,
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: search,
@@ -4859,6 +5118,23 @@ async fn trace_count_handler(
             error_response(StatusCode::BAD_GATEWAY, "trace count failed")
         }
     }
+}
+
+/// Empty means the filter was cleared. A nonempty list must contain only known
+/// kinds; accepting the known half of an invalid list would silently widen it.
+fn parse_issue_filter(raw: Option<&str>) -> Result<Vec<Issue>, ()> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut issues = Vec::new();
+    for kind in raw.split(',') {
+        let issue = serde_json::from_value::<Issue>(serde_json::Value::String(kind.to_owned()))
+            .map_err(|_| ())?;
+        if !issues.contains(&issue) {
+            issues.push(issue);
+        }
+    }
+    Ok(issues)
 }
 
 /// Minimum free-text term length, tied to the `ngrambf_v1(4, …)` index `n`.
@@ -4896,6 +5172,16 @@ async fn list_traces_handler(
         Err(resp) => return resp,
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    let issues = match parse_issue_filter(q.issue.as_deref()) {
+        Ok(issues) => issues,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown_issue", "allowed": ISSUES})),
+            )
+                .into_response();
+        }
+    };
 
     let search = match validate_search_term(q.q.as_deref()) {
         Ok(s) => s,
@@ -4926,6 +5212,7 @@ async fn list_traces_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        issues,
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: search.clone(),
@@ -4966,12 +5253,125 @@ async fn list_traces_handler(
     } else {
         None
     };
-    let traces = enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows).await;
+    let ids = rows.iter().map(|r| r.trace_id.clone()).collect::<Vec<_>>();
+    let issues_deferred = q.include_issues == Some(false);
+    let (traces, issues_available) = if issues_deferred {
+        (
+            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows).await,
+            false,
+        )
+    } else {
+        let (mut traces, issue_rows) = tokio::join!(
+            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows),
+            state.reader.trace_issue_rollup(&claims.tenant_id, &ids),
+        );
+        let available = apply_trace_issues(&mut traces, issue_rows);
+        (traces, available)
+    };
     Json(TraceListResponse {
         traces,
         next_cursor,
+        issues_available,
+        issues_deferred,
     })
     .into_response()
+}
+
+/// Fail OPEN for display enrichment: the primary rows remain usable on failure.
+/// An explicit availability flag prevents an outage from looking like no issues.
+fn decode_trace_issues(
+    rows: Result<Vec<TraceIssueRow>>,
+) -> Option<std::collections::HashMap<String, Vec<IssueChip>>> {
+    use tracelane_shared::degradation::{self, Degradation};
+    let rows = match rows {
+        Ok(rows) if rows.iter().all(|r| r.issue_counts.len() == ISSUES.len()) => rows,
+        _ => {
+            degradation::note(Degradation::TraceIssueReadFailed);
+            return None;
+        }
+    };
+    if !rows.is_empty() {
+        degradation::resolve(Degradation::TraceIssueReadFailed);
+    }
+    Some(
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.trace_id,
+                    ISSUES
+                        .into_iter()
+                        .zip(r.issue_counts)
+                        .filter(|(_, count)| *count > 0)
+                        .map(|(issue, count)| issue.chip(count))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn apply_trace_issues(traces: &mut [TraceSummary], rows: Result<Vec<TraceIssueRow>>) -> bool {
+    let decoded = decode_trace_issues(rows);
+    let available = decoded.is_some();
+    let mut by_trace = decoded.unwrap_or_default();
+    for trace in traces {
+        trace.issues = Some(by_trace.remove(&trace.trace_id).unwrap_or_default());
+    }
+    available
+}
+
+#[derive(Deserialize)]
+struct TraceIssueQuery {
+    trace_ids: Option<String>,
+}
+
+/// Optional second read for list clients: bound to one page and authenticated
+/// through the same read-scope seam as the primary list.
+async fn trace_issue_rollup_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<TraceIssueQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let ids = q
+        .trace_ids
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if ids.len() > MAX_TRACE_LIMIT as usize || ids.iter().any(|id| id.is_empty()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "trace_ids must contain one page of nonempty ids",
+        );
+    }
+    let policy = state.reader.generation_issue_policy();
+    if !policy.valid() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "generation issue policy unavailable",
+        );
+    }
+    let decoded = decode_trace_issues(
+        state
+            .reader
+            .trace_issue_rollup(&claims.tenant_id, &ids)
+            .await,
+    );
+    let available = decoded.is_some();
+    let mut decoded = decoded.unwrap_or_default();
+    let traces = ids
+        .into_iter()
+        .map(|id| {
+            let issues = decoded.remove(&id).unwrap_or_default();
+            serde_json::json!({"trace_id":id, "issues":issues})
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({"traces":traces,"issues_available":available,"inline_limit":policy.inline_chip_limit})).into_response()
 }
 
 /// Map CH trace rows → public [`TraceSummary`], enriching each with the
@@ -5023,6 +5423,16 @@ async fn export_traces_handler(
         Err(resp) => return resp,
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    let issues = match parse_issue_filter(q.issue.as_deref()) {
+        Ok(issues) => issues,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown_issue", "allowed": ISSUES})),
+            )
+                .into_response();
+        }
+    };
 
     let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
         Ok(v) => v,
@@ -5037,6 +5447,7 @@ async fn export_traces_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        issues,
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: None,
@@ -5184,6 +5595,16 @@ async fn list_trace_groups_handler(
         Err(resp) => return resp,
     };
     tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    let issues = match parse_issue_filter(q.issue.as_deref()) {
+        Ok(issues) => issues,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown_issue", "allowed": ISSUES})),
+            )
+                .into_response();
+        }
+    };
 
     let Some(by) = parse_group_by(q.by.as_deref().unwrap_or("")) else {
         return error_response(
@@ -5204,6 +5625,7 @@ async fn list_trace_groups_handler(
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
     let filters = TraceListFilters {
+        issues,
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: None,
@@ -5265,7 +5687,13 @@ async fn list_spans_handler(
     if spans.is_empty() {
         return error_response(StatusCode::NOT_FOUND, "trace not found");
     }
-    Json(spans).into_response()
+    Json(
+        spans
+            .into_iter()
+            .map(SpanResponse::from)
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 /// GET /v1/traces/compare?a=&b= — OBS-10 side-by-side diff of two traces.
@@ -7983,6 +8411,603 @@ mod tests {
         assert!(i_dur < i_subq_tenant && i_subq_tenant < i_has && i_has < i_limit);
     }
 
+    fn issue_summary_fixture_bytes() -> Vec<u8> {
+        let mut data = Vec::new();
+        for n in [2_u64, 3, 1, 2, 0] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.push(9);
+        for n in [0_u64, 0, 0, 1, 0, 0, 0, 0, 0] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data
+    }
+
+    #[tokio::test]
+    async fn issue_summary_cache_separates_tenants_and_refreshes_policy_and_expiry() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(issue_summary_fixture_bytes()),
+            )
+            .mount(&server)
+            .await;
+        let card = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::billing::RateCard::unavailable(),
+        ));
+        let mut next = (**card.load()).clone();
+        next.policy.generation_issues.dashboard_window_days = 1;
+        card.store(Arc::new(next.clone()));
+        let reader = ClickHouseTraceReader::new(
+            clickhouse::Client::default()
+                .with_url(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        )
+        .with_rate_card(card.clone());
+        let a = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let b = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let first = reader.generation_issue_summary(&a).await.unwrap();
+        assert_eq!(first.window_days, 1);
+        assert!(Arc::ptr_eq(
+            &first,
+            &reader.generation_issue_summary(&a).await.unwrap()
+        ));
+        reader.generation_issue_summary(&b).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        next.policy.generation_issues.dashboard_window_days = 2;
+        next.policy.generation_issues.summary_cache_ttl_seconds = 1;
+        card.store(Arc::new(next));
+        let changed = reader.generation_issue_summary(&a).await.unwrap();
+        assert_eq!(changed.window_days, 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let expired = reader.generation_issue_summary(&a).await.unwrap();
+        assert!(!Arc::ptr_eq(&changed, &expired));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn issue_summary_failures_are_not_cached_or_returned_as_zero() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let reader = ClickHouseTraceReader::new(
+            clickhouse::Client::default()
+                .with_url(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        );
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        assert!(reader.generation_issue_summary(&tenant).await.is_err());
+        assert!(reader.generation_issue_summary(&tenant).await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        server.reset().await;
+        // Measured empty window: five zero counters and nine zero issue counts.
+        let mut empty = vec![0_u8; 5 * 8];
+        empty.push(9);
+        empty.extend_from_slice(&[0_u8; 9 * 8]);
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(empty))
+            .mount(&server)
+            .await;
+        let summary = reader.generation_issue_summary(&tenant).await.unwrap();
+        assert_eq!(summary.total_traces, 0);
+        assert_eq!(summary.llm_calls, 0);
+        assert_eq!(summary.no_served_model_calls, 0);
+        assert!(summary.counts.iter().all(|c| c.trace_count == 0));
+    }
+
+    #[tokio::test]
+    async fn issue_summary_is_cached_tenant_scoped_and_reports_unknowns() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        let server = wiremock::MockServer::start().await;
+        // RowBinary: five UInt64 fields, then Array(UInt64), in SELECT order.
+        let mut data = Vec::new();
+        for n in [2_u64, 3, 1, 2, 0] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.push(9);
+        for n in [0_u64, 0, 0, 1, 0, 0, 0, 0, 0] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(data))
+            .mount(&server)
+            .await;
+        let reader = ClickHouseTraceReader::new(
+            clickhouse::Client::default()
+                .with_url(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        );
+        let app = routes().with_state(TraceReadState {
+            reader: Arc::new(reader),
+            rejections: test_rejections(),
+        });
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/traces/issues/summary?tenant_id=foreign")
+                .header("Authorization", "Bearer dev-test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        let first = first.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let a = body_json(first).await;
+        let b = body_json(second.unwrap()).await;
+        assert_eq!(a, b);
+        assert_eq!(a["total_traces"], 2);
+        assert_eq!(a["no_served_model_calls"], 1);
+        assert_eq!(a["gateway_signal_calls"], 0);
+        assert_eq!(a["counts"][3]["trace_count"], 1);
+        assert_eq!(
+            a["window_days"],
+            crate::billing::rating::breakdown_defaults().1
+        );
+        assert!(a["as_of"].as_str().is_some());
+        assert_eq!(a["content_capture"], false);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "single-flight and cached within TTL");
+        let query = requests[0]
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "query")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_else(|| String::from_utf8(requests[0].body.clone()).unwrap());
+        assert!(
+            query.contains(&format!(
+                "WHERE tenant_id = '{DEV_TENANT}' AND start_time >="
+            )),
+            "{query}"
+        );
+        assert!(!query.contains("foreign"));
+        let unauthorized = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/traces/issues/summary")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn deferred_issue_rollup_authenticates_bounds_and_fails_open() {
+        let _g = DevAuthGuard::new();
+        for fails in [false, true] {
+            let reader = Arc::new(MockTraceReader {
+                trace_issues: vec![
+                    TraceIssueRow {
+                        trace_id: "own".into(),
+                        issue_counts: vec![0, 0, 0, 1, 0, 0, 0, 0, 0],
+                    },
+                    TraceIssueRow {
+                        trace_id: "outside-page".into(),
+                        issue_counts: vec![1; 9],
+                    },
+                ],
+                issue_read_fails: fails,
+                ..MockTraceReader::new()
+            });
+            let state = TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            };
+            let unauthorized = trace_issue_rollup_handler(
+                State(state.clone()),
+                Query(TraceIssueQuery {
+                    trace_ids: Some("own".into()),
+                }),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+            assert!(reader.seen_issue_reads.lock().unwrap().is_empty());
+            for ids in [
+                None,
+                Some("".into()),
+                Some(vec!["id"; MAX_TRACE_LIMIT as usize + 1].join(",")),
+            ] {
+                let r = trace_issue_rollup_handler(
+                    State(state.clone()),
+                    Query(TraceIssueQuery { trace_ids: ids }),
+                    bearer_headers(),
+                )
+                .await;
+                assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            }
+            let response = trace_issue_rollup_handler(
+                State(state),
+                Query(TraceIssueQuery {
+                    trace_ids: Some("own,unknown".into()),
+                }),
+                bearer_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["issues_available"], !fails);
+            assert_eq!(
+                body["inline_limit"],
+                crate::generation_issues::SummaryPolicy::embedded().inline_chip_limit
+            );
+            assert_eq!(body["traces"].as_array().unwrap().len(), 2);
+            assert_eq!(body["traces"][1]["issues"], serde_json::json!([]));
+            assert!(!body.to_string().contains("outside-page"));
+            if !fails {
+                assert_eq!(body["traces"][0]["issues"][0]["kind"], "truncated");
+            }
+            assert_eq!(
+                reader.seen_issue_reads.lock().unwrap().as_slice(),
+                &[(
+                    DEV_TENANT.to_owned(),
+                    vec!["own".to_owned(), "unknown".to_owned()]
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_badges_can_be_deferred_without_running_the_secondary_read() {
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader {
+            traces: vec![trace_row("trace-page", 100)],
+            issue_read_fails: true,
+            ..MockTraceReader::new()
+        });
+        let response = list_traces_handler(
+            State(TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            }),
+            Query(serde_json::from_value(serde_json::json!({"include_issues":false})).unwrap()),
+            bearer_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            reader.seen_issue_reads.lock().unwrap().is_empty(),
+            "the primary list must not wait for badge enrichment"
+        );
+        assert_eq!(body["issues_deferred"], true);
+        assert!(body["traces"][0].get("issues").is_none());
+    }
+
+    #[tokio::test]
+    async fn issue_filter_rejects_unknown_kinds_on_every_trace_surface() {
+        let _g = DevAuthGuard::new();
+        for issue in [
+            "unknown",
+            "truncated,unknown",
+            "truncated,,filtered",
+            "' OR 1=1",
+        ] {
+            let state = TraceReadState {
+                reader: Arc::new(MockTraceReader::new()),
+                rejections: test_rejections(),
+            };
+            let query = serde_json::json!({"issue": issue, "by": "model"});
+            let responses = [
+                list_traces_handler(
+                    State(state.clone()),
+                    Query(serde_json::from_value(query.clone()).unwrap()),
+                    bearer_headers(),
+                )
+                .await,
+                trace_count_handler(
+                    State(state.clone()),
+                    Query(serde_json::from_value(query.clone()).unwrap()),
+                    bearer_headers(),
+                )
+                .await,
+                export_traces_handler(
+                    State(state.clone()),
+                    Query(serde_json::from_value(query.clone()).unwrap()),
+                    bearer_headers(),
+                )
+                .await,
+                list_trace_groups_handler(
+                    State(state),
+                    Query(serde_json::from_value(query).unwrap()),
+                    bearer_headers(),
+                )
+                .await,
+            ];
+            for response in responses {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{issue}");
+                let body = body_json(response).await;
+                assert_eq!(body["error"], "unknown_issue");
+                assert_eq!(body["allowed"], serde_json::to_value(ISSUES).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn issue_filter_is_closed_deduplicated_and_tenant_window_scoped() {
+        assert!(parse_issue_filter(None).unwrap().is_empty());
+        assert!(parse_issue_filter(Some("")).unwrap().is_empty());
+        for issue in ISSUES {
+            let name = serde_json::to_value(issue).unwrap();
+            assert_eq!(parse_issue_filter(name.as_str()).unwrap(), vec![issue]);
+        }
+        let issues = parse_issue_filter(Some("truncated,filtered,truncated")).unwrap();
+        assert_eq!(issues, vec![Issue::Truncated, Issue::Filtered]);
+        let filters = TraceListFilters {
+            issues,
+            ..Default::default()
+        };
+        let clause = format!(
+            "trace_id IN (SELECT trace_id FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND (({}) OR ({})))",
+            issue_predicate_sql(Issue::Truncated),
+            issue_predicate_sql(Issue::Filtered)
+        );
+        for sql in [
+            build_trace_list_sql(&filters),
+            build_trace_count_sql(&filters),
+            build_trace_groups_sql(TraceGroupBy::Model, &filters),
+        ] {
+            assert!(sql.contains(&clause), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_filter_reaches_list_count_export_and_groups() {
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader::new());
+        let state = TraceReadState {
+            reader: reader.clone(),
+            rejections: test_rejections(),
+        };
+        let query = serde_json::json!({"issue":"truncated,filtered", "by":"model", "tenant_id":"foreign", "since":"2026-09-20T00:00:00Z", "until":"2026-09-21T00:00:00Z"});
+        let responses = [
+            list_traces_handler(
+                State(state.clone()),
+                Query(serde_json::from_value(query.clone()).unwrap()),
+                bearer_headers(),
+            )
+            .await,
+            trace_count_handler(
+                State(state.clone()),
+                Query(serde_json::from_value(query.clone()).unwrap()),
+                bearer_headers(),
+            )
+            .await,
+            export_traces_handler(
+                State(state.clone()),
+                Query(serde_json::from_value(query.clone()).unwrap()),
+                bearer_headers(),
+            )
+            .await,
+            list_trace_groups_handler(
+                State(state),
+                Query(serde_json::from_value(query).unwrap()),
+                bearer_headers(),
+            )
+            .await,
+        ];
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            reader.seen_tenant.lock().unwrap().as_slice(),
+            &[DEV_TENANT; 4]
+        );
+        let filters = reader.seen_trace_filters.lock().unwrap();
+        assert_eq!(filters.len(), 4);
+        for f in filters.iter() {
+            assert_eq!(f.issues, vec![Issue::Truncated, Issue::Filtered]);
+            assert_eq!(
+                f.since_us,
+                parse_rfc3339_micros(Some("2026-09-20T00:00:00Z")).unwrap()
+            );
+            assert_eq!(
+                f.until_us,
+                parse_rfc3339_micros(Some("2026-09-21T00:00:00Z")).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_filter_reader_binds_each_tenant_before_subquery_filters() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let reader =
+            ClickHouseTraceReader::new(clickhouse::Client::default().with_url(server.uri()));
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let filters = TraceListFilters {
+            issues: vec![Issue::Truncated],
+            failover: Some(true),
+            end_user: Some("user-'quoted".into()),
+            since_us: Some(1000),
+            until_us: Some(2000),
+            limit: 2,
+            ..Default::default()
+        };
+        assert!(reader.list_traces(&tenant, &filters).await.is_err());
+        assert!(reader.count_traces(&tenant, &filters).await.is_err());
+        assert!(
+            reader
+                .list_trace_groups(&tenant, TraceGroupBy::Model, &filters)
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            let sql = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "query")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_else(|| String::from_utf8(request.body).unwrap());
+            assert_eq!(
+                sql.matches(&format!("tenant_id = '{tenant}'")).count(),
+                5,
+                "{sql}"
+            );
+            assert!(
+                sql.contains("fromUnixTimestamp64Micro(1000) AS w_since"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("fromUnixTimestamp64Micro(2000) AS w_until"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("JSONExtractString(attributes, 'user_id') = 'user-\\'quoted'"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(&issue_predicate_sql(Issue::Truncated)),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_issue_rollup_is_tenant_first_deduplicated_and_page_bounded() {
+        let sql = build_trace_issue_rollup_sql(3);
+        assert!(
+            sql.contains(
+                "FROM spans FINAL WHERE tenant_id = ? AND trace_id IN (?, ?, ?) GROUP BY trace_id"
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql.matches('?').count(), 4);
+        for issue in ISSUES {
+            assert!(sql.contains(&format!("countIf({})", issue_predicate_sql(issue))));
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_issue_reader_binds_tenant_and_page_ids_and_skips_empty_pages() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let reader =
+            ClickHouseTraceReader::new(clickhouse::Client::default().with_url(server.uri()));
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        assert!(
+            reader
+                .trace_issue_rollup(&tenant, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(
+            reader
+                .trace_issue_rollup(&tenant, &["page-a".into(), "page-b".into()])
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let sql = requests[0]
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        assert!(
+            sql.contains(&format!(
+                "WHERE tenant_id = '{}' AND trace_id IN ('page-a', 'page-b')",
+                tenant
+            )),
+            "{sql}"
+        );
+        assert!(sql.contains("SETTINGS"), "{sql}");
+    }
+
+    #[test]
+    fn trace_issue_fields_do_not_assert_a_verdict_without_enrichment() {
+        let mut rows = vec![TraceSummary::from(trace_row("exported", 100))];
+        let raw = serde_json::to_value(&rows[0]).unwrap();
+        assert!(raw.get("issues").is_none());
+        assert!(!apply_trace_issues(
+            &mut rows,
+            Ok(vec![TraceIssueRow {
+                trace_id: "exported".into(),
+                issue_counts: vec![],
+            }])
+        ));
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["issues"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_trace_issues_bind_claim_and_page_and_fail_open() {
+        let _g = DevAuthGuard::new();
+        for fails in [false, true] {
+            let reader = Arc::new(MockTraceReader {
+                traces: vec![trace_row("t1", 100), trace_row("t2", 90)],
+                trace_issues: vec![
+                    TraceIssueRow {
+                        trace_id: "t1".into(),
+                        issue_counts: vec![0, 0, 0, 2, 0, 0, 0, 0, 0],
+                    },
+                    TraceIssueRow {
+                        trace_id: "not-on-page".into(),
+                        issue_counts: vec![1; 9],
+                    },
+                ],
+                issue_read_fails: fails,
+                ..MockTraceReader::new()
+            });
+            let before = tracelane_shared::degradation::count(
+                tracelane_shared::degradation::Degradation::TraceIssueReadFailed,
+            );
+            let response = list_traces_handler(
+                State(TraceReadState {
+                    reader: reader.clone(),
+                    rejections: test_rejections(),
+                }),
+                Query(serde_json::from_value(serde_json::json!({"limit":50})).unwrap()),
+                bearer_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["issues_available"], !fails);
+            assert_eq!(body["traces"].as_array().unwrap().len(), 2);
+            assert_eq!(body["traces"][1]["issues"], serde_json::json!([]));
+            assert_eq!(
+                reader.seen_issue_reads.lock().unwrap().as_slice(),
+                &[(
+                    DEV_TENANT.to_owned(),
+                    vec!["t1".to_owned(), "t2".to_owned()]
+                )]
+            );
+            if fails {
+                assert_eq!(body["traces"][0]["issues"], serde_json::json!([]));
+                assert!(
+                    tracelane_shared::degradation::count(
+                        tracelane_shared::degradation::Degradation::TraceIssueReadFailed
+                    ) > before
+                );
+            } else {
+                assert_eq!(body["traces"][0]["issues"][0]["kind"], "truncated");
+                assert_eq!(body["traces"][0]["issues"][0]["affected_spans"], 2);
+                assert_eq!(body["traces"][0]["issues"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn trace_cost_rollup_sql_is_tenant_first_and_bounded() {
         let sql = build_trace_cost_rollup_sql(3);
@@ -8250,6 +9275,10 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         session_turns: Vec<(SessionTurnRow, Option<SessionExchange>)>,
         groups: Vec<TraceGroupRow>,
         trace_costs: Vec<TraceCostRow>,
+        trace_issues: Vec<TraceIssueRow>,
+        issue_read_fails: bool,
+        seen_issue_reads: Mutex<Vec<(String, Vec<String>)>>,
+        seen_trace_filters: Mutex<Vec<TraceListFilters>>,
         chain_status: Option<TraceChainStatus>,
         seen_tenant: Mutex<Vec<String>>,
         /// CX-26: every `CostFilters` the handler passed, so a test can prove the
@@ -8278,6 +9307,10 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 session_turns: Vec::new(),
                 groups: Vec::new(),
                 trace_costs: Vec::new(),
+                trace_issues: Vec::new(),
+                issue_read_fails: false,
+                seen_issue_reads: Mutex::new(Vec::new()),
+                seen_trace_filters: Mutex::new(Vec::new()),
                 chain_status: None,
                 seen_tenant: Mutex::new(Vec::new()),
                 seen_cost_filters: Mutex::new(Vec::new()),
@@ -8287,12 +9320,19 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     #[async_trait::async_trait]
     impl TraceReader for MockTraceReader {
+        async fn generation_issue_summary(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<Arc<IssueSummary>> {
+            anyhow::bail!("summary fixture unavailable")
+        }
         async fn list_traces(
             &self,
             tenant_id: &TenantId,
-            _f: &TraceListFilters,
+            f: &TraceListFilters,
         ) -> Result<Vec<TraceSummaryRow>> {
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
+            self.seen_trace_filters.lock().unwrap().push(f.clone());
             Ok(self.traces.clone())
         }
         async fn trace_cost_rollup(
@@ -8304,17 +9344,33 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
             // tenant for isolation assertions; don't double-count seen_tenant.
             Ok(self.trace_costs.clone())
         }
+        async fn trace_issue_rollup(
+            &self,
+            tenant_id: &TenantId,
+            trace_ids: &[String],
+        ) -> Result<Vec<TraceIssueRow>> {
+            self.seen_issue_reads
+                .lock()
+                .unwrap()
+                .push((tenant_id.to_string(), trace_ids.to_vec()));
+            if self.issue_read_fails {
+                anyhow::bail!("synthetic rollup failure");
+            }
+            Ok(self.trace_issues.clone())
+        }
         async fn list_trace_groups(
             &self,
             tenant_id: &TenantId,
             _by: TraceGroupBy,
-            _f: &TraceListFilters,
+            f: &TraceListFilters,
         ) -> Result<Vec<TraceGroupRow>> {
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
+            self.seen_trace_filters.lock().unwrap().push(f.clone());
             Ok(self.groups.clone())
         }
-        async fn count_traces(&self, tenant_id: &TenantId, _f: &TraceListFilters) -> Result<u64> {
+        async fn count_traces(&self, tenant_id: &TenantId, f: &TraceListFilters) -> Result<u64> {
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
+            self.seen_trace_filters.lock().unwrap().push(f.clone());
             Ok(self.traces.len() as u64)
         }
         async fn list_spans(&self, tenant_id: &TenantId, _t: &str) -> Result<Vec<SpanRow>> {
@@ -9588,6 +10644,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -9612,6 +10670,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         assert_eq!(reader.seen_tenant.lock().unwrap().as_slice(), &[DEV_TENANT]);
         let v = body_json(resp).await;
         assert_eq!(v["traces"].as_array().unwrap().len(), 2);
+        assert_eq!(v["traces"][0]["issues"], serde_json::json!([]));
+        assert_eq!(v["issues_available"], true);
         // Short page (2 < limit 50) → no next cursor.
         assert!(v["next_cursor"].is_null());
     }
@@ -9636,6 +10696,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -9734,6 +10796,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceExportQuery {
+                issue: None,
                 agent: None,
                 model_family: None,
                 format: Some("csv".into()),
@@ -9793,6 +10856,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceExportQuery {
+                issue: None,
                 agent: None,
                 model_family: None,
                 format: Some("json".into()),
@@ -10001,6 +11065,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceGroupsQuery {
+                issue: None,
                 agent: None,
                 model_family: None,
                 by: Some("model".into()),
@@ -10029,6 +11094,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceGroupsQuery {
+                issue: None,
                 agent: None,
                 model_family: None,
                 by: Some("bogus".into()),
@@ -10062,6 +11128,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -10104,6 +11172,131 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(reader.seen_tenant.lock().unwrap().as_slice(), &[DEV_TENANT]);
+    }
+
+    #[tokio::test]
+    async fn generation_signal_details_on_spans_preserve_rows_and_report_missing_evidence() {
+        let _g = DevAuthGuard::new();
+        let mut flagged = span_row("child");
+        flagged.parent_span_id = Some("root".into());
+        flagged.attributes = serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_finish_reasons":["length"], "gen_ai_usage_output_tokens":5}).to_string();
+        let mut unknown = span_row("root");
+        unknown.attributes = serde_json::json!({"gen_ai_operation_name":"chat"}).to_string();
+        let reader = Arc::new(MockTraceReader {
+            spans: vec![unknown, flagged],
+            ..MockTraceReader::new()
+        });
+        let response = list_spans_handler(
+            State(TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            }),
+            Path("trace-abcdefgh".into()),
+            bearer_headers(),
+        )
+        .await;
+        let body = body_json(response).await;
+        assert_eq!(body[0]["issues"], serde_json::json!([]));
+        assert_eq!(body[1]["issues"][0]["kind"], "truncated");
+        assert_eq!(body[1]["parent_span_id"], "root");
+        assert!(
+            body[0]["signals_recorded"]["missing"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("gen_ai_response_model"))
+        );
+        assert_eq!(reader.seen_tenant.lock().unwrap().as_slice(), &[DEV_TENANT]);
+    }
+
+    #[test]
+    fn generation_signal_details_on_exchanges_survive_absent_content() {
+        let exchange = build_session_exchange(
+            "s1".into(),
+            r#"{"gen_ai_operation_name":"chat","gen_ai_response_finish_reasons":["length"]}"#,
+            1,
+        );
+        let body = serde_json::to_value(exchange).unwrap();
+        assert_eq!(body["content"], "absent");
+        assert_eq!(body["issues"][0]["kind"], "truncated");
+        assert!(
+            body["signals_recorded"]["missing"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("gen_ai_response_model"))
+        );
+    }
+
+    #[test]
+    fn generation_signal_details_use_exchange_status_and_keep_all_content_states() {
+        for (input, content) in [
+            (None, "absent"),
+            (Some(serde_json::json!({"missing":true})), "unloaded"),
+            (Some(serde_json::json!("wrong shape")), "unreadable"),
+            (
+                Some(serde_json::json!([{"role":"user","content":"private input"}])),
+                "captured",
+            ),
+        ] {
+            let mut attrs =
+                serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_usage_output_tokens":0});
+            if let Some(input) = input {
+                attrs["gen_ai_input_messages"] = input;
+            }
+            let failed = build_session_exchange("failed".into(), &attrs.to_string(), 2);
+            assert_eq!(failed.content, content);
+            assert!(
+                failed.generation.issues.is_empty(),
+                "errors are never Empty"
+            );
+            let ok = build_session_exchange("ok".into(), &attrs.to_string(), 1);
+            assert_eq!(ok.content, content);
+            assert_eq!(ok.generation.issues[0].kind, Issue::Empty);
+            assert!(
+                !serde_json::to_string(&ok.generation)
+                    .unwrap()
+                    .contains("private input")
+            );
+        }
+        let unreadable = build_session_exchange("bad".into(), "not JSON", 1);
+        assert_eq!(unreadable.content, "unreadable");
+        assert!(!unreadable.generation.signals_recorded.attributes_readable);
+        assert!(unreadable.generation.issues.is_empty());
+    }
+
+    #[test]
+    fn generation_signal_details_do_not_change_storage_or_public_share_shape() {
+        let mut span = span_row("tool");
+        span.attributes = serde_json::json!({"gen_ai_operation_name":"embeddings", "gen_ai_usage_output_tokens":0}).to_string();
+        let raw = serde_json::to_value(&span).unwrap();
+        assert!(raw.get("issues").is_none());
+        let detail = serde_json::to_value(SpanResponse::from(span)).unwrap();
+        for (key, value) in raw.as_object().unwrap() {
+            assert_eq!(&detail[key], value);
+        }
+        assert_eq!(detail["issues"], serde_json::json!([]));
+        assert_eq!(detail["signals_recorded"]["missing"], serde_json::json!([]));
+        assert_eq!(detail["signals_recorded"]["chat_operation"], false);
+        let malformed = SpanResponse::from(SpanRow {
+            attributes: "broken".into(),
+            ..span_row("broken")
+        });
+        assert!(!malformed.generation.signals_recorded.attributes_readable);
+        assert_eq!(
+            malformed.generation.signals_recorded.missing,
+            vec!["gen_ai_operation_name"]
+        );
+    }
+
+    #[test]
+    fn generation_signal_details_exchange_sql_keeps_tenant_first_and_reads_span_status() {
+        let sql = build_session_exchange_sql(2);
+        assert!(sql.starts_with("SELECT trace_id, span_id, attributes, status_code FROM spans FINAL WHERE tenant_id = ? AND trace_id IN (?, ?)"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 3);
+        assert!(sql.ends_with("LIMIT 1 BY trace_id"));
+        assert_eq!(
+            <ExchangeSpanRow as clickhouse::Row>::COLUMN_NAMES,
+            &["trace_id", "span_id", "attributes", "status_code"]
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -10200,6 +11393,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -10236,6 +11431,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -10270,6 +11467,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                include_issues: None,
+                issue: None,
                 agent: None,
                 model_family: None,
                 q: None,
@@ -10680,6 +11879,12 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     fn session_exchange_fixture() -> SessionExchange {
         SessionExchange {
+            generation: crate::generation_issues::details(
+                &crate::generation_issues::SpanAttrsView {
+                    attributes: &serde_json::json!({"gen_ai_operation_name":"chat"}),
+                    status_code: 1,
+                },
+            ),
             span_id: "span-1".into(),
             input_tail: Vec::new(),
             input_message_count: 1,
@@ -10947,6 +12152,176 @@ mod clickhouse_roundtrip {
     /// for the whole test, is the honest fix: the hazard is real sharing, not a
     /// flaky assertion.
     static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL; isolated fixture writes, never production"]
+    async fn trace_issue_rollup_excludes_other_tenant_spans_on_the_same_page() {
+        let _serial = SHARED_DB.lock().await;
+        let client = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&client).await;
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let other = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let own_id = uuid::Uuid::new_v4().to_string();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        for (owner, trace_id, reason) in [
+            (&tenant, &own_id, "length"),
+            (&other, &own_id, "content_filter"),
+            (&other, &other_id, "length"),
+        ] {
+            client.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) VALUES (?, ?, ?, 'gen_ai.chat', now64(6), now64(6), ?)")
+                .bind(owner.to_string()).bind(trace_id).bind(uuid::Uuid::new_v4().to_string())
+                .bind(serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_finish_reasons":[reason]}).to_string())
+                .execute().await.expect("fixture span insert");
+        }
+        let reader = ClickHouseTraceReader::new(client);
+        let rows = reader
+            .trace_issue_rollup(&tenant, &[own_id.clone(), other_id])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trace_id, own_id);
+        assert_eq!(rows[0].issue_counts, vec![0, 0, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL; isolated fixture writes, never production"]
+    async fn issue_summary_distinguishes_traces_calls_and_tenants_on_real_clickhouse() {
+        let _serial = SHARED_DB.lock().await;
+        let client = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&client).await;
+        let a = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let b = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let trace = uuid::Uuid::new_v4().to_string();
+        let embedding = uuid::Uuid::new_v4().to_string();
+        let foreign = uuid::Uuid::new_v4().to_string();
+        for (owner, id, attrs) in [
+            (
+                &a,
+                &trace,
+                serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_finish_reasons":["length"]}),
+            ),
+            (
+                &a,
+                &trace,
+                serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_model":"gpt-4o", "gen_ai_response_finish_reasons":["length"]}),
+            ),
+            (
+                &a,
+                &embedding,
+                serde_json::json!({"gen_ai_operation_name":"embeddings"}),
+            ),
+            (
+                &b,
+                &foreign,
+                serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_finish_reasons":["content_filter"]}),
+            ),
+        ] {
+            client.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) VALUES (?, ?, ?, 'summary-fixture', now64(6) - toIntervalSecond(1), now64(6), ?)")
+                .bind(owner.to_string()).bind(id).bind(uuid::Uuid::new_v4().to_string()).bind(attrs.to_string())
+                .execute().await.expect("fixture span insert");
+        }
+        let reader = ClickHouseTraceReader::new(client);
+        let own = reader.generation_issue_summary(&a).await.unwrap();
+        assert_eq!(
+            (own.total_traces, own.llm_calls, own.no_served_model_calls),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            own.counts
+                .iter()
+                .find(|c| c.kind == Issue::Truncated)
+                .unwrap()
+                .trace_count,
+            1
+        );
+        let other = reader.generation_issue_summary(&b).await.unwrap();
+        assert_eq!(other.total_traces, 1);
+        assert_eq!(
+            other
+                .counts
+                .iter()
+                .find(|c| c.kind == Issue::Truncated)
+                .unwrap()
+                .trace_count,
+            0
+        );
+        assert_eq!(
+            other
+                .counts
+                .iter()
+                .find(|c| c.kind == Issue::Filtered)
+                .unwrap()
+                .trace_count,
+            1
+        );
+        let f = TraceListFilters {
+            issues: vec![Issue::Truncated],
+            since_us: parse_rfc3339_micros(Some(&own.since)).unwrap(),
+            until_us: parse_rfc3339_micros(Some(&own.until)).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(reader.count_traces(&a, &f).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL; isolated fixture writes, never production"]
+    async fn issue_filter_returns_only_matching_tenant_traces_in_the_window() {
+        let _serial = SHARED_DB.lock().await;
+        let client = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&client).await;
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let other = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let flagged = uuid::Uuid::new_v4().to_string();
+        let clean = uuid::Uuid::new_v4().to_string();
+        let old = uuid::Uuid::new_v4().to_string();
+        let now = now_us();
+        for (owner, id, reason, time) in [
+            (&tenant, &flagged, "length", now - 1_000_000),
+            (&tenant, &clean, "stop", now - 1_000_000),
+            (&other, &clean, "length", now - 1_000_000),
+            (&tenant, &old, "length", now - 600_000_000),
+        ] {
+            client.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) VALUES (?, ?, ?, 'gen_ai.chat', fromUnixTimestamp64Micro(?), fromUnixTimestamp64Micro(?), ?)")
+                .bind(owner.to_string()).bind(id).bind(uuid::Uuid::new_v4().to_string()).bind(time).bind(time)
+                .bind(serde_json::json!({"gen_ai_operation_name":"chat", "gen_ai_response_finish_reasons":[reason]}).to_string())
+                .execute().await.expect("fixture span insert");
+        }
+        let reader = ClickHouseTraceReader::new(client);
+        let filters = TraceListFilters {
+            issues: vec![Issue::Truncated],
+            since_us: Some(now - 60_000_000),
+            until_us: Some(now),
+            limit: 50,
+            ..Default::default()
+        };
+        let rows = reader.list_traces(&tenant, &filters).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| &r.trace_id).collect::<Vec<_>>(),
+            vec![&flagged]
+        );
+        assert_eq!(reader.count_traces(&tenant, &filters).await.unwrap(), 1);
+        let groups = reader
+            .list_trace_groups(&tenant, TraceGroupBy::Model, &filters)
+            .await
+            .unwrap();
+        assert_eq!(groups.iter().map(|g| g.trace_count).sum::<u64>(), 1);
+        let foreign = reader.list_traces(&other, &filters).await.unwrap();
+        assert_eq!(
+            foreign.iter().map(|r| &r.trace_id).collect::<Vec<_>>(),
+            vec![&clean]
+        );
+        let unfiltered = reader
+            .list_traces(
+                &tenant,
+                &TraceListFilters {
+                    issues: vec![],
+                    ..filters
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.len(), 2);
+    }
 
     fn ch() -> Option<clickhouse::Client> {
         let url = std::env::var("CLICKHOUSE_TEST_URL").ok()?;
@@ -11820,6 +13195,7 @@ mod clickhouse_roundtrip {
     ) {
         let mut attrs = serde_json::json!({
             "gen_ai_conversation_id": conv_id,
+            "gen_ai_operation_name": "chat",
             "gen_ai_request_model": model,
             "gen_ai_provider_name": "anthropic",
             "gen_ai_usage_input_tokens": input_tokens,
@@ -11984,6 +13360,24 @@ mod clickhouse_roundtrip {
             .expect("turn B's span carries a model, so it IS the exchange span");
         assert_eq!(exchange_b.content, "absent");
         assert_eq!(exchange_b.input_tail.len(), 0);
+        assert!(
+            exchange_b.generation.issues.is_empty(),
+            "the exchange span's error status excludes Empty despite zero output tokens"
+        );
+        assert!(
+            exchange_b
+                .generation
+                .signals_recorded
+                .missing
+                .contains(&"gen_ai_response_model")
+        );
+        assert!(
+            exchange_b
+                .generation
+                .signals_recorded
+                .present
+                .contains(&"gen_ai_usage_output_tokens")
+        );
 
         // ── a foreign/unknown session resolves to `None`, never zeros ───────
         assert!(

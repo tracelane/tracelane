@@ -1,3 +1,4 @@
+import { issueLabel } from "@/lib/generation-issues";
 /**
  * Pure copy/classification helpers for `/traces`'s "no rows" and "the gateway
  * rejected the request" states, extracted from `page.tsx` so the OBS-01
@@ -16,7 +17,12 @@ export interface EmptyCopy {
  * change, distinct from "no data matches these filters" — the range/model
  * copy is the wrong hint when the user just mistyped a search term.
  */
-export function noMatchCopy(q: string | undefined): EmptyCopy {
+export function noMatchCopy(q: string | undefined, issue?: string): EmptyCopy {
+	if (issue)
+		return {
+			title: `No traces in this window have ${issue.split(",").map(issueLabel).join(" or ")}.`,
+			description: "Clear the issue filter or widen the time range.",
+		};
 	if (q) {
 		return {
 			title: `No traces match \`${q}\` in this window`,
@@ -37,6 +43,7 @@ export interface GatewayErrorLike {
 }
 
 export type TraceFetchFailure =
+	| { kind: "forbidden" }
 	// A REJECTED request — most commonly `?q=` forced below the gateway's
 	// 4-char minimum, but any bad filter reads the same way.
 	| { kind: "rejected"; message: string }
@@ -53,6 +60,12 @@ export type TraceFetchFailure =
 export function classifyTraceFetchError(
 	err: GatewayErrorLike,
 ): TraceFetchFailure {
+	if (err.status === 403) return { kind: "forbidden" };
+	if (err.body?.error === "unknown_issue" && Array.isArray(err.body.allowed))
+		return {
+			kind: "rejected",
+			message: `Unknown issue. Allowed: ${err.body.allowed.join(", ")}`,
+		};
 	if (err.status >= 400 && err.status < 500) {
 		const message = (err.body?.error as string | undefined) ?? err.message;
 		return { kind: "rejected", message };

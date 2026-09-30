@@ -149,6 +149,10 @@ KNOWN_DATA_FILES = {
     # membership handler parses. It names no provider and no model, so it cannot
     # be a second routing source — the guard asks, and this is the answer.
     "crates/gateway/tests/fixtures/workos-membership-created.json": "recorded WorkOS membership event body for the provisioning test; carries no provider or model",
+    # 2026-09-30 (OBS-58): the reviewed finish-reason vocabulary the generation-issue
+    # classifier maps to Truncated / Filtered. Two arrays of finish-reason strings; it
+    # names no provider and no model, so it cannot route anything.
+    "crates/gateway/src/generation_issues.v1.json": "OBS-58 finish-reason vocabulary (length / filtered spellings); carries no provider or model",
 }
 
 # Parser floors. A guard that silently parses nothing and reports OK is the defect

@@ -64,6 +64,7 @@ def test_create_emits_span_and_never_leaks(spans: InMemorySpanExporter) -> None:
     span = _only_span(spans)
     assert span.name == "anthropic.messages.create"
     a = span.attributes
+    assert a["tracelane.usage.input_includes_cache"] is False
     assert a is not None
     assert a["gen_ai.usage.input_tokens"] == 13
     assert a["gen_ai.usage.output_tokens"] == 5

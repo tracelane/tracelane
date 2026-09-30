@@ -44,6 +44,7 @@ def _set_usage_attributes(span: Any, result: Any) -> None:
         return
     input_tokens = getattr(usage, "input_tokens", None)
     if input_tokens is not None:
+        span.set_attribute("tracelane.usage.input_includes_cache", False)
         span.set_attribute("gen_ai.usage.input_tokens", int(input_tokens))
     output_tokens = getattr(usage, "output_tokens", None)
     if output_tokens is not None:

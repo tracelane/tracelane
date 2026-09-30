@@ -28,7 +28,7 @@ import {
 type ToolContent = { type: "text"; text: string };
 type ToolResult = { content: ToolContent[]; isError?: true };
 
-function textResult(payload: unknown): ToolResult {
+export function textResult(payload: unknown): ToolResult {
 	return { content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
 
@@ -38,7 +38,7 @@ function textResult(payload: unknown): ToolResult {
  * status and the gateway's own message — never silently swallowed into an
  * empty result (the class of bug §4 of the spec exists to prevent).
  */
-function toolErrorResult(err: unknown): ToolResult {
+export function toolErrorResult(err: unknown): ToolResult {
 	if (err instanceof GatewayError) {
 		return {
 			content: [

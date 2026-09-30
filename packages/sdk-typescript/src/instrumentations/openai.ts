@@ -105,6 +105,7 @@ function _recordResponse(
 		const completionTokens = Number(usage.completion_tokens ?? 0);
 		span.setAttributes({
 			"gen_ai.usage.input_tokens": promptTokens,
+			"tracelane.usage.input_includes_cache": true,
 			"gen_ai.usage.output_tokens": completionTokens,
 			"llm.token_count.prompt": promptTokens,
 			"llm.token_count.completion": completionTokens,
@@ -137,7 +138,7 @@ function _recordResponse(
 	if (Array.isArray(choices) && choices.length > 0) {
 		const finishReason = choices[0]?.finish_reason;
 		if (typeof finishReason === "string") {
-			span.setAttribute("gen_ai.response.finish_reason", finishReason);
+			span.setAttribute("gen_ai.response.finish_reasons", [finishReason]);
 		}
 	}
 }

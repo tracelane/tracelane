@@ -107,9 +107,19 @@ const MAX_TOKEN_LEN: usize = 256;
 // ── Content denylist (spec §2) ───────────────────────────────────────────────
 
 /// Exact key matches, stripped from every span's `attributes` JSON before it
-/// reaches the public route. Copied verbatim from the spec table — do not
-/// paraphrase or reorder derive meaning from this list; it IS the contract.
+/// reaches the public route. New content producers must extend this boundary
+/// before their fields can reach public shares.
 const DENYLIST_KEYS: &[&str] = &[
+    "tracelane_metadata",
+    "tracelane_tags",
+    "tracelane_events",
+    "exception_message",
+    "input_value",
+    "output_value",
+    "gen_ai_tool_call_arguments",
+    "gen_ai_tool_call_result",
+    "tracelane_retrieval_query",
+    "tracelane_retrieval_documents",
     "gen_ai_input_messages",
     "gen_ai_output_messages",
     "gen_ai_system_instructions",
@@ -135,6 +145,33 @@ fn is_content_key(key: &str) -> bool {
     DENYLIST_KEYS.contains(&key) || DENYLIST_SUFFIXES.iter().any(|suf| key.ends_with(suf))
 }
 
+/// The ONLY text-valued stored (underscore) keys a public share may carry — the
+/// fields the shared trace view renders: model, provider, operation, tool and agent
+/// names. An ALLOWLIST, not a denylist (security review 2026-09-29): the denylist
+/// shape let every other text key through by default, which exposed the end-user id
+/// (`user_id`), `tracelane_business_reference`, `gen_ai_conversation_id` and the
+/// GWY-54 labels (`service_*`, `deployment_environment`) to anyone holding the link.
+/// A new text field reaches a public share only by being added here on purpose.
+/// Numbers and booleans pass for any key — they cannot carry customer text.
+const SHARE_TEXT_KEYS: &[&str] = &[
+    "gen_ai_agent_name",
+    "gen_ai_operation_name",
+    "gen_ai_output_type",
+    "gen_ai_provider_name",
+    "gen_ai_request_model",
+    "gen_ai_response_finish_reasons",
+    "gen_ai_response_model",
+    "gen_ai_system",
+    "gen_ai_tool_name",
+    "gen_ai_tool_type",
+    "tracelane_client_name",
+    "tracelane_model_substitution",
+    "tracelane_request_tool_choice_function",
+    "tracelane_request_tool_choice_mode",
+    "tracelane_request_tool_names",
+    "tracelane_response_tool_names",
+];
+
 /// Strip every content-bearing key from one span's `attributes` JSON string.
 ///
 /// Fails CLOSED: a parse error or a non-object shape returns `"{}"` rather
@@ -145,7 +182,37 @@ fn is_content_key(key: &str) -> bool {
 fn strip_content(attributes_json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(attributes_json) {
         Ok(serde_json::Value::Object(mut map)) => {
-            map.retain(|k, _| !is_content_key(k));
+            map.retain(|k, v| {
+                let metadata = matches!(
+                    k.as_str(),
+                    "gen_ai.tool.name"
+                        | "gen_ai.tool.type"
+                        | "gen_ai.agent.id"
+                        | "gen_ai.agent.parent_id"
+                        | "gen_ai.prompt.name"
+                        | "gen_ai.prompt.version"
+                        | "gen_ai.workflow.name"
+                        | "gen_ai.output.type"
+                        | "gen_ai.data_source.id"
+                        | "mcp.method.name"
+                        | "mcp.session.id"
+                        | "mcp.protocol.version"
+                        | "llm.model_name"
+                        | "llm.request.model_name"
+                        | "llm.response.model_name"
+                        | "llm.provider"
+                        | "llm.system"
+                        | "input.mime_type"
+                        | "output.mime_type"
+                        | "openai.response.system_fingerprint"
+                );
+                let numeric = v.is_number()
+                    || v.is_boolean()
+                    || v.as_array()
+                        .is_some_and(|a| a.iter().all(|v| v.is_number() || v.is_boolean()));
+                let share_text = !k.contains('.') && SHARE_TEXT_KEYS.contains(&k.as_str());
+                !is_content_key(k) && (share_text || metadata || numeric)
+            });
             serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".into())
         }
         _ => "{}".into(),
@@ -969,6 +1036,14 @@ mod tests {
     // ── content stripping ────────────────────────────────────────────────
 
     #[test]
+    fn openinference_content_never_reaches_a_public_share() {
+        let raw = serde_json::json!({"tracelane_events":[{"attributes":{"explanation":"private"}}], "exception_message":"private", "input_value":"private", "output_value":"private", "gen_ai_tool_call_arguments":"private", "gen_ai_tool_call_result":"private", "tracelane_retrieval_query":"private", "tracelane_retrieval_documents":[{"content":"private"}], "gen_ai_request_model":"model"});
+        let stripped = strip_content(&raw.to_string());
+        assert!(!stripped.contains("private"));
+        assert!(stripped.contains("model"));
+    }
+
+    #[test]
     fn strips_every_denylisted_key_and_every_suffix_case() {
         let attrs = serde_json::json!({
             "gen_ai_input_messages": "SECRET PROMPT",
@@ -989,9 +1064,12 @@ mod tests {
             "custom_thing_messages": "leak",
             "weird_json": "leak",
             "nested.body": "leak",
-            // must survive
-            "name": "chat.completions",
-            "model": "gpt-4o",
+            // must survive — the REAL stored keys the share view renders (the bare
+            // `name` / `model` keys this fixture used never occur: the span name is a
+            // column and the model is stored as `gen_ai_request_model`; text keys are
+            // allowlisted since 2026-09-29, see `SHARE_TEXT_KEYS`)
+            "gen_ai_operation_name": "chat",
+            "gen_ai_request_model": "gpt-4o",
             "tokens": 120,
             "cost": 0.004,
             "gen_ai.tool.name": "search",
@@ -1013,14 +1091,60 @@ mod tests {
             );
         }
         for key in [
-            "name",
-            "model",
+            "gen_ai_operation_name",
+            "gen_ai_request_model",
             "tokens",
             "cost",
             "gen_ai.tool.name",
             "gen_ai_agent_name",
         ] {
             assert!(obj.contains_key(key), "{key} was wrongly stripped");
+        }
+    }
+
+    #[test]
+    fn public_share_strips_unknown_string_passthrough() {
+        let value: serde_json::Value = serde_json::from_str(&strip_content(r#"{"custom.label":"secret","custom.mixed":[1,"secret"],"custom.count":2,"gen_ai.tool.name":"search"}"#)).unwrap();
+        assert!(value.get("custom.label").is_none());
+        assert!(value.get("custom.mixed").is_none());
+        assert_eq!(value["custom.count"], 2);
+        assert_eq!(value["gen_ai.tool.name"], "search");
+    }
+
+    #[test]
+    fn strip_content_keeps_only_allowlisted_text_on_public_shares() {
+        // Security review 2026-09-29: text keys are allowlisted, not denylisted.
+        let out = strip_content(
+            r#"{"gen_ai_request_model":"gpt-4o","gen_ai_provider_name":"openai",
+                "gen_ai_usage_input_tokens":12,"tracelane_stream":true,
+                "user_id":"alice@example.com","tracelane_business_reference":"INV-991",
+                "gen_ai_conversation_id":"conv-7","service_name":"billing-bot",
+                "deployment_environment":"prod","service_version":"1.4.2",
+                "mcp.resource.uri":"file:///Users/a/.env","gen_ai.tool.description":"reads secrets",
+                "gen_ai.agent.description":"internal ops agent","gen_ai.tool.name":"read_file"}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        for kept in [
+            "gen_ai_request_model",
+            "gen_ai_provider_name",
+            "gen_ai_usage_input_tokens",
+            "tracelane_stream",
+            "gen_ai.tool.name",
+        ] {
+            assert!(v.get(kept).is_some(), "{kept} must survive");
+        }
+        for gone in [
+            "user_id",
+            "tracelane_business_reference",
+            "gen_ai_conversation_id",
+            "service_name",
+            "deployment_environment",
+            "service_version",
+            "mcp.resource.uri",
+            "gen_ai.tool.description",
+            "gen_ai.agent.description",
+        ] {
+            assert!(v.get(gone).is_none(), "{gone} leaked onto a public share");
         }
     }
 
@@ -1178,6 +1302,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TraceReader for FakeReader {
+        async fn generation_issue_summary(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> anyhow::Result<Arc<crate::generation_issues::IssueSummary>> {
+            unimplemented!("public shares never read issue summaries")
+        }
         async fn list_traces(
             &self,
             _t: &TenantId,
@@ -1218,6 +1348,13 @@ mod tests {
                 .chain_by_trace
                 .get(&(tenant_id.to_string(), trace_id.to_string()))
                 .cloned())
+        }
+        async fn trace_issue_rollup(
+            &self,
+            _t: &TenantId,
+            _ids: &[String],
+        ) -> Result<Vec<crate::trace_reads::TraceIssueRow>> {
+            unimplemented!("public shares do not read issue rollups")
         }
         async fn trace_cost_rollup(
             &self,

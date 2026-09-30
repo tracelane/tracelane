@@ -50,7 +50,7 @@ use tracing::instrument;
 use tracelane_shared::{
     TenantId,
     otlp::{
-        decode::{BatchReject, DecodeOutcome, decode_batch_with_limits, wire_from_content_type},
+        decode::{BatchReject, DecodeOutcome, decode_batch_with_policies, wire_from_content_type},
         limits::{IngestLimits, RejectReason, WARNING_ENFORCEMENT_DATE, record_reject},
     },
 };
@@ -203,13 +203,24 @@ fn backfill_span_costs(spans: &mut [tracelane_shared::TracelaneSpan]) {
         if !has_any_tokens {
             continue;
         }
-        let usage = tracelane_shared::Usage {
-            input_tokens: attrs.gen_ai_usage_input_tokens.unwrap_or(0),
-            output_tokens: attrs.gen_ai_usage_output_tokens.unwrap_or(0),
-            cache_read_input_tokens: attrs.gen_ai_usage_cache_read_input_tokens,
-            cache_creation_input_tokens: attrs.gen_ai_usage_cache_creation_input_tokens,
+        let Some(usage) = crate::usage_breakdown::exclusive_usage(attrs) else {
+            continue;
         };
         attrs.gen_ai_usage_cost = crate::pricing::cost_usd(&model, &usage);
+    }
+}
+
+fn capture_batch(
+    spans: &mut [tracelane_shared::TracelaneSpan],
+    capture: crate::server::config::ContentCapture,
+) {
+    let halves = tracelane_shared::otlp::content::CaptureHalves {
+        input: capture.input,
+        output: capture.output,
+        max_field_bytes: capture.max_field_bytes,
+    };
+    for span in spans {
+        tracelane_shared::otlp::content::apply_capture(span, &halves);
     }
 }
 
@@ -374,10 +385,26 @@ pub async fn ingest_traces_handler(
 
     // ── 6. Decode + enforce every ADR-029 cap, off the async runtime ────────
     let decode_tenant = tenant_id.clone();
+    let (capture_policy, label_caps) = {
+        let card = state.rate_card.load();
+        (
+            card.policy.otlp_capture.clone(),
+            card.policy.request_labels.clone(),
+        )
+    };
+    let decode_policy = capture_policy.clone();
     let decode = tokio::time::timeout(
         DECODE_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            decode_batch_with_limits(&bytes, &decode_tenant, &cap, MAX_SPANS_PER_REQUEST, wire)
+            decode_batch_with_policies(
+                &bytes,
+                &decode_tenant,
+                &cap,
+                MAX_SPANS_PER_REQUEST,
+                wire,
+                &decode_policy,
+                &label_caps,
+            )
         }),
     )
     .await;
@@ -424,6 +451,15 @@ pub async fn ingest_traces_handler(
     // change adds — the chat path (`server.rs`) is untouched, proven by
     // `chat_path_source_gains_no_new_cost_usd_call_site` below.
     backfill_span_costs(&mut batch.spans);
+
+    // Fail CLOSED for unknown workspace content settings. Resolve once for the
+    // validated tenant, never from OTLP attributes and never per span.
+    let mut capture =
+        crate::server::config::content_capture_for(state.entitlements.as_deref(), &tenant_id).await;
+    if crate::server::config::trace_content().is_none() {
+        capture.max_field_bytes = capture_policy.default_max_field_bytes;
+    }
+    capture_batch(&mut batch.spans, capture);
 
     // ── 7. Serialize everything BEFORE publishing anything ──────────────────
     // All-or-nothing at the size gate. Publishing half a batch and then returning
@@ -670,6 +706,68 @@ mod tests {
         assert_eq!(MAX_NATS_PAYLOAD_BYTES, 1_048_576);
     }
 
+    #[test]
+    fn otlp_capture_publish_boundary_uses_workspace_halves_and_tenant_allowlist() {
+        use crate::db::workspace_capture::WorkspaceCapture;
+        use crate::server::config::capture_decision;
+        let mut original = bare_span();
+        original.attributes.gen_ai_input_messages =
+            Some(serde_json::json!([{"content": "private"}]));
+        let tenant = original.tenant_id.clone();
+        let capture = capture_decision(
+            None,
+            Some(WorkspaceCapture {
+                input: false,
+                output: false,
+            }),
+            &tenant,
+        );
+        let mut batch = vec![original.clone()];
+        capture_batch(&mut batch, capture);
+        let published = serde_json::to_value(&batch[0]).unwrap();
+        assert!(
+            published["attributes"]
+                .get("gen_ai_input_messages")
+                .is_none(),
+            "capture-OFF content must not be published"
+        );
+        assert_eq!(
+            published["attributes"]["tracelane_content_withheld"],
+            serde_json::json!(["input"])
+        );
+        let cfg = crate::server::config::parse(&format!(
+            "trace_content:\n  tenants: {tenant}\n  max_field_bytes: 1024\n"
+        ))
+        .unwrap();
+        let mut allowed = vec![original.clone()];
+        capture_batch(
+            &mut allowed,
+            capture_decision(cfg.trace_content(), None, &tenant),
+        );
+        assert!(allowed[0].attributes.gen_ai_input_messages.is_some());
+        let other_tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let mut denied = vec![original.clone()];
+        denied[0].tenant_id = other_tenant.clone();
+        capture_batch(
+            &mut denied,
+            capture_decision(cfg.trace_content(), None, &other_tenant),
+        );
+        assert!(denied[0].attributes.gen_ai_input_messages.is_none());
+        let mut batch = vec![original];
+        capture_batch(
+            &mut batch,
+            capture_decision(
+                None,
+                Some(WorkspaceCapture {
+                    input: true,
+                    output: false,
+                }),
+                &tenant,
+            ),
+        );
+        assert!(batch[0].attributes.gen_ai_input_messages.is_some());
+    }
+
     // ── PLT-46: cost backfill from the price catalog ────────────────────────
 
     fn bare_span() -> tracelane_shared::TracelaneSpan {
@@ -684,6 +782,61 @@ mod tests {
             attributes: tracelane_shared::SpanAttributes::default(),
             status: tracelane_shared::SpanStatus::default(),
         }
+    }
+
+    #[test]
+    fn inclusive_cache_backfill_matches_exclusive_and_never_guesses() {
+        fn fixture(
+            input: u32,
+            flag: Option<bool>,
+            provider: &str,
+        ) -> tracelane_shared::TracelaneSpan {
+            let mut span = bare_span();
+            span.attributes = serde_json::from_value(serde_json::json!({
+                "gen_ai_request_model": "claude-sonnet-4-5-20250929",
+                "gen_ai_provider_name": provider,
+                "gen_ai_usage_input_tokens": input,
+                "gen_ai_usage_output_tokens": 57,
+                "gen_ai_usage_cache_read_input_tokens": 300,
+                "gen_ai_usage_cache_creation_input_tokens": 12,
+                "tracelane_usage_input_includes_cache": flag,
+            }))
+            .unwrap();
+            span
+        }
+        let mut spans = vec![
+            fixture(1546, Some(true), "anthropic"),
+            fixture(1234, Some(false), "openai"),
+        ];
+        backfill_span_costs(&mut spans);
+        assert_eq!(
+            spans[0].attributes.gen_ai_usage_cost,
+            spans[1].attributes.gen_ai_usage_cost
+        );
+        assert!(spans[0].attributes.gen_ai_usage_cost.is_some());
+        let mut unknown = vec![
+            fixture(1234, None, "unknown"),
+            fixture(100, Some(true), "openai"),
+        ];
+        backfill_span_costs(&mut unknown);
+        assert!(
+            unknown
+                .iter()
+                .all(|s| s.attributes.gen_ai_usage_cost.is_none())
+        );
+        let mut inferred = vec![
+            fixture(1546, None, "openai"),
+            fixture(1234, None, "anthropic"),
+        ];
+        backfill_span_costs(&mut inferred);
+        assert_eq!(
+            inferred[0].attributes.gen_ai_usage_cost,
+            spans[0].attributes.gen_ai_usage_cost
+        );
+        assert_eq!(
+            inferred[1].attributes.gen_ai_usage_cost,
+            spans[0].attributes.gen_ai_usage_cost
+        );
     }
 
     /// A known model + real tokens + no pre-existing cost → the catalog price

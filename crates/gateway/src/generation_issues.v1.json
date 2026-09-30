@@ -1,0 +1,4 @@
+{
+  "length": ["length", "max_tokens"],
+  "filtered": ["content_filter", "refusal"]
+}

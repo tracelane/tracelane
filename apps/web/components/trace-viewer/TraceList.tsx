@@ -58,6 +58,7 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { IssueChips, useIssueRollup } from "./IssueChip";
 import { TraceBulkBar } from "./TraceBulkBar";
 
 export type TraceSummary = {
@@ -223,8 +224,10 @@ export function TraceList({
 	selectable = false,
 	selectionMax,
 	viewerRole,
+	withGenerationIssues = false,
 }: {
 	traces: TraceSummary[];
+	withGenerationIssues?: boolean;
 	sort?: string;
 	order?: string;
 	durationHref?: string;
@@ -235,6 +238,10 @@ export function TraceList({
 	viewerRole?: string | null;
 }) {
 	const router = useRouter();
+	const badges = useIssueRollup(
+		traces.map((t) => t.trace_id).join(","),
+		withGenerationIssues,
+	);
 	const [bulkBusy, setBulkBusy] = useState(false);
 	const [selected, setSelected] = useState(new Set<string>());
 	const [selectionError, setSelectionError] = useState("");
@@ -368,6 +375,11 @@ export function TraceList({
 					</>
 				) : null}
 			</div>
+			{badges.error && (
+				<output className="block px-3 py-2 text-sm text-ink-2">
+					{badges.error}
+				</output>
+			)}
 			<div className="overflow-x-auto">
 				<Table className="w-full text-sm">
 					<THead>
@@ -402,6 +414,9 @@ export function TraceList({
 							>
 								Model
 							</TH>
+							{withGenerationIssues && (
+								<TH className="px-3 py-1.5 text-left t-metric-label">Issues</TH>
+							)}
 							{win && (
 								// ADR-074 §7's ruler, inside the column whose bars it describes —
 								// see the header comment for why it cannot sit above the table.
@@ -553,7 +568,7 @@ export function TraceList({
 										</span>
 									</Tooltip>
 								</TD>
-								<TD className="px-3 py-2 font-mono text-xs text-ink-2">
+								<TD className="whitespace-nowrap px-3 py-2 font-mono text-xs text-ink-2">
 									<IdentityAvatar
 										identity={
 											resolveIdentity({ gen_ai_request_model: t.model })
@@ -562,6 +577,20 @@ export function TraceList({
 										showLabel
 									/>
 								</TD>
+								{withGenerationIssues && (
+									<TD className="px-3 py-2">
+										{badges.data && (
+											<IssueChips
+												issues={
+													badges.data.traces.find(
+														(row) => row.trace_id === t.trace_id,
+													)?.issues ?? []
+												}
+												inlineLimit={badges.data.inline_limit}
+											/>
+										)}
+									</TD>
+								)}
 								{win && (
 									<TD className="px-3 py-2">
 										<TraceBar trace={t} win={win} />

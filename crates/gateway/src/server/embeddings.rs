@@ -132,6 +132,18 @@ pub(crate) async fn embeddings_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    let labels =
+        super::request_labels::read(&headers, &state.rate_card.load().policy.request_labels);
+    let result = embeddings_handler_with_labels(State(state), headers, Json(body), &labels).await;
+    super::request_labels::response(result, &labels)
+}
+
+async fn embeddings_handler_with_labels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+    labels: &super::request_labels::BoundedLabels,
+) -> axum::response::Response {
     use crate::admission::{Embeddings, Route as _};
     let control = match crate::semantic_cache::CacheControl::parse(&headers) {
         Ok(control) => control,
@@ -143,10 +155,11 @@ pub(crate) async fn embeddings_handler(
     // allowance) → key + workspace budgets → predictive → audit publish
     // (fail-CLOSED). The parse sits ABOVE the quota by construction, so a
     // malformed request never consumes a trace from the paid allowance.
-    let admitted = match crate::admission::admit::<Embeddings>(&state, &headers, body).await {
+    let mut admitted = match crate::admission::admit::<Embeddings>(&state, &headers, body).await {
         Ok(a) => a,
         Err(refusal) => return Embeddings::refuse(refusal),
     };
+    super::request_labels::attach(&mut admitted, labels);
     let policy = match control.resolve(
         admitted.entitlements.as_deref(),
         state.semantic_cache.as_deref(),

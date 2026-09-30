@@ -233,6 +233,18 @@ export class GatewayReader implements TraceReader {
 		path: string,
 		params?: Record<string, string | undefined>,
 	): Promise<T> {
+		const resp = await this.get(path, params);
+		return (await resp.json()) as T;
+	}
+
+	/** GET `path?params` and return the 2xx `Response` unread (the body is
+	 * the caller's to parse — JSON for most routes, fixture TEXT for the
+	 * EVL-40 regression export). Non-2xx throws `GatewayError` exactly as
+	 * `getJson` always has. */
+	private async get(
+		path: string,
+		params?: Record<string, string | undefined>,
+	): Promise<Response> {
 		const url = new URL(path, `${this.baseUrl}/`);
 		if (params) {
 			for (const [k, v] of Object.entries(params)) {
@@ -267,7 +279,36 @@ export class GatewayReader implements TraceReader {
 			}
 			throw new GatewayError(resp.status, message);
 		}
-		return (await resp.json()) as T;
+		return resp;
+	}
+
+	/** EVL-40 §2.1 — the incident packet for one trace, returned as-is. */
+	async getIncident(traceId: string): Promise<unknown> {
+		return this.getJson<unknown>(
+			`v1/traces/${encodeURIComponent(traceId)}/incident`,
+		);
+	}
+
+	/** EVL-40 §2.2 — the regression fixture TEXT for one trace, plus the
+	 * `x-tracelane-*` headers that carry its honest limits (mode, whether an
+	 * expected output exists). The gateway builds it from the RECORDED trace;
+	 * nothing is re-executed. */
+	async exportRegression(
+		traceId: string,
+		format: string,
+		mode: string,
+	): Promise<{ fixture: string; limits: Record<string, string> }> {
+		const resp = await this.get(
+			`v1/traces/${encodeURIComponent(traceId)}/regression`,
+			{ format, mode },
+		);
+		const limits: Record<string, string> = {};
+		resp.headers.forEach((value, key) => {
+			if (key.toLowerCase().startsWith("x-tracelane-")) {
+				limits[key.toLowerCase()] = value;
+			}
+		});
+		return { fixture: await resp.text(), limits };
 	}
 
 	async listTraces(args: ListTracesArgs): Promise<TraceSummaryLike[]> {

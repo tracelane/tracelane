@@ -1,6 +1,10 @@
 "use client";
 
-import { nextFilterParams } from "@/app/traces/filter-params";
+import {
+	nextFilterParams,
+	nextIssueFilterParams,
+} from "@/app/traces/filter-params";
+import { ISSUE_LABELS, issueLabel } from "@/lib/generation-issues";
 import { Button, SegmentedControl, cn } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -97,6 +101,9 @@ export function FilterBar() {
 	// "All time" is the explicit opt-out (range=all).
 	const range = sp.get("range") ?? "1h";
 	const group = sp.get("group") ?? "";
+	const issues = (sp.get("issue") ?? "").split(",").filter(Boolean);
+	const toggleIssue = (kind: string) =>
+		router.replace(`${pathname}?${nextIssueFilterParams(sp, kind)}`);
 	const [model, setModel] = useState(sp.get("model") ?? "");
 	const [latency, setLatency] = useState(sp.get("min_latency_ms") ?? "");
 	const [signature, setSignature] = useState(sp.get("signature_id") ?? "");
@@ -208,7 +215,8 @@ export function FilterBar() {
 	// The default 1h range isn't a "custom" filter — only a non-default range
 	// counts toward showing "Clear all".
 	const active = Boolean(
-		status ||
+		issues.length ||
+			status ||
 			(range && range !== "1h") ||
 			model ||
 			latency ||
@@ -247,6 +255,33 @@ export function FilterBar() {
 				)}
 			</div>
 
+			<select
+				aria-label="Add generation issue filter"
+				value=""
+				onChange={(e) => {
+					if (e.target.value) toggleIssue(e.target.value);
+				}}
+				className={inputCls}
+			>
+				<option value="">Issue…</option>
+				{Object.entries(ISSUE_LABELS)
+					.filter(([kind]) => !issues.includes(kind))
+					.map(([kind, label]) => (
+						<option key={kind} value={kind}>
+							{label}
+						</option>
+					))}
+			</select>
+			{issues.map((kind) => (
+				<FilterChip
+					key={kind}
+					label={issueLabel(kind)}
+					onRemove={() => toggleIssue(kind)}
+				/>
+			))}
+			{issues.length > 1 && (
+				<span className="text-xs text-ink-3">Any selected issue</span>
+			)}
 			{/* Status */}
 			<SegmentedControl
 				label="Trace status"

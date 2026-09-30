@@ -83,12 +83,7 @@ struct ReceiverState {
     /// FT-08: disk-pressure flag. `is_shedding()` is a single atomic load on
     /// the hot path; a background task refreshes it.
     disk: DiskGuard,
-    // `tenant_cfg` (ADR-048 D4.1) was REMOVED from this struct (BILL-01 /
-    // ADR-076, 2026-09-13) — its one consumer here was the per-tenant span
-    // quota check + 429, both retired outright: "ingest is NEVER blocked by
-    // billing state, on any tier". The ClickHouse writer still holds its own
-    // clone of the SAME cache for the sampling policy; nothing on this
-    // receiver's request path reads it any more.
+    tenant_cfg: Arc<crate::tenant_config::TenantConfigCache>,
     /// ADR-067 single-tenant self-host: when `Some`, EVERY decoded span is
     /// attributed to this one operator-configured tenant, overriding both the
     /// SPIFFE peer extension AND the resource-attribute fallback. This is what
@@ -114,11 +109,13 @@ pub async fn run(
     span_tx: mpsc::Sender<crate::span_envelope::SpanEnvelope>,
     disk: DiskGuard,
     single_tenant: Option<tracelane_shared::TenantId>,
+    tenant_cfg: Arc<crate::tenant_config::TenantConfigCache>,
     shutdown: crate::shutdown::Signal,
 ) -> Result<()> {
     let state = ReceiverState {
         span_tx: Arc::new(span_tx),
         cardinality: CardinalityTracker::new(),
+        tenant_cfg,
         disk,
         single_tenant: single_tenant.clone(),
     };
@@ -160,17 +157,19 @@ pub async fn run(
 /// # Errors
 /// Returns `Err` only on bind failure. Per-connection TLS / handshake
 /// failures are logged and dropped without affecting the loop.
-#[instrument(skip(span_tx, server_config, disk, shutdown), fields(port))]
+#[instrument(skip(span_tx, server_config, disk, tenant_cfg, shutdown), fields(port))]
 pub async fn run_mtls(
     port: u16,
     span_tx: mpsc::Sender<crate::span_envelope::SpanEnvelope>,
     server_config: Arc<rustls::ServerConfig>,
     disk: DiskGuard,
+    tenant_cfg: Arc<crate::tenant_config::TenantConfigCache>,
     shutdown: crate::shutdown::Signal,
 ) -> Result<()> {
     let state = ReceiverState {
         span_tx: Arc::new(span_tx),
         cardinality: CardinalityTracker::new(),
+        tenant_cfg,
         disk,
         // mTLS is the hosted, multi-tenant ingest path — tenant comes from the
         // verified SPIFFE peer, never a fixed single tenant (ADR-067's guard
@@ -550,8 +549,21 @@ async fn traces_handler(
 
     // All spans within caps. Map the (possibly mutated) decoded
     // request directly — no second protobuf decode.
-    let spans = match crate::otlp_decode::map_otlp_to_tracelane_spans(pb_req, peer_tenant.as_ref())
-    {
+    let (policy, label_caps) = if let Some(tenant) = peer_tenant.as_ref() {
+        let config = state.tenant_cfg.resolve_into_cache(*tenant.as_uuid()).await;
+        (config.otlp_capture, config.request_labels)
+    } else {
+        (
+            tracelane_shared::otlp::content::OtlpCapturePolicy::embedded(),
+            tracelane_shared::labels::LabelCaps::embedded(),
+        )
+    };
+    let spans = match crate::otlp_decode::map_otlp_with_policies(
+        pb_req,
+        peer_tenant.as_ref(),
+        &policy,
+        &label_caps,
+    ) {
         Ok(s) => s,
         Err(err) => {
             // Distinguish "no tenant attributable" (401) from "bad
@@ -813,6 +825,7 @@ mod tests {
         let state = ReceiverState {
             span_tx: Arc::new(tx),
             cardinality: crate::cardinality::CardinalityTracker::new(),
+            tenant_cfg: Arc::new(crate::tenant_config::TenantConfigCache::default_tail()),
             disk,
             single_tenant,
         };

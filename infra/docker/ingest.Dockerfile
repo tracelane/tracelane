@@ -17,6 +17,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY packages/verifier-rust/ packages/verifier-rust/
+# Reference tables embedded at compile time (CLAUDE.md §23 fallbacks): the plan/policy seed read by
+# crates/shared (labels, OTLP capture caps) and crates/gateway (rating), and the provider usage
+# conventions (usage_breakdown). A build context without them fails `include_str!` — the
+# 2026-09-29 capture deploy did exactly that on the node.
+COPY apps/web/db/plans.v3.json apps/web/db/plans.v3.json
+COPY apps/web/db/usage_conventions.v1.json apps/web/db/usage_conventions.v1.json
 RUN cargo build --release -p ingest
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:57e5704e70a85b90191182eb6110d1c817df0d8e96035cb041195c5a351f0861 AS runtime

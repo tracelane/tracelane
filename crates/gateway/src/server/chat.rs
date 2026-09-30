@@ -180,6 +180,19 @@ pub(crate) async fn chat_completions_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    let labels =
+        super::request_labels::read(&headers, &state.rate_card.load().policy.request_labels);
+    let result =
+        chat_completions_handler_with_labels(State(state), headers, Json(body), &labels).await;
+    super::request_labels::response(result, &labels)
+}
+
+async fn chat_completions_handler_with_labels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+    labels: &super::request_labels::BoundedLabels,
+) -> axum::response::Response {
     use crate::admission::{Chat, Route as _};
     let cache_control = match crate::semantic_cache::CacheControl::parse(&headers) {
         Ok(control) => control,
@@ -188,10 +201,11 @@ pub(crate) async fn chat_completions_handler(
     // --- Step 1: ADMISSION. Nothing above this line resolves a credential. ---
     // Every refusal (401 / 403 / 400 / 429 / 402 / 503) is rendered on this wire
     // by `Chat::refuse`; an `Err` here means NO ledger row landed.
-    let admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
+    let mut admitted = match crate::admission::admit::<Chat>(&state, &headers, body).await {
         Ok(a) => a,
         Err(refusal) => return Chat::refuse(refusal),
     };
+    super::request_labels::attach(&mut admitted, labels);
     let crate::admission::Admitted {
         claims,
         mut identity,

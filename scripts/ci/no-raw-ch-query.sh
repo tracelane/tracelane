@@ -138,6 +138,21 @@ scan_tree() {
             #  · the `eval_runs` reads are small tenant-scoped lookups bounded by
             #    LIMIT, the same shape as prompt_router's gate read above.
             crates/gateway/src/prompt_eval.rs) continue ;;
+            # OBS-58 (2026-09-30): every PRODUCTION read goes through `TenantQuery` in
+            # trace_reads.rs; this file's only `.query(` is the `#[cfg(test)]` real-ClickHouse
+            # parity test (SELECT over bound literals, no table). CHECKED, not waved: the
+            # production part (test items blanked by the check-banned-patterns walker) must
+            # hold zero `.query(` calls, or this is a violation like any other file.
+            crates/gateway/src/generation_issues.rs)
+                if python3 - "$f" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("bp", "scripts/ci/check-banned-patterns.py")
+bp = importlib.util.module_from_spec(spec); spec.loader.exec_module(bp)
+src = open(sys.argv[1]).read()
+prod = bp.production_part(bp.strip_comments_and_strings(src))
+sys.exit(1 if ".query(" in prod else 0)
+PY
+                then continue; fi ;;
             # GWY-24 semantic cache. The one SELECT is wrapped by `TenantQuery`
             # at the TIGHTEST (Builder) caps — a cache lookup sits ON the hot
             # path, so it must never out-consume the interactive queries of the

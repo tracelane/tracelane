@@ -308,7 +308,11 @@ def check(lines: list[str], admission: list[str]) -> list[str]:
                 f"publish at +{a_publish} — a refused request would record a cancellation."
             )
 
-    hdl = fn_body(lines, "chat_completions_handler")
+    # 2026-09-30: the body moved to `chat_completions_handler_with_labels` (GWY-54,
+    # `38aed5aa`); the old name is a label-reading wrapper that delegates. Read the body.
+    hdl = fn_body(lines, "chat_completions_handler_with_labels") or fn_body(
+        lines, "chat_completions_handler"
+    )
     if hdl is None:
         errors.append(
             "could not find `fn chat_completions_handler` in server.rs or server/*.rs"

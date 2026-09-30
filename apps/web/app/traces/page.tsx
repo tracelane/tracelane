@@ -102,6 +102,7 @@ function parseSize(sp: SP): PageSize {
 
 /** The page-facing filter params (not the gateway-derived ones). */
 const PAGE_PARAMS = [
+	"issue",
 	"status",
 	"model",
 	"range",
@@ -171,6 +172,7 @@ function buildQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	q.set("limit", String(parseSize(sp)));
 	if (sp.model) q.set("model", sp.model);
+	if (sp.issue) q.set("issue", sp.issue);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
@@ -213,6 +215,7 @@ function buildExportBase(sp: SP): string {
 	const q = new URLSearchParams();
 	if (sp.status) q.set("status", sp.status);
 	if (sp.model) q.set("model", sp.model);
+	if (sp.issue) q.set("issue", sp.issue);
 	if (sp.range) q.set("range", sp.range);
 	// A custom window survives into the export (it used to be dropped, so the CSV
 	// covered a different period than the list it was exported from).
@@ -234,6 +237,7 @@ function buildGroupQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	if (sp.group) q.set("by", sp.group);
 	if (sp.model) q.set("model", sp.model);
+	if (sp.issue) q.set("issue", sp.issue);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
@@ -255,6 +259,7 @@ function buildGroupQuery(sp: SP, w: TimeRange | null): string {
 function buildStreamParams(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	if (sp.model) q.set("model", sp.model);
+	if (sp.issue) q.set("issue", sp.issue);
 	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
 	if (sp.signature_id) q.set("signature_id", sp.signature_id);
 	if (sp.end_user) q.set("end_user", sp.end_user);
@@ -269,6 +274,7 @@ function buildStreamParams(sp: SP, w: TimeRange | null): string {
 	// ever appear (2026-09-27). A custom absolute window keeps its end — it is a
 	// deliberate slice of the past, not a tail.
 	if (!w || w.kind === "preset") q.delete("until");
+	q.set("include_issues", "false");
 	return q.toString();
 }
 
@@ -372,7 +378,7 @@ async function TracesData({
 		const data = await gatewayGet<{
 			traces: TraceSummary[];
 			next_cursor: string | null;
-		}>(`/v1/traces?${query}`);
+		}>(`/v1/traces?${query}&include_issues=false`);
 		traces = data.traces;
 		nextCursor = data.next_cursor ?? null;
 	} catch (err) {
@@ -385,17 +391,28 @@ async function TracesData({
 			// failure would tell the user their gateway is down when it
 			// answered them perfectly correctly.
 			const failure = classifyTraceFetchError(err);
+			if (failure.kind === "forbidden")
+				return (
+					<ErrorState
+						title="You don't have access to trace data"
+						description="Ask a workspace administrator for access."
+					/>
+				);
 			if (failure.kind === "rejected") {
 				return (
 					<ErrorState
-						title="Search error"
+						title={sp.issue ? "Issue filter error" : "Search error"}
 						description={failure.message}
 						action={
 							<Link
-								href={pageHref(sp, { q: undefined, cursor: undefined })}
+								href={pageHref(sp, {
+									q: undefined,
+									issue: undefined,
+									cursor: undefined,
+								})}
 								className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 							>
-								Clear search
+								{sp.issue ? "Clear filter" : "Clear search"}
 							</Link>
 						}
 					/>
@@ -438,7 +455,8 @@ async function TracesData({
 		//    older than 1h); serve both, with an all-time escape
 		//  · explicit all-time, no filters → genuinely no data → full onboarding
 		const contentFilter = Boolean(
-			sp.status ||
+			sp.issue ||
+				sp.status ||
 				sp.model ||
 				sp.since ||
 				sp.until ||
@@ -456,7 +474,7 @@ async function TracesData({
 			// (`empty-state.ts`) — a SEARCH returning zero rows names the term
 			// as the thing to change, distinct from "no data matches these
 			// filters" (spec §2, proof #3).
-			const copy = noMatchCopy(sp.q);
+			const copy = noMatchCopy(sp.q, sp.issue);
 			return (
 				<EmptyState
 					title={copy.title}
@@ -464,13 +482,19 @@ async function TracesData({
 					action={
 						<Link
 							href={
-								sp.q
-									? pageHref(sp, { q: undefined, cursor: undefined })
-									: "/traces"
+								sp.issue
+									? pageHref(sp, { issue: undefined, cursor: undefined })
+									: sp.q
+										? pageHref(sp, { q: undefined, cursor: undefined })
+										: "/traces"
 							}
 							className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
 						>
-							{sp.q ? "Clear search" : "Clear filters"}
+							{sp.issue
+								? "Clear filter"
+								: sp.q
+									? "Clear search"
+									: "Clear filters"}
 						</Link>
 					}
 				/>
@@ -507,6 +531,7 @@ async function TracesData({
 	return (
 		<>
 			<TraceList
+				withGenerationIssues
 				key={query}
 				selectable
 				selectionMax={bulk.max}
@@ -529,12 +554,28 @@ async function TracesData({
 	);
 }
 
-async function GroupData({ by, query }: { by: string; query: string }) {
+async function GroupData({
+	by,
+	query,
+	sp,
+}: { by: string; query: string; sp: SP }) {
 	let groups: TraceGroup[];
 	try {
 		groups = await gatewayGet<TraceGroup[]>(`/v1/traces/groups?${query}`);
 	} catch (err) {
 		if (err instanceof GatewayError) {
+			const failure = classifyTraceFetchError(err);
+			if (failure.kind === "forbidden")
+				return (
+					<ErrorState
+						title="You don't have access to trace data"
+						description="Ask a workspace administrator for access."
+					/>
+				);
+			if (failure.kind === "rejected")
+				return (
+					<ErrorState title="Filter error" description={failure.message} />
+				);
 			return (
 				<>
 					<WarmingBanner />
@@ -544,6 +585,20 @@ async function GroupData({ by, query }: { by: string; query: string }) {
 		}
 		throw err;
 	}
+	if (!groups.length && sp.issue)
+		return (
+			<EmptyState
+				{...noMatchCopy(sp.q, sp.issue)}
+				action={
+					<Link
+						href={pageHref(sp, { issue: undefined, cursor: undefined })}
+						className="text-sm text-ink-2 underline"
+					>
+						Clear filter
+					</Link>
+				}
+			/>
+		);
 	return <TraceGroupTable groups={groups} by={by} />;
 }
 
@@ -627,6 +682,11 @@ export default async function TracesPage({
 			)}
 
 			{w && <WindowNotice range={w} />}
+			{sp.issue && (
+				<p className="mb-2 text-xs text-ink-2">
+					Window: {w?.label ?? "All time"}
+				</p>
+			)}
 			{groupBy ? (
 				<Suspense
 					key={groupQuery}
@@ -638,7 +698,7 @@ export default async function TracesPage({
 						</div>
 					}
 				>
-					<GroupData by={groupBy} query={groupQuery} />
+					<GroupData by={groupBy} query={groupQuery} sp={sp} />
 				</Suspense>
 			) : (
 				<LiveTraces streamParams={buildStreamParams(sp, w)}>

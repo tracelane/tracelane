@@ -112,7 +112,15 @@ def strip_comments(src: str) -> str:
 
 def handler_body(lines: list[str]) -> tuple[int, int]:
     """(start, end) line indices of the handler body, brace-matched. Fails closed."""
-    start = next((i for i, ln in enumerate(lines) if HANDLER in ln), None)
+    # 2026-09-30: GWY-54 (Codex, `38aed5aa`) moved the handler BODY into
+    # `chat_completions_handler_with_labels`; the old name is now a 5-line wrapper that
+    # reads labels and delegates. The invariant lives in the body, so the body is what
+    # this guard reads when it exists (fixtures without the wrapper still resolve).
+    start = next(
+        (i for i, ln in enumerate(lines) if HANDLER + "_with_labels(" in ln), None
+    )
+    if start is None:
+        start = next((i for i, ln in enumerate(lines) if HANDLER in ln), None)
     if start is None:
         sys.exit(
             f"CANNOT DETERMINE — `{HANDLER}` not found in {TARGET}. Anchors moved."

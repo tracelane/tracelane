@@ -37,6 +37,11 @@
     ]
   },
   "policy": {
+    "generation_issues": {
+      "dashboard_window_days": 7,
+      "summary_cache_ttl_seconds": 60,
+      "inline_chip_limit": 3
+    },
     "web_list_page_sizes": { "experiments": 25, "datasets": 100, "experiment_datasets": 100, "session_turns": 20, "dataset_items": 50 },
     "playground_limits": {
       "max_columns": 4,
@@ -90,7 +95,34 @@
     "velocity_window_days": 7,
     "velocity_interval_secs": 300,
     "velocity_recheck_secs": 3600,
-    "blob_gc_grace_days": 14
+    "blob_gc_grace_days": 14,
+    "otlp_capture": {
+      "passthrough_max_keys_per_span": 32,
+      "passthrough_max_key_bytes": 128,
+      "passthrough_max_string_bytes": 256,
+      "passthrough_max_array_items": 16,
+      "max_events_per_span": 32,
+      "max_event_attribute_bytes": 1024,
+      "max_stacktrace_bytes": 16384,
+      "max_links_per_span": 16,
+      "max_retrieval_documents": 20,
+      "default_max_field_bytes": 65536
+    },
+    "output_speed": {
+      "min_generation_ms": 50
+    },
+    "request_labels": {
+      "max_metadata_keys": 16,
+      "max_key_bytes": 64,
+      "max_value_bytes": 256,
+      "max_metadata_total_bytes": 2048,
+      "max_tags": 16,
+      "max_tag_bytes": 64,
+      "max_environment_bytes": 64,
+      "max_release_bytes": 128,
+      "max_service_bytes": 128
+    },
+    "window_breakdown_max_rows": 200
   },
   "plans": {
     "free_v1": {

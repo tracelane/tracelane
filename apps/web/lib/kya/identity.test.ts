@@ -86,3 +86,13 @@ it("dot names remain routable and cannot collide with reserved key escapes", () 
 	expect(encodeIdentityKey("agent", ".")).toBe("~.");
 	expect(encodeIdentityKey("model", "..")).toBe("~..");
 });
+
+it("folds ISO snapshots to the same model family as the gateway read", () => {
+	expect(
+		resolveIdentity({ gen_ai_response_model: "OpenAI/GPT-4o-2024-08-06" }).model
+			?.key,
+	).toBe("gpt-4o");
+	expect(
+		resolveIdentity({ gen_ai_response_model: "claude-haiku-4-5" }).model?.key,
+	).toBe("claude-haiku-4-5");
+});

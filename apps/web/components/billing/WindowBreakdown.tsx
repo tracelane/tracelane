@@ -2,7 +2,7 @@
 
 /**
  * WindowBreakdown — "What's using your window" (spec §8), grouped by
- * project / service / capture state / trace shape. A SEPARATE on-demand
+ * API key / service / capture state / trace shape. A SEPARATE on-demand
  * fetch to `/api/billing/window-breakdown` (spec §2.5b) — it does not run on
  * the usage board's initial load, only when this panel is open.
  */
@@ -12,17 +12,17 @@ import type { GatewayWindowBreakdownResponse } from "@/lib/billing-usage";
 import { SegmentedControl } from "@tracelanedev/ui";
 import { useEffect, useState } from "react";
 
-type By = "project" | "service" | "capture" | "shape";
+type By = GatewayWindowBreakdownResponse["by"];
 
 const OPTIONS: { value: By; label: string }[] = [
-	{ value: "project", label: "project" },
+	{ value: "key", label: "API key" },
 	{ value: "service", label: "service" },
 	{ value: "capture", label: "capture state" },
 	{ value: "shape", label: "trace shape" },
 ];
 
 export function WindowBreakdown() {
-	const [by, setBy] = useState<By>("project");
+	const [by, setBy] = useState<By>("capture");
 	const [data, setData] = useState<GatewayWindowBreakdownResponse | null>(null);
 	const [error, setError] = useState(false);
 	const [loading, setLoading] = useState(true);
@@ -85,26 +85,40 @@ export function WindowBreakdown() {
 			{!loading && !error && data && data.rows.length > 0 && (
 				<>
 					<div>
-						{data.rows.map((row) => (
-							<div
-								key={row.label}
-								className="grid grid-cols-[minmax(110px,160px)_1fr_auto] items-center gap-3 border-b border-line py-2 text-xs last:border-b-0"
-							>
-								<span className="text-ink-2">{row.label}</span>
-								<div className="h-1.5 overflow-hidden rounded-full bg-surface-2">
-									<div
-										className="h-full rounded-full bar-data"
-										style={{ width: `${row.pct}%` }}
-									/>
+						{data.rows.map((row) => {
+							const pct =
+								data.total_bytes > 0
+									? Math.round((row.bytes / data.total_bytes) * 100)
+									: 0;
+							return (
+								<div
+									key={row.key}
+									className="grid grid-cols-[minmax(110px,160px)_1fr_auto] items-center gap-3 border-b border-line py-2 text-xs last:border-b-0"
+								>
+									<span className="text-ink-2">
+										{row.key ||
+											(by === "key"
+												? "Dashboard session (no key)"
+												: "(not set)")}
+									</span>
+									<div className="h-1.5 overflow-hidden rounded-full bg-surface-2">
+										<div
+											className="h-full rounded-full bar-data"
+											style={{ width: `${pct}%` }}
+										/>
+									</div>
+									<span className="whitespace-nowrap tabular-nums text-ink">
+										{(row.bytes / 1e9).toFixed(1)} GB · {pct}%
+									</span>
 								</div>
-								<span className="whitespace-nowrap tabular-nums text-ink">
-									{row.gb.toFixed(1)} GB · {row.pct}%
-								</span>
-							</div>
-						))}
+							);
+						})}
 					</div>
 					<p className="mt-2 text-2xs text-ink-3">
-						showing top {data.shown} of {data.total}
+						Showing {data.rows.length} groups
+						{data.truncated
+							? " — row limit reached; percentages cover the groups shown."
+							: ""}
 					</p>
 				</>
 			)}

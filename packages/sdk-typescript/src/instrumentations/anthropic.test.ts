@@ -63,6 +63,7 @@ describe("instrumentAnthropic", () => {
 		});
 
 		const s = onlySpan();
+		expect(s.attributes["tracelane.usage.input_includes_cache"]).toBe(false);
 		expect(s.name).toBe("anthropic.messages.create");
 		expect(s.attributes["gen_ai.provider.name"]).toBe("anthropic");
 		expect(s.attributes["gen_ai.usage.input_tokens"]).toBe(13);

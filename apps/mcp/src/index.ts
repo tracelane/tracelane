@@ -39,7 +39,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { bootstrapStdioTenant } from "./auth.js";
 import { runHttp } from "./http.js";
-import { createReader } from "./reader.js";
+import { GatewayReader, createReader } from "./reader.js";
 import { instrumentMcpServer } from "./semconv.js";
 import { registerEvalTools } from "./tools/evals.js";
 import { registerTraceTools } from "./tools/traces.js";
@@ -63,6 +63,10 @@ async function runStdio(): Promise<void> {
 	);
 	registerTraceTools(server, reader);
 	registerEvalTools(server);
+	// EVL-40 slice 6: `registerIncidentTools` (./tools/incidents.ts) is built and
+	// tested but NOT registered until the gateway serves `/v1/traces/{id}/incident`
+	// and `/regression` (EVL-40 slices 1–2) — a tool whose route 404s is a claim the
+	// product does not support. Register here, gateway mode only, when they land.
 
 	const transport = new StdioServerTransport();
 	await server.connect(transport);

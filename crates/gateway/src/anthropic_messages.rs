@@ -1072,6 +1072,20 @@ pub async fn messages_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let labels = crate::server::request_labels::read(
+        &headers,
+        &state.rate_card.load().policy.request_labels,
+    );
+    let result = messages_with_labels(State(state), headers, body, &labels).await;
+    crate::server::request_labels::response(result, &labels)
+}
+
+async fn messages_with_labels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    labels: &crate::server::request_labels::BoundedLabels,
+) -> Response {
     use crate::admission::Route as _;
     let control = match crate::semantic_cache::CacheControl::parse(&headers) {
         Ok(control) => control,
@@ -1079,6 +1093,7 @@ pub async fn messages_handler(
     };
     match crate::admission::admit::<Messages>(&state, &headers, body).await {
         Ok(mut admitted) => {
+            crate::server::request_labels::attach(&mut admitted, labels);
             let policy = match control.resolve(
                 admitted.entitlements.as_deref(),
                 state.semantic_cache.as_deref(),

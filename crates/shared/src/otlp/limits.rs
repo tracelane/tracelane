@@ -283,7 +283,9 @@ pub fn check_span_post_decode(
     }
 
     for kv in &span.attributes {
-        if attribute_value_bytes(kv) > limits.max_attribute_value_bytes {
+        if !super::content::is_content_key(&kv.key)
+            && attribute_value_bytes(kv) > limits.max_attribute_value_bytes
+        {
             return Err(RejectReason::AttributeTooLarge);
         }
     }
@@ -437,6 +439,31 @@ mod tests {
         assert_eq!(
             check_span_post_decode(&span, &l),
             Err(RejectReason::TooManyAttributes)
+        );
+    }
+
+    #[test]
+    fn oversized_content_preserves_metadata_but_non_content_still_rejects() {
+        let limits = IngestLimits::default();
+        let large = "é".repeat(limits.max_attribute_value_bytes);
+        for key in [
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "input.value",
+            "llm.input_messages.0.message.content",
+        ] {
+            assert!(
+                check_span_post_decode(&span_with_attrs(vec![make_attr(key, &large)]), &limits)
+                    .is_ok(),
+                "{key} must reach the content gate"
+            );
+        }
+        assert_eq!(
+            check_span_post_decode(
+                &span_with_attrs(vec![make_attr("other.value", &large)]),
+                &limits
+            ),
+            Err(RejectReason::AttributeTooLarge)
         );
     }
 

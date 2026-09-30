@@ -4,10 +4,8 @@
 //! ## Scope
 //!
 //! Decodes the protobuf wire format (Content-Type
-//! `application/x-protobuf`). JSON OTLP support is deliberately
-//! out of scope for V1 — every SDK we ship and every OTel
-//! collector we expect to peer with supports protobuf, and binary
-//! is meaningfully cheaper at ingest scale.
+//! `application/x-protobuf`) and OTLP/JSON (`application/json`). Both formats
+//! are decoded to the same protobuf model before validation and mapping.
 //!
 //! ## Tenant identity
 //!
@@ -45,6 +43,8 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use prost::Message;
 use uuid::Uuid;
+
+use super::content::OtlpCapturePolicy;
 
 use crate::{
     TenantId, TracelaneSpan,
@@ -87,6 +87,33 @@ pub fn map_otlp_to_tracelane_spans(
     req: ExportTraceServiceRequest,
     peer_tenant: Option<&TenantId>,
 ) -> Result<Vec<TracelaneSpan>> {
+    map_otlp_with_policy(req, peer_tenant, &OtlpCapturePolicy::embedded())
+}
+
+/// Map using the authenticated caller’s cached capture limits.
+///
+/// # Errors
+/// Returns an error for an unresolvable tenant, malformed IDs or timestamps.
+pub fn map_otlp_with_policy(
+    req: ExportTraceServiceRequest,
+    peer_tenant: Option<&TenantId>,
+    policy: &OtlpCapturePolicy,
+) -> Result<Vec<TracelaneSpan>> {
+    map_otlp_with_policies(
+        req,
+        peer_tenant,
+        policy,
+        &crate::labels::LabelCaps::embedded(),
+    )
+}
+
+/// Map using both cached reference policies; no per-span policy lookup.
+pub fn map_otlp_with_policies(
+    req: ExportTraceServiceRequest,
+    peer_tenant: Option<&TenantId>,
+    policy: &OtlpCapturePolicy,
+    label_caps: &crate::labels::LabelCaps,
+) -> Result<Vec<TracelaneSpan>> {
     let mut out = Vec::new();
     for resource_spans in req.resource_spans {
         // Resolve tenant for this ResourceSpans block.
@@ -97,16 +124,54 @@ pub fn map_otlp_to_tracelane_spans(
             .unwrap_or(&[]);
 
         let tenant_id = resolve_tenant(peer_tenant, resource_attrs)?;
+        let resource = resource_labels(resource_attrs);
 
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
-                let mapped = map_span(&tenant_id, span)?;
+                let mapped = map_span(&tenant_id, span, policy, label_caps, &resource)?;
+
                 out.push(mapped);
             }
         }
     }
 
     Ok(out)
+}
+
+#[derive(Default)]
+struct ResourceLabels {
+    service: Option<String>,
+    version: Option<String>,
+    environment: Option<String>,
+    dropped: usize,
+}
+
+fn reported_service(av: &AnyValue) -> Option<String> {
+    any_value_string(av)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty() && s != "unknown-service" && !s.starts_with("unknown_service"))
+}
+
+fn resource_labels(attrs: &[KeyValue]) -> ResourceLabels {
+    let mut labels = ResourceLabels::default();
+    for kv in attrs {
+        let Some(value) = &kv.value else {
+            labels.dropped += 1;
+            continue;
+        };
+        match kv.key.as_str() {
+            "service.name" => labels.service = reported_service(value),
+            "service.version" => labels.version = any_value_string(value),
+            "deployment.environment.name" => labels.environment = any_value_string(value),
+            "deployment.environment" => {
+                if labels.environment.is_none() {
+                    labels.environment = any_value_string(value);
+                }
+            }
+            _ => labels.dropped += 1,
+        }
+    }
+    labels
 }
 
 /// Resolve the tenant for a `ResourceSpans` block.
@@ -153,7 +218,13 @@ fn resolve_tenant(peer_tenant: Option<&TenantId>, resource_attrs: &[KeyValue]) -
     }
 }
 
-fn map_span(tenant_id: &TenantId, span: OtlpSpan) -> Result<TracelaneSpan> {
+fn map_span(
+    tenant_id: &TenantId,
+    span: OtlpSpan,
+    policy: &OtlpCapturePolicy,
+    label_caps: &crate::labels::LabelCaps,
+    resource: &ResourceLabels,
+) -> Result<TracelaneSpan> {
     let trace_id =
         otlp_trace_id_to_uuid(&span.trace_id).context("OTLP trace_id is not 16 bytes")?;
     let span_id = otlp_span_id_to_uuid(&span.span_id).context("OTLP span_id is not 8 bytes")?;
@@ -174,7 +245,22 @@ fn map_span(tenant_id: &TenantId, span: OtlpSpan) -> Result<TracelaneSpan> {
         Some(nanos_to_utc(span.end_time_unix_nano).context("invalid end_time_unix_nano")?)
     };
 
-    let attributes = build_attributes(&span.attributes);
+    let mut attributes = build_attributes_with_policy(&span.attributes, policy);
+    attributes.service_name = attributes
+        .service_name
+        .take()
+        .or_else(|| resource.service.clone());
+    attributes.service_version = attributes
+        .service_version
+        .take()
+        .or_else(|| resource.version.clone());
+    attributes.deployment_environment = attributes
+        .deployment_environment
+        .take()
+        .or_else(|| resource.environment.clone());
+    super::content::note_drop(&mut attributes, "resource", resource.dropped);
+    super::labels::apply(&span.attributes, &mut attributes, label_caps);
+    super::events::apply(&span, &mut attributes, policy);
 
     let status = match span.status {
         Some(s) => SpanStatus {
@@ -241,30 +327,18 @@ fn nanos_to_utc(nanos: u64) -> Result<DateTime<Utc>> {
         .context("unix timestamp out of range")
 }
 
-/// Pull the OTel-GenAI-semconv-mapped fields out of the span's
-/// attributes vector.
-///
-/// **Anything not on the curated list is DROPPED.** Corrected 2026-09-10
-/// (`OBS-20`): this comment used to say unmapped attributes were *"kept in
-/// `_extra` (JSON) for forensic visibility"*, and that has never been true — the
-/// `_` arm at the bottom of the match is empty and says so in its own body. Only
-/// keys with an explicit arm reach `extra` (`gen_ai.tool.name`, `tool.name`,
-/// `tool_name`, `gen_ai.agent.id`, `agent_id`, `parent_agent_id`, the
-/// `gen_ai.openai.*` / `openai.*` pair).
-///
-/// The difference is not cosmetic and it is why `OBS-20` needed an alias table
-/// rather than a read-side lookup: a customer running stock OpenInference or
-/// Langfuse instrumentation emits `user.id`, and with no arm for it the value was
-/// silently discarded at ingest — there is no forensic fallback catching it
-/// later. CLAUDE.md §17: the code wins and the comment was the defect.
-///
-/// Curated keys that DO land are not used by the gateway's hot-path queries;
-/// they are read back with `JSONExtract*` over the `attributes` blob.
+/// Decode curated metadata and stage bounded unknown attributes for the content gate.
+#[cfg(test)]
 fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
+    build_attributes_with_policy(attrs, &OtlpCapturePolicy::embedded())
+}
+
+fn build_attributes_with_policy(attrs: &[KeyValue], policy: &OtlpCapturePolicy) -> SpanAttributes {
     let mut out = SpanAttributes::default();
     for kv in attrs {
         let Some(av) = &kv.value else { continue };
-        match kv.key.as_str() {
+        let key = kv.key.as_str();
+        match key {
             // OTel GenAI semconv — provider identity.
             // Store-side normalization (ADR-032): a legacy adapter emits
             // `gen_ai.system`, a v1.41 adapter emits `gen_ai.provider.name`.
@@ -284,13 +358,26 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             "gen_ai.response.model" => out.gen_ai_response_model = any_value_string(av),
             // RI-05 (2026-09-19): the two response-identity keys the SDK path may carry.
             "gen_ai.response.id" => out.gen_ai_response_id = any_value_string(av),
+            "gen_ai.response.finish_reason" if out.gen_ai_response_finish_reasons.is_none() => {
+                out.gen_ai_response_finish_reasons = any_value_string(av).map(|value| vec![value]);
+            }
+            // Plural wins — but an EMPTY plural must not erase a singular value
+            // already decoded (code review 2026-09-29).
             "gen_ai.response.finish_reasons" => {
-                out.gen_ai_response_finish_reasons = any_value_strings(av);
+                if let Some(v) = any_value_strings(av).filter(|v| !v.is_empty()) {
+                    out.gen_ai_response_finish_reasons = Some(v);
+                }
             }
             "gen_ai.operation.name" => out.gen_ai_operation_name = any_value_string(av),
             "gen_ai.agent.name" => out.gen_ai_agent_name = any_value_string(av),
             "gen_ai.agent.version" => out.gen_ai_agent_version = any_value_string(av),
             "gen_ai.conversation.id" => out.gen_ai_conversation_id = any_value_string(av),
+            "tracelane.usage.input_includes_cache" => {
+                out.tracelane_usage_input_includes_cache = any_value_bool(av);
+            }
+            "gen_ai.usage.cost" => {
+                out.gen_ai_usage_cost = any_value_f64(av).filter(|v| v.is_finite() && *v >= 0.0);
+            }
             "gen_ai.usage.input_tokens" => {
                 out.gen_ai_usage_input_tokens = any_value_u32(av);
             }
@@ -418,6 +505,104 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
             "model" if out.gen_ai_request_model.is_none() => {
                 out.gen_ai_request_model = any_value_string(av);
             }
+            "service.name" => out.service_name = reported_service(av),
+            "service.version" => out.service_version = any_value_string(av),
+            "deployment.environment.name" => out.deployment_environment = any_value_string(av),
+            "deployment.environment" if out.deployment_environment.is_none() => {
+                out.deployment_environment = any_value_string(av)
+            }
+            "gen_ai.usage.cache_write.input_tokens"
+                if out.gen_ai_usage_cache_creation_input_tokens.is_none() =>
+            {
+                out.gen_ai_usage_cache_creation_input_tokens = any_value_u32(av)
+            }
+            "gen_ai.tool.call.id" => out.gen_ai_tool_call_id = any_value_string(av),
+            "gen_ai.tool.call.arguments" => out.gen_ai_tool_call_arguments = content_text(av),
+            "gen_ai.tool.call.result" => out.gen_ai_tool_call_result = content_text(av),
+            "gen_ai.retrieval.query.text" => out.tracelane_retrieval_query = any_value_string(av),
+            "error.type" => out.error_type = any_value_string(av),
+            "gen_ai.retrieval.documents" => {
+                if let Some(serde_json::Value::Array(values)) = any_value_json(av) {
+                    super::content::note_drop(
+                        &mut out,
+                        "cap",
+                        values.len().saturating_sub(policy.max_retrieval_documents),
+                    );
+                    out.tracelane_retrieval_documents = Some(
+                        values
+                            .into_iter()
+                            .take(policy.max_retrieval_documents)
+                            .map(|v| crate::span::RetrievalDocument {
+                                id: v
+                                    .get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                                score: v
+                                    .get("score")
+                                    .and_then(serde_json::Value::as_f64)
+                                    .filter(|v| v.is_finite()),
+                                content: v
+                                    .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            "gen_ai.tool.definitions" => {
+                if let Some(serde_json::Value::Array(values)) = any_value_json(av) {
+                    super::openinference::record_tools(&mut out, values.into_iter(), policy);
+                }
+            }
+            "mcp.tool_name" => {
+                if let Some(v) = any_value_string(av) {
+                    out.extra
+                        .entry("gen_ai.tool.name".into())
+                        .or_insert(serde_json::Value::String(v));
+                }
+            }
+            "gen_ai.tool.type"
+            | "gen_ai.tool.description"
+            | "gen_ai.data_source.id"
+            | "gen_ai.prompt.name"
+            | "gen_ai.prompt.version"
+            | "gen_ai.agent.description"
+            | "gen_ai.workflow.name"
+            | "gen_ai.output.type"
+            | "mcp.method.name"
+            | "mcp.session.id"
+            | "mcp.protocol.version"
+            | "mcp.resource.uri" => {
+                super::openinference::metadata(
+                    &mut out,
+                    key,
+                    any_value_string(av).map(serde_json::Value::String),
+                    policy,
+                );
+            }
+            "gen_ai.conversation.compacted" | "mcp.is_error" => {
+                super::openinference::metadata(
+                    &mut out,
+                    key,
+                    any_value_bool(av).map(serde_json::Value::Bool),
+                    policy,
+                );
+            }
+            "gen_ai.retrieval.top_k"
+            | "gen_ai.request.top_k"
+            | "gen_ai.request.frequency_penalty"
+            | "gen_ai.request.presence_penalty"
+            | "gen_ai.request.choice.count"
+            | "mcp.content_count"
+            | "mcp.argument_count" => {
+                super::openinference::metadata(
+                    &mut out,
+                    key,
+                    super::openinference::scalar(av).filter(serde_json::Value::is_number),
+                    policy,
+                );
+            }
             // Structured message capture (v1.37+, replaces per-message events)
             "gen_ai.system_instructions" => {
                 out.gen_ai_system_instructions = any_value_json(av);
@@ -544,32 +729,35 @@ fn build_attributes(attrs: &[KeyValue]) -> SpanAttributes {
                     .as_deref()
                     .and_then(crate::span::bounded_business_reference);
             }
-            // Legacy `gen_ai.openai.*` → canonical `openai.*` (v1.37 rename,
-            // ADR-032). Preserved in the `extra` blob under the renamed key so
-            // provider-specific detail is not lost. Already-`openai.*` keys
-            // pass through unchanged below.
+            "gen_ai.openai.response.system_fingerprint" | "openai.response.system_fingerprint" => {
+                super::openinference::metadata(
+                    &mut out,
+                    "openai.response.system_fingerprint",
+                    any_value_string(av).map(serde_json::Value::String),
+                    policy,
+                );
+            }
             k if k.starts_with("gen_ai.openai.") => {
-                if let Some(v) = any_value_string(av) {
-                    let renamed = k.replacen("gen_ai.openai.", "openai.", 1);
-                    out.extra.insert(renamed, serde_json::Value::String(v));
-                }
+                let renamed = k.replacen("gen_ai.openai.", "openai.", 1);
+                super::passthrough::collect(&mut out, &renamed, av, policy, None);
             }
-            k if k.starts_with("openai.") => {
-                if let Some(v) = any_value_string(av) {
-                    out.extra
-                        .insert(k.to_string(), serde_json::Value::String(v));
-                }
-            }
-            _ => {
-                // Unmapped attribute — ignored for V1. A future
-                // schema can stash these in `_extra` JSON.
-            }
+            // Aliases already resolved above must not re-enter the unknown-key path.
+            "session.id"
+            | "enduser.pseudo.id"
+            | "enduser.id"
+            | "langfuse.user.id"
+            | "gen_ai.response.finish_reason"
+            | "deployment.environment"
+            | "gen_ai.usage.cache_write.input_tokens" => {}
+            k if super::openinference::handles(k) || super::labels::handles(k) => {}
+            _ => super::passthrough::collect(&mut out, key, av, policy, None),
         }
     }
+    super::openinference::apply(attrs, &mut out, policy);
     out
 }
 
-fn any_value_string(av: &AnyValue) -> Option<String> {
+pub(super) fn any_value_string(av: &AnyValue) -> Option<String> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) => {
             Some(s.clone())
@@ -580,7 +768,7 @@ fn any_value_string(av: &AnyValue) -> Option<String> {
 
 /// An OTLP array of strings (`gen_ai.response.finish_reasons`). Non-string elements
 /// are skipped; an empty or non-array value is `None`, never `Some(vec![])`.
-fn any_value_strings(av: &AnyValue) -> Option<Vec<String>> {
+pub(super) fn any_value_strings(av: &AnyValue) -> Option<Vec<String>> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::ArrayValue(arr)) => {
             let v: Vec<String> = arr.values.iter().filter_map(any_value_string).collect();
@@ -593,7 +781,7 @@ fn any_value_strings(av: &AnyValue) -> Option<Vec<String>> {
     }
 }
 
-fn any_value_u32(av: &AnyValue) -> Option<u32> {
+pub(super) fn any_value_u32(av: &AnyValue) -> Option<u32> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(n)) => {
             if *n >= 0 && *n <= u32::MAX as i64 {
@@ -606,7 +794,7 @@ fn any_value_u32(av: &AnyValue) -> Option<u32> {
     }
 }
 
-fn any_value_f32(av: &AnyValue) -> Option<f32> {
+pub(super) fn any_value_f32(av: &AnyValue) -> Option<f32> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(d)) => {
             Some(*d as f32)
@@ -623,7 +811,7 @@ fn any_value_f32(av: &AnyValue) -> Option<f32> {
 /// so a seed above `i64::MAX` — which the OpenAI API permits — is unrepresentable
 /// on the OTLP wire whatever this function does. The GATEWAY path carries the
 /// full `u64` (it reads `req.seed` directly); only the SDK/OTLP path is bounded.
-fn any_value_u64(av: &AnyValue) -> Option<u64> {
+pub(super) fn any_value_u64(av: &AnyValue) -> Option<u64> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(n)) => {
             u64::try_from(*n).ok()
@@ -632,14 +820,14 @@ fn any_value_u64(av: &AnyValue) -> Option<u64> {
     }
 }
 
-fn any_value_bool(av: &AnyValue) -> Option<bool> {
+pub(super) fn any_value_bool(av: &AnyValue) -> Option<bool> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::BoolValue(b)) => Some(*b),
         _ => None,
     }
 }
 
-fn any_value_f64(av: &AnyValue) -> Option<f64> {
+pub(super) fn any_value_f64(av: &AnyValue) -> Option<f64> {
     match &av.value {
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(d)) => Some(*d),
         Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(n)) => {
@@ -652,9 +840,31 @@ fn any_value_f64(av: &AnyValue) -> Option<f64> {
 /// Decode a structured-message attribute (`gen_ai.input.messages` etc.). Adapters
 /// emit these as a JSON-serialized string; parse it when valid, else keep the
 /// raw string so no content is lost.
-fn any_value_json(av: &AnyValue) -> Option<serde_json::Value> {
-    let s = any_value_string(av)?;
-    Some(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)))
+pub(super) fn any_value_json(av: &AnyValue) -> Option<serde_json::Value> {
+    if let Some(s) = any_value_string(av) {
+        return Some(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)));
+    }
+    wire_json(av)
+}
+
+fn content_text(av: &AnyValue) -> Option<String> {
+    any_value_string(av).or_else(|| wire_json(av).map(|v| v.to_string()))
+}
+
+pub(super) fn wire_json(av: &AnyValue) -> Option<serde_json::Value> {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value as Wire;
+    match av.value.as_ref()? {
+        Wire::ArrayValue(a) => Some(serde_json::Value::Array(
+            a.values.iter().filter_map(wire_json).collect(),
+        )),
+        Wire::KvlistValue(kv) => Some(serde_json::Value::Object(
+            kv.values
+                .iter()
+                .filter_map(|kv| Some((kv.key.clone(), wire_json(kv.value.as_ref()?)?)))
+                .collect(),
+        )),
+        _ => super::openinference::scalar(av),
+    }
 }
 
 // ── GWY-41: the one decode-and-enforce entry point for an UNTRUSTED caller ──
@@ -756,6 +966,46 @@ pub fn decode_batch_with_limits(
     max_spans: usize,
     wire: Wire,
 ) -> DecodeOutcome {
+    decode_batch_with_policy(
+        body,
+        tenant,
+        cap,
+        max_spans,
+        wire,
+        &OtlpCapturePolicy::embedded(),
+    )
+}
+
+/// Decode either wire format using cached limits for optional retained fields.
+pub fn decode_batch_with_policy(
+    body: &[u8],
+    tenant: &TenantId,
+    cap: &crate::otlp::limits::IngestLimits,
+    max_spans: usize,
+    wire: Wire,
+    policy: &OtlpCapturePolicy,
+) -> DecodeOutcome {
+    decode_batch_with_policies(
+        body,
+        tenant,
+        cap,
+        max_spans,
+        wire,
+        policy,
+        &crate::labels::LabelCaps::embedded(),
+    )
+}
+
+/// Decode with the gateway's cached content and label limits.
+pub fn decode_batch_with_policies(
+    body: &[u8],
+    tenant: &TenantId,
+    cap: &crate::otlp::limits::IngestLimits,
+    max_spans: usize,
+    wire: Wire,
+    policy: &OtlpCapturePolicy,
+    label_caps: &crate::labels::LabelCaps,
+) -> DecodeOutcome {
     use crate::otlp::limits::{RejectReason, check_payload_pre_decode, check_span_post_decode};
 
     if let Err(reason) = check_payload_pre_decode(body.len(), cap) {
@@ -842,7 +1092,7 @@ pub fn decode_batch_with_limits(
         }
     }
 
-    match map_otlp_to_tracelane_spans(req, Some(tenant)) {
+    match map_otlp_with_policies(req, Some(tenant), policy, label_caps) {
         Ok(spans) => DecodeOutcome::Ok(DecodedBatch {
             spans,
             any_warning_band,
@@ -873,6 +1123,57 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{
         ResourceSpans, ScopeSpans, Span as ProtoSpan, Status as ProtoStatus,
     };
+
+    #[test]
+    fn input_cache_convention_flag_survives_decode() {
+        for flag in [true, false] {
+            let attrs = build_attributes(&[ProtoKeyValue {
+                key: "tracelane.usage.input_includes_cache".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::BoolValue(flag)),
+                }),
+            }]);
+            assert_eq!(
+                serde_json::to_value(attrs).unwrap()["tracelane_usage_input_includes_cache"],
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn singular_finish_reason_is_preserved_and_plural_wins_both_orders() {
+        let singular = kv_str("gen_ai.response.finish_reason", "stop");
+        assert_eq!(
+            build_attributes(std::slice::from_ref(&singular)).gen_ai_response_finish_reasons,
+            Some(vec!["stop".into()])
+        );
+        let plural = ProtoKeyValue {
+            key: "gen_ai.response.finish_reasons".into(),
+            value: Some(ProtoAnyValue {
+                value: Some(ProtoValue::ArrayValue(
+                    opentelemetry_proto::tonic::common::v1::ArrayValue {
+                        values: vec![ProtoAnyValue {
+                            value: Some(ProtoValue::StringValue("length".into())),
+                        }],
+                    },
+                )),
+            }),
+        };
+        for attrs in [
+            vec![singular.clone(), plural.clone()],
+            vec![plural, singular],
+        ] {
+            assert_eq!(
+                build_attributes(&attrs).gen_ai_response_finish_reasons,
+                Some(vec!["length".into()])
+            );
+        }
+        assert!(
+            build_attributes(&[kv_int("gen_ai.response.finish_reason", 1)])
+                .gen_ai_response_finish_reasons
+                .is_none()
+        );
+    }
 
     fn tenant() -> TenantId {
         TenantId::from_jwt_claim(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
@@ -1127,6 +1428,476 @@ mod tests {
             }],
         };
         req.encode_to_vec()
+    }
+
+    #[test]
+    fn label_otlp_uses_runtime_caps_on_span_and_resource_values() {
+        let mut wire = sample_span();
+        wire.attributes = vec![
+            kv_str("tracelane.metadata.first", "kept"),
+            kv_str("tracelane.metadata.second", "dropped"),
+            ProtoKeyValue {
+                key: "tracelane.tags".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::ArrayValue(
+                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                            values: vec![
+                                kv_str("", "beta").value.unwrap(),
+                                kv_str("", "gamma").value.unwrap(),
+                                kv_int("", 3).value.unwrap(),
+                            ],
+                        },
+                    )),
+                }),
+            },
+        ];
+        let request = ExportTraceServiceRequest::decode(
+            wrap_in_request(
+                wire,
+                vec![kv_str("deployment.environment.name", "production")],
+            )
+            .as_slice(),
+        )
+        .unwrap();
+        let mut caps = crate::labels::LabelCaps::embedded();
+        caps.max_metadata_keys = 1;
+        caps.max_tags = 1;
+        caps.max_environment_bytes = 3;
+        let span = map_otlp_with_policies(
+            request,
+            Some(&tenant()),
+            &OtlpCapturePolicy::embedded(),
+            &caps,
+        )
+        .unwrap()
+        .remove(0);
+        let a = serde_json::to_value(span.attributes).unwrap();
+        assert_eq!(a["tracelane_metadata"], serde_json::json!({"first":"kept"}));
+        assert_eq!(a["tracelane_tags"], serde_json::json!(["beta"]));
+        assert!(a.get("deployment_environment").is_none());
+        assert_eq!(
+            a["tracelane_labels_dropped"],
+            serde_json::json!({"metadata_keys":1,"tags":2,"environment":1})
+        );
+    }
+
+    #[test]
+    fn label_otlp_aliases_share_bounds_and_canonical_precedence() {
+        use super::super::content::{CaptureHalves, apply_capture};
+        let mut attrs = vec![
+            kv_str(
+                "metadata",
+                r#"{"feature":"openinference","n":2,"nested":{}}"#,
+            ),
+            kv_str("langfuse.trace.metadata.feature", "langfuse"),
+            kv_str("tracelane.metadata.feature", "canonical"),
+            kv_str("tag.tags", "openinference"),
+            kv_str("langfuse.trace.tags", "langfuse"),
+            kv_str("tracelane.tags", "canonical"),
+            kv_str("service.version", &"x".repeat(129)),
+        ];
+        for _ in 0..2 {
+            let mut wire = sample_span();
+            wire.attributes = attrs.clone();
+            let mut span = decode_otlp_protobuf(
+                &wrap_in_request(
+                    wire,
+                    vec![
+                        kv_str("service.name", "checkout"),
+                        kv_str("deployment.environment.name", " Production "),
+                    ],
+                ),
+                Some(&tenant()),
+            )
+            .unwrap()
+            .remove(0);
+            apply_capture(&mut span, &CaptureHalves::closed());
+            let a = serde_json::to_value(span.attributes).unwrap();
+            assert_eq!(
+                a["tracelane_metadata"],
+                serde_json::json!({"feature":"canonical","n":"2"})
+            );
+            assert_eq!(a["tracelane_tags"], serde_json::json!(["canonical"]));
+            assert_eq!(a["deployment_environment"], "production");
+            assert_eq!(a["service_name"], "checkout");
+            assert!(a.get("service_version").is_none());
+            assert_eq!(a["tracelane_labels_dropped"]["metadata_keys"], 1);
+            assert_eq!(a["tracelane_labels_dropped"]["release"], 1);
+            assert!(a.get("langfuse.trace.metadata.feature").is_none());
+            attrs.reverse();
+        }
+        for attributes in [
+            vec![
+                kv_str("metadata", r#"{"feature":"checkout"}"#),
+                kv_str("tag.tags", "beta"),
+            ],
+            vec![
+                kv_str("langfuse.trace.metadata.feature", "checkout"),
+                kv_str("langfuse.trace.tags", "beta"),
+            ],
+        ] {
+            let mut wire = sample_span();
+            wire.attributes = attributes;
+            let span = decode_otlp_protobuf(&wrap_in_request(wire, vec![]), Some(&tenant()))
+                .unwrap()
+                .remove(0);
+            let a = serde_json::to_value(span.attributes).unwrap();
+            assert_eq!(a["tracelane_metadata"]["feature"], "checkout");
+            assert_eq!(a["tracelane_tags"], serde_json::json!(["beta"]));
+        }
+    }
+
+    #[test]
+    fn passthrough_arrays_and_events_share_the_runtime_budget() {
+        use super::super::content::{CaptureHalves, apply_capture};
+        let mut caps = OtlpCapturePolicy::embedded();
+        caps.passthrough_max_keys_per_span = 2;
+        caps.passthrough_max_array_items = 2;
+        let mut wire = sample_span();
+        wire.attributes = vec![
+            ProtoKeyValue {
+                key: "custom.array".into(),
+                value: Some(ProtoAnyValue {
+                    value: Some(ProtoValue::ArrayValue(
+                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                            values: vec![
+                                kv_str("", "secret").value.unwrap(),
+                                kv_int("", 7).value.unwrap(),
+                                kv_int("", 8).value.unwrap(),
+                            ],
+                        },
+                    )),
+                }),
+            },
+            kv_int("custom.number", 9),
+        ];
+        wire.events = vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+            name: "custom".into(),
+            attributes: vec![kv_int("custom.event", 10)],
+            ..Default::default()
+        }];
+        let request =
+            ExportTraceServiceRequest::decode(wrap_in_request(wire, vec![]).as_slice()).unwrap();
+        let mut span = map_otlp_with_policy(request, Some(&tenant()), &caps)
+            .unwrap()
+            .remove(0);
+        apply_capture(&mut span, &CaptureHalves::closed());
+        let a = serde_json::to_value(span.attributes).unwrap();
+        assert_eq!(a["custom.array"], serde_json::json!([7]));
+        assert_eq!(a["custom.number"], 9);
+        assert!(
+            a["tracelane_events"][0]["attributes"]
+                .get("custom.event")
+                .is_none()
+        );
+        assert_eq!(a["tracelane_attrs_dropped"]["reasons"]["cap"], 2);
+        assert_eq!(
+            a["tracelane_attrs_dropped"]["reasons"]["string_capture_off"],
+            1
+        );
+    }
+
+    #[test]
+    fn passthrough_enforces_key_content_string_and_count_budgets() {
+        use super::super::content::{CaptureHalves, apply_capture};
+        let mut attrs = vec![
+            kv_str("tracelane_api_key_id", "forged"),
+            kv_int("gen_ai_usage_cost", 99),
+            kv_int("tracelane.failover.activated", 1),
+            kv_str("gen_ai.prompt.0.content", "secret"),
+            kv_str("custom.label", "secret"),
+            kv_str("custom.large", &"x".repeat(257)),
+            kv_str("openai.private", "secret"),
+        ];
+        for i in 0..40 {
+            attrs.push(kv_int(&format!("custom.n{i}"), i));
+        }
+        for (input, output) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut wire = sample_span();
+            wire.attributes = attrs.clone();
+            let mut span = decode_otlp_protobuf(&wrap_in_request(wire, vec![]), Some(&tenant()))
+                .unwrap()
+                .remove(0);
+            // Candidates cannot leak if accidentally serialized before the decision.
+            assert!(!serde_json::to_string(&span).unwrap().contains("secret"));
+            apply_capture(
+                &mut span,
+                &CaptureHalves {
+                    input,
+                    output,
+                    max_field_bytes: 65536,
+                },
+            );
+            let a = serde_json::to_value(&span.attributes).unwrap();
+            for key in [
+                "tracelane_api_key_id",
+                "gen_ai_usage_cost",
+                "tracelane.failover.activated",
+                "gen_ai.prompt.0.content",
+                "custom.large",
+            ] {
+                assert!(a.get(key).is_none(), "{key}");
+            }
+            assert_eq!(span.attributes.extra.len(), 32);
+            assert_eq!(a["custom.n0"], 0);
+            assert_eq!(a.get("custom.label").is_some(), input && output);
+            assert_eq!(
+                a["tracelane_attrs_dropped"]["reasons"]["content_unmapped"],
+                1
+            );
+            assert!(a["tracelane_attrs_dropped"]["count"].as_u64().unwrap() >= 13);
+        }
+    }
+
+    #[test]
+    fn resource_metadata_reaches_every_span_with_span_and_current_key_precedence() {
+        let mut resource = vec![
+            kv_str("service.name", "checkout"),
+            kv_str("service.version", "v1"),
+            kv_str("deployment.environment.name", "Production"),
+            kv_str("deployment.environment", "legacy"),
+            kv_str("telemetry.sdk.language", "python"),
+        ];
+        for _ in 0..2 {
+            let bytes = wrap_in_request(sample_span(), resource.clone());
+            let mut req = ExportTraceServiceRequest::decode(bytes.as_slice()).unwrap();
+            let mut custom = sample_span();
+            custom.attributes.extend([
+                kv_str("service.name", "worker"),
+                kv_str("service.version", "v2"),
+                kv_str("deployment.environment", "staging"),
+            ]);
+            req.resource_spans[0].scope_spans[0].spans.push(custom);
+            let spans = map_otlp_to_tracelane_spans(req, Some(&tenant())).unwrap();
+            assert_eq!(spans.len(), 2);
+            for (i, span) in spans.into_iter().enumerate() {
+                assert_eq!(span.tenant_id, tenant());
+                let a = serde_json::to_value(span.attributes).unwrap();
+                assert_eq!(
+                    a["service_name"],
+                    if i == 0 { "checkout" } else { "worker" }
+                );
+                assert_eq!(a["service_version"], if i == 0 { "v1" } else { "v2" });
+                assert_eq!(
+                    a["deployment_environment"],
+                    if i == 0 { "production" } else { "staging" }
+                );
+                assert_eq!(a["tracelane_attrs_dropped"]["reasons"]["resource"], 1);
+                assert!(a.get("telemetry.sdk.language").is_none());
+            }
+            resource.reverse();
+        }
+        for name in [
+            "unknown-service",
+            "unknown_service",
+            "unknown_service:python",
+        ] {
+            let bytes = wrap_in_request(sample_span(), vec![kv_str("service.name", name)]);
+            let spans = decode_otlp_protobuf(&bytes, Some(&tenant())).unwrap();
+            assert!(
+                serde_json::to_value(&spans[0].attributes)
+                    .unwrap()
+                    .get("service_name")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn events_fold_content_preserve_exception_metadata_and_convert_links() {
+        use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+        let mut proto = sample_span();
+        proto.events = vec![
+            Event {
+                name: "exception".into(),
+                time_unix_nano: 123000,
+                attributes: vec![
+                    kv_str("exception.type", "ValueError"),
+                    kv_str("exception.message", "bad value"),
+                    kv_str("exception.stacktrace", &"é".repeat(100)),
+                ],
+                ..Default::default()
+            },
+            Event {
+                name: "gen_ai.choice".into(),
+                attributes: vec![kv_str(
+                    "message",
+                    r#"{"role":"assistant","content":"private choice"}"#,
+                )],
+                ..Default::default()
+            },
+            Event {
+                name: "gen_ai.user.message".into(),
+                attributes: vec![kv_str("content", "private input")],
+                ..Default::default()
+            },
+            Event {
+                name: "gen_ai.evaluation.result".into(),
+                attributes: vec![
+                    kv_str("gen_ai.evaluation.name", "quality"),
+                    kv_double("score.value", 0.8),
+                    kv_str("explanation", "private explanation"),
+                ],
+                ..Default::default()
+            },
+            Event {
+                name: "custom".into(),
+                attributes: vec![
+                    kv_str("custom.secret", "private extra"),
+                    kv_int("custom.count", 4),
+                    kv_str("custom.content", "private unmapped"),
+                ],
+                ..Default::default()
+            },
+        ];
+        proto.links = vec![Link {
+            trace_id: vec![1; 16],
+            span_id: vec![3; 8],
+            attributes: vec![kv_str("link.secret", "private link")],
+            ..Default::default()
+        }];
+        let bytes = wrap_in_request(proto, vec![]);
+        let request = ExportTraceServiceRequest::decode(bytes.as_slice()).unwrap();
+        let mut policy = OtlpCapturePolicy::embedded();
+        policy.max_stacktrace_bytes = 40;
+        let mut spans = map_otlp_with_policy(request, Some(&tenant()), &policy).unwrap();
+        let span = &mut spans[0];
+        let a = serde_json::to_value(&span.attributes).unwrap();
+        assert_eq!(a["exception_type"], "ValueError");
+        assert_eq!(a["exception_message"], "bad value");
+        assert_eq!(a["gen_ai_output_messages"][0]["content"], "private choice");
+        assert_eq!(a["tracelane_events"][0]["time_unix_us"], 123);
+        let stack = a["tracelane_events"][0]["attributes"]["exception.stacktrace"]
+            .as_str()
+            .unwrap();
+        assert!(stack.len() <= 40);
+        assert!(stack.ends_with("…[truncated]"));
+        assert_eq!(
+            a["tracelane_links"][0]["span_id"],
+            span.parent_span_id.unwrap().to_string()
+        );
+        assert_eq!(
+            a["tracelane_links"][0]["trace_id"],
+            span.trace_id.to_string()
+        );
+        super::super::content::apply_capture(span, &super::super::content::CaptureHalves::closed());
+        let a = serde_json::to_value(&span.attributes).unwrap();
+        assert!(!a.to_string().contains("private"));
+        assert_eq!(a["tracelane_events"][2]["attributes"]["custom.count"], 4);
+        assert_eq!(a["tracelane_attrs_dropped"]["reasons"]["link_attrs"], 1);
+        assert_eq!(
+            a["tracelane_attrs_dropped"]["reasons"]["string_capture_off"],
+            1
+        );
+        assert_eq!(
+            a["tracelane_attrs_dropped"]["reasons"]["content_unmapped"],
+            1
+        );
+        assert_eq!(
+            a["tracelane_content_withheld"],
+            serde_json::json!(["input", "output"])
+        );
+    }
+
+    #[test]
+    fn event_and_link_budgets_count_drops_and_canonical_content_wins() {
+        use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+        let mut proto = sample_span();
+        proto.attributes.push(kv_str(
+            "gen_ai.output.messages",
+            r#"[{"content":"canonical"}]"#,
+        ));
+        proto.events = vec![
+            Event {
+                name: "gen_ai.choice".into(),
+                attributes: vec![kv_str("message", r#"{"content":"alias"}"#)],
+                ..Default::default()
+            },
+            Event {
+                name: "later".into(),
+                ..Default::default()
+            },
+        ];
+        proto.links = vec![
+            Link {
+                trace_id: vec![1; 16],
+                span_id: vec![3; 8],
+                ..Default::default()
+            };
+            2
+        ];
+        let request =
+            ExportTraceServiceRequest::decode(wrap_in_request(proto, vec![]).as_slice()).unwrap();
+        let mut policy = OtlpCapturePolicy::embedded();
+        policy.max_events_per_span = 1;
+        policy.max_links_per_span = 1;
+        let spans = map_otlp_with_policy(request, Some(&tenant()), &policy).unwrap();
+        let a = serde_json::to_value(&spans[0].attributes).unwrap();
+        assert_eq!(a["gen_ai_output_messages"][0]["content"], "canonical");
+        assert_eq!(a["tracelane_links"].as_array().unwrap().len(), 1);
+        assert_eq!(a["tracelane_attrs_dropped"]["reasons"]["cap"], 2);
+    }
+
+    #[test]
+    fn message_event_variants_fold_and_unknown_prompt_families_never_pass_raw() {
+        use opentelemetry_proto::tonic::trace::v1::span::Event;
+        for (name, field) in [
+            ("gen_ai.user.message", "gen_ai_input_messages"),
+            ("gen_ai.system.message", "gen_ai_system_instructions"),
+            ("gen_ai.tool.message", "gen_ai_input_messages"),
+            ("gen_ai.assistant.message", "gen_ai_output_messages"),
+            ("gen_ai.choice", "gen_ai_output_messages"),
+        ] {
+            let mut proto = sample_span();
+            proto.events = vec![Event {
+                name: name.into(),
+                attributes: vec![kv_str("body", "private body")],
+                ..Default::default()
+            }];
+            let spans =
+                decode_otlp_protobuf(&wrap_in_request(proto, vec![]), Some(&tenant())).unwrap();
+            assert_eq!(
+                serde_json::to_value(&spans[0].attributes).unwrap()[field][0]["content"],
+                "private body"
+            );
+        }
+        let mut proto = sample_span();
+        proto.events = vec![
+            Event {
+                name: "gen_ai.client.inference.operation.details".into(),
+                attributes: vec![
+                    kv_str("gen_ai.input.messages", r#"[{"content":"in"}]"#),
+                    kv_str("gen_ai.output.messages", r#"[{"content":"out"}]"#),
+                ],
+                ..Default::default()
+            },
+            Event {
+                name: "custom".into(),
+                attributes: vec![
+                    kv_str("custom.prompt_template", "never store raw"),
+                    kv_str("custom.label", "allowed"),
+                ],
+                ..Default::default()
+            },
+        ];
+        let mut spans =
+            decode_otlp_protobuf(&wrap_in_request(proto, vec![]), Some(&tenant())).unwrap();
+        super::super::content::apply_capture(
+            &mut spans[0],
+            &super::super::content::CaptureHalves {
+                input: true,
+                output: true,
+                max_field_bytes: 1000,
+            },
+        );
+        let a = serde_json::to_value(&spans[0].attributes).unwrap();
+        assert_eq!(a["gen_ai_input_messages"][0]["content"], "in");
+        assert_eq!(a["gen_ai_output_messages"][0]["content"], "out");
+        assert!(!a.to_string().contains("never store raw"));
+        assert_eq!(
+            a["tracelane_events"][0]["attributes"]["custom.label"],
+            "allowed"
+        );
     }
 
     // ── GWY-41: decode_batch_with_limits — every cap, both sides ────────────
@@ -2200,3 +2971,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "openinference_tests.rs"]
+mod openinference_tests;

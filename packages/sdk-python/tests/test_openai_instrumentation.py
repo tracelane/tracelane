@@ -90,11 +90,12 @@ def test_sync_create_emits_genai_span(spans: InMemorySpanExporter) -> None:
     span = _only_span(spans)
     assert span.name == "openai.chat.completions.create"
     a = span.attributes
+    assert a["tracelane.usage.input_includes_cache"] is True
     assert a["gen_ai.provider.name"] == "openai"
     assert a["gen_ai.request.model"] == "gpt-4o-mini"
     assert a["gen_ai.usage.input_tokens"] == 11
     assert a["gen_ai.usage.output_tokens"] == 7
-    assert a["gen_ai.response.finish_reason"] == "stop"
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
     assert a["gen_ai.response.model"] == "gpt-4o-mini-2024-07-18"
 
 
@@ -173,3 +174,22 @@ def test_exception_in_call_records_error_status(spans: InMemorySpanExporter) -> 
     span = _only_span(spans)
     # StatusCode.ERROR == 2; the span must record the failure, not swallow it.
     assert span.status.status_code.value == 2
+
+
+@pytest.mark.parametrize("adapter", ["openai", "azure_openai", "vertexai"])
+def test_finish_reason_emitters_use_plural_arrays(adapter: str) -> None:
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    module = import_module(f"tracelane.instrumentations.{adapter}")
+    attrs = {}
+    span = SimpleNamespace(set_attribute=lambda key, value: attrs.__setitem__(key, value))
+    result = SimpleNamespace(
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=2),
+        candidates=[SimpleNamespace(finish_reason="stop")],
+        choices=[SimpleNamespace(finish_reason="stop")],
+    )
+    record = module._record_usage if adapter == "vertexai" else module._record_response
+    record(span, result)
+    assert attrs.get("gen_ai.response.finish_reasons") == ["stop"]
+    assert "gen_ai.response.finish_reason" not in attrs

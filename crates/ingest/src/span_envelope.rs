@@ -17,8 +17,15 @@ use tracelane_shared::TracelaneSpan;
 /// after the durable write; an unacked message is redelivered). It is `None` for
 /// OTLP-sourced spans — push delivery, already acknowledged to the SDK at the
 /// receiver, with no redelivery semantics to manage here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanSource {
+    Nats,
+    OtlpDirect,
+}
+
 pub struct SpanEnvelope {
     pub span: TracelaneSpan,
+    pub source: SpanSource,
     pub ack: Option<async_nats::jetstream::Message>,
 }
 
@@ -26,7 +33,11 @@ impl SpanEnvelope {
     /// An OTLP-sourced span (no JetStream message to ack).
     #[must_use]
     pub fn otlp(span: TracelaneSpan) -> Self {
-        Self { span, ack: None }
+        Self {
+            span,
+            ack: None,
+            source: SpanSource::OtlpDirect,
+        }
     }
 
     /// A NATS-sourced span carrying its JetStream message for ack-after-write.
@@ -35,6 +46,7 @@ impl SpanEnvelope {
         Self {
             span,
             ack: Some(msg),
+            source: SpanSource::Nats,
         }
     }
 }

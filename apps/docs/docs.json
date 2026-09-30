@@ -41,6 +41,7 @@
 					{
 						"group": "Integrations",
 						"pages": [
+							"integrations/opentelemetry",
 							"integrations/langchain",
 							"integrations/langgraph",
 							"integrations/helicone-history",

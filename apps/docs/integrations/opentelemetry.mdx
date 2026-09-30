@@ -1,0 +1,80 @@
+---
+classification: PUBLIC
+title: OpenTelemetry capture
+description: What OTLP spans retain, which fields follow the workspace content setting, and how limits are reported.
+---
+
+Send OTLP trace spans to the gateway's authenticated `POST /v1/traces` endpoint.
+The gateway accepts OTLP protobuf and OTLP JSON. The API key identifies the
+workspace; a tenant ID in the payload does not select another workspace.
+
+## Content follows the workspace setting
+
+In **Settings → Workspace**, the owner controls input and output capture separately.
+An exporter sending text does not override that choice. Without a known workspace
+choice, the workspace half is off. A gateway operator's configured capture
+allowlist can also enable a half. The direct mTLS ingest receiver uses only the
+workspace decision; without a control plane, it drops content and keeps metadata.
+
+| Input capture | Output capture |
+|---|---|
+| Input messages and system instructions | Output messages |
+| OpenInference `input.value` | OpenInference `output.value` |
+| Retrieval query and document content | Model-generated tool arguments |
+| Tool results fed back to the model | Evaluation explanations |
+
+Unknown string attributes require **both** halves to be enabled. Unknown content
+families, such as prompt or completion keys without a supported typed mapping,
+are dropped even when capture is on. A span's `tracelane_content_withheld` field
+names input/output halves that arrived and were removed; absence of that marker
+does not imply the exporter sent text.
+
+Metadata and tags are developer labels, stored independently of the content
+switches. Do not put end-user text in them. Supported sources include
+`tracelane.metadata.<key>` / `tracelane.tags`, OpenInference `metadata` / `tag.tags`,
+and Langfuse trace metadata/tags. Values are bounded and pass through ingest redaction.
+
+## Fields retained
+
+The decoder maps supported OpenInference `llm.*` aliases and current OTel GenAI
+attributes into model, provider, token, finish-reason and tool metadata. Canonical
+GenAI attributes win over aliases regardless of their order. Tool definitions
+retain names and counts; schemas are not retained. Indexed OpenInference messages
+are assembled in index order and then passed through the content decision.
+
+Resource `service.name`, `service.version` and `deployment.environment.name`
+(or legacy `deployment.environment`) reach each span; span attributes take
+precedence. Default unknown-service names stay absent. Other resource attributes
+are dropped.
+
+Exception events retain type, message and a bounded stack trace as metadata.
+Message events fold into the input/output fields and follow their capture setting.
+Links retain trace/span IDs; link attributes are dropped. Supported MCP method,
+session, protocol and tool metadata are retained. Ingest redaction applies to
+retained attributes before storage.
+
+## Limits
+
+These are the seeded defaults; operator policy can change them.
+
+| Field | Default bound |
+|---|---|
+| Each retained content field | 65,536 UTF-8 bytes, including a truncation marker |
+| Unknown attributes, shared across span and events | 32 keys per span |
+| Unknown attribute key / string value | 128 / 256 bytes |
+| Unknown scalar array | 16 items |
+| Events / links / retrieval documents | 32 / 16 / 20 per span |
+| Event attribute / exception stack trace | 1,024 / 16,384 bytes |
+
+Oversized unknown strings are dropped, not truncated. Content and stack traces
+are cut safely at UTF-8 boundaries; sufficiently large caps include
+`…[truncated]`. Other batch, span-size and attribute-count limits still apply.
+`tracelane_attrs_dropped` records dropped items by reason, including limits,
+strings withheld by capture policy, unmapped content, resource keys and link attributes.
+
+The gateway cache has a nominal 15-minute TTL; a failed refresh can retain the
+last known choice longer. The direct ingest cache uses a 30-second TTL and drops
+content when its policy lookup fails. Turning capture off affects new spans once
+the receiving process observes the change. It does not retroactively erase
+recorded text. See [Prompt content](/security#prompt-content)
+for ownership, redaction and retention details.

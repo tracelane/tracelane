@@ -38,6 +38,7 @@ function setUsageAttributes(span: Span, result: Record<string, unknown>): void {
 	const inputTokens = usage.input_tokens;
 	if (inputTokens != null) {
 		span.setAttribute("gen_ai.usage.input_tokens", Number(inputTokens));
+		span.setAttribute("tracelane.usage.input_includes_cache", false);
 	}
 	const outputTokens = usage.output_tokens;
 	if (outputTokens != null) {

@@ -188,15 +188,14 @@ export function meterRateText(
 }
 
 export interface WindowBreakdownRow {
-	label: string;
-	gb: number;
-	pct: number;
+	key: string;
+	bytes: number;
 }
 export interface GatewayWindowBreakdownResponse {
-	by: "project" | "service" | "capture" | "shape";
+	by: "key" | "service" | "capture" | "shape";
 	rows: WindowBreakdownRow[];
-	shown: number;
-	total: number;
+	total_bytes: number;
+	truncated: boolean;
 }
 
 export type WarnLevel = "ok" | "warn" | "danger";

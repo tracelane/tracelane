@@ -13,7 +13,7 @@ classification: PUBLIC
 | Tenant metadata, API keys | Neon Postgres — **EU, Germany** (Frankfurt, `eu-central-1`) | Workspace deletion archives first; eligible for purge after the 30-day recovery window. Ledger records are retained separately. |
 | Audit log | **Neon Postgres — EU, Germany (Frankfurt)** holds the canonical chain rows and anchor records; ClickHouse (EU, Germany) holds a derived copy for the dashboards. Export and verification read the canonical store. Tamper-evident hash chain + Ed25519 per-tenant signing; Sigstore Rekor v2 anchoring best-effort, opt-in | Kept for the ledger's lifetime (no TTL) |
 | Provider API keys | Postgres (envelope-encrypted) | Stored until removed; workspace purge removes the credential rows. Access revocation and erasing stored data are separate operations. |
-| Prompt/completion text | ClickHouse spans — **EU, Germany** | Same as the trace it belongs to: your plan's queryable history (Free 30 days, every paid tier 730 days). Gateway capture is **off by default**; a workspace owner turns it on. OTLP instrumentation and history imports can send content independently. Completion bodies are also held by the response cache for up to 7 days — see [Prompt content](#prompt-content) |
+| Prompt/completion text | ClickHouse spans — **EU, Germany** | Same as the trace it belongs to: your plan's queryable history (Free 30 days, every paid tier 730 days). Message capture is **off by default**; a workspace owner turns it on. OTLP instrumentation and history imports obey the same input/output decision. Completion bodies are also held by the response cache for up to 7 days — see [Prompt content](#prompt-content) |
 
 ### Sigstore Rekor — an external dependency, deliberately not a sub-processor
 
@@ -137,6 +137,9 @@ are two separate switches.
 - Nothing from `POST /v1/embeddings`, and nothing from requests made before the
   setting was turned on.
 
+The following message-selection rules describe proxy capture. OTLP content
+uses the field caps described in [OpenTelemetry capture](/integrations/opentelemetry).
+
 **Limits.** Each field is cut at the operator's maximum field size (64 KiB on
 Tracelane Cloud) and the cut is marked `…[truncated]`. For a long conversation the
 most recent messages that fit are kept, and the span records how many earlier
@@ -165,8 +168,10 @@ and who made the change — so you can show when recording was on. The setting i
 On a self-hosted deployment the operator can also turn recording on for named
 workspaces with a `trace_content:` block in `tracelane.yaml` (workspace IDs and the
 maximum field size). That block does not ask the workspace owner and writes no
-ledger event; Tracelane Cloud uses it only for its own test workspace. Neither
-setting governs content sent through OTLP.
+ledger event; Tracelane Cloud uses it only for its own test workspace. The gateway
+applies this combined decision to proxy requests and OTLP spans. The direct mTLS
+ingest receiver uses the workspace decision only; without a control plane it
+keeps metadata and drops content.
 
 The SDK provider adapters normally record model, tokens and timing rather than
 message bodies. Framework instrumentation has its own capture settings; see
@@ -194,8 +199,12 @@ configuration; `GET /v1/gateway/settings` exposes the same authenticated read.
 
 OTLP clients, including the history importer, can send `gen_ai.input.messages` /
 `gen_ai.output.messages` to `POST /v1/traces`. These reach stored trace content
-through the ingestion pipeline; the gateway's content-capture setting does not
-govern this path. Retention and content processing still apply.
+only when the corresponding input/output setting is on. Disabled fields are
+removed before publication, with a marker distinguishing withheld text from
+text the producer never sent. The gateway cache has a nominal 15-minute TTL;
+failed refreshes can retain the last known choice longer. The direct ingest cache
+uses a 30-second TTL and drops content on policy lookup failure. See [OpenTelemetry capture](/integrations/opentelemetry) for field
+classification and limits.
 
 <Note>
 Earlier revisions of this page documented a `TRACELANE_TRACE_CONTENT=false`

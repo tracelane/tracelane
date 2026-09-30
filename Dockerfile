@@ -27,6 +27,12 @@ COPY packages/verifier-rust/ packages/verifier-rust/
 COPY apps/web/db/migrations/ apps/web/db/migrations/
 # Reviewed identity classifier, embedded at compile time.
 COPY apps/web/db/kya_catalog.v1.json apps/web/db/kya_catalog.v1.json
+# Reference tables embedded at compile time (CLAUDE.md §23 fallbacks): the plan/policy seed read by
+# crates/shared (labels, OTLP capture caps) and crates/gateway (rating), and the provider usage
+# conventions (usage_breakdown). A build context without them fails `include_str!` — the
+# 2026-09-29 capture deploy did exactly that on the node.
+COPY apps/web/db/plans.v3.json apps/web/db/plans.v3.json
+COPY apps/web/db/usage_conventions.v1.json apps/web/db/usage_conventions.v1.json
 # BuildKit cache mounts persist the cargo registry + target/ across builds. The
 # binary MUST be copied OUT of the target cache mount — cache-mount contents are
 # NOT in the layer the runtime COPY reads (that would `COPY … not found`).

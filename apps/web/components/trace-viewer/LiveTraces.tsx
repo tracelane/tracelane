@@ -1,5 +1,9 @@
 "use client";
+import { noMatchCopy } from "@/app/traces/empty-state";
+import { nextFilterParams } from "@/app/traces/filter-params";
 import { Button } from "@tracelanedev/ui";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 
 /**
  * LiveTraces — opt-in live trace feed (V-4).
@@ -43,6 +47,8 @@ export function LiveTraces({
 	children: React.ReactNode;
 	streamParams: string;
 }) {
+	const pageParams = useSearchParams();
+	const selectedIssue = new URLSearchParams(streamParams).get("issue");
 	const [live, setLive] = useState(false);
 	const [rows, setRows] = useState<TraceSummary[] | null>(null);
 	const [status, setStatus] = useState<LiveStatus>("connecting");
@@ -172,11 +178,28 @@ export function LiveTraces({
 					<p aria-live="polite">Connecting to live traces…</p>
 				) : rows.length === 0 ? (
 					<EmptyState
-						title="No live traces yet"
+						title={
+							new URLSearchParams(streamParams).get("issue")
+								? noMatchCopy(
+										undefined,
+										new URLSearchParams(streamParams).get("issue") ?? undefined,
+									).title
+								: "No live traces yet"
+						}
 						description="New traces matching the current filters appear here automatically."
+						action={
+							selectedIssue ? (
+								<Link
+									className="text-sm text-ink-2 underline"
+									href={`/traces?${nextFilterParams(pageParams, "issue", "")}`}
+								>
+									Clear filter
+								</Link>
+							) : undefined
+						}
 					/>
 				) : (
-					<TraceList traces={rows} />
+					<TraceList withGenerationIssues traces={rows} />
 				)
 			) : (
 				children

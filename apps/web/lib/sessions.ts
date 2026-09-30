@@ -1,3 +1,4 @@
+import type { GenerationDetails } from "@/lib/generation-issues";
 /**
  * Session-list and session-detail gateway reads.
  *
@@ -143,7 +144,7 @@ export type SessionCapture = { workspace_policy: "on" | "off" };
  * `"unloaded"` (a stored `$ref` failed to rehydrate — retry), `"unreadable"`
  * (present but not in a shape this gateway can parse).
  */
-export type SessionExchange = {
+export type SessionExchange = GenerationDetails & {
 	span_id: string;
 	input_tail: unknown[];
 	input_message_count: number;

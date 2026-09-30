@@ -84,6 +84,11 @@ pub struct Band {
 /// once and this default is used), never a silent literal price.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
+    pub generation_issues: crate::generation_issues::SummaryPolicy,
+    pub window_breakdown_max_rows: usize,
+    pub request_labels: tracelane_shared::labels::LabelCaps,
+    pub output_speed: tracelane_shared::labels::OutputSpeedPolicy,
+    pub otlp_capture: tracelane_shared::otlp::content::OtlpCapturePolicy,
     /// Meters 1 and 4: any single day's usage up to this multiple of the
     /// trailing 30-day average is billed at included rates (ADR-076 §0.4).
     pub burst_multiple: f64,
@@ -107,11 +112,40 @@ pub struct Policy {
     pub blob_gc_grace_days: i64,
 }
 
+/// Existing breakdown bounds, sourced from the reviewed row cap and Free plan.
+/// Falls back to the values seeded today (200 rows, Free's 3-day window)
+/// if the embedded table is ever malformed — a display default, never a panic.
+pub(crate) fn breakdown_defaults() -> (usize, i32) {
+    const FALLBACK: (usize, i32) = (200, 3);
+    static VALUES: std::sync::LazyLock<(usize, i32)> = std::sync::LazyLock::new(|| {
+        let Ok(seed) = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../../apps/web/db/plans.v3.json"
+        )) else {
+            return FALLBACK;
+        };
+        let rows = seed["policy"]["window_breakdown_max_rows"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(FALLBACK.0);
+        let days = seed["plans"]["free_v1"]["indexed_window_days"]
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or(FALLBACK.1);
+        (rows, days)
+    });
+    *VALUES
+}
+
 impl Default for Policy {
     /// The fail-open display defaults — used only when `billing_policy` has
     /// no row for a key, which this module warns about once when it happens.
     fn default() -> Self {
         Self {
+            generation_issues: crate::generation_issues::SummaryPolicy::embedded(),
+            window_breakdown_max_rows: breakdown_defaults().0,
+            request_labels: tracelane_shared::labels::LabelCaps::embedded(),
+            output_speed: tracelane_shared::labels::OutputSpeedPolicy::embedded(),
+            otlp_capture: tracelane_shared::otlp::content::OtlpCapturePolicy::embedded(),
             burst_multiple: 5.0,
             warn_pct: vec![75, 90],
             velocity_sigma: 2.0,
@@ -270,6 +304,36 @@ impl Policy {
             }
         };
         Self {
+            generation_issues: raw
+                .get("generation_issues")
+                .and_then(|v| {
+                    serde_json::from_str::<crate::generation_issues::SummaryPolicy>(v).ok()
+                })
+                .filter(crate::generation_issues::SummaryPolicy::valid)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        policy_key = "generation_issues",
+                        "billing_policy row missing/invalid — using the embedded display default"
+                    );
+                    default.generation_issues
+                }),
+            window_breakdown_max_rows: raw
+                .get("window_breakdown_max_rows")
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default.window_breakdown_max_rows),
+            request_labels: raw
+                .get("request_labels")
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or(default.request_labels),
+            output_speed: raw
+                .get("output_speed")
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or(default.output_speed),
+            otlp_capture: raw
+                .get("otlp_capture")
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or(default.otlp_capture),
             burst_multiple: num("burst_multiple", default.burst_multiple),
             warn_pct,
             velocity_sigma: num("velocity_sigma", default.velocity_sigma),
@@ -461,6 +525,68 @@ pub fn burst_exempt_days(daily: &[f64], multiple: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn breakdown_reference_preserves_existing_bounds_and_loads_override() {
+        assert_eq!(super::breakdown_defaults(), (200, 3));
+        let raw =
+            std::collections::HashMap::from([("window_breakdown_max_rows".into(), "7".into())]);
+        assert_eq!(super::Policy::from_raw(&raw).window_breakdown_max_rows, 7);
+        assert_eq!(
+            super::Policy::default().window_breakdown_max_rows,
+            super::breakdown_defaults().0
+        );
+    }
+
+    #[test]
+    fn label_policy_loader_overrides_and_fallback_match_seed() {
+        let mut caps = tracelane_shared::labels::LabelCaps::embedded();
+        caps.max_tags = 3;
+        let speed = tracelane_shared::labels::OutputSpeedPolicy {
+            min_generation_ms: 75,
+        };
+        let raw = std::collections::HashMap::from([
+            (
+                "request_labels".into(),
+                serde_json::to_string(&caps).unwrap(),
+            ),
+            (
+                "output_speed".into(),
+                serde_json::to_string(&speed).unwrap(),
+            ),
+        ]);
+        let policy = super::Policy::from_raw(&raw);
+        assert_eq!(policy.request_labels, caps);
+        assert_eq!(policy.output_speed, speed);
+        let default = super::Policy::from_raw(&std::collections::HashMap::new());
+        assert_eq!(
+            default.request_labels,
+            tracelane_shared::labels::LabelCaps::embedded()
+        );
+        assert_eq!(
+            default.output_speed,
+            tracelane_shared::labels::OutputSpeedPolicy::embedded()
+        );
+    }
+
+    #[test]
+    fn otlp_policy_loader_reads_overrides_and_embedded_fallback() {
+        let mut caps = tracelane_shared::otlp::content::OtlpCapturePolicy::embedded();
+        assert_eq!(
+            caps.default_max_field_bytes,
+            crate::server::config::DEFAULT_MAX_FIELD_BYTES
+        );
+        caps.max_links_per_span = 3;
+        let raw = std::collections::HashMap::from([(
+            "otlp_capture".to_string(),
+            serde_json::to_string(&caps).unwrap(),
+        )]);
+        assert_eq!(super::Policy::from_raw(&raw).otlp_capture, caps);
+        assert_eq!(
+            super::Policy::from_raw(&std::collections::HashMap::new()).otlp_capture,
+            tracelane_shared::otlp::content::OtlpCapturePolicy::embedded()
+        );
+    }
+
     use super::*;
     use serde::Deserialize;
 
@@ -783,6 +909,35 @@ mod tests {
         assert_eq!(p.velocity_sigma, 3.0);
         assert_eq!(p.velocity_window_days, 14);
         assert_eq!(p.velocity_interval_secs, 60);
+    }
+
+    #[test]
+    fn issue_summary_policy_loads_overrides_and_rejects_missing_or_zero_values() {
+        let raw = HashMap::from([(
+            "generation_issues".into(),
+            r#"{"dashboard_window_days":2,"summary_cache_ttl_seconds":5,"inline_chip_limit":3}"#
+                .into(),
+        )]);
+        let loaded = Policy::from_raw(&raw).generation_issues;
+        assert_eq!(loaded.dashboard_window_days, 2);
+        assert_eq!(loaded.summary_cache_ttl_seconds, 5);
+        assert_eq!(loaded.inline_chip_limit, 3);
+        for raw_value in [
+            "{}",
+            "null",
+            r#"{"dashboard_window_days":0,"summary_cache_ttl_seconds":5,"inline_chip_limit":3}"#,
+            "invalid",
+        ] {
+            let raw = HashMap::from([("generation_issues".into(), raw_value.into())]);
+            assert_eq!(
+                Policy::from_raw(&raw).generation_issues,
+                crate::generation_issues::SummaryPolicy::embedded()
+            );
+        }
+        assert_eq!(
+            Policy::from_raw(&HashMap::new()).generation_issues,
+            crate::generation_issues::SummaryPolicy::embedded()
+        );
     }
 
     #[test]

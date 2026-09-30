@@ -25,8 +25,54 @@ pub struct TracelaneSpan {
     pub status: SpanStatus,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetrievalDocument {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttributesDropped {
+    pub count: usize,
+    pub reasons: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanEvent {
+    pub name: String,
+    pub time_unix_us: u64,
+    pub attributes: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanLink {
+    pub trace_id: Uuid,
+    pub span_id: Uuid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpanAttributes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_metadata: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_labels_dropped: Option<crate::labels::Dropped>,
+    /// Process-local candidates. Never serialize before the content gate decides.
+    #[serde(skip)]
+    pub otlp_pending: crate::otlp::passthrough::PendingAttributes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_events: Option<Vec<SpanEvent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_links: Option<Vec<SpanLink>>,
     // OTel GenAI semconv
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_system: Option<String>,
@@ -73,6 +119,10 @@ pub struct SpanAttributes {
     /// has no gateway provenance marker. This is display metadata, not authority.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_agent_name_source: Option<String>,
+
+    /// Producer-declared input convention; true means cache counts are subsets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_usage_input_includes_cache: Option<bool>,
 
     // OTel GenAI semconv v1.40/v1.41 additions (ADR-032)
     /// Prompt-cache read tokens (`gen_ai.usage.cache_read.input_tokens`, v1.40).
@@ -253,8 +303,39 @@ pub struct SpanAttributes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_context_truncated: Option<bool>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openinference_span_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_tool_call_arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_tool_call_result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_retrieval_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_retrieval_documents: Option<Vec<RetrievalDocument>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_attrs_dropped: Option<AttributesDropped>,
+
+    /// Halves whose content arrived but the workspace declined to record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_content_withheld: Option<Vec<String>>,
+
     // Structured message capture (v1.37+, replaces deprecated per-message events).
-    // Populated only when content capture is enabled (TRACELANE_TRACE_CONTENT);
+    // Kept only when the workspace/operator capture decision enables that half;
     // off by default for privacy. Stored as JSON arrays/object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_system_instructions: Option<Value>,
@@ -298,14 +379,6 @@ pub struct SpanAttributes {
     /// planned for it (an SDK cannot see the gateway's own retries).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_dispatch_attempts: Option<Vec<DispatchAttempt>>,
-
-    // Lethal trifecta taint attributes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tracelane_taint_reads_private_data: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tracelane_taint_sees_untrusted_content: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tracelane_taint_can_exfiltrate: Option<bool>,
 
     // MCP attributes
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,18 +449,6 @@ pub struct SpanAttributes {
     /// permanent and would falsify the ground truth that decision depends on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
-
-    // x402 / AP2 / ACP payment protocol
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_intent: Option<String>, // "payment.intent": declared intent to pay
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_mandate: Option<String>, // "payment.mandate": signed mandate ID (AP2)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_settled: Option<bool>, // "payment.settled": x402 settlement confirmed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_amount_usd: Option<f64>, // payment amount in USD cents
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_recipient: Option<String>, // recipient address/account
 
     // ── GWY-48 request configuration · OBS-53 confidence · OBS-52 flags ──────
     //

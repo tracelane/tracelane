@@ -133,7 +133,7 @@ def _record_response(span: Any, result: Any) -> None:
     if choices:
         finish_reason = getattr(choices[0], "finish_reason", None)
         if finish_reason:
-            span.set_attribute("gen_ai.response.finish_reason", finish_reason)
+            span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
 
     response_model = getattr(result, "model", None)
     if response_model:

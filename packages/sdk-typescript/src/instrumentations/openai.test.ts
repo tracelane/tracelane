@@ -17,6 +17,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { instrumentOpenAI, instrumentOpenAIAsync } from "./openai.js";
+import { tracelaneTelemetry } from "./vercel_ai.js";
 
 const exporter = new InMemorySpanExporter();
 
@@ -62,12 +63,13 @@ describe("instrumentOpenAI", () => {
 		});
 
 		const s = onlySpan();
+		expect(s.attributes["tracelane.usage.input_includes_cache"]).toBe(true);
 		expect(s.name).toBe("openai.chat.completions.create");
 		expect(s.attributes["gen_ai.provider.name"]).toBe("openai");
 		expect(s.attributes["gen_ai.request.model"]).toBe("gpt-4o-mini");
 		expect(s.attributes["gen_ai.usage.input_tokens"]).toBe(11);
 		expect(s.attributes["gen_ai.usage.output_tokens"]).toBe(7);
-		expect(s.attributes["gen_ai.response.finish_reason"]).toBe("stop");
+		expect(s.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
 		expect(s.attributes["gen_ai.response.model"]).toBe(
 			"gpt-4o-mini-2024-07-18",
 		);
@@ -146,5 +148,25 @@ describe("instrumentOpenAI", () => {
 			expect(s.attributes["gen_ai.usage.input_tokens"]).toBeUndefined();
 			expect(s.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
 		}
+	});
+});
+
+describe("Vercel finish reasons", () => {
+	it("emits the canonical plural string array", () => {
+		const telemetry = tracelaneTelemetry();
+		telemetry.onStart?.({ callId: "finish-test" } as never);
+		telemetry.onLanguageModelCallStart?.({ callId: "finish-test" } as never);
+		telemetry.onLanguageModelCallEnd?.({
+			callId: "finish-test",
+			finishReason: { unified: "stop" },
+		} as never);
+		telemetry.onEnd?.({ callId: "finish-test" } as never);
+		const span = exporter
+			.getFinishedSpans()
+			.find((s) => s.name === "ai.languageModelCall");
+		expect(span?.attributes["gen_ai.response.finish_reasons"]).toEqual([
+			"stop",
+		]);
+		expect(span?.attributes["gen_ai.response.finish_reason"]).toBeUndefined();
 	});
 });

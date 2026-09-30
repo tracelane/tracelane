@@ -62,12 +62,13 @@ export function normalizeAgent(value: string): string {
 		.slice(0, catalog.limits.agent_name_chars)
 		.join("");
 }
+export const MODEL_DATE_SUFFIX = /-(?:\d{8}|\d{4}-\d{2}-\d{2})$/;
 export function normalizeModel(value: string): string {
 	return value
 		.trim()
 		.toLowerCase()
 		.replace(/^([^/]+\/)+/, "")
-		.replace(/-\d{8}$/, "");
+		.replace(MODEL_DATE_SUFFIX, "");
 }
 export function encodeIdentityKey(kind: IdentityKind, key: string): string {
 	if (!key) return kind === "agent" ? "~direct" : "~unidentified";

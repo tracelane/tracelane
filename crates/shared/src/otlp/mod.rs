@@ -19,5 +19,12 @@
 //!   unusable in release builds.
 //! - [`limits`] — ADR-029 size caps, the reject taxonomy and its counters.
 
+pub mod content;
 pub mod decode;
 pub mod limits;
+
+mod openinference;
+
+mod events;
+mod labels;
+pub mod passthrough;

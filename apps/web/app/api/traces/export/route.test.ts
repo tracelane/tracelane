@@ -44,7 +44,7 @@ describe("GET /api/traces/export", () => {
 		});
 		const res = await GET(
 			req(
-				"status=error&model=gpt-4o&range=24h&format=csv&sort=duration&order=asc",
+				"status=error&model=gpt-4o&range=24h&format=csv&sort=duration&order=asc&issue=truncated,filtered",
 			),
 		);
 		expect(res.status).toBe(200);
@@ -56,6 +56,7 @@ describe("GET /api/traces/export", () => {
 		expect(url).toContain("since="); // range=24h → since present
 		expect(url).toContain("sort=duration"); // active sort forwarded → CSV matches screen
 		expect(url).toContain("order=asc");
+		expect(new URL(url).searchParams.get("issue")).toBe("truncated,filtered");
 		expect((init.headers as Record<string, string>).authorization).toBe(
 			"Bearer wos_jwt_user_a",
 		);

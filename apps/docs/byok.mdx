@@ -86,9 +86,8 @@ curl -X POST https://app.tracelane.dev/api/settings/cmk-keys \
 
 Prompt and completion text is **not captured by default**. The gateway records it
 only when a workspace owner turns recording on ([Prompt content](/security#prompt-content)),
-and the first-party SDK provider adapters do not send message bodies. Otherwise text
-reaches us only if your own OpenTelemetry instrumentation sends the
-`gen_ai.*.messages` attributes. Recorded text is not encrypted under your key
+and the first-party SDK provider adapters do not send message bodies. OpenTelemetry message fields are also kept only when the corresponding capture
+half is enabled; sending them does not override the workspace decision. Recorded text is not encrypted under your key
 today — the `trace-payload` scope above is not available.
 
 ## Rotate & revoke

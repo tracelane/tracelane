@@ -70,8 +70,10 @@ Each request becomes one `helicone.request` span at its original timestamps
 (stored with microsecond precision),
 with provider/model and token fields when supplied, and success/error status.
 Its business reference is `helicone:<request_id>`. Request and response bodies
-are preserved as JSON text parts in the input and output messages, independently
-of the provider's payload shape. Missing bodies stay absent. This does not
+are sent as JSON text parts in the input and output messages, independently
+of the provider's payload shape. The destination workspace must enable the
+corresponding input/output capture setting for those bodies to be stored.
+Missing bodies stay absent. This does not
 reconstruct sessions, tool subspans, or Helicone feedback and scores. Other export
 fields are not copied. Helicone's cost is not imported; Tracelane may calculate
 cost from the imported model and tokens using its own pricing reference.

@@ -582,6 +582,7 @@ pub(crate) fn bounded_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> Op
 /// `.clone()` calls it replaces.
 #[derive(Clone, Default)]
 pub(crate) struct CallerIdentity {
+    pub(crate) labels: super::request_labels::BoundedLabels,
     pub(crate) agent_name: Option<String>,
     pub(crate) client_name: Option<String>,
     /// `x-agent-id` — KYA. Which agent made this call.
@@ -681,6 +682,7 @@ impl CallerIdentity {
                 .and_then(tracelane_shared::span::bounded_end_user_id)
         };
         Self {
+            labels: Default::default(),
             agent_name: headers
                 .get("x-tracelane-agent-name")
                 .and_then(|v| v.to_str().ok())
@@ -1121,7 +1123,7 @@ pub(crate) fn build_gateway_span(
     let ttft_secs = timing
         .and_then(|t| t.ttft_us)
         .map(|us| f64::from(us) / 1_000_000.0);
-    TracelaneSpan {
+    let mut span = TracelaneSpan {
         span_id: Uuid::new_v4(),
         trace_id,
         // ADR-075 / B-311: the caller's `traceparent` span, when it sent one. Was
@@ -1133,6 +1135,11 @@ pub(crate) fn build_gateway_span(
         end_time: Some(end_time),
         attributes: SpanAttributes {
             gen_ai_operation_name: Some("chat".to_string()),
+            tracelane_intervention: if error_reason == Some("guardrail_block") {
+                Some(tracelane_shared::span::Intervention::Block)
+            } else {
+                aft_id.map(|_| tracelane_shared::span::Intervention::Warn)
+            },
             // Canonical v1.41 provider field; `gen_ai_system` kept for
             // legacy-downstream round-trip (ADR-032).
             gen_ai_system: Some(provider.to_string()),
@@ -1158,6 +1165,7 @@ pub(crate) fn build_gateway_span(
                 failover_from.is_some(),
             )
             .map(str::to_owned),
+            tracelane_usage_input_includes_cache: (provider == "anthropic").then_some(false),
             gen_ai_usage_input_tokens: Some(input_tokens),
             gen_ai_usage_output_tokens: Some(output_tokens),
             gen_ai_usage_cache_read_input_tokens: usage_meta.cache_read_input_tokens,
@@ -1246,7 +1254,12 @@ pub(crate) fn build_gateway_span(
                 message: None,
             },
         },
-    }
+    };
+    identity
+        .labels
+        .0
+        .write_to(&mut span.attributes, &identity.labels.1);
+    span
 }
 
 /// Add a completed request's cost to its API key's monthly total.
@@ -1436,11 +1449,42 @@ mod tests {
     }
 
     #[test]
+    fn intervention_records_observed_action_and_never_calls_errors_blocks() {
+        use tracelane_shared::span::Intervention::{Block, Warn};
+        for (aft, reason, want) in [
+            (Some("AFT-01"), None, Some(Warn)),
+            (None, Some("guardrail_block"), Some(Block)),
+            (Some("AFT-01"), Some("guardrail_block"), Some(Block)),
+            (None, Some("provider_stream_error"), None),
+            (None, None, None),
+        ] {
+            let span = build_gateway_span(
+                &TenantId::from_jwt_claim(Uuid::from_u128(7)),
+                Uuid::new_v4(),
+                None,
+                "claude-haiku-4-5",
+                &CallerIdentity::default(),
+                chrono::Utc::now(),
+                0,
+                0,
+                aft,
+                SpanUsageMeta::default(),
+                None,
+                None,
+                reason,
+                None,
+            );
+            assert_eq!(span.attributes.tracelane_intervention, want);
+        }
+    }
+
+    #[test]
     fn kya_header_names_the_agent_and_records_its_source() {
         let mut h = HeaderMap::new();
         h.insert("x-tracelane-agent-name", "  KYA-Proof  ".parse().unwrap());
         let a = kya_attributes(h);
         assert_eq!(a["gen_ai_agent_name"], "kya-proof");
+        assert_eq!(a["tracelane_usage_input_includes_cache"], false);
         assert_eq!(a["tracelane_agent_name_source"], "header");
     }
 

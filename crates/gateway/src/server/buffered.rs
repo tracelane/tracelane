@@ -701,6 +701,8 @@ pub(super) async fn buffer_provider_stream(
         let head = match guard.on_delta(&text, Some(&final_usage)).await {
             crate::guardrail::GuardStep::Emit(s) => s,
             crate::guardrail::GuardStep::Block { reason_code } => {
+                span.attributes.tracelane_intervention =
+                    Some(tracelane_shared::span::Intervention::Block);
                 post.mark("response_guard");
                 publish_and_time_post(state, span, post, provider_complete_ts);
                 return content_filter_response(model, reason_code, input_tokens, output_tokens);
@@ -709,6 +711,8 @@ pub(super) async fn buffer_provider_stream(
         let tail = match guard.on_end(Some(&final_usage)).await {
             crate::guardrail::GuardStep::Emit(s) => s,
             crate::guardrail::GuardStep::Block { reason_code } => {
+                span.attributes.tracelane_intervention =
+                    Some(tracelane_shared::span::Intervention::Block);
                 post.mark("response_guard");
                 publish_and_time_post(state, span, post, provider_complete_ts);
                 return content_filter_response(model, reason_code, input_tokens, output_tokens);
